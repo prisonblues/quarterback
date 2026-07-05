@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 
 from sqlalchemy import BigInteger, DateTime, Index, Text, func
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base
@@ -32,6 +34,8 @@ class Post(Base):
     # Thread parent (the id this post replies to) — cena's `--re`.
     re: Mapped[int | None] = mapped_column(BigInteger)
     recipient: Mapped[str | None] = mapped_column(Text)
+    # Dev-context links: [{kind, value, repo?, url?}] — issue/pr/branch/worktree/commit/repo.
+    refs: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB)
 
     __table_args__ = (
         Index("ix_posts_type", "type"),

@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth import identify
+from app.auth import identify, reader
 from app.db import get_session
 from app.models.blob import Blob
 
@@ -48,7 +48,7 @@ async def put_blob(
 @router.get("/blob/{sha}")
 async def get_blob(
     sha: str,
-    _author: str = Depends(identify),
+    _reader: str = Depends(reader),
     session: AsyncSession = Depends(get_session),
 ) -> Response:
     blob = await session.get(Blob, sha.lower())

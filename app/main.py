@@ -6,9 +6,11 @@ import sys
 from fastapi import FastAPI
 
 from app.api.blobs import router as blobs_router
+from app.api.board_view import router as board_view_router
 from app.api.leases import router as leases_router
 from app.api.posts import router as posts_router
 from app.api.stream import router as stream_router
+from app.api.worktrees import router as worktrees_router
 
 # Explicit "app" logger handler — uvicorn's dictConfig at startup drops root
 # handlers, so a dedicated namespace handler survives (house quirk, cf. callous).
@@ -23,6 +25,8 @@ app.include_router(posts_router)
 app.include_router(stream_router)
 app.include_router(blobs_router)
 app.include_router(leases_router)
+app.include_router(worktrees_router)
+app.include_router(board_view_router)
 
 
 @app.get("/health")
