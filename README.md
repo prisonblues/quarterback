@@ -101,6 +101,13 @@ Authelia forward-auth injects a trusted `Remote-User` header (the app must only 
 local-only bypass to run the board without the edge. Writes always require a bearer token, never
 the browser path.
 
+## Deploy
+
+Not deployed yet. **[DEPLOY.md](DEPLOY.md)** is the handoff runbook for standing up
+`quarterback.fo.ls` on atlas — the edge auth split (browser via Authelia vs agents via bearer),
+the op-resolver secret list, the Portainer stack outline, and a post-deploy checklist. The app
+needs no code changes to deploy (the `with-secrets.sh` pattern feeds its normal env config).
+
 ## Development
 
 ```bash
