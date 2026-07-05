@@ -1,8 +1,36 @@
 # Deploying quarterback
 
 Handoff runbook for standing up `quarterback.fo.ls` on **atlas**. The app is built and
-verified locally (see README); this covers the edge + secrets + stack wiring only. Nothing
-here has been executed yet.
+verified locally (see README); this covers the edge + secrets + stack wiring only.
+
+> ## Deployment status — 2026-07-05
+>
+> **DONE (live on atlas):**
+> - GitHub repo `prisonblues/quarterback` (private) + CI; image published to
+>   `ghcr.io/prisonblues/quarterback:latest`.
+> - `selfhost/stacks/quarterback.yml` authored (op-resolver + db + app on loopback `127.0.0.1:9037`).
+> - nginx vhosts **deployed + enabled + reloaded** on atlas: `quarterback.fo.ls` (Authelia) and
+>   `qb.fo.ls` (bearer, strips all `Remote-*`, `limit_req`, 200m body).
+> - HAProxy: both hosts added to PUBLIC+LOCAL maps, tested, reloaded.
+> - **DNS + TLS: no-ops** — `*.fo.ls` wildcard DNS resolves both, and the `*.fo.ls` wildcard cert
+>   covers both. (Corrects §3's "add via dynu" / per-domain assumptions.)
+> - Edge verified: `qb.fo.ls/health` → 502 (routes to app, which is down); `quarterback.fo.ls/`
+>   → 403 (routes to Authelia; becomes 302→login once the rule below is live).
+>
+> **REMAINING (bring-up — needs the secret first):**
+> 1. **Secret (you):** `op signin` then create the `quarterback` item (§1 command below).
+> 2. **Authelia rule:** the `quarterback.fo.ls → two_factor` rule is in
+>    `selfhost/authelia/configuration.yml` but **not yet deployed**. Deploy + restart:
+>    `AtlasSSH().write_file('/data/authelia/config/configuration.yml', <content>)` then
+>    `docker restart authelia` (brief fleet-wide auth blip — deferred deliberately, it's unused
+>    until the app is up).
+> 3. **Stack:** create the Portainer stack `quarterback` from `stacks/quarterback.yml` with
+>    `OP_SERVICE_ACCOUNT_TOKEN` env var. **First check Portainer can pull the private GHCR image**
+>    (`zeus-selfhost` lacks `docker pull` sudo, so this is unverified; Portainer uses its own GHCR
+>    cred — the one that pulls `prisonblues/miniflux`. If denied, grant the package access to that
+>    cred or make it public — the image carries no secrets).
+> 4. **Verify (§5):** health, `board` 401, the **spoof check** (`Remote-User: rich` → 401 not 200),
+>    browser 2FA. Then point one agent's MCP at `qb.fo.ls`.
 
 Canonical spec: `selfhost/issues/open/127-…`. Patterns to mirror:
 `selfhost/stacks/miniflux.yml` (op-resolver), `selfhost/secrets/README.md`,
