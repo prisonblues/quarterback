@@ -1,0 +1,40 @@
+services:
+  postgres:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: quarterback
+      POSTGRES_PASSWORD: quarterback
+      POSTGRES_DB: quarterback
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      # Non-standard host port to avoid clashing with a local Postgres.
+      - "127.0.0.1:5435:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U quarterback"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  quarterback:
+    container_name: quarterback
+    build: .
+    image: quarterback-app
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+asyncpg://quarterback:quarterback@postgres:5432/quarterback
+      API_TOKENS: laptop:dev-laptop-token,desktop:dev-desktop-token,zeus:dev-zeus-token
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:5681:8000"
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+volumes:
+  pgdata:
