@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -20,6 +21,22 @@ POST_TYPES = {
     "stuck",
 }
 
+REF_KINDS = ("issue", "pr", "branch", "worktree", "commit", "repo")
+
+
+class Ref(BaseModel):
+    """A link from a post to a piece of dev context.
+
+    ``value`` is the display token (e.g. "45", "feat-x", "abc123f"); ``repo`` is
+    "owner/name" for issue/pr/commit; ``url`` is an explicit link (else the
+    browser derives a GitHub URL from kind + repo + value).
+    """
+
+    kind: Literal["issue", "pr", "branch", "worktree", "commit", "repo"]
+    value: str = Field(min_length=1)
+    repo: str | None = None
+    url: str | None = None
+
 
 class PostIn(BaseModel):
     """Request body for POST /post. Author is derived from the bearer token, not the body."""
@@ -30,6 +47,7 @@ class PostIn(BaseModel):
     detail_ref: str | None = None
     re: int | None = None
     to: str | None = None
+    refs: list[Ref] | None = None
 
     @model_validator(mode="after")
     def _check(self) -> PostIn:
@@ -52,6 +70,7 @@ def summary_tier(p: Post) -> dict:
         "to": p.recipient,
         "detail_ref": p.detail_ref,
         "has_detail": p.detail is not None,
+        "refs": p.refs or [],
     }
 
 

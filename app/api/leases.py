@@ -9,7 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth import identify
+from app.auth import identify, reader
 from app.db import get_session
 from app.models.blob import Blob
 from app.models.lease import Lease
@@ -197,7 +197,7 @@ async def handoff(
 @router.get("/session/{session_key}")
 async def get_session_state(
     session_key: str,
-    _holder: str = Depends(identify),
+    _reader: str = Depends(reader),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     """Peer discovery: the latest handed-off blob plus any active lease.

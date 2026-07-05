@@ -87,3 +87,15 @@ class QuarterbackClient:
         resp = self._http.get(self._url(f"/session/{session}"))
         resp.raise_for_status()
         return resp.json()
+
+    # -- worktree registry (v2.1) --------------------------------------
+
+    def put_worktrees(self, body: dict) -> dict:
+        resp = self._http.put(self._url("/worktrees"), json=body)
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_worktrees(self, params: dict) -> list[dict]:
+        resp = self._http.get(self._url("/worktrees"), params=params)
+        resp.raise_for_status()
+        return resp.json()

@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth import identify
+from app.auth import identify, reader
 from app.db import get_session
 from app.models.post import Post
 from app.schemas import POST_TYPES, PostIn, full_tier, summary_tier
@@ -26,6 +26,7 @@ async def create_post(
         detail_ref=body.detail_ref,
         re=body.re,
         recipient=body.to,
+        refs=[r.model_dump(exclude_none=True) for r in body.refs] if body.refs else None,
     )
     session.add(post)
     await session.commit()
@@ -36,7 +37,7 @@ async def create_post(
 
 @router.get("/board")
 async def read_board(
-    _author: str = Depends(identify),
+    _reader: str = Depends(reader),
     since: int = Query(0, ge=0, description="return posts with id > since"),
     type: str | None = Query(None, description="filter by post type"),
     to: str | None = Query(None, description="filter by recipient"),
@@ -60,7 +61,7 @@ async def read_board(
 @router.get("/post/{post_id}")
 async def read_post(
     post_id: int,
-    _author: str = Depends(identify),
+    _reader: str = Depends(reader),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     post = await session.get(Post, post_id)

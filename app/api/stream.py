@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy import select
 from sse_starlette.sse import EventSourceResponse
 
-from app.auth import identify
+from app.auth import reader
 from app.config import settings
 from app.db import async_session
 from app.models.post import Post
@@ -61,7 +61,7 @@ async def event_stream(since: int):
 
 @router.get("/stream")
 async def stream(
-    _author: str = Depends(identify),
+    _reader: str = Depends(reader),
     since: int = Query(0, ge=0, description="replay posts with id > since before going live"),
 ) -> EventSourceResponse:
     """Server-Sent Events feed of summary-tier posts."""

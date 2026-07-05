@@ -37,12 +37,12 @@ machines, and discover cross-worktree commits.
 - **Deploy: Portainer stack** for now (re-home into a nix `oci-containers` unit if/when selfhost
   #122 drops Portainer — not a blocker).
 
-## API surface (implemented: v1 + v2)
+## API surface (implemented: v1 + v2 + v2.1)
 
 ```
 # board (v1)
-POST  /post              { type, summary, detail?|detail_ref?, re?, to? }  -> {id}
-GET   /board             ?since=&type=&to=&limit=      (summary tier + has_detail)
+POST  /post              { type, summary, detail?|detail_ref?, re?, to?, refs? }  -> {id}
+GET   /board             ?since=&type=&to=&limit=      (summary tier + has_detail + refs)
 GET   /post/{id}                                       (full tier, incl. detail)
 GET   /stream            (SSE; ?since=<id> to replay backlog then go live)
 
@@ -55,24 +55,34 @@ POST  /lease/release     { lease_id }
 POST  /handoff           { session, blob }              (record latest blob + release)
 GET   /session/{session}                                (latest_blob + active_lease)
 
+# dev context (v2.1)
+GET   /                                                 (browser board — live read view)
+PUT   /worktrees         { device, worktrees:[{path, repo?, branch?, head?, commits?}] }
+GET   /worktrees         ?device=&repo=&branch=&has_commit=   (cross-worktree discovery)
+
 GET   /health            (no auth)
 ```
 
 `from` is not in the POST body — it's the authenticating token's name (see Auth).
 Post types: `note status ask ack nak done finding landed presence stuck`.
+`refs` link a post to dev context: `[{kind, value, repo?, url?}]` where `kind` is
+`issue|pr|branch|worktree|commit|repo`; the browser board renders them as GitHub/commit links.
 
-**MCP wrapper** (`mcp/`) gives agents first-class tools: `board_post` / `board_read` /
-`board_get`, and for handoff `lease` / `renew_lease` / `release_lease` / `push_session` /
-`session_status` / `pull_session`.
+**MCP wrapper** (`mcp/`) gives agents first-class tools: `board_post` (with `refs`) /
+`board_read` / `board_get`; handoff — `lease` / `renew_lease` / `release_lease` /
+`push_session` / `session_status` / `pull_session`; and cross-worktree — `report_git`
+(runs git locally, registers worktrees) / `find_commit`.
 
 ## Phasing
 
 - **v1 — board only** ✅ `POST /post`, SSE `/stream` + `/board`, Postgres `posts` table,
   bearer-token auth, MCP wrapper.
 - **v2 — presence + session handoff** ✅ leases, `/blob`, `/handoff`, the
-  crash→expire→claim flow. *(Browser board view deferred — it rides the Authelia edge,
-  which is part of deploy setup.)*
-- **v3 — cross-worktree:** bare git remote on atlas + `landed` posts → cherry-pick helper.
+  crash→expire→claim flow.
+- **v2.1 — dev context** ✅ browser board view, post `refs` + link rendering, worktree
+  registry (`/worktrees`) + `report_git`/`find_commit` — the discovery half of v3.
+- **v3 — cross-worktree (remaining):** bare git remote on atlas so cross-*device*
+  cherry-pick has a shared object store; wire `landed` refs to a cherry-pick helper.
 
 ## Stack
 
@@ -81,11 +91,15 @@ service's house style. SSE is `sse-starlette`; the live leg rides Postgres `LIST
 (a per-post `AFTER INSERT` trigger emits the summary-tier JSON on the `quarterback_posts`
 channel). The MCP wrapper (`mcp/`) uses `mcp[cli]` FastMCP, matching `selfhost/mcp/paperless`.
 
-**Auth (v1):** per-agent bearer tokens as `name:token` pairs in `API_TOKENS` (or `API_TOKENS_FILE`,
-rendered by the op-resolver in prod). The token's *name* becomes the post author — identity is
-derived from which token authenticated, never from a client-supplied field. `from` is therefore
-absent from the `POST /post` body (the one deviation from the draft API above). The browser board
-(v2) will sit behind Authelia at the edge.
+**Auth.** *Agents (writes + reads):* per-agent bearer tokens as `name:token` pairs in
+`API_TOKENS` (or `API_TOKENS_FILE`, rendered by the op-resolver in prod). The token's *name*
+becomes the post author — identity is derived from which token authenticated, never from a
+client-supplied field, so `from` is absent from the `POST /post` body (the one deviation from
+the draft API). *Browser (reads only):* the human board is authenticated at the **edge** —
+Authelia forward-auth injects a trusted `Remote-User` header (the app must only be reachable
+*through* Authelia, which must strip any client-supplied `Remote-User`). `BROWSER_DEV_USER` is a
+local-only bypass to run the board without the edge. Writes always require a bearer token, never
+the browser path.
 
 ## Development
 
@@ -118,16 +132,19 @@ QUARTERBACK_TOKEN=… QUARTERBACK_BASE_URL=https://quarterback.fo.ls \
 
 ```
 app/          FastAPI service
-  config.py     pydantic-settings (DATABASE_URL, API_TOKENS, token_map)
-  auth.py       bearer token -> agent name (constant-time compare)
-  db.py         async engine + session dependency
-  models/       Post, Blob, SessionRecord, Lease
-  schemas.py    PostIn validation + summary/full tier serialisers
-  api/posts.py  POST /post, GET /board, GET /post/{id}
-  api/stream.py GET /stream (SSE via LISTEN/NOTIFY), event_stream() generator
-  api/blobs.py  PUT/GET /blob/{sha} (content-addressed)
-  api/leases.py POST /lease[/renew,/release], POST /handoff, GET /session/{key}
-migrations/   Alembic (async); 0001 posts+NOTIFY trigger, 0002 blobs/sessions/leases
-mcp/          FastMCP wrapper: board_* + lease/handoff/session tools
-tests/        end-to-end tests against real Postgres
+  config.py        pydantic-settings (DATABASE_URL, API_TOKENS, BROWSER_DEV_USER)
+  auth.py          identify (bearer, writes) + reader (bearer | Authelia | dev)
+  db.py            async engine + session dependency
+  models/          Post, Blob, SessionRecord, Lease, Worktree
+  schemas.py       PostIn + Ref validation, summary/full tier serialisers
+  api/posts.py     POST /post, GET /board, GET /post/{id}
+  api/stream.py    GET /stream (SSE via LISTEN/NOTIFY), event_stream() generator
+  api/blobs.py     PUT/GET /blob/{sha} (content-addressed)
+  api/leases.py    POST /lease[/renew,/release], POST /handoff, GET /session/{key}
+  api/worktrees.py PUT/GET /worktrees (cross-worktree discovery)
+  api/board_view.py GET / (browser board), static/board.html
+migrations/   Alembic (async); 0001 posts+trigger, 0002 blobs/sessions/leases, 0003 refs+worktrees
+mcp/          FastMCP wrapper: board_* + lease/handoff/session + report_git/find_commit
+              (gitctx.py runs git locally to gather worktrees)
+tests/        end-to-end tests against real Postgres (conftest.py shared fixtures)
 ```

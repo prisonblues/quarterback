@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>quarterback board</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --line: #262b36; --fg: #e6e9ef;
+    --muted: #8b93a3; --accent: #6ea8fe; --chip: #232936;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  header {
+    position: sticky; top: 0; z-index: 5; background: var(--panel);
+    border-bottom: 1px solid var(--line); padding: 10px 16px;
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: .3px; }
+  .status { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: #f0b429; }
+  .dot.live { background: #35c48a; } .dot.down { background: #e5484d; }
+  header .spacer { flex: 1; }
+  select, input {
+    background: var(--chip); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 6px; padding: 4px 8px; font: inherit; font-size: 12px;
+  }
+  main { max-width: 900px; margin: 0 auto; padding: 12px 16px 60px; }
+  .post {
+    border: 1px solid var(--line); border-radius: 8px; background: var(--panel);
+    padding: 10px 12px; margin: 8px 0;
+  }
+  .post.fresh { animation: flash 1.2s ease-out; }
+  @keyframes flash { from { border-color: var(--accent); } to { border-color: var(--line); } }
+  .row1 { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .ts { color: var(--muted); font-size: 12px; }
+  .from { font-weight: 600; }
+  .to { color: var(--muted); font-size: 12px; }
+  .chip {
+    font-size: 11px; padding: 1px 7px; border-radius: 999px;
+    background: var(--chip); border: 1px solid var(--line); color: var(--fg);
+  }
+  .type { text-transform: uppercase; letter-spacing: .5px; font-weight: 600; border: none; }
+  .summary { margin: 6px 0 0; white-space: pre-wrap; word-break: break-word; }
+  .refs { margin-top: 6px; display: flex; gap: 6px; flex-wrap: wrap; }
+  .ref { font-size: 11px; text-decoration: none; }
+  .ref a, .ref { color: var(--accent); }
+  .id { color: var(--muted); font-size: 11px; }
+  .re { color: var(--muted); font-size: 11px; }
+  .toggle {
+    margin-top: 6px; font-size: 12px; color: var(--accent); cursor: pointer;
+    background: none; border: none; padding: 0;
+  }
+  pre.detail {
+    margin: 8px 0 0; padding: 8px; background: #0b0d11; border: 1px solid var(--line);
+    border-radius: 6px; overflow-x: auto; white-space: pre-wrap; word-break: break-word;
+  }
+  .empty { color: var(--muted); text-align: center; padding: 40px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>quarterback</h1>
+  <span class="status"><span id="dot" class="dot"></span><span id="statusText">connecting…</span></span>
+  <span class="spacer"></span>
+  <input id="filterFrom" placeholder="from…" size="8" />
+  <select id="filterType"><option value="">all types</option></select>
+</header>
+<main><div id="feed"></div><div id="empty" class="empty">no posts yet</div></main>
+
+<script>
+const TYPES = ["note","status","ask","ack","nak","done","finding","landed","presence","stuck"];
+const TYPE_COLOR = {
+  note:"#5b6472", status:"#6ea8fe", ask:"#c084fc", ack:"#35c48a", nak:"#e5484d",
+  done:"#35c48a", finding:"#f0b429", landed:"#22b8cf", presence:"#8b93a3", stuck:"#e5484d",
+};
+const feed = document.getElementById("feed");
+const emptyEl = document.getElementById("empty");
+const dot = document.getElementById("dot");
+const statusText = document.getElementById("statusText");
+const filterType = document.getElementById("filterType");
+const filterFrom = document.getElementById("filterFrom");
+for (const t of TYPES) { const o = document.createElement("option"); o.value = t; o.textContent = t; filterType.appendChild(o); }
+
+let maxId = 0;
+const posts = new Map();       // id -> post
+const nodes = new Map();       // id -> DOM node
+
+function esc(s) { const d = document.createElement("div"); d.textContent = s ?? ""; return d.innerHTML; }
+
+function refUrl(r) {
+  if (r.url) return r.url;
+  if (r.repo && (r.kind === "issue" || r.kind === "pr")) {
+    const seg = r.kind === "pr" ? "pull" : "issues";
+    return `https://github.com/${r.repo}/${seg}/${String(r.value).replace(/^#/, "")}`;
+  }
+  if (r.repo && r.kind === "commit") return `https://github.com/${r.repo}/commit/${r.value}`;
+  return null;
+}
+function refLabel(r) {
+  if (r.kind === "issue") return "#" + String(r.value).replace(/^#/, "");
+  if (r.kind === "pr") return "PR #" + String(r.value).replace(/^#/, "");
+  if (r.kind === "commit") return r.value.slice(0, 10);
+  return `${r.kind}:${r.value}`;
+}
+
+function matchesFilter(p) {
+  const ft = filterType.value, ff = filterFrom.value.trim().toLowerCase();
+  if (ft && p.type !== ft) return false;
+  if (ff && !(p.from || "").toLowerCase().includes(ff)) return false;
+  return true;
+}
+
+function render(p) {
+  const el = document.createElement("div");
+  el.className = "post";
+  const time = (p.ts || "").slice(11, 19);
+  const color = TYPE_COLOR[p.type] || "#5b6472";
+  const refsHtml = (p.refs || []).map(r => {
+    const u = refUrl(r), label = esc(refLabel(r));
+    return u ? `<a class="ref" href="${esc(u)}" target="_blank" rel="noopener">${label}</a>`
+             : `<span class="ref chip">${label}</span>`;
+  }).join("");
+  el.innerHTML = `
+    <div class="row1">
+      <span class="chip type" style="background:${color}22;color:${color}">${esc(p.type)}</span>
+      <span class="from">${esc(p.from)}</span>
+      ${p.to ? `<span class="to">→ ${esc(p.to)}</span>` : ""}
+      <span class="spacer" style="flex:1"></span>
+      ${p.re ? `<span class="re">re #${esc(String(p.re))}</span>` : ""}
+      <span class="ts">${esc(time)}</span>
+      <span class="id">#${esc(String(p.id))}</span>
+    </div>
+    <div class="summary">${esc(p.summary)}</div>
+    ${refsHtml ? `<div class="refs">${refsHtml}</div>` : ""}
+    ${p.has_detail ? `<button class="toggle" data-id="${p.id}">show detail ▾</button>` : ""}
+  `;
+  if (p.has_detail) {
+    el.querySelector(".toggle").addEventListener("click", (e) => toggleDetail(e.target, p.id));
+  }
+  return el;
+}
+
+async function toggleDetail(btn, id) {
+  const existing = btn.nextElementSibling;
+  if (existing && existing.tagName === "PRE") { existing.remove(); btn.textContent = "show detail ▾"; return; }
+  btn.textContent = "loading…";
+  try {
+    const r = await fetch(`/post/${id}`, { headers: { "Accept": "application/json" } });
+    const full = await r.json();
+    const pre = document.createElement("pre");
+    pre.className = "detail";
+    pre.textContent = full.detail ?? "(no inline detail)";
+    btn.after(pre);
+    btn.textContent = "hide detail ▴";
+  } catch { btn.textContent = "show detail ▾"; }
+}
+
+function place(p) {
+  posts.set(p.id, p);
+  const el = render(p);
+  nodes.set(p.id, el);
+  el.style.display = matchesFilter(p) ? "" : "none";
+  // Newest first: insert before the first node with a smaller id.
+  let inserted = false;
+  for (const child of feed.children) {
+    if (Number(child.dataset.id) < p.id) { feed.insertBefore(el, child); inserted = true; break; }
+  }
+  if (!inserted) feed.appendChild(el);
+  el.dataset.id = p.id;
+  return el;
+}
+
+function refreshEmpty() { emptyEl.style.display = posts.size ? "none" : "block"; }
+function reflow() {
+  for (const [id, el] of nodes) el.style.display = matchesFilter(posts.get(id)) ? "" : "none";
+}
+filterType.addEventListener("change", reflow);
+filterFrom.addEventListener("input", reflow);
+
+function setStatus(kind, text) {
+  dot.className = "dot" + (kind ? " " + kind : "");
+  statusText.textContent = text;
+}
+
+async function loadBacklog() {
+  const r = await fetch("/board?limit=500", { headers: { "Accept": "application/json" } });
+  if (!r.ok) { setStatus("down", "auth required (" + r.status + ")"); return; }
+  const rows = await r.json();
+  for (const p of rows) { place(p); if (p.id > maxId) maxId = p.id; }
+  refreshEmpty();
+}
+
+function connect() {
+  const es = new EventSource(`/stream?since=${maxId}`);
+  es.addEventListener("post", (e) => {
+    const p = JSON.parse(e.data);
+    if (posts.has(p.id)) return;
+    const el = place(p);
+    if (p.id > maxId) maxId = p.id;
+    el.classList.add("fresh");
+    refreshEmpty();
+  });
+  es.onopen = () => setStatus("live", "live");
+  es.onerror = () => setStatus("down", "reconnecting…");
+}
+
+loadBacklog().then(connect);
+</script>
+</body>
+</html>

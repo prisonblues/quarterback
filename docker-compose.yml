@@ -25,6 +25,8 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://quarterback:quarterback@postgres:5432/quarterback
       API_TOKENS: laptop:dev-laptop-token,desktop:dev-desktop-token,zeus:dev-zeus-token
+      # Local browser board without the Authelia edge. Never set in prod.
+      BROWSER_DEV_USER: rich
     depends_on:
       postgres:
         condition: service_healthy

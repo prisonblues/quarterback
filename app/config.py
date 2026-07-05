@@ -15,6 +15,11 @@ class Settings(BaseSettings):
     # Prod: a file (rendered by the op-resolver) holding the same name:token format.
     api_tokens_file: str = ""
 
+    # Browser board: a local-only bypass so the read views work without the
+    # Authelia edge. Set to a display name (e.g. "rich"); leave empty in prod,
+    # where Authelia's Remote-User header authenticates the browser instead.
+    browser_dev_user: str = ""
+
     # Optional persistent app log (mirrors the callous LOG_FILE convention).
     log_file: str = ""
 

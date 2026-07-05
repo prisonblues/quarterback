@@ -20,6 +20,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 
 from mcp_server.client import QuarterbackClient
+from mcp_server.gitctx import gather_worktrees
 
 POST_TYPES = [
     "note",
@@ -72,6 +73,10 @@ mcp = FastMCP(
         "**Resume elsewhere:** session_status(session) — if active_lease is null and "
         "latest_blob is set, lease(session, device) then pull_session(latest_blob).\n"
         "Never sync a session another device still holds a live lease on.\n\n"
+        "## Cross-worktree discovery\n"
+        "After landing a commit, report_git(device) registers your worktrees so a "
+        "peer can find_commit(sha) to see where it already exists (same machine ⇒ "
+        "cherry-pick by SHA just works). Attach refs to a 'landed' post to announce it.\n\n"
         "## Post types\n"
         "note status ask ack nak done finding landed presence stuck"
     ),
@@ -91,6 +96,7 @@ def board_post(
     detail: str | None = None,
     re: int | None = None,
     to: str | None = None,
+    refs: list[dict] | None = None,
 ) -> dict:
     """Post an entry to the coordination board.
 
@@ -102,6 +108,10 @@ def board_post(
         detail: Optional longer body, fetched on demand (not shown in the stream).
         re: Optional id of the post this replies to (threading).
         to: Optional recipient agent name (a directed post).
+        refs: Optional dev-context links, each {kind, value, repo?, url?} where kind is
+            issue|pr|branch|worktree|commit|repo (e.g. a 'landed' post referencing the
+            commit and PR it shipped: [{"kind":"commit","value":"abc123","repo":"me/app"},
+            {"kind":"pr","value":"45","repo":"me/app"}]).
 
     Returns: {"id": <new post id>}
     """
@@ -117,6 +127,8 @@ def board_post(
         body["re"] = re
     if to is not None:
         body["to"] = to
+    if refs:
+        body["refs"] = refs
     try:
         return _get_client(ctx).post(body)
     except httpx.HTTPStatusError as e:
@@ -266,6 +278,61 @@ def pull_session(ctx: Context, sha: str) -> dict:
         return {"jsonl": content.decode("utf-8")}
     except UnicodeDecodeError as e:
         raise ToolError("blob is not utf-8 text") from e
+
+
+@mcp.tool()
+def report_git(ctx: Context, device: str, repo_path: str = ".", commit_depth: int = 15) -> dict:
+    """Register this machine's git worktrees so peers can discover commits.
+
+    Runs git locally (the repo lives here; the board server can't see it),
+    snapshots every worktree's branch/HEAD/recent commits, and registers them.
+    Run after landing work so `find_commit` can locate the SHA elsewhere.
+
+    Args:
+        device: This device's name (e.g. "laptop").
+        repo_path: Path inside the repo (default cwd).
+        commit_depth: Recent commits to index per worktree (default 15).
+    """
+    import subprocess
+
+    try:
+        _slug, worktrees = gather_worktrees(repo_path, commit_depth)
+    except subprocess.CalledProcessError as e:
+        raise ToolError(f"git failed: {e.stderr or e}") from e
+    except FileNotFoundError as e:
+        raise ToolError("git not found on PATH") from e
+    try:
+        result = _get_client(ctx).put_worktrees({"device": device, "worktrees": worktrees})
+    except httpx.HTTPStatusError as e:
+        _raise(e, "register worktrees")
+    return {
+        **result,
+        "worktrees": [
+            {"path": w["path"], "branch": w["branch"], "head": w["head"]} for w in worktrees
+        ],
+    }
+
+
+@mcp.tool()
+def find_commit(ctx: Context, sha: str, repo: str | None = None) -> dict:
+    """Find which registered worktrees hold a commit (cross-worktree discovery).
+
+    Args:
+        sha: Full or short (>=7 char) commit SHA to locate.
+        repo: Optional owner/name filter.
+
+    Returns {"worktrees": [...]} — each entry's device/path/branch tells you
+    where the commit already exists (same machine ⇒ cherry-pick by SHA just works).
+    """
+    if len(sha) < 7:
+        raise ToolError("provide at least 7 characters of the SHA")
+    params: dict = {"has_commit": sha}
+    if repo is not None:
+        params["repo"] = repo
+    try:
+        return {"worktrees": _get_client(ctx).get_worktrees(params)}
+    except httpx.HTTPStatusError as e:
+        _raise(e, "find_commit")
 
 
 def main():
