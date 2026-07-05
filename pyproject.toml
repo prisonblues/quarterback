@@ -1,0 +1,55 @@
+[project]
+name = "quarterback"
+version = "0.1.0"
+description = "Cross-device agent coordination + session-sync board (v1: board only)"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]",
+    "sqlalchemy[asyncio]>=2.0",
+    "asyncpg>=0.29",
+    "alembic",
+    "pydantic-settings",
+    "sse-starlette>=2.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "httpx",
+    "ruff",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+# One shared event loop for the whole session so the module-level async engine's
+# connection pool isn't torn down under a closed loop between tests.
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+    "F",      # pyflakes
+    "E", "W", # pycodestyle
+    "I",      # isort
+    "UP",     # pyupgrade
+    "B",      # flake8-bugbear
+    "SIM",    # flake8-simplify
+    "RUF",    # ruff-specific rules
+]
+ignore = [
+    "B008",   # function-call-in-default-argument (FastAPI Depends pattern)
+    "E501",   # line-too-long (handled by formatter)
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]

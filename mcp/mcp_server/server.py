@@ -1,0 +1,186 @@
+"""quarterback coordination-board MCP server.
+
+Exposes the board as first-class agent tools — post to it, read the ordered
+stream, and pull a post's full detail — so agents coordinate through tools
+rather than shell commands.
+
+Configuration via environment variables:
+    QUARTERBACK_TOKEN     — bearer token (required); its configured name is the author
+    QUARTERBACK_BASE_URL  — board base URL (default: https://board.example.com)
+"""
+
+from __future__ import annotations
+
+import os
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+
+import httpx
+from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
+
+from mcp_server.client import QuarterbackClient
+
+POST_TYPES = [
+    "note",
+    "status",
+    "ask",
+    "ack",
+    "nak",
+    "done",
+    "finding",
+    "landed",
+    "presence",
+    "stuck",
+]
+
+
+@dataclass
+class AppContext:
+    client: QuarterbackClient
+
+
+@asynccontextmanager
+async def app_lifespan(server: FastMCP):
+    token = os.environ.get("QUARTERBACK_TOKEN", "")
+    base_url = os.environ.get("QUARTERBACK_BASE_URL", "https://board.example.com")
+    if not token:
+        raise ValueError("QUARTERBACK_TOKEN environment variable is required")
+    client = QuarterbackClient(base_url, token)
+    try:
+        yield AppContext(client=client)
+    finally:
+        client.close()
+
+
+mcp = FastMCP(
+    "quarterback",
+    instructions=(
+        "quarterback is a shared, ordered, replayable board for coordinating "
+        "across devices and agents.\n\n"
+        "## Workflows\n\n"
+        "**Announce what you're doing:** board_post(type='status', summary=...).\n"
+        "**Catch up:** board_read() returns posts newest work last; pass since=<id> "
+        "to get only what's new, then remember the highest id you saw as your cursor.\n"
+        "**Ask / answer:** board_post(type='ask', summary=..., to='<agent>'); the "
+        "responder replies with type='ack'/'nak' and re=<the ask's id>.\n"
+        "**Big content:** keep summary short; put long detail in `detail`. board_read "
+        "returns summaries only — call board_get(id) to pull a post's full detail.\n\n"
+        "## Post types\n"
+        "note status ask ack nak done finding landed presence stuck"
+    ),
+    lifespan=app_lifespan,
+)
+
+
+def _get_client(ctx: Context) -> QuarterbackClient:
+    return ctx.request_context.lifespan_context.client
+
+
+@mcp.tool()
+def board_post(
+    ctx: Context,
+    summary: str,
+    type: str = "note",
+    detail: str | None = None,
+    re: int | None = None,
+    to: str | None = None,
+) -> dict:
+    """Post an entry to the coordination board.
+
+    The author is derived from your token — do not include it.
+
+    Args:
+        summary: Short headline, always shown in the stream. Keep it tight.
+        type: One of note, status, ask, ack, nak, done, finding, landed, presence, stuck.
+        detail: Optional longer body, fetched on demand (not shown in the stream).
+        re: Optional id of the post this replies to (threading).
+        to: Optional recipient agent name (a directed post).
+
+    Returns: {"id": <new post id>}
+    """
+    if type not in POST_TYPES:
+        raise ToolError(f"unknown type {type!r}; allowed: {POST_TYPES}")
+    if not summary.strip():
+        raise ToolError("summary cannot be empty")
+
+    body: dict = {"type": type, "summary": summary}
+    if detail is not None:
+        body["detail"] = detail
+    if re is not None:
+        body["re"] = re
+    if to is not None:
+        body["to"] = to
+    try:
+        return _get_client(ctx).post(body)
+    except httpx.HTTPStatusError as e:
+        raise ToolError(f"board rejected post: {e.response.status_code} {e.response.text}") from e
+
+
+@mcp.tool()
+def board_read(
+    ctx: Context,
+    since: int = 0,
+    type: str | None = None,
+    to: str | None = None,
+    limit: int = 100,
+) -> dict:
+    """Read the board in order (oldest→newest), summary tier only.
+
+    Args:
+        since: Return only posts with id greater than this. Use your saved cursor.
+        type: Optional filter to a single post type.
+        to: Optional filter to posts directed at this recipient.
+        limit: Max posts to return (1-1000, default 100).
+
+    Returns: {"posts": [...], "cursor": <highest id, or `since` if none>}
+    """
+    params: dict = {"since": since, "limit": limit}
+    if type is not None:
+        params["type"] = type
+    if to is not None:
+        params["to"] = to
+    try:
+        posts = _get_client(ctx).board(params)
+    except httpx.HTTPStatusError as e:
+        raise ToolError(f"board read failed: {e.response.status_code} {e.response.text}") from e
+    cursor = posts[-1]["id"] if posts else since
+    return {"posts": posts, "cursor": cursor}
+
+
+@mcp.tool()
+def board_get(ctx: Context, id: int) -> dict:
+    """Fetch a single post including its full `detail` blob.
+
+    Args:
+        id: The post id (from a board_read summary).
+    """
+    try:
+        return _get_client(ctx).get_post(id)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            raise ToolError(f"no post with id {id}") from e
+        raise ToolError(f"board get failed: {e.response.status_code} {e.response.text}") from e
+
+
+def main():
+    """Run the MCP server with configurable transport."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="quarterback board MCP server")
+    parser.add_argument("--transport", default="stdio", choices=["stdio", "streamable-http"])
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=8080)
+    args = parser.parse_args()
+
+    if args.transport == "streamable-http":
+        from mcp.server.fastmcp.server import TransportSecuritySettings
+
+        mcp.settings.host = args.host
+        mcp.settings.port = args.port
+        mcp.settings.json_response = True
+        mcp.settings.stateless_http = True
+        mcp.settings.transport_security = TransportSecuritySettings(
+            enable_dns_rebinding_protection=False,
+        )
+    mcp.run(transport=args.transport)
