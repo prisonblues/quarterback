@@ -1,51 +1,17 @@
 """End-to-end board tests against a real Postgres (docker compose up -d postgres).
 
-Runs migrations, then drives the ASGI app over an in-process httpx transport so
-the NOTIFY trigger and SSE stream exercise real database machinery.
+The NOTIFY trigger and SSE stream exercise real database machinery. Shared
+fixtures (schema setup, client) live in conftest.py.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-import os
-import subprocess
-import sys
-
-import httpx
-import pytest
-from httpx import ASGITransport
-
-# Point the app at the compose-mapped Postgres before importing it.
-os.environ.setdefault(
-    "DATABASE_URL",
-    "postgresql+asyncpg://quarterback:quarterback@localhost:5435/quarterback",
-)
-os.environ.setdefault("API_TOKENS", "laptop:tok-laptop,zeus:tok-zeus")
 
 from app.api.stream import event_stream
-from app.db import engine
-from app.main import app
 
-LAPTOP = {"Authorization": "Bearer tok-laptop"}
-ZEUS = {"Authorization": "Bearer tok-zeus"}
-
-
-@pytest.fixture(scope="module", autouse=True)
-async def _schema():
-    # Rebuild schema (+ trigger) via alembic so tests exercise the real migration.
-    alembic = [sys.executable, "-m", "alembic"]
-    subprocess.run([*alembic, "downgrade", "base"], check=False)
-    subprocess.run([*alembic, "upgrade", "head"], check=True)
-    yield
-    await engine.dispose()
-
-
-@pytest.fixture
-async def client():
-    transport = ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
-        yield c
+from .conftest import LAPTOP, ZEUS
 
 
 async def test_health_needs_no_auth(client):

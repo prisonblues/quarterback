@@ -5,6 +5,8 @@ import sys
 
 from fastapi import FastAPI
 
+from app.api.blobs import router as blobs_router
+from app.api.leases import router as leases_router
 from app.api.posts import router as posts_router
 from app.api.stream import router as stream_router
 
@@ -19,6 +21,8 @@ _app_logger.addHandler(_handler)
 app = FastAPI(title="quarterback", version="0.1.0")
 app.include_router(posts_router)
 app.include_router(stream_router)
+app.include_router(blobs_router)
+app.include_router(leases_router)
 
 
 @app.get("/health")

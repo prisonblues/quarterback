@@ -66,6 +66,12 @@ mcp = FastMCP(
         "responder replies with type='ack'/'nak' and re=<the ask's id>.\n"
         "**Big content:** keep summary short; put long detail in `detail`. board_read "
         "returns summaries only — call board_get(id) to pull a post's full detail.\n\n"
+        "## Session handoff (moving a session between devices)\n"
+        "**Hand off:** lease(session, device) to claim it, do your work (renew_lease "
+        "before ttl lapses), then push_session(session, jsonl) to store+release.\n"
+        "**Resume elsewhere:** session_status(session) — if active_lease is null and "
+        "latest_blob is set, lease(session, device) then pull_session(latest_blob).\n"
+        "Never sync a session another device still holds a live lease on.\n\n"
         "## Post types\n"
         "note status ask ack nak done finding landed presence stuck"
     ),
@@ -161,6 +167,105 @@ def board_get(ctx: Context, id: int) -> dict:
         if e.response.status_code == 404:
             raise ToolError(f"no post with id {id}") from e
         raise ToolError(f"board get failed: {e.response.status_code} {e.response.text}") from e
+
+
+def _raise(e: httpx.HTTPStatusError, prefix: str):
+    # Surface the server's JSON error detail (e.g. a lease conflict) to the caller.
+    raise ToolError(f"{prefix}: {e.response.status_code} {e.response.text}") from e
+
+
+@mcp.tool()
+def lease(ctx: Context, session: str, device: str, ttl: int = 300) -> dict:
+    """Claim a session so you can safely sync its JSONL — or renew if you hold it.
+
+    Fails with a conflict if another device holds a live lease; that device must
+    release, hand off, or crash (its lease then lapses) before you can take over.
+    Renew before `ttl` seconds elapse, or the claim lapses.
+
+    Args:
+        session: Opaque session key (its uuid / cwd-encoded path).
+        device: Your device name (e.g. "laptop", "desktop").
+        ttl: Seconds until the lease lapses without a renew (default 300).
+
+    Returns the lease incl. lease_id and expiry; remember lease_id to renew/release.
+    """
+    try:
+        return _get_client(ctx).lease({"session": session, "device": device, "ttl": ttl})
+    except httpx.HTTPStatusError as e:
+        _raise(e, "lease")
+
+
+@mcp.tool()
+def renew_lease(ctx: Context, lease_id: str) -> dict:
+    """Extend a lease you hold by another ttl. Re-acquire via `lease` if it already lapsed."""
+    try:
+        return _get_client(ctx).renew_lease(lease_id)
+    except httpx.HTTPStatusError as e:
+        _raise(e, "renew")
+
+
+@mcp.tool()
+def release_lease(ctx: Context, lease_id: str) -> dict:
+    """Release a lease you hold without handing off state (idempotent)."""
+    try:
+        return _get_client(ctx).release_lease(lease_id)
+    except httpx.HTTPStatusError as e:
+        _raise(e, "release")
+
+
+@mcp.tool()
+def push_session(ctx: Context, session: str, jsonl: str) -> dict:
+    """Store a session's JSONL and hand it off in one step, releasing your lease.
+
+    You must already hold the lease for `session`. Stores the JSONL as a
+    content-addressed blob, then records it as the session's latest and releases
+    your lease so a peer can claim and resume.
+
+    Args:
+        session: The session key you hold a lease on.
+        jsonl: The full session JSONL text to hand off.
+
+    Returns the handoff result including the stored blob's sha (`latest_blob`).
+    """
+    client = _get_client(ctx)
+    try:
+        blob = client.put_blob(jsonl.encode("utf-8"))
+        return client.handoff(session, blob["sha"])
+    except httpx.HTTPStatusError as e:
+        _raise(e, "handoff")
+
+
+@mcp.tool()
+def session_status(ctx: Context, session: str) -> dict:
+    """Check a session before resuming it: its latest blob and any active lease.
+
+    If `active_lease` is null and `latest_blob` is set, the session is free to
+    claim (via `lease`) and pull (via `pull_session`).
+    """
+    try:
+        return _get_client(ctx).session_state(session)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            raise ToolError(f"no known session {session!r}") from e
+        _raise(e, "session_status")
+
+
+@mcp.tool()
+def pull_session(ctx: Context, sha: str) -> dict:
+    """Fetch a session JSONL blob by sha (from session_status's `latest_blob`).
+
+    Returns {"jsonl": <text>}. Claim the lease first so it isn't a hot session.
+    """
+    try:
+        content = _get_client(ctx).get_blob(sha)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            raise ToolError(f"no blob {sha!r}") from e
+        _raise(e, "pull_session")
+    try:
+        return {"jsonl": content.decode("utf-8")}
+    except UnicodeDecodeError as e:
+        raise ToolError("blob is not utf-8 text") from e
 
 
 def main():
