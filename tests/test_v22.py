@@ -23,12 +23,16 @@ async def test_sessions_lists_live_then_resumable_with_size_and_cwd(client):
     sess = f"s-{uuid.uuid4()}"
     cwd = "/home/devuser/source/selfhost"
 
-    # live: lease claimed with cwd, no blob yet
-    await client.post("/lease", json={"session": sess, "device": "lap", "cwd": cwd}, headers=LAPTOP)
+    # live: lease claimed with cwd + title + recap, no blob yet
+    await client.post("/lease", json={
+        "session": sess, "device": "lap", "cwd": cwd,
+        "title": "Wire the board", "recap": "building v2.3 session registry",
+    }, headers=LAPTOP)
     row = _find((await client.get("/sessions", headers=SERVER)).json(), sess)
     assert row is not None
     assert row["live"] is True and row["resumable"] is False
     assert row["cwd"] == cwd and row["size"] is None
+    assert row["title"] == "Wire the board" and row["recap"] == "building v2.3 session registry"
 
     # snapshot: push a blob without releasing → size appears, still live
     jsonl = b'{"turn":1}\n{"turn":2}\n'

@@ -61,12 +61,19 @@
   .empty { color: var(--muted); text-align: center; padding: 40px; }
 #sessions { display:flex; gap:8px; overflow-x:auto; padding:8px 12px; border-bottom:1px solid #222; }
 #sessions:empty { display:none; }
-.sess { flex:0 0 auto; min-width:180px; background:#161a20; border:1px solid #262b33; border-radius:8px; padding:8px 10px; font-size:12px; }
+.sess { flex:0 0 auto; width:230px; background:#161a20; border:1px solid #262b33; border-radius:8px; padding:8px 10px; font-size:12px; }
+.sess.islive { border-color:#2f6f52; box-shadow:0 0 0 1px #2f6f5255, 0 0 12px #35c48a22; }
+.sess.isstale { opacity:0.6; }
 .sess .top { display:flex; align-items:center; gap:6px; }
-.sess .live, .sess .stale { width:8px; height:8px; border-radius:50%; }
-.sess .live { background:#35c48a; } .sess .stale { background:#5b6472; }
-.sess .who { font-weight:600; }
+.sess .live, .sess .stale { width:8px; height:8px; border-radius:50%; flex:0 0 auto; }
+.sess .live { background:#35c48a; animation:pulse 1.8s ease-in-out infinite; }
+.sess .stale { background:#5b6472; }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+.sess .who { font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .sess .meta { color:#8b93a3; margin-top:3px; }
+.sess .recap { color:#aeb6c2; margin-top:5px; font-size:11px; line-height:1.35;
+  display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+.sess .id { opacity:0.55; }
 .sess .rev { margin-top:6px; }
 .sess .rev button { font:inherit; cursor:pointer; background:#222831; color:#9fddc7; border:1px solid #2e3742; border-radius:5px; padding:2px 6px; }
 .sess .rev button:active { background:#2e3742; }
@@ -231,12 +238,14 @@ async function loadSessions(){
   sessionsEl.innerHTML = "";
   for(const s of rows){
     const repo = s.cwd ? s.cwd.split("/").filter(Boolean).pop() : "?";
-    const el = document.createElement("div"); el.className = "sess";
+    const el = document.createElement("div");
+    el.className = "sess " + (s.live ? "islive" : "isstale");
     el.innerHTML = `
       <div class="top"><span class="${s.live?'live':'stale'}"></span>
-        <span class="who">${esc(s.holder||"?")}${s.device?"@"+esc(s.device):""}</span></div>
-      <div class="meta">${esc(repo)} · ${ago(s.updated_at)} · ${human(s.size)}${s.live?" · live":""}</div>
-      <div class="meta" title="${esc(s.session)}">#${esc(String(s.session).slice(0,8))}</div>
+        <span class="who">${esc(s.title || repo)}</span></div>
+      <div class="meta">${esc(s.holder||"?")}${s.device?"@"+esc(s.device):""} · ${esc(repo)} · ${ago(s.updated_at)} · ${human(s.size)}${s.live?" · live":""}</div>
+      ${s.recap?`<div class="recap">${esc(s.recap)}</div>`:""}
+      <div class="meta id" title="${esc(s.session)}">#${esc(String(s.session).slice(0,8))}</div>
       ${s.resumable?`<div class="rev"><button data-cmd="qb resume ${esc(s.session)}">copy revive ⧉</button></div>`:""}`;
     sessionsEl.appendChild(el);
   }

@@ -25,6 +25,8 @@ class Lease(Base):
     device: Mapped[str] = mapped_column(Text, nullable=False)
     holder: Mapped[str] = mapped_column(Text, nullable=False)  # token name (see auth.identify)
     cwd: Mapped[str | None] = mapped_column(Text)              # project dir (for revive)
+    title: Mapped[str | None] = mapped_column(Text)            # CC ai-title
+    recap: Mapped[str | None] = mapped_column(Text)            # compact-summary head / last prompt
     ttl_seconds: Mapped[int] = mapped_column(BigInteger, nullable=False)
     acquired_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

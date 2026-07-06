@@ -49,16 +49,18 @@ async def _active_lease(session: AsyncSession, sess_key: str, now: datetime) -> 
 
 async def _record_blob(
     session: AsyncSession, sess_key: str, blob_sha: str,
-    device: str | None, holder: str, cwd: str | None, now: datetime,
+    holder: str, fields: dict, now: datetime,
 ) -> None:
-    """Upsert the durable sessions pointer (shared by /handoff and /snapshot)."""
-    set_ = {"latest_blob": blob_sha, "device": device, "holder": holder, "updated_at": now}
-    if cwd:
-        set_["cwd"] = cwd
+    """Upsert the durable sessions pointer (shared by /handoff and /snapshot).
+
+    ``fields`` carries optional metadata (device/cwd/title/recap); a None value is
+    inserted but never overwrites an existing value on conflict.
+    """
+    base = {"latest_blob": blob_sha, "holder": holder, "updated_at": now}
+    set_ = {**base, **{k: v for k, v in fields.items() if v is not None}}
     await session.execute(
         pg_insert(SessionRecord)
-        .values(session=sess_key, latest_blob=blob_sha, device=device,
-                holder=holder, cwd=cwd, updated_at=now)
+        .values(session=sess_key, **base, **fields)
         .on_conflict_do_update(index_elements=[SessionRecord.session], set_=set_)
     )
 
@@ -68,6 +70,8 @@ class LeaseIn(BaseModel):
     device: str = Field(min_length=1)
     ttl: int = Field(default=300, ge=1, le=86400)
     cwd: str | None = None      # project dir (for `claude --resume` on a peer)
+    title: str | None = None    # CC ai-title
+    recap: str | None = None    # compact-summary head / last prompt
 
 
 class RenewIn(BaseModel):
@@ -82,6 +86,8 @@ class HandoffIn(BaseModel):
     session: str = Field(min_length=1)
     blob: str = Field(min_length=1, description="sha of the JSONL blob already PUT to /blob")
     cwd: str | None = None
+    title: str | None = None
+    recap: str | None = None
 
 
 class SnapshotIn(BaseModel):
@@ -91,6 +97,8 @@ class SnapshotIn(BaseModel):
     session: str = Field(min_length=1)
     blob: str = Field(min_length=1, description="sha of the JSONL blob already PUT to /blob")
     cwd: str | None = None
+    title: str | None = None
+    recap: str | None = None
 
 
 @router.post("/lease")
@@ -123,6 +131,10 @@ async def acquire_lease(
         active.expires_at = now + timedelta(seconds=body.ttl)
         if body.cwd:
             active.cwd = body.cwd
+        if body.title:
+            active.title = body.title
+        if body.recap:
+            active.recap = body.recap
         await session.commit()
         return {**_lease_view(active), "renewed": True}
 
@@ -133,6 +145,8 @@ async def acquire_lease(
         ttl_seconds=body.ttl,
         expires_at=now + timedelta(seconds=body.ttl),
         cwd=body.cwd,
+        title=body.title,
+        recap=body.recap,
     )
     session.add(lease)
     await session.commit()
@@ -196,8 +210,12 @@ async def handoff(
     if await session.get(Blob, body.blob.lower()) is None:
         raise HTTPException(400, "unknown blob; PUT it to /blob/<sha> first")
 
-    await _record_blob(session, body.session, body.blob.lower(), active.device,
-                       holder, body.cwd or active.cwd, now)
+    await _record_blob(session, body.session, body.blob.lower(), holder, {
+        "device": active.device,
+        "cwd": body.cwd or active.cwd,
+        "title": body.title or active.title,
+        "recap": body.recap or active.recap,
+    }, now)
     active.released_at = now
     await session.commit()
     return {
@@ -224,8 +242,12 @@ async def snapshot(
         raise HTTPException(409, "you do not hold an active lease on this session")
     if await session.get(Blob, body.blob.lower()) is None:
         raise HTTPException(400, "unknown blob; PUT it to /blob/<sha> first")
-    await _record_blob(session, body.session, body.blob.lower(), active.device,
-                       holder, body.cwd or active.cwd, now)
+    await _record_blob(session, body.session, body.blob.lower(), holder, {
+        "device": active.device,
+        "cwd": body.cwd or active.cwd,
+        "title": body.title or active.title,
+        "recap": body.recap or active.recap,
+    }, now)
     await session.commit()
     return {"session": body.session, "latest_blob": body.blob.lower()}
 
@@ -259,21 +281,26 @@ async def list_sessions(
     live = {lease.session: lease for lease in active}
     out: dict[str, dict] = {}
     for r in records:
+        lv = live.get(r.session)
         out[r.session] = {
             "session": r.session,
             "cwd": r.cwd,
-            "device": (live[r.session].device if r.session in live else r.device),
+            "title": (lv.title if lv else None) or r.title,
+            "recap": (lv.recap if lv else None) or r.recap,
+            "device": (lv.device if lv else r.device),
             "holder": r.holder,
             "updated_at": r.updated_at.isoformat(),
             "blob": r.latest_blob,
             "size": sizes.get(r.latest_blob) if r.latest_blob else None,
-            "live": r.session in live,
+            "live": lv is not None,
             "resumable": r.latest_blob is not None,
         }
     for lease in active:  # live sessions not yet handed off (no record)
         out.setdefault(lease.session, {
             "session": lease.session,
             "cwd": lease.cwd,
+            "title": lease.title,
+            "recap": lease.recap,
             "device": lease.device,
             "holder": lease.holder,
             "updated_at": lease.acquired_at.isoformat(),
@@ -304,6 +331,8 @@ async def get_session_state(
         "session": session_key,
         "latest_blob": record.latest_blob if record else None,
         "cwd": (record.cwd if record else None) or (active.cwd if active else None),
+        "title": (record.title if record else None) or (active.title if active else None),
+        "recap": (record.recap if record else None) or (active.recap if active else None),
         "device": record.device if record else None,
         "holder": record.holder if record else None,
         "updated_at": record.updated_at.isoformat() if record else None,
