@@ -26,6 +26,7 @@ class Post(Base):
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
     author: Mapped[str] = mapped_column(Text, nullable=False)
+    session: Mapped[str | None] = mapped_column(Text)   # the CC session this event came from
     type: Mapped[str] = mapped_column(Text, nullable=False)
     summary: Mapped[str] = mapped_column(Text, nullable=False)
     # Layered detail: inline blob (v1) or a content-addressed ref fetched on demand (v2 /blob).
@@ -40,4 +41,5 @@ class Post(Base):
     __table_args__ = (
         Index("ix_posts_type", "type"),
         Index("ix_posts_recipient", "recipient"),
+        Index("ix_posts_session", "session"),
     )

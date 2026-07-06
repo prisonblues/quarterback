@@ -72,6 +72,19 @@ async def test_snapshot_keeps_the_lease(client):
 
 
 @pytest.mark.asyncio
+async def test_posts_carry_session_and_filter(client):
+    sess = f"s-{uuid.uuid4()}"
+    await client.post("/post", json={"type": "status", "summary": "working", "session": sess}, headers=ZEUS)
+    await client.post("/post", json={"type": "note", "summary": "elsewhere", "session": "other"}, headers=ZEUS)
+    # summary_tier carries the session
+    board = (await client.get("/board", headers=LAPTOP)).json()
+    assert any(p["session"] == sess and p["summary"] == "working" for p in board)
+    # /board?session filters to one session
+    only = (await client.get(f"/board?session={sess}", headers=LAPTOP)).json()
+    assert len(only) == 1 and only[0]["session"] == sess
+
+
+@pytest.mark.asyncio
 async def test_snapshot_requires_active_lease(client):
     sess = f"s-{uuid.uuid4()}"
     jsonl = b'{}\n'

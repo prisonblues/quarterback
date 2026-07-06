@@ -47,6 +47,7 @@ class PostIn(BaseModel):
     detail_ref: str | None = None
     re: int | None = None
     to: str | None = None
+    session: str | None = None      # the CC session this event belongs to
     refs: list[Ref] | None = None
 
     @model_validator(mode="after")
@@ -62,6 +63,7 @@ def summary_tier(p: Post) -> dict:
     """The lightweight view carried in /board and /stream — no detail blob."""
     return {
         "id": p.id,
+        "session": p.session,
         "ts": p.ts.isoformat() if isinstance(p.ts, datetime) else p.ts,
         "from": p.author,
         "type": p.type,
