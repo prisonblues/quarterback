@@ -72,6 +72,7 @@ class LeaseIn(BaseModel):
     cwd: str | None = None      # project dir (for `claude --resume` on a peer)
     title: str | None = None    # CC ai-title
     recap: str | None = None    # compact-summary head / last prompt
+    model: str | None = None    # model id from last assistant msg
 
 
 class RenewIn(BaseModel):
@@ -88,6 +89,7 @@ class HandoffIn(BaseModel):
     cwd: str | None = None
     title: str | None = None
     recap: str | None = None
+    model: str | None = None
 
 
 class SnapshotIn(BaseModel):
@@ -99,6 +101,7 @@ class SnapshotIn(BaseModel):
     cwd: str | None = None
     title: str | None = None
     recap: str | None = None
+    model: str | None = None
 
 
 @router.post("/lease")
@@ -135,6 +138,8 @@ async def acquire_lease(
             active.title = body.title
         if body.recap:
             active.recap = body.recap
+        if body.model:
+            active.model = body.model
         await session.commit()
         return {**_lease_view(active), "renewed": True}
 
@@ -147,6 +152,7 @@ async def acquire_lease(
         cwd=body.cwd,
         title=body.title,
         recap=body.recap,
+        model=body.model,
     )
     session.add(lease)
     await session.commit()
@@ -215,6 +221,7 @@ async def handoff(
         "cwd": body.cwd or active.cwd,
         "title": body.title or active.title,
         "recap": body.recap or active.recap,
+        "model": body.model or active.model,
     }, now)
     active.released_at = now
     await session.commit()
@@ -247,6 +254,7 @@ async def snapshot(
         "cwd": body.cwd or active.cwd,
         "title": body.title or active.title,
         "recap": body.recap or active.recap,
+        "model": body.model or active.model,
     }, now)
     await session.commit()
     return {"session": body.session, "latest_blob": body.blob.lower()}
@@ -287,6 +295,7 @@ async def list_sessions(
             "cwd": r.cwd,
             "title": (lv.title if lv else None) or r.title,
             "recap": (lv.recap if lv else None) or r.recap,
+            "model": (lv.model if lv else None) or r.model,
             "device": (lv.device if lv else r.device),
             "holder": r.holder,
             "updated_at": r.updated_at.isoformat(),
@@ -301,6 +310,7 @@ async def list_sessions(
             "cwd": lease.cwd,
             "title": lease.title,
             "recap": lease.recap,
+            "model": lease.model,
             "device": lease.device,
             "holder": lease.holder,
             "updated_at": lease.acquired_at.isoformat(),
@@ -333,6 +343,7 @@ async def get_session_state(
         "cwd": (record.cwd if record else None) or (active.cwd if active else None),
         "title": (record.title if record else None) or (active.title if active else None),
         "recap": (record.recap if record else None) or (active.recap if active else None),
+        "model": (record.model if record else None) or (active.model if active else None),
         "device": record.device if record else None,
         "holder": record.holder if record else None,
         "updated_at": record.updated_at.isoformat() if record else None,
