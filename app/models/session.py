@@ -21,6 +21,7 @@ class SessionRecord(Base):
 
     session: Mapped[str] = mapped_column(Text, primary_key=True)
     latest_blob: Mapped[str | None] = mapped_column(Text)
+    cwd: Mapped[str | None] = mapped_column(Text)      # project dir for `claude --resume`
     device: Mapped[str | None] = mapped_column(Text)
     holder: Mapped[str | None] = mapped_column(Text)
     updated_at: Mapped[datetime] = mapped_column(

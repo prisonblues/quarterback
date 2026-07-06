@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime, timedelta
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -47,10 +47,27 @@ async def _active_lease(session: AsyncSession, sess_key: str, now: datetime) -> 
     return await session.scalar(stmt)
 
 
+async def _record_blob(
+    session: AsyncSession, sess_key: str, blob_sha: str,
+    device: str | None, holder: str, cwd: str | None, now: datetime,
+) -> None:
+    """Upsert the durable sessions pointer (shared by /handoff and /snapshot)."""
+    set_ = {"latest_blob": blob_sha, "device": device, "holder": holder, "updated_at": now}
+    if cwd:
+        set_["cwd"] = cwd
+    await session.execute(
+        pg_insert(SessionRecord)
+        .values(session=sess_key, latest_blob=blob_sha, device=device,
+                holder=holder, cwd=cwd, updated_at=now)
+        .on_conflict_do_update(index_elements=[SessionRecord.session], set_=set_)
+    )
+
+
 class LeaseIn(BaseModel):
     session: str = Field(min_length=1)
     device: str = Field(min_length=1)
     ttl: int = Field(default=300, ge=1, le=86400)
+    cwd: str | None = None      # project dir (for `claude --resume` on a peer)
 
 
 class RenewIn(BaseModel):
@@ -64,6 +81,16 @@ class ReleaseIn(BaseModel):
 class HandoffIn(BaseModel):
     session: str = Field(min_length=1)
     blob: str = Field(min_length=1, description="sha of the JSONL blob already PUT to /blob")
+    cwd: str | None = None
+
+
+class SnapshotIn(BaseModel):
+    """Update a live session's latest blob WITHOUT releasing the lease — the
+    mid-session freshness path (Stop hook), so a peer can pull a current
+    transcript. Contrast /handoff, which also releases."""
+    session: str = Field(min_length=1)
+    blob: str = Field(min_length=1, description="sha of the JSONL blob already PUT to /blob")
+    cwd: str | None = None
 
 
 @router.post("/lease")
@@ -94,6 +121,8 @@ async def acquire_lease(
         # Same device re-claiming — treat as a renew.
         active.ttl_seconds = body.ttl
         active.expires_at = now + timedelta(seconds=body.ttl)
+        if body.cwd:
+            active.cwd = body.cwd
         await session.commit()
         return {**_lease_view(active), "renewed": True}
 
@@ -103,6 +132,7 @@ async def acquire_lease(
         holder=holder,
         ttl_seconds=body.ttl,
         expires_at=now + timedelta(seconds=body.ttl),
+        cwd=body.cwd,
     )
     session.add(lease)
     await session.commit()
@@ -166,25 +196,8 @@ async def handoff(
     if await session.get(Blob, body.blob.lower()) is None:
         raise HTTPException(400, "unknown blob; PUT it to /blob/<sha> first")
 
-    await session.execute(
-        pg_insert(SessionRecord)
-        .values(
-            session=body.session,
-            latest_blob=body.blob.lower(),
-            device=active.device,
-            holder=holder,
-            updated_at=now,
-        )
-        .on_conflict_do_update(
-            index_elements=[SessionRecord.session],
-            set_={
-                "latest_blob": body.blob.lower(),
-                "device": active.device,
-                "holder": holder,
-                "updated_at": now,
-            },
-        )
-    )
+    await _record_blob(session, body.session, body.blob.lower(), active.device,
+                       holder, body.cwd or active.cwd, now)
     active.released_at = now
     await session.commit()
     return {
@@ -192,6 +205,84 @@ async def handoff(
         "latest_blob": body.blob.lower(),
         "released_lease": str(active.id),
     }
+
+
+@router.post("/snapshot")
+async def snapshot(
+    body: SnapshotIn,
+    holder: str = Depends(identify),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Update a live session's latest blob without releasing the lease.
+
+    The mid-session freshness path (Stop hook): a peer can pull a current
+    transcript. Requires you hold the active lease and the blob is already PUT.
+    """
+    now = _utcnow()
+    active = await _active_lease(session, body.session, now)
+    if active is None or active.holder != holder:
+        raise HTTPException(409, "you do not hold an active lease on this session")
+    if await session.get(Blob, body.blob.lower()) is None:
+        raise HTTPException(400, "unknown blob; PUT it to /blob/<sha> first")
+    await _record_blob(session, body.session, body.blob.lower(), active.device,
+                       holder, body.cwd or active.cwd, now)
+    await session.commit()
+    return {"session": body.session, "latest_blob": body.blob.lower()}
+
+
+@router.get("/sessions")
+async def list_sessions(
+    _reader: str = Depends(reader),
+    session: AsyncSession = Depends(get_session),
+    limit: int = Query(50, ge=1, le=500),
+) -> list[dict]:
+    """All known sessions — live (held now) and resumable (handed off) — with
+    freshness and transcript size, for the board + `qb sessions`/`qb resume`."""
+    now = _utcnow()
+    records = (
+        await session.scalars(
+            select(SessionRecord).order_by(SessionRecord.updated_at.desc()).limit(limit)
+        )
+    ).all()
+    active = (
+        await session.scalars(
+            select(Lease).where(Lease.released_at.is_(None), Lease.expires_at > now)
+        )
+    ).all()
+
+    shas = {r.latest_blob for r in records if r.latest_blob}
+    sizes: dict[str, int] = {}
+    if shas:
+        rows = await session.execute(select(Blob.sha, Blob.size).where(Blob.sha.in_(shas)))
+        sizes = dict(rows.all())
+
+    live = {lease.session: lease for lease in active}
+    out: dict[str, dict] = {}
+    for r in records:
+        out[r.session] = {
+            "session": r.session,
+            "cwd": r.cwd,
+            "device": (live[r.session].device if r.session in live else r.device),
+            "holder": r.holder,
+            "updated_at": r.updated_at.isoformat(),
+            "blob": r.latest_blob,
+            "size": sizes.get(r.latest_blob) if r.latest_blob else None,
+            "live": r.session in live,
+            "resumable": r.latest_blob is not None,
+        }
+    for lease in active:  # live sessions not yet handed off (no record)
+        out.setdefault(lease.session, {
+            "session": lease.session,
+            "cwd": lease.cwd,
+            "device": lease.device,
+            "holder": lease.holder,
+            "updated_at": lease.acquired_at.isoformat(),
+            "blob": None,
+            "size": None,
+            "live": True,
+            "resumable": False,
+        })
+    return sorted(out.values(), key=lambda s: (s["live"], s["updated_at"]), reverse=True)[:limit]
 
 
 @router.get("/session/{session_key}")
@@ -212,6 +303,7 @@ async def get_session_state(
     return {
         "session": session_key,
         "latest_blob": record.latest_blob if record else None,
+        "cwd": (record.cwd if record else None) or (active.cwd if active else None),
         "device": record.device if record else None,
         "holder": record.holder if record else None,
         "updated_at": record.updated_at.isoformat() if record else None,

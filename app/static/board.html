@@ -59,6 +59,17 @@
     border-radius: 6px; overflow-x: auto; white-space: pre-wrap; word-break: break-word;
   }
   .empty { color: var(--muted); text-align: center; padding: 40px; }
+#sessions { display:flex; gap:8px; overflow-x:auto; padding:8px 12px; border-bottom:1px solid #222; }
+#sessions:empty { display:none; }
+.sess { flex:0 0 auto; min-width:180px; background:#161a20; border:1px solid #262b33; border-radius:8px; padding:8px 10px; font-size:12px; }
+.sess .top { display:flex; align-items:center; gap:6px; }
+.sess .live, .sess .stale { width:8px; height:8px; border-radius:50%; }
+.sess .live { background:#35c48a; } .sess .stale { background:#5b6472; }
+.sess .who { font-weight:600; }
+.sess .meta { color:#8b93a3; margin-top:3px; }
+.sess .rev { margin-top:6px; }
+.sess .rev button { font:inherit; cursor:pointer; background:#222831; color:#9fddc7; border:1px solid #2e3742; border-radius:5px; padding:2px 6px; }
+.sess .rev button:active { background:#2e3742; }
 </style>
 </head>
 <body>
@@ -69,6 +80,7 @@
   <input id="filterFrom" placeholder="from…" size="8" />
   <select id="filterType"><option value="">all types</option></select>
 </header>
+<section id="sessions" title="Claude Code sessions — live + resumable"></section>
 <main><div id="feed"></div><div id="empty" class="empty">no posts yet</div></main>
 
 <script>
@@ -207,6 +219,34 @@ function connect() {
   es.onopen = () => setStatus("live", "live");
   es.onerror = () => setStatus("down", "reconnecting…");
 }
+
+// ---- sessions panel (v2.2) ------------------------------------------------
+const sessionsEl = document.getElementById("sessions");
+function human(b){ if(b==null) return "—"; const u=["B","KB","MB","GB"]; let n=b,i=0; while(n>=1024&&i<u.length-1){n/=1024;i++;} return (i?n.toFixed(1):n)+u[i]; }
+function ago(iso){ const s=Math.max(0,(Date.now()-Date.parse(iso))/1000); if(s<60)return Math.floor(s)+"s"; if(s<3600)return Math.floor(s/60)+"m"; if(s<86400)return Math.floor(s/3600)+"h"; return Math.floor(s/86400)+"d"; }
+async function loadSessions(){
+  let rows;
+  try { const r = await fetch("/sessions", { headers:{ "Accept":"application/json" } }); if(!r.ok) return; rows = await r.json(); }
+  catch(e){ return; }
+  sessionsEl.innerHTML = "";
+  for(const s of rows){
+    const repo = s.cwd ? s.cwd.split("/").filter(Boolean).pop() : "?";
+    const el = document.createElement("div"); el.className = "sess";
+    el.innerHTML = `
+      <div class="top"><span class="${s.live?'live':'stale'}"></span>
+        <span class="who">${esc(s.holder||"?")}${s.device?"@"+esc(s.device):""}</span></div>
+      <div class="meta">${esc(repo)} · ${ago(s.updated_at)} · ${human(s.size)}${s.live?" · live":""}</div>
+      <div class="meta" title="${esc(s.session)}">#${esc(String(s.session).slice(0,8))}</div>
+      ${s.resumable?`<div class="rev"><button data-cmd="qb resume ${esc(s.session)}">copy revive ⧉</button></div>`:""}`;
+    sessionsEl.appendChild(el);
+  }
+}
+sessionsEl.addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-cmd]"); if(!b) return;
+  navigator.clipboard && navigator.clipboard.writeText(b.dataset.cmd);
+  const t = b.textContent; b.textContent = "copied ✓"; setTimeout(() => b.textContent = t, 1200);
+});
+loadSessions(); setInterval(loadSessions, 15000);
 
 loadBacklog().then(connect);
 </script>
