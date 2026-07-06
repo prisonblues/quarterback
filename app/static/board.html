@@ -74,7 +74,8 @@
 .sess .recap { color:#aeb6c2; margin-top:5px; font-size:11px; line-height:1.35;
   display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
 .sess .id { opacity:0.55; }
-.sess .rev { margin-top:6px; }
+.sess .model { margin-left:auto; font-size:10px; color:#c9b6f5; background:#2a2340; border:1px solid #3a2f56; border-radius:4px; padding:1px 5px; white-space:nowrap; }
+.sess .rev { margin-top:6px; display:flex; gap:6px; }
 .sess .rev button { font:inherit; cursor:pointer; background:#222831; color:#9fddc7; border:1px solid #2e3742; border-radius:5px; padding:2px 6px; }
 .sess .rev button:active { background:#2e3742; }
 </style>
@@ -240,13 +241,18 @@ async function loadSessions(){
     const repo = s.cwd ? s.cwd.split("/").filter(Boolean).pop() : "?";
     const el = document.createElement("div");
     el.className = "sess " + (s.live ? "islive" : "isstale");
+    const model = s.model ? s.model.replace(/^claude-/, "") : "";
     el.innerHTML = `
       <div class="top"><span class="${s.live?'live':'stale'}"></span>
-        <span class="who">${esc(s.title || repo)}</span></div>
+        <span class="who">${esc(s.title || repo)}</span>
+        ${model?`<span class="model">${esc(model)}</span>`:""}</div>
       <div class="meta">${esc(s.holder||"?")}${s.device?"@"+esc(s.device):""} · ${esc(repo)} · ${ago(s.updated_at)} · ${human(s.size)}${s.live?" · live":""}</div>
       ${s.recap?`<div class="recap">${esc(s.recap)}</div>`:""}
       <div class="meta id" title="${esc(s.session)}">#${esc(String(s.session).slice(0,8))}</div>
-      ${s.resumable?`<div class="rev"><button data-cmd="qb resume ${esc(s.session)}">copy revive ⧉</button></div>`:""}`;
+      <div class="rev">
+        ${s.resumable?`<button data-cmd="qb resume ${esc(s.session)}">resume ⧉</button>`:""}
+        ${s.live?`<button data-cmd="qb focus ${esc(s.session)}">focus ⧉</button>`:""}
+      </div>`;
     sessionsEl.appendChild(el);
   }
 }

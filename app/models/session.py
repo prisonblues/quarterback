@@ -24,6 +24,7 @@ class SessionRecord(Base):
     cwd: Mapped[str | None] = mapped_column(Text)      # project dir for `claude --resume`
     title: Mapped[str | None] = mapped_column(Text)    # CC ai-title
     recap: Mapped[str | None] = mapped_column(Text)    # compact-summary head / last prompt
+    model: Mapped[str | None] = mapped_column(Text)    # model id from last assistant msg
     device: Mapped[str | None] = mapped_column(Text)
     holder: Mapped[str | None] = mapped_column(Text)
     updated_at: Mapped[datetime] = mapped_column(
