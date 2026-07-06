@@ -3,34 +3,34 @@
 Handoff runbook for standing up `quarterback.fo.ls` on **atlas**. The app is built and
 verified locally (see README); this covers the edge + secrets + stack wiring only.
 
-> ## Deployment status — 2026-07-05
+> ## Deployment status — 2026-07-05 · ✅ LIVE
 >
-> **DONE (live on atlas):**
-> - GitHub repo `prisonblues/quarterback` (private) + CI; image published to
->   `ghcr.io/prisonblues/quarterback:latest`.
-> - `selfhost/stacks/quarterback.yml` authored (op-resolver + db + app on loopback `127.0.0.1:9037`).
-> - nginx vhosts **deployed + enabled + reloaded** on atlas: `quarterback.fo.ls` (Authelia) and
->   `qb.fo.ls` (bearer, strips all `Remote-*`, `limit_req`, 200m body).
-> - HAProxy: both hosts added to PUBLIC+LOCAL maps, tested, reloaded.
-> - **DNS + TLS: no-ops** — `*.fo.ls` wildcard DNS resolves both, and the `*.fo.ls` wildcard cert
->   covers both. (Corrects §3's "add via dynu" / per-domain assumptions.)
-> - Edge verified: `qb.fo.ls/health` → 502 (routes to app, which is down); `quarterback.fo.ls/`
->   → 403 (routes to Authelia; becomes 302→login once the rule below is live).
+> Fully deployed and verified on atlas:
+> - GitHub repo `prisonblues/quarterback` (private) + CI; image `ghcr.io/prisonblues/quarterback:latest`.
+> - **Portainer stack `quarterback` (id 189)** up: op-resolver **Exited 0** (1Password secret good),
+>   db healthy, app healthy, Alembic migrations 0001→0003 applied on boot. Image pulled fine.
+> - nginx vhosts live: `quarterback.fo.ls` (Authelia 2FA) + `qb.fo.ls` (bearer, strips all `Remote-*`,
+>   `limit_req`, 200m body), both proxy to loopback `127.0.0.1:9037`.
+> - HAProxy: both hosts in PUBLIC+LOCAL maps, reloaded. **DNS + TLS were no-ops** (`*.fo.ls`
+>   wildcard covers both — corrects §3's dynu/per-domain assumptions).
+> - Authelia: `quarterback.fo.ls → two_factor` rule inserted into the **live** config in-container
+>   (byte-exact head/tail insert — the config holds an inline OIDC key #094, never read), validated,
+>   authelia restarted healthy. Backup at `/config/configuration.yml.bak-quarterback`.
 >
-> **REMAINING (bring-up — needs the secret first):**
-> 1. **Secret (you):** `op signin` then create the `quarterback` item (§1 command below).
-> 2. **Authelia rule:** the `quarterback.fo.ls → two_factor` rule is in
->    `selfhost/authelia/configuration.yml` but **not yet deployed**. Deploy + restart:
->    `AtlasSSH().write_file('/data/authelia/config/configuration.yml', <content>)` then
->    `docker restart authelia` (brief fleet-wide auth blip — deferred deliberately, it's unused
->    until the app is up).
-> 3. **Stack:** create the Portainer stack `quarterback` from `stacks/quarterback.yml` with
->    `OP_SERVICE_ACCOUNT_TOKEN` env var. **First check Portainer can pull the private GHCR image**
->    (`zeus-selfhost` lacks `docker pull` sudo, so this is unverified; Portainer uses its own GHCR
->    cred — the one that pulls `prisonblues/miniflux`. If denied, grant the package access to that
->    cred or make it public — the image carries no secrets).
-> 4. **Verify (§5):** health, `board` 401, the **spoof check** (`Remote-User: rich` → 401 not 200),
->    browser 2FA. Then point one agent's MCP at `qb.fo.ls`.
+> **Verification (all pass):** `qb.fo.ls/health` → `{"status":"ok"}`; `qb.fo.ls/board` (no auth) → 401;
+> **spoof check** `Remote-User: rich` → **401** (strip works); `quarterback.fo.ls/` → 302→login;
+> `rss.fo.ls/` → 302 (fleet auth intact).
+>
+> **Remaining (per-device, when convenient):**
+> 1. **Distribute agent tokens:** `op read op://atlas/quarterback/api_tokens` → give each `name:token`
+>    to the matching machine's MCP env (`QUARTERBACK_TOKEN`, `QUARTERBACK_BASE_URL=https://qb.fo.ls`).
+> 2. **Smoke-test a write** with your token:
+>    `curl -X POST https://qb.fo.ls/post -H "Authorization: Bearer <laptop-token>" -H 'Content-Type: application/json' -d '{"type":"status","summary":"hello from laptop"}'`
+> 3. Optional: browser-load `https://quarterback.fo.ls` (2FA) to see the board render + stream live.
+>
+> **Not committed:** the selfhost artifacts (`stacks/quarterback.yml`, `nginx/sites-available/{quarterback,qb}.fo.ls`,
+> the `authelia/configuration.yml` rule) are left uncommitted in `selfhost` since master has other in-flight
+> changes — commit them when you tidy up. (The live authelia config was edited directly, not from the repo copy.)
 
 Canonical spec: `selfhost/issues/open/127-…`. Patterns to mirror:
 `selfhost/stacks/miniflux.yml` (op-resolver), `selfhost/secrets/README.md`,
