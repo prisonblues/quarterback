@@ -22,6 +22,8 @@ class SessionRecord(Base):
     session: Mapped[str] = mapped_column(Text, primary_key=True)
     latest_blob: Mapped[str | None] = mapped_column(Text)
     cwd: Mapped[str | None] = mapped_column(Text)      # project dir for `claude --resume`
+    title: Mapped[str | None] = mapped_column(Text)    # CC ai-title
+    recap: Mapped[str | None] = mapped_column(Text)    # compact-summary head / last prompt
     device: Mapped[str | None] = mapped_column(Text)
     holder: Mapped[str | None] = mapped_column(Text)
     updated_at: Mapped[datetime] = mapped_column(
