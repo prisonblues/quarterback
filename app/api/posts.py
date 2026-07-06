@@ -20,6 +20,7 @@ async def create_post(
 ) -> dict:
     post = Post(
         author=author,
+        session=body.session,
         type=body.type,
         summary=body.summary,
         detail=body.detail,
@@ -41,8 +42,9 @@ async def read_board(
     since: int = Query(0, ge=0, description="return posts with id > since"),
     type: str | None = Query(None, description="filter by post type"),
     to: str | None = Query(None, description="filter by recipient"),
+    session: str | None = Query(None, description="filter to one CC session"),
     limit: int = Query(100, ge=1, le=1000),
-    session: AsyncSession = Depends(get_session),
+    db: AsyncSession = Depends(get_session),
 ) -> list[dict]:
     if type is not None and type not in POST_TYPES:
         raise HTTPException(422, f"unknown type {type!r}")
@@ -52,9 +54,11 @@ async def read_board(
         stmt = stmt.where(Post.type == type)
     if to is not None:
         stmt = stmt.where(Post.recipient == to)
+    if session is not None:
+        stmt = stmt.where(Post.session == session)
     stmt = stmt.order_by(Post.id).limit(limit)
 
-    rows = (await session.scalars(stmt)).all()
+    rows = (await db.scalars(stmt)).all()
     return [summary_tier(p) for p in rows]
 
 
