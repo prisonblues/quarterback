@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -91,8 +91,25 @@ async def register_subagent(
     Called by a Task/Agent-tool PreToolUse hook on spawn. Upserts on
     ``(parent_session, agent_id)``: re-registering renews the TTL and clears any
     prior end (``started_at`` is preserved). Never writes to the posts log.
+
+    409 if the key already exists under a *different* holder — a token may only
+    manage its own sub-agents (mirrors the lease ownership model).
     """
     now = _utcnow()
+    existing = await session.scalar(
+        select(Subagent).where(
+            Subagent.parent_session == body.parent_session,
+            Subagent.agent_id == body.agent_id,
+        )
+    )
+    if existing is not None and existing.holder != holder:
+        raise HTTPException(
+            409,
+            detail={
+                "error": "sub-agent registered by another holder",
+                "held_by": existing.holder,
+            },
+        )
     values = {
         "parent_session": body.parent_session,
         "agent_id": body.agent_id,
@@ -124,10 +141,13 @@ async def register_subagent(
 @router.post("/subagent/end")
 async def end_subagent(
     body: SubagentEndIn,
-    _holder: str = Depends(identify),
+    holder: str = Depends(identify),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
-    """Mark a sub-agent finished (idempotent). Called by a PostToolUse hook."""
+    """Mark a sub-agent finished (idempotent). Called by a PostToolUse hook.
+
+    403 if the sub-agent belongs to another holder (mirrors lease release).
+    """
     now = _utcnow()
     row = await session.scalar(
         select(Subagent).where(
@@ -137,6 +157,8 @@ async def end_subagent(
     )
     if row is None:
         return {"ended": False, "reason": "unknown subagent"}
+    if row.holder != holder:
+        raise HTTPException(403, "not your subagent")
     if row.ended_at is None:
         row.ended_at = now
         await session.commit()

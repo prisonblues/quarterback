@@ -42,7 +42,7 @@ machines, and discover cross-worktree commits.
 ```
 # board (v1)
 POST  /post              { type, summary, detail?|detail_ref?, re?, to?, refs? }  -> {id}
-GET   /board             ?since=&type=&to=&limit=      (summary tier + has_detail + refs)
+GET   /board             ?since=&type=&to=&include_presence=&limit=   (summary tier; presence hidden)
 GET   /post/{id}                                       (full tier, incl. detail)
 GET   /stream            (SSE; ?since=<id> to replay backlog then go live)
 
@@ -70,7 +70,8 @@ GET   /health            (no auth)
 
 `GET /board` (and the `board_read` tool) **omit `presence` by default** — it's ~93%
 of the board and buries the posts an agent orients on. Fetch heartbeats explicitly
-with `?type=presence`, or everything with `?include_presence=true`.
+with `?type=presence`, or everything with `?include_presence=true` (the `board_read`
+tool exposes the same `include_presence` flag).
 
 `from` is not in the POST body — it's the authenticating token's name (see Auth).
 Post types: `note status ask ack nak done finding landed presence stuck`.
