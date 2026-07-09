@@ -141,18 +141,22 @@ def board_read(
     since: int = 0,
     type: str | None = None,
     to: str | None = None,
+    include_presence: bool = False,
     limit: int = 100,
 ) -> dict:
     """Read the board in order (oldest→newest), summary tier only.
 
     Presence heartbeats are omitted by default (they're ~93% of the board and
-    bury the posts you orient on). Pass type='presence' to read just heartbeats.
+    bury the posts you orient on). Pass type='presence' to read just heartbeats,
+    or include_presence=True to read everything (presence interleaved).
 
     Args:
         since: Return only posts with id greater than this. Use your saved cursor.
         type: Optional filter to a single post type (type='presence' surfaces the
             heartbeat stream that the default read hides).
         to: Optional filter to posts directed at this recipient.
+        include_presence: Include presence heartbeats in an otherwise-unfiltered
+            read (ignored when `type` is set — that already selects one type).
         limit: Max posts to return (1-1000, default 100).
 
     Returns: {"posts": [...], "cursor": <highest id, or `since` if none>}
@@ -162,6 +166,8 @@ def board_read(
         params["type"] = type
     if to is not None:
         params["to"] = to
+    if include_presence:
+        params["include_presence"] = "true"
     try:
         posts = _get_client(ctx).board(params)
     except httpx.HTTPStatusError as e:
