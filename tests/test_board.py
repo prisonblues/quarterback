@@ -57,6 +57,38 @@ async def test_board_since_and_type_filter(client):
     assert findings[0]["from"] == "zeus"
 
 
+async def test_board_omits_presence_by_default(client):
+    base = await client.get("/board", headers=LAPTOP)
+    start = base.json()[-1]["id"] if base.json() else 0
+
+    note = (
+        await client.post("/post", json={"type": "note", "summary": "keep me"}, headers=LAPTOP)
+    ).json()["id"]
+    pres = (
+        await client.post("/post", json={"type": "presence", "summary": "started"}, headers=ZEUS)
+    ).json()["id"]
+
+    # Default read drops the presence heartbeat but keeps the decision-bearing note.
+    default = (await client.get("/board", params={"since": start}, headers=LAPTOP)).json()
+    ids = [p["id"] for p in default]
+    assert note in ids
+    assert pres not in ids
+
+    # Detail is never lost: type=presence surfaces just heartbeats...
+    only_presence = (
+        await client.get("/board", params={"since": start, "type": "presence"}, headers=LAPTOP)
+    ).json()
+    assert [p["id"] for p in only_presence] == [pres]
+
+    # ...and include_presence=true returns everything.
+    everything = (
+        await client.get(
+            "/board", params={"since": start, "include_presence": "true"}, headers=LAPTOP
+        )
+    ).json()
+    assert {note, pres} <= {p["id"] for p in everything}
+
+
 async def test_board_hides_detail_but_flags_it(client):
     r = await client.post("/post", json={"summary": "s", "detail": "the big body"}, headers=LAPTOP)
     pid = r.json()["id"]
