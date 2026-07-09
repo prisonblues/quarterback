@@ -99,3 +99,20 @@ class QuarterbackClient:
         resp = self._http.get(self._url("/worktrees"), params=params)
         resp.raise_for_status()
         return resp.json()
+
+    # -- coordination: collision index + sub-agents (v2.6) -------------
+
+    def active(self, params: dict) -> dict:
+        resp = self._http.get(self._url("/active"), params=params)
+        resp.raise_for_status()
+        return resp.json()
+
+    def subagent_start(self, body: dict) -> dict:
+        resp = self._http.post(self._url("/subagent"), json=body)
+        resp.raise_for_status()
+        return resp.json()
+
+    def subagent_end(self, body: dict) -> dict:
+        resp = self._http.post(self._url("/subagent/end"), json=body)
+        resp.raise_for_status()
+        return resp.json()

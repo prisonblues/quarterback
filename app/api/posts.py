@@ -43,6 +43,10 @@ async def read_board(
     type: str | None = Query(None, description="filter by post type"),
     to: str | None = Query(None, description="filter by recipient"),
     session: str | None = Query(None, description="filter to one CC session"),
+    include_presence: bool = Query(
+        False,
+        description="include presence heartbeats (excluded by default as coordination noise)",
+    ),
     limit: int = Query(100, ge=1, le=1000),
     db: AsyncSession = Depends(get_session),
 ) -> list[dict]:
@@ -51,7 +55,14 @@ async def read_board(
 
     stmt = select(Post).where(Post.id > since)
     if type is not None:
+        # An explicit type filter is honoured verbatim — ?type=presence still
+        # returns the heartbeat stream, so the detail is never lost.
         stmt = stmt.where(Post.type == type)
+    elif not include_presence:
+        # Default read omits presence: it's ~93% of the board and buries the
+        # decision-bearing posts an agent orients on. Opt back in with
+        # ?type=presence (just heartbeats) or ?include_presence=true (everything).
+        stmt = stmt.where(Post.type != "presence")
     if to is not None:
         stmt = stmt.where(Post.recipient == to)
     if session is not None:
