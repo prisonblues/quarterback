@@ -9,6 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.subagents import active_subagents_by_session
 from app.auth import identify, reader
 from app.db import get_session
 from app.models.blob import Blob
@@ -319,6 +320,11 @@ async def list_sessions(
             "live": True,
             "resumable": False,
         })
+
+    subs_by_session = await active_subagents_by_session(session, now)
+    for s in out.values():
+        s["subagents"] = subs_by_session.get(s["session"], [])
+
     return sorted(out.values(), key=lambda s: (s["live"], s["updated_at"]), reverse=True)[:limit]
 
 

@@ -59,6 +59,9 @@
   .tl-ref { color:var(--accent); text-decoration:none; font-size:11px; margin-left:6px; }
   .tl-more { color:var(--accent); cursor:pointer; font-size:11px; padding:3px 0; }
   .tl-none { color:var(--muted); font-size:11px; padding:3px 0; }
+  .ssubs { display:flex; gap:6px; flex-wrap:wrap; padding:4px 12px 2px; }
+  .subchip { font-size:11px; padding:1px 8px; border-radius:999px; color:var(--accent);
+    background:var(--chip); border:1px solid var(--line); }
 
   /* flat "all activity" view */
   #feedView .post { border:1px solid var(--line); border-radius:8px; background:var(--panel);
@@ -165,6 +168,9 @@ function sessionCard(s){
       </span>
     </div>
     ${s.recap?`<div class="srecap">${esc(s.recap)}</div>`:""}
+    ${(s.subagents&&s.subagents.length)?`<div class="ssubs">${
+      s.subagents.map(sa=>`<span class="subchip">⤷ ${esc(sa.label||sa.agent_id)}</span>`).join("")
+    }</div>`:""}
     <div class="timeline ${open?"":"collapsed"}">${tl}${more}</div>`;
   return el;
 }
@@ -231,7 +237,9 @@ async function loadSessions(){
   }catch(e){}
 }
 async function loadBacklog(){
-  const r=await fetch("/board?limit=500",{headers:{Accept:"application/json"}});
+  // The human board is a monitor — show everything, presence included (the
+  // agent-facing /board default hides presence; this view opts back in).
+  const r=await fetch("/board?limit=500&include_presence=1",{headers:{Accept:"application/json"}});
   if(!r.ok){ setStatus("down","auth required ("+r.status+")"); return; }
   for(const p of await r.json()){ if(ingest(p)){ placeInFeed(p); if(p.id>maxId) maxId=p.id; } }
   renderSessions();

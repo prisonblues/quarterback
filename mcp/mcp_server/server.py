@@ -141,14 +141,22 @@ def board_read(
     since: int = 0,
     type: str | None = None,
     to: str | None = None,
+    include_presence: bool = False,
     limit: int = 100,
 ) -> dict:
     """Read the board in order (oldest→newest), summary tier only.
 
+    Presence heartbeats are omitted by default (they're ~93% of the board and
+    bury the posts you orient on). Pass type='presence' to read just heartbeats,
+    or include_presence=True to read everything (presence interleaved).
+
     Args:
         since: Return only posts with id greater than this. Use your saved cursor.
-        type: Optional filter to a single post type.
+        type: Optional filter to a single post type (type='presence' surfaces the
+            heartbeat stream that the default read hides).
         to: Optional filter to posts directed at this recipient.
+        include_presence: Include presence heartbeats in an otherwise-unfiltered
+            read (ignored when `type` is set — that already selects one type).
         limit: Max posts to return (1-1000, default 100).
 
     Returns: {"posts": [...], "cursor": <highest id, or `since` if none>}
@@ -158,6 +166,8 @@ def board_read(
         params["type"] = type
     if to is not None:
         params["to"] = to
+    if include_presence:
+        params["include_presence"] = "true"
     try:
         posts = _get_client(ctx).board(params)
     except httpx.HTTPStatusError as e:
@@ -223,6 +233,61 @@ def release_lease(ctx: Context, lease_id: str) -> dict:
         return _get_client(ctx).release_lease(lease_id)
     except httpx.HTTPStatusError as e:
         _raise(e, "release")
+
+
+@mcp.tool()
+def active(ctx: Context, cwd: str | None = None) -> dict:
+    """Who/what is live right now — the collision index. Check this before you
+    start substantive work so two agents don't collide on the same worktree.
+
+    Pass `cwd` to ask "is anyone already working in this directory?". Returns
+    {"agents": [...top-level sessions...], "subagents": [...their fan-out...]};
+    an empty result for your cwd means the coast is clear.
+    """
+    params: dict = {}
+    if cwd is not None:
+        params["cwd"] = cwd
+    try:
+        return _get_client(ctx).active(params)
+    except httpx.HTTPStatusError as e:
+        _raise(e, "active")
+
+
+@mcp.tool()
+def subagent_start(
+    ctx: Context,
+    parent_session: str,
+    agent_id: str,
+    label: str | None = None,
+    cwd: str | None = None,
+    device: str | None = None,
+    ttl: int = 900,
+) -> dict:
+    """Register a live sub-agent under its parent session (current-state, no post).
+
+    Normally driven by a Task-tool PreToolUse hook, not by hand. Idempotent per
+    (parent_session, agent_id): calling again renews the TTL. Pair with
+    `subagent_end` when the sub-agent finishes.
+    """
+    body: dict = {"parent_session": parent_session, "agent_id": agent_id, "ttl": ttl}
+    for k, v in (("label", label), ("cwd", cwd), ("device", device)):
+        if v is not None:
+            body[k] = v
+    try:
+        return _get_client(ctx).subagent_start(body)
+    except httpx.HTTPStatusError as e:
+        _raise(e, "subagent_start")
+
+
+@mcp.tool()
+def subagent_end(ctx: Context, parent_session: str, agent_id: str) -> dict:
+    """Mark a sub-agent finished (idempotent). Usually a Task-tool PostToolUse hook."""
+    try:
+        return _get_client(ctx).subagent_end(
+            {"parent_session": parent_session, "agent_id": agent_id}
+        )
+    except httpx.HTTPStatusError as e:
+        _raise(e, "subagent_end")
 
 
 @mcp.tool()
