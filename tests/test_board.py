@@ -9,7 +9,10 @@ from __future__ import annotations
 import asyncio
 import json
 
+from sqlalchemy import text
+
 from app.api.stream import event_stream
+from app.db import engine
 
 from .conftest import LAPTOP, SERVER
 
@@ -96,6 +99,57 @@ async def test_board_hides_detail_but_flags_it(client):
     assert "detail" not in row
     assert row["has_detail"] is True
     assert (await client.get(f"/post/{pid}", headers=LAPTOP)).json()["detail"] == "the big body"
+
+
+async def _backdate(post_id: int, minutes: int):
+    """Age a post so it falls outside the orient window (tests can't wait wall-clock)."""
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE posts SET ts = now() - make_interval(mins => :m) WHERE id = :id"),
+            {"m": minutes, "id": post_id},
+        )
+
+
+async def test_board_orient_window_excludes_stale_but_floors_when_quiet(client):
+    # Scope to a private recipient so posts accumulated by other tests don't interfere.
+    to = "wtest"
+    old = (
+        await client.post("/post", json={"summary": "old", "to": to}, headers=LAPTOP)
+    ).json()["id"]
+    await _backdate(old, 120)  # 2h ago — outside the 30-min window
+
+    # Quiet window (nothing fresh): the floor still surfaces the last decision.
+    quiet = (await client.get("/board", params={"to": to, "window_min": 30}, headers=LAPTOP)).json()
+    assert old in [p["id"] for p in quiet]
+
+    # Ten fresh posts fill the window past the floor → the stale post drops off.
+    fresh = [
+        (
+            await client.post("/post", json={"summary": f"f{i}", "to": to}, headers=LAPTOP)
+        ).json()["id"]
+        for i in range(10)
+    ]
+    live = (await client.get("/board", params={"to": to, "window_min": 30}, headers=LAPTOP)).json()
+    ids = [p["id"] for p in live]
+    assert old not in ids
+    assert set(fresh) <= set(ids)
+
+
+async def test_board_cursor_read_ignores_window(client):
+    # A catch-up read (since=cursor) returns backdated posts the window would hide.
+    to = "wtest2"
+    cursor = (
+        await client.post("/post", json={"summary": "c0", "to": to}, headers=LAPTOP)
+    ).json()["id"]
+    gap = (
+        await client.post("/post", json={"summary": "gap", "to": to}, headers=LAPTOP)
+    ).json()["id"]
+    await _backdate(gap, 240)  # 4h ago — the window would exclude it
+
+    caught_up = (
+        await client.get("/board", params={"to": to, "since": cursor}, headers=LAPTOP)
+    ).json()
+    assert gap in [p["id"] for p in caught_up]
 
 
 async def test_stream_requires_auth(client):
