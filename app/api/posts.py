@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -10,6 +12,11 @@ from app.models.post import Post
 from app.schemas import POST_TYPES, PostIn, full_tier, summary_tier
 
 router = APIRouter(tags=["board"])
+
+# A cursor-less orient read never returns empty: even when the time window is
+# quiet, surface at least the most recent few decisions so an arriving agent
+# still learns who made the last call.
+_ORIENT_FLOOR = 10
 
 
 @router.post("/post")
@@ -40,6 +47,13 @@ async def create_post(
 async def read_board(
     _reader: str = Depends(reader),
     since: int = Query(0, ge=0, description="return posts with id > since"),
+    window_min: int = Query(
+        30,
+        ge=0,
+        le=1440,
+        description="cursor-less orient window in minutes (0 disables); "
+        "ignored when since>0, where catch-up returns everything new",
+    ),
     type: str | None = Query(None, description="filter by post type"),
     to: str | None = Query(None, description="filter by recipient"),
     session: str | None = Query(None, description="filter to one CC session"),
@@ -53,7 +67,7 @@ async def read_board(
     if type is not None and type not in POST_TYPES:
         raise HTTPException(422, f"unknown type {type!r}")
 
-    stmt = select(Post).where(Post.id > since)
+    stmt = select(Post)
     if type is not None:
         # An explicit type filter is honoured verbatim — ?type=presence still
         # returns the heartbeat stream, so the detail is never lost.
@@ -67,9 +81,24 @@ async def read_board(
         stmt = stmt.where(Post.recipient == to)
     if session is not None:
         stmt = stmt.where(Post.session == session)
-    stmt = stmt.order_by(Post.id).limit(limit)
 
-    rows = (await db.scalars(stmt)).all()
+    if since > 0:
+        # Catch-up mode: an agent with a cursor wants every post it missed,
+        # time-unclipped — a 2-hour gap still returns the whole gap.
+        stmt = stmt.where(Post.id > since).order_by(Post.id).limit(limit)
+        rows = (await db.scalars(stmt)).all()
+        return [summary_tier(p) for p in rows]
+
+    # Orient mode (no cursor): the last `window_min` minutes of live
+    # coordination, so a fresh session reads "now" instead of ancient history.
+    # Fetch newest-first up to `limit`, clip to the window, but floor at the
+    # most recent few so a quiet board still orients (never an empty read).
+    rows = list((await db.scalars(stmt.order_by(Post.id.desc()).limit(limit))).all())
+    if window_min > 0:
+        cutoff = datetime.now(UTC) - timedelta(minutes=window_min)
+        windowed = [p for p in rows if p.ts >= cutoff]
+        rows = windowed if len(windowed) >= _ORIENT_FLOOR else rows[:_ORIENT_FLOOR]
+    rows.reverse()  # back to oldest-first reading order
     return [summary_tier(p) for p in rows]
 
 
