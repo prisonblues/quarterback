@@ -25,6 +25,8 @@ class Lease(Base):
     device: Mapped[str] = mapped_column(Text, nullable=False)
     holder: Mapped[str] = mapped_column(Text, nullable=False)  # token name (see auth.identify)
     cwd: Mapped[str | None] = mapped_column(Text)              # project dir (for revive)
+    repo: Mapped[str | None] = mapped_column(Text)             # git repo name (topic-overlap match)
+    branch: Mapped[str | None] = mapped_column(Text)           # git branch (finer overlap signal)
     title: Mapped[str | None] = mapped_column(Text)            # CC ai-title
     recap: Mapped[str | None] = mapped_column(Text)            # compact-summary head / last prompt
     model: Mapped[str | None] = mapped_column(Text)            # model id from last assistant msg
@@ -35,4 +37,7 @@ class Lease(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
-    __table_args__ = (Index("ix_leases_session", "session"),)
+    __table_args__ = (
+        Index("ix_leases_session", "session"),
+        Index("ix_leases_repo", "repo"),
+    )

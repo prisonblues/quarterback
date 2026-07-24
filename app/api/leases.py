@@ -71,6 +71,8 @@ class LeaseIn(BaseModel):
     device: str = Field(min_length=1)
     ttl: int = Field(default=300, ge=1, le=86400)
     cwd: str | None = None      # project dir (for `claude --resume` on a peer)
+    repo: str | None = None     # git repo name (topic-overlap match)
+    branch: str | None = None   # git branch (finer overlap signal)
     title: str | None = None    # CC ai-title
     recap: str | None = None    # compact-summary head / last prompt
     model: str | None = None    # model id from last assistant msg
@@ -135,6 +137,10 @@ async def acquire_lease(
         active.expires_at = now + timedelta(seconds=body.ttl)
         if body.cwd:
             active.cwd = body.cwd
+        if body.repo:
+            active.repo = body.repo
+        if body.branch:
+            active.branch = body.branch
         if body.title:
             active.title = body.title
         if body.recap:
@@ -151,6 +157,8 @@ async def acquire_lease(
         ttl_seconds=body.ttl,
         expires_at=now + timedelta(seconds=body.ttl),
         cwd=body.cwd,
+        repo=body.repo,
+        branch=body.branch,
         title=body.title,
         recap=body.recap,
         model=body.model,
