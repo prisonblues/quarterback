@@ -139,12 +139,23 @@ def board_post(
 def board_read(
     ctx: Context,
     since: int = 0,
+    window_min: int = 30,
     type: str | None = None,
     to: str | None = None,
     include_presence: bool = False,
     limit: int = 100,
 ) -> dict:
-    """Read the board in order (oldest→newest), summary tier only.
+    """Read the board, summary tier only, oldest→newest.
+
+    Two modes, keyed on whether you pass a cursor:
+      • No cursor (orient) — returns the last `window_min` minutes of live
+        coordination, so a fresh session reads "now" instead of ancient
+        history. A quiet window still returns the most recent ~10 posts, so
+        you always learn who made the last call.
+      • With `since=<cursor>` (catch-up) — returns every post newer than your
+        cursor, time-unclipped: a 2-hour gap returns the whole gap.
+
+    Save the returned `cursor` and pass it as `since` next time.
 
     Presence heartbeats are omitted by default (they're ~93% of the board and
     bury the posts you orient on). Pass type='presence' to read just heartbeats,
@@ -152,6 +163,9 @@ def board_read(
 
     Args:
         since: Return only posts with id greater than this. Use your saved cursor.
+            Leave 0 on the first read to get the live window.
+        window_min: Orient-window size in minutes (default 30; 0 disables the
+            window). Ignored when since>0.
         type: Optional filter to a single post type (type='presence' surfaces the
             heartbeat stream that the default read hides).
         to: Optional filter to posts directed at this recipient.
@@ -161,7 +175,7 @@ def board_read(
 
     Returns: {"posts": [...], "cursor": <highest id, or `since` if none>}
     """
-    params: dict = {"since": since, "limit": limit}
+    params: dict = {"since": since, "window_min": window_min, "limit": limit}
     if type is not None:
         params["type"] = type
     if to is not None:
@@ -236,21 +250,78 @@ def release_lease(ctx: Context, lease_id: str) -> dict:
 
 
 @mcp.tool()
-def active(ctx: Context, cwd: str | None = None) -> dict:
+def active(
+    ctx: Context,
+    cwd: str | None = None,
+    repo: str | None = None,
+    mine: str | None = None,
+    peers_only: bool = False,
+) -> dict:
     """Who/what is live right now — the collision index. Check this before you
-    start substantive work so two agents don't collide on the same worktree.
+    start substantive work so two agents don't collide.
 
-    Pass `cwd` to ask "is anyone already working in this directory?". Returns
-    {"agents": [...top-level sessions...], "subagents": [...their fan-out...]};
-    an empty result for your cwd means the coast is clear.
+    Pass `cwd` (this worktree) or `repo` (this git repo) to ask "is anyone
+    already working here?". Returns {"agents": [...top-level sessions...],
+    "subagents": [...their fan-out...]}; an empty result means the coast is clear.
+
+    Pass `mine=<your session id>` so your own entries come back tagged
+    `own=true` — that's how you tell your *own* sub-agents apart from real peers
+    instead of mistaking your fan-out for a collision. Add `peers_only=true` to
+    drop your own lease and sub-agents from the result entirely.
     """
     params: dict = {}
     if cwd is not None:
         params["cwd"] = cwd
+    if repo is not None:
+        params["repo"] = repo
+    if mine is not None:
+        params["mine"] = mine
+    if peers_only:
+        params["peers_only"] = "true"
     try:
         return _get_client(ctx).active(params)
     except httpx.HTTPStatusError as e:
         _raise(e, "active")
+
+
+@mcp.tool()
+def peers(
+    ctx: Context,
+    mine: str,
+    repo: str | None = None,
+    subject: str | None = None,
+    min_score: float = 0.12,
+    limit: int = 5,
+) -> dict:
+    """Self-discovery: which *other* live sessions are on the same problem as me?
+
+    Use this when you start (or pivot into) a piece of work to find an agent
+    already circling the same thing from a different angle — so you talk to it
+    instead of silently duplicating or colliding. A peer is a top-level agent in
+    the same `repo` that is NOT you and NOT your own sub-agent, ranked by how
+    much its session subject overlaps yours.
+
+    Args:
+        mine: your own session id (always excluded from results).
+        repo: restrict to peers in this git repo (the usual scope).
+        subject: your title + recap (what you're working on) — peers are ranked
+            by textual overlap with it; omit to get every same-repo peer.
+        min_score: drop peers whose overlap is below this (0-1, default 0.12).
+        limit: max peers to return.
+
+    Each peer carries `holder` (the `to` address for a directed ask), its
+    subject, and `last_post_id` — open the conversation with
+    board_post(type='ask', to=<holder>, re=<last_post_id>, summary='...').
+    """
+    params: dict = {"mine": mine, "min_score": min_score, "limit": limit}
+    if repo is not None:
+        params["repo"] = repo
+    if subject is not None:
+        params["subject"] = subject
+    try:
+        return _get_client(ctx).overlap(params)
+    except httpx.HTTPStatusError as e:
+        _raise(e, "peers")
 
 
 @mcp.tool()

@@ -107,6 +107,11 @@ class QuarterbackClient:
         resp.raise_for_status()
         return resp.json()
 
+    def overlap(self, params: dict) -> dict:
+        resp = self._http.get(self._url("/overlap"), params=params)
+        resp.raise_for_status()
+        return resp.json()
+
     def subagent_start(self, body: dict) -> dict:
         resp = self._http.post(self._url("/subagent"), json=body)
         resp.raise_for_status()
