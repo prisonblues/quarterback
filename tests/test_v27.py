@@ -1,0 +1,164 @@
+"""v2.7: topic-based self-discovery, self-quiet, and directed-ask seeding.
+
+The overlap scorer is pure (unit-tested directly); the /active and /overlap
+endpoints run against the real Postgres via the shared client fixture. Leases
+are scoped to a unique repo name so rows from other tests can't leak in.
+"""
+
+from __future__ import annotations
+
+from app.overlap import overlap_score, tokenize
+
+from .conftest import DESKTOP, LAPTOP, ZEUS
+
+REPO = "v27repo"
+
+
+def _lease_body(session: str, title: str, recap: str = "", repo: str = REPO) -> dict:
+    return {"session": session, "device": "d", "repo": repo, "title": title, "recap": recap}
+
+
+# ---- overlap scorer (pure) --------------------------------------------------
+
+def test_tokenize_drops_stopwords_and_noise():
+    toks = tokenize("Investigating the merge-test flakiness on CI")
+    assert "merge" in toks and "flakiness" in toks
+    assert "the" not in toks and "on" not in toks  # stopwords
+    assert "ci" not in toks  # 2-char noise
+    assert "investigating" not in toks  # domain filler
+
+
+def test_overlap_identical_and_disjoint():
+    assert overlap_score("merge test flakiness", "merge test flakiness") == 1.0
+    assert overlap_score("merge test flakiness", "css button colors") == 0.0
+    assert overlap_score("anything", None) == 0.0
+
+
+def test_overlap_coefficient_not_diluted_by_length():
+    # A terse title fully contained in a verbose recap scores 1.0 (overlap
+    # coefficient), not a Jaccard-diluted fraction.
+    assert overlap_score(
+        "doltgres flakiness",
+        "the doltgres host resolution flakiness keeps failing the merge suite",
+    ) == 1.0
+
+
+# ---- /active: repo scope + self-quiet ---------------------------------------
+
+async def test_active_repo_filter_and_peers_only(client):
+    await client.post("/lease", json=_lease_body("s-laptop", "merge tests"), headers=LAPTOP)
+    await client.post("/lease", json=_lease_body("s-zeus", "merge tests"), headers=ZEUS)
+
+    both = (await client.get("/active", params={"repo": REPO}, headers=LAPTOP)).json()
+    sessions = {a["session"] for a in both["agents"]}
+    assert {"s-laptop", "s-zeus"} <= sessions
+    assert all(a["repo"] == REPO for a in both["agents"])
+
+    # mine tags ownership; peers_only drops my own lease entirely.
+    tagged = (
+        await client.get(
+            "/active", params={"repo": REPO, "mine": "s-laptop"}, headers=LAPTOP
+        )
+    ).json()
+    own = {a["session"]: a["own"] for a in tagged["agents"]}
+    assert own["s-laptop"] is True and own["s-zeus"] is False
+
+    peers = (
+        await client.get(
+            "/active",
+            params={"repo": REPO, "mine": "s-laptop", "peers_only": "true"},
+            headers=LAPTOP,
+        )
+    ).json()
+    assert "s-laptop" not in {a["session"] for a in peers["agents"]}
+    assert "s-zeus" in {a["session"] for a in peers["agents"]}
+
+
+async def test_active_self_quiet_excludes_own_subagents(client):
+    # A session with its own fan-out must not read that fan-out as a peer.
+    await client.post("/lease", json=_lease_body("s-parent", "big audit"), headers=LAPTOP)
+    await client.post(
+        "/subagent",
+        json={"parent_session": "s-parent", "agent_id": "sa1", "label": "Explore: x", "cwd": "/w"},
+        headers=LAPTOP,
+    )
+    view = (await client.get("/active", params={"mine": "s-parent"}, headers=LAPTOP)).json()
+    own_subs = [s for s in view["subagents"] if s["parent_session"] == "s-parent"]
+    assert own_subs and all(s["own"] is True for s in own_subs)
+
+    peers = (
+        await client.get(
+            "/active", params={"mine": "s-parent", "peers_only": "true"}, headers=LAPTOP
+        )
+    ).json()
+    assert all(s["parent_session"] != "s-parent" for s in peers["subagents"])
+
+
+# ---- /overlap: genuine peers ranked by subject ------------------------------
+
+async def test_overlap_finds_same_problem_peer_and_threads_last_post(client):
+    await client.post(
+        "/lease",
+        json=_lease_body("o-laptop", "merge test repeatability"),
+        headers=LAPTOP,
+    )
+    await client.post(
+        "/lease",
+        json=_lease_body("o-zeus", "flaky merge tests after PR merge", "the merge suite is flaky"),
+        headers=ZEUS,
+    )
+    # A same-repo agent on an unrelated topic must NOT surface.
+    await client.post(
+        "/lease", json=_lease_body("o-desktop", "css button palette"), headers=DESKTOP
+    )
+    # zeus's latest post — the overlap result should thread onto it.
+    pid = (
+        await client.post(
+            "/post",
+            json={"type": "finding", "summary": "merge suite non-deterministic", "session": "o-zeus"},
+            headers=ZEUS,
+        )
+    ).json()["id"]
+
+    res = (
+        await client.get(
+            "/overlap",
+            params={"mine": "o-laptop", "repo": REPO, "subject": "merge test repeatability"},
+            headers=LAPTOP,
+        )
+    ).json()
+    peers = {p["session"]: p for p in res["peers"]}
+    assert "o-zeus" in peers  # same problem, different angle
+    assert "o-laptop" not in peers  # never myself
+    assert "o-desktop" not in peers  # same repo, unrelated subject → filtered
+    assert peers["o-zeus"]["score"] > 0
+    assert peers["o-zeus"]["last_post_id"] == pid
+    assert peers["o-zeus"]["holder"] == "zeus"  # the `to` address for a directed ask
+
+
+async def test_directed_ask_inbox_by_to_and_type(client):
+    # The bidirectional close: an incumbent polls /board?to=<me>&type=ask for
+    # questions a peer directed at it. Lock that filter combination.
+    start = (await client.get("/board", headers=DESKTOP)).json()
+    start_id = start[-1]["id"] if start else 0
+
+    aid = (
+        await client.post(
+            "/post",
+            json={"type": "ask", "summary": "re-run merge suite?", "to": "desktop"},
+            headers=ZEUS,
+        )
+    ).json()["id"]
+    # A note to desktop and an ask to someone else must NOT show in desktop's ask inbox.
+    await client.post("/post", json={"type": "note", "summary": "fyi", "to": "desktop"}, headers=ZEUS)
+    await client.post("/post", json={"type": "ask", "summary": "other", "to": "laptop"}, headers=ZEUS)
+
+    inbox = (
+        await client.get(
+            "/board",
+            params={"to": "desktop", "type": "ask", "since": start_id},
+            headers=DESKTOP,
+        )
+    ).json()
+    assert [p["id"] for p in inbox] == [aid]
+    assert inbox[0]["from"] == "zeus"
