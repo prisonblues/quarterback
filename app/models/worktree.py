@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import DateTime, Index, Text, func
+from sqlalchemy import Boolean, DateTime, Index, Integer, Text, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -26,6 +26,13 @@ class Worktree(Base):
     branch: Mapped[str | None] = mapped_column(Text)
     head_sha: Mapped[str | None] = mapped_column(Text)
     commits: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB)
+    # Sync state (v2.8): what the device knows about its own tracking branch, so
+    # /sync can answer "is this checkout stale" without the server running git.
+    upstream: Mapped[str | None] = mapped_column(Text)      # e.g. "origin/main"
+    remote_sha: Mapped[str | None] = mapped_column(Text)    # upstream ref at report time
+    ahead: Mapped[int | None] = mapped_column(Integer)      # local commits not on upstream
+    behind: Mapped[int | None] = mapped_column(Integer)     # upstream commits not local
+    dirty: Mapped[bool | None] = mapped_column(Boolean)     # uncommitted tracked changes
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )

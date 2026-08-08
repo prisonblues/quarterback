@@ -23,6 +23,12 @@ class WorktreeIn(BaseModel):
     branch: str | None = None
     head: str | None = None
     commits: list[Commit] = Field(default_factory=list)
+    # Sync state (v2.8) — optional so an older MCP server still registers cleanly.
+    upstream: str | None = None
+    remote_sha: str | None = None
+    ahead: int | None = Field(default=None, ge=0)
+    behind: int | None = Field(default=None, ge=0)
+    dirty: bool | None = None
 
 
 class WorktreesIn(BaseModel):
@@ -38,6 +44,11 @@ def _view(w: Worktree) -> dict:
         "branch": w.branch,
         "head_sha": w.head_sha,
         "commits": w.commits or [],
+        "upstream": w.upstream,
+        "remote_sha": w.remote_sha,
+        "ahead": w.ahead,
+        "behind": w.behind,
+        "dirty": w.dirty,
         "updated_at": w.updated_at.isoformat(),
     }
 
@@ -70,6 +81,11 @@ async def register_worktrees(
                 branch=wt.branch,
                 head_sha=wt.head,
                 commits=[c.model_dump() for c in wt.commits] or None,
+                upstream=wt.upstream,
+                remote_sha=wt.remote_sha,
+                ahead=wt.ahead,
+                behind=wt.behind,
+                dirty=wt.dirty,
             )
         )
     await session.commit()

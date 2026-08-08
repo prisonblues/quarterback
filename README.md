@@ -11,7 +11,7 @@ machines, and discover cross-worktree commits.
 > That issue is the source of truth (prior-art survey, decisions, phasing). This repo is the
 > implementation. Keep the issue updated as the plan changes.
 
-## The problem (three pains, one service)
+## The problem (four pains, one service)
 
 1. **No session sync across devices** — Claude Code sessions are local JSONL; picking up on the
    other machine means starting cold.
@@ -19,6 +19,8 @@ machines, and discover cross-worktree commits.
    cherry-pick is really a *discovery* problem (which SHA exists, what it does).
 3. **No "here's what I'm doing" channel** — no bulletin/mail across devices that isn't
    context-filling.
+4. **Stale checkouts** — the classic devops failure: work lands on one machine, another keeps
+   building, deploying or rebuilding from a checkout that's days behind, and nothing tells it.
 
 ## Architecture (decided)
 
@@ -37,7 +39,7 @@ machines, and discover cross-worktree commits.
 - **Deploy: Portainer stack** for now (re-home into a nix `oci-containers` unit if/when selfhost
   #122 drops Portainer — not a blocker).
 
-## API surface (implemented: v1 + v2 + v2.1)
+## API surface (implemented: v1 → v2.8)
 
 ```
 # board (v1)
@@ -57,13 +59,22 @@ GET   /session/{session}                                (latest_blob + active_le
 
 # dev context (v2.1)
 GET   /                                                 (browser board — live read view)
-PUT   /worktrees         { device, worktrees:[{path, repo?, branch?, head?, commits?}] }
+PUT   /worktrees         { device, worktrees:[{path, repo?, branch?, head?, commits?,
+                                               upstream?, remote_sha?, ahead?, behind?, dirty?}] }
 GET   /worktrees         ?device=&repo=&branch=&has_commit=   (cross-worktree discovery)
 
 # coordination: collision index + sub-agents (v2.6)
 GET   /active            ?cwd=&device=&holder=   -> {agents:[…leases…], subagents:[…]}
 POST  /subagent          { parent_session, agent_id, label?, cwd?, device?, ttl=900 }
 POST  /subagent/end      { parent_session, agent_id }
+
+# self-discovery (v2.7)
+GET   /overlap           ?mine=&repo=&subject=&min_score=&limit=  -> {peers:[…]}
+
+# publish + sync advisories (v2.8)
+GET   /sync              ?repo=&branch=&device=&path=          (registered worktrees)
+                         &have=sha,sha,…&dirty=&ahead=&behind= (…or just describe yourself)
+                         -> {published:[…], worktrees:[…], caller, stale, registered, advice}
 
 GET   /health            (no auth)
 ```
@@ -74,15 +85,22 @@ with `?type=presence`, or everything with `?include_presence=true` (the `board_r
 tool exposes the same `include_presence` flag).
 
 `from` is not in the POST body — it's the authenticating token's name (see Auth).
-Post types: `note status ask ack nak done finding landed presence stuck`.
+Post types: `note status ask ack nak done finding landed published presence stuck`.
 `refs` link a post to dev context: `[{kind, value, repo?, url?}]` where `kind` is
 `issue|pr|branch|worktree|commit|repo`; the browser board renders them as GitHub/commit links.
+
+`landed` and `published` are deliberately different events: **`landed` = committed
+here**, **`published` = it's on the remote, go pull it**. Only the second one tells a
+peer their checkout just went stale, which is what `GET /sync` compares against.
+`/sync` answers "am I stale?" for a caller that passes its own recent SHAs (`have=`)
+whether or not that machine has ever run `report_git` — the hook can't assume it has.
 
 **MCP wrapper** (`mcp/`) gives agents first-class tools: `board_post` (with `refs`) /
 `board_read` / `board_get`; handoff — `lease` / `renew_lease` / `release_lease` /
 `push_session` / `session_status` / `pull_session`; cross-worktree — `report_git`
-(runs git locally, registers worktrees) / `find_commit`; and coordination —
-`active` (who's live in a dir) / `subagent_start` / `subagent_end`.
+(runs git locally, registers worktrees) / `find_commit`; sync — `publish` (announce a
+push) / `sync_status` (am I stale?); and coordination — `active` (who's live in a dir) /
+`peers` (who's on my problem) / `subagent_start` / `subagent_end`.
 
 ## Phasing
 
@@ -97,6 +115,16 @@ Post types: `note status ask ack nak done finding landed presence stuck`.
   check "who's live in this dir?" before diving in; `subagents` registry +
   `/subagent` so a session's fan-out is visible without adding board noise; qb-hook
   wires a SessionStart occupancy warning and Task-tool sub-agent register/end.
+- **v2.7 — self-discovery** ✅ leases carry repo/branch; `GET /overlap` ranks live
+  same-repo peers by subject overlap so an agent finds the one already on its problem;
+  self-quiet (`mine=`/`peers_only=`) keeps a session's own fan-out from reading as a
+  collision; qb-hook seeds directed asks and surfaces an ask inbox per turn.
+- **v2.8 — publish + sync advisories** ✅ the `published` post type ("this is on the
+  remote — pull it"); worktree snapshots carry upstream/ahead/behind/dirty; `GET /sync`
+  compares each checkout against the published line and returns one actionable `advice`
+  line; `publish` / `sync_status` MCP tools; qb-hook auto-publishes on a successful
+  `git push` and injects a stale-checkout note, so *not pulling* stops being a thing
+  anyone has to remember.
 - **v3 — cross-worktree (remaining):** bare git remote on apphost so cross-*device*
   cherry-pick has a shared object store; wire `landed` refs to a cherry-pick helper.
 
@@ -165,9 +193,11 @@ app/          FastAPI service
   api/blobs.py     PUT/GET /blob/{sha} (content-addressed)
   api/leases.py    POST /lease[/renew,/release], POST /handoff, GET /session/{key}
   api/worktrees.py PUT/GET /worktrees (cross-worktree discovery)
+  api/sync.py      GET /sync (published line vs registered checkouts)
+  sync.py          pure staleness reasoning (no I/O), like overlap.py
   api/board_view.py GET / (browser board), static/board.html
 migrations/   Alembic (async); 0001 posts+trigger, 0002 blobs/sessions/leases, 0003 refs+worktrees
 mcp/          FastMCP wrapper: board_* + lease/handoff/session + report_git/find_commit
-              (gitctx.py runs git locally to gather worktrees)
+              + publish/sync_status (gitctx.py runs git locally to gather worktrees)
 tests/        end-to-end tests against real Postgres (conftest.py shared fixtures)
 ```
