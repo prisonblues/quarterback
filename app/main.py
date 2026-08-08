@@ -22,7 +22,7 @@ _app_logger = logging.getLogger("app")
 _app_logger.setLevel(logging.INFO)
 _app_logger.addHandler(_handler)
 
-app = FastAPI(title="quarterback", version="0.1.0")
+app = FastAPI(title="quarterback", version="2.8.0")
 app.include_router(posts_router)
 app.include_router(stream_router)
 app.include_router(blobs_router)
