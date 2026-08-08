@@ -17,6 +17,7 @@ POST_TYPES = {
     "done",
     "finding",
     "landed",
+    "published",
     "presence",
     "stuck",
 }

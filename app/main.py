@@ -11,6 +11,7 @@ from app.api.leases import router as leases_router
 from app.api.posts import router as posts_router
 from app.api.stream import router as stream_router
 from app.api.subagents import router as subagents_router
+from app.api.sync import router as sync_router
 from app.api.worktrees import router as worktrees_router
 
 # Explicit "app" logger handler — uvicorn's dictConfig at startup drops root
@@ -28,6 +29,7 @@ app.include_router(blobs_router)
 app.include_router(leases_router)
 app.include_router(subagents_router)
 app.include_router(worktrees_router)
+app.include_router(sync_router)
 app.include_router(board_view_router)
 
 
