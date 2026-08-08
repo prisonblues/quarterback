@@ -61,3 +61,32 @@ jobs:
             "https://hooks.example.com/hooks/DEPLOY_WEBHOOK_ID/deploy-quarterback" \
             || { echo "Failed to trigger deploy"; exit 1; }
           echo "Deploy triggered successfully"
+
+      # Announce the commit on the quarterback board so peers learn their checkout
+      # went stale. The lifecycle hook covers a local `git push`, but a PR merged
+      # on GitHub is nobody's push — which is exactly how most work reaches main,
+      # so without this the branch peers care about is the one never announced.
+      # Best-effort: announcing is not worth failing a green deploy over.
+      - name: Announce on the coordination board
+        if: ${{ secrets.QUARTERBACK_TOKEN != '' }}
+        continue-on-error: true
+        env:
+          QUARTERBACK_TOKEN: ${{ secrets.QUARTERBACK_TOKEN }}
+          # Via env, never inlined into the script: a commit message is attacker-
+          # controlled text and `${{ }}` interpolation would make it executable.
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+          COMMIT_SHA: ${{ github.sha }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          summary=$(printf '%s' "$COMMIT_MESSAGE" | head -1 | cut -c1-120)
+          [ -n "$summary" ] || summary="pushed ${COMMIT_SHA:0:7}"
+          body=$(jq -nc --arg s "$summary" --arg c "$COMMIT_SHA" --arg b "$BRANCH" \
+            '{type:"published", summary:$s,
+              refs:[{kind:"commit", value:$c, repo:"prisonblues/quarterback"},
+                    {kind:"repo", value:"quarterback"},
+                    {kind:"branch", value:$b}]}')
+          curl -sf --max-time 10 -X POST "https://qb.example.com/post" \
+            -H "Authorization: Bearer $QUARTERBACK_TOKEN" \
+            -H "Content-Type: application/json" -d "$body" \
+            && echo "Announced ${COMMIT_SHA:0:7} on the board" \
+            || echo "Board announce failed (non-fatal)"

@@ -333,6 +333,31 @@ async def test_caller_verdict_wins_over_other_stale_worktrees(client):
     assert res["worktrees"][0]["stale"] is True  # the peer is still reported, just not as mine
 
 
+async def test_the_same_commit_announced_twice_counts_once(client):
+    # A local push fires the lifecycle hook; CI announces the same commit again
+    # on merge. Counting both would say "2 commits behind" when it's one.
+    repo = f"{REPO}-dup"
+    await _publish(client, repo, C, "fix the resolver", headers=SERVER)
+    await _publish(client, repo, C[:7], "fix the resolver", headers=LAPTOP)  # abbreviated
+    res = (
+        await client.get(
+            "/sync", params={"repo": repo, "branch": "main", "have": B}, headers=LAPTOP
+        )
+    ).json()
+    shas = [p["sha"] for p in res["published"]]
+    assert len(shas) == 1 and C.startswith(shas[0])  # one entry, naming that commit
+    assert res["caller"]["behind_published"] == 1
+    assert "1 published commit" in res["advice"]
+
+    # And a caller holding it is current, whichever form it was announced in.
+    held = (
+        await client.get(
+            "/sync", params={"repo": repo, "branch": "main", "have": C}, headers=LAPTOP
+        )
+    ).json()
+    assert held["stale"] is False
+
+
 async def test_worktree_sync_state_round_trips(client):
     await client.put(
         "/worktrees",

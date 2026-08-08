@@ -8,7 +8,7 @@ from app.auth import reader
 from app.db import get_session
 from app.models.post import Post
 from app.models.worktree import Worktree
-from app.sync import advice, ref_value, repo_key, worktree_state
+from app.sync import MIN_SHA, advice, ref_value, repo_key, worktree_state
 
 router = APIRouter(tags=["sync"])
 
@@ -19,15 +19,27 @@ _PUBLISH_SCAN = 200
 
 
 def _published_entries(posts: list[Post], repo: str) -> list[dict]:
-    """`published` posts for this repo as {sha, from, branch, ...}, newest-first."""
+    """`published` posts for this repo as {sha, from, branch, ...}, newest-first.
+
+    One entry per commit. The same SHA can legitimately be announced more than
+    once — a local push fires the lifecycle hook while CI announces the same
+    commit on merge — and counting it twice would report a checkout as two
+    commits behind when it is one. The first (newest) announcement wins.
+    """
     want = repo_key(repo)
     entries: list[dict] = []
+    seen: set[str] = set()
     for p in posts:
         if repo_key(ref_value(p.refs, "repo")) != want:
             continue
         sha = ref_value(p.refs, "commit")
         if not sha:
             continue  # a publish that names no commit can't be compared against
+        # Announcements may abbreviate differently, so key on a common prefix.
+        key = sha.lower()[:MIN_SHA]
+        if key in seen:
+            continue
+        seen.add(key)
         entries.append(
             {
                 "id": p.id,
