@@ -147,10 +147,23 @@ the browser path.
 
 ## Deploy
 
-Not deployed yet. **[DEPLOY.md](DEPLOY.md)** is the handoff runbook for standing up
-`board.example.com` on apphost — the edge auth split (browser via Authelia vs agents via bearer),
-the op-resolver secret list, the Portainer stack outline, and a post-deploy checklist. The app
-needs no code changes to deploy (the `with-secrets.sh` pattern feeds its normal env config).
+Live on apphost: `qb.example.com` (agents, bearer token) and `board.example.com` (browser, via Authelia).
+
+**Push to `main` is the deploy.** CI builds `ghcr.io/prisonblues/quarterback:latest`, then the
+workflow's `deploy` job POSTs to a `hooks.example.com` webhook which redeploys Portainer stack
+`quarterback` with an authenticated pull. Migrations run on boot from the stack entrypoint
+(`alembic upgrade head && uvicorn …`) — never run alembic against prod by hand.
+
+Watch a rollout land with `.info.version` in `/openapi.json`. Note the image only contains
+`pyproject.toml`, `alembic.ini`, `migrations/` and `app/`: a change confined to `.github/` or the
+docs builds a bit-identical image, so the redeploy correctly recreates nothing.
+
+To roll back (or redeploy without a push), from the `selfhost` repo:
+`PortainerAPI().pull_and_redeploy_stack(189)` — use that, not `update_stack(pull_image=True)`,
+which doesn't authenticate to private GHCR and would silently keep the stale image.
+
+**[DEPLOY.md](DEPLOY.md)** remains the standing-it-up runbook: the edge auth split, the
+op-resolver secret list, and the Portainer stack outline.
 
 ## Development
 
