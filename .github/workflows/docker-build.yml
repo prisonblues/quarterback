@@ -43,3 +43,21 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # Without this job the build half runs and nothing ever rolls out — which is
+  # exactly what happened to v2.7 (built, then sat undeployed for two weeks).
+  # The webhook redeploys Portainer stack `quarterback`; migrations run on boot
+  # from the stack's own entrypoint, so no post-deploy command is needed.
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger deploy via webhook
+        run: |
+          curl -sf -X POST \
+            -H "Content-Type: application/json" \
+            -H "Authorization: ${{ secrets.DEPLOY_TOKEN }}" \
+            -d '{}' \
+            "https://hooks.fo.ls/hooks/ee02824e-13fc-4f62-b522-818fb1221969/deploy-quarterback" \
+            || { echo "Failed to trigger deploy"; exit 1; }
+          echo "Deploy triggered successfully"
