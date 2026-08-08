@@ -61,16 +61,29 @@ async def sync_status(
     branch: str | None = Query(None, description="restrict to one branch line"),
     device: str | None = Query(None, description="restrict to one device's worktrees"),
     path: str | None = Query(None, description="restrict to one worktree path"),
+    have: str | None = Query(
+        None, description="caller's own recent SHAs, newest first, comma-separated"
+    ),
+    dirty: bool | None = Query(None, description="caller's working tree has uncommitted changes"),
+    ahead: int | None = Query(None, ge=0, description="caller's commits not on its upstream"),
+    behind: int | None = Query(None, ge=0, description="caller's upstream commits it lacks"),
     limit: int = Query(_PUBLISH_SCAN, ge=1, le=1000, description="published posts to consider"),
     db: AsyncSession = Depends(get_session),
 ) -> dict:
     """Is this repo in sync across the fleet — and what should I pull?
 
-    Compares each registered worktree against the ``published`` line (the commits
-    peers have announced as pushed) and returns a per-worktree verdict plus one
-    actionable ``advice`` line. Scope it with device/path to ask only about your
-    own checkout; that narrowed form is what the lifecycle hook injects.
+    Compares checkouts against the ``published`` line (the commits peers have
+    announced as pushed) and returns a per-worktree verdict plus one actionable
+    ``advice`` line.
+
+    Two ways to ask about *your* checkout. Pass ``have`` (your recent SHAs) and
+    the answer is about you, whether or not you've ever registered — that's the
+    form the lifecycle hook uses, since it can't assume ``report_git`` has run.
+    Otherwise scope with device/path to ask about a registered worktree.
     """
+    # A client that sends `branch=` (detached HEAD, unset variable) means "no
+    # branch", not "the branch named empty string" — which would match nothing.
+    branch = branch or None
     posts = list(
         (
             await db.scalars(
@@ -116,14 +129,33 @@ async def sync_status(
     # worktree that needs action.
     states.sort(key=lambda s: (not s["stale"], s["device"] or "", s["path"] or ""))
 
-    line = advice(repo, states)
-    if not states and (device is not None or path is not None):
+    caller = None
+    if have:
+        shas = [s for s in (part.strip() for part in have.split(",")) if s]
+        caller = worktree_state(
+            {
+                "device": _reader,
+                "path": path,
+                "branch": branch,
+                "head_sha": shas[0] if shas else None,
+                "commits": [{"sha": s} for s in shas],
+                "ahead": ahead,
+                "behind": behind,
+                "dirty": dirty,
+            },
+            _on_branch(all_published, branch),
+        )
+
+    # The caller asked about itself: answer about itself, not about the fleet.
+    subject = [caller] if caller else states
+    line = advice(repo, subject)
+    if caller is None and not states and (device is not None or path is not None):
         # Scoped to a specific checkout that the board has never seen. Silence
         # here would read as "you're in sync", which is the one answer we can't
         # support — say what's actually missing instead.
         line = (
             f"{repo}: this worktree isn't registered with the board, so staleness "
-            f"can't be checked — run report_git first."
+            f"can't be checked — run report_git, or pass `have`."
         )
 
     return {
@@ -131,7 +163,8 @@ async def sync_status(
         "branch": branch,
         "published": _on_branch(all_published, branch),
         "worktrees": states,
+        "caller": caller,
         "registered": bool(states),
-        "stale": any(s["stale"] for s in states),
+        "stale": any(s["stale"] for s in subject),
         "advice": line,
     }

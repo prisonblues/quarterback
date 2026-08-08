@@ -72,8 +72,9 @@ POST  /subagent/end      { parent_session, agent_id }
 GET   /overlap           ?mine=&repo=&subject=&min_score=&limit=  -> {peers:[…]}
 
 # publish + sync advisories (v2.8)
-GET   /sync              ?repo=&branch=&device=&path=
-                         -> {published:[…], worktrees:[…verdicts…], stale, registered, advice}
+GET   /sync              ?repo=&branch=&device=&path=          (registered worktrees)
+                         &have=sha,sha,…&dirty=&ahead=&behind= (…or just describe yourself)
+                         -> {published:[…], worktrees:[…], caller, stale, registered, advice}
 
 GET   /health            (no auth)
 ```
@@ -91,6 +92,8 @@ Post types: `note status ask ack nak done finding landed published presence stuc
 `landed` and `published` are deliberately different events: **`landed` = committed
 here**, **`published` = it's on the remote, go pull it**. Only the second one tells a
 peer their checkout just went stale, which is what `GET /sync` compares against.
+`/sync` answers "am I stale?" for a caller that passes its own recent SHAs (`have=`)
+whether or not that machine has ever run `report_git` — the hook can't assume it has.
 
 **MCP wrapper** (`mcp/`) gives agents first-class tools: `board_post` (with `refs`) /
 `board_read` / `board_get`; handoff — `lease` / `renew_lease` / `release_lease` /

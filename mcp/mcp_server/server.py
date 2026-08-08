@@ -20,7 +20,18 @@ from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 
 from mcp_server.client import QuarterbackClient
-from mcp_server.gitctx import gather_worktrees, head_context, repo_slug, upstream_contains
+from mcp_server.gitctx import (
+    gather_worktrees,
+    head_context,
+    recent_shas,
+    repo_slug,
+    sync_state,
+    upstream_contains,
+)
+
+# How much of the caller's history to send with a sync check. Deep enough that a
+# checkout idle for a while still matches a publish it already holds.
+_CALLER_DEPTH = 25
 
 POST_TYPES = [
     "note",
@@ -554,11 +565,13 @@ def sync_status(
     before you build, deploy, or rebuild from a repo other machines also write
     to — that's the case where working from a stale checkout costs real time.
 
+    Reads your checkout's own recent commits, so the answer is about *you*
+    whether or not this machine has ever run `report_git`.
+
     Args:
         repo_path: Path inside the repo (default cwd).
-        device: Your device name — pass it when several machines check out the
-            same path, so you get your own worktree's verdict.
-        fleet: Report every registered worktree of this repo, not just yours —
+        device: Your device name — only needed to scope the fleet listing.
+        fleet: Also judge every other registered worktree of this repo —
             "is the fleet in sync", rather than "am I stale".
     """
     ctxt = head_context(repo_path)
@@ -569,9 +582,18 @@ def sync_status(
     params: dict = {"repo": repo}
     if ctxt["branch"]:
         params["branch"] = ctxt["branch"]
-    if not fleet and ctxt["toplevel"]:
-        params["path"] = ctxt["toplevel"]
-    if device is not None:
+    if ctxt["toplevel"]:
+        have = recent_shas(ctxt["toplevel"], _CALLER_DEPTH)
+        if have:
+            params["have"] = ",".join(have)
+        state = sync_state(ctxt["toplevel"])
+        for key in ("dirty", "ahead", "behind"):
+            if state.get(key) is not None:
+                params[key] = state[key]
+        if not fleet:
+            # Scope the registry listing to this checkout too; `fleet` widens it.
+            params["path"] = ctxt["toplevel"]
+    if device is not None and not fleet:
         params["device"] = device
     try:
         return _get_client(ctx).sync(params)

@@ -111,6 +111,12 @@ def head_context(repo_path: str) -> dict:
     }
 
 
+def recent_shas(worktree_path: str, depth: int) -> list[str]:
+    """The last `depth` commit SHAs, newest first — a checkout's "what I have"."""
+    out = _try(worktree_path, "log", f"-n{depth}", "--format=%H")
+    return out.splitlines() if out else []
+
+
 def _recent_commits(worktree_path: str, depth: int) -> list[dict]:
     try:
         out = _git(worktree_path, "log", f"-n{depth}", f"--format=%H{US}%s")

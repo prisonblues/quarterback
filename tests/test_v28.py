@@ -283,6 +283,56 @@ async def test_a_feature_worktree_is_not_stale_for_lacking_a_main_publish(client
     assert by_path["/src/feat"]["stale"] is False
 
 
+async def test_caller_gets_a_verdict_without_ever_registering(client):
+    # The hook path: no report_git, just "here's what I have". Same answer.
+    repo = f"{REPO}-caller"
+    await _publish(client, repo, B, "base")
+    await _publish(client, repo, C, "fix the resolver")
+    res = (
+        await client.get(
+            "/sync",
+            params={"repo": repo, "branch": "main", "have": f"{B},{A}", "dirty": "true"},
+            headers=LAPTOP,
+        )
+    ).json()
+    assert res["registered"] is False       # nothing registered, and it doesn't matter
+    assert res["stale"] is True
+    assert res["caller"]["behind_published"] == 1
+    assert res["caller"]["missing"][0]["sha"] == C
+    assert res["caller"]["device"] == "laptop"   # identity comes from the token
+    assert "git pull" in res["advice"] and "dirty" in res["advice"]
+
+    # Caller holding the newest publish: current, and told so by silence.
+    current = (
+        await client.get(
+            "/sync", params={"repo": repo, "branch": "main", "have": f"{C},{B}"}, headers=LAPTOP
+        )
+    ).json()
+    assert current["stale"] is False and current["advice"] is None
+
+
+async def test_caller_verdict_wins_over_other_stale_worktrees(client):
+    # A peer's stale checkout must not make *my* "am I stale?" answer yes.
+    repo = f"{REPO}-callerwins"
+    await _publish(client, repo, C, "shipped")
+    await client.put(
+        "/worktrees",
+        json={
+            "device": "sync-laggard",
+            "worktrees": [{"path": "/src/old", "repo": repo, "branch": "main", "head": A,
+                           "commits": [{"sha": A, "subject": "ancient"}]}],
+        },
+        headers=ZEUS,
+    )
+    res = (
+        await client.get(
+            "/sync", params={"repo": repo, "branch": "main", "have": C}, headers=LAPTOP
+        )
+    ).json()
+    assert res["stale"] is False and res["advice"] is None
+    assert res["worktrees"][0]["stale"] is True  # the peer is still reported, just not as mine
+
+
 async def test_worktree_sync_state_round_trips(client):
     await client.put(
         "/worktrees",
