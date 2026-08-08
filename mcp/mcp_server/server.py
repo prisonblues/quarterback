@@ -20,7 +20,18 @@ from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 
 from mcp_server.client import QuarterbackClient
-from mcp_server.gitctx import gather_worktrees
+from mcp_server.gitctx import (
+    gather_worktrees,
+    head_context,
+    recent_shas,
+    repo_slug,
+    sync_state,
+    upstream_contains,
+)
+
+# How much of the caller's history to send with a sync check. Deep enough that a
+# checkout idle for a while still matches a publish it already holds.
+_CALLER_DEPTH = 25
 
 POST_TYPES = [
     "note",
@@ -31,6 +42,7 @@ POST_TYPES = [
     "done",
     "finding",
     "landed",
+    "published",
     "presence",
     "stuck",
 ]
@@ -77,8 +89,14 @@ mcp = FastMCP(
         "After landing a commit, report_git(device) registers your worktrees so a "
         "peer can find_commit(sha) to see where it already exists (same machine ⇒ "
         "cherry-pick by SHA just works). Attach refs to a 'landed' post to announce it.\n\n"
+        "## Staying in sync (v2.8)\n"
+        "'landed' means committed here; **'published' means it's on the remote — go "
+        "pull it**. After a successful `git push`, call publish(summary) so peers on "
+        "other machines learn their checkout went stale. Before you build, deploy or "
+        "rebuild from a shared repo, call sync_status() — it compares your checkout "
+        "against the published line and tells you whether to pull first.\n\n"
         "## Post types\n"
-        "note status ask ack nak done finding landed presence stuck"
+        "note status ask ack nak done finding landed published presence stuck"
     ),
     lifespan=app_lifespan,
 )
@@ -469,6 +487,118 @@ def find_commit(ctx: Context, sha: str, repo: str | None = None) -> dict:
         return {"worktrees": _get_client(ctx).get_worktrees(params)}
     except httpx.HTTPStatusError as e:
         _raise(e, "find_commit")
+
+
+@mcp.tool()
+def publish(
+    ctx: Context,
+    summary: str,
+    repo_path: str = ".",
+    sha: str | None = None,
+    branch: str | None = None,
+    to: str | None = None,
+    detail: str | None = None,
+) -> dict:
+    """Announce that commits are on the remote — the fleet's "pull this" event.
+
+    Post this right after a successful `git push`. It is the signal peers on
+    other machines act on: their `sync_status` (and the lifecycle hook's stale
+    note) turns "your checkout is behind" into a named commit and a reason. A
+    `landed` post says you committed something; `published` says the rest of the
+    fleet can and should get it.
+
+    Repo, branch and SHA are read from your checkout when you don't pass them.
+    Refuses to post if the SHA isn't on the tracking branch yet — publishing a
+    commit nobody can fetch is worse than saying nothing.
+
+    Args:
+        summary: One line, what the push changes ("op-resolver ordering fix").
+            Say it in terms of why a peer should care — they decide from this.
+        repo_path: Path inside the repo (default cwd).
+        sha: Commit to announce (default: HEAD).
+        branch: Branch it's on (default: the current branch).
+        to: Optional agent to direct it at, when one peer specifically needs it.
+        detail: Optional longer body (e.g. what a puller must do after pulling).
+
+    Returns: {"id": <post id>, "sha": ..., "repo": ..., "branch": ...}
+    """
+    ctxt = head_context(repo_path)
+    sha = sha or ctxt["head"]
+    branch = branch or ctxt["branch"]
+    repo = repo_slug(repo_path)
+    if not sha:
+        raise ToolError(f"no commit found at {repo_path!r} — is it a git checkout?")
+    if not repo:
+        raise ToolError(f"no origin remote at {repo_path!r}; nothing for a peer to pull from")
+
+    on_remote = upstream_contains(repo_path, sha)
+    if on_remote is False:
+        raise ToolError(f"{sha[:7]} is not on the tracking branch yet — git push first")
+
+    refs = [{"kind": "repo", "value": repo}, {"kind": "commit", "value": sha}]
+    if branch:
+        refs.append({"kind": "branch", "value": branch})
+    body: dict = {"type": "published", "summary": summary, "refs": refs}
+    if to is not None:
+        body["to"] = to
+    if detail is not None:
+        body["detail"] = detail
+    try:
+        result = _get_client(ctx).post(body)
+    except httpx.HTTPStatusError as e:
+        raise ToolError(f"board rejected publish: {e.response.status_code} {e.response.text}") from e
+    return {**result, "sha": sha, "repo": repo, "branch": branch}
+
+
+@mcp.tool()
+def sync_status(
+    ctx: Context,
+    repo_path: str = ".",
+    device: str | None = None,
+    fleet: bool = False,
+) -> dict:
+    """Is my checkout stale — should I pull before I touch this?
+
+    Compares this worktree against the commits peers have `publish`ed and
+    against your own tracking branch, and returns an `advice` line naming what
+    you're missing and who pushed it (null when you're current). Worth calling
+    before you build, deploy, or rebuild from a repo other machines also write
+    to — that's the case where working from a stale checkout costs real time.
+
+    Reads your checkout's own recent commits, so the answer is about *you*
+    whether or not this machine has ever run `report_git`.
+
+    Args:
+        repo_path: Path inside the repo (default cwd).
+        device: Your device name — only needed to scope the fleet listing.
+        fleet: Also judge every other registered worktree of this repo —
+            "is the fleet in sync", rather than "am I stale".
+    """
+    ctxt = head_context(repo_path)
+    repo = repo_slug(repo_path) or (ctxt["toplevel"] or "").rsplit("/", 1)[-1]
+    if not repo:
+        raise ToolError(f"no git repo at {repo_path!r}")
+
+    params: dict = {"repo": repo}
+    if ctxt["branch"]:
+        params["branch"] = ctxt["branch"]
+    if ctxt["toplevel"]:
+        have = recent_shas(ctxt["toplevel"], _CALLER_DEPTH)
+        if have:
+            params["have"] = ",".join(have)
+        state = sync_state(ctxt["toplevel"])
+        for key in ("dirty", "ahead", "behind"):
+            if state.get(key) is not None:
+                params[key] = state[key]
+        if not fleet:
+            # Scope the registry listing to this checkout too; `fleet` widens it.
+            params["path"] = ctxt["toplevel"]
+    if device is not None and not fleet:
+        params["device"] = device
+    try:
+        return _get_client(ctx).sync(params)
+    except httpx.HTTPStatusError as e:
+        _raise(e, "sync_status")
 
 
 def main():

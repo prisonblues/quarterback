@@ -100,6 +100,13 @@ class QuarterbackClient:
         resp.raise_for_status()
         return resp.json()
 
+    # -- publish / sync advisories (v2.8) ------------------------------
+
+    def sync(self, params: dict) -> dict:
+        resp = self._http.get(self._url("/sync"), params=params)
+        resp.raise_for_status()
+        return resp.json()
+
     # -- coordination: collision index + sub-agents (v2.6) -------------
 
     def active(self, params: dict) -> dict:
