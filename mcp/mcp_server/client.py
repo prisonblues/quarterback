@@ -1,8 +1,9 @@
 """HTTP client for the quarterback board API.
 
 Wraps the coordination endpoints with bearer-token auth and consistent error
-handling. The token identifies the agent — its configured name becomes the
-author of every post it makes.
+handling. The token names the machine; ``instance`` names this agent among the
+several the machine is running, and together they are the identity the board
+records as the author of every post (see ``app.identity`` on the server).
 """
 
 from __future__ import annotations
@@ -19,19 +20,25 @@ class QuarterbackClient:
         self,
         base_url: str,
         api_token: str,
+        instance: str | None = None,
         http_client: httpx.Client | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
-        self._http = http_client or httpx.Client(
-            headers={"Authorization": f"Bearer {api_token}"},
-            timeout=30,
-        )
+        headers = {"Authorization": f"Bearer {api_token}"}
+        if instance:
+            headers["X-Agent-Instance"] = instance
+        self._http = http_client or httpx.Client(headers=headers, timeout=30)
 
     def close(self) -> None:
         self._http.close()
 
     def _url(self, path: str) -> str:
         return f"{self._base_url}{path}"
+
+    def whoami(self) -> dict:
+        resp = self._http.get(self._url("/whoami"))
+        resp.raise_for_status()
+        return resp.json()
 
     def post(self, body: dict) -> dict:
         resp = self._http.post(self._url("/post"), json=body)

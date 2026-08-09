@@ -70,6 +70,9 @@
   @keyframes flash { from { border-color:var(--accent); } to { border-color:var(--line); } }
   .row1 { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
   .from { font-weight:600; } .to,.ts,.id,.re { color:var(--muted); font-size:12px; }
+  /* machine/instance: the machine reads at full weight, the instance recedes —
+     it disambiguates co-located agents without shouting a session id. */
+  .inst { font-weight:400; color:var(--muted); }
   .chip { font-size:11px; padding:1px 7px; border-radius:999px; background:var(--chip);
     border:1px solid var(--line); }
   .type { text-transform:uppercase; letter-spacing:.5px; font-weight:600; border:none; }
@@ -114,6 +117,9 @@ const postsBySession = new Map();         // session id ("(none)" for orphans) -
 const expanded = new Set();               // session ids whose timeline is expanded
 
 function esc(s){ const d=document.createElement("div"); d.textContent=s??""; return d.innerHTML; }
+// An agent identity is machine/instance — render the instance quietly (see .inst).
+function who(name){ const i=(name??"").indexOf("/");
+  return i<0 ? esc(name) : `${esc(name.slice(0,i))}<span class="inst">/${esc(name.slice(i+1))}</span>`; }
 function human(b){ if(b==null) return "—"; const u=["B","KB","MB","GB"]; let n=b,i=0; while(n>=1024&&i<3){n/=1024;i++;} return (i?n.toFixed(1):n)+u[i]; }
 function ago(iso){ const s=Math.max(0,(Date.now()-Date.parse(iso))/1000); if(s<60)return Math.floor(s)+"s"; if(s<3600)return Math.floor(s/60)+"m"; if(s<86400)return Math.floor(s/3600)+"h"; return Math.floor(s/86400)+"d"; }
 function setStatus(kind,text){ dot.className="dot"+(kind?" "+kind:""); statusText.textContent=text; }
@@ -162,7 +168,7 @@ function sessionCard(s){
       <span class="stitle">${esc(s.title || repo)}</span>
       ${model?`<span class="smodel">${esc(model)}</span>`:""}
       <span class="spacer" style="flex:1"></span>
-      <span class="smeta">${esc(s.holder||"?")}${s.device?"@"+esc(s.device):""} · ${esc(repo)} · ${ago(s.updated_at)} · ${human(s.size)}</span>
+      <span class="smeta">${who(s.holder||"?")}${s.device?"@"+esc(s.device):""} · ${esc(repo)} · ${ago(s.updated_at)} · ${human(s.size)}</span>
       <span class="sactions">
         ${s.resumable?`<button data-cmd="qb resume ${esc(s.session)}">resume ⧉</button>`:""}
         ${s.live?`<button data-cmd="qb focus ${esc(s.session)}">focus ⧉</button>`:""}
@@ -211,7 +217,7 @@ function feedRow(p){
   const c=TYPE_COLOR[p.type]||"#5b6472";
   el.innerHTML=`<div class="row1">
     <span class="chip type" style="background:${c}22;color:${c}">${esc(p.type)}</span>
-    <span class="from">${esc(p.from)}</span>${p.to?`<span class="to">→ ${esc(p.to)}</span>`:""}
+    <span class="from">${who(p.from)}</span>${p.to?`<span class="to">→ ${who(p.to)}</span>`:""}
     <span style="flex:1"></span><span class="ts">${esc((p.ts||"").slice(11,19))}</span>
     <span class="id">#${esc(String(p.id))}</span></div>
     <div class="summary">${esc(p.summary)}</div>

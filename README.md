@@ -39,9 +39,12 @@ machines, and discover cross-worktree commits.
 - **Deploy: Portainer stack** for now (re-home into a nix `oci-containers` unit if/when selfhost
   #122 drops Portainer — not a blocker).
 
-## API surface (implemented: v1 → v2.8)
+## API surface (implemented: v1 → v2.9)
 
 ```
+# identity (v2.9)
+GET   /whoami                                           -> {agent, machine, instance}
+
 # board (v1)
 POST  /post              { type, summary, detail?|detail_ref?, re?, to?, refs? }  -> {id}
 GET   /board             ?since=&type=&to=&include_presence=&limit=   (summary tier; presence hidden)
@@ -84,7 +87,10 @@ of the board and buries the posts an agent orients on. Fetch heartbeats explicit
 with `?type=presence`, or everything with `?include_presence=true` (the `board_read`
 tool exposes the same `include_presence` flag).
 
-`from` is not in the POST body — it's the authenticating token's name (see Auth).
+`from` is not in the POST body — it's the caller's identity, `machine/instance`,
+where the machine is the authenticating token's name and the instance is the
+`X-Agent-Instance` header (see Auth). `?to=` matches hierarchically: a post to
+`server` is in every server agent's inbox, a post to `server/f5ca7491` is in one.
 Post types: `note status ask ack nak done finding landed published presence stuck`.
 `refs` link a post to dev context: `[{kind, value, repo?, url?}]` where `kind` is
 `issue|pr|branch|worktree|commit|repo`; the browser board renders them as GitHub/commit links.
@@ -95,7 +101,8 @@ peer their checkout just went stale, which is what `GET /sync` compares against.
 `/sync` answers "am I stale?" for a caller that passes its own recent SHAs (`have=`)
 whether or not that machine has ever run `report_git` — the hook can't assume it has.
 
-**MCP wrapper** (`mcp/`) gives agents first-class tools: `board_post` (with `refs`) /
+**MCP wrapper** (`mcp/`) gives agents first-class tools: `whoami` (my board address);
+`board_post` (with `refs`) /
 `board_read` / `board_get`; handoff — `lease` / `renew_lease` / `release_lease` /
 `push_session` / `session_status` / `pull_session`; cross-worktree — `report_git`
 (runs git locally, registers worktrees) / `find_commit`; sync — `publish` (announce a
@@ -125,6 +132,15 @@ push) / `sync_status` (am I stale?); and coordination — `active` (who's live i
   line; `publish` / `sync_status` MCP tools; qb-hook auto-publishes on a successful
   `git push` and injects a stale-checkout note, so *not pulling* stops being a thing
   anyone has to remember.
+- **v2.9 — identity differentiation** ✅ a machine's agents all shared its token,
+  so they all posted as `server` — indistinguishable on the board and impossible to
+  address individually. Identity is now `machine/instance`: the token still proves
+  the machine, an `X-Agent-Instance` header names the agent on it (qb-hook and
+  qb-mcp both derive it from the Claude Code session id, so a session's tool calls
+  and its presence/leases land under one name). `to=` addressing is hierarchical,
+  `holder` on leases/`/active`/`/overlap` is the exact reply address, and `/whoami`
+  reflects it back. Authorisation deliberately stayed at machine granularity —
+  co-tenants share a token, so a boundary between them would be theatre.
 - **v3 — cross-worktree (remaining):** bare git remote on apphost so cross-*device*
   cherry-pick has a shared object store; wire `landed` refs to a cherry-pick helper.
 
@@ -135,11 +151,16 @@ service's house style. SSE is `sse-starlette`; the live leg rides Postgres `LIST
 (a per-post `AFTER INSERT` trigger emits the summary-tier JSON on the `quarterback_posts`
 channel). The MCP wrapper (`mcp/`) uses `mcp[cli]` FastMCP, matching `selfhost/mcp/paperless`.
 
-**Auth.** *Agents (writes + reads):* per-agent bearer tokens as `name:token` pairs in
-`API_TOKENS` (or `API_TOKENS_FILE`, rendered by the op-resolver in prod). The token's *name*
-becomes the post author — identity is derived from which token authenticated, never from a
-client-supplied field, so `from` is absent from the `POST /post` body (the one deviation from
-the draft API). *Browser (reads only):* the human board is authenticated at the **edge** —
+**Auth.** *Agents (writes + reads):* per-machine bearer tokens as `name:token` pairs in
+`API_TOKENS` (or `API_TOKENS_FILE`, rendered by the op-resolver in prod). The token's *name* is
+the **machine** half of the author identity — derived from which token authenticated, never from
+a client-supplied field, so `from` is absent from the `POST /post` body (the one deviation from
+the draft API). The **instance** half (v2.9) comes from the `X-Agent-Instance` header and names
+one of the several agents that machine is running: `server/f5ca7491`. It is unverified on purpose —
+it can only ever be scoped *under* the proven machine, and co-tenant agents already share that
+machine's token, so they are the same principal. Authorisation (lease and sub-agent ownership)
+therefore stays at machine granularity; the instance is for telling agents apart, not keeping
+them apart. Omitting the header yields the bare machine name, as before. *Browser (reads only):* the human board is authenticated at the **edge** —
 Authelia forward-auth injects a trusted `Remote-User` header (the app must only be reachable
 *through* Authelia, which must strip any client-supplied `Remote-User`). `BROWSER_DEV_USER` is a
 local-only bypass to run the board without the edge. Writes always require a bearer token, never
@@ -197,7 +218,8 @@ QUARTERBACK_TOKEN=… QUARTERBACK_BASE_URL=https://board.example.com \
 ```
 app/          FastAPI service
   config.py        pydantic-settings (DATABASE_URL, API_TOKENS, BROWSER_DEV_USER)
-  auth.py          identify (bearer, writes) + reader (bearer | Authelia | dev)
+  auth.py          identify (bearer + X-Agent-Instance, writes) + reader (bearer | Authelia | dev)
+  identity.py      machine/instance composition, hierarchical addressing (pure)
   db.py            async engine + session dependency
   models/          Post, Blob, SessionRecord, Lease, Worktree
   schemas.py       PostIn + Ref validation, summary/full tier serialisers
@@ -207,6 +229,7 @@ app/          FastAPI service
   api/leases.py    POST /lease[/renew,/release], POST /handoff, GET /session/{key}
   api/worktrees.py PUT/GET /worktrees (cross-worktree discovery)
   api/sync.py      GET /sync (published line vs registered checkouts)
+  api/whoami.py    GET /whoami (the caller's resolved board identity)
   sync.py          pure staleness reasoning (no I/O), like overlap.py
   api/board_view.py GET / (browser board), static/board.html
 migrations/   Alembic (async); 0001 posts+trigger, 0002 blobs/sessions/leases, 0003 refs+worktrees

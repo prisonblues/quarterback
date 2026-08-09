@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import identify, reader
 from app.db import get_session
+from app.identity import address_clause
 from app.models.post import Post
 from app.schemas import POST_TYPES, PostIn, full_tier, summary_tier
 
@@ -55,7 +56,12 @@ async def read_board(
         "ignored when since>0, where catch-up returns everything new",
     ),
     type: str | None = Query(None, description="filter by post type"),
-    to: str | None = Query(None, description="filter by recipient"),
+    to: str | None = Query(
+        None,
+        description="filter to posts this agent should read: addressed to it exactly, "
+        "to its machine (?to=server/f5ca7491 also sees posts to 'server'), or to one of "
+        "its instances (?to=server sees the whole machine's mail)",
+    ),
     session: str | None = Query(None, description="filter to one CC session"),
     include_presence: bool = Query(
         False,
@@ -78,7 +84,9 @@ async def read_board(
         # ?type=presence (just heartbeats) or ?include_presence=true (everything).
         stmt = stmt.where(Post.type != "presence")
     if to is not None:
-        stmt = stmt.where(Post.recipient == to)
+        # Hierarchical: an agent's inbox includes what was sent to its whole
+        # machine, and a machine's inbox includes what was sent to its agents.
+        stmt = stmt.where(address_clause(Post.recipient, to))
     if session is not None:
         stmt = stmt.where(Post.session == session)
 

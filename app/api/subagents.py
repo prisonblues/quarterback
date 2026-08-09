@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import identify, reader
 from app.db import get_session
+from app.identity import address_clause, addressed_to, same_machine
 from app.models.lease import Lease
 from app.models.post import Post
 from app.models.subagent import Subagent
@@ -104,7 +105,7 @@ async def register_subagent(
             Subagent.agent_id == body.agent_id,
         )
     )
-    if existing is not None and existing.holder != holder:
+    if existing is not None and not same_machine(existing.holder, holder):
         raise HTTPException(
             409,
             detail={
@@ -159,7 +160,7 @@ async def end_subagent(
     )
     if row is None:
         return {"ended": False, "reason": "unknown subagent"}
-    if row.holder != holder:
+    if not same_machine(row.holder, holder):
         raise HTTPException(403, "not your subagent")
     if row.ended_at is None:
         row.ended_at = now
@@ -174,7 +175,11 @@ async def list_active(
     cwd: str | None = Query(None, description="only agents live in this working dir"),
     repo: str | None = Query(None, description="only agents live in this git repo"),
     device: str | None = Query(None, description="only agents on this device"),
-    holder: str | None = Query(None, description="only agents held by this token name"),
+    holder: str | None = Query(
+        None,
+        description="only agents held by this identity; a bare machine name "
+        "(?holder=server) matches every agent instance on it",
+    ),
     mine: str | None = Query(
         None,
         description="the caller's own session id; entries owned by it are tagged own=true",
@@ -205,7 +210,7 @@ async def list_active(
     if device is not None:
         lstmt = lstmt.where(Lease.device == device)
     if holder is not None:
-        lstmt = lstmt.where(Lease.holder == holder)
+        lstmt = lstmt.where(address_clause(Lease.holder, holder))
     leases = (await session.scalars(lstmt)).all()
     if peers_only and mine is not None:
         leases = [ln for ln in leases if ln.session != mine]
@@ -229,7 +234,7 @@ async def list_active(
     if device is not None:
         subs = [s for s in subs if s["device"] == device]
     if holder is not None:
-        subs = [s for s in subs if s["holder"] == holder]
+        subs = [s for s in subs if addressed_to(s["holder"], holder)]
     for s in subs:
         s["own"] = mine is not None and s["parent_session"] == mine
     if peers_only and mine is not None:
