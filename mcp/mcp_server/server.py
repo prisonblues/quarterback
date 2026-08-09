@@ -83,13 +83,26 @@ def resolve_instance() -> str | None:
     )
 
 
+def resolve_session() -> str | None:
+    """The Claude Code session these tool calls belong to, for `session` on a post.
+
+    Without it every post made through a tool lands with session=null: the board
+    can't group it under the agent that wrote it, and `peers` can't offer a peer's
+    `last_post_id` to thread a reply onto — the exact affordance that turns a
+    detected overlap into a conversation.
+    """
+    return os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip() or None
+
+
 @asynccontextmanager
 async def app_lifespan(server: FastMCP):
     token = os.environ.get("QUARTERBACK_TOKEN", "")
     base_url = os.environ.get("QUARTERBACK_BASE_URL", "https://quarterback.fo.ls")
     if not token:
         raise ValueError("QUARTERBACK_TOKEN environment variable is required")
-    client = QuarterbackClient(base_url, token, instance=resolve_instance())
+    client = QuarterbackClient(
+        base_url, token, instance=resolve_instance(), session=resolve_session()
+    )
     try:
         yield AppContext(client=client)
     finally:
