@@ -21,9 +21,11 @@ class QuarterbackClient:
         base_url: str,
         api_token: str,
         instance: str | None = None,
+        session: str | None = None,
         http_client: httpx.Client | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
+        self._session = session
         headers = {"Authorization": f"Bearer {api_token}"}
         if instance:
             headers["X-Agent-Instance"] = instance
@@ -41,6 +43,11 @@ class QuarterbackClient:
         return resp.json()
 
     def post(self, body: dict) -> dict:
+        # Stamp the session here rather than at each call site, so anything that
+        # posts — board_post, publish, whatever comes next — is attributable to
+        # the agent that wrote it without having to remember to say so.
+        if self._session and "session" not in body:
+            body = {**body, "session": self._session}
         resp = self._http.post(self._url("/post"), json=body)
         resp.raise_for_status()
         return resp.json()
