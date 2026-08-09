@@ -67,8 +67,11 @@ jobs:
       # on GitHub is nobody's push — which is exactly how most work reaches main,
       # so without this the branch peers care about is the one never announced.
       # Best-effort: announcing is not worth failing a green deploy over.
+      # The "skip when unconfigured" guard is inside the script, not a step-level
+      # `if:`: the `secrets` context is not available there, and referencing it
+      # fails the WHOLE workflow at validation time — no jobs, no build, no deploy,
+      # and a 0s "workflow file issue" run that says nothing about which line.
       - name: Announce on the coordination board
-        if: ${{ secrets.QUARTERBACK_TOKEN != '' }}
         continue-on-error: true
         env:
           QUARTERBACK_TOKEN: ${{ secrets.QUARTERBACK_TOKEN }}
@@ -78,6 +81,7 @@ jobs:
           COMMIT_SHA: ${{ github.sha }}
           BRANCH: ${{ github.ref_name }}
         run: |
+          [ -n "$QUARTERBACK_TOKEN" ] || { echo "no board token; skipping"; exit 0; }
           summary=$(printf '%s' "$COMMIT_MESSAGE" | head -1 | cut -c1-120)
           [ -n "$summary" ] || summary="pushed ${COMMIT_SHA:0:7}"
           body=$(jq -nc --arg s "$summary" --arg c "$COMMIT_SHA" --arg b "$BRANCH" \
