@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.subagents import active_subagents_by_session
 from app.auth import identify, reader
 from app.db import get_session
+from app.identity import same_machine
 from app.models.blob import Blob
 from app.models.lease import Lease
 from app.models.session import SessionRecord
@@ -116,11 +117,15 @@ async def acquire_lease(
     """Claim a session, or renew if you already hold it.
 
     409 if a *different* device holds an active lease — that device must crash
-    (lease lapses) or hand off before this one can take over.
+    (lease lapses) or hand off before this one can take over. "Different" is
+    judged at machine granularity: a lease belongs to the box, so a session
+    reclaimed by another agent on the same machine is a renew, not a conflict.
     """
     now = _utcnow()
     active = await _active_lease(session, body.session, now)
-    if active is not None and (active.holder != holder or active.device != body.device):
+    if active is not None and (
+        not same_machine(active.holder, holder) or active.device != body.device
+    ):
         raise HTTPException(
             409,
             detail={
@@ -132,7 +137,10 @@ async def acquire_lease(
         )
 
     if active is not None:
-        # Same device re-claiming — treat as a renew.
+        # Same device re-claiming — treat as a renew. Take the caller's identity:
+        # a lease claimed before the holder had an instance (or by the machine
+        # itself) upgrades to the live agent's address on the next heartbeat.
+        active.holder = holder
         active.ttl_seconds = body.ttl
         active.expires_at = now + timedelta(seconds=body.ttl)
         if body.cwd:
@@ -178,7 +186,7 @@ async def renew_lease(
     lease = await session.get(Lease, body.lease_id)
     if lease is None:
         raise HTTPException(404, "lease not found")
-    if lease.holder != holder:
+    if not same_machine(lease.holder, holder):
         raise HTTPException(403, "not your lease")
     if lease.released_at is not None:
         raise HTTPException(409, "lease already released; re-acquire via POST /lease")
@@ -199,7 +207,7 @@ async def release_lease(
     lease = await session.get(Lease, body.lease_id)
     if lease is None:
         raise HTTPException(404, "lease not found")
-    if lease.holder != holder:
+    if not same_machine(lease.holder, holder):
         raise HTTPException(403, "not your lease")
     if lease.released_at is None:
         lease.released_at = _utcnow()
@@ -220,7 +228,7 @@ async def handoff(
     """
     now = _utcnow()
     active = await _active_lease(session, body.session, now)
-    if active is None or active.holder != holder:
+    if active is None or not same_machine(active.holder, holder):
         raise HTTPException(409, "you do not hold an active lease on this session")
     if await session.get(Blob, body.blob.lower()) is None:
         raise HTTPException(400, "unknown blob; PUT it to /blob/<sha> first")
@@ -254,7 +262,7 @@ async def snapshot(
     """
     now = _utcnow()
     active = await _active_lease(session, body.session, now)
-    if active is None or active.holder != holder:
+    if active is None or not same_machine(active.holder, holder):
         raise HTTPException(409, "you do not hold an active lease on this session")
     if await session.get(Blob, body.blob.lower()) is None:
         raise HTTPException(400, "unknown blob; PUT it to /blob/<sha> first")
