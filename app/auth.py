@@ -5,6 +5,10 @@ import hmac
 from fastapi import Header, HTTPException, status
 
 from app.config import settings
+from app.identity import INSTANCE_RE, compose, valid_instance
+
+#: Header an agent uses to distinguish itself from its co-tenants on a machine.
+INSTANCE_HEADER = "X-Agent-Instance"
 
 
 def _match_bearer(authorization: str) -> str | None:
@@ -18,11 +22,17 @@ def _match_bearer(authorization: str) -> str | None:
     return None
 
 
-def identify(authorization: str = Header(default="")) -> str:
-    """Resolve a request's bearer token to the agent name that owns it (write paths).
+def identify(
+    authorization: str = Header(default=""),
+    instance: str = Header(default="", alias=INSTANCE_HEADER),
+) -> str:
+    """Resolve a request to the agent identity that made it (write paths).
 
-    Identity is derived from *which* token authenticated, not a client-supplied
-    field — that name becomes the post author.
+    The machine half comes from *which* token authenticated, never from a
+    client-supplied field. The optional ``X-Agent-Instance`` header adds the
+    finer grain — one of the several agents running on that machine — giving
+    ``machine/instance``. Without it the identity is the bare machine name, as
+    it was before v2.9. See app.identity for why the instance needs no proof.
     """
     if not settings.token_map:
         raise HTTPException(
@@ -36,7 +46,12 @@ def identify(authorization: str = Header(default="")) -> str:
             "invalid or missing bearer token",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    return name
+    if instance and not valid_instance(instance):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"{INSTANCE_HEADER} {instance!r} must match {INSTANCE_RE.pattern}",
+        )
+    return compose(name, instance or None)
 
 
 def reader(

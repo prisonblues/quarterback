@@ -12,6 +12,7 @@ from app.api.posts import router as posts_router
 from app.api.stream import router as stream_router
 from app.api.subagents import router as subagents_router
 from app.api.sync import router as sync_router
+from app.api.whoami import router as whoami_router
 from app.api.worktrees import router as worktrees_router
 
 # Explicit "app" logger handler — uvicorn's dictConfig at startup drops root
@@ -22,7 +23,8 @@ _app_logger = logging.getLogger("app")
 _app_logger.setLevel(logging.INFO)
 _app_logger.addHandler(_handler)
 
-app = FastAPI(title="quarterback", version="2.8.0")
+app = FastAPI(title="quarterback", version="2.9.0")
+app.include_router(whoami_router)
 app.include_router(posts_router)
 app.include_router(stream_router)
 app.include_router(blobs_router)
