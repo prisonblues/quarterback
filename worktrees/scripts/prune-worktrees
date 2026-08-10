@@ -90,8 +90,25 @@ detect_project_name() {
     basename "$root"
 }
 
-detect_postgres_container() {
-    docker ps --format '{{.Names}}' 2>/dev/null | grep -iE 'postgres|pgdb|_db' | head -1
+# Every running container whose name looks like a Postgres, most-plausible
+# first. Deliberately NOT `| head -1`: "the first thing docker happens to list"
+# is not a choice. On a box that also runs CI containers this picked
+# `10bad74c…_postgres16_…` — an ephemeral runner service — over the project's
+# own `postgres-local`. The psql call against it then failed behind `2>/dev/null`
+# and the sweep reported "Orphan databases: none" while 103 orphans sat in the
+# real container. Silent, and it flipped run to run as containers came and went.
+# The caller picks the first candidate that actually answers as $PG_USER.
+postgres_container_candidates() {
+    local names
+    names=$(docker ps --format '{{.Names}}' 2>/dev/null || true)
+    # Stable, human-named containers first; hex-prefixed ephemerals last.
+    grep -iE 'postgres|pgdb|_db' <<<"$names" | grep -vE '^[0-9a-f]{16,}_' || true
+    grep -iE 'postgres|pgdb|_db' <<<"$names" | grep -E '^[0-9a-f]{16,}_' || true
+}
+
+# True if $1 can list databases as $PG_USER — the only test that matters.
+postgres_container_answers() {
+    docker exec "$1" psql -U "$PG_USER" -d postgres -tAc 'SELECT 1' >/dev/null 2>&1
 }
 
 # Drop a database robustly. Try WITH (FORCE) (Postgres 13+) to evict any stray
@@ -221,8 +238,6 @@ is_live_suffix() {
 # ============================================
 ORPHAN_DBS=()
 if [[ "$DB_ENGINE" = "postgresql" ]]; then
-    [[ "$DB_CONTAINER" = "auto" ]] && DB_CONTAINER=$(detect_postgres_container)
-
     PG_USER=""
     if [[ -f "$MAIN_REPO/.env" ]]; then
         PG_USER=$(env_val "$DB_USER_ENV" "$MAIN_REPO/.env")
@@ -238,10 +253,23 @@ if [[ "$DB_ENGINE" = "postgresql" ]]; then
     PROTECT["${PROJECT}_test"]=1
     while IFS= read -r p; do [[ -n "$p" ]] && PROTECT["$p"]=1; done < <(cfg_array '.database.protect')
 
-    if [[ -z "$DB_CONTAINER" ]]; then
-        echo -e "${YELLOW}! Postgres container not found — skipping DB scan${NC}"
-    elif [[ -z "$PG_USER" ]]; then
+    # Resolve the container only once PG_USER is known, so "does it answer as
+    # this user?" is available as the tie-breaker.
+    if [[ "$DB_CONTAINER" = "auto" && -n "$PG_USER" ]]; then
+        DB_CONTAINER=""
+        while IFS= read -r c; do
+            [[ -z "$c" ]] && continue
+            if postgres_container_answers "$c"; then DB_CONTAINER="$c"; break; fi
+        done < <(postgres_container_candidates)
+    fi
+
+    if [[ -z "$PG_USER" ]]; then
         echo -e "${YELLOW}! Could not determine DB user — skipping DB scan${NC}"
+    elif [[ -z "$DB_CONTAINER" || "$DB_CONTAINER" = "auto" ]]; then
+        # Loud, because the failure mode this replaces was a confident "none".
+        echo -e "${YELLOW}! No Postgres container answered as '$PG_USER' — skipping DB scan.${NC}"
+        echo -e "${YELLOW}  Candidates tried: $(postgres_container_candidates | tr '\n' ' ')${NC}"
+        echo -e "${YELLOW}  'Orphan databases: none' below means NOT SCANNED, not clean.${NC}"
     else
         while IFS= read -r db; do
             [[ "$db" == "${PROJECT}_"* ]] || continue
