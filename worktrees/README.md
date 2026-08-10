@@ -182,6 +182,15 @@ Read these before adopting rather than after.
   their own from a normal shell.
 - **The database copy assumes PostgreSQL in a container.** Other engines are configurable in
   principle but far less exercised.
+- **Pin `database.container` if the machine runs more than one Postgres.** Left at `auto`,
+  the scripts look for a running container whose name matches `postgres|pgdb|_db`. They now
+  prefer stable human-named containers over hex-prefixed ephemeral ones and verify the
+  candidate actually answers as your DB user — but "guess the container" is still a guess.
+  On a host also running self-hosted CI it originally picked a runner's throwaway
+  `<hex>_postgres16_<hex>` service, which made `create-worktree` fail with `role "..." does
+  not exist` and, worse, made `prune-worktrees` report `Orphan databases: none` while a
+  hundred orphans sat in the real container. An explicit name (as in
+  `worktree.example.json`) removes the ambiguity entirely.
 - **`/fix-issue` references commands not included here** — `/review-pr`, `/panel-review-pr`,
   `/epic`, `/fix-issue-here`. Those references are inert; the command works without them,
   it will just mention things you do not have.

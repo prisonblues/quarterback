@@ -42,6 +42,46 @@ report verbatim. It reports five categories:
 
 If it says "Nothing to prune. Clean.", report that and stop — you're done.
 
+### 2a. Independently verify the destructive categories (MANDATORY)
+
+**Do not trust the report for the two categories that destroy work.** Verify
+them yourself against `git worktree list` before offering to apply anything:
+
+```bash
+git worktree list --porcelain | awk '/^worktree /{print substr($0,10)}' | sort > /tmp/ts_live.txt
+# every path prune-worktrees called a leftover:
+comm -12 /tmp/ts_live.txt /tmp/ts_leftover.txt        # <-- MUST be empty
+```
+
+- **Any overlap → STOP.** A directory that is both "leftover" and a registered
+  worktree is a false positive, and `--remove-dirs` would `rm -rf` live work.
+  Report it as a tooling bug and do not pass `--remove-dirs`.
+- Also run `git -C <dir> status --porcelain` on each reported leftover. A
+  *genuinely* de-registered directory can still hold uncommitted work — show the
+  user the dirty ones and get explicit per-directory confirmation.
+- Because `--remove-containers` is gated on the leftover/stale-port evidence, a
+  false leftover poisons it too. If the leftover list was wrong, treat the
+  container list as unproven as well.
+
+This step exists because the detector has been wrong in exactly this way: a
+`git worktree list --porcelain | grep -qxF ...` liveness check under
+`set -o pipefail` returned 141 (git killed by SIGPIPE when `grep -q`
+short-circuited on a match) *even when the match succeeded*, so live worktrees
+were classified as leftovers — non-deterministically, 12/18/20/21 of them on
+four consecutive dry-runs. Fixed in `prune-worktrees`, but keep verifying: this
+skill's job is to be the check on the script, not its megaphone.
+
+### 2b. Sanity-check the orphan database list
+
+`--prune` drops databases. The mapping it uses is per-*worktree*
+(`<project>_<create-name>`), so anything else that merely starts with the
+project name — per-test-run databases, cached migration templates — is
+"orphaned" by construction rather than by evidence. That is usually fine (they
+are disposable and get recreated), but say so explicitly and name what will go,
+rather than reporting a bare count. Call out in particular any template
+database matching the **current** migration head: dropping it is safe but costs
+a rebuild on the next test run.
+
 ## 3. Apply on confirm
 
 Show the user exactly which categories are non-empty and ask whether to apply.
