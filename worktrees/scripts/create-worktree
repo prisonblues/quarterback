@@ -271,8 +271,27 @@ detect_nginx_container() {
     docker ps --format '{{.Names}}' 2>/dev/null | grep -iE 'nginx' | head -1
 }
 
-detect_postgres_container() {
-    docker ps --format '{{.Names}}' 2>/dev/null | grep -iE 'postgres|pgdb|_db' | head -1
+# Every running container that looks like a Postgres, most-plausible first.
+# NOT `| head -1`: on a box also running self-hosted CI runners that picked an
+# ephemeral `<hex>_postgres16_<hex>` service over the project's own container,
+# and the DB copy then died with `role "lexray" does not exist`. The caller
+# resolves PG_USER first and takes the first candidate that answers as it.
+postgres_container_candidates() {
+    local names
+    names=$(docker ps --format '{{.Names}}' 2>/dev/null || true)
+    grep -iE 'postgres|pgdb|_db' <<<"$names" | grep -vE '^[0-9a-f]{16,}_' || true
+    grep -iE 'postgres|pgdb|_db' <<<"$names" | grep -E '^[0-9a-f]{16,}_' || true
+}
+
+resolve_postgres_container() {
+    local user="$1" c
+    while IFS= read -r c; do
+        [[ -z "$c" ]] && continue
+        if docker exec "$c" psql -U "$user" -d postgres -tAc 'SELECT 1' >/dev/null 2>&1; then
+            echo "$c"; return 0
+        fi
+    done < <(postgres_container_candidates)
+    return 1
 }
 
 # Is this repo container-based? (i.e. is there something to build or compose up)
@@ -740,8 +759,12 @@ fi
 # STEP: Database setup
 # ============================================
 # Resolve DB container up-front so we can degrade gracefully when it's absent
+DB_CONTAINER_AUTO=false
 if [[ "$SHARED_DB" = false && "$DB_ENGINE" = "postgresql" && "$DB_CONTAINER" = "auto" ]]; then
-    DB_CONTAINER=$(detect_postgres_container)
+    # Presence check only — "is there anything to talk to?". Which one is right
+    # cannot be known until PG_USER is read from the worktree .env below.
+    DB_CONTAINER=$(postgres_container_candidates | head -1 || true)
+    DB_CONTAINER_AUTO=true
 fi
 
 if [[ "$SHARED_DB" = false && "$DB_ENGINE" = "postgresql" && -z "$DB_CONTAINER" ]]; then
@@ -767,6 +790,14 @@ elif [[ "$SHARED_DB" = false && "$DB_ENGINE" = "postgresql" ]]; then
     fi
     [[ -z "$MAIN_DB_NAME" ]] && die "Could not determine main database name from .env"
     [[ -z "$PG_USER" ]] && die "Could not determine database user from .env"
+
+    # Now that PG_USER is known, pick the container that actually answers as it.
+    if [[ "$DB_CONTAINER_AUTO" = true ]]; then
+        resolved_container=$(resolve_postgres_container "$PG_USER" || true)
+        [[ -z "$resolved_container" ]] && die \
+            "No Postgres container answered as '$PG_USER'. Tried: $(postgres_container_candidates | tr '\n' ' ')"
+        DB_CONTAINER="$resolved_container"
+    fi
 
     DB_BRANCH=$(echo "$BRANCH_NAME" | tr '/-' '__')
     WORKTREE_DB="${PROJECT}_${DB_BRANCH}"
@@ -979,7 +1010,13 @@ port_available() {
     if command -v ss >/dev/null 2>&1; then
         [[ -n "$(ss -Hltn "sport = :$p" 2>/dev/null)" ]] && return 1
     fi
-    docker ps --format '{{.Ports}}' 2>/dev/null | grep -qE ":$p->" && return 1
+    # Capture first, then match. `docker ps ... | grep -q` is unsafe under
+    # `set -o pipefail`: grep exits the moment it matches, docker dies of
+    # SIGPIPE, and the pipeline reports 141 despite the match — so `&& return 1`
+    # is skipped and a port that IS in use is reported free. That is the
+    # "port is already allocated" start-up failure this script retries below.
+    local docker_ports; docker_ports=$(docker ps --format '{{.Ports}}' 2>/dev/null || true)
+    grep -qE ":$p->" <<<"$docker_ports" && return 1
     return 0
 }
 
@@ -1046,11 +1083,13 @@ if [[ "$SKIP_DOCKER" = false ]]; then
 
     # Detect network — prefer the explicit default, fall back to pattern match
     step "Detecting Docker network..."
-    if docker network ls --format '{{.Name}}' 2>/dev/null | grep -qxF "$NETWORK_DEFAULT"; then
+    # Captured, not piped: see the SIGPIPE/pipefail note in port_available().
+    DOCKER_NETWORKS=$(docker network ls --format '{{.Name}}' 2>/dev/null || true)
+    if grep -qxF "$NETWORK_DEFAULT" <<<"$DOCKER_NETWORKS"; then
         NETWORK_NAME="$NETWORK_DEFAULT"
         echo -e "  ${GREEN}$NETWORK_NAME${NC}"
     else
-        NETWORK_NAME=$(docker network ls --format '{{.Name}}' 2>/dev/null | grep -iE "$NETWORK_PATTERN" | head -1)
+        NETWORK_NAME=$(grep -iE "$NETWORK_PATTERN" <<<"$DOCKER_NETWORKS" | head -1)
         if [[ -z "$NETWORK_NAME" ]]; then
             NETWORK_NAME="$NETWORK_DEFAULT"
             echo -e "  ${YELLOW}Not found, using default: $NETWORK_NAME${NC}"
@@ -1160,7 +1199,7 @@ if [[ "$SKIP_DOCKER" = false ]]; then
             break
         fi
         echo "$UP_LOG"
-        if echo "$UP_LOG" | grep -qiE 'port is already allocated|Bind for .* failed'; then
+        if grep -qiE 'port is already allocated|Bind for .* failed' <<<"$UP_LOG"; then
             OLD_PORT=$NEXT_PORT
             NEXT_PORT=$((NEXT_PORT + 1))
             while ! port_available "$NEXT_PORT"; do NEXT_PORT=$((NEXT_PORT + 1)); done
@@ -1180,7 +1219,8 @@ if [[ "$SKIP_DOCKER" = false ]]; then
     if [[ "$START_OK" = true ]]; then
         echo -e "${GREEN}Containers started${NC}"
         sleep 3
-        if docker ps | grep -q "${PROJECT}-${SAFE_NAME}"; then
+        RUNNING_CONTAINERS=$(docker ps --format '{{.Names}}' 2>/dev/null || true)
+        if grep -qF "${PROJECT}-${SAFE_NAME}" <<<"$RUNNING_CONTAINERS"; then
             echo -e "${GREEN}Containers are healthy${NC}"
         else
             echo -e "${RED}Warning: Containers may not have started correctly${NC}"
