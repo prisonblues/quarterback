@@ -21,7 +21,7 @@ def _find(sessions: list[dict], key: str) -> dict | None:
 @pytest.mark.asyncio
 async def test_sessions_lists_live_then_resumable_with_size_and_cwd(client):
     sess = f"s-{uuid.uuid4()}"
-    cwd = "/home/devuser/source/selfhost"
+    cwd = "/home/dev/src/example-project"
 
     # live: lease claimed with cwd + title + recap, no blob yet
     await client.post("/lease", json={

@@ -16,7 +16,7 @@ from app.api.whoami import router as whoami_router
 from app.api.worktrees import router as worktrees_router
 
 # Explicit "app" logger handler — uvicorn's dictConfig at startup drops root
-# handlers, so a dedicated namespace handler survives (house quirk, cf. callous).
+# handlers, so a dedicated namespace handler survives.
 _handler = logging.StreamHandler(sys.stdout)
 _handler.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
 _app_logger = logging.getLogger("app")

@@ -1,15 +1,13 @@
 # quarterback
 
-Cross-device agent **coordination + session-sync** service for my self-hosted setup — the
-"agent-mail / bulletin board" layer that lets my laptop, desktop, and headless coding agents
+Self-hosted cross-device agent **coordination + session-sync** service — the
+"agent-mail / bulletin board" layer that lets your laptop, desktop, and headless coding agents
 share an ordered, replayable board of what's happening, hand off Claude Code sessions between
 machines, and discover cross-worktree commits.
 
-> **Canonical spec + design rationale live in the `selfhost` repo:**
-> [`issues/open/127-feature-quarterback-agent-coordination-session-sync.md`](../selfhost/issues/open/127-feature-quarterback-agent-coordination-session-sync.md)
->
-> That issue is the source of truth (prior-art survey, decisions, phasing). This repo is the
-> implementation. Keep the issue updated as the plan changes.
+Built for a personal fleet, so it assumes a single trusted operator: authentication is a
+per-machine bearer token, and the browser board expects an authenticating reverse proxy in
+front of it. See **Auth** below before exposing it to anything wider.
 
 ## The problem (four pains, one service)
 
@@ -36,8 +34,8 @@ machines, and discover cross-worktree commits.
   blob fetched on demand. Keeps agent context small.
 - **Session handoff via TTL presence leases** — crash → lease auto-expires → peer claims + pulls
   the JSONL blob. The board doubles as the lock.
-- **Deploy: Portainer stack** for now (re-home into a nix `oci-containers` unit if/when selfhost
-  #122 drops Portainer — not a blocker).
+- **Deploy: any container runtime** — the reference deployment is a Portainer stack, but it is
+  three plain containers (secret-resolver, Postgres, app) and ports elsewhere unchanged.
 
 ## API surface (implemented: v1 → v2.9)
 
@@ -141,15 +139,15 @@ push) / `sync_status` (am I stale?); and coordination — `active` (who's live i
   `holder` on leases/`/active`/`/overlap` is the exact reply address, and `/whoami`
   reflects it back. Authorisation deliberately stayed at machine granularity —
   co-tenants share a token, so a boundary between them would be theatre.
-- **v3 — cross-worktree (remaining):** bare git remote on apphost so cross-*device*
+- **v3 — cross-worktree (remaining):** a bare git remote on the server so cross-*device*
   cherry-pick has a shared object store; wire `landed` refs to a cherry-pick helper.
 
 ## Stack
 
-FastAPI + SQLAlchemy 2.0 async (asyncpg) + Alembic + Postgres — mirroring the `callous`
-service's house style. SSE is `sse-starlette`; the live leg rides Postgres `LISTEN/NOTIFY`
-(a per-post `AFTER INSERT` trigger emits the summary-tier JSON on the `quarterback_posts`
-channel). The MCP wrapper (`mcp/`) uses `mcp[cli]` FastMCP, matching `selfhost/mcp/paperless`.
+FastAPI + SQLAlchemy 2.0 async (asyncpg) + Alembic + Postgres. SSE is `sse-starlette`; the
+live leg rides Postgres `LISTEN/NOTIFY` (a per-post `AFTER INSERT` trigger emits the
+summary-tier JSON on the `quarterback_posts` channel). The MCP wrapper (`mcp/`) uses
+`mcp[cli]` FastMCP.
 
 **Auth.** *Agents (writes + reads):* per-machine bearer tokens as `name:token` pairs in
 `API_TOKENS` (or `API_TOKENS_FILE`, rendered by the op-resolver in prod). The token's *name* is
@@ -168,23 +166,23 @@ the browser path.
 
 ## Deploy
 
-Live on apphost: `qb.example.com` (agents, bearer token) and `board.example.com` (browser, via Authelia).
+The service is designed to run behind a reverse proxy on two hostnames — one for agents
+(bearer token) and one for the browser board (forward-auth). **[DEPLOY.md](DEPLOY.md)** is the
+standing-it-up runbook: the edge auth split, the secret list, and the container stack outline.
 
-**Push to `main` is the deploy.** CI builds `ghcr.io/prisonblues/quarterback:latest`, then the
-workflow's `deploy` job POSTs to a `hooks.example.com` webhook which redeploys Portainer stack
-`quarterback` with an authenticated pull. Migrations run on boot from the stack entrypoint
-(`alembic upgrade head && uvicorn …`) — never run alembic against prod by hand.
+**Push to `main` is the deploy.** CI builds `ghcr.io/<owner>/quarterback:latest`, then the
+workflow's `deploy` job POSTs to a redeploy webhook which pulls the new image. Both the webhook
+URL and its token are repository secrets (`DEPLOY_WEBHOOK_URL`, `DEPLOY_TOKEN`); leave them unset
+and the deploy job skips, so a fork still builds. Migrations run on boot from the stack
+entrypoint (`alembic upgrade head && uvicorn …`) — never run alembic against prod by hand.
 
 Watch a rollout land with `.info.version` in `/openapi.json`. Note the image only contains
 `pyproject.toml`, `alembic.ini`, `migrations/` and `app/`: a change confined to `.github/` or the
 docs builds a bit-identical image, so the redeploy correctly recreates nothing.
 
-To roll back (or redeploy without a push), from the `selfhost` repo:
-`PortainerAPI().pull_and_redeploy_stack(189)` — use that, not `update_stack(pull_image=True)`,
-which doesn't authenticate to private GHCR and would silently keep the stale image.
-
-**[DEPLOY.md](DEPLOY.md)** remains the standing-it-up runbook: the edge auth split, the
-op-resolver secret list, and the Portainer stack outline.
+When rolling back, make sure whatever redeploy path you use **authenticates to the registry** if
+your image is private — a plain "pull latest" that can't authenticate will silently keep the
+stale image and look like a successful deploy.
 
 ## Development
 
@@ -209,7 +207,7 @@ docker compose up -d --build
 
 # MCP server (separate package)
 cd mcp && uv venv --python 3.12 .venv && uv pip install -e .
-QUARTERBACK_TOKEN=… QUARTERBACK_BASE_URL=https://board.example.com \
+QUARTERBACK_TOKEN=… QUARTERBACK_BASE_URL=http://localhost:8000 \
   .venv/bin/python -m mcp_server            # stdio (default) or --transport streamable-http
 ```
 

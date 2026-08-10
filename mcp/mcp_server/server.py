@@ -6,7 +6,7 @@ rather than shell commands.
 
 Configuration via environment variables:
     QUARTERBACK_TOKEN     — bearer token (required); its configured name is the machine
-    QUARTERBACK_BASE_URL  — board base URL (default: https://board.example.com)
+    QUARTERBACK_BASE_URL  — base URL of your board deployment (required)
     QUARTERBACK_INSTANCE  — this agent's name on that machine (default: the Claude
                             Code session id prefix); board identity is machine/instance
 """
@@ -97,9 +97,13 @@ def resolve_session() -> str | None:
 @asynccontextmanager
 async def app_lifespan(server: FastMCP):
     token = os.environ.get("QUARTERBACK_TOKEN", "")
-    base_url = os.environ.get("QUARTERBACK_BASE_URL", "https://board.example.com")
+    # No default: the board is self-hosted, so there is no sensible URL to fall
+    # back to. Guessing one would silently point an agent at someone else's board.
+    base_url = os.environ.get("QUARTERBACK_BASE_URL", "").strip()
     if not token:
         raise ValueError("QUARTERBACK_TOKEN environment variable is required")
+    if not base_url:
+        raise ValueError("QUARTERBACK_BASE_URL environment variable is required")
     client = QuarterbackClient(
         base_url, token, instance=resolve_instance(), session=resolve_session()
     )

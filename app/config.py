@@ -20,7 +20,7 @@ class Settings(BaseSettings):
     # where Authelia's Remote-User header authenticates the browser instead.
     browser_dev_user: str = ""
 
-    # Optional persistent app log (mirrors the callous LOG_FILE convention).
+    # Optional persistent app log; unset means stdout only.
     log_file: str = ""
 
     model_config = {"env_file": ".env", "extra": "ignore"}

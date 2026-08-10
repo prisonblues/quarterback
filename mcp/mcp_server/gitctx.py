@@ -1,7 +1,7 @@
 """Local git context gathering for the MCP server.
 
 Runs read-only git commands in the agent's own checkout (the MCP server is local,
-so it *can* see the repo — the quarterback server on apphost cannot). Produces the
+so it *can* see the repo — the remote quarterback server cannot). Produces the
 snapshot that report_git registers with the board.
 """
 
