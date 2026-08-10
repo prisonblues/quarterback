@@ -1,0 +1,1441 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Generic Worktree Setup Script
+# Usage: create-worktree [options] <branch-name>
+#
+# Creates a git worktree with Docker containers, database copy, and nginx proxy.
+# Configuration via .worktree.json (or passed via --config). Auto-detects what it can.
+#
+# Docker/DB/nginx are auto-detected: if the repo has no Dockerfile/compose file
+# (or docker isn't installed), Docker and nginx are skipped automatically, so a
+# plain repo gets just a worktree + symlinks. Override with --docker / --no-docker.
+#
+# Options:
+#   --config <path>      Config file path (default: .worktree.json in repo root)
+#   --from <branch>      Fork from this branch instead of HEAD
+#   --choose             Interactive branch picker
+#   --dry-run            Show plan without executing
+#   --frontend-only      Skip worker container, use shared queue
+#   --shared-db          Use main database (no copy)
+#   --docker             Force Docker on (override auto-detection)
+#   --no-nginx           Skip nginx configuration
+#   --no-docker          Skip Docker (worktree + symlinks only)
+#   --no-workspace       Skip workspace file generation
+#   --no-fetch           Skip the git fetch (default: fetch origin first, and
+#                        fast-forward an existing local branch to its upstream)
+
+# ============================================
+# COLORS
+# ============================================
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+# ============================================
+# HELPERS
+# ============================================
+TOTAL_STEPS=0
+CURRENT_STEP=0
+
+count_steps() {
+    # These always emit a step, including their "skipping..." branches:
+    # git worktree, env, database, symlinks, copies, port, claude-local,
+    # workspace, gitignore, quiet-git
+    TOTAL_STEPS=10
+    if [[ "$SKIP_DOCKER" = false ]]; then
+        TOTAL_STEPS=$((TOTAL_STEPS + 4))  # network, images, compose, start
+    fi
+    if [[ "$SKIP_NGINX" = false ]]; then
+        TOTAL_STEPS=$((TOTAL_STEPS + 2))  # nginx config, restart
+    fi
+}
+
+step() {
+    CURRENT_STEP=$((CURRENT_STEP + 1))
+    echo -e "${YELLOW}[$CURRENT_STEP/$TOTAL_STEPS] $1${NC}"
+}
+
+die() { echo -e "${RED}Error: $1${NC}" >&2; exit 1; }
+
+# Read a value from a .env file, handling quotes and whitespace
+# Usage: env_val "VAR_NAME" "/path/to/.env"
+env_val() {
+    local var="$1" file="$2"
+    [[ -f "$file" ]] || return 0
+    local line
+    line=$(grep "^[[:space:]]*${var}[[:space:]]*=" "$file" 2>/dev/null | head -1 || true)
+    [[ -z "$line" ]] && return 0
+    local val
+    # Strip everything up to and including first =
+    val="${line#*=}"
+    # Trim leading/trailing whitespace
+    val="${val#"${val%%[![:space:]]*}"}"
+    val="${val%"${val##*[![:space:]]}"}"
+    # Strip surrounding quotes (single or double)
+    if [[ "$val" =~ ^\"(.*)\"$ ]]; then
+        val="${BASH_REMATCH[1]}"
+    elif [[ "$val" =~ ^\'(.*)\'$ ]]; then
+        val="${BASH_REMATCH[1]}"
+    fi
+    # Strip inline comments (but not inside URLs)
+    if [[ "$val" != *"://"* ]]; then
+        val="${val%%[[:space:]]#*}"
+    fi
+    echo "$val"
+}
+
+# Extract user from a DATABASE_URL value
+# Handles: postgresql://user:pass@host:port/db
+#           postgresql+asyncpg://user:pass@host:port/db
+db_url_user() {
+    local url="$1"
+    echo "$url" | sed 's|.*://\([^:]*\):.*|\1|'
+}
+
+# Extract database name from a DATABASE_URL value
+db_url_dbname() {
+    local url="$1"
+    echo "$url" | sed 's|.*/||' | sed 's|?.*||'
+}
+
+# Read a JSON config value, return empty string if missing
+cfg() {
+    local key="$1"
+    local default="${2:-}"
+    if [[ -n "$CONFIG_JSON" ]]; then
+        local val
+        # Check if key exists first (handles false/null correctly)
+        if echo "$CONFIG_JSON" | jq -e "$key != null" >/dev/null 2>&1; then
+            val=$(echo "$CONFIG_JSON" | jq -r "$key" 2>/dev/null)
+            echo "$val"
+            return
+        fi
+    fi
+    echo "$default"
+}
+
+# Read a JSON array as newline-separated values
+cfg_array() {
+    local key="$1"
+    if [[ -n "$CONFIG_JSON" ]]; then
+        echo "$CONFIG_JSON" | jq -r "$key[]? // empty" 2>/dev/null
+    fi
+}
+
+# Read a JSON object as key=value lines
+cfg_object() {
+    local key="$1"
+    if [[ -n "$CONFIG_JSON" ]]; then
+        echo "$CONFIG_JSON" | jq -r "$key // {} | to_entries[] | \"\(.key)=\(.value)\"" 2>/dev/null
+    fi
+}
+
+pick_base_branch() {
+    echo -e "${YELLOW}Choose a branch to fork from:${NC}"
+    echo ""
+    local branches=()
+    for priority in main master; do
+        if git show-ref --verify --quiet "refs/heads/$priority"; then
+            branches+=("$priority")
+        fi
+    done
+    while IFS= read -r b; do
+        [[ "$b" == "main" || "$b" == "master" ]] && continue
+        branches+=("$b")
+    done < <(git for-each-ref --sort=-committerdate --format='%(refname:short)' refs/heads/)
+
+    for i in "${!branches[@]}"; do
+        printf "  ${GREEN}%2d${NC}) %s\n" "$((i + 1))" "${branches[$i]}"
+    done
+    echo ""
+
+    while true; do
+        read -rp "Enter number or branch name: " input
+        if [[ -z "$input" ]]; then
+            echo -e "${RED}No selection made${NC}"
+            continue
+        fi
+        if [[ "$input" =~ ^[0-9]+$ ]]; then
+            if (( input >= 1 && input <= ${#branches[@]} )); then
+                BASE_BRANCH="${branches[$((input - 1))]}"
+                echo -e "  -> ${GREEN}$BASE_BRANCH${NC}"
+                return
+            else
+                echo -e "${RED}Invalid number (1-${#branches[@]})${NC}"
+                continue
+            fi
+        fi
+        BASE_BRANCH="$input"
+        echo -e "  -> ${GREEN}$BASE_BRANCH${NC}"
+        return
+    done
+}
+
+# ============================================
+# AUTO-DETECTION
+# ============================================
+detect_project_name() {
+    local root="$1"
+    # Try pyproject.toml name field
+    if [[ -f "$root/pyproject.toml" ]]; then
+        local name
+        name=$(grep -E '^name[[:space:]]*=' "$root/pyproject.toml" | head -1 | sed 's/.*=[[:space:]]*"\(.*\)".*/\1/' 2>/dev/null)
+        if [[ -n "$name" ]]; then
+            echo "$name"
+            return
+        fi
+    fi
+    # Try package.json
+    if [[ -f "$root/package.json" ]]; then
+        local name
+        name=$(jq -r '.name // empty' "$root/package.json" 2>/dev/null)
+        if [[ -n "$name" ]]; then
+            echo "$name"
+            return
+        fi
+    fi
+    # Fallback to directory name
+    basename "$root"
+}
+
+detect_framework() {
+    local root="$1"
+    if [[ -f "$root/pyproject.toml" ]]; then
+        if grep -qi 'fastapi' "$root/pyproject.toml" 2>/dev/null; then
+            echo "fastapi"; return
+        fi
+        if grep -qi 'flask' "$root/pyproject.toml" 2>/dev/null; then
+            echo "flask"; return
+        fi
+    fi
+    if [[ -f "$root/requirements.txt" ]]; then
+        if grep -qi 'fastapi' "$root/requirements.txt" 2>/dev/null; then
+            echo "fastapi"; return
+        fi
+        if grep -qi 'flask' "$root/requirements.txt" 2>/dev/null; then
+            echo "flask"; return
+        fi
+    fi
+    if [[ -f "$root/package.json" ]]; then
+        if jq -e '.dependencies.express // .dependencies.fastify' "$root/package.json" >/dev/null 2>&1; then
+            echo "node"; return
+        fi
+    fi
+    echo "unknown"
+}
+
+detect_worker_type() {
+    local root="$1"
+    for file in "$root/pyproject.toml" "$root/requirements.txt"; do
+        [[ -f "$file" ]] || continue
+        if grep -qi 'huey' "$file" 2>/dev/null; then echo "huey"; return; fi
+        if grep -qi '\brq\b' "$file" 2>/dev/null; then echo "rq"; return; fi
+        if grep -qi 'celery' "$file" 2>/dev/null; then echo "celery"; return; fi
+    done
+    # Check docker-compose for worker services
+    if [[ -f "$root/docker-compose.yml" ]]; then
+        if grep -qi 'huey' "$root/docker-compose.yml" 2>/dev/null; then echo "huey"; return; fi
+        if grep -qi '\brq\b' "$root/docker-compose.yml" 2>/dev/null; then echo "rq"; return; fi
+        if grep -qi 'celery' "$root/docker-compose.yml" 2>/dev/null; then echo "celery"; return; fi
+    fi
+    echo "none"
+}
+
+detect_docker_network() {
+    local project="$1"
+    docker network ls --format '{{.Name}}' 2>/dev/null | grep -iE "${project}.*web|${project}.*app" | head -1
+}
+
+detect_docker_image() {
+    local project="$1"
+    docker images --format '{{.Repository}}' 2>/dev/null | grep -iE "^${project}" | head -1
+}
+
+detect_nginx_config() {
+    local root="$1"
+    # Look for nginx config files
+    local conf
+    conf=$(find "$root/nginx" -name "*.conf" -type f 2>/dev/null | head -1)
+    if [[ -n "$conf" ]]; then
+        # Return relative path
+        echo "${conf#$root/}"
+        return
+    fi
+    echo ""
+}
+
+detect_nginx_container() {
+    docker ps --format '{{.Names}}' 2>/dev/null | grep -iE 'nginx' | head -1
+}
+
+detect_postgres_container() {
+    docker ps --format '{{.Names}}' 2>/dev/null | grep -iE 'postgres|pgdb|_db' | head -1
+}
+
+# Is this repo container-based? (i.e. is there something to build or compose up)
+detect_dockerized() {
+    local root="$1"
+    [[ -f "$root/docker-compose.yml" || -f "$root/docker-compose.yaml" \
+       || -f "$root/compose.yml" || -f "$root/compose.yaml" \
+       || -f "$root/Dockerfile" ]]
+}
+
+# ============================================
+# PARSE ARGUMENTS
+# ============================================
+BRANCH_NAME=""
+BASE_BRANCH=""
+CHOOSE_BASE=false
+DRY_RUN=false
+FRONTEND_ONLY=false
+SHARED_DB=false
+SKIP_NGINX=false
+SKIP_DOCKER=false
+DOCKER_MODE="auto"        # auto | on | off
+DOCKER_SKIP_REASON=""
+SKIP_WORKSPACE=false
+FETCH=true                # fetch origin before worktree-add; --no-fetch to skip
+CONFIG_FILE=""
+CONFIG_JSON=""
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --config)
+            [[ -z "${2:-}" ]] && die "--config requires a path"
+            CONFIG_FILE="$2"; shift 2 ;;
+        --from)
+            [[ -z "${2:-}" ]] && die "--from requires a branch name"
+            BASE_BRANCH="$2"; shift 2 ;;
+        --choose)
+            CHOOSE_BASE=true; shift ;;
+        --dry-run)
+            DRY_RUN=true; shift ;;
+        --frontend-only)
+            FRONTEND_ONLY=true; SHARED_DB=true; shift ;;
+        --shared-db)
+            SHARED_DB=true; shift ;;
+        --no-nginx)
+            SKIP_NGINX=true; shift ;;
+        --docker)
+            DOCKER_MODE="on"; shift ;;
+        --no-docker)
+            DOCKER_MODE="off"; shift ;;
+        --no-workspace)
+            SKIP_WORKSPACE=true; shift ;;
+        --fetch)
+            FETCH=true; shift ;;
+        --no-fetch)
+            FETCH=false; shift ;;
+        --*)
+            die "Unknown option: $1" ;;
+        *)
+            [[ -n "$BRANCH_NAME" ]] && die "Unexpected argument '$1' (branch already set to '$BRANCH_NAME')"
+            BRANCH_NAME="$1"; shift ;;
+    esac
+done
+
+[[ -n "$BASE_BRANCH" && "$CHOOSE_BASE" = true ]] && die "--from and --choose cannot be used together"
+
+# ============================================
+# FIND REPO ROOT AND LOAD CONFIG
+# ============================================
+MAIN_REPO=$(git rev-parse --show-toplevel 2>/dev/null) || die "Not inside a git repository"
+MAIN_BASENAME=$(basename "$MAIN_REPO")
+
+# Load config file
+if [[ -n "$CONFIG_FILE" ]]; then
+    [[ -f "$CONFIG_FILE" ]] || die "Config file not found: $CONFIG_FILE"
+    CONFIG_JSON=$(cat "$CONFIG_FILE")
+elif [[ -f "$MAIN_REPO/.worktree.json" ]]; then
+    CONFIG_JSON=$(cat "$MAIN_REPO/.worktree.json")
+else
+    CONFIG_JSON=""
+fi
+
+# ============================================
+# RESOLVE ALL CONFIGURATION (config -> auto-detect -> defaults)
+# ============================================
+PROJECT=$(cfg '.project' "$(detect_project_name "$MAIN_REPO")")
+FRAMEWORK=$(cfg '.framework' "$(detect_framework "$MAIN_REPO")")
+
+# Ports
+BASE_PORT=$(cfg '.base_port' "5680")
+if [[ "$FRAMEWORK" = "fastapi" ]]; then
+    APP_PORT=$(cfg '.app_port' "8000")
+else
+    APP_PORT=$(cfg '.app_port' "5005")
+fi
+
+# Docker
+NETWORK_PATTERN=$(cfg '.docker.network_pattern' "${PROJECT}.*web")
+NETWORK_DEFAULT=$(cfg '.docker.network_default' "${PROJECT}_web_network")
+IMAGE_PATTERN=$(cfg '.docker.image_pattern' "")
+
+# Nginx
+NGINX_CONFIG=$(cfg '.nginx.config' "$(detect_nginx_config "$MAIN_REPO")")
+NGINX_CONTAINER=$(cfg '.nginx.container' "auto")
+NGINX_MAIN_PORT=$(cfg '.nginx.main_port' "")
+NGINX_RESOLVER=$(cfg '.nginx.resolver' "false")
+
+# Database
+DB_ENGINE=$(cfg '.database.engine' "")
+DB_CONTAINER=$(cfg '.database.container' "auto")
+DB_USER_ENV=$(cfg '.database.user_env' "POSTGRES_USER")
+DB_PASS_ENV=$(cfg '.database.password_env' "POSTGRES_PASSWORD")
+DB_NAME_ENV=$(cfg '.database.name_env' "POSTGRES_DB")
+DB_URL_ENV=$(cfg '.database.url_env' "")
+
+# If no DB engine specified, infer from the repo's own .env. We deliberately do
+# NOT infer from running containers — a postgres container belonging to another
+# project on the host doesn't mean THIS repo wants an isolated DB copy.
+if [[ -z "$DB_ENGINE" ]]; then
+    if [[ -f "$MAIN_REPO/.env" ]] && grep -qiE 'POSTGRES|postgresql' "$MAIN_REPO/.env" 2>/dev/null; then
+        DB_ENGINE="postgresql"
+    fi
+fi
+
+# Worker
+WORKER_TYPE=$(cfg '.worker.type' "$(detect_worker_type "$MAIN_REPO")")
+WORKER_PREFIX=$(cfg '.worker.container_prefix' "")
+WORKER_QUEUE_ENV=$(cfg '.worker.queue_env' "")
+WORKER_QUEUE_DEFAULT=$(cfg '.worker.queue_default' "$PROJECT")
+WORKER_COMMAND=$(cfg '.worker.command' "")
+
+# Set worker defaults based on type
+if [[ -z "$WORKER_PREFIX" ]]; then
+    case "$WORKER_TYPE" in
+        huey) WORKER_PREFIX="huey-consumer" ;;
+        rq) WORKER_PREFIX="${PROJECT}-rq-worker" ;;
+        celery) WORKER_PREFIX="${PROJECT}-celery-worker" ;;
+    esac
+fi
+if [[ -z "$WORKER_QUEUE_ENV" ]]; then
+    case "$WORKER_TYPE" in
+        huey) WORKER_QUEUE_ENV="HUEY_QUEUE_NAME" ;;
+        celery) WORKER_QUEUE_ENV="CELERY_QUEUE" ;;
+    esac
+fi
+if [[ -z "$WORKER_COMMAND" ]]; then
+    case "$WORKER_TYPE" in
+        huey) WORKER_COMMAND="python huey_startup.py" ;;
+        rq) WORKER_COMMAND="uv run rq worker" ;;
+        celery) WORKER_COMMAND="celery -A tasks worker --loglevel=info" ;;
+    esac
+fi
+
+# Env
+ENV_COPY_FROM=$(cfg '.env.copy_from' ".env")
+
+# Server
+SERVER_WORKERS_ENV=$(cfg '.server.workers_env' "")
+if [[ -z "$SERVER_WORKERS_ENV" ]]; then
+    case "$FRAMEWORK" in
+        flask) SERVER_WORKERS_ENV="GUNICORN_WORKERS" ;;
+        fastapi) SERVER_WORKERS_ENV="WEB_CONCURRENCY" ;;
+    esac
+fi
+SERVER_WORKERS_DEFAULT=$(cfg '.server.workers_default' "1")
+
+# Workspace
+WORKSPACE_ENABLED=$(cfg '.workspace.enabled' "true")
+EDITOR_CLI=$(cfg '.workspace.editor_cli' "/Applications/Cursor.app/Contents/Resources/app/bin/cursor")
+
+# Collect symlinks, copies, reserved names, gitignore additions
+SYMLINKS=()
+while IFS= read -r line; do
+    [[ -n "$line" ]] && SYMLINKS+=("$line")
+done < <(cfg_array '.symlinks')
+# Defaults if none configured
+if [[ ${#SYMLINKS[@]} -eq 0 ]]; then
+    for p in .venv .claude CLAUDE.md; do
+        [[ -e "$MAIN_REPO/$p" ]] && SYMLINKS+=("$p")
+    done
+fi
+
+COPIES=()
+while IFS= read -r line; do
+    [[ -n "$line" ]] && COPIES+=("$line")
+done < <(cfg_array '.copies')
+
+RESERVED_NAMES=()
+while IFS= read -r line; do
+    [[ -n "$line" ]] && RESERVED_NAMES+=("$line")
+done < <(cfg_array '.reserved_names')
+if [[ ${#RESERVED_NAMES[@]} -eq 0 ]]; then
+    RESERVED_NAMES=("static" "admin" "api" "login" "logout" "home")
+fi
+
+GITIGNORE_ADDITIONS=()
+while IFS= read -r line; do
+    [[ -n "$line" ]] && GITIGNORE_ADDITIONS+=("$line")
+done < <(cfg_array '.gitignore_additions')
+if [[ ${#GITIGNORE_ADDITIONS[@]} -eq 0 ]]; then
+    GITIGNORE_ADDITIONS=(".worktree-port" "*.code-workspace")
+fi
+
+# ============================================
+# INTERACTIVE PROMPTS (if needed)
+# ============================================
+if [[ -z "$BRANCH_NAME" ]]; then
+    echo -e "${YELLOW}Enter the new branch name:${NC}"
+    read -r BRANCH_NAME
+    [[ -z "$BRANCH_NAME" ]] && die "Branch name required"
+fi
+
+if [[ "$CHOOSE_BASE" = true ]]; then
+    cd "$MAIN_REPO"
+    pick_base_branch
+fi
+
+# ============================================
+# VALIDATE
+# ============================================
+for reserved in "${RESERVED_NAMES[@]}"; do
+    if [[ "$BRANCH_NAME" = "$reserved" ]]; then
+        die "'$BRANCH_NAME' is a reserved route name (${RESERVED_NAMES[*]})"
+    fi
+done
+
+SAFE_NAME=$(echo "$BRANCH_NAME" | tr "/" "-")
+WORKTREE_DIR="$(dirname "$MAIN_REPO")/${PROJECT}-${SAFE_NAME}"
+WORKTREE_DB=""   # set below if an isolated DB copy is created; used in CLAUDE.local.md
+
+if [[ -d "$WORKTREE_DIR" ]]; then
+    die "Worktree directory already exists: $WORKTREE_DIR"
+fi
+
+# ============================================
+# RESOLVE DOCKER MODE (auto-detect unless forced with --docker / --no-docker)
+# ============================================
+# Let .worktree.json pin it explicitly: "docker": { "enabled": true|false }
+DOCKER_ENABLED_CFG=$(cfg '.docker.enabled' "")
+if [[ "$DOCKER_MODE" = "auto" && -n "$DOCKER_ENABLED_CFG" ]]; then
+    [[ "$DOCKER_ENABLED_CFG" = "true" ]] && DOCKER_MODE="on" || DOCKER_MODE="off"
+fi
+
+case "$DOCKER_MODE" in
+    on)
+        SKIP_DOCKER=false ;;
+    off)
+        SKIP_DOCKER=true; SKIP_NGINX=true
+        DOCKER_SKIP_REASON="disabled by flag/config" ;;
+    auto)
+        if ! command -v docker >/dev/null 2>&1; then
+            SKIP_DOCKER=true; SKIP_NGINX=true
+            DOCKER_SKIP_REASON="docker CLI not found"
+        elif ! detect_dockerized "$MAIN_REPO"; then
+            SKIP_DOCKER=true; SKIP_NGINX=true
+            DOCKER_SKIP_REASON="no Dockerfile or compose file in repo"
+        else
+            SKIP_DOCKER=false
+        fi ;;
+esac
+
+# ============================================
+# DISPLAY CONFIGURATION
+# ============================================
+echo ""
+echo -e "${GREEN}Creating worktree for branch: $BRANCH_NAME${NC}"
+echo -e "  Project:   ${CYAN}$PROJECT${NC} ($FRAMEWORK)"
+echo -e "  Repo:      $MAIN_REPO"
+echo -e "  Worktree:  $WORKTREE_DIR"
+if [[ -n "$BASE_BRANCH" ]]; then
+    echo -e "  Fork from: ${GREEN}$BASE_BRANCH${NC}"
+fi
+if [[ "$FRONTEND_ONLY" = true ]]; then
+    echo -e "  Mode:      ${YELLOW}Frontend-only${NC}"
+elif [[ "$WORKER_TYPE" != "none" ]]; then
+    echo -e "  Mode:      ${GREEN}Full stack${NC} ($WORKER_TYPE worker)"
+else
+    echo -e "  Mode:      ${GREEN}Web only${NC} (no task queue)"
+fi
+if [[ -n "$DB_ENGINE" ]]; then
+    if [[ "$SHARED_DB" = true ]]; then
+        echo -e "  Database:  ${YELLOW}Shared${NC} (main instance)"
+    else
+        echo -e "  Database:  ${GREEN}Isolated${NC} (copy)"
+    fi
+fi
+if [[ "$SKIP_DOCKER" = true ]]; then
+    if [[ -n "$DOCKER_SKIP_REASON" ]]; then
+        echo -e "  Docker:    ${YELLOW}Skipped${NC} ($DOCKER_SKIP_REASON)"
+    else
+        echo -e "  Docker:    ${YELLOW}Skipped${NC}"
+    fi
+fi
+if [[ "$SKIP_NGINX" = true ]]; then
+    echo -e "  Nginx:     ${YELLOW}Skipped${NC}"
+fi
+echo ""
+
+# Count steps for progress display
+count_steps
+
+# ============================================
+# DRY RUN
+# ============================================
+if [[ "$DRY_RUN" = true ]]; then
+    echo -e "${YELLOW}[DRY RUN] Steps that would be performed:${NC}"
+    echo ""
+    local_step=0
+
+    local_step=$((local_step + 1))
+    echo -e "  $local_step. Create git worktree at $WORKTREE_DIR"
+
+    local_step=$((local_step + 1))
+    echo -e "  $local_step. Copy $ENV_COPY_FROM and customize"
+
+    if [[ "$SHARED_DB" = false && -n "$DB_ENGINE" ]]; then
+        local_step=$((local_step + 1))
+        DB_BRANCH=$(echo "$BRANCH_NAME" | tr '/-' '__')
+        echo -e "  $local_step. Create isolated database: ${PROJECT}_${DB_BRANCH}"
+    fi
+
+    if [[ ${#SYMLINKS[@]} -gt 0 ]]; then
+        local_step=$((local_step + 1))
+        echo -e "  $local_step. Create symlinks: ${SYMLINKS[*]}"
+    fi
+
+    if [[ ${#COPIES[@]} -gt 0 ]]; then
+        local_step=$((local_step + 1))
+        echo -e "  $local_step. Copy: ${COPIES[*]}"
+    fi
+
+    local_step=$((local_step + 1))
+    echo -e "  $local_step. Assign port (base: $BASE_PORT)"
+
+    if [[ "$SKIP_DOCKER" = false ]]; then
+        local_step=$((local_step + 1))
+        echo -e "  $local_step. Detect Docker network"
+        local_step=$((local_step + 1))
+        echo -e "  $local_step. Detect Docker images"
+        local_step=$((local_step + 1))
+        echo -e "  $local_step. Generate docker-compose.yml"
+        local_step=$((local_step + 1))
+        echo -e "  $local_step. Start Docker containers"
+    fi
+
+    if [[ "$SKIP_NGINX" = false && -n "$NGINX_CONFIG" ]]; then
+        local_step=$((local_step + 1))
+        echo -e "  $local_step. Update nginx config ($NGINX_CONFIG)"
+        local_step=$((local_step + 1))
+        echo -e "  $local_step. Restart nginx container"
+    fi
+
+    if [[ "$SKIP_WORKSPACE" = false && "$WORKSPACE_ENABLED" = "true" ]]; then
+        local_step=$((local_step + 1))
+        echo -e "  $local_step. Create workspace file"
+    fi
+
+    local_step=$((local_step + 1))
+    echo -e "  $local_step. Update .gitignore"
+
+    echo ""
+    echo -e "${YELLOW}No changes were made.${NC}"
+    exit 0
+fi
+
+# ============================================
+# STEP: Create git worktree
+# ============================================
+step "Creating git worktree and branch..."
+cd "$MAIN_REPO"
+
+# Refresh remote-tracking refs so an existing/remote branch checks out at its
+# latest pushed state, not whatever was cached at the last fetch. Best-effort:
+# never fail worktree creation just because the network/remote is unavailable
+# (e.g. working offline). Skip with --no-fetch.
+if [[ "$FETCH" = true ]] && git remote get-url origin >/dev/null 2>&1; then
+    echo -e "  Fetching origin..."
+    if ! git fetch --quiet --prune origin 2>/dev/null; then
+        echo -e "  ${YELLOW}fetch failed (offline?) — continuing with cached refs${NC}"
+    fi
+fi
+
+if git show-ref --verify --quiet "refs/heads/$BRANCH_NAME"; then
+    if [[ -n "$BASE_BRANCH" || "$CHOOSE_BASE" = true ]]; then
+        echo -e "${YELLOW}Note: --from/--choose ignored — '$BRANCH_NAME' already exists locally${NC}"
+    fi
+    echo -e "${GREEN}Local branch '$BRANCH_NAME' exists, checking out...${NC}"
+    git worktree add "$WORKTREE_DIR" "$BRANCH_NAME"
+    # Fetch only refreshes origin/*, not the local branch ref. Now that the
+    # branch is checked out in the worktree, fast-forward it to its upstream
+    # if one exists and it's behind. ff-only: never merge/rebase divergent or
+    # unpushed local commits — just warn and leave them.
+    if [[ "$FETCH" = true ]] && git -C "$WORKTREE_DIR" rev-parse --abbrev-ref '@{u}' >/dev/null 2>&1; then
+        if git -C "$WORKTREE_DIR" merge --ff-only '@{u}' >/dev/null 2>&1; then
+            echo -e "  ${GREEN}fast-forwarded to $(git -C "$WORKTREE_DIR" rev-parse --abbrev-ref '@{u}')${NC}"
+        else
+            echo -e "  ${YELLOW}local '$BRANCH_NAME' has diverged from upstream — left as-is (pull/rebase manually)${NC}"
+        fi
+    fi
+elif git show-ref --verify --quiet "refs/remotes/origin/$BRANCH_NAME"; then
+    if [[ -n "$BASE_BRANCH" || "$CHOOSE_BASE" = true ]]; then
+        echo -e "${YELLOW}Note: --from/--choose ignored — 'origin/$BRANCH_NAME' exists on remote${NC}"
+    fi
+    echo -e "${GREEN}Remote branch found, creating local tracking branch...${NC}"
+    git worktree add "$WORKTREE_DIR" -b "$BRANCH_NAME" "origin/$BRANCH_NAME"
+else
+    if [[ -n "$BASE_BRANCH" ]]; then
+        if ! git show-ref --verify --quiet "refs/heads/$BASE_BRANCH" && \
+           ! git show-ref --verify --quiet "refs/remotes/origin/$BASE_BRANCH"; then
+            die "Base branch '$BASE_BRANCH' not found locally or on remote"
+        fi
+        echo -e "${GREEN}Creating new branch '$BRANCH_NAME' from '$BASE_BRANCH'...${NC}"
+        git worktree add "$WORKTREE_DIR" -b "$BRANCH_NAME" "$BASE_BRANCH"
+    else
+        echo -e "${GREEN}Creating new branch '$BRANCH_NAME' from HEAD...${NC}"
+        git worktree add "$WORKTREE_DIR" -b "$BRANCH_NAME"
+    fi
+fi
+
+# ============================================
+# STEP: Copy and customize .env
+# ============================================
+step "Copying and customizing .env..."
+if [[ -f "$MAIN_REPO/$ENV_COPY_FROM" ]]; then
+    cp "$MAIN_REPO/$ENV_COPY_FROM" "$WORKTREE_DIR/.env"
+
+    echo "" >> "$WORKTREE_DIR/.env"
+    echo "# Worktree-specific configuration (auto-generated by create-worktree)" >> "$WORKTREE_DIR/.env"
+
+    # Reduce server workers
+    if [[ -n "$SERVER_WORKERS_ENV" ]]; then
+        sed -i.bak "/^${SERVER_WORKERS_ENV}=/d" "$WORKTREE_DIR/.env"
+        rm -f "$WORKTREE_DIR/.env.bak"
+        echo "${SERVER_WORKERS_ENV}=${SERVER_WORKERS_DEFAULT}" >> "$WORKTREE_DIR/.env"
+    fi
+
+    # Configure worker queue
+    if [[ "$WORKER_TYPE" != "none" && -n "$WORKER_QUEUE_ENV" ]]; then
+        sed -i.bak "/^${WORKER_QUEUE_ENV}=/d" "$WORKTREE_DIR/.env"
+        rm -f "$WORKTREE_DIR/.env.bak"
+        if [[ "$FRONTEND_ONLY" = true ]]; then
+            echo "${WORKER_QUEUE_ENV}=${WORKER_QUEUE_DEFAULT}" >> "$WORKTREE_DIR/.env"
+        else
+            echo "${WORKER_QUEUE_ENV}=${PROJECT}-${SAFE_NAME}" >> "$WORKTREE_DIR/.env"
+        fi
+    fi
+
+    # Append extra env vars from config
+    while IFS='=' read -r key val; do
+        [[ -z "$key" ]] && continue
+        # Don't duplicate if already handled above
+        [[ "$key" = "$SERVER_WORKERS_ENV" ]] && continue
+        [[ "$key" = "$WORKER_QUEUE_ENV" ]] && continue
+        sed -i.bak "/^${key}=/d" "$WORKTREE_DIR/.env"
+        rm -f "$WORKTREE_DIR/.env.bak"
+        echo "${key}=${val}" >> "$WORKTREE_DIR/.env"
+    done < <(cfg_object '.env.extra')
+
+    echo -e "${GREEN}Done${NC}"
+else
+    echo -e "${YELLOW}Warning: $ENV_COPY_FROM not found, skipping${NC}"
+fi
+
+# ============================================
+# STEP: Database setup
+# ============================================
+# Resolve DB container up-front so we can degrade gracefully when it's absent
+if [[ "$SHARED_DB" = false && "$DB_ENGINE" = "postgresql" && "$DB_CONTAINER" = "auto" ]]; then
+    DB_CONTAINER=$(detect_postgres_container)
+fi
+
+if [[ "$SHARED_DB" = false && "$DB_ENGINE" = "postgresql" && -z "$DB_CONTAINER" ]]; then
+    step "Setting up isolated database..."
+    echo -e "  ${YELLOW}No running PostgreSQL container found — skipping DB copy.${NC}"
+    echo -e "  ${YELLOW}Worktree .env still references the main database; edit it if you need isolation.${NC}"
+elif [[ "$SHARED_DB" = false && "$DB_ENGINE" = "postgresql" ]]; then
+    step "Setting up isolated database..."
+
+    # Read credentials from worktree .env (handles quotes, whitespace, various formats)
+    PG_USER=$(env_val "$DB_USER_ENV" "$WORKTREE_DIR/.env")
+    PG_PASS=$(env_val "$DB_PASS_ENV" "$WORKTREE_DIR/.env")
+
+    if [[ -n "$DB_URL_ENV" ]]; then
+        # Extract DB name and user from DATABASE_URL
+        db_url=$(env_val "$DB_URL_ENV" "$WORKTREE_DIR/.env")
+        if [[ -n "$db_url" ]]; then
+            MAIN_DB_NAME=$(db_url_dbname "$db_url")
+            [[ -z "$PG_USER" ]] && PG_USER=$(db_url_user "$db_url")
+        fi
+    else
+        MAIN_DB_NAME=$(env_val "$DB_NAME_ENV" "$WORKTREE_DIR/.env")
+    fi
+    [[ -z "$MAIN_DB_NAME" ]] && die "Could not determine main database name from .env"
+    [[ -z "$PG_USER" ]] && die "Could not determine database user from .env"
+
+    DB_BRANCH=$(echo "$BRANCH_NAME" | tr '/-' '__')
+    WORKTREE_DB="${PROJECT}_${DB_BRANCH}"
+
+    echo -e "  Source: ${GREEN}$MAIN_DB_NAME${NC}  Target: ${GREEN}$WORKTREE_DB${NC}"
+
+    DB_EXISTS=$(docker exec "$DB_CONTAINER" psql -U "$PG_USER" -d postgres -tAc \
+        "SELECT 1 FROM pg_database WHERE datname='$WORKTREE_DB'" 2>/dev/null || true)
+
+    if [[ "$DB_EXISTS" = "1" ]]; then
+        echo -e "${YELLOW}Database '$WORKTREE_DB' already exists, reusing${NC}"
+    else
+        echo -e "  Copying database..."
+
+        # Robustness: the old version piped both steps to /dev/null and then
+        # checked `if [[ $? -ne 0 ]]`. Under `set -euo pipefail` a bare failing
+        # command exits the script BEFORE that check runs, so the cleanup/die was
+        # dead code and any failure (a busy container, a bad dump) aborted the
+        # whole run with NO message and no worktree DB. Test each step with `if !`
+        # (exempt from set -e) so we can surface the error, clean up, and die loud.
+        copy_log=$(mktemp)
+
+        if ! docker exec "$DB_CONTAINER" psql -U "$PG_USER" -d postgres \
+                -c "CREATE DATABASE $WORKTREE_DB;" >"$copy_log" 2>&1; then
+            echo -e "${RED}$(cat "$copy_log")${NC}" >&2
+            rm -f "$copy_log"
+            die "Failed to create database '$WORKTREE_DB'"
+        fi
+
+        # pipefail so a failing pg_dump propagates; ON_ERROR_STOP=1 so a partial
+        # restore fails non-zero instead of silently leaving a corrupt half-copy.
+        if ! docker exec "$DB_CONTAINER" bash -c \
+                "set -o pipefail; pg_dump -U $PG_USER $MAIN_DB_NAME | psql -v ON_ERROR_STOP=1 -U $PG_USER -d $WORKTREE_DB" \
+                >"$copy_log" 2>&1; then
+            echo -e "${RED}$(tail -n 20 "$copy_log")${NC}" >&2
+            docker exec "$DB_CONTAINER" psql -U "$PG_USER" -d postgres \
+                -c "DROP DATABASE IF EXISTS $WORKTREE_DB;" >/dev/null 2>&1 || true
+            rm -f "$copy_log"
+            die "Failed to copy database into '$WORKTREE_DB' (dropped partial copy)"
+        fi
+        rm -f "$copy_log"
+        echo -e "${GREEN}Done${NC}"
+    fi
+
+    # Repoint the worktree .env at the isolated DB. The app may read the DB name
+    # from ANY of several conventional vars — rewrite every one that currently
+    # points at the main DB, not just the configured name_env. Rewriting only one
+    # (and missing the var the app actually reads) silently runs the worktree
+    # against the MAIN database — a migration there would corrupt shared data.
+    db_name_vars=("$DB_NAME_ENV" DB_NAME DATABASE_NAME POSTGRES_DB PGDATABASE)
+    repointed=()
+    for v in "${db_name_vars[@]}"; do
+        [[ -z "$v" ]] && continue
+        # Exact-value match only, so we never clobber an unrelated var that merely
+        # shares the string (e.g. APP_NAME=<projname>).
+        if [[ "$(env_val "$v" "$WORKTREE_DIR/.env")" = "$MAIN_DB_NAME" ]]; then
+            sed -i.bak "s/^${v}=.*/${v}=${WORKTREE_DB}/" "$WORKTREE_DIR/.env"
+            rm -f "$WORKTREE_DIR/.env.bak"
+            repointed+=("$v")
+        fi
+    done
+    # Repoint connection-string URLs (DATABASE_URL etc.) — only on lines that look
+    # like a URL, so we don't touch a filesystem path that ends in the DB name.
+    if grep -qE '://' "$WORKTREE_DIR/.env" 2>/dev/null; then
+        sed -i.bak -E "\\#://#{ s#/${MAIN_DB_NAME}([\"?]|\$)#/${WORKTREE_DB}\\1#g }" "$WORKTREE_DIR/.env"
+        rm -f "$WORKTREE_DIR/.env.bak"
+        repointed+=("<url>")
+    fi
+    [[ ${#repointed[@]} -gt 0 ]] && echo -e "  Repointed at isolated DB: ${GREEN}${repointed[*]}${NC}"
+
+    # Safety net: make the old silent failure LOUD. If any entry still has the
+    # main DB name as its exact value (a non-standard var we didn't rewrite, or a
+    # URL we missed), warn — because if the app reads it, this worktree runs
+    # against shared data and migrations WILL corrupt it.
+    residual=$(grep -nE "=[\"']?${MAIN_DB_NAME}[\"']?[[:space:]]*\$" "$WORKTREE_DIR/.env" 2>/dev/null | grep -vE '://' || true)
+    if [[ -n "$residual" ]]; then
+        echo -e "  ${RED}WARNING: these .env entries still equal the main DB name '${MAIN_DB_NAME}':${NC}"
+        echo "$residual" | sed 's/^/      /'
+        echo -e "  ${RED}If the app reads one as its database, this worktree will use the MAIN DB${NC}"
+        echo -e "  ${RED}(migrations would corrupt shared data). Fix the worktree .env before starting it.${NC}"
+    fi
+elif [[ "$SHARED_DB" = true && -n "$DB_ENGINE" ]]; then
+    step "Using shared database..."
+    echo -e "${YELLOW}WARNING: Schema changes will affect the main database!${NC}"
+else
+    step "No database configured, skipping..."
+fi
+
+# ============================================
+# STEP: Create symlinks
+# ============================================
+step "Creating symlinks..."
+
+# A symlink target that is a git-*tracked* directory must NOT be replaced by a
+# whole-directory symlink. git owns those files in the worktree, so any later
+# merge/rebase/checkout that writes a tracked path under the link materializes
+# the symlink into a real dir mid-operation — then it has to be hand-restored
+# (seen for real: a merge that added `commands/write-tests.md` forced a
+# symlinked `.claude` back into a real dir, and the `rm -rf .claude && ln -s`
+# needed to restore it got blocked by the command guard). For a tracked dir we
+# instead leave git's
+# checkout in place and symlink only the *untracked* entries inside it
+# (settings.local.json, memory, auth state, ...), so shared local state still
+# follows main while git owns the committed tree per-branch.
+tracked_in_main() {  # true if the pathspec has ≥1 tracked file under it
+    [[ -n "$(git -C "$MAIN_REPO" ls-files -- "$1" 2>/dev/null | head -1)" ]]
+}
+rel_prefix() {  # emit N "../" segments
+    local n="$1" out=""
+    while (( n-- > 0 )); do out+="../"; done
+    printf '%s' "$out"
+}
+
+SYMLINKED_WHOLE=()   # items replaced wholesale with a symlink (need git-quieting)
+for item in "${SYMLINKS[@]}"; do
+    # -e follows symlinks, so a self-referential/broken source in the main repo
+    # reads as "not found" here — warn loudly, since that usually means the main
+    # checkout itself is corrupted (e.g. a tracked self-loop link).
+    if [[ ! -e "$MAIN_REPO/$item" ]]; then
+        if [[ -L "$MAIN_REPO/$item" ]]; then
+            echo -e "  ${RED}$item: source '$MAIN_REPO/$item' is a broken symlink — skipping${NC}"
+            echo -e "  ${RED}  the main checkout looks corrupted; fix it before relying on shared $item${NC}"
+        else
+            echo -e "  ${YELLOW}$item not found in $PROJECT, skipping (removed any stale checkout)${NC}"
+            [[ -e "$WORKTREE_DIR/$item" || -L "$WORKTREE_DIR/$item" ]] && rm -rf "$WORKTREE_DIR/$item"
+        fi
+        continue
+    fi
+
+    if [[ -d "$MAIN_REPO/$item" ]] && tracked_in_main "$item"; then
+        # Tracked directory in main: git already checked it out in the worktree —
+        # leave it alone and share only the untracked top-level entries from main.
+        #
+        # CRITICAL: some branches commit the path itself AS A SYMLINK (e.g. a
+        # repo committing .claude as `../<project>/.claude`). git then
+        # checks it out as a link pointing back into main, and writing "shared"
+        # entries beneath it would go *through the link into the main checkout* —
+        # silently clobbering main's real files. If git produced a symlink here,
+        # that is exactly the branch's intent; leave it untouched.
+        if [[ -L "$WORKTREE_DIR/$item" ]]; then
+            echo -e "  ${YELLOW}$item${NC} (git checked it out as a symlink — left as-is, not writing through it)"
+            continue
+        fi
+        echo -e "  ${GREEN}$item${NC} (tracked dir — git-owned; sharing untracked entries)"
+        prefix="$(rel_prefix "$(( $(tr -cd / <<<"$item" | wc -c) + 2 ))")"
+        shared=0
+        while IFS= read -r entry; do
+            [[ -n "$entry" ]] || continue
+            tracked_in_main "$item/$entry" && continue   # git owns it; don't touch
+            if [[ -e "$WORKTREE_DIR/$item/$entry" || -L "$WORKTREE_DIR/$item/$entry" ]]; then
+                rm -rf "$WORKTREE_DIR/$item/$entry"
+            fi
+            mkdir -p "$WORKTREE_DIR/$item"
+            ln -s "${prefix}${PROJECT}/$item/$entry" "$WORKTREE_DIR/$item/$entry"
+            echo -e "    ${GREEN}$item/$entry${NC} -> shared"
+            shared=$(( shared + 1 ))
+        done < <(ls -A "$MAIN_REPO/$item" 2>/dev/null)
+        (( shared == 0 )) && echo -e "    ${YELLOW}(no untracked entries to share)${NC}"
+        continue
+    fi
+
+    # Untracked target (gitignored dir/file, or a symlink): replace wholesale.
+    # Clear whatever git checked out first — a real dir, a file, or a symlink
+    # (including a *dangling* one; -e is false for those, so test -L too,
+    # otherwise a checked-out broken link survives and `ln -s` fails with
+    # "File exists", or Docker bind-mounts the dead link and dies — both seen
+    # for real on a `data` dir).
+    if [[ -e "$WORKTREE_DIR/$item" || -L "$WORKTREE_DIR/$item" ]]; then
+        rm -rf "$WORKTREE_DIR/$item"
+    fi
+    mkdir -p "$(dirname "$WORKTREE_DIR/$item")"
+    ln -s "../${PROJECT}/$item" "$WORKTREE_DIR/$item"
+    echo -e "  ${GREEN}$item${NC} -> ../${PROJECT}/$item"
+    SYMLINKED_WHOLE+=("$item")
+done
+
+# ============================================
+# STEP: Copy assets
+# ============================================
+step "Copying assets..."
+if [[ ${#COPIES[@]} -eq 0 ]]; then
+    echo -e "  Nothing to copy"
+else
+    for item in "${COPIES[@]}"; do
+        if [[ -e "$MAIN_REPO/$item" ]]; then
+            mkdir -p "$(dirname "$WORKTREE_DIR/$item")"
+            cp -r "$MAIN_REPO/$item" "$WORKTREE_DIR/$item"
+            echo -e "  ${GREEN}$item${NC} copied"
+        else
+            echo -e "  ${YELLOW}$item not found, skipping${NC}"
+        fi
+    done
+fi
+
+# ============================================
+# STEP: Assign port
+# ============================================
+step "Assigning port..."
+PORT_TRACKING_FILE="$MAIN_REPO/.worktree-ports"
+[[ ! -f "$PORT_TRACKING_FILE" ]] && touch "$PORT_TRACKING_FILE"
+
+# A port is unavailable if it's recorded in the tracking file OR actually bound
+# on the host right now. Checking real bindings — not just the file — is what
+# stops us handing out a port that docker then refuses ('port is already
+# allocated' at compose-up), e.g. when a prior worktree's entry has drifted out
+# of the tracking file.
+port_available() {
+    local p=$1
+    grep -q "^$p:" "$PORT_TRACKING_FILE" 2>/dev/null && return 1
+    if command -v ss >/dev/null 2>&1; then
+        [[ -n "$(ss -Hltn "sport = :$p" 2>/dev/null)" ]] && return 1
+    fi
+    docker ps --format '{{.Ports}}' 2>/dev/null | grep -qE ":$p->" && return 1
+    return 0
+}
+
+NEXT_PORT=$BASE_PORT
+while ! port_available "$NEXT_PORT"; do
+    NEXT_PORT=$((NEXT_PORT + 1))
+done
+
+echo "$NEXT_PORT:$BRANCH_NAME" >> "$PORT_TRACKING_FILE"
+echo "$NEXT_PORT" > "$WORKTREE_DIR/.worktree-port"
+echo -e "  ${GREEN}Port: $NEXT_PORT${NC}"
+
+# ============================================
+# STEP: Worktree context note (CLAUDE.local.md)
+# ============================================
+# This repo's CLAUDE.md is typically symlinked (sometimes committed) and shared
+# with the main checkout, so we must NOT overwrite it to add worktree context.
+# Instead drop a gitignored CLAUDE.local.md, which Claude Code auto-loads
+# per-worktree alongside CLAUDE.md. It tells an agent it is operating inside a
+# worktree (isolated DB, ports) and warns about the host-vs-container DB hostname
+# trap that otherwise bites migrations run from a host shell rather than in the
+# container.
+step "Writing worktree context (CLAUDE.local.md)..."
+{
+    echo "# ⚙️ Git worktree — branch \`$BRANCH_NAME\`"
+    echo ""
+    echo "This checkout is a **git worktree**, not the main repo. Auto-generated by"
+    echo "\`create-worktree\`; gitignored and local to this worktree."
+    echo ""
+    echo "- **Main repo:** \`../$MAIN_BASENAME\` (shared \`.venv\`/\`CLAUDE.md\` via symlink; \`.claude\` is git-owned per branch)."
+    if [[ -n "$WORKTREE_DB" ]]; then
+        echo "- **Isolated database:** \`$WORKTREE_DB\` — migrations and schema changes here are"
+        echo "  safe and will **not** touch the main database."
+        echo "- **DB host depends on where you run.** The app runs *in-container*, where the DB"
+        echo "  host is \`db\` (\`DB_HOST=db\` in \`.env\`) — correct for the app and \`docker compose"
+        echo "  exec\`. From a **host shell** (\`uv run flask db ...\`, \`psql\`, ad-hoc scripts) \`db\`"
+        echo "  does **not** resolve; point the tool at the postgres container on \`localhost\`"
+        echo "  (its published host port, typically 5432) instead."
+    elif [[ "$SHARED_DB" = true && -n "$DB_ENGINE" ]]; then
+        echo "- **⚠️ Shared database:** this worktree uses the **main** database. Schema changes"
+        echo "  and migrations affect main — do not run destructive migrations here."
+    fi
+    if [[ "$SKIP_DOCKER" = false ]]; then
+        echo "- **Direct app:** http://localhost:$NEXT_PORT"
+    fi
+    if [[ "$SKIP_NGINX" = false && -n "$NGINX_CONFIG" ]]; then
+        echo "- **Via nginx:** \`/$BRANCH_NAME/\`"
+    fi
+    echo "- **Remove this worktree:** \`remove-worktree $BRANCH_NAME\`"
+} > "$WORKTREE_DIR/CLAUDE.local.md"
+
+# Ensure it is never committed. A project's .worktree.json may override the
+# default gitignore_additions (which run in a later step), so add it here
+# explicitly and idempotently rather than relying on those defaults.
+if ! grep -qxF "CLAUDE.local.md" "$WORKTREE_DIR/.gitignore" 2>/dev/null; then
+    echo "CLAUDE.local.md" >> "$WORKTREE_DIR/.gitignore"
+fi
+echo -e "${GREEN}Done${NC}"
+
+# ============================================
+# DOCKER STEPS
+# ============================================
+if [[ "$SKIP_DOCKER" = false ]]; then
+
+    # Detect network — prefer the explicit default, fall back to pattern match
+    step "Detecting Docker network..."
+    if docker network ls --format '{{.Name}}' 2>/dev/null | grep -qxF "$NETWORK_DEFAULT"; then
+        NETWORK_NAME="$NETWORK_DEFAULT"
+        echo -e "  ${GREEN}$NETWORK_NAME${NC}"
+    else
+        NETWORK_NAME=$(docker network ls --format '{{.Name}}' 2>/dev/null | grep -iE "$NETWORK_PATTERN" | head -1)
+        if [[ -z "$NETWORK_NAME" ]]; then
+            NETWORK_NAME="$NETWORK_DEFAULT"
+            echo -e "  ${YELLOW}Not found, using default: $NETWORK_NAME${NC}"
+        else
+            echo -e "  ${GREEN}$NETWORK_NAME${NC} (pattern match)"
+        fi
+    fi
+
+    # Detect images
+    step "Detecting Docker images..."
+    USE_BUILD=true
+    if [[ -n "$IMAGE_PATTERN" ]]; then
+        APP_IMAGE=$(docker images --format '{{.Repository}}' 2>/dev/null | grep -E "^${IMAGE_PATTERN}$" | head -1)
+    else
+        APP_IMAGE=$(detect_docker_image "$PROJECT")
+    fi
+    if [[ -n "$APP_IMAGE" ]]; then
+        echo -e "  ${GREEN}Using image: $APP_IMAGE${NC}"
+        USE_BUILD=false
+    else
+        echo -e "  ${YELLOW}No existing image found, will build from Dockerfile${NC}"
+    fi
+
+    # Generate docker-compose.yml
+    step "Generating docker-compose.yml..."
+
+    if [[ "$USE_BUILD" = true ]]; then
+        IMAGE_LINE="    build: ."
+    else
+        IMAGE_LINE="    image: $APP_IMAGE"
+    fi
+
+    # Framework-specific environment
+    ENV_BLOCK=""
+    case "$FRAMEWORK" in
+        flask)
+            ENV_BLOCK="    environment:
+      - FLASK_DEBUG=1" ;;
+        fastapi)
+            ENV_BLOCK="" ;;  # uvicorn --reload is handled by command
+    esac
+
+    # Build compose file
+    {
+        echo "services:"
+        echo "  ${PROJECT}-${SAFE_NAME}:"
+        echo "    container_name: ${PROJECT}-${SAFE_NAME}"
+        echo "    restart: no"
+        echo "    env_file: .env"
+        echo "$IMAGE_LINE"
+        echo "    networks:"
+        echo "      ${NETWORK_NAME}:"
+        echo "        aliases: []"
+        echo "    volumes:"
+        echo "      - .:/app"
+        # Check if DATA_PATH is used in the main compose
+        if [[ -f "$MAIN_REPO/docker-compose.yml" ]] && grep -q 'DATA_PATH' "$MAIN_REPO/docker-compose.yml" 2>/dev/null; then
+            echo "      - \${DATA_PATH}:/data"
+        fi
+        echo "    ports:"
+        echo "      - \"${NEXT_PORT}:${APP_PORT}\""
+        if [[ -n "$ENV_BLOCK" ]]; then
+            echo "$ENV_BLOCK"
+        fi
+
+        # Worker container (if not frontend-only and worker type exists)
+        if [[ "$FRONTEND_ONLY" = false && "$WORKER_TYPE" != "none" ]]; then
+            echo ""
+            echo "  ${WORKER_PREFIX}-${SAFE_NAME}:"
+            echo "    container_name: ${WORKER_PREFIX}-${SAFE_NAME}"
+            echo "    restart: no"
+            echo "    env_file: .env"
+            echo "$IMAGE_LINE"
+            echo "    command: ${WORKER_COMMAND}"
+            echo "    networks:"
+            echo "      ${NETWORK_NAME}:"
+            echo "        aliases: []"
+            echo "    depends_on:"
+            echo "      - ${PROJECT}-${SAFE_NAME}"
+            echo "    volumes:"
+            echo "      - .:/app"
+            if [[ -f "$MAIN_REPO/docker-compose.yml" ]] && grep -q 'DATA_PATH' "$MAIN_REPO/docker-compose.yml" 2>/dev/null; then
+                echo "      - \${DATA_PATH}:/data"
+            fi
+        fi
+
+        echo ""
+        echo "networks:"
+        echo "  ${NETWORK_NAME}:"
+        echo "    external: true"
+    } > "$WORKTREE_DIR/docker-compose.yml"
+
+    echo -e "${GREEN}Done${NC}"
+
+    # Start containers, self-healing on a port-bind conflict: another worktree
+    # may have grabbed the assigned port between allocation and now, or the
+    # tracking file drifted out of sync. Re-allocate a genuinely-free port and
+    # retry rather than leaving a half-built worktree behind. Bail only on a
+    # failure that isn't about port binding.
+    step "Starting Docker containers..."
+    cd "$WORKTREE_DIR"
+    START_OK=false
+    for _attempt in 1 2 3 4 5; do
+        if UP_LOG=$(docker compose up -d 2>&1); then
+            echo "$UP_LOG"
+            START_OK=true
+            break
+        fi
+        echo "$UP_LOG"
+        if echo "$UP_LOG" | grep -qiE 'port is already allocated|Bind for .* failed'; then
+            OLD_PORT=$NEXT_PORT
+            NEXT_PORT=$((NEXT_PORT + 1))
+            while ! port_available "$NEXT_PORT"; do NEXT_PORT=$((NEXT_PORT + 1)); done
+            echo -e "${YELLOW}Port $OLD_PORT is already in use — retrying on $NEXT_PORT${NC}"
+            # Update the three places the old port was recorded.
+            grep -v "^${OLD_PORT}:" "$PORT_TRACKING_FILE" > "$PORT_TRACKING_FILE.tmp" \
+                && mv "$PORT_TRACKING_FILE.tmp" "$PORT_TRACKING_FILE"
+            echo "${NEXT_PORT}:${BRANCH_NAME}" >> "$PORT_TRACKING_FILE"
+            echo "$NEXT_PORT" > "$WORKTREE_DIR/.worktree-port"
+            sed -i "s|\"${OLD_PORT}:${APP_PORT}\"|\"${NEXT_PORT}:${APP_PORT}\"|" \
+                "$WORKTREE_DIR/docker-compose.yml"
+            continue
+        fi
+        break
+    done
+
+    if [[ "$START_OK" = true ]]; then
+        echo -e "${GREEN}Containers started${NC}"
+        sleep 3
+        if docker ps | grep -q "${PROJECT}-${SAFE_NAME}"; then
+            echo -e "${GREEN}Containers are healthy${NC}"
+        else
+            echo -e "${RED}Warning: Containers may not have started correctly${NC}"
+        fi
+
+        # Verify DNS aliases don't conflict with main project container.
+        # If the worktree container registers a DNS alias matching the main
+        # project name, nginx will round-robin between main and worktree.
+        WORKTREE_DNS=$(docker inspect "${PROJECT}-${SAFE_NAME}" \
+            --format '{{json .NetworkSettings.Networks}}' 2>/dev/null || true)
+        if echo "$WORKTREE_DNS" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    for net in data.values():
+        if '${PROJECT}' in (net.get('DNSNames') or []):
+            sys.exit(1)
+except: pass
+sys.exit(0)
+" 2>/dev/null; then
+            echo -e "${GREEN}DNS aliases are clean${NC}"
+        else
+            echo -e "${YELLOW}WARNING: Worktree has '${PROJECT}' DNS alias — fixing...${NC}"
+            docker network disconnect "$NETWORK_NAME" "${PROJECT}-${SAFE_NAME}" 2>/dev/null || true
+            docker network connect --alias "${PROJECT}-${SAFE_NAME}" \
+                "$NETWORK_NAME" "${PROJECT}-${SAFE_NAME}" 2>/dev/null || true
+            echo -e "${GREEN}DNS alias conflict resolved${NC}"
+        fi
+    else
+        echo -e "${RED}Failed to start containers after retries${NC}"
+        echo -e "${YELLOW}The worktree exists but its containers are not running.${NC}"
+        echo -e "${YELLOW}  Retry:  cd $WORKTREE_DIR && docker compose up -d${NC}"
+        echo -e "${YELLOW}  Remove: remove-worktree $BRANCH_NAME${NC}"
+        exit 1
+    fi
+fi
+
+# ============================================
+# NGINX STEPS
+# ============================================
+if [[ "$SKIP_NGINX" = false && -n "$NGINX_CONFIG" ]]; then
+    NGINX_CONF_PATH="$MAIN_REPO/$NGINX_CONFIG"
+
+    if [[ -f "$NGINX_CONF_PATH" ]]; then
+        step "Updating nginx configuration..."
+
+        # Add worktree markers if this is the first worktree
+        if ! grep -q "# END WORKTREE ROUTES" "$NGINX_CONF_PATH"; then
+            # Insert markers before the last closing brace
+            awk '/^}$/ { last_brace = NR }
+            { lines[NR] = $0 }
+            END {
+                for (i = 1; i <= NR; i++) {
+                    if (i == last_brace) {
+                        print "    # BEGIN WORKTREE ROUTES"
+                        print "    # END WORKTREE ROUTES"
+                    }
+                    print lines[i]
+                }
+            }' "$NGINX_CONF_PATH" > "$NGINX_CONF_PATH.tmp" && mv "$NGINX_CONF_PATH.tmp" "$NGINX_CONF_PATH"
+        fi
+
+        # Add DNS resolver if configured
+        if [[ "$NGINX_RESOLVER" = "true" ]]; then
+            if ! grep -q "resolver 127.0.0.11" "$NGINX_CONF_PATH"; then
+                sed -i.bak '/client_max_body_size/i\    resolver 127.0.0.11 valid=10s;\n' "$NGINX_CONF_PATH"
+                rm -f "$NGINX_CONF_PATH.bak"
+            fi
+        fi
+
+        # Sanitize branch name for nginx variable
+        NGINX_VAR=$(echo "$SAFE_NAME" | tr '-' '_')
+
+        if ! grep -q "# WORKTREE-START:$BRANCH_NAME" "$NGINX_CONF_PATH"; then
+            # Read extra proxy headers from config
+            EXTRA_HEADERS=""
+            while IFS= read -r header; do
+                [[ -z "$header" ]] && continue
+                # Replace {branch} placeholder
+                header="${header//\{branch\}/$BRANCH_NAME}"
+                EXTRA_HEADERS="${EXTRA_HEADERS}
+            print \"        proxy_set_header ${header};\";"
+            done < <(cfg_array '.nginx.extra_proxy_headers')
+
+            awk -v branch="$BRANCH_NAME" -v varname="$NGINX_VAR" \
+                -v prefix="$PROJECT" -v port="$APP_PORT" \
+                -v extra_headers="$EXTRA_HEADERS" '
+            /# END WORKTREE ROUTES/ {
+                print "    # WORKTREE-START:" branch
+                print "    location /" branch "/static/ {"
+                print "        set $" varname "_backend \"" prefix "-" branch ":" port "\";"
+                print "        rewrite ^/" branch "/(.*)$ /$1 break;"
+                print "        proxy_pass http://$" varname "_backend;"
+                print "        proxy_set_header Host $host;"
+                print "        proxy_set_header X-Real-IP $remote_addr;"
+                print "    }"
+                print ""
+                print "    location /" branch "/ {"
+                print "        set $" varname "_backend \"" prefix "-" branch ":" port "\";"
+                print "        proxy_pass http://$" varname "_backend/;"
+                print "        proxy_read_timeout 300s;"
+                print "        proxy_send_timeout 300s;"
+                print "        proxy_set_header Host $host:$server_port;"
+                print "        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;"
+                print "        proxy_set_header X-Script-Name /" branch ";"
+                print "        proxy_set_header Upgrade $http_upgrade;"
+                print "        proxy_set_header Connection \"upgrade\";"
+                print "        proxy_http_version 1.1;"
+                print "        proxy_buffering off;"
+                print "        proxy_cache off;"
+                print "        chunked_transfer_encoding off;"
+                print "    }"
+                print "    # WORKTREE-END:" branch
+                print ""
+            }
+            { print }
+            ' "$NGINX_CONF_PATH" > "$NGINX_CONF_PATH.tmp" && mv "$NGINX_CONF_PATH.tmp" "$NGINX_CONF_PATH"
+            echo -e "${GREEN}Done${NC}"
+        else
+            echo -e "${GREEN}Already configured for $BRANCH_NAME${NC}"
+        fi
+
+        # Restart nginx
+        step "Restarting nginx container..."
+        if [[ "$NGINX_CONTAINER" = "auto" ]]; then
+            NGINX_CONTAINER=$(detect_nginx_container)
+        fi
+        if [[ -n "$NGINX_CONTAINER" ]]; then
+            docker restart "$NGINX_CONTAINER" >/dev/null 2>&1
+            echo -e "${GREEN}Restarted: $NGINX_CONTAINER${NC}"
+        else
+            echo -e "${YELLOW}Nginx container not found, skipping restart${NC}"
+        fi
+    else
+        step "Nginx config not found at $NGINX_CONFIG, skipping..."
+        step "Skipping nginx restart..."
+    fi
+elif [[ "$SKIP_NGINX" = false ]]; then
+    step "No nginx config detected, skipping..."
+    step "Skipping nginx restart..."
+fi
+
+# ============================================
+# STEP: Workspace file
+# ============================================
+if [[ "$SKIP_WORKSPACE" = false && "$WORKSPACE_ENABLED" = "true" ]]; then
+    step "Creating workspace file..."
+    WORKSPACE_FILE="$WORKTREE_DIR/${PROJECT}-${SAFE_NAME}.code-workspace"
+    cat > "$WORKSPACE_FILE" <<WSEOF
+{
+    "folders": [
+        {
+            "path": ".",
+            "name": "${PROJECT}-${SAFE_NAME}"
+        }
+    ],
+    "settings": {
+        "window.title": "${PROJECT} [${BRANCH_NAME}] - \${activeEditorShort}"
+    }
+}
+WSEOF
+    echo -e "${GREEN}Created: ${PROJECT}-${SAFE_NAME}.code-workspace${NC}"
+else
+    step "Skipping workspace file..."
+fi
+
+# ============================================
+# STEP: Update .gitignore
+# ============================================
+step "Updating .gitignore..."
+GITIGNORE="$WORKTREE_DIR/.gitignore"
+ADDED_ANY=false
+for pattern in "${GITIGNORE_ADDITIONS[@]}"; do
+    if ! grep -qF "$pattern" "$GITIGNORE" 2>/dev/null; then
+        if [[ "$ADDED_ANY" = false ]]; then
+            echo "" >> "$GITIGNORE"
+            echo "# Worktree files (auto-added by create-worktree)" >> "$GITIGNORE"
+            ADDED_ANY=true
+        fi
+        echo "$pattern" >> "$GITIGNORE"
+    fi
+done
+if [[ "$ADDED_ANY" = true ]]; then
+    echo -e "${GREEN}Done${NC}"
+else
+    echo -e "${GREEN}Already up to date${NC}"
+fi
+
+# ============================================
+# STEP: Quiet the git state
+# ============================================
+# Several tracked paths intentionally diverge from HEAD inside the worktree:
+# the shared symlinks (.claude, CLAUDE.md, ...) read as deleted, and the
+# generated docker-compose.yml plus the appended .gitignore read as modified.
+# None of it is ever committed from a worktree — it's pure setup scaffolding —
+# but it makes `git status` noisy on every new worktree. Mark each tracked path
+# skip-worktree so git ignores the local divergence and the worktree opens on a
+# clean status. The bit lives in THIS worktree's own index, so it neither
+# affects the main checkout nor leaks past `remove-worktree`.
+step "Quieting git state..."
+cd "$WORKTREE_DIR"
+QUIET_PATHS=(".gitignore" "${SYMLINKED_WHOLE[@]}")
+[[ "$SKIP_DOCKER" = false ]] && QUIET_PATHS+=("docker-compose.yml")
+QUIETED=false
+for p in "${QUIET_PATHS[@]}"; do
+    # git ls-files emits nothing for untracked paths, so xargs -r no-ops; -z/-0
+    # keeps paths with spaces intact. skip-worktree on an unchanged tracked file
+    # is harmless.
+    while IFS= read -r -d '' f; do
+        git update-index --skip-worktree -- "$f" 2>/dev/null && QUIETED=true
+    done < <(git ls-files -z -- "$p" 2>/dev/null)
+done
+if [[ "$QUIETED" = true ]]; then
+    echo -e "${GREEN}Done${NC} (tracked scaffolding marked skip-worktree)"
+else
+    echo -e "${GREEN}Nothing to quiet${NC}"
+fi
+
+# ============================================
+# SUMMARY
+# ============================================
+echo ""
+echo -e "${GREEN}========================================${NC}"
+echo -e "${GREEN}Worktree setup complete!${NC}"
+echo -e "${GREEN}========================================${NC}"
+echo ""
+echo -e "  Branch:   ${GREEN}$BRANCH_NAME${NC}"
+echo -e "  Location: ${GREEN}$WORKTREE_DIR${NC}"
+
+if [[ "$SKIP_DOCKER" = false ]]; then
+    echo -e "  Network:  ${GREEN}${NETWORK_NAME:-none}${NC}"
+    echo ""
+    echo -e "  ${GREEN}Containers:${NC}"
+    echo -e "    - ${PROJECT}-${SAFE_NAME}"
+    if [[ "$FRONTEND_ONLY" = false && "$WORKER_TYPE" != "none" ]]; then
+        echo -e "    - ${WORKER_PREFIX}-${SAFE_NAME}"
+    fi
+fi
+
+echo ""
+echo -e "  Access:"
+if [[ "$SKIP_NGINX" = false && -n "$NGINX_CONFIG" && -n "$NGINX_MAIN_PORT" ]]; then
+    echo -e "    Via nginx: ${GREEN}http://localhost:${NGINX_MAIN_PORT}/${BRANCH_NAME}/${NC}"
+fi
+if [[ "$SKIP_DOCKER" = false ]]; then
+    echo -e "    Direct:    ${GREEN}http://localhost:${NEXT_PORT}/${NC}"
+fi
+
+echo ""
+echo -e "  ${YELLOW}To remove:${NC} remove-worktree $BRANCH_NAME"
+echo ""
+
+# Open editor if configured
+if [[ "$SKIP_WORKSPACE" = false && "$WORKSPACE_ENABLED" = "true" && -f "$EDITOR_CLI" ]]; then
+    if "$EDITOR_CLI" -n "$WORKSPACE_FILE" 2>/dev/null; then
+        echo -e "${GREEN}Editor opened${NC}"
+    fi
+fi

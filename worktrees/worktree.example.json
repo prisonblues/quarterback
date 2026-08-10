@@ -1,0 +1,39 @@
+{
+  "_comment": [
+    "Copy this to .worktree.json in your repo root and edit. Every key is",
+    "optional — create-worktree auto-detects Docker, nginx and the database,",
+    "and skips whatever it cannot find. A repo with no Dockerfile gets just a",
+    "worktree plus symlinks. The values below describe quarterback itself, as",
+    "a worked example."
+  ],
+
+  "project": "quarterback",
+  "framework": "fastapi",
+
+  "base_port": 5681,
+  "app_port": 8000,
+
+  "docker": {
+    "network_pattern": "quarterback.*default",
+    "network_default": "quarterback_default"
+  },
+
+  "database": {
+    "engine": "postgresql",
+    "container": "quarterback-postgres-1",
+    "url_env": "DATABASE_URL",
+    "user_env": "POSTGRES_USER",
+    "password_env": "POSTGRES_PASSWORD",
+    "name_env": "POSTGRES_DB"
+  },
+
+  "worker": {
+    "type": "none"
+  },
+
+  "symlinks": [".venv", ".claude", "CLAUDE.md"],
+
+  "workspace": {
+    "enabled": false
+  }
+}

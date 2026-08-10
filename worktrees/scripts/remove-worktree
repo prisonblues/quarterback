@@ -1,0 +1,397 @@
+#!/usr/bin/env bash
+set +e  # Don't exit on errors — try all cleanup steps
+
+# Generic Worktree Removal Script
+# Usage: remove-worktree [options] <branch-name>
+#
+# Options:
+#   --config <path>      Config file path (default: .worktree.json in repo root)
+#   --keep-branch        Don't delete the git branch
+#   --keep-db            Don't drop the isolated database
+
+# ============================================
+# COLORS & HELPERS
+# ============================================
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+die() { echo -e "${RED}Error: $1${NC}" >&2; exit 1; }
+
+env_val() {
+    local var="$1" file="$2"
+    [[ -f "$file" ]] || return 0
+    local line
+    line=$(grep "^[[:space:]]*${var}[[:space:]]*=" "$file" 2>/dev/null | head -1 || true)
+    [[ -z "$line" ]] && return 0
+    local val="${line#*=}"
+    val="${val#"${val%%[![:space:]]*}"}"
+    val="${val%"${val##*[![:space:]]}"}"
+    if [[ "$val" =~ ^\"(.*)\"$ ]]; then val="${BASH_REMATCH[1]}"
+    elif [[ "$val" =~ ^\'(.*)\'$ ]]; then val="${BASH_REMATCH[1]}"; fi
+    if [[ "$val" != *"://"* ]]; then val="${val%%[[:space:]]#*}"; fi
+    echo "$val"
+}
+
+db_url_user() { echo "$1" | sed 's|.*://\([^:]*\):.*|\1|'; }
+
+cfg() {
+    local key="$1"
+    local default="${2:-}"
+    if [[ -n "$CONFIG_JSON" ]]; then
+        if echo "$CONFIG_JSON" | jq -e "$key != null" >/dev/null 2>&1; then
+            echo "$CONFIG_JSON" | jq -r "$key" 2>/dev/null
+            return
+        fi
+    fi
+    echo "$default"
+}
+
+detect_project_name() {
+    local root="$1"
+    if [[ -f "$root/pyproject.toml" ]]; then
+        local name
+        name=$(grep -E '^name[[:space:]]*=' "$root/pyproject.toml" | head -1 | sed 's/.*=[[:space:]]*"\(.*\)".*/\1/' 2>/dev/null)
+        [[ -n "$name" ]] && echo "$name" && return
+    fi
+    if [[ -f "$root/package.json" ]]; then
+        local name
+        name=$(jq -r '.name // empty' "$root/package.json" 2>/dev/null)
+        [[ -n "$name" ]] && echo "$name" && return
+    fi
+    basename "$root"
+}
+
+detect_postgres_container() {
+    docker ps --format '{{.Names}}' 2>/dev/null | grep -iE 'postgres|pgdb|_db' | head -1
+}
+
+detect_nginx_container() {
+    docker ps --format '{{.Names}}' 2>/dev/null | grep -iE 'nginx' | head -1
+}
+
+# ============================================
+# PARSE ARGUMENTS
+# ============================================
+BRANCH_NAME=""
+CONFIG_FILE=""
+CONFIG_JSON=""
+KEEP_BRANCH=false
+KEEP_DB=false
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --config)
+            [[ -z "${2:-}" ]] && die "--config requires a path"
+            CONFIG_FILE="$2"; shift 2 ;;
+        --keep-branch)
+            KEEP_BRANCH=true; shift ;;
+        --keep-db)
+            KEEP_DB=true; shift ;;
+        --*)
+            die "Unknown option: $1" ;;
+        *)
+            [[ -n "$BRANCH_NAME" ]] && die "Unexpected argument '$1'"
+            BRANCH_NAME="$1"; shift ;;
+    esac
+done
+
+[[ -z "$BRANCH_NAME" ]] && die "Branch name required\nUsage: remove-worktree [options] <branch-name>"
+
+# ============================================
+# FIND REPO AND LOAD CONFIG
+# ============================================
+MAIN_REPO=$(git rev-parse --show-toplevel 2>/dev/null) || die "Not inside a git repository"
+
+if [[ -n "$CONFIG_FILE" ]]; then
+    [[ -f "$CONFIG_FILE" ]] || die "Config file not found: $CONFIG_FILE"
+    CONFIG_JSON=$(cat "$CONFIG_FILE")
+elif [[ -f "$MAIN_REPO/.worktree.json" ]]; then
+    CONFIG_JSON=$(cat "$MAIN_REPO/.worktree.json")
+else
+    CONFIG_JSON=""
+fi
+
+# ============================================
+# RESOLVE CONFIG
+# ============================================
+PROJECT=$(cfg '.project' "$(detect_project_name "$MAIN_REPO")")
+SAFE_NAME=$(echo "$BRANCH_NAME" | tr "/" "-")
+WORKTREE_DIR="$(dirname "$MAIN_REPO")/${PROJECT}-${SAFE_NAME}"
+NGINX_CONFIG=$(cfg '.nginx.config' "")
+NGINX_CONTAINER=$(cfg '.nginx.container' "auto")
+DB_ENGINE=$(cfg '.database.engine' "")
+DB_CONTAINER=$(cfg '.database.container' "auto")
+DB_USER_ENV=$(cfg '.database.user_env' "POSTGRES_USER")
+DB_NAME_ENV=$(cfg '.database.name_env' "POSTGRES_DB")
+DB_URL_ENV=$(cfg '.database.url_env' "")
+WORKER_TYPE=$(cfg '.worker.type' "none")
+WORKER_PREFIX=$(cfg '.worker.container_prefix' "")
+
+if [[ -z "$WORKER_PREFIX" ]]; then
+    case "$WORKER_TYPE" in
+        huey) WORKER_PREFIX="huey-consumer" ;;
+        rq) WORKER_PREFIX="${PROJECT}-rq-worker" ;;
+        celery) WORKER_PREFIX="${PROJECT}-celery-worker" ;;
+    esac
+fi
+
+# If no DB engine in config, check .env
+if [[ -z "$DB_ENGINE" && -f "$MAIN_REPO/.env" ]]; then
+    if grep -qiE 'POSTGRES|postgresql' "$MAIN_REPO/.env" 2>/dev/null; then
+        DB_ENGINE="postgresql"
+    fi
+fi
+
+# ============================================
+# RESOLVE WORKTREE IDENTITY
+# ============================================
+# The positional arg is the "create-name": the identifier used at creation for
+# the directory, database, port entry, nginx block and containers. The git
+# *branch* can diverge from it — e.g. you check out or fork a different branch
+# inside the worktree after creating it. So we (a) resolve the real worktree
+# even when the caller passes the current branch name instead of the
+# create-name, and (b) capture the worktree's actual branch to delete later,
+# rather than assuming arg == branch.
+RESOLVED_BRANCH=""
+if [[ ! -d "$WORKTREE_DIR" ]]; then
+    # Derived dir not found — caller may have passed the branch name. Look it up
+    # in the worktree list and recover the create-name from the dir suffix.
+    found_dir=$(git worktree list --porcelain 2>/dev/null | awk -v b="refs/heads/$BRANCH_NAME" '
+        /^worktree / { wt = substr($0, 10) }
+        /^branch / && $2 == b { print wt; exit }
+    ')
+    if [[ -n "$found_dir" && -d "$found_dir" ]]; then
+        WORKTREE_DIR="$found_dir"
+        CREATE_NAME=$(basename "$found_dir"); CREATE_NAME="${CREATE_NAME#${PROJECT}-}"
+        # Prefer the original (possibly slash-bearing) create-name from the port
+        # file, so port/nginx keys still match.
+        if [[ -f "$MAIN_REPO/.worktree-ports" ]]; then
+            pf=$(awk -F: -v d="$CREATE_NAME" '{n=$2; gsub("/","-",n); if (n==d) {print $2; exit}}' "$MAIN_REPO/.worktree-ports")
+            [[ -n "$pf" ]] && CREATE_NAME="$pf"
+        fi
+        BRANCH_NAME="$CREATE_NAME"
+        SAFE_NAME=$(echo "$BRANCH_NAME" | tr "/" "-")
+    fi
+fi
+# Capture the worktree's real branch before we remove it (may differ from arg).
+if [[ -d "$WORKTREE_DIR" ]]; then
+    RESOLVED_BRANCH=$(git -C "$WORKTREE_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+    [[ "$RESOLVED_BRANCH" = "HEAD" ]] && RESOLVED_BRANCH=""  # detached HEAD — nothing to delete
+fi
+
+echo -e "${GREEN}Removing worktree for branch: $BRANCH_NAME${NC}"
+echo -e "  Main repo: $MAIN_REPO"
+echo -e "  Worktree:  $WORKTREE_DIR"
+echo ""
+
+TOTAL_STEPS=7
+CURRENT=0
+step() { CURRENT=$((CURRENT + 1)); echo -e "${YELLOW}[$CURRENT/$TOTAL_STEPS] $1${NC}"; }
+
+# ============================================
+# STEP 1: Stop and remove Docker containers
+# ============================================
+step "Stopping Docker containers..."
+CLEANED=false
+
+if [[ -d "$WORKTREE_DIR" && -f "$WORKTREE_DIR/docker-compose.yml" ]]; then
+    cd "$WORKTREE_DIR"
+    if docker compose down 2>/dev/null; then
+        echo -e "${GREEN}Containers stopped via docker compose down${NC}"
+        CLEANED=true
+    fi
+    cd "$MAIN_REPO"
+fi
+
+# Force-remove if still running
+for container in "${PROJECT}-${SAFE_NAME}" "${WORKER_PREFIX}-${SAFE_NAME}"; do
+    [[ -z "$container" || "$container" = "-${SAFE_NAME}" ]] && continue
+    if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${container}$"; then
+        docker rm -f "$container" 2>/dev/null && CLEANED=true
+    fi
+done
+
+if [[ "$CLEANED" = true ]]; then
+    echo -e "${GREEN}Done${NC}"
+else
+    echo -e "${YELLOW}No containers found${NC}"
+fi
+
+# ============================================
+# STEP 2: Remove nginx configuration
+# ============================================
+step "Removing nginx configuration..."
+if [[ -n "$NGINX_CONFIG" ]]; then
+    NGINX_CONF_PATH="$MAIN_REPO/$NGINX_CONFIG"
+    if [[ -f "$NGINX_CONF_PATH" ]] && grep -q "# WORKTREE-START:$BRANCH_NAME" "$NGINX_CONF_PATH"; then
+        awk -v branch="$BRANCH_NAME" '
+        BEGIN { skip = 0 }
+        /# WORKTREE-START:/ && $0 ~ branch { skip = 1; next }
+        /# WORKTREE-END:/ && $0 ~ branch { skip = 0; next }
+        skip { next }
+        { print }
+        ' "$NGINX_CONF_PATH" > "$NGINX_CONF_PATH.tmp" && mv "$NGINX_CONF_PATH.tmp" "$NGINX_CONF_PATH"
+
+        # Clean up excess blank lines
+        awk 'NF {blank=0; print} !NF {blank++; if (blank <= 2) print}' \
+            "$NGINX_CONF_PATH" > "$NGINX_CONF_PATH.tmp" && mv "$NGINX_CONF_PATH.tmp" "$NGINX_CONF_PATH"
+
+        echo -e "${GREEN}Removed nginx block${NC}"
+    else
+        echo -e "${YELLOW}No nginx block found${NC}"
+    fi
+else
+    echo -e "${YELLOW}No nginx config configured${NC}"
+fi
+
+# ============================================
+# STEP 3: Restart nginx
+# ============================================
+step "Restarting nginx..."
+if [[ -z "$NGINX_CONFIG" ]]; then
+    # No nginx config for this repo — we didn't touch nginx, so don't restart
+    # an unrelated project's nginx container.
+    echo -e "${YELLOW}No nginx config — skipping restart${NC}"
+else
+    if [[ "$NGINX_CONTAINER" = "auto" ]]; then
+        NGINX_CONTAINER=$(detect_nginx_container)
+    fi
+    if [[ -n "$NGINX_CONTAINER" ]]; then
+        docker restart "$NGINX_CONTAINER" 2>/dev/null && echo -e "${GREEN}Done${NC}" \
+            || echo -e "${YELLOW}Could not restart nginx${NC}"
+    else
+        echo -e "${YELLOW}Nginx container not found${NC}"
+    fi
+fi
+
+# ============================================
+# STEP 4: Backup and remove worktree directory
+# ============================================
+step "Handling worktree directory..."
+if [[ -d "$WORKTREE_DIR" ]]; then
+    cd "$WORKTREE_DIR" 2>/dev/null || true
+    DIRTY_FILES=$(git status --porcelain 2>/dev/null || true)
+    if [[ -n "$DIRTY_FILES" ]]; then
+        BACKUP="$(dirname "$MAIN_REPO")/${PROJECT}-${SAFE_NAME}-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
+        echo -e "${YELLOW}Uncommitted changes found, creating backup of dirty files...${NC}"
+        # Collect modified/added/untracked files from porcelain output
+        # For renames ("old -> new"), keep only the new path
+        FILE_LIST=$(echo "$DIRTY_FILES" | awk '{
+            s = substr($0, 4)
+            if (i = index(s, " -> ")) s = substr(s, i + 4)
+            print s
+        }')
+        FILE_COUNT=$(echo "$FILE_LIST" | wc -l | tr -d ' ')
+        echo "$FILE_LIST" | tar -czf "$BACKUP" -C "$WORKTREE_DIR" -T - 2>/dev/null \
+            && echo -e "${GREEN}Backup ($FILE_COUNT files): $BACKUP${NC}" \
+            || echo -e "${YELLOW}Backup failed${NC}"
+    fi
+    cd "$MAIN_REPO"
+fi
+
+# Remove git worktree. A worktree with a copied apps/models (hundreds of MB of
+# spaCy models) can take longer than a couple of seconds to delete, so allow a
+# generous timeout — too short a limit leaves a half-removed directory behind.
+if git worktree list 2>/dev/null | grep -q "$WORKTREE_DIR"; then
+    timeout 60 git worktree remove "$WORKTREE_DIR" 2>/dev/null \
+        || timeout 60 git worktree remove --force "$WORKTREE_DIR" 2>/dev/null \
+        || true
+fi
+
+# Force-remove directory if still there
+if [[ -d "$WORKTREE_DIR" ]]; then
+    rm -rf "$WORKTREE_DIR" 2>/dev/null
+    git worktree prune 2>/dev/null || true
+fi
+
+echo -e "${GREEN}Done${NC}"
+
+# ============================================
+# STEP 5: Drop database
+# ============================================
+step "Cleaning up database..."
+if [[ "$KEEP_DB" = true ]]; then
+    echo -e "${YELLOW}Keeping database (--keep-db)${NC}"
+elif [[ "$DB_ENGINE" = "postgresql" ]]; then
+    if [[ "$DB_CONTAINER" = "auto" ]]; then
+        DB_CONTAINER=$(detect_postgres_container)
+    fi
+    if [[ -n "$DB_CONTAINER" ]]; then
+        DB_BRANCH=$(echo "$BRANCH_NAME" | tr '/-' '__')
+        WORKTREE_DB="${PROJECT}_${DB_BRANCH}"
+
+        # Read user from .env
+        PG_USER=""
+        if [[ -f "$MAIN_REPO/.env" ]]; then
+            PG_USER=$(env_val "$DB_USER_ENV" "$MAIN_REPO/.env")
+            if [[ -z "$PG_USER" && -n "$DB_URL_ENV" ]]; then
+                db_url=$(env_val "$DB_URL_ENV" "$MAIN_REPO/.env")
+                [[ -n "$db_url" ]] && PG_USER=$(db_url_user "$db_url")
+            fi
+        fi
+
+        if [[ -n "$PG_USER" ]]; then
+            DB_EXISTS=$(docker exec "$DB_CONTAINER" psql -U "$PG_USER" -d postgres -tAc \
+                "SELECT 1 FROM pg_database WHERE datname='$WORKTREE_DB'" 2>/dev/null || true)
+            if [[ "$DB_EXISTS" = "1" ]]; then
+                docker exec "$DB_CONTAINER" psql -U "$PG_USER" -d postgres \
+                    -c "DROP DATABASE IF EXISTS $WORKTREE_DB;" 2>/dev/null \
+                    && echo -e "${GREEN}Dropped database: $WORKTREE_DB${NC}" \
+                    || echo -e "${YELLOW}Could not drop database${NC}"
+            else
+                echo -e "${YELLOW}Database $WORKTREE_DB not found${NC}"
+            fi
+        else
+            echo -e "${YELLOW}Could not determine DB user${NC}"
+        fi
+    else
+        echo -e "${YELLOW}PostgreSQL container not found${NC}"
+    fi
+else
+    echo -e "${YELLOW}No database to clean${NC}"
+fi
+
+# ============================================
+# STEP 6: Delete git branch
+# ============================================
+step "Cleaning up git branch..."
+cd "$MAIN_REPO"
+# Delete the worktree's *actual* branch (captured before removal), which can
+# differ from the create-name arg if the branch was switched/forked after
+# creation. Fall back to the arg when we couldn't resolve one.
+DEL_BRANCH="${RESOLVED_BRANCH:-$BRANCH_NAME}"
+if [[ "$KEEP_BRANCH" = true ]]; then
+    echo -e "${YELLOW}Keeping branch (--keep-branch)${NC}"
+elif ! git show-ref --verify --quiet "refs/heads/$DEL_BRANCH"; then
+    echo -e "${YELLOW}Branch not found: $DEL_BRANCH${NC}"
+elif git worktree list 2>/dev/null | grep -qF "[$DEL_BRANCH]"; then
+    echo -e "${YELLOW}Branch still used by another worktree, skipping: $DEL_BRANCH${NC}"
+elif git branch -d "$DEL_BRANCH" 2>/dev/null || git branch -D "$DEL_BRANCH" 2>/dev/null; then
+    echo -e "${GREEN}Branch deleted: $DEL_BRANCH${NC}"
+else
+    echo -e "${YELLOW}Could not delete branch: $DEL_BRANCH${NC}"
+fi
+
+# ============================================
+# STEP 7: Clean up port tracking
+# ============================================
+step "Cleaning up port tracking..."
+PORT_FILE="$MAIN_REPO/.worktree-ports"
+if [[ -f "$PORT_FILE" ]] && grep -q ":${BRANCH_NAME}$" "$PORT_FILE"; then
+    grep -v ":${BRANCH_NAME}$" "$PORT_FILE" > "$PORT_FILE.tmp"
+    mv "$PORT_FILE.tmp" "$PORT_FILE"
+    echo -e "${GREEN}Done${NC}"
+else
+    echo -e "${YELLOW}No port entry found${NC}"
+fi
+
+# ============================================
+# SUMMARY
+# ============================================
+echo ""
+echo -e "${GREEN}========================================${NC}"
+echo -e "${GREEN}Cleanup complete: $BRANCH_NAME${NC}"
+echo -e "${GREEN}========================================${NC}"
+echo ""

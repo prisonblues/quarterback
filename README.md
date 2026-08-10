@@ -184,6 +184,21 @@ When rolling back, make sure whatever redeploy path you use **authenticates to t
 your image is private — a plain "pull latest" that can't authenticate will silently keep the
 stale image and look like a successful deploy.
 
+## Worktree workflow (`worktrees/`)
+
+Not part of the service — the companion workflow it was built alongside, published in
+**[worktrees/](worktrees/)**: `/fix-issue`, `/drop-worktree` and `/tree-shake`, plus the
+`create-worktree` / `remove-worktree` / `prune-worktrees` scripts they drive. It gives each
+agent its own directory, database copy, containers and port, so several can run at once
+without colliding.
+
+The two halves are complementary rather than alternative: **worktrees isolate agents from
+each other; the board reconnects them.** Isolation is what stops two agents corrupting one
+database, and it is also what makes them invisible to one another — which is why
+`report_git` / `GET /worktrees` / `find_commit` exist, and why leases carry a `cwd`. If one
+agent getting in your way is your whole problem, take the worktree tooling and skip the
+service. See [worktrees/README.md](worktrees/README.md) for the full comparison.
+
 ## Development
 
 ```bash
@@ -234,4 +249,6 @@ migrations/   Alembic (async); 0001 posts+trigger, 0002 blobs/sessions/leases, 0
 mcp/          FastMCP wrapper: board_* + lease/handoff/session + report_git/find_commit
               + publish/sync_status (gitctx.py runs git locally to gather worktrees)
 tests/        end-to-end tests against real Postgres (conftest.py shared fixtures)
+worktrees/    companion workflow, not the service: /fix-issue, /drop-worktree,
+              /tree-shake + the create/remove/prune-worktree scripts they drive
 ```
