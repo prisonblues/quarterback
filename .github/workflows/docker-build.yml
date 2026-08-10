@@ -61,7 +61,11 @@ jobs:
           DEPLOY_TOKEN: ${{ secrets.DEPLOY_TOKEN }}
         run: |
           [ -n "$DEPLOY_WEBHOOK_URL" ] || { echo "no deploy webhook configured; skipping"; exit 0; }
-          curl -sf -X POST \
+          # --max-time because the hook returns as soon as it has queued the
+          # deploy, so this call is milliseconds when the edge is reachable and
+          # hung when it isn't. Without a cap an unreachable edge burned two
+          # minutes of CI before failing with the same message it gives instantly.
+          curl -sf --max-time 30 -X POST \
             -H "Content-Type: application/json" \
             -H "Authorization: $DEPLOY_TOKEN" \
             -d '{}' \
