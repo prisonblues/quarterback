@@ -185,15 +185,29 @@ echo ""
 # Suffixes are dir basenames with the "<project>-" prefix stripped. The main
 # repo (basename == project) has no suffix and is skipped.
 declare -A LIVE_DB=()
+declare -A LIVE_DIR=()
 LIVE_SUFFIXES=()
+LIVE_LIST_OK=false
 while IFS= read -r p; do
     [[ -z "$p" ]] && continue
+    LIVE_LIST_OK=true
+    LIVE_DIR["$p"]=1
     b=$(basename "$p")
     [[ "$b" == "${PROJECT}-"* ]] || continue
     suffix="${b#${PROJECT}-}"
     LIVE_SUFFIXES+=("$suffix")
     LIVE_DB["${PROJECT}_$(echo "$suffix" | tr '-' '_')"]=1
 done < <(git worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10)}')
+
+# Everything downstream decides what to DELETE by asking "is this live?", so an
+# empty or truncated worktree list does not mean "nothing is live" — it means we
+# cannot tell, and every live worktree then looks like detritus. Refuse rather
+# than report a sweep that would delete the user's work.
+if [[ "$LIVE_LIST_OK" != true ]]; then
+    die "\`git worktree list\` returned nothing (run from inside the repo?).
+Refusing to classify anything as orphaned: with no live list, every worktree
+directory, database and container looks dead."
+fi
 
 is_live_suffix() {
     local norm; norm="$(echo "$1" | tr '/' '-')"
@@ -280,7 +294,16 @@ SKIPPED_DIRS=()
 shopt -s nullglob
 for d in "$PARENT/${PROJECT}-"*; do
     [[ -d "$d" ]] || continue
-    git worktree list --porcelain 2>/dev/null | grep -qxF "worktree $d" && continue
+    # Membership test against the list captured once above — never a fresh
+    # `git worktree list | grep -q` per directory. Under `set -o pipefail` that
+    # pipeline is a coin flip: `grep -q` exits the moment it matches, git dies
+    # of SIGPIPE, and the pipeline reports 141 *even though the match
+    # succeeded*. The `&& continue` is then skipped and a LIVE worktree is
+    # classified as a leftover — which `--remove-dirs` would `rm -rf`. The race
+    # is per-directory and per-run, so the damage looked like flakiness: on this
+    # repo it flagged 12, 18, 20 and 21 of 20-odd live worktrees on four
+    # consecutive dry-runs, including ones with uncommitted work.
+    [[ -n "${LIVE_DIR[$d]:-}" ]] && continue
     if dir_is_worktree_remnant "$d"; then LEFTOVER_DIRS+=("$d"); else SKIPPED_DIRS+=("$d"); fi
 done
 shopt -u nullglob
