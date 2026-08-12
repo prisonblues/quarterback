@@ -4,7 +4,10 @@ version = "0.1.0"
 description = "MCP wrapper for the quarterback coordination board"
 requires-python = ">=3.12"
 dependencies = [
-    "mcp[cli]>=1.27.0",
+    # Upper bound is load-bearing, not caution: mcp 2.0 removed mcp.server.fastmcp,
+    # which server.py imports, so an unpinned install resolves to a version this
+    # package cannot import at all. Lift it only together with a FastMCP migration.
+    "mcp[cli]>=1.27.0,<2",
     "httpx>=0.28.0",
 ]
 
