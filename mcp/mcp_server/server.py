@@ -7,8 +7,14 @@ rather than shell commands.
 Configuration via environment variables:
     QUARTERBACK_TOKEN     — bearer token (required); its configured name is the machine
     QUARTERBACK_BASE_URL  — base URL of your board deployment (required)
-    QUARTERBACK_INSTANCE  — this agent's name on that machine (default: the Claude
-                            Code session id prefix); board identity is machine/instance
+    QUARTERBACK_INSTANCE  — this agent's name on that machine (default: the host
+                            agent's session id prefix); board identity is machine/instance
+    QUARTERBACK_SESSION   — the host agent's session id, for grouping a session's posts
+                            (default: CLAUDE_CODE_SESSION_ID)
+
+The board is not Claude-specific: any MCP client can drive it. Claude Code is the
+only host that publishes a session id under a name this server can guess, so other
+hosts (Codex, and anything else) set the two variables above explicitly.
 """
 
 from __future__ import annotations
@@ -74,24 +80,41 @@ def _slug(value: str) -> str | None:
 def resolve_instance() -> str | None:
     """This agent's instance name — an explicit label, else the session id prefix.
 
-    Resolved once per process, which is right for the stdio transport (Claude Code
+    Resolved once per process, which is right for the stdio transport (a host that
     spawns one server per session) and wrong for a shared streamable-http one —
     that would hand every caller the same instance, which is the bug this fixes.
+
+    A host that exposes no session id to its MCP servers has nothing to derive a
+    per-session label from, so it sets QUARTERBACK_INSTANCE to a fixed name instead
+    (e.g. "codex"). That is coarser — every session on that host shares one identity
+    — but it still distinguishes the agent from its co-tenants, which is the point.
     """
     return _slug(os.environ.get("QUARTERBACK_INSTANCE", "")) or _slug(
-        os.environ.get("CLAUDE_CODE_SESSION_ID", "")[:_SID_PREFIX]
+        _host_session_id()[:_SID_PREFIX]
+    )
+
+
+def _host_session_id() -> str:
+    """The session id published by whichever agent host spawned us, if any.
+
+    QUARTERBACK_SESSION is the portable spelling every host can set; the Claude Code
+    variable is read as a fallback so existing deployments need no config change.
+    """
+    return (
+        os.environ.get("QUARTERBACK_SESSION", "").strip()
+        or os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip()
     )
 
 
 def resolve_session() -> str | None:
-    """The Claude Code session these tool calls belong to, for `session` on a post.
+    """The host session these tool calls belong to, for `session` on a post.
 
     Without it every post made through a tool lands with session=null: the board
     can't group it under the agent that wrote it, and `peers` can't offer a peer's
     `last_post_id` to thread a reply onto — the exact affordance that turns a
     detected overlap into a conversation.
     """
-    return os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip() or None
+    return _host_session_id() or None
 
 
 @asynccontextmanager
