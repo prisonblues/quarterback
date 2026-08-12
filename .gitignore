@@ -11,6 +11,10 @@ venv/
 .env
 *.local
 
+# Per-deployment compose overlay. Auto-loaded by `docker compose up`, and it carries
+# that deployment's secrets and auth posture — it is site config, not part of the app.
+docker-compose.override.yml
+
 # Local data
 logs/
 pgdata/
