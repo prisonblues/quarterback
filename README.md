@@ -77,11 +77,13 @@ GET   /sync              ?repo=&branch=&device=&path=          (registered workt
                          &have=sha,sha,…&dirty=&ahead=&behind= (…or just describe yourself)
                          -> {published:[…], worktrees:[…], caller, stale, registered, advice}
 
-# reviewer-panel stats (v2.10)
-POST  /review            (panel.py --json payload)              -> {id, recorded}
+# reviewer-panel stats (v2.10, per-reviewer accounts v2.11)
+POST  /review            (panel.py --json payload)              -> {id, recorded, accounts}
 GET   /reviews           ?repo=&pr=&author=&since=&days=&limit=  (runs + scorecards)
-GET   /review/{id}                                              (scorecards + findings)
+GET   /review/{id}                                              (scorecards + findings + accounts)
 GET   /review/stats      ?repo=&author=&days=&judged_only=       -> {by_model, by_agent}
+GET   /review/findings   ?repo=&pr=&limit=                       (one PR's findings as
+                                                                  chains of observations)
 GET   /panel             (browser view — the leaderboard)
 
 GET   /health            (no auth)
@@ -162,6 +164,26 @@ lander loops — is counted without an agent having to remember to say so.
   finding and scoring those as correct would flatter whichever reviewer was
   noisiest that day. Answers "which model finds the real issues" and "is the
   expensive tier worth it" from accumulated evidence rather than impression.
+- **v2.11 — per-reviewer accounts + finding identity** ✅ a finding recorded one
+  title, one detail and a list of reviewer *names*, because the panel merged
+  before the judge and kept a single member's text. It could say "codex and pi
+  both reported this" but not what either of them said — the exact question the
+  stats exist to answer, and the ranking's `solo`/`n_reviewers` rested on that
+  merge. `POST /review` now takes `reported_by: [{reviewer, severity, line,
+  account}]` per finding and stores each account verbatim
+  (`review_finding_reports`), so merging is additive: the judge's synthesis is
+  new and the originals ride along, auditable. Each reviewer's own severity
+  yields **severity calibration** against the judge (right but always cries P1
+  is a cost precision can't show) and its own **consensus rate**. Each finding
+  also carries a `key` — the identity of the *defect*, not the observation — so
+  the same bug seen in run 3 and again in run 7 stays two rows that
+  `GET /review/findings` joins into a chain: `open` / `gone` / `dismissed` per
+  defect, which is how "did the fix land?" and "how many rounds did this PR
+  take?" become queries. Older payloads (`reviewers: [...]`, no key) record
+  exactly as before, and migration 0012 backfills existing findings with the
+  same key recipe so pre-v2.11 runs join the same chains. The panel half of the
+  change lives in `nix-fleet` (`panel.py` merges at the judge instead of before
+  it).
 - **v3 — cross-worktree (remaining):** a bare git remote on the server so cross-*device*
   cherry-pick has a shared object store; wire `landed` refs to a cherry-pick helper.
 
