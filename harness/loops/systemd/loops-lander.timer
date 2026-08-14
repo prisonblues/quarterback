@@ -1,0 +1,12 @@
+[Unit]
+Description=Timer for the agent coding loops dependabot sweep (#117)
+
+[Timer]
+# Opportunistic: fire ~10 min after boot, then every 10 min while zeus is up.
+OnBootSec=10min
+OnUnitActiveSec=10min
+# No catch-up replay storm if zeus was off for a while — just the next tick.
+Persistent=false
+
+[Install]
+WantedBy=timers.target

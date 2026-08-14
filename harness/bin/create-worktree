@@ -271,6 +271,21 @@ detect_nginx_container() {
     docker ps --format '{{.Names}}' 2>/dev/null | grep -iE 'nginx' | head -1
 }
 
+# Does <conf> already hold a worktree block for exactly <create-name>? A
+# substring grep would let "feat-a" match "feat-abc"'s marker and conclude the
+# block was already written — leaving the route unwritten but advertised.
+nginx_block_present() {
+    awk -v want="$2" '
+        /# WORKTREE-START:/ {
+            line = $0
+            sub(/^.*# WORKTREE-START:/, "", line)
+            sub(/[ \t\r]+$/, "", line)
+            if (line == want) found = 1
+        }
+        END { exit !found }
+    ' "$1"
+}
+
 # Every running container that looks like a Postgres, most-plausible first.
 # NOT `| head -1`: on a box also running self-hosted CI runners that picked an
 # ephemeral `<hex>_postgres16_<hex>` service over the project's own container,
@@ -398,6 +413,9 @@ NGINX_CONFIG=$(cfg '.nginx.config' "$(detect_nginx_config "$MAIN_REPO")")
 NGINX_CONTAINER=$(cfg '.nginx.container' "auto")
 NGINX_MAIN_PORT=$(cfg '.nginx.main_port' "")
 NGINX_RESOLVER=$(cfg '.nginx.resolver' "false")
+# True once the location block is actually in the config. The summary only
+# advertises the sub-path route when it is.
+NGINX_ROUTE_READY=false
 
 # Database
 DB_ENGINE=$(cfg '.database.engine' "")
@@ -1291,23 +1309,62 @@ if [[ "$SKIP_NGINX" = false && -n "$NGINX_CONFIG" ]]; then
             fi
         fi
 
-        # Sanitize branch name for nginx variable
-        NGINX_VAR=$(echo "$SAFE_NAME" | tr '-' '_')
+        # nginx variable names are [A-Za-z0-9_] only, so derive one from the
+        # already-slash-free SAFE_NAME (a branch like feat/v1.2 still carries a
+        # dot at this point).
+        NGINX_VAR="${SAFE_NAME//[^a-zA-Z0-9]/_}"
 
-        if ! grep -q "# WORKTREE-START:$BRANCH_NAME" "$NGINX_CONF_PATH"; then
-            # Read extra proxy headers from config
+        # Everything below is keyed on SAFE_NAME, not BRANCH_NAME: the container
+        # this block proxies to is ${PROJECT}-${SAFE_NAME}, so a branch with a
+        # slash in it (fix/issue-42) used to emit the unresolvable backend host
+        # "project-fix/issue-42" and a route that could only 502.
+        if ! nginx_block_present "$NGINX_CONF_PATH" "$SAFE_NAME"; then
+            # Extra proxy headers from config, one "Name value" per line. An
+            # extra that names a header the template emits itself (Host,
+            # X-Forwarded-For, X-Script-Name, Upgrade, Connection) replaces that
+            # value rather than being sent alongside it; everything else is
+            # appended.
             EXTRA_HEADERS=""
             while IFS= read -r header; do
                 [[ -z "$header" ]] && continue
-                # Replace {branch} placeholder
-                header="${header//\{branch\}/$BRANCH_NAME}"
-                EXTRA_HEADERS="${EXTRA_HEADERS}
-            print \"        proxy_set_header ${header};\";"
+                header="${header//\{branch\}/$SAFE_NAME}"
+                EXTRA_HEADERS="${EXTRA_HEADERS}${header}"$'\n'
             done < <(cfg_array '.nginx.extra_proxy_headers')
 
-            awk -v branch="$BRANCH_NAME" -v varname="$NGINX_VAR" \
+            awk -v branch="$SAFE_NAME" -v varname="$NGINX_VAR" \
                 -v prefix="$PROJECT" -v port="$APP_PORT" \
                 -v extra_headers="$EXTRA_HEADERS" '
+            # A header the template owns: the configured value replaces the
+            # default, because nginx would otherwise send both to the backend.
+            function emit_header(name, default_value,   override) {
+                override = extra_value(name)
+                if (override != "")
+                    print "        proxy_set_header " override ";"
+                else
+                    print "        proxy_set_header " name " " default_value ";"
+            }
+            function header_name(line,   n) {
+                n = index(line, " ")
+                return (n ? substr(line, 1, n - 1) : line)
+            }
+            function extra_value(name,   i, n, parts) {
+                n = split(extra_headers, parts, "\n")
+                for (i = 1; i <= n; i++)
+                    if (parts[i] != "" && tolower(header_name(parts[i])) == tolower(name))
+                        return parts[i]
+                return ""
+            }
+            function print_extra_headers(   i, n, parts, name) {
+                n = split(extra_headers, parts, "\n")
+                for (i = 1; i <= n; i++) {
+                    if (parts[i] == "") continue
+                    name = tolower(header_name(parts[i]))
+                    if (name == "host" || name == "x-forwarded-for" \
+                        || name == "x-script-name" || name == "upgrade" \
+                        || name == "connection") continue
+                    print "        proxy_set_header " parts[i] ";"
+                }
+            }
             /# END WORKTREE ROUTES/ {
                 print "    # WORKTREE-START:" branch
                 print "    location /" branch "/static/ {"
@@ -1323,11 +1380,12 @@ if [[ "$SKIP_NGINX" = false && -n "$NGINX_CONFIG" ]]; then
                 print "        proxy_pass http://$" varname "_backend/;"
                 print "        proxy_read_timeout 300s;"
                 print "        proxy_send_timeout 300s;"
-                print "        proxy_set_header Host $host:$server_port;"
-                print "        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;"
-                print "        proxy_set_header X-Script-Name /" branch ";"
-                print "        proxy_set_header Upgrade $http_upgrade;"
-                print "        proxy_set_header Connection \"upgrade\";"
+                emit_header("Host", "$host:$server_port")
+                emit_header("X-Forwarded-For", "$proxy_add_x_forwarded_for")
+                emit_header("X-Script-Name", "/" branch)
+                print_extra_headers()
+                emit_header("Upgrade", "$http_upgrade")
+                emit_header("Connection", "\"upgrade\"")
                 print "        proxy_http_version 1.1;"
                 print "        proxy_buffering off;"
                 print "        proxy_cache off;"
@@ -1338,9 +1396,19 @@ if [[ "$SKIP_NGINX" = false && -n "$NGINX_CONFIG" ]]; then
             }
             { print }
             ' "$NGINX_CONF_PATH" > "$NGINX_CONF_PATH.tmp" && mv "$NGINX_CONF_PATH.tmp" "$NGINX_CONF_PATH"
-            echo -e "${GREEN}Done${NC}"
+            # Confirm rather than assume: the block is inserted at the
+            # "# END WORKTREE ROUTES" marker, and a config we could not add that
+            # marker to (no line that is just "}") silently receives nothing.
+            if nginx_block_present "$NGINX_CONF_PATH" "$SAFE_NAME"; then
+                echo -e "${GREEN}Done${NC}"
+                NGINX_ROUTE_READY=true
+            else
+                echo -e "${RED}No block was written to $NGINX_CONFIG${NC}"
+                echo -e "${YELLOW}  Add a '# END WORKTREE ROUTES' marker inside its server block.${NC}"
+            fi
         else
-            echo -e "${GREEN}Already configured for $BRANCH_NAME${NC}"
+            echo -e "${GREEN}Already configured for $SAFE_NAME${NC}"
+            NGINX_ROUTE_READY=true
         fi
 
         # Restart nginx
@@ -1355,7 +1423,11 @@ if [[ "$SKIP_NGINX" = false && -n "$NGINX_CONFIG" ]]; then
             echo -e "${YELLOW}Nginx container not found, skipping restart${NC}"
         fi
     else
-        step "Nginx config not found at $NGINX_CONFIG, skipping..."
+        # Loud, because the route is configured and will not exist: the summary
+        # used to advertise it regardless (lexray #1501).
+        step "Nginx config not found at $NGINX_CONFIG"
+        echo -e "${RED}  The /${SAFE_NAME}/ route will NOT work — use the direct port.${NC}"
+        echo -e "${YELLOW}  Point .worktree.json's nginx.config at a file that exists.${NC}"
         step "Skipping nginx restart..."
     fi
 elif [[ "$SKIP_NGINX" = false ]]; then
@@ -1462,8 +1534,12 @@ fi
 
 echo ""
 echo -e "  Access:"
-if [[ "$SKIP_NGINX" = false && -n "$NGINX_CONFIG" && -n "$NGINX_MAIN_PORT" ]]; then
-    echo -e "    Via nginx: ${GREEN}http://localhost:${NGINX_MAIN_PORT}/${BRANCH_NAME}/${NC}"
+if [[ "$NGINX_ROUTE_READY" = true && -n "$NGINX_MAIN_PORT" ]]; then
+    echo -e "    Via nginx: ${GREEN}http://localhost:${NGINX_MAIN_PORT}/${SAFE_NAME}/${NC}"
+elif [[ "$SKIP_NGINX" = false && -n "$NGINX_CONFIG" && -n "$NGINX_MAIN_PORT" ]]; then
+    # A configured-but-absent nginx file skips its step; advertising the route
+    # anyway is what made that skip invisible (lexray #1501).
+    echo -e "    Via nginx: ${RED}not configured — see the nginx step above${NC}"
 fi
 if [[ "$SKIP_DOCKER" = false ]]; then
     echo -e "    Direct:    ${GREEN}http://localhost:${NEXT_PORT}/${NC}"
