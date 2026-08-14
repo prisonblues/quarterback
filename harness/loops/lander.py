@@ -117,13 +117,27 @@ def decide(klass: str, checks: str, policy: str) -> str:
 
 
 def head_commit_author(gh_repo: str, branch: str) -> str:
-    """Login of the author of a branch's tip commit (read-only)."""
+    """Login of the author of a branch's tip commit (read-only).
+
+    Deliberately NOT routed through gh(), because both of that helper's
+    conveniences are wrong for this call: `gh api` carries the repo in the URL
+    path and REJECTS a `--repo` flag, and `-q` yields a bare login rather than
+    JSON, so json.loads() would choke on the very output we want.
+
+    Getting this wrong failed open and silently: every lookup raised, every
+    caller read "", and fix_red's idempotency guard below — the one its docstring
+    says stops it looping forever — never fired once. An empty return still means
+    "could not tell", so the guard stays fail-open by design; the point is that it
+    now only happens when the lookup genuinely fails.
+    """
     try:
-        data = gh(["api", f"repos/{gh_repo}/commits/{branch}",
-                   "-q", ".author.login"], gh_repo)
-        return data if isinstance(data, str) else ""
-    except subprocess.CalledProcessError:
+        out = subprocess.run(
+            ["gh", "api", f"repos/{gh_repo}/commits/{branch}", "-q", ".author.login"],
+            capture_output=True, text=True, check=True,
+        ).stdout
+    except (subprocess.CalledProcessError, OSError):
         return ""
+    return out.strip()
 
 
 def fix_red(d: Decision, gh_repo: str, repo_path: str, execute: bool) -> None:
