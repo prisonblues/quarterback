@@ -111,28 +111,117 @@ async def _backdate(post_id: int, minutes: int):
 
 
 async def test_board_orient_window_excludes_stale_but_floors_when_quiet(client):
-    # Scope to a private recipient so posts accumulated by other tests don't interfere.
-    to = "wtest"
+    # An orientation read (not narrowed to a recipient) still floors when quiet.
+    # Scope by type — 'stuck' is used by no other test — so posts accumulated
+    # elsewhere in the suite don't interfere. A `to=` scope can't be used here:
+    # that's a mailbox read, which deliberately has no floor (issue #17).
+    kind = "stuck"
     old = (
-        await client.post("/post", json={"summary": "old", "to": to}, headers=LAPTOP)
+        await client.post("/post", json={"type": kind, "summary": "old"}, headers=LAPTOP)
     ).json()["id"]
     await _backdate(old, 120)  # 2h ago — outside the 30-min window
 
     # Quiet window (nothing fresh): the floor still surfaces the last decision.
-    quiet = (await client.get("/board", params={"to": to, "window_min": 30}, headers=LAPTOP)).json()
+    quiet = (
+        await client.get("/board", params={"type": kind, "window_min": 30}, headers=LAPTOP)
+    ).json()
     assert old in [p["id"] for p in quiet]
 
     # Ten fresh posts fill the window past the floor → the stale post drops off.
     fresh = [
         (
-            await client.post("/post", json={"summary": f"f{i}", "to": to}, headers=LAPTOP)
+            await client.post("/post", json={"type": kind, "summary": f"f{i}"}, headers=LAPTOP)
         ).json()["id"]
         for i in range(10)
     ]
-    live = (await client.get("/board", params={"to": to, "window_min": 30}, headers=LAPTOP)).json()
+    live = (
+        await client.get("/board", params={"type": kind, "window_min": 30}, headers=LAPTOP)
+    ).json()
     ids = [p["id"] for p in live]
     assert old not in ids
     assert set(fresh) <= set(ids)
+
+
+async def test_board_inbox_read_has_no_floor_so_stale_mail_stays_hidden(client):
+    # Issue #17: the floor made every ?to= poll return "the last 10 asks ever
+    # sent to this machine", so each new session rediscovered days-dead mail.
+    to = "wtest-inbox"
+    stale = (
+        await client.post(
+            "/post", json={"type": "ask", "summary": "old ask", "to": to}, headers=LAPTOP
+        )
+    ).json()["id"]
+    await _backdate(stale, 6 * 24 * 60)  # 6 days ago
+
+    empty = (
+        await client.get(
+            "/board", params={"to": to, "type": "ask", "window_min": 30}, headers=LAPTOP
+        )
+    ).json()
+    assert empty == []  # an empty inbox is the correct answer, not a reason to backfill
+
+
+async def test_board_inbox_still_returns_mail_inside_the_window(client):
+    # The floor going away must not cost an inbox its actual live mail.
+    to = "wtest-inbox2"
+    fresh = (
+        await client.post(
+            "/post", json={"type": "ask", "summary": "live ask", "to": to}, headers=SERVER
+        )
+    ).json()["id"]
+    stale = (
+        await client.post(
+            "/post", json={"type": "ask", "summary": "old ask", "to": to}, headers=SERVER
+        )
+    ).json()["id"]
+    await _backdate(stale, 90)  # 1.5h ago — outside the window
+
+    got = (
+        await client.get(
+            "/board", params={"to": to, "type": "ask", "window_min": 30}, headers=LAPTOP
+        )
+    ).json()
+    assert [p["id"] for p in got] == [fresh]
+
+
+async def test_board_inbox_window_zero_returns_full_history(client):
+    # window_min=0 disables the window — the documented knob for looking further
+    # back now that the floor no longer does it by accident.
+    to = "wtest-inbox3"
+    stale = (
+        await client.post(
+            "/post", json={"type": "ask", "summary": "old ask", "to": to}, headers=LAPTOP
+        )
+    ).json()["id"]
+    await _backdate(stale, 6 * 24 * 60)
+
+    got = (
+        await client.get(
+            "/board", params={"to": to, "type": "ask", "window_min": 0}, headers=LAPTOP
+        )
+    ).json()
+    assert [p["id"] for p in got] == [stale]
+
+
+async def test_board_session_filter_has_no_floor_either(client):
+    # ?session= is a lookup for one session's posts, not an orientation read.
+    sess = "s-wtest-floor"
+    stale = (
+        await client.post(
+            "/post", json={"summary": "old session post", "session": sess}, headers=LAPTOP
+        )
+    ).json()["id"]
+    await _backdate(stale, 240)  # 4h ago
+
+    windowed = (
+        await client.get("/board", params={"session": sess, "window_min": 30}, headers=LAPTOP)
+    ).json()
+    assert windowed == []
+
+    unwindowed = (
+        await client.get("/board", params={"session": sess, "window_min": 0}, headers=LAPTOP)
+    ).json()
+    assert [p["id"] for p in unwindowed] == [stale]
 
 
 async def test_board_cursor_read_ignores_window(client):

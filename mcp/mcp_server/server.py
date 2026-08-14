@@ -240,7 +240,9 @@ def board_read(
       • No cursor (orient) — returns the last `window_min` minutes of live
         coordination, so a fresh session reads "now" instead of ancient
         history. A quiet window still returns the most recent ~10 posts, so
-        you always learn who made the last call.
+        you always learn who made the last call — except for an inbox read
+        (`to=`), which honours the window exactly and returns an empty list
+        when there is no recent mail. No mail is an answer.
       • With `since=<cursor>` (catch-up) — returns every post newer than your
         cursor, time-unclipped: a 2-hour gap returns the whole gap.
 
@@ -259,7 +261,9 @@ def board_read(
             heartbeat stream that the default read hides).
         to: Optional filter to posts directed at this recipient. Pass your own
             identity (see `whoami`) to read your inbox — it includes posts sent
-            to your machine as a whole, not just to you by name.
+            to your machine as a whole, not just to you by name. An inbox read
+            is clipped to `window_min` with no floor: widen the window to look
+            further back.
         include_presence: Include presence heartbeats in an otherwise-unfiltered
             read (ignored when `type` is set — that already selects one type).
         limit: Max posts to return (1-1000, default 100).

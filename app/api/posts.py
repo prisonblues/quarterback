@@ -17,6 +17,12 @@ router = APIRouter(tags=["board"])
 # A cursor-less orient read never returns empty: even when the time window is
 # quiet, surface at least the most recent few decisions so an arriving agent
 # still learns who made the last call.
+#
+# The floor applies to *orientation* reads only. A read narrowed by `to` or
+# `session` is a lookup — a mailbox, not a briefing — and an empty mailbox is
+# both the correct answer and the usual one. Flooring those turns "no mail"
+# into "here is your mail from last Tuesday, please respond": every fresh
+# session rediscovers the same handful of long-dead asks (issue #17).
 _ORIENT_FLOOR = 10
 
 
@@ -53,16 +59,24 @@ async def read_board(
         ge=0,
         le=1440,
         description="cursor-less orient window in minutes (0 disables); "
-        "ignored when since>0, where catch-up returns everything new",
+        "ignored when since>0, where catch-up returns everything new. "
+        "An unfiltered orient read floors at the most recent few posts when the "
+        "window is quiet; a read narrowed by to= or session= honours the window "
+        "exactly and may return nothing",
     ),
     type: str | None = Query(None, description="filter by post type"),
     to: str | None = Query(
         None,
         description="filter to posts this agent should read: addressed to it exactly, "
         "to its machine (?to=server/f5ca7491 also sees posts to 'server'), or to one of "
-        "its instances (?to=server sees the whole machine's mail)",
+        "its instances (?to=server sees the whole machine's mail). Inbox semantics: "
+        "the orient floor is skipped, so a quiet window returns an empty list "
+        "rather than stale mail",
     ),
-    session: str | None = Query(None, description="filter to one CC session"),
+    session: str | None = Query(
+        None,
+        description="filter to one CC session (a lookup, so the orient floor is skipped)",
+    ),
     include_presence: bool = Query(
         False,
         description="include presence heartbeats (excluded by default as coordination noise)",
@@ -100,12 +114,15 @@ async def read_board(
     # Orient mode (no cursor): the last `window_min` minutes of live
     # coordination, so a fresh session reads "now" instead of ancient history.
     # Fetch newest-first up to `limit`, clip to the window, but floor at the
-    # most recent few so a quiet board still orients (never an empty read).
+    # most recent few so a quiet *board* still orients (never an empty read).
+    # A mailbox read (`to=` / `session=`) skips the floor and honours the
+    # window verbatim — see _ORIENT_FLOOR.
     rows = list((await db.scalars(stmt.order_by(Post.id.desc()).limit(limit))).all())
     if window_min > 0:
         cutoff = datetime.now(UTC) - timedelta(minutes=window_min)
         windowed = [p for p in rows if p.ts >= cutoff]
-        rows = windowed if len(windowed) >= _ORIENT_FLOOR else rows[:_ORIENT_FLOOR]
+        floored = to is None and session is None and len(windowed) < _ORIENT_FLOOR
+        rows = rows[:_ORIENT_FLOOR] if floored else windowed
     rows.reverse()  # back to oldest-first reading order
     return [summary_tier(p) for p in rows]
 
