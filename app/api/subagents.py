@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import identify, reader
 from app.db import get_session
-from app.identity import address_clause, addressed_to, same_machine
+from app.identity import address_clause, addressed_to, resolve_alias, same_machine
 from app.models.lease import Lease
 from app.models.post import Post
 from app.models.subagent import Subagent
@@ -177,8 +177,8 @@ async def list_active(
     device: str | None = Query(None, description="only agents on this device"),
     holder: str | None = Query(
         None,
-        description="only agents held by this identity; a bare machine name "
-        "(?holder=server) matches every agent instance on it",
+        description="only agents held by this identity, spelled by name or by key; "
+        "a bare machine name (?holder=server) matches every agent on it",
     ),
     mine: str | None = Query(
         None,
@@ -202,6 +202,11 @@ async def list_active(
     peers); add ``peers_only=true`` to drop them from the result altogether.
     """
     now = _utcnow()
+    # Both spellings of an agent select the same leases, so a peer holding only
+    # the permanent key form doesn't have to know the name it maps to today.
+    aliases: tuple[str, ...] = ()
+    if holder is not None:
+        holder, aliases = await resolve_alias(session, holder)
     lstmt = select(Lease).where(Lease.released_at.is_(None), Lease.expires_at > now)
     if cwd is not None:
         lstmt = lstmt.where(Lease.cwd == cwd)
@@ -210,7 +215,7 @@ async def list_active(
     if device is not None:
         lstmt = lstmt.where(Lease.device == device)
     if holder is not None:
-        lstmt = lstmt.where(address_clause(Lease.holder, holder))
+        lstmt = lstmt.where(address_clause(Lease.holder, holder, aliases))
     leases = (await session.scalars(lstmt)).all()
     if peers_only and mine is not None:
         leases = [ln for ln in leases if ln.session != mine]
@@ -234,7 +239,7 @@ async def list_active(
     if device is not None:
         subs = [s for s in subs if s["device"] == device]
     if holder is not None:
-        subs = [s for s in subs if addressed_to(s["holder"], holder)]
+        subs = [s for s in subs if addressed_to(s["holder"], holder, aliases)]
     for s in subs:
         s["own"] = mine is not None and s["parent_session"] == mine
     if peers_only and mine is not None:

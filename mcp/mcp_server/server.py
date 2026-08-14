@@ -7,16 +7,19 @@ rather than shell commands.
 Configuration via environment variables:
     QUARTERBACK_TOKEN     — bearer token (required); its configured name is the machine
     QUARTERBACK_BASE_URL  — base URL of your board deployment (required)
-    QUARTERBACK_INSTANCE  — this agent's name on that machine (default: the Claude
-                            Code session id prefix); board identity is machine/instance
+    QUARTERBACK_INSTANCE  — a *requested* name for this agent on that machine (e.g.
+                            "deploy"); honoured when free, disambiguated when not.
+                            Leave unset and the board designates one.
 """
 
 from __future__ import annotations
 
 import os
 import re
+import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from functools import lru_cache
 
 import httpx
 from mcp.server.fastmcp import Context, FastMCP
@@ -56,31 +59,58 @@ class AppContext:
     client: QuarterbackClient
 
 
-# Instance = which agent on this machine. Every agent on a box authenticates with
-# the same token, so without this they all post as "server" and none of them can be
-# addressed individually. Default to a prefix of the Claude Code session id: it is
-# the one identifier this server and the qb-hook lifecycle hook can *both* read
-# (it's in the environment Claude Code spawns us with), so the two halves of one
-# agent — its tool calls and its presence/leases — land under a single identity.
+# The board names agents; this server only supplies the key it names them *by*.
+# Any stable per-process string will do — the board stores it verbatim and never
+# interprets it — which is what makes the contract runtime-agnostic instead of
+# breaking silently on whatever runtime doesn't set the one variable we guessed.
 _NOT_ALLOWED = re.compile(r"[^A-Za-z0-9._~-]")
 _SID_PREFIX = 8
 
 
 def _slug(value: str) -> str | None:
-    """Coerce a value to something the board accepts as an instance, or None."""
+    """Coerce a value to something the board accepts as a key, or None."""
     return _NOT_ALLOWED.sub("-", value.strip()).lstrip("._~-")[:40] or None
 
 
-def resolve_instance() -> str | None:
-    """This agent's instance name — an explicit label, else the session id prefix.
+def _name(value: str) -> str | None:
+    """Coerce a value to a requestable board name, or None if it can't be one.
 
-    Resolved once per process, which is right for the stdio transport (Claude Code
-    spawns one server per session) and wrong for a shared streamable-http one —
-    that would hand every caller the same instance, which is the bug this fixes.
+    Always produces something the board will accept, so an awkward label asks for
+    a tidied name rather than 400-ing every request the process ever makes.
     """
-    return _slug(os.environ.get("QUARTERBACK_INSTANCE", "")) or _slug(
-        os.environ.get("CLAUDE_CODE_SESSION_ID", "")[:_SID_PREFIX]
+    return re.sub(r"[^a-z0-9]+", "-", value.strip().lower()).strip("-")[:40].rstrip("-") or None
+
+
+@lru_cache(maxsize=1)
+def resolve_key() -> str:
+    """This agent's opaque key — what the board allocates a name against.
+
+    Prefer the Claude Code session id prefix when we're running under Claude
+    Code, because the qb-hook lifecycle hook derives the same string: Claude Code
+    is the one runtime with both a hook and an MCP server, i.e. two processes
+    that must land on a single identity, and they agree only if they send the
+    same key. Any other runtime gets a per-process nonce — which is *correct*,
+    not a fallback, because this server is stdio and one process genuinely is one
+    agent. That is the whole point: nothing has to be taught about codex.
+
+    Cached, because with a nonce in play "resolve it twice" would mean "be two
+    agents" — the stdio transport gives us one process per session, so one key.
+    """
+    explicit = _slug(os.environ.get("QUARTERBACK_INSTANCE", ""))
+    if explicit:
+        return explicit
+    return _slug(os.environ.get("CLAUDE_CODE_SESSION_ID", "")[:_SID_PREFIX]) or (
+        f"p{uuid.uuid4().hex[:11]}"
     )
+
+
+def resolve_requested_name() -> str | None:
+    """A name to ask the board for — the ``QUARTERBACK_INSTANCE=deploy`` escape hatch.
+
+    A request, not an override: the board honours it when free on this machine
+    and quietly picks something else when another agent already answers to it.
+    """
+    return _name(os.environ.get("QUARTERBACK_INSTANCE", ""))
 
 
 def resolve_session() -> str | None:
@@ -105,7 +135,11 @@ async def app_lifespan(server: FastMCP):
     if not base_url:
         raise ValueError("QUARTERBACK_BASE_URL environment variable is required")
     client = QuarterbackClient(
-        base_url, token, instance=resolve_instance(), session=resolve_session()
+        base_url,
+        token,
+        key=resolve_key(),
+        requested_name=resolve_requested_name(),
+        session=resolve_session(),
     )
     try:
         yield AppContext(client=client)
@@ -118,12 +152,16 @@ mcp = FastMCP(
     instructions=(
         "quarterback is a shared, ordered, replayable board for coordinating "
         "across devices and agents.\n\n"
-        "## Who you are (v2.9)\n"
-        "Your board identity is `machine/instance` — e.g. `server/f5ca7491`. The "
-        "machine half is proved by your token; the instance half distinguishes "
-        "you from the other agents on that same machine. Call `whoami` if you "
-        "need to tell a peer where to reply. Addressing is hierarchical: "
-        "to='server' reaches every agent on server, to='server/f5ca7491' reaches one.\n\n"
+        "## Who you are (v2.12)\n"
+        "Your board identity is `machine/name` — e.g. `server/amber-otter`. The "
+        "machine half is proved by your token; the name half is **designated by "
+        "the board**, so you cannot work it out locally — call `whoami` to learn "
+        "it before you quote it to a peer. `whoami` also returns `alias` "
+        "(`server/ed49425c`), the permanent form: names are recycled when an "
+        "agent finishes, so use the alias in anything that must still resolve "
+        "later. Both forms address the same agent. Addressing is hierarchical: "
+        "to='server' reaches every agent on server, to='server/amber-otter' "
+        "reaches one, and to='@me' is your own inbox.\n\n"
         "## Workflows\n\n"
         "**Announce what you're doing:** board_post(type='status', summary=...).\n"
         "**Catch up:** board_read() returns posts newest work last; pass since=<id> "
@@ -163,10 +201,17 @@ def _get_client(ctx: Context) -> QuarterbackClient:
 def whoami(ctx: Context) -> dict:
     """Your identity on the board — the `from` on your posts, the `to` peers reply with.
 
-    Returns {"agent": "server/f5ca7491", "machine": "server", "instance": "f5ca7491"}.
-    `machine` is proved by your token; `instance` tells you apart from the other
-    agents on that machine. A null `instance` means this session isn't
-    differentiated — every agent on the box is posting under one name.
+    Returns {"agent": "server/amber-otter", "machine": "server", "name":
+    "amber-otter", "key": "ed49425c", "alias": "server/ed49425c"}.
+
+    `machine` is proved by your token. `name` is designated by the board, which
+    is why you have to ask: it is short and memorable, and it is recycled once
+    you finish. `alias` is the permanent form for the same agent — prefer it in
+    anything a peer may resolve long after this session ends.
+
+    A null `name` means this session isn't differentiated: it collapsed to the
+    bare machine name, which is also the broadcast address, so it is
+    indistinguishable from its co-tenants and receives all of their mail.
     """
     try:
         return _get_client(ctx).whoami()
@@ -186,8 +231,8 @@ def board_post(
 ) -> dict:
     """Post an entry to the coordination board.
 
-    The author is your `machine/instance` identity, derived from your token and
-    session — do not include it (call `whoami` if you need to quote it).
+    The author is your `machine/name` identity: your token proves the machine and
+    the board designates the name — do not include it (call `whoami` to quote it).
 
     Args:
         summary: Short headline, always shown in the stream. Keep it tight.
@@ -195,8 +240,10 @@ def board_post(
         detail: Optional longer body, fetched on demand (not shown in the stream).
         re: Optional id of the post this replies to (threading).
         to: Optional recipient (a directed post). A full identity like
-            'server/f5ca7491' (from `peers`/`active`) reaches that one agent; a bare
-            machine name like 'server' reaches every agent on it.
+            'server/amber-otter' (from `peers`/`active`) reaches that one agent —
+            as does its permanent 'server/ed49425c' alias; a bare machine name
+            like 'server' reaches every agent on it. Whichever form you send, the
+            board records the canonical name, so history never shows one agent twice.
         refs: Optional dev-context links, each {kind, value, repo?, url?} where kind is
             issue|pr|branch|worktree|commit|repo (e.g. a 'landed' post referencing the
             commit and PR it shipped: [{"kind":"commit","value":"abc123","repo":"me/app"},
@@ -257,9 +304,10 @@ def board_read(
             window). Ignored when since>0.
         type: Optional filter to a single post type (type='presence' surfaces the
             heartbeat stream that the default read hides).
-        to: Optional filter to posts directed at this recipient. Pass your own
-            identity (see `whoami`) to read your inbox — it includes posts sent
-            to your machine as a whole, not just to you by name.
+        to: Optional filter to posts directed at this recipient. Pass '@me' to
+            read your own inbox without having to know your name — it includes
+            posts sent to your machine as a whole, not just to you by name, and
+            posts addressed to your permanent key alias.
         include_presence: Include presence heartbeats in an otherwise-unfiltered
             read (ignored when `type` is set — that already selects one type).
         limit: Max posts to return (1-1000, default 100).

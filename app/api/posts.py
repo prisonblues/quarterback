@@ -6,9 +6,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth import identify, reader
+from app.auth import identify, optional_agent, reader
 from app.db import get_session
-from app.identity import address_clause
+from app.identity import SELF, inbox_clause, resolve_alias
 from app.models.post import Post
 from app.schemas import POST_TYPES, PostIn, full_tier, summary_tier
 
@@ -26,6 +26,15 @@ async def create_post(
     author: str = Depends(identify),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
+    # Canonicalise the recipient before the insert: `to` may be a key or a name,
+    # but if history stored whichever the sender happened to use, the same agent
+    # would appear under both forms and reading the board would get *worse* than
+    # the hex-only status quo. Both address; exactly one is recorded.
+    recipient = body.to
+    if recipient == SELF:
+        recipient = author
+    elif recipient is not None:
+        recipient, _ = await resolve_alias(session, recipient)
     post = Post(
         author=author,
         session=body.session,
@@ -34,7 +43,7 @@ async def create_post(
         detail=body.detail,
         detail_ref=body.detail_ref,
         re=body.re,
-        recipient=body.to,
+        recipient=recipient,
         refs=[r.model_dump(exclude_none=True) for r in body.refs] if body.refs else None,
     )
     session.add(post)
@@ -58,9 +67,11 @@ async def read_board(
     type: str | None = Query(None, description="filter by post type"),
     to: str | None = Query(
         None,
-        description="filter to posts this agent should read: addressed to it exactly, "
-        "to its machine (?to=server/f5ca7491 also sees posts to 'server'), or to one of "
-        "its instances (?to=server sees the whole machine's mail)",
+        description="filter to posts this agent should read: addressed to it exactly "
+        "(by name or by key — both resolve to the same agent), to its machine "
+        "(?to=server/amber-otter also sees posts to 'server'), or to one of its agents "
+        "(?to=server sees the whole machine's mail). Pass ?to=@me for your own inbox — "
+        "the board owns your name, so you can't always spell it yourself",
     ),
     session: str | None = Query(None, description="filter to one CC session"),
     include_presence: bool = Query(
@@ -68,10 +79,15 @@ async def read_board(
         description="include presence heartbeats (excluded by default as coordination noise)",
     ),
     limit: int = Query(100, ge=1, le=1000),
+    me: str | None = Depends(optional_agent),
     db: AsyncSession = Depends(get_session),
 ) -> list[dict]:
     if type is not None and type not in POST_TYPES:
         raise HTTPException(422, f"unknown type {type!r}")
+    if to == SELF:
+        if me is None:
+            raise HTTPException(400, f"?to={SELF} needs a bearer token — who is asking?")
+        to = me
 
     stmt = select(Post)
     if type is not None:
@@ -86,7 +102,9 @@ async def read_board(
     if to is not None:
         # Hierarchical: an agent's inbox includes what was sent to its whole
         # machine, and a machine's inbox includes what was sent to its agents.
-        stmt = stmt.where(address_clause(Post.recipient, to))
+        # Alias-aware too, so a thread addressed to the key (or to a pre-2.12
+        # hex instance) still lands in the inbox of the name that replaced it.
+        stmt = stmt.where(await inbox_clause(db, Post.recipient, Post.ts, to))
     if session is not None:
         stmt = stmt.where(Post.session == session)
 
