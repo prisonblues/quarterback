@@ -162,7 +162,8 @@ lander loops — is counted without an agent having to remember to say so.
 
 ## Releases
 
-Running version: **v2.12** (`GET /openapi.json` → `.info.version` on any instance).
+Running board version: **v2.12** (`GET /openapi.json` → `.info.version` on any instance).
+The latest release, v2.13, ships the harness alongside the service and changes no board behaviour.
 
 - **v1–v2.1** — the board, then presence leases + session handoff, then dev context.
 - **v2.2–v2.5** — the session registry: sessions became listable, named, resumable, and the
@@ -170,6 +171,7 @@ Running version: **v2.12** (`GET /openapi.json` → `.info.version` on any insta
 - **v2.6–v2.9** — coordination: quiet presence, the collision index, peer self-discovery,
   publish/sync advisories, per-agent identity.
 - **v2.10–v2.12** — reviewer-panel stats, per-reviewer accounts, board-designated names.
+- **v2.13** — the harness (loops, worktree tooling, slash commands) ships in this repo.
 - **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
   object store; wire `landed` refs to a cherry-pick helper.
 
@@ -227,20 +229,37 @@ When rolling back, make sure whatever redeploy path you use **authenticates to t
 your image is private — a plain "pull latest" that can't authenticate will silently keep the
 stale image and look like a successful deploy.
 
-## Worktree workflow (`worktrees/`)
+## The harness (`harness/`) — step 2 of the install
 
-Not part of the service — the companion workflow it was built alongside, published in
-**[worktrees/](worktrees/)**: `/fix-issue`, `/drop-worktree` and `/tree-shake`, plus the
-`create-worktree` / `remove-worktree` / `prune-worktrees` scripts they drive. It gives each
-agent its own directory, database copy, containers and port, so several can run at once
-without colliding.
+quarterback installs in two steps: **the board** (this service, deployed as containers —
+see [Deploy](#deploy)) and **the harness** it coordinates, in
+**[harness/](harness/)**. The harness is the reviewer panel (`loops/panel.py`), the epic and
+lander loops, the worktree-per-issue tooling, and the Claude Code slash commands that drive
+all of it.
 
-The two halves are complementary rather than alternative: **worktrees isolate agents from
-each other; the board reconnects them.** Isolation is what stops two agents corrupting one
-database, and it is also what makes them invisible to one another — which is why
-`report_git` / `GET /worktrees` / `find_commit` exist, and why leases carry a `cwd`. If one
-agent getting in your way is your whole problem, take the worktree tooling and skip the
-service. See [worktrees/README.md](worktrees/README.md) for the full comparison.
+They ship together because a coordination layer with nothing to coordinate is a thin
+product: `GET /review/stats` and the `/panel` leaderboard only have data once the panel is
+running and recording against them.
+
+**Each step stands alone, and that is a design constraint rather than an accident.** The
+harness runs with no board configured — the panel's recording is best-effort and no-ops when
+no `qb` CLI is present, because telemetry that can fail a review which already succeeded is
+worse than no telemetry. The service is equally useful with no harness, for session handoff,
+presence and sync advisories.
+
+The complementarity is worth stating precisely: **worktrees isolate agents from each other;
+the board reconnects them.** Isolation is what stops two agents corrupting one database, and
+it is also what makes them invisible to one another — which is why `report_git` /
+`GET /worktrees` / `find_commit` exist, and why leases carry a `cwd`. If one agent getting in
+your way is your whole problem, install the harness and skip the service. See
+[harness/README.md](harness/README.md) for the full comparison and both install paths.
+
+```nix
+# nix / home-manager consumers
+inputs.quarterback.url = "github:prisonblues/quarterback";
+imports = [ inputs.quarterback.homeManagerModules.default ];
+programs.quarterback-harness.enable = true;
+```
 
 ## Development
 
@@ -301,6 +320,10 @@ mcp/          FastMCP wrapper: whoami + board_* + lease/handoff/session + active
               + subagent_start/end + report_git/find_commit + publish/sync_status
               (gitctx.py runs git locally to gather worktrees)
 tests/        end-to-end tests against real Postgres (conftest.py shared fixtures)
-worktrees/    companion workflow, not the service: /fix-issue, /drop-worktree,
-              /tree-shake + the create/remove/prune-worktree scripts they drive
+harness/      step 2 of the install — the workflow the board coordinates
+  loops/           panel.py (reviewer panel), epic.py, lander.py, harness_rules.py
+  commands/        Claude Code slash commands (/panel, /fix-issue, /wt, …)
+  bin/             create-worktree, remove-worktree, prune-worktrees
+  package.nix      the derivation; hm-module.nix wires it into ~/.claude
+flake.nix     packages.harness, homeManagerModules.default, checks (runs the loops tests)
 ```

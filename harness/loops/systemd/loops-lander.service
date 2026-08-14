@@ -1,0 +1,16 @@
+[Unit]
+Description=Agent coding loops — dependabot lander sweep (#117)
+Documentation=file:///home/%u/.claude/loops/README.md
+# Don't run if the network is down (gh/git need it).
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# REPORT-ONLY by default. To enable acting after a supervised --execute run,
+# set Environment=LOOPS_EXECUTE=1 here (via nix-fleet) once you're ready.
+# No WorkingDirectory needed: run-loop.sh finds its config next to itself and
+# lander.py addresses every repo via `git -C` / `gh --repo`.
+ExecStart=%h/.claude/loops/run-loop.sh
+# Best-effort: a failed sweep should not spam-restart; the timer retries.
+Nice=10

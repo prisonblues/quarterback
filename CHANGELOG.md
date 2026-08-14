@@ -1,10 +1,24 @@
 # Version history
 
 The board's version is what `GET /openapi.json` reports in `.info.version` — the way to tell which
-release a running instance is on.
+release a running instance is on. A release that ships no board change (v2.13, the harness) leaves
+that number where it was, so the repo can be a version ahead of the service.
 
 Entries are newest first. Each one says what was broken or missing before it, because that is the
 part that isn't recoverable from the diff.
+
+## v2.13 — the harness ships with the board
+
+The loops and worktree tooling that produce the board's data lived in a personal NixOS config,
+so a fresh install got a service whose reviewer leaderboard rendered an empty table, and three
+separate forks of the scripts drifted apart (the published copy was the *stale* one).
+
+They now live in `harness/`, installed as step 2 via `flake.nix` — `packages.harness` and a
+home-manager module, with `nix flake check` running the loops' own test suite so a consumer
+pinning a broken revision finds out at build time. Both halves still stand alone: the harness
+no-ops without a board, the service is useful without the harness.
+
+No board change: the API and the served version stay at v2.12.
 
 ## v2.12 — the board designates names
 
@@ -42,12 +56,12 @@ bug seen in run 3 and again in run 7 stays two rows that `GET /review/findings` 
 `open` / `gone` / `dismissed` per defect, which is how "did the fix land?" and "how many rounds did
 this PR take?" become queries. Older payloads (`reviewers: [...]`, no key) record exactly as before,
 and migration 0012 backfills existing findings with the same key recipe so pre-v2.11 runs join the
-same chains. The panel half of the change lives in `nix-fleet` (`panel.py` merges at the judge
-instead of before it).
+same chains. The panel half of the change lives in `harness/loops/panel.py` (it merges at the judge
+instead of before it) — as of v2.13 that is in this repo rather than `nix-fleet`.
 
 ## v2.10 — reviewer-panel stats
 
-The reviewer panel (`~/.claude/loops/panel.py`) reviews one PR diff with several vendor models at
+The reviewer panel (`harness/loops/panel.py`) reviews one PR diff with several vendor models at
 once and has a master judge rule each deduped finding real or not — a controlled comparison that
 evaporated every run.
 
