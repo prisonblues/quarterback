@@ -15,6 +15,8 @@ import pytest
 from .conftest import LAPTOP, SERVER
 
 REPO = "acme/v210repo"
+# Deliberately the pre-2.12 header: fleet-side clients ship from another repo, so
+# the legacy spelling has to keep identifying an agent (as a key) indefinitely.
 AGENT_A = {**LAPTOP, "X-Agent-Instance": "a1b2c3"}
 AGENT_B = {**SERVER, "X-Agent-Instance": "d4e5f6"}
 
@@ -184,13 +186,29 @@ async def test_judged_only_is_the_default_window(client):
 
 
 async def test_by_agent_attributes_runs_to_the_agent_that_ordered_them(client):
-    """`author` is machine/instance, so two agents on one box stay distinct."""
+    """`author` is the agent identity, so two agents on one box stay distinct.
+
+    The agent half is the board's designated name (v2.12), not anything the
+    caller sent, so the expected authors come from /whoami rather than the key.
+    """
     await record(client, 8130, headers=AGENT_A)
     await record(client, 8131, headers=AGENT_B)
     stats = (await client.get(f"/review/stats?repo={REPO}", headers=AGENT_A)).json()
     authors = {a["author"] for a in stats["by_agent"]}
-    assert "laptop/a1b2c3" in authors
-    assert "server/d4e5f6" in authors
+    for headers in (AGENT_A, AGENT_B):
+        assert (await client.get("/whoami", headers=headers)).json()["agent"] in authors
+
+
+async def test_author_filter_accepts_the_permanent_alias(client):
+    """A filter written from `whoami`'s alias has to find the runs that agent
+    recorded — they are stored under its name, not its key."""
+    me = (await client.get("/whoami", headers=AGENT_A)).json()
+    await record(client, 8135, headers=AGENT_A)
+    for spelling in (me["agent"], me["alias"]):
+        rows = (await client.get(
+            f"/reviews?repo={REPO}&pr=8135&author={spelling}", headers=AGENT_A
+        )).json()
+        assert [r["pr"] for r in rows] == [8135]
 
 
 async def test_reviews_list_filters_and_carries_scorecards(client):

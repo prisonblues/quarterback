@@ -45,9 +45,28 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import identify, reader
 from app.db import get_session
+from app.identity import agent_row, compose, machine_of
 from app.models.review import ReviewFinding, ReviewFindingReport, ReviewReviewer, ReviewRun
 
 router = APIRouter(tags=["review"])
+
+
+async def _authored_as(session: AsyncSession, author: str) -> str:
+    """The spelling a run was recorded under, for an ``author=`` filter.
+
+    Runs store the agent's name, so a filter written from a `whoami` alias (the
+    key form) has to be translated or it silently matches nothing. Unlike
+    addressing, this resolves to the name even for a retired agent: the question
+    is "what did it author under", and the answer does not change when it goes.
+
+    Which means a name that has since been recycled attributes both holders'
+    runs to one filter. That is a property of storing names in history, not of
+    the translation — a filter written with the name directly does the same —
+    and telling them apart would need a tenure log this doesn't keep.
+    """
+    row = await agent_row(session, author)
+    return compose(machine_of(author), row.name) if row is not None else author
+
 
 SEVERITIES = ("P1", "P2", "P3", "P4")
 
@@ -597,6 +616,7 @@ async def list_reviews(
     if pr is not None:
         stmt = stmt.where(ReviewRun.pr == pr)
     if author is not None:
+        author = await _authored_as(session, author)
         stmt = stmt.where(ReviewRun.author == author)
     cutoff = _since_clause(since, days)
     if cutoff is not None:
@@ -639,6 +659,7 @@ async def review_stats(
     if repo is not None:
         filters.append(ReviewRun.repo == repo)
     if author is not None:
+        author = await _authored_as(session, author)
         filters.append(ReviewRun.author == author)
     cutoff = _since_clause(since, days)
     if cutoff is not None:

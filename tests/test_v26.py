@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from app.identity import machine_of
+
 from .conftest import DESKTOP, LAPTOP, SERVER
 
 
@@ -98,11 +100,13 @@ async def test_active_filters_by_device_and_holder(client):
     assert "sl" not in {s["agent_id"] for s in by_device["subagents"]}
     assert all(s["device"] == "server" for s in by_device["subagents"])
 
+    # A bare machine name matches every agent on it, so the invariant is the
+    # machine half — not string equality with the filter.
     by_holder = (await client.get("/active", params={"holder": "laptop"}, headers=DESKTOP)).json()
     assert "s-dev-laptop" in {a["session"] for a in by_holder["agents"]}
-    assert all(a["holder"] == "laptop" for a in by_holder["agents"])
+    assert all(machine_of(a["holder"]) == "laptop" for a in by_holder["agents"])
     assert "sl" in {s["agent_id"] for s in by_holder["subagents"]}
-    assert all(s["holder"] == "laptop" for s in by_holder["subagents"])
+    assert all(machine_of(s["holder"]) == "laptop" for s in by_holder["subagents"])
 
 
 async def test_subagent_register_conflict_across_holders(client):
