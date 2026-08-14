@@ -1,7 +1,7 @@
 [project]
 name = "quarterback"
-version = "0.1.0"
-description = "Cross-device agent coordination + session-sync board (v1: board only)"
+version = "2.12.0"  # served version lives in app/main.py — keep the two in step
+description = "Cross-device agent coordination + session-sync board"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115",
