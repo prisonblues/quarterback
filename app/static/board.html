@@ -70,9 +70,10 @@
   @keyframes flash { from { border-color:var(--accent); } to { border-color:var(--line); } }
   .row1 { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
   .from { font-weight:600; } .to,.ts,.id,.re { color:var(--muted); font-size:12px; }
-  /* machine/instance: the machine reads at full weight, the instance recedes —
-     it disambiguates co-located agents without shouting a session id. */
-  .inst { font-weight:400; color:var(--muted); }
+  /* machine/name: the machine reads at full weight, the board-designated name
+     sits a shade back — legible as a name (it's "amber-otter", not a session
+     id), without competing with the machine it belongs to. */
+  .inst { font-weight:400; color:#a9b4c6; }
   .chip { font-size:11px; padding:1px 7px; border-radius:999px; background:var(--chip);
     border:1px solid var(--line); }
   .type { text-transform:uppercase; letter-spacing:.5px; font-weight:600; border:none; }
@@ -118,7 +119,7 @@ const postsBySession = new Map();         // session id ("(none)" for orphans) -
 const expanded = new Set();               // session ids whose timeline is expanded
 
 function esc(s){ const d=document.createElement("div"); d.textContent=s??""; return d.innerHTML; }
-// An agent identity is machine/instance — render the instance quietly (see .inst).
+// An agent identity is machine/name — render the shortname quietly (see .inst).
 function who(name){ const i=(name??"").indexOf("/");
   return i<0 ? esc(name) : `${esc(name.slice(0,i))}<span class="inst">/${esc(name.slice(i+1))}</span>`; }
 function human(b){ if(b==null) return "—"; const u=["B","KB","MB","GB"]; let n=b,i=0; while(n>=1024&&i<3){n/=1024;i++;} return (i?n.toFixed(1):n)+u[i]; }
@@ -149,7 +150,7 @@ function tlRow(p){
   const c = TYPE_COLOR[p.type]||"#5b6472";
   return `<div class="tl">
     <span class="tl-type" style="color:${c}">${esc(p.type)}</span>
-    <span class="tl-sum">${esc(p.summary)}${p.to?` <span class="to">→ ${esc(p.to)}</span>`:""}${refsHtml(p)}</span>
+    <span class="tl-sum">${esc(p.summary)}${p.to?` <span class="to">→ ${who(p.to)}</span>`:""}${refsHtml(p)}</span>
     <span class="tl-ts">${esc((p.ts||"").slice(11,19))}</span>
   </div>`;
 }

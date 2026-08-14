@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.subagents import active_subagents_by_session
 from app.auth import identify, reader
 from app.db import get_session
-from app.identity import same_machine
+from app.identity import retire, same_machine
 from app.models.blob import Blob
 from app.models.lease import Lease
 from app.models.session import SessionRecord
@@ -47,6 +47,23 @@ async def _active_lease(session: AsyncSession, sess_key: str, now: datetime) -> 
         .limit(1)
     )
     return await session.scalar(stmt)
+
+
+async def _retire_if_idle(session: AsyncSession, holder: str, now: datetime) -> None:
+    """Free ``holder``'s shortname once its last live lease is gone.
+
+    An agent can hold several sessions at once, and ending one is not the end of
+    it. Retiring on the first release would hand its name away mid-life — the
+    rename this whole design exists to avoid — and split the rest of its work
+    across two identities.
+    """
+    still_working = await session.scalar(
+        select(Lease.id)
+        .where(Lease.holder == holder, Lease.released_at.is_(None), Lease.expires_at > now)
+        .limit(1)
+    )
+    if still_working is None:
+        await retire(session, holder)
 
 
 async def _record_blob(
@@ -210,7 +227,19 @@ async def release_lease(
     if not same_machine(lease.holder, holder):
         raise HTTPException(403, "not your lease")
     if lease.released_at is None:
-        lease.released_at = _utcnow()
+        now = _utcnow()
+        lease.released_at = now
+        # Releasing is SessionEnd: that agent is going. Free *its* shortname —
+        # the holder's, not the caller's, since a co-tenant may release on its
+        # behalf — keeping the name on everything it authored (identity.retire),
+        # so the live space recycles without rewriting the past.
+        #
+        # Only while the lease is still live. `holder` is a name, and names
+        # recycle, so a belated release of a lease that lapsed weeks ago would
+        # otherwise unname whichever agent inherited it since. A lapsed lease
+        # already gave up its claim; there is nothing left here to retire.
+        if lease.expires_at > now:
+            await _retire_if_idle(session, lease.holder, now)
         await session.commit()
     return {"lease_id": str(lease.id), "released": True}
 
@@ -241,6 +270,7 @@ async def handoff(
         "model": body.model or active.model,
     }, now)
     active.released_at = now
+    await _retire_if_idle(session, active.holder, now)  # handoff releases — that agent is done
     await session.commit()
     return {
         "session": body.session,
