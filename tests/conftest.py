@@ -33,9 +33,18 @@ if _problem:
     raise RuntimeError(_problem)
 os.environ["DATABASE_URL"] = _url
 
-# Tokens are test fixtures, not deployment config: these names are what the
-# assertions below expect, so they take precedence over any .env the checkout has.
+# The database is the ONLY setting the suite takes from its surroundings.
+# Everything else the app reads is pinned here, because a checkout's .env is
+# developer convenience and the tests are assertions about behaviour: letting
+# .env through would make the suite mean different things in different
+# checkouts. BROWSER_DEV_USER is the concrete one — .env.example sets it, and
+# with it set `reader` authenticates everybody, so the test asserting that
+# /stream 401s without auth instead receives a live SSE stream and hangs
+# forever on a transport that buffers whole responses.
 os.environ["API_TOKENS"] = "laptop:tok-laptop,server:tok-server,desktop:tok-desktop"
+os.environ["API_TOKENS_FILE"] = ""
+os.environ["BROWSER_DEV_USER"] = ""
+os.environ["LOG_FILE"] = ""
 
 from app.db import engine  # noqa: E402
 from app.main import app  # noqa: E402

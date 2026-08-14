@@ -33,6 +33,17 @@ Three rules fix it:
    That is never intentional, and it is the one mistake with unrecoverable
    consequences.
 
+A fourth rule, learned the hard way while writing this: take *only* the database
+target from the environment, and pin every other setting your app reads. Once
+your suite honours `.env` it honours all of it, and a `.env` is developer
+convenience — dev auth bypasses, debug flags, log paths. In quarterback's case
+`.env.example` sets a browser dev-user that authenticates every request, which
+turned the test asserting an endpoint returns 401 into one that opened a live
+event stream and hung until killed. Pin them:
+
+    os.environ["API_TOKENS"] = "…"      # what the assertions expect
+    os.environ["BROWSER_DEV_USER"] = ""  # no auth bypass during tests
+
 Adapt: change DEV_FALLBACK_URL and the variable name if yours isn't
 DATABASE_URL. If your suite writes to more than one store, apply the same three
 rules to each (a shared Redis or Elasticsearch index is the usual second one).
