@@ -36,6 +36,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from harness_rules import RepoNotFound, describe, resolve_repo  # noqa: E402
+from panel import stderr_gist  # noqa: E402
 
 PANEL = Path(__file__).with_name("panel.py")
 # State must live OUTSIDE the script dir for the same reason (the store is read-only).
@@ -389,7 +390,14 @@ def triage(w: IssueWork, model: str) -> tuple[bool | None, str, str]:
         return None, "untriaged (judge error)", ""
     m = re.search(r"\{.*\}", proc.stdout or "", re.S)
     if not m:
-        return None, "untriaged (no verdict)", ""
+        # Same failure as panel.run_cli's: the judge CLI can exit 0 having printed
+        # nothing (a tool permission headless mode auto-denied, an unusable model
+        # pin) and say why on stderr. This used to report a bare "no verdict",
+        # which is true and unactionable — and it silently skips the sub-issue on
+        # --execute, so the one line the operator gets has to name the cause.
+        why = stderr_gist(proc.stderr or "", limit=120) or (
+            f"exited {proc.returncode}" if proc.returncode else "")
+        return None, f"untriaged (no verdict{f': {why}' if why else ''})", ""
     try:
         v = json.loads(m.group(0))
     except json.JSONDecodeError:

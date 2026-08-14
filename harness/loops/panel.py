@@ -340,7 +340,28 @@ def run_cli(args: list[str], label: str, timeout: int = 600,
     tail / OSError) so callers can SURFACE why a step degraded instead of
     reporting a bare 'unavailable'. A request the server has REJECTED on its
     merits is not retried either: a bad model pin fails identically all three
-    times, so retrying only triples the wait for a certainty."""
+    times, so retrying only triples the wait for a certainty.
+
+    **A zero exit with no output is a failure, not an empty review.** Headless
+    CLIs exit 0 while producing nothing — `agy` does it when a tool needs a
+    permission headless mode cannot prompt for, so it is auto-denied — and
+    "reviewed, found nothing" and "produced nothing" are opposite claims that a
+    bare `""` cannot tell apart. Returned as success it becomes a reviewer that
+    appears in the report as having run, contributes no findings, weakens the
+    ⋆consensus signal with no explanation, and feeds the board's reviewer
+    leaderboard a false zero — the one datum a reviewer comparison must be able
+    to trust. So callers may rely on the invariant that a non-None stdout has
+    non-whitespace content.
+
+    Stderr is read on a ZERO exit too, for the same run. The CLI has usually
+    already diagnosed itself there ("a tool required the \"command\" permission
+    … add an allow-rule under permissions.allow"), and gating that read on a
+    non-zero exit discarded it on exactly the runs that needed it most. It is
+    read only when stdout is empty: a CLI that produced its findings AND chattered
+    on stderr succeeded, and reporting its warm-up noise would be the opposite
+    error. Empty output IS retried — unlike a rejection it is not self-evidently
+    deterministic, and losing a whole reviewer to one blank reply costs the panel
+    more than two extra fast-failing attempts."""
     last = f"{label}: no attempt made"
     for _ in range(max(1, attempts)):
         try:
@@ -356,6 +377,10 @@ def run_cli(args: list[str], label: str, timeout: int = 600,
             last = f"{label}: exited {proc.returncode}" + (f" ({msg})" if msg else "")
             if is_rejection(proc.stderr or ""):
                 return None, last
+            continue
+        if not (proc.stdout or "").strip():
+            msg = stderr_gist(proc.stderr or "")
+            last = f"{label}: exited 0 but produced no output" + (f" ({msg})" if msg else "")
             continue
         return proc.stdout, None
     return None, last
@@ -572,16 +597,16 @@ def review_llm(cmd_name: str, model: str, prompt: str,
         # Unparseable JSON — give the reviewer one more shot (a common flake is a
         # stray prose preamble the model omits on a retry), then, rather than drop
         # its work, keep the raw reply as a single markdown finding for the judge.
+        # There is no empty-output case to guard here: run_cli only returns stdout
+        # with non-whitespace content, so "produced nothing" has already come back
+        # as a skip reason naming the cause, rather than as a blank raw finding.
         out2, err2 = run_cli(args, label, attempts=1)
         if not err2 and out2:
             retried = parse_findings(cmd_name, out2)
             if retried is not None:
                 return retried, None, elapsed()
             out = out2
-        text = (out or "").strip()
-        if not text:
-            return [], f"{label}: no parseable findings and empty output", elapsed()
-        return [_raw_finding(cmd_name, text)], None, elapsed()
+        return [_raw_finding(cmd_name, (out or "").strip())], None, elapsed()
     return findings, None, elapsed()
 
 
@@ -976,9 +1001,10 @@ def judge(groups: list[tuple[Finding, list[str]]], diff: str, model: str,
     """The 'master' adjudicates each finding on its merits. Returns
     (verdicts, skip_reason). skip_reason is None when the judge ran successfully
     (even if it dismissed nothing); otherwise it explains WHY the judge could not
-    rule — CLI absent, timeout, crash, or unparseable output — so the caller can
-    surface it rather than silently reporting a bare 'unavailable'. A real bug
-    from a single reviewer is confirmed; only genuine false positives are dropped
+    rule — CLI absent, timeout, crash, a zero exit that produced no output, or
+    output with no JSON verdict in it — so the caller can surface it rather than
+    silently reporting a bare 'unavailable'. A real bug from a single reviewer is
+    confirmed; only genuine false positives are dropped
     (style and polish are kept). When the judge can't rule, the caller keeps everything (we never
     silently suppress a finding). No findings -> ({}, None): nothing to judge."""
     if not groups:

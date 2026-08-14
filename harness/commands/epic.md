@@ -71,7 +71,10 @@ branch is cut off this base; in multi mode each sub-PR targets it directly. Merg
 trunk stays a human step regardless.
 
 3. The **master triages each sub-issue for doability** — issues an agent can't actually do (e.g.
-   "obtain a content licence") are flagged `blocked` and skipped, not implemented.
+   "obtain a content licence") are flagged `blocked` and skipped, not implemented. A judge that
+   could not rule at all reports `untriaged (no verdict: …)` quoting what the CLI said on stderr
+   (a denied tool permission, an unusable model pin). Untriaged issues are skipped on `--execute`
+   as well, so that reason is the only account of why one was passed over.
 4. If the user asked to `--execute`: this **creates branches/worktrees, runs `/fix-issue` +
    `/review-pr`, and opens PRs**. It is gated on `loops.issue_executor` in the repo's `.harness-rules` and uses
    `headless_permission_mode`. **Confirm with the user and check prerequisites first**, then run

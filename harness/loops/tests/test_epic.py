@@ -219,3 +219,34 @@ def test_clamp_model_over_ceiling_falls_to_ceiling():
     assert epic.clamp_model("sonnet", "opus") == "sonnet"
     assert epic.clamp_model("", "opus") == "opus"
     assert epic.clamp_model("opus", "unrecognised") == ""
+
+
+# --------------------------------------------------------------- triage verdicts
+# (_fake_gh fakes any subprocess.run, the triage judge included)
+
+def test_triage_no_verdict_names_what_stderr_said(monkeypatch):
+    """The judge CLI can exit 0 having printed nothing, and explain itself on
+    stderr. `doable=None` skips the sub-issue on --execute, so this one line is
+    the operator's only account of why — "no verdict" alone is unactionable."""
+    monkeypatch.setattr(epic.shutil, "which", lambda _: "/usr/bin/claude")
+    _fake_gh(monkeypatch, stdout="", stderr="a tool required the \"command\" "
+             "permission that headless mode cannot prompt for, so it was auto-denied")
+    doable, reason, impl = epic.triage(mk(1), "opus")
+    assert doable is None and impl == ""
+    assert "no verdict" in reason and "auto-denied" in reason
+
+
+def test_triage_no_verdict_falls_back_to_the_exit_code(monkeypatch):
+    """A crash with nothing on stderr still beats a bare "no verdict"."""
+    monkeypatch.setattr(epic.shutil, "which", lambda _: "/usr/bin/claude")
+    _fake_gh(monkeypatch, stdout="", stderr="", rc=2)
+    _doable, reason, _impl = epic.triage(mk(1), "opus")
+    assert "exited 2" in reason
+
+
+def test_triage_reads_a_real_verdict_unchanged(monkeypatch):
+    monkeypatch.setattr(epic.shutil, "which", lambda _: "/usr/bin/claude")
+    _fake_gh(monkeypatch, stdout=json.dumps(
+        {"doable": True, "reason": "self-contained", "model": "sonnet"}),
+        stderr="loaded 3 plugins")
+    assert epic.triage(mk(1), "opus") == (True, "self-contained", "sonnet")

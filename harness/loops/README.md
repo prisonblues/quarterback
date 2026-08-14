@@ -192,6 +192,15 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   a filter. Only clear false positives are dismissed, with a recorded reason. If no
   judge is available, nothing is suppressed.
 - Reviewers whose prerequisites are missing are reported **SKIPPED**, not failed.
+- **A reviewer that produces nothing is skipped, never counted as an empty review.**
+  Headless CLIs exit `0` having printed nothing — `agy` does it when a tool needs a
+  permission headless mode cannot prompt for, so it is auto-denied — and "found
+  nothing" and "produced nothing" are opposite claims. Both the panel members and
+  the master treat a zero exit with empty stdout as a failure, and read the CLI's
+  own stderr (which usually names the cause and the fix, e.g. the `permissions.allow`
+  rule to add) into the skip line. Otherwise a dead reviewer reads as a live one:
+  `⋆consensus` weakens with no explanation and the board's reviewer leaderboard is
+  fed a false zero.
 - **The `/panel` skill (default = fix)** consumes `--json`, checks out the PR branch in
   an isolated worktree, fixes confirmed findings, runs lint + unit tests (**aborts the
   commit on failure**), makes one commit, pushes, and comments the summary.
