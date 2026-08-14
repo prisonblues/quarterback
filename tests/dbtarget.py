@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from urllib.parse import urlsplit
 
 #: Last-resort target when nothing is configured: the compose Postgres from
 #: README's Development section. Only correct in the main checkout — a worktree
@@ -48,6 +49,22 @@ def env_file_value(var: str, env_file: Path) -> str | None:
 def database_name(url: str) -> str:
     """The database a SQLAlchemy/libpq URL points at ('…:5435/foo?x=1' -> 'foo')."""
     return url.rsplit("/", 1)[-1].split("?", 1)[0]
+
+
+def endpoint(url: str) -> tuple[str | None, int | None, str]:
+    """(host, port, database) — what actually identifies one database.
+
+    Credentials are excluded deliberately: two URLs differing only in user or
+    password address the same data, and comparing the name alone would refuse a
+    genuinely separate database that happens to share a name on another host.
+    """
+    parts = urlsplit(url)
+    return parts.hostname, parts.port, database_name(url)
+
+
+def redact(url: str) -> str:
+    """The URL with any password starred out, for printing."""
+    return re.sub(r"(://[^:/@]+):[^@]*@", r"\1:***@", url)
 
 
 def main_checkout(checkout: Path) -> Path | None:
@@ -97,18 +114,22 @@ def isolation_error(url: str, checkout: Path) -> str | None:
     main = main_checkout(checkout)
     if main is None:
         return None  # main checkout: its dev database is its own to rebuild
-    main_url = env_file_value("DATABASE_URL", main / ".env")
-    main_db = database_name(main_url) if main_url else database_name(DEV_FALLBACK_URL)
-    if database_name(url) != main_db:
+    main_url = env_file_value("DATABASE_URL", main / ".env") or DEV_FALLBACK_URL
+    if endpoint(url) != endpoint(main_url):
         return None
+    main_db = database_name(main_url)
+    # Suggest a scratch database on the same server, derived from the main URL
+    # so the hint is right for whatever server this actually is — redacted,
+    # because a refusal message ends up in terminal scrollback and CI logs.
+    scratch = f"{redact(main_url).rsplit('/', 1)[0]}/{main_db}_scratch"
     return (
         f"refusing to run: this worktree ({checkout}) would rebuild the main "
         f"checkout's database '{main_db}', destroying its data.\n"
-        f"  target: {url}\n"
+        f"  target: {redact(url)}\n"
         f"  The worktree's .env should name its own database — create-worktree "
         f"writes one when the repo has a .worktree.json with a `database` block "
         f"and the main checkout has a .env.\n"
-        f"  Fix that .env, or pin a scratch database for this run:\n"
-        f"    DATABASE_URL=postgresql+asyncpg://quarterback:quarterback@localhost:5435/"
-        f"{main_db}_scratch pytest"
+        f"  Fix that .env, or pin a scratch database for this run (put the real "
+        f"password back in):\n"
+        f"    DATABASE_URL={scratch} pytest"
     )

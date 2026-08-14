@@ -12,9 +12,11 @@ from pathlib import Path
 from .dbtarget import (
     DEV_FALLBACK_URL,
     database_name,
+    endpoint,
     env_file_value,
     isolation_error,
     main_checkout,
+    redact,
     resolve_database_url,
 )
 
@@ -111,6 +113,37 @@ def test_main_checkout_may_rebuild_its_own_database(tmp_path):
     # checkout's to rebuild, and refusing there would block the normal run.
     main = _main_repo(tmp_path)
     assert isolation_error(MAIN_URL, main) is None
+
+
+def test_same_name_on_another_server_is_a_different_database(tmp_path):
+    # Refusing this would block a legitimate run: same name, different host or
+    # port means different data.
+    main = _main_repo(tmp_path)
+    wt = _worktree(tmp_path, main)
+    other_host = "postgresql+asyncpg://quarterback:quarterback@db.internal:5435/quarterback"
+    other_port = "postgresql+asyncpg://quarterback:quarterback@localhost:5999/quarterback"
+    assert isolation_error(other_host, wt) is None
+    assert isolation_error(other_port, wt) is None
+    # …but different credentials on the same server are the same database.
+    same_db = "postgresql+asyncpg://admin:hunter2@localhost:5435/quarterback"
+    assert isolation_error(same_db, wt) is not None
+
+
+def test_endpoint_identifies_a_database_without_its_credentials():
+    assert endpoint(MAIN_URL) == ("localhost", 5435, "quarterback")
+    assert endpoint("postgresql://admin:pw@localhost:5435/quarterback") == endpoint(MAIN_URL)
+
+
+def test_refusal_does_not_print_the_password(tmp_path):
+    main = _main_repo(tmp_path)
+    wt = _worktree(tmp_path, main, env=MAIN_URL)
+    problem = isolation_error(MAIN_URL, wt)
+    assert "quarterback:quarterback@" not in problem
+    assert ":***@" in problem
+
+
+def test_redact_leaves_a_credential_free_url_alone():
+    assert redact("postgresql://localhost:5435/db") == "postgresql://localhost:5435/db"
 
 
 def test_guard_uses_the_main_env_not_a_hardcoded_name(tmp_path):

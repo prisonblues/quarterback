@@ -54,6 +54,7 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path
+from urllib.parse import urlsplit
 
 # Last-resort target when nothing is configured. Correct only in the main
 # checkout — a worktree that reaches this fallback is misconfigured, and the
@@ -84,6 +85,22 @@ def env_file_value(var: str, env_file: Path) -> str | None:
 def database_name(url: str) -> str:
     """The database a connection URL points at ('…:5432/foo?ssl=1' -> 'foo')."""
     return url.rsplit("/", 1)[-1].split("?", 1)[0]
+
+
+def endpoint(url: str) -> tuple[str | None, int | None, str]:
+    """(host, port, database) — what actually identifies one database.
+
+    Credentials excluded on purpose: two URLs differing only in user or password
+    address the same data, while comparing the name alone would refuse a
+    genuinely separate database that happens to share a name on another host.
+    """
+    parts = urlsplit(url)
+    return parts.hostname, parts.port, database_name(url)
+
+
+def redact(url: str) -> str:
+    """The URL with any password starred out, for printing."""
+    return re.sub(r"(://[^:/@]+):[^@]*@", r"\1:***@", url)
 
 
 def main_checkout(checkout: Path) -> Path | None:
@@ -121,18 +138,22 @@ def isolation_error(url: str, checkout: Path) -> str | None:
     main = main_checkout(checkout)
     if main is None:
         return None  # main checkout: its dev database is its own to rebuild
-    main_url = env_file_value(ENV_VAR, main / ".env")
-    main_db = database_name(main_url) if main_url else database_name(DEV_FALLBACK_URL)
-    if database_name(url) != main_db:
+    main_url = env_file_value(ENV_VAR, main / ".env") or DEV_FALLBACK_URL
+    if endpoint(url) != endpoint(main_url):
         return None
+    main_db = database_name(main_url)
+    # Derived from the main URL so the hint fits this server, and redacted
+    # because refusal messages land in terminal scrollback and CI logs.
+    scratch = f"{redact(main_url).rsplit('/', 1)[0]}/{main_db}_scratch"
     return (
         f"refusing to run: this worktree ({checkout}) would rebuild the main "
         f"checkout's database '{main_db}', destroying its data.\n"
-        f"  target: {url}\n"
+        f"  target: {redact(url)}\n"
         f"  Expected the worktree's .env to name its own database. Check that the "
         f"repo has a .worktree.json with a `database` block and that the main "
-        f"checkout has a .env, then re-provision — or pin a scratch database:\n"
-        f"    {ENV_VAR}=…/{main_db}_scratch pytest"
+        f"checkout has a .env, then re-provision — or pin a scratch database "
+        f"(with the real password):\n"
+        f"    {ENV_VAR}={scratch} pytest"
     )
 
 
