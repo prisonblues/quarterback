@@ -135,6 +135,19 @@ class ReviewReviewer(Base):
     #: Confirmed findings no other panel member raised — the marginal value of
     #: keeping this reviewer on the panel, which a raw count can't show.
     solo: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    #: Findings (any verdict) at least one other member also reported. With
+    #: ``raised`` this is the consensus rate: a member that agrees with everyone
+    #: and a member that only ever reports alone are different propositions even
+    #: at the same precision.
+    shared: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+
+    #: Severity calibration against the judge, over confirmed findings where the
+    #: member sent its own severity (``reported_by[].severity``). "Stricter" =
+    #: the member rated it more severe than the judge settled on. A reviewer that
+    #: is right but always cries P1 costs triage time, which precision can't say.
+    sev_stricter: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    sev_agree: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    sev_looser: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
 
     p1: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     p2: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
@@ -148,10 +161,15 @@ class ReviewReviewer(Base):
 
 
 class ReviewFinding(Base):
-    """One deduped finding from a run, with the judge's verdict on it.
+    """One merged finding from a run, with the judge's verdict on it.
 
     Stored per run (not per PR): the same defect found again after a fix loop is
-    a new observation, and collapsing the two would erase the fix.
+    a new observation, and collapsing the two would erase the fix. ``key`` is
+    what links those observations without collapsing them — see below.
+
+    ``title``/``detail`` are the judge's synthesis of the group. What each
+    reviewer actually said lives in :class:`ReviewFindingReport`, one row per
+    reporter, so a merge is additive rather than a survivor of a coin toss.
     """
 
     __tablename__ = "review_findings"
@@ -169,6 +187,19 @@ class ReviewFinding(Base):
     detail: Mapped[str | None] = mapped_column(Text)
     reason: Mapped[str | None] = mapped_column(Text)  # the judge's rationale
 
+    #: Identity of the *defect*, so two observations of it can be joined without
+    #: being merged: "was this actually fixed?" and "how many rounds did this PR
+    #: take?" are then queries. Scoped by the run's (repo, pr) at read time, so
+    #: the same key in another repo is a different chain. Client-supplied when
+    #: the panel has a stable id of its own; otherwise derived from file + a
+    #: normalised title, deliberately *without* the line — a line number moves
+    #: when the fix above it lands, and an identity that moves links nothing.
+    finding_key: Mapped[str] = mapped_column(Text, nullable=False)
+    #: Other findings in the same run that share a cause and should be fixed
+    #: together, as their ``finding_key``s. A decision spread over four files is
+    #: not one finding, but it is one fix — no positional rule can say that.
+    related: Mapped[list[Any] | None] = mapped_column(JSONB)
+
     reviewers: Mapped[list[Any] | None] = mapped_column(JSONB)  # ["codex", "gemini"]
     #: Denormalised len(reviewers) so consensus/solo queries don't unnest JSONB.
     n_reviewers: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
@@ -176,4 +207,38 @@ class ReviewFinding(Base):
     __table_args__ = (
         Index("ix_review_findings_run", "run_id"),
         Index("ix_review_findings_verdict", "verdict"),
+        Index("ix_review_findings_key", "finding_key"),
+    )
+
+
+class ReviewFindingReport(Base):
+    """What one reviewer actually said about one finding — verbatim.
+
+    The panel used to merge before the judge and keep a single representative's
+    text, so two models describing the same bug from different angles left one
+    description on the floor. This is where the other accounts live: merging
+    becomes additive, the synthesis is new and the originals ride along, and a
+    human can audit whether the merge was right.
+
+    It also turns attribution into a stored fact rather than an inference.
+    ``severity``/``line`` are *this reviewer's own*, which differ from the
+    judge's and are the raw material for calibration stats; "confirmed findings
+    where pi was the sole reporter" becomes a join rather than a JSONB unnest.
+    """
+
+    __tablename__ = "review_finding_reports"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    finding_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("review_findings.id", ondelete="CASCADE"), nullable=False
+    )
+    reviewer: Mapped[str] = mapped_column(Text, nullable=False)
+    severity: Mapped[str | None] = mapped_column(Text)  # what this reviewer called it
+    line: Mapped[int | None] = mapped_column(Integer)  # where this reviewer put it
+    account: Mapped[str | None] = mapped_column(Text)  # verbatim, never rewritten
+
+    __table_args__ = (
+        UniqueConstraint("finding_id", "reviewer", name="uq_review_report_finding_reviewer"),
+        Index("ix_review_finding_reports_finding", "finding_id"),
+        Index("ix_review_finding_reports_reviewer", "reviewer"),
     )
