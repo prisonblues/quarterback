@@ -182,6 +182,13 @@ also prints the target in the pytest header, so which database is about to be de
 something you read rather than deduce. quarterback runs this as `tests/dbtarget.py`, with
 `tests/test_dbtarget.py` covering the precedence rules and the guard.
 
+One consequence to plan for: once the suite honours `.env` it honours *all* of it, and a
+`.env` is developer convenience — dev auth bypasses, debug flags, log paths. Take only the
+database target from the environment and pin everything else in `conftest.py`. Doing this to
+quarterback surfaced it immediately: `.env.example` sets a browser dev-user that
+authenticates every request, which turned "this endpoint 401s without auth" into a test that
+opened a live event stream and hung until killed.
+
 ### Checking it actually worked
 
 ```bash
