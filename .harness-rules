@@ -1,0 +1,40 @@
+{
+  "_": "Agent harness rules for this repo. Read by ~/.claude/loops/*, whose source lives in harness/loops/ HERE — so this file doubles as the worked example the harness README describes. Everything is optional; omitted keys fall back to harness_rules.py DEFAULTS, which are the safe end of every switch. path/github/default_branch are NOT settable — they are detected from the checkout.",
+
+  "reviewers": {
+    "_": "claude stays on the default `opus`, a floating alias that always resolves to the current model and so cannot rot. The other three are pinned, because their slugs are versioned build names.",
+
+    "codex": {
+      "model": "gpt-5.6-luna",
+      "effort": "max",
+      "_": "Pinned rather than left on the CLI's own default, which is whatever that install happens to ship and therefore differs between boxes — the panel is a controlled comparison, and an unpinned seat makes 'codex found more than claude' unattributable to a model.",
+      "_effort": "luna accepts low|medium|high|xhigh|max but NOT ultra, so `max` is the top of its range. Spelled `model_reasoning_effort` via `-c` on this CLI, `--thinking` on pi — same config key here, different word there.",
+      "_precondition": "Needs codex >= 0.144; an older CLI is refused by the API with a 400 'requires a newer version of Codex'. That failure is loud rather than silent — `is_rejection` short-circuits the retries and the report names the model that was refused — so a rotted pin costs a reviewer visibly. Verified 2026-08-15 on codex-cli 0.147.0: the exact panel argv (`codex exec … --model gpt-5.6-luna -c model_reasoning_effort=max`) returned a well-formed findings array at exit 0."
+    },
+
+    "antigravity": {
+      "enabled": true,
+      "model": "gemini-3.7-flash-high",
+      "_": "Third vendor. Off by default because `agy` is a workstation package authenticating against a personal Google account, so it never reaches a headless box. That needs no switch here: panel.py skips any reviewer whose CLI is not on PATH, and such a host records `antigravity: CLI absent` and runs the panel without it. Host scope is enforced by where the package lives.",
+      "_model": "Pinned to a slug `agy models` actually lists, and confirmed by RUNNING it — 2026-08-15, the exact panel argv (`agy --mode plan -p … --model gemini-3.7-flash-high`) returned a well-formed findings array at exit 0. Name resolution, model availability and remaining quota are three different questions, and only a real run answers the last two.",
+      "_no_effort": "`effort` is deliberately unset. agy bakes the reasoning level into the slug — `agy models` lists gemini-3.7-flash-high / -medium / -low as three separate models — so an `--effort` on top would be a second, conflicting knob for the same thing.",
+      "_not_gemini_cli": "This is `agy` (Antigravity), NOT gemini-cli: a different CLI on a different endpoint. lexray dropped `gemini-3.7-flash` from its gemini-cli seat because every call 429'd on an exhausted free-tier bucket shared with 3.5. That finding does not transfer to this seat, and the control run above is what says so rather than the assumption."
+    },
+
+    "pi": {
+      "enabled": true,
+      "model": "openrouter/moonshotai/kimi-k3",
+      "effort": "high",
+      "_": "Fourth vendor, and the only member reaching outside the three US frontier labs — claude, codex and antigravity are trained similarly enough to agree for the same reasons, so Kimi is the one seat that can disagree for a different one. That is the whole point of a diverse panel.",
+      "_model": "Fully qualified because pi fronts many providers and openrouter is the only one authenticated here (`pi auth check --provider openrouter` -> ready, 2026-08-15). A bare slug would be sent to an unauthenticated default. Verified with the exact panel argv, same run as above.",
+      "_effort": "Maps to pi's `--thinking`, whose set (off|minimal|low|medium|high|xhigh|max) is NOT codex's — see EFFORTS in panel.py. Same config key, different word on each CLI.",
+      "_cost": "The only METERED member: the other three ride subscriptions, this one bills per token through OpenRouter. It is the seat to look at first if the OpenRouter bill surprises you.",
+      "_hosts": "Same story as antigravity — `pi` is a workstation package, and a box without it records `pi: CLI absent` rather than failing the panel."
+    },
+
+    "sonarqube": {
+      "enabled": false,
+      "_": "No SonarCloud project covers this repo, so the panel runs with no hard gate and every finding is a soft one judged on its merits. Stated explicitly rather than omitted: the default is off too, but a reader of this file should not have to guess whether the absence was a decision or an oversight."
+    }
+  }
+}
