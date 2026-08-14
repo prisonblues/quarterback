@@ -7,6 +7,34 @@ that number where it was, so the repo can be a version ahead of the service.
 Entries are newest first. Each one says what was broken or missing before it, because that is the
 part that isn't recoverable from the diff.
 
+## v2.14 — the panel merges once, in the judge, without losing what anyone said
+
+v2.11 gave the board somewhere to put each reviewer's own account of a finding, and nothing to put
+there: the panel still merged upstream of its judge, and that merge kept `min(grp, key=severity)`
+and discarded every other reviewer's text. So the leaderboard's consensus and unique-catch columns
+were wrong at source, and a re-review of the same PR produced findings that joined no chain.
+
+The merge now happens in the judge, which is the only step that reads every account and can write a
+new one. It is shown one entry per *reviewer*, merges the entries that are one defect, and returns a
+`synthesis` — with every original riding along verbatim in `reported_by`, its reporter's own severity
+and line intact. Additive, so nothing has to be thrown away to merge; and separate defects that share
+a cause are linked with `related` rather than merged, so a decision spread over four files is fixed
+once. `panel.py --json` and the board record are that same canonical list, so the fix loop consumes
+merged findings instead of collapsing an over-counted one by hand (29 rows into 15, on the run that
+prompted this).
+
+Dedup before the judge was also leaky in both directions — `line // 10` is a grid, not a window, so
+lines 39 and 41 landed in different buckets while 40 and 49 shared one, and `Path(file).name` merged
+same-named files from different directories. It survives only as a *hint* to the judge, now keyed on
+the full path with a real ±10 window. The duplicates that actually recur are semantic (one defect,
+two line numbers cited), which no line arithmetic finds — which is why the ruling belongs to the
+judge and not to the key.
+
+`--json` also stops printing its two-line progress preamble to stdout; that goes to stderr, so the
+payload is parseable without stripping it first.
+
+No board change: `POST /review` has accepted this shape since v2.11, and the API stays at v2.12.
+
 ## v2.13 — the harness ships with the board
 
 The loops and worktree tooling that produce the board's data lived in a personal NixOS config,

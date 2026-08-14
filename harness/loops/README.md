@@ -178,24 +178,37 @@ cwd's repo; `--repo` takes a path or a name under `~/source`.
 ## Reviewer panel (`panel.py`)
 
 `python3 ~/.claude/loops/panel.py --pr <n>` (report) / `--post` (also comment on the
-PR) / `--json` (findings as JSON, no report).
+PR) / `--json` (the run as JSON on stdout — nothing else, progress goes to stderr).
 
 Read-only, so it runs in **any** repo — an unconfigured one just uses the defaults.
 
 - Runs the repo's **enabled** reviewers in parallel over the PR diff: SonarQube (HARD
   quality-gate pass/fail), Claude (SOFT, read-only), Codex (SOFT, different vendor).
-- **Skip patterns:** PRs matching `skip_title_patterns` are skipped entirely.
-  Otherwise all enabled reviewers run — no diff-size de-minimis.
-- **Master judgment, no consensus gate:** findings are deduped (file + nearby line)
-  then a master reviewer judges each on its merits. A real defect flagged by only ONE
-  reviewer is still fixed — agreement shows as a `⋆consensus` confidence marker, never
-  a filter. Only clear false positives are dismissed, with a recorded reason. If no
-  judge is available, nothing is suppressed.
+- **Skip patterns:** PRs matching `skip_title_patterns` are skipped entirely (under
+  `--json` that is still a payload, marked `reviewed: false` — an empty stdout would
+  read as a clean PR). Otherwise all enabled reviewers run — no diff-size de-minimis.
+- **Master judgment, no consensus gate:** a master reviewer judges every finding on
+  its merits. A real defect flagged by only ONE reviewer is still fixed — agreement
+  shows as a `⋆consensus` confidence marker, never a filter. Only clear false
+  positives are dismissed, with a recorded reason. If no judge is available, nothing
+  is suppressed.
+- **Merging happens once, in the judge, and adds rather than replaces.** The judge
+  sees one entry per *reviewer*, merges the entries that are the same defect, and
+  writes a `synthesis`; each reviewer's own account, severity and line ride along
+  verbatim in `reported_by`. Dedup upstream of the judge could only keep one
+  reviewer's text and discard the rest — so the point only one reviewer made
+  survived exactly when the merge *failed*, and a better key made the loss worse.
+  Findings are pre-clustered by file and adjacent lines purely as a **hint**; the
+  duplicates that matter are semantic (one defect, two line numbers), which no line
+  arithmetic finds. Separate defects sharing one cause are linked with `related`
+  instead of merged, so the fixer decides once.
 - Reviewers whose prerequisites are missing are reported **SKIPPED**, not failed.
 - **The `/panel` skill (default = fix)** consumes `--json`, checks out the PR branch in
   an isolated worktree, fixes confirmed findings, runs lint + unit tests (**aborts the
   commit on failure**), makes one commit, pushes, and comments the summary.
   `panel.py` itself stays read-only — the fix/verify/commit lives in the skill.
+  The fixer consumes findings already merged, each carrying every reviewer's account,
+  rather than collapsing an over-counted list by hand as it used to.
 
 ## Epic driver (`epic.py`)
 
