@@ -1,0 +1,45 @@
+{
+  "_comment": [
+    "POSTGRES, NO CONTAINERS — each worktree gets its own copy of the database;",
+    "the app is run directly (uvicorn/gunicorn/manage.py) on the assigned port.",
+    "This is quarterback's own shape; see the repo root .worktree.json.",
+    "",
+    "Choose this over the docker template when your compose file is tracked in",
+    "git: the Docker path WRITES a generated docker-compose.yml into the worktree,",
+    "which would leave every worktree dirty and invite committing it.",
+    "",
+    "PREREQUISITE: a .env in the main checkout holding url_env (DATABASE_URL).",
+    "create-worktree copies that file into the worktree and rewrites the database",
+    "name in it. No .env, no isolation — it cannot invent your credentials.",
+    "",
+    "container 'auto' resolves whichever running Postgres answers as the URL's",
+    "user, so it survives being cloned into a differently-named directory. Pin a",
+    "name instead if several of your stacks share one username.",
+    "",
+    "Then make your TEST SUITE honour that .env — see conftest-db-isolation.py",
+    "here. A suite that hardcodes its database URL will cheerfully rebuild the",
+    "shared one while the isolated copy sits unused."
+  ],
+
+  "project": "myapp",
+  "framework": "fastapi",
+
+  "base_port": 5690,
+  "app_port": 8000,
+
+  "docker": {
+    "enabled": false
+  },
+
+  "database": {
+    "engine": "postgresql",
+    "container": "auto",
+    "url_env": "DATABASE_URL"
+  },
+
+  "symlinks": [".venv"],
+
+  "workspace": {
+    "enabled": false
+  }
+}

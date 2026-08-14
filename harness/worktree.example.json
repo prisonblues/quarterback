@@ -1,10 +1,17 @@
 {
   "_comment": [
-    "Copy this to .worktree.json in your repo root and edit. Every key is",
-    "optional — create-worktree auto-detects Docker, nginx and the database,",
-    "and skips whatever it cannot find. A repo with no Dockerfile gets just a",
-    "worktree plus symlinks. The values below describe quarterback itself, as",
-    "a worked example."
+    "REFERENCE — every key the script reads, in one file, so you can see what",
+    "is available. To start a repo off, copy the closest file from templates/",
+    "instead; this one turns everything on at once.",
+    "",
+    "Every key is optional — create-worktree auto-detects Docker, nginx and the",
+    "database, and skips whatever it cannot find. A repo with no Dockerfile gets",
+    "just a worktree plus symlinks.",
+    "",
+    "The values below are quarterback's, but note that quarterback's real",
+    ".worktree.json (repo root) sets docker.enabled=false and does not pin the",
+    "Postgres container — because its docker-compose.yml is tracked in git and",
+    "the Docker path would overwrite it. Read that file too."
   ],
 
   "project": "quarterback",

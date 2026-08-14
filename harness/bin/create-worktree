@@ -1107,7 +1107,13 @@ if [[ "$SKIP_DOCKER" = false ]]; then
         NETWORK_NAME="$NETWORK_DEFAULT"
         echo -e "  ${GREEN}$NETWORK_NAME${NC}"
     else
-        NETWORK_NAME=$(grep -iE "$NETWORK_PATTERN" <<<"$DOCKER_NETWORKS" | head -1)
+        # `|| true` because a no-match grep exits 1, and under `set -o pipefail`
+        # that failure propagates out of the assignment and `set -e` kills the
+        # whole script — mid-run, after the worktree exists, with no message and
+        # the fallback three lines below never reached. Every step after this one
+        # (Docker, nginx, .gitignore, quieting git) was silently skipped whenever
+        # the repo's network wasn't up or its pattern didn't match.
+        NETWORK_NAME=$(grep -iE "$NETWORK_PATTERN" <<<"$DOCKER_NETWORKS" | head -1 || true)
         if [[ -z "$NETWORK_NAME" ]]; then
             NETWORK_NAME="$NETWORK_DEFAULT"
             echo -e "  ${YELLOW}Not found, using default: $NETWORK_NAME${NC}"

@@ -130,8 +130,18 @@ hand-rolling `docker rm` / `dropdb` / `rm -rf` is not.
 
 Drop a `.worktree.json` in your repo root. Every key is optional — Docker, nginx and the
 database are auto-detected, and anything absent is skipped, so a plain library repo gets a
-worktree and symlinks and nothing else. See `worktree.example.json`, which is filled in with
-quarterback's own values.
+worktree and symlinks and nothing else.
+
+Copy the closest template from `templates/` and edit `project`:
+
+| Template | What you get | Pick it when |
+|---|---|---|
+| `minimal.worktree.json` | Worktree, symlinks, port | No database, or one you're happy to share |
+| `postgres-no-docker.worktree.json` | The above + an isolated database copy | Your `docker-compose.yml` is tracked in git, or you run the app directly |
+| `postgres-docker-nginx.worktree.json` | The above + per-worktree containers behind an nginx sub-path | Compose is untracked and you want each branch reachable at a URL |
+
+`worktree.example.json` documents every key in one annotated file; quarterback's own
+`.worktree.json` (repo root) is the live worked example of the middle row.
 
 Keys the script reads: `project`, `framework`, `base_port`, `app_port`,
 `docker.{enabled,network_pattern,network_default,image_pattern}`,
@@ -140,6 +150,47 @@ Keys the script reads: `project`, `framework`, `base_port`, `app_port`,
 `nginx.{config,container,main_port,resolver,extra_proxy_headers}`,
 `server.{workers_env,workers_default}`, `env.copy_from`, `workspace.{enabled,editor_cli}`,
 and the arrays `symlinks`, `copies`, `reserved_names`, `gitignore_additions`.
+
+### Two prerequisites for database isolation
+
+Both are easy to miss, and missing either gets you a worktree that *looks* isolated while
+running against shared data.
+
+**1. The main checkout needs a `.env`.** It is the file `create-worktree` copies into the
+worktree and then rewrites the database name in. There is nothing else for it to derive
+credentials from, so with no `.env` the DB step has nothing to copy and says so —
+`cp .env.example .env` is part of setting a repo up, not an optional nicety. (A repo that
+keeps its env elsewhere can point `env.copy_from` at that file instead.)
+
+**2. Your test suite must honour that `.env`.** This is the one that bites hardest, because
+provisioning succeeds and the damage happens later. A suite that decides its own database
+URL — the near-universal
+
+```python
+os.environ.setdefault("DATABASE_URL", "postgresql://…/myapp")   # the bug
+```
+
+overrides the worktree's isolated database, because config libraries that read `.env`
+(pydantic-settings, python-dotenv, django-environ) rank a real environment variable *above*
+the file. So the isolated copy sits unused while the suite drops and rebuilds the schema of
+the shared one. Nothing in the output mentions it.
+
+`templates/conftest-db-isolation.py` is a drop-in fix: resolve the URL once (explicit env
+var → the checkout's `.env` → fallback), assign it back so subprocesses like `alembic` agree,
+and refuse outright when a worktree is about to rebuild the main checkout's database. It
+also prints the target in the pytest header, so which database is about to be destroyed is
+something you read rather than deduce. quarterback runs this as `tests/dbtarget.py`, with
+`tests/test_dbtarget.py` covering the precedence rules and the guard.
+
+### Checking it actually worked
+
+```bash
+grep DATABASE_URL ../myapp-fix-issue-42/.env     # should name myapp_fix_issue_42, not myapp
+cd ../myapp-fix-issue-42 && pytest -q | head -3  # the header states the database
+```
+
+`create-worktree` also shouts if any `.env` var still equals the main database name after
+rewriting. If you see that warning, stop — a migration would hit shared data.
 
 ---
 

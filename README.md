@@ -261,22 +261,33 @@ imports = [ inputs.quarterback.homeManagerModules.default ];
 programs.quarterback-harness.enable = true;
 ```
 
+This repo's own `.worktree.json` is the worked example of the isolation half: a Postgres
+copy per worktree, Docker left off (the compose file here is tracked, and the Docker path
+writes its own), and `tests/dbtarget.py` making the test suite honour the worktree's
+database rather than rebuilding the shared one. `harness/templates/` has copyable versions
+of both for other repos.
+
 ## Development
 
 ```bash
 # One-time: local dev env
 uv venv --python 3.12 .venv && uv pip install -e '.[dev]'
 
+# One-time: local config. Also the file create-worktree copies into a new
+# worktree and repoints at that worktree's own database, so worktree DB
+# isolation depends on it existing.
+cp .env.example .env
+
 # Postgres for tests / local run (host port 5435)
 docker compose up -d postgres
 
-# Migrate + run the API locally
-export DATABASE_URL=postgresql+asyncpg://quarterback:quarterback@localhost:5435/quarterback
-export API_TOKENS=laptop:dev-laptop-token,server:dev-server-token
+# Migrate + run the API locally (.env supplies DATABASE_URL and API_TOKENS)
 .venv/bin/alembic upgrade head
 .venv/bin/uvicorn app.main:app --reload
 
-# Tests (integration — needs the postgres container up)
+# Tests (integration — needs the postgres container up). The suite rebuilds the
+# schema, so it DESTROYS every row in its target database; the run header names
+# that database. It's this checkout's .env, or DATABASE_URL=… to pin another.
 .venv/bin/pytest -q
 
 # Full stack in containers (app on host port 5681, migrations run on boot)
@@ -320,10 +331,13 @@ mcp/          FastMCP wrapper: whoami + board_* + lease/handoff/session + active
               + subagent_start/end + report_git/find_commit + publish/sync_status
               (gitctx.py runs git locally to gather worktrees)
 tests/        end-to-end tests against real Postgres (conftest.py shared fixtures)
+  dbtarget.py      which database the suite may rebuild; refuses a worktree
+                   pointed at the main checkout's data
 harness/      step 2 of the install — the workflow the board coordinates
   loops/           panel.py (reviewer panel), epic.py, lander.py, harness_rules.py
   commands/        Claude Code slash commands (/panel, /fix-issue, /wt, …)
   bin/             create-worktree, remove-worktree, prune-worktrees
+  templates/       copyable .worktree.json starting points + the conftest recipe
   package.nix      the derivation; hm-module.nix wires it into ~/.claude
 flake.nix     packages.harness, homeManagerModules.default, checks (runs the loops tests)
 ```
