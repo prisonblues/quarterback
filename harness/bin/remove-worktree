@@ -115,6 +115,21 @@ detect_nginx_container() {
     docker ps --format '{{.Names}}' 2>/dev/null | grep -iE 'nginx' | head -1
 }
 
+# Does <conf> hold a worktree block for exactly <create-name>? Kept identical to
+# create-worktree's copy: a substring match would answer "feat-a" with
+# "feat-abc"'s marker.
+nginx_block_present() {
+    awk -v want="$2" '
+        /# WORKTREE-START:/ {
+            line = $0
+            sub(/^.*# WORKTREE-START:/, "", line)
+            sub(/[ \t\r]+$/, "", line)
+            if (line == want) found = 1
+        }
+        END { exit !found }
+    ' "$1"
+}
+
 # ============================================
 # PARSE ARGUMENTS
 # ============================================
@@ -269,11 +284,22 @@ fi
 step "Removing nginx configuration..."
 if [[ -n "$NGINX_CONFIG" ]]; then
     NGINX_CONF_PATH="$MAIN_REPO/$NGINX_CONFIG"
-    if [[ -f "$NGINX_CONF_PATH" ]] && grep -q "# WORKTREE-START:$BRANCH_NAME" "$NGINX_CONF_PATH"; then
-        awk -v branch="$BRANCH_NAME" '
+    # SAFE_NAME, not BRANCH_NAME: create-worktree keys the markers (and the
+    # container the block proxies to) on the slash-free name. Exact match, so
+    # tearing down "feat-a" does not answer to "feat-abc"'s marker.
+    if [[ -f "$NGINX_CONF_PATH" ]] && nginx_block_present "$NGINX_CONF_PATH" "$SAFE_NAME"; then
+        awk -v branch="$SAFE_NAME" '
+        # Exact marker name, never a regex match on the whole line: `$0 ~ branch`
+        # let worktree "feat-a" strip the block belonging to "feat-abc", and any
+        # dot in a branch name matched as a wildcard.
+        function marker_name(line, kind) {
+            sub("^.*# WORKTREE-" kind ":", "", line)
+            sub(/[ \t\r]+$/, "", line)
+            return line
+        }
         BEGIN { skip = 0 }
-        /# WORKTREE-START:/ && $0 ~ branch { skip = 1; next }
-        /# WORKTREE-END:/ && $0 ~ branch { skip = 0; next }
+        /# WORKTREE-START:/ && marker_name($0, "START") == branch { skip = 1; next }
+        /# WORKTREE-END:/ && marker_name($0, "END") == branch { skip = 0; next }
         skip { next }
         { print }
         ' "$NGINX_CONF_PATH" > "$NGINX_CONF_PATH.tmp" && mv "$NGINX_CONF_PATH.tmp" "$NGINX_CONF_PATH"

@@ -1,14 +1,23 @@
-# Worktree-per-issue workflow
+# The quarterback harness
 
-The tooling in this directory is **not part of the quarterback service**. It is the
-workflow the board was built alongside, published here because the two solve adjacent
-halves of the same problem and the second half makes little sense without the first.
+**Step 2 of the install.** The service in this repo is the board; this directory is the
+workflow it coordinates. They ship together because the board on its own is a coordination
+layer with nothing to coordinate — `/panel`'s reviewer leaderboard, for one, renders an
+empty table until `loops/panel.py` starts recording runs against it.
 
-Short version: **worktrees isolate agents from each other; the board reconnects them.**
+Short version: **worktrees isolate agents from each other; the loops put them to work; the
+board reconnects them.**
 
-- `commands/` — Claude Code slash commands (`/fix-issue`, `/drop-worktree`, `/tree-shake`)
-- `scripts/` — the bash the commands drive (`create-worktree`, `remove-worktree`, `prune-worktrees`)
+- `loops/` — the engine: the reviewer panel (`panel.py`), the epic driver (`epic.py`), the
+  Dependabot lander (`lander.py`), and the per-repo config layer (`harness_rules.py`)
+- `commands/` — Claude Code slash commands (`/panel`, `/panel-review-pr`, `/review-pr`,
+  `/fix-issue`, `/epic`, `/lander`, `/wt`, `/drop-worktree`, `/tree-shake`, …)
+- `bin/` — the bash the worktree commands drive (`create-worktree`, `remove-worktree`,
+  `prune-worktrees`)
 - `worktree.example.json` — per-repo config, annotated with quarterback's own values
+
+Neither half needs the other. The loops run with no board configured (recording is
+best-effort and no-ops), and the worktree scripts are plain bash usable from any shell.
 
 ---
 
@@ -26,6 +35,35 @@ usable. `create-worktree` does the rest, so an agent gets a genuinely independen
 work in one command.
 
 ## What each piece does
+
+### `/panel` and `/panel-review-pr` — the reviewer panel
+
+`loops/panel.py` reviews one PR diff with several vendor CLIs at once (Claude, Codex,
+and others per config), deduplicates their findings, and has a master judge rule each one
+real or not. SonarCloud can be wired in as a hard gate alongside them. `/panel` reviews and
+comments; `/panel-review-pr` takes the confirmed findings and has a sub-agent fix every one
+of them.
+
+This is the piece with the tightest board coupling, and the reason the two halves ship
+together. A panel run is a controlled comparison — one diff, several models, one judge —
+and it used to evaporate when the process exited. Each run now records itself
+(`qb record-review`), so `GET /review/stats` and the board's `/panel` page can answer
+"which reviewer actually finds the real issues, and is the expensive tier worth it" from
+accumulated evidence instead of impression.
+
+The recording is **best-effort by construction**: a board that is down, or absent entirely,
+prints one line and changes nothing about the review. Telemetry that can fail a review which
+already succeeded is worse than no telemetry.
+
+### `/epic` and `/lander` — the long-running loops
+
+`epic.py` drives a multi-issue epic: it fans sub-issues out into their own worktrees, stacks
+their PRs onto an integration branch, and keeps going. `lander.py` is the Dependabot lander —
+it batches dependency PRs, verifies them, and lands the ones that pass. Both are usable from
+the slash commands or on a timer (`loops/systemd/`).
+
+Because `~/.claude/loops` is a read-only store symlink when installed via nix, these write
+their run state to `~/.local/state/loops` rather than beside themselves.
 
 ### `/fix-issue <number>` — the driver
 
@@ -57,7 +95,7 @@ leftover directories, containers, nginx blocks. `/tree-shake` first offers to te
 *finished* worktrees properly (merged PRs), then dry-runs an orphan sweep and applies only
 what you confirm.
 
-### The scripts
+### The worktree scripts
 
 `create-worktree` is the substantial one. It provisions the directory, symlinks shared
 local state, copies configured data, clones the database, wires Docker and nginx, and
@@ -105,9 +143,10 @@ and the arrays `symlinks`, `copies`, `reserved_names`, `gitignore_additions`.
 
 ---
 
-## How this relates to quarterback
+## How this relates to the board
 
-The two answer different questions, and it is worth being precise about which:
+They ship together, but they are not the same tool, and it is worth being precise about
+which answers what:
 
 |  | Worktree tooling | quarterback |
 |---|---|---|
@@ -115,12 +154,14 @@ The two answer different questions, and it is worth being precise about which:
 | **Scope** | One machine | Across machines and agents |
 | **Failure it prevents** | Physical collision — files, database, ports, containers | Informational collision — duplicated work, stale checkouts |
 
-### Using the worktrees instead
+### Using the harness alone
 
 If your problem is *"my agent's half-finished refactor means I can't touch anything else"*,
 you need worktrees and you do not need a board. quarterback isolates nothing — it will
 happily watch two agents overwrite each other and report both. Plenty of people should
-start with `create-worktree`, stop there, and never run the service.
+install step 2, stop there, and never run the service. That is why the harness degrades
+rather than fails when no board is configured, and why this install step comes with no
+requirement to do the other one.
 
 The board only starts earning its keep when there is a second agent whose work you cannot
 see, or a second machine whose commits you do not have.
@@ -154,29 +195,58 @@ Adopt the second when you can no longer tell what the others are doing.
 
 ## Installing
 
-The scripts are plain bash with no build step. Put them somewhere on `PATH`:
+Nothing here has a build step — it is bash and standard-library Python. There are two ways
+in, and neither requires the board to be running.
 
-```bash
-install -m 0755 worktrees/scripts/* ~/.local/bin/
+### With nix (flake)
+
+The repo root is a flake. As a home-manager consumer:
+
+```nix
+{
+  inputs.quarterback.url = "github:prisonblues/quarterback";
+
+  # …then in your home-manager configuration:
+  imports = [ inputs.quarterback.homeManagerModules.default ];
+  programs.quarterback-harness.enable = true;
+}
 ```
 
-The commands are Claude Code slash commands — copy them where Claude Code looks for
-commands (`~/.claude/commands/` for global, `.claude/commands/` for per-project):
+That links `loops/` to `~/.claude/loops`, every slash command to `~/.claude/commands/`, and
+puts the worktree scripts on `PATH`. Narrow `programs.quarterback-harness.commands` if your
+host already defines a command of the same name — home-manager will collide rather than pick
+a winner silently, which is the behaviour you want. Set `installScripts = false` to take the
+loops and commands without the worktree tooling.
+
+Outside home-manager, `nix build github:prisonblues/quarterback#harness` puts the scripts in
+`result/bin` and the rest in `result/share/quarterback-harness`.
+
+### By hand
 
 ```bash
-cp worktrees/commands/*.md ~/.claude/commands/
+install -m 0755 harness/bin/* ~/.local/bin/
+cp -r harness/loops ~/.claude/loops
+cp harness/commands/*.md ~/.claude/commands/
 ```
 
-Requirements: `git`, `jq`, `bash`. `docker` and a database client only if your repo uses
-them; `gh` for `/fix-issue` and `/tree-shake`, which talk to GitHub.
+### Requirements
+
+`git`, `jq`, `bash`, and Python 3 (standard library only — the loops import nothing
+third-party). `gh` for anything that talks to GitHub, which is most of it. `docker` and a
+database client only if your repo uses them. The reviewer CLIs the panel drives (`claude`,
+`codex`, …) are needed only for the reviewers you actually enable — a missing one is
+reported as skipped, not fatal.
+
+### Connecting it to a board (optional)
+
+The panel looks for a `qb` CLI to record runs. With none on `PATH`, it no-ops silently and
+everything else works unchanged. Point `qb` at your board to light up `GET /review/stats`
+and the board's `/panel` page.
 
 ## Caveats
 
 Read these before adopting rather than after.
 
-- **These are vendored copies.** They are maintained in the author's personal machine
-  config, and this directory is a snapshot. It will drift. Treat it as a starting point to
-  adapt, not a dependency to track.
 - **The commands assume Claude Code**, specifically `$CLAUDE_CODE_SESSION_ID` and the
   session-marker convention above. The *scripts* have no such dependency and are useful on
   their own from a normal shell.
@@ -191,9 +261,6 @@ Read these before adopting rather than after.
   not exist` and, worse, made `prune-worktrees` report `Orphan databases: none` while a
   hundred orphans sat in the real container. An explicit name (as in
   `worktree.example.json`) removes the ambiguity entirely.
-- **`/fix-issue` references commands not included here** — `/review-pr`, `/panel-review-pr`,
-  `/epic`, `/fix-issue-here`. Those references are inert; the command works without them,
-  it will just mention things you do not have.
 - **`/fix-issue` does not stop to ask.** It plans, implements, pushes and opens a PR in one
   run. That is the point of it, and it is also the reason to read it before pointing it at
   a repo you care about.
