@@ -20,7 +20,7 @@ from app.identity import (
 #: at startup. The board stores it and hands back a name; it never interprets it.
 KEY_HEADER = "X-Agent-Key"
 
-#: What v2.9 called the instance. Pre-2.11 clients send a locally-derived handle
+#: What v2.9 called the instance. Pre-2.12 clients send a locally-derived handle
 #: here; it is a perfectly good key, so it is still accepted as one. That matters
 #: because the clients live in another repo and don't ship with the server.
 LEGACY_KEY_HEADER = "X-Agent-Instance"

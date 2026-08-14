@@ -1,4 +1,4 @@
-"""v2.11: board-designated agent names — (machine, key) -> name
+"""v2.12: board-designated agent names — (machine, key) -> name
 
 Naming moves from the client to the board. A client sends a stable opaque key
 and the board allocates a two-word name that is free on that machine; both
@@ -9,8 +9,8 @@ name nothing live is using" safe when two agents start at the same instant.
 Retired rows keep their name (history references it) but drop out of the index,
 so the name is free for the next agent.
 
-Revision ID: 0012
-Revises: 0011
+Revision ID: 0013
+Revises: 0012
 Create Date: 2026-08-14
 
 """
@@ -22,8 +22,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0012"
-down_revision: str | None = "0011"
+revision: str = "0013"
+down_revision: str | None = "0012"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

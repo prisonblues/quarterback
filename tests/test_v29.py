@@ -7,11 +7,11 @@ the hierarchical addressing that falls out of it, and the fact that
 authorisation deliberately did *not* get finer (co-tenants share a token, so a
 permission boundary between them would be theatre).
 
-v2.11 changed *who picks* that second half — the board designates it now, rather
+v2.12 changed *who picks* that second half — the board designates it now, rather
 than the client deriving it — so these tests no longer hard-code the agent half;
 they ask ``/whoami`` for it. What v2.9 established is unchanged: two agents on
 one machine are two identities, and a lease is still owned by the box.
-See test_v211 for the naming, aliasing and allocation that replaced it.
+See test_v212 for the naming, aliasing and allocation that replaced it.
 """
 
 from __future__ import annotations

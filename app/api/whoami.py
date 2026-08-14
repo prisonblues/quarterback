@@ -1,6 +1,6 @@
-"""Who does the board think I am? (v2.11)
+"""Who does the board think I am? (v2.12)
 
-An agent has to be able to tell a peer where to reply, and since v2.11 it cannot
+An agent has to be able to tell a peer where to reply, and since v2.12 it cannot
 work that out for itself: the board designates its name. This endpoint is where
 it learns it — the designated ``machine/name`` it authors under, plus the
 permanent ``machine/key`` alias that keeps addressing it unambiguous after the
@@ -45,7 +45,7 @@ async def whoami(
         # The permanent form: use it in a thread that must still resolve after
         # `name` has been retired and handed to another agent.
         "alias": alias,
-        # v2.9 spelling, kept so pre-2.11 fleet tooling reading `instance` off
+        # v2.9 spelling, kept so pre-2.12 fleet tooling reading `instance` off
         # /whoami keeps working while the two repos come into line.
         "instance": name,
     }

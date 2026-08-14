@@ -1,461 +1,357 @@
-"""v2.11: the board designates agent names; the client's key is a permanent alias.
+"""v2.11: per-reviewer accounts, defect identity, calibration.
 
-v2.9 had each client derive its own instance from a Claude Code environment
-variable. Any other runtime set nothing, derived nothing, and collapsed to the
-bare machine name — which is also the *broadcast* address, so such an agent was
-indistinguishable from its co-tenants, unaddressable, and receiving all of their
-mail. Adding one more variable to the `or` chain would have fixed one runtime and
-left the next one broken the same way, silently.
-
-So the client now sends only an opaque key and the board allocates the name.
-These tests cover the four things that decide whether that helps or hurts:
-allocation never collides (it can't — the server sees who is live), naming
-happens on first contact so nothing is authored under a key, both forms address
-the same agent, and exactly one of them appears in history.
+A finding used to keep one reviewer's text and reduce the rest to names, so the
+board could say "codex and pi both reported this" but not what either of them
+said — and the same defect seen twice was two unrelated rows. These tests pin
+the three properties that fixes: accounts survive verbatim, attribution is
+stored rather than inferred, and observations of one defect link across runs
+without being collapsed into one.
 """
 
 from __future__ import annotations
 
-import asyncio
-from datetime import UTC, datetime
+import pytest
+from sqlalchemy import text
 
-from sqlalchemy import update
+from app.api.reviews import _derive_key
+from app.db import engine
 
-from app.db import async_session
-from app.identity import (
-    NAME_SPACE,
-    NAME_TTL,
-    SELF,
-    WORDS,
-    address_clause,
-    addressed_to,
-    allocate_name,
-    name_at,
-    name_probe,
-    valid_name,
-)
-from app.models.agent_name import AgentName
-from app.models.post import Post
+from .conftest import LAPTOP, SERVER
 
-from .conftest import DESKTOP, LAPTOP, SERVER
-
-REPO = "v211repo"
-
-CODEX = {**DESKTOP, "X-Agent-Key": "nonce-no-session-id"}   # a nonce: no session id anywhere
-CLAUDE = {**DESKTOP, "X-Agent-Key": "key-session-prefix"}    # a session-id prefix
-NAMED = {**LAPTOP, "X-Agent-Key": "deploybox", "X-Agent-Name": "deploy"}
+REPO = "acme/v211repo"
+AGENT_A = {**LAPTOP, "X-Agent-Instance": "aa11bb"}
+AGENT_B = {**SERVER, "X-Agent-Instance": "cc22dd"}
 
 
-async def whoami(client, headers) -> dict:
-    return (await client.get("/whoami", headers=headers)).json()
+def finding(**over) -> dict:
+    """A judged finding two reviewers described differently."""
+    f = {
+        "severity": "P2",
+        "file": "apps/europa/text_utils.py",
+        "line": 213,
+        "title": "unicode dash survives the strip",
+        "detail": "the judge's merged statement",
+        "verdict": "confirmed",
+        "reason": "real — the regex only covers ascii",
+        "reported_by": [
+            {"reviewer": "claude", "severity": "P2", "line": 213,
+             "account": "strip() leaves the en dash, so the key never matches"},
+            {"reviewer": "pi", "severity": "P1", "line": 209,
+             "account": "callers downstream compare the raw string; this is a P1"},
+        ],
+    }
+    return {**f, **over}
 
 
-# ---- the name space (pure) --------------------------------------------------
-
-def test_word_list_is_distinct_and_sized_for_the_stated_space():
-    assert len(WORDS) == 100 and len(set(WORDS)) == len(WORDS)
-    assert NAME_SPACE == 9900  # 100 x 99 ordered distinct pairs
-
-
-def test_every_index_yields_a_distinct_two_word_name():
-    names = {name_at(i) for i in range(NAME_SPACE)}
-    assert len(names) == NAME_SPACE
-    for name in ("amber-otter", name_at(0), name_at(NAME_SPACE - 1)):
-        first, _, second = name.partition("-")
-        assert first != second and valid_name(name)
-
-
-def test_probe_covers_the_whole_space_so_allocation_cannot_wedge():
-    """Linear probing from a hashed start visits every name — which is why
-    'pick one that is free' has no failure mode short of all 9,900 being live."""
-    assert len(set(name_probe("some-key"))) == NAME_SPACE
+def payload(pr: int, **over) -> dict:
+    body = {
+        "repo": REPO,
+        "pr": pr,
+        "pr_title": f"feat: thing {pr}",
+        "judged": True,
+        "judge_model": "opus",
+        "reviewers_selected": ["claude", "pi"],
+        "reviewers": {
+            "claude": {"model": "sonnet", "ran": True},
+            "pi": {"model": "kimi-k3", "effort": "high", "ran": True},
+        },
+        "to_fix": [finding()],
+        "dismissed": [],
+        "sonar_findings": [],
+    }
+    return {**body, **over}
 
 
-def test_allocation_avoids_live_names_where_hashing_would_collide():
-    taken = {name_at(i) for i in range(50)}
-    assert allocate_name("k", taken) not in taken
-    # Two different keys that hash to the same start still get different names,
-    # because the second one sees the first as taken.
-    first = allocate_name("alpha", set())
-    assert allocate_name("beta", {first}) != first
+async def record(client, pr: int, headers=AGENT_A, **over) -> dict:
+    r = await client.post("/review", json=payload(pr, **over), headers=headers)
+    assert r.status_code == 201, r.text
+    return r.json()
 
 
-def test_a_requested_name_is_honoured_when_free_and_disambiguated_when_not():
-    assert allocate_name("k", set(), requested="deploy") == "deploy"
-    fallback = allocate_name("k", {"deploy"}, requested="deploy")
-    assert fallback != "deploy" and valid_name(fallback)
+async def detail(client, run_id: int, headers=AGENT_A) -> dict:
+    r = await client.get(f"/review/{run_id}", headers=headers)
+    assert r.status_code == 200, r.text
+    return r.json()
 
 
-def test_addressing_matches_every_spelling_of_one_agent():
-    assert addressed_to("zeus/amber-otter", "zeus/ed49425c", ("zeus/amber-otter",))
-    assert addressed_to("zeus/ed49425c", "zeus/amber-otter", ("zeus/ed49425c",))
-    assert addressed_to("zeus", "zeus/amber-otter", ("zeus/ed49425c",))
-    assert not addressed_to("zeus/flint-raven", "zeus/amber-otter", ("zeus/ed49425c",))
-    # The SQL form has to agree with the Python one, or the inbox read and the
-    # inbox test disagree about the same post.
-    clause = str(address_clause(Post.recipient, "zeus/amber-otter", ("zeus/ed49425c",)))
-    assert "IN" in clause and "LIKE" in clause
+# ---- accounts --------------------------------------------------------------
+
+async def test_each_reviewers_account_is_kept_verbatim(client):
+    """The merge is additive: the synthesis is new, the originals ride along."""
+    run = await record(client, 8201)
+    f = (await detail(client, run["id"]))["findings"][0]
+
+    assert f["title"] == "unicode dash survives the strip"  # the judge's synthesis
+    by = {r["reviewer"]: r for r in f["reported_by"]}
+    assert by["claude"]["account"].startswith("strip() leaves the en dash")
+    assert by["pi"]["account"].startswith("callers downstream compare")
+    # Each reviewer's own severity and line, not the judge's — the difference is
+    # the calibration signal, so it must not be reconciled away.
+    assert by["pi"]["severity"] == "P1" and by["pi"]["line"] == 209
+    assert f["severity"] == "P2" and f["line"] == 213
 
 
-# ---- allocation on first contact --------------------------------------------
-
-async def test_a_runtime_that_exposes_nothing_still_gets_a_real_identity(client):
-    """The bug: a non-Claude-Code runtime used to collapse to the bare machine
-    name. A nonce is all it needs now, because the board does the naming."""
-    me = await whoami(client, CODEX)
-    assert me["machine"] == "desktop"
-    assert me["name"] and me["name"] != "desktop"
-    assert me["agent"] == f"desktop/{me['name']}"
-    assert me["key"] == "nonce-no-session-id" and me["alias"] == "desktop/nonce-no-session-id"
-    assert "-" in me["name"]  # a two-word designation, not the key echoed back
+async def test_reported_by_implies_attribution_without_a_reviewers_list(client):
+    """`reviewers` becomes derivable, so a caller sending only accounts is whole."""
+    run = await record(client, 8202)
+    d = await detail(client, run["id"])
+    assert d["findings"][0]["reviewers"] == ["claude", "pi"]
+    cards = {c["name"]: c for c in d["reviewers"]}
+    assert cards["claude"]["confirmed"] == 1 and cards["pi"]["confirmed"] == 1
 
 
-async def test_two_agents_on_one_machine_never_share_a_name(client):
-    a, b = await whoami(client, CODEX), await whoami(client, CLAUDE)
-    assert a["name"] != b["name"] and a["machine"] == b["machine"]
+async def test_named_reviewer_without_an_account_still_gets_credit(client):
+    """A member listed alongside `reported_by` contributed no text, not nothing."""
+    run = await record(client, 8203, to_fix=[finding(reviewers=["codex", "claude"])])
+    d = await detail(client, run["id"])
+    f = d["findings"][0]
+    assert f["reviewers"] == ["codex", "claude", "pi"]   # payload order, then reporters
+    assert {r["reviewer"] for r in f["reported_by"]} == {"claude", "pi"}
+    assert {c["name"] for c in d["reviewers"]} >= {"codex", "claude", "pi"}
 
 
-async def test_the_name_is_stable_across_calls(client):
-    first = await whoami(client, CLAUDE)
-    for _ in range(3):
-        assert (await whoami(client, CLAUDE))["agent"] == first["agent"]
+async def test_legacy_names_only_payload_still_records(client):
+    """Older panels must not start failing to record."""
+    run = await record(client, 8204, to_fix=[
+        {"severity": "P1", "file": "app/x.py", "line": 4, "title": "off-by-one",
+         "reviewers": ["claude", "codex"], "reason": "confirmed"},
+    ])
+    f = (await detail(client, run["id"]))["findings"][0]
+    assert f["reviewers"] == ["claude", "codex"]
+    assert f["reported_by"] == []
+    assert f["key"]  # still identified, so old runs join the same chains
 
 
-async def test_nothing_is_ever_authored_under_a_key(client):
-    """Allocation is lazy but happens *before* the write, so there is no window
-    of history written under the hex and no rename event to reconcile."""
-    fresh = {**SERVER, "X-Agent-Key": "firstpost"}
-    post_id = (await client.post(
-        "/post", json={"summary": "my very first post"}, headers=fresh
-    )).json()["id"]
-    author = (await client.get(f"/post/{post_id}", headers=SERVER)).json()["from"]
-    assert author == (await whoami(client, fresh))["agent"]
-    assert author != "server/firstpost" and author != "server"
+async def test_two_accounts_from_one_reviewer_keep_the_first(client):
+    """(finding, reviewer) is unique; ingest is best-effort, so it must not 500."""
+    run = await record(client, 8205, to_fix=[finding(reported_by=[
+        {"reviewer": "pi", "severity": "P1", "account": "first"},
+        {"reviewer": "pi", "severity": "P3", "account": "second"},
+    ])])
+    f = (await detail(client, run["id"]))["findings"][0]
+    assert [r["account"] for r in f["reported_by"]] == ["first"]
+    assert f["reviewers"] == ["pi"]
 
 
-async def test_a_requested_name_survives_allocation(client):
-    """`QUARTERBACK_INSTANCE=deploy` still works — as a request, not an override."""
-    assert (await whoami(client, NAMED))["name"] == "deploy"
+async def test_panel_canonical_field_names_are_accepted(client):
+    """`synthesis`/`rationale` in the judge's shape, `title`/`reason` in the old
+    one — a renamed field would otherwise fail silently into a null column."""
+    run = await record(client, 8206, to_fix=[{
+        "severity": "P2", "file": "app/a.py", "line": 9,
+        "synthesis": "the judge's merged statement of the bug",
+        "rationale": "real — both accounts describe the same write",
+        "reported_by": [{"reviewer": "codex", "severity": "P2", "detail": "verbatim"}],
+    }])
+    f = (await detail(client, run["id"]))["findings"][0]
+    assert f["title"] == "the judge's merged statement of the bug"
+    assert f["reason"].startswith("real —")
+    assert f["reported_by"][0]["account"] == "verbatim"
 
 
-async def test_a_malformed_requested_name_is_rejected_not_ignored(client):
-    bad = {**SERVER, "X-Agent-Key": "k1", "X-Agent-Name": "Not A Name"}
-    r = await client.get("/whoami", headers=bad)
-    assert r.status_code == 400 and "X-Agent-Name" in r.json()["detail"]
+async def test_an_unstorable_line_number_costs_the_line_not_the_run(client):
+    """Recording is best-effort: a line too big for the column must not take the
+    whole run's record down with it."""
+    run = await record(client, 8207, to_fix=[finding(
+        line=9_999_999_999,
+        reported_by=[{"reviewer": "pi", "severity": "P2", "line": -9_999_999_999,
+                      "account": "still worth keeping"}],
+    )])
+    f = (await detail(client, run["id"]))["findings"][0]
+    assert f["line"] is None
+    assert f["reported_by"][0]["line"] is None
+    assert f["reported_by"][0]["account"] == "still worth keeping"
 
 
-async def test_the_legacy_instance_header_is_accepted_as_a_key(client):
-    """Fleet clients ship from another repo, so the old spelling has to keep
-    identifying the same agent — and identify it the *same* as the new one."""
-    legacy = {**SERVER, "X-Agent-Instance": "sharedkey"}
-    modern = {**SERVER, "X-Agent-Key": "sharedkey"}
-    assert (await whoami(client, legacy))["agent"] == (await whoami(client, modern))["agent"]
+# ---- scorecards ------------------------------------------------------------
+
+async def test_severity_calibration_counts_against_the_judge(client):
+    """A reviewer that is right but always cries P1 costs triage time, which
+    precision alone cannot say."""
+    run = await record(client, 8210)
+    cards = {c["name"]: c for c in (await detail(client, run["id"]))["reviewers"]}
+    assert cards["claude"]["sev_agree"] == 1     # P2 == the judge's P2
+    assert cards["claude"]["sev_stricter"] == 0
+    assert cards["pi"]["sev_stricter"] == 1      # called P1 what the judge called P2
+    assert cards["pi"]["sev_agree"] == 0
+
+    stats = (await client.get(
+        f"/review/stats?repo={REPO}&judged_only=true", headers=AGENT_A)).json()
+    pi = next(m for m in stats["by_model"] if m["reviewer"] == "pi")
+    assert pi["sev_stricter"] >= 1
+    assert pi["severity_calibration"] == round(
+        pi["sev_agree"] / (pi["sev_agree"] + pi["sev_stricter"] + pi["sev_looser"]), 3)
 
 
-async def test_a_blank_new_header_does_not_mask_the_legacy_one(client):
-    """A proxy that injects an empty X-Agent-Key must not silently un-identify a
-    client that named itself the old way — that is the collapse, reintroduced."""
-    both = {**SERVER, "X-Agent-Key": "   ", "X-Agent-Instance": "notblank"}
-    assert (await whoami(client, both))["key"] == "notblank"
+async def test_calibration_stays_none_without_reviewer_severities(client):
+    """Pre-v2.11 runs carry no per-reviewer severity; that must read as unknown,
+    not as perfect disagreement."""
+    await record(client, 8211, reviewers_selected=["gemini"],
+                 reviewers={"gemini": {"model": "gemini-3.7-flash", "ran": True}},
+                 to_fix=[{"severity": "P1", "file": "app/q.py", "title": "leak",
+                          "reviewers": ["gemini"], "reason": "confirmed"}])
+    stats = (await client.get(f"/review/stats?repo={REPO}", headers=AGENT_A)).json()
+    gemini = next(m for m in stats["by_model"] if m["reviewer"] == "gemini")
+    assert gemini["confirmed"] >= 1
+    assert gemini["severity_calibration"] is None
 
 
-async def test_concurrent_first_contact_allocates_exactly_one_name(client):
-    """Two processes of one agent starting together must not become two agents."""
-    headers = {**SERVER, "X-Agent-Key": "raceykey"}
-    results = await asyncio.gather(*(whoami(client, headers) for _ in range(6)))
-    assert len({r["agent"] for r in results}) == 1
+async def test_consensus_counts_findings_someone_else_also_raised(client):
+    """Agreeing with everyone and always reporting alone are different
+    propositions at the same precision."""
+    run = await record(client, 8212, to_fix=[
+        finding(),                                    # claude + pi
+        finding(title="solo catch", line=9, reported_by=[
+            {"reviewer": "pi", "severity": "P3", "account": "only pi saw this"}]),
+    ])
+    cards = {c["name"]: c for c in (await detail(client, run["id"]))["reviewers"]}
+    assert cards["pi"]["raised"] == 2 and cards["pi"]["shared"] == 1
+    assert cards["pi"]["solo"] == 1
+    assert cards["claude"]["raised"] == 1 and cards["claude"]["shared"] == 1
+
+    stats = (await client.get(f"/review/stats?repo={REPO}", headers=AGENT_A)).json()
+    pi = next(m for m in stats["by_model"] if m["reviewer"] == "pi")
+    assert pi["consensus_rate"] == round(pi["shared"] / pi["raised"], 3)
 
 
-async def test_distinct_keys_starting_together_get_distinct_names(client):
-    batch = [{**DESKTOP, "X-Agent-Key": f"burst{i}"} for i in range(6)]
-    names = {r["name"] for r in await asyncio.gather(*(whoami(client, h) for h in batch))}
-    assert len(names) == len(batch)
+# ---- defect identity -------------------------------------------------------
+
+async def test_related_ids_are_stored_as_keys_not_run_local_ids(client):
+    """One decision spread over four files is not one finding, but it is one
+    fix — and the panel's ids restart every run, so they cannot carry the link."""
+    run = await record(client, 8220, to_fix=[
+        finding(id="F01", related=["F02", "F99"]),
+        finding(id="F02", file="apps/luna/text_utils.py", title="same decision"),
+    ])
+    finds = {f["title"]: f for f in (await detail(client, run["id"]))["findings"]}
+    a = finds["unicode dash survives the strip"]
+    b = finds["same decision"]
+    assert a["related"] == [b["key"]]   # resolved; the dangling F99 is dropped
+    assert b["related"] == []
 
 
-# ---- both forms address; one form is recorded -------------------------------
-
-async def test_a_post_addressed_by_key_is_recorded_under_the_name(client):
-    target = await whoami(client, CLAUDE)
-    post_id = (await client.post(
-        "/post", json={"summary": "by key", "to": target["alias"]}, headers=NAMED
-    )).json()["id"]
-    # Canonicalised on write: history shows one spelling per agent, never two.
-    assert (await client.get(f"/post/{post_id}", headers=SERVER)).json()["to"] == target["agent"]
+async def test_explicit_key_wins_over_the_derived_one(client):
+    """A caller with a stable defect id of its own must be able to say so."""
+    run = await record(client, 8221, to_fix=[finding(key="europa-dash-1")])
+    assert (await detail(client, run["id"]))["findings"][0]["key"] == "europa-dash-1"
 
 
-async def test_both_forms_reach_the_same_inbox(client):
-    target = await whoami(client, CLAUDE)
-    by_name = (await client.post(
-        "/post", json={"summary": "by name", "to": target["agent"]}, headers=NAMED
-    )).json()["id"]
-    by_key = (await client.post(
-        "/post", json={"summary": "by key", "to": target["alias"]}, headers=NAMED
-    )).json()["id"]
+async def test_derived_key_ignores_the_line(client):
+    """The line moves when the fix above it lands; an identity that moves links
+    nothing."""
+    assert _derive_key("a/b.py", "Off-by-one!") == _derive_key("a/b.py", "off by one")
+    assert _derive_key("a/b.py", "x") != _derive_key("c/b.py", "x")
 
-    for spelling in (target["agent"], target["alias"]):
-        inbox = (await client.get("/board", params={"to": spelling}, headers=DESKTOP)).json()
-        assert {by_name, by_key} <= {p["id"] for p in inbox}
+    one = await record(client, 8222, to_fix=[finding(line=213)])
+    two = await record(client, 8222, to_fix=[finding(line=880)])
+    keys = {(await detail(client, r["id"]))["findings"][0]["key"] for r in (one, two)}
+    assert len(keys) == 1
 
 
-async def test_an_agent_reads_its_own_inbox_without_knowing_its_name(client):
-    """`to=@me` is the point: the board owns the name, so the caller can't spell
-    it — the hook used to compose one locally and assume it was right."""
-    target = await whoami(client, CLAUDE)
-    mine = (await client.post(
-        "/post", json={"summary": "direct", "to": target["agent"]}, headers=NAMED
-    )).json()["id"]
-    broadcast = (await client.post(
-        "/post", json={"summary": "to the box", "to": "desktop"}, headers=NAMED
-    )).json()["id"]
-    theirs = (await client.post(
-        "/post", json={"summary": "not for you", "to": "laptop"}, headers=NAMED
-    )).json()["id"]
-
-    inbox = {p["id"] for p in (
-        await client.get("/board", params={"to": SELF}, headers=CLAUDE)
-    ).json()}
-    assert {mine, broadcast} <= inbox and theirs not in inbox
+async def test_an_untitled_finding_is_keyed_on_what_was_stored(client):
+    """The stored title is defaulted, and the backfill keys the *stored* title —
+    so keying the raw empty string would put new rows in a different chain from
+    the identical old ones."""
+    run = await record(client, 8223, to_fix=[
+        {"file": "app/n.py", "reviewers": ["codex"], "reason": "confirmed"},
+    ])
+    f = (await detail(client, run["id"]))["findings"][0]
+    assert f["title"] == "(untitled)"
+    assert f["key"] == _derive_key("app/n.py", "(untitled)")
 
 
-async def test_to_me_needs_a_bearer_token(client):
-    r = await client.get("/board", params={"to": SELF}, headers={"Remote-User": "someone"})
-    assert r.status_code == 400
-
-
-async def test_active_holder_filter_accepts_either_spelling(client):
-    me = await whoami(client, CLAUDE)
-    await client.post(
-        "/lease", json={"session": "v211-lease", "device": "desktop", "repo": REPO}, headers=CLAUDE
-    )
-    for spelling in (me["agent"], me["alias"]):
-        found = (await client.get(
-            "/active", params={"repo": REPO, "holder": spelling}, headers=LAPTOP
-        )).json()["agents"]
-        assert "v211-lease" in {a["session"] for a in found}
-
-
-# ---- retirement: the live space recycles, the past does not change ----------
-
-async def test_releasing_a_lease_frees_the_name_without_rewriting_history(client):
-    agent = {**SERVER, "X-Agent-Key": "retiree"}
-    me = await whoami(client, agent)
-    post_id = (await client.post(
-        "/post", json={"summary": "before I go"}, headers=agent
-    )).json()["id"]
-    lease_id = (await client.post(
-        "/lease", json={"session": "v211-retire", "device": "server"}, headers=agent
-    )).json()["lease_id"]
-    await client.post("/lease/release", json={"lease_id": lease_id}, headers=agent)
-
-    # The post keeps the name it was authored under...
-    assert (await client.get(f"/post/{post_id}", headers=SERVER)).json()["from"] == me["agent"]
-    # ...and the key still resolves to it, which is why the alias exists.
-    inbox_probe = (await client.get(
-        "/board", params={"to": me["alias"]}, headers=SERVER
-    )).json()
-    assert isinstance(inbox_probe, list)
-
-    # A returning agent is handed its old name back (nobody took it meanwhile).
-    assert (await whoami(client, agent))["agent"] == me["agent"]
-
-
-async def test_an_agent_keeps_its_name_while_it_still_holds_another_lease(client):
-    """One agent, several sessions: ending one is not the end of it. Retiring on
-    the first release would rename it mid-life and split its work in two."""
-    busy = {**SERVER, "X-Agent-Key": "twohats"}
-    me = await whoami(client, busy)
-    ids = [
-        (await client.post(
-            "/lease", json={"session": f"v211-hat{n}", "device": "server", "ttl": 600},
-            headers=busy,
-        )).json()["lease_id"]
-        for n in (1, 2)
+async def test_backfilled_keys_match_the_apps_recipe(client):
+    """Migration 0012 keys pre-v2.11 rows in SQL. If the two recipes drift, old
+    runs join no chain — and nothing else would notice."""
+    sql = ("select substr(md5(coalesce(:f, '') || '|' || "
+           "btrim(regexp_replace(lower(:t), '[^a-z0-9]+', ' ', 'g'))), 1, 16)")
+    cases = [
+        ("app/x.py", "Off-by-one in the retry loop"),
+        (None, "  spaces   and\tTABS  "),
+        # An en dash by escape, not literally: the point is that a non-ascii
+        # char normalises the same way in both recipes, and RUF001 is right that
+        # a literal one in source is otherwise indistinguishable from a hyphen.
+        ("apps/europa/text_utils.py", "unicode \u2013 dash survives the strip"),
+        ("a.py", ""),
     ]
-
-    await client.post("/lease/release", json={"lease_id": ids[0]}, headers=busy)
-    contender = {**SERVER, "X-Agent-Key": "hatthief", "X-Agent-Name": me["name"]}
-    assert (await whoami(client, contender))["name"] != me["name"]
-    assert (await whoami(client, busy))["agent"] == me["agent"]
-
-    # Once the last one goes, the name is free as usual.
-    await client.post("/lease/release", json={"lease_id": ids[1]}, headers=busy)
-    heir = {**SERVER, "X-Agent-Key": "hatheir", "X-Agent-Name": me["name"]}
-    assert (await whoami(client, heir))["name"] == me["name"]
+    async with engine.connect() as conn:
+        for f, t in cases:
+            got = await conn.scalar(text(sql), {"f": f, "t": t})
+            assert got == _derive_key(f, t), f"drift on {t!r}"
 
 
-async def test_a_freed_name_can_be_taken_by_another_agent(client):
-    first = {**DESKTOP, "X-Agent-Key": "recycle1"}
-    me = await whoami(client, first)
-    lease_id = (await client.post(
-        "/lease", json={"session": "v211-recycle", "device": "desktop"}, headers=first
-    )).json()["lease_id"]
-    await client.post("/lease/release", json={"lease_id": lease_id}, headers=first)
+# ---- linking observations across runs --------------------------------------
 
-    # A second agent may now request the freed name and get it.
-    second = {**DESKTOP, "X-Agent-Key": "recycle2", "X-Agent-Name": me["name"]}
-    assert (await whoami(client, second))["agent"] == me["agent"]
+async def test_the_same_defect_in_two_runs_is_two_linked_observations(client):
+    """Collapsing them would erase whether the fix landed; not linking them
+    leaves 'how many rounds did this PR take?' unanswerable."""
+    await record(client, 8230)
+    await record(client, 8230)
+    h = (await client.get(f"/review/findings?repo={REPO}&pr=8230", headers=AGENT_A)).json()
 
-    # The original comes back to a *different* name rather than a stolen one —
-    # this is why the key alias has to be permanent and the name does not.
-    back = await whoami(client, first)
-    assert back["name"] != me["name"] and back["alias"] == me["alias"]
-
-
-async def test_replaying_an_old_release_does_not_retire_the_current_holder(client):
-    """Names recycle, so a lease's stored holder can name a *different* agent by
-    the time a duplicate release arrives. Only the transition may retire."""
-    gone = {**SERVER, "X-Agent-Key": "replay1"}
-    original = await whoami(client, gone)
-    lease_id = (await client.post(
-        "/lease", json={"session": "v211-replay", "device": "server"}, headers=gone
-    )).json()["lease_id"]
-    await client.post("/lease/release", json={"lease_id": lease_id}, headers=gone)
-
-    successor = {**SERVER, "X-Agent-Key": "replay2", "X-Agent-Name": original["name"]}
-    assert (await whoami(client, successor))["name"] == original["name"]
-
-    # The duplicate release is still idempotent-OK, and must not unname the heir.
-    again = await client.post("/lease/release", json={"lease_id": lease_id}, headers=gone)
-    assert again.status_code == 200
-    assert (await whoami(client, successor))["name"] == original["name"]
+    assert h["rounds"] == 2 and h["truncated"] is False
+    chain = next(c for c in h["findings"] if c["title"] == "unicode dash survives the strip")
+    assert chain["runs_seen"] == 2
+    assert chain["status"] == "open"            # still raised in the newest run
+    assert chain["first_run"] != chain["last_run"]
+    # The accounts travel with each observation, so the merge stays auditable.
+    assert {r["reviewer"] for r in chain["observations"][0]["reported_by"]} == {"claude", "pi"}
 
 
-async def test_a_name_is_never_allocated_over_another_agents_key(client):
-    """Both spellings live in one namespace, so a name that shadowed someone's
-    key would make that agent unreachable by the form meant to be permanent."""
-    holder = {**DESKTOP, "X-Agent-Key": "shadowme"}
-    await whoami(client, holder)
-    thief = {**DESKTOP, "X-Agent-Key": "thiefkey", "X-Agent-Name": "shadowme"}
-    assert (await whoami(client, thief))["name"] != "shadowme"
+async def test_a_finding_absent_from_the_latest_run_reads_as_gone(client):
+    await record(client, 8231)
+    await record(client, 8231, to_fix=[finding(file="app/other.py", title="something else")])
+    h = (await client.get(f"/review/findings?repo={REPO}&pr=8231", headers=AGENT_A)).json()
+    by_title = {c["title"]: c for c in h["findings"]}
+    assert by_title["unicode dash survives the strip"]["status"] == "gone"
+    assert by_title["something else"]["status"] == "open"
 
 
-async def test_a_leased_agent_is_exempt_from_the_staleness_sweep(client):
-    """The sweep is a leak backstop, not a scheduler: an agent the board can see
-    is alive keeps its name however long its stint has run."""
-    longrunner = {**LAPTOP, "X-Agent-Key": "longrun"}
-    me = await whoami(client, longrunner)
-    await client.post(
-        "/lease", json={"session": "v211-longrun", "device": "laptop", "ttl": 600},
-        headers=longrunner,
-    )
-    async with async_session() as db:
-        await db.execute(
-            update(AgentName)
-            .where(AgentName.machine == "laptop", AgentName.key == "longrun")
-            .values(allocated_at=datetime.now(UTC) - NAME_TTL * 2)
-        )
-        await db.commit()
-
-    # Someone else allocating triggers the sweep — which must skip the leaseholder.
-    await whoami(client, {**LAPTOP, "X-Agent-Key": "sweeper1"})
-    contender = {**LAPTOP, "X-Agent-Key": "contend1", "X-Agent-Name": me["name"]}
-    assert (await whoami(client, contender))["name"] != me["name"]
-    assert (await whoami(client, longrunner))["agent"] == me["agent"]
+async def test_a_finding_the_judge_always_rejected_reads_as_dismissed(client):
+    await record(client, 8232, to_fix=[], dismissed=[finding()])
+    await record(client, 8232, to_fix=[], dismissed=[finding()])
+    h = (await client.get(f"/review/findings?repo={REPO}&pr=8232", headers=AGENT_A)).json()
+    assert h["findings"][0]["status"] == "dismissed"
+    assert h["findings"][0]["runs_seen"] == 2
 
 
-async def test_a_successor_does_not_inherit_its_predecessors_mail(client):
-    """History keeps the name its author held at the time, so a recycled name
-    points at two agents across time. The inbox only reaches back as far as the
-    current holder has held it — the key alias is what stays permanent."""
-    first = {**DESKTOP, "X-Agent-Key": "mailbox1"}
-    original = await whoami(client, first)
-    for_original = (await client.post(
-        "/post", json={"summary": "for the first holder", "to": original["agent"]}, headers=NAMED
-    )).json()["id"]
-    lease_id = (await client.post(
-        "/lease", json={"session": "v211-mailbox", "device": "desktop"}, headers=first
-    )).json()["lease_id"]
-    await client.post("/lease/release", json={"lease_id": lease_id}, headers=first)
-
-    heir = {**DESKTOP, "X-Agent-Key": "mailbox2", "X-Agent-Name": original["name"]}
-    assert (await whoami(client, heir))["name"] == original["name"]
-    for_heir = (await client.post(
-        "/post", json={"summary": "for the heir", "to": original["agent"]}, headers=NAMED
-    )).json()["id"]
-
-    heir_inbox = {p["id"] for p in (
-        await client.get("/board", params={"to": SELF, "window_min": 0}, headers=heir)
-    ).json()}
-    assert for_heir in heir_inbox and for_original not in heir_inbox
-
-    # The original still reaches its own mail by the permanent form.
-    by_alias = {p["id"] for p in (
-        await client.get(
-            "/board", params={"to": original["alias"], "window_min": 0}, headers=DESKTOP
-        )
-    ).json()}
-    assert for_original in by_alias
+async def test_chains_are_scoped_to_one_pr(client):
+    """`key` identifies a defect within a PR: the same 'unused import' in two
+    PRs is not one chain."""
+    await record(client, 8240)
+    await record(client, 8241)
+    h = (await client.get(f"/review/findings?repo={REPO}&pr=8240", headers=AGENT_A)).json()
+    assert h["rounds"] == 1
+    assert all(o["run_id"] == h["runs"][0]["id"]
+               for c in h["findings"] for o in c["observations"])
 
 
-async def test_mail_to_a_retired_agents_alias_never_reaches_its_successor(client):
-    """The alias is only permanent if it keeps meaning one agent. A post sent to
-    a retired agent's key must not be rewritten to the name a successor now
-    holds, and must not turn up in that successor's inbox."""
-    first = {**DESKTOP, "X-Agent-Key": "willed1"}
-    original = await whoami(client, first)
-    lease_id = (await client.post(
-        "/lease", json={"session": "v211-willed", "device": "desktop"}, headers=first
-    )).json()["lease_id"]
-    await client.post("/lease/release", json={"lease_id": lease_id}, headers=first)
-
-    heir = {**DESKTOP, "X-Agent-Key": "willed2", "X-Agent-Name": original["name"]}
-    assert (await whoami(client, heir))["name"] == original["name"]
-
-    late = (await client.post(
-        "/post", json={"summary": "for the one who left", "to": original["alias"]}, headers=NAMED
-    )).json()["id"]
-    # Recorded under the key, because the name no longer identifies that agent.
-    assert (await client.get(f"/post/{late}", headers=DESKTOP)).json()["to"] == original["alias"]
-
-    heir_inbox = {p["id"] for p in (
-        await client.get("/board", params={"to": SELF, "window_min": 0}, headers=heir)
-    ).json()}
-    assert late not in heir_inbox
+async def test_history_window_reports_when_it_truncated(client):
+    """A `gone` status over a truncated window describes the window, so the
+    window has to say it was one."""
+    await record(client, 8250)
+    await record(client, 8250)
+    h = (await client.get(f"/review/findings?repo={REPO}&pr=8250&limit=1",
+                          headers=AGENT_A)).json()
+    assert h["rounds"] == 1 and h["truncated"] is True
 
 
-async def test_reading_a_retired_alias_does_not_spill_the_successors_mail(client):
-    """The name half of an inbox is clipped to the stint that held it — on both
-    sides, or looking up an old agent would read its successor's post."""
-    first = {**SERVER, "X-Agent-Key": "spill1"}
-    original = await whoami(client, first)
-    mine = (await client.post(
-        "/post", json={"summary": "sent while I held it", "to": original["agent"]}, headers=NAMED
-    )).json()["id"]
-    lease_id = (await client.post(
-        "/lease", json={"session": "v211-spill", "device": "server"}, headers=first
-    )).json()["lease_id"]
-    await client.post("/lease/release", json={"lease_id": lease_id}, headers=first)
-
-    heir = {**SERVER, "X-Agent-Key": "spill2", "X-Agent-Name": original["name"]}
-    heir_id = (await whoami(client, heir))["agent"]
-    theirs = (await client.post(
-        "/post", json={"summary": "sent to the heir", "to": heir_id}, headers=NAMED
-    )).json()["id"]
-
-    history = {p["id"] for p in (await client.get(
-        "/board", params={"to": original["alias"], "window_min": 0}, headers=SERVER
-    )).json()}
-    assert mine in history and theirs not in history
+async def test_history_of_an_unreviewed_pr_is_empty_not_404(client):
+    h = (await client.get(f"/review/findings?repo={REPO}&pr=999999", headers=AGENT_A)).json()
+    assert h == {"repo": REPO, "pr": 999999, "rounds": 0, "truncated": False,
+                 "runs": [], "findings": []}
 
 
-async def test_a_name_never_retired_is_reclaimed_after_the_ttl(client):
-    """The runtimes this change exists for have no lifecycle hooks, so they never
-    release a lease and never retire a name. Without a backstop the live space
-    would only ever fill; with one, an abandoned name comes back."""
-    ghost = {**LAPTOP, "X-Agent-Key": "ghostkey"}
-    stranded = await whoami(client, ghost)
+async def test_history_needs_a_repo_and_pr(client):
+    assert (await client.get("/review/findings", headers=AGENT_A)).status_code == 422
 
-    async with async_session() as db:  # backdate it past any plausible session
-        await db.execute(
-            update(AgentName)
-            .where(AgentName.machine == "laptop", AgentName.key == "ghostkey")
-            .values(allocated_at=datetime.now(UTC) - NAME_TTL * 2)
-        )
-        await db.commit()
 
-    heir = {**LAPTOP, "X-Agent-Key": "heirkey", "X-Agent-Name": stranded["name"]}
-    assert (await whoami(client, heir))["name"] == stranded["name"]
+async def test_history_requires_auth(client):
+    assert (await client.get(f"/review/findings?repo={REPO}&pr=8230")).status_code == 401
 
-    # And the ghost, if it ever speaks again, is renamed rather than duplicated.
-    revived = await whoami(client, ghost)
-    assert revived["name"] != stranded["name"] and revived["alias"] == stranded["alias"]
+
+@pytest.mark.parametrize("headers", [AGENT_A, AGENT_B])
+async def test_history_is_readable_by_any_authenticated_machine(client, headers):
+    """The board is one shared workspace; a review is not private to its author."""
+    await record(client, 8260, headers=AGENT_A)
+    r = await client.get(f"/review/findings?repo={REPO}&pr=8260", headers=headers)
+    assert r.status_code == 200 and r.json()["rounds"] >= 1

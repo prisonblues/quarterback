@@ -9,7 +9,7 @@ from app.models.base import Base
 
 
 class AgentName(Base):
-    """The board-designated shortname for one agent on one machine (v2.11).
+    """The board-designated shortname for one agent on one machine (v2.12).
 
     The client sends a stable opaque ``key`` — a session id, a rollout id, or a
     nonce a one-shot process makes at startup; the board does not interpret it —

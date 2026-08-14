@@ -102,7 +102,7 @@ async def read_board(
     if to is not None:
         # Hierarchical: an agent's inbox includes what was sent to its whole
         # machine, and a machine's inbox includes what was sent to its agents.
-        # Alias-aware too, so a thread addressed to the key (or to a pre-2.11
+        # Alias-aware too, so a thread addressed to the key (or to a pre-2.12
         # hex instance) still lands in the inbox of the name that replaced it.
         stmt = stmt.where(await inbox_clause(db, Post.recipient, Post.ts, to))
     if session is not None:

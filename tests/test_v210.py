@@ -15,7 +15,7 @@ import pytest
 from .conftest import LAPTOP, SERVER
 
 REPO = "acme/v210repo"
-# Deliberately the pre-2.11 header: fleet-side clients ship from another repo, so
+# Deliberately the pre-2.12 header: fleet-side clients ship from another repo, so
 # the legacy spelling has to keep identifying an agent (as a key) indefinitely.
 AGENT_A = {**LAPTOP, "X-Agent-Instance": "a1b2c3"}
 AGENT_B = {**SERVER, "X-Agent-Instance": "d4e5f6"}
@@ -188,7 +188,7 @@ async def test_judged_only_is_the_default_window(client):
 async def test_by_agent_attributes_runs_to_the_agent_that_ordered_them(client):
     """`author` is the agent identity, so two agents on one box stay distinct.
 
-    The agent half is the board's designated name (v2.11), not anything the
+    The agent half is the board's designated name (v2.12), not anything the
     caller sent, so the expected authors come from /whoami rather than the key.
     """
     await record(client, 8130, headers=AGENT_A)

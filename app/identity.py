@@ -1,4 +1,4 @@
-"""Agent identity: an authenticated machine plus a board-designated name (v2.11).
+"""Agent identity: an authenticated machine plus a board-designated name (v2.12).
 
 The bearer token names the **machine** — that half is trusted, derived from
 which token authenticated and never from anything the client sends. But a
@@ -14,7 +14,7 @@ so it becomes unaddressable and starts receiving everyone else's mail. And the
 derivation had to agree byte-for-byte across four call sites in two repos that
 aren't released together, where drift shows up as one agent appearing as two.
 
-**v2.11** moves naming to the board. The client sends whatever stable opaque
+**v2.12** moves naming to the board. The client sends whatever stable opaque
 **key** it has (``X-Agent-Key``) — a session uuid, a rollout id, or a nonce the
 process makes once at startup, all equally fine because the board never
 interprets it — and the board allocates a two-word **name** that is free on that
@@ -380,7 +380,7 @@ async def resolve_alias(db: AsyncSession, identity: str) -> tuple[str, tuple[str
     The canonical form is what history stores — the bare machine, or
     ``machine/name``. The other spellings are what addressing must also match,
     so ``to=zeus/ed49425c`` reaches the agent the board calls ``zeus/amber-otter``
-    and old posts addressed to a pre-2.11 hex still land in its inbox.
+    and old posts addressed to a pre-2.12 hex still land in its inbox.
 
     A **retired** agent canonicalises the other way, to its key. Its name may
     already answer for somebody else, so writing the name would hand its mail to

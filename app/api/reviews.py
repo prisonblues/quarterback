@@ -1,4 +1,4 @@
-"""Reviewer-panel stats (v2.10).
+"""Reviewer-panel stats (v2.10, per-reviewer accounts in v2.11).
 
 ``~/.claude/loops/panel.py`` reviews one PR diff with several vendor models at
 once and has a master judge rule each deduped finding real or not. That is a
@@ -17,21 +17,36 @@ flatter whichever reviewer was noisiest that day.
 
 The ingest payload is ``panel.py --json`` as-is plus a small envelope, so the
 panel needs no bespoke serialiser and the two can't drift apart.
+
+**v2.11 — what each reviewer said, and which defect it was.** A finding used to
+be one title, one detail and a list of reviewer *names*, because the panel
+merged before the judge and kept one member's text; "codex and pi both reported
+this" was recorded but not what either of them said. ``reported_by`` now carries
+each reporter's verbatim account with its own severity and line
+(``review_finding_reports``), so merging is additive and severity calibration
+against the judge is answerable. Each finding also carries a ``key`` — the
+identity of the *defect*, not of the observation — so the same bug seen in run 3
+and again in run 7 stays two rows that can be joined (``GET /review/findings``),
+which is what makes "was it actually fixed?" a query. The older payload shape
+(``reviewers: ["codex", "pi"]``, no key) still records exactly as before.
 """
 
 from __future__ import annotations
 
+import hashlib
+import re
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import identify, reader
 from app.db import get_session
 from app.identity import agent_row, compose, machine_of
-from app.models.review import ReviewFinding, ReviewReviewer, ReviewRun
+from app.models.review import ReviewFinding, ReviewFindingReport, ReviewReviewer, ReviewRun
 
 router = APIRouter(tags=["review"])
 
@@ -55,19 +70,88 @@ async def _authored_as(session: AsyncSession, author: str) -> str:
 
 SEVERITIES = ("P1", "P2", "P3", "P4")
 
+_INT32 = 2_147_483_647
+
+
+def _line_or_none(v: int | None) -> int | None:
+    """A line number the column cannot hold is no line number.
+
+    Recording is best-effort for the panel — a review must never fail because
+    the board choked — so a garbled line is dropped rather than costing the run
+    its whole record, which is what both a 422 here and the driver's error on
+    an out-of-range INTEGER would do.
+    """
+    return v if v is None or -_INT32 - 1 <= v <= _INT32 else None
+
 
 # ----------------------------------------------------------------- ingest models
 
+class ReportIn(BaseModel):
+    """One reviewer's own account of a finding, before the judge merged it.
+
+    ``severity``/``line`` are that reviewer's, not the judge's: the difference is
+    the calibration signal, so they are stored rather than reconciled.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    reviewer: str
+    severity: str | None = None
+    line: int | None = None
+    #: Verbatim. ``detail`` is accepted as an alias because that is what the
+    #: panel calls the same text on an unmerged finding.
+    account: str = Field(default="", validation_alias=AliasChoices("account", "detail"))
+
+    @field_validator("reviewer")
+    @classmethod
+    def _trim(cls, v: str) -> str:
+        return v.strip()
+
+    @field_validator("line")
+    @classmethod
+    def _line(cls, v: int | None) -> int | None:
+        return _line_or_none(v)
+
+
 class FindingIn(BaseModel):
-    """One deduped finding, exactly as ``panel.py --json`` serialises it."""
+    """One merged finding, exactly as ``panel.py --json`` serialises it.
+
+    The aliases follow the same rule as :class:`ReviewIn`'s — take the panel's
+    words rather than making it translate. The judge's merged statement is
+    ``synthesis`` in its canonical shape and ``title`` in the older one; both
+    land here, because a renamed field would otherwise fail silently into a null
+    column rather than erroring.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
 
     severity: str = "P3"
     file: str | None = None
     line: int | None = None
-    title: str = ""
+    title: str = Field(default="", validation_alias=AliasChoices("title", "synthesis"))
     detail: str = ""
     reviewers: list[str] = Field(default_factory=list)
-    reason: str = ""
+    reason: str = Field(default="", validation_alias=AliasChoices("reason", "rationale"))
+
+    #: Per-reviewer accounts. Supersedes ``reviewers`` (the names are implied by
+    #: it) but does not replace it: a panel may list a member that contributed no
+    #: text, and every older panel sends names only.
+    reported_by: list[ReportIn] = Field(default_factory=list)
+
+    #: The panel's id for this finding *within this run* (e.g. ``"1609-F03"``).
+    #: Used only to resolve ``related`` into finding keys — never as the defect's
+    #: identity, because the numbering restarts every run.
+    id: str | None = None
+    #: A stable identity for the defect, if the caller has one. Wins over the
+    #: derived key, which is a best-effort fallback (see :func:`_derive_key`).
+    key: str | None = None
+    #: ``id``s of other findings in this payload that share a cause.
+    related: list[str] = Field(default_factory=list)
+
+    @field_validator("line")
+    @classmethod
+    def _line(cls, v: int | None) -> int | None:
+        return _line_or_none(v)
 
 
 class ReviewerIn(BaseModel):
@@ -138,8 +222,99 @@ def _verdict(f: FindingIn, judged: bool) -> str:
     return "confirmed" if judged and f.reason != "unjudged" else "unjudged"
 
 
+_NOT_WORD = re.compile(r"[^a-z0-9]+")
+
+
+def _derive_key(file: str | None, title: str) -> str:
+    """A defect identity for a caller that has none of its own.
+
+    File plus a normalised title, and deliberately **not** the line: the line
+    moves when the fix above it lands, and an identity that moves links nothing.
+    Best-effort by nature — a judge that rewords its synthesis between runs
+    breaks the chain, which is why an explicit ``key`` always wins.
+
+    Duplicated as SQL in migration 0012 to backfill pre-v2.11 rows; the two must
+    stay identical or old runs join no chain.
+    """
+    norm = _NOT_WORD.sub(" ", title.lower()).strip()
+    return hashlib.md5(f"{file or ''}|{norm}".encode(), usedforsecurity=False).hexdigest()[:16]
+
+
+@dataclass(slots=True)
+class Prepared:
+    """A finding with its ingest-time derivations settled once, up front."""
+
+    f: FindingIn
+    verdict: str
+    #: What gets stored, which is also what the key is derived from — a title
+    #: defaulted at storage time but keyed before it would put an untitled
+    #: finding in a different chain from the backfilled ones.
+    title: str
+    #: Every member credited, in payload order: ``reviewers`` then any reporter
+    #: only ``reported_by`` names.
+    reviewers: list[str]
+    reports: list[ReportIn]
+    key: str
+    related: list[str] = field(default_factory=list)
+
+
+def _prepare(findings: list[tuple[FindingIn, str]]) -> list[Prepared]:
+    """Settle attribution, defect key and ``related`` links for one payload.
+
+    Attribution is unioned rather than chosen: ``reported_by`` is authoritative
+    about *what* was said, but a panel may still list a member alongside it that
+    contributed no text, and dropping that member would silently un-credit it.
+    """
+    prepared: list[Prepared] = []
+    for f, verdict in findings:
+        reports: list[ReportIn] = []
+        seen: set[str] = set()
+        for r in f.reported_by:
+            # Two accounts from one reviewer would violate the table's
+            # (finding, reviewer) uniqueness; the first is kept rather than the
+            # request being rejected, since ingest is best-effort for the panel.
+            if r.reviewer and r.reviewer not in seen:
+                seen.add(r.reviewer)
+                reports.append(r)
+
+        reviewers = [n for n in dict.fromkeys(x.strip() for x in f.reviewers) if n]
+        reviewers += [r.reviewer for r in reports if r.reviewer not in reviewers]
+
+        title = f.title or "(untitled)"
+        prepared.append(Prepared(
+            f=f,
+            verdict=verdict,
+            title=title,
+            reviewers=reviewers,
+            reports=reports,
+            key=(f.key or "").strip() or _derive_key(f.file, title),
+        ))
+
+    # `related` arrives as the panel's run-local ids; stored as keys so the
+    # links survive the run they were made in. A ref to something not in this
+    # payload names nothing that can be linked, so it is dropped.
+    by_id = {p.f.id: p.key for p in prepared if p.f.id}
+    for p in prepared:
+        p.related = sorted({by_id[r] for r in p.f.related if r in by_id} - {p.key})
+    return prepared
+
+
+def _calibration(own: str | None, judged: str | None) -> str | None:
+    """Which way this reviewer's severity missed the judge's, if it can be told.
+
+    ``P1 < P2`` lexically and P1 is the more severe, so a reviewer whose severity
+    sorts *before* the judge's called it worse than it was.
+    """
+    a, b = (own or "").upper(), (judged or "").upper()
+    if a not in SEVERITIES or b not in SEVERITIES:
+        return None
+    if a == b:
+        return "sev_agree"
+    return "sev_stricter" if a < b else "sev_looser"
+
+
 def _scorecards(
-    findings: list[tuple[FindingIn, str]],
+    findings: list[Prepared],
     cfg: dict[str, ReviewerIn],
     selected: list[str],
     skipped: list[str],
@@ -154,29 +329,39 @@ def _scorecards(
     run unless it appears in ``skipped``, whose entries read ``"codex: CLI
     absent"``. Assuming the opposite would file every quiet reviewer as broken.
     """
-    credited = {r for f, _ in findings for r in f.reviewers}
+    credited = {r for p in findings for r in p.reviewers}
     skips = {s.split(":", 1)[0].strip(): s for s in skipped if ":" in s}
     names = sorted(set(cfg) | set(selected) | credited)
 
     # Tallied as plain counters first: a column ``default=0`` is applied at
     # flush, so incrementing a freshly-constructed ORM object would start from
     # None.
-    zero = ("raised", "confirmed", "dismissed", "unjudged", "solo",
+    zero = ("raised", "confirmed", "dismissed", "unjudged", "solo", "shared",
+            "sev_stricter", "sev_agree", "sev_looser",
             *(s.lower() for s in SEVERITIES))
     tally: dict[str, dict[str, int]] = {n: dict.fromkeys(zero, 0) for n in names}
-    for f, verdict in findings:
-        for name in f.reviewers:
+    for p in findings:
+        own = {r.reviewer: r for r in p.reports}
+        for name in p.reviewers:
             t = tally[name]
             t["raised"] += 1
-            if verdict == "confirmed":
+            if len(p.reviewers) > 1:
+                t["shared"] += 1
+            if p.verdict == "confirmed":
                 t["confirmed"] += 1
-                if len(f.reviewers) == 1:
+                if len(p.reviewers) == 1:
                     t["solo"] += 1
-                sev = (f.severity or "").upper()
+                sev = (p.f.severity or "").upper()
                 if sev in SEVERITIES:
                     t[sev.lower()] += 1
-            elif verdict in ("dismissed", "unjudged"):
-                t[verdict] += 1
+                # Calibration only over confirmed findings: on a dismissal the
+                # recorded severity is the panel's own, so comparing a reviewer
+                # against it would be comparing it to itself.
+                bucket = _calibration(own[name].severity, sev) if name in own else None
+                if bucket:
+                    t[bucket] += 1
+            elif p.verdict in ("dismissed", "unjudged"):
+                t[p.verdict] += 1
 
     cards = []
     for name in names:
@@ -215,12 +400,12 @@ async def record_review(
         if existing is not None:
             return {"id": existing.id, "recorded": False, "reason": "duplicate run_key"}
 
-    findings: list[tuple[FindingIn, str]] = (
+    findings = _prepare(
         [(f, _verdict(f, body.judged)) for f in body.to_fix]
         + [(f, "dismissed") for f in body.dismissed]
         + [(f, "sonar") for f in body.sonar_findings]
     )
-    counts = {v: sum(1 for _, x in findings if x == v) for v in
+    counts = {v: sum(1 for p in findings if p.verdict == v) for v in
               ("confirmed", "dismissed", "unjudged", "sonar")}
 
     run = ReviewRun(
@@ -253,29 +438,52 @@ async def record_review(
     # Sonar's hard-gate issues are the gate's own output, not a panel member's
     # judged findings — excluded from the scorecards so they can't inflate a
     # precision the judge never ruled on.
-    scored = [(f, v) for f, v in findings if v != "sonar"]
+    scored = [p for p in findings if p.verdict != "sonar"]
     for card in _scorecards(scored, body.reviewers, body.reviewers_selected, body.skipped):
         card.run_id = run.id
         session.add(card)
 
-    for f, verdict in findings:
-        session.add(
+    rows = [
+        (
             ReviewFinding(
                 run_id=run.id,
-                verdict=verdict,
-                severity=(f.severity or "").upper() or None,
-                file=f.file,
-                line=f.line,
-                title=f.title or "(untitled)",
-                detail=f.detail or None,
-                reason=f.reason or None,
-                reviewers=f.reviewers or None,
-                n_reviewers=len(f.reviewers),
-            )
+                verdict=p.verdict,
+                severity=(p.f.severity or "").upper() or None,
+                file=p.f.file,
+                line=p.f.line,
+                title=p.title,
+                detail=p.f.detail or None,
+                reason=p.f.reason or None,
+                finding_key=p.key,
+                related=p.related or None,
+                reviewers=p.reviewers or None,
+                n_reviewers=len(p.reviewers),
+            ),
+            p.reports,
         )
+        for p in findings
+    ]
+    for finding, _ in rows:
+        session.add(finding)
+    if rows:
+        await session.flush()  # need finding.id for the accounts hanging off it
+
+    accounts = 0
+    for finding, reports in rows:
+        for r in reports:
+            accounts += 1
+            session.add(
+                ReviewFindingReport(
+                    finding_id=finding.id,
+                    reviewer=r.reviewer,
+                    severity=(r.severity or "").upper() or None,
+                    line=r.line,
+                    account=r.account or None,
+                )
+            )
 
     await session.commit()
-    return {"id": run.id, "recorded": True, "findings": len(findings)}
+    return {"id": run.id, "recorded": True, "findings": len(findings), "accounts": accounts}
 
 
 # ------------------------------------------------------------------ read paths
@@ -323,8 +531,54 @@ def _card_view(c: ReviewReviewer) -> dict:
         "dismissed": c.dismissed,
         "unjudged": c.unjudged,
         "solo": c.solo,
+        "shared": c.shared,
+        "sev_stricter": c.sev_stricter,
+        "sev_agree": c.sev_agree,
+        "sev_looser": c.sev_looser,
         "p1": c.p1, "p2": c.p2, "p3": c.p3, "p4": c.p4,
     }
+
+
+def _report_view(r: ReviewFindingReport) -> dict:
+    return {
+        "reviewer": r.reviewer,
+        "severity": r.severity,
+        "line": r.line,
+        "account": r.account,
+    }
+
+
+def _finding_view(f: ReviewFinding, reports: list[ReviewFindingReport]) -> dict:
+    return {
+        "key": f.finding_key,
+        "verdict": f.verdict,
+        "severity": f.severity,
+        "file": f.file,
+        "line": f.line,
+        "title": f.title,
+        "detail": f.detail,
+        "reason": f.reason,
+        "reviewers": f.reviewers or [],
+        "related": f.related or [],
+        "reported_by": [_report_view(r) for r in reports],
+    }
+
+
+async def _reports_by_finding(
+    session: AsyncSession, finding_ids: list[int]
+) -> dict[int, list[ReviewFindingReport]]:
+    """Every account for these findings, in one query rather than N."""
+    if not finding_ids:
+        return {}
+    rows = (await session.scalars(
+        select(ReviewFindingReport)
+        .where(ReviewFindingReport.finding_id.in_(finding_ids))
+        .order_by(ReviewFindingReport.reviewer)
+    )).all()
+    out: dict[int, list[ReviewFindingReport]] = {}
+    for r in rows:
+        out.setdefault(r.finding_id, []).append(r)
+    return out
 
 
 def _since_clause(since: str | None, days: int | None):
@@ -445,6 +699,11 @@ async def review_stats(
                 func.avg(ReviewReviewer.duration_ms).filter(
                     ReviewReviewer.duration_ms.isnot(None)
                 ),
+                func.sum(ReviewReviewer.shared),
+                func.sum(ReviewReviewer.sev_stricter),
+                func.sum(ReviewReviewer.sev_agree),
+                func.sum(ReviewReviewer.sev_looser),
+                func.sum(ReviewReviewer.duration_ms),
             )
             .join(ReviewRun, ReviewRun.id == ReviewReviewer.run_id)
             .where(*filters)
@@ -454,10 +713,16 @@ async def review_stats(
 
     by_model = []
     for (name, model, effort, runs, skipped, raised, confirmed, dismissed,
-         unjudged, solo, p1, p2, p3, p4, avg_ms) in model_rows:
+         unjudged, solo, p1, p2, p3, p4, avg_ms,
+         shared, stricter, agree, looser, total_ms) in model_rows:
         confirmed, dismissed = int(confirmed or 0), int(dismissed or 0)
+        raised = int(raised or 0)
         ruled = confirmed + dismissed
         ran = runs - skipped
+        shared = int(shared or 0)
+        stricter, agree, looser = int(stricter or 0), int(agree or 0), int(looser or 0)
+        rated = stricter + agree + looser
+        total_ms = int(total_ms) if total_ms is not None else None
         by_model.append({
             "reviewer": name,
             "model": model,
@@ -465,17 +730,31 @@ async def review_stats(
             "runs": runs,
             "ran": ran,
             "skipped_runs": skipped,
-            "raised": int(raised or 0),
+            "raised": raised,
             "confirmed": confirmed,
             "dismissed": dismissed,
             "unjudged": int(unjudged or 0),
             "solo": int(solo or 0),
+            # Findings someone else raised too. Its complement is a superset of
+            # `solo` — a lone reporter is either the only one who saw it or the
+            # only one who was wrong, and precision is what separates those.
+            "shared": shared,
+            "consensus_rate": round(shared / raised, 3) if raised else None,
             # None, not 0.0 — "the judge never ruled on anything it raised" is a
             # different statement from "everything it raised was wrong".
             "precision": round(confirmed / ruled, 3) if ruled else None,
             "confirmed_per_run": round(confirmed / ran, 2) if ran else None,
             "p1": int(p1 or 0), "p2": int(p2 or 0), "p3": int(p3 or 0), "p4": int(p4 or 0),
+            "sev_stricter": stricter,
+            "sev_agree": agree,
+            "sev_looser": looser,
+            # Needs `reported_by` severities to be non-null, so it stays None for
+            # every pre-v2.11 run rather than reading as perfect disagreement.
+            "severity_calibration": round(agree / rated, 3) if rated else None,
             "avg_duration_ms": round(float(avg_ms)) if avg_ms is not None else None,
+            # The cost side of "is the expensive tier worth it": time spent per
+            # finding that survived the judge, not per finding raised.
+            "ms_per_confirmed": round(total_ms / confirmed) if total_ms and confirmed else None,
         })
     by_model.sort(key=lambda m: (-m["confirmed"], m["reviewer"]))
 
@@ -524,6 +803,117 @@ async def review_stats(
     }
 
 
+@router.get("/review/findings")
+async def pr_finding_history(
+    _reader: str = Depends(reader),
+    repo: str = Query(..., min_length=1, description="github nameWithOwner"),
+    pr: int = Query(..., ge=1),
+    limit: int = Query(50, ge=1, le=200, description="trace this many of the PR's runs"),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """One PR's findings as chains of observations — did the fix land?
+
+    Observations are never collapsed: run 3 and run 7 seeing the same defect are
+    two rows joined by ``key``, which is what makes "was this actually fixed?"
+    and "how many rounds did this PR take?" answerable at all. Collapsing them
+    into one current-state row would erase precisely that.
+
+    ``status`` is what the record supports, not a claim about the code:
+
+    * ``dismissed`` — the judge ruled against it every time it was raised.
+    * ``gone`` — raised in an earlier run of this PR and not in the latest one.
+      Usually the fix landed; it can also mean the reviewer that raised it did
+      not run again, which the observation list shows.
+    * ``open`` — still raised in the most recent run.
+
+    Scoped to one PR because ``key`` identifies a defect within a PR: the same
+    "unused import" in two repos is not one chain.
+    """
+    # One over the window, so "there is older history" is a fact rather than the
+    # guess "we returned exactly as many as we asked for".
+    fetched = list(
+        (await session.scalars(
+            select(ReviewRun)
+            .where(ReviewRun.repo == repo, ReviewRun.pr == pr)
+            .order_by(ReviewRun.ts.desc(), ReviewRun.id.desc())
+            .limit(limit + 1)
+        )).all()
+    )
+    if not fetched:
+        return {"repo": repo, "pr": pr, "rounds": 0, "truncated": False,
+                "runs": [], "findings": []}
+
+    truncated = len(fetched) > limit
+    runs = list(reversed(fetched[:limit]))  # chronological: a chain reads left to right
+    order = {r.id: i for i, r in enumerate(runs)}
+    ts_by_run = {r.id: r.ts for r in runs}
+    latest_id = runs[-1].id
+
+    findings = list(
+        (await session.scalars(
+            select(ReviewFinding)
+            .where(ReviewFinding.run_id.in_(list(order)))
+            .order_by(ReviewFinding.id)
+        )).all()
+    )
+    reports = await _reports_by_finding(session, [f.id for f in findings])
+
+    chains: dict[str, list[ReviewFinding]] = {}
+    for f in sorted(findings, key=lambda f: order[f.run_id]):
+        chains.setdefault(f.finding_key, []).append(f)
+
+    out = []
+    for key, obs in chains.items():
+        last = obs[-1]
+        reviewers: list[str] = []
+        related: list[str] = []
+        for f in obs:
+            reviewers += [r for r in (f.reviewers or []) if r not in reviewers]
+            related += [r for r in (f.related or []) if r not in related]
+        verdicts = {f.verdict for f in obs}
+        out.append({
+            "key": key,
+            # The latest observation's words: the newest statement of the defect
+            # is the one worth showing, and its line has survived any fix above it.
+            "file": last.file,
+            "line": last.line,
+            "title": last.title,
+            "severity": last.severity,
+            "status": ("dismissed" if verdicts == {"dismissed"}
+                       else "open" if last.run_id == latest_id else "gone"),
+            "runs_seen": len(obs),
+            "first_run": obs[0].run_id,
+            "last_run": last.run_id,
+            "reviewers": reviewers,
+            "related": related,
+            "observations": [
+                {
+                    "run_id": f.run_id,
+                    "ts": ts_by_run[f.run_id].isoformat(),
+                    **_finding_view(f, reports.get(f.id, [])),
+                }
+                for f in obs
+            ],
+        })
+    out.sort(key=lambda c: (c["severity"] or "P9", order[c["first_run"]], c["key"]))
+
+    return {
+        "repo": repo,
+        "pr": pr,
+        "rounds": len(runs),
+        # More runs exist than the window traced, so `first_run` and a `gone`
+        # status describe the window, not the PR's whole history.
+        "truncated": truncated,
+        "runs": [
+            {"id": r.id, "ts": r.ts.isoformat(), "author": r.author, "judged": r.judged,
+             "confirmed": r.n_confirmed, "dismissed": r.n_dismissed,
+             "unjudged": r.n_unjudged, "sonar": r.n_sonar}
+            for r in runs
+        ],
+        "findings": out,
+    }
+
+
 @router.get("/review/{run_id}")
 async def get_review(
     run_id: int,
@@ -548,20 +938,9 @@ async def get_review(
             .order_by(ReviewFinding.severity, ReviewFinding.id)
         )).all()
     )
+    reports = await _reports_by_finding(session, [f.id for f in findings])
     return {
         **_run_view(run),
         "reviewers": [_card_view(c) for c in cards],
-        "findings": [
-            {
-                "verdict": f.verdict,
-                "severity": f.severity,
-                "file": f.file,
-                "line": f.line,
-                "title": f.title,
-                "detail": f.detail,
-                "reason": f.reason,
-                "reviewers": f.reviewers or [],
-            }
-            for f in findings
-        ],
+        "findings": [_finding_view(f, reports.get(f.id, [])) for f in findings],
     }

@@ -152,7 +152,7 @@ mcp = FastMCP(
     instructions=(
         "quarterback is a shared, ordered, replayable board for coordinating "
         "across devices and agents.\n\n"
-        "## Who you are (v2.11)\n"
+        "## Who you are (v2.12)\n"
         "Your board identity is `machine/name` — e.g. `server/amber-otter`. The "
         "machine half is proved by your token; the name half is **designated by "
         "the board**, so you cannot work it out locally — call `whoami` to learn "
