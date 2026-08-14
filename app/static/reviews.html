@@ -1,0 +1,333 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>quarterback — reviewer panel</title>
+<style>
+  :root {
+    --bg:#0f1115; --panel:#171a21; --line:#262b36; --fg:#e6e9ef;
+    --muted:#8b93a3; --accent:#6ea8fe; --chip:#232936;
+    /* Categorical slots, stepped for the dark panel surface and validated as a
+       set (adjacent CVD ΔE 8.4, normal-vision 19.3, all ≥3:1 on #171a21).
+       Bound to the VENDOR, not to rank: filtering the table must never repaint
+       a reviewer, or a week-on-week read of the same page lies. */
+    --s-claude:#3987e5; --s-codex:#d95926; --s-gemini:#199e70;
+    --s-pi:#c98500; --s-sonarqube:#d55181; --s-other:#8b93a3;
+    /* Reserved status steps — never reused as a categorical slot. */
+    --good:#35c48a; --warn:#f0b429; --bad:#e5484d;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+    font:14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  a { color:var(--accent); }
+  header { position:sticky; top:0; z-index:5; background:var(--panel);
+    border-bottom:1px solid var(--line); padding:10px 16px;
+    display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+  header h1 { font-size:15px; margin:0; font-weight:600; letter-spacing:.3px; }
+  header .spacer { flex:1; }
+  select, input, label { font:inherit; font-size:12px; }
+  select { background:var(--chip); color:var(--fg); border:1px solid var(--line);
+    border-radius:6px; padding:4px 8px; }
+  label.check { color:var(--muted); display:flex; align-items:center; gap:5px; cursor:pointer; }
+  main { max-width:1080px; margin:0 auto; padding:14px 16px 60px; }
+  h2 { font-size:13px; font-weight:600; letter-spacing:.4px; text-transform:uppercase;
+    color:var(--muted); margin:26px 0 8px; }
+  h2 .note { text-transform:none; letter-spacing:0; font-weight:400; font-size:12px; }
+  .empty { color:var(--muted); text-align:center; padding:36px; }
+
+  /* headline tiles — a hero number needs no plot */
+  .tiles { display:flex; gap:10px; flex-wrap:wrap; }
+  .tile { border:1px solid var(--line); border-radius:10px; background:var(--panel);
+    padding:10px 14px; min-width:120px; }
+  .tile .n { font-size:22px; font-weight:600; line-height:1.2; }
+  .tile .k { font-size:11px; color:var(--muted); letter-spacing:.4px; }
+
+  table { width:100%; border-collapse:collapse; background:var(--panel);
+    border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+  th { text-align:right; font-weight:600; font-size:11px; color:var(--muted);
+    letter-spacing:.4px; padding:7px 8px; border-bottom:1px solid var(--line);
+    white-space:nowrap; }
+  th:first-child, td:first-child { text-align:left; padding-left:12px; }
+  td { padding:7px 8px; text-align:right; border-bottom:1px solid #1e222b;
+    white-space:nowrap; font-variant-numeric:tabular-nums; }
+  tr:last-child td { border-bottom:none; }
+  tbody tr:hover { background:#1c212b; }
+  .dim { color:var(--muted); }
+
+  .who { display:flex; align-items:center; gap:7px; }
+  /* 2px surface ring so a swatch never touches the row fill */
+  .sw { width:9px; height:9px; border-radius:2px; flex:0 0 auto;
+    box-shadow:0 0 0 2px var(--panel); }
+  .chip { font-size:10px; padding:1px 6px; border-radius:4px; background:var(--chip);
+    border:1px solid var(--line); color:var(--muted); }
+
+  /* ranked bar: thin mark, 4px rounded data-end, anchored to a common baseline */
+  .barcell { width:34%; }
+  .bar { position:relative; height:12px; background:#1e222b; border-radius:3px; }
+  .bar > i { position:absolute; left:0; top:0; bottom:0; border-radius:0 4px 4px 0;
+    display:block; min-width:2px; }
+  .barlab { position:absolute; right:6px; top:-1px; font-size:11px; color:var(--fg);
+    text-shadow:0 0 4px var(--panel); }
+
+  /* precision meter: one neutral fill — identity is already carried by the row */
+  .meter { display:inline-flex; align-items:center; gap:7px; }
+  .meter .track { width:52px; height:6px; background:#1e222b; border-radius:3px;
+    position:relative; overflow:hidden; }
+  .meter .fill { position:absolute; left:0; top:0; bottom:0; border-radius:0 3px 3px 0; }
+  .pct { min-width:38px; display:inline-block; }
+
+  .runrow { cursor:pointer; }
+  .detail td { background:#12151c; text-align:left; white-space:normal; padding:10px 12px 12px; }
+  .detail table { background:transparent; border:none; }
+  .fnd { display:flex; gap:8px; align-items:baseline; padding:2px 0; font-size:12px; }
+  .fnd .sev { font-weight:600; font-size:10px; min-width:22px; }
+  .fnd .loc { color:var(--accent); }
+  .fnd.dismissed { color:var(--muted); text-decoration:line-through; }
+  .fnd .by { color:var(--muted); font-size:11px; }
+
+  #tip { position:fixed; z-index:20; pointer-events:none; display:none;
+    background:#0b0d12; border:1px solid var(--line); border-radius:6px;
+    padding:6px 9px; font-size:11px; line-height:1.45; box-shadow:0 6px 18px #0008; }
+</style>
+</head>
+<body>
+<header>
+  <h1>quarterback · reviewer panel</h1>
+  <span class="dim" id="window"></span>
+  <span class="spacer"></span>
+  <select id="repo"><option value="">all repos</option></select>
+  <select id="days">
+    <option value="">all time</option>
+    <option value="7">last 7 days</option>
+    <option value="30" selected>last 30 days</option>
+    <option value="90">last 90 days</option>
+    <option value="365">last year</option>
+  </select>
+  <label class="check"><input type="checkbox" id="judged" checked /> judged runs only</label>
+  <a href="/">board →</a>
+</header>
+<main>
+  <div class="tiles" id="tiles"></div>
+
+  <h2>Model leaderboard
+    <span class="note" id="lbNote"></span></h2>
+  <div id="leaderboard"></div>
+
+  <h2>By agent <span class="note">— who ordered the review</span></h2>
+  <div id="agents"></div>
+
+  <h2>Recent runs</h2>
+  <div id="runs"></div>
+</main>
+<div id="tip"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const SERIES = ["claude", "codex", "gemini", "pi", "sonarqube"];
+
+// Quotes too, not just angle brackets: nearly every use here is inside an
+// attribute, where innerHTML escaping alone leaves a value free to close it.
+function esc(s){ const d=document.createElement("div"); d.textContent=s??"";
+  return d.innerHTML.replace(/"/g,"&quot;").replace(/'/g,"&#39;"); }
+function hue(name){ return SERIES.includes(name) ? `var(--s-${name})` : "var(--s-other)"; }
+function ago(iso){ if(!iso) return "—";
+  const s=Math.max(0,(Date.now()-Date.parse(iso))/1000);
+  if(s<60) return Math.floor(s)+"s"; if(s<3600) return Math.floor(s/60)+"m";
+  if(s<86400) return Math.floor(s/3600)+"h"; return Math.floor(s/86400)+"d"; }
+function pct(x){ return x==null ? "—" : Math.round(x*100)+"%"; }
+// Precision is a quality reading, not a series — status colours, which are
+// reserved for exactly this and always ship beside the number, never alone.
+function precColor(x){ return x==null ? "var(--muted)"
+  : x>=0.75 ? "var(--good)" : x>=0.5 ? "var(--warn)" : "var(--bad)"; }
+// 100% off two findings must not read like 86% off ninety. Below this many
+// adjudicated findings the ratio is recessive and marked, not hidden — the row
+// still exists, it just stops competing for the eye.
+const THIN = 10;
+function ruled(r){ return r.confirmed + r.dismissed; }
+function thin(r){ return r.precision != null && ruled(r) < THIN; }
+
+let tipEl = $("tip");
+function bindTip(el, html){
+  el.addEventListener("mousemove", (e) => {
+    tipEl.innerHTML = html; tipEl.style.display = "block";
+    const pad = 14, w = tipEl.offsetWidth, h = tipEl.offsetHeight;
+    tipEl.style.left = Math.min(e.clientX + pad, innerWidth - w - 8) + "px";
+    tipEl.style.top  = Math.min(e.clientY + pad, innerHeight - h - 8) + "px";
+  });
+  el.addEventListener("mouseleave", () => { tipEl.style.display = "none"; });
+}
+
+function qs(extra){
+  const p = new URLSearchParams();
+  if ($("repo").value) p.set("repo", $("repo").value);
+  if ($("days").value) p.set("days", $("days").value);
+  Object.entries(extra || {}).forEach(([k, v]) => p.set(k, v));
+  return p;
+}
+
+// ---- leaderboard -----------------------------------------------------------
+// Ranked horizontal bars: the job is "who found the most real issues", which is
+// magnitude + identity, so one bar per competitor on a shared baseline, sorted.
+// Every row is direct-labelled with its reviewer, so identity never rests on
+// colour alone and no legend box is needed.
+function renderLeaderboard(rows, judgedOnly){
+  $("lbNote").textContent = (judgedOnly
+    ? "— judged runs only, so precision is a real ratio"
+    : "— includes unjudged runs; precision counts only adjudicated findings")
+    + `; * = fewer than ${THIN} findings ruled on`;
+  if (!rows.length){ $("leaderboard").innerHTML = '<div class="empty">no runs recorded yet</div>'; return; }
+  const max = Math.max(...rows.map(r => r.confirmed), 1);
+  const body = rows.map(r => {
+    const label = r.model ? `${r.reviewer} <span class="chip">${esc(r.model)}${r.effort ? " · " + esc(r.effort) : ""}</span>`
+                          : `${r.reviewer} <span class="chip dim">model not recorded</span>`;
+    const w = (r.confirmed / max) * 100;
+    return `<tr>
+      <td><span class="who"><span class="sw" style="background:${hue(r.reviewer)}"></span>${label}</span></td>
+      <td class="barcell"><div class="bar"><i style="width:${w}%;background:${hue(r.reviewer)}"></i>
+        <span class="barlab">${r.confirmed}</span></div></td>
+      <td><span class="meter" style="opacity:${thin(r) ? .45 : 1}"><span class="track"><span class="fill"
+          style="width:${r.precision == null ? 0 : r.precision * 100}%;background:${precColor(r.precision)}"></span></span>
+        <span class="pct" style="color:${precColor(r.precision)}">${pct(r.precision)}${thin(r) ? "*" : ""}</span></span></td>
+      <td>${r.solo}</td><td>${r.p1}</td><td>${r.raised}</td><td>${r.dismissed}</td>
+      <td>${r.confirmed_per_run ?? "—"}</td>
+      <td class="dim">${r.ran}${r.skipped_runs ? ` <span style="color:var(--warn)">+${r.skipped_runs}✗</span>` : ""}</td>
+    </tr>`;
+  }).join("");
+  $("leaderboard").innerHTML = `<table>
+    <thead><tr>
+      <th>reviewer</th><th>confirmed findings</th><th>precision</th><th>solo</th>
+      <th>P1</th><th>raised</th><th>dismissed</th><th>conf/run</th><th>runs</th>
+    </tr></thead><tbody>${body}</tbody></table>`;
+
+  // Bound by index against the same sorted array the rows came from — the row
+  // object stays a JS value rather than being round-tripped through a DOM
+  // attribute, which is where the quoting goes wrong.
+  $("leaderboard").querySelectorAll("tbody tr").forEach((tr, i) => {
+    const r = rows[i];
+    bindTip(tr, `<b>${esc(r.reviewer)}</b>${r.model ? " · " + esc(r.model) : ""}${r.effort ? " · " + esc(r.effort) : ""}<br>
+      raised ${r.raised} → <b>${r.confirmed} confirmed</b>, ${r.dismissed} dismissed${r.unjudged ? `, ${r.unjudged} unjudged` : ""}<br>
+      ${r.solo} found by nobody else · ${r.p1} P1<br>
+      precision over ${ruled(r)} adjudicated finding${ruled(r) === 1 ? "" : "s"}<br>
+      ran in ${r.ran} of ${r.runs} runs${r.skipped_runs ? ` (${r.skipped_runs} skipped)` : ""}
+      ${r.avg_duration_ms ? `<br>avg ${Math.round(r.avg_duration_ms / 1000)}s per review` : ""}`);
+  });
+}
+
+function renderAgents(rows){
+  if (!rows.length){ $("agents").innerHTML = '<div class="empty">—</div>'; return; }
+  $("agents").innerHTML = `<table>
+    <thead><tr><th>agent</th><th>runs</th><th>PRs</th><th>confirmed</th><th>dismissed</th><th>last</th></tr></thead>
+    <tbody>${rows.map(a => `<tr>
+      <td>${esc(a.author)}</td><td>${a.runs}</td><td>${a.prs}</td>
+      <td>${a.confirmed}</td><td class="dim">${a.dismissed}</td>
+      <td class="dim">${ago(a.last_run)} ago</td></tr>`).join("")}</tbody></table>`;
+}
+
+// ---- recent runs -----------------------------------------------------------
+function runRow(r){
+  const gate = r.ci_status === "FAIL" || r.sonar_gate === "ERROR" ? "var(--bad)"
+             : r.ci_status === "PASS" ? "var(--good)" : "var(--muted)";
+  const swatches = (r.reviewers || []).map(c =>
+    `<span class="sw" title="${esc(c.name)}${c.ran ? "" : " (skipped)"}"
+       style="background:${hue(c.name)};opacity:${c.ran ? 1 : .28}"></span>`).join(" ");
+  return `<tr class="runrow" data-id="${r.id}">
+    <td><span class="who">${swatches}<a href="https://github.com/${esc(r.repo)}/pull/${r.pr}"
+      target="_blank" rel="noreferrer">${esc(r.repo)}#${r.pr}</a></span>
+      <div class="dim" style="font-size:11px">${esc(r.pr_title || "")}</div></td>
+    <td class="dim">${esc(r.author)}</td>
+    <td>${r.confirmed}${r.unjudged ? ` <span style="color:var(--warn)"
+      title="kept but never adjudicated">+${r.unjudged}?</span>` : ""}</td>
+    <td class="dim">${r.dismissed}</td>
+    <td>${r.sonar ? r.sonar : "<span class='dim'>—</span>"}</td>
+    <td style="color:${gate}">${esc(r.ci_status || "—")}</td>
+    <td class="dim">${r.judged ? esc(r.judge_model || "judged") : "<span style='color:var(--warn)'>unjudged</span>"}</td>
+    <td class="dim">${ago(r.ts)} ago</td>
+  </tr>`;
+}
+
+async function toggleRun(tr){
+  const next = tr.nextElementSibling;
+  if (next && next.classList.contains("detail")){ next.remove(); return; }
+  const row = document.createElement("tr");
+  row.className = "detail";
+  row.innerHTML = `<td colspan="8" class="dim">loading…</td>`;
+  tr.after(row);
+  const res = await fetch(`/review/${tr.dataset.id}`, { headers: { Accept: "application/json" } });
+  if (!res.ok){ row.firstChild.textContent = "could not load run"; return; }
+  const r = await res.json();
+  const cards = r.reviewers.map(c => `<tr>
+      <td><span class="who"><span class="sw" style="background:${hue(c.name)}"></span>${esc(c.name)}
+        ${c.model ? `<span class="chip">${esc(c.model)}${c.effort ? " · " + esc(c.effort) : ""}</span>` : ""}</span></td>
+      <td>${c.ran ? c.raised : `<span style="color:var(--warn)">did not run</span>`}</td>
+      <td>${c.confirmed}</td><td class="dim">${c.dismissed}</td><td>${c.solo}</td>
+      <td class="dim">${c.truncated ? `saw ${c.max_diff_chars?.toLocaleString()} chars` : "saw whole diff"}</td>
+    </tr>`).join("");
+  const finds = r.findings.map(f => `<div class="fnd ${f.verdict}">
+      <span class="sev">${esc(f.severity || "")}</span>
+      <span class="loc">${esc(f.file || "")}${f.line ? ":" + f.line : ""}</span>
+      <span>${esc(f.title)}</span>
+      <span class="by">${(f.reviewers || []).map(esc).join(", ") || f.verdict}${f.reviewers && f.reviewers.length > 1 ? " ⋆" : ""}</span>
+    </div>`).join("") || '<div class="dim">no findings</div>';
+  row.innerHTML = `<td colspan="8">
+    <table><thead><tr><th>panel member</th><th>raised</th><th>confirmed</th>
+      <th>dismissed</th><th>solo</th><th>diff seen</th></tr></thead><tbody>${cards}</tbody></table>
+    ${r.skipped.length ? `<div class="dim" style="margin-top:8px">skipped: ${r.skipped.map(esc).join(" · ")}</div>` : ""}
+    <div style="margin-top:10px">${finds}</div></td>`;
+}
+
+function renderRuns(runs){
+  if (!runs.length){ $("runs").innerHTML = '<div class="empty">no runs recorded yet</div>'; return; }
+  $("runs").innerHTML = `<table><thead><tr>
+    <th>PR</th><th>ran by</th><th>confirmed</th><th>dismissed</th><th>sonar</th>
+    <th>CI</th><th>judge</th><th>when</th></tr></thead>
+    <tbody>${runs.map(runRow).join("")}</tbody></table>`;
+  $("runs").querySelectorAll(".runrow").forEach(tr =>
+    tr.addEventListener("click", () => toggleRun(tr)));
+
+  const repos = [...new Set(runs.map(r => r.repo))].sort();
+  const sel = $("repo"), keep = sel.value;
+  if (sel.options.length - 1 !== repos.length){
+    sel.innerHTML = '<option value="">all repos</option>' +
+      repos.map(r => `<option>${esc(r)}</option>`).join("");
+    sel.value = keep;
+  }
+}
+
+function renderTiles(s){
+  $("window").textContent = s.window.since
+    ? `since ${s.window.since.slice(0, 10)}`
+    : (s.window.first_run ? `since ${s.window.first_run.slice(0, 10)}` : "");
+  const top = s.by_model[0];
+  $("tiles").innerHTML = `
+    <div class="tile"><div class="n">${s.runs}</div><div class="k">panel runs</div></div>
+    <div class="tile"><div class="n">${s.prs}</div><div class="k">PRs reviewed</div></div>
+    <div class="tile"><div class="n">${s.repos}</div><div class="k">repos</div></div>
+    <div class="tile"><div class="n">${s.by_model.reduce((a, m) => a + m.confirmed, 0)}</div>
+      <div class="k">confirmed findings</div></div>
+    ${top ? `<div class="tile"><div class="n" style="color:${hue(top.reviewer)}">${esc(top.reviewer)}</div>
+      <div class="k">most confirmed${top.model ? " · " + esc(top.model) : ""}</div></div>` : ""}`;
+}
+
+async function load(){
+  const judgedOnly = $("judged").checked;
+  const [statsRes, runsRes] = await Promise.all([
+    fetch("/review/stats?" + qs({ judged_only: judgedOnly }), { headers: { Accept: "application/json" } }),
+    fetch("/reviews?" + qs({ limit: 50 }), { headers: { Accept: "application/json" } }),
+  ]);
+  if (!statsRes.ok || !runsRes.ok){
+    $("leaderboard").innerHTML = '<div class="empty">could not load review stats</div>';
+    return;
+  }
+  const stats = await statsRes.json();
+  renderTiles(stats);
+  renderLeaderboard(stats.by_model, judgedOnly);
+  renderAgents(stats.by_agent);
+  renderRuns(await runsRes.json());
+}
+
+["repo", "days", "judged"].forEach(id => $(id).addEventListener("change", load));
+load();
+</script>
+</body>
+</html>

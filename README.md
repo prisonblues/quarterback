@@ -77,6 +77,13 @@ GET   /sync              ?repo=&branch=&device=&path=          (registered workt
                          &have=sha,sha,…&dirty=&ahead=&behind= (…or just describe yourself)
                          -> {published:[…], worktrees:[…], caller, stale, registered, advice}
 
+# reviewer-panel stats (v2.10)
+POST  /review            (panel.py --json payload)              -> {id, recorded}
+GET   /reviews           ?repo=&pr=&author=&since=&days=&limit=  (runs + scorecards)
+GET   /review/{id}                                              (scorecards + findings)
+GET   /review/stats      ?repo=&author=&days=&judged_only=       -> {by_model, by_agent}
+GET   /panel             (browser view — the leaderboard)
+
 GET   /health            (no auth)
 ```
 
@@ -105,7 +112,10 @@ whether or not that machine has ever run `report_git` — the hook can't assume 
 `push_session` / `session_status` / `pull_session`; cross-worktree — `report_git`
 (runs git locally, registers worktrees) / `find_commit`; sync — `publish` (announce a
 push) / `sync_status` (am I stale?); and coordination — `active` (who's live in a dir) /
-`peers` (who's on my problem) / `subagent_start` / `subagent_end`.
+`peers` (who's on my problem) / `subagent_start` / `subagent_end`. Panel stats are
+deliberately *not* an MCP tool: they are recorded by the panel process itself
+(`qb record-review`), so every caller — `/panel-review-pr`, `/panel`, the epic and
+lander loops — is counted without an agent having to remember to say so.
 
 ## Phasing
 
@@ -139,6 +149,19 @@ push) / `sync_status` (am I stale?); and coordination — `active` (who's live i
   `holder` on leases/`/active`/`/overlap` is the exact reply address, and `/whoami`
   reflects it back. Authorisation deliberately stayed at machine granularity —
   co-tenants share a token, so a boundary between them would be theatre.
+- **v2.10 — reviewer-panel stats** ✅ the reviewer panel
+  (`~/.claude/loops/panel.py`) reviews one PR diff with several vendor models at
+  once and has a master judge rule each deduped finding real or not — a
+  controlled comparison that evaporated every run. `POST /review` records the
+  run, a scorecard per panel member and every finding with its verdict; the
+  panel posts it through `qb record-review` best-effort (a down board never
+  fails a review). `GET /review/stats` groups by (reviewer, model, effort), so
+  the same vendor at two tiers competes with itself, and `/panel` renders the
+  leaderboard: confirmed findings, **solo** finds nobody else raised, and
+  precision — counted only over judged runs, because an unjudged run keeps every
+  finding and scoring those as correct would flatter whichever reviewer was
+  noisiest that day. Answers "which model finds the real issues" and "is the
+  expensive tier worth it" from accumulated evidence rather than impression.
 - **v3 — cross-worktree (remaining):** a bare git remote on the server so cross-*device*
   cherry-pick has a shared object store; wire `landed` refs to a cherry-pick helper.
 
