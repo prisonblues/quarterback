@@ -90,8 +90,25 @@ detect_project_name() {
     basename "$root"
 }
 
-detect_postgres_container() {
-    docker ps --format '{{.Names}}' 2>/dev/null | grep -iE 'postgres|pgdb|_db' | head -1
+# Every running container whose name looks like a Postgres, most-plausible
+# first. Deliberately NOT `| head -1`: "the first thing docker happens to list"
+# is not a choice. On a box that also runs CI containers this picked
+# `10bad74c…_postgres16_…` — an ephemeral runner service — over the project's
+# own `postgres-local`. The psql call against it then failed behind `2>/dev/null`
+# and the sweep reported "Orphan databases: none" while 103 orphans sat in the
+# real container. Silent, and it flipped run to run as containers came and went.
+# The caller picks the first candidate that actually answers as $PG_USER.
+postgres_container_candidates() {
+    local names
+    names=$(docker ps --format '{{.Names}}' 2>/dev/null || true)
+    # Stable, human-named containers first; hex-prefixed ephemerals last.
+    grep -iE 'postgres|pgdb|_db' <<<"$names" | grep -vE '^[0-9a-f]{16,}_' || true
+    grep -iE 'postgres|pgdb|_db' <<<"$names" | grep -E '^[0-9a-f]{16,}_' || true
+}
+
+# True if $1 can list databases as $PG_USER — the only test that matters.
+postgres_container_answers() {
+    docker exec "$1" psql -U "$PG_USER" -d postgres -tAc 'SELECT 1' >/dev/null 2>&1
 }
 
 # Drop a database robustly. Try WITH (FORCE) (Postgres 13+) to evict any stray
@@ -185,15 +202,29 @@ echo ""
 # Suffixes are dir basenames with the "<project>-" prefix stripped. The main
 # repo (basename == project) has no suffix and is skipped.
 declare -A LIVE_DB=()
+declare -A LIVE_DIR=()
 LIVE_SUFFIXES=()
+LIVE_LIST_OK=false
 while IFS= read -r p; do
     [[ -z "$p" ]] && continue
+    LIVE_LIST_OK=true
+    LIVE_DIR["$p"]=1
     b=$(basename "$p")
     [[ "$b" == "${PROJECT}-"* ]] || continue
     suffix="${b#${PROJECT}-}"
     LIVE_SUFFIXES+=("$suffix")
     LIVE_DB["${PROJECT}_$(echo "$suffix" | tr '-' '_')"]=1
 done < <(git worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10)}')
+
+# Everything downstream decides what to DELETE by asking "is this live?", so an
+# empty or truncated worktree list does not mean "nothing is live" — it means we
+# cannot tell, and every live worktree then looks like detritus. Refuse rather
+# than report a sweep that would delete the user's work.
+if [[ "$LIVE_LIST_OK" != true ]]; then
+    die "\`git worktree list\` returned nothing (run from inside the repo?).
+Refusing to classify anything as orphaned: with no live list, every worktree
+directory, database and container looks dead."
+fi
 
 is_live_suffix() {
     local norm; norm="$(echo "$1" | tr '/' '-')"
@@ -207,8 +238,6 @@ is_live_suffix() {
 # ============================================
 ORPHAN_DBS=()
 if [[ "$DB_ENGINE" = "postgresql" ]]; then
-    [[ "$DB_CONTAINER" = "auto" ]] && DB_CONTAINER=$(detect_postgres_container)
-
     PG_USER=""
     if [[ -f "$MAIN_REPO/.env" ]]; then
         PG_USER=$(env_val "$DB_USER_ENV" "$MAIN_REPO/.env")
@@ -224,10 +253,23 @@ if [[ "$DB_ENGINE" = "postgresql" ]]; then
     PROTECT["${PROJECT}_test"]=1
     while IFS= read -r p; do [[ -n "$p" ]] && PROTECT["$p"]=1; done < <(cfg_array '.database.protect')
 
-    if [[ -z "$DB_CONTAINER" ]]; then
-        echo -e "${YELLOW}! Postgres container not found — skipping DB scan${NC}"
-    elif [[ -z "$PG_USER" ]]; then
+    # Resolve the container only once PG_USER is known, so "does it answer as
+    # this user?" is available as the tie-breaker.
+    if [[ "$DB_CONTAINER" = "auto" && -n "$PG_USER" ]]; then
+        DB_CONTAINER=""
+        while IFS= read -r c; do
+            [[ -z "$c" ]] && continue
+            if postgres_container_answers "$c"; then DB_CONTAINER="$c"; break; fi
+        done < <(postgres_container_candidates)
+    fi
+
+    if [[ -z "$PG_USER" ]]; then
         echo -e "${YELLOW}! Could not determine DB user — skipping DB scan${NC}"
+    elif [[ -z "$DB_CONTAINER" || "$DB_CONTAINER" = "auto" ]]; then
+        # Loud, because the failure mode this replaces was a confident "none".
+        echo -e "${YELLOW}! No Postgres container answered as '$PG_USER' — skipping DB scan.${NC}"
+        echo -e "${YELLOW}  Candidates tried: $(postgres_container_candidates | tr '\n' ' ')${NC}"
+        echo -e "${YELLOW}  'Orphan databases: none' below means NOT SCANNED, not clean.${NC}"
     else
         while IFS= read -r db; do
             [[ "$db" == "${PROJECT}_"* ]] || continue
@@ -280,7 +322,16 @@ SKIPPED_DIRS=()
 shopt -s nullglob
 for d in "$PARENT/${PROJECT}-"*; do
     [[ -d "$d" ]] || continue
-    git worktree list --porcelain 2>/dev/null | grep -qxF "worktree $d" && continue
+    # Membership test against the list captured once above — never a fresh
+    # `git worktree list | grep -q` per directory. Under `set -o pipefail` that
+    # pipeline is a coin flip: `grep -q` exits the moment it matches, git dies
+    # of SIGPIPE, and the pipeline reports 141 *even though the match
+    # succeeded*. The `&& continue` is then skipped and a LIVE worktree is
+    # classified as a leftover — which `--remove-dirs` would `rm -rf`. The race
+    # is per-directory and per-run, so the damage looked like flakiness: on this
+    # repo it flagged 12, 18, 20 and 21 of 20-odd live worktrees on four
+    # consecutive dry-runs, including ones with uncommitted work.
+    [[ -n "${LIVE_DIR[$d]:-}" ]] && continue
     if dir_is_worktree_remnant "$d"; then LEFTOVER_DIRS+=("$d"); else SKIPPED_DIRS+=("$d"); fi
 done
 shopt -u nullglob

@@ -19,6 +19,16 @@ NC='\033[0m'
 
 die() { echo -e "${RED}Error: $1${NC}" >&2; exit 1; }
 
+# Steps that fail non-fatally record here instead of printing a yellow note and
+# being forgotten. The old behaviour ended every run with an unconditional
+# "Cleanup complete", so a database that was never dropped looked like a clean
+# teardown — which is exactly how five orphans accumulated unnoticed.
+CLEANUP_WARNINGS=()
+warn_cleanup() {
+    CLEANUP_WARNINGS+=("$1")
+    echo -e "${YELLOW}$1${NC}"
+}
+
 env_val() {
     local var="$1" file="$2"
     [[ -f "$file" ]] || return 0
@@ -63,8 +73,42 @@ detect_project_name() {
     basename "$root"
 }
 
-detect_postgres_container() {
-    docker ps --format '{{.Names}}' 2>/dev/null | grep -iE 'postgres|pgdb|_db' | head -1
+# Every running container that looks like a Postgres, most-plausible first.
+# Deliberately NOT `| head -1`: on a machine also running self-hosted CI, that
+# picked an ephemeral `<hex>_postgres16_<hex>` runner service over the project's
+# own container. The existence probe then failed against the wrong server and
+# printed "Database <name> not found" — a false negative that reads as "already
+# clean", so five worktree databases survived a teardown that reported success.
+postgres_container_candidates() {
+    local names
+    names=$(docker ps --format '{{.Names}}' 2>/dev/null || true)
+    grep -iE 'postgres|pgdb|_db' <<<"$names" | grep -vE '^[0-9a-f]{16,}_' || true
+    grep -iE 'postgres|pgdb|_db' <<<"$names" | grep -E '^[0-9a-f]{16,}_' || true
+}
+
+# Pick the first candidate that actually answers as $1 (the DB user).
+resolve_postgres_container() {
+    local user="$1" c
+    while IFS= read -r c; do
+        [[ -z "$c" ]] && continue
+        if docker exec "$c" psql -U "$user" -d postgres -tAc 'SELECT 1' >/dev/null 2>&1; then
+            echo "$c"; return 0
+        fi
+    done < <(postgres_container_candidates)
+    return 1
+}
+
+# Drop a database robustly: WITH (FORCE) evicts stray connections (PG 13+),
+# else terminate backends and retry. Mirrors prune-worktrees' drop_db.
+drop_db_forcefully() {
+    local container="$1" user="$2" db="$3"
+    docker exec "$container" psql -U "$user" -d postgres \
+        -c "DROP DATABASE IF EXISTS \"$db\" WITH (FORCE);" >/dev/null 2>&1 && return 0
+    docker exec "$container" psql -U "$user" -d postgres \
+        -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='$db';" \
+        >/dev/null 2>&1 || true
+    docker exec "$container" psql -U "$user" -d postgres \
+        -c "DROP DATABASE IF EXISTS \"$db\";" >/dev/null 2>&1
 }
 
 detect_nginx_container() {
@@ -315,39 +359,42 @@ step "Cleaning up database..."
 if [[ "$KEEP_DB" = true ]]; then
     echo -e "${YELLOW}Keeping database (--keep-db)${NC}"
 elif [[ "$DB_ENGINE" = "postgresql" ]]; then
-    if [[ "$DB_CONTAINER" = "auto" ]]; then
-        DB_CONTAINER=$(detect_postgres_container)
-    fi
-    if [[ -n "$DB_CONTAINER" ]]; then
-        DB_BRANCH=$(echo "$BRANCH_NAME" | tr '/-' '__')
-        WORKTREE_DB="${PROJECT}_${DB_BRANCH}"
+    DB_BRANCH=$(echo "$BRANCH_NAME" | tr '/-' '__')
+    WORKTREE_DB="${PROJECT}_${DB_BRANCH}"
 
-        # Read user from .env
-        PG_USER=""
-        if [[ -f "$MAIN_REPO/.env" ]]; then
-            PG_USER=$(env_val "$DB_USER_ENV" "$MAIN_REPO/.env")
-            if [[ -z "$PG_USER" && -n "$DB_URL_ENV" ]]; then
-                db_url=$(env_val "$DB_URL_ENV" "$MAIN_REPO/.env")
-                [[ -n "$db_url" ]] && PG_USER=$(db_url_user "$db_url")
-            fi
+    # Read user from .env
+    PG_USER=""
+    if [[ -f "$MAIN_REPO/.env" ]]; then
+        PG_USER=$(env_val "$DB_USER_ENV" "$MAIN_REPO/.env")
+        if [[ -z "$PG_USER" && -n "$DB_URL_ENV" ]]; then
+            db_url=$(env_val "$DB_URL_ENV" "$MAIN_REPO/.env")
+            [[ -n "$db_url" ]] && PG_USER=$(db_url_user "$db_url")
         fi
+    fi
 
-        if [[ -n "$PG_USER" ]]; then
-            DB_EXISTS=$(docker exec "$DB_CONTAINER" psql -U "$PG_USER" -d postgres -tAc \
-                "SELECT 1 FROM pg_database WHERE datname='$WORKTREE_DB'" 2>/dev/null || true)
-            if [[ "$DB_EXISTS" = "1" ]]; then
-                docker exec "$DB_CONTAINER" psql -U "$PG_USER" -d postgres \
-                    -c "DROP DATABASE IF EXISTS $WORKTREE_DB;" 2>/dev/null \
-                    && echo -e "${GREEN}Dropped database: $WORKTREE_DB${NC}" \
-                    || echo -e "${YELLOW}Could not drop database${NC}"
+    # Resolve the container only once the user is known, so "answers as this
+    # user" can be the tie-breaker rather than docker's listing order.
+    if [[ -n "$PG_USER" && "$DB_CONTAINER" = "auto" ]]; then
+        DB_CONTAINER=$(resolve_postgres_container "$PG_USER" || true)
+    fi
+
+    if [[ -z "$PG_USER" ]]; then
+        warn_cleanup "could not determine DB user — database $WORKTREE_DB NOT dropped"
+    elif [[ -z "$DB_CONTAINER" || "$DB_CONTAINER" = "auto" ]]; then
+        warn_cleanup "no Postgres container answered as '$PG_USER' — database $WORKTREE_DB NOT dropped"
+        echo -e "${YELLOW}  Candidates tried: $(postgres_container_candidates | tr '\n' ' ')${NC}"
+    else
+        DB_EXISTS=$(docker exec "$DB_CONTAINER" psql -U "$PG_USER" -d postgres -tAc \
+            "SELECT 1 FROM pg_database WHERE datname='$WORKTREE_DB'" 2>/dev/null || true)
+        if [[ "$DB_EXISTS" = "1" ]]; then
+            if drop_db_forcefully "$DB_CONTAINER" "$PG_USER" "$WORKTREE_DB"; then
+                echo -e "${GREEN}Dropped database: $WORKTREE_DB${NC}"
             else
-                echo -e "${YELLOW}Database $WORKTREE_DB not found${NC}"
+                warn_cleanup "could not drop database $WORKTREE_DB (still present)"
             fi
         else
-            echo -e "${YELLOW}Could not determine DB user${NC}"
+            echo -e "${YELLOW}Database $WORKTREE_DB not found${NC}"
         fi
-    else
-        echo -e "${YELLOW}PostgreSQL container not found${NC}"
     fi
 else
     echo -e "${YELLOW}No database to clean${NC}"
@@ -379,12 +426,37 @@ fi
 # ============================================
 step "Cleaning up port tracking..."
 PORT_FILE="$MAIN_REPO/.worktree-ports"
-if [[ -f "$PORT_FILE" ]] && grep -q ":${BRANCH_NAME}$" "$PORT_FILE"; then
-    grep -v ":${BRANCH_NAME}$" "$PORT_FILE" > "$PORT_FILE.tmp"
-    mv "$PORT_FILE.tmp" "$PORT_FILE"
-    echo -e "${GREEN}Done${NC}"
+# create-worktree writes "<port>:<branch>" using the branch AS TYPED, so the key
+# keeps its slashes ("5698:fix/issue-1503") while the worktree directory has them
+# flattened ("lexray-fix-issue-1503"). remove-worktree is normally called with
+# that flattened create-name, so an exact ":$BRANCH_NAME$" match never fired and
+# every teardown left its entry behind — 18 had silently accumulated here, and
+# the "No port entry found" note made it look intentional. (The slash-bearing
+# name IS recovered from this file, but only on the branch of the code that runs
+# when the derived directory is missing — not the common path.)
+#
+# Match on the normalised key instead, so either spelling is found, and also on
+# the worktree's real branch for entries written under a different create-name.
+if [[ -f "$PORT_FILE" ]]; then
+    awk -F: -v flat="$SAFE_NAME" -v rb="$RESOLVED_BRANCH" '
+        {
+            key = $2
+            norm = key
+            gsub("/", "-", norm)
+            if (norm == flat || (rb != "" && key == rb)) { dropped++; next }
+            print
+        }
+        END { exit (dropped ? 0 : 1) }
+    ' "$PORT_FILE" > "$PORT_FILE.tmp"
+    if [[ $? -eq 0 ]]; then
+        mv "$PORT_FILE.tmp" "$PORT_FILE"
+        echo -e "${GREEN}Done${NC}"
+    else
+        rm -f "$PORT_FILE.tmp"
+        echo -e "${YELLOW}No port entry found${NC}"
+    fi
 else
-    echo -e "${YELLOW}No port entry found${NC}"
+    echo -e "${YELLOW}No port file${NC}"
 fi
 
 # ============================================
@@ -392,6 +464,14 @@ fi
 # ============================================
 echo ""
 echo -e "${GREEN}========================================${NC}"
-echo -e "${GREEN}Cleanup complete: $BRANCH_NAME${NC}"
-echo -e "${GREEN}========================================${NC}"
-echo ""
+if [[ ${#CLEANUP_WARNINGS[@]} -eq 0 ]]; then
+    echo -e "${GREEN}Cleanup complete: $BRANCH_NAME${NC}"
+    echo -e "${GREEN}========================================${NC}"
+    echo ""
+else
+    echo -e "${YELLOW}Cleanup finished WITH WARNINGS: $BRANCH_NAME${NC}"
+    echo -e "${YELLOW}========================================${NC}"
+    for w in "${CLEANUP_WARNINGS[@]}"; do echo -e "  ${YELLOW}- $w${NC}"; done
+    echo -e "  ${YELLOW}Re-run \`prune-worktrees\` to sweep whatever was left behind.${NC}"
+    echo ""
+fi
