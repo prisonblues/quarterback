@@ -65,7 +65,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 import harness_rules  # noqa: E402
-from harness_rules import RepoNotFound, describe, resolve_repo  # noqa: E402
+# stderr_gist lives with the shared plumbing, and is re-exported here because it
+# reads as part of run_cli's contract at every call site in this file.
+from harness_rules import RepoNotFound, describe, resolve_repo, stderr_gist  # noqa: E402
 
 # Chars of diff handed to a model, when nothing in .harness-rules says otherwise.
 # It is a per-MODEL budget (review_panel.max_diff_chars, overridable per reviewer
@@ -306,27 +308,32 @@ def is_rejection(stderr: str) -> bool:
             or "requires a newer version" in low)
 
 
-def stderr_gist(stderr: str, limit: int = 200) -> str:
-    """The most INFORMATIVE stderr line, not blindly the last one.
+def is_permission_denied(stderr: str) -> bool:
+    """Did the CLI's OWN sandbox refuse a tool the run needed?
 
-    A CLI's real complaint is routinely followed by teardown noise, and codex is
-    the worst case: a client older than its own models cache logs a decode error
-    ("unknown variant `max`") on every single run, plus websocket teardown lines
-    — so the naive tail reported that housekeeping and buried the sentence that
-    actually explains the failure. Where the line carries a JSON error envelope
-    we lift its `message`, which is how a pinned-model rejection reads as
-    "The 'gpt-5.6-luna' model requires a newer version of Codex" rather than 200
-    characters of serialised envelope."""
-    lines = [ln.strip() for ln in (stderr or "").splitlines() if ln.strip()]
-    if not lines:
-        return ""
-    noise = ("failed to load models cache", "failed to refresh available models",
-             "worker quit with fatal", "failed to connect to websocket")
-    signal = [ln for ln in lines if not any(n in ln for n in noise)] or lines
-    errors = [ln for ln in signal if "error" in ln.lower()]
-    pick = (errors or signal)[-1]
-    msg = re.search(r'"message"\s*:\s*"((?:[^"\\]|\\.){4,400})"', pick)
-    return (msg.group(1) if msg else pick)[:limit]
+    Deliberately a sibling of is_rejection rather than part of it, because the
+    two are settled in different files and the report must not conflate them: a
+    rejection is the SERVER declining the request (a retired model pin — fix
+    `.harness-rules`), this is the local CLI auto-denying a tool because headless
+    mode has no one to prompt (fix `permissions.allow` in its settings.json).
+    What they share is the only property retrying cares about — both are decided
+    by configuration, so all three attempts fail identically.
+
+    The observed shape, from `agy` 1.1.12: exit 0, empty stdout, and 'a tool
+    required the "command" permission that headless mode cannot prompt for, so
+    it was auto-denied' on stderr.
+    """
+    low = stderr.lower()
+    return ("auto-denied" in low
+            or "permissions.allow" in low
+            or "cannot prompt for" in low
+            or ("permission" in low and "denied" in low))
+
+
+def is_deterministic_failure(stderr: str) -> bool:
+    """Will another identical attempt fail in the identical way? Either settled
+    cause counts — a request the server refused, or a tool the CLI refused."""
+    return is_rejection(stderr) or is_permission_denied(stderr)
 
 
 def run_cli(args: list[str], label: str, timeout: int = 600,
@@ -359,9 +366,15 @@ def run_cli(args: list[str], label: str, timeout: int = 600,
     non-zero exit discarded it on exactly the runs that needed it most. It is
     read only when stdout is empty: a CLI that produced its findings AND chattered
     on stderr succeeded, and reporting its warm-up noise would be the opposite
-    error. Empty output IS retried — unlike a rejection it is not self-evidently
-    deterministic, and losing a whole reviewer to one blank reply costs the panel
-    more than two extra fast-failing attempts."""
+    error. A blank reply IS retried when nothing says it would come back blank —
+    losing a whole reviewer to one flake costs the panel more than two extra
+    attempts. It is NOT retried when stderr names a settled cause
+    (is_deterministic_failure: a refused request, or a tool the CLI auto-denied),
+    because a missing permission rule is every bit as fixed as a bad model pin,
+    and blank runs do not fail fast the way non-zero exits do — the observed one
+    burned its full model call each time. Three of those is up to 3x600s held
+    against the joined futures of the whole panel, 3x the duration_ms the board's
+    leaderboard is scored on, and on the metered `pi` seat, three bills."""
     last = f"{label}: no attempt made"
     for _ in range(max(1, attempts)):
         try:
@@ -381,6 +394,8 @@ def run_cli(args: list[str], label: str, timeout: int = 600,
         if not (proc.stdout or "").strip():
             msg = stderr_gist(proc.stderr or "")
             last = f"{label}: exited 0 but produced no output" + (f" ({msg})" if msg else "")
+            if is_deterministic_failure(proc.stderr or ""):
+                return None, last
             continue
         return proc.stdout, None
     return None, last
@@ -1004,8 +1019,8 @@ def judge(groups: list[tuple[Finding, list[str]]], diff: str, model: str,
     rule — CLI absent, timeout, crash, a zero exit that produced no output, or
     output with no JSON verdict in it — so the caller can surface it rather than
     silently reporting a bare 'unavailable'. A real bug from a single reviewer is
-    confirmed; only genuine false positives are dropped
-    (style and polish are kept). When the judge can't rule, the caller keeps everything (we never
+    confirmed; only genuine false positives are dropped (style and polish are
+    kept). When the judge can't rule, the caller keeps everything (we never
     silently suppress a finding). No findings -> ({}, None): nothing to judge."""
     if not groups:
         return {}, None

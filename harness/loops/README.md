@@ -26,6 +26,17 @@ optional**; anything omitted falls back to `DEFAULTS` in `harness_rules.py`, whi
 is the safe end of every switch — no auto-merge, no unattended loop, edit-only
 headless agents. A repo with no rules file at all still works.
 
+Two conventions the resolver enforces so a rules file can be read like prose:
+
+- **A key starting with `_` is a comment**, at any depth (`"_": "why this seat is
+  on"`, `"_effort": "…"`). JSON has none of its own, these files exist to be argued
+  with, and comments are stripped before anything reads the config — so they can
+  never be mistaken for a setting.
+- **A reviewer name nothing recognises is warned about on stderr**, loudly and
+  non-fatally. `reviewers.antigravty` would otherwise be a silent one-vendor-short
+  panel; a warning rather than a hard exit, because a file shared across boxes may
+  name a seat only a newer harness knows.
+
 This replaced a central `config.json` in the fleet config. That file was a registry
 of personal repos that had to be enrolled by hand before anything would run; the
 plumbing it carried (`path`, `github`, `default_branch`) was derivable from the
@@ -192,15 +203,12 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   a filter. Only clear false positives are dismissed, with a recorded reason. If no
   judge is available, nothing is suppressed.
 - Reviewers whose prerequisites are missing are reported **SKIPPED**, not failed.
-- **A reviewer that produces nothing is skipped, never counted as an empty review.**
-  Headless CLIs exit `0` having printed nothing — `agy` does it when a tool needs a
-  permission headless mode cannot prompt for, so it is auto-denied — and "found
-  nothing" and "produced nothing" are opposite claims. Both the panel members and
-  the master treat a zero exit with empty stdout as a failure, and read the CLI's
-  own stderr (which usually names the cause and the fix, e.g. the `permissions.allow`
-  rule to add) into the skip line. Otherwise a dead reviewer reads as a live one:
-  `⋆consensus` weakens with no explanation and the board's reviewer leaderboard is
-  fed a false zero.
+- **A reviewer that produces nothing is SKIPPED, never counted as an empty review.**
+  A zero exit with empty stdout is a failure for panel members and the master alike,
+  and the skip line quotes the CLI's own stderr, which usually names both the cause
+  and the fix. A blank reply is retried unless that stderr names a settled cause (a
+  refused request, an auto-denied tool permission), which no retry can change.
+  Why it is worth the code: `run_cli`'s docstring in `panel.py`.
 - **The `/panel` skill (default = fix)** consumes `--json`, checks out the PR branch in
   an isolated worktree, fixes confirmed findings, runs lint + unit tests (**aborts the
   commit on failure**), makes one commit, pushes, and comments the summary.

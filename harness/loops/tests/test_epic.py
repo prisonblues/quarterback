@@ -221,6 +221,21 @@ def test_clamp_model_over_ceiling_falls_to_ceiling():
     assert epic.clamp_model("opus", "unrecognised") == ""
 
 
+# --------------------------------------------------------------- module boundary
+
+def test_epic_keeps_panel_at_arms_length():
+    """epic runs panel.py as a SUBPROCESS on purpose (see run_panel) — they are
+    two programs, and epic must not depend on the project. Importing panel for
+    one generic helper made all of panel's imports load-bearing for the driver
+    at module scope. Shared CLI-failure plumbing belongs in harness_rules, which
+    both already import."""
+    import harness_rules
+
+    assert epic.stderr_gist is harness_rules.stderr_gist
+    src = Path(epic.__file__).read_text()
+    assert "import panel" not in src
+
+
 # --------------------------------------------------------------- triage verdicts
 # (_fake_gh fakes any subprocess.run, the triage judge included)
 
@@ -240,8 +255,49 @@ def test_triage_no_verdict_falls_back_to_the_exit_code(monkeypatch):
     """A crash with nothing on stderr still beats a bare "no verdict"."""
     monkeypatch.setattr(epic.shutil, "which", lambda _: "/usr/bin/claude")
     _fake_gh(monkeypatch, stdout="", stderr="", rc=2)
-    _doable, reason, _impl = epic.triage(mk(1), "opus")
+    doable, reason, impl = epic.triage(mk(1), "opus")
+    assert doable is None and impl == ""
     assert "exited 2" in reason
+
+
+def test_triage_blames_the_reply_not_the_stderr_when_the_judge_answered(monkeypatch):
+    """The mirror error, and the one this branch is most likely to make.
+
+    A judge that replies in PROSE at exit 0 has not failed at running — it failed
+    at answering in JSON. Reading stderr anyway pins the blame on whatever the CLI
+    happened to log while warming up ("loaded 3 plugins"), which is a confident
+    wrong cause on the only line explaining a silently skipped sub-issue. Chatter
+    on stderr is the normal state of these CLIs, so this is not a rare shape."""
+    monkeypatch.setattr(epic.shutil, "which", lambda _: "/usr/bin/claude")
+    _fake_gh(monkeypatch, stdout="I think this one is doable, roughly speaking.",
+             stderr="loaded 3 plugins")
+    doable, reason, impl = epic.triage(mk(1), "opus")
+    assert doable is None and impl == ""
+    assert "no JSON in reply" in reason
+    assert "plugins" not in reason
+
+
+def test_triage_bad_verdict_says_what_was_wrong_with_it(monkeypatch):
+    """A malformed verdict is the same class of failure as no verdict — same
+    silent --execute skip — so it gets the same diagnosis rather than a bare
+    "bad verdict". `{...}` matched, so the judge answered: blame the reply."""
+    monkeypatch.setattr(epic.shutil, "which", lambda _: "/usr/bin/claude")
+    _fake_gh(monkeypatch, stdout='{"doable": True, "reason": unquoted}',
+             stderr="loaded 3 plugins")
+    doable, reason, impl = epic.triage(mk(1), "opus")
+    assert doable is None and impl == ""
+    assert "bad verdict" in reason and "malformed JSON" in reason
+    assert "plugins" not in reason
+
+
+def test_triage_bad_verdict_on_a_crash_still_quotes_stderr(monkeypatch):
+    """A non-zero exit means the run itself went wrong, so whatever partial
+    brace-soup reached stdout is not the story — stderr is."""
+    monkeypatch.setattr(epic.shutil, "which", lambda _: "/usr/bin/claude")
+    _fake_gh(monkeypatch, stdout='{"doable": tru}',
+             stderr="error: the model pin is unusable", rc=1)
+    _doable, reason, _impl = epic.triage(mk(1), "opus")
+    assert "the model pin is unusable" in reason
 
 
 def test_triage_reads_a_real_verdict_unchanged(monkeypatch):

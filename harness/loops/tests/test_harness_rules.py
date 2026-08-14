@@ -115,6 +115,69 @@ def test_bad_json_fails_loudly(repo):
         hr.resolve_repo(str(repo))
 
 
+# ------------------------------------------- doc comments and unknown reviewers
+
+def test_underscore_keys_never_reach_the_resolved_config(repo):
+    """Every rules file in the fleet documents itself with `"_": "why"` keys,
+    JSON having no comments. Merged through as-is, the one inside a reviewer
+    block arrives in cfg["reviewers"] as a bare STRING next to the dicts, and the
+    next caller to write the obvious `for name, r in rev.items(): r.get(...)`
+    gets an AttributeError from a file whose only sin was explaining itself."""
+    write_rules(repo, {
+        "_": "top-level prose",
+        "reviewers": {"_": "why these seats",
+                      "claude": {"model": "opus", "_": "a floating alias"}},
+        "epic": {"_": "prose here too", "auto_finish": True},
+    })
+    cfg = hr.resolve_repo(str(repo))
+    assert "_" not in cfg
+    assert "_" not in cfg["reviewers"]
+    assert "_" not in cfg["epic"]
+    assert all(isinstance(r, dict) for r in cfg["reviewers"].values())
+    # …and the real settings around them are untouched.
+    assert cfg["reviewers"]["claude"]["model"] == "opus"
+    assert cfg["epic"]["auto_finish"] is True
+
+
+def test_underscore_keys_are_not_mistaken_for_reviewer_names(repo, capsys):
+    write_rules(repo, {"reviewers": {"_": "prose", "_pi": "more prose"}})
+    hr.resolve_repo(str(repo))
+    assert "unknown reviewer" not in capsys.readouterr().err
+
+
+def test_a_typod_reviewer_name_is_shouted_about(repo, capsys):
+    """The merge is a blind dict update, so `antigravty` is not an error — it
+    adds a block nothing reads, and the panel quietly runs one vendor short.
+    That silence is the exact failure this harness refuses to have anywhere
+    else, and committed to a file it survives every run until someone counts."""
+    write_rules(repo, {"reviewers": {"antigravty": {"enabled": True}}})
+    cfg = hr.resolve_repo(str(repo))
+    err = capsys.readouterr().err
+    assert "unknown reviewer" in err and "antigravty" in err
+    assert "antigravity" in err                  # the known names are listed
+    # Non-fatal: a rules file shared across a fleet may name a seat only a newer
+    # harness knows about, and hard-failing would make it a version pin.
+    assert cfg["reviewers"]["claude"]["enabled"] is True
+
+
+def test_known_reviewers_are_silent(repo, capsys):
+    write_rules(repo, {"reviewers": {n: {"enabled": True} for n in hr.DEFAULTS["reviewers"]}})
+    hr.resolve_repo(str(repo))
+    assert capsys.readouterr().err == ""
+
+
+def test_defaults_carry_every_seat_the_panel_can_run(repo):
+    """The rules files promise that an omitted key falls back to DEFAULTS. That
+    is only true of seats DEFAULTS actually has — a repo enabling `antigravity`
+    with no base entry was relying on spelling out every field itself."""
+    assert set(hr.DEFAULTS["reviewers"]) == {
+        "claude", "codex", "antigravity", "pi", "sonarqube"}
+    write_rules(repo, {"reviewers": {"antigravity": {"model": "gemini-3.7-flash-high"}}})
+    cfg = hr.resolve_repo(str(repo))
+    assert cfg["reviewers"]["antigravity"]["enabled"] is False    # inherited
+    assert cfg["reviewers"]["antigravity"]["model"] == "gemini-3.7-flash-high"
+
+
 # ------------------------------------------------- the two-ref trust boundary
 
 def test_unattended_ignores_the_working_tree(repo):

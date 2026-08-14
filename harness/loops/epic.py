@@ -35,8 +35,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from harness_rules import RepoNotFound, describe, resolve_repo  # noqa: E402
-from panel import stderr_gist  # noqa: E402
+from harness_rules import RepoNotFound, describe, resolve_repo, stderr_gist  # noqa: E402
 
 PANEL = Path(__file__).with_name("panel.py")
 # State must live OUTSIDE the script dir for the same reason (the store is read-only).
@@ -370,6 +369,24 @@ def toposort(work: list[IssueWork], edges: list) -> list[IssueWork]:
     return [by_num[n] for n in out]
 
 
+def judge_gist(proc: subprocess.CompletedProcess, about_the_reply: str) -> str:
+    """Why the triage judge gave no usable verdict, in one clause.
+
+    The gate is the whole point, and porting this from panel.run_cli without it
+    is how you get a confident wrong cause. Stderr is read only when the run has
+    nothing of its own to explain itself with — a blank stdout, or a non-zero
+    exit. A judge that REPLIED, at exit 0, and also logged warm-up chatter has
+    not failed at running; blaming "loaded 3 plugins" for a reply that simply
+    was not JSON puts a fabricated cause on the only line the operator gets for
+    a silently skipped sub-issue. In that case the reply itself is the story, so
+    `about_the_reply` is used instead.
+    """
+    if (proc.stdout or "").strip() and not proc.returncode:
+        return about_the_reply
+    return (stderr_gist(proc.stderr or "", limit=120)
+            or (f"exited {proc.returncode}" if proc.returncode else "no output"))
+
+
 def triage(w: IssueWork, model: str) -> tuple[bool | None, str, str]:
     """Master decides whether a coding agent can actually implement this issue, and
     which model tier should implement it. The judge runs at `model` — the tier the
@@ -388,20 +405,17 @@ def triage(w: IssueWork, model: str) -> tuple[bool | None, str, str]:
                               stdin=subprocess.DEVNULL, timeout=300)
     except (subprocess.TimeoutExpired, OSError):
         return None, "untriaged (judge error)", ""
+    # Both failures below silently skip the sub-issue on --execute, so the one
+    # line the operator gets has to name a cause: the judge CLI can exit 0 having
+    # printed nothing (a tool permission headless mode auto-denied, an unusable
+    # model pin) and say why on stderr, which a bare "no verdict" threw away.
     m = re.search(r"\{.*\}", proc.stdout or "", re.S)
     if not m:
-        # Same failure as panel.run_cli's: the judge CLI can exit 0 having printed
-        # nothing (a tool permission headless mode auto-denied, an unusable model
-        # pin) and say why on stderr. This used to report a bare "no verdict",
-        # which is true and unactionable — and it silently skips the sub-issue on
-        # --execute, so the one line the operator gets has to name the cause.
-        why = stderr_gist(proc.stderr or "", limit=120) or (
-            f"exited {proc.returncode}" if proc.returncode else "")
-        return None, f"untriaged (no verdict{f': {why}' if why else ''})", ""
+        return None, f"untriaged (no verdict: {judge_gist(proc, 'no JSON in reply')})", ""
     try:
         v = json.loads(m.group(0))
     except json.JSONDecodeError:
-        return None, "untriaged (bad verdict)", ""
+        return None, f"untriaged (bad verdict: {judge_gist(proc, 'malformed JSON')})", ""
     return (bool(v.get("doable", False)), str(v.get("reason", ""))[:120],
             clamp_model(str(v.get("model", "")), model))
 

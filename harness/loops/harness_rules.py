@@ -38,8 +38,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
+import sys
 from pathlib import Path
+from typing import Any
 
 RULES_FILENAME = ".harness-rules"
 
@@ -66,15 +69,21 @@ DEFAULTS: dict = {
         # footnoted, and the report names the model that actually ran.
         # effort: low|medium|high|xhigh|max|ultra (per-model support varies).
         "codex": {"enabled": True, "model": "", "effort": ""},
-        # Off by default, unlike claude/codex: `gemini` is a workstation-only
-        # package (it authenticates against a personal Google account, so it
-        # never reaches sisyphus), and the machines differ in which harnesses
-        # they carry. A repo that wants the third vendor asks for it, rather
-        # than every repo on every box inheriting a reviewer half of them
-        # cannot run. Enable per repo, or reach for it ad hoc with
-        # `panel.py --reviewers claude,codex,gemini`.
-        "gemini": {"enabled": False, "model": ""},
-        # Off by default for the same reason as gemini — `pi` is a workstation
+        # The third vendor, run through Google's Antigravity CLI (`agy` — the
+        # command differs from the reviewer's name; see CLI_BIN in panel.py).
+        # Off by default, unlike claude/codex: it is a workstation-only package
+        # authenticating against a personal Google account, so it never reaches
+        # a headless box, and the machines differ in which harnesses they carry.
+        # A repo that wants the third vendor asks for it, rather than every repo
+        # on every box inheriting a reviewer half of them cannot run. Enable per
+        # repo, or ad hoc with `panel.py --reviewers claude,codex,antigravity`.
+        # `effort` is accepted (low|medium|high, narrower than codex's or pi's)
+        # but left unset here, because agy bakes the reasoning level into the
+        # model slug too — gemini-3.7-flash-high/-medium/-low are three separate
+        # models. Pin it in the slug OR in `effort`, not both; two ways to say
+        # the same thing is how they come to disagree.
+        "antigravity": {"enabled": False, "model": "", "effort": ""},
+        # Off by default for the same reason as antigravity — `pi` is a workstation
         # package, not on every box. It is the widest-reach member when enabled:
         # it fronts many providers, so its `model` is a full provider/id pattern
         # (`openrouter/moonshotai/kimi-k3`), not a bare slug, and that is how the
@@ -119,6 +128,11 @@ DEFAULTS: dict = {
 # Blocks merged one level deep rather than replaced wholesale, so a repo can set
 # `reviewers.sonarqube` without having to restate claude and codex.
 _DEEP_BLOCKS = ("reviewers", "review_panel", "loops", "epic")
+
+# The documentation convention every rules file in the fleet leans on: a key
+# whose name starts with "_" is prose for whoever reads the file next, not a
+# setting. JSON has no comments, and these files exist to be argued with.
+COMMENT_PREFIX = "_"
 
 
 class RepoNotFound(Exception):
@@ -207,6 +221,52 @@ def _read_rules(root: Path, default_branch: str, from_default_branch: bool) -> t
         raise SystemExit(f"{p} is not valid JSON: {e}")
 
 
+def strip_comments(obj: Any) -> Any:
+    """Drop `_`-prefixed keys, at every depth. A comment is not configuration.
+
+    Left in, a `"_": "why this seat is on"` inside a reviewer block arrives in
+    `cfg["reviewers"]` as a bare STRING alongside the dicts, so the first caller
+    that writes the obvious `for name, r in rev.items(): r.get("enabled")` dies
+    with an AttributeError — on a rules file whose only sin was explaining
+    itself. Stripped once, here, rather than guarded at every read site, because
+    the read sites are the part that keeps getting written by someone who has
+    never seen this file.
+    """
+    if isinstance(obj, dict):
+        return {k: strip_comments(v) for k, v in obj.items()
+                if not k.startswith(COMMENT_PREFIX)}
+    if isinstance(obj, list):
+        return [strip_comments(v) for v in obj]
+    return obj
+
+
+def warn_unknown_reviewers(rules: dict, provenance: str) -> list[str]:
+    """Shout about a reviewer name nothing will ever read. Returns the names.
+
+    The merge below is a blind dict update, so `reviewers.antigravty` is not an
+    error — it just adds a block no reviewer looks at, and the panel quietly
+    runs one vendor short with nothing in the report saying so. That is the exact
+    failure this harness refuses to have anywhere else (`--reviewers antigravty`
+    hard-exits before a diff is even fetched), and it is worse committed to a
+    file, where it survives every run until someone counts the reviewers.
+
+    Non-fatal on purpose. A rules file may legitimately name a seat that only a
+    NEWER harness knows about — shared across a fleet of boxes that upgrade at
+    different times — and hard-failing there would turn every rules file into a
+    version pin on every machine that reads it.
+    """
+    block = rules.get("reviewers")
+    if not isinstance(block, dict):
+        return []
+    unknown = sorted(n for n in block if n not in DEFAULTS["reviewers"])
+    if unknown:
+        print(f"{RULES_FILENAME} ({provenance}): unknown reviewer "
+              f"{', '.join(repr(u) for u in unknown)} — ignored; no reviewer of "
+              f"that name exists. Known: {', '.join(sorted(DEFAULTS['reviewers']))}",
+              file=sys.stderr)
+    return unknown
+
+
 def resolve_repo(spec: str | None, *, from_default_branch: bool | None = None) -> dict:
     """Full config for a repo: built-in defaults, overlaid with its
     `.harness-rules`, plus the plumbing (path/github/default_branch) detected
@@ -221,6 +281,8 @@ def resolve_repo(spec: str | None, *, from_default_branch: bool | None = None) -
     root = find_repo(spec)
     default_branch = detect_default_branch(root)
     rules, provenance = _read_rules(root, default_branch, from_default_branch)
+    rules = strip_comments(rules)
+    warn_unknown_reviewers(rules, provenance)
 
     cfg = {**DEFAULTS, **rules}
     for block in _DEEP_BLOCKS:
@@ -255,6 +317,37 @@ def describe(cfg: dict) -> str:
     return (f"[{cfg['name']}] {cfg['github']} @ {cfg['default_branch']} — "
             f"rules: {cfg['_rules_from']}"
             + ("  (unattended)" if unattended() else ""))
+
+
+# ------------------------------------------------- shared CLI-failure plumbing
+# Every loop here drives headless vendor CLIs and has to explain, in one line,
+# why one of them came back useless. That reasoning is generic — it is about how
+# CLIs fail, not about panels or epics — so it lives with the other shared
+# plumbing rather than in whichever script needed it first. epic.py used to
+# reach into panel.py for it, which made all of panel's imports load-bearing for
+# a driver that deliberately shells out to panel.py instead of importing it.
+
+def stderr_gist(stderr: str, limit: int = 200) -> str:
+    """The most INFORMATIVE stderr line, not blindly the last one.
+
+    A CLI's real complaint is routinely followed by teardown noise, and codex is
+    the worst case: a client older than its own models cache logs a decode error
+    ("unknown variant `max`") on every single run, plus websocket teardown lines
+    — so the naive tail reported that housekeeping and buried the sentence that
+    actually explains the failure. Where the line carries a JSON error envelope
+    we lift its `message`, which is how a pinned-model rejection reads as
+    "The 'gpt-5.6-luna' model requires a newer version of Codex" rather than 200
+    characters of serialised envelope."""
+    lines = [ln.strip() for ln in (stderr or "").splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    noise = ("failed to load models cache", "failed to refresh available models",
+             "worker quit with fatal", "failed to connect to websocket")
+    signal = [ln for ln in lines if not any(n in ln for n in noise)] or lines
+    errors = [ln for ln in signal if "error" in ln.lower()]
+    pick = (errors or signal)[-1]
+    msg = re.search(r'"message"\s*:\s*"((?:[^"\\]|\\.){4,400})"', pick)
+    return (msg.group(1) if msg else pick)[:limit]
 
 
 def read_dotenv(root: Path | str) -> dict[str, str]:

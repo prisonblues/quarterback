@@ -26,12 +26,23 @@ DENIED = ('jetski: no output produced — a tool required the "command" permissi
           "that headless mode cannot prompt for, so it was auto-denied. Add an "
           "allow-rule under permissions.allow in settings.json.")
 
+# A blank run whose stderr is a SERVER refusal rather than a local permission —
+# the other settled cause, and the reason the short-circuit asks
+# is_deterministic_failure rather than either predicate alone.
+REJECTED = ('{"type":"error","error":{"type":"invalid_request_error",'
+            '"message":"The model `gemini-3.9-nope` does not exist"}}')
+
+# Warm-up noise, on a blank run that carries no diagnosis at all. Nothing here
+# says the next attempt would also come back blank, so this one IS retried.
+FLAKE = "loaded 3 plugins\n"
+
 FINDINGS = '[{"severity":"P2","file":"a.py","line":1,"title":"t","detail":"d"}]'
 
 
 def _fake_cli(monkeypatch, *runs):
     """Patch subprocess.run to replay `runs` — one (stdout, stderr, rc) per
     attempt, the last repeating once exhausted."""
+    assert runs, "give _fake_cli at least one (stdout, stderr, rc) to replay"
     calls = []
 
     def fake_run(cmd, **kwargs):
@@ -80,20 +91,59 @@ def test_a_run_that_produced_findings_is_untouched_by_chatty_stderr(monkeypatch)
     assert out == FINDINGS and err is None
 
 
-def test_a_blank_reply_is_retried_and_a_later_attempt_wins(monkeypatch):
-    """Unlike a rejected request, a blank reply is not self-evidently
-    deterministic — losing a whole panel member to one costs more than the two
-    extra attempts, which fail fast anyway."""
-    calls = _fake_cli(monkeypatch, ("", DENIED, 0), (FINDINGS, "", 0))
+def test_a_blank_reply_with_no_diagnosis_is_retried_and_a_later_attempt_wins(monkeypatch):
+    """A blank reply that says nothing about WHY may well be a flake, and losing
+    a whole panel member to one costs more than the extra attempts."""
+    calls = _fake_cli(monkeypatch, ("", FLAKE, 0), (FINDINGS, "", 0))
     out, err = panel.run_cli(["agy"], "antigravity (m)")
     assert out == FINDINGS and err is None
     assert len(calls) == 2
 
 
 def test_a_persistently_blank_reviewer_gives_up_after_its_attempts(monkeypatch):
-    calls = _fake_cli(monkeypatch, ("", DENIED, 0))
+    calls = _fake_cli(monkeypatch, ("", FLAKE, 0))
     _out, err = panel.run_cli(["agy"], "antigravity (m)", attempts=3)
     assert len(calls) == 3 and "produced no output" in err
+
+
+# ------------------------------------------- blank output, but a settled cause
+
+def test_an_auto_denied_permission_is_not_retried(monkeypatch):
+    """A missing `permissions.allow` rule is as fixed as a bad model pin: the
+    second and third attempts are auto-denied by the same rule, in the same way.
+
+    Retrying is not free here. A blank run does NOT fail fast the way a non-zero
+    exit does — the observed one burned its whole model call — so three of them
+    is up to 3x600s held against the joined futures of the entire panel, 3x the
+    duration_ms the board's leaderboard ranks this member on, and on the metered
+    `pi` seat, three bills for one answer nobody can use."""
+    calls = _fake_cli(monkeypatch, ("", DENIED, 0), (FINDINGS, "", 0))
+    out, err = panel.run_cli(["agy"], "antigravity (m)", attempts=3)
+    assert len(calls) == 1
+    assert out is None
+    # Short-circuiting must not cost the diagnosis — that is the whole PR.
+    assert "produced no output" in err and "permissions.allow" in err
+
+
+def test_a_blank_reply_the_server_refused_is_not_retried(monkeypatch):
+    """The other settled cause, and the one is_rejection already short-circuited
+    on a non-zero exit. A CLI that swallows the refusal into a zero exit must not
+    buy itself two more attempts by doing so."""
+    calls = _fake_cli(monkeypatch, ("", REJECTED, 0), (FINDINGS, "", 0))
+    out, err = panel.run_cli(["agy"], "antigravity (m)", attempts=3)
+    assert len(calls) == 1 and out is None
+    assert "does not exist" in err
+
+
+def test_the_two_settled_causes_stay_distinguishable():
+    """They are fixed in different files — a model pin in `.harness-rules`, a
+    permission rule in the CLI's own settings.json — so a report that conflated
+    them would send you to the wrong one."""
+    assert panel.is_rejection(REJECTED) and not panel.is_permission_denied(REJECTED)
+    assert panel.is_permission_denied(DENIED) and not panel.is_rejection(DENIED)
+    assert panel.is_deterministic_failure(DENIED)
+    assert panel.is_deterministic_failure(REJECTED)
+    assert not panel.is_deterministic_failure(FLAKE)
 
 
 # ---------------------------------------------------------------- review_llm
