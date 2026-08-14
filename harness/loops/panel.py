@@ -54,11 +54,13 @@ import shutil
 import ssl
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -329,8 +331,9 @@ def stderr_gist(stderr: str, limit: int = 200) -> str:
     return (msg.group(1) if msg else pick)[:limit]
 
 
-def run_cli(args: list[str], label: str, timeout: int = 600,
-            attempts: int = 3) -> tuple[str | None, str | None]:
+def run_cli(args: list[str] | Callable[[], list[str]], label: str, timeout: int = 600,
+            attempts: int = 3,
+            on_output: Callable[[str | None], None] | None = None) -> tuple[str | None, str | None]:
     """Run a headless CLI, returning (stdout, error_reason); error_reason is
     None on success. Retries transient failures (non-zero exits such as rate
     limits, and OS errors) up to `attempts` times with no delay — these fail
@@ -340,17 +343,32 @@ def run_cli(args: list[str], label: str, timeout: int = 600,
     tail / OSError) so callers can SURFACE why a step degraded instead of
     reporting a bare 'unavailable'. A request the server has REJECTED on its
     merits is not retried either: a bad model pin fails identically all three
-    times, so retrying only triples the wait for a certainty."""
+    times, so retrying only triples the wait for a certainty.
+
+    `args` may be a CALLABLE returning the argv, for a command line that cannot
+    be reused verbatim: `claude --session-id` refuses an id that already exists
+    ("Session ID … is already in use"), so a reviewer whose session is pinned
+    needs a fresh one per attempt or the retry that exists to recover a flake
+    fails every time by construction.
+
+    `on_output` is handed EVERY attempt's stdout, including the ones that then
+    failed. Only the last is returned, but an attempt that burned tokens before
+    exiting non-zero still spent them, and a caller reading usage off stdout
+    (codex) would otherwise under-report exactly the seat that is flaking.
+    """
     last = f"{label}: no attempt made"
     for _ in range(max(1, attempts)):
+        argv = args() if callable(args) else args
         try:
-            proc = subprocess.run(args, capture_output=True, text=True,
+            proc = subprocess.run(argv, capture_output=True, text=True,
                                   stdin=subprocess.DEVNULL, timeout=timeout)
         except subprocess.TimeoutExpired:
             return None, f"{label}: timed out after {timeout}s"
         except OSError as e:
             last = f"{label}: {e.__class__.__name__}"
             continue
+        if on_output:
+            on_output(proc.stdout)
         if proc.returncode != 0:
             msg = stderr_gist(proc.stderr or "")
             last = f"{label}: exited {proc.returncode}" + (f" ({msg})" if msg else "")
@@ -439,15 +457,28 @@ def reviewer_label(name: str, model: str, effort: str = "") -> str:
     return f"{name} ({spec})" if spec else f"{name} (CLI default)"
 
 
-def codex_args(model: str, effort: str, prompt: str) -> list[str]:
+def codex_args(model: str, effort: str, prompt: str,
+               reply_file: Path | None = None) -> list[str]:
     """codex exec argv. Both knobs are optional and independent: effort is a
     `-c` config override rather than a flag, and applies to the CLI's default
-    model just as well as to a pinned one."""
+    model just as well as to a pinned one.
+
+    `reply_file` turns on the pair that gets usage out of this seat WITHOUT
+    wrapping the findings: `--json` puts the event stream (which carries
+    `turn.completed.usage`) on stdout, and `--output-last-message` writes the
+    model's reply to that file as plain text — the same text stdout used to
+    carry, read by the same parser. codex is the one member that cannot pin a
+    session id for a new run, so its usage has to come off the stream; the
+    alternative, matching a rollout under `~/.codex/sessions/` after the fact,
+    races the up-to-4 concurrent panels `/panel-review-pr` fans out.
+    """
     args = ["codex", "exec", prompt]
     if model:
         args += ["--model", model]
     if effort:
         args += ["-c", f"model_reasoning_effort={effort}"]
+    if reply_file is not None:
+        args += ["--json", "--output-last-message", str(reply_file)]
     return args
 
 
@@ -476,20 +507,31 @@ def antigravity_args(model: str, effort: str, prompt: str) -> list[str]:
     return args
 
 
-def pi_args(model: str, effort: str, prompt: str) -> list[str]:
+def pi_args(model: str, effort: str, prompt: str,
+            session_id: str, session_dir: Path) -> list[str]:
     """pi argv. `-p` is its non-interactive mode; `--no-tools` is what makes it a
     REVIEWER — pi ships read/bash/edit/write, and a panel member has no business
     editing the tree it is reviewing (the same reason agy runs in plan mode).
     The diff is in the prompt, so it needs no tools to do the job.
 
-    `--no-session` keeps a review out of the session store: a panel run is not a
-    conversation anyone resumes, and one runs per PR.
+    `--session-id` + `--session-dir` replace what used to be `--no-session`. The
+    reason for `--no-session` still holds — a panel run is not a conversation
+    anyone resumes — and is now served better: the session is written into a
+    per-run temporary directory that is deleted when the member returns, so it
+    still never reaches the user's session store, and on the way out it is read
+    for what the turn cost. pi is the one seat that states a cost of its own.
+
+    The id is pinned UP FRONT rather than matched afterwards because
+    `/panel-review-pr` fans out up to 4 concurrent panels, each running its own
+    copy of each reviewer — picking a session by mtime would hand one panel
+    another's numbers.
 
     pi reaches many providers, so `model` here is a full `provider/id` pattern
     (`openrouter/moonshotai/kimi-k3`) rather than a bare slug, and its thinking
     level is spelled `--thinking` where codex spells it `model_reasoning_effort`.
     Same knob, same config key (`effort`), different word on each CLI."""
-    args = ["pi", "-p", "--no-session", "--no-tools", prompt]
+    args = ["pi", "-p", "--session-id", session_id, "--session-dir", str(session_dir),
+            "--no-tools", prompt]
     if model:
         args += ["--model", model]
     if effort:
@@ -522,9 +564,218 @@ def select_reviewers(rev: dict, spec: str | None) -> tuple[set[str], str | None]
                         + " (repo config overridden)")
 
 
+def _int(v: object) -> int:
+    """A usage figure as an int, or 0 — vendors omit fields they have nothing for."""
+    return v if isinstance(v, int) and not isinstance(v, bool) else 0
+
+
+def _jsonl(path: Path) -> list[dict]:
+    """Every JSON object in a JSONL file, skipping whatever doesn't parse.
+
+    Session transcripts are written as the turn runs, so the last line can be a
+    half-flushed one; a partial tail costs a message, never the read.
+    """
+    out: list[dict] = []
+    try:
+        text = path.read_text(errors="replace")
+    except OSError:
+        return out
+    for ln in text.splitlines():
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            o = json.loads(ln)
+        except ValueError:
+            continue
+        if isinstance(o, dict):
+            out.append(o)
+    return out
+
+
+def _usage(inp: int, out: int, cached: int, reasoning: int,
+           cost: float | None = None) -> dict:
+    """One member's spend, normalised so the four fields mean the same everywhere.
+
+    Every vendor slices this differently, so the shape is pinned here rather than
+    at each call site:
+
+    * ``input_tokens`` — EVERY prompt-side token, cache hits and cache writes
+      included. Claude reports the uncached remainder under that name and pi
+      reports cache reads *beside* input rather than inside it, so taking either
+      vendor's `input` verbatim would report a 60k-char diff as a 2-token prompt.
+    * ``cached_input_tokens`` — the cached slice OF that input, never a sibling.
+    * ``output_tokens`` — completion tokens.
+    * ``reasoning_tokens`` — thinking, which every vendor here counts INSIDE
+      output. It is reported alongside, never added, or the seats that think
+      would be double-charged for it.
+
+    Even normalised these compare only *within* a vendor: different tokenizers,
+    different cache semantics. Duration is the cross-vendor axis.
+    """
+    u = {"input_tokens": inp, "output_tokens": out,
+         "cached_input_tokens": cached, "reasoning_tokens": reasoning}
+    # Only where the VENDOR states it. Never tokens times a price table: a run
+    # priced at today's rates is silently wrong when the board is queried in six
+    # weeks, and the record is meant to still be true then.
+    if cost is not None:
+        u["cost_usd"] = round(cost, 6)
+    return u
+
+
+def claude_usage(session_ids: list[str]) -> dict | None:
+    """What a pinned `claude -p` member cost, read back out of its transcripts.
+
+    Takes every session the member used, not one: a retry has to run under a
+    FRESH id (claude refuses one that already exists), so a member that flaked
+    once and landed on the second attempt genuinely spent two turns and is
+    charged for both.
+
+    Each is located by GLOB on the id rather than by rebuilding the project-slug
+    directory name from the cwd: the id is unique, so the glob is unambiguous,
+    and it does not break the day the slug rule changes.
+
+    Usage is per assistant message and summed across the turn — but the
+    transcript writes a message more than once (a streamed one lands twice with
+    the same `message.id` under different line `uuid`s), so identical blocks are
+    deduped by that id first. Summing the lines naively double-counts every
+    streamed reply, which reads as a reviewer costing twice what it did.
+    """
+    inp = out = cached = reasoning = 0
+    seen: set[str] = set()
+    for session_id in session_ids:
+        files = list(Path.home().glob(f".claude/projects/*/{session_id}.jsonl"))
+        if not files:
+            continue
+        for rec in _jsonl(files[0]):
+            msg = rec.get("message")
+            if rec.get("type") != "assistant" or not isinstance(msg, dict):
+                continue
+            u = msg.get("usage")
+            if not isinstance(u, dict):
+                continue
+            mid = msg.get("id") or rec.get("requestId") or rec.get("uuid")
+            if mid in seen:
+                continue
+            seen.add(mid)
+            cache_read = _int(u.get("cache_read_input_tokens"))
+            # Claude's `input_tokens` is only the part it neither cached nor read
+            # from cache; the whole prompt is all three added up.
+            inp += (_int(u.get("input_tokens"))
+                    + _int(u.get("cache_creation_input_tokens")) + cache_read)
+            cached += cache_read
+            out += _int(u.get("output_tokens"))
+            details = u.get("output_tokens_details")
+            if isinstance(details, dict):
+                reasoning += _int(details.get("thinking_tokens"))
+    if not seen:
+        return None
+    # No cost: the transcript states none. `--output-format json` does put one on
+    # stdout, but that mode wraps the findings in an envelope, which is the trade
+    # this whole approach exists to refuse.
+    return _usage(inp, out, cached, reasoning)
+
+
+def pi_usage(session_dir: Path, session_ids: list[str]) -> dict | None:
+    """What a pinned `pi -p` member cost, from the sessions it was told to write.
+
+    One per attempt, like claude's — pi would happily RESUME an id it already
+    has, but then a retry would carry the failed reply into its context and stop
+    being the independent second shot the caller asked for. A fresh id per
+    attempt keeps the old `--no-session` semantics and still charges for both.
+
+    pi names each file `<timestamp>_<session-id>.jsonl`, so this globs on the id
+    rather than assuming the timestamp. It is the one seat that states a cost of
+    its own, which is therefore the one recorded — never a derived figure.
+    """
+    inp = out = cached = reasoning = 0
+    cost = 0.0
+    stated = False
+    found = False
+    for session_id in session_ids:
+        files = sorted(session_dir.glob(f"*_{session_id}.jsonl"))
+        if not files:
+            continue
+        for rec in _jsonl(files[0]):
+            msg = rec.get("message")
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                continue
+            u = msg.get("usage")
+            if not isinstance(u, dict):
+                continue
+            found = True
+            # pi reports cacheRead/cacheWrite BESIDE input, not inside it (its own
+            # totalTokens adds all of them), so the prompt total is the sum.
+            cache_read, cache_write = _int(u.get("cacheRead")), _int(u.get("cacheWrite"))
+            inp += _int(u.get("input")) + cache_read + cache_write
+            cached += cache_read
+            out += _int(u.get("output"))
+            reasoning += _int(u.get("reasoning"))
+            c = u.get("cost")
+            if isinstance(c, dict) and isinstance(c.get("total"), (int, float)):
+                cost += float(c["total"])
+                stated = True
+    if not found:
+        return None
+    return _usage(inp, out, cached, reasoning, cost if stated else None)
+
+
+def codex_usage(stdout: str | None) -> dict | None:
+    """What a `codex exec --json` turn cost, from its own event stream.
+
+    codex cannot pin a session id for a NEW run (only `resume`), and picking our
+    rollout out of `~/.codex/sessions/` by mtime races the up-to-4 concurrent
+    panels `/panel-review-pr` fans out. So this seat reads usage off stdout
+    instead — which it can do without putting the findings in an envelope,
+    because `--output-last-message` hands those over as plain text in a file.
+
+    Summed over `turn.completed` events rather than taking the last, so a run
+    that took more than one turn is charged for all of them.
+    """
+    inp = out = cached = reasoning = 0
+    found = False
+    for ln in (stdout or "").splitlines():
+        ln = ln.strip()
+        if not ln.startswith("{"):
+            continue
+        try:
+            o = json.loads(ln)
+        except ValueError:
+            continue
+        u = o.get("usage")
+        if o.get("type") != "turn.completed" or not isinstance(u, dict):
+            continue
+        found = True
+        # codex's `input_tokens` is already the whole prompt, cached reads
+        # included — so unlike pi's, nothing is added to it. `cached_input_tokens`
+        # is recorded as the slice of it that was cached.
+        inp += _int(u.get("input_tokens"))
+        cached += _int(u.get("cached_input_tokens"))
+        out += _int(u.get("output_tokens"))
+        reasoning += _int(u.get("reasoning_output_tokens"))
+    return _usage(inp, out, cached, reasoning) if found else None
+
+
+@dataclass(slots=True)
+class MemberRun:
+    """One panel member's whole turn: what it found, why it didn't, what it cost.
+
+    A tuple would do until it wouldn't — findings, skip and duration were three
+    and tokens made four, at which point the caller is unpacking by position and
+    a reordered return is a silent mis-record.
+    """
+
+    findings: list[Finding] = field(default_factory=list)
+    skip: str | None = None
+    duration_ms: int = 0
+    #: The board's token fields, or None where nothing could be read. Never a
+    #: zeroed dict: "not recorded" and "spent nothing" must stay distinguishable.
+    usage: dict | None = None
+
+
 def review_llm(cmd_name: str, model: str, prompt: str,
-               effort: str = "") -> tuple[list[Finding], str | None, int]:
-    """Run a headless LLM CLI reviewer. Returns (findings, skip_reason, duration_ms).
+               effort: str = "") -> MemberRun:
+    """Run a headless LLM CLI reviewer and report what it found and what it cost.
 
     Duration is wall-clock for this member's whole turn — every CLI attempt it
     made, including the reparse retry below, because a reviewer that only lands
@@ -533,10 +784,21 @@ def review_llm(cmd_name: str, model: str, prompt: str,
     want to know about a reviewer that times out. Config errors that return
     before any process starts report ~0, which is honest — nothing ran.
 
+    **Tokens are read back out of a pinned session, not out of a JSON output
+    mode.** Every vendor's JSON mode moves the reply inside an envelope
+    (``.result``, ``.response``, ``item.completed``, ``.message.content[]``), so
+    ``parse_findings`` would need four bespoke unwrappers — four new failure
+    modes on the path that currently works, added to gain telemetry. Pinning
+    inverts that risk: a transcript that cannot be read loses a number, while a
+    broken unwrapper loses the findings on every run. So each seat keeps its
+    plain-text reply and its session id is fixed UP FRONT — matching a session
+    afterwards by mtime would race the up-to-4 concurrent panels that
+    `/panel-review-pr` fans out.
+
     This is the cost side of the board's scorecard. "Finds more" is only half an
-    answer; the panel is a choice about where to spend wall-clock, and until this
-    was measured the /panel leaderboard could rank a member top on findings while
-    silently being the one that made every review twice as slow.
+    answer; the panel is a choice about where to spend, and without this the
+    /panel leaderboard could rank a member top on findings while it was quietly
+    the most expensive seat on the panel.
     """
     started = time.monotonic()
 
@@ -552,37 +814,130 @@ def review_llm(cmd_name: str, model: str, prompt: str,
     if effort and effort not in valid:
         expected = ("expected one of " + ", ".join(valid) if valid
                     else f"{cmd_name} takes no reasoning effort")
-        return [], f"{label}: unknown reasoning effort {effort!r} — {expected}", elapsed()
+        return MemberRun(skip=f"{label}: unknown reasoning effort {effort!r} — {expected}",
+                         duration_ms=elapsed())
     if not shutil.which(CLI_BIN.get(cmd_name, cmd_name)):
-        return [], f"{label}: CLI absent", elapsed()
-    if cmd_name == "claude":
-        args = ["claude", "-p", prompt, "--model", model]
-    elif cmd_name == "antigravity":
-        args = antigravity_args(model, effort, prompt)
-    elif cmd_name == "pi":
-        args = pi_args(model, effort, prompt)
-    else:
-        args = codex_args(model, effort, prompt)
-    out, err = run_cli(args, label)
-    if err:
-        err += cli_hint(cmd_name, err, model)
-        return [], err, elapsed()
-    findings = parse_findings(cmd_name, out)
-    if findings is None:
-        # Unparseable JSON — give the reviewer one more shot (a common flake is a
-        # stray prose preamble the model omits on a retry), then, rather than drop
-        # its work, keep the raw reply as a single markdown finding for the judge.
-        out2, err2 = run_cli(args, label, attempts=1)
-        if not err2 and out2:
-            retried = parse_findings(cmd_name, out2)
-            if retried is not None:
-                return retried, None, elapsed()
-            out = out2
-        text = (out or "").strip()
-        if not text:
-            return [], f"{label}: no parseable findings and empty output", elapsed()
-        return [_raw_finding(cmd_name, text)], None, elapsed()
-    return findings, None, elapsed()
+        return MemberRun(skip=f"{label}: CLI absent", duration_ms=elapsed())
+
+    # A private directory per member per run holds whatever telemetry that CLI
+    # needs somewhere to put (pi's session, codex's reply file). Removed however
+    # this returns, so a panel that runs all day leaves nothing behind.
+    with tempfile.TemporaryDirectory(prefix=f"panel-{cmd_name}-") as tmp:
+        tmpdir = Path(tmp)
+        reply_file: Path | None = None
+        #: Every session this member opened — one per CLI attempt, because a
+        #: pinned id cannot be reused (claude: "Session ID … is already in use")
+        #: and reusing pi's would turn the retry into a continuation of the reply
+        #: it is retrying. Usage is read back from all of them, so a member that
+        #: flaked once and landed on the second attempt is charged for both.
+        sessions: list[str] = []
+
+        def new_session() -> str:
+            # A BARE uuid4, with no readability prefix: `claude --session-id`
+            # refuses anything that is not a valid UUID, which would fail every
+            # claude review rather than merely lose its token count. pi accepts
+            # any string, so one form serves both.
+            sessions.append(str(uuid.uuid4()))
+            return sessions[-1]
+
+        # A thunk, not a fixed argv: run_cli retries a flake up to three times,
+        # and each of those attempts needs its own session id.
+        if cmd_name == "claude":
+            def args():
+                return ["claude", "-p", prompt, "--model", model,
+                        "--session-id", new_session()]
+        elif cmd_name == "antigravity":
+            # Not instrumented: `agy` has no session-id to pin, and its usage
+            # lives only in the JSON mode this design declines. It reviews
+            # exactly as before and reports no tokens, which the board renders as
+            # "not recorded" rather than as zero.
+            args = antigravity_args(model, effort, prompt)
+        elif cmd_name == "pi":
+            def args():
+                return pi_args(model, effort, prompt, new_session(), tmpdir)
+        else:
+            reply_file = tmpdir / "reply.txt"
+            args = codex_args(model, effort, prompt, reply_file)
+
+        #: Every attempt's stdout, failed ones included — codex reads its usage
+        #: from there, and an attempt that burned tokens before exiting non-zero
+        #: still spent them. The session-pinned seats get the same completeness
+        #: from `sessions` above.
+        outputs: list[str] = []
+
+        def collect(stdout: str | None) -> None:
+            if stdout:
+                outputs.append(stdout)
+
+        def usage_of() -> dict | None:
+            """What this member spent across every attempt it made, or None.
+
+            Deliberately catching everything: this is the last line of the
+            guarantee the whole design is built on — a review that has already
+            succeeded must not fail because a transcript moved, changed shape, or
+            grew a field of a type the reader didn't expect. The cost of being
+            wrong here is one missing number, and it is announced rather than
+            swallowed silently.
+            """
+            try:
+                if cmd_name == "claude":
+                    return claude_usage(sessions)
+                if cmd_name == "pi":
+                    return pi_usage(tmpdir, sessions)
+                if cmd_name == "codex":
+                    return codex_usage("\n".join(outputs))
+            except Exception as e:  # noqa: BLE001 - telemetry never fails a review
+                print(f"panel: no usage for {label} ({e.__class__.__name__})", file=sys.stderr)
+            return None
+
+        def reply_of(stdout: str | None) -> str | None:
+            """The reviewer's actual reply text for this attempt.
+
+            codex is the one seat whose stdout is not its reply: `--json` puts
+            events there and `--output-last-message` puts the reply in a file, so
+            the findings still arrive as plain text and never as an envelope to
+            unwrap. If the file is missing the run produced no reply, which the
+            caller already handles as empty output.
+            """
+            if reply_file is None:
+                return stdout
+            try:
+                return reply_file.read_text()
+            except OSError:
+                return None
+
+        out, err = run_cli(args, label, on_output=collect)
+        if err:
+            err += cli_hint(cmd_name, err, model)
+            # A member that burned tokens and then failed still spent them, so
+            # the usage is reported on this path too.
+            return MemberRun(skip=err, duration_ms=elapsed(), usage=usage_of())
+
+        text = reply_of(out)
+        findings = parse_findings(cmd_name, text)
+        if findings is None:
+            # Unparseable JSON — give the reviewer one more shot (a common flake is a
+            # stray prose preamble the model omits on a retry), then, rather than drop
+            # its work, keep the raw reply as a single markdown finding for the judge.
+            # The retry costs another turn, which `usage_of` already counts: it runs
+            # under its own fresh session, and its stdout lands in `outputs` too.
+            out2, err2 = run_cli(args, label, attempts=1, on_output=collect)
+            retry_text = reply_of(out2) if not err2 else None
+            if retry_text:
+                retried = parse_findings(cmd_name, retry_text)
+                if retried is not None:
+                    return MemberRun(findings=retried, duration_ms=elapsed(),
+                                     usage=usage_of())
+                text = retry_text
+            usage = usage_of()
+            raw = (text or "").strip()
+            if not raw:
+                return MemberRun(skip=f"{label}: no parseable findings and empty output",
+                                 duration_ms=elapsed(), usage=usage)
+            return MemberRun(findings=[_raw_finding(cmd_name, raw)],
+                             duration_ms=elapsed(), usage=usage)
+        return MemberRun(findings=findings, duration_ms=elapsed(), usage=usage_of())
+
 
 
 def resolve_token(sonar: dict, repo_path: str = "") -> str:
@@ -1103,22 +1458,27 @@ def run(repo_name: str, pr_number: int, post: bool, json_out: bool = False,
         # repins, a slug retires, --reviewers hand-picks a set).
         reviewer_meta: dict[str, dict] = {}
         for name, fut in tasks.items():
-            finds, skip, duration_ms = fut.result()
+            member = fut.result()
             reviewer_meta[name] = {
                 "model": models[name] or None,
                 "effort": efforts.get(name) or None,
-                "ran": not skip,
-                "skip": skip,
+                "ran": not member.skip,
+                "skip": member.skip,
                 "max_diff_chars": budgets[name],
                 "truncated": name in truncated_for,
-                "duration_ms": duration_ms,
+                "duration_ms": member.duration_ms,
+                # Spread, not nested: a member whose usage could not be read
+                # contributes no keys at all, so the board stores nulls and
+                # renders "not recorded" — rather than a zero it would average in
+                # as though the reviewer had cost nothing.
+                **(member.usage or {}),
             }
-            if skip:
-                result.skipped.append(skip)
-                llm_skipped.append(skip)
+            if member.skip:
+                result.skipped.append(member.skip)
+                llm_skipped.append(member.skip)
             else:
                 ran_llm.append(labels[name])
-                llm_findings.extend(finds)
+                llm_findings.extend(member.findings)
         if sonar_future:
             gate, hard, soft, skip = sonar_future.result()
             result.sonar_gate = gate

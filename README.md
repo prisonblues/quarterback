@@ -98,7 +98,7 @@ GET   /sync              ?repo=&branch=&device=&path=          (registered workt
                          &have=sha,sha,…&dirty=&ahead=&behind= (…or just describe yourself)
                          -> {published:[…], worktrees:[…], caller, stale, registered, advice}
 
-# reviewer-panel stats (v2.10, per-reviewer accounts v2.11)
+# reviewer-panel stats (v2.10, accounts v2.11, per-reviewer cost v2.14)
 POST  /review            (panel.py --json payload)              -> {id, recorded, accounts}
 GET   /reviews           ?repo=&pr=&author=&since=&days=&limit=  (runs + scorecards)
 GET   /review/{id}                                              (scorecards + findings + accounts)
@@ -160,10 +160,26 @@ deliberately *not* an MCP tool: they are recorded by the panel process itself
 (`qb record-review`), so every caller — `/panel-review-pr`, `/panel`, the epic and
 lander loops — is counted without an agent having to remember to say so.
 
+**What a review cost, and what that can honestly be compared against.** Each scorecard carries
+`duration_ms` and, since v2.14, `input_tokens` / `output_tokens` / `cached_input_tokens` /
+`reasoning_tokens` and a `cost_usd` **only where the vendor states one** — never derived from a
+price table, because a run priced at today's rates reads wrong the moment the rates move, and
+these rows are meant to still be true in six weeks. The panel gets the numbers by pinning a
+session id before each reviewer runs and reading usage back out of the session afterwards, so
+every reviewer keeps its plain-text reply: a transcript that cannot be read loses a number,
+whereas a vendor's JSON output mode would put the findings inside an envelope and could lose
+those on every run.
+
+Tokens compare **within one vendor only** — different tokenizers, different cache semantics, and
+only some vendors state a price. `GET /review/stats` therefore groups by (reviewer, model,
+effort), which makes "is the expensive tier worth it" answerable (opus vs sonnet, codex `xhigh`
+vs `medium`) while leaving `duration_ms` as the axis that compares one vendor with another. Any
+of these may be null, which always means *not recorded* and never *spent nothing*; `token_runs`
+says how much of a window actually reported.
+
 ## Releases
 
-Running board version: **v2.12** (`GET /openapi.json` → `.info.version` on any instance).
-The latest release, v2.13, ships the harness alongside the service and changes no board behaviour.
+Running board version: **v2.14** (`GET /openapi.json` → `.info.version` on any instance).
 
 - **v1–v2.1** — the board, then presence leases + session handoff, then dev context.
 - **v2.2–v2.5** — the session registry: sessions became listable, named, resumable, and the
@@ -172,6 +188,8 @@ The latest release, v2.13, ships the harness alongside the service and changes n
   publish/sync advisories, per-agent identity.
 - **v2.10–v2.12** — reviewer-panel stats, per-reviewer accounts, board-designated names.
 - **v2.13** — the harness (loops, worktree tooling, slash commands) ships in this repo.
+- **v2.14** — per-reviewer token usage and vendor-stated cost, so the leaderboard ranks
+  reviewers on what they cost as well as what they find.
 - **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
   object store; wire `landed` refs to a cherry-pick helper.
 

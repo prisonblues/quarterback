@@ -7,6 +7,48 @@ that number where it was, so the repo can be a version ahead of the service.
 Entries are newest first. Each one says what was broken or missing before it, because that is the
 part that isn't recoverable from the diff.
 
+## v2.14 — what each reviewer cost, not just what it found
+
+The leaderboard could rank a panel member top on confirmed findings while it was quietly the most
+expensive seat on the panel. v2.13 had wired wall-clock, which is the only cost axis comparable
+*across* vendors; tokens are the other half and answer a narrower question — **within** one
+vendor, is the expensive tier worth it (opus over sonnet, codex `xhigh` over `medium`). Same
+tokenizer, same cache semantics, so directly comparable, and exactly the grouping
+`GET /review/stats` already did by (reviewer, model, effort).
+
+`review_reviewers` gains `input_tokens`, `output_tokens`, `cached_input_tokens`,
+`reasoning_tokens` and `cost_usd`, all nullable, aggregated in `GET /review/stats` and rendered
+on `/panel`.
+
+**The findings path did not change shape to get this.** The obvious implementation is to switch
+each reviewer CLI to its JSON output mode, which carries a `usage` block — and every one of those
+modes moves the reply inside an envelope (`.result`, `.response`, `item.completed`,
+`.message.content[]`), so `parse_findings` would need four bespoke unwrappers: four new failure
+modes on the path that currently works, added in order to gain telemetry. Instead every reviewer
+stays in plain text, its session id is pinned **up front**, and usage is read back out of the
+persisted session afterwards. That inverts the risk — a failed transcript read loses a number,
+a broken unwrapper would lose the findings on every run — and it shipped one reviewer at a time
+with no flag day. Pinned up front rather than matched afterwards because `/panel-review-pr` fans
+out up to 4 concurrent panels, each running its own copy of each reviewer, so matching a session
+by mtime and cwd races.
+
+Per seat: **claude** pins `--session-id` and is read from `~/.claude/projects/*/<id>.jsonl` —
+deduped by `message.id` first, because a streamed reply is written to the transcript twice and
+summing the lines charged it double. **pi** swaps `--no-session` for `--session-id` plus a
+`--session-dir` temp directory deleted when the member returns, which keeps a review out of the
+user's session store exactly as before while making it readable on the way out; it is the one
+vendor that states a cost. **codex** cannot pin a session id for a new run, so it uses `--json`
+for the usage events on stdout together with `--output-last-message`, which hands the findings
+over as plain text in a file — still no envelope. **antigravity** is left uninstrumented rather
+than half-converted.
+
+`cost_usd` is stored **only where the vendor states it**, never derived from a price table: a run
+priced at today's rates is silently wrong when queried in six weeks, and the point of the table is
+that it stays true later. Every column is nullable and a null always means *not recorded*, never
+*spent nothing* — the stats carry `token_runs` so a half-instrumented window cannot read as a
+complete one. The page presents tokens as a within-vendor tier comparison, with the comparison bar
+drawn only against the same vendor's other tiers, and keeps duration as the cross-vendor axis.
+
 ## v2.13 — the harness ships with the board
 
 The loops and worktree tooling that produce the board's data lived in a personal NixOS config,

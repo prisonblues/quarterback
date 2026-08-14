@@ -23,7 +23,8 @@ FINDINGS = '[{"severity":"P2","file":"a.py","line":1,"title":"t","detail":"d"}]'
 def test_a_successful_review_reports_a_duration(monkeypatch):
     monkeypatch.setattr(panel.shutil, "which", lambda _: "/usr/bin/claude")
     monkeypatch.setattr(panel, "run_cli", lambda *a, **k: (FINDINGS, None))
-    finds, skip, ms = panel.review_llm("claude", "opus", "p")
+    run = panel.review_llm("claude", "opus", "p")
+    finds, skip, ms = run.findings, run.skip, run.duration_ms
     assert skip is None and len(finds) == 1
     assert isinstance(ms, int) and ms >= 0
 
@@ -34,7 +35,8 @@ def test_a_dead_reviewer_is_still_timed(monkeypatch):
     monkeypatch.setattr(panel.shutil, "which", lambda _: "/usr/bin/codex")
     monkeypatch.setattr(panel, "run_cli",
                         lambda *a, **k: (None, "codex: timed out after 600s"))
-    finds, skip, ms = panel.review_llm("codex", "gpt-5.6-luna", "p")
+    run = panel.review_llm("codex", "gpt-5.6-luna", "p")
+    finds, skip, ms = run.findings, run.skip, run.duration_ms
     assert finds == [] and "timed out" in skip
     assert isinstance(ms, int) and ms >= 0
 
@@ -45,6 +47,7 @@ def test_a_config_error_reports_a_duration_too(monkeypatch):
     measured."""
     monkeypatch.setattr(panel, "run_cli",
                         lambda *a, **k: (_ for _ in ()).throw(AssertionError("ran")))
-    _, skip, ms = panel.review_llm("claude", "sonnet", "p", effort="high")
+    run = panel.review_llm("claude", "sonnet", "p", effort="high")
+    skip, ms = run.skip, run.duration_ms
     assert "takes no reasoning effort" in skip
     assert isinstance(ms, int) and ms >= 0

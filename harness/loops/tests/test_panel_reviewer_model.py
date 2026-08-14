@@ -45,7 +45,8 @@ def test_typo_effort_is_refused_without_spending_a_run(monkeypatch):
     it downstream and report it as an opaque non-zero exit."""
     called = []
     monkeypatch.setattr(panel, "run_cli", lambda *a, **k: called.append(a) or (None, None))
-    finds, skip, _ms = panel.review_llm("codex", "gpt-5.6-luna", "p", effort="hi")
+    run = panel.review_llm("codex", "gpt-5.6-luna", "p", effort="hi")
+    finds, skip = run.findings, run.skip
     assert finds == [] and called == []
     assert "unknown reasoning effort" in skip and "'hi'" in skip
     assert "xhigh" in skip                      # the valid set is stated, not implied

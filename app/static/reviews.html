@@ -77,6 +77,17 @@
   .meter .fill { position:absolute; left:0; top:0; bottom:0; border-radius:0 3px 3px 0; }
   .pct { min-width:38px; display:inline-block; }
 
+  /* tokens: same meter shape as precision, but the track only appears when the
+     vendor has a second tier to compare against — a full-width bar next to a
+     lone row would invite exactly the cross-vendor read this must not support. */
+  .tokcell { width:11%; }
+  .tok { display:inline-flex; align-items:center; gap:7px; justify-content:flex-end; }
+  .tok .track { width:40px; height:6px; background:#1e222b; border-radius:3px;
+    position:relative; overflow:hidden; }
+  .tok .fill { position:absolute; left:0; top:0; bottom:0; border-radius:0 3px 3px 0; }
+  .tok .tokn { min-width:44px; display:inline-block; }
+  .tok.lone .tokn { color:var(--muted); }
+
   .runrow { cursor:pointer; }
   .detail td { background:#12151c; text-align:left; white-space:normal; padding:10px 12px 12px; }
   .detail table { background:transparent; border:none; }
@@ -154,6 +165,16 @@ function ago(iso){ if(!iso) return "—";
   if(s<60) return Math.floor(s)+"s"; if(s<3600) return Math.floor(s/60)+"m";
   if(s<86400) return Math.floor(s/3600)+"h"; return Math.floor(s/86400)+"d"; }
 function pct(x){ return x==null ? "—" : Math.round(x*100)+"%"; }
+// Token counts run to seven figures, and seven figures in a table column is a
+// number nobody reads. One significant decimal keeps 1.2M distinguishable from
+// 1.9M, which is the only comparison this column is for.
+function fmtTok(n){
+  if (n == null) return "—";
+  if (n >= 1e6) return (n/1e6).toFixed(n < 1e7 ? 1 : 0)+"M";
+  if (n >= 1e3) return (n/1e3).toFixed(n < 1e4 ? 1 : 0)+"k";
+  return String(n);
+}
+function fmtUsd(x){ return x == null ? "—" : "$" + (x >= 1 ? x.toFixed(2) : x.toFixed(4)); }
 // Precision is a quality reading, not a series — status colours, which are
 // reserved for exactly this and always ship beside the number, never alone.
 function precColor(x){ return x==null ? "var(--muted)"
@@ -189,17 +210,64 @@ function qs(extra){
 // magnitude + identity, so one bar per competitor on a shared baseline, sorted.
 // Every row is direct-labelled with its reviewer, so identity never rests on
 // colour alone and no legend box is needed.
+// Tokens are the one column here that must NOT be read down the page. Different
+// vendors tokenize differently and cache differently — a "say hi" to Claude has
+// billed almost entirely against cache-*creation* tokens on a two-token prompt —
+// so ranking vendors by them measures the tokenizer, not the reviewer. They are
+// only meaningful BETWEEN TIERS OF THE SAME VENDOR (opus vs sonnet, codex xhigh
+// vs medium): same tokenizer, same cache semantics, directly comparable. So the
+// bar is scaled within the reviewer's own group and drawn only when that group
+// has a sibling to compare against; duration stays the cross-vendor axis.
+function tokenScale(rows){
+  const max = {};
+  rows.forEach(r => {
+    if (r.tokens_per_run == null) return;
+    const g = max[r.reviewer] || (max[r.reviewer] = { peak: 0, tiers: 0 });
+    g.peak = Math.max(g.peak, r.tokens_per_run);
+    g.tiers++;
+  });
+  return max;
+}
+
+// The token half of a row's tooltip. Says nothing at all when nothing was
+// recorded — a "0 tokens" line under a reviewer the panel simply never
+// instrumented is a worse answer than no line.
+function tokenTip(r){
+  if (r.total_tokens == null && r.cost_usd == null) return "";
+  const parts = [];
+  if (r.input_tokens != null) parts.push(`${fmtTok(r.input_tokens)} in`);
+  if (r.output_tokens != null) parts.push(`${fmtTok(r.output_tokens)} out`);
+  if (r.cached_input_tokens) parts.push(`${fmtTok(r.cached_input_tokens)} cached`);
+  if (r.reasoning_tokens) parts.push(`${fmtTok(r.reasoning_tokens)} thinking`);
+  const cover = r.token_runs < r.ran
+    ? ` <span style="color:var(--warn)">(${r.token_runs} of ${r.ran} runs reported)</span>` : "";
+  return `<br>—<br>${parts.join(" · ")}${cover}
+    ${r.tokens_per_confirmed ? `<br>${fmtTok(r.tokens_per_confirmed)} tokens per confirmed finding` : ""}
+    ${r.cost_usd != null
+      ? `<br>${fmtUsd(r.cost_usd)} stated by the vendor${
+          r.cost_per_confirmed ? ` · ${fmtUsd(r.cost_per_confirmed)} per confirmed` : ""}`
+      : "<br><span class='dim'>no cost stated by this vendor</span>"}
+    <br><span class="dim">tokens compare this vendor's tiers, not one vendor with another</span>`;
+}
+
 function renderLeaderboard(rows, judgedOnly){
   $("lbNote").textContent = (judgedOnly
     ? "— judged runs only, so precision is a real ratio"
     : "— includes unjudged runs; precision counts only adjudicated findings")
-    + `; * = fewer than ${THIN} findings ruled on`;
+    + `; * = fewer than ${THIN} findings ruled on`
+    + "; tokens compare tiers of ONE vendor, never two vendors";
   if (!rows.length){ $("leaderboard").innerHTML = '<div class="empty">no runs recorded yet</div>'; return; }
   const max = Math.max(...rows.map(r => r.confirmed), 1);
+  const scale = tokenScale(rows);
   const body = rows.map(r => {
     const label = r.model ? `${r.reviewer} <span class="chip">${esc(r.model)}${r.effort ? " · " + esc(r.effort) : ""}</span>`
                           : `${r.reviewer} <span class="chip dim">model not recorded</span>`;
     const w = (r.confirmed / max) * 100;
+    // "?" where only some of the group's runs reported usage: the number is real
+    // but it is not the whole window, and an unmarked partial sum reads as total.
+    const partial = r.token_runs > 0 && r.token_runs < r.ran;
+    const g = scale[r.reviewer];
+    const cmp = g && g.tiers > 1 && r.tokens_per_run != null;
     return `<tr>
       <td><span class="who"><span class="sw" style="background:${hue(r.reviewer)}"></span>${label}</span></td>
       <td class="barcell"><div class="bar"><i style="width:${w}%;background:${hue(r.reviewer)}"></i>
@@ -210,13 +278,20 @@ function renderLeaderboard(rows, judgedOnly){
       <td>${r.solo}</td><td class="dim">${pct(r.consensus_rate)}</td>
       <td>${r.p1}</td><td>${r.raised}</td><td>${r.dismissed}</td>
       <td>${r.confirmed_per_run ?? "—"}</td>
+      <td class="tokcell">${r.tokens_per_run == null ? '<span class="dim">—</span>'
+        : `<span class="tok${cmp ? "" : " lone"}">${cmp
+            ? `<span class="track"><span class="fill" style="width:${
+                 (r.tokens_per_run / g.peak) * 100}%;background:${hue(r.reviewer)}"></span></span>` : ""
+           }<span class="tokn">${fmtTok(r.tokens_per_run)}${partial ? "?" : ""}</span></span>`}</td>
       <td class="dim">${r.ran}${r.skipped_runs ? ` <span style="color:var(--warn)">+${r.skipped_runs}✗</span>` : ""}</td>
     </tr>`;
   }).join("");
   $("leaderboard").innerHTML = `<table>
     <thead><tr>
       <th>reviewer</th><th>confirmed findings</th><th>precision</th><th>solo</th>
-      <th>consensus</th><th>P1</th><th>raised</th><th>dismissed</th><th>conf/run</th><th>runs</th>
+      <th>consensus</th><th>P1</th><th>raised</th><th>dismissed</th><th>conf/run</th>
+      <th title="tokens per review — comparable only against the same vendor's other tiers">tokens/run</th>
+      <th>runs</th>
     </tr></thead><tbody>${body}</tbody></table>`;
 
   // Bound by index against the same sorted array the rows came from — the row
@@ -235,7 +310,8 @@ function renderLeaderboard(rows, judgedOnly){
            (${r.sev_stricter} rated worse, ${r.sev_looser} milder)`}<br>
       ran in ${r.ran} of ${r.runs} runs${r.skipped_runs ? ` (${r.skipped_runs} skipped)` : ""}
       ${r.avg_duration_ms ? `<br>avg ${Math.round(r.avg_duration_ms / 1000)}s per review` : ""}
-      ${r.ms_per_confirmed ? `<br>${Math.round(r.ms_per_confirmed / 1000)}s per confirmed finding` : ""}`);
+      ${r.ms_per_confirmed ? `<br>${Math.round(r.ms_per_confirmed / 1000)}s per confirmed finding` : ""}
+      ${tokenTip(r)}`);
   });
 }
 
@@ -331,6 +407,17 @@ async function renderHistory(box, repo, pr){
       · <b>gone</b> = raised earlier, not in the latest run</div>${chains}`;
 }
 
+// One member's spend on one run: whatever the vendor actually stated. The dollar
+// figure is shown only where the vendor states one — this page never multiplies
+// tokens by a price table, because a run priced at today's rates reads wrong the
+// moment the rates move, and these rows are meant to still be true in six weeks.
+function cardCost(c){
+  const t = [c.input_tokens, c.output_tokens].filter(x => x != null);
+  const tok = t.length ? fmtTok(t.reduce((a, b) => a + b, 0)) + " tok" : "";
+  const usd = c.cost_usd != null ? fmtUsd(c.cost_usd) : "";
+  return [tok, usd].filter(Boolean).join(" · ") || "—";
+}
+
 async function toggleRun(tr){
   const next = tr.nextElementSibling;
   if (next && next.classList.contains("detail")){ next.remove(); return; }
@@ -346,12 +433,15 @@ async function toggleRun(tr){
         ${c.model ? `<span class="chip">${esc(c.model)}${c.effort ? " · " + esc(c.effort) : ""}</span>` : ""}</span></td>
       <td>${c.ran ? c.raised : `<span style="color:var(--warn)">did not run</span>`}</td>
       <td>${c.confirmed}</td><td class="dim">${c.dismissed}</td><td>${c.solo}</td>
+      <td class="dim">${c.duration_ms == null ? "—" : Math.round(c.duration_ms / 1000) + "s"}</td>
+      <td class="dim">${cardCost(c)}</td>
       <td class="dim">${c.truncated ? `saw ${c.max_diff_chars?.toLocaleString()} chars` : "saw whole diff"}</td>
     </tr>`).join("");
   const finds = r.findings.map(findingBlock).join("") || '<div class="dim">no findings</div>';
   row.innerHTML = `<td colspan="8">
     <table><thead><tr><th>panel member</th><th>raised</th><th>confirmed</th>
-      <th>dismissed</th><th>solo</th><th>diff seen</th></tr></thead><tbody>${cards}</tbody></table>
+      <th>dismissed</th><th>solo</th><th>took</th><th>cost</th><th>diff seen</th>
+    </tr></thead><tbody>${cards}</tbody></table>
     ${r.skipped.length ? `<div class="dim" style="margin-top:8px">skipped: ${r.skipped.map(esc).join(" · ")}</div>` : ""}
     <div style="margin-top:10px">${finds}</div>
     <button class="toggle">this defect across every run of the PR →</button>

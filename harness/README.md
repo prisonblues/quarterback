@@ -55,6 +55,25 @@ The recording is **best-effort by construction**: a board that is down, or absen
 prints one line and changes nothing about the review. Telemetry that can fail a review which
 already succeeded is worse than no telemetry.
 
+The same rule shapes how a run's **cost** is measured. Each member is timed, and each one that
+can be is also asked what it spent in tokens — but never by switching its CLI to a JSON output
+mode. Those modes all move the reply inside an envelope (`.result`, `.response`,
+`item.completed`, `.message.content[]`), so adopting them would mean four bespoke unwrappers on
+the one path that currently works. Instead every reviewer keeps its plain-text reply, its
+session id is pinned **before** it runs, and usage is read back out of the session afterwards:
+a transcript that cannot be read costs a number, where a broken unwrapper would cost the
+findings on every run. The id is fixed up front rather than matched afterwards because
+`/panel-review-pr` fans out up to 4 concurrent panels, each running its own copy of each
+reviewer — picking a session by mtime would hand one panel another's numbers.
+
+Claude pins `--session-id`; pi pins `--session-id` into a per-run `--session-dir` that is
+deleted when the member returns, so a review still never lands in the user's session store;
+codex has no session id to pin for a new run, so it uses `--json` for the usage events and
+`--output-last-message` to hand the findings over as plain text in a file. Antigravity is left
+uninstrumented rather than half-converted. A cost in dollars is recorded **only where the vendor
+states one** (pi does) and never derived from a price table, and anything unread stays null —
+which the board renders as "not recorded", never as a reviewer that cost nothing.
+
 ### `/epic` and `/lander` — the long-running loops
 
 `epic.py` drives a multi-issue epic: it fans sub-issues out into their own worktrees, stacks
