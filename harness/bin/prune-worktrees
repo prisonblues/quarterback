@@ -235,6 +235,88 @@ is_live_suffix() {
     return 1
 }
 
+# A leftover is a `<project>-*` sibling that is NOT a registered worktree but
+# DOES look like a worktree remnant — i.e. it carries a worktree marker: a .git
+# pointer, or any top-level entry create-worktree symlinks/copies in. This keeps
+# unrelated dirs that merely share the prefix (and stray empty dirs) untouched.
+WT_MARKERS=(.git)
+while IFS= read -r m; do [[ -n "$m" ]] && WT_MARKERS+=("${m%%/*}"); done < <(
+    { cfg_array '.symlinks'; cfg_array '.copies'; }
+)
+
+dir_is_worktree_remnant() {
+    local dir="$1" m
+    for m in "${WT_MARKERS[@]}"; do
+        [[ -e "$dir/$m" || -L "$dir/$m" ]] && return 0
+    done
+    return 1
+}
+
+# A de-registered directory is not necessarily an abandoned one. An agent can be
+# three commits into a review cycle in a worktree whose registration was lost —
+# and this detector has classified LIVE worktrees as leftovers before (see the
+# SIGPIPE note below), so a second, independent opinion on "is anybody in there"
+# is worth having before `--remove-dirs` runs `rm -rf`. Only a named, live holder
+# counts: `worktree-holder` may be absent and the board may be down, and neither
+# is a reason to leave real debris uncollected.
+
+# Resolved ONCE, not per directory: this runs inside a loop over every sibling
+# directory of the project, and `command -v` in there was pure repetition.
+HOLDER_BIN=$(command -v worktree-holder 2>/dev/null || true)
+if [[ -z "$HOLDER_BIN" && "$0" == */* ]]; then HOLDER_BIN="${0%/*}/worktree-holder"; fi
+[[ -n "$HOLDER_BIN" && -x "$HOLDER_BIN" ]] || HOLDER_BIN=""
+
+# Exit 4 is "could not tell", and its usual cause — no board configured, or a
+# board that is down — is a property of the RUN, not of the directory. Paying it
+# once per sibling meant up to 20 × `curl --max-time 5` of stall on a plain dry
+# run, plus one "could not check …" warning per directory, all saying the same
+# thing. The first 4 settles it for the sweep.
+HOLDER_GAVE_UP=false
+
+holder_of() {
+    local dir="$1" rc
+    [[ -n "$HOLDER_BIN" ]] || return 1
+    [[ "$HOLDER_GAVE_UP" = true ]] && return 1
+    "$HOLDER_BIN" "$dir" >/dev/null
+    rc=$?
+    [[ $rc -eq 3 ]] && return 0
+    # 4 = could not tell. Nothing else will tell either.
+    [[ $rc -eq 4 ]] && HOLDER_GAVE_UP=true
+    return 1
+}
+
+
+# ============================================
+# A HELD WORKTREE COUNTS AS LIVE
+# ============================================
+# Run BEFORE any sweep, and fold the answer into LIVE_* rather than filtering a
+# list afterwards. Diverting only the DIRECTORY was not enough: the database,
+# port, nginx and container sweeps each derive orphan-ness independently from
+# `git worktree list`, so a de-registered-but-HELD worktree was still reported as
+# an orphan database and had DROP DATABASE run on it, still had its port entry
+# rewritten away and reallocated, still had its nginx block stripped, and — via
+# DEAD_SUFFIX, which is seeded from the stale-port list as well as the leftover
+# dirs — still had `docker rm -f` run on its containers. All under a live agent,
+# and all while the report said the directory was being left alone.
+#
+# Registering the suffix as live is the fix that cannot be forgotten by the next
+# sweep somebody adds, because every one of them already asks "is this live?".
+HELD_DIRS=()
+shopt -s nullglob
+for d in "$PARENT/${PROJECT}-"*; do
+    [[ -d "$d" ]] || continue
+    [[ -n "${LIVE_DIR[$d]:-}" ]] && continue      # already live; nothing to add
+    dir_is_worktree_remnant "$d" || continue      # not ours to reason about
+    holder_of "$d" || continue
+    HELD_DIRS+=("$d")
+    LIVE_DIR["$d"]=1
+    b=$(basename "$d")
+    suffix="${b#${PROJECT}-}"
+    LIVE_SUFFIXES+=("$suffix")
+    LIVE_DB["${PROJECT}_$(echo "$suffix" | tr '-' '_')"]=1
+done
+shopt -u nullglob
+
 # ============================================
 # 1. ORPHAN DATABASES
 # ============================================
@@ -302,58 +384,7 @@ fi
 # ============================================
 # 3. LEFTOVER DIRECTORIES (de-registered)
 # ============================================
-# A leftover is a `<project>-*` sibling that is NOT a registered worktree but
-# DOES look like a worktree remnant — i.e. it carries a worktree marker: a .git
-# pointer, or any top-level entry create-worktree symlinks/copies in. This keeps
-# unrelated dirs that merely share the prefix (and stray empty dirs) untouched.
-WT_MARKERS=(.git)
-while IFS= read -r m; do [[ -n "$m" ]] && WT_MARKERS+=("${m%%/*}"); done < <(
-    { cfg_array '.symlinks'; cfg_array '.copies'; }
-)
-
-dir_is_worktree_remnant() {
-    local dir="$1" m
-    for m in "${WT_MARKERS[@]}"; do
-        [[ -e "$dir/$m" || -L "$dir/$m" ]] && return 0
-    done
-    return 1
-}
-
-# A de-registered directory is not necessarily an abandoned one. An agent can be
-# three commits into a review cycle in a worktree whose registration was lost —
-# and this detector has classified LIVE worktrees as leftovers before (see the
-# SIGPIPE note below), so a second, independent opinion on "is anybody in there"
-# is worth having before `--remove-dirs` runs `rm -rf`. Only a named, live holder
-# counts: `worktree-holder` may be absent and the board may be down, and neither
-# is a reason to leave real debris uncollected.
-
-# Resolved ONCE, not per directory: this runs inside a loop over every sibling
-# directory of the project, and `command -v` in there was pure repetition.
-HOLDER_BIN=$(command -v worktree-holder 2>/dev/null || true)
-if [[ -z "$HOLDER_BIN" && "$0" == */* ]]; then HOLDER_BIN="${0%/*}/worktree-holder"; fi
-[[ -n "$HOLDER_BIN" && -x "$HOLDER_BIN" ]] || HOLDER_BIN=""
-
-# Exit 4 is "could not tell", and its usual cause — no board configured, or a
-# board that is down — is a property of the RUN, not of the directory. Paying it
-# once per sibling meant up to 20 × `curl --max-time 5` of stall on a plain dry
-# run, plus one "could not check …" warning per directory, all saying the same
-# thing. The first 4 settles it for the sweep.
-HOLDER_GAVE_UP=false
-
-holder_of() {
-    local dir="$1" rc
-    [[ -n "$HOLDER_BIN" ]] || return 1
-    [[ "$HOLDER_GAVE_UP" = true ]] && return 1
-    "$HOLDER_BIN" "$dir" >/dev/null
-    rc=$?
-    [[ $rc -eq 3 ]] && return 0
-    # 4 = could not tell. Nothing else will tell either.
-    [[ $rc -eq 4 ]] && HOLDER_GAVE_UP=true
-    return 1
-}
-
 LEFTOVER_DIRS=()
-HELD_DIRS=()
 SKIPPED_DIRS=()
 shopt -s nullglob
 for d in "$PARENT/${PROJECT}-"*; do
@@ -369,10 +400,9 @@ for d in "$PARENT/${PROJECT}-"*; do
     # consecutive dry-runs, including ones with uncommitted work.
     [[ -n "${LIVE_DIR[$d]:-}" ]] && continue
     if ! dir_is_worktree_remnant "$d"; then SKIPPED_DIRS+=("$d"); continue; fi
-    # Classified here rather than filtered later, so every downstream consumer
-    # inherits the protection — including the container sweep, which takes its
-    # evidence of a dead worktree straight from LEFTOVER_DIRS.
-    if holder_of "$d"; then HELD_DIRS+=("$d"); else LEFTOVER_DIRS+=("$d"); fi
+    # Held dirs were registered as LIVE above and skipped by the LIVE_DIR test,
+    # so anything reaching here is a genuine leftover.
+    LEFTOVER_DIRS+=("$d")
 done
 shopt -u nullglob
 

@@ -592,3 +592,60 @@ def test_a_subagent_with_no_title_keeps_its_marker(wt, board):
     r = run(wt, board_url=b.url, markers=wt.parent / "markers")
     assert r.returncode == 3
     assert "(sub-agent)" in r.stderr
+
+
+def test_an_agent_launched_inside_the_worktree_is_a_holder(wt, board):
+    """`here()` compared a lease `cwd` to the worktree root by string equality,
+    so an agent launched from a SUBDIRECTORY — `src/`, `harness/`, anywhere below
+    the root, which is the ordinary case — was not reported at all, and
+    `remove-worktree` would delete the checkout out from under it. A false
+    negative, which is the one answer this tool must never give quietly."""
+    b = board(agents=[lease(PEER, cwd=str(wt / "harness" / "loops"))])
+    r = run(wt, board_url=b.url, markers=wt.parent / "markers")
+    assert r.returncode == 3
+    assert "zeus/ember-marten" in r.stderr
+
+
+def test_a_sibling_sharing_a_path_prefix_is_not_a_holder(wt, board):
+    """The boundary the separator buys: `…/proj-fix-issue-4` must not match
+    `…/proj-fix-issue-43`. Prefix matching without it turns a false negative into
+    a false positive, which blocks work on a worktree nobody is in."""
+    b = board(agents=[lease(PEER, cwd=str(wt) + "-and-more")])
+    r = run(wt, board_url=b.url, markers=wt.parent / "markers")
+    assert r.returncode == 0
+
+
+def test_a_held_worktree_is_protected_from_every_sweep_not_just_the_directory(
+        tmp_path, board):
+    """The held-worktree guard used to divert only the DIRECTORY into HELD_DIRS,
+    while the database, port, nginx and container sweeps each derived
+    orphan-ness independently from `git worktree list`. So a de-registered but
+    HELD worktree was still reported as an orphan database and had DROP DATABASE
+    run on it, still had its port entry rewritten away and the port
+    reallocated, still had its nginx block stripped — and, because DEAD_SUFFIX is
+    seeded from the stale-port list as well as the leftover dirs, still had
+    `docker rm -f` run on its containers. All under a live agent, and all while
+    the report said the directory was being left alone.
+
+    A held worktree is registered as LIVE now, so every sweep inherits the
+    protection — including any sweep added later, since they all already ask
+    "is this live?". The port entry is the one this test can drive without a
+    database or a docker daemon."""
+    main, left = _repo_with_leftover(tmp_path, "proj-fix-issue-43")
+    (main / ".worktree-ports").write_text("8091:fix/issue-43\n8092:gone-for-good\n")
+    markers = tmp_path / "markers"
+    markers.mkdir()
+    mark(markers, PEER, left)
+    b = board(agents=[lease(PEER)])
+
+    r = subprocess.run(
+        [str(BIN / "prune-worktrees"), "--project", "proj"],
+        cwd=str(main), capture_output=True, text=True,
+        env=_caller_env(b.url, markers, str(BIN)),
+    )
+
+    assert "Held by a live agent" in r.stdout
+    # The held worktree's port entry is not stale — something is using it.
+    assert "8091:fix/issue-43" not in r.stdout, "a held worktree's port was reclaimed"
+    # …and the genuinely dead one still is, or the guard has swallowed the sweep.
+    assert "8092:gone-for-good" in r.stdout

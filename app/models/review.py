@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import (
@@ -11,6 +12,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    Numeric,
     Text,
     UniqueConstraint,
     func,
@@ -196,11 +198,35 @@ class ReviewReviewer(Base):
     rereview_flagged: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0"
     )
-    #: Wall-clock for this reviewer's CLI call. Nullable and unset for now — the
-    #: panel doesn't time its members yet; the column is here so it can start
-    #: without a migration, since duration is the cost proxy that turns
-    #: "finds more" into "worth it".
+    #: Wall-clock for this reviewer's whole turn, every CLI attempt included.
+    #: The cost axis that is comparable *across* vendors — unlike the token
+    #: counts below, a second is a second whoever spent it.
     duration_ms: Mapped[int | None] = mapped_column(Integer)
+
+    #: What the turn cost in tokens, read back out of the vendor's own session
+    #: after the fact (the panel pins a session id up front rather than switching
+    #: the CLI to a JSON output mode, which would put the findings inside an
+    #: envelope on the one path that currently works).
+    #:
+    #: Null means *not recorded*, never zero: a vendor may not state a figure, or
+    #: the transcript read may have failed, and both must stay distinguishable
+    #: from a reviewer that genuinely spent nothing.
+    #:
+    #: Only comparable **within** a vendor — different tokenizers, different cache
+    #: semantics. A "say hi" to Claude billed almost entirely against 10k
+    #: cache-*creation* tokens on a two-token prompt; ranking vendors by this
+    #: would be noise. Grouped by (name, model, effort), though, it is the answer
+    #: to "is the higher tier worth it".
+    input_tokens: Mapped[int | None] = mapped_column(Integer)
+    output_tokens: Mapped[int | None] = mapped_column(Integer)
+    cached_input_tokens: Mapped[int | None] = mapped_column(Integer)
+    #: Thinking tokens where the vendor separates them; folded into ``output``
+    #: where it doesn't, which is another reason not to race two vendors on these.
+    reasoning_tokens: Mapped[int | None] = mapped_column(Integer)
+    #: Only where the **vendor states it**, never derived from a price table: a
+    #: run priced at today's rates is silently wrong when queried in six weeks,
+    #: and the point of this table is that it stays true later.
+    cost_usd: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
 
     raised: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     confirmed: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")

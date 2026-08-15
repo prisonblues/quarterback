@@ -181,7 +181,16 @@ HOLDERS=$(jq -c \
     --arg p "$WT_PATH" --arg pl "$WT_LOGICAL" --arg mine "$MINE" --argjson marked "$MARKED" '
     # $sess, not sess: a filter parameter would be re-evaluated against $marked
     # inside the pipe and index an array with a path expression.
-    def here($sess): (.cwd == $p) or (.cwd == $pl) or (($marked | index($sess)) != null);
+    # A path-boundary match, not string equality. An agent launched from INSIDE
+    # the checkout — `src/`, `harness/`, anywhere below the root — is the ordinary
+    # case, and its lease cwd is a descendant of the worktree rather than the
+    # worktree itself. Equality reported it as absent, so `remove-worktree` would
+    # delete the checkout out from under it: a false negative, the one answer this
+    # tool must never give quietly. The trailing separator is what keeps
+    # `…/proj-fix-issue-4` from matching `…/proj-fix-issue-43`.
+    def under($dir): $dir != "" and (. == $dir or startswith($dir + "/"));
+    def here($sess): (.cwd | under($p)) or (.cwd | under($pl))
+                     or (($marked | index($sess)) != null);
     # The lease branch is deliberately dropped: it is the branch of the dir the
     # agent was launched in (the main checkout), so reporting it here would
     # answer "on main" about a worktree that is on fix/issue-31. The real branch
