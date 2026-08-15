@@ -19,7 +19,9 @@ stdenvNoCC.mkDerivation {
   # `loops` and `commands` go to share/ rather than bin/ because neither is
   # something you invoke by name: the loops are driven by the slash commands
   # (which reference them by path), and the commands are read by Claude Code out
-  # of ~/.claude. Only the three worktree scripts are genuine CLI entry points.
+  # of ~/.claude. Only the worktree scripts are genuine CLI entry points — and
+  # they must land in one directory together, because each finds `worktree-holder`
+  # as a sibling of $0 when it is not otherwise on PATH.
   installPhase = ''
     runHook preInstall
 

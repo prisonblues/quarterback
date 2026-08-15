@@ -355,8 +355,11 @@ tests/        end-to-end tests against real Postgres (conftest.py shared fixture
 harness/      step 2 of the install — the workflow the board coordinates
   loops/           panel.py (reviewer panel), epic.py, lander.py, harness_rules.py
   commands/        Claude Code slash commands (/panel, /fix-issue, /wt, …)
-  bin/             create-worktree, remove-worktree, prune-worktrees
+  bin/             create-worktree, remove-worktree, prune-worktrees,
+                   worktree-holder (who is live in a worktree — asked before
+                   anything destroys one)
+  tests/           the worktree-tooling suite (pytest driving the bash)
   templates/       copyable .worktree.json starting points + dbtarget.py (the DB guard)
   package.nix      the derivation; hm-module.nix wires it into ~/.claude
-flake.nix     packages.harness, homeManagerModules.default, checks (runs the loops tests)
+flake.nix     packages.harness, homeManagerModules.default, checks (runs the harness tests)
 ```

@@ -35,9 +35,10 @@ in
       type = lib.types.bool;
       default = true;
       description = ''
-        Put create-worktree / remove-worktree / prune-worktrees on PATH by adding
-        the package to home.packages. Turn this off to take the loops and commands
-        without the worktree tooling — the two halves are independent.
+        Put create-worktree / remove-worktree / prune-worktrees / worktree-holder
+        on PATH by adding the package to home.packages. Turn this off to take the
+        loops and commands without the worktree tooling — the two halves are
+        independent.
       '';
     };
   };

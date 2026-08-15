@@ -14,7 +14,9 @@ set -uo pipefail
 #                ->  port  .worktree-ports line "<port>:<create-name>"
 #
 # Safe by default: DRY-RUN unless --prune is given. The main DB (<project>) and
-# <project>_test are always protected, plus anything in `.database.protect`.
+# <project>_test are always protected, plus anything in `.database.protect`. A
+# directory another live agent is working in is reported separately and never
+# removed, however de-registered it looks (see `worktree-holder`).
 #
 # Usage: prune-worktrees [options]
 #   (no flags)         Dry-run: report orphan DBs, ports, dirs, containers, nginx.
@@ -142,7 +144,7 @@ while [[ $# -gt 0 ]]; do
         --remove-nginx)      REMOVE_NGINX=true; shift ;;
         --config)      [[ -z "${2:-}" ]] && die "--config requires a path"; CONFIG_FILE="$2"; shift 2 ;;
         --project)     [[ -z "${2:-}" ]] && die "--project requires a name"; PROJECT_OVERRIDE="$2"; shift 2 ;;
-        -h|--help)     sed -n '4,38p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help)     sed -n '4,34p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *)             die "Unknown option: $1" ;;
     esac
 done
@@ -317,7 +319,26 @@ dir_is_worktree_remnant() {
     return 1
 }
 
+# A de-registered directory is not necessarily an abandoned one. An agent can be
+# three commits into a review cycle in a worktree whose registration was lost —
+# and this detector has classified LIVE worktrees as leftovers before (see the
+# SIGPIPE note below), so a second, independent opinion on "is anybody in there"
+# is worth having before `--remove-dirs` runs `rm -rf`. Only a named, live holder
+# counts: `worktree-holder` may be absent and the board may be down, and neither
+# is a reason to leave real debris uncollected.
+holder_of() {
+    local dir="$1" hb="" rc
+    hb=$(command -v worktree-holder 2>/dev/null || true)
+    if [[ -z "$hb" && "$0" == */* ]]; then hb="${0%/*}/worktree-holder"; fi
+    [[ -n "$hb" && -x "$hb" ]] || return 1
+    "$hb" "$dir" >/dev/null
+    rc=$?
+    [[ $rc -eq 3 ]] && return 0
+    return 1
+}
+
 LEFTOVER_DIRS=()
+HELD_DIRS=()
 SKIPPED_DIRS=()
 shopt -s nullglob
 for d in "$PARENT/${PROJECT}-"*; do
@@ -332,7 +353,11 @@ for d in "$PARENT/${PROJECT}-"*; do
     # repo it flagged 12, 18, 20 and 21 of 20-odd live worktrees on four
     # consecutive dry-runs, including ones with uncommitted work.
     [[ -n "${LIVE_DIR[$d]:-}" ]] && continue
-    if dir_is_worktree_remnant "$d"; then LEFTOVER_DIRS+=("$d"); else SKIPPED_DIRS+=("$d"); fi
+    if ! dir_is_worktree_remnant "$d"; then SKIPPED_DIRS+=("$d"); continue; fi
+    # Classified here rather than filtered later, so every downstream consumer
+    # inherits the protection — including the container sweep, which takes its
+    # evidence of a dead worktree straight from LEFTOVER_DIRS.
+    if holder_of "$d"; then HELD_DIRS+=("$d"); else LEFTOVER_DIRS+=("$d"); fi
 done
 shopt -u nullglob
 
@@ -408,6 +433,11 @@ report "Orphan containers"    "${#ORPHAN_CONTAINERS[@]}" "${ORPHAN_CONTAINERS[@]
 report "Orphan nginx blocks"  "${#ORPHAN_NGINX[@]}"      "${ORPHAN_NGINX[@]:-}"
 if [[ ${#SKIPPED_DIRS[@]} -gt 0 ]]; then
     echo -e "${YELLOW}  (ignored ${#SKIPPED_DIRS[@]} ${PROJECT}-* dir(s) with no worktree markers — not touched)${NC}"
+fi
+if [[ ${#HELD_DIRS[@]} -gt 0 ]]; then
+    echo -e "${YELLOW}Held by a live agent — left alone, NOT counted as leftovers (${#HELD_DIRS[@]}):${NC}"
+    printf '    %s\n' "${HELD_DIRS[@]}"
+    echo -e "${YELLOW}  Run ${CYAN}worktree-holder <dir>${YELLOW} to see who, and talk to them before removing it.${NC}"
 fi
 echo ""
 

@@ -21,11 +21,19 @@ cleans their DB, containers, nginx block, port, and dir in one go):
   done — e.g. its PR is merged (`gh pr view <branch> --json state,mergedAt` or
   `gh pr list --head <branch> --state merged`) or the branch is fully merged
   into the default branch (`git branch --merged`).
+- **A merged PR does not mean nobody is in there.** Run
+  `worktree-holder <path>` on every candidate before offering it for teardown,
+  and treat exit 3 as in-progress no matter what its PR says — an agent can be
+  addressing review findings on the same branch after the merge. Name the holder
+  when you report it.
 - Show the user the list of worktrees that look **finished** vs **in-progress**.
   Ask (AskUserQuestion) which to tear down. For each approved one, run
   `remove-worktree <create-name>` (the dir suffix after `<project>-`). This is
   the clean path — it handles all trappings and prunes the branch too.
 - Leave in-progress worktrees alone.
+- If `remove-worktree` refuses because another agent holds the worktree, relay
+  that verbatim and stop. Do **not** pass `--force` on your own initiative; it
+  exists for a user who has seen the holder's name and decided anyway.
 
 Skip this phase if the user just wants the orphan sweep, or if there are no
 finished worktrees.
@@ -59,6 +67,11 @@ comm -12 /tmp/ts_live.txt /tmp/ts_leftover.txt        # <-- MUST be empty
 - Also run `git -C <dir> status --porcelain` on each reported leftover. A
   *genuinely* de-registered directory can still hold uncommitted work — show the
   user the dirty ones and get explicit per-directory confirmation.
+- `prune-worktrees` reports directories held by a live agent under their own
+  heading ("Held by a live agent — left alone") and keeps them out of the
+  leftover list entirely, so `--remove-dirs` cannot reach them. Relay that
+  section if it is non-empty: it is the sweep telling you an agent is still
+  working somewhere the tooling thought was debris.
 - Because `--remove-containers` is gated on the leftover/stale-port evidence, a
   false leftover poisons it too. If the leftover list was wrong, treat the
   container list as unproven as well.
