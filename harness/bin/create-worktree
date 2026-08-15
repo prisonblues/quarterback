@@ -753,8 +753,30 @@ else
            ! git show-ref --verify --quiet "refs/remotes/origin/$BASE_BRANCH"; then
             die "Base branch '$BASE_BRANCH' not found locally or on remote"
         fi
-        echo -e "${GREEN}Creating new branch '$BRANCH_NAME' from '$BASE_BRANCH'...${NC}"
-        git worktree add "$WORKTREE_DIR" -b "$BRANCH_NAME" "$BASE_BRANCH"
+        # Fork from the REMOTE ref where there is one. origin was fetched moments
+        # ago, so `origin/main` is what main actually is; the local `main` is only
+        # as fresh as the last time somebody checked it out and pulled — and in a
+        # worktree-per-issue setup nobody ever checks main out, so it goes stale
+        # and stays stale. Forking from it silently produces a worktree that looks
+        # right and is missing commits, which surfaces later as conflicts, or as
+        # work redone on a base that had already moved.
+        # A base that exists only locally (never pushed) is still honoured: there
+        # is no remote ref to prefer, so nothing changes for that case.
+        #
+        # The exception is a local base that is AHEAD of its remote. Unpushed
+        # commits on the base are deliberate — and a remote-tracking ref left
+        # behind by a branch deleted upstream but not yet pruned is stale in the
+        # other direction, so preferring the remote unconditionally would
+        # reintroduce this same bug pointing the other way.
+        BASE_REF="$BASE_BRANCH"
+        if git show-ref --verify --quiet "refs/remotes/origin/$BASE_BRANCH"; then
+            ahead=0
+            git show-ref --verify --quiet "refs/heads/$BASE_BRANCH" && \
+                ahead=$(git rev-list --count "origin/$BASE_BRANCH..$BASE_BRANCH" 2>/dev/null || echo 0)
+            (( ahead > 0 )) || BASE_REF="origin/$BASE_BRANCH"
+        fi
+        echo -e "${GREEN}Creating new branch '$BRANCH_NAME' from '$BASE_REF'...${NC}"
+        git worktree add "$WORKTREE_DIR" -b "$BRANCH_NAME" "$BASE_REF"
     else
         echo -e "${GREEN}Creating new branch '$BRANCH_NAME' from HEAD...${NC}"
         git worktree add "$WORKTREE_DIR" -b "$BRANCH_NAME"
