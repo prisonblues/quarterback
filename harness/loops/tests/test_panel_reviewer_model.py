@@ -25,7 +25,8 @@ TOO_OLD = (
 #: What every codex argv opens with — the seat's `--no-tools`, spelled as the two
 #: `-c` overrides codex takes instead of a flag. Named so the tests below assert
 #: the model/effort shape without restating it.
-NO_TOOLS = ["codex", "exec", "-c", 'web_search="disabled"',
+NO_TOOLS = ["codex", "exec", "-s", "read-only",
+            "-c", 'web_search="disabled"',
             "-c", "features.shell_tool=false",
             "-c", "features.apps=false", "-c", "features.plugins=false"]
 
@@ -69,6 +70,10 @@ def test_codex_seat_can_neither_search_the_web_nor_run_a_shell():
         assert "features.shell_tool=false" in args
         assert "features.apps=false" in args
         assert "features.plugins=false" in args
+        # Pinned, not inherited: `apply_patch` outlives every -c key above and is
+        # inert only because of this. `codex exec --help` documents no default,
+        # so an unpinned seat is one release from being write-capable silently.
+        assert args[args.index("-s") + 1] == "read-only"
 
 
 # ---------------------------------------------------------------- failing cleanly
