@@ -1136,18 +1136,40 @@ def member_sandbox(where: Path) -> str:
     satisfies it, exposes no configuration, contains nothing to mistake for the code
     under review, and is per-member so two seats cannot interact through it.
 
-    A `git init` that fails is not silenced but not fatal either: the seat then hits
-    codex's own loud "not inside a trusted directory", which names the cause. That is
-    #19's rule — a failure that reports itself beats a guess — applied to the setup
-    step rather than to the review.
+    A `git init` that fails is reported and then degraded past, never raised. **Every
+    way it can fail, not just a non-zero exit** — `git` absent from PATH raises
+    `FileNotFoundError`, a bad temp root raises `PermissionError`, a stalled mount or
+    an `init.templateDir` on a dead one hangs until `TimeoutExpired`. None of those is
+    a returncode, and none was caught in the first version of this function: `run()`
+    joins the seats with a bare `fut.result()`, so ONE member's setup failing took
+    down the whole panel — the seats that succeeded, the sonar gate and the report
+    with it. `review_llm` is otherwise total (every failure path returns a
+    `ReviewerRun(skip=…)`), and the judge's call is worse still, turning a recoverable
+    "judge unavailable → unruled" into a traceback.
+
+    The directory is created regardless, because that is what makes the degraded path
+    the DOCUMENTED one. Without it `run_cli`'s `subprocess.run(cwd=…)` raises
+    `FileNotFoundError` about a path — three times, once per attempt — and the seat
+    never reaches codex's own "not inside a trusted directory", which is the message
+    that actually names the cause. Reporting the real reason is #19's rule applied to
+    the setup step; a seat that dies confusingly is the thing that rule exists against.
     """
-    proc = subprocess.run(["git", "init", "--quiet", str(where)],
-                          capture_output=True, text=True,
-                          stdin=subprocess.DEVNULL, timeout=30)
-    if proc.returncode != 0:
-        print(f"! sandbox: git init failed in {where} "
-              f"({(proc.stderr or '').strip()[:120]}) — a seat may refuse to start",
-              file=sys.stderr)
+    where.mkdir(parents=True, exist_ok=True)
+    try:
+        proc = subprocess.run(["git", "init", "--quiet", str(where)],
+                              capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL, timeout=30)
+        why = (proc.stderr or "").strip()[:120] if proc.returncode else ""
+    except subprocess.TimeoutExpired:
+        why = "git init timed out after 30s"
+    except OSError as e:
+        # errno and strerror rather than the class name, for the reason run_cli
+        # gives: "OSError" sends people looking for a crash that was "No such file
+        # or directory: 'git'".
+        why = " ".join(str(x) for x in (e.errno, e.strerror or e) if x)[:120]
+    if why:
+        print(f"! sandbox: git init failed in {where} ({why}) — a seat that requires "
+              f"a git repo will refuse to start and say so", file=sys.stderr)
     return str(where)
 
 
@@ -3705,6 +3727,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 tasks[name] = ex.submit(review_llm, name, models[name],
                                         prompt_for(budgets[name]), efforts.get(name, ""))
         sonar_future = None
+        sonar_filed = False
         if "sonarqube" in selected:
             sonar_future = ex.submit(
                 review_sonarqube, rev.get("sonarqube", {}),
@@ -3770,6 +3793,11 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 # issues are soft — judged on merits alongside the LLM reviewers.
                 result.sonar_findings = hard
                 llm_findings.extend(soft)
+                # Recorded HERE, where it is a fact rather than an inference: the
+                # consensus count below needs to know whether sonarqube put
+                # anything into the population the judge clusters, and only this
+                # branch can. See `filers`.
+                sonar_filed = bool(soft)
         ci_status, ci_failing, ci_skip = ci_future.result()
         if ci_skip:
             result.skipped.append(ci_skip)
@@ -3956,7 +3984,17 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # ⋆consensus on that finding while the header two dozen lines below declared
     # consensus impossible — the report contradicting itself in the exact place
     # this was added to stop it being misread.
-    filers = seats_filled + (1 if result.sonar_gate not in ("skipped", "ERROR") else 0)
+    #
+    # `sonar_filed`, not the gate STATUS, and the distinction is the same one #62
+    # spent three rounds on: a status is a side effect, not the thing itself. Only
+    # the `no-pr-analysis` fallback yields soft findings that can share a canonical
+    # record — the scanned paths return `hard`, which renders in its own section
+    # and never reaches `conf()`. So keying on the gate over-counted at one end (a
+    # scanned "OK" repo with one LLM seat suppressed both the banner and the
+    # sole-reviewer note, on findings nobody could corroborate) and under-counted
+    # at the other ("ERROR" can still return hard findings, so the report could
+    # claim nobody reviewed while Sonar issues were displayed beneath it).
+    filers = seats_filled + (1 if sonar_filed else 0)
     consensus_possible = filers > 1
 
     def conf(c: Canonical) -> str:

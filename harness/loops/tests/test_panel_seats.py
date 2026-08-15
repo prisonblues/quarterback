@@ -139,6 +139,39 @@ def test_the_sandbox_is_a_git_repo_because_that_is_the_whole_point(monkeypatch,
     assert inits, "the member's sandbox was never made a git repo"
 
 
+def test_a_sandbox_that_cannot_be_made_degrades_instead_of_killing_the_panel(
+        monkeypatch, tmp_path, capsys):
+    """`run()` joins the seats with a bare `fut.result()`, so an exception raised
+    setting one member's sandbox does not cost that seat — it costs the whole
+    panel, including the seats that worked, the sonar gate and the report.
+
+    Every failure shape, because only one of them is a returncode: git absent
+    from PATH raises FileNotFoundError, a bad temp root PermissionError, a stalled
+    mount TimeoutExpired. The first version of this caught none of them."""
+    for boom in (FileNotFoundError(2, "No such file or directory"),
+                 PermissionError(13, "Permission denied"),
+                 subprocess.TimeoutExpired(["git", "init"], 30)):
+        def fake_run(argv, **kw):
+            raise boom
+        monkeypatch.setattr(panel.subprocess, "run", fake_run)
+        made = panel.member_sandbox(tmp_path / f"cwd{id(boom)}")
+        assert Path(made).is_dir(), "the directory must exist even when git init fails"
+        assert "git init failed" in capsys.readouterr().err, boom
+
+
+def test_the_sandbox_directory_exists_even_when_git_init_fails(monkeypatch, tmp_path):
+    """Why the mkdir is unconditional rather than left to `git init`.
+
+    With no directory, `run_cli`'s `subprocess.run(cwd=…)` raises FileNotFoundError
+    about a path — three times, once per attempt — and the seat never reaches
+    codex's own "not inside a trusted directory", which is the message that names
+    the actual cause. Degrading to the DOCUMENTED failure is the point."""
+    monkeypatch.setattr(panel.subprocess, "run", lambda *a, **k: type(
+        "P", (), {"returncode": 1, "stdout": "", "stderr": "fatal: nope"})())
+    made = panel.member_sandbox(tmp_path / "cwd")
+    assert Path(made).is_dir()
+
+
 def test_a_real_sandbox_is_a_real_repo(tmp_path):
     """The one test here that runs git rather than mocking it — the mocked tests
     above all assert plumbing, and plumbing that produces a directory git does not
@@ -308,3 +341,25 @@ def test_sonarqube_counts_as_somebody_to_agree_WITH(monkeypatch, capsys):
     # banner claiming otherwise would be false.
     assert "no ⋆consensus is possible" not in report
     assert "sole reviewer" not in report
+
+
+def test_sonarqube_that_RAN_but_filed_nothing_is_not_somebody_to_agree_with(
+        monkeypatch, capsys):
+    """The other end of the same count, and the reason it keys on what sonar filed
+    rather than on its gate status — a status is a side effect, not the thing.
+
+    Only the `no-pr-analysis` fallback yields soft findings that can share a
+    canonical record; a scanned PR returns `hard`, which renders in its own
+    section and never reaches `conf()`. So a repo with one LLM seat and a
+    successfully scanned Sonar gate has nobody to corroborate its findings, and
+    keying on the gate suppressed both the banner and the per-finding note on
+    exactly the report that needed them."""
+    cfg = {**TWO_SEAT_CFG,
+           "reviewers": {"claude": {"enabled": True, "model": "sonnet"},
+                         "sonarqube": {"enabled": True}}}
+    # Scanned cleanly: a real gate result, hard findings only, nothing soft.
+    monkeypatch.setattr(panel, "review_sonarqube",
+                        lambda *a, **k: ("OK", [], [], None))
+    report = _report(monkeypatch, capsys, cfg=cfg)
+    assert "no ⋆consensus is possible" in report
+    assert "sole reviewer, no second opinion" in report

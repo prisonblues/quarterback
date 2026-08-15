@@ -187,8 +187,8 @@ The deployed board version lags the repo until the stack is redeployed, and only
 service knows which it is: ask it with `GET /openapi.json` → `.info.version`, for whichever
 instance you care about. (Anything built off this branch says 2.19.0 — v2.20 is harness-side.) A number written here
 instead would be wrong the next time Portainer redeploys, with no diff to catch it.
-Latest release: **v2.21**, harness-side — a panel reviewer now runs in the repo under review rather
-than in whatever directory the panel was launched from, and a panel that lost a seat says so.
+Latest release: **v2.21**, harness-side — each panel member now runs in its own empty sandbox repo
+rather than in whatever directory the panel was launched from, and a panel that lost a seat says so.
 Before it, **v2.20** (also harness-side) had the worktree
 tooling ask who is in a directory before rewriting it, and **v2.19** added the per-reviewer
 cost columns (schema revision 0015) and was the first to move the board since v2.15; **v2.18**
@@ -215,8 +215,9 @@ judge) are harness-side too.
   reviewers on what they cost as well as what they find.
 - **v2.20** — the worktree tooling asks who is in a directory before rewriting it: an advisory
   holder check, unioning the board's live leases with the local session markers.
-- **v2.21** — a panel reviewer runs in the repo under review, not in whatever directory the panel
-  was launched from; and a panel that lost a seat says so above its findings.
+- **v2.21** — each panel member runs in its own empty sandbox repo, not in whatever directory the
+  panel was launched from and not in the repo under review; and a panel that lost a seat says so
+  above its findings.
 - **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
   object store; wire `landed` refs to a cherry-pick helper.
 
