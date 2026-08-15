@@ -103,16 +103,32 @@ Detected from the checkout, **not settable** here: `path`, `github`, `default_br
 - `sonarqube` — deterministic static-analysis **hard gate**. `project_key`,
   `organization` and `host` are non-secret and belong here; the token does not.
 
-`review_panel.max_diff_chars` (default 60,000) — how much of the diff each model
-is given. Override per reviewer with `reviewers.<name>.max_diff_chars` and for
-the master with `review_panel.judge_max_diff_chars`; both inherit the panel value
-when unset. It is per-model because one number was standing in for several
-different context windows. Any positive value is honoured — there is no lower
-sanity bound, deliberately; what surfaces a too-small budget is that the report
-names **which** reviewers were truncated and at what budget (worth knowing when
-two reviewers disagree and only one of them saw the whole change). Only a value
-that cannot be a budget at all — not a number, or `<= 0` — falls back to the
-inherited one, with a ⚠️ config line in the report saying so.
+`review_panel.max_diff_chars` (default: **none — the whole diff**) — how much of
+the diff each model is given. Override per reviewer with
+`reviewers.<name>.max_diff_chars` and for the master with
+`review_panel.judge_max_diff_chars`; both inherit the panel value when unset.
+
+There used to be a 60,000-char default, and it was a fossil: prompts travelled in
+argv, where Linux caps one element at 128 KiB, so a budget was mandatory. Since
+they moved to stdin the only ceiling is the model's own context, and 60k chars is
+about 15k tokens — an order of magnitude under every reviewer the panel runs.
+Truncating when nothing forces it is not a saving, because a truncated reviewer
+cannot notice that it was truncated: it reports on a prefix with full confidence,
+and the errors that produces are *false positives* ("this migration is
+syntactically incomplete" — it was cut mid-file) that then cost a judge call and
+a fixer's attention to disprove.
+
+Set one only if a model you run cannot take the change. Any positive value is
+honoured — there is no lower sanity bound, deliberately; what surfaces a
+too-small budget is that the report names **which** reviewers were truncated and
+at what budget, which is worth knowing when two reviewers disagree and only one
+of them saw the whole change. Only a value that cannot be a budget at all — not a
+number, or `<= 0` — falls back, with a ⚠️ config line in the report saying so.
+
+One seat is capped whatever you configure: `agy` takes its prompt in argv, so the
+kernel bounds it. The panel clamps that seat to what `execve` will carry and
+reports it as ordinary truncation rather than dying at exec — which is what it
+used to do, reporting "LLM reviewers ran: none" as a clean review.
 
 ### The SonarQube token
 

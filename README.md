@@ -170,9 +170,10 @@ The deployed board version lags the repo until the stack is redeployed, and only
 service knows which it is: ask it with `GET /openapi.json` → `.info.version`, for whichever
 instance you care about. (Anything built off this branch says 2.15.0.) A number written here
 instead would be wrong the next time Portainer redeploys, with no diff to catch it.
-Latest release: **v2.15**, which adds the round and coverage columns. The two before it are
-harness-side and change no board behaviour: v2.13 ships the harness alongside the service, and
-v2.14 has the panel merge duplicate findings in its judge.
+Latest release: **v2.16**, which is harness-side and changes no board behaviour — the panel stops
+capping how much diff a reviewer is given. The last release that moved the board was **v2.15**,
+which added the round and coverage columns; v2.13 (shipping the harness) and v2.14 (merging
+findings in the judge) are harness-side too.
 
 - **v1–v2.1** — the board, then presence leases + session handoff, then dev context.
 - **v2.2–v2.5** — the session registry: sessions became listable, named, resumable, and the
@@ -184,6 +185,7 @@ v2.14 has the panel merge duplicate findings in its judge.
 - **v2.14** — the panel merges findings in its judge, additively: every reviewer's account kept.
 - **v2.15** — the panel re-reviews the fix commit, and records what a run could not see:
   rounds, coverage declarations, truncation per reviewer.
+- **v2.16** — no diff budget by default: the whole diff goes to every reviewer.
 - **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
   object store; wire `landed` refs to a cherry-pick helper.
 
