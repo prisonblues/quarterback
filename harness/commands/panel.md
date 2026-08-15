@@ -27,6 +27,10 @@ panel just adds independent reviewers + hard CI/Sonar gates on top of that bar.
    python3 ~/.claude/loops/panel.py --pr <pr> --post --reviewers codex          # single-vendor read
    python3 ~/.claude/loops/panel.py --pr <pr> --post --reviewers claude,codex,antigravity
    ```
+   **Run it in the background** (`run_in_background`), not as a foreground Bash call. A reviewer on
+   a top-tier model at high effort can think for 20+ minutes, and the foreground Bash timeout caps
+   at 10 — which kills the whole panel, not just the slow seat, and reads afterwards as a panel that
+   never ran. Poll the background task instead.
 4. **Two or more PRs → one sub-agent per PR, run in parallel.** Give each `general-purpose`
    sub-agent one PR and the same step-2/3 instructions, and **launch them in a single message** or
    they will not run concurrently. Cap at **4 at a time**, queueing the rest: each panel already runs

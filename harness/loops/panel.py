@@ -329,14 +329,21 @@ def stderr_gist(stderr: str, limit: int = 200) -> str:
     return (msg.group(1) if msg else pick)[:limit]
 
 
-def run_cli(args: list[str], label: str, timeout: int = 600,
+def run_cli(args: list[str], label: str, timeout: int = 1800,
             attempts: int = 3) -> tuple[str | None, str | None]:
     """Run a headless CLI, returning (stdout, error_reason); error_reason is
     None on success. Retries transient failures (non-zero exits such as rate
     limits, and OS errors) up to `attempts` times with no delay — these fail
     fast, so retrying is cheap and recovers the common flake. A full timeout is
     NOT retried (it already burned the whole budget; retrying just doubles the
-    wall-clock). The reason string is specific (timeout / exit code + stderr
+    wall-clock).
+
+    The timeout is deliberately generous. It exists to stop a wedged process
+    hanging the panel forever, NOT to bound how long a reviewer may think: at
+    10 minutes codex on a top-tier model at `max` effort routinely lost its
+    seat on real diffs, which costs a whole vendor's eyes to save wall-clock we
+    weren't waiting on anyway — the reviewers run concurrently, so a slow seat
+    only extends the run when it is the slowest one. The reason string is specific (timeout / exit code + stderr
     tail / OSError) so callers can SURFACE why a step degraded instead of
     reporting a bare 'unavailable'. A request the server has REJECTED on its
     merits is not retried either: a bad model pin fails identically all three
