@@ -98,7 +98,7 @@ Detected from the checkout, **not settable** here: `path`, `github`, `default_br
 | `dependabot_author` | Author filter for the lander (`app/dependabot`). |
 | `reviewers` | Which reviewers run — see below. |
 | `review_panel.skip_title_patterns` | Regexes for PRs not worth LLM review (merge/promote/release/format-the-world). These drove a cost blow-up in #117 — one release-merge ≈ $750. |
-| `review_panel.judge_model` | Claude model for the master judge (`""` = default). |
+| `review_panel.judge_model` | Claude model for the master judge (`""` = default). Defaults to `fable` — **not** `reviewers.claude.model`, on purpose; see below. |
 | `loops` | `dependabot_lander` / `stacked_driver` / `issue_executor` — which loops may run. |
 | `epic` | Epic-driver settings — see below. |
 
@@ -121,6 +121,20 @@ Detected from the checkout, **not settable** here: `path`, `github`, `default_br
   flags a lost reviewer next to the reviewer list, not in a footnote.
 - `sonarqube` — deterministic static-analysis **hard gate**. `project_key`,
   `organization` and `host` are non-secret and belong here; the token does not.
+
+`review_panel.judge_model` (default: **`fable`**) — the model that adjudicates what
+the seats found. It is deliberately not `opus`, which is `reviewers.claude.model`: the
+adjudicator should not be the same brain as a seat it rules on, which is the note above
+about `claude.model` applied one level up. The evidence is one day's worth and small —
+on 2026-08-15 four judge-confirmed findings turned out plainly wrong on inspection, and
+all four were raised by claude and confirmed by an `opus` judge — so the mechanism is the
+argument, not the sample. `fable` rather than `sonnet` because the judge's job did not get
+easier; `clamp_model` already states this repo's tie-break as failing toward capability.
+
+This is only the default. **Pinning both keys to the same model still works and says
+nothing** — the enforcement half (`judge_independent`: refuse to run when the judge's
+model matches an enabled seat's) is [#78](https://github.com/prisonblues/quarterback/issues/78)
+and is not implemented.
 
 `review_panel.max_diff_chars` (default: **none — the whole diff**) — how much of
 the diff each model is given. Override per reviewer with
@@ -184,6 +198,11 @@ on no branch and a PR cannot introduce one.
   rather than failing the issue.
 - `executor_worktree_args` — extra flags for `create-worktree` (e.g. `["--no-docker"]`).
 - `min_free_mb` — preflight warns below this `MemAvailable`.
+- `model_ceiling` — highest tier a sub-issue may be implemented at when `--model` is
+  not passed (`sonnet` < `opus` < `fable`; default `opus`). The triage judge runs here
+  and routes each issue to this tier or lower. Anything outside those three turns model
+  routing off. It used to fall back to `review_panel.judge_model`, which is a different
+  question and now deliberately has a different answer — see below.
 - `migrations_dir` — where alembic revisions live, for the linear-heads guard.
   **Leave it alone in a repo without alembic.** The default doesn't exist there, so the
   guard returns `None` and no-ops. Setting it to `""` breaks that: `Path(repo)/""` *is*

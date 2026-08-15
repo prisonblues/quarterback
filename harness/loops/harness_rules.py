@@ -113,7 +113,25 @@ DEFAULTS: dict = {
             "adopt ruff", "format-the-world", "deduplicate", "consolidate",
             "relocate top-level",
         ],
-        "judge_model": "opus",
+        # NOT `opus`, which is `reviewers.claude.model` — the adjudicator must
+        # not be the same brain as a seat it rules on. On 2026-08-15 four
+        # judge-confirmed findings turned out plainly wrong on inspection
+        # (64-F02/F03/F04, 32-F06) and all four were raised by claude and
+        # confirmed by an opus judge; n=4, so the mechanism is the argument
+        # rather than the sample. The README already says the same thing one
+        # level down — "set claude.model to a different model than the PR
+        # author; same-model self-review is the weak case (#117)".
+        # Upward rather than to `sonnet` because the judge's job got no easier:
+        # `clamp_model` states this repo's tie-break as failing toward
+        # capability, not cheapness. The full rule this is the default half of
+        # — refuse to run when judge_model matches any enabled seat's model —
+        # is #78's `judge_independent`, and is not here yet: a repo that pins
+        # both to one model still gets today's behaviour, silently.
+        # Verified rather than assumed, since a default the CLI rejects would
+        # cost the panel its judge on every run: `claude -p --model fable`
+        # returned a reply at exit 0 on 2026-08-15. Like `opus` it is a floating
+        # alias, so it cannot rot the way a versioned codex slug does.
+        "judge_model": "fable",
         # Chars of diff each model is given. `null` — the default — means the
         # whole diff: the number that used to be here was inherited from the
         # kernel's argv limit and outlived it, and a reviewer handed a prefix
@@ -140,6 +158,14 @@ DEFAULTS: dict = {
         "auto_finish": False,
         "executor_worktree_args": [],
         "min_free_mb": 2048,
+        # Highest tier the epic may spend on a sub-issue when `--model` is not
+        # passed: the triage judge runs here and routes each issue to this tier
+        # or a lesser one (sonnet < opus < fable). `opus` is what the fallback
+        # to review_panel.judge_model used to resolve to, kept deliberately —
+        # this is a spending ceiling and inherits nothing from who adjudicates.
+        # Anything not in MODEL_TIERS (including "") turns model routing off
+        # altogether, which stays available to a repo that asks for it by name.
+        "model_ceiling": "opus",
         # Left at a path that will not exist in a repo without alembic, so the
         # linear-heads guard returns None and no-ops. Do NOT "clear" this to "":
         # Path(repo)/"" IS the repo root, so an empty value makes the guard think

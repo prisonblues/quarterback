@@ -958,9 +958,16 @@ def run(repo_name: str, epic: int, execute: bool, max_issues: int | None,
     # Master triages not-yet-started issues for doability (no agent-ready label —
     # the master reads each issue and decides). Non-doable → 'blocked'. The judge
     # runs at the tier the epic was initiated with (--model, from the /epic master;
-    # falls back to review_panel.judge_model) and routes each sub-issue to an
+    # falls back to `epic.model_ceiling`) and routes each sub-issue to an
     # equal-or-lesser tier for implementation.
-    ceiling = model or cfg.get("review_panel", {}).get("judge_model", "")
+    #
+    # This used to fall back to `review_panel.judge_model`, and the two agreed
+    # only by accident. That key answers "which brain adjudicates the panel",
+    # and since it became deliberately UNLIKE a seat's model (#78) it no longer
+    # answers "how capable a model may this epic spend on an issue" — a ceiling
+    # of `fable` would quietly route every sub-issue's implementation at the top
+    # tier. Two questions, two keys.
+    ceiling = model or cfg.get("epic", {}).get("model_ceiling", "")
     impl = [w for w in work if w.stage == "implement"]
     if impl:
         with ThreadPoolExecutor(max_workers=4) as ex:
@@ -1166,8 +1173,9 @@ def main() -> int:
                     help="tier the epic run is initiated with (the /epic master passes its "
                          "own tier). The triage judge runs at this tier and routes each "
                          "sub-issue to an equal-or-lesser tier for /fix-issue + /review-pr. "
-                         "Omitted: judge falls back to review_panel.judge_model; nothing "
-                         "is pinned for implementation unless that is a recognised tier.")
+                         "Omitted: falls back to the epic.model_ceiling setting (default "
+                         "opus); nothing is pinned for implementation unless that is a "
+                         "recognised tier.")
     ap.add_argument("--keep-going", action="store_true",
                     help="don't stop the run on a failed/ non-green issue — collect the "
                          "failure and continue (default: stop and surface, so the stack "
