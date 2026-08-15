@@ -103,7 +103,12 @@ from typing import NamedTuple
 
 sys.path.insert(0, str(Path(__file__).parent))
 import harness_rules  # noqa: E402
-from harness_rules import RepoNotFound, describe, resolve_repo  # noqa: E402
+# stderr_gist and cli_outcome live with the shared plumbing — how headless CLIs
+# fail is not a panel question — and are re-exported here because they read as
+# part of run_cli's contract at every call site in this file.
+from harness_rules import (DENIAL_MARKERS, REJECTION_MARKERS,  # noqa: E402
+                           RepoNotFound, cli_outcome, describe,
+                           resolve_repo, stderr_gist)
 
 # Chars of diff handed to a model, when nothing in .harness-rules says otherwise:
 # NONE OF THEM. The whole diff goes to every reviewer unless a repo asks for a
@@ -147,6 +152,21 @@ DEFAULT_MAX_ROUNDS = 2
 # `--print-timeout` (default 5m0s), so the seat that does not read this number
 # silently reviews on a five-minute clock while the report claims thirty.
 CLI_TIMEOUT = 1800
+
+# How long a blank reply may take and still be worth retrying. A zero exit with
+# no output is retried because it is often a flake — but a blank run does NOT
+# fail fast the way a non-zero exit does, so three of them is up to three whole
+# CLI_TIMEOUTs held against the joined futures of the entire panel, which is the
+# exact cost the timeout branch already refuses to pay ("it already burned the
+# whole budget"). A blank that comes back inside a minute plausibly never
+# reached a model at all, which is the flake the retry exists for; one that
+# spent real time thinking and still said nothing will spend it again.
+BLANK_RETRY_MAX_S = 60
+
+# The one skip reason that says nothing about the round: this box does not carry
+# that CLI. The wording is free to change — what coverage_veto branches on is
+# ReviewerRun.absent, not this string.
+CLI_ABSENT = "CLI absent"
 
 # Linux caps ONE argv string at MAX_ARG_STRLEN = 131,072 bytes, independently of
 # the much larger total ARG_MAX; cross it and execve fails with E2BIG before the
@@ -338,6 +358,12 @@ class ReviewerRun:
     #: are real work, but nothing it might have declared survived the parse — so a
     #: quiet round that includes one is not evidence of a quiet PR.
     unstructured: bool = False
+    #: This box does not carry the reviewer's CLI. Recorded as state rather than
+    #: read back out of `skip` — a message tail is free text, and matching on it
+    #: both lets an installed CLI whose stderr happens to end that way escape the
+    #: coverage veto, and silently restores the veto the moment the absent
+    #: branch's wording gains a suffix.
+    absent: bool = False
 
 
 @dataclass
@@ -949,32 +975,46 @@ def is_rejection(stderr: str) -> bool:
     so it is worth distinguishing from the rate limits and blips that retrying
     exists for. 429 is excluded on purpose: that one IS worth another go."""
     low = stderr.lower()
-    return ('"status":400' in low.replace(" ", "")
-            or "invalid_request_error" in low
-            or "requires a newer version" in low)
+    return (any(m in low for m in REJECTION_MARKERS)
+            or '"status":400' in low.replace(" ", ""))
 
 
-def stderr_gist(stderr: str, limit: int = 200) -> str:
-    """The most INFORMATIVE stderr line, not blindly the last one.
+def is_permission_denied(stderr: str) -> bool:
+    """Did the CLI's OWN sandbox refuse a tool the run needed?
 
-    A CLI's real complaint is routinely followed by teardown noise, and codex is
-    the worst case: a client older than its own models cache logs a decode error
-    ("unknown variant `max`") on every single run, plus websocket teardown lines
-    — so the naive tail reported that housekeeping and buried the sentence that
-    actually explains the failure. Where the line carries a JSON error envelope
-    we lift its `message`, which is how a pinned-model rejection reads as
-    "The 'gpt-5.6-luna' model requires a newer version of Codex" rather than 200
-    characters of serialised envelope."""
-    lines = [ln.strip() for ln in (stderr or "").splitlines() if ln.strip()]
-    if not lines:
-        return ""
-    noise = ("failed to load models cache", "failed to refresh available models",
-             "worker quit with fatal", "failed to connect to websocket")
-    signal = [ln for ln in lines if not any(n in ln for n in noise)] or lines
-    errors = [ln for ln in signal if "error" in ln.lower()]
-    pick = (errors or signal)[-1]
-    msg = re.search(r'"message"\s*:\s*"((?:[^"\\]|\\.){4,400})"', pick)
-    return (msg.group(1) if msg else pick)[:limit]
+    Deliberately a sibling of is_rejection rather than part of it, because the
+    two are settled in different files and the report must not conflate them: a
+    rejection is the SERVER declining the request (a retired model pin — fix
+    `.harness-rules`), this is the local CLI auto-denying a tool because headless
+    mode has no one to prompt (fix `permissions.allow` in its settings.json).
+    What they share is the only property retrying cares about — both are decided
+    by configuration, so all three attempts fail identically.
+
+    The observed shape, from `agy` 1.1.12: exit 0, empty stdout, and 'a tool
+    required the "command" permission that headless mode cannot prompt for, so
+    it was auto-denied' on stderr.
+
+    Matched as a CO-OCCURRENCE ON ONE LINE — a permission word next to a
+    headless-denial word — rather than either token anywhere in the stream, and
+    that narrowness is the point. This predicate now suppresses retries on
+    non-zero exits too, so every over-match costs a reviewer its remaining
+    attempts and the panel a whole vendor for the round. The shapes it must NOT
+    claim: an `EACCES: permission denied` on a temp file (a real error, and a
+    transient one as often as not), a CLI echoing its own `permissions.allow`
+    config at startup, and a log line about one optional tool being auto-denied
+    on a run that then fails for a rate limit — all of which used to match, and
+    turned three attempts into one.
+    """
+    for line in stderr.lower().splitlines():
+        if "permission" in line and any(d in line for d in DENIAL_MARKERS):
+            return True
+    return False
+
+
+def is_deterministic_failure(stderr: str) -> bool:
+    """Will another identical attempt fail in the identical way? Either settled
+    cause counts — a request the server refused, or a tool the CLI refused."""
+    return is_rejection(stderr) or is_permission_denied(stderr)
 
 
 def run_cli(args: list[str], label: str, timeout: int = CLI_TIMEOUT,
@@ -1000,12 +1040,44 @@ def run_cli(args: list[str], label: str, timeout: int = CLI_TIMEOUT,
     weren't waiting on anyway — the reviewers run concurrently, so a slow seat
     only extends the run when it is the slowest one. The reason string is specific (timeout / exit code + stderr
     tail / OSError) so callers can SURFACE why a step degraded instead of
-    reporting a bare 'unavailable'. A request the server has REJECTED on its
-    merits is not retried either: a bad model pin fails identically all three
-    times, so retrying only triples the wait for a certainty."""
+    reporting a bare 'unavailable'. A failure something has already SETTLED is
+    not retried either, whichever exit code it arrives with — a bad model pin the
+    server refuses, or a tool the CLI's own sandbox auto-denies (see
+    is_deterministic_failure) — because it fails identically all three times, so
+    retrying only triples the wait for a certainty.
+
+    **A zero exit with no output is a failure, not an empty review.** Headless
+    CLIs exit 0 while producing nothing — `agy` does it when a tool needs a
+    permission headless mode cannot prompt for, so it is auto-denied — and
+    "reviewed, found nothing" and "produced nothing" are opposite claims that a
+    bare `""` cannot tell apart. Returned as success it becomes a reviewer that
+    appears in the report as having run, contributes no findings, weakens the
+    ⋆consensus signal with no explanation, and feeds the board's reviewer
+    leaderboard a false zero — the one datum a reviewer comparison must be able
+    to trust. So callers may rely on the invariant that a non-None stdout has
+    non-whitespace content.
+
+    Stderr is read on a ZERO exit too, for the same run. The CLI has usually
+    already diagnosed itself there ("a tool required the \"command\" permission
+    … add an allow-rule under permissions.allow"), and gating that read on a
+    non-zero exit discarded it on exactly the runs that needed it most. It is
+    read only when stdout is empty: a CLI that produced its findings AND chattered
+    on stderr succeeded, and reporting its warm-up noise would be the opposite
+    error. A blank reply IS retried when nothing says it would come back blank —
+    losing a whole reviewer to one flake costs the panel more than two extra
+    attempts. Two things stop that retry: stderr naming a settled cause
+    (is_deterministic_failure — a refused request, or a tool the CLI auto-denied;
+    a missing permission rule is every bit as fixed as a bad model pin), and the
+    attempt having taken longer than BLANK_RETRY_MAX_S. The second is what keeps
+    the flake recovery from inheriting the cost the timeout branch refuses:
+    blank runs do not fail fast the way non-zero exits do, so three SLOW ones is
+    up to three whole CLI_TIMEOUTs held against the joined futures of the whole
+    panel, 3x the duration_ms the board's leaderboard is scored on, and on the
+    metered `pi` seat, three bills."""
     last = f"{label}: no attempt made"
     feed = {"input": stdin_text} if stdin_text is not None else {"stdin": subprocess.DEVNULL}
     for _ in range(max(1, attempts)):
+        started = time.monotonic()
         try:
             proc = subprocess.run(args, capture_output=True, text=True,
                                   timeout=timeout, **feed)
@@ -1018,13 +1090,19 @@ def run_cli(args: list[str], label: str, timeout: int = CLI_TIMEOUT,
             why = " ".join(str(x) for x in (e.errno, e.strerror or e) if x)
             last = f"{label}: OSError {why}"[:300]
             continue
-        if proc.returncode != 0:
-            msg = stderr_gist(proc.stderr or "")
-            last = f"{label}: exited {proc.returncode}" + (f" ({msg})" if msg else "")
-            if is_rejection(proc.stderr or ""):
-                return None, last
-            continue
-        return proc.stdout, None
+        # One branch for both failure shapes on purpose: they differ only in the
+        # sentence, and split they were two copies of the same short-circuit for
+        # the next failure class to have to be added to twice.
+        outcome = cli_outcome(proc)
+        if not outcome:
+            return proc.stdout, None
+        took = time.monotonic() - started
+        msg = stderr_gist(proc.stderr or "")
+        last = f"{label}: {outcome}" + (f" ({msg})" if msg else "")
+        if is_deterministic_failure(proc.stderr or ""):
+            return None, last
+        if not proc.returncode and took >= BLANK_RETRY_MAX_S:
+            return None, f"{last} after {int(took)}s — not retried"
     return None, last
 
 
@@ -1292,7 +1370,8 @@ def review_llm(cmd_name: str, model: str, prompt: str,
         return ReviewerRun(skip=f"{label}: unknown reasoning effort {effort!r} — {expected}",
                            duration_ms=elapsed())
     if not shutil.which(CLI_BIN.get(cmd_name, cmd_name)):
-        return ReviewerRun(skip=f"{label}: CLI absent", duration_ms=elapsed())
+        return ReviewerRun(skip=f"{label}: {CLI_ABSENT}", duration_ms=elapsed(),
+                           absent=True)
     # The prompt goes on stdin wherever the CLI will take it there — which is
     # everywhere but `agy`. That is not a style choice: a diff big enough to be
     # worth a panel is big enough to exceed the kernel's per-argument limit, and
@@ -1323,8 +1402,16 @@ def review_llm(cmd_name: str, model: str, prompt: str,
                 return ReviewerRun(retried[0], None, elapsed(), retried[1])
             out = out2
         text = (out or "").strip()
+        # Unreachable today — run_cli refuses to return whitespace-only stdout —
+        # and kept anyway, because it is the LOCAL half of the guard. The
+        # invariant that makes it dead lives ~350 lines away in a docstring, and
+        # the day it is relaxed (a new caller, a check_output=False variant, a
+        # mocked run_cli in a future test) this line is all that stands between
+        # the judge and a blank finding flagged `unstructured` — a dead reviewer
+        # wearing a live one's clothes, which is the failure this file exists to
+        # kill. Two lines is a cheap place to keep it.
         if not text:
-            return ReviewerRun(skip=f"{label}: no parseable findings and empty output",
+            return ReviewerRun(skip=f"{label}: produced no output",
                                duration_ms=elapsed())
         return ReviewerRun([_raw_finding(cmd_name, text)], None, elapsed(),
                            unstructured=True)
@@ -2147,8 +2234,12 @@ def adjudicate(clusters: list[list[Finding]], diff: str, model: str, pr: int,
 
     Returns (canonical findings, skip_reason, coverage_note). skip_reason is None
     when the judge ran (even if it dismissed nothing); otherwise it explains WHY
-    it could not rule — CLI absent, timeout, crash, unparseable output — so the
-    caller can surface that rather than a bare 'unavailable'.
+    it could not rule — CLI absent, timeout, crash, a zero exit that produced no
+    output, or output with no JSON verdict in it — so the caller can surface that
+    rather than a bare 'unavailable'. The judge inherits run_cli's empty-output
+    guard for free: a judge that printed nothing now reports "produced no output"
+    (with its own stderr quoted) instead of blaming the shape of a reply it never
+    made.
 
     The coverage ruling is one extra key in the object the judge already returns,
     so it costs no additional model call — and its own reply may still be the
@@ -2538,11 +2629,35 @@ def coverage_veto(reviewer_meta: dict[str, dict], judge_skip: str | None,
     distinguish them, and they exist to stop a failure being read as convergence.
     They do NOT drive the loop: a truncated reviewer is truncated again next round
     at the same budget, so treating that as a reason to go again is a loop with no
-    exit. It is a reason to stop CLAIMING the PR is clean."""
+    exit. It is a reason to stop CLAIMING the PR is clean.
+
+    The one absence that is not an observation about the round is a reviewer
+    whose CLI this box does not carry — see below."""
     out = []
     for name, meta in sorted(reviewer_meta.items()):
         if not meta.get("ran"):
-            out.append(f"{name} did not run ({meta.get('skip') or 'no reason recorded'})")
+            skip = str(meta.get("skip") or "")
+            # A seat whose CLI is not INSTALLED on this box is a fact about the
+            # host, not about the round: it is absent every round, so vetoing on
+            # it makes `confident` permanently unreachable on the headless
+            # machines — which is where the unattended loops run and where the
+            # signal has to mean something. A repo that lists a workstation-only
+            # vendor would otherwise buy every one of its unattended runs a
+            # standing veto and train the reader to discount all of them. The
+            # skip is still REPORTED (result.skipped carries it, and the header
+            # names who ran); what it is not is evidence a quiet round hid
+            # something. Every other way of not running — a crash, a timeout, a
+            # bad model pin, a CLI that produced nothing — is about THIS run and
+            # still vetoes.
+            #
+            # Read off the recorded state, never off the skip TEXT: the message
+            # is free-form, so `skip.endswith(CLI_ABSENT)` would let an installed
+            # CLI whose stderr tail happens to read that way skip the veto, and
+            # would silently restore the standing veto the first time this
+            # branch's wording gained a suffix.
+            if meta.get("absent"):
+                continue
+            out.append(f"{name} did not run ({skip or 'no reason recorded'})")
             continue
         if meta.get("truncated"):
             budget = meta.get("max_diff_chars") or 0
@@ -2551,6 +2666,14 @@ def coverage_veto(reviewer_meta: dict[str, dict], judge_skip: str | None,
             out.append(f"{name} returned no structured reply — its coverage is unknown")
         for gap in meta.get("could_not_assess") or []:
             out.append(f"{name} could not assess: {gap}")
+    # The floor under the absence exemption above. Exempting absent seats one by
+    # one means a box carrying NONE of the reviewer CLIs produces an empty veto
+    # list, and `confident` is `not veto` — a confident stop on a diff nobody
+    # read, which is the strongest wrong signal this file can emit and lands
+    # exactly on the unattended hosts the exemption was added for. At least one
+    # reviewer has to have actually run.
+    if not any(m.get("ran") for m in reviewer_meta.values()):
+        out.append("no reviewer ran — nothing read this diff")
     if judge_skip:
         # Phrased for both halves of the judge's job: on a round with no findings
         # it is the coverage split that went unadjudicated, not the findings.
@@ -2977,6 +3100,10 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 "duration_ms": got.duration_ms,
                 "could_not_assess": got.could_not_assess,
                 "unstructured": got.unstructured,
+                # A fact about the HOST rather than about the round — see
+                # coverage_veto, which is the one consumer that treats it
+                # differently from every other way of not running.
+                "absent": got.absent,
             }
             if got.skip:
                 result.skipped.append(got.skip)

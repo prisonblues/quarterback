@@ -35,7 +35,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from harness_rules import RepoNotFound, describe, resolve_repo  # noqa: E402
+from harness_rules import (RepoNotFound, cli_failure_gist, describe,  # noqa: E402
+                           resolve_repo)
 
 PANEL = Path(__file__).with_name("panel.py")
 # State must live OUTSIDE the script dir for the same reason (the store is read-only).
@@ -369,6 +370,12 @@ def toposort(work: list[IssueWork], edges: list) -> list[IssueWork]:
     return [by_num[n] for n in out]
 
 
+# How long the triage judge may take per sub-issue. Named rather than inline
+# because the skip line quotes it: "untriaged (judge timed out after 300s)" has
+# to stay true if the number moves.
+TRIAGE_TIMEOUT = 300
+
+
 def triage(w: IssueWork, model: str) -> tuple[bool | None, str, str]:
     """Master decides whether a coding agent can actually implement this issue, and
     which model tier should implement it. The judge runs at `model` — the tier the
@@ -382,18 +389,37 @@ def triage(w: IssueWork, model: str) -> tuple[bool | None, str, str]:
     prompt = TRIAGE_PROMPT.format(n=w.num, title=w.title, body=w.body[:6000],
                                   models=", ".join(choices) or "(default)")
     args = ["claude", "-p", prompt] + (["--model", model] if model else [])
+    # Every failure below silently skips the sub-issue on --execute, so the one
+    # line the operator gets has to name a cause: the judge CLI can exit 0 having
+    # printed nothing (a tool permission headless mode auto-denied, an unusable
+    # model pin) and say why on stderr, which a bare "no verdict" threw away —
+    # and a launch that never ran at all knows why too.
     try:
         proc = subprocess.run(args, capture_output=True, text=True,
-                              stdin=subprocess.DEVNULL, timeout=300)
-    except (subprocess.TimeoutExpired, OSError):
-        return None, "untriaged (judge error)", ""
+                              stdin=subprocess.DEVNULL, timeout=TRIAGE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return None, f"untriaged (judge timed out after {TRIAGE_TIMEOUT}s)", ""
+    except OSError as e:
+        # errno and strerror, not the bare class name: "OSError" says nothing,
+        # and "Argument list too long" says everything.
+        why = " ".join(str(x) for x in (e.errno, e.strerror or e) if x)[:120]
+        return None, f"untriaged (judge could not start: {why})", ""
+    if proc.returncode:
+        # A non-zero exit means the RUN failed, so whatever reached stdout is not
+        # a verdict even when it parses — the rule the two branches below already
+        # get from cli_failure_gist, applied before anything is parsed rather
+        # than after, since valid-looking JSON printed on the way out would
+        # otherwise be accepted as a real ruling and the failure never reported.
+        return None, f"untriaged (judge failed: {cli_failure_gist(proc)})", ""
     m = re.search(r"\{.*\}", proc.stdout or "", re.S)
     if not m:
-        return None, "untriaged (no verdict)", ""
+        return None, ("untriaged (no verdict: "
+                      f"{cli_failure_gist(proc, 'no JSON in reply')})"), ""
     try:
         v = json.loads(m.group(0))
     except json.JSONDecodeError:
-        return None, "untriaged (bad verdict)", ""
+        return None, ("untriaged (bad verdict: "
+                      f"{cli_failure_gist(proc, 'malformed JSON')})"), ""
     return (bool(v.get("doable", False)), str(v.get("reason", ""))[:120],
             clamp_model(str(v.get("model", "")), model))
 
@@ -699,7 +725,10 @@ def work_issue(cfg: dict, w: IssueWork, execute: bool, base: str | None = None,
         print(f"  #{w.num}: done — skip")
         return WorkResult(w.num, "done", w.pr_number)
     if w.stage == "blocked":
-        print(f"  #{w.num}: NOT agent-doable ({w.reason}) — skipping (needs a human)")
+        # "NOT agent-doable" is a RULING, and an untriaged issue has none — the
+        # judge never answered. Both are skipped; only one of them was judged.
+        verdict = "NOT agent-doable" if w.doable is False else "not confirmed doable"
+        print(f"  #{w.num}: {verdict} ({w.reason}) — skipping (needs a human)")
         return WorkResult(w.num, "blocked", detail=w.reason)
 
     if not execute:
@@ -939,7 +968,12 @@ def run(repo_name: str, epic: int, execute: bool, max_issues: int | None,
             for fut in futs:
                 w = futs[fut]
                 w.doable, w.reason, w.model = fut.result()
-                if w.doable is False:
+                # `is not True`, not `is False`: an untriaged sub-issue (doable
+                # is None — the judge timed out, crashed, or printed nothing) has
+                # no doability ruling at all, and handing it to the autonomous
+                # executor is precisely what the reason line it prints says did
+                # not happen. Not confirmed doable means a human looks at it.
+                if w.doable is not True:
                     w.stage = "blocked"
     # review-stage issues skip triage; their /review-pr fix-up runs at the ceiling
     # (only when routing is on — an unrecognised ceiling pins nothing).

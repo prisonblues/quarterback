@@ -170,9 +170,9 @@ The deployed board version lags the repo until the stack is redeployed, and only
 service knows which it is: ask it with `GET /openapi.json` → `.info.version`, for whichever
 instance you care about. (Anything built off this branch says 2.15.0.) A number written here
 instead would be wrong the next time Portainer redeploys, with no diff to catch it.
-Latest release: **v2.17**, which is harness-side and changes no board behaviour — the panel settles a
-reply carrying several JSON-shaped values by agreement rather than by rank. The last release that
-moved the board was **v2.15**,
+Latest release: **v2.18**, which is harness-side and changes no board behaviour — the panel settles a
+reply carrying several JSON-shaped values by agreement rather than by rank. v2.17 before it made a
+reviewer that produced nothing a failure that says why. The last release that moved the board was **v2.15**,
 which added the round and coverage columns; v2.13 (shipping the harness) and v2.14 (merging
 findings in the judge) are harness-side too.
 
@@ -187,7 +187,8 @@ findings in the judge) are harness-side too.
 - **v2.15** — the panel re-reviews the fix commit, and records what a run could not see:
   rounds, coverage declarations, truncation per reviewer.
 - **v2.16** — no diff budget by default: the whole diff goes to every reviewer.
-- **v2.17** — a reply holding several JSON values is settled by agreement, not by rank; where the
+- **v2.17** — a reviewer that produced nothing has failed, and says why.
+- **v2.18** — a reply holding several JSON values is settled by agreement, not by rank; where the
   candidates disagree the reply is kept as unstructured rather than resolved wrongly.
 - **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
   object store; wire `landed` refs to a cherry-pick helper.
