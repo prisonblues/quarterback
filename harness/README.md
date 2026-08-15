@@ -141,7 +141,9 @@ Copy the closest template from `templates/` and edit `project`:
 | `postgres-docker-nginx.worktree.json` | The above + per-worktree containers behind an nginx sub-path | Compose is untracked and you want each branch reachable at a URL |
 
 `worktree.example.json` documents every key in one annotated file; quarterback's own
-`.worktree.json` (repo root) is the live worked example of the middle row.
+`.worktree.json` (repo root) is the live worked example of the middle row. `templates/` also
+holds `dbtarget.py`, the test-suite half of database isolation — see the prerequisites below,
+because a `.worktree.json` alone does not get you there.
 
 Keys the script reads: `project`, `framework`, `base_port`, `app_port`,
 `docker.{enabled,network_pattern,network_default,image_pattern}`,
@@ -175,12 +177,17 @@ overrides the worktree's isolated database, because config libraries that read `
 the file. So the isolated copy sits unused while the suite drops and rebuilds the schema of
 the shared one. Nothing in the output mentions it.
 
-`templates/conftest-db-isolation.py` is a drop-in fix: resolve the URL once (explicit env
-var → the checkout's `.env` → fallback), assign it back so subprocesses like `alembic` agree,
-and refuse outright when a worktree is about to rebuild the main checkout's database. It
-also prints the target in the pytest header, so which database is about to be destroyed is
-something you read rather than deduce. quarterback runs this as `tests/dbtarget.py`, with
-`tests/test_dbtarget.py` covering the precedence rules and the guard.
+`templates/dbtarget.py` is the fix, importable as it ships: copy it into your `tests/`,
+change the two constants at the top, and wire it into `conftest.py` with the snippet in its
+docstring. It resolves the URL once (explicit env var → the checkout's `.env` → fallback),
+assigns it back so subprocesses like `alembic` agree, and refuses outright when a worktree
+is about to rebuild a database another checkout is using — the main one or a sibling. It
+also prints the target as the first line of the run, `-q` included, so which database is
+about to be destroyed is something you read rather than deduce.
+
+quarterback runs the same file as `tests/dbtarget.py`; the two are kept byte-identical below
+their constants, and `tests/test_dbtarget.py` runs every scenario against both, so the copy
+you are given is the copy that is tested.
 
 One consequence to plan for: once the suite honours `.env` it honours *all* of it, and a
 `.env` is developer convenience — dev auth bypasses, debug flags, log paths. Take only the
@@ -192,9 +199,12 @@ opened a live event stream and hung until killed.
 ### Checking it actually worked
 
 ```bash
-grep DATABASE_URL ../myapp-fix-issue-42/.env     # should name myapp_fix_issue_42, not myapp
-cd ../myapp-fix-issue-42 && pytest -q | head -3  # the header states the database
+grep DATABASE_URL ../myapp-fix-issue-42/.env       # should name myapp_fix_issue_42, not myapp
+cd ../myapp-fix-issue-42 && pytest --collect-only  # first line states the target database
 ```
+
+Not piped into `head`: closing the pipe early hands pytest a SIGPIPE partway through, and
+`--collect-only` answers the question without running anything destructive.
 
 `create-worktree` also shouts if any `.env` var still equals the main database name after
 rewriting. If you see that warning, stop — a migration would hit shared data.

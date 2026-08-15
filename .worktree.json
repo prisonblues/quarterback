@@ -1,7 +1,8 @@
 {
   "_comment": [
-    "create-worktree config for quarterback itself. See worktrees/README.md for",
-    "the full key reference and worktrees/templates/ for copyable starting points.",
+    "create-worktree config for quarterback itself. harness/README.md explains the",
+    "keys, harness/worktree.example.json shows every one of them in a single",
+    "annotated file, and harness/templates/ holds copyable starting points.",
     "",
     "Two choices here are deliberate and worth the note:",
     "",
@@ -18,6 +19,12 @@
     "",
     "base_port starts at 5690 because the main compose stack already publishes",
     "5681 for the app; allocating from 5681 hands a worktree a port it cannot bind.",
+    "",
+    "symlinks lists .venv only, and listing anything replaces the default set",
+    "rather than adding to it. That is deliberate here: the default is",
+    "[.venv, .claude, CLAUDE.md] filtered to what exists, and this repo keeps no",
+    ".claude/ or CLAUDE.md — the agent configuration is global, in ~/.claude. Add",
+    "them back to this list if either ever lands in the repo root.",
     "",
     "Requires a .env in the main checkout (cp .env.example .env). That is the file",
     "create-worktree copies and then repoints at the worktree's own database."

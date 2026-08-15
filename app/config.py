@@ -6,8 +6,11 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    # Database — SQLAlchemy asyncpg URL
-    database_url: str = "postgresql+asyncpg://quarterback:quarterback@localhost:5432/quarterback"
+    # Database — SQLAlchemy asyncpg URL. The port is compose's *published* one
+    # (5435), matching .env.example and the test suite's fallback: a checkout
+    # with no .env should land on this project's Postgres or fail, not connect
+    # to whatever unrelated server happens to own the standard 5432.
+    database_url: str = "postgresql+asyncpg://quarterback:quarterback@localhost:5435/quarterback"
 
     # Per-agent bearer tokens as "name:token" pairs, comma-separated.
     # The name of the token that authenticates a request becomes the post author.

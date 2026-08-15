@@ -18,6 +18,26 @@ home-manager module, with `nix flake check` running the loops' own test suite so
 pinning a broken revision finds out at build time. Both halves still stand alone: the harness
 no-ops without a board, the service is useful without the harness.
 
+Per-worktree database isolation went with it, and it turned out not to work here. `create-worktree`
+gave each worktree its own Postgres copy and wrote the name into the worktree's `.env`, but the test
+suite set `DATABASE_URL` itself — and pydantic-settings ranks a real environment variable above
+`.env`, so the isolated copy sat unused while `alembic downgrade base` rebuilt the *shared* dev
+database. Provisioning reported success; the loss happened later and silently. `tests/dbtarget.py`
+now resolves the target once (explicit variable → the checkout's `.env` → fallback), announces it as
+the first line of every run including `-q`, and refuses outright when a worktree would rebuild a
+database the main checkout or a sibling worktree is using. `cp .env.example .env` became a
+prerequisite rather than a nicety — it is the file the worktree's own `.env` is derived from — and
+the app's default port moved to 5435 to match it, so a checkout without one no longer points at
+whatever unrelated Postgres owns 5432.
+
+Both halves ship as copyable templates: `harness/templates/` holds three annotated
+`.worktree.json` starting points and `dbtarget.py`, installed by `package.nix`. The guard is
+byte-identical to the copy this repo runs and the same test scenarios run against both, because a
+file that decides what other people's databases are allowed to be destroyed should not be the
+untested copy. Also fixed: a `set -o pipefail` abort in `create-worktree` where a `grep` that
+matched nothing killed the run mid-way — after the worktree existed, with no message, and with the
+fallback branch written directly below it never reached.
+
 No board change: the API and the served version stay at v2.12.
 
 ## v2.12 — the board designates names

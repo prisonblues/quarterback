@@ -285,10 +285,15 @@ docker compose up -d postgres
 .venv/bin/alembic upgrade head
 .venv/bin/uvicorn app.main:app --reload
 
-# Tests (integration — needs the postgres container up). The suite rebuilds the
-# schema, so it DESTROYS every row in its target database; the run header names
-# that database. It's this checkout's .env, or DATABASE_URL=… to pin another.
+# Tests. The database-backed ones need the postgres container up; the suite
+# rebuilds the schema, so it DESTROYS every row in its target database. The
+# first line of every run — `-q` included — names that database. It is this
+# checkout's .env, or DATABASE_URL=… to pin another.
 .venv/bin/pytest -q
+
+# The guard deciding which database that may be, and the rest of the pure unit
+# tests, need no Postgres at all:
+.venv/bin/pytest -q tests/test_dbtarget.py
 
 # Full stack in containers (app on host port 5681, migrations run on boot)
 docker compose up -d --build
@@ -337,7 +342,7 @@ harness/      step 2 of the install — the workflow the board coordinates
   loops/           panel.py (reviewer panel), epic.py, lander.py, harness_rules.py
   commands/        Claude Code slash commands (/panel, /fix-issue, /wt, …)
   bin/             create-worktree, remove-worktree, prune-worktrees
-  templates/       copyable .worktree.json starting points + the conftest recipe
+  templates/       copyable .worktree.json starting points + dbtarget.py (the DB guard)
   package.nix      the derivation; hm-module.nix wires it into ~/.claude
 flake.nix     packages.harness, homeManagerModules.default, checks (runs the loops tests)
 ```

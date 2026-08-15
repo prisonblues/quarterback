@@ -11,13 +11,17 @@
     "The values below are quarterback's, but note that quarterback's real",
     ".worktree.json (repo root) sets docker.enabled=false and does not pin the",
     "Postgres container — because its docker-compose.yml is tracked in git and",
-    "the Docker path would overwrite it. Read that file too."
+    "the Docker path would overwrite it. Read that file too.",
+    "",
+    "base_port is 5690, not 5681: the main compose stack already publishes 5681",
+    "for the app, and allocating from there hands the first worktree a port it",
+    "cannot bind. Start yours above every port your own compose file publishes."
   ],
 
   "project": "quarterback",
   "framework": "fastapi",
 
-  "base_port": 5681,
+  "base_port": 5690,
   "app_port": 8000,
 
   "docker": {

@@ -1,25 +1,75 @@
-"""Which database the suite is allowed to point its destructive rebuild at.
+"""TEMPLATE — make a pytest suite honour the worktree's database.
 
-The session fixture rebuilds the schema with ``alembic downgrade base && upgrade
-head``. That destroys every row in the target database, so *which* database the
-target is has to be decided deliberately rather than inherited by accident.
+Copy this file into your ``tests/`` as ``dbtarget.py``, change the two constants
+below, and wire it into ``conftest.py`` with the three lines at the end of this
+docstring. Do that whenever your suite does anything destructive to its target
+database: creating and dropping the schema, ``alembic downgrade base``,
+``manage.py flush``, ``create_all``/``drop_all``, truncating between tests.
 
-The accident this exists to prevent: ``create-worktree`` gives a worktree its own
-database and writes the name into the worktree's ``.env`` — but pydantic-settings
-reads real environment variables in preference to ``.env``, so a conftest that
-did ``os.environ.setdefault("DATABASE_URL", <main dev DB>)`` silently overrode
-the isolated database and wiped the shared one instead. Isolation that the test
-suite ignores is not isolation.
+## The trap it exists for
 
-So: resolve the URL here, from an explicit environment variable first and the
-checkout's own ``.env`` second, and refuse to run at all when a worktree is about
-to rebuild a database another checkout is using.
+``create-worktree`` gives a worktree its own copy of the database and writes the
+name into the worktree's ``.env``. That does nothing for a test suite that
+decides its own URL, and suites usually do — most commonly::
 
-Everything below the "shared guard" marker is byte-identical to
-``harness/templates/dbtarget.py``, the copy shipped to other repos; only the two
-constants above it differ. ``tests/test_dbtarget.py`` asserts that and runs the
-same scenarios against both, because the shipped copy runs against other
-people's data and untested parsing is not something to hand out.
+    os.environ.setdefault("DATABASE_URL", "postgresql://…/myapp")   # <-- the bug
+
+Two ways that bites. Config libraries that read ``.env`` (pydantic-settings,
+python-dotenv with ``override=False``, Django's environ helpers) treat a real
+environment variable as higher priority than the file — so the ``setdefault``
+above *wins over* the worktree's ``.env`` and the suite rebuilds the main
+database. And with no ``.env`` support at all, the hardcoded default is the main
+database by construction. Either way the isolated copy sits unused while the
+shared one is destroyed, and nothing in the output says so.
+
+Three rules fix it:
+
+1. Resolve the URL in one place, with an explicit environment variable first
+   (so CI and ``DATABASE_URL=… pytest`` still pin it), then the checkout's own
+   ``.env``, then a fallback — never the fallback first.
+2. Assign the resolved value back into the environment, so subprocesses
+   (alembic, manage.py) target the same database as the in-process app whatever
+   directory pytest was run from.
+3. Refuse to run when a *worktree* would rebuild a database another checkout is
+   using. That is never intentional, and it is the one mistake with
+   unrecoverable consequences.
+
+A fourth rule, learned the hard way while writing this: take *only* the database
+target from the environment, and pin every other setting your app reads. Once
+your suite honours ``.env`` it honours all of it, and a ``.env`` is developer
+convenience — dev auth bypasses, debug flags, log paths. In quarterback's case
+``.env.example`` sets a browser dev-user that authenticates every request, which
+turned the test asserting an endpoint returns 401 into one that opened a live
+event stream and hung until killed.
+
+## Wiring it up
+
+In ``tests/conftest.py``, above every import of your application::
+
+    import os
+    from pathlib import Path
+    import pytest
+    from .dbtarget import ENV_VAR, database_name, isolation_error, resolve_database_url
+
+    _url, _source = resolve_database_url(dict(os.environ), Path(__file__).resolve().parent.parent)
+    if problem := isolation_error(_url, Path(__file__).resolve().parent.parent):
+        pytest.exit(problem, returncode=pytest.ExitCode.USAGE_ERROR)
+    os.environ[ENV_VAR] = _url
+    os.environ["BROWSER_DEV_USER"] = ""   # …and every other setting your app reads
+
+    def pytest_configure(config):
+        # Not pytest_report_header: that block is suppressed at -q, and the
+        # database about to be destroyed should not hide behind a verbosity flag.
+        reporter = config.pluginmanager.get_plugin("terminalreporter")
+        if reporter is not None:
+            reporter.write_line(f"database: {database_name(_url)} (from {_source})", bold=True)
+
+Make the destructive fixture depend on the client/session fixture rather than
+autouse, so the suite's own pure unit tests still run without a database.
+
+Adapt: ``DEV_FALLBACK_URL`` and ``ENV_VAR`` below. If your suite writes to more
+than one store, apply the same three rules to each (a shared Redis or
+Elasticsearch index is the usual second one).
 """
 
 from __future__ import annotations
@@ -36,13 +86,13 @@ try:  # ships with pydantic-settings; the hand parser below covers its absence
 except ImportError:  # pragma: no cover - only when python-dotenv is absent
     dotenv_values = None
 
-#: Last-resort target when nothing is configured: the compose Postgres from
-#: README's Development section. Only correct in the main checkout — a worktree
-#: reaching this fallback is the bug this module reports. Kept in step with
-#: .env.example and app/config.py's default by tests/test_settings.py.
-DEV_FALLBACK_URL = "postgresql+asyncpg://quarterback:quarterback@localhost:5435/quarterback"
+#: ADAPT ME — the last-resort target when nothing is configured. Correct only in
+#: the main checkout: a worktree that reaches this fallback is misconfigured, and
+#: the guard below reports that rather than letting it run.
+DEV_FALLBACK_URL = "postgresql://myapp:myapp@localhost:5432/myapp"
 
-#: The variable that names the database, in the environment and in `.env`.
+#: ADAPT ME — the variable that names the database, in the environment and in
+#: `.env`. DATABASE_URL for most stacks; DJANGO_DATABASE_URL, MYAPP_DSN, … else.
 ENV_VAR = "DATABASE_URL"
 
 # --- shared guard: kept byte-identical by tests/test_dbtarget.py ------------

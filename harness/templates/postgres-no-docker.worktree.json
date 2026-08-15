@@ -16,9 +16,10 @@
     "user, so it survives being cloned into a differently-named directory. Pin a",
     "name instead if several of your stacks share one username.",
     "",
-    "Then make your TEST SUITE honour that .env — see conftest-db-isolation.py",
-    "here. A suite that hardcodes its database URL will cheerfully rebuild the",
-    "shared one while the isolated copy sits unused."
+    "Then make your TEST SUITE honour that .env — copy dbtarget.py from this",
+    "directory into your tests/ and follow its docstring. A suite that hardcodes",
+    "its database URL will cheerfully rebuild the shared one while the isolated",
+    "copy sits unused."
   ],
 
   "project": "myapp",
