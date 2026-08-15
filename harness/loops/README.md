@@ -326,6 +326,19 @@ own fields (`judged`, `reviewers`, `diff_budgets`, `run_key`, …). A skipped PR
 same keys with empty values and `reviewed: false`, so nothing has to branch on which
 exit produced it.
 
+**v2.23 — what the PR touched.** The run carries `changed_files` (the PR's paths, each
+with its own `additions`/`deletions`) beside the `changed_lines` total, plus
+`changed_files_total`, GitHub's own count. **The two are allowed to disagree**: `gh` pages
+the file list and GitHub caps it at 3,000, so `len(changed_files) < changed_files_total`
+means the list is a prefix — read them against each other before building on it, and the
+run's `config_notes` say so when they differ.
+
+It is the **PR's** file list, not the round's, read from `gh pr view` rather than from the
+diff the reviewers are handed. That is what lets the skip path — which never fetches a diff
+— still emit a complete one, and what keeps it correct under a round that reviews only the
+increment: a collision surface that narrowed with the increment would report two PRs as no
+longer colliding because one stopped *re-reading* a file it still changes.
+
 Each finding record:
 
 | field | what it is |

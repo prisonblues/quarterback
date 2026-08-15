@@ -73,6 +73,21 @@ them, so the sums include it and the coverage counts have to cover the same rows
 Compare them only WITHIN a vendor — different tokenizers, different cache
 semantics; duration stays the cross-vendor axis. ``cost_usd`` is stored only
 where the vendor states it, never derived from a price table.
+
+**v2.23 — which FILES the PR touched, not just how many lines.** A run recorded
+``changed_lines: 2032`` and no paths, so the board could not answer the question
+integration cost actually turns on: *which other PRs does landing this one
+disturb?* The only paths it held were the ones findings happened to name — a
+proxy for the diff, and not the diff. A run now carries ``changed_files`` (the
+PR's paths, each with its own additions/deletions) and ``changed_files_total``,
+GitHub's own count, kept separate so a list truncated by GitHub's 3,000-file cap
+is detectable rather than reading as complete. ``GET /review/collisions`` is what
+that buys: the other PRs whose most recent run touched any of the same files, and
+which files those are. It is deliberately only the OVERLAP, not an ordering —
+ranking PRs by it is #80's job and needs a policy this endpoint should not
+presume. Every pre-v2.23 run has no file list at all, which is not the same fact
+as a PR that changed no files, and the endpoint says which runs it could not
+speak for rather than silently reading them as disjoint.
 """
 
 from __future__ import annotations
@@ -84,7 +99,14 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 from sqlalchemy import func, select
 from sqlalchemy import or_ as sa_or
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -92,7 +114,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth import identify, reader
 from app.db import get_session
 from app.identity import agent_row, compose, machine_of
-from app.models.review import ReviewFinding, ReviewFindingReport, ReviewReviewer, ReviewRun
+from app.models.review import (
+    ReviewFinding,
+    ReviewFindingReport,
+    ReviewReviewer,
+    ReviewRun,
+    ReviewRunFile,
+)
 
 router = APIRouter(tags=["review"])
 
@@ -413,6 +441,28 @@ class StopIn(BaseModel):
         return _phrases(v)
 
 
+class ChangedFileIn(BaseModel):
+    """One path the PR touched, with that path's own share of ``changed_lines``.
+
+    A bare string is accepted too, and is the shape a hand-rolled caller reaches
+    for first: ``["a.py", "b.py"]`` records the paths with null churn rather than
+    422-ing the whole payload away. Recording is best-effort here as everywhere
+    else in this module — losing the findings over the shape of a file list would
+    be the wrong trade by a wide margin.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    path: str = Field(min_length=1)
+    additions: int | None = Field(default=None, ge=0)
+    deletions: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _bare_path(cls, v: object) -> object:
+        return {"path": v} if isinstance(v, str) else v
+
+
 class ReviewIn(BaseModel):
     """The panel's ``--json`` payload, accepted verbatim.
 
@@ -432,6 +482,15 @@ class ReviewIn(BaseModel):
                                  validation_alias=AliasChoices("pr_title", "title"))
     base: str | None = None
     changed_lines: int | None = None
+    #: The PR's touched paths — the PR's, never the round's. Under #41 a later
+    #: round reviews only the increment; narrowing this to it would report two
+    #: PRs as no longer colliding because one stopped re-reading a file it still
+    #: changes. Absent for every pre-v2.23 run, which is "no list", not "no files".
+    changed_files: list[ChangedFileIn] = Field(default_factory=list)
+    #: GitHub's own count of the PR's changed files. NOT derived from
+    #: ``len(changed_files)``: `gh` pages that list and GitHub caps it at 3,000,
+    #: so the two disagreeing is the only signal a collision query under-reports.
+    changed_files_total: int | None = Field(default=None, ge=0)
     diff_chars: int | None = None
     diff_truncated: bool | None = None
 
@@ -764,6 +823,12 @@ async def record_review(
         pr_title=body.pr_title,
         base_branch=body.base,
         changed_lines=body.changed_lines,
+        # Stored AS SENT rather than backfilled from len(changed_files). A caller
+        # that sends the paths and not the count leaves this NULL, and NULL there
+        # honestly means "nobody said how many there were" — filling it in from
+        # the rows would manufacture agreement between the two numbers whose
+        # DISAGREEMENT is the only evidence the list is short.
+        changed_files_total=body.changed_files_total,
         diff_chars=body.diff_chars,
         diff_truncated=body.diff_truncated,
         judged=body.judged,
@@ -804,6 +869,21 @@ async def record_review(
     )
     session.add(run)
     await session.flush()  # need run.id for the children
+
+    # Deduped on the way in, keeping the first mention of each path. The table's
+    # unique constraint would otherwise turn a sender that repeats a path into an
+    # IntegrityError that costs the whole run its findings — and this module's
+    # rule is that recording is best-effort. Order is the sender's, so a reader
+    # of one run's files sees them as the panel listed them.
+    seen: set[str] = set()
+    for cf in body.changed_files:
+        path = cf.path.strip()
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        session.add(ReviewRunFile(
+            run_id=run.id, path=path, additions=cf.additions, deletions=cf.deletions,
+        ))
 
     # Sonar's hard-gate issues are the gate's own output, not a panel member's
     # judged findings — excluded from the scorecards so they can't inflate a
@@ -878,6 +958,10 @@ def _run_view(r: ReviewRun) -> dict:
         "pr_title": r.pr_title,
         "base": r.base_branch,
         "changed_lines": r.changed_lines,
+        # The count only — the paths themselves are per-run children and would
+        # turn every page of `GET /reviews` into a file dump. `GET /review/{id}`
+        # carries the list; this is what a run LIST needs to know a list exists.
+        "changed_files_total": r.changed_files_total,
         "diff_chars": r.diff_chars,
         "diff_truncated": r.diff_truncated,
         "judged": r.judged,
@@ -1611,6 +1695,110 @@ async def pr_finding_history(
     }
 
 
+@router.get("/review/collisions")
+async def pr_collisions(
+    _reader: str = Depends(reader),
+    repo: str = Query(..., description="github nameWithOwner"),
+    pr: int = Query(..., ge=1),
+    since: str | None = Query(None, description="ISO timestamp"),
+    days: int | None = Query(30, ge=1, le=3650,
+                             description="how far back a rival PR's newest run may be"),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Which other PRs of this repo touch the files this one does.
+
+    The overlap, and only the overlap. Ordering PRs by it — landing the disjoint
+    ones first — is #80's job and needs a policy about what a collision COSTS
+    that this endpoint has no business presuming; what was missing was the datum,
+    not the ranking.
+
+    A PR is represented by its most recent run **that recorded a file list**, not
+    simply its most recent run, and that run's ``id``/``ts`` come back with it so
+    a caller can see how stale the answer is. A PR still open whose last panel was
+    Tuesday collides on Tuesday's files; the board is not told about pushes.
+
+    ``unknown`` is the half that matters more than it looks. Every run recorded
+    before v2.23 has no file list, and so does any PR that has never been
+    panelled — those PRs are not disjoint from this one, they are *unanswered*.
+    Returning them silently absent would make an empty ``collides`` read as "safe
+    to land", which is exactly the shortfall-as-clean-result failure this codebase
+    keeps finding in itself.
+    """
+    # The subject's files: its newest run that has any. Falling back through
+    # earlier runs is deliberate — a round that skipped on a title pattern still
+    # records a list, but a pre-v2.23 round does not, and the PR's file set is
+    # better known late than not at all.
+    has_files = select(ReviewRunFile.run_id)
+    subject_id = await session.scalar(
+        select(func.max(ReviewRun.id)).where(
+            ReviewRun.repo == repo, ReviewRun.pr == pr, ReviewRun.id.in_(has_files)
+        )
+    )
+    if subject_id is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            f"no run of {repo}#{pr} recorded a changed-file list — nothing to compare",
+        )
+    subject = await session.get(ReviewRun, subject_id)
+    paths = list((await session.scalars(
+        select(ReviewRunFile.path).where(ReviewRunFile.run_id == subject_id)
+    )).all())
+
+    cutoff = _since_clause(since, days)
+    others = select(ReviewRun.pr).where(ReviewRun.repo == repo, ReviewRun.pr != pr)
+    if cutoff is not None:
+        others = others.where(ReviewRun.ts >= cutoff)
+
+    # One row per rival PR: its newest file-bearing run. `pr` is grouped on, so
+    # two runs of the same PR can never both answer for it.
+    latest = (
+        select(ReviewRun.pr.label("pr"), func.max(ReviewRun.id).label("run_id"))
+        .where(ReviewRun.repo == repo, ReviewRun.pr != pr, ReviewRun.id.in_(has_files))
+    )
+    if cutoff is not None:
+        latest = latest.where(ReviewRun.ts >= cutoff)
+    latest = latest.group_by(ReviewRun.pr).subquery()
+
+    shared = (
+        await session.execute(
+            select(latest.c.pr, latest.c.run_id, ReviewRun.ts, ReviewRun.pr_title,
+                   ReviewRunFile.path)
+            .join(ReviewRunFile, ReviewRunFile.run_id == latest.c.run_id)
+            .join(ReviewRun, ReviewRun.id == latest.c.run_id)
+            .where(ReviewRunFile.path.in_(paths))
+            .order_by(latest.c.pr, ReviewRunFile.path)
+        )
+    ).all() if paths else []
+
+    hits: dict[int, dict] = {}
+    for other_pr, run_id, ts, title, path in shared:
+        row = hits.setdefault(other_pr, {
+            "pr": other_pr, "pr_title": title, "run_id": run_id,
+            "ts": ts.isoformat(), "files": [],
+        })
+        row["files"].append(path)
+
+    answered = set((await session.scalars(select(latest.c.pr))).all())
+    unknown = sorted(set((await session.scalars(others.distinct())).all()) - answered)
+
+    return {
+        "repo": repo,
+        "pr": pr,
+        "run_id": subject_id,
+        "ts": subject.ts.isoformat() if subject else None,
+        "files": sorted(paths),
+        # Read against len(files): GitHub caps a PR's file list at 3,000, and a
+        # subject whose own list was truncated under-reports its own collisions.
+        "changed_files_total": subject.changed_files_total if subject else None,
+        # Most shared files first — a description of the overlap, not a
+        # recommendation about it.
+        "collides": sorted(hits.values(), key=lambda h: (-len(h["files"]), h["pr"])),
+        #: PRs of this repo with a run in the window and NO recorded file list.
+        #: Not disjoint — unanswered. Every pre-v2.23 run lands here.
+        "unknown": unknown,
+    }
+
+
 @router.get("/review/{run_id}")
 async def get_review(
     run_id: int,
@@ -1636,8 +1824,22 @@ async def get_review(
         )).all()
     )
     reports = await _reports_by_finding(session, [f.id for f in findings])
+    files = list(
+        (await session.scalars(
+            select(ReviewRunFile)
+            .where(ReviewRunFile.run_id == run_id)
+            .order_by(ReviewRunFile.path)
+        )).all()
+    )
     return {
         **_run_view(run),
+        # Read `changed_files_total` against `len(changed_files)` before building
+        # anything on this list: they are allowed to disagree, and when they do
+        # the list is a PREFIX of what the PR touches.
+        "changed_files": [
+            {"path": f.path, "additions": f.additions, "deletions": f.deletions}
+            for f in files
+        ],
         "reviewers": [_card_view(c) for c in cards],
         "findings": [_finding_view(f, reports.get(f.id, [])) for f in findings],
     }

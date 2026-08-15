@@ -7,6 +7,46 @@ that number where it was, so the repo can be a version ahead of the service.
 Entries are newest first. Each one says what was broken or missing before it, because that is the
 part that isn't recoverable from the diff.
 
+## v2.23 — the board knew how many lines a merge changed, and not which files
+
+`POST /review` carried `changed_lines: 2032` and no paths. The only file names the board held for a
+run were the ones its findings happened to mention — nine, on the run that number came from — which
+is a proxy for the diff and not the diff. So the question that decides what landing a PR costs was
+unanswerable: **which other open PRs does this merge disturb?** On 2026-08-15 six PRs took eleven
+integration merges to land, and the one pair that turned out disjoint (#73 against #62) was found to
+be disjoint by trying it. Nothing recorded it either before or after.
+
+A run now records the PR's changed files: `changed_files`, each path with its own additions and
+deletions, and `changed_files_total` (schema revision 0016). `GET /review/collisions?repo=&pr=` reads
+them back the way the question is asked — the other PRs whose most recent run touched any of the same
+files, and which files those are.
+
+**It is the PR's file list, not the round's**, and that distinction is the reason it is read from
+`gh pr view` rather than from the diff the reviewers are handed. Under #41 a later round reviews only
+the increment; a collision surface that narrowed with it would report two PRs as no longer colliding
+because one of them had stopped *re-reading* a file it still changes. Reading it off the PR metadata
+makes that true by construction — and it is also why the title-skip path, which never fetches a diff
+at all, still records a complete list. A skipped PR collides with everything it touches, and it is
+the one most likely to be merged unattended.
+
+**`changed_files_total` is GitHub's own count and is deliberately not derived from the list.** `gh`
+pages the files connection and GitHub caps a PR's file list at 3,000, so the two are allowed to
+disagree — and their disagreement is the only evidence that the stored list is a prefix. Derive one
+from the other and a truncated list reads as a complete one, which is this repo's recurring failure:
+a shortfall presenting as a clean result. When they disagree the panel says so above its findings,
+the same treatment v2.21 gave a short panel.
+
+**Three ways of not knowing are kept apart, because collapsing them all fail safe-looking.** A run
+that changed no files has an empty list; a run recorded before this release has no list at all
+(`changed_files_total` is NULL); a PR whose newest run has no list is neither disjoint nor colliding
+but *unanswered*, and `/review/collisions` returns it under `unknown` rather than omitting it. An
+empty `collides` with a silently absent PR reads as "safe to land", which is the most expensive wrong
+answer this endpoint could give.
+
+The endpoint describes the overlap and does not rank it. Ordering PRs by collision — landing the
+disjoint ones first — needs a policy about what a collision actually costs, and that is #80's. What
+was missing was the datum. Closes #82.
+
 ## v2.21 — a panel that lost a seat said nothing about it
 
 A reviewer went missing and the report read the same. On PR #64 codex exited 1 with "Not inside a

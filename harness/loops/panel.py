@@ -3414,6 +3414,41 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
 
 # ----------------------------------------------------------------------------- run
 
+def _changed_files(meta: dict) -> tuple[list[dict], int]:
+    """The PR's touched paths, with each one's own share of ``changed_lines``.
+
+    Returns ``(files, total)`` where ``total`` is GitHub's own count of the PR's
+    changed files. It is carried separately and NOT derived from ``len(files)``,
+    because those two numbers are allowed to disagree: `gh` pages the `files`
+    connection and GitHub caps a PR's file list at 3,000. A consumer comparing
+    them learns the list is partial; one told only ``len(files)`` reads a
+    truncated list as a complete one, which is this repo's standing disease —
+    a shortfall presenting as a clean result.
+
+    Paths, not hunk ranges. Paths answer "will these two PRs collide", which is
+    what #80 orders by; ranges would answer "and exactly where", which nothing
+    asks yet. The per-file additions/deletions ride along because the same `gh`
+    call already returns them, and they turn ``changed_lines`` from a bare total
+    into something attributable to a file.
+    """
+    files = []
+    for f in meta.get("files") or []:
+        path = (f.get("path") or "").strip()
+        if not path:
+            continue
+        files.append({
+            "path": path,
+            "additions": f.get("additions") or 0,
+            "deletions": f.get("deletions") or 0,
+        })
+    files.sort(key=lambda f: f["path"])
+    # `changedFiles` absent means an older `gh` that does not carry the field —
+    # falling back to the list's own length says "complete" without knowing it,
+    # so fall back to what we can prove instead and let the two agree.
+    total = meta.get("changedFiles")
+    return files, len(files) if total is None else int(total)
+
+
 def _payload_defaults() -> dict:
     """Every key a run payload carries, valued as "this run never got that far".
 
@@ -3424,6 +3459,11 @@ def _payload_defaults() -> dict:
     case that payload exists FOR — was the one that raised KeyError."""
     return {
         "changed_lines": 0,
+        # The PR's file list, not this round's. Under #41 a later round reviews
+        # only the increment, so the round's files narrow while the PR's
+        # collision surface does not — and collision is what this is for.
+        "changed_files": [],
+        "changed_files_total": 0,
         "reviewed": False,
         "skip_reason": None,
         # Where a run sits in the panel -> fix -> panel cycle. Defaulted here too,
@@ -3599,13 +3639,17 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     try:
         meta = json.loads(sh(["gh", "pr", "view", str(pr_number), "--repo", gh_repo,
                               "--json", "title,additions,deletions,baseRefName,"
-                                        "headRefName,headRefOid"]))
+                                        "headRefName,headRefOid,files,changedFiles"]))
     except subprocess.CalledProcessError as e:
         tail = (e.stderr or "").strip().splitlines()
         sys.exit(f"panel: cannot read PR #{pr_number} in {gh_repo}"
                  + (f" — {tail[-1][:160]}" if tail else ""))
     title, base = meta["title"], meta["baseRefName"]
     changed = meta["additions"] + meta["deletions"]
+    # Same call that already produced `changed`, one field wider — so the board
+    # gets the paths behind the number without a second round-trip, and gets
+    # them on the skip path too, where no diff is ever fetched.
+    changed_files, changed_files_total = _changed_files(meta)
 
     # Progress goes to stderr in --json mode, so stdout is the payload and only
     # the payload: it is a machine-readable artifact, and a consumer that has to
@@ -3637,6 +3681,12 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 **_payload_defaults(),
                 "repo": repo_name, "github": gh_repo, "pr": pr_number,
                 "title": title, "base": base,
+                # A skipped PR still collides with everything it touches, and it
+                # is the case most likely to be re-merged unattended. The paths
+                # are already in hand here — the diff never is.
+                "changed_lines": changed,
+                "changed_files": changed_files,
+                "changed_files_total": changed_files_total,
                 "round": round_no,
                 "cycle": skip_prior.cycle,
                 "prior_rounds": len(skip_prior.rounds),
@@ -3671,6 +3721,15 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # Diff budgets: panel-wide value, then each model's own override. Every
     # reviewer used to get the same 60k prefix regardless of its context window.
     notes: list[str] = []
+    # Said out loud, because a short file list is the same class of failure as a
+    # short panel: the collision answers built on it are wrong in the direction
+    # of "no collision", and nothing downstream can tell a partial list from a
+    # small PR. The payload carries both numbers regardless — this is the copy a
+    # human reads.
+    if len(changed_files) < changed_files_total:
+        notes.append(f"the PR's file list came back partial — {len(changed_files):,} of "
+                     f"{changed_files_total:,} changed files; collision queries "
+                     "against this run will under-report")
     panel_budget = diff_budget(panel, "max_diff_chars", DEFAULT_DIFF_BUDGET, notes)
     # Only for the reviewers actually running: a budget warning about a model
     # this run never asked for is noise, and a "truncated for antigravity" footnote
@@ -3892,6 +3951,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         **_payload_defaults(),
         "repo": repo_name, "github": gh_repo, "pr": pr_number,
         "title": title, "base": base, "changed_lines": changed,
+        "changed_files": changed_files, "changed_files_total": changed_files_total,
         # Always True in a payload the BOARD sees — the skip path returns before
         # `record_run` because no review happened. It is here for `--json`
         # consumers, which get both shapes and need to tell them apart.

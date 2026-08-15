@@ -98,7 +98,8 @@ GET   /sync              ?repo=&branch=&device=&path=          (registered workt
                          &have=sha,sha,…&dirty=&ahead=&behind= (…or just describe yourself)
                          -> {published:[…], worktrees:[…], caller, stale, registered, advice}
 
-# reviewer-panel stats (v2.10, accounts v2.11, rounds + coverage v2.15, cost v2.19)
+# reviewer-panel stats (v2.10, accounts v2.11, rounds + coverage v2.15, cost v2.19,
+#                        changed files v2.23)
 POST  /review            (panel.py --json payload)              -> {id, recorded, accounts}
 GET   /reviews           ?repo=&pr=&author=&since=&days=&limit=  (runs + scorecards)
 GET   /review/{id}                                              (scorecards + findings + accounts)
@@ -109,6 +110,10 @@ GET   /review/findings   ?repo=&pr=&limit=                       (one PR's findi
                                                                   what stopped the loop,
                                                                   whether a re-review flag
                                                                   was borne out)
+GET   /review/collisions ?repo=&pr=&since=&days=                 (which other PRs touch
+                                                                  this one's files, and
+                                                                  which PRs have no file
+                                                                  list to answer with)
 GET   /panel             (browser view — the leaderboard)
 
 GET   /health            (no auth)
@@ -185,11 +190,12 @@ says how much of a window actually reported.
 
 The deployed board version lags the repo until the stack is redeployed, and only the running
 service knows which it is: ask it with `GET /openapi.json` → `.info.version`, for whichever
-instance you care about. (Anything built off this branch says 2.19.0 — v2.20 is harness-side.) A number written here
+instance you care about. (Anything built off this branch says 2.23.0.) A number written here
 instead would be wrong the next time Portainer redeploys, with no diff to catch it.
-Latest release: **v2.21**, harness-side — each panel member now runs in its own empty sandbox repo
-rather than in whatever directory the panel was launched from, and a panel that lost a seat says so.
-Before it, **v2.20** (also harness-side) had the worktree
+Latest release: **v2.23** — a run records which FILES the PR changed and not just how many lines, so
+`GET /review/collisions` can say which other PRs a merge disturbs (schema revision 0016).
+Before it, **v2.21** (harness-side) had each panel member run in its own empty sandbox repo
+rather than in whatever directory the panel was launched from, **v2.20** (also harness-side) had the worktree
 tooling ask who is in a directory before rewriting it, and **v2.19** added the per-reviewer
 cost columns (schema revision 0015) and was the first to move the board since v2.15; **v2.18**
 settles a reply carrying several JSON-shaped values by agreement rather than by rank, **v2.17** made
@@ -218,6 +224,9 @@ judge) are harness-side too.
 - **v2.21** — each panel member runs in its own empty sandbox repo, not in whatever directory the
   panel was launched from and not in the repo under review; and a panel that lost a seat says so
   above its findings.
+- **v2.23** — a run records the PR's changed FILES, not just its line count: `GET /review/collisions`
+  answers which other PRs a merge disturbs, and says which it has no file list for rather than
+  reporting them as disjoint.
 - **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
   object store; wire `landed` refs to a cherry-pick helper.
 
@@ -367,7 +376,8 @@ app/          FastAPI service
   api/leases.py    POST /lease[/renew,/release], POST /handoff, POST /snapshot,
                    GET /sessions, GET /session/{key}
   api/subagents.py POST /subagent[/end], GET /active (collision index), GET /overlap
-  api/reviews.py   POST /review, GET /reviews, /review/{id}, /review/stats, /review/findings
+  api/reviews.py   POST /review, GET /reviews, /review/{id}, /review/stats, /review/findings,
+                   /review/collisions
   api/worktrees.py PUT/GET /worktrees (cross-worktree discovery)
   api/sync.py      GET /sync (published line vs registered checkouts)
   api/whoami.py    GET /whoami (the caller's resolved board identity)
