@@ -1,6 +1,6 @@
 # Drop worktree — destroy this session's worktree, keep the branch
 
-@description Tear down the worktree this session is working in and all its trappings — Docker containers, nginx block, isolated DB, port entry, directory — but KEEP the branch. Blocks if the tree is dirty. Clears the session's statusline marker.
+@description Tear down the worktree this session is working in and all its trappings — Docker containers, nginx block, isolated DB, port entry, directory — but KEEP the branch. Blocks if the tree is dirty. Clears the session's statusline markers (worktree + PR).
 
 Thin, safe driver over `remove-worktree --keep-branch`. The script does the
 actual teardown (containers, nginx + restart, DB drop, port prune, dir removal);
@@ -63,13 +63,16 @@ the isolated DB, prunes the `.worktree-ports` entry, and deletes the directory.
 
 ## 4. Clear the session marker
 
-Remove the marker so the statusline stops pointing at the now-deleted worktree
-and falls back to the main checkout:
+Remove both markers so the statusline stops pointing at the now-deleted worktree
+and its PR, and falls back to the main checkout:
 ```bash
 rm -f "$HOME/.cache/claude-code/session-cwd/$CLAUDE_CODE_SESSION_ID"
+rm -f "$HOME/.cache/claude-code/session-pr/$CLAUDE_CODE_SESSION_ID"
 ```
-(Even if you forget, the statusline self-heals — it drops a marker whose worktree
-no longer exists — but clear it now so the next render is correct immediately.)
+(Even if you forget the first, the statusline self-heals — it drops a marker
+whose worktree no longer exists. The PR marker has no such check: nothing about
+a PR number goes stale when a directory disappears, so an uncleared one keeps
+showing a PR this session no longer has a tree for. Clear both now.)
 
 ## 5. Report
 
@@ -77,7 +80,8 @@ Confirm to the user:
 - the worktree directory is gone and its trappings (containers, nginx block, DB,
   port) were cleaned,
 - the **branch `<name>` survives** (with its commits / PR intact),
-- the statusline marker is cleared, so the bar reflects the main checkout again.
+- the statusline markers (worktree + PR) are cleared, so the bar reflects the
+  main checkout again.
 
 If `remove-worktree` reported anything it couldn't clean (e.g. a root-owned dir,
 a container it couldn't stop), relay that verbatim and suggest `/tree-shake` to

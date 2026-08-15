@@ -73,6 +73,25 @@ them, so the sums include it and the coverage counts have to cover the same rows
 Compare them only WITHIN a vendor — different tokenizers, different cache
 semantics; duration stays the cross-vendor axis. ``cost_usd`` is stored only
 where the vendor states it, never derived from a price table.
+
+**v2.23 — which FILES the PR touched, not just how many lines.** A run recorded
+``changed_lines: 2032`` and no paths, so the board could not answer the question
+integration cost actually turns on: *which other PRs does landing this one
+disturb?* The only paths it held were the ones findings happened to name — a
+proxy for the diff, and not the diff. A run now carries ``changed_files`` (the
+PR's paths, each with its own additions/deletions), ``changed_files_total`` —
+GitHub's own count, kept separate so a list truncated by GitHub's 3,000-file cap
+is detectable rather than reading as complete — and the PR's ``pr_state`` /
+``is_draft`` as of that panel, so a rival merged last week is distinguishable
+from a live one.
+
+This release lands the **datum only**. Reading it back as a collision query is
+deliberately not here: two full panel rounds put the same defect in that endpoint
+twice — a filter composed in front of the newest-run selection, resurrecting a
+stale run under a confident answer — and the second instance was introduced by
+the fix for the first. That is a design that wants its own rounds rather than a
+third patch, and it has them (#101). What ships is the record: durable, queryable,
+and with every "I do not know" kept apart from every "I know it is none".
 """
 
 from __future__ import annotations
@@ -84,7 +103,14 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 from sqlalchemy import func, select
 from sqlalchemy import or_ as sa_or
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -92,7 +118,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth import identify, reader
 from app.db import get_session
 from app.identity import agent_row, compose, machine_of
-from app.models.review import ReviewFinding, ReviewFindingReport, ReviewReviewer, ReviewRun
+from app.models.review import (
+    ReviewFinding,
+    ReviewFindingReport,
+    ReviewReviewer,
+    ReviewRun,
+    ReviewRunFile,
+)
 
 router = APIRouter(tags=["review"])
 
@@ -413,6 +445,88 @@ class StopIn(BaseModel):
         return _phrases(v)
 
 
+#: A path longer than this is not a path. Bounded because ``ReviewRunFile.path``
+#: is ``Text`` and the sender is trusted only in the sense of being authenticated.
+MAX_PATH_CHARS = 4096
+#: GitHub caps a PR's file list at 3,000; this leaves room above it and still
+#: bounds one request to something a single transaction can hold. A list longer
+#: than this is truncated with a note, never silently — see :class:`ReviewIn`.
+MAX_CHANGED_FILES = 5000
+#: The states GitHub reports for a PR. Anything else is recorded as NULL rather
+#: than verbatim — see :meth:`ReviewIn._state`.
+PR_STATES = frozenset({"OPEN", "MERGED", "CLOSED"})
+
+
+class ChangedFileIn(BaseModel):
+    """One path the PR touched, with that path's own share of ``changed_lines``.
+
+    **Every field is coerced, never rejected.** This module's rule is that
+    recording is best-effort — a run's findings, scorecards and accounts must not
+    be lost over the shape of its file list — and the first version of this model
+    only honoured that rule for one shape. A bare string was coerced, and then
+    ``additions: -1``, ``path: ""``, ``path: null`` and a numeric entry each 422'd
+    the entire payload, findings included. The leniency was applied to shape and
+    not to values, which is the same thing as not being lenient.
+
+    So: a bare string becomes a path; a negative or non-numeric churn number
+    becomes None ("nobody said") rather than a rejection; anything with no usable
+    path at all is dropped by :func:`record_review` rather than refused here.
+    ``ReviewIn.changed_files`` accepts ``null`` for the same reason.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    #: May be empty after coercion — `record_review` drops those rows. Validating
+    #: it here would cost the whole run, which is exactly the trade this class
+    #: exists not to make.
+    path: str = ""
+    additions: int | None = None
+    deletions: int | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce(cls, v: object) -> object:
+        """``"a.py"`` → ``{"path": "a.py"}``, and anything unusable → droppable."""
+        if isinstance(v, str):
+            return {"path": v}
+        if not isinstance(v, dict):
+            # A number, a list, a null in the array. Not a file, and not worth a
+            # 422 either — it becomes a pathless row and is dropped downstream.
+            return {"path": ""}
+        return {**v, "path": v.get("path") if isinstance(v.get("path"), str) else ""}
+
+    @field_validator("path", mode="after")
+    @classmethod
+    def _bound_path(cls, v: str) -> str:
+        return v[:MAX_PATH_CHARS]
+
+    @field_validator("additions", "deletions", mode="before")
+    @classmethod
+    def _churn(cls, v: object) -> int | None:
+        """A count, or None. Negative and non-numeric both mean "nobody said" —
+        the same NULL the column carries for a caller that sent nothing, because
+        a number that cannot be true is not more informative than no number."""
+        if isinstance(v, bool) or not isinstance(v, (int, float, str)):
+            return None
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            return None
+        except OverflowError:
+            # JSON `1e309` parses to `inf`, which clears the isinstance gate and
+            # then raises here — escaping the validator and 500-ing the request,
+            # in the one model whose whole rule is that a malformed file list must
+            # never cost a run its findings.
+            return None
+        # A non-integral float is "nobody said" rather than a silent truncation to
+        # 3 — GitHub only ever sends integers, so a fractional churn count is a
+        # value this cannot represent, and every other unrepresentable value here
+        # becomes None rather than quietly changing.
+        if isinstance(v, float) and n != v:
+            return None
+        return n if n >= 0 else None
+
+
 class ReviewIn(BaseModel):
     """The panel's ``--json`` payload, accepted verbatim.
 
@@ -432,7 +546,73 @@ class ReviewIn(BaseModel):
                                  validation_alias=AliasChoices("pr_title", "title"))
     base: str | None = None
     changed_lines: int | None = None
+    #: The PR's touched paths — the PR's, never the round's. Under #41 a later
+    #: round reviews only the increment; narrowing this to it would report two
+    #: PRs as no longer colliding because one stopped re-reading a file it still
+    #: changes. Absent for every pre-v2.23 run, which is "no list", not "no files".
+    #: ``null`` is accepted and means the empty list — a hand-rolled caller with
+    #: no files to send reaches for it, and every neighbouring field on this model
+    #: is ``| None``. Truncated at :data:`MAX_CHANGED_FILES` with a note rather
+    #: than refused, and never silently: an authenticated sender is not a bounded
+    #: one, and one request should not be able to insert a million rows in a
+    #: single transaction.
+    changed_files: list[ChangedFileIn] = Field(default_factory=list)
+    #: GitHub's own count of the PR's changed files. NOT derived from
+    #: ``len(changed_files)``: `gh` pages that list and GitHub caps it at 3,000,
+    #: so the two disagreeing is the only signal a collision query under-reports.
+    #: Coerced rather than validated, like everything else here.
+    changed_files_total: int | None = None
+    #: The PR's state as of this panel — `OPEN` / `MERGED` / `CLOSED`. Without it
+    #: a collision query cannot tell a live rival from one merged last week.
+    pr_state: str | None = None
+    is_draft: bool | None = None
+    #: How many entries the sender actually put in ``changed_files`` before the
+    #: cap trimmed it. Set by the validator, never by the caller — it exists so
+    #: the handler can report what it dropped instead of trimming in silence.
+    changed_files_sent: int = 0
     diff_chars: int | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _count_files_sent(cls, v: object) -> object:
+        if isinstance(v, dict) and isinstance(v.get("changed_files"), list):
+            return {**v, "changed_files_sent": len(v["changed_files"])}
+        return v
+
+    @field_validator("changed_files", mode="before")
+    @classmethod
+    def _files(cls, v: object) -> object:
+        """``null`` → ``[]``, a non-list → ``[]``, and bounded. Never a 422: the
+        findings in the same payload are worth more than the file list is.
+
+        What is trimmed here is counted in ``changed_files_sent`` and reported in
+        the response — a truncation the sender cannot see is one it will read as
+        a complete list."""
+        if not isinstance(v, list):
+            return []
+        return v[:MAX_CHANGED_FILES]
+
+    @field_validator("changed_files_total", mode="before")
+    @classmethod
+    def _files_total(cls, v: object) -> int | None:
+        return _count_or_none(v)
+
+    @field_validator("pr_state", mode="before")
+    @classmethod
+    def _state(cls, v: object) -> str | None:
+        """One of :data:`PR_STATES`, upper-cased, or None.
+
+        Anything outside the set becomes None rather than being stored verbatim.
+        A typo, a variant spelling or a future GitHub state stored as-is is worse
+        than useless to a consumer filtering on it: `!= "OPEN"` silently reclassifies
+        the PR, and it does so in the direction that hides work. None is honest —
+        "nobody stated a state I understand" — and is the value every consumer
+        already has to handle, because every pre-v2.23 run carries it.
+        """
+        if not isinstance(v, str):
+            return None
+        s = v.strip().upper()
+        return s if s in PR_STATES else None
     diff_truncated: bool | None = None
 
     judged: bool = False
@@ -764,6 +944,14 @@ async def record_review(
         pr_title=body.pr_title,
         base_branch=body.base,
         changed_lines=body.changed_lines,
+        # Stored AS SENT rather than backfilled from len(changed_files). A caller
+        # that sends the paths and not the count leaves this NULL, and NULL there
+        # honestly means "nobody said how many there were" — filling it in from
+        # the rows would manufacture agreement between the two numbers whose
+        # DISAGREEMENT is the only evidence the list is short.
+        changed_files_total=body.changed_files_total,
+        pr_state=body.pr_state,
+        is_draft=body.is_draft,
         diff_chars=body.diff_chars,
         diff_truncated=body.diff_truncated,
         judged=body.judged,
@@ -804,6 +992,44 @@ async def record_review(
     )
     session.add(run)
     await session.flush()  # need run.id for the children
+
+    #: Entries this request sent that were not stored: over the cap, or with no
+    #: usable path. Reported back in the response, because the alternative is the
+    #: silence the first version shipped — a caller posting 6,000 paths got a run
+    #: short by 1,000 with nothing anywhere saying so, and then read its own
+    #: complete-looking list as evidence of no collision. A cap that trims an
+    #: answer has to announce itself, which is this module's rule elsewhere and
+    #: had no channel here.
+    over_cap = max(0, body.changed_files_sent - len(body.changed_files))
+
+    # Deduped on the way in, keeping the first mention of each path. The table's
+    # unique constraint would otherwise turn a sender that repeats a path into an
+    # IntegrityError that costs the whole run its findings — and this module's
+    # rule is that recording is best-effort.
+    #
+    # Paths are STRIPPED before storing and comparing, which is a real
+    # normalisation and not just tidying: it is what makes `" a.py"` and `"a.py"`
+    # one row rather than an IntegrityError, and a padded path would otherwise
+    # join to nothing in every collision query. Git does permit leading and
+    # trailing whitespace in a path, so this can in principle fold two genuinely
+    # distinct paths together; that trade is taken deliberately, because the
+    # alternative is a silent collision miss on every ordinary padded path.
+    #
+    # No insertion order is preserved or promised: there is no ordinal column and
+    # every reader sorts by path (`GET /review/{id}`).
+    seen: set[str] = set()
+    unusable = 0
+    for cf in body.changed_files:
+        path = cf.path.strip()
+        if not path:
+            unusable += 1
+            continue
+        if path in seen:
+            continue
+        seen.add(path)
+        session.add(ReviewRunFile(
+            run_id=run.id, path=path, additions=cf.additions, deletions=cf.deletions,
+        ))
 
     # Sonar's hard-gate issues are the gate's own output, not a panel member's
     # judged findings — excluded from the scorecards so they can't inflate a
@@ -862,7 +1088,13 @@ async def record_review(
             )
 
     await session.commit()
-    return {"id": run.id, "recorded": True, "findings": len(findings), "accounts": accounts}
+    recorded = {"id": run.id, "recorded": True, "findings": len(findings),
+                "accounts": accounts, "changed_files": len(seen)}
+    # Only when something WAS dropped, so an ordinary response stays the shape
+    # every existing caller already parses.
+    if over_cap or unusable:
+        recorded["changed_files_dropped"] = {"over_cap": over_cap, "unusable": unusable}
+    return recorded
 
 
 # ------------------------------------------------------------------ read paths
@@ -878,6 +1110,13 @@ def _run_view(r: ReviewRun) -> dict:
         "pr_title": r.pr_title,
         "base": r.base_branch,
         "changed_lines": r.changed_lines,
+        # The count only — the paths themselves are per-run children and would
+        # turn every page of `GET /reviews` into a file dump. `GET /review/{id}`
+        # carries the list; this is what a run LIST needs to know a list exists.
+        "changed_files_total": r.changed_files_total,
+        # As of this run, not live — the run's own `ts` is the staleness signal.
+        "pr_state": r.pr_state,
+        "is_draft": r.is_draft,
         "diff_chars": r.diff_chars,
         "diff_truncated": r.diff_truncated,
         "judged": r.judged,
@@ -1636,8 +1875,22 @@ async def get_review(
         )).all()
     )
     reports = await _reports_by_finding(session, [f.id for f in findings])
+    files = list(
+        (await session.scalars(
+            select(ReviewRunFile)
+            .where(ReviewRunFile.run_id == run_id)
+            .order_by(ReviewRunFile.path)
+        )).all()
+    )
     return {
         **_run_view(run),
+        # Read `changed_files_total` against `len(changed_files)` before building
+        # anything on this list: they are allowed to disagree, and when they do
+        # the list is a PREFIX of what the PR touches.
+        "changed_files": [
+            {"path": f.path, "additions": f.additions, "deletions": f.deletions}
+            for f in files
+        ],
         "reviewers": [_card_view(c) for c in cards],
         "findings": [_finding_view(f, reports.get(f.id, [])) for f in findings],
     }

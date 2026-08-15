@@ -98,10 +98,13 @@ GET   /sync              ?repo=&branch=&device=&path=          (registered workt
                          &have=sha,sha,…&dirty=&ahead=&behind= (…or just describe yourself)
                          -> {published:[…], worktrees:[…], caller, stale, registered, advice}
 
-# reviewer-panel stats (v2.10, accounts v2.11, rounds + coverage v2.15, cost v2.19)
-POST  /review            (panel.py --json payload)              -> {id, recorded, accounts}
+# reviewer-panel stats (v2.10, accounts v2.11, rounds + coverage v2.15, cost v2.19,
+#                        changed files v2.23)
+POST  /review            (panel.py --json payload)              -> {id, recorded, accounts,
+                                                                    changed_files[, dropped]}
 GET   /reviews           ?repo=&pr=&author=&since=&days=&limit=  (runs + scorecards)
-GET   /review/{id}                                              (scorecards + findings + accounts)
+GET   /review/{id}                                              (scorecards + findings + accounts
+                                                                 + the PR's changed_files)
 GET   /review/stats      ?repo=&author=&days=&judged_only=       -> {by_model, by_agent}
 GET   /review/findings   ?repo=&pr=&limit=                       (one PR's findings as
                                                                   chains of observations,
@@ -185,14 +188,17 @@ says how much of a window actually reported.
 
 The deployed board version lags the repo until the stack is redeployed, and only the running
 service knows which it is: ask it with `GET /openapi.json` → `.info.version`, for whichever
-instance you care about. (Anything built off this branch says 2.19.0 — v2.20 onward are harness-side.) A number written here
+instance you care about. (Anything built off this branch says 2.23.0 — v2.24 is harness-side.) A number written here
 instead would be wrong the next time Portainer redeploys, with no diff to catch it.
 Latest release: **v2.24**, harness-side — a new finding now says whether the last fix pass caused it
-or the last round missed it, which were one number before and want opposite remedies. (v2.22 and
-v2.23 are claimed by branches not yet merged, which is why the numbering jumps.)
-Before it, **v2.21** had each panel member run in its own empty sandbox repo rather than in whatever
-directory the panel was launched from, and made a panel that lost a seat say so; **v2.20** had the worktree
-tooling ask who is in a directory before rewriting it, and **v2.19** added the per-reviewer
+or the last round missed it, which were one number before and want opposite remedies. (**v2.22** is
+claimed by a branch not yet merged, which is why the numbering skips it.)
+Before it, **v2.23** had a run record which FILES the PR changed and not just how many lines, plus
+the PR's state as of that panel, so the board finally holds what collision ordering needs (schema
+revision 0016) — reading it back as a collision query ships separately, see #101.
+**v2.21** (harness-side) had each panel member run in its own empty sandbox repo
+rather than in whatever directory the panel was launched from. **v2.20** (also harness-side) had the
+worktree tooling ask who is in a directory before rewriting it, and **v2.19** added the per-reviewer
 cost columns (schema revision 0015) and was the first to move the board since v2.15; **v2.18**
 settles a reply carrying several JSON-shaped values by agreement rather than by rank, **v2.17** made
 a reviewer that produced nothing a failure that says why, and **v2.16** stopped the panel capping
@@ -220,6 +226,9 @@ judge) are harness-side too.
 - **v2.21** — each panel member runs in its own empty sandbox repo, not in whatever directory the
   panel was launched from and not in the repo under review; and a panel that lost a seat says so
   above its findings.
+- **v2.23** — a run records the PR's changed FILES and its state, not just a line count, so "which
+  other PRs does this merge disturb" becomes answerable from stored data. NULL and zero are kept
+  apart throughout: "nobody counted" is never "it changed nothing".
 - **v2.24** — a new finding records whether the last fix pass introduced it or the last round missed
   it: two facts with opposite remedies that `new_this_round` collapsed into one, plus the commit each
   round reviewed and the files it was truncated out of. A signal, not a verdict — nothing gates on it.
@@ -372,7 +381,8 @@ app/          FastAPI service
   api/leases.py    POST /lease[/renew,/release], POST /handoff, POST /snapshot,
                    GET /sessions, GET /session/{key}
   api/subagents.py POST /subagent[/end], GET /active (collision index), GET /overlap
-  api/reviews.py   POST /review, GET /reviews, /review/{id}, /review/stats, /review/findings
+  api/reviews.py   POST /review, GET /reviews, /review/{id}, /review/stats, /review/findings,
+                   /review/collisions
   api/worktrees.py PUT/GET /worktrees (cross-worktree discovery)
   api/sync.py      GET /sync (published line vs registered checkouts)
   api/whoami.py    GET /whoami (the caller's resolved board identity)
