@@ -26,6 +26,11 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.pytest.ini_options]
+# Named explicitly so a bare `pytest` loads tests/conftest.py as an *initial*
+# conftest — which is what lets it announce the database it is about to rebuild
+# before collection starts, rather than after. It also keeps a bare run off
+# harness/, which carries its own suite with its own conventions.
+testpaths = ["tests"]
 asyncio_mode = "auto"
 # One shared event loop for the whole session so the module-level async engine's
 # connection pool isn't torn down under a closed loop between tests.
