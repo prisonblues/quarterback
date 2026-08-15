@@ -154,7 +154,7 @@ DEFAULT_MAX_ROUNDS = 2
 # What a round past the first REVIEWS. "increment" makes the review target the
 # diff between the previous round's head and this one's — the fix commit, which
 # is the only thing round 2 exists to read (#24) — with the rest of the PR
-# supplied as context rather than as target. "pr" is the pre-v2.23 behaviour:
+# supplied as context rather than as target. "pr" is the pre-v2.25 behaviour:
 # re-read the whole growing PR every round.
 #
 # The default is `increment` because the alternative degrades as it works. Over
@@ -2308,17 +2308,21 @@ PR_SCOPE_HEADER = "--- DIFF ---"
 INCREMENT_BRIEF = """This is round {round_no} of a panel -> fix -> panel cycle, and it is scoped.
 Round {prior_round} reviewed this PR at {since8}; a fixer has written more since. What changed
 between them is YOUR REVIEW TARGET and comes first below. The rest of the PR follows it as
-CONTEXT: earlier rounds have already reviewed that code and their findings have already been
-fixed, so do not re-report it.
+CONTEXT, and the target is where your effort belongs.
 
 Read the context anyway, and read it hardest where the target touches it. What a fix pass
 breaks, it usually breaks at the seam — the new code is correct on its own terms and wrong
 where it meets what was already there. A defect that is only visible in the target BECAUSE of
-what the context does is exactly what this round exists to find, and it is in scope.
+what the context does is exactly what this round exists to find.
 
-If the context you were given is not enough to judge something in the target, say so in
-`could_not_assess` rather than guessing. Being short of context is expected here and saying
-so is useful; a confident answer built on a file you could not see is not."""
+**A defect nobody has raised yet is in scope wherever you find it, context included.** Earlier
+rounds read that code; reading it is not the same as being right about it, and they are
+demonstrably wrong about some of it. What is out of scope is re-reporting a defect an earlier
+round already raised — those have been fixed, and the fix is in the target you are reading.
+
+If the context you were given is not enough to judge something, say so in `could_not_assess`
+rather than guessing. Being short of context is expected here and saying so is useful; a
+confident answer built on a file you could not see is not."""
 
 JUDGE_INCREMENT_BRIEF = """This round of the panel was SCOPED, and you are seeing what the reviewers saw.
 Round {prior_round} reviewed this PR at {since8}. The reviewers' target was what a fixer has
@@ -2330,8 +2334,10 @@ Two consequences for your ruling, and they pull in opposite directions:
 - A finding about the CONTEXT is not automatically out of scope. A defect in the target that
   is only visible against the code it landed in is precisely what this round was run to find,
   and it should be confirmed on its merits.
-- A finding that merely re-reports already-reviewed context, with nothing to do with the
-  target, is out of scope for this round — earlier rounds ruled on that code."""
+- What is out of scope is a finding an earlier round ALREADY RAISED, which has been fixed and
+  whose fix is in the target. A defect in the context that nobody has raised is NOT out of
+  scope merely for sitting outside the target: earlier rounds read that code, which is not the
+  same as being right about it, and the reviewers were told so."""
 
 
 @dataclass
@@ -2416,7 +2422,7 @@ class ReviewScope:
             notes.append(
                 f"round {round_no} reviewed the whole PR, not the increment: no baseline "
                 "said which commit it reviewed (`head_sha`). Pass --since <sha>, or a "
-                "baseline written by v2.23 or later")
+                "baseline written by v2.25 or later")
             return whole, notes
         if anchor == head:
             # A fact about the cycle rather than a failure, and a loud one: the
@@ -4354,6 +4360,17 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # nothing outstanding — over code that no round in it ever read. So a quiet
     # round here is not evidence about that region, and says so.
     inherited: list[str] = []
+    # Context the budget cut is a coverage gap in its own right, and it has to
+    # veto rather than merely be noted. A scoped round is still allowed to raise a
+    # defect nobody raised before, wherever it sits — the brief says so in as many
+    # words — so the context is not decoration, it is the only part of the PR this
+    # round can find a pre-existing defect in. Cut it and that becomes
+    # unreachable, and the round would report the resulting quiet as convergence.
+    if review.scope == "increment" and short_context:
+        inherited.append(
+            f"{', '.join(short_context)} saw only part of the PR behind the increment — a "
+            "defect earlier rounds misjudged, in the part that did not fit, could not have "
+            "been raised this round")
     if review.scope == "increment" and prior.truncated_rounds:
         was = ", ".join(str(r) for r in sorted(prior.truncated_rounds))
         inherited.append(
@@ -4809,7 +4826,7 @@ def main() -> int:
                          "commits since the last round's head, with the rest of the "
                          "PR as context — cheaper as the PR grows, and it is the fix "
                          "commit the cycle exists to read. pr: re-read the whole diff, "
-                         "as every release before v2.23 did. auto (default): the repo's "
+                         "as every release before v2.25 did. auto (default): the repo's "
                          f"review_panel.round_scope, itself defaulting to "
                          f"{DEFAULT_ROUND_SCOPE}. Round 1 is always the whole PR")
     ap.add_argument("--since", default="", metavar="SHA",

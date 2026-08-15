@@ -7,7 +7,7 @@ that number where it was, so the repo can be a version ahead of the service.
 Entries are newest first. Each one says what was broken or missing before it, because that is the
 part that isn't recoverable from the diff.
 
-## v2.23 — a later round reads the fix commit, not the whole PR again
+## v2.25 — a later round reads the fix commit, not the whole PR again
 
 A panel/fix cycle exists because nobody reads the fixer's commit (v2.15). Round 2 was then handed
 the entire PR — the fix plus everything rounds before it had already read, ruled on and confirmed —
@@ -58,7 +58,21 @@ The judge sees exactly what the panel saw, briefed to rule rather than to review
 nothing if it rules "not in the diff" while holding a different diff, and it would do so with the
 authority of the final call.
 
-**One caveat travels with the saving, and it vetoes a confident stop.** Increment scope makes an
+**A scoped round can still raise a defect nobody has raised, wherever it sits.** The obvious rule —
+"the context has already been reviewed, do not report it" — makes a pre-existing defect
+structurally unfindable, and #48's `missed` bucket then reads zero by construction rather than by
+measurement. On PR #75's real round 1 to round 2 that bucket was 12 of 26: twelve defects that sat
+in round 1's diff and round 1 did not see. Suppressing them would not re-attribute them, it would
+make them invisible, and the loop would look converged because it had stopped looking. So what is
+out of scope is a defect an earlier round *already raised* — which is fixed, and whose fix is in
+the target. Earlier rounds read the rest; reading it is not the same as being right about it, and
+both briefs say so.
+
+That is also why context the budget cut is a **veto** and not merely a note: the context is the only
+part of the PR a scoped round can find a pre-existing defect in, so a round that could not see all of
+it must not report the resulting quiet as convergence.
+
+**One more caveat, and it vetoes a confident stop too.** Increment scope makes an
 earlier round's truncation permanent. Under whole-PR scope a region round 1 was cut off from is read
 again by round 2; under increment scope round 2 reads only the fix commit and never returns, so a
 cycle can now converge — nothing new, nothing outstanding — over code that no round in it ever read.

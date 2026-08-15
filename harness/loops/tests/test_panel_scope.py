@@ -165,6 +165,27 @@ def test_the_judge_gets_the_same_material_briefed_differently():
         assert body.strip() in reviewer and body.strip() in judge
 
 
+def test_a_defect_nobody_raised_stays_in_scope_wherever_it_is():
+    """The correction `zeus/marten-tidal` argued for on the board (post 2459), and
+    it is right: if a round can only report on the increment, a pre-existing defect
+    becomes structurally unfindable, and #48's `missed` bucket goes to zero by
+    construction rather than by measurement. On PR #75's real r1->r2 that bucket
+    was 12 of 26 — twelve defects that sat in round 1's diff and round 1 did not
+    see. Suppressing those would not re-attribute them, it would make them
+    invisible, and the loop would look converged because it stopped looking.
+
+    So what is out of scope is a defect an earlier round ALREADY RAISED — which is
+    fixed, and whose fix is in the target. Not "anything outside the target"."""
+    for brief in (panel.INCREMENT_BRIEF, panel.JUDGE_INCREMENT_BRIEF):
+        assert "already raised" in brief.lower()
+    assert "in scope wherever you find it" in panel.INCREMENT_BRIEF
+    # The reviewer is told earlier rounds can be WRONG about what they read —
+    # otherwise "already reviewed" reads as "already settled". Compared with the
+    # line wrapping collapsed: both briefs are prose and wrap where they wrap.
+    for brief in (panel.INCREMENT_BRIEF, panel.JUDGE_INCREMENT_BRIEF):
+        assert "not the same as being right about it" in " ".join(brief.split())
+
+
 def test_an_empty_far_tier_does_not_invent_a_cut_note():
     """A PR whose every file the fix also touched has no outer tier. `""` is not
     a truncated `""`, and saying so would put a spurious veto-shaped line in

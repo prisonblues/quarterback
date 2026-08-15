@@ -126,12 +126,12 @@ Detected from the checkout, **not settable** here: `path`, `github`, `default_br
 the diff each model is given. Override per reviewer with
 `reviewers.<name>.max_diff_chars` and for the master with
 `review_panel.judge_max_diff_chars`; both inherit the panel value when unset. Since
-v2.23 that budget buys the review target first and the PR context with whatever is left
+v2.25 that budget buys the review target first and the PR context with whatever is left
 (see rounds, below), so on a scoped round it is no longer the target that a tight budget
 cuts.
 
 `review_panel.round_scope` (default: **`increment`**) — whether a round past the first
-reads the fix commit or the whole PR again. `pr` restores the pre-v2.23 behaviour for a
+reads the fix commit or the whole PR again. `pr` restores the pre-v2.25 behaviour for a
 repo whose PRs are small enough that re-reading them costs nothing.
 
 There used to be a 60,000-char default, and it was a fossil: prompts travelled in
@@ -307,7 +307,7 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   reviewer is truncated again next round — they only stop a broken round being reported
   as clean. A round past the first with no `--baseline` is itself a veto: it has nothing
   to compare against, so its "all new" count means nothing and its stop is unearned.
-- **A round past the first reviews the INCREMENT, not the whole PR** (v2.23). The target is
+- **A round past the first reviews the INCREMENT, not the whole PR** (v2.25). The target is
   what changed since the head its baseline reviewed (`head_sha` in the payload; `--since`
   overrides it), and the rest of the PR follows as context in two tiers: the PR's other
   changes to the files the increment touches, then everything else. A budget is spent in

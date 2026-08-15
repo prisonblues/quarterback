@@ -233,7 +233,7 @@ all is reported the same way, and costs the round its confidence.)
 Pass **every** earlier round's payload as a `--baseline`, or a finding raised in
 round 1, missed in round 2 and raised again in round 3 counts as new.
 
-**Round 2+ reviews the fix commit, not the whole PR again** (v2.23), and it gets
+**Round 2+ reviews the fix commit, not the whole PR again** (v2.25), and it gets
 there off the baseline you just passed — `head_sha` in that payload is the anchor,
 so this needs no new flag from you. Two consequences worth knowing when you read
 the result:

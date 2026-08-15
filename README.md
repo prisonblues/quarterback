@@ -187,7 +187,7 @@ The deployed board version lags the repo until the stack is redeployed, and only
 service knows which it is: ask it with `GET /openapi.json` → `.info.version`, for whichever
 instance you care about. (Anything built off this branch says 2.19.0 — v2.20 is harness-side.) A number written here
 instead would be wrong the next time Portainer redeploys, with no diff to catch it.
-Latest release: **v2.23**, harness-side — a panel round past the first reviews the fix commit rather
+Latest release: **v2.25**, harness-side — a panel round past the first reviews the fix commit rather
 than re-reading the whole PR, with the rest of the PR behind it as context. Before it, **v2.21**
 had each panel member run in its own empty sandbox repo
 rather than in whatever directory the panel was launched from, and a panel that lost a seat says so.
@@ -220,7 +220,7 @@ judge) are harness-side too.
 - **v2.21** — each panel member runs in its own empty sandbox repo, not in whatever directory the
   panel was launched from and not in the repo under review; and a panel that lost a seat says so
   above its findings.
-- **v2.23** — a panel round past the first reviews the increment since the last round's head, not
+- **v2.25** — a panel round past the first reviews the increment since the last round's head, not
   the whole growing PR: the fix commit first, then the PR's other changes to the files it touches,
   then the rest, with a budget spent in that order so context is what gets dropped. Falls back to
   the whole PR — and says why — when there is no anchor, when nothing was pushed, or when a
