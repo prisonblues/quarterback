@@ -7,6 +7,53 @@ that number where it was, so the repo can be a version ahead of the service.
 Entries are newest first. Each one says what was broken or missing before it, because that is the
 part that isn't recoverable from the diff.
 
+## v2.17 — a reviewer that produced nothing has failed, and says why
+
+`run_cli` read a CLI's stderr only when it exited non-zero, and treated every zero exit as a
+successful run. A headless CLI that exits 0 having printed nothing was therefore recorded as a
+reviewer that ran and found nothing — the opposite claim. Observed against `agy` 1.1.12 on a real
+PR diff: exit 0, `status: SUCCESS`, `response: ""`, because a tool needed a permission headless
+mode cannot prompt for and it was auto-denied. `agy` said exactly that on stderr and named both
+remedies, and the run that had a diagnosis was the one run whose stderr nothing read.
+
+The cost isn't one lost review. The member still appears in the report as having run, `⋆consensus`
+weakens with no indication why, and the board's reviewer leaderboard is fed a false zero — the one
+datum a reviewer comparison has to be able to trust. It gets worse, not better, as reviewers are
+given broader tool permissions, since a mis-scoped permission rule is precisely what produces this
+state.
+
+So a zero exit with empty or whitespace-only stdout is now a failure, its reason quoting the CLI's
+own sentence, and callers may rely on a non-`None` stdout having content. Stderr is read on a zero
+exit **only** when stdout is empty: a CLI that delivered its findings and also logged warm-up noise
+succeeded, and reporting that noise would be the mirror of the bug. A blank reply is retried,
+because unlike a refused request it isn't self-evidently deterministic — unless its stderr names a
+settled cause, of which there are now two, kept distinct because they are fixed in different files:
+a request the server refused (a rotted model pin — `.harness-rules`) and a tool the CLI's own
+sandbox auto-denied (`permissions.allow` in its settings.json). That test now short-circuits a
+non-zero exit as well, where only the server refusal used to.
+
+The judge inherits the fix: an empty verdict reports "produced no output" instead of blaming the
+shape of a reply it never made. `epic.py`'s triage had the same bug in another seat — exit 0 with
+no verdict reported a bare `untriaged (no verdict)` and dropped the stderr explaining it, having
+never looked at the exit code either — and untriaged sub-issues are skipped on `--execute`, so that
+one line is the operator's only account of why one was passed over.
+
+The neighbouring case is deliberately *not* a skip: output that is neither empty nor a findings
+array — an agent narrating a wait, prose where JSON was asked for — is still kept as one raw
+finding, because "no parseable array" would also throw away a reviewer that answered in prose
+because it had something to say. It is flagged `unstructured`, which the coverage veto states as
+"returned no structured reply — its coverage is unknown", so such a round cannot be read as
+evidence of a quiet PR.
+
+Also here, from working on the above: this repo gets its own `.harness-rules` (all four vendors
+pinned and verified by running them), `_`-prefixed keys are stripped as comments at every depth
+before anything reads the config, and a reviewer name nothing recognises is warned about on stderr
+rather than silently producing a panel one vendor short. `harness_rules.DEFAULTS` also learns the
+`antigravity` seat's real name — it still said `gemini`, which `panel.py` has not answered to since
+the seat moved to Google's Antigravity CLI.
+
+No board change: the API and the served version stay at v2.15.
+
 ## v2.16 — no diff budget by default
 
 The panel gave every reviewer 60,000 chars of diff and no more. That number was inherited from a

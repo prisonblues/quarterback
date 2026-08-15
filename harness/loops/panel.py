@@ -684,9 +684,11 @@ def run_cli(args: list[str], label: str, timeout: int = CLI_TIMEOUT,
     weren't waiting on anyway — the reviewers run concurrently, so a slow seat
     only extends the run when it is the slowest one. The reason string is specific (timeout / exit code + stderr
     tail / OSError) so callers can SURFACE why a step degraded instead of
-    reporting a bare 'unavailable'. A request the server has REJECTED on its
-    merits is not retried either: a bad model pin fails identically all three
-    times, so retrying only triples the wait for a certainty.
+    reporting a bare 'unavailable'. A failure something has already SETTLED is
+    not retried either, whichever exit code it arrives with — a bad model pin the
+    server refuses, or a tool the CLI's own sandbox auto-denies (see
+    is_deterministic_failure) — because it fails identically all three times, so
+    retrying only triples the wait for a certainty.
 
     **A zero exit with no output is a failure, not an empty review.** Headless
     CLIs exit 0 while producing nothing — `agy` does it when a tool needs a
@@ -733,7 +735,7 @@ def run_cli(args: list[str], label: str, timeout: int = CLI_TIMEOUT,
         if proc.returncode != 0:
             msg = stderr_gist(proc.stderr or "")
             last = f"{label}: exited {proc.returncode}" + (f" ({msg})" if msg else "")
-            if is_rejection(proc.stderr or ""):
+            if is_deterministic_failure(proc.stderr or ""):
                 return None, last
             continue
         if not (proc.stdout or "").strip():

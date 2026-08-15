@@ -135,6 +135,24 @@ def test_a_blank_reply_the_server_refused_is_not_retried(monkeypatch):
     assert "does not exist" in err
 
 
+def test_an_auto_denied_permission_is_not_retried_on_a_NON_zero_exit_either(monkeypatch):
+    """The predicate is about whether another attempt would differ, not about the
+    exit code that carried the news. A CLI that auto-denies a tool AND exits
+    non-zero is as settled as one that swallows it into a zero exit — retrying it
+    three times only spends the reviewer's slot on the same refusal."""
+    calls = _fake_cli(monkeypatch, ("", DENIED, 1), (FINDINGS, "", 0))
+    out, err = panel.run_cli(["agy"], "antigravity (m)", attempts=3)
+    assert len(calls) == 1 and out is None
+    assert "exited 1" in err and "permissions.allow" in err
+
+
+def test_a_non_zero_exit_with_no_settled_cause_is_still_retried(monkeypatch):
+    """The other side of it: rate limits and blips are why the retry exists."""
+    calls = _fake_cli(monkeypatch, ("", "429 rate limited\n", 1), (FINDINGS, "", 0))
+    out, err = panel.run_cli(["agy"], "antigravity (m)", attempts=3)
+    assert len(calls) == 2 and out == FINDINGS and err is None
+
+
 def test_the_two_settled_causes_stay_distinguishable():
     """They are fixed in different files — a model pin in `.harness-rules`, a
     permission rule in the CLI's own settings.json — so a report that conflated
@@ -153,29 +171,67 @@ def test_the_reviewer_is_reported_skipped_with_the_cause(monkeypatch):
     — not a reviewer that silently contributed nothing."""
     monkeypatch.setattr(panel.shutil, "which", lambda _: "/usr/bin/agy")
     _fake_cli(monkeypatch, ("", DENIED, 0))
-    finds, skip, _ms = panel.review_llm("antigravity", "gemini-3.7-flash-high", "p")
-    assert finds == []
-    assert "produced no output" in skip and "permissions.allow" in skip
+    got = panel.review_llm("antigravity", "gemini-3.7-flash-high", "p")
+    assert got.findings == []
+    assert "produced no output" in got.skip and "permissions.allow" in got.skip
 
 
 def test_an_empty_reply_never_becomes_an_unstructured_finding(monkeypatch):
     """The fallback that keeps an unparseable reply as a raw markdown finding is
     for a reviewer that said something. Handing the judge an empty one is how a
-    dead reviewer used to look like a live one."""
+    dead reviewer used to look like a live one — and `unstructured` is the flag
+    the coverage veto reads, so a run that produced nothing must not set it
+    either: "returned no structured reply" and "did not run" are different
+    accounts, and only the second one is true here."""
     monkeypatch.setattr(panel.shutil, "which", lambda _: "/usr/bin/agy")
     _fake_cli(monkeypatch, ("", DENIED, 0))
-    finds, skip, _ms = panel.review_llm("antigravity", "m", "p")
-    assert finds == [] and skip is not None
+    got = panel.review_llm("antigravity", "m", "p")
+    assert got.findings == [] and got.skip is not None
+    assert got.unstructured is False
 
 
 def test_prose_is_still_kept_as_a_raw_finding(monkeypatch):
     """The regression guard on the above: output that isn't JSON but IS a review
-    still reaches the judge rather than being discarded as unparseable."""
+    still reaches the judge rather than being discarded as unparseable — and is
+    flagged `unstructured`, because nothing it might have declared about its own
+    coverage survived the parse."""
     monkeypatch.setattr(panel.shutil, "which", lambda _: "/usr/bin/agy")
     _fake_cli(monkeypatch, ("The retry loop double-counts on line 12.", "", 0))
-    finds, skip, _ms = panel.review_llm("antigravity", "m", "p")
-    assert skip is None and len(finds) == 1
-    assert "double-counts" in finds[0].detail
+    got = panel.review_llm("antigravity", "m", "p")
+    assert got.skip is None and len(got.findings) == 1
+    assert "double-counts" in got.findings[0].detail
+    assert got.unstructured is True
+
+
+# The other half of the same reviewer failure, from the issue's follow-up: exit
+# 0 with stdout that is neither empty nor a review. `agy` had assembled 18
+# findings — the transcript shows them — but the print-mode turn ended while the
+# agent was narrating a wait, so the answer never reached stdout.
+NARRATION = ("I have launched the pytest suite in the background to inspect test results "
+             "while analyzing the diff. I will wait for it to complete.\n"
+             "I am waiting for the test suite task to finish execution.")
+
+
+def test_narration_passes_the_emptiness_guard_but_is_still_not_a_clean_review(monkeypatch):
+    """This one the emptiness guard cannot catch, and deliberately is not made to:
+    "no parseable findings array" would also discard the reviewer that answered in
+    prose because it had something to say, and losing real findings to a formatting
+    miss is the more expensive of the two errors.
+
+    What it must never do is read as a reviewer that engaged and found little. It
+    does not: the reply is flagged `unstructured`, which the coverage veto turns
+    into a stated reason the round is not evidence of a quiet PR, and the judge
+    rules on the text rather than the panel silently counting it."""
+    monkeypatch.setattr(panel.shutil, "which", lambda _: "/usr/bin/agy")
+    _fake_cli(monkeypatch, (NARRATION, "", 0))
+    got = panel.review_llm("antigravity", "m", "p")
+    assert got.unstructured is True
+    # None of its own coverage survived the parse, so it declared nothing — which
+    # is null (never said), not [] (asked, and had no gap).
+    assert got.could_not_assess is None
+    veto = panel.coverage_veto(
+        {"antigravity": {"ran": True, "unstructured": True}}, None, [], len(NARRATION))
+    assert any("no structured reply" in v for v in veto)
 
 
 # ---------------------------------------------------------------- judge
@@ -187,7 +243,11 @@ def test_the_judge_reports_no_output_rather_than_unparseable(monkeypatch):
     signal that the adjudication silently stopped happening."""
     monkeypatch.setattr(panel.shutil, "which", lambda _: "/usr/bin/claude")
     _fake_cli(monkeypatch, ("", DENIED, 0))
-    groups = panel.group_findings(panel.parse_findings("claude", FINDINGS))
-    verdicts, skip = panel.judge(groups, "diff", "opus")
-    assert verdicts == {}
+    findings, _gaps = panel.parse_reply("claude", FINDINGS)
+    out, skip, _note = panel.adjudicate(panel.cluster_findings(findings),
+                                        "diff", "opus", 19)
+    # Nothing is suppressed when the judge cannot rule — the finding survives,
+    # unjudged, and the skip reason is the only account of why.
+    assert [c.verdict for c in out] == ["unjudged"]
     assert "produced no output" in skip and "unparseable" not in skip
+    assert "permissions.allow" in skip

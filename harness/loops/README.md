@@ -238,7 +238,12 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   and the skip line quotes the CLI's own stderr, which usually names both the cause
   and the fix. A blank reply is retried unless that stderr names a settled cause (a
   refused request, an auto-denied tool permission), which no retry can change.
-  Why it is worth the code: `run_cli`'s docstring in `panel.py`.
+  Why it is worth the code: `run_cli`'s docstring in `panel.py`. The neighbouring
+  case — output that is neither empty nor a findings array, e.g. an agent narrating
+  a wait — is *not* a skip, because "no parseable array" would also throw away a
+  reviewer that answered in prose because it had something to say. It is kept as one
+  raw finding and flagged `unstructured`, which the coverage veto states as
+  "returned no structured reply — its coverage is unknown".
 - **Reviewers declare their own coverage.** Each returns `could_not_assess` (areas it
   could not judge — a file the diff omits, a runtime behaviour) and can mark a finding
   `needs_rereview` (fixing it takes a structural change whose result should be read
