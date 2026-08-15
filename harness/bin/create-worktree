@@ -734,6 +734,27 @@ fi
 step "Creating git worktree and branch..."
 cd "$MAIN_REPO"
 
+# Remember how a conflict was resolved, and replay it the next time the same one
+# appears. Asserted here rather than left to whoever remembers, because this is
+# the tool whose value is proportional to the number of worktrees: one merge into
+# the default branch produces the SAME conflict in every open branch, and every
+# worktree of a repo shares its common git dir — so `rr-cache` is shared with no
+# further configuration. Resolve once, replay in the other nine.
+#
+# Repo-local, never --global: it is this repo's shape that justifies it. Only set
+# when unset, so a repo that turned it off stays off. And `rerere.autoUpdate` is
+# deliberately NOT set — a replayed resolution is left unstaged, so it has to be
+# looked at before it is committed. That matters: rerere matches on conflict text
+# and cannot know the right answer changed since last time, which is the live
+# hazard for the file this helps most with (a CHANGELOG's version narrative,
+# where the correct resolution depends on which releases are in flight).
+if ! git config --get rerere.enabled >/dev/null 2>&1; then
+    git config rerere.enabled true
+    echo -e "  ${GREEN}rerere enabled${NC} for this repo — conflict resolutions are now"
+    echo -e "  remembered and replayed across its worktrees. Read a replayed one before"
+    echo -e "  committing it: it is git's last answer, not necessarily this one's."
+fi
+
 # Refresh remote-tracking refs so an existing/remote branch checks out at its
 # latest pushed state, not whatever was cached at the last fetch. Best-effort:
 # never fail worktree creation just because the network/remote is unavailable

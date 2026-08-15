@@ -130,6 +130,22 @@ The commands are thin, guarded drivers over these. The scripts hold the determin
 logic on purpose: a model deciding *which* worktree to destroy is fine, a model
 hand-rolling `docker rm` / `dropdb` / `rm -rf` is not.
 
+**`create-worktree` also turns on `git rerere` for the repo, once, if nobody has set
+it either way.** This is the setting whose value scales with the number of worktrees:
+one merge into the default branch produces the *same* conflict in every open branch,
+and worktrees share the repo's common git dir — so `rr-cache` is shared with no further
+configuration, and a conflict resolved by hand in one tree is replayed in the rest.
+
+The part to know before it surprises you: **a replayed resolution is git's answer from
+last time, not a judgement about this merge.** rerere matches on the conflict text, so
+the same hunks get the same answer even when the right answer has changed — a CHANGELOG
+version narrative being the obvious case, since the correct resolution there depends on
+which releases happen to be in flight. `rerere.autoUpdate` is therefore deliberately
+left off: the merge still stops, the file is left **unstaged** with the previous answer
+in it, and you have to look at it and `git add` it yourself. Read a replayed resolution;
+do not trust it. Turn the whole thing off for a repo with `git config rerere.enabled
+false` — the script only ever sets it when it is unset, so that decision sticks.
+
 ### `worktree-holder` — is somebody else in there?
 
 The fourth script answers one question: **which live agent is working in this

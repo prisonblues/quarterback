@@ -7,6 +7,56 @@ that number where it was, so the repo can be a version ahead of the service.
 Entries are newest first. Each one says what was broken or missing before it, because that is the
 part that isn't recoverable from the diff.
 
+## v2.22 — the judge was one of the parties, and every worktree re-resolved the same conflict
+
+Two defaults, both cheap, both fixing something a day of dogfooding actually ran into. Harness-side
+only: the served version stays at 2.19.0.
+
+**`review_panel.judge_model` was `opus`, and so is `reviewers.claude.model`.** The panel's
+adjudicator was therefore the same brain as one of the seats it rules on, by default, in every repo.
+On 2026-08-15 four judge-confirmed findings turned out plainly wrong on inspection — `64-F02`,
+`64-F03`, `64-F04`, `32-F06` — and all four were raised by claude and confirmed by an `opus` judge.
+n=4, so the mechanism is the argument and not the sample; a model asked to rule on its own reasoning
+tends to find it sound. The harness already held this exact principle one level down, in the README
+line telling you to set `claude.model` to a different model than the PR author because same-model
+self-review is the weak case. The judge is that argument applied upward, and nothing applied it.
+
+The default is now `fable`. Upward rather than to `sonnet` because the judge's job did not get any
+easier, and `clamp_model` already states this repo's tie-break as failing toward capability rather
+than cheapness. **This is only a default**: pinning both keys to the same model still works and
+still says nothing. The enforcement half — refuse to run when the judge's model matches an enabled
+seat's — is `judge_independent` in #78 and is not implemented here.
+
+**Changing it exposed a coupling that was only ever true by accident.** `epic.py` read
+`review_panel.judge_model` as its *tier ceiling* when `--model` was not passed: the model that
+adjudicates a panel doubling as the most capable model an epic may spend on implementing a
+sub-issue. Those are two different questions that happened to have the same answer while both were
+`opus`, and a judge deliberately unlike a seat is exactly what breaks that. Left alone, this
+release would have quietly routed every unattended sub-issue's implementation at the top tier. The
+ceiling is now its own setting, `epic.model_ceiling`, defaulting to `opus` — which is what the old
+fallback resolved to, so epic behaviour is unchanged.
+
+**`git rerere` is off, so git forgets every conflict resolution the moment it is made.** That is the
+wrong default for work shaped like this one: a single merge into `main` produces the *same* conflict
+in every open branch, landing six PRs took eleven integration merges, and the CHANGELOG version
+narrative above was resolved by hand four separate times in four worktrees — same hunks, same
+answer. `create-worktree` now sets `rerere.enabled` for the repo, once, and only when nobody has set
+it either way, so a repo that turned it off stays off. Worktrees share the common git dir, so
+`rr-cache` is shared across every worktree of a repo with no further configuration: resolve once,
+replay in the other nine. Verified end to end — with rerere off the second branch gets raw conflict
+markers, with it on the same merge in a *worktree* prints `Resolved 'CHANGELOG.md' using previous
+resolution` and the resolved content is there.
+
+`rerere.autoUpdate` is deliberately **not** set, and that is the interesting half. rerere matches on
+the conflict text, so it replays last time's answer without knowing whether the right answer changed
+— and the file it helps most with is the one where the correct resolution depends on which release
+numbers are in flight. With autoUpdate off the merge still stops and the file is left unstaged, so a
+replayed resolution has to be read and staged by hand. It is git's previous answer, not a ruling
+about this merge.
+
+Closes #81. #78 keeps the rest of its constitution: quorum, threshold, `judge_independent`,
+segregation of duties, materiality, reserved matters, audit.
+
 ## v2.20 — nothing asked who was in the worktree
 
 Worktree-per-issue is how several agents work at once, and its isolation is file-level: separate
