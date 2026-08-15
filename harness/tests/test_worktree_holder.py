@@ -559,3 +559,36 @@ def test_a_symlinked_path_still_matches_its_marker(tmp_path, board):
     # …and the other way round.
     mark(markers, PEER, link)
     assert run(link, board_url=b.url, markers=markers).returncode == 3
+
+
+def test_a_lease_with_no_title_still_reports_the_right_fields(wt, board):
+    """The holder line is read back with `IFS` set to the field separator, and
+    tab is an IFS *whitespace* character — so bash collapsed the two tabs around
+    an empty title into one and every field after it shifted left. The title held
+    the timestamp, `since` held the literal word "agent" (which `age_of` then
+    printed verbatim, having failed to parse it as a date), and the "(sub-agent)"
+    marker disappeared.
+
+    A lease with no title is not exotic: the board's `title` is optional and jq
+    emits `""` for it. Unit Separator is not IFS whitespace, so empty fields stay
+    empty and stay put."""
+    b = board(agents=[lease(PEER, cwd=str(wt), title="")])
+    r = run(wt, board_url=b.url, markers=wt.parent / "markers")
+
+    assert r.returncode == 3
+    assert "zeus/ember-marten" in r.stderr
+    # The timestamp must not be quoted back as if the agent had named its task.
+    assert '"2026-08-15T13:07:26' not in r.stderr
+    # `since` is still a date, so the age renders as an age rather than a word.
+    assert "held for" in r.stderr and "held for agent" not in r.stderr
+
+
+def test_a_subagent_with_no_title_keeps_its_marker(wt, board):
+    """A sub-agent entry carries no `title` at all, and the marker that says it is
+    a fan-out rather than a peer is the LAST field — the one a field shift drops
+    first. This passes on the old code too, so it is a guard rather than a
+    regression test; the shift itself is pinned by the lease case above."""
+    b = board(subagents=[subagent(PEER, str(wt))])
+    r = run(wt, board_url=b.url, markers=wt.parent / "markers")
+    assert r.returncode == 3
+    assert "(sub-agent)" in r.stderr

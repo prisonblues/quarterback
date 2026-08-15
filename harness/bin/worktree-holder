@@ -224,8 +224,17 @@ elif [[ "$QUIET" != true ]]; then
         echo "worktree-holder: nobody else is live in $WT_PATH"
     else
         echo -e "${YELLOW}worktree-holder: $WT_PATH is held by another live agent${NC}" >&2
-        while IFS=$'\t' read -r holder session title since kind; do
-            [[ -z "$holder" ]] && continue
+        # Unit Separator, not tab. Tab is an IFS *whitespace* character, so bash
+        # collapses runs of them and strips leading/trailing ones — and a lease
+        # with no title is exactly that: jq emits an empty field, the two tabs
+        # around it become one, and every field after it shifts left. The title
+        # then held the timestamp, `since` held "agent" (so `age_of` printed the
+        # literal word), and the "(sub-agent)" marker vanished. With a null
+        # `.holder` the shift also slid a real value into `$holder`, so the
+        # skip-empty guard below stopped firing on the row it exists for.
+        # US is not IFS whitespace, so empty fields stay empty and stay in place.
+        while IFS=$'\x1f' read -r holder session title since kind; do
+            [[ -z "$holder" || "$holder" = "null" ]] && continue
             line="  $holder"
             [[ -n "$WT_BRANCH" ]] && line="$line · on $WT_BRANCH"
             [[ -n "$title" && "$title" != "null" ]] && line="$line · \"$title\""
@@ -233,7 +242,8 @@ elif [[ "$QUIET" != true ]]; then
             line="$line · session ${session:0:8}"
             [[ "$kind" = "subagent" ]] && line="$line (sub-agent)"
             echo -e "${YELLOW}$line${NC}" >&2
-        done < <(jq -r '.[] | [.holder, .session, (.title // ""), .since, .kind] | @tsv' <<<"$HOLDERS")
+        done < <(jq -r '.[] | [(.holder // ""), (.session // ""), (.title // ""),
+                              (.since // ""), (.kind // "")] | join("\u001f")' <<<"$HOLDERS")
     fi
 fi
 

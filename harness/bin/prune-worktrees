@@ -326,14 +326,29 @@ dir_is_worktree_remnant() {
 # is worth having before `--remove-dirs` runs `rm -rf`. Only a named, live holder
 # counts: `worktree-holder` may be absent and the board may be down, and neither
 # is a reason to leave real debris uncollected.
+
+# Resolved ONCE, not per directory: this runs inside a loop over every sibling
+# directory of the project, and `command -v` in there was pure repetition.
+HOLDER_BIN=$(command -v worktree-holder 2>/dev/null || true)
+if [[ -z "$HOLDER_BIN" && "$0" == */* ]]; then HOLDER_BIN="${0%/*}/worktree-holder"; fi
+[[ -n "$HOLDER_BIN" && -x "$HOLDER_BIN" ]] || HOLDER_BIN=""
+
+# Exit 4 is "could not tell", and its usual cause — no board configured, or a
+# board that is down — is a property of the RUN, not of the directory. Paying it
+# once per sibling meant up to 20 × `curl --max-time 5` of stall on a plain dry
+# run, plus one "could not check …" warning per directory, all saying the same
+# thing. The first 4 settles it for the sweep.
+HOLDER_GAVE_UP=false
+
 holder_of() {
-    local dir="$1" hb="" rc
-    hb=$(command -v worktree-holder 2>/dev/null || true)
-    if [[ -z "$hb" && "$0" == */* ]]; then hb="${0%/*}/worktree-holder"; fi
-    [[ -n "$hb" && -x "$hb" ]] || return 1
-    "$hb" "$dir" >/dev/null
+    local dir="$1" rc
+    [[ -n "$HOLDER_BIN" ]] || return 1
+    [[ "$HOLDER_GAVE_UP" = true ]] && return 1
+    "$HOLDER_BIN" "$dir" >/dev/null
     rc=$?
     [[ $rc -eq 3 ]] && return 0
+    # 4 = could not tell. Nothing else will tell either.
+    [[ $rc -eq 4 ]] && HOLDER_GAVE_UP=true
     return 1
 }
 
