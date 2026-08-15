@@ -9,8 +9,8 @@ part that isn't recoverable from the diff.
 
 ## v2.25 — a later round reads the fix commit, not the whole PR again
 
-(v2.22, v2.23 and v2.24 have no entry here because their numbers are held by PRs #87, #88 and #89,
-still open. This one landed first; the gap closes when they do.)
+(There is no v2.22 entry: that number is held by PR #87, which is harness-side and still open.
+v2.23 and v2.24 are below — both landed via #89, which carried the work #88 was closed in favour of.)
 
 A panel/fix cycle exists because nobody reads the fixer's commit (v2.15). Round 2 was then handed
 the entire PR — the fix plus everything rounds before it had already read, ruled on and confirmed —
@@ -106,6 +106,138 @@ again by round 2; under increment scope round 2 reads only the fix commit and ne
 cycle can now converge — nothing new, nothing outstanding — over code that no round in it ever read.
 The baseline carries which rounds were truncated, and a scoped round that inherits one says its quiet
 is not evidence about that region.
+
+## v2.24 — a new finding says whether the last fix caused it or the last round missed it
+
+`new_this_round` is binary: did an earlier round of this cycle raise this defect. So a finding new
+to round 2 was one of two very different things, recorded as one number.
+
+Either the round-1 **fix commit created it** — the loop finding its own damage, where the remedy is
+smaller and more conservative fix passes, because more rounds will keep generating more work. Or it
+was sitting in round 1's diff and **round 1 did not see it** — where the remedy is the opposite:
+spend on coverage, more budget, more reviewers, and more rounds genuinely help.
+
+Conflated, neither conclusion was available, including the one an operator has to draw at the cap.
+And the conflated number turns out to carry no information at all: across every payload banked on
+2026-08-15, `new_this_round` is true for **every single finding** — 26 of 26 on PR #75's round 2, 23
+of 23 on #76's. "No round has ever re-raised a finding" is not an approximation in this dataset, it
+is the whole of it, so the one signal there was is a constant.
+
+A round now records, per new finding, `provenance: introduced | missed | missed-unread | unknown`,
+and a `provenance_counts` tally beside it. The report prints the split under the round line, because
+the operator deciding whether to go again is who the distinction is for.
+
+**Nothing recorded which commit a round reviewed, and that had to come first.** The payload's `base`
+holds a branch *name*; the head oid was fetched for the SonarCloud staleness check and then dropped.
+So `head_sha` is now on every payload — including the *skipped* one, since a skipped round is still
+the round the next one baselines against, and a null there would blind the round after it. A
+baseline written before this release yields no SHA, and provenance then reads `unknown` rather than
+attributing against a range it invented.
+
+**`missed-unread` is the bucket that indicts the harness rather than the panel:** a defect in a file
+the earlier round was *truncated out of* is a coverage failure, not a reviewer failure. Truncation is
+a plain prefix cut, so what a round could not read is computed as it runs and banked for the next one
+(`unread_files`). A file counts as unread only if every reviewer that ran was cut on it — one seat
+that read it means the round saw it — and a file *straddling* the cut counts as unread, because a
+reviewer holding half a file's hunks has not read that file. A round that read *nothing* — every seat
+lost, or the PR skipped by title — records no coverage rather than full coverage, since an empty
+unread list read the other way turns every later coverage failure into a reviewer miss.
+
+**It is a signal, not a verdict, and is recorded as one.** A fix can break something at a distance,
+so a defect outside the fix's own lines is evidence of a miss rather than proof of one. Nothing gates
+on it, deliberately: recording that a fixer introduced 22 defects is data, and failing a fix pass for
+it before the signal is calibrated against a few dozen cycles would be acting on a heuristic. What it
+will not do is guess: a branch *rewritten* between rounds makes the compare range span history no fix
+pass wrote, so that range is refused rather than attributed, and so is a finding whose path could name
+two of the changed files. #41 (review the increment) is what would make it exact, at which point a
+finding in the increment is introduced by construction and the line-intersection guess can be retired.
+
+Verified against real history rather than only in tests: replaying PR #75's genuine round 1 → round 2
+(`b1ccc79`…`1538626`) splits its 26 new findings **14 introduced / 12 missed**, which is the point —
+a measure that put everything in one bucket would have been worth nothing.
+
+*(**v2.22** is missing from this file and that is deliberate — see the note under v2.23 below. It was
+written here as "v2.22 and v2.23 are claimed by branches that had not merged yet"; v2.23 has since
+landed, so only v2.22 is still outstanding.)*
+
+## v2.23 — the board knew how many lines a merge changed, and not which files
+
+`POST /review` carried `changed_lines: 2032` and no paths. The only file names the board held for a
+run were the ones its findings happened to mention — nine, on the run that number came from — which
+is a proxy for the diff and not the diff. So the question that decides what landing a PR costs was
+unanswerable: **which other open PRs does this merge disturb?** On 2026-08-15 six PRs took eleven
+integration merges to land, and the one pair that turned out disjoint (#73 against #62) was found to
+be disjoint by trying it. Nothing recorded it either before or after.
+
+A run now records the PR's changed files: `changed_files`, each path with its own additions and
+deletions, `changed_files_total`, and the PR's `pr_state`/`is_draft` as of that panel (schema
+revision 0016). `GET /review/{id}` reads them back.
+
+**This release lands the datum and not the query**, and the split is deliberate rather than
+unfinished. The collision endpoint that reads these rows was written, reviewed twice by a full
+four-seat panel, and pulled: two rounds put the *same* defect in it — a filter composed in front of
+the newest-run selection, so a stale run answers behind a confident result — and the second instance
+was introduced by the fix for the first. That is a design wanting its own rounds, not a third patch
+applied as an unreviewed final pass to a read path whose failure mode is a false all-clear. It ships
+in #101. What lands here is the record, which is what #82 asked for and what #80 needs.
+
+**It is the PR's file list, not the round's**, and that distinction is the reason it is read from
+`gh pr view` rather than from the diff the reviewers are handed. Under #41 a later round reviews only
+the increment; a collision surface that narrowed with it would report two PRs as no longer colliding
+because one of them had stopped *re-reading* a file it still changes. Reading it off the PR metadata
+makes that true by construction — and it is also why the title-skip path, which never fetches a diff
+at all, still emits a complete list in its payload, warnings included. A skipped PR collides with
+everything it touches, and it is the one most likely to be merged unattended.
+
+> **What the skip path does NOT do is reach the board**, and the first draft of this entry claimed
+> otherwise. It returns before `record_run`, deliberately — no review happened, and recording one
+> would put a row in `review_runs` that every stat in the module would then have to learn to
+> exclude. So a skipped PR's file list is available to `--json` consumers and to the next round's
+> `--baseline`, and no board query can see it in either direction. Making the board ingest
+> a skip payload as a file-list-only record is a real piece of work with a real decision in it, and
+> it is filed rather than smuggled in here.
+
+**The board also records the PR's state** (`OPEN`/`MERGED`/`CLOSED`, and whether it is a draft),
+from the same call. Without it a collision query has no way to tell a live rival from one merged
+last week and would report both — on a repo landing several a week that is most of the answer, which
+is how an advisory endpoint stops being read. The state is *as of that PR's last panel*, never live:
+the board is told about panels, not about merges, which is why every row carries its run's timestamp
+beside it. Anything outside GitHub's three values is stored as NULL rather than verbatim, because a
+consumer filtering on `!= "OPEN"` would silently reclassify a typo in the direction that hides work.
+
+**`changed_files_total` is GitHub's own count and is deliberately not derived from the list.** `gh`
+pages the files connection and GitHub caps a PR's file list at 3,000, so the two are allowed to
+disagree — and their disagreement is the only evidence that the stored list is a prefix. Derive one
+from the other and a truncated list reads as a complete one, which is this repo's recurring failure:
+a shortfall presenting as a clean result. When they disagree the panel says so above its findings,
+the same treatment v2.21 gave a short panel.
+
+**"Nobody counted" and "counted, and it was none" are kept apart everywhere**, because collapsing
+them makes every one of them read as a clean result. A run that changed no files has an empty list
+*and* a count of zero, which is knowledge — that PR is disjoint from everything. A run recorded
+before this release has no list at all, and `changed_files_total` is NULL. The same rule holds per
+file: an `additions` of NULL means "GitHub did not say", never "no lines".
+
+Keeping that apart turned out to be harder than saying it, and the panel caught **three separate
+places** where this release's own code collapsed the two — a per-file churn count defaulting to 0, an
+unstated total falling back to the list's own length under the name "falling back to what we can
+prove", and the payload defaults asserting zero files for a run that never got that far. Agreeing by
+construction is not proof. That is the same mistake this entry is entirely about, made three times
+inside it, which is worth recording rather than quietly fixing.
+
+**A limit that travels with the datum**, and it is why the query is hard: the board only knows PRs
+it has panelled. A PR nobody ever ran a panel on leaves no row, so no query over these tables can
+report it in any state. Closing that needs an open-PR list from GitHub on a board read path, which
+is a decision #80 owns and this release deliberately does not make.
+
+What was missing was the datum. Closes #82.
+
+> **There is no v2.22 in this file, and that is deliberate.** It is held by PR #87, which is
+> harness-side and still open; this release took the next free number rather than blocking on it.
+> Recorded here because a number that exists in the sequence and nowhere in the history is exactly
+> the gap this file exists to close — and because it is the fifth release-number collision of the
+> day, two agents having announced v2.23 one second apart. #76's check cannot catch that (both
+> branches are self-consistent); only #46's allocator half can.
 
 ## v2.21 — a panel that lost a seat said nothing about it
 

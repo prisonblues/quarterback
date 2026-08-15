@@ -87,8 +87,8 @@ def test_a_path_containing_the_separator_is_keyed_by_the_whole_path():
 def test_a_rename_header_still_gives_the_b_side():
     """The symmetry that pins an ambiguous path does not hold for a rename, which
     falls back to the first `" b/"` — what this always did."""
-    assert panel._diff_header_path("diff --git a/old.py b/new.py") == "new.py"
-    assert panel._diff_header_path("diff --git nonsense") is None
+    assert panel._diff_file_path("diff --git a/old.py b/new.py") == "new.py"
+    assert panel._diff_file_path("diff --git nonsense") is None
 
 
 def test_the_two_splitters_agree_on_the_key_for_ordinary_paths():
@@ -853,10 +853,23 @@ def _stub_run(monkeypatch, seen, *, cfg=None, findings=(), increment=INCREMENT,
     """Every process a run would spawn, replaced — so what is under test is the
     wiring inside `run()` rather than any CLI."""
     monkeypatch.setattr(panel, "load_repo_cfg", lambda name: dict(cfg or CFG))
-    monkeypatch.setattr(panel, "sh", lambda args, **kw: (
-        json.dumps({"title": title, "additions": 3, "deletions": 1, "baseRefName": "main",
-                    "headRefName": "feat/x", "headRefOid": HEAD})
-        if args[:3] == ["gh", "pr", "view"] else PR))
+
+    def fake_sh(args, **kw):
+        if args[:3] == ["gh", "pr", "view"]:
+            return json.dumps({"title": title, "additions": 3, "deletions": 1,
+                               "baseRefName": "main", "headRefName": "feat/x",
+                               "headRefOid": HEAD})
+        # The compare call PROVENANCE makes (v2.24), answered in the shape its
+        # `--jq` projects. Scope's own compare calls are stubbed at
+        # `fetch_increment`/`compare_facts` below, so this one is the only reader
+        # left — and left unanswered it degrades to a `config_notes` entry, which
+        # these tests read as a scope note that never happened.
+        if args[:2] == ["gh", "api"] and "/compare/" in args[2]:
+            return json.dumps({"status": "ahead", "files": [
+                {"filename": "fix.py", "patch": "@@ -1,1 +1,2 @@\n+the fix commit"}]})
+        return PR
+
+    monkeypatch.setattr(panel, "sh", fake_sh)
     monkeypatch.setattr(panel, "fetch_increment",
                         lambda repo, a, b: (PRIOR, "") if a == "main"
                         else (increment, problem))

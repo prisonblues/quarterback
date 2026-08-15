@@ -115,9 +115,15 @@ fails to load and the round-2 payload lands at the filesystem root. There is no
 shell variable to carry; substitute the actual directory into each command:
 
 ```
+qb-stage R1                                      # what the statusline shows
 python3 ~/.claude/loops/panel.py --pr <pr> --post --round 1 --max-rounds <N> \
     --json-file /tmp/tmp.AbC123/r1.json          # ← the path mktemp -d printed
 ```
+
+(`qb-stage` is best-effort and takes no time; stamp it before the panel starts,
+not after, because a round is when the bar most needs to say what is happening —
+a top-tier reviewer can think for 20+ minutes and an unstamped bar reads as an
+idle session for all of it.)
 
 (`--post` comments the panel summary on the PR by default — that is the review
 record the fixer then resolves. Drop `--post` only if the user explicitly asked
@@ -181,6 +187,16 @@ Show the user this panel summary before launching the fixer.
 
 ## 4. Launch the fixer sub-agent
 
+Stamp the stage first — `R<r>F`, the fix phase of round `<r>` (`R1F` after round
+1, `R2F` after round 2):
+```bash
+qb-stage R1F
+```
+This is the half of the cycle nothing else can see. A review round and its fix
+phase sit on the same branch, the same PR and the same commit range, so without
+it the bar cannot tell "waiting on four reviewers" from "a sub-agent is
+rewriting the code right now" — and those want very different things from you.
+
 Read `~/.claude/commands/review-pr.md` and lift its **SUB-AGENT BRIEF** verbatim
 — that is the canonical boil-the-ocean fix/verify/commit discipline; keep it
 single-sourced. Launch **one** `general-purpose` sub-agent with that brief,
@@ -216,6 +232,7 @@ with these overrides:
 Once the fixer has **pushed**, run the panel again over the new commit:
 
 ```
+qb-stage R<r>                                    # R2 in round 2, R3 in round 3 …
 python3 ~/.claude/loops/panel.py --pr <pr> --post --round <r> --max-rounds <N> \
     --baseline /tmp/tmp.AbC123/r1.json [--baseline …each earlier round…] \
     --json-file /tmp/tmp.AbC123/r<r>.json
