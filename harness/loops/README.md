@@ -326,6 +326,34 @@ own fields (`judged`, `reviewers`, `diff_budgets`, `run_key`, …). A skipped PR
 same keys with empty values and `reviewed: false`, so nothing has to branch on which
 exit produced it.
 
+**v2.23 — what the PR touched, and what state it is in.** The run carries `changed_files`
+(the PR's paths, each with its own `additions`/`deletions`) beside the `changed_lines`
+total, plus `changed_files_total` (GitHub's own count), `pr_state` and `is_draft`.
+
+**`changed_files_total` may be NULL, and that is not the same as `0`.** NULL means GitHub
+did not state a count; `0` means it counted and the answer was none — the second is
+knowledge and the board acts on it. The same rule holds per file: an `additions` of `null`
+means "not stated", never "no lines". The one number never derived from another is this
+one, because `len(changed_files) < changed_files_total` is the *only* evidence the list is
+a prefix — `gh` pages it and GitHub caps it at 3,000. When they differ the run's
+`config_notes` say so, on **every** exit including the skipped one.
+
+It is the **PR's** file list, not the round's, read from `gh pr view` rather than from the
+diff the reviewers are handed. That is what lets the skip path — which never fetches a diff
+— still emit a complete one, and what keeps it correct under a round that reviews only the
+increment: a collision surface that narrowed with the increment would report two PRs as no
+longer colliding because one stopped *re-reading* a file it still changes.
+
+> **The skip path emits this but does not record it.** It returns before `record_run` — no
+> review happened — so a skipped PR's file list reaches `--json` and the next round's
+> `--baseline`, and never the board. Do not read "the skip payload carries it" as "the
+> board can answer collision queries about a skipped PR"; it cannot.
+
+Note that `gh pr view --json` **fails the whole command** on a field it does not recognise
+rather than omitting it, so there is no graceful degradation on an older `gh` — the run
+exits before any review. `panel.py` needs a `gh` carrying `files`, `changedFiles`, `state`
+and `isDraft`.
+
 Each finding record:
 
 | field | what it is |

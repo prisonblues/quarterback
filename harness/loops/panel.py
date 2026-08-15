@@ -3414,6 +3414,79 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
 
 # ----------------------------------------------------------------------------- run
 
+def _changed_files(meta: dict) -> tuple[list[dict], int | None, int]:
+    """The PR's touched paths, with each one's own share of ``changed_lines``.
+
+    Returns ``(files, total, dropped)``. ``total`` is GitHub's own count of the
+    PR's changed files, carried separately and NOT derived from ``len(files)``,
+    because the two are allowed to disagree: `gh` pages the `files` connection
+    and GitHub caps a PR's file list at 3,000. A consumer comparing them learns
+    the list is partial; one told only ``len(files)`` reads a truncated list as a
+    complete one, which is this repo's standing disease — a shortfall presenting
+    as a clean result.
+
+    **``total`` is None when GitHub did not state it, never ``len(files)``.** The
+    first version of this fell back to the list's own length and called that
+    "falling back to what we can prove" — but agreeing by construction is not
+    proof, and when BOTH fields were missing it returned ``([], 0)``, turning an
+    unknown file list into a *known empty* PR. That is the same absent-vs-zero
+    collapse this release exists to prevent, committed by the code enforcing it.
+    None travels to a NULL column that already means "nobody said".
+
+    ``dropped`` counts entries discarded for having no usable path, so the caller
+    can tell "GitHub paged us short" from "we discarded a malformed row" — two
+    different facts with different fixes, and the partial-list warning is only
+    about the first.
+
+    Paths, not hunk ranges. Paths answer "will these two PRs collide", which is
+    what #80 orders by; ranges would answer "and exactly where", which nothing
+    asks yet. The per-file additions/deletions ride along because the same `gh`
+    call already returns them, and they turn ``changed_lines`` from a bare total
+    into something attributable to a file — as themselves, so a file GitHub
+    stated nothing about stays distinguishable from a pure-deletion file.
+
+    A rename is recorded under its DESTINATION path only: `gh pr view --json
+    files` offers `path`, `additions`, `deletions` and `changeType` and no
+    previous filename (verified — `previousFilename` is not an available field),
+    so another PR still touching the old path is a collision this cannot see.
+    The REST `pulls/{n}/files` endpoint does carry `previous_filename`; wiring it
+    up is a second call and is deliberately left to whoever needs rename-grain.
+    """
+    files, dropped = [], 0
+    for f in meta.get("files") or []:
+        # Shape-checked, not assumed. A bare string, a number or a null in the
+        # array raised AttributeError inside `run()` — after the PR read and
+        # before any review — killing a run that had not started yet. The board
+        # end of this same field coerces exactly these shapes into a droppable
+        # row (`ChangedFileIn._coerce`), and the two ends of one field should not
+        # disagree about what they tolerate.
+        if not isinstance(f, dict) or not isinstance(f.get("path"), str):
+            dropped += 1
+            continue
+        path = f["path"].strip()
+        if not path:
+            dropped += 1
+            continue
+        files.append({
+            "path": path,
+            # `.get` without `or 0`: 0 and "not stated" are different facts, and
+            # the board's columns are nullable precisely to keep them apart.
+            "additions": f.get("additions"),
+            "deletions": f.get("deletions"),
+        })
+    files.sort(key=lambda f: f["path"])
+    total = meta.get("changedFiles")
+    if total is not None:
+        try:
+            total = int(total)
+        except (TypeError, ValueError):
+            # A shape `gh` has never returned. Degrade like everything else in
+            # this neighbourhood rather than killing a review that has not run
+            # yet with an uncaught TypeError from inside `run()`.
+            total = None
+    return files, total, dropped
+
+
 def _payload_defaults() -> dict:
     """Every key a run payload carries, valued as "this run never got that far".
 
@@ -3424,6 +3497,19 @@ def _payload_defaults() -> dict:
     case that payload exists FOR — was the one that raised KeyError."""
     return {
         "changed_lines": 0,
+        # The PR's file list, not this round's. Under #41 a later round reviews
+        # only the increment, so the round's files narrow while the PR's
+        # collision surface does not — and collision is what this is for.
+        "changed_files": [],
+        # None, not 0. This structure exists to describe a run that never got
+        # that far, so the one value it must not assert is "this PR changed zero
+        # files" — the release's whole distinction is NULL ("nobody said") versus
+        # 0 ("counted, and it was none").
+        "changed_files_total": None,
+        # As of this PR's last panel, not live. Same currency as the file list,
+        # and `ts` is what a reader judges staleness by.
+        "pr_state": None,
+        "is_draft": None,
         "reviewed": False,
         "skip_reason": None,
         # Where a run sits in the panel -> fix -> panel cycle. Defaulted here too,
@@ -3599,13 +3685,48 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     try:
         meta = json.loads(sh(["gh", "pr", "view", str(pr_number), "--repo", gh_repo,
                               "--json", "title,additions,deletions,baseRefName,"
-                                        "headRefName,headRefOid"]))
+                                        "headRefName,headRefOid,files,changedFiles,"
+                                        "state,isDraft"]))
     except subprocess.CalledProcessError as e:
         tail = (e.stderr or "").strip().splitlines()
+        # `gh pr view --json` rejects the WHOLE command on a field it does not
+        # know ("Unknown JSON field: …", exit 1) rather than omitting it — which
+        # is why no absent-field fallback lives in `_changed_files` any more: on
+        # a `gh` too old for `files`/`changedFiles`/`state` the run dies here, and
+        # the branch that claimed to handle it could never have run. Say so, since
+        # "cannot read PR" reads like a network or permissions problem.
         sys.exit(f"panel: cannot read PR #{pr_number} in {gh_repo}"
-                 + (f" — {tail[-1][:160]}" if tail else ""))
+                 + (f" — {tail[-1][:160]}" if tail else "")
+                 + ("\n  (a `gh` predating --json files/changedFiles/state fails the whole "
+                    "call on an unknown field; panel needs gh >= 2.40)"
+                    if tail and "Unknown JSON field" in tail[-1] else ""))
     title, base = meta["title"], meta["baseRefName"]
     changed = meta["additions"] + meta["deletions"]
+    # Same call that already produced `changed`, three fields wider — so the board
+    # gets the paths behind the number, and the PR's state, without a second
+    # round-trip, and gets them on the skip path too, where no diff is ever
+    # fetched. The state is as of THIS panel: the board is told about panels, not
+    # about merges, which is what the payload's timestamp is for.
+    changed_files, changed_files_total, dropped_files = _changed_files(meta)
+    pr_state, is_draft = meta.get("state"), meta.get("isDraft")
+
+    # Built BEFORE the skip branch, because the skip branch returns. It used to
+    # sit with the diff budgets forty lines below, so a skipped PR carrying two
+    # paths and a total of 3,000 said nothing at all — and the skip path is the
+    # one this release argues is most likely to be merged unattended, which makes
+    # it the worst possible place for the warning to go missing.
+    notes: list[str] = []
+    # `dropped` is excluded on purpose: a discarded malformed row is not GitHub
+    # paging us short, and one note covering both would send a reader looking for
+    # a truncation that never happened.
+    listed = len(changed_files) + dropped_files
+    if changed_files_total is not None and listed < changed_files_total:
+        notes.append(f"the PR's file list came back partial — {listed:,} of "
+                     f"{changed_files_total:,} changed files; collision queries "
+                     "against this run will under-report")
+    if dropped_files:
+        notes.append(f"{dropped_files:,} file entr{'y' if dropped_files == 1 else 'ies'} "
+                     "had no usable path and were dropped")
 
     # Progress goes to stderr in --json mode, so stdout is the payload and only
     # the payload: it is a machine-readable artifact, and a consumer that has to
@@ -3637,14 +3758,23 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 **_payload_defaults(),
                 "repo": repo_name, "github": gh_repo, "pr": pr_number,
                 "title": title, "base": base,
+                # A skipped PR still collides with everything it touches, and it
+                # is the case most likely to be re-merged unattended. The paths
+                # are already in hand here — the diff never is.
+                "changed_lines": changed,
+                "changed_files": changed_files,
+                "changed_files_total": changed_files_total,
+                "pr_state": pr_state,
+                "is_draft": is_draft,
+                # The file-list warnings, built above this branch for exactly this
+                # reason, plus any baseline problem — a baseline this run could not
+                # read is a fact about the cycle, not about the review it skipped,
+                # so it travels rather than being dropped on the floor.
+                "config_notes": notes + skip_prior.problems,
                 "round": round_no,
                 "cycle": skip_prior.cycle,
                 "prior_rounds": len(skip_prior.rounds),
                 "prior_findings": len(skip_prior.keys),
-                # A baseline this run could not read is a fact about the cycle,
-                # not about the review it skipped, so it travels with the payload
-                # rather than being dropped on the floor.
-                "config_notes": skip_prior.problems,
                 "skip_reason": f"title matches skip pattern /{pat}/",
                 "run_key": run_key,
             }
@@ -3670,7 +3800,8 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
 
     # Diff budgets: panel-wide value, then each model's own override. Every
     # reviewer used to get the same 60k prefix regardless of its context window.
-    notes: list[str] = []
+    # `notes` is already populated — the file-list warnings are built above the
+    # skip branch so a skipped run carries them too.
     panel_budget = diff_budget(panel, "max_diff_chars", DEFAULT_DIFF_BUDGET, notes)
     # Only for the reviewers actually running: a budget warning about a model
     # this run never asked for is noise, and a "truncated for antigravity" footnote
@@ -3892,6 +4023,8 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         **_payload_defaults(),
         "repo": repo_name, "github": gh_repo, "pr": pr_number,
         "title": title, "base": base, "changed_lines": changed,
+        "changed_files": changed_files, "changed_files_total": changed_files_total,
+        "pr_state": pr_state, "is_draft": is_draft,
         # Always True in a payload the BOARD sees — the skip path returns before
         # `record_run` because no review happened. It is here for `--json`
         # consumers, which get both shapes and need to tell them apart.
