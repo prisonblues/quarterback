@@ -1136,6 +1136,19 @@ def member_sandbox(where: Path) -> str:
     satisfies it, exposes no configuration, contains nothing to mistake for the code
     under review, and is per-member so two seats cannot interact through it.
 
+    **An empty cwd bounds what a seat is POINTED at, not what it can reach**, and
+    that limit was found the hard way. A sandboxed codex run read the real
+    checkout anyway — `git show-ref`, then `git show <sha>:harness/loops/panel.py`
+    — by passing an absolute `workdir` to its shell tool, and read another agent's
+    files under /tmp on the way. Read-only mode did not stop it: it bounds writes,
+    while reads are granted at filesystem root. So the paragraph above holds for
+    the CONFIGURATION channel (a CLAUDE.md or a hook is resolved from cwd, and an
+    empty cwd has neither) and not for the EVIDENCE one. Closing the second takes
+    away the tool rather than the directory, which is why every seat is now
+    toolless — `--no-tools` on pi, the two `-c` overrides in `codex_args` — and why
+    a future seat that arrives with tools it can reach the disk with is not made
+    safe by being handed this directory.
+
     A `git init` that fails is reported and then degraded past, never raised. **Every
     way it can fail, not just a non-zero exit** — `git` absent from PATH raises
     `FileNotFoundError`, a bad temp root raises `PermissionError`, a stalled mount or
@@ -1464,8 +1477,43 @@ def codex_args(model: str, effort: str, reply_file: Path | None = None) -> list[
     session id for a new run, so its usage has to come off the stream; the
     alternative, matching a rollout under `~/.codex/sessions/` after the fact,
     races the up-to-4 concurrent panels `/panel-review-pr` fans out.
+
+    **The two `-c` overrides are this seat's `--no-tools`.** `pi` gets that flag
+    outright and every seat wants the same thing — the diff is in the prompt and
+    `member_sandbox` gives them an EMPTY repo, so there is nothing a tool can
+    correctly find. codex was the one seat still holding its full toolset there,
+    and measured over seven runs it used them to go looking for the code anyway:
+    `git status` / `rg --files` / `find` against the empty sandbox first, then up
+    to ten `web__run` calls searching github.com, api.github.com and
+    raw.githubusercontent.com for a repo that is PRIVATE and answers none of them.
+    Five of seven runs did it. The tool phase was a median third of the run and in
+    the worst case 99% of it — still calling tools at 1133s — which is what put a
+    review of an already-in-prompt diff over the 1800s CLI_TIMEOUT and cost the
+    panel the whole vendor.
+
+    The second override is not only about wall-clock: it closes the hole that
+    made member_sandbox's guarantee thinner than its docstring claims. Read-only
+    is a policy about WRITES — codex grants reads at filesystem root
+    (`<file_system type="restricted"><entry access="read"><special>:root</special>`)
+    and the model reaches past the sandbox by passing an absolute `workdir`. One
+    run did exactly that: `git show-ref` and `git show <sha>:harness/loops/panel.py`
+    against the real checkout, plus another agent's files under /tmp. That is the
+    "reads a tree on a different branch and quotes it as the code under review"
+    failure member_sandbox exists to prevent, arriving through the tool rather
+    than through the cwd. Without a shell there is no workdir to pass.
+
+    Set unconditionally rather than from .harness-rules: a seat that reviews the
+    diff it was handed is what the panel MEANS by a reviewer, not a preference a
+    repo gets to hold. Verified on codex-cli 0.147.0 — both keys survive
+    `--strict-config`, and a run carrying them reports the shell and web tools as
+    unavailable rather than silently keeping them.
     """
-    args = ["codex", "exec"]
+    # `web_search` is the top-level mode key, which is what also takes away the
+    # code-mode `web__run` exposure; `tools.web_search=false` parses too but is
+    # the narrower spelling.
+    args = ["codex", "exec",
+            "-c", 'web_search="disabled"',
+            "-c", "features.shell_tool=false"]
     if model:
         args += ["--model", model]
     if effort:

@@ -217,8 +217,11 @@ def test_codex_argv_asks_for_the_stream_and_the_plain_text_reply(tmp_path):
     assert args[-3:] == ["--json", "--output-last-message", str(f)]
     # The old shape is still what an unmetered call produces, so nothing else
     # that builds codex argv had to change. (The prompt itself goes on stdin —
-    # `codex exec` with no positional argument reads it there.)
-    assert panel.codex_args("", "") == ["codex", "exec"]
+    # `codex exec` with no positional argument reads it there. The two `-c`
+    # overrides are the seat's --no-tools; see codex_args.)
+    assert panel.codex_args("", "") == [
+        "codex", "exec", "-c", 'web_search="disabled"',
+        "-c", "features.shell_tool=false"]
 
 
 # ------------------------------------------------- review_llm, end to end

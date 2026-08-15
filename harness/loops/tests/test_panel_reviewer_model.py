@@ -22,20 +22,44 @@ TOO_OLD = (
 
 # ---------------------------------------------------------------- argv
 
+#: What every codex argv opens with — the seat's `--no-tools`, spelled as the two
+#: `-c` overrides codex takes instead of a flag. Named so the tests below assert
+#: the model/effort shape without restating it.
+NO_TOOLS = ["codex", "exec", "-c", 'web_search="disabled"',
+            "-c", "features.shell_tool=false"]
+
+
 def test_unpinned_codex_passes_no_model_flag():
     """Empty == the CLI's own default, which is the global default: no --model."""
-    assert panel.codex_args("", "") == ["codex", "exec"]
+    assert panel.codex_args("", "") == NO_TOOLS
 
 
 def test_model_and_effort_are_independent():
     """Effort is a `-c` override, not a flag, and applies to the default model
     too — so someone can raise reasoning without pinning a slug that will rot."""
     assert panel.codex_args("", "high")[-2:] == ["-c", "model_reasoning_effort=high"]
-    assert panel.codex_args("gpt-5.6-luna", "") == [
-        "codex", "exec", "--model", "gpt-5.6-luna"]
+    assert panel.codex_args("gpt-5.6-luna", "") == [*NO_TOOLS, "--model", "gpt-5.6-luna"]
     assert panel.codex_args("gpt-5.6-luna", "high") == [
-        "codex", "exec", "--model", "gpt-5.6-luna",
-        "-c", "model_reasoning_effort=high"]
+        *NO_TOOLS, "--model", "gpt-5.6-luna", "-c", "model_reasoning_effort=high"]
+
+
+def test_codex_seat_can_neither_search_the_web_nor_run_a_shell():
+    """The seat reviews the diff it was handed, like every other seat.
+
+    Not a preference: `member_sandbox` hands codex an EMPTY repo, so a tool can
+    only find the wrong answer. With its tools it went hunting — the empty
+    sandbox first, then web searches for a private repo — which is what put runs
+    over CLI_TIMEOUT, and it reached the real checkout by passing an absolute
+    `workdir`, which read-only mode permits (it bounds writes, not reads).
+
+    Asserted for EVERY argv shape, pinned or not, because both are reachable
+    from .harness-rules and a seat that keeps its tools on the unpinned path is
+    the same lost reviewer.
+    """
+    for args in (panel.codex_args("", ""), panel.codex_args("gpt-5.6-luna", "max"),
+                 panel.codex_args("gpt-5.6-luna", "max", Path("/tmp/reply.txt"))):
+        assert 'web_search="disabled"' in args
+        assert "features.shell_tool=false" in args
 
 
 # ---------------------------------------------------------------- failing cleanly
