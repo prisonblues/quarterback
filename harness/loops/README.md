@@ -353,6 +353,16 @@ Its known biases, since the defence of a heuristic is that they are written down
   genuinely "ahead" and indistinguishable from a fix commit at this grain.
 - **Two changed files a finding's path could name** (a reviewer writes `panel.py`; the diff has
   two of them) yields `unknown`, not a coin toss.
+- **A defect the fix pass introduced by DELETING something reads as `missed`.** The fix range is
+  reduced to the lines the fix pass *added*, so removing a guard, a null check, a `finally` or an
+  `await` introduces a defect with no added line to place it on. `introduced` under-counts by
+  however much of the fix pass was subtraction, and `missed` absorbs it.
+- **`introduced` requires exact line membership, and reviewer line numbers drift.** LLM reviewers
+  routinely report a line a few off — the top of the enclosing function, the closing brace, the
+  line after the defect — and Sonar reports the issue's own anchor, which need not be a line the
+  fix wrote. Each of those misses the added-line set and comes back `missed`. Both biases push the
+  same way, so read `introduced` as a **floor** and `missed` as the bucket that absorbs whatever
+  the arithmetic could not place.
 - **Sonar's hard-gate issues carry provenance and are counted with the rest.** They are PR-scanned
   — SonarCloud's new-code view — so the same reading holds; a Sonar issue that predates the PR
   would read `missed`, and that is the scanner's file scope rather than the panel's under-reading.
@@ -361,7 +371,7 @@ Run-level fields it depends on:
 
 | field | what it is |
 |---|---|
-| `head_sha` | **v2.24.** The commit this round reviewed. Recorded because nothing else identified one — `base` holds a branch *name* — and the next round needs it as one end of the fix range. Re-read after the diff is fetched, so a push landing mid-round names the commit the reviewers actually got. Present on the **skipped** payload too: a skipped round is still the round the next one baselines against |
+| `head_sha` | **v2.24.** The commit this round reviewed. Recorded because nothing else identified one — `base` holds a branch *name* — and the next round needs it as one end of the fix range. Re-read straight after the diff is fetched, which narrows the mid-round-push window without closing it: a push can land either side of the fetch and nothing can tell which, so a move is reported as a move (`config_notes`) rather than as a claim about which commit produced the diff, and the later commit is recorded because it is where the next round's fix range starts. Present on the **skipped** payload too: a skipped round is still the round the next one baselines against |
 | `unread_files` | **v2.24.** Files no reviewer that ran read in full, for the next round's `missed-unread`. A file counts as unread only if *every* running reviewer was cut on it, and a file straddling the cut counts as unread — half a file's hunks is not a read file. Empty on a payload whose `reviewed` is `false` means *no coverage at all* (a skipped round never fetched a diff to name files from), not "read everything" — the consumer tells the two apart by `reviewed` |
 | `provenance_counts` | **v2.24.** The per-round tally over the findings the cycle has to clear, so a consumer gets the shape of a round without walking every finding. `{}` where the question does not arise — outside a cycle, or in a cycle's round 1, which has no earlier round to attribute against. All-zero is the other statement: a round that could have attributed and had nothing to, which is what a **skipped** in-cycle round sends |
 

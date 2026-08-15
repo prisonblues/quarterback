@@ -781,3 +781,89 @@ def test_a_head_that_MOVES_while_the_diff_is_fetched_is_noticed(monkeypatch, tmp
                          head="aaa111", moves_to="ccc333")
     assert r1["head_sha"] == "ccc333"
     assert any("the PR head moved from aaa111 to ccc333" in n for n in r1["config_notes"])
+
+
+# --------------------------------------------------------------------------
+# The branches round 2 of the panel found untested
+# --------------------------------------------------------------------------
+
+def test_a_finding_with_no_FILE_cannot_be_placed_either():
+    """A finding carrying a line but no path is as unplaceable as one carrying a
+    path and no line, and belongs in the same bucket. It used to fall through to
+    `missed` — a positive claim that the earlier round looked straight at this and
+    did not see it, made about a defect that cannot be located anywhere."""
+    assert panel._provenance("", 11, {"app/sync.py": {11}}, set(), True) == "unknown"
+
+
+def test_the_head_RE_READ_is_bounded_by_a_timeout(monkeypatch):
+    """It runs on the critical path of every non-skipped round, before any reviewer
+    is dispatched, so a hung `gh pr view` stalls the whole panel — and for the same
+    ungated attribution `_fix_range_diff` refuses to hang for."""
+    seen = {}
+
+    def fake(args, **kw):
+        seen.update(kw)
+        return json.dumps({"headRefOid": "ccc333"})
+
+    monkeypatch.setattr(panel, "sh", fake)
+    assert panel._head_sha_now("acme/board", 77) == "ccc333"
+    assert seen.get("timeout") == panel.FIX_RANGE_TIMEOUT_S
+
+
+def test_a_compare_body_that_is_valid_json_but_not_an_OBJECT_is_a_reason(monkeypatch):
+    """`<html>502</html>` never reaches the isinstance guard — it dies at
+    `json.loads` and leaves through the ValueError arm. A body of `null` or `[]`
+    parses cleanly and then has no `.get`, which is the case that guard is for."""
+    for body in ("null", "[]"):
+        monkeypatch.setattr(panel, "sh", _sh_returning(body))
+        diff, why = panel._fix_range_diff("acme/board", "aaaa1111", "bbbb2222")
+        assert diff is None and "not an object" in why
+
+
+def test_a_round_where_NO_SEAT_RAN_read_nothing_rather_than_everything(monkeypatch, tmp_path):
+    """No LLM seat ran at all, so there is no cut set to intersect and an empty
+    `unread_files` would tell the next round this one read the whole diff. It read
+    none of it, so every file is named. The guard has to be on whether any seat RAN
+    rather than on whether the cut list came back empty — those are two different
+    states, and only one of them is zero coverage."""
+    _, r1 = _panel_round(monkeypatch, tmp_path, 1, [], head="aaa111",
+                         cfg={**CFG, "reviewers": {}})
+    assert r1["unread_files"] == ["app/far.py", "app/sync.py"]
+
+
+def test_the_report_SPLITS_the_new_findings_out_loud(monkeypatch, tmp_path, capsys):
+    """The payload carries the split, but the operator deciding whether to go again
+    reads the comment. Only the populated buckets appear, and `unknown` is not
+    bolded — nothing here may read as a claim about the fix pass that the counts do
+    not support."""
+    r1_path, _ = _panel_round(monkeypatch, tmp_path, 1,
+                              [("app/sync.py", 11, "a stale mirror")], head="aaa111")
+    capsys.readouterr()
+    _panel_round(monkeypatch, tmp_path, 2,
+                 [("app/sync.py", 11, "the fix left a dangling handle"),
+                  ("app/sync.py", 90, "an unrelated defect nobody saw")],
+                 head="bbb222", baseline=[r1_path])
+    line = next(ln for ln in capsys.readouterr().out.splitlines()
+                if ln.startswith("  - of those:"))
+    assert "**1 introduced** by the last fix pass" in line
+    assert "**1 missed** by the last round" in line
+    # Nothing landed in these two, so neither may be printed as a zero.
+    assert "could not read" not in line and "unattributable" not in line
+
+
+def test_a_round_that_could_attribute_NOTHING_says_nothing_rather_than_zeroes(
+        monkeypatch, tmp_path, capsys):
+    """When `unknown` is the only populated bucket, the whole line is withheld.
+    Printed, it leads with "**0 introduced**, **0 missed**" directly under a note
+    explaining that nothing could be attributed — a bolded claim about the fix
+    pass, and a false one. A regression to `if pc:` prints exactly that."""
+    old = tmp_path / "old.json"
+    old.write_text(json.dumps({"round": 1, "cycle": "cyc", "reviewed": True,
+                               "repo": "e2e", "github": "acme/e2e", "pr": 77,
+                               "to_fix": [], "dismissed": [], "sonar_findings": []}))
+    _, r2 = _panel_round(monkeypatch, tmp_path, 2,
+                         [("app/sync.py", 11, "a stale mirror")],
+                         head="bbb222", baseline=[str(old)])
+    assert r2["provenance_counts"] == {"introduced": 0, "missed": 0,
+                                       "missed-unread": 0, "unknown": 1}
+    assert "of those:" not in capsys.readouterr().out

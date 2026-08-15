@@ -2374,10 +2374,17 @@ def _fix_range_diff(gh_repo: str, base_sha: str | None,
 def _head_sha_now(gh_repo: str, pr_number: int) -> str | None:
     """The PR's head commit, re-read. None if it cannot be had — the caller only
     uses it to notice that the head MOVED, and "could not tell" has to leave the
-    earlier answer standing rather than erase it."""
+    earlier answer standing rather than erase it.
+
+    Bounded for the same reason :func:`_fix_range_diff` is, and more urgently: this
+    one runs on the critical path of every non-skipped round, before any reviewer
+    is dispatched, so a hung `gh` would stall the whole panel indefinitely for an
+    attribution nothing gates on. `SubprocessError` already covers the
+    `TimeoutExpired` that then arrives."""
     try:
         return json.loads(sh(["gh", "pr", "view", str(pr_number), "--repo", gh_repo,
-                              "--json", "headRefOid"])).get("headRefOid") or None
+                              "--json", "headRefOid"],
+                             timeout=FIX_RANGE_TIMEOUT_S)).get("headRefOid") or None
     except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
         return None
 
@@ -2410,6 +2417,26 @@ def _provenance(file: str, line: int | None, added: dict[str, set[int]],
     the one bucket that indicts the harness instead of the panel. `all_unread`
     says that round read NOTHING (it was skipped, or lost every seat), which is
     the same failure with no file list to name it by.
+
+    Two limits of the line-intersection rule itself, written down rather than
+    fixed, because changing the matching rule trades a known bias for an unknown
+    one and nothing gates on the answer:
+
+    - **A defect a fix pass introduced by DELETING something is invisible here and
+      reads as `missed`.** `added` only knows lines the fix pass ADDED, so removing
+      a guard, a null check, a `finally` or an `await` introduces a defect with no
+      added line to place it on. The `introduced` bucket therefore under-counts by
+      however much of the fix pass was subtraction, and `missed` absorbs it.
+    - **`introduced` requires EXACT membership in the added lines, and reviewer
+      line numbers drift.** LLM reviewers routinely report a line a few off — the
+      top of the enclosing function, the closing brace, the line after the defect —
+      and Sonar reports the issue's own anchor, which need not be a line the fix
+      wrote. Every one of those misses the set by a line or two and comes back
+      `missed`. So the split is biased toward `missed` in BOTH directions, and the
+      `introduced` count should be read as a floor rather than as a measurement.
+
+    #41 (review the increment) is what removes both: a finding raised against the
+    increment is introduced by construction, with no line arithmetic in the middle.
     """
     if not have_range:
         return "unknown"
@@ -2425,7 +2452,11 @@ def _provenance(file: str, line: int | None, added: dict[str, set[int]],
     # no line in an unread file is still squarely a coverage failure.
     if all_unread or any(_same_file(file, f) for f in unread):
         return "missed-unread"
-    if line is None or len(hits) > 1:
+    # An empty path is as unplaceable as a missing line, and belongs in the same
+    # guard. Falling through to `missed` reads as "the earlier round looked at
+    # this and did not see it" about a finding that cannot be placed anywhere,
+    # which is exactly the invented attribution this bucket exists to avoid.
+    if line is None or not file or len(hits) > 1:
         return "unknown"
     return "missed"
 
@@ -4045,14 +4076,18 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # the diff was fetched, so a push landing in between leaves the payload naming
     # one commit while the reviewers read another — and the next round then
     # attributes its findings to a range that never produced the diff anyone
-    # reviewed. Re-read beside the diff and take the later answer: the diff is
-    # what was reviewed, and it came from whatever head was current when it was
-    # fetched. "Could not tell" leaves the earlier answer standing.
+    # reviewed. Re-read straight after the diff fetch above, which NARROWS that
+    # window but does not close it: the push could have landed either side of the
+    # fetch, and nothing here can tell which. So the note reports the move rather
+    # than claiming which commit produced the diff. The later commit is recorded
+    # because it is the one the next round's fix range has to start from — and
+    # "could not tell" (a None) leaves the earlier answer standing.
     moved_to = _head_sha_now(gh_repo, pr_number)
     if moved_to and moved_to != head_sha:
         notes.append(f"the PR head moved from {head_sha[:8]} to {moved_to[:8]} while this "
-                     "round was fetching the diff — the diff reviewed is the newer one, so "
-                     "that is the commit recorded")
+                     "round was running — the diff was fetched somewhere in that window and "
+                     "which of the two produced it cannot be told from here; the later commit "
+                     "is recorded, and provenance against this round is that much less certain")
         head_sha = moved_to
     panel_budget = diff_budget(panel, "max_diff_chars", DEFAULT_DIFF_BUDGET, notes)
     # Only for the reviewers actually running: a budget warning about a model
@@ -4267,17 +4302,33 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # therefore empty on every run this ever made — the `missed-unread` bucket
     # unreachable in production while 487 unit tests, which call the helpers
     # directly with correct inputs, stayed green over it.
+    # Defensive rather than expected: `budgets` is built over the same selected
+    # seats `tasks` is, so a seat that ran normally has an entry (possibly None,
+    # meaning uncapped). It survives so a future change to how `budgets` is built
+    # cannot quietly turn "no budget recorded" into "read nothing".
     no_budget = [n for n in ran_names if n not in budgets]
     if no_budget:
         notes.append("no diff budget is recorded for " + ", ".join(sorted(no_budget))
                      + " — those seats are left out of the unread-file record rather than "
                        "silently emptying it")
     cut = [_diff_files_cut(diff, budgets[n]) for n in ran_names if n in budgets]
-    # No seat read anything, so nothing was read: every file is unread. The empty
-    # set says the opposite — that the round read all of it — and would hand the
-    # next round a `missed` for every defect in a diff nobody ever saw.
-    unread_files = (sorted(set.intersection(*cut)) if cut
-                    else sorted(_diff_files_cut(diff, 0)))
+    if cut:
+        unread_files = sorted(set.intersection(*cut))
+    elif not ran_names:
+        # NO SEAT RAN, so nothing was read: every file is unread. The empty set
+        # says the opposite — that the round read all of it — and would hand the
+        # next round a `missed` for every defect in a diff nobody ever saw.
+        unread_files = sorted(_diff_files_cut(diff, 0))
+    else:
+        # Seats ran, none of them with a recorded budget. That is a lookup miss,
+        # not zero coverage, and the guard has to be on `ran_names` rather than on
+        # `cut`: keyed on `cut`, one config miss would record a round that read the
+        # whole diff as having read none of it, and the next round would bucket
+        # every new finding `missed-unread` — a blanket indictment of the harness
+        # bought by a missing dict key. Empty is what the `no_budget` note above
+        # already promises ("left out of the record rather than silently emptying
+        # it"), and the note is what tells the operator coverage is unrecorded.
+        unread_files = []
     # Attribution needs both ends of the fix range, and `_fix_range_diff` says why
     # when it has none: a baseline written before `head_sha` was recorded, a
     # head that never moved, a branch rewritten between rounds, an API refusal.
