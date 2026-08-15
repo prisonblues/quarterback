@@ -312,7 +312,7 @@ def test_an_ambiguous_reply_lands_in_the_degradation_path_that_already_exists(mo
     calls = []
 
     def fake_run_cli(args, label, timeout=panel.CLI_TIMEOUT, attempts=3, stdin_text=None,
-                     on_output=None, replied=None):
+                     on_output=None, replied=None, cwd=None):
         calls.append(attempts)
         return raw, None
 
@@ -1071,7 +1071,7 @@ def _judge_returning(monkeypatch, reply):
     seen = {}
 
     def fake_run_cli(args, label, timeout=panel.CLI_TIMEOUT, attempts=3, stdin_text=None,
-                     on_output=None, replied=None):
+                     on_output=None, replied=None, cwd=None):
         seen["prompt"] = stdin_text
         return reply, None
 
@@ -1152,7 +1152,7 @@ PANEL_CFG = {"github": "acme/board", "path": "/tmp/acme-board",
              "review_panel": {}}
 
 
-def _fake_adjudicate(clusters, diff, model, pr, budget=None, coverage=None):
+def _fake_adjudicate(clusters, diff, model, pr, budget=None, coverage=None, cwd=None):
     """Every reported finding confirmed, one canonical record each — the judge's
     ruling is not what these tests are about."""
     flat = [f for grp in clusters for f in grp]
@@ -1603,7 +1603,7 @@ def test_the_judge_gets_the_same_one_shot_reparse_the_reviewers_get(monkeypatch)
     calls = []
 
     def fake_run_cli(args, label, timeout=panel.CLI_TIMEOUT, attempts=3, stdin_text=None,
-                     on_output=None, replied=None):
+                     on_output=None, replied=None, cwd=None):
         calls.append(attempts)
         return (ambiguous if len(calls) == 1 else settled), None
 

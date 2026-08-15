@@ -185,13 +185,15 @@ says how much of a window actually reported.
 
 The deployed board version lags the repo until the stack is redeployed, and only the running
 service knows which it is: ask it with `GET /openapi.json` → `.info.version`, for whichever
-instance you care about. (Anything built off this branch says 2.19.0 — v2.20 and v2.22 are both
-harness-side.) A number written here
+instance you care about. (Anything built off this branch says 2.19.0 — v2.20, v2.21 and v2.22 are
+all harness-side.) A number written here
 instead would be wrong the next time Portainer redeploys, with no diff to catch it.
 Latest release: **v2.22**, harness-side, changing no board behaviour — the panel's judge stops
 being the same model as a seat it rules on, and a conflict resolution is remembered instead of
-re-derived once per worktree. Before it, **v2.20** made the worktree tooling ask who is in a
-directory before rewriting it, and **v2.19** added the per-reviewer
+re-derived once per worktree. Before it, **v2.21** (also harness-side) gave each panel member its
+own empty sandbox repo rather than whatever directory the panel was launched from, and made a panel
+that lost a seat say so; **v2.20** had the worktree
+tooling ask who is in a directory before rewriting it, and **v2.19** added the per-reviewer
 cost columns (schema revision 0015) and was the first to move the board since v2.15; **v2.18**
 settles a reply carrying several JSON-shaped values by agreement rather than by rank, **v2.17** made
 a reviewer that produced nothing a failure that says why, and **v2.16** stopped the panel capping
@@ -216,6 +218,9 @@ judge) are harness-side too.
   reviewers on what they cost as well as what they find.
 - **v2.20** — the worktree tooling asks who is in a directory before rewriting it: an advisory
   holder check, unioning the board's live leases with the local session markers.
+- **v2.21** — each panel member runs in its own empty sandbox repo, not in whatever directory the
+  panel was launched from and not in the repo under review; and a panel that lost a seat says so
+  above its findings.
 - **v2.22** — the panel's judge is no longer the same model as a seat it rules on, and
   `create-worktree` turns on `rerere` so one conflict is resolved once, not once per worktree.
 - **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared

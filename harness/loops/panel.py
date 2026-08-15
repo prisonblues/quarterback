@@ -1109,16 +1109,100 @@ def is_deterministic_failure(stderr: str) -> bool:
     return is_rejection(stderr) or is_permission_denied(stderr)
 
 
+def member_sandbox(where: Path) -> str:
+    """`git init` an empty repo at `where` and return it as the directory a panel
+    member runs in. One per member per run; removed with the temp dir that holds it.
+
+    **An empty repo rather than the repo under review, which is the whole design
+    decision.** Pinning the seats to the checkout was the first fix for #68 and it
+    traded one defect for three. A headless CLI resolves its project configuration
+    from its cwd — CLAUDE.md, `.claude/settings.json` including hooks, which execute
+    commands — so running there hands the repo being reviewed a channel into the
+    reviewer and the judge ruling on it. Under the epic that is aimed at exactly the
+    untrusted-contributor population the panel exists to read. It is not this repo's
+    problem today (quarterback has neither file) but it is squarely the problem of
+    the other repos #39 and #59 point the panel at.
+
+    Worse, it did not even buy the access it cost. `cfg["path"]` is the MAIN
+    checkout, sitting on whatever branch it was last left on — never the PR's code,
+    which the panel deliberately reads as a diff and never checks out. So a
+    tool-capable seat pointed there can Read and Grep a tree on a different branch
+    and quote it as the code under review: a plausible wrong answer where the old
+    bug gave a visible failure. That is a strictly worse trade.
+
+    What the seats actually need from a working directory is nothing at all — the
+    diff arrives in the prompt, and `pi` is given `--no-tools` outright. The only
+    real requirement is codex's, that the directory be *a* git repo. An empty one
+    satisfies it, exposes no configuration, contains nothing to mistake for the code
+    under review, and is per-member so two seats cannot interact through it.
+
+    A `git init` that fails is reported and then degraded past, never raised. **Every
+    way it can fail, not just a non-zero exit** — `git` absent from PATH raises
+    `FileNotFoundError`, a bad temp root raises `PermissionError`, a stalled mount or
+    an `init.templateDir` on a dead one hangs until `TimeoutExpired`. None of those is
+    a returncode, and none was caught in the first version of this function: `run()`
+    joins the seats with a bare `fut.result()`, so ONE member's setup failing took
+    down the whole panel — the seats that succeeded, the sonar gate and the report
+    with it. `review_llm` is otherwise total (every failure path returns a
+    `ReviewerRun(skip=…)`), and the judge's call is worse still, turning a recoverable
+    "judge unavailable → unruled" into a traceback.
+
+    The directory is created regardless, because that is what makes the degraded path
+    the DOCUMENTED one. Without it `run_cli`'s `subprocess.run(cwd=…)` raises
+    `FileNotFoundError` about a path — three times, once per attempt — and the seat
+    never reaches codex's own "not inside a trusted directory", which is the message
+    that actually names the cause. Reporting the real reason is #19's rule applied to
+    the setup step; a seat that dies confusingly is the thing that rule exists against.
+    """
+    where.mkdir(parents=True, exist_ok=True)
+    try:
+        proc = subprocess.run(["git", "init", "--quiet", str(where)],
+                              capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL, timeout=30)
+        why = (proc.stderr or "").strip()[:120] if proc.returncode else ""
+    except subprocess.TimeoutExpired:
+        why = "git init timed out after 30s"
+    except OSError as e:
+        # errno and strerror rather than the class name, for the reason run_cli
+        # gives: "OSError" sends people looking for a crash that was "No such file
+        # or directory: 'git'".
+        why = " ".join(str(x) for x in (e.errno, e.strerror or e) if x)[:120]
+    if why:
+        print(f"! sandbox: git init failed in {where} ({why}) — a seat that requires "
+              f"a git repo will refuse to start and say so", file=sys.stderr)
+    return str(where)
+
+
 def run_cli(args: list[str] | Callable[[], list[str]], label: str, timeout: int = CLI_TIMEOUT,
             attempts: int = 3, stdin_text: str | None = None,
             on_output: Callable[[str | None], None] | None = None,
-            replied: Callable[[], bool] | None = None) -> tuple[str | None, str | None]:
+            replied: Callable[[], bool] | None = None,
+            cwd: str | None = None) -> tuple[str | None, str | None]:
     """Run a headless CLI, returning (stdout, error_reason); error_reason is
     None on success. Retries transient failures (non-zero exits such as rate
     limits, and OS errors) up to `attempts` times with no delay — these fail
     fast, so retrying is cheap and recovers the common flake. A full timeout is
     NOT retried (it already burned the whole budget; retrying just doubles the
     wall-clock).
+
+    **`cwd` is the member's own empty sandbox repo (see `member_sandbox`), and
+    passing it is what makes a seat reproducible.** Without it every reviewer
+    inherited whatever directory the panel process happened to be started from,
+    so a run's membership was decided by ambient state that nothing configured,
+    nothing recorded, and nothing could reproduce. That is not hypothetical: on
+    PR #64 codex exited 1 with "Not inside a trusted directory and
+    --skip-git-repo-check was not specified" while the two panels launched beside
+    it in the same second ran codex fine. The inputs were not in fact identical —
+    those panels were started from inside a git checkout and that one from a
+    scratch directory under /tmp, and codex refuses to start outside a repo. The
+    panel lost a whole vendor's eyes to the caller's shell, and #68 is the report
+    that reads the same either way.
+
+    A sandbox satisfies codex's check by construction, which is why no
+    `--skip-git-repo-check` appears anywhere here — verified against an untrusted
+    checkout, an untrusted *worktree* (the `.git` file rather than directory was
+    the open question) and a freshly `git init`ed empty directory. The flag would
+    buy nothing and would trade a guard for it.
 
     `stdin_text` is how a prompt reaches a CLI that accepts one there, which is
     the only way to hand a reviewer a diff larger than the kernel's per-argument
@@ -1186,7 +1270,7 @@ def run_cli(args: list[str] | Callable[[], list[str]], label: str, timeout: int 
         started = time.monotonic()
         try:
             proc = subprocess.run(argv, capture_output=True, text=True,
-                                  timeout=timeout, **feed)
+                                  timeout=timeout, cwd=cwd, **feed)
         except subprocess.TimeoutExpired as e:
             # A timeout is the most expensive outcome the panel has: the model
             # read the whole diff and thought about it for the full budget before
@@ -1760,6 +1844,11 @@ def review_llm(cmd_name: str, model: str, prompt: str,
     """Run a headless LLM CLI reviewer. Returns a :class:`ReviewerRun` — what it
     found, what it could not judge, and what it cost.
 
+    The member runs in its own empty sandbox repo (see `member_sandbox`), carved
+    out of the private temp directory it already gets. Nothing is threaded in from
+    the caller: the working directory is not a property of the review, and making
+    it one is what let the launching shell decide who sat on the panel (#68).
+
     Duration is wall-clock for this member's whole turn — every CLI attempt it
     made, including the reparse retry below, because a reviewer that only lands
     on the second try genuinely costs twice. It is measured even on the failure
@@ -1808,6 +1897,11 @@ def review_llm(cmd_name: str, model: str, prompt: str,
     # this returns, so a panel that runs all day leaves nothing behind.
     with tempfile.TemporaryDirectory(prefix=f"panel-{cmd_name}-") as tmp:
         tmpdir = Path(tmp)
+        # The member's working directory, carved out of the same private temp dir
+        # so it is removed on every exit path this function has. A subdirectory
+        # rather than tmpdir itself: the seats' own telemetry (pi's session,
+        # codex's reply files) has no business inside a repo the CLI can see.
+        sandbox = member_sandbox(tmpdir / "cwd")
         #: One reply path per codex ATTEMPT, in the order they were made; empty
         #: for every other seat. A single shared path let an attempt that wrote
         #: no `--output-last-message` serve the PREVIOUS attempt's text as its
@@ -1918,7 +2012,7 @@ def review_llm(cmd_name: str, model: str, prompt: str,
         wrote_reply = (lambda: bool(replies) and replies[-1].exists()
                        and replies[-1].read_text().strip()) if replies_used else None
         out, err = run_cli(args, label, stdin_text=stdin_text, on_output=collect,
-                           replied=wrote_reply)
+                           replied=wrote_reply, cwd=sandbox)
         if err:
             err += cli_hint(cmd_name, err, model)
             # A member that burned tokens and then failed still spent them, so
@@ -1934,7 +2028,7 @@ def review_llm(cmd_name: str, model: str, prompt: str,
             # The retry costs another turn, which `usage_of` already counts: it runs
             # under its own fresh session, and its stdout lands in `outputs` too.
             out2, err2 = run_cli(args, label, attempts=1, stdin_text=stdin_text,
-                                 on_output=collect, replied=wrote_reply)
+                                 on_output=collect, replied=wrote_reply, cwd=sandbox)
             retry_text = reply_of(out2) if not err2 else None
             if retry_text:
                 retried = parse_reply(cmd_name, retry_text)
@@ -2841,24 +2935,31 @@ def adjudicate(clusters: list[list[Finding]], diff: str, model: str, pr: int,
     # triaged review rather than like a failure.
     prompt = JUDGE_PROMPT.format(findings=listing, coverage=stated, diff=diff_text)
     args = ["claude", "-p"] + (["--model", model] if model else [])
-    out, err = run_cli(args, "judge", stdin_text=prompt)
-    if err:
-        return unruled(err)
-    parsed = extract_json_value(out, "verdicts")
-    if parsed is None:
-        # The same one-shot reparse retry `review_llm` gets, and the judge needs it
-        # more. Agreement strictly ENLARGES the set of replies that resolve to
-        # None — an envelope plus a restatement of it, an envelope plus a
-        # self-authored illustration, any two candidates that read differently —
-        # so a failure that was rare under ranking now fires on ordinary model
-        # prose. The asymmetry was the expensive part: a reviewer that cannot be
-        # read costs one seat, a judge that cannot be read takes EVERY finding
-        # through `unjudged` and adds the "round was not adjudicated" veto. One
-        # more turn keeps the pessimistic rule without paying for it with the
-        # whole adjudication.
-        out2, err2 = run_cli(args, "judge", attempts=1, stdin_text=prompt)
-        if not err2:
-            parsed = extract_json_value(out2, "verdicts")
+    # The judge gets a sandbox of its own on the same reasoning as the reviewers,
+    # and one sharper argument: it is the seat whose loss is worst (a judge that
+    # dies takes every finding through `unjudged`), so it is the last place to
+    # leave depending on the caller's shell.
+    with tempfile.TemporaryDirectory(prefix="panel-judge-") as tmp:
+        sandbox = member_sandbox(Path(tmp) / "cwd")
+        out, err = run_cli(args, "judge", stdin_text=prompt, cwd=sandbox)
+        if err:
+            return unruled(err)
+        parsed = extract_json_value(out, "verdicts")
+        if parsed is None:
+            # The same one-shot reparse retry `review_llm` gets, and the judge
+            # needs it more. Agreement strictly ENLARGES the set of replies that
+            # resolve to None — an envelope plus a restatement of it, an envelope
+            # plus a self-authored illustration, any two candidates that read
+            # differently — so a failure that was rare under ranking now fires on
+            # ordinary model prose. The asymmetry was the expensive part: a
+            # reviewer that cannot be read costs one seat, a judge that cannot be
+            # read takes EVERY finding through `unjudged` and adds the "round was
+            # not adjudicated" veto. One more turn keeps the pessimistic rule
+            # without paying for it with the whole adjudication.
+            out2, err2 = run_cli(args, "judge", attempts=1, stdin_text=prompt,
+                                 cwd=sandbox)
+            if not err2:
+                parsed = extract_json_value(out2, "verdicts")
     note = ""
     reply = parsed if isinstance(parsed, dict) else None
     if reply is not None:
@@ -3626,6 +3727,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 tasks[name] = ex.submit(review_llm, name, models[name],
                                         prompt_for(budgets[name]), efforts.get(name, ""))
         sonar_future = None
+        sonar_filed = False
         if "sonarqube" in selected:
             sonar_future = ex.submit(
                 review_sonarqube, rev.get("sonarqube", {}),
@@ -3691,6 +3793,11 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 # issues are soft — judged on merits alongside the LLM reviewers.
                 result.sonar_findings = hard
                 llm_findings.extend(soft)
+                # Recorded HERE, where it is a fact rather than an inference: the
+                # consensus count below needs to know whether sonarqube put
+                # anything into the population the judge clusters, and only this
+                # branch can. See `filers`.
+                sonar_filed = bool(soft)
         ci_status, ci_failing, ci_skip = ci_future.result()
         if ci_skip:
             result.skipped.append(ci_skip)
@@ -3847,9 +3954,57 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         print(json.dumps(payload, indent=2))
         return finish(write_failed)
 
+    # How many LLM seats the run was CONFIGURED to fill, against how many filled.
+    # Both halves are needed and neither is derivable from the other: "claude ran"
+    # is the same sentence whether it was the only seat asked for or the only one
+    # of four that answered, and those are a hand-picked single-vendor read and a
+    # panel that lost three quarters of its eyes.
+    seats_asked = [n for n in LLM_REVIEWERS if n in selected]
+    seats_filled = len(ran_llm)
+    # A seat whose CLI this box does not carry is NOT a degraded panel, and this
+    # is the same distinction `coverage_veto` makes at length a few hundred lines
+    # up: an absent CLI is a fact about the HOST, not about the round. It is
+    # absent every run, so counting it as degradation prints the warning on every
+    # unattended run of a repo that enables a workstation-only vendor — where
+    # nothing was lost and nothing could be recovered. That is the alert fatigue
+    # `test_a_full_panel_says_none_of_it` exists to prevent, and it would take the
+    # real degraded case down with it. Read off recorded state, never off the skip
+    # TEXT, for the reason `ReviewerRun.absent` was added.
+    seats_absent = [n for n in seats_asked if reviewer_meta.get(n, {}).get("absent")]
+    seats_lost = len(seats_asked) - seats_filled - len(seats_absent)
+    # The consensus signal needs two seats to exist AT ALL. Below that, "no
+    # finding earned ⋆consensus" and "there was nobody to agree with" render
+    # identically, and a reader takes the first meaning — the pessimistic
+    # reading of a review that never had the chance to be pessimistic.
+    #
+    # Counted over everything that can FILE a finding, not over the LLM seats:
+    # sonarqube's base-branch issues are judged alongside them (`llm_findings`
+    # takes `soft`), so a canonical finding's `reviewers` can legitimately read
+    # ["claude", "sonarqube"]. Counting LLM seats alone let `conf()` stamp
+    # ⋆consensus on that finding while the header two dozen lines below declared
+    # consensus impossible — the report contradicting itself in the exact place
+    # this was added to stop it being misread.
+    #
+    # `sonar_filed`, not the gate STATUS, and the distinction is the same one #62
+    # spent three rounds on: a status is a side effect, not the thing itself. Only
+    # the `no-pr-analysis` fallback yields soft findings that can share a canonical
+    # record — the scanned paths return `hard`, which renders in its own section
+    # and never reaches `conf()`. So keying on the gate over-counted at one end (a
+    # scanned "OK" repo with one LLM seat suppressed both the banner and the
+    # sole-reviewer note, on findings nobody could corroborate) and under-counted
+    # at the other ("ERROR" can still return hard findings, so the report could
+    # claim nobody reviewed while Sonar issues were displayed beneath it).
+    filers = seats_filled + (1 if sonar_filed else 0)
+    consensus_possible = filers > 1
+
     def conf(c: Canonical) -> str:
         revs = c.reviewers
-        return f" _(via {', '.join(revs)}{' ⋆consensus' if len(revs) > 1 else ''})_"
+        if len(revs) > 1:
+            return f" _(via {', '.join(revs)} ⋆consensus)_"
+        # Said per finding rather than once at the top, because this is the line a
+        # reader is looking at when they decide how much a finding is worth.
+        sole = " — sole reviewer, no second opinion" if not consensus_possible else ""
+        return f" _(via {', '.join(revs)}{sole})_"
 
     def accounts(c: Canonical) -> list[str]:
         """What each reviewer actually said, under a MERGED finding.
@@ -3901,7 +4056,45 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                      "No hard gate: publish a PR analysis to get one.")
     else:
         lines.append(f"**SonarCloud:** {gate_txt}")
-    lines.append(f"**LLM reviewers ran:** {', '.join(ran_llm) or 'none'}")
+    # The seat count rides with the reviewer list on EVERY run, not only degraded
+    # ones. A round's finding count is not comparable across different panel
+    # sizes, and the convergence table this repo keeps has been read as if it
+    # were: #32 went 22 -> 43 between rounds and gained a reviewer in the same
+    # step. The number that disambiguates it has to be in the artifact.
+    lines.append(f"**LLM reviewers ran:** {', '.join(ran_llm) or 'none'}"
+                 f" — {seats_filled} of {len(seats_asked)} configured")
+    # The panel-level version of #19's per-reviewer fix. #19 stopped a reviewer
+    # that produced nothing from reading as a reviewer that found nothing; this
+    # stops a PANEL that lost half its seats from reading as a panel that agreed.
+    # A run with empty seats is a materially weaker artifact than a full one and
+    # was presented identically — on PR #64 that meant 23 findings from a single
+    # reviewer, whose own master wrote that nine self-declared coverage gaps
+    # "stand unchallenged and unread", laid out exactly like 23 from a full panel.
+    # It is stated here, above the findings, rather than in a footer: under the
+    # epic (#52) nobody is reading this in a terminal as it happens.
+    if seats_lost > 0:
+        lines.append(f"  - ⚠️ **panel degraded** — {seats_lost} of {len(seats_asked)} "
+                     f"configured reviewer{'s' if len(seats_asked) != 1 else ''} did not "
+                     "run. Read what follows as a weaker review, not a cleaner one: "
+                     "an empty seat cannot report what it would have found.")
+    if seats_absent:
+        # Quieter, and separate, for the reason above: this one is about the box,
+        # is true every run on it, and is nobody's fault.
+        lines.append(f"  - _{', '.join(seats_absent)} not installed on this host — "
+                     "configured, but never a seat here_")
+    if not consensus_possible and seats_asked:
+        # Two different sentences, because the one-seat and no-seat cases are
+        # different claims and the single wording asserted "one filed" on a run
+        # where nobody had — the exact class of misreport this block exists to
+        # prevent, in the block itself.
+        if filers == 0:
+            lines.append("  - ⚠️ **nothing below was reviewed by a panel member** — "
+                         "every configured seat is empty, so there are no findings to "
+                         "agree about and no ⋆consensus notation appears at all.")
+        else:
+            lines.append("  - ⚠️ **no ⋆consensus is possible this round** — it takes two "
+                         "reviewers to agree, and one filed. Absence of ⋆consensus below "
+                         "means nobody was there to agree, NOT that nobody agreed.")
     if override_note:
         # Said on the PR, not just in the terminal: a reader of the comment needs
         # to know this panel was hand-picked before reading "reviewed by one".
