@@ -15,6 +15,7 @@ converged one.
 """
 
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -41,6 +42,58 @@ def _canonical(file, title, severity="P2", reviewer="codex"):
 
 # ---- the reply envelope ----------------------------------------------------
 
+def _echoed(prompt: str, **fields) -> str:
+    """The schema block exactly as `prompt` ships it, as a model that quoted the
+    request back would return it: rendered, with the two tokens that are not JSON
+    (`<int|null>`, `true|false`) resolved and nothing else touched.
+
+    Extracted here independently of `panel._schema`, which is the point — the
+    parser's idea of "the example this prompt ships" has to keep matching the
+    text the prompt actually sends, and a guard that asked panel.py what its own
+    prompts say would agree with itself for ever.
+
+    It reports its own failure rather than raising out of import: a drift guard
+    that dies during collection names no assertion, which is precisely the
+    reader it exists for."""
+    rendered = prompt.format(**fields)
+    block = next((s for _, s in panel._spans(rendered, "{", "}")
+                  if any(f'"{k}"' in s for k in panel.ENVELOPE_KEYS)), None)
+    assert block, "no schema block found in the prompt — has its shape changed?"
+    assert "<" not in re.sub(r"<[^<>]+>", "", block), f"unpaired `<` in the schema: {block}"
+    return re.sub(r"<[^<>]+>", "null", block).replace("true|false", "true")
+
+
+REVIEW_ECHO = _echoed(panel.REVIEW_PROMPT, n=1, repo="acme/board", base="main", diff="")
+JUDGE_ECHO = _echoed(panel.JUDGE_PROMPT, findings="", coverage="", diff="")
+
+
+def test_the_schema_the_prompts_ship_is_recognised_as_a_quotation():
+    """The drift guard, and the whole basis of the design: an echo is discarded
+    because it is POSITIVELY identified as the example our prompts ship, so the
+    example panel.py reads out of its own prompt text has to be the one the
+    prompt sends. Edit either schema without this staying true and the parser
+    starts treating a quotation as an answer — it fails right here instead.
+
+    Only this direction can be checked cheaply, and only this direction is safe
+    to get wrong: a quotation mistaken for an answer costs a retry, whereas the
+    converse — an answer mistaken for a quotation — silently discards a review,
+    which is what the old stand-in blacklist did."""
+    for echo, key in ((REVIEW_ECHO, "findings"), (JUDGE_ECHO, "verdicts")):
+        assert panel.SCHEMA_ECHOES[key] is not None, key
+        assert panel._quoted(json.loads(echo), panel.SCHEMA_ECHOES[key]), echo
+        # ...including its single example entry, which is what stops the example
+        # riding into a real reply as a finding or a ruling nobody made.
+        assert not panel._is_answer(json.loads(echo)[key][0], key), echo
+
+
+def test_every_envelope_has_a_declaration_beside_it():
+    """`_read` reads `DECLARATION_KEYS[kind]` for a kind taken from
+    `ENVELOPE_KEYS`, and the two are maintained a hundred lines apart. A third
+    envelope key added without its declaration would crash the panel mid-run."""
+    assert set(panel.ENVELOPE_KEYS) == set(panel.DECLARATION_KEYS)
+    assert set(panel.ENVELOPE_KEYS) == set(panel.SCHEMA_ECHOES)
+
+
 def test_the_envelope_carries_findings_and_declarations():
     raw = json.dumps({
         "findings": [{"severity": "P2", "file": "a.py", "line": 4, "title": "leak",
@@ -52,24 +105,336 @@ def test_the_envelope_carries_findings_and_declarations():
     assert gaps == ["the migration, which is not in the diff"]
 
 
-def test_a_schema_echoed_before_the_answer_is_not_the_answer():
-    """Quoting the requested shape and then answering is ordinary model behaviour,
-    and the echo is a well-formed envelope carrying an empty `findings`. Taking the
-    FIRST one replaced a real review with a clean "found nothing" — silently, since
-    a quoted example parses perfectly. Whatever the model wrote last is its answer."""
-    raw = ('I will reply as {"findings": [], "could_not_assess": []}.\n\n'
-           'Here it is:\n'
-           '{"findings": [{"severity": "P1", "file": "a.py", "title": "boom"}], '
-           '"could_not_assess": ["the migration"]}')
+def test_an_illustration_the_model_wrote_itself_is_not_resolved_either_way():
+    """A model that invents its own example — *"e.g. `{"findings": [{"severity":
+    "P2", "file": "a.py", "title": "example only"}]}`"* — has written something
+    this parser cannot tell from an answer, because it is not the schema and its
+    text is ordinary. Ranking by how much a candidate reports read the
+    illustration as the fuller answer, and the result was the one artefact the
+    module must never produce: a FABRICATED finding filed under the reviewer's
+    name, with the reviewer's real declaration discarded beside it.
+
+    So it is not resolved. The reply retries once and is then kept as the
+    reviewer's own words — which loses nothing and invents nothing."""
+    illustration = ('e.g. {"findings": [{"severity": "P2", "file": "a.py", '
+                    '"title": "example only"}]}')
+    answer = '{"findings": [], "could_not_assess": ["the migration"]}'
+    for raw in (f"{illustration}\n\n{answer}", f"{answer}\n\nFor reference, {illustration}"):
+        assert panel.parse_reply("codex", raw) is None, raw
+
+
+def test_two_paraphrases_of_the_envelope_are_not_a_ranking_problem():
+    """The mirror direction, and the pair that broke both earlier rules inside one
+    release: an empty envelope beside a full one. First-wins lost the review to
+    the example in front of it; last-wins lost it to the one behind. Quantity
+    settled it in the right direction here and the wrong one above, which is what
+    quantity being no evidence means.
+
+    Neither of these is the schema THIS file sends (see below, where the real echo
+    is dropped and the answer survives) — they are a model's own shorthand, and
+    nothing in the reply says which is meant."""
+    empty = '{"findings": [], "could_not_assess": []}'
+    full = ('{"findings": [{"severity": "P1", "file": "a.py", "title": "boom"}], '
+            '"could_not_assess": ["the migration"]}')
+    for raw in (f"I will reply as {empty}.\n\nHere it is:\n{full}",
+                f"{full}\n\nFor reference, the shape I used was {empty}."):
+        assert panel.parse_reply("codex", raw) is None, raw
+
+
+def test_the_schema_this_file_actually_sends_is_not_an_answer():
+    """The premise, checked against the prompt instead of against an invented
+    example. `REVIEW_PROMPT` ends `"could_not_assess": ["..."]` and ships one
+    populated example finding, so an echo read literally is not empty at all: it
+    declares a gap of "..." and reports a P3 in a file called "path", which beats
+    a clean review from either side — putting `codex could not assess: ...` in the
+    PR comment and costing the round its confidence for good — and ties with a
+    real declaration, which discards the whole reply."""
+    clean = '{"findings": [], "could_not_assess": []}'
+    declared = '{"findings": [], "could_not_assess": ["the migration"]}'
+    found = ('{"findings": [{"severity": "P1", "file": "a.py", "title": "boom"}], '
+             '"could_not_assess": []}')
+    for answer, titles, gaps in ((clean, [], []),
+                                 (declared, [], ["the migration"]),
+                                 (found, ["boom"], [])):
+        for raw in (f"I will reply as {REVIEW_ECHO}\n\n{answer}",
+                    f"{answer}\n\nThe shape I used was {REVIEW_ECHO}"):
+            got = panel.parse_reply("codex", raw)
+            assert got is not None, raw
+            assert ([f.title for f in got[0]], got[1]) == (titles, gaps), raw
+
+
+def test_the_schema_does_not_beat_an_answer_in_a_lower_tier():
+    """Shape is asked before agreement, and the requested envelope beats the bare
+    array a model reached for instead — so an echo of the envelope would win the
+    whole reply while the review sits one tier below it. Discounting what the echo
+    SAYS is not enough to stop that: it has to stop being a candidate."""
+    raw = (f"The shape asked for is {REVIEW_ECHO}\n\n"
+           '[{"severity": "P2", "file": "a.py", "title": "the real one"}]')
     findings, gaps = panel.parse_reply("codex", raw)
-    assert [f.title for f in findings] == ["boom"]
-    assert gaps == ["the migration"]
+    assert [f.title for f in findings] == ["the real one"] and gaps is None
+
+
+def test_a_reply_that_is_only_the_schema_is_unreadable_not_flawless():
+    """With no answer beside it the echo is all there is, and taking it at face
+    value files a P3 in a file called "path" titled "..." and declares a coverage
+    gap of "...". Unreadable is the truthful answer: the caller asks again and then
+    keeps the reply's own words, which is how the round stays suspect."""
+    assert panel.parse_reply("codex", REVIEW_ECHO) is None
+
+
+def test_a_terse_verdict_whose_only_free_text_is_its_own_id_is_still_a_ruling(monkeypatch):
+    """The direction that matters, and the one nothing pinned. `JUDGE_PROMPT`
+    tells the judge that an issue id is "a label YOU invent for an issue you are
+    returning ('F01')" and illustrates `related` as `["F03"]`, so those strings
+    are simultaneously the schema's stand-ins and the values a compliant judge
+    writes. A rule that read them as quotation marks discarded this whole reply:
+    no ruling, every finding through as `unjudged`, and the round vetoed as not
+    adjudicated — on a verdict shaped exactly as asked."""
+    _judge_returning(monkeypatch, '{"verdicts": [{"id": "F01", "members": [0], '
+                                  '"real": true, "related": ["F03"]}]}')
+    leak = panel.Finding("codex", "P2", "a.py", 1, "leak", "")
+    out, skip, note = panel.adjudicate([[leak]], "diff", "", 34)
+    assert skip is None and [c.verdict for c in out] == ["confirmed"]
+    assert [c.reviewers for c in out] == [["codex"]]
+
+
+def test_a_finding_against_a_file_called_path_is_still_a_finding():
+    """The reviewers' side of the same collision: `"path"` is the schema's example
+    file name AND a plausible real one, and `"..."` is what a model writes when it
+    has nothing to add to a title. Neither is evidence of anything on its own."""
+    raw = json.dumps({"findings": [{"severity": "P2", "file": "path", "line": 12,
+                                    "title": "the package shadows the stdlib name",
+                                    "detail": "..."}]})
+    findings, _ = panel.parse_reply("codex", raw)
+    assert [(f.file, f.title) for f in findings] == [
+        ("path", "the package shadows the stdlib name")]
+
+
+def test_a_clean_review_that_left_the_prompts_ellipsis_in_place_is_still_clean():
+    """`{"findings": [], "could_not_assess": ["..."]}` is a sloppy but perfectly
+    real "I found nothing" — not the schema, which ships a populated example
+    finding beside that declaration. Discarding the whole candidate bought a retry
+    and then an `unstructured` veto for a flawless review. The stand-in is
+    stripped off the DECLARATION instead, which is the one field where a stand-in
+    cannot also be an answer: the reviewer is left never heard on coverage rather
+    than declaring a gap of "..."."""
+    raw = '{"findings": [], "could_not_assess": ["..."]}'
+    assert panel.parse_reply("codex", raw) == ([], None)
+
+
+def test_the_judges_own_schema_is_not_an_answer_either(monkeypatch):
+    """`JUDGE_PROMPT` ends `"coverage_note": "..."`, and the judge gets NO retry.
+    An echo taken for its reply reports an adjudicated round — no "not adjudicated"
+    veto, and a coverage ruling nobody made — on the one round where the coverage
+    split most needed ruling on."""
+    answer = '{"verdicts": [], "coverage_note": "the migration is unread"}'
+    for raw in (f"Shape: {JUDGE_ECHO}\n{answer}", f"{answer}\nShape used: {JUDGE_ECHO}"):
+        val = panel.extract_json_value(raw, "verdicts")
+        assert val["coverage_note"] == "the migration is unread", raw
+    _judge_returning(monkeypatch, JUDGE_ECHO)
+    out, skip, note = panel.adjudicate([], "diff", "", 34, coverage={"codex": ["the migration"]})
+    assert out == [] and note == ""
+    assert skip and "unparseable" in skip
+
+
+def test_the_judge_is_picked_the_same_way():
+    """`verdicts` is an envelope key too, and the judge runs the same parser. An
+    echo taken as its answer rules on nothing — which sends every finding through
+    as `unjudged` while the round reports a judge that answered."""
+    raw = ('{"verdicts": [{"id": "F01", "members": [0], "real": true}], '
+           '"coverage_note": "the migration is unread"}\n'
+           f'Shape used: {JUDGE_ECHO}')
+    val = panel.extract_json_value(raw, "verdicts")
+    assert [v["id"] for v in val["verdicts"]] == ["F01"]
+    assert val["coverage_note"] == "the migration is unread"
+
+
+def test_the_schemas_example_verdict_rules_on_nothing_even_beside_a_real_note(monkeypatch):
+    """The example verdict does not have to arrive alone. A judge that quotes it
+    and then writes a genuine `coverage_note` produces a candidate that is NOT the
+    schema handed back whole, so it is read as the answer — and consumed
+    verbatim it claims reports 0 and 3, synthesises "the merged statement of the
+    issue" and marks them real on nobody's authority.
+
+    So the entry is dropped where entries are dropped, on both paths. The round is
+    then a judge that ruled on nothing, which is what it was."""
+    example = json.loads(JUDGE_ECHO)["verdicts"][0] | {"members": [0, 3]}
+    _judge_returning(monkeypatch, json.dumps(
+        {"verdicts": [example], "coverage_note": "the migration is unread"}))
+    leak = panel.Finding("codex", "P2", "a.py", 1, "leak", "")
+    out, skip, note = panel.adjudicate([[leak]], "diff", "", 34)
+    assert [c.verdict for c in out] == ["unjudged"] and skip is None
+    assert [c.synthesis for c in out] == ["leak"]
+    assert note == "the migration is unread"
+
+
+def test_a_judge_reply_is_read_on_its_verdicts_not_on_a_findings_key():
+    """`findings` comes first in `ENVELOPE_KEYS`, so a judge candidate carrying an
+    incidental `findings` key was read as a review — on the wrong items and the
+    wrong declaration, which can call two spellings of one ruling an ambiguity and
+    take the whole round through `unjudged`. The caller says which envelope it
+    asked for."""
+    verdict = '{"id": "F01", "members": [0], "real": true}'
+    note = '"coverage_note": "the migration is unread"'
+    raw = (f'{{"verdicts": [{verdict}], {note}, "findings": []}}\n'
+           f'{{"verdicts": [{verdict}], {note}}}')
+    val = panel.extract_json_value(raw, "verdicts")
+    assert [v["id"] for v in val["verdicts"]] == ["F01"]
+    assert val["coverage_note"] == "the migration is unread"
+    # ...and read as a reviewer's reply the same text says two different things.
+    assert panel.extract_json_value(raw) is None
+
+
+def test_two_different_answers_are_not_resolved_by_position():
+    """Nothing in a reply carrying two equally-shaped, equally-full envelopes says
+    which is the answer. Picking either is a bet on prose style, and one of the two
+    bets loses a whole review — so the reply is reported as unstructured instead.
+    That path retries once and then keeps the raw text as a finding, which
+    preserves the uncertainty rather than resolving it wrongly."""
+    raw = ('{"findings": [{"title": "the first answer"}]}\n'
+           '{"findings": [{"title": "a different one"}]}')
+    assert panel.parse_reply("codex", raw) is None
+
+
+def test_an_ambiguous_reply_lands_in_the_degradation_path_that_already_exists(monkeypatch):
+    """What "not resolved" costs, end to end: one retry, and then the reviewer's
+    own words kept as a finding with the round marked as carrying an unstructured
+    reply — which is what stops that round being read as a quiet PR. Nothing is
+    dropped and nothing clean is manufactured."""
+    raw = ('{"findings": [{"title": "the first answer"}]}\n'
+           '{"findings": [{"title": "a different one"}]}')
+    calls = []
+
+    def fake_run_cli(args, label, timeout=panel.CLI_TIMEOUT, attempts=3, stdin_text=None):
+        calls.append(attempts)
+        return raw, None
+
+    monkeypatch.setattr(panel.shutil, "which", lambda name: "/usr/bin/" + name)
+    monkeypatch.setattr(panel, "run_cli", fake_run_cli)
+    got = panel.review_llm("codex", "gpt-5.6-luna", "p")
+    assert got.unstructured is True and len(calls) == 2
+    assert got.skip is None and "the first answer" in got.findings[0].detail
+
+
+def test_one_answer_printed_twice_is_not_an_ambiguity():
+    """Fencing the envelope and then repeating it is one answer, not two — and
+    degrading it would cost a second CLI call and the round its confidence."""
+    envelope = '{"findings": [{"title": "boom"}], "could_not_assess": ["the migration"]}'
+    raw = f'```json\n{envelope}\n```\n\nAgain, in full:\n{envelope}'
+    findings, gaps = panel.parse_reply("pi", raw)
+    assert [f.title for f in findings] == ["boom"] and gaps == ["the migration"]
+
+
+def test_a_review_that_genuinely_found_nothing_is_not_degraded():
+    """Two empty candidates report the same absence, so there is no answer to lose
+    by taking one — and calling it ambiguous would buy a retry and a coverage veto
+    for a reply that was perfectly clear."""
+    raw = ('I will reply as {"findings": [], "could_not_assess": []}.\n'
+           '{"findings": [], "could_not_assess": []}')
+    assert panel.parse_reply("claude", raw) == ([], [])
+
+
+def test_two_spellings_of_one_declaration_are_one_answer():
+    """`could_not_assess: "the migration"` and `["the migration"]` are the same
+    declaration to `_str_list` — the parser says so itself — so a reply carrying
+    both spellings has said one thing, not two. Comparing raw Python values called
+    that an ambiguity and spent a CLI call and the round's confidence on a reply
+    nobody could have misread; the comparison is over what the parser will read."""
+    one = '{"findings": [{"title": "boom"}], "could_not_assess": "the migration"}'
+    other = '{"findings": [{"title": "boom"}], "could_not_assess": ["the migration"]}'
+    for raw in (f"{one}\n{other}", f"{other}\n{one}"):
+        findings, gaps = panel.parse_reply("codex", raw)
+        assert [f.title for f in findings] == ["boom"] and gaps == ["the migration"], raw
+
+
+def test_two_spellings_of_one_review_are_one_review():
+    """The same rule over the findings, which is where it earns its keep now that
+    equality is the WHOLE mechanism. `"p1"` and `"P1"`, `"line": null` and no line
+    at all, an omitted `detail`, a per-finding `needs_rereview` and the matching
+    `fix_needs_rereview` index, and any key the parser ignores are one review — so
+    a model that fences its envelope and then restates it slightly differently has
+    said one thing, and calling that an ambiguity spends a CLI call and the round's
+    confidence on a reply nobody could have misread."""
+    one = ('{"findings": [{"severity": "p1", "file": "a.py", "line": null, '
+           '"title": "boom", "needs_rereview": true}]}')
+    other = ('{"findings": [{"severity": "P1", "file": "a.py", "title": "boom", '
+             '"detail": ""}], "fix_needs_rereview": [0], "summary": "I read it all"}')
+    for raw in (f"{one}\n{other}", f"{other}\n{one}"):
+        findings, gaps = panel.parse_reply("codex", raw)
+        assert [(f.severity, f.title, f.line, f.needs_rereview) for f in findings] == [
+            ("P1", "boom", None, True)], raw
+        assert gaps is None, raw
+
+
+def test_declaring_clean_is_not_the_same_answer_as_never_mentioning_the_key():
+    """`[]` is "asked, and had nothing to declare"; a bare `{"findings": []}` was
+    never heard on the question at all. The board stores the first as `[]` and the
+    second as null, and a comparison that collapsed them would call one of these
+    the other's repeat and pick whichever came last — in the payload where that
+    distinction is the whole point."""
+    declared = '{"findings": [], "could_not_assess": []}'
+    silent = '{"findings": []}'
+    for raw in (f"{silent}\n{declared}", f"{declared}\n{silent}"):
+        assert panel.parse_reply("codex", raw) is None, raw
+    # ...and each on its own still says its own thing.
+    assert panel.parse_reply("codex", declared) == ([], [])
+    assert panel.parse_reply("codex", silent) == ([], None)
+
+
+def test_a_declaration_the_parser_keeps_nothing_of_is_not_a_clean_one():
+    """Nulls, empty strings and nested objects are still dropped rather than
+    stringified — `could_not_assess: [{"area": "the migration"}]` used to become
+    the Python repr `"{'area': 'the migration'}"`, which `/panel` printed verbatim
+    as words a reviewer had written, and `app/api/reviews.py::_phrases` has always
+    dropped them.
+
+    But dropping them is not the same as the reviewer having had nothing to say,
+    and this test used to assert it was. A reviewer that WROTE something the
+    parser cannot read has declared a gap it cannot name, which is `None` ("said
+    nothing"), not `[]` ("asked, and had nothing to declare"). `coverage_veto`
+    iterates the declaration, so `[]` here retired the reviewer's veto and let a
+    round be recorded confident on a seat that had said out loud it could not
+    assess something. Only a genuinely EMPTY list is a clean declaration.
+
+    Storing `[]` and SCORING the round on `[]` are different questions; the
+    `_phrases` mirror argument settles the first and says nothing about this."""
+    junk = '{"findings": [], "could_not_assess": ["", null, {"area": "x"}, []]}'
+    assert panel.parse_reply("codex", junk) == ([], None)
+    empty = '{"findings": [], "could_not_assess": []}'
+    assert panel.parse_reply("codex", empty) == ([], [])
+
+
+def test_the_lower_tiers_answer_the_same_question_the_same_way():
+    """Two tiers went on resolving by position after the others stopped — the
+    object that is prose ABOUT the schema, and the fallback that takes any JSON at
+    all. Nothing observable turned on it, since they only ever win when nothing
+    better exists; but one file cannot hold two answers to "which value is the
+    reply", and a later reader could not tell which was meant. Both now ask what
+    was said, which among candidates that say nothing is the last of them — the
+    behaviour these tiers always had."""
+    prose = ('{"findings": "an array of objects"}\n'
+             '{"findings": "one object per defect, severity P1..P4"}')
+    assert panel.extract_json_value(prose) == {
+        "findings": "one object per defect, severity P1..P4"}
+    assert panel.extract_json_value('{"a": 1}\n{"b": 2}') == {"b": 2}
+    assert panel.extract_json_value("no json here at all") is None
 
 
 def test_a_sentence_about_the_schema_is_not_an_envelope():
     """`{"findings": "an array of objects"}` carries the key and no answer. The
     real reply — a bare array here — must win over it."""
     raw = ('{"findings": "an array of objects, severity P1..P4"}\n'
+           '[{"severity": "P2", "file": "a.py", "title": "the real one"}]')
+    findings, _ = panel.parse_reply("codex", raw)
+    assert [f.title for f in findings] == ["the real one"]
+
+
+def test_a_list_of_phrases_does_not_outweigh_the_review_beside_it():
+    """A declaration list holds PHRASES and a findings array holds objects, so a
+    rule that counted raw items would let a two-phrase `could_not_assess` beat a
+    one-finding answer — and a list of strings survives `_to_findings` as nothing
+    at all, which is the clean "found nothing" this parser must never invent."""
+    raw = ('{"findings": "an array of objects", "could_not_assess": ["a", "b"]}\n'
            '[{"severity": "P2", "file": "a.py", "title": "the real one"}]')
     findings, _ = panel.parse_reply("codex", raw)
     assert [f.title for f in findings] == ["the real one"]
@@ -139,6 +504,22 @@ def test_unparseable_is_still_none_so_the_caller_can_retry():
     # An object that isn't the envelope has no findings to take.
     assert panel.parse_reply("codex", '{"verdict": "looks fine"}') is None
     assert panel.parse_reply("codex", "[]") == ([], None)
+
+
+def test_findings_that_are_not_objects_are_unreadable_not_absent():
+    """A model that answers with a list of SENTENCES has reviewed the diff and
+    said so; every entry is dropped by `_to_findings`, and reporting the empty
+    remainder records the one thing that must never be manufactured — a reviewer
+    that read the diff and found it flawless. Unreadable is the truthful answer,
+    and it keeps the sentences: the caller retries and then holds the raw reply as
+    a finding."""
+    assert panel.parse_reply("codex", '["the migration is unread", "x is leaky"]') is None
+    assert panel.parse_reply("codex", json.dumps(
+        {"findings": ["x is leaky"], "could_not_assess": ["the migration"]})) is None
+    # ...and a findings array with one usable entry among the junk is still a
+    # review, which is the distinction the existing index arithmetic rests on.
+    findings, _ = panel.parse_reply("codex", json.dumps({"findings": [None, {"title": "x"}]}))
+    assert [f.title for f in findings] == ["x"]
 
 
 # ---- the re-review declaration ---------------------------------------------
@@ -598,7 +979,7 @@ def test_a_baseline_that_could_not_be_read_also_costs_the_verdict_its_confidence
 def test_the_veto_names_every_way_a_round_can_look_quiet_without_being_quiet():
     meta = {
         "claude": {"ran": True, "truncated": True, "max_diff_chars": 60_000},
-        "codex": {"ran": False, "skip": "codex (gpt): CLI absent"},
+        "codex": {"ran": False, "skip": "codex (gpt): exited 1 (429 rate limited)"},
         "pi": {"ran": True, "could_not_assess": ["the amendment path"]},
         "antigravity": {"ran": True, "unstructured": True},
     }
@@ -611,6 +992,65 @@ def test_the_veto_names_every_way_a_round_can_look_quiet_without_being_quiet():
     assert "antigravity returned no structured reply" in joined
     assert "not adjudicated" in joined
     assert "2 finding(s) whose reporter said the FIX needs re-reading" in joined
+
+
+def test_a_seat_this_box_does_not_carry_is_reported_without_vetoing():
+    """A reviewer whose CLI is not installed is a fact about the HOST, not about
+    the round: it is absent every round, so a veto on it makes `confident`
+    permanently unreachable on the headless machines — which is exactly where
+    the unattended loops run and where the signal has to mean something. A repo
+    that lists a workstation-only vendor (this one lists two) would otherwise
+    buy every unattended run a standing veto and teach the reader to discount
+    all of them. The skip is still reported; it is just not evidence."""
+    absent = {"antigravity": {"ran": False, "absent": True,
+                              "skip": "antigravity (m): CLI absent"},
+              "pi": {"ran": False, "absent": True, "skip": "pi (kimi): CLI absent"},
+              "claude": {"ran": True}}
+    assert panel.coverage_veto(absent, None, 0, 1_000) == []
+    assert panel.round_stop(1, 2, [], [], [])["confident"] is True
+    # Every other way of not running still says something about this round.
+    crashed = {"antigravity": {"ran": False, "skip": "antigravity (m): exited 1 (boom)"},
+               "claude": {"ran": True}}
+    assert panel.coverage_veto(crashed, None, 0, 1_000) == [
+        "antigravity did not run (antigravity (m): exited 1 (boom))"]
+
+
+def test_a_box_carrying_none_of_the_reviewer_clis_cannot_stop_confidently():
+    """The floor under the exemption above. Absent seats are exempted one at a
+    time, so a host that carries NONE of them produces an empty veto list — and
+    `confident` is `not veto`, so the round reports a confident stop on a diff
+    nobody read. That is the strongest wrong signal the panel can emit, and it
+    lands on exactly the unattended hosts the exemption was added for."""
+    none_ran = {"antigravity": {"ran": False, "absent": True, "skip": "a: CLI absent"},
+                "pi": {"ran": False, "absent": True, "skip": "p: CLI absent"}}
+    veto = panel.coverage_veto(none_ran, None, 0, 1_000)
+    assert veto == ["no reviewer ran — nothing read this diff"]
+    assert panel.round_stop(1, 2, [], [], veto)["confident"] is False
+
+
+def test_absence_is_recorded_state_rather_than_a_message_tail():
+    """The exemption reads `meta["absent"]`, not the end of the skip line.
+
+    Both directions of the message-matching version are wrong. A genuine failure
+    whose composed reason happens to end in those words would escape the veto;
+    and the day the absent branch's message gains a suffix — a hint, an install
+    pointer — the standing veto the exemption exists to remove comes back, with
+    nothing failing to say so."""
+    lookalike = {"codex": {"ran": False, "skip": "codex (gpt): exited 1 — no CLI absent"},
+                 "claude": {"ran": True}}
+    assert panel.coverage_veto(lookalike, None, 0, 1_000) == [
+        "codex did not run (codex (gpt): exited 1 — no CLI absent)"]
+    decorated = {"codex": {"ran": False, "absent": True,
+                           "skip": "codex (gpt): CLI absent — install it first"},
+                 "claude": {"ran": True}}
+    assert panel.coverage_veto(decorated, None, 0, 1_000) == []
+
+
+def test_a_reviewer_whose_cli_is_missing_records_that_as_state(monkeypatch):
+    """Where the flag comes from — the one branch that may set it."""
+    monkeypatch.setattr(panel.shutil, "which", lambda _: None)
+    got = panel.review_llm("antigravity", "m", "p")
+    assert got.absent is True and got.skip.endswith(panel.CLI_ABSENT)
 
 
 def test_a_panel_with_nothing_to_declare_vetoes_nothing():
@@ -644,6 +1084,25 @@ def test_a_round_with_no_findings_still_gets_its_coverage_adjudicated(monkeypatc
     assert findings == [] and skip is None
     assert note.startswith("the migration is unread")
     assert "could not assess the migration" in seen["prompt"]
+
+
+def test_an_ambiguous_judge_reply_is_not_a_ruling(monkeypatch):
+    """The reviewer path pays for an unresolved reply with one retry and its raw
+    text kept; the judge has no second attempt, so the same reply takes the WHOLE
+    round through `unruled` — every finding unjudged and a veto that says the
+    round was not adjudicated. That asymmetry is what makes a new way to discard
+    the judge's reply worth pinning: the failure has to be loud, because the
+    alternative is a round that reads as triaged."""
+    _judge_returning(monkeypatch, (
+        '{"verdicts": [{"id": "F01", "members": [0], "real": true, '
+        '"synthesis": "the handle is never closed"}]}\n'
+        '{"verdicts": [{"id": "F01", "members": [0], "real": false, '
+        '"synthesis": "the handle is closed by the context manager"}]}'))
+    leak = panel.Finding("codex", "P2", "a.py", 1, "leak", "")
+    out, skip, note = panel.adjudicate([[leak]], "diff", "", 34)
+    assert [c.verdict for c in out] == ["unjudged"] and note == ""
+    assert skip and "unparseable" in skip
+    assert "not adjudicated" in " | ".join(panel.coverage_veto({}, skip, 0, 1_000))
 
 
 def test_a_coverage_only_reply_is_not_a_judge_that_failed_to_rule(monkeypatch):
@@ -1046,3 +1505,102 @@ def test_the_round_the_default_cap_allows_is_still_accepted(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["panel.py", "--pr", "1", "--round", "2"])
     monkeypatch.setattr(panel, "run", lambda *a, **k: 0)
     assert panel.main() == 0
+
+
+def test_a_malformed_rereview_flag_costs_its_flags_not_the_run():
+    """`"fix_needs_rereview": 1` used to raise TypeError out of `_findings_of`.
+
+    Not a parse failure the caller could degrade from: `_read` calls
+    `_findings_of` while reading CANDIDATES, so the crash escaped the
+    retry-then-keep-it-unstructured path and could take the whole run down. A
+    flag list the parser cannot read costs its flags; the review survives."""
+    body = ('{"findings": [{"severity": "P1", "file": "a.py", "title": "t", '
+            '"detail": "d"}], "fix_needs_rereview": %s}')
+    for junk in ("1", "true", '"0"', '{"0": true}', "null"):
+        findings, _ = panel.parse_reply("codex", body % junk)
+        assert len(findings) == 1 and findings[0].needs_rereview is False
+    findings, _ = panel.parse_reply("codex", body % "[0]")
+    assert findings[0].needs_rereview is True
+
+
+def test_two_coverage_only_replies_that_disagree_are_not_one_answer():
+    """`adjudicate` accepts a coverage-only reply as a judge that ruled on
+    nothing rather than one that failed to rule. `_read` used to skip the
+    declaration whenever no envelope list sat beside it, so two such candidates
+    carrying CONFLICTING notes both read as `_Read((), None)` — one answer, and
+    `_agreed` returned the last of them. Position deciding which text survives is
+    what this release removes; it cannot come back through the one reply shape
+    that carries no items."""
+    a, b = {"coverage_note": "could not read the migration"}, {"coverage_note": "saw everything"}
+    read_a, read_b = panel._read(a, "verdicts"), panel._read(b, "verdicts")
+    assert read_a != read_b
+    assert panel._agreed([(a, read_a), (b, read_b)]) is panel._AMBIGUOUS
+    # Two spellings of ONE answer are still one answer.
+    assert panel._agreed([(a, read_a), (a, panel._read(a, "verdicts"))]) == a
+
+
+def test_a_prose_bracket_does_not_rival_a_real_findings_array():
+    """Tier 2 admitted any non-empty top-level array, so `[42]` written in prose
+    parsed, escaped containment, was no schema echo, and became a RIVAL to the
+    real answer — `_AMBIGUOUS`, a retry, the reply kept unstructured, and
+    `coverage_veto` filing "returned no structured reply". All of it on exactly
+    the older reviewers the bare-array tier exists to serve. An array the reader
+    keeps nothing of is positively identifiable as not-an-answer, the same
+    standard `_quoted` applies to the echo — no ranking needed."""
+    real = '[{"severity": "P2", "file": "a.py", "title": "t", "detail": "d"}]'
+    for noise in ("the severity on line [42]", "see [1]", "restating ids [0, 3]"):
+        assert panel.extract_json_value(f"{noise}\n{real}", "findings") == json.loads(real)
+    # Two arrays that BOTH say something still disagree, and still say so.
+    other = '[{"severity": "P1", "file": "b.py", "title": "u", "detail": "e"}]'
+    assert panel.extract_json_value(f"{real}\n{other}", "findings") is None
+
+
+def test_echo_detection_wildcards_the_prompt_s_tokens_and_nothing_else():
+    """`_quoted` used to accept ANY scalar wherever the schema held one, which was
+    right only because every scalar in both schemas comes from `<int|null>` or
+    `true|false`. Read as written it said a real `real: false` quotes the
+    example's `true` and a real `line: 42` quotes its `null` — so the first
+    literal scalar added to either prompt would have turned echo detection into a
+    rule that discards rulings. The wildcards are now the tokens themselves."""
+    schema = panel.SCHEMA_ECHOES["verdicts"]
+    verbatim = json.loads(json.dumps(schema, default=lambda _: None))
+    assert panel._quoted(verbatim, schema)
+    # A token position takes any scalar; `members` takes any NON-EMPTY scalar list.
+    assert panel.SCHEMA_ITEMS["verdicts"]["real"] is panel._TOKEN
+    assert panel.SCHEMA_ITEMS["verdicts"]["line"] is panel._TOKEN
+    named_nobody = json.loads(json.dumps(schema, default=lambda _: None))
+    named_nobody["verdicts"][0]["members"] = []
+    assert not panel._quoted(named_nobody, schema), "a verdict naming nobody is not a quotation"
+    # A literal scalar means itself rather than "any scalar".
+    assert panel._quoted(1, 1) and not panel._quoted(2, 1)
+
+
+def test_the_judge_gets_the_same_one_shot_reparse_the_reviewers_get(monkeypatch):
+    """`review_llm` answers an unresolvable reply with a second CLI call before
+    degrading; `adjudicate` went straight to `unruled`. The asymmetry was the
+    expensive half: a reviewer that cannot be read costs one seat, a judge that
+    cannot be read takes EVERY finding through `unjudged` and vetoes the round.
+
+    Agreement strictly enlarges the set of replies that resolve to None — an
+    envelope plus a restatement, an envelope plus a self-authored illustration —
+    so a failure that was rare under ranking now fires on ordinary model prose.
+    One more turn keeps the pessimistic rule without paying the whole round for
+    it."""
+    ambiguous = ('{"verdicts": [{"id": "F01", "members": [0], "real": true, '
+                 '"synthesis": "the handle is never closed"}]}\n'
+                 '{"verdicts": [{"id": "F01", "members": [0], "real": false, '
+                 '"synthesis": "the handle is closed by the context manager"}]}')
+    settled = ('{"verdicts": [{"id": "F01", "members": [0], "real": true, '
+               '"synthesis": "the handle is never closed"}]}')
+    calls = []
+
+    def fake_run_cli(args, label, timeout=panel.CLI_TIMEOUT, attempts=3, stdin_text=None):
+        calls.append(attempts)
+        return (ambiguous if len(calls) == 1 else settled), None
+
+    monkeypatch.setattr(panel.shutil, "which", lambda name: "/usr/bin/" + name)
+    monkeypatch.setattr(panel, "run_cli", fake_run_cli)
+    leak = panel.Finding("codex", "P2", "a.py", 1, "leak", "")
+    out, skip, _ = panel.adjudicate([[leak]], "diff", "", 34)
+    assert len(calls) == 2 and calls[1] == 1, "one extra attempt, not another three"
+    assert skip is None and [c.verdict for c in out] == ["confirmed"]

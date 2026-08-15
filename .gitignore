@@ -23,3 +23,8 @@ CLAUDE.local.md
 # port. Both are per-machine state written by create-worktree.
 .worktree-ports
 .worktree-port
+
+# uv resolves this from pyproject.toml on every `uv run`; it is a build artefact
+# here, not a pinned input. It reached main once via a stray `git add -A` (99ba651).
+# Tracking it is a reasonable choice — but a deliberate one, not an accidental one.
+uv.lock
