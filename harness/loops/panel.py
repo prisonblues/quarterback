@@ -2171,6 +2171,101 @@ def _diff_added_lines(diff: str) -> dict[str, set[int]]:
     return out
 
 
+def _diff_files_cut(diff: str, budget: int | None) -> set[str]:
+    """Which files a reviewer handed only the first `budget` chars of `diff` could
+    not read IN FULL — the tail that fell off the end of its prompt.
+
+    Truncation is a plain prefix cut (see the `prompt_for` budgets), so this is
+    mechanical rather than asked for, for the same reason `reviewers.*.truncated`
+    is: the one thing a truncated reviewer cannot notice is its own truncation.
+
+    A file counts as cut if ANY of it lies past the budget, not merely if it
+    starts past it. A reviewer holding half a file's hunks has not read that
+    file, and the opposite reading is the optimistic one — it would let a defect
+    in the unseen half be scored as a reviewer miss.
+
+    FILE-grain, deliberately, and like :func:`_same_file`'s consumers say of
+    themselves: the question a later round actually asks is "could the earlier
+    round see this file at all", and a per-line char offset would imply a
+    precision the prefix cut does not have.
+    """
+    if budget is None or len(diff) <= budget:
+        return set()
+    out: set[str] = set()
+    cur = None
+    off = 0
+    for line in diff.splitlines(keepends=True):
+        if line.startswith("diff --git "):
+            parts = line.split(" b/", 1)
+            cur = parts[1].strip() if len(parts) == 2 else None
+        if cur is not None and off + len(line) > budget:
+            out.add(cur)
+        off += len(line)
+    return out
+
+
+def _fix_range_diff(gh_repo: str, base_sha: str | None, head_sha: str | None) -> str | None:
+    """The diff of everything that landed BETWEEN two rounds — i.e. the fix pass
+    whose damage (or thoroughness) provenance is trying to attribute.
+
+    Returns None rather than raising whenever the range cannot be read: a
+    force-push that orphaned the earlier head, a baseline written before
+    `head_sha` was recorded, an API refusal. Provenance is a signal and not a
+    verdict, so an unreadable range has to degrade to "unknown" and leave the
+    rest of the round untouched — the alternative is a round that dies because
+    an attribution nobody gates on could not be computed.
+    """
+    if not (gh_repo and base_sha and head_sha) or base_sha == head_sha:
+        return None
+    try:
+        return sh(["gh", "api", f"repos/{gh_repo}/compare/{base_sha}...{head_sha}",
+                   "-H", "Accept: application/vnd.github.v3.diff"])
+    except subprocess.CalledProcessError:
+        return None
+
+
+#: The buckets :func:`_provenance` sorts a new finding into. `unknown` is a real
+#: answer and not a failure — it is what an unreadable fix range or an
+#: unplaceable finding honestly leaves.
+PROVENANCE = ("introduced", "missed", "missed-unread", "unknown")
+
+
+def _provenance(file: str, line: int | None, added: dict[str, set[int]],
+                unread: set[str], have_range: bool) -> str:
+    """Did the previous round's FIX introduce this defect, or did that round MISS it?
+
+    The two are one number today (`new_this_round`), and they want opposite
+    remedies: self-inflicted findings say make fix passes smaller and more
+    conservative, because more rounds will keep generating more work; missed ones
+    say the earlier round under-read, and spending on coverage genuinely helps.
+    Conflated, neither conclusion is available — including the one an operator
+    has to draw at the cap.
+
+    A SIGNAL, not a verdict, and recorded as one. A fix can break something at a
+    distance, so a defect outside the fix's own lines is *evidence of* a miss
+    rather than proof of one; #41 (review the increment) is what would make this
+    exact, at which point a finding in the increment is introduced by
+    construction and this heuristic can be retired.
+
+    `missed-unread` is the honest bucket for a defect in a file the earlier round
+    was truncated out of — a coverage failure rather than a reviewer failure, and
+    the one bucket that indicts the harness instead of the panel.
+    """
+    if not have_range:
+        return "unknown"
+    if line is not None and any(line in lines for f, lines in added.items()
+                                if _same_file(file, f)):
+        return "introduced"
+    # Checked before the unplaceable case: "the earlier round could not see this
+    # file" is a better answer than "we could not place it", and a finding with
+    # no line in an unread file is still squarely a coverage failure.
+    if any(_same_file(file, f) for f in unread):
+        return "missed-unread"
+    if line is None:
+        return "unknown"
+    return "missed"
+
+
 _SONAR_SEV = {"BLOCKER": "P1", "CRITICAL": "P1", "MAJOR": "P2", "MINOR": "P3", "INFO": "P3"}
 
 
@@ -3076,6 +3171,18 @@ class Baseline:
     #: the earliest one so every round of a cycle carries the same id. None when
     #: there was no usable baseline, in which case the run mints its own.
     cycle: str | None = None
+    #: The commit the IMMEDIATELY PRECEDING round reviewed — the other end of the
+    #: fix range provenance attributes a new finding to. Taken from the LATEST
+    #: usable baseline, deliberately the opposite end from `cycle`: the fix pass
+    #: under attribution is the one that ran between the last round and this one,
+    #: while the cycle id has to come from the earliest so every round shares it.
+    #: None for a baseline written before `head_sha` was recorded, which is every
+    #: payload banked before this landed — provenance then reads "unknown", which
+    #: is the honest answer rather than a silently wrong attribution.
+    head_sha: str | None = None
+    #: Files that preceding round could not read in full (:func:`_diff_files_cut`).
+    #: A new finding in one of them is a coverage failure, not a reviewer miss.
+    unread_files: set[str] = field(default_factory=set)
     problems: list[str] = field(default_factory=list)
 
     def raised_before(self, finding: Canonical) -> bool:
@@ -3258,6 +3365,7 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
         b.problems.append(f"{len(usable)} baselines cover {len(distinct_rounds)} round(s) — "
                           "two payloads for one round, so which of them named the cycle "
                           "was arbitrary")
+    accepted: list[tuple[int, dict]] = []
     for was, got, path, payload in usable:
         if got and b.cycle and got != b.cycle:
             b.problems.append(f"baseline {path} is from cycle {got}, not this run's "
@@ -3266,6 +3374,7 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
                               "rounds")
             continue
         b.rounds.add(was)
+        accepted.append((was, payload))
         for bucket in ("to_fix", "dismissed", "sonar_findings"):
             for f in payload.get(bucket) or []:
                 if not isinstance(f, dict):
@@ -3275,6 +3384,15 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
                 norm = _norm_title(title)
                 if norm:
                     b.titles.setdefault(norm, set()).add(file or "")
+    # Provenance's fix range runs from the LATEST accepted round to this one, so
+    # these two come from the highest round rather than from the merge of all of
+    # them: `keys` and `titles` are a union over every earlier round ("has anyone
+    # raised this before"), while "which commit did the fix pass start from" has
+    # exactly one right answer and the earlier rounds' answers are stale.
+    if accepted:
+        latest = max(accepted, key=lambda e: e[0])[1]
+        b.head_sha = str(latest.get("head_sha") or "") or None
+        b.unread_files = {str(f) for f in (latest.get("unread_files") or []) if f}
     return b
 
 
@@ -3426,6 +3544,19 @@ def _payload_defaults() -> dict:
         "changed_lines": 0,
         "reviewed": False,
         "skip_reason": None,
+        # The commit this round actually reviewed. Recorded because NOTHING else
+        # in the payload identifies one: `base` holds a branch NAME, and the head
+        # oid was fetched for the Sonar staleness check and then dropped. The next
+        # round needs it to diff the fix pass that ran in between — without it,
+        # provenance cannot be computed at all rather than computed badly.
+        "head_sha": None,
+        # What this round could not read in full, for the NEXT round's
+        # `missed-unread` bucket. See :func:`_diff_files_cut`.
+        "unread_files": [],
+        # Per-round tally of the buckets below, so a consumer gets the shape of a
+        # round without walking every finding. Empty outside a cycle, where the
+        # question does not arise.
+        "provenance_counts": {},
         # Where a run sits in the panel -> fix -> panel cycle. Defaulted here too,
         # so the skipped PR answers `payload['round_stop']` with "no cycle ran"
         # rather than with a KeyError.
@@ -3605,6 +3736,10 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         sys.exit(f"panel: cannot read PR #{pr_number} in {gh_repo}"
                  + (f" — {tail[-1][:160]}" if tail else ""))
     title, base = meta["title"], meta["baseRefName"]
+    # The commit under review. Already fetched for the Sonar staleness check; it
+    # is carried into the payload now because the next round needs it to tell a
+    # defect its own fix pass created from one this round simply missed.
+    head_sha = meta["headRefOid"]
     changed = meta["additions"] + meta["deletions"]
 
     # Progress goes to stderr in --json mode, so stdout is the payload and only
@@ -3637,6 +3772,11 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 **_payload_defaults(),
                 "repo": repo_name, "github": gh_repo, "pr": pr_number,
                 "title": title, "base": base,
+                # Recorded even though nothing was reviewed: a skipped round is
+                # still the round the NEXT one baselines against, and its head is
+                # where that round's fix range has to start. Left null, a skip
+                # anywhere in a cycle would blind provenance for the round after it.
+                "head_sha": head_sha,
                 "round": round_no,
                 "cycle": skip_prior.cycle,
                 "prior_rounds": len(skip_prior.rounds),
@@ -3864,6 +4004,41 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # will advance) and one without as `stopped: true, stop_confident: true` — a
     # confident-convergence record for a PR that had no cycle.
     cycle_run = bool(in_cycle or prior_rounds)
+
+    # ---- provenance: did the last fix pass INTRODUCE this, or did it MISS it? --
+    #
+    # What this round could not read, banked for the next one. A file is unread
+    # only if EVERY reviewer that ran was cut on it: one seat that read it means
+    # the ROUND saw it, and blaming coverage for a defect some reviewer could
+    # plainly see would let the panel off the hook for its own miss.
+    cut = [_diff_files_cut(diff, budgets.get(n)) for n in ran_llm]
+    unread_files = sorted(set.intersection(*cut)) if cut else []
+    # Attribution needs both ends of the fix range. `prior.head_sha` is None for
+    # any baseline written before it was recorded, and `_fix_range_diff` returns
+    # None for a range GitHub cannot serve (a force-push orphaning the old head),
+    # so both degrade to "unknown" rather than to a wrong answer.
+    attributable = bool(cycle_run and prior_rounds)
+    fix_diff = _fix_range_diff(gh_repo, prior.head_sha, head_sha) if attributable else None
+    fix_added = _diff_added_lines(fix_diff) if fix_diff else {}
+    if attributable and fix_diff is None:
+        notes.append(
+            "provenance unavailable: " + (
+                "the baseline does not record which commit it reviewed (written before "
+                "`head_sha` existed)" if not prior.head_sha
+                else f"could not read the range {prior.head_sha[:8]}..{(head_sha or '')[:8]}")
+            + " — new findings are recorded as `unknown`, not attributed")
+
+    def provenance_of(c: Canonical) -> str | None:
+        """None where the question does not arise — outside a cycle, in round 1,
+        or for a defect an earlier round already raised. A repeat's provenance is
+        not "unknown", it is not asked: it was not introduced by the fix pass
+        under attribution, because it predates it. Same discipline as
+        `new_findings` being None rather than 0 for a review-only run — the
+        board's column already means "the panel did not say"."""
+        if not attributable or not is_new(c):
+            return None
+        return _provenance(c.file or "", c.line, fix_added,
+                           prior.unread_files, fix_diff is not None)
     # A cycle's rounds share one id, inherited from the earliest baseline, so the
     # board can tell "the re-review of THIS declaration" from "whatever ran next
     # on this PR". Only a round 1 of an actual cycle MINTS one.
@@ -3892,6 +4067,8 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         **_payload_defaults(),
         "repo": repo_name, "github": gh_repo, "pr": pr_number,
         "title": title, "base": base, "changed_lines": changed,
+        "head_sha": head_sha,
+        "unread_files": unread_files,
         # Always True in a payload the BOARD sees — the skip path returns before
         # `record_run` because no review happened. It is here for `--json`
         # consumers, which get both shapes and need to tell them apart.
@@ -3931,9 +4108,23 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # about this run's comparison against a baseline, not a property of the
         # defect, and a Canonical that carried it would have to be told about a
         # baseline to know its own shape.
-        "to_fix": [{**c.as_dict(), "new_this_round": is_new(c)} for c in to_fix],
-        "sonar_findings": [{**c.as_dict(), "new_this_round": is_new(c)} for c in sonar],
-        "dismissed": [{**c.as_dict(), "new_this_round": is_new(c)} for c in dismissed],
+        # `provenance` rides beside `new_this_round` and for the same reason: both
+        # are facts about this run's comparison against a baseline rather than
+        # properties of the defect, and a Canonical that carried either would have
+        # to be told about a baseline to know its own shape.
+        "to_fix": [{**c.as_dict(), "new_this_round": is_new(c),
+                    "provenance": provenance_of(c)} for c in to_fix],
+        "sonar_findings": [{**c.as_dict(), "new_this_round": is_new(c),
+                            "provenance": provenance_of(c)} for c in sonar],
+        "dismissed": [{**c.as_dict(), "new_this_round": is_new(c),
+                       "provenance": provenance_of(c)} for c in dismissed],
+        # Counted over `outstanding` — the findings the cycle actually has to
+        # clear — so the tally matches `new_findings` above rather than roping in
+        # the dismissed ones, which no fixer will ever touch.
+        "provenance_counts": {
+            bucket: sum(1 for c in outstanding if provenance_of(c) == bucket)
+            for bucket in PROVENANCE
+        } if attributable else {},
         "skipped": result.skipped,
         "run_key": run_key,
     }
@@ -4038,6 +4229,22 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                      f"{len(new_keys)} of {len(outstanding)} finding(s) here were raised by "
                      f"no earlier round ({len(prior_keys)} known from {prior_rounds} earlier "
                      f"round{'s' if prior_rounds != 1 else ''}).")
+        # The split those "new" findings hide. Printed rather than left to the
+        # payload because the operator deciding whether to go again is the one
+        # the distinction is FOR: findings the fix pass created argue for a
+        # smaller next pass, findings the last round missed argue for more
+        # coverage, and the two read identically as a count.
+        pc = payload["provenance_counts"]
+        if any(pc.values()):
+            detail = [f"**{pc['introduced']} introduced** by the last fix pass",
+                      f"**{pc['missed']} missed** by the last round"]
+            if pc["missed-unread"]:
+                detail.append(f"{pc['missed-unread']} in files that round could not read")
+            if pc["unknown"]:
+                detail.append(f"{pc['unknown']} unattributable")
+            lines.append("  - of those: " + ", ".join(detail)
+                         + ". A signal, not a verdict — a fix can break something at a "
+                           "distance, so `missed` is evidence rather than proof.")
     ci_txt = {"PASS": "✅ PASS", "FAIL": "❌ FAIL", "PENDING": "⏳ pending",
               "none": "no checks reported", "unknown": "unknown"}.get(ci_status, ci_status)
     lines.append(f"**CI (`gh pr checks`, hard gate):** {ci_txt}")

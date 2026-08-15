@@ -187,9 +187,10 @@ The deployed board version lags the repo until the stack is redeployed, and only
 service knows which it is: ask it with `GET /openapi.json` → `.info.version`, for whichever
 instance you care about. (Anything built off this branch says 2.19.0 — v2.20 is harness-side.) A number written here
 instead would be wrong the next time Portainer redeploys, with no diff to catch it.
-Latest release: **v2.21**, harness-side — each panel member now runs in its own empty sandbox repo
-rather than in whatever directory the panel was launched from, and a panel that lost a seat says so.
-Before it, **v2.20** (also harness-side) had the worktree
+Latest release: **v2.24**, harness-side — a new finding now says whether the last fix pass caused it
+or the last round missed it, which were one number before and want opposite remedies.
+Before it, **v2.21** had each panel member run in its own empty sandbox repo rather than in whatever
+directory the panel was launched from, and made a panel that lost a seat say so; **v2.20** had the worktree
 tooling ask who is in a directory before rewriting it, and **v2.19** added the per-reviewer
 cost columns (schema revision 0015) and was the first to move the board since v2.15; **v2.18**
 settles a reply carrying several JSON-shaped values by agreement rather than by rank, **v2.17** made
@@ -218,6 +219,9 @@ judge) are harness-side too.
 - **v2.21** — each panel member runs in its own empty sandbox repo, not in whatever directory the
   panel was launched from and not in the repo under review; and a panel that lost a seat says so
   above its findings.
+- **v2.24** — a new finding records whether the last fix pass introduced it or the last round missed
+  it: two facts with opposite remedies that `new_this_round` collapsed into one, plus the commit each
+  round reviewed and the files it was truncated out of. A signal, not a verdict — nothing gates on it.
 - **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
   object store; wire `landed` refs to a cherry-pick helper.
 

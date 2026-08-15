@@ -338,6 +338,23 @@ Each finding record:
 | `reviewers`, `related`, `rationale` | who reported it, sibling findings from one cause, and the judge's reason |
 | `needs_rereview`, `rereview_by` | a reporter declared that fixing this takes a structural change whose *result* should be read again, and which reporters said so — the declaration the next round is checked against |
 | `new_this_round` | no earlier round of this cycle raised this defect (`--baseline`); `false` on a repeat. A run with no baseline has no earlier round, so every finding is `true` — which is why a round past the first with no `--baseline` is a veto rather than a clean sweep |
+| `provenance` | **v2.24.** Which of the two things a `new_this_round` finding is: `introduced` (on a line the last fix pass wrote), `missed` (present in the earlier round's diff and not seen), `missed-unread` (in a file that round was truncated out of — a coverage failure, not a reviewer one), or `unknown` (no readable fix range, or a finding with no line to place). `null` where the question does not arise: outside a cycle, in round 1, or on a repeat — a repeat's provenance is not unknown, it is not asked, because the defect predates the fix pass under attribution |
+
+Provenance is a **signal, not a verdict**, and nothing gates on it. A fix can break something at a
+distance, so `missed` is evidence of a miss rather than proof of one — the same discipline as
+`rereview_hit` being file-grain and saying so. #41 (review the increment) is what would make it
+exact, at which point a finding in the increment is introduced by construction.
+
+Run-level fields it depends on:
+
+| field | what it is |
+|---|---|
+| `head_sha` | **v2.24.** The commit this round reviewed. Recorded because nothing else identified one — `base` holds a branch *name* — and the next round needs it as one end of the fix range. Present on the **skipped** payload too: a skipped round is still the round the next one baselines against |
+| `unread_files` | **v2.24.** Files no reviewer that ran read in full, for the next round's `missed-unread`. A file counts as unread only if *every* running reviewer was cut on it, and a file straddling the cut counts as unread — half a file's hunks is not a read file |
+| `provenance_counts` | **v2.24.** The per-round tally over the findings the cycle has to clear, so a consumer gets the shape of a round without walking every finding. `{}` outside a cycle |
+
+A baseline written before v2.24 carries no `head_sha`, so provenance degrades to `unknown` rather
+than attributing findings against a range it invented.
 
 **Breaking, v2.14:** the per-finding keys were `title` / `detail` / `reason` with a
 `reviewers` name list. They are now `synthesis` / `detail` / `rationale`, and `id`,
