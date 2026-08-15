@@ -12,6 +12,26 @@ Allocation (a board that hands out the next free number) is the issue's larger h
 needs a board. This needs nothing, and it catches the class: a number that disagrees with
 itself, a heading claimed twice, a new release whose entry was written but never listed.
 
+**Scope, stated because the paragraph above names more than this enforces.** The four sites
+asserted here are `pyproject.toml`, `app/main.py`, `CHANGELOG.md` and `README.md` — the ones
+that decide what a running instance reports and what a reader is told is current. The
+docstrings and filenames from that first collision (`migrations/versions/0015_*.py`,
+`app/api/reviews.py`, `tests/test_v219.py`, and a `v2.19` inside a README code comment) are
+NOT asserted and can still drift silently. They are prose about which release added a
+feature, not claims about which release this is, so a check would have to encode "does this
+sentence still describe history correctly" — and a `tests/test_vNNN.py` rule would be wrong
+outright, since a harness-side release ships no app test file at all. Narrow and honest
+beats broad and noisy: this suite's whole argument is that a check which fires on a
+correctly-updated repo gets switched off.
+
+**Why it lives under `harness/` rather than in `tests/`.** It reads four text files and needs
+nothing else, but `tests/conftest.py` resolves `DATABASE_URL`, imports the app and can raise
+`pytest.UsageError` at collection when a worktree would rebuild another checkout's database.
+That made the cheapest check in the repo the hardest to run — needing `docker compose up -d
+postgres`, and impossible in an isolation-flagged worktree, which is exactly the release-day
+situation it exists for. CI discovers every `harness/**/tests` directory, so it still runs on
+every push.
+
 **What is deliberately NOT asserted: that the served version matches the newest release.**
 It routinely does not, and correctly — v2.16, v2.17, v2.18, v2.20 and v2.21 are all
 harness-side and each left the served version where it was. That looks like five missed
@@ -30,7 +50,7 @@ from pathlib import Path
 
 import pytest
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
 #: Releases are named with two components (`v2.20`); the packaged and served versions carry
 #: three (`2.20.0`). So they are compared at the grain the CHANGELOG actually uses, which
@@ -84,16 +104,31 @@ def served_version() -> str:
     importing the app: the assertion is that these two FILES agree, and an import would
     resolve the same value through whichever one happened to win.
 
-    Anchored on the `app = FastAPI(` assignment across newlines rather than scanning for
-    the first `FastAPI(` with `[^)]*`. That earlier pattern broke on a close-paren inside
-    the call — `FastAPI(title=…, lifespan=make_lifespan(), version=…)` is the ordinary
-    next edit for an app that already has a module-level engine — and would have failed
-    four tests with "the parser is wrong, not the file" on a repo whose numbers agree."""
+    Anchored on the `app = FastAPI(` assignment AND bounded to that call. Two earlier
+    versions of this pattern each failed in a different direction, and the second was
+    worse than the first:
+
+      `FastAPI\\([^)]*version=` stopped at the first close-paren, so the ordinary
+      `FastAPI(title=…, lifespan=make_lifespan(), version=…)` broke it and four tests
+      errored with "the parser is wrong, not the file" on a repo whose numbers agree.
+
+      `^app = FastAPI\\(.*?version=` with DOTALL fixed that by never stopping at all: the
+      lazy `.*?` walks past the call's closing paren and through the rest of the file, so
+      the day the version stops being an inline literal here it does NOT fail loudly — it
+      latches onto the next `version="X.Y.Z"` anywhere below (a router kwarg, a schema
+      constant, a docstring example) and every dependent test then asserts about a string
+      unrelated to what the app serves. If that stray literal happens to match pyproject's,
+      the whole suite passes green while OpenAPI reports something else.
+
+    So the match is bounded to the call's own parentheses, tolerating one level of nesting
+    (`[^()]` or a balanced `\\([^()]*\\)`) and needing no DOTALL. A version that moves out of
+    the call now fails the assert, which is the honest outcome: this fixture is coupled to
+    an inline literal, and it should say so rather than quietly find another one."""
     text = (REPO_ROOT / "app" / "main.py").read_text()
-    m = re.search(r"^app\s*=\s*FastAPI\(.*?version=\"(\d+\.\d+\.\d+)\"",
-                  text, flags=re.MULTILINE | re.DOTALL)
+    m = re.search(r"^app\s*=\s*FastAPI\((?:[^()]|\([^()]*\))*?version=\"(\d+\.\d+\.\d+)\"",
+                  text, flags=re.MULTILINE)
     assert m, ("app/main.py has no `app = FastAPI(… version=\"X.Y.Z\" …)` — the parser is "
-               "wrong, or the version stopped being an inline literal")
+               "wrong, or the version stopped being an inline literal in that call")
     return m.group(1)
 
 
@@ -170,10 +205,18 @@ def test_the_readme_prose_names_the_version_this_branch_serves(served_version):
     built off this branch says 2.19.0 …)". It drifts like the others and is likelier to
     be missed, being parenthetical prose rather than a labelled field: a board bump can
     leave it stale while the latest-release line and the bullet are both updated, and
-    every other assertion here still passes."""
+    every other assertion here still passes.
+
+    Anchored on that paragraph's own wording rather than on a bare `says (\\d+\\.\\d+\\.\\d+)`.
+    The loose pattern took the first match anywhere in the file and landed on the right
+    line only by luck — README already carries two other "says" sentences and a `v2.19` in
+    a code comment. One new sentence pairing "says" with a dotted triple, or a reordering
+    of the deploy section, silently retargets the assertion: it then fails pointing at the
+    wrong paragraph, or passes while the real one drifts."""
     text = (REPO_ROOT / "README.md").read_text()
-    m = re.search(r"says (\d+\.\d+\.\d+)", text)
-    assert m, "README.md's deploy paragraph no longer says what this branch serves"
+    m = re.search(r"built off this branch says (\d+\.\d+\.\d+)", text)
+    assert m, ("README.md has no 'Anything built off this branch says X.Y.Z' sentence — the "
+               "deploy paragraph was reworded, or it stopped naming a version")
     assert m.group(1) == served_version, (
         f"README.md says this branch serves {m.group(1)}; app/main.py serves "
         f"{served_version}")
