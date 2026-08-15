@@ -123,3 +123,20 @@ def test_a_silent_agent_that_left_a_real_fix_still_gets_it_pushed(
     assert "agent FAILED" not in out
     assert "pushing them" in out
     assert any("push" in c for c in calls), "the fix reaches the branch"
+
+
+def test_a_failed_agent_that_left_edits_still_pushes_nothing(
+        monkeypatch, tmp_path, capsys):
+    """The third corner of the same square, and the one that keeps the F08 fix
+    honest: staging first must not turn a genuinely failed run into a push.
+
+    A non-zero exit means the run failed, and half-finished edits from a run that
+    fell over are not a fix — pushing them to a dependabot PR is worse than
+    leaving it red. Only the exit-0-and-silent case is allowed to let the staged
+    diff speak, and only when stderr named no cause."""
+    agent = subprocess.CompletedProcess([], 1, "I got partway.", "Error: rate limited")
+    calls = arrange(monkeypatch, tmp_path, agent, staged_changes=True)
+
+    out = capsys.readouterr().out
+    assert "agent FAILED" in out
+    assert not any("push" in c for c in calls), "a failed run's edits stay put"

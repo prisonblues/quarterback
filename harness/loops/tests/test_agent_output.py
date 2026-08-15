@@ -121,8 +121,14 @@ def test_run_agent_does_not_deadlock_on_a_chatty_agent():
     one pipe's buffer while we wait on the other never exits."""
     proc = harness_rules.run_agent(_py(
         "import sys; sys.stdout.write('o' * 300000); sys.stderr.write('e' * 300000)"))
-    assert len(proc.stdout) == 300000
-    assert len(proc.stderr) == 300000
+    # Both streams were drained to EOF — that is what "no deadlock" means here.
+    # The RETAINED copy is capped (see KEEP_TAIL_BYTES); what matters is that the
+    # child ran to completion rather than blocking on a full pipe, and that both
+    # streams still carry their content.
+    assert proc.returncode == 0
+    assert proc.stdout.endswith("o") and proc.stderr.endswith("e")
+    assert len(proc.stdout) == harness_rules.KEEP_TAIL_BYTES
+    assert len(proc.stderr) == harness_rules.KEEP_TAIL_BYTES
 
 
 def test_run_agent_gives_the_agent_no_stdin():
@@ -199,3 +205,21 @@ def test_a_wedged_agent_is_killed_and_reported_rather_than_waited_on_forever():
     assert "timed out after 1s" in proc.stderr
     assert "working" in proc.stdout, "what it managed to say is still captured"
     assert harness_rules.agent_failure(proc), "and it reads as a failure"
+
+
+def test_a_very_chatty_agent_does_not_grow_the_timer_process_without_bound():
+    """The retained copy exists to answer two questions about the TAIL — what did
+    it say last, and did it say anything — and it was holding every byte of a run
+    documented to last tens of minutes. A verbose agent emits tens of MB, all
+    kept for the lifetime of a systemd-timer process.
+
+    The live log is unaffected: the pass-through still writes every line."""
+    proc = harness_rules.run_agent(_py(
+        "import sys\n"
+        "for i in range(20000): sys.stdout.write('x' * 100 + '\\n')\n"
+        "sys.stdout.write('THE LAST WORD\\n')"))
+    assert proc.returncode == 0
+    assert len(proc.stdout) <= harness_rules.KEEP_TAIL_BYTES + 200
+    # The end is what everything reads, so the end is what survives.
+    assert "THE LAST WORD" in harness_rules.tail_gist(proc.stdout)
+    assert not harness_rules.agent_failure(proc), "still plainly not a blank run"

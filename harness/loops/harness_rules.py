@@ -32,6 +32,20 @@ A human at the keyboard IS the authorization, and editing the file locally takes
 effect immediately. Unattended runs only honour rules that were merged to the
 default branch. Set HARNESS_UNATTENDED=1 (run-loop.sh does) to select the
 unattended read.
+
+SECOND RESPONSIBILITY: RUNNING HEADLESS CLIs AND READING WHAT THEY SAID.
+
+`run_agent`, `_pump`, and the `*_gist` / `*_failure` / `cli_outcome` readers live
+here too, and they are not about the rules file at all. They are here because
+`epic.py`, `lander.py` and `panel.py` all run headless CLIs unattended and all
+have to answer the same two questions afterwards — did this run happen, and what
+did it say — and three copies of that judgement is how they came to disagree
+about it. This module is the one both concerns already reached, so it is the
+cheapest place for the shared answer rather than a fourth import.
+
+Worth knowing, because "harness rules" does not say it: if you are looking for
+why a loop reported an agent the way it did, it is in this file's second half,
+not in panel.py.
 """
 
 from __future__ import annotations
@@ -640,8 +654,17 @@ def agent_failure(proc: subprocess.CompletedProcess) -> str:
     return ""
 
 
+#: How much of each stream to KEEP. The pass-through is unaffected — the live
+#: log still gets every byte — but the retained copy exists only so `tail_gist`
+#: can read the last ~200 characters and `agent_failure` can ask whether the
+#: stream was blank. These runs last tens of minutes and a verbose agent emits
+#: tens of MB, all of which was being held for the lifetime of a timer process
+#: to answer two questions about its tail.
+KEEP_TAIL_BYTES = 64 * 1024
+
+
 def _pump(src: TextIO, sink: TextIO, buf: list[str]) -> None:
-    """Copy a child stream to ours line by line, keeping a copy.
+    """Copy a child stream to ours line by line, keeping a BOUNDED copy.
 
     The pass-through is best-effort; the DRAIN is not. If writing to our own
     stdout fails — a BrokenPipeError because the loop's output went to `| head`
@@ -655,9 +678,23 @@ def _pump(src: TextIO, sink: TextIO, buf: list[str]) -> None:
     reachable from a closed pipe.
     """
     passthrough = True
+    kept = 0
     with src:
         for line in src:
             buf.append(line)
+            kept += len(line)
+            # Drop from the FRONT, never the back: everything that reads this
+            # buffer wants the end of it. Whole lines first, so a gist never
+            # starts mid-character, and only past the cap, so the overwhelmingly
+            # common short run copies nothing.
+            while kept > KEEP_TAIL_BYTES and len(buf) > 1:
+                kept -= len(buf.pop(0))
+            # One line can exceed the cap on its own — a CLI writing a progress
+            # bar with no newline, or a JSON blob on a single line — and trimming
+            # only whole lines would leave that unbounded, which is the same bug.
+            if kept > KEEP_TAIL_BYTES:
+                buf[-1] = buf[-1][-KEEP_TAIL_BYTES:]
+                kept = len(buf[-1])
             if not passthrough:
                 continue
             try:
