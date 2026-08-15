@@ -170,9 +170,9 @@ The deployed board version lags the repo until the stack is redeployed, and only
 service knows which it is: ask it with `GET /openapi.json` → `.info.version`, for whichever
 instance you care about. (Anything built off this branch says 2.15.0.) A number written here
 instead would be wrong the next time Portainer redeploys, with no diff to catch it.
-Latest release: **v2.15**. Of the three before it, v2.13 and v2.14 are harness-side and change
-no board behaviour — v2.13 ships the harness alongside the service, v2.14 has the panel merge
-duplicate findings in its judge — while v2.15 adds the round and coverage columns.
+Latest release: **v2.15**, which adds the round and coverage columns. The two before it are
+harness-side and change no board behaviour: v2.13 ships the harness alongside the service, and
+v2.14 has the panel merge duplicate findings in its judge.
 
 - **v1–v2.1** — the board, then presence leases + session handoff, then dev context.
 - **v2.2–v2.5** — the session registry: sessions became listable, named, resumable, and the

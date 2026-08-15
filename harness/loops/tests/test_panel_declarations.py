@@ -497,6 +497,23 @@ def test_a_reworded_finding_is_the_same_defect_as_far_as_the_round_diff_goes(tmp
     assert not b.raised_before(_canonical("b.py", "unused import in the header"))
 
 
+def test_a_plural_ending_in_es_still_matches_its_own_singular(tmp_path):
+    """The commonest noun class in a review title ends in a plain `s` after an
+    `e` — files, lines, nodes, values, handles. An `es` rule ahead of the `s` one
+    took two characters off every one of them ("files" -> "fil") while the
+    singular stemmed to itself, so singular and plural never matched and the
+    reword fallback never fired for the words it exists for: a persistent defect
+    reworded from "handle" to "handles" between rounds read as one no earlier
+    round raised, which prints as the fix having broken something."""
+    path = _payload(tmp_path, "r1.json", 1, ["the stale node handle"])
+    b = panel.load_baseline([path], THIS_RUN)
+    assert b.raised_before(_canonical("a.py", "the stale node handles"))
+    assert panel._stem("files") == panel._stem("file")
+    assert panel._stem("values") == panel._stem("value")
+    # ...and two different words are still two different words.
+    assert not b.raised_before(_canonical("a.py", "the stale node cache"))
+
+
 def test_one_material_word_apart_is_two_defects_however_alike_the_titles_read(tmp_path):
     """Findings share long boilerplate and differ in one noun. A character ratio
     puts these at 0.93, and calling the second a repeat drops it from
@@ -557,7 +574,10 @@ def test_a_finding_still_there_after_the_fix_earns_another_round():
     finding, not every P1/P2."""
     d = panel.round_stop(2, 3, [], [_confirmed("P3")], [], repeated=1)
     assert d["stop"] is False and "still outstanding" in d["reason"]
-    assert any("did not land" in v for v in d["veto"])
+    # No veto, though: the veto list answers "why this round's QUIET is not
+    # evidence of a quiet PR", and this round was not quiet — its repeat is
+    # already the stated reason for going again.
+    assert d["veto"] == []
 
 
 def test_the_cap_is_what_ends_an_argument_about_a_repeated_p4():
@@ -888,7 +908,7 @@ def test_a_json_file_that_could_not_be_written_fails_the_run(monkeypatch, capsys
     monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
     unwritable = tmp_path / "no-such-dir" / "r1.json"
     assert panel.run("board", 34, post=False, json_file=str(unwritable),
-                     record=False, round_no=1, max_rounds=2) == 2
+                     record=False, round_no=1, max_rounds=2) == panel.UNWRITTEN_PAYLOAD_EXIT
     err = capsys.readouterr().err
     # ...and the review it already paid for is still reported, not thrown away.
     assert "could not write" in err and "re-run the CYCLE" in err
@@ -911,6 +931,71 @@ def test_a_skipped_pr_still_writes_the_baseline_the_caller_was_promised(monkeypa
     assert payload["round_stop"] is None
 
 
+def test_a_skipped_round_says_which_round_it_was_and_whose_cycle(monkeypatch, capsys,
+                                                                 tmp_path):
+    """The skip payload was built from the defaults alone, so a skipped round 2
+    serialised itself as round 1 with a fresh id. Fed forward as the next round's
+    `--baseline` — which is what the caller is told to do with every round's file —
+    it collided with the real round 1 over the round number and renamed the cycle
+    out from under every later round."""
+    r1 = _payload(tmp_path, "r1.json", 1, ["unused import"], cycle="cyc-1")
+    _stub_panel(monkeypatch, title="chore(deps): bump x", cfg=SKIP_CFG)
+    out = tmp_path / "skip.json"
+    assert panel.run("board", 34, post=False, json_file=str(out), record=False,
+                     round_no=2, baseline=[r1]) == 0
+    payload = json.loads(out.read_text())
+    assert payload["round"] == 2 and payload["cycle"] == "cyc-1"
+    assert payload["prior_rounds"] == 1 and payload["prior_findings"] == 1
+    # ...and a round 3 reading both files sees two rounds of one cycle, not an
+    # ambiguity and not a conflict.
+    b = panel.load_baseline([r1, str(out)],
+                            {"github": "acme/board", "pr": 34, "round": 3})
+    assert b.problems == [] and b.rounds == {1, 2} and b.cycle == "cyc-1"
+
+
+def test_a_round_that_lost_its_baseline_records_no_cycle_rather_than_a_new_one(
+        monkeypatch, capsys, tmp_path):
+    """`followed_by` requires the cycles to match, so minting a fresh id for a
+    round 2 whose `--baseline` was mistyped makes round 1 and round 2 of one PR two
+    unrelated cycles forever — every re-review declaration round 1 made answers
+    `null` permanently, and nothing on the board says why. Null records
+    "unattributable", which is the truth and is recoverable."""
+    _, out = _report(monkeypatch, capsys, tmp_path, 2,
+                     baseline=[str(tmp_path / "nope.json")])
+    payload = json.loads(Path(out).read_text())
+    assert payload["cycle"] is None
+    assert any("unreadable" in n for n in payload["config_notes"])
+
+
+def test_a_review_only_run_records_no_cycle_either(monkeypatch, capsys, tmp_path):
+    """`ReviewIn.cycle` documents "absent ... for a standalone review that is
+    nobody's round 2", and the producer minted one on every path anyway."""
+    _, out = _report(monkeypatch, capsys, tmp_path, 1)
+    assert json.loads(Path(out).read_text())["cycle"] is None
+
+
+def test_a_json_file_that_is_a_symlink_is_not_followed(tmp_path):
+    """`Path.write_text` follows symlinks, so a pre-planted
+    `/tmp/panel-34-r1.json` -> `~/.ssh/authorized_keys` is a write under the
+    caller's own identity. The shipped defence was a paragraph telling an LLM
+    orchestrator to `mktemp -d`; this is the one every caller gets."""
+    target = tmp_path / "authorized_keys"
+    target.write_text("original")
+    link = tmp_path / "r1.json"
+    link.symlink_to(target)
+    assert panel.write_payload(str(link), {"round": 1})
+    assert target.read_text() == "original"
+
+
+def test_an_integral_float_is_the_same_declaration_on_both_paths():
+    """`app/api/reviews.py::_count_or_none` accepts `1.0` as a count; `_flag` fell
+    through to False for it. One model output, two answers about whether a
+    declaration was made."""
+    assert panel._flag(1.0) is True
+    assert panel._flag(0.0) is False
+    assert panel._flag(1.5) is False
+
+
 def test_a_skipped_pr_whose_baseline_could_not_be_written_fails_too(monkeypatch,
                                                                     capsys, tmp_path):
     """Same contract as a reviewed run: exit non-zero, so the orchestrator does not
@@ -918,7 +1003,7 @@ def test_a_skipped_pr_whose_baseline_could_not_be_written_fails_too(monkeypatch,
     _stub_panel(monkeypatch, title="chore(deps): bump x", cfg=SKIP_CFG)
     unwritable = tmp_path / "no-such-dir" / "skip.json"
     assert panel.run("board", 34, post=False, json_file=str(unwritable),
-                     record=False) == 2
+                     record=False) == panel.UNWRITTEN_PAYLOAD_EXIT
     assert "could not write" in capsys.readouterr().err
 
 

@@ -20,7 +20,9 @@ buys more.
 
 - Parse `$ARGS` in two passes. **First consume every `--flag` together with its
   value** (`--rounds 3`, `--reviewers codex,antigravity`) and remove both from the
-  string. **Then** read what is left: every integer is a PR number — `12`, `#12`,
+  string — except **`--loop`, which takes no value and is consumed alone**
+  (`--loop 12` is `--loop` and PR #12, not a flag whose value is `12`).
+  **Then** read what is left: every integer is a PR number — `12`, `#12`,
   `12,14` and `12 14 19` all parse — and an optional remaining non-numeric word is
   the repo. Order matters, and doing it the other way round is wrong for every
   flag, not just one: `--rounds 3` reviews PR #3, and `--reviewers codex` eats

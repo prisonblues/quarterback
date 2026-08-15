@@ -90,8 +90,25 @@ def upgrade() -> None:
         sa.Column("needs_rereview", sa.Boolean(), server_default="false", nullable=False),
     )
 
+    # The API coerces these three (round to at least 1, the counts to non-negative
+    # integers), but it is not the only writer: a migration, a backfill script or a
+    # psql session can put a round 0 or a negative count in, and both break run
+    # ordering and the published per-reviewer statistics. Checked in the schema so
+    # the guarantee holds for whoever writes.
+    op.create_check_constraint("ck_review_runs_round_positive", "review_runs",
+                               '"round" >= 1')
+    op.create_check_constraint("ck_review_runs_new_findings_non_negative", "review_runs",
+                               "new_findings >= 0")
+    op.create_check_constraint("ck_review_reviewers_rereview_flagged_non_negative",
+                               "review_reviewers", "rereview_flagged >= 0")
+
 
 def downgrade() -> None:
+    op.drop_constraint("ck_review_reviewers_rereview_flagged_non_negative",
+                       "review_reviewers", type_="check")
+    op.drop_constraint("ck_review_runs_new_findings_non_negative", "review_runs",
+                       type_="check")
+    op.drop_constraint("ck_review_runs_round_positive", "review_runs", type_="check")
     op.drop_column("review_finding_reports", "needs_rereview")
     op.drop_column("review_findings", "new_this_round")
     op.drop_column("review_findings", "needs_rereview")

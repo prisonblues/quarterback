@@ -477,6 +477,11 @@ def _flag(val) -> bool:
         return val.strip().lower() in _TRUTHY
     if isinstance(val, int):  # 1/0 from a model that sent a number
         return bool(val)
+    # ...including one that sent `1.0`. `app/api/reviews.py::_count_or_none`
+    # accepts an integral float for the same reason, and the two coercers must
+    # not disagree about whether one model output was a declaration.
+    if isinstance(val, float) and val.is_integer():
+        return bool(val)
     return False
 
 
@@ -551,15 +556,6 @@ def parse_reply(reviewer: str, raw: str) -> tuple[list[Finding], list[str] | Non
     declared = val.get("could_not_assess")
     gaps = _str_list(declared) if isinstance(declared, (list, str)) else None
     return findings, gaps
-
-
-def parse_findings(reviewer: str, raw: str) -> list[Finding] | None:
-    """Just the findings out of a reviewer's reply, for a caller with no use for
-    what it declared. Returns None when the reply has no usable JSON (the caller
-    retries, then falls back to a raw-text finding) — distinct from [], which
-    means the reviewer ran and found nothing."""
-    parsed = parse_reply(reviewer, raw)
-    return None if parsed is None else parsed[0]
 
 
 def _raw_finding(reviewer: str, text: str) -> Finding:
@@ -1926,8 +1922,16 @@ def _stem(word: str) -> str:
     subject — "import"/"imports", "query"/"queries". Crude on purpose: it only has
     to make two spellings of one noun agree, and over-stemming two DIFFERENT words
     into one is the failure that costs a finding, so nothing here shortens a word
-    to fewer than three characters."""
-    for suffix, repl in (("ies", "y"), ("es", ""), ("s", "")):
+    to fewer than three characters.
+
+    Plain ``-s`` is stripped before anything else, so "files" reduces to "file"
+    and agrees with its own singular. An ``-es`` rule ahead of it took two
+    characters off every word merely ENDING in es — "files"/"file",
+    "nodes"/"node", "values"/"value" — which is the noun class review titles are
+    made of, so singular and plural never matched and the reword fallback this
+    exists for never fired. The cost is the other direction, "boxes"/"box", which
+    is rarer in a title and costs a false "new" rather than a lost finding."""
+    for suffix, repl in (("ies", "y"), ("s", "")):
         if word.endswith(suffix) and len(word) - len(suffix) >= 3:
             return word[:len(word) - len(suffix)] + repl
     return word
@@ -2253,7 +2257,12 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     if not stop and round_no >= max_rounds:
         stop, capped = True, True
         reason = f"round cap ({max_rounds}) reached — {reason}, unreviewed"
-    if repeated:
+    # Only on a STOP. The veto list is printed under "why this round's quiet is
+    # not evidence of a quiet PR", and on a `go again` round the repeat IS the
+    # reason — printing it there told a reader that a round which was not quiet
+    # had untrustworthy quiet. `confident` is unaffected: it already requires
+    # `stop`.
+    if repeated and stop:
         veto = [*veto, f"{repeated} finding(s) an earlier round already raised are "
                        "still outstanding — the fix for them did not land"]
     return {
@@ -2331,16 +2340,30 @@ def write_payload(json_file: str, payload: dict) -> str:
     the failure for :func:`finish` to fail the run with. Shared by every non-error
     exit, because the file is the NEXT round's baseline and a caller told "the
     round did not happen unless the panel wrote that file" must get that answer
-    from the skip-pattern exit too."""
+    from the skip-pattern exit too.
+
+    Opened ``O_NOFOLLOW``, so a pre-planted symlink at the requested path
+    (``/tmp/panel-34-r1.json`` -> ``~/.ssh/authorized_keys``) fails the write
+    instead of following it — the hazard ``panel-review-pr.md`` §3 warns about,
+    enforced here rather than left to an instruction the caller may never read."""
     if not json_file:
         return ""
     try:
-        Path(json_file).write_text(json.dumps(payload, indent=2))
+        fd = os.open(json_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(json.dumps(payload, indent=2))
     except OSError as e:
         failed = f"{json_file} ({e.__class__.__name__})"
         print(f"panel: could not write {failed}", file=sys.stderr)
         return failed
     return ""
+
+
+#: Exit code for "the review ran, but the requested --json-file was not written".
+#: Deliberately not 2: argparse exits 2 on its own usage errors, and the caller is
+#: told a non-zero exit means the round did not happen for cycle purposes — which
+#: it cannot tell from a mistyped flag if the two share a code.
+UNWRITTEN_PAYLOAD_EXIT = 3
 
 
 def finish(write_failed: str, code: int = 0) -> int:
@@ -2362,7 +2385,7 @@ def finish(write_failed: str, code: int = 0) -> int:
               f"{write_failed}. The review above is complete, but the next round "
               "has no baseline: fix the path and re-run the CYCLE from round 1 "
               "rather than treating this round as done.", file=sys.stderr)
-        return 2
+        return UNWRITTEN_PAYLOAD_EXIT
     return code
 
 
@@ -2466,10 +2489,28 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             # clean PR. Same SHAPE as a reviewed run, too, so reading any
             # other key of it is not a KeyError. Not recorded on the board:
             # no review happened.
+            #
+            # It says WHICH round it is and which cycle that round belongs to,
+            # because the caller is told to feed every round's --json-file
+            # forward as the next round's --baseline. Left on the defaults it
+            # serialised a skipped round 2 as round 1 with a fresh id, which then
+            # collided with the real round 1 over the round number and renamed
+            # the cycle out from under every later round.
+            skip_prior = load_baseline(baseline or [],
+                                       {"repo": repo_name, "github": gh_repo,
+                                        "pr": pr_number, "round": round_no})
             skipped_payload = {
                 **_payload_defaults(),
                 "repo": repo_name, "github": gh_repo, "pr": pr_number,
                 "title": title, "base": base,
+                "round": round_no,
+                "cycle": skip_prior.cycle,
+                "prior_rounds": len(skip_prior.rounds),
+                "prior_findings": len(skip_prior.keys),
+                # A baseline this run could not read is a fact about the cycle,
+                # not about the review it skipped, so it travels with the payload
+                # rather than being dropped on the floor.
+                "config_notes": skip_prior.problems,
                 "skip_reason": f"title matches skip pattern /{pat}/",
                 "run_key": run_key,
             }
@@ -2667,8 +2708,18 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     cycle_run = bool(in_cycle or prior_rounds)
     # A cycle's rounds share one id, inherited from the earliest baseline, so the
     # board can tell "the re-review of THIS declaration" from "whatever ran next
-    # on this PR". Round 1 (and any run with no usable baseline) mints its own.
-    cycle = prior.cycle or run_key
+    # on this PR". Only a round 1 of an actual cycle MINTS one.
+    #
+    # A later round whose baseline was missing, unreadable, from another PR or
+    # not earlier sends null rather than a fresh id: `followed_by` requires the
+    # cycles to match, so a minted one would make round 1 and round 2 of the same
+    # PR two unrelated cycles forever and void every re-review declaration round 1
+    # made — a permanent hole in a published measure, bought by a mistyped path.
+    # Null records "unattributable", which is the truth and is recoverable.
+    # A review-only run sends null too, which is what `ReviewIn.cycle` has always
+    # documented ("for a standalone review that is nobody's round 2") and what the
+    # producer never emitted.
+    cycle = prior.cycle or (run_key if cycle_run and round_no == 1 else None)
 
     def loc(x: Canonical | Finding) -> str:
         return f"{x.file}:{x.line}" if x.line else x.file

@@ -138,7 +138,10 @@ def _count_or_none(v: object) -> int | None:
 def _phrases(v: object) -> list[str]:
     """A list of phrases, however the caller spelled it — mirroring
     ``panel.py::_str_list``, which tolerates the same shapes on the way IN from a
-    model. Anything unusable becomes [].
+    model. Anything unusable becomes [] — including a non-string ITEM, which is
+    dropped rather than stringified. ``could_not_assess: [{"area": "the
+    migration"}]`` used to store the Python repr ``"{'area': 'the migration'}"``,
+    which ``/panel`` then printed verbatim as words a reviewer had written.
 
     Same rule as :func:`_count_or_none`, one type over. The declaration fields
     were the only strictly-typed ones in an ingest path that documents best-effort
@@ -150,7 +153,23 @@ def _phrases(v: object) -> list[str]:
         v = [v]
     if not isinstance(v, list):
         return []
-    return [s for s in (str(x).strip() for x in v) if s]
+    return [s for s in (x.strip() for x in v if isinstance(x, str)) if s]
+
+
+def _same_file(a: str, b: str) -> bool:
+    """Do two path spellings name the same file? Equal, or one a path-suffix of
+    the other (``reviews.py`` vs ``app/api/reviews.py``) — but never two distinct
+    paths that merely end in the same basename.
+
+    The same rule as ``panel.py::_same_file``, and it has to be: reviewers spell
+    paths differently and the judge takes whichever spelling it likes per round,
+    so scoring a re-review declaration on exact equality marked an honest flag on
+    ``reviews.py`` a miss against the next round's ``app/api/reviews.py``. That
+    error only ever runs one way — against the reviewer — which is the direction a
+    published honesty measure must not be biased in."""
+    if a == b:
+        return True
+    return a.endswith("/" + b) or b.endswith("/" + a)
 
 
 # ----------------------------------------------------------------- ingest models
@@ -170,7 +189,9 @@ class ReportIn(BaseModel):
     #: Verbatim. ``detail`` is accepted as an alias because that is what the
     #: panel calls the same text on an unmerged finding.
     account: str = Field(default="", validation_alias=AliasChoices("account", "detail"))
-    #: This reviewer declared the FIX for this finding needs re-reading.
+    #: This reviewer declared the FIX for this finding needs re-reading. Omitting
+    #: the key is not a declaration either way — only an explicit ``false`` says
+    #: "no", and only that overrides the finding-level ``rereview_by``.
     needs_rereview: bool = False
 
     @field_validator("reviewer")
@@ -229,7 +250,8 @@ class FindingIn(BaseModel):
     #: A reporter declared that fixing this takes a structural change whose result
     #: should be re-read. ``rereview_by`` names which members said so, for a caller
     #: that merges before it can send per-reporter accounts; where ``reported_by``
-    #: carries its own flags those win, being the finer grain.
+    #: carries its own flags those win, being the finer grain. A reporter row that
+    #: OMITS ``needs_rereview`` has declared nothing, so this still speaks for it.
     needs_rereview: bool = False
     rereview_by: list[str] = Field(default_factory=list)
     #: No earlier round of this PR raised this. The panel computes it against the
@@ -280,7 +302,11 @@ class ReviewerIn(BaseModel):
 class StopIn(BaseModel):
     """The panel's mechanical verdict on whether the loop should go again."""
 
-    stop: bool = True
+    #: None when the caller nested a ``round_stop`` but did not say — the same
+    #: rule the flat ``stop_reason`` path follows, and the same one ``confident``
+    #: follows here. Defaulting to True recorded a running cycle as finished on
+    #: the strength of a payload that only carried a reason and a veto list.
+    stop: bool | None = None
     reason: str = ""
     #: Whether stopping was convergence. False when the round was capped, or a
     #: reviewer was truncated / absent / unparsed / declaring a gap — the cases
@@ -420,13 +446,14 @@ class Prepared:
     #: Members that declared this finding's fix worth re-reading, finest grain
     #: first: each reporter's own flag, then the panel's ``rereview_by``, then —
     #: when the finding is flagged with no attribution at all — every credited
-    #: member that sent no account, which over-credits but never silently drops
-    #: the declaration.
+    #: member that sent no flag of its own, which over-credits but never silently
+    #: drops the declaration.
     #:
     #: It CAN end up empty on a finding whose ``needs_rereview`` is true: when
-    #: every credited member sent an account and every one of them said false. A
-    #: reporter is authoritative about its own silence, so there is nobody left to
-    #: credit, and filling it in would manufacture a declaration nobody made. The
+    #: every credited member sent an EXPLICIT ``needs_rereview`` and every one of
+    #: them said false. A reporter is authoritative about its own no, so there is
+    #: nobody left to credit, and filling it in would manufacture a declaration
+    #: nobody made. The
     #: finding still stores the flag (the caller said so at finding level), so
     #: ``GET /review/findings`` shows it while no member's ``rereview_flagged``
     #: counts it — a caller contradicting itself, recorded rather than resolved.
@@ -457,17 +484,25 @@ def _prepare(findings: list[tuple[FindingIn, str]]) -> list[Prepared]:
 
         title = f.title or "(untitled)"
         # Who declared the fix worth re-reading, finest grain first. A reporter
-        # that sent an account is authoritative about ITSELF — including its
-        # silence, so `rereview_by` may only fill in for members that sent none.
-        # Reading a member's own `false` as "no data" and then crediting it from
-        # the coarser list would manufacture a declaration it did not make.
-        named = {r.reviewer for r in reports}
+        # that sent an EXPLICIT `needs_rereview` is authoritative about itself —
+        # including its `false`, which `rereview_by` may not overturn, since
+        # reading a member's own no as "no data" would manufacture a declaration
+        # it declined to make.
+        #
+        # A reporter that omitted the key said nothing at all, and a defaulted
+        # False is not a declaration: `rereview_by` is the coarser grain that
+        # remains for a caller sending accounts without per-report flags, and
+        # dropping it for every reviewer that happened to send an account lost
+        # the attribution outright — the finding stored `needs_rereview=True`
+        # with nobody credited for it.
+        named = {r.reviewer for r in reports if "needs_rereview" in r.model_fields_set}
         flagged = [r.reviewer for r in reports if r.needs_rereview]
         flagged += [n for n in f.rereview_by if n in reviewers and n not in named]
         # A finding flagged with nobody creditable: credit every member that is
         # not authoritative about its own silence — i.e. everyone credited on the
-        # finding that sent no account. Over-crediting is visible and correctable;
-        # dropping the declaration is neither — and "nobody creditable" includes a
+        # finding that sent no `needs_rereview` of its own, whether or not it sent
+        # an account. Over-crediting is visible and correctable; dropping the
+        # declaration is neither — and "nobody creditable" includes a
         # `rereview_by` naming only members this finding does not credit (a
         # renamed or retired reviewer, a typo, a member merged out), which is
         # exactly the case that used to leave `needs_rereview` stored with no
@@ -549,8 +584,14 @@ def _scorecards(
     tally: dict[str, dict[str, int]] = {n: dict.fromkeys(zero, 0) for n in names}
     for p in findings:
         own = {r.reviewer: r for r in p.reports}
-        for name in p.rereview_by:
-            tally[name]["rereview_flagged"] += 1
+        # Confirmed only, which is the population `pr_finding_history` scores the
+        # same declaration over. Counting dismissed and unjudged findings here
+        # published two different numbers under one name — the run detail table's
+        # "flagged for re-review" column and `/review/stats.rereview_flagged`
+        # against the history block printed directly beneath them.
+        if p.verdict == "confirmed":
+            for name in p.rereview_by:
+                tally[name]["rereview_flagged"] += 1
         for name in p.reviewers:
             t = tally[name]
             t["raised"] += 1
@@ -651,8 +692,8 @@ async def record_review(
         # Stored AS SENT, empty list included. `veto or None` collapsed "the panel
         # ran the stopping rule and found nothing to veto" onto "no panel ever
         # said" — the same NULL/[] collapse this release argues at length must not
-        # happen to `could_not_assess`, one field over. `_run_view` masks it on
-        # read; a query over the column cannot.
+        # happen to `could_not_assess`, one field over — and `_run_view` passes
+        # it through unmasked, so a reader of the API sees the distinction too.
         stop_veto=body.round_stop.veto if body.round_stop else None,
         sonar_gate=body.sonar_gate,
         ci_status=body.ci_status,
@@ -753,7 +794,11 @@ def _run_view(r: ReviewRun) -> dict:
         "stopped": r.stopped,
         "stop_reason": r.stop_reason,
         "stop_confident": r.stop_confident,
-        "stop_veto": r.stop_veto or [],
+        # Unmasked, like `could_not_assess` two fields down: ingest stores this
+        # AS SENT so that "the stopping rule ran and vetoed nothing" ([]) and "no
+        # panel ever said" (NULL) stay apart, and masking it on read handed every
+        # consumer exactly the collapse the storage side argues against.
+        "stop_veto": r.stop_veto,
         "sonar_gate": r.sonar_gate,
         "ci_status": r.ci_status,
         "reviewers_selected": r.reviewers_selected or [],
@@ -1275,7 +1320,9 @@ async def pr_finding_history(
         def hit(flagged: set[str]) -> bool | None:
             # None = nobody looked (no following round) or nothing was claimed,
             # which is a different answer from "nothing was there".
-            return None if j is None or not flagged else bool(flagged & answered)
+            if j is None or not flagged:
+                return None
+            return any(_same_file(a, b) for a in flagged for b in answered)
 
         return {
             "rereview_flagged": flagged_counts.get(i, 0),

@@ -135,7 +135,9 @@ async def test_an_older_payload_is_a_first_round_that_declared_nothing(client):
     run = await detail(client, r.json()["id"])
     assert run["round"] == 1
     assert run["new_findings"] is None and run["stop_reason"] is None
-    assert run["stopped"] is None and run["stop_veto"] == []
+    # `stop_veto` NULL, not []: "no panel ever said" is not "the stopping rule ran
+    # and vetoed nothing", and the read path keeps them apart as ingest does.
+    assert run["stopped"] is None and run["stop_veto"] is None
     assert run["stop_confident"] is None and run["coverage_note"] is None
     assert run["cycle"] is None
     assert card(run, "claude")["could_not_assess"] is None
@@ -204,22 +206,29 @@ async def test_a_flag_is_credited_to_the_member_that_made_it(client):
 
 
 async def test_a_reporters_own_flag_wins_over_the_panels_attribution(client):
-    """``reported_by`` is the finer grain — where it carries flags, they are the
-    record, and the coarser ``rereview_by`` is not consulted."""
+    """``reported_by`` is the finer grain, per REPORTER: a row carrying an explicit
+    flag is the record for that member, and a row that omits the key has declared
+    nothing, so the coarser ``rereview_by`` still speaks for it. Dropping it for
+    every member that merely sent an account lost the attribution outright."""
     run = await detail(client, await record(client, 6121, to_fix=[{
         "severity": "P1", "file": "app/db.py", "title": "session leak",
         "reason": "real",
-        "rereview_by": ["claude"],
+        "rereview_by": ["claude", "pi"],
         "reported_by": [
             {"reviewer": "claude", "severity": "P1", "account": "leaks on the error path"},
             {"reviewer": "codex", "severity": "P2", "account": "same, plus the retry",
              "needs_rereview": True},
+            {"reviewer": "pi", "severity": "P2", "account": "no need to re-read it",
+             "needs_rereview": False},
         ],
     }]))
     assert card(run, "codex")["rereview_flagged"] == 1
-    assert card(run, "claude")["rereview_flagged"] == 0
+    # claude sent an account but no flag of its own, so `rereview_by` fills in.
+    assert card(run, "claude")["rereview_flagged"] == 1
+    # pi said false in its own words, and that is not overturned by the coarser list.
+    assert card(run, "pi")["rereview_flagged"] == 0
     flags = {r["reviewer"]: r["needs_rereview"] for r in run["findings"][0]["reported_by"]}
-    assert flags == {"claude": False, "codex": True}
+    assert flags == {"claude": True, "codex": True, "pi": False}
 
 
 async def test_a_reporters_silence_is_not_treated_as_missing_data(client):
@@ -377,6 +386,62 @@ async def test_a_cycle_less_pair_is_unanswered_rather_than_guessed_at(client):
     assert h["runs"][0]["rereview_hit"] is None
 
 
+async def test_a_short_path_and_the_full_one_score_as_the_same_file(client):
+    """Reviewers spell paths differently and the judge takes whichever spelling it
+    likes per round — `panel.py::_same_file` exists for exactly that. Scoring the
+    re-review flag on exact string equality made an honest declaration about
+    `sync.py` a miss against the next round's `app/sync.py`, and that error only
+    ever runs one way: against the reviewer."""
+    await record(client, 6145, to_fix=[{
+        "severity": "P2", "file": "sync.py", "title": "half-stale node",
+        "reason": "real", "needs_rereview": True, "new_this_round": True,
+        "reported_by": [{"reviewer": "codex", "account": "a", "needs_rereview": True}]}])
+    await record(client, 6145, round=2, new_findings=1, to_fix=[{
+        "severity": "P2", "file": "app/sync.py", "title": "the early return again",
+        "reviewers": ["claude"], "reason": "real", "new_this_round": True}])
+    h = (await client.get(f"/review/findings?repo={REPO}&pr=6145", headers=AGENT)).json()
+    assert h["runs"][0]["rereview_hit"] is True
+    assert h["runs"][0]["rereview_by_reviewer"]["codex"]["hit"] is True
+
+
+async def test_two_files_that_merely_share_a_basename_are_not_one_file(client):
+    """The suffix rule is a path suffix, not a basename match — `api/tests/x.py`
+    and `web/tests/x.py` are two files, and crediting one flag for the other would
+    be the same over-scoring in the opposite direction."""
+    await record(client, 6146, to_fix=[{
+        "severity": "P2", "file": "api/tests/x.py", "title": "half-stale node",
+        "reviewers": ["codex"], "reason": "real",
+        "needs_rereview": True, "rereview_by": ["codex"], "new_this_round": True}])
+    await record(client, 6146, round=2, new_findings=1, to_fix=[{
+        "severity": "P2", "file": "web/tests/x.py", "title": "somewhere else",
+        "reviewers": ["claude"], "reason": "real", "new_this_round": True}])
+    h = (await client.get(f"/review/findings?repo={REPO}&pr=6146", headers=AGENT)).json()
+    assert h["runs"][0]["rereview_hit"] is False
+
+
+async def test_a_nested_stop_that_did_not_say_records_no_stop(client):
+    """The flat path's rule, stated in `record_review`: a caller that says nothing
+    about whether the cycle stopped records NULL, not a guessed True. `stop`
+    defaulting to True made `round_stop: {"reason": ..., "veto": [...]}` render a
+    running cycle as finished."""
+    run = await detail(client, await record(client, 6147, round_stop={
+        "reason": "1 finding(s) no earlier round raised",
+        "veto": ["codex saw 60,000 of 118,402 diff chars"]}))
+    assert run["stopped"] is None
+    assert run["stop_reason"] == "1 finding(s) no earlier round raised"
+    assert run["stop_veto"] == ["codex saw 60,000 of 118,402 diff chars"]
+
+
+async def test_a_declaration_that_is_not_a_phrase_is_dropped_not_stringified(client):
+    """`str(x)` on a dict stored the Python repr `"{'area': 'the migration'}"` as
+    something a reviewer declared, and `/panel` then printed it verbatim. The
+    helper's contract is that anything unusable becomes nothing."""
+    run = await detail(client, await record(client, 6148, reviewers={
+        "codex": {"model": "gpt-5.6", "ran": True,
+                  "could_not_assess": [{"area": "the migration"}, "the migration"]}}))
+    assert card(run, "codex")["could_not_assess"] == ["the migration"]
+
+
 async def test_a_flag_the_judge_never_ruled_on_is_not_a_scorable_prediction(client):
     """The two halves of one measurement used different populations. `flagged`
     counted every verdict including `dismissed`, so a declaration attached to a
@@ -393,10 +458,11 @@ async def test_a_flag_the_judge_never_ruled_on_is_not_a_scorable_prediction(clie
     h = (await client.get(f"/review/findings?repo={REPO}&pr=6139", headers=AGENT)).json()
     assert h["runs"][0]["rereview_flagged"] == 0
     assert h["runs"][0]["rereview_hit"] is None
-    # The scorecard still records that codex made the call — the run-level
-    # measurement is about what was SCORABLE, not about what was said.
+    # ...and the scorecard counts the same population, so the detail table and the
+    # history block printed under it cannot publish two different numbers under one
+    # name. A flag on a finding nobody ruled on is scored nowhere.
     run = await detail(client, h["runs"][0]["id"])
-    assert card(run, "codex")["rereview_flagged"] == 1
+    assert card(run, "codex")["rereview_flagged"] == 0
 
 
 async def test_an_unjudged_finding_does_not_vindicate_the_flag_that_pointed_at_it(client):

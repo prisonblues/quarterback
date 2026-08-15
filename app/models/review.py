@@ -6,6 +6,7 @@ from typing import Any
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    CheckConstraint,
     DateTime,
     ForeignKey,
     Index,
@@ -129,6 +130,11 @@ class ReviewRun(Base):
         Index("ix_review_runs_repo_pr", "repo", "pr"),
         Index("ix_review_runs_ts", "ts"),
         Index("ix_review_runs_author", "author"),
+        # The API is not the only writer, and a round 0 or a negative count breaks
+        # run ordering and the published statistics (see migration 0014).
+        CheckConstraint('"round" >= 1', name="ck_review_runs_round_positive"),
+        CheckConstraint("new_findings >= 0",
+                        name="ck_review_runs_new_findings_non_negative"),
     )
 
 
@@ -225,6 +231,8 @@ class ReviewReviewer(Base):
     __table_args__ = (
         UniqueConstraint("run_id", "name", name="uq_review_reviewer_run_name"),
         Index("ix_review_reviewers_name_model", "name", "model"),
+        CheckConstraint("rereview_flagged >= 0",
+                        name="ck_review_reviewers_rereview_flagged_non_negative"),
     )
 
 

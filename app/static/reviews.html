@@ -257,15 +257,11 @@ function renderAgents(rows){
 // A reviewer that saw half the diff, one that never ran, and one that said what
 // it could not judge all leave the same finding count behind. These are the
 // marks that keep them apart on the page — never as colour alone, and never
-// hidden behind a click.
-function truncMark(c){
-  return c.truncated
-    ? `<span style="color:var(--warn)" title="read the first ${
-        (c.max_diff_chars || 0).toLocaleString()} chars of the diff">✂</span>` : "";
-}
-// Row-level: which members of THIS run read a prefix, and which said what they
-// could not judge. A run whose reviewers saw half the change has to look
-// different in the list, not only once you open it.
+// hidden behind a click. Row-level only: which members of THIS run read a prefix,
+// and which said what they could not judge. A run whose reviewers saw half the
+// change has to look different in the list, not only once you open it — inside
+// the detail table the cell says "saw N chars" in words, so a glyph repeating it
+// earns nothing.
 function coverageMarks(cards){
   const cut = cards.filter(c => c.truncated).map(c => c.name);
   // A member whose reply did not parse declared nothing it may have wanted to,
@@ -426,7 +422,7 @@ async function toggleRun(tr){
         ${c.model ? `<span class="chip">${esc(c.model)}${c.effort ? " · " + esc(c.effort) : ""}</span>` : ""}</span></td>
       <td>${c.ran ? c.raised : `<span style="color:var(--warn)">did not run</span>`}</td>
       <td>${c.confirmed}</td><td class="dim">${c.dismissed}</td><td>${c.solo}</td>
-      <td class="dim">${c.truncated ? `${truncMark(c)} saw ${c.max_diff_chars?.toLocaleString()} chars`
+      <td class="dim">${c.truncated ? `saw ${c.max_diff_chars?.toLocaleString()} chars`
                                     : "saw whole diff"}</td>
       <td class="dim" style="white-space:normal;text-align:left">${
         c.unstructured ? `<span style="color:var(--warn)"

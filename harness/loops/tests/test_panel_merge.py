@@ -38,7 +38,7 @@ def test_a_severity_the_panel_does_not_count_is_normalised_where_it_arrives():
     representative pick, headed the fix list, and counted in no severity bucket
     on the board. Normalised on the way in, so no comparison downstream has to
     defend itself — including the judge's own fallback to the reviewer's call."""
-    parsed = panel.parse_findings("codex", json.dumps([
+    parsed, _ = panel.parse_reply("codex", json.dumps([
         {"severity": "BLOCKER", "file": "a.py", "title": "t"},
         {"severity": " p1 ", "file": "a.py", "title": "u"},
         {"file": "a.py", "title": "v"},
@@ -47,8 +47,8 @@ def test_a_severity_the_panel_does_not_count_is_normalised_where_it_arrives():
 
 
 def test_an_unreadable_severity_cannot_win_the_representative_pick():
-    a = panel.parse_findings("codex", '[{"severity":"BLOCKER","file":"a.py","title":"a"}]')[0]
-    b = panel.parse_findings("pi", '[{"severity":"P2","file":"a.py","title":"b"}]')[0]
+    a = panel.parse_reply("codex", '[{"severity":"BLOCKER","file":"a.py","title":"a"}]')[0][0]
+    b = panel.parse_reply("pi", '[{"severity":"P2","file":"a.py","title":"b"}]')[0][0]
     [c] = judged([{"id": "F1", "members": [0, 1]}], [a, b])
     assert (c.severity, c.synthesis) == ("P2", "b")
 
