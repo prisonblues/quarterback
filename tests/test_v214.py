@@ -244,6 +244,37 @@ async def test_a_flag_nothing_followed_up_on_is_recorded_as_a_miss(client):
     assert h["runs"][0]["rereview_hit"] is False
 
 
+async def test_a_finding_the_judge_threw_out_is_not_the_flag_being_borne_out(client):
+    """`rereview_hit` is the accuracy check on a declaration the declarer cannot
+    mark itself. Letting a false positive the judge dismissed count as the flagged
+    fix having gone wrong is the one thing that makes the number uninformative."""
+    await record(client, 6134)
+    await record(client, 6134, round=2, new_findings=0, to_fix=[],
+                 dismissed=[{"severity": "P3", "file": "app/sync.py",
+                             "title": "the mirror is redundant", "reviewers": ["claude"],
+                             "reason": "not a defect"}])
+    h = (await client.get(f"/review/findings?repo={REPO}&pr=6134", headers=AGENT)).json()
+    assert h["runs"][0]["rereview_flagged"] == 1
+    assert h["runs"][0]["rereview_hit"] is False
+
+
+async def test_a_later_cycle_is_not_the_answer_to_an_earlier_rounds_flag(client):
+    """A standalone `/panel` read, or a new cycle restarting at round 1, lands in
+    the next slot by position. Crediting it as the re-review of the earlier round
+    attributes one cycle's findings to another cycle's declaration, and this
+    number is presented as an honesty measure."""
+    await record(client, 6135)                      # round 1, flags app/sync.py
+    await record(client, 6135, round=1, new_findings=1,
+                 to_fix=[{"severity": "P2", "file": "app/sync.py",
+                          "title": "a wholly separate review of the same file",
+                          "reviewers": ["claude"], "reason": "real"}])
+    h = (await client.get(f"/review/findings?repo={REPO}&pr=6135", headers=AGENT)).json()
+    assert [r["round"] for r in h["runs"]] == [1, 1]
+    assert h["runs"][0]["rereview_flagged"] == 1
+    # A round 1 is nobody's round 2 — unanswered, not vindicated.
+    assert h["runs"][0]["rereview_hit"] is None
+
+
 async def test_a_flag_with_no_round_after_it_is_unanswered_not_wrong(client):
     """None, not False: nobody looked. Scoring an unrun round as a miss would
     punish the reviewer for the workflow stopping."""
@@ -257,6 +288,36 @@ async def test_a_chain_carries_the_declaration_it_was_given(client):
     h = await _two_rounds(client, 6133, "app/sync.py")
     flagged = [c for c in h["findings"] if c["needs_rereview"]]
     assert [c["file"] for c in flagged] == ["app/sync.py"]
+
+
+async def test_a_flag_naming_only_unknown_members_credits_someone(client):
+    """`rereview_by: ["gemini"]` on a finding credited to codex — a retired member,
+    a typo, a reviewer merged out. The filtered attribution comes back empty, and
+    the fallback used to be skipped because `rereview_by` was non-empty: the flag
+    was stored with nobody credited and nothing tallied, which is exactly the
+    silent drop the fallback exists to prevent."""
+    run = await detail(client, await record(client, 6124, to_fix=[{
+        "severity": "P2", "file": "a.py", "title": "structural", "reason": "real",
+        "reviewers": ["codex"], "needs_rereview": True, "rereview_by": ["gemini"],
+    }]))
+    assert run["findings"][0]["needs_rereview"] is True
+    assert card(run, "codex")["rereview_flagged"] == 1
+
+
+# ---- best-effort ingest ----------------------------------------------------
+
+async def test_a_garbled_round_costs_the_number_not_the_whole_record(client):
+    """This module's rule is that a review must never fail because the board
+    choked (see `_line_or_none`). A `round: 0` or `new_findings: -1` from a
+    hand-rolled caller used to 422 the payload, losing the findings, the
+    scorecards and the accounts along with the bad integer."""
+    r = await client.post("/review", json=payload(6150, round=0, new_findings=-1),
+                          headers=AGENT)
+    assert r.status_code == 201, r.text
+    run = await detail(client, r.json()["id"])
+    assert run["round"] == 1               # rounds are numbered from 1
+    assert run["new_findings"] is None     # "the panel did not say", not "none"
+    assert len(run["findings"]) == 1       # ...and the review itself survived
 
 
 # ---- the stats side --------------------------------------------------------
@@ -323,7 +384,10 @@ def _panel_round(monkeypatch, tmp_path, round_no, title, baseline=()):
                 [panel.Finding("codex", "P2", "app/sync.py", 12, title,
                                "detail", needs_rereview=True)],
                 None, 900, ["the migration, which the diff omits"])
-        return panel.ReviewerRun([], None, 800, [])
+        # claude answered in the old bare-array shape: it declared NOTHING, which
+        # is None all the way to the column — not [], which would say it was asked
+        # and had no gap.
+        return panel.ReviewerRun([], None, 800, None)
 
     monkeypatch.setattr(panel, "load_repo_cfg", lambda name: PANEL_CFG)
     monkeypatch.setattr(panel, "sh", _fake_sh)
@@ -350,6 +414,7 @@ async def test_a_real_panel_payload_records_and_reads_back(client, monkeypatch, 
     assert r1["reviewers"]["codex"]["truncated"] is True
     assert r1["reviewers"]["codex"]["could_not_assess"] == \
         ["the migration, which the diff omits"]
+    assert r1["reviewers"]["claude"]["could_not_assess"] is None
     assert r1["to_fix"][0]["needs_rereview"] is True
     assert r1["to_fix"][0]["rereview_by"] == ["codex"]
 
@@ -359,6 +424,7 @@ async def test_a_real_panel_payload_records_and_reads_back(client, monkeypatch, 
     assert run["round"] == 1 and run["new_findings"] == 1
     assert run["coverage_note"] == "codex is right that the migration is unread"
     assert card(run, "codex")["could_not_assess"] == ["the migration, which the diff omits"]
+    assert card(run, "claude")["could_not_assess"] is None
     assert card(run, "codex")["rereview_flagged"] == 1
     assert run["findings"][0]["new_this_round"] is True
 

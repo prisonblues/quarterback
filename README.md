@@ -166,7 +166,10 @@ lander loops — is counted without an agent having to remember to say so.
 
 ## Releases
 
-Running board version: **v2.14** (`GET /openapi.json` → `.info.version` on any instance).
+Running board version: **v2.12** (`GET /openapi.json` → `.info.version` on any instance).
+Latest release: **v2.14** — a deployed instance reports it once the stack is redeployed; v2.13
+shipped the harness and changed no board behaviour, so the repo runs a version ahead of the
+service until then.
 
 - **v1–v2.1** — the board, then presence leases + session handoff, then dev context.
 - **v2.2–v2.5** — the session registry: sessions became listable, named, resumable, and the

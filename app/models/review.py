@@ -150,8 +150,11 @@ class ReviewReviewer(Base):
     #: What this member said it could NOT judge — a file the diff omits, a runtime
     #: behaviour, a schema it cannot see. An observation, not a forecast, and the
     #: only thing that separates "clean" from "I could not tell"; a finding count
-    #: reports both as zero. NULL = the member declared nothing (pre-v2.14 panels
-    #: were never asked), [] = it was asked and had no gap.
+    #: reports both as zero. NULL = not asked, or asked and it said nothing (every
+    #: pre-v2.14 panel, and any reviewer whose CLI answers in the old bare-array
+    #: shape); [] = asked, and it had nothing to declare. The two states must not
+    #: collapse — that is the whole point of the column — so this says it the same
+    #: way ``app.api.reviews.ReviewerIn.could_not_assess`` does.
     could_not_assess: Mapped[list[Any] | None] = mapped_column(JSONB)
     #: Findings this member flagged as needing the FIX re-read. With the next
     #: round's new findings this is the accuracy check on the declaration itself —
@@ -272,6 +275,12 @@ class ReviewFindingReport(Base):
     ``severity``/``line`` are *this reviewer's own*, which differ from the
     judge's and are the raw material for calibration stats; "confirmed findings
     where pi was the sole reporter" becomes a join rather than a JSONB unnest.
+
+    Fed by callers that send ``reported_by``. ``panel.py`` does not yet — it
+    merges a group down to one representative before it serialises — so for panel
+    runs this table stays empty, the finding's own ``rereview_by`` attribution
+    carries the declaration instead, and the calibration counters stay at zero.
+    Issue #26 is where the panel starts sending the accounts.
     """
 
     __tablename__ = "review_finding_reports"

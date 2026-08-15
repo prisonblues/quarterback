@@ -31,7 +31,9 @@ own future findings, and a reviewer that silently produced nothing would answer
 "no" with complete confidence. Rounds are driven mechanically instead — --round
 and --baseline say which findings no earlier round raised, and that plus severity
 decides whether to go again; the declarations only stop a broken round being read
-as a clean one.
+as a clean one. The cycle belongs to the CALLER (/panel-review-pr): a run given
+none of --round/--baseline/--max-rounds is a single review and says nothing about
+rounds, rather than promising a re-review nothing will run.
 
 Default prints a report. Pass --post to also comment the summary on the PR, or
 --json to emit findings as JSON (consumed by the /panel skill's fix loop);
@@ -52,15 +54,19 @@ Usage:
     python3 ~/.claude/loops/panel.py --pr 734 --json
     python3 ~/.claude/loops/panel.py --pr 734 --reviewers codex
     python3 ~/.claude/loops/panel.py --pr 734 --reviewers claude,codex,antigravity
-    python3 ~/.claude/loops/panel.py --pr 734 --post --json-file /tmp/panel.json
-    python3 ~/.claude/loops/panel.py --pr 734 --post --round 2 \
-        --baseline /tmp/panel-r1.json --json-file /tmp/panel-r2.json
+    python3 ~/.claude/loops/panel.py --pr 734 --post --json-file "$rundir/panel.json"
+    python3 ~/.claude/loops/panel.py --pr 734 --post --round 2 --max-rounds 2 \
+        --baseline "$rundir/r1.json" --json-file "$rundir/r2.json"
+
+(`$rundir` being a `mktemp -d` of the caller's: a fixed /tmp path is a symlink
+away from writing the payload somewhere else, and world-readable meanwhile.)
 """
 
 from __future__ import annotations
 
 import argparse
 import base64
+import difflib
 import hashlib
 import json
 import os
@@ -209,7 +215,7 @@ class Finding:
     #: happened to raise the finding makes the member that called it and the
     #: member that missed it indistinguishable on exactly the statistic that
     #: separates them.
-    rereview_by: list = field(default_factory=list)
+    rereview_by: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -219,10 +225,15 @@ class ReviewerRun:
     their own coverage, and a 4-tuple unpacked at three call sites is where the
     declarations quietly become the duration."""
 
-    findings: list = field(default_factory=list)          # Finding
+    findings: list[Finding] = field(default_factory=list)
     skip: str | None = None
     duration_ms: int = 0
-    could_not_assess: list = field(default_factory=list)  # str
+    #: None = the member declared nothing (its CLI answered in the old bare-array
+    #: shape, or never got the question); [] = asked, and it had no gap. The board
+    #: stores that distinction, so the panel must not flatten it here — a reviewer
+    #: that never engaged with the coverage question would otherwise be
+    #: indistinguishable from one that engaged and reported clean.
+    could_not_assess: list[str] | None = None
     #: The reply had no JSON in it and was kept as one raw finding. Its findings
     #: are real work, but nothing it might have declared survived the parse — so a
     #: quiet round that includes one is not evidence of a quiet PR.
@@ -232,8 +243,8 @@ class ReviewerRun:
 @dataclass
 class PanelResult:
     sonar_gate: str = "skipped"          # OK | ERROR | skipped | no-analysis
-    sonar_findings: list = field(default_factory=list)   # Finding (the hard gate's issues)
-    skipped: list = field(default_factory=list)          # ["codex: CLI absent", ...]
+    sonar_findings: list[Finding] = field(default_factory=list)  # the hard gate's issues
+    skipped: list[str] = field(default_factory=list)     # ["codex: CLI absent", ...]
 
 
 # ----------------------------------------------------------------------------- helpers
@@ -252,13 +263,18 @@ def load_repo_cfg(name: str) -> dict:
         sys.exit(str(e))
 
 
-def _span_at(text: str, open_ch: str, close_ch: str) -> tuple[int, str] | None:
-    """Return (start index, first top-level balanced open_ch..close_ch span),
-    string-aware, or None. Beats a greedy `open.*close` regex: LLMs love to wrap
-    their JSON in prose or ``` fences that ALSO contain brackets, and a greedy
-    match then spans from the first stray bracket to the last, producing invalid
-    JSON. Scanning for a balanced span (and skipping brackets inside JSON string
-    literals) finds the real array/object instead."""
+def _spans(text: str, open_ch: str, close_ch: str) -> list[tuple[int, str]]:
+    """Every top-level balanced open_ch..close_ch span, as (start index, text),
+    string-aware. Beats a greedy `open.*close` regex: LLMs love to wrap their
+    JSON in prose or ``` fences that ALSO contain brackets, and a greedy match
+    then spans from the first stray bracket to the last, producing invalid JSON.
+    Scanning for balanced spans (and skipping brackets inside JSON string
+    literals) finds the real arrays/objects instead.
+
+    ALL of them, not just the first: a reply that says "severities are {P1..P4}"
+    before its envelope has a first `{` span that is not JSON, and stopping there
+    used to leave the envelope unconsidered."""
+    out: list[tuple[int, str]] = []
     depth = 0
     start = -1
     in_str = esc = False
@@ -280,28 +296,35 @@ def _span_at(text: str, open_ch: str, close_ch: str) -> tuple[int, str] | None:
         elif ch == close_ch and depth:
             depth -= 1
             if depth == 0:
-                return start, text[start:i + 1]
-    return None
+                out.append((start, text[start:i + 1]))
+    return out
+
+
+#: Keys that identify an object as the envelope a panel member (or the judge)
+#: was asked for, rather than some other object that happens to parse.
+ENVELOPE_KEYS = ("findings", "verdicts")
 
 
 def extract_json_value(raw: str) -> list | dict | None:
     """Best-effort parse of the JSON value an LLM meant to return — an object
     envelope or a bare array — tolerating ``` fences and surrounding prose.
 
-    Which of the two it is, is decided by WHICH STARTS FIRST in the reply, not by
-    trying one shape and falling back. An envelope's `{` precedes its findings
-    `[`; a bare array's `[` precedes its first item's `{`. Preferring one bracket
-    unconditionally would read an envelope's inner array as the whole reply
-    (silently dropping the declarations that ride alongside it) or an array's
-    first element as the envelope.
+    EVERY top-level `{...}` and `[...]` span is tried, and the envelope wins over
+    position: the first span that parses into an object carrying one of
+    :data:`ENVELOPE_KEYS` is the reply, whatever preceded it. Position alone is
+    not enough, and got this wrong in the one case that matters — a prose `{...}`
+    before the envelope fails to parse, and the next span by offset is the
+    envelope's own INNER findings array, which parses cleanly and silently drops
+    every declaration riding alongside it. A non-empty array is preferred next,
+    so a bare findings array behind a prose object is not lost either.
 
     Returns None when no valid JSON value is present, so callers can tell
     "parsed empty → flawless" apart from "unparseable → retry / keep raw text"
     rather than silently dropping the reviewer's work."""
     if not raw:
         return None
-    spans = [s for s in (_span_at(raw, "{", "}"), _span_at(raw, "[", "]")) if s]
-    spans.sort(key=lambda s: s[0])
+    spans = sorted(_spans(raw, "{", "}") + _spans(raw, "[", "]"), key=lambda s: s[0])
+    parsed: list[list | dict] = []
     for candidate in [s[1] for s in spans] + [raw.strip()]:
         if not candidate:
             continue
@@ -310,8 +333,14 @@ def extract_json_value(raw: str) -> list | dict | None:
         except json.JSONDecodeError:
             continue
         if isinstance(val, (list, dict)):
+            parsed.append(val)
+    for val in parsed:
+        if isinstance(val, dict) and any(k in val for k in ENVELOPE_KEYS):
             return val
-    return None
+    for val in parsed:
+        if isinstance(val, list) and val:
+            return val
+    return parsed[0] if parsed else None
 
 
 def _to_findings(reviewer: str, items: list) -> list[Finding]:
@@ -336,30 +365,34 @@ def _str_list(val) -> list[str]:
     return [s for s in (str(x).strip() for x in val) if s]
 
 
-def parse_reply(reviewer: str, raw: str) -> tuple[list[Finding], list[str]] | None:
+def parse_reply(reviewer: str, raw: str) -> tuple[list[Finding], list[str] | None] | None:
     """Parse a reviewer's reply into (findings, could_not_assess).
 
     Two shapes are accepted, because the panel's members are four different CLIs
     and a contract change lands on them at different speeds:
 
-    * ``{"findings": [...], "could_not_assess": [...], "fix_needs_rereview": [i]}``
-      — the current one, which carries the reviewer's own coverage declarations.
-    * a bare ``[...]`` of findings — every reviewer before this, and any model that
-      ignores the envelope. It records no declarations, which is honest: it made
-      none.
+    * ``{"findings": [...], "could_not_assess": [...]}`` — the current envelope,
+      which carries the reviewer's own coverage declarations.
+    * a bare ``[...]`` of findings — every reviewer before this, and any model
+      that ignores the envelope. It declares NOTHING, which is ``None`` rather
+      than ``[]``: the board's contract is that null means never asked/never
+      said and ``[]`` means asked and had no gap, and a member whose CLI ignored
+      the envelope must not read as one that engaged and reported clean.
 
-    ``fix_needs_rereview`` holds INDEXES into the findings array just returned, so
-    a reviewer needs no id scheme of its own; a per-finding ``needs_rereview``
-    boolean means the same thing and both are honoured.
+    ``fix_needs_rereview`` (a list of INDEXES into the findings array just
+    returned) is a TOLERATED alternative spelling, not what reviewers are asked
+    for: :data:`REVIEW_PROMPT` documents only the per-finding ``needs_rereview``
+    boolean. Both are honoured, so a model that reaches for the index form is
+    still heard.
 
     Returns None when the reply has no usable JSON at all (caller retries, then
-    keeps the raw text as one finding) — distinct from ([], []) which means the
-    reviewer ran, found nothing, and declared no gaps."""
+    keeps the raw text as one finding) — distinct from ``([], None)``/``([], [])``
+    which mean the reviewer ran and found nothing."""
     val = extract_json_value(raw)
     if val is None:
         return None
     if isinstance(val, list):
-        return _to_findings(reviewer, val), []
+        return _to_findings(reviewer, val), None
     items = val.get("findings")
     if not isinstance(items, list):
         return None
@@ -374,7 +407,13 @@ def parse_reply(reviewer: str, raw: str) -> tuple[list[Finding], list[str]] | No
         # what a model that wrote a boolean meant.
         if isinstance(i, int) and not isinstance(i, bool) and i in at:
             findings[at[i]].needs_rereview = True
-    return findings, _str_list(val.get("could_not_assess"))
+    # Present-and-empty is "asked, and had nothing to declare"; absent (or a
+    # value of a shape no declaration can be read out of) is "said nothing".
+    # Collapsing the two would let a reviewer that never engaged with the
+    # coverage question read as one that engaged and reported clean.
+    declared = val.get("could_not_assess")
+    gaps = _str_list(declared) if isinstance(declared, (list, str)) else None
+    return findings, gaps
 
 
 def _raw_finding(reviewer: str, text: str) -> Finding:
@@ -1084,8 +1123,24 @@ def review_ci(gh_repo: str, pr_number: int) -> tuple[str, list[str], str | None]
 # ----------------------------------------------------------------------------- synthesis
 
 def _key(f: Finding) -> tuple:
-    """Dedup bucket: same file + nearby line (±10) is treated as one issue."""
+    """Dedup bucket: same file + nearby line (±10) is treated as one issue.
+
+    The file is the BASENAME, because reviewers spell paths differently (one
+    quotes the repo-relative path, another just the file). :func:`_same_file`
+    then splits the bucket back apart where two different files share a name —
+    the representative's full path becomes this round's :func:`finding_key`, so
+    merging ``app/api/reviews.py`` with ``harness/loops/reviews.py`` would hand
+    one file's defect the other's identity."""
     return (Path(f.file).name, (f.line or 0) // 10)
+
+
+def _same_file(a: str, b: str) -> bool:
+    """Do two path spellings name the same file? Equal, or one a path-suffix of
+    the other (``reviews.py`` vs ``app/api/reviews.py``) — but never two distinct
+    paths that merely end in the same basename."""
+    if a == b:
+        return True
+    return a.endswith("/" + b) or b.endswith("/" + a)
 
 
 def group_findings(llm_findings: list[Finding]) -> list[tuple[Finding, list[str]]]:
@@ -1094,20 +1149,35 @@ def group_findings(llm_findings: list[Finding]) -> list[tuple[Finding, list[str]
 
     A ``needs_rereview`` declaration survives the merge from ANY reporter: one
     reviewer seeing that the fix will be structural is the observation, and the
-    others not saying so is not a contradiction of it."""
-    groups: dict[tuple, list[Finding]] = {}
+    others not saying so is not a contradiction of it.
+
+    The representative is the lowest severity, then the lowest title — a
+    deterministic tie-break rather than whichever member happened to be listed
+    first, because its title becomes the round's :func:`finding_key` and an
+    identity that changes when a member drops out links nothing."""
+    buckets: dict[tuple, list[list[Finding]]] = {}
     for f in llm_findings:
-        groups.setdefault(_key(f), []).append(f)
+        groups = buckets.setdefault(_key(f), [])
+        for grp in groups:
+            if _same_file(grp[0].file, f.file):
+                grp.append(f)
+                break
+        else:
+            groups.append([f])
     out = []
-    for grp in groups.values():
-        reviewers = sorted({f.reviewer for f in grp})
-        rep = min(grp, key=lambda f: f.severity)  # P1 < P2 < P3 lexically
-        # Read before it is written: the representative is one of the group's own
-        # findings, so setting its flag first would credit its reviewer with a
-        # declaration another member made.
-        rep.rereview_by = sorted({f.reviewer for f in grp if f.needs_rereview})
-        rep.needs_rereview = bool(rep.rereview_by)
-        out.append((rep, reviewers))
+    for groups in buckets.values():
+        for grp in groups:
+            reviewers = sorted({f.reviewer for f in grp})
+            rep = min(grp, key=lambda f: (f.severity, f.title))  # P1 < P2 < P3 lexically
+            # The most specific spelling of the path the group agreed on, so the
+            # key does not depend on which member wrote the shortest one.
+            rep.file = max((f.file for f in grp), key=len)
+            # Read before it is written: the representative is one of the group's
+            # own findings, so setting its flag first would credit its reviewer
+            # with a declaration another member made.
+            rep.rereview_by = sorted({f.reviewer for f in grp if f.needs_rereview})
+            rep.needs_rereview = bool(rep.rereview_by)
+            out.append((rep, reviewers))
     out.sort(key=lambda e: e[0].severity)
     return out
 
@@ -1124,21 +1194,29 @@ def judge(groups: list[tuple[Finding, list[str]]], diff: str, model: str,
     surface it rather than silently reporting a bare 'unavailable'. A real bug
     from a single reviewer is confirmed; only genuine false positives are dropped
     (style and polish are kept). When the judge can't rule, the caller keeps everything (we never
-    silently suppress a finding). No findings -> ({}, None, ""): nothing to judge.
+    silently suppress a finding).
+
+    Neither findings NOR declarations -> ({}, None, ""): there is nothing to rule
+    on. Declarations with no findings still run: that is the round where "clean
+    versus could-not-tell" most needs adjudicating — two members saying they
+    could not read the migration while a third reports clean is a split, and a
+    finding count of zero says nothing about it.
 
     The judge is asked to rule on coverage in the same call — one extra key in the
     object it already returns, no additional model call. Its own reply may still
     be the bare verdict array every earlier judge returned, in which case there is
     simply no coverage note."""
     declared = {k: v for k, v in (coverage or {}).items() if v}
-    if not groups:
+    if not groups and not declared:
         return {}, None, ""
     if not shutil.which("claude"):
         return {}, "judge: claude CLI absent", ""
     listing = "\n".join(
         f"[{i}] {f.severity} {f.file}:{f.line or '?'} (via {', '.join(revs)}) — "
         f"{f.title} — {f.detail}"
-        for i, (f, revs) in enumerate(groups))
+        for i, (f, revs) in enumerate(groups)) \
+        or ("- (no findings this round — there is nothing to adjudicate but the "
+            "coverage below; return an empty `verdicts` array)")
     stated = "\n".join(f"- {name}: could not assess {'; '.join(items)}"
                        for name, items in sorted(declared.items())) \
         or "- (no reviewer declared a gap in its coverage)"
@@ -1153,6 +1231,10 @@ def judge(groups: list[tuple[Finding, list[str]]], diff: str, model: str,
         note = str(parsed.get("coverage_note") or "").strip()
         parsed = parsed.get("verdicts")
     if not isinstance(parsed, list):
+        # With nothing to adjudicate, a reply that carries only the coverage note
+        # is a complete answer — not a judge that failed to rule.
+        if not groups:
+            return {}, None, note
         return {}, "judge: no JSON verdict in output (unparseable)", note
     verdicts: dict[int, dict] = {}
     for v in parsed:
@@ -1175,15 +1257,56 @@ def finding_key(file: str | None, title: str) -> str:
     that arrives without one, so a panel that computed it differently would put
     the local round-over-round diff and the board's cross-run chains on two
     different notions of "the same finding" — and only one of them would be
-    visible to the person reading the stats."""
+    visible to the person reading the stats.
+
+    Known limitation, and the reason :func:`Baseline.raised_before` exists: the
+    title is whichever group member won the merge, so a defect described one way
+    in round 1 and another way in round 2 hashes to two different keys. Rewording
+    must not turn a persistent defect into a new one, so the ROUND diff matches
+    on the key OR on a near-identical title in the same file; the board's chains
+    stay on the exact key, because that is the identity it shares with the SQL."""
     norm = re.sub(r"[^a-z0-9]+", " ", (title or "").lower()).strip()
     return hashlib.md5(f"{file or ''}|{norm}".encode(),
                        usedforsecurity=False).hexdigest()[:16]
 
 
-def load_baseline(paths: list[str]) -> tuple[set[str], int, list[str]]:
-    """Every finding key earlier rounds of this PR already raised, from their
-    ``--json-file`` payloads. Returns (keys, rounds_covered, problems).
+#: How alike two titles for the same file must read before the round diff treats
+#: them as one defect reworded. Deliberately high: this only ever has to absorb
+#: "unused import" vs "import is unused", never two genuinely different defects.
+REWORD_RATIO = 0.85
+
+
+@dataclass
+class Baseline:
+    """What earlier rounds of THIS PR already raised."""
+
+    keys: set[str] = field(default_factory=set)
+    #: normalised title -> the file it was raised against, for the reworded case.
+    titles: dict[str, str] = field(default_factory=dict)
+    #: Which earlier rounds are actually represented here, not the highest round
+    #: label among them: baselines for rounds 1 and 3 are two earlier rounds, and
+    #: calling that three invents one nobody ran. ``len(rounds)`` is what prints.
+    rounds: set[int] = field(default_factory=set)
+    problems: list[str] = field(default_factory=list)
+
+    def raised_before(self, file: str | None, title: str) -> bool:
+        """Did an earlier round raise this defect — under this key, or under a
+        near-identical title in the same file?"""
+        if finding_key(file, title) in self.keys:
+            return True
+        norm = re.sub(r"[^a-z0-9]+", " ", (title or "").lower()).strip()
+        if not norm:
+            return False
+        return any(
+            was_file == (file or "")
+            and difflib.SequenceMatcher(None, norm, was).ratio() >= REWORD_RATIO
+            for was, was_file in self.titles.items()
+        )
+
+
+def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
+    """Every finding earlier rounds of this PR already raised, from their
+    ``--json-file`` payloads.
 
     Keyed on what was RAISED, not on what was confirmed: a finding the judge
     dismissed in round 1 and a reviewer raises again in round 2 is not new
@@ -1192,26 +1315,54 @@ def load_baseline(paths: list[str]) -> tuple[set[str], int, list[str]]:
     A baseline that cannot be read is reported rather than swallowed. Its absence
     makes every finding look new, which reads as "the fix broke things" — the
     exact opposite of the truth — so the caller marks the round's verdict
-    unearned instead of quietly believing it."""
-    keys: set[str] = set()
-    rounds = 0
-    problems: list[str] = []
+    unearned instead of quietly believing it. Every defect in a payload is
+    downgraded to a ``problems`` entry for that reason — including a malformed
+    ``round``, which used to raise out of ``run()`` and kill a review after the
+    diff had been fetched and every reviewer CLI had been paid for.
+
+    ``expect`` (``repo``/``github``/``pr``/``round``) is checked against what the
+    payload says it is. A baseline from another PR is not a thinner baseline, it
+    is a wrong one: its keys would make real findings read as repeated and stop
+    the loop early, so a mismatched payload is REPORTED and its keys dropped."""
+    b = Baseline()
+    want = expect or {}
     for path in paths:
         try:
             payload = json.loads(Path(path).read_text())
         except (OSError, json.JSONDecodeError) as e:
-            problems.append(f"baseline {path} unreadable ({e.__class__.__name__})")
+            b.problems.append(f"baseline {path} unreadable ({e.__class__.__name__})")
             continue
         if not isinstance(payload, dict):
-            problems.append(f"baseline {path} is not a panel payload")
+            b.problems.append(f"baseline {path} is not a panel payload")
             continue
-        rounds = max(rounds, int(payload.get("round") or 1))
+        wrong = [f"{k}={payload.get(k)!r} (this run: {want[k]!r})"
+                 for k in ("repo", "github", "pr")
+                 if k in want and payload.get(k) is not None and payload.get(k) != want[k]]
+        if wrong:
+            b.problems.append(f"baseline {path} is another review's — " + ", ".join(wrong)
+                              + " — its findings were NOT counted as earlier rounds")
+            continue
+        try:
+            was = int(payload.get("round") or 1)
+        except (TypeError, ValueError):
+            b.problems.append(f"baseline {path} has a malformed round "
+                              f"({payload.get('round')!r}) — counted as round 1")
+            was = 1
+        if "round" in want and was >= want["round"]:
+            b.problems.append(f"baseline {path} is round {was}, which is not earlier than "
+                              f"this run's round {want['round']} — pass the round this "
+                              "run actually is")
+        b.rounds.add(was)
         for bucket in ("to_fix", "dismissed", "sonar_findings"):
             for f in payload.get(bucket) or []:
-                if isinstance(f, dict):
-                    keys.add(str(f.get("key") or "")
-                             or finding_key(f.get("file"), str(f.get("title", ""))))
-    return keys, rounds, problems
+                if not isinstance(f, dict):
+                    continue
+                file, title = f.get("file"), str(f.get("title", ""))
+                b.keys.add(str(f.get("key") or "") or finding_key(file, title))
+                norm = re.sub(r"[^a-z0-9]+", " ", title.lower()).strip()
+                if norm:
+                    b.titles[norm] = file or ""
+    return b
 
 
 def coverage_veto(reviewer_meta: dict[str, dict], judge_skip: str | None,
@@ -1238,7 +1389,9 @@ def coverage_veto(reviewer_meta: dict[str, dict], judge_skip: str | None,
         for gap in meta.get("could_not_assess") or []:
             out.append(f"{name} could not assess: {gap}")
     if judge_skip:
-        out.append(f"findings were not adjudicated ({judge_skip})")
+        # Phrased for both halves of the judge's job: on a round with no findings
+        # it is the coverage split that went unadjudicated, not the findings.
+        out.append(f"the round was not adjudicated ({judge_skip})")
     if flagged:
         out.append(f"{flagged} finding(s) whose reporter said the FIX needs re-reading")
     return out
@@ -1301,7 +1454,14 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
 def run(repo_name: str, pr_number: int, post: bool, json_out: bool = False,
         reviewers: str | None = None, json_file: str = "", record: bool = True,
         round_no: int = 1, baseline: list[str] | None = None,
-        max_rounds: int = DEFAULT_MAX_ROUNDS) -> int:
+        max_rounds: int | None = None) -> int:
+    # A cycle is something the CALLER drives, and only /panel-review-pr does:
+    # naming a cap (or a round, or a baseline) is what says this run is part of
+    # one. A review-only /panel run left to the default is a single pass, and
+    # must not report itself as "round 1 of at most 2 — go again", promising a
+    # re-review nothing will run.
+    in_cycle = max_rounds is not None or round_no > 1 or bool(baseline)
+    cap = DEFAULT_MAX_ROUNDS if max_rounds is None else max_rounds
     # Idempotency key for the board record, minted once per process so a retry of
     # the POST cannot double-count the run into the stats. A fresh panel run is a
     # genuinely new observation and gets a new key — re-reviewing a PR after a fix
@@ -1459,22 +1619,21 @@ def run(repo_name: str, pr_number: int, post: bool, json_out: bool = False,
 
     # ---- this round against the ones before it. Mechanical: which findings are
     # ones no earlier round raised, and does that make the loop done?
-    prior_keys, prior_rounds, baseline_problems = load_baseline(baseline or [])
-    notes.extend(baseline_problems)
-    if prior_keys and round_no == 1:
-        # Not fatal — the diff against the baseline is still right — but the round
-        # number is what the board files this run under, so a re-review recorded
-        # as a first round makes the PR look like it was reviewed twice from
-        # scratch rather than once and then again.
-        notes.append("`--baseline` given with `--round 1` — this run records as a "
-                     "first round; pass the round it actually is")
-    round_keys = {finding_key(f.file, f.title) for f, _, _ in to_fix}
-    new_keys = sorted(round_keys - prior_keys)
+    prior = load_baseline(baseline or [],
+                          {"repo": repo_name, "github": gh_repo, "pr": pr_number,
+                           "round": round_no})
+    prior_keys, prior_rounds = prior.keys, len(prior.rounds)
+    notes.extend(prior.problems)
+    # Reworded findings count as raised before, not as fresh damage — see
+    # Baseline.raised_before.
+    seen_before = {finding_key(f.file, f.title): prior.raised_before(f.file, f.title)
+                   for f, _, _ in to_fix}
+    new_keys = sorted(k for k, before in seen_before.items() if not before)
     flagged = sum(1 for f, _, _ in to_fix if f.needs_rereview)
     veto = coverage_veto(reviewer_meta, judge_skip, flagged, len(diff))
-    stop = round_stop(round_no, max_rounds, new_keys,
-                      [f for f, _, _ in to_fix], veto, not baseline_problems,
-                      repeated=len(round_keys & prior_keys))
+    stop = round_stop(round_no, cap, new_keys,
+                      [f for f, _, _ in to_fix], veto, not prior.problems,
+                      repeated=sum(1 for before in seen_before.values() if before))
 
     def loc(f: Finding) -> str:
         return f"{f.file}:{f.line}" if f.line else f.file
@@ -1492,7 +1651,7 @@ def run(repo_name: str, pr_number: int, post: bool, json_out: bool = False,
                 # are the same one, and sending it keeps the local round diff and
                 # the board's chains provably on the same identity.
                 "key": key,
-                "new_this_round": key not in prior_keys,
+                "new_this_round": not prior.raised_before(f.file, f.title),
                 "needs_rereview": f.needs_rereview,
                 "rereview_by": list(f.rereview_by)}
     payload = {
@@ -1558,7 +1717,10 @@ def run(repo_name: str, pr_number: int, post: bool, json_out: bool = False,
     if round_no > 1 or prior_rounds:
         heading += f" · round {round_no}"
     lines = [heading, ""]
-    if round_no > 1 or prior_keys:
+    # One predicate for the heading and the summary beneath it: a baseline that
+    # parsed but held no findings is still an earlier round, and used to produce a
+    # "· round 1" heading with nothing under it.
+    if round_no > 1 or prior_rounds:
         lines.append(f"**Round {round_no}** — re-reviewing after the fix. "
                      f"{len(new_keys)} of {len(to_fix)} finding(s) here were raised by no "
                      f"earlier round ({len(prior_keys)} known from {prior_rounds} earlier "
@@ -1593,7 +1755,8 @@ def run(repo_name: str, pr_number: int, post: bool, json_out: bool = False,
     for skip in llm_skipped:
         lines.append(f"  - ⚠️ **not reviewed** — {skip}")
     if not groups:
-        judge_txt = "n/a — no findings to judge"
+        judge_txt = ("ruled on coverage only — no findings to judge" if coverage_note
+                     else "n/a — no findings to judge")
     elif judged:
         judge_txt = reviewer_label("claude", panel.get("judge_model", ""))
     else:
@@ -1614,7 +1777,8 @@ def run(repo_name: str, pr_number: int, post: bool, json_out: bool = False,
             tail = f" — {reason}" if reason and reason != "unjudged" else ""
             # Only where there IS an earlier round to be new against: on a first
             # round every finding is new and the marker would be decoration.
-            fresh = " 🆕" if prior_keys and finding_key(f.file, f.title) not in prior_keys else ""
+            fresh = (" 🆕" if prior_rounds and not prior.raised_before(f.file, f.title)
+                     else "")
             again = (" ↻ _fix needs re-reading (" + ", ".join(f.rereview_by) + ")_"
                      if f.needs_rereview else "")
             lines.append(f"- **{f.severity}**{fresh} `{loc(f)}` — {f.title}{conf(revs)}{tail}{again}")
@@ -1651,13 +1815,23 @@ def run(repo_name: str, pr_number: int, post: bool, json_out: bool = False,
 
     verdict = "**stop**" if stop["stop"] else "**go again**"
     unearned = stop["stop"] and not stop["confident"]
-    lines.append(f"\n**Rounds:** round {round_no} of at most {max_rounds} — {verdict}: "
-                 + stop["reason"]
-                 + (" — a stop, not convergence" if unearned else ""))
+    # Only where a loop actually exists. `--max-rounds` is the CALLER's cap and
+    # only /panel-review-pr drives the loop; a review-only run (`/panel`, or
+    # panel.py by hand) that printed "round 1 of at most 2 — go again" promised a
+    # round nothing would run, and counted every finding of a first review as one
+    # "no earlier round raised" — which is vacuously all of them.
+    if in_cycle or prior_rounds:
+        lines.append(f"\n**Rounds:** round {round_no} of at most {cap} — {verdict}: "
+                     + stop["reason"]
+                     + (" — a stop, not convergence" if unearned else ""))
+        veto_head, bullet = "  _why this round's quiet is not evidence of a quiet PR:_", "  - ⚠️ "
+    else:
+        veto_head, bullet = ("\n**Coverage caveats** — why this review's quiet is not "
+                             "evidence of a quiet PR:"), "- ⚠️ "
     if stop["veto"]:
-        lines.append("  _why this round's quiet is not evidence of a quiet PR:_")
+        lines.append(veto_head)
         for why in stop["veto"]:
-            lines.append(f"  - ⚠️ {why}")
+            lines.append(f"{bullet}{why}")
 
     report = "\n".join(lines)
     print(report)
@@ -1712,16 +1886,28 @@ def main() -> int:
     ap.add_argument("--baseline", action="append", default=[], metavar="PATH",
                     help="a previous round's --json-file payload, so this run can say "
                          "which findings no earlier round raised. Repeatable")
-    ap.add_argument("--max-rounds", type=int, default=DEFAULT_MAX_ROUNDS,
+    ap.add_argument("--max-rounds", type=int, default=None,
                     dest="max_rounds", metavar="N",
-                    help=f"the caller's round cap (default {DEFAULT_MAX_ROUNDS}); used to "
-                         "tell a round that stopped because it was done from one that "
-                         "stopped because it ran out")
+                    help=f"the CALLER's round cap ({DEFAULT_MAX_ROUNDS} when this run is "
+                         "part of a cycle); used to tell a round that stopped because it "
+                         "was done from one that stopped because it ran out. Passing it "
+                         "is what says this run belongs to a panel -> fix -> panel cycle: "
+                         "without it (and without --round/--baseline) the run is a single "
+                         "review and reports no rounds. `/panel-review-pr` spells it "
+                         "--rounds N and passes it here on every invocation")
     args = ap.parse_args()
     if args.round_no < 1:
         raise SystemExit("--round: rounds are numbered from 1")
-    if args.max_rounds < 1:
+    if args.max_rounds is not None and args.max_rounds < 1:
         raise SystemExit("--max-rounds: at least one round has to run")
+    if args.max_rounds is not None and args.round_no > args.max_rounds:
+        # Otherwise the run records an impossible position ("round 5 of at most
+        # 2") and hits the cap branch on the spot, writing "round cap (2) reached"
+        # into a round 5's stop reason. The copy-paste that produces it is cheap
+        # to catch here and corrupts cycle metadata everywhere else.
+        raise SystemExit(f"--round {args.round_no} is past --max-rounds "
+                         f"{args.max_rounds}: raise the cap, or pass the round "
+                         "this run actually is")
     return run(args.repo, args.pr, args.post, args.json_out, args.reviewers,
                args.json_file, args.record, args.round_no, args.baseline,
                args.max_rounds)

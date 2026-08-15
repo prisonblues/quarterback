@@ -364,10 +364,15 @@ async function renderHistory(box, repo, pr){
   // Per round: what it found that the one before had not, and whether the fixes
   // it asked to have re-read were worth re-reading. That last one is the accuracy
   // check on the declaration — the declarer cannot mark its own homework.
+  // A hit is the declaration BORNE OUT, so it reads as the good outcome: --warn
+  // is this page's mark for something wrong with the review (unjudged, truncated,
+  // did not run, not convergence) and must not also mean "the reviewer was right".
+  const hitTitle = "file-grain: the next round in this cycle raised a confirmed "
+    + "finding in a file this round flagged — not a claim that the fix caused it";
   const rounds = h.runs.map(r => {
     const hit = r.rereview_hit == null ? "" :
-      r.rereview_hit ? ' <span style="color:var(--warn)">→ the next round found something there</span>'
-                     : ' <span class="dim">→ the next round found nothing there</span>';
+      r.rereview_hit ? ` <span style="color:var(--good)" title="${hitTitle}">→ the next round found something there</span>`
+                     : ` <span class="dim" title="${hitTitle}">→ the next round found nothing there</span>`;
     return `<div class="dim">r${r.round || 1}: ${
       r.new_findings == null ? "new count not recorded" : `${r.new_findings} new`}${
       r.rereview_flagged ? ` · ${r.rereview_flagged} flagged for re-review${hit}` : ""}${

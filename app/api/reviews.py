@@ -43,8 +43,13 @@ per reporter. Together those make the review reviewable: whether a clean verdict
 was *earned* is on the row rather than in a transcript, and a reviewer that says
 "I could not assess X" and turns out to be right becomes distinguishable from one
 that silently reported clean — see ``GET /review/findings``, which checks each
-re-review flag against what the following round actually found. Payloads without
-any of it record exactly as before, as round 1 with nothing declared.
+re-review flag against what the following round of the same cycle actually found,
+at file grain. Payloads without any of it record exactly as before, as round 1
+with nothing declared: ``could_not_assess`` is NULL for a member that said
+nothing and ``[]`` only for one that was asked and had no gap, and the two never
+collapse. ``needs_rereview`` is per reporter where the caller sends
+``reported_by``; ``panel.py`` merges before it serialises, so its runs attribute
+at the coarser ``rereview_by`` grain until issue #26.
 """
 
 from __future__ import annotations
@@ -98,6 +103,23 @@ def _line_or_none(v: int | None) -> int | None:
     an out-of-range INTEGER would do.
     """
     return v if v is None or -_INT32 - 1 <= v <= _INT32 else None
+
+
+def _count_or_none(v: object) -> int | None:
+    """A non-negative count the column can hold, or no count at all.
+
+    Same rule as :func:`_line_or_none`, for the same reason: a hand-rolled caller
+    that sends ``new_findings: -1`` must not lose its findings, its scorecards and
+    its accounts to a 422 over one bad integer. "The panel did not say" is a state
+    this column already has, so a value that cannot be believed becomes it.
+    """
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        n = int(v)  # a count spelled as a string is still a count
+    except (TypeError, ValueError):
+        return None
+    return n if 0 <= n <= _INT32 else None
 
 
 # ----------------------------------------------------------------- ingest models
@@ -154,6 +176,13 @@ class FindingIn(BaseModel):
     #: Per-reviewer accounts. Supersedes ``reviewers`` (the names are implied by
     #: it) but does not replace it: a panel may list a member that contributed no
     #: text, and every older panel sends names only.
+    #:
+    #: ``panel.py`` does not send this yet — it merges a group down to one
+    #: representative and discards each member's severity, line and detail before
+    #: serialising (issue #26 is where that changes). So for panel runs the finest
+    #: attribution that arrives is ``rereview_by`` below, and the calibration
+    #: counters, which need a reporter's own severity, stay at zero. Callers that
+    #: do send accounts — and the tests — exercise the finer path.
     reported_by: list[ReportIn] = Field(default_factory=list)
 
     #: The panel's id for this finding *within this run* (e.g. ``"1609-F03"``).
@@ -242,9 +271,12 @@ class ReviewIn(BaseModel):
     ci_status: str | None = None
 
     #: Where this run sat in the panel -> fix -> panel cycle. Absent = round 1,
-    #: which is what every pre-v2.14 run was.
-    round: int = Field(default=1, ge=1)
-    new_findings: int | None = Field(default=None, ge=0)
+    #: which is what every pre-v2.14 run was. Coerced rather than validated: this
+    #: module's rule is that recording is best-effort (see :func:`_line_or_none`),
+    #: and rejecting the payload would lose the findings, the scorecards and the
+    #: accounts along with the bad integer.
+    round: int = 1
+    new_findings: int | None = None
     #: The stopping rule's own account of itself. ``stop_reason`` is accepted flat
     #: as well, because the panel prints it both ways and a caller reproducing the
     #: payload by hand should not have to nest one string.
@@ -268,6 +300,19 @@ class ReviewIn(BaseModel):
         default=None,
         description="idempotency key; re-POSTing the same key returns the first run",
     )
+
+    @field_validator("round", mode="before")
+    @classmethod
+    def _round(cls, v: object) -> int:
+        """Rounds are numbered from 1, and an unbelievable one is round 1 — the
+        same answer the migration gives every row that predates the column."""
+        n = _count_or_none(v)
+        return n if n and n >= 1 else 1
+
+    @field_validator("new_findings", mode="before")
+    @classmethod
+    def _new_findings(cls, v: object) -> int | None:
+        return _count_or_none(v)
 
 
 def _verdict(f: FindingIn, judged: bool) -> str:
@@ -351,10 +396,14 @@ def _prepare(findings: list[tuple[FindingIn, str]]) -> list[Prepared]:
         named = {r.reviewer for r in reports}
         flagged = [r.reviewer for r in reports if r.needs_rereview]
         flagged += [n for n in f.rereview_by if n in reviewers and n not in named]
-        # A finding flagged with no attribution at all: credit everyone credited
-        # on it. Over-crediting is visible and correctable; dropping the
-        # declaration is neither.
-        if not flagged and f.needs_rereview and not named and not f.rereview_by:
+        # A finding flagged with nobody creditable: credit everyone credited on
+        # it. Over-crediting is visible and correctable; dropping the declaration
+        # is neither — and "nobody creditable" includes a `rereview_by` naming
+        # only members this finding does not credit (a renamed or retired
+        # reviewer, a typo, a member merged out), which is exactly the case that
+        # used to leave `needs_rereview` stored with no member credited and no
+        # `rereview_flagged` tallied anywhere.
+        if not flagged and f.needs_rereview and not named:
             flagged = list(reviewers)
         prepared.append(Prepared(
             f=f,
@@ -405,6 +454,12 @@ def _scorecards(
     run unless it appears in ``skipped``, whose entries read ``"codex: CLI
     absent"``. Assuming the opposite would file every quiet reviewer as broken.
     """
+    # `rereview_by` is unioned in defensively, not because it can add a name
+    # today: :func:`_prepare` builds it from report reviewers (appended to
+    # `reviewers`), from `f.rereview_by` filtered by membership, or from
+    # `reviewers` itself, so it is always a subset. The tally below indexes
+    # `tally[name]` for every name in it, and that lookup must stay total if the
+    # attribution rules ever widen.
     credited = {r for p in findings for r in (*p.reviewers, *p.rereview_by)}
     skips = {s.split(":", 1)[0].strip(): s for s in skipped if ":" in s}
     names = sorted(set(cfg) | set(selected) | credited)
@@ -964,6 +1019,14 @@ async def pr_finding_history(
 
     Scoped to one PR because ``key`` identifies a defect within a PR: the same
     "unused import" in two repos is not one chain.
+
+    Each run also carries ``rereview_flagged``/``rereview_hit``. A hit says the
+    round that followed *in the same cycle* (the next run, and only when its
+    round number is this one's plus 1) raised a confirmed finding in a file this
+    round flagged for re-reading. That is a file-grain coincidence, not a causal
+    claim: an unrelated defect in a large flagged file counts, a regression that
+    lands in another file does not, and it is worth reading over many rounds
+    rather than as a verdict on one.
     """
     # One over the window, so "there is older history" is a fact rather than the
     # guess "we returned exactly as many as we asked for".
@@ -1005,9 +1068,19 @@ async def pr_finding_history(
     # or it did not. Derived from the record rather than asked for — the declarer
     # cannot mark its own homework.
     #
+    # What it establishes is FILE-GRAIN and no more: something the following round
+    # raised in a file this round flagged. It does not establish that the later
+    # finding was caused by the earlier fix — an unrelated defect in a big flagged
+    # file scores as a hit, and a regression that surfaces in another file scores
+    # as a miss. It is a signal over many rounds, not a verdict on one.
+    #
     # "New" is computed within the traced window, so a finding first raised before
     # it counts as new here; the run's own `new_findings`, which the panel
     # computed against its real baseline, is reported alongside for that reason.
+    # Only findings that survived the judge count as new: a false positive the
+    # judge threw out is not the flagged fix being borne out, and admitting it is
+    # the one thing that would make this number uninformative. Sonar's hard-gate
+    # issues are excluded for the same reason — nobody adjudicated them.
     first_seen = {key: order[obs[0].run_id] for key, obs in chains.items()}
     flagged_files: dict[int, set[str]] = {}
     fresh_files: dict[int, set[str]] = {}
@@ -1018,8 +1091,21 @@ async def pr_finding_history(
             flagged_counts[i] = flagged_counts.get(i, 0) + 1
             if f.file:
                 flagged_files.setdefault(i, set()).add(f.file)
-        if f.file and first_seen[f.finding_key] == i:
+        if (f.file and first_seen[f.finding_key] == i
+                and f.verdict not in ("dismissed", "sonar")):
             fresh_files.setdefault(i, set()).add(f.file)
+
+    def followed_by(i: int) -> int | None:
+        """The run that re-reviewed run ``i``'s fix, if the record says there was
+        one: the next run in the window, and only when its round number is this
+        one's plus 1. Position alone credited whatever ran next — a standalone
+        `/panel` read, or a new cycle restarting at round 1 — as the answer to an
+        earlier round's declaration, and this number is presented as an honesty
+        measure, where a wrong attribution is worse than none.
+        """
+        if i + 1 >= len(runs):
+            return None
+        return i + 1 if runs[i + 1].round == (runs[i].round or 1) + 1 else None
 
     out = []
     for key, obs in chains.items():
@@ -1077,12 +1163,13 @@ async def pr_finding_history(
              "round": r.round, "new_findings": r.new_findings,
              "stop_reason": r.stop_reason, "stop_confident": r.stop_confident,
              # Findings this round declared worth re-reading, and whether the
-             # round that followed found anything where it pointed. None = no
-             # round followed, which is a different answer from "nothing there".
+             # round that followed found anything where it pointed — file-grain,
+             # over confirmed findings only. None = no round followed it in this
+             # cycle, which is a different answer from "nothing there".
              "rereview_flagged": flagged_counts.get(i, 0),
              "rereview_hit": (
-                 None if i + 1 >= len(runs) or not flagged_files.get(i)
-                 else bool(flagged_files[i] & fresh_files.get(i + 1, set()))
+                 None if followed_by(i) is None or not flagged_files.get(i)
+                 else bool(flagged_files[i] & fresh_files.get(followed_by(i), set()))
              )}
             for i, r in enumerate(runs)
         ],

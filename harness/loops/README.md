@@ -178,8 +178,9 @@ cwd's repo; `--repo` takes a path or a name under `~/source`.
 ## Reviewer panel (`panel.py`)
 
 `python3 ~/.claude/loops/panel.py --pr <n>` (report) / `--post` (also comment on the
-PR) / `--json` (findings as JSON, no report) / `--round <r> --baseline <earlier
-round's --json-file>` (a re-review that knows what the earlier rounds raised).
+PR) / `--json` (findings as JSON, no report) / `--round <r> --max-rounds <N> --baseline
+<earlier round's --json-file>` (a re-review that knows what the earlier rounds raised,
+and where it sits in the caller's cycle).
 
 Read-only, so it runs in **any** repo — an unconfigured one just uses the defaults.
 
@@ -207,6 +208,13 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   or a P1/P2 still confirmed) or stop (dry / round cap), and whether stopping was
   *convergence*. The declarations never extend the loop — a truncated reviewer is
   truncated again next round — they only stop a broken round being reported as clean.
+- **`--max-rounds N` is the CALLER's cap**, not a loop panel.py runs: it is the only
+  input that tells a round which stopped because it was done from one which stopped
+  because it ran out, and `/panel-review-pr` passes it on every invocation. Its flag is
+  spelled `--rounds N` on the slash command and `--max-rounds N` here — same number, and
+  `--round <r>` (singular) is a different thing entirely: which round THIS run is.
+  A run given none of the three is a single review and says nothing about rounds.
+  A `--round` past `--max-rounds` is rejected rather than recorded.
 - **The `/panel` skill (default = fix)** consumes `--json`, checks out the PR branch in
   an isolated worktree, fixes confirmed findings, runs lint + unit tests (**aborts the
   commit on failure**), makes one commit, pushes, and comments the summary.

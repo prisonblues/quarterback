@@ -33,9 +33,17 @@ that found nothing because it could not look is no longer recorded as convergenc
 All of it reaches the board (`round`, `new_findings`, `stop_reason`, `stop_confident`,
 `could_not_assess`, `rereview_flagged`) and the `/panel` page, so a human can review the review:
 whether a clean verdict was earned, without re-reading a transcript. `GET /review/findings` checks
-each re-review flag against what the following round actually found, which makes **honesty per
-reviewer** measurable for the first time — a member that says "I could not assess X" and is right
-is worth more than one that silently reports clean, and until now nothing distinguished them.
+each re-review flag against what the following round of the same cycle actually found, which makes
+**honesty per reviewer** measurable for the first time — a member that says "I could not assess X"
+and is right is worth more than one that silently reports clean, and until now nothing
+distinguished them.
+
+Two limits on that number, stated because a measure nobody can calibrate is worse than none. It is
+**file-grain**: the next round raised a confirmed finding in a file this round flagged, which is
+not a claim that the fix caused it. And the flag is attributed **per member** via the panel's
+`rereview_by` — the finer per-reporter accounts (`reported_by`, and the severity calibration that
+needs them) are fed only by callers that send them, because `panel.py` still merges a group down to
+one representative before it serialises; issue #26 is where that changes.
 
 Payloads without any of it record exactly as before, as round 1 with nothing declared.
 

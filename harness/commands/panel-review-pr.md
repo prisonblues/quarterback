@@ -18,11 +18,13 @@ buys more.
 
 ## 1. Ensure a PR exists (the panel diffs via `gh pr diff`, so a PR is required)
 
-- Parse `$ARGS`: **every** integer is a PR number — `12`, `#12`, `12,14`, and
-  `12 14 19` all parse; an optional non-numeric word (not a `--flag`) = repo.
-  **Except a flag's own value:** the integer in `--rounds 3` is a round cap, not
-  a PR. Consume it with its flag before scanning for PR numbers, or `/panel-review-pr
-  --rounds 3` reviews PR #3.
+- Parse `$ARGS` in two passes. **First consume every `--flag` together with its
+  value** (`--rounds 3`, `--reviewers codex,antigravity`) and remove both from the
+  string. **Then** read what is left: every integer is a PR number — `12`, `#12`,
+  `12,14` and `12 14 19` all parse — and an optional remaining non-numeric word is
+  the repo. Order matters, and doing it the other way round is wrong for every
+  flag, not just one: `--rounds 3` reviews PR #3, and `--reviewers codex` eats
+  `codex` as the repo name.
 - **Rounds:** `--rounds N` caps the panel/fix cycles (default **2**); `--loop` is
   `--rounds 5`. `--rounds 1` restores the old fix-and-don't-look behaviour and
   should be used only when someone explicitly asks for it — say in the relay that
@@ -76,9 +78,9 @@ with these parallel-mode overrides:
 - **Pass the repo explicitly:** `python3 ~/.claude/loops/panel.py --repo <abs
   repo path> --pr <n> --post …` — a sub-agent's cwd is not guaranteed to be your
   checkout, and `--repo` defaulting to cwd would silently review the wrong repo.
-  It carries the same `--round`/`--baseline`/`--json-file` arguments; give each
-  PR its own `/tmp/panel-<pr>-r<n>.json` so concurrent agents cannot read each
-  other's baseline.
+  It carries the same `--round`/`--baseline`/`--json-file` arguments; each agent
+  makes its own `mktemp -d` directory for them (§3), so concurrent agents cannot
+  read or clobber each other's baseline.
 - A `--reviewers` list from `$ARGS` applies to **every** PR in the run.
 - Each sub-agent returns its own panel summary (findings, SonarCloud gate,
   skipped reviewers, coverage declared) **and** the §4 fixer summary table for
@@ -97,15 +99,30 @@ handled when its agent stopped early.
 
 ## 3. Run the panel (round 1)
 
+Make one private directory for this PR's round payloads first, and keep using it
+for every round:
+
 ```
+rundir=$(mktemp -d)                       # 0700, and a name nobody can predict
 python3 ~/.claude/loops/panel.py --pr <pr> --post --round 1 --max-rounds <N> \
-    --json-file /tmp/panel-<pr>-r1.json
+    --json-file "$rundir/r1.json"
 ```
+
 (`--post` comments the panel summary on the PR by default — that is the review
 record the fixer then resolves. Drop `--post` only if the user explicitly asked
 not to comment. `--json-file` is what makes round 2 able to say which findings
 are NEW rather than the same ones again; without it every reappearing finding
-reads as fresh damage. `<N>` is the round cap from `$ARGS`.)
+reads as fresh damage. `<N>` is the round cap from `$ARGS`, and passing it is
+also what tells the panel this run is part of a cycle rather than a one-off
+read.)
+
+**Not** a fixed `/tmp/panel-<pr>-r<n>.json`. Two reasons, both real on a shared
+host: the panel writes that path with `Path.write_text`, which follows symlinks,
+so a pre-planted `/tmp/panel-34-r1.json → ~/.ssh/authorized_keys` is a write
+under your own identity — and the payload (diff excerpts, every finding's text)
+is world-readable while it sits there. Separately the name is scoped by PR
+number alone, so two repos reviewing their own PR #34 overwrite each other's
+baseline and round 2 silently diffs against the wrong PR.
 
 **Panel members** default to the repo's `.harness-rules`; pass no `--reviewers`
 unless the user named who should review ("just codex", "codex and antigravity"), then
@@ -177,9 +194,14 @@ Once the fixer has **pushed**, run the panel again over the new commit:
 
 ```
 python3 ~/.claude/loops/panel.py --pr <pr> --post --round <r> --max-rounds <N> \
-    --baseline /tmp/panel-<pr>-r1.json [--baseline …each earlier round…] \
-    --json-file /tmp/panel-<pr>-r<r>.json
+    --baseline "$rundir/r1.json" [--baseline …each earlier round…] \
+    --json-file "$rundir/r<r>.json"
 ```
+
+(`$rundir` is the `mktemp -d` from §3 — same directory every round. The panel
+checks each baseline's `repo`/`github`/`pr` against the run it is doing and
+refuses to count a payload from another review, so a mis-wired `--baseline`
+shows up as a reported problem rather than as findings that look repeated.)
 
 Pass **every** earlier round's payload as a `--baseline`, or a finding raised in
 round 1, missed in round 2 and raised again in round 3 counts as new.
