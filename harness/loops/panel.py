@@ -448,6 +448,32 @@ def _scalar(val: object) -> bool:
     return not isinstance(val, (str, list, dict))
 
 
+class _Tok:
+    """A position the prompt filled with a token rather than a value — `<int|null>`,
+    `true|false`. It stands for whatever the model resolves it to, so it is the one
+    place :func:`_quoted` may accept any scalar."""
+
+    def __repr__(self) -> str:
+        return "<token>"
+
+
+_TOKEN = _Tok()
+
+#: What a token becomes on the way through `json.loads`, before `_tokenise` turns
+#: it back into :data:`_TOKEN`. Long and bracketed so no prompt text collides with
+#: it, and plain ASCII so it survives being written into this file.
+_TOKEN_MARK = "[[qb-schema-token]]"
+
+
+def _tokenise(val):
+    """Restore :data:`_TOKEN` wherever the marker survived the JSON round-trip."""
+    if isinstance(val, dict):
+        return {k: _tokenise(v) for k, v in val.items()}
+    if isinstance(val, list):
+        return [_tokenise(v) for v in val]
+    return _TOKEN if val == _TOKEN_MARK else val
+
+
 def _schema(prompt: str) -> dict | None:
     """The example object a prompt ships, parsed — the exact value a model that
     quotes the request back returns.
@@ -464,7 +490,10 @@ def _schema(prompt: str) -> dict | None:
     imported reviews nothing, and the failure would surface as a collection
     error naming no assertion."""
     text = prompt.replace("{{", "{").replace("}}", "}")
-    text = re.sub(r"<[^<>]*>", "null", text).replace("true|false", "true")
+    # A FUNCTION replacement, not the string: `re.sub` reads a string repl as a
+    # template, and a JSON-escaped marker's backslashes parse as escapes.
+    mark = json.dumps(_TOKEN_MARK)
+    text = re.sub(r"<[^<>]*>", lambda _: mark, text).replace("true|false", mark)
     for _, span in _spans(text, "{", "}"):
         if not any(f'"{k}"' in span for k in ENVELOPE_KEYS):
             continue
@@ -472,7 +501,7 @@ def _schema(prompt: str) -> dict | None:
             val = json.loads(span)
         except json.JSONDecodeError:
             return None
-        return val if isinstance(val, dict) else None
+        return _tokenise(val) if isinstance(val, dict) else None
     return None
 
 
@@ -520,23 +549,38 @@ def _quoted(val: object, schema: object) -> bool:
     those as quotation marks discarded `{"id": "F01", "members": [0], "real":
     true}` — a compliant terse verdict — and with it the judge's entire reply.
     Requiring every key and every phrase of the example is the only test a real
-    answer cannot fail by accident."""
+    answer cannot fail by accident.
+
+    The wildcards are exactly the prompt's TOKENS (:data:`_TOKEN`), not every
+    scalar. Both rules agree on today's schemas — every scalar in both comes from
+    `<int|null>` or `true|false` — so this changes no current behaviour. What it
+    changes is that the agreement stops being a coincidence: read as "any scalar
+    quotes any scalar", the check says a real `real: false` quotes the example's
+    `true` and a real `line: 42` quotes its `null`, and the first literal scalar
+    added to either prompt would turn that from harmless into a rule that
+    discards rulings."""
+    if schema is _TOKEN:
+        return _scalar(val)
     if isinstance(schema, dict):
         return (isinstance(val, dict) and set(val) == set(schema)
                 and all(_quoted(val[k], schema[k]) for k in schema))
     if isinstance(schema, list):
         if not isinstance(val, list):
             return False
-        # A `<...>` token standing INSIDE a list — the judge's `"members": [<the
-        # bracketed report NUMBERS ...>]` — stands for however many the model
-        # writes, so any list of scalars quotes it. Elsewhere the length is part
-        # of the example: an empty `findings` is a review, not a quotation.
-        if schema and all(map(_scalar, schema)):
-            return all(map(_scalar, val))
+        # A token standing INSIDE a list — the judge's `"members": [<the bracketed
+        # report NUMBERS ...>]` — stands for however many the model writes, so any
+        # NON-EMPTY list of scalars quotes it. Empty does not: `"members": []` is a
+        # verdict that named nobody, and calling that a quotation drops a real
+        # ruling. Elsewhere the length is part of the example: an empty `findings`
+        # is a review, not a quotation.
+        if len(schema) == 1 and schema[0] is _TOKEN:
+            return bool(val) and all(map(_scalar, val))
         return len(val) == len(schema) and all(map(_quoted, val, schema))
     if isinstance(schema, str):
         return isinstance(val, str) and val.strip() == schema.strip()
-    return _scalar(val)
+    # A literal scalar in a schema means itself. There are none today; the branch
+    # is what stops one silently becoming a wildcard the day it is added.
+    return val == schema
 
 
 def _is_answer(item: object, kind: str = "findings") -> bool:
@@ -579,7 +623,14 @@ def _read(val: list | dict, want: str | None = None) -> _Read:
     key = next((k for k in kinds if isinstance(obj.get(k), list)), None)
     kind = key or kinds[0]
     items = obj[key] if key else (val if isinstance(val, list) else [])
-    declared = obj.get(DECLARATION_KEYS.get(kind)) if key else None
+    # Read the declaration even with no envelope list beside it. `adjudicate`
+    # accepts a coverage-only reply (`{"coverage_note": "..."}`) as a judge that
+    # ruled on nothing rather than one that failed to rule, and gating this on
+    # `key` left two such candidates carrying CONFLICTING notes both reading as
+    # `_Read((), None)` — one answer, resolved by taking the last. Position
+    # deciding which text survives is the whole thing this release removes, so
+    # it cannot come back through the one reply shape that carries no items.
+    declared = obj.get(DECLARATION_KEYS.get(kind))
     if kind == "verdicts":
         kept: tuple = tuple(_verdict_reading(it) for it in items if _is_answer(it, kind))
     else:
@@ -715,13 +766,27 @@ def extract_json_value(raw: str, want: str | None = None) -> list | dict | None:
         return isinstance(val, dict) and any(
             k in val and (not shaped or isinstance(val[k], list)) for k in keys)
 
+    def says_something(read: _Read) -> bool:
+        # A bare array the reader keeps NOTHING of is positively identifiable as
+        # not-an-answer — the same standard `_quoted` applies to the schema echo,
+        # and like it, no ranking choice is involved. Tier 2 admitted any
+        # non-empty array, so an incidental prose bracket (`see [1]`, `the
+        # severity on line [42]`, `[0, 3]` restating report ids) parsed, escaped
+        # containment, was no echo, and became a RIVAL to a real findings array.
+        # Two candidates that disagree is `_AMBIGUOUS` → a CLI retry → the reply
+        # kept unstructured → `coverage_veto` filing "returned no structured
+        # reply" and blocking a confident stop. All of it landing on exactly the
+        # older, simpler reviewers the bare-array tier exists to serve.
+        return bool(read.items) or read.declared is not None
+
     # Shape first, then agreement — every tier by the same rule, so the file does
     # not hold two contradictory answers to one question. The tiers are what keep
     # the bare array an older reviewer returns from being weighed against a prose
     # object that merely mentions the schema; the last two can only ever win when
     # nothing better exists: an object ABOUT the schema, then any JSON at all.
     for tier in ([c for c in parsed if envelope(c[0], shaped=True)],
-                 [c for c in parsed if isinstance(c[0], list) and c[0]],
+                 [c for c in parsed
+                  if isinstance(c[0], list) and c[0] and says_something(c[1])],
                  [c for c in parsed if envelope(c[0], shaped=False)],
                  parsed):
         pick = _agreed(tier)
@@ -800,7 +865,13 @@ def _findings_of(reviewer: str, obj: dict, items: list) -> list[Finding]:
     kept = [(i, it) for i, it in enumerate(items) if _is_answer(it, "findings")]
     out = _to_findings(reviewer, [it for _, it in kept])
     at = {sent: n for n, (sent, _) in enumerate(kept)}
-    for i in obj.get("fix_needs_rereview") or []:
+    # A truthy non-list (`"fix_needs_rereview": 1`) used to reach `for i in ...`
+    # and raise TypeError. That is not a parse failure the caller can degrade
+    # from: `_read` calls this while READING CANDIDATES, so the crash escaped
+    # the retry-then-keep-it-unstructured path entirely and took the run with
+    # it. A malformed flag list costs its flags, never the review.
+    flags = obj.get("fix_needs_rereview")
+    for i in flags if isinstance(flags, list) else ():
         # Bools are ints in Python, and `true` here means nothing — index 1 is not
         # what a model that wrote a boolean meant.
         if isinstance(i, int) and not isinstance(i, bool) and i in at:
@@ -868,7 +939,19 @@ def _declaration(val, kind: str = "findings") -> list[str] | None:
     and reading them as quotation marks discarded whole replies."""
     if not isinstance(val, (list, str)):
         return None
+    raw = [val] if isinstance(val, str) else val
     phrases = _str_list(val)
+    # Wrote something, none of it readable: "said nothing", not "nothing to
+    # declare". `could_not_assess: [{"area": "the migration"}]` is a reviewer
+    # naming a gap in a shape the parser will not take, and the two branches
+    # used to disagree about it — a value of the wrong TYPE was None while a
+    # value whose ITEMS were all unreadable was [], which `coverage_veto` reads
+    # as a clean seat. That let a round be recorded confident on a reviewer that
+    # had said out loud it could not assess something, which is the one thing
+    # this module promises never to do: nothing is read as cleaner than it was.
+    # Only an EMPTY list means the reviewer was asked and had nothing to say.
+    if raw and not phrases:
+        return None
     kept = [p for p in phrases if p not in SCHEMA_DECLARATIONS.get(kind, ())]
     return kept if kept or not phrases else None
 
@@ -2301,6 +2384,20 @@ def adjudicate(clusters: list[list[Finding]], diff: str, model: str, pr: int,
     if err:
         return unruled(err)
     parsed = extract_json_value(out, "verdicts")
+    if parsed is None:
+        # The same one-shot reparse retry `review_llm` gets, and the judge needs it
+        # more. Agreement strictly ENLARGES the set of replies that resolve to
+        # None — an envelope plus a restatement of it, an envelope plus a
+        # self-authored illustration, any two candidates that read differently —
+        # so a failure that was rare under ranking now fires on ordinary model
+        # prose. The asymmetry was the expensive part: a reviewer that cannot be
+        # read costs one seat, a judge that cannot be read takes EVERY finding
+        # through `unjudged` and adds the "round was not adjudicated" veto. One
+        # more turn keeps the pessimistic rule without paying for it with the
+        # whole adjudication.
+        out2, err2 = run_cli(args, "judge", attempts=1, stdin_text=prompt)
+        if not err2:
+            parsed = extract_json_value(out2, "verdicts")
     note = ""
     reply = parsed if isinstance(parsed, dict) else None
     if reply is not None:
