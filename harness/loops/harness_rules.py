@@ -128,6 +128,20 @@ DEFAULTS: dict = {
         # missing from here would be warned about and dropped as a typo. `None`
         # and absent mean the same thing to diff_budget — inherit max_diff_chars.
         "judge_max_diff_chars": None,
+        # `panel.py --ask` — the cheap premise check. How many seats must have
+        # ANSWERED for the tally to mean anything (quorum), and how many must
+        # have said the same thing for it to be that answer (threshold). Two of
+        # each: one seat agreeing with the agent that wrote the premise is not a
+        # challenge, and the default panel is two seats, so the default is "both
+        # of them".
+        #
+        # Named for the ask, not `quorum`/`threshold`, and deliberately so. #78
+        # generalises the same two primitives to a ROUND's verdict — where they
+        # govern what gets merged — and a bare name claimed here would be a key
+        # whose name promises more than anything reads. #78 renames these into
+        # its own scheme; until then they say exactly what they do.
+        "ask_quorum": 2,
+        "ask_threshold": 2,
     },
     "loops": {
         "dependabot_lander": False,

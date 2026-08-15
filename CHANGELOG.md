@@ -7,6 +7,61 @@ that number where it was, so the repo can be a version ahead of the service.
 Entries are newest first. Each one says what was broken or missing before it, because that is the
 part that isn't recoverable from the diff.
 
+## v2.27 — one question to the panel, when a whole round was never the question
+
+A fix's premise had no cheap challenger. The only thing that reviewed a fix was a full panel round:
+twenty minutes, every seat reading the entire diff, thirty-odd findings back when what was needed
+was one answer to one question.
+
+So a premise went unchallenged until the next round, and on PR #62 that cost three of them. Each
+round trusted a fresh proxy for *"did a review actually happen?"* — the exit code, then the push,
+then the payload artefact — and each proxy was killed by the round after it. Every one of those is a
+yes/no question about one branch of `panel.py`, answerable in a minute by anyone willing to read it.
+None of them needed a diff review, and all three cost a full round.
+
+`panel.py --ask "<premise>" [--context <path[:first-last]> ...]` puts that question to the enabled
+seats. **No diff, no clustering, no judge — the vote is the output.** Each seat answers `holds` /
+`fails` / `cannot tell` with one line of reason, and the run reports the tally. It is fast because
+of what it does not do: a reviewer is slow here because it reads a whole PR and thinks about
+everything in it, and a premise plus the one function it rests on is a small prompt and a short
+reply.
+
+**It is deliberately not a gate.** It exits 0 on every verdict, `fails` included. This is a check a
+fixer runs before committing, not another thing that must pass — making it mandatory turns a
+one-minute question into a required wait, and a required wait gets skipped.
+
+Four decisions in it are worth more than the feature:
+
+- **`cannot tell` is a first-class answer, and an unreadable reply is not it.** One is a seat saying
+  its context did not settle the question — it counts toward the quorum and never toward the
+  threshold. The other is a seat whose answer we do not have, and it counts for neither. Collapsing
+  them is #68's panel-of-one arriving through a side door: a tally reading "nobody objected" over
+  seats that never spoke.
+- **The asker cannot be the only seat.** `--asker` says which seat the agent running the challenge
+  is, detected from the environment when a coding agent is running it, and a tally whose only voter
+  is the asker comes back `unchallenged` — which is where the premise started. An agent putting its
+  own premise to itself has confirmed nothing, and reporting it as `holds` is worse than reporting
+  nothing, because it carries a panel's authority.
+- **Nothing picks between candidate answers.** A reply holding two different legal verdicts is
+  unreadable, not an opportunity to guess which the model meant — the same rule v2.18 settled for
+  reviews, for the same reason.
+- **Quorum and threshold are configuration** (`review_panel.ask_quorum` / `ask_threshold`, both 2),
+  so "1 of 1 says it holds" reports as unchallenged rather than as agreement. They are named for the
+  ask because that is all they govern today; #78 generalises the same two primitives to a round's
+  verdict, where they decide what gets merged.
+
+One implementation runs a seat now, not two: the sandbox, the pinned sessions, the retry policy, the
+usage read-back and the four CLIs' argv moved into `run_seat`, and a round and an ask differ only in
+how they read the reply. A second copy would have been a second place for a seat to silently stop
+running, which is the whole of #68.
+
+**The board half is not here.** `qb record-ask` is called best-effort and says so once when this
+host's `qb` does not have it: `qb` lives in the fleet's own repo, and the row it writes is #77's
+shape to define, since #77 is what will read it. The payload is complete on stdout and in
+`--json-file` regardless.
+
+Harness-side: the board is untouched, so the served version stays at 2.23.0.
+
 ## v2.24 — a new finding says whether the last fix caused it or the last round missed it
 
 `new_this_round` is binary: did an earlier round of this cycle raise this defect. So a finding new

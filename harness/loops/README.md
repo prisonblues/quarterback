@@ -99,6 +99,7 @@ Detected from the checkout, **not settable** here: `path`, `github`, `default_br
 | `reviewers` | Which reviewers run — see below. |
 | `review_panel.skip_title_patterns` | Regexes for PRs not worth LLM review (merge/promote/release/format-the-world). These drove a cost blow-up in #117 — one release-merge ≈ $750. |
 | `review_panel.judge_model` | Claude model for the master judge (`""` = default). |
+| `review_panel.ask_quorum` / `ask_threshold` | `--ask`'s tally rules: how many seats must have **answered** for the vote to mean anything, and how many must have said the same thing for it to be that answer. Both **2** — one seat agreeing with the agent that wrote the premise is not a challenge. |
 | `loops` | `dependabot_lander` / `stacked_driver` / `issue_executor` — which loops may run. |
 | `epic` | Epic-driver settings — see below. |
 
@@ -222,7 +223,8 @@ cwd's repo; `--repo` takes a path or a name under `~/source`.
 `python3 ~/.claude/loops/panel.py --pr <n>` (report) / `--post` (also comment on the
 PR) / `--json` (the run as JSON on stdout — nothing else, progress goes to stderr) /
 `--round <r> --max-rounds <N> --baseline <earlier round's --json-file>` (a re-review that
-knows what the earlier rounds raised, and where it sits in the caller's cycle).
+knows what the earlier rounds raised, and where it sits in the caller's cycle) /
+`--ask "<premise>"` (one question to the seats instead of a review — see below).
 
 Read-only, so it runs in **any** repo — an unconfigured one just uses the defaults.
 
@@ -318,6 +320,62 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   and then panels the fix commit, 2 rounds by default (`--rounds N`), so the fixer's
   own work is read by somebody. `panel.py` itself stays read-only either way: the
   fix/verify/commit lives in the skill, and so does the loop.
+
+### The premise check (`--ask`)
+
+`python3 ~/.claude/loops/panel.py --ask "<premise>" [--context <path[:first-last]> …]
+[--pr N] [--asker <seat>]` — one question to the enabled seats instead of a review.
+**No diff, no clustering, no judge: the vote is the output.**
+
+```
+$ panel.py --ask "panel.py exits non-zero when it skips a PR on a title pattern" \
+           --context harness/loops/panel.py:3500-3560
+    claude  fails       — the skip branch calls finish(failed) and returns 0
+    codex   fails       — write_payload then `return finish(...)`; exit 0 on that path
+    pi      cannot tell — did not locate the skip branch in the given range
+
+→ the premise FAILS — 2 of 3 say the premise FAILS (quorum 2, threshold 2)
+```
+
+- **It is not a gate.** Exit 0 on every verdict, `fails` included. A fixer runs it before
+  committing; making it mandatory turns a one-minute question into a required wait, and a
+  required wait gets skipped. It takes none of a round's flags (`--post`, `--round`,
+  `--baseline`, `--max-rounds`) and says so rather than ignoring them — there is no diff to
+  post about and no cycle for a baseline to be part of.
+- **`cannot tell` is an answer, and an unreadable reply is not that answer.** A seat whose
+  context did not settle the question counts toward the **quorum** and never toward the
+  **threshold**; a seat whose reply carried no verdict counts toward neither and is shown
+  as such, with the head of what it did say. Folding the second into the first is #68's
+  panel-of-one through a side door: a tally reading "nobody objected" over seats that
+  never spoke.
+- **The asker cannot be the only seat.** `--asker` names the seat the agent running the
+  challenge is, and is detected from the environment when a coding agent is running it
+  (pass `--asker ''` for a human at a terminal). A tally whose only voter is the asker is
+  `unchallenged` — where the premise started — never `holds`.
+- **Nothing picks between candidate answers.** Two different legal verdicts in one reply is
+  an unreadable reply, not a chance to guess which the model meant; an unreadable reply
+  buys exactly one retry, the same as a review's. The schema's own example is refused by
+  the same check that refuses a typo, because it spells the verdict as the union of the
+  three legal values.
+- **Verdicts:** `holds` / `fails` (threshold reached, one way only), `unresolved` (the seats
+  looked and did not agree), `unchallenged` (too few answered, or only the asker did).
+  `review_panel.ask_quorum` and `ask_threshold` govern it, both 2 — so "1 of 1 says it
+  holds" reports as unchallenged rather than as agreement. Named for the ask because that
+  is all they govern today; #78 generalises the same primitives to a round's verdict.
+- **`--context` is confined to the repo under review**, symlinks resolved before the
+  containment test and the file then read by walking down from a descriptor on the repo
+  root — resolving a path and re-opening it by that path are two traversals of one string,
+  and a component that changes between them would pass the check and read elsewhere.
+  A spec that cannot be read is a stated problem rather than a silent
+  omission — a seat given less context than the asker believes it has answers `cannot tell`
+  about a question the asker thinks it supplied the answer to. A range past the end is
+  clamped and said. With no context at all the prompt says so, which is what keeps
+  `cannot tell` available instead of inviting an answer from memory.
+- **`--json` / `--json-file`** emit the ask's own payload (`kind: "ask"`, the premise, the
+  context read, every seat's verdict and reason, the tally and its rules). Recording on the
+  board goes through `qb record-ask`, best-effort: `qb` ships in the fleet's own repo and
+  the row it writes is #77's to define, so on a host whose `qb` predates it the ask says so
+  once and is otherwise untouched.
 
 ### The `--json` payload
 

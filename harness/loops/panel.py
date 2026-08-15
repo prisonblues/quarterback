@@ -64,6 +64,17 @@ Which reviewers run comes from the repo's .harness-rules; --reviewers overrides
 that for one run, which is how you get a single-vendor read (--reviewers codex)
 without editing config to get it.
 
+--ask challenges ONE premise instead of reviewing a PR: the same seats, no diff,
+no clustering and no judge — each answers holds / fails / cannot tell in one line
+and the vote is the output. It exists because a round is the only thing that
+currently reviews a fix, and a round is twenty minutes and thirty findings when
+what was wanted was one answer to one question. PR #62 spent three of them
+answering "did a review actually happen?", each round trusting a fresh proxy for
+it (the exit code, then the push, then the payload artefact), every one of them a
+yes/no question about one branch of this file. It is deliberately NOT a gate: a
+point of order a fixer runs before committing, exiting 0 on every verdict, since
+a required minute is a minute that gets skipped.
+
 Usage:
     python3 ~/.claude/loops/panel.py --pr 734
     python3 ~/.claude/loops/panel.py --pr 734 --post
@@ -73,6 +84,9 @@ Usage:
     python3 ~/.claude/loops/panel.py --pr 734 --post --json-file "$rundir/panel.json"
     python3 ~/.claude/loops/panel.py --pr 734 --post --round 2 --max-rounds 2 \
         --baseline "$rundir/r1.json" --json-file "$rundir/r2.json"
+    python3 ~/.claude/loops/panel.py \
+        --ask "panel.py exits non-zero when it skips a PR on a title pattern" \
+        --context harness/loops/panel.py:3500-3560
 
 (`$rundir` being a `mktemp -d` of the caller's: a fixed /tmp path is a symlink
 away from writing the payload somewhere else, and world-readable meanwhile.)
@@ -83,6 +97,7 @@ from __future__ import annotations
 import argparse
 import base64
 import difflib
+import errno
 import hashlib
 import json
 import os
@@ -319,6 +334,32 @@ Coverage declared by the reviewers:
 --- DIFF ---
 {diff}
 """
+
+ASK_PROMPT = """You are answering ONE question about a system, as a point of order. This is NOT a
+code review: do not look for defects, do not suggest improvements, and do not report anything the
+question below does not ask about. A finding you make here goes nowhere.
+
+Someone is about to build a fix on the PREMISE below. Say whether it HOLDS.
+
+Answer from the material you are given and from nothing else. You have no tools and cannot open
+the repository, so if what you were given does not settle the question, say so — "cannot tell" is
+a real answer here and it is the right one whenever you would otherwise be guessing. It is never a
+polite way of agreeing.
+
+Return ONLY a JSON object (no prose):
+  {{"verdict": "holds|fails|cannot tell", "reason": "one line"}}
+
+- "holds" — the material shows the premise is true.
+- "fails" — the material shows the premise is FALSE. Say in `reason` what makes it false, citing
+  the line or the construct that decides it.
+- "cannot tell" — the material does not settle it. Say in `reason` what you would need to see.
+
+`reason` is ONE line: what decided it, not an essay. There is no severity, no file, and no
+findings array — a reply carrying those is an answer to a question nobody asked.
+
+--- PREMISE ---
+{premise}
+{context}"""
 
 
 @dataclass
@@ -1031,6 +1072,206 @@ def _raw_finding(reviewer: str, text: str) -> Finding:
     )
 
 
+# ----------------------------------------------------------------------------- the ask
+
+#: The only three answers to a premise challenge. `cannot tell` is one of them
+#: and not an abstention: a seat whose context did not settle the question has
+#: said something, and it is not agreement. Counting it as agreement is #68's
+#: panel-of-one arriving through a side door — a tally that reads "3 seats, and
+#: nobody objected" over two seats that could not see the code.
+ASK_VERDICTS = ("holds", "fails", "cannot tell")
+
+#: Spellings of "cannot tell" a model reaches for unprompted. Deliberately a
+#: short closed list of the same three words rather than a fuzzy match: an
+#: unrecognised verdict makes the reply unreadable, which costs one retry and is
+#: then reported as a seat that did not answer — whereas guessing at what a
+#: novel word meant would put a verdict nobody wrote into the tally.
+_ASK_ALIASES = {"cannot tell": "cannot tell", "cant tell": "cannot tell",
+                "can't tell": "cannot tell", "cannot-tell": "cannot tell"}
+
+#: How long a reason may be. It is asked for as one line and rendered as one; a
+#: model that writes an essay gets it cut here rather than in the report alone,
+#: so the payload and the board carry the same text the reader saw.
+ASK_REASON_CHARS = 400
+
+
+class Answer(NamedTuple):
+    """One seat's reply to `--ask`: a verdict from :data:`ASK_VERDICTS` and the
+    one line behind it."""
+
+    verdict: str
+    reason: str
+
+
+def _ask_verdict(val: object) -> str | None:
+    """`val` as one of :data:`ASK_VERDICTS`, or None when it is not one of them.
+
+    None includes the schema's own `"holds|fails|cannot tell"` handed straight
+    back, and that is the whole echo defence this parser needs: the review
+    prompt's example is a fully populated finding that reads as an answer until
+    :func:`_quoted` positively identifies it, while here the illustration is
+    spelled as the union of the three legal values and so is not one of them.
+    A quotation is refused by the same check that refuses a typo."""
+    if not isinstance(val, str):
+        return None
+    said = " ".join(val.strip().lower().replace("_", " ").split())
+    if said in ASK_VERDICTS:
+        return said
+    return _ASK_ALIASES.get(said)
+
+
+def parse_answer(raw: str | None) -> Answer | None:
+    """Read a seat's reply to a premise challenge, or None when it cannot be read.
+
+    None means UNREADABLE and never "the seat had no opinion" — the same
+    distinction :func:`parse_reply` keeps, and for the same reason: a seat whose
+    reply could not be parsed must not be counted in a tally as one that looked
+    and could not tell. The caller retries once (see :func:`run_seat`) and then
+    records the seat as having answered nothing, which is louder than a
+    `cannot tell` and correctly so.
+
+    Candidates are settled by AGREEMENT, never by rank, exactly as
+    :func:`_agreed` settles a review: a reply holding an echo of the schema and a
+    real answer resolves, because the echo is not a legal verdict and is dropped
+    before agreement is tested; a reply holding two DIFFERENT legal verdicts does
+    not, because nothing here is willing to choose which of them the model meant.
+    Picking one would be how a `holds` gets recorded for a seat that also wrote
+    `fails`."""
+    if not raw:
+        return None
+    seen: list[Answer] = []
+    for _, text in _spans(raw, "{", "}"):
+        try:
+            val = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(val, dict):
+            continue
+        verdict = _ask_verdict(val.get("verdict"))
+        if verdict is None:
+            continue
+        reason = val.get("reason")
+        reason = " ".join(str(reason).split()) if isinstance(reason, str) else ""
+        seen.append(Answer(verdict, reason[:ASK_REASON_CHARS]))
+    if not seen:
+        return None
+    # Agreement on the VERDICT alone: two candidates that say `fails` for
+    # differently worded reasons are one answer, and the last of them is as good
+    # as the first. Two that say different verdicts are not an answer at all.
+    if len({a.verdict for a in seen}) > 1:
+        return None
+    # The last one, among candidates that agree — a model that restates its
+    # answer at the end of a reply has restated it, and its wording there is the
+    # one it settled on.
+    return seen[-1]
+
+
+@dataclass
+class SeatAnswer:
+    """What one seat did with a premise challenge.
+
+    Three outcomes, kept apart on purpose, because the tally treats them
+    differently and a report that flattened them would be the panel-of-one
+    problem in miniature:
+
+    * it answered — `verdict` is one of :data:`ASK_VERDICTS`;
+    * it never ran — `skip` says why, and `absent` says whether that is a fact
+      about this box rather than about the ask;
+    * it ran, replied, and neither attempt's reply could be read as a verdict —
+      `unreadable`. That is NOT `cannot tell`: one is a seat saying it could not
+      settle the question, the other is a seat whose answer we do not have.
+    """
+
+    verdict: str | None = None
+    reason: str = ""
+    skip: str | None = None
+    unreadable: bool = False
+    duration_ms: int = 0
+    usage: dict | None = None
+    absent: bool = False
+
+
+class AskTally(NamedTuple):
+    """What the seats' answers add up to, and why."""
+
+    #: holds | fails | unresolved | unchallenged. The last two are different
+    #: failures to reach an answer: `unresolved` is a panel that looked and did
+    #: not agree, `unchallenged` is a tally with no standing to say anything —
+    #: too few seats answered, or the only one that did is the agent that wrote
+    #: the premise.
+    verdict: str
+    reason: str
+    #: One count per entry of :data:`ASK_VERDICTS`.
+    counts: dict[str, int]
+    #: How many seats answered at all — the quorum numerator. An unreadable or
+    #: skipped seat is not in it.
+    answered: int
+
+
+def ask_tally(answers: dict[str, SeatAnswer], quorum: int, threshold: int,
+              asker: str = "") -> AskTally:
+    """The vote, and it IS the output — there is no judge here.
+
+    Quorum counts seats that ANSWERED; threshold counts seats that said the same
+    thing. `cannot tell` is in the first and never in the second, which is what
+    stops a panel that could not read the code from reporting agreement.
+
+    `asker` is the seat the agent running this challenge is itself. When it is
+    the only seat that answered, the result is `unchallenged` however emphatic
+    the answer was: an agent putting its own premise to itself has confirmed
+    nothing, and reporting that as `holds` is worse than reporting nothing at all
+    because it carries a panel's authority. Same rule as #78's `self_approval`
+    and #40's refusal to let a reviewer act on its own finding unattended.
+
+    A split that reaches the threshold BOTH ways is `unresolved`, not the first
+    branch tested. That is only reachable with `ask_threshold: 1`, which is a
+    repo asking for a lower bar and not for the tie to be broken by the order
+    this function happens to check things in.
+    """
+    voted = {n: a for n, a in answers.items() if a.verdict}
+    counts = {v: sum(1 for a in voted.values() if a.verdict == v) for v in ASK_VERDICTS}
+    answered = len(voted)
+    tally = (f"{counts['holds']} holds / {counts['fails']} fails / "
+             f"{counts['cannot tell']} cannot tell")
+    rule = f"quorum {quorum}, threshold {threshold}"
+    if not answered:
+        return AskTally("unchallenged", "no seat answered — nothing was challenged",
+                        counts, answered)
+    if answered < quorum:
+        return AskTally("unchallenged",
+                        f"{answered} seat{'s' if answered != 1 else ''} answered, "
+                        f"and the quorum is {quorum} — {tally}", counts, answered)
+    if asker and set(voted) == {asker}:
+        return AskTally("unchallenged",
+                        f"the only seat that answered is {asker}, which is the asker "
+                        "— a premise put to yourself is not a challenge", counts, answered)
+    reached = [v for v in ("holds", "fails") if counts[v] >= threshold]
+    if len(reached) == 1:
+        won = reached[0]
+        # The self-challenge rule again, one layer in — and this is the layer that
+        # matters, because the outer check only catches the asker being the only
+        # SEAT. Under `ask_threshold: 1` an asker could reach the threshold on its
+        # own vote while every other seat answered `cannot tell`: quorum met, more
+        # than one seat answered, and a verdict resting entirely on the agent that
+        # wrote the premise. What has to be true is that the ANSWER is not the
+        # asker's alone, not merely that the panel was not.
+        backers = {n for n, a in voted.items() if a.verdict == won}
+        if asker and backers == {asker}:
+            return AskTally("unchallenged",
+                            f"the only seat saying the premise {won.upper()} is "
+                            f"{asker}, which is the asker — the others could not "
+                            f"tell or said otherwise ({tally})", counts, answered)
+        return AskTally(won, f"{counts[won]} of {answered} say the premise "
+                             f"{won.upper()} ({rule})", counts, answered)
+    # Two different sentences, because "nobody reached the threshold" and "both
+    # answers did" are opposite states and the single wording asserted the first
+    # of a panel that had split down the middle — which reads as an unconvincing
+    # challenge rather than as a genuine disagreement worth reading.
+    why = ("both answers reached the threshold" if reached
+           else "no answer reached the threshold")
+    return AskTally("unresolved", f"{why} — {tally} ({rule})", counts, answered)
+
+
 # ----------------------------------------------------------------------------- reviewers
 
 # Reasoning levels each CLI accepts for the shared `effort` config key — codex
@@ -1364,6 +1605,46 @@ def record_run(payload: dict) -> None:
     # qb exits 0 whether or not the board answered, and says which on stderr; the
     # note is worth surfacing (a board that has been down for a week is invisible
     # otherwise) but is never an error here.
+    note = (proc.stdout or proc.stderr or "").strip().splitlines()
+    if note:
+        print(f"panel: {note[-1]}", file=sys.stderr)
+
+
+#: `qb`'s exit code for a subcommand it does not have. Its usage branch is the
+#: only place it exits 2, and telling that apart from a board that answered badly
+#: is what keeps :func:`record_ask` quiet on a host whose `qb` predates the ask.
+QB_NO_SUBCOMMAND = 2
+
+
+def record_ask(payload: dict) -> None:
+    """Record one premise challenge on the board, best-effort, through the same
+    pipe and for the same reasons as :func:`record_run`.
+
+    **The board half of this is not here, and that is deliberate.** `qb` lives in
+    the fleet's own repo, not in this one, and it learns `record-ask` there;
+    the row it writes is #77's shape to define, since #77 is what will read it
+    ("was this fix built on a premise anyone checked, and was the answer right?").
+    Guessing that schema now to have something to POST at would put a table in
+    front of the issue that owns it.
+
+    So this call is the seam, placed where it belongs and inert until the other
+    half lands: a `qb` that does not know the subcommand says so once, on stderr,
+    and the ask itself is untouched. A challenge is a minute of two models'
+    attention — it must never fail because the recorder is a release behind, and
+    the payload is on stdout and in `--json-file` either way."""
+    if not shutil.which("qb"):
+        return
+    try:
+        proc = subprocess.run(["qb", "record-ask"], input=json.dumps(payload),
+                              capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"panel: ask not recorded ({e.__class__.__name__})", file=sys.stderr)
+        return
+    if proc.returncode == QB_NO_SUBCOMMAND:
+        print("panel: ask not recorded — this host's `qb` has no `record-ask` "
+              "(the board half of #79); the payload is complete either way",
+              file=sys.stderr)
+        return
     note = (proc.stdout or proc.stderr or "").strip().splitlines()
     if note:
         print(f"panel: {note[-1]}", file=sys.stderr)
@@ -1840,10 +2121,44 @@ def codex_usage(stdout: str | None) -> dict | None:
     return _usage(inp, out, cached, reasoning, observed=observed) if found else None
 
 
-def review_llm(cmd_name: str, model: str, prompt: str,
-               effort: str = "") -> ReviewerRun:
-    """Run a headless LLM CLI reviewer. Returns a :class:`ReviewerRun` — what it
-    found, what it could not judge, and what it cost.
+class SeatTurn(NamedTuple):
+    """One seat's turn at a headless CLI — everything that happened to the
+    PROCESS, and nothing about what the reply meant.
+
+    The split exists because the panel now asks its seats two different
+    questions. A round asks for a review and reads the answer with
+    :func:`parse_reply`; `--ask` asks whether one premise holds and reads it with
+    :func:`parse_answer`. Everything between those two — the sandbox, the pinned
+    sessions, the retry policy, the usage read-back, the four CLIs' argv — is
+    identical, and identical is the one thing it has to stay: a second copy of
+    :func:`run_seat` would be a second place for a seat to silently stop running,
+    which is the defect class this whole module exists to close (#68).
+    """
+
+    #: The seat's final reply text, or None when it produced none. The RETRY's
+    #: reply where a retry happened and produced something, matching `run_cli`,
+    #: which returns the last attempt's stdout.
+    reply: str | None = None
+    #: What `parse` made of that reply, or None when it could not read it (or no
+    #: parser was given). None is "unreadable", never "read, and it said
+    #: nothing" — the caller's parser owns that distinction and every one of them
+    #: is written to keep it.
+    parsed: object | None = None
+    #: Why this seat produced nothing at all. Mutually exclusive with a reply.
+    skip: str | None = None
+    duration_ms: int = 0
+    usage: dict | None = None
+    absent: bool = False
+
+
+def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
+             parse: Callable[[str], object | None] | None = None) -> SeatTurn:
+    """Put one question to a headless LLM CLI and return what came back.
+
+    `parse` reads the reply, and returning None from it means "I could not read
+    this" — which buys the seat ONE more CLI attempt, because the common flake is
+    a stray prose preamble the model omits on a retry. Pass no parser and no
+    retry happens; the raw reply comes back for the caller to do as it likes with.
 
     The member runs in its own empty sandbox repo (see `member_sandbox`), carved
     out of the private temp directory it already gets. Nothing is threaded in from
@@ -1887,11 +2202,11 @@ def review_llm(cmd_name: str, model: str, prompt: str,
     if effort and effort not in valid:
         expected = ("expected one of " + ", ".join(valid) if valid
                     else f"{cmd_name} takes no reasoning effort")
-        return ReviewerRun(skip=f"{label}: unknown reasoning effort {effort!r} — {expected}",
-                           duration_ms=elapsed())
+        return SeatTurn(skip=f"{label}: unknown reasoning effort {effort!r} — {expected}",
+                        duration_ms=elapsed())
     if not shutil.which(CLI_BIN.get(cmd_name, cmd_name)):
-        return ReviewerRun(skip=f"{label}: {CLI_ABSENT}", duration_ms=elapsed(),
-                           absent=True)
+        return SeatTurn(skip=f"{label}: {CLI_ABSENT}", duration_ms=elapsed(),
+                        absent=True)
 
     # A private directory per member per run holds whatever telemetry that CLI
     # needs somewhere to put (pi's session, codex's reply file). Removed however
@@ -2018,43 +2333,103 @@ def review_llm(cmd_name: str, model: str, prompt: str,
             err += cli_hint(cmd_name, err, model)
             # A member that burned tokens and then failed still spent them, so
             # the usage is reported on this path too.
-            return ReviewerRun(skip=err, duration_ms=elapsed(), usage=usage_of())
+            return SeatTurn(skip=err, duration_ms=elapsed(), usage=usage_of())
 
         text = reply_of(out)
-        parsed = parse_reply(cmd_name, text)
-        if parsed is None:
-            # Unparseable JSON — give the reviewer one more shot (a common flake is a
-            # stray prose preamble the model omits on a retry), then, rather than drop
-            # its work, keep the raw reply as a single markdown finding for the judge.
-            # The retry costs another turn, which `usage_of` already counts: it runs
-            # under its own fresh session, and its stdout lands in `outputs` too.
+        parsed = parse(text) if parse else None
+        if parse and parsed is None:
+            # Unreadable reply — give the seat one more shot (a common flake is a
+            # stray prose preamble the model omits on a retry). What the CALLER
+            # then does with a reply neither attempt could be read is the caller's
+            # business: a round keeps it as a raw finding for the judge, an ask
+            # records the seat as having answered nothing. The retry costs another
+            # turn, which `usage_of` already counts: it runs under its own fresh
+            # session, and its stdout lands in `outputs` too.
             out2, err2 = run_cli(args, label, attempts=1, stdin_text=stdin_text,
                                  on_output=collect, replied=wrote_reply, cwd=sandbox)
             retry_text = reply_of(out2) if not err2 else None
             if retry_text:
-                retried = parse_reply(cmd_name, retry_text)
+                retried = parse(retry_text)
                 if retried is not None:
-                    return ReviewerRun(retried[0], None, elapsed(), retried[1],
-                                       usage=usage_of())
+                    return SeatTurn(retry_text, retried, duration_ms=elapsed(),
+                                    usage=usage_of())
                 text = retry_text
-            usage = usage_of()
-            raw = (text or "").strip()
-            # Unreachable today — run_cli refuses to return whitespace-only stdout —
-            # and kept anyway, because it is the LOCAL half of the guard. The
-            # invariant that makes it dead lives ~350 lines away in a docstring, and
-            # the day it is relaxed (a new caller, a check_output=False variant, a
-            # mocked run_cli in a future test) this line is all that stands between
-            # the judge and a blank finding flagged `unstructured` — a dead reviewer
-            # wearing a live one's clothes, which is the failure this file exists to
-            # kill. Two lines is a cheap place to keep it. codex reaches it by a
-            # second route: its reply lands in a file, so an unreadable one is empty
-            # here with stdout non-empty and the run_cli invariant untouched.
-            if not raw:
-                return ReviewerRun(skip=f"{label}: produced no output",
-                                   duration_ms=elapsed(), usage=usage)
-            return ReviewerRun([_raw_finding(cmd_name, raw)], None, elapsed(),
-                               unstructured=True, usage=usage)
-        return ReviewerRun(parsed[0], None, elapsed(), parsed[1], usage=usage_of())
+            return SeatTurn(text, None, duration_ms=elapsed(), usage=usage_of())
+        return SeatTurn(text, parsed, duration_ms=elapsed(), usage=usage_of())
+
+
+def review_llm(cmd_name: str, model: str, prompt: str,
+               effort: str = "") -> ReviewerRun:
+    """Run a headless LLM CLI reviewer. Returns a :class:`ReviewerRun` — what it
+    found, what it could not judge, and what it cost.
+
+    Everything about the process belongs to :func:`run_seat`; what is left here
+    is the reading of the reply, which is the half a round does differently from
+    an ask."""
+    turn = run_seat(cmd_name, model, prompt, effort,
+                    parse=lambda text: parse_reply(cmd_name, text))
+    if turn.skip:
+        return ReviewerRun(skip=turn.skip, duration_ms=turn.duration_ms,
+                           usage=turn.usage, absent=turn.absent)
+    if turn.parsed is not None:
+        findings, declared = turn.parsed
+        return ReviewerRun(findings, None, turn.duration_ms, declared, usage=turn.usage)
+    # Neither attempt's reply could be read. Rather than drop the reviewer's
+    # work, keep the raw text as a single markdown finding for the judge.
+    raw = (turn.reply or "").strip()
+    # Unreachable today — run_cli refuses to return whitespace-only stdout — and
+    # kept anyway, because it is the LOCAL half of the guard. The invariant that
+    # makes it dead lives ~350 lines away in a docstring, and the day it is
+    # relaxed (a new caller, a check_output=False variant, a mocked run_cli in a
+    # future test) this line is all that stands between the judge and a blank
+    # finding flagged `unstructured` — a dead reviewer wearing a live one's
+    # clothes, which is the failure this file exists to kill. Two lines is a cheap
+    # place to keep it. codex reaches it by a second route: its reply lands in a
+    # file, so an unreadable one is empty here with stdout non-empty and the
+    # run_cli invariant untouched.
+    if not raw:
+        return ReviewerRun(skip=f"{reviewer_label(cmd_name, model, effort)}: "
+                                "produced no output",
+                           duration_ms=turn.duration_ms, usage=turn.usage)
+    return ReviewerRun([_raw_finding(cmd_name, raw)], None, turn.duration_ms,
+                       unstructured=True, usage=turn.usage)
+
+
+def ask_llm(cmd_name: str, model: str, prompt: str, effort: str = "") -> SeatAnswer:
+    """Put a premise to one seat and read its verdict back.
+
+    The same seat, the same sandbox, the same retry as a review — see
+    :func:`run_seat`. What differs is only what a reply that cannot be read means:
+    a round keeps it as a finding for the judge to look at, because half a review
+    is still worth reading. An ask has nothing to keep. A verdict is the entire
+    answer, so a reply carrying none is a seat that did not answer, recorded as
+    such and shown in the report rather than folded into `cannot tell`."""
+    turn = run_seat(cmd_name, model, prompt, effort, parse=parse_answer)
+    label = reviewer_label(cmd_name, model, effort)
+    if turn.skip:
+        return SeatAnswer(skip=turn.skip, duration_ms=turn.duration_ms,
+                          usage=turn.usage, absent=turn.absent)
+    if turn.parsed is not None:
+        return SeatAnswer(turn.parsed.verdict, turn.parsed.reason,
+                          duration_ms=turn.duration_ms, usage=turn.usage)
+    # Same guard, and the same reasoning, as the review path's: a seat that said
+    # nothing at all is a different report from one that said something
+    # unreadable, and only the second is worth quoting back at whoever tunes the
+    # prompt.
+    if not (turn.reply or "").strip():
+        return SeatAnswer(skip=f"{label}: produced no output",
+                          duration_ms=turn.duration_ms, usage=turn.usage)
+    return SeatAnswer(unreadable=True, reason=_ask_gist(turn.reply or ""),
+                      duration_ms=turn.duration_ms, usage=turn.usage)
+
+
+def _ask_gist(reply: str, limit: int = 120) -> str:
+    """The head of an unreadable reply, so the report can show WHAT the seat said
+    instead of only that it could not be read. Whoever is tuning the prompt needs
+    the difference between a model that reviewed the context and one that
+    answered in prose."""
+    first = next((ln.strip() for ln in reply.splitlines() if ln.strip()), "")
+    return first if len(first) <= limit else first[:limit - 1] + "…"
 
 
 def resolve_token(sonar: dict, repo_path: str = "") -> str:
@@ -4908,10 +5283,384 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     return finish(write_failed)
 
 
+# ----------------------------------------------------------------------------- ask
+
+#: `path`, `path:12`, `path:3500-3560`. Anchored, so a colon inside a path
+#: (`odd:dir/x.py`) is a path and not a malformed range.
+_RANGE = re.compile(r"^(\d+)(?:-(\d+))?$")
+
+
+class AskContext(NamedTuple):
+    """One `--context` argument, resolved and read."""
+
+    spec: str
+    #: Repo-relative, resolved — what the report and the payload name it by.
+    path: str
+    first: int | None
+    last: int | None
+    text: str
+
+
+def _context_spec(spec: str) -> tuple[str, int | None, int | None]:
+    """Split `path[:first[-last]]`. A bare `path:12` is the single line 12."""
+    head, sep, tail = spec.rpartition(":")
+    m = _RANGE.match(tail) if sep else None
+    if not m:
+        return spec, None, None
+    first = int(m.group(1))
+    return head, first, int(m.group(2)) if m.group(2) else first
+
+
+def _read_confined(root: Path, resolved: Path) -> str:
+    """Read `resolved` by walking DOWN from a descriptor on `root`, refusing a
+    symlink at every step.
+
+    The containment test in :func:`read_context` states the rule; this enforces
+    it. Resolving a path and then opening it by that path are two traversals of
+    the same string, and between them any component can become a symlink out of
+    the repo — so the check would pass and the read would leave. Opening each
+    component `O_NOFOLLOW` relative to the descriptor of the one above it never
+    re-traverses anything: the file read is the file checked, or the open fails.
+
+    It narrows nothing a caller can reach by typing. `resolved` is symlink-free
+    by construction — `Path.resolve` followed every link before the containment
+    test — so a spec naming a link inside the repo still reads its target, and the
+    walk sees only real directories. `O_NOFOLLOW` firing here means a component
+    turned into a symlink AFTER it was checked, which is the race and nothing
+    else, and the caller is told so in those words."""
+    parts = resolved.relative_to(root).parts
+    if not parts:
+        raise IsADirectoryError(errno.EISDIR, "the repo root is not a file", str(root))
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in parts[:-1]:
+            nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+        leaf = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
+    finally:
+        os.close(fd)
+    with os.fdopen(leaf, encoding="utf-8", errors="replace") as fh:
+        return fh.read()
+
+
+def read_context(root: Path, specs: list[str], problems: list[str]) -> list[AskContext]:
+    """The files (or line ranges) an ask hands its seats, read from the repo under
+    review.
+
+    **Confined to that repo, and refused rather than clamped when it is not.**
+    The path comes off a command line that an agent composes, so `--context
+    ../../.ssh/id_ed25519` is a real shape: this is a prompt builder, and every
+    seat's reply is a place its contents could come back out. Resolution follows
+    symlinks before the containment test for the same reason `write_payload`
+    opens `O_NOFOLLOW` — a link inside the repo is not a file inside the repo.
+
+    A spec that cannot be read is a PROBLEM and never a silent omission. A seat
+    given less context than the asker believes it has will answer `cannot tell`
+    about a question the asker thinks it supplied the answer to, and the asker
+    will read that as the code being unclear rather than as the file being
+    missing."""
+    root = root.resolve()
+    out: list[AskContext] = []
+    for spec in specs:
+        path, first, last = _context_spec(spec)
+        if not path.strip():
+            problems.append(f"`--context {spec}` names no file")
+            continue
+        try:
+            resolved = (root / path).resolve()
+        except OSError as e:
+            problems.append(f"`--context {spec}` could not be resolved ({e.__class__.__name__})")
+            continue
+        if not resolved.is_relative_to(root):
+            problems.append(f"`--context {spec}` is outside {root} — an ask reads the "
+                            "repo under review and nothing else")
+            continue
+        if not resolved.is_file():
+            problems.append(f"`--context {spec}` is not a file in {root}")
+            continue
+        try:
+            text = _read_confined(root, resolved)
+        except OSError as e:
+            # ELOOP or ENOTDIR from the walk means the tree changed under it —
+            # a directory that was checked is now a symlink (Linux answers a
+            # no-follow open of one with ENOTDIR when O_DIRECTORY is also set,
+            # which is why both codes read the same way here). Nothing a caller
+            # can type reaches either: `resolve()` already settled the links, and
+            # a non-directory component fails `is_file()` before the read.
+            why = ("a component of the path changed after it was checked — it is "
+                   "now a symlink, or no longer a directory"
+                   if e.errno in (errno.ELOOP, errno.ENOTDIR) else e.__class__.__name__)
+            problems.append(f"`--context {spec}` could not be read ({why})")
+            continue
+        rel = str(resolved.relative_to(root))
+        lines = text.splitlines()
+        if first is None:
+            out.append(AskContext(spec, rel, None, None, text))
+            continue
+        if first < 1:
+            problems.append(f"`--context {spec}`: lines are numbered from 1")
+            continue
+        if first > len(lines):
+            problems.append(f"`--context {spec}`: {rel} has {len(lines):,} lines")
+            continue
+        if last < first:
+            problems.append(f"`--context {spec}`: the range ends before it starts")
+            continue
+        if last > len(lines):
+            # Clamped and SAID, rather than clamped quietly: "3500-3560" against a
+            # 3,510-line file is usually a stale line number, and a seat answering
+            # from ten lines where the asker meant sixty is the failure this whole
+            # feature exists to make cheap to notice.
+            problems.append(f"`--context {spec}`: {rel} has {len(lines):,} lines — "
+                            f"the seats got {first}-{len(lines)}")
+            last = len(lines)
+        out.append(AskContext(spec, rel, first, last, "\n".join(lines[first - 1:last])))
+    return out
+
+
+def _context_block(contexts: list[AskContext]) -> str:
+    """The context as the seats see it, or the sentence that goes where it would
+    have been.
+
+    An ask with no context is legitimate — some premises are settled by their own
+    terms — but a model handed a bare assertion and no material will reach for
+    what it remembers about a library, or about this repo, and answer with real
+    confidence from nothing. Saying out loud that it was given nothing is what
+    makes `cannot tell` the available answer rather than a gap it has to invent
+    its way across."""
+    if not contexts:
+        return ("\n--- CONTEXT ---\nNone was given. Answer from the premise's own terms, "
+                "and where those do not settle it answer \"cannot tell\" — you have "
+                "nothing to check it against and must not answer from memory.\n")
+    out = []
+    for c in contexts:
+        where = f"{c.path}:{c.first}-{c.last}" if c.first else c.path
+        out.append(f"\n--- CONTEXT: {where} ---\n{c.text}\n")
+    return "".join(out)
+
+
+def _ask_rule(panel: dict, key: str, fallback: int, notes: list[str]) -> int:
+    """A tally rule as a positive int, saying so when the config is not one.
+
+    Same discipline as :func:`diff_budget`: what cannot be the thing at all falls
+    back and is reported, because silently honouring `ask_quorum: 0` would let a
+    tally of nobody decide, and silently dropping it would leave you believing a
+    rule you never got."""
+    raw = panel.get(key)
+    if raw is None or raw == "":
+        return fallback
+    n = None
+    if not isinstance(raw, bool) and isinstance(raw, (int, str)):
+        try:
+            n = int(raw)
+        except ValueError:
+            n = None
+    if n is None:
+        notes.append(f"`{key}`={raw!r} is not a number — using {fallback}")
+        return fallback
+    if n < 1:
+        notes.append(f"`{key}`={n} would let a tally of nobody decide — using {fallback}")
+        return fallback
+    return n
+
+
+#: Environment that says an agent, rather than a person at a prompt, is running
+#: this challenge — and which seat that agent is. Claude Code exports both of
+#: these into every command it runs, so an agent that asks does not have to
+#: remember to declare itself; forgetting is precisely how a premise gets
+#: "confirmed" by the model that wrote it.
+ASKER_ENV = {"CLAUDE_CODE_SESSION_ID": "claude", "CLAUDECODE": "claude"}
+
+
+def asking_seat(explicit: str | None) -> str:
+    """Which seat is asking, from `--asker` or from the environment.
+
+    `--asker ''` is an explicit "nobody" — for a human at a terminal, where there
+    is no agent and so no self-challenge to guard against. It is honoured, since
+    the alternative is a person unable to turn off a rule that does not apply to
+    them; it is the one hole in this, and it is one an agent has to type."""
+    if explicit is not None:
+        return explicit.strip().lower()
+    return next((seat for var, seat in ASKER_ENV.items() if os.environ.get(var)), "")
+
+
+def ask(repo_name: str | None, premise: str, contexts: list[str] | None = None,
+        reviewers: str | None = None, pr_number: int | None = None,
+        json_out: bool = False, json_file: str = "", record: bool = True,
+        asker: str = "") -> int:
+    """Put one premise to the panel's seats and print what they said.
+
+    No diff, no clustering, no judge. A round already votes on fixes — that is
+    what a round IS — so the gap this fills is granularity and latency, not
+    absence: three of PR #62's rounds each spent twenty minutes and thirty
+    findings answering a yes/no question about one branch of `panel.py`.
+
+    **Not a gate.** It exits 0 on every verdict, including `fails`. Making it a
+    pass/fail step turns a one-minute question into a required wait, and a
+    required wait gets skipped."""
+    run_key = uuid.uuid4().hex
+    cfg = load_repo_cfg(repo_name)
+    repo_name = cfg.get("name") or repo_name
+    rev, panel = cfg["reviewers"], cfg["review_panel"]
+    selected, override_note = select_reviewers(rev, reviewers)
+    # Progress and warnings go to stderr under --json, so stdout is the payload
+    # and only the payload — the same rule the review path follows.
+    chatter = sys.stderr if json_out else sys.stdout
+
+    notes: list[str] = []
+    if "sonarqube" in selected:
+        # Selectable for a review, and meaningless here: it is a scanner with a
+        # rule set, not a correspondent. Said rather than silently dropped —
+        # `--reviewers claude,sonarqube` otherwise looks like a two-seat ask.
+        notes.append("sonarqube cannot be asked a question — it scans code against a "
+                     "rule set and has no reply to give. Not a seat on this ask.")
+    seats = [n for n in LLM_REVIEWERS if n in selected]
+    quorum = _ask_rule(panel, "ask_quorum", 2, notes)
+    threshold = _ask_rule(panel, "ask_threshold", 2, notes)
+    if threshold > quorum:
+        # Not corrected, because both numbers are somebody's decision — but a
+        # threshold no quorum can reach makes every ask `unresolved` forever, and
+        # that reads as an indecisive panel rather than as a config error.
+        notes.append(f"`ask_threshold` ({threshold}) is above `ask_quorum` ({quorum}) — "
+                     "an ask that meets quorum can still never reach the threshold")
+
+    read = read_context(Path(cfg["path"]), contexts or [], notes)
+    context = _context_block(read)
+
+    print(f"\n[{repo_name}] premise challenge — {len(seats)} seat"
+          f"{'s' if len(seats) != 1 else ''}", file=chatter)
+    print(f"  {premise[:120]}\n", file=chatter)
+
+    models = {n: rev.get(n, {}).get("model", "") for n in LLM_REVIEWERS}
+    models["claude"] = rev.get("claude", {}).get("model", "sonnet")
+    efforts = {n: rev.get(n, {}).get("effort", "") for n in EFFORTS}
+
+    def prompt_for(budget: int | None) -> str:
+        return ASK_PROMPT.format(premise=premise,
+                                 context=context if budget is None else context[:budget])
+
+    prompts = {n: prompt_for(None) for n in seats}
+    # `agy`'s prompt travels in argv and the kernel caps one element, whatever is
+    # in it — a premise is small but a `--context` file need not be. Same clamp,
+    # same report, as the diff gets on a round.
+    if "antigravity" in prompts:
+        fitted = fit_argv_budget(prompt_for, len(context))
+        if fitted < len(context):
+            notes.append(f"antigravity gets {fitted:,} of {len(context):,} context chars "
+                         "— its prompt travels in argv and the kernel caps one element "
+                         f"at {ARGV_PROMPT_MAX_BYTES:,} bytes")
+            prompts["antigravity"] = prompt_for(fitted)
+
+    answers: dict[str, SeatAnswer] = {}
+    if seats:
+        with ThreadPoolExecutor(max_workers=len(seats)) as ex:
+            tasks = {n: ex.submit(ask_llm, n, models[n], prompts[n], efforts.get(n, ""))
+                     for n in seats}
+            answers = {n: fut.result() for n, fut in tasks.items()}
+
+    tally = ask_tally(answers, quorum, threshold, asker)
+    payload = {
+        "kind": "ask",
+        "repo": repo_name, "github": cfg["github"],
+        # The PR this premise is being asked ON BEHALF of, when there is one.
+        # Nothing is fetched for it: an ask reads the context it was handed, and
+        # a PR number it never opened is a link, not a claim about the PR.
+        "pr": pr_number,
+        "premise": premise,
+        "context": [{"spec": c.spec, "path": c.path, "first": c.first, "last": c.last,
+                     "chars": len(c.text)} for c in read],
+        "asker": asker or None,
+        "verdict": tally.verdict,
+        "verdict_reason": tally.reason,
+        "quorum": quorum,
+        "threshold": threshold,
+        "answered": tally.answered,
+        "counts": tally.counts,
+        "seats_selected": sorted(selected),
+        "seats_override": override_note,
+        "answers": {n: {"verdict": a.verdict, "reason": a.reason, "skip": a.skip,
+                        "unreadable": a.unreadable, "absent": a.absent,
+                        "model": models[n] or None, "effort": efforts.get(n) or None,
+                        "duration_ms": a.duration_ms, **(a.usage or {})}
+                    for n, a in sorted(answers.items())},
+        "config_notes": notes,
+        "run_key": run_key,
+    }
+    write_failed = write_payload(json_file, payload)
+    if record:
+        record_ask(payload)
+    if json_out:
+        print(json.dumps(payload, indent=2))
+        return finish(write_failed)
+
+    lines = [f"## Premise challenge — {repo_name}"
+             + (f"#{pr_number}" if pr_number else ""), ""]
+    lines.append(f"**Premise:** {premise}")
+    if read:
+        lines.append("**Context:** " + ", ".join(
+            f"`{c.path}:{c.first}-{c.last}`" if c.first else f"`{c.path}`" for c in read))
+    else:
+        lines.append("**Context:** none given — the seats answered from the premise alone")
+    lines.append("**Seats:** " + (", ".join(reviewer_label(n, models[n], efforts.get(n, ""))
+                                            for n in seats) or "none"))
+    if asker:
+        lines.append(f"**Asked by:** {asker} — its own answer is one vote and cannot be "
+                     "the only one")
+    if override_note:
+        lines.append(f"  - {override_note}")
+    for note in notes:
+        lines.append(f"  - ⚠️ config: {note}")
+    lines.append("")
+
+    # One column per seat, whether or not it answered, because the absences are
+    # the part a tally hides: "2 of 2 say it holds" over a four-seat panel is a
+    # different sentence from the same words over a two-seat one.
+    width = max((len(n) for n in seats), default=0)
+    for name in seats:
+        a = answers[name]
+        if a.verdict:
+            lines.append(f"    {name.ljust(width)}  {a.verdict.ljust(11)}"
+                         + (f" — {a.reason}" if a.reason else ""))
+        elif a.unreadable:
+            lines.append(f"    {name.ljust(width)}  ⚠️ no verdict — its reply could not be "
+                         "read as one, and is NOT counted as `cannot tell`"
+                         + (f" (it said: {a.reason})" if a.reason else ""))
+        else:
+            lines.append(f"    {name.ljust(width)}  ⚠️ did not answer — {a.skip}")
+    arrow = {"holds": "the premise HOLDS", "fails": "the premise FAILS",
+             "unresolved": "UNRESOLVED", "unchallenged": "UNCHALLENGED"}[tally.verdict]
+    lines.append(f"\n→ **{arrow}** — {tally.reason}")
+    if tally.verdict == "unchallenged":
+        lines.append("  _An unchallenged premise is not a confirmed one. Read this as "
+                     "\"nobody checked\", which is where it started._")
+    lines.append("\n_Not a gate: this is a point of order, and it decides nothing on its "
+                 "own. It is one question to the seats — no diff was read and no judge "
+                 "ruled, so it is evidence about the premise and not a review._")
+    print("\n".join(lines))
+    return finish(write_failed)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Reviewer panel for a PR")
     ap.add_argument("--repo", help="repo path, or a name under ~/source (default: cwd)")
-    ap.add_argument("--pr", required=True, type=int)
+    ap.add_argument("--pr", type=int,
+                    help="the PR to review. With --ask, the PR the premise is being "
+                         "asked on behalf of — recorded as a link, never fetched")
+    ap.add_argument("--ask", metavar="PREMISE",
+                    help="challenge one premise instead of reviewing a PR: put this "
+                         "yes/no question to the enabled seats, with no diff, no judge "
+                         "and no cycle, and print the tally. NOT a gate — it exits 0 on "
+                         "every verdict, including `fails`")
+    ap.add_argument("--context", action="append", default=[], metavar="PATH[:A-B]",
+                    help="a file (or line range) from the repo under review to hand the "
+                         "seats with the premise, e.g. harness/loops/panel.py:3500-3560. "
+                         "Repeatable. --ask only")
+    ap.add_argument("--asker", metavar="SEAT", default=None,
+                    help="which seat the agent running this challenge IS, so its own "
+                         f"vote cannot be the only one ({', '.join(LLM_REVIEWERS)}). "
+                         "Detected from the environment when a coding agent is running "
+                         "this; pass an empty string to say there is no asker. --ask only")
     ap.add_argument("--post", action="store_true", help="post summary as a PR comment")
     ap.add_argument("--json", action="store_true", dest="json_out",
                     help="emit the whole run as JSON on stdout; no report/post")
@@ -4925,7 +5674,12 @@ def main() -> int:
                          "(and --post) — unlike --json, which replaces them")
     ap.add_argument("--no-record", action="store_false", dest="record",
                     help="don't record this run on the quarterback board")
-    ap.add_argument("--round", type=int, default=1, dest="round_no", metavar="N",
+    # Defaulted to None rather than 1, so "not passed" and "passed as 1" stay
+    # distinguishable. They are the same round to `run()` — resolved to 1 a few
+    # lines below — but not to the `--ask` guard: comparing against the default
+    # accepted `--ask --round 1` silently, which is a caller believing it asked
+    # for something this run does not do.
+    ap.add_argument("--round", type=int, default=None, dest="round_no", metavar="N",
                     help="which panel/fix cycle this is (default 1). Round 2+ is the "
                          "re-review of the fix commit — the one nobody reads otherwise")
     ap.add_argument("--baseline", action="append", default=[], metavar="PATH",
@@ -4941,7 +5695,38 @@ def main() -> int:
                          "review and reports no rounds. `/panel-review-pr` spells it "
                          "--rounds N and passes it here on every invocation")
     args = ap.parse_args()
-    if args.round_no < 1:
+    # The ask is settled before the round flags are validated, because it accepts
+    # none of them: an ask that reached those checks would be answering a question
+    # about a cycle it is not part of.
+    if args.ask is not None:
+        if not args.ask.strip():
+            raise SystemExit("--ask: the premise is empty — say what is being challenged")
+        wrong = [f for f, used in (("--post", args.post),
+                                   ("--round", args.round_no is not None),
+                                   ("--baseline", bool(args.baseline)),
+                                   ("--max-rounds", args.max_rounds is not None)) if used]
+        if wrong:
+            raise SystemExit(f"--ask does not take {', '.join(wrong)}: an ask is one "
+                             "question to the seats, not a round — there is no diff to "
+                             "post about, no judge, and no cycle for a baseline to be "
+                             "part of")
+        asker = asking_seat(args.asker)
+        if asker and asker not in LLM_REVIEWERS:
+            raise SystemExit(f"--asker: unknown seat {asker!r} — expected one of "
+                             f"{', '.join(LLM_REVIEWERS)}, or '' for no asker")
+        return ask(args.repo, args.ask.strip(), args.context, args.reviewers,
+                   args.pr, args.json_out, args.json_file, args.record, asker)
+    if args.pr is None:
+        raise SystemExit("--pr is required — or pass --ask to challenge one premise "
+                         "instead of reviewing a PR")
+    for flag, given in (("--context", bool(args.context)),
+                        ("--asker", args.asker is not None)):
+        if given:
+            raise SystemExit(f"{flag} belongs to --ask — a PR review takes neither")
+    # The sentinel has done its one job (telling `--ask --round 1` from `--ask`);
+    # from here down a round that was not named is round 1, exactly as before.
+    round_no = 1 if args.round_no is None else args.round_no
+    if round_no < 1:
         raise SystemExit("--round: rounds are numbered from 1")
     if args.max_rounds is not None and args.max_rounds < 1:
         raise SystemExit("--max-rounds: at least one round has to run")
@@ -4953,14 +5738,14 @@ def main() -> int:
     # metadata this guard exists to prevent, leaking through the one spelling it
     # did not cover.
     cap = DEFAULT_MAX_ROUNDS if args.max_rounds is None else args.max_rounds
-    if args.round_no > cap:
+    if round_no > cap:
         default_note = "" if args.max_rounds is not None else \
             " (the default, since --max-rounds was not passed)"
-        raise SystemExit(f"--round {args.round_no} is past --max-rounds "
+        raise SystemExit(f"--round {round_no} is past --max-rounds "
                          f"{cap}{default_note}: raise the cap, or pass the round "
                          "this run actually is")
     return run(args.repo, args.pr, args.post, args.json_out, args.reviewers,
-               args.json_file, args.record, args.round_no, args.baseline,
+               args.json_file, args.record, round_no, args.baseline,
                args.max_rounds)
 
 

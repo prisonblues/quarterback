@@ -188,12 +188,15 @@ says how much of a window actually reported.
 
 The deployed board version lags the repo until the stack is redeployed, and only the running
 service knows which it is: ask it with `GET /openapi.json` → `.info.version`, for whichever
-instance you care about. (Anything built off this branch says 2.23.0 — v2.24 is harness-side.) A number written here
+instance you care about. (Anything built off this branch says 2.23.0 — v2.24 and v2.27 are
+harness-side.) A number written here
 instead would be wrong the next time Portainer redeploys, with no diff to catch it.
-Latest release: **v2.24**, harness-side — a new finding now says whether the last fix pass caused it
-or the last round missed it, which were one number before and want opposite remedies. (**v2.22** is
-claimed by a branch not yet merged, which is why the numbering skips it.)
-Before it, **v2.23** had a run record which FILES the PR changed and not just how many lines, plus
+Latest release: **v2.27**, harness-side — `panel.py --ask` puts one premise to the seats and reports
+the tally, with no diff, no judge and no gate, so a fix's assumption can be challenged in a minute
+instead of in a twenty-minute round. (**v2.22**, **v2.25** and **v2.26** are claimed by branches not
+yet merged, which is why the numbering skips them.)
+Before it, **v2.24** made a new finding say whether the last fix pass caused it or the last round
+missed it, which were one number before and want opposite remedies, and **v2.23** had a run record which FILES the PR changed and not just how many lines, plus
 the PR's state as of that panel, so the board finally holds what collision ordering needs (schema
 revision 0016) — reading it back as a collision query ships separately, see #101.
 **v2.21** (harness-side) had each panel member run in its own empty sandbox repo
@@ -232,6 +235,10 @@ judge) are harness-side too.
 - **v2.24** — a new finding records whether the last fix pass introduced it or the last round missed
   it: two facts with opposite remedies that `new_this_round` collapsed into one, plus the commit each
   round reviewed and the files it was truncated out of. A signal, not a verdict — nothing gates on it.
+- **v2.27** — `panel.py --ask "<premise>"` challenges one assumption with one question to the seats:
+  no diff, no judge, the vote is the output, and it gates nothing. `cannot tell` counts toward the
+  quorum and never toward the answer, and a tally whose only voter is the agent that wrote the
+  premise reports as unchallenged rather than as agreement.
 - **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
   object store; wire `landed` refs to a cherry-pick helper.
 
