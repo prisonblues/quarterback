@@ -13,7 +13,8 @@ board reconnects them.**
 - `commands/` — Claude Code slash commands (`/panel`, `/panel-review-pr`, `/review-pr`,
   `/fix-issue`, `/epic`, `/lander`, `/wt`, `/drop-worktree`, `/tree-shake`, …)
 - `bin/` — the bash the worktree commands drive (`create-worktree`, `remove-worktree`,
-  `prune-worktrees`, `worktree-holder`)
+  `prune-worktrees`, `worktree-holder`), plus `qb-stage`, which records the workflow
+  stage a session is in for the statusline
 - `worktree.example.json` — per-repo config, annotated with quarterback's own values
 
 Neither half needs the other. The loops run with no board configured (recording is
@@ -204,7 +205,27 @@ running raw git was never going to be caught by tooling it did not invoke.
   which PR a session is on; the statusline falls back to a cached `gh pr list --head` when
   it is absent. **Write both with `tee`, never `>`** — a `>` redirect anywhere under
   `$HOME` is refused by the `dcg` pre-tool guard, and an agent that hits that block leaves
-  the bar pointing at the main checkout for the whole session. `/drop-worktree` clears both.
+  the bar pointing at the main checkout for the whole session.
+- **Workflow stage.** `qb-stage <stage>` records how far along the work is, in
+  `~/.cache/claude-code/session-stage/$CLAUDE_CODE_SESSION_ID`:
+
+  | Stage | Means | Written by |
+  |---|---|---|
+  | `F0` | implementing the first cut | `/fix-issue` |
+  | `R1` | review round 1 | `/review-pr`, `/panel`, `/panel-review-pr` |
+  | `R1F` | fixing round 1's findings | `/panel-review-pr`'s fix fan-out |
+  | `R2`, `R2F`, … | and so on, per round | `/panel-review-pr` |
+
+  Repo, branch and PR all say *which* work a session is on and none of them say how far
+  along it is — they read identically at every stage of a PR's life. Nothing local can
+  derive it either: a round number is handed to `panel.py` (`--round <r>`), never computed,
+  so it has to be said out loud. `/review-pr` stamps only `R1`, because one agent there
+  both reviews and fixes and a bar that claimed `R1F` while a reviewer was still reading
+  would be worse than one that said less. `qb-stage` checks the *shape* (1–6 alphanumerics)
+  and not the vocabulary, so a new stage needs no edit to it — and it exits 0 in silence
+  when there is no session id, because a loop under systemd has nobody watching a bar.
+
+`/drop-worktree` clears all three.
 
 ## Configuration
 

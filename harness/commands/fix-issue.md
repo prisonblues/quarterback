@@ -151,6 +151,15 @@ schema changes against the shared DB.
 
 ## 4. Implement
 
+**Say what stage you are in**, so the statusline can show it — the branch and PR
+name *which* work, never how far along it is:
+```bash
+qb-stage F0
+```
+(`F0` = implementing the first cut. The review skills move it on to `R1`, `R1F`,
+`R2` … as rounds happen; `/drop-worktree` clears it. Best-effort — if `qb-stage`
+is not on PATH, carry on, it is a status field and nothing depends on it.)
+
 Follow the project's CLAUDE.md standards.
 
 Write the complete solution:

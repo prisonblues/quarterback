@@ -23,6 +23,7 @@ panel just adds independent reviewers + hard CI/Sonar gates on top of that bar.
    didn't ask for, and never pass the flag to "be explicit" about the default.
 3. Run (from anywhere — post-by-default, drop `--post` only on `--no-post`):
    ```
+   qb-stage R1                                                # what the statusline shows
    python3 ~/.claude/loops/panel.py --pr <pr> --post          # add --repo <path|name> for another repo
    python3 ~/.claude/loops/panel.py --pr <pr> --post --reviewers codex          # single-vendor read
    python3 ~/.claude/loops/panel.py --pr <pr> --post --reviewers claude,codex,antigravity

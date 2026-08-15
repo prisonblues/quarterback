@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+# qb-stage — record which stage of the workflow this session is in.
+#
+# Usage: qb-stage <stage>     record it (F0, R1, R1F, R2, R2F, …)
+#        qb-stage --clear     forget it (the work is finished or torn down)
+#        qb-stage --show      print the current stage, if any
+#        qb-stage -h|--help   this text
+#
+# Exit codes:
+#   0  recorded, cleared, or nothing to do (no session id — not under Claude Code)
+#   2  malformed stage — a typo, which is a caller bug and says so
+#
+# WHAT THIS IS FOR. The statusline can say which repo, branch, worktree and PR a
+# session is on, and still not answer the question you actually have when you
+# glance at eight of them: is this one still writing the fix, or is it three
+# review rounds deep? Branch and PR are identical at every stage of a PR's life.
+# Nothing else knows the answer either — a round number lives in the skill
+# driving the loop (`panel.py --round <r>` is passed it, not derived), so it
+# cannot be recovered from the repo, the board, or the process table. It has to
+# be *said*, which is what this does.
+#
+# THE CONVENTION (documented, not enforced — see below):
+#
+#   F0     implementing the first cut          /fix-issue
+#   R1     review round 1                      /review-pr, /panel, /panel-review-pr
+#   R1F    fixing round 1's findings           /panel-review-pr's fix fan-out
+#   R2     review round 2                      …and so on, R2F, R3, R3F
+#
+# Only the SHAPE is checked (1-6 alphanumerics), not the vocabulary. A check
+# that hard-coded F/R would have to be edited by anyone adding a stage, and the
+# cost of the two failure modes is lopsided: an unknown-but-well-formed token
+# renders as six harmless characters on a status bar, where a rejected one stops
+# a workflow to argue about a cosmetic field. The vocabulary is a convention
+# between the skills and the reader; this only defends the pixels.
+#
+# BEST-EFFORT BY CONSTRUCTION. No session id means nobody is watching a bar —
+# a loop under systemd, a script run by hand — so that exits 0 in silence rather
+# than failing a review over a status field. Same reasoning as the panel's board
+# recording: telemetry that can fail the thing it reports on is worse than none.
+#
+# WHY tee AND NOT `>`. A `>` redirect anywhere under $HOME is refused by the dcg
+# pre-tool guard (core.filesystem:redirect-truncate-root-home), so the obvious
+# `printf … > "$marker"` is blocked when an agent runs it. That is not a
+# hypothetical: it is what silently broke the session-cwd marker this sits
+# beside, leaving the bar pointing at the main checkout for whole sessions.
+# Having one short command to call is the other half of the fix — a caller that
+# writes no path of its own cannot get the path or the redirect wrong.
+
+STAGE_DIR="${QB_SESSION_STAGE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/claude-code/session-stage}"
+SESSION_ID="${CLAUDE_CODE_SESSION_ID:-}"
+
+usage() { sed -n '4,9p' "$0" | sed 's/^# \{0,1\}//'; }
+
+case "${1-}" in
+    -h|--help)
+        usage
+        exit 0
+        ;;
+    "")
+        printf 'qb-stage: need a stage (or --clear)\n\n' >&2
+        usage >&2
+        exit 2
+        ;;
+esac
+
+# No session, no marker, no complaint. Checked after --help so the help text
+# still works anywhere, and before the write so the rest can assume an id.
+[[ -n "$SESSION_ID" ]] || exit 0
+
+# The session id becomes a filename, so it must not be able to escape the
+# directory. Claude Code's ids are UUIDs; anything else is refused rather than
+# sanitised, because a mangled id would write a marker no reader ever finds.
+if [[ ! "$SESSION_ID" =~ ^[A-Za-z0-9._-]+$ || "$SESSION_ID" == *".."* ]]; then
+    printf 'qb-stage: refusing a session id that is not a plain token: %s\n' \
+        "$SESSION_ID" >&2
+    exit 2
+fi
+
+MARKER="$STAGE_DIR/$SESSION_ID"
+
+case "$1" in
+    --clear)
+        rm -f "$MARKER"
+        exit 0
+        ;;
+    --show)
+        [[ -f "$MARKER" ]] && cat "$MARKER"
+        exit 0
+        ;;
+esac
+
+STAGE="$1"
+if [[ ! "$STAGE" =~ ^[A-Za-z0-9]{1,6}$ ]]; then
+    printf 'qb-stage: %s is not a stage — expected 1-6 alphanumerics (F0, R1, R1F)\n' \
+        "$STAGE" >&2
+    exit 2
+fi
+
+mkdir -p "$STAGE_DIR" || exit 0
+printf '%s' "$STAGE" | tee "$MARKER" >/dev/null
