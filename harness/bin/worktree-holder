@@ -1,0 +1,260 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+# worktree-holder — is another live agent working in this worktree?
+#
+# Usage: worktree-holder [options] <path|branch>
+#
+# Options:
+#   --json       machine-readable answer on stdout
+#   --quiet      no output, exit code only
+#   -h, --help   this text
+#
+# Exit codes:
+#   0  nobody else is here — free, or held only by this session
+#   3  held by another live agent
+#   4  could not tell (no board configured or reachable, or no curl/jq)
+#
+# The all-clear goes to stdout and every warning to stderr, so a caller that only
+# wants to speak up when there IS a holder can just drop stdout.
+#
+# ADVISORY, NEVER A LOCK. Exit 3 is a caller's cue to refuse and say who, not to
+# make a worktree permanently unusable: leases expire, an agent can die holding
+# one, and the fleet's convention throughout is that presence lapses rather than
+# blocks. That is also why "could not tell" is its own code — a board that is
+# down must not stop anyone working. The failure worth preventing is the *silent*
+# rewrite of somebody else's checkout, not the deliberate one.
+#
+# WHY THE BOARD ALONE CANNOT ANSWER THIS. A lease records the directory the agent
+# was *launched* in, which for the worktree workflow is the main checkout: the
+# shell cwd resets between tool calls, so an agent given a worktree by /fix-issue
+# still reports `cwd=~/src/proj` and `branch=main`. Every live agent in this repo
+# looks identical on the board no matter which worktree it is really in. The
+# missing link is local: the session marker /fix-issue writes to
+# ~/.cache/claude-code/session-cwd/<session-id>, whose contents ARE the worktree
+# path. So this asks two sources and unions them:
+#
+#   1. the markers  — which sessions were handed this worktree
+#   2. the board    — which of those sessions is still live, and who holds it,
+#                     plus anyone whose lease cwd is the worktree itself (an
+#                     agent started inside it directly, which does report it)
+#
+# Markers are machine-local, which is the right scope: a worktree can only be
+# rewritten from the machine holding it.
+
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+die() { echo -e "${RED}Error: $1${NC}" >&2; exit 2; }
+
+JSON=false
+QUIET=false
+TARGET=""
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --json)     JSON=true; shift ;;
+        --quiet|-q) QUIET=true; shift ;;
+        -h|--help)  sed -n '4,19p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --*)        die "Unknown option: $1" ;;
+        *)
+            [[ -n "$TARGET" ]] && die "Unexpected argument '$1' (target already set to '$TARGET')"
+            TARGET="$1"; shift ;;
+    esac
+done
+
+[[ -z "$TARGET" ]] && die "Path or branch required\nUsage: worktree-holder [--json] [--quiet] <path|branch>"
+
+# ============================================
+# RESOLVE THE TARGET WORKTREE
+# ============================================
+# Two spellings are kept and both are matched against, because the board stores
+# the path as the agent's shell reported it while `pwd -P` resolves symlinks. A
+# checkout under a symlinked home would otherwise compare unequal and read as
+# free — a false negative, the one answer this tool must never give quietly.
+WT_PATH=""
+WT_LOGICAL=""
+
+if [[ -d "$TARGET" ]]; then
+    WT_LOGICAL=$(cd "$TARGET" 2>/dev/null && pwd) || die "Cannot enter directory: $TARGET"
+    WT_PATH=$(cd "$TARGET" 2>/dev/null && pwd -P)
+else
+    found=$(git worktree list --porcelain 2>/dev/null | awk -v b="refs/heads/$TARGET" '
+        /^worktree / { wt = substr($0, 10) }
+        /^branch / && $2 == b { print wt; exit }
+    ')
+    [[ -z "$found" ]] && die "No worktree found for '$TARGET' (not a directory, not a checked-out branch)"
+    WT_LOGICAL="$found"
+    WT_PATH=$(cd "$found" 2>/dev/null && pwd -P) || WT_PATH="$found"
+fi
+[[ -z "$WT_PATH" ]] && WT_PATH="$WT_LOGICAL"
+
+WT_BRANCH=$(git -C "$WT_PATH" branch --show-current 2>/dev/null || true)
+
+# ============================================
+# GIVE UP HONESTLY
+# ============================================
+# Every early exit is 4, not 0: "I could not ask" and "nobody is there" are
+# different answers and must not be spelled the same way.
+cannot_tell() {
+    if [[ "$JSON" = true ]]; then
+        jq -nc --arg p "$WT_PATH" --arg b "$WT_BRANCH" --arg why "$1" \
+            '{path:$p, branch:$b, checked:false, held:false, reason:$why, holders:[]}' 2>/dev/null \
+            || printf '{"path":"%s","checked":false,"held":false,"reason":"%s","holders":[]}\n' "$WT_PATH" "$1"
+    elif [[ "$QUIET" != true ]]; then
+        echo -e "${YELLOW}worktree-holder: could not check $WT_PATH ($1)${NC}" >&2
+    fi
+    exit 4
+}
+
+command -v curl >/dev/null 2>&1 || cannot_tell "curl not installed"
+command -v jq   >/dev/null 2>&1 || cannot_tell "jq not installed"
+
+# ============================================
+# BOARD CONFIGURATION
+# ============================================
+# The per-host contract documented in `qb-env`, read directly rather than by
+# sourcing it: qb-env lives beside the `qb` CLI, which is a separate install, and
+# the harness is meant to work without it. There is deliberately NO default base
+# URL — an unset variable means "this machine has not been told which board it
+# belongs to", and guessing would point the query at another island's board.
+board_config() {
+    local env_url="${QUARTERBACK_BASE_URL:-}" env_tok="${QUARTERBACK_TOKEN:-}"
+    local env_cmd="${QUARTERBACK_TOKEN_CMD:-}"
+    local cfg="${QUARTERBACK_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/quarterback/config}"
+    if [[ -r "$cfg" ]]; then
+        # shellcheck disable=SC1090
+        . "$cfg" || return 1
+    fi
+    # Sourcing assigns unconditionally, so restore anything the caller had set:
+    # a single invocation must be able to override the file without editing it.
+    # TOKEN_CMD included — it is a whole credential source, and a config file
+    # silently winning it means querying the board as somebody else.
+    [[ -n "$env_url" ]] && QUARTERBACK_BASE_URL="$env_url"
+    [[ -n "$env_tok" ]] && QUARTERBACK_TOKEN="$env_tok"
+    [[ -n "$env_cmd" ]] && QUARTERBACK_TOKEN_CMD="$env_cmd"
+    [[ -n "${QUARTERBACK_BASE_URL:-}" ]] || return 1
+    if [[ -z "${QUARTERBACK_TOKEN:-}" && -n "${QUARTERBACK_TOKEN_CMD:-}" ]]; then
+        QUARTERBACK_TOKEN="$(eval "$QUARTERBACK_TOKEN_CMD" 2>/dev/null | head -1)"
+    fi
+    [[ -n "${QUARTERBACK_TOKEN:-}" ]] || return 1
+    BASE="${QUARTERBACK_BASE_URL%/}"
+    return 0
+}
+
+board_config || cannot_tell "no board configured (QUARTERBACK_BASE_URL / token)"
+
+# ============================================
+# LOCAL HALF: WHICH SESSIONS WERE HANDED THIS WORKTREE
+# ============================================
+MARKER_DIR="${QB_SESSION_CWD_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/claude-code/session-cwd}"
+
+marker_sessions() {
+    local f content
+    [[ -d "$MARKER_DIR" ]] || return 0
+    for f in "$MARKER_DIR"/*; do
+        [[ -f "$f" ]] || continue
+        content=$(<"$f")
+        content="${content//$'\n'/}"
+        content="${content%"${content##*[![:space:]]}"}"
+        content="${content#"${content%%[![:space:]]*}"}"
+        [[ "$content" = "$WT_PATH" || "$content" = "$WT_LOGICAL" ]] && basename "$f"
+    done
+    return 0
+}
+
+MARKED=$(marker_sessions | jq -R . | jq -sc . 2>/dev/null) || MARKED='[]'
+[[ -z "$MARKED" ]] && MARKED='[]'
+
+# ============================================
+# BOARD HALF: WHICH OF THEM IS STILL LIVE
+# ============================================
+# Unfiltered: `?cwd=` would only ever match the launched-here case, and the
+# marked sessions have to be matched by session id. The live set is small.
+RESP=$(curl -sf --max-time 5 -H "Authorization: Bearer $QUARTERBACK_TOKEN" "$BASE/active" 2>/dev/null) \
+    || cannot_tell "board unreachable at $BASE"
+
+MINE="${CLAUDE_CODE_SESSION_ID:-}"
+
+HOLDERS=$(jq -c \
+    --arg p "$WT_PATH" --arg pl "$WT_LOGICAL" --arg mine "$MINE" --argjson marked "$MARKED" '
+    # $sess, not sess: a filter parameter would be re-evaluated against $marked
+    # inside the pipe and index an array with a path expression.
+    # A path-boundary match, not string equality. An agent launched from INSIDE
+    # the checkout — `src/`, `harness/`, anywhere below the root — is the ordinary
+    # case, and its lease cwd is a descendant of the worktree rather than the
+    # worktree itself. Equality reported it as absent, so `remove-worktree` would
+    # delete the checkout out from under it: a false negative, the one answer this
+    # tool must never give quietly. The trailing separator is what keeps
+    # `…/proj-fix-issue-4` from matching `…/proj-fix-issue-43`.
+    def under($dir): $dir != "" and (. == $dir or startswith($dir + "/"));
+    def here($sess): (.cwd | under($p)) or (.cwd | under($pl))
+                     or (($marked | index($sess)) != null);
+    # The lease branch is deliberately dropped: it is the branch of the dir the
+    # agent was launched in (the main checkout), so reporting it here would
+    # answer "on main" about a worktree that is on fix/issue-31. The real branch
+    # of the worktree is read from git and sits at the top level of the result.
+    [ (.agents // [])[]
+      | select($mine == "" or .session != $mine)
+      | select(here(.session))
+      | {kind: "agent", holder, session, device, title, since} ]
+    + [ (.subagents // [])[]
+      | select($mine == "" or .parent_session != $mine)
+      | select(here(.parent_session))
+      | {kind: "subagent", holder, session: .parent_session, device,
+         title: .label, since} ]
+' <<<"$RESP" 2>/dev/null) || cannot_tell "board returned something jq could not read"
+
+COUNT=$(jq -r 'length' <<<"$HOLDERS" 2>/dev/null || echo 0)
+
+# ============================================
+# REPORT
+# ============================================
+# Ages in whole units, computed by date(1) rather than eyeballed. A non-GNU date
+# cannot parse an ISO-8601 string with an offset, so fall back to printing the
+# timestamp as it came — a slightly clumsier line beats a wrong one.
+age_of() {
+    local iso="$1" then now delta
+    then=$(date -d "$iso" +%s 2>/dev/null) || { printf '%s' "$iso"; return; }
+    now=$(date +%s)
+    delta=$(( now - then ))
+    if   (( delta <   60 )); then printf '%ds' "$delta"
+    elif (( delta < 3600 )); then printf '%dm' "$(( delta / 60 ))"
+    else printf '%dh%02dm' "$(( delta / 3600 ))" "$(( (delta % 3600) / 60 ))"
+    fi
+}
+
+if [[ "$JSON" = true ]]; then
+    jq -nc --arg p "$WT_PATH" --arg b "$WT_BRANCH" --argjson h "$HOLDERS" \
+        '{path:$p, branch:$b, checked:true, held:(($h|length) > 0), reason:null, holders:$h}'
+elif [[ "$QUIET" != true ]]; then
+    if (( COUNT == 0 )); then
+        echo "worktree-holder: nobody else is live in $WT_PATH"
+    else
+        echo -e "${YELLOW}worktree-holder: $WT_PATH is held by another live agent${NC}" >&2
+        # Unit Separator, not tab. Tab is an IFS *whitespace* character, so bash
+        # collapses runs of them and strips leading/trailing ones — and a lease
+        # with no title is exactly that: jq emits an empty field, the two tabs
+        # around it become one, and every field after it shifts left. The title
+        # then held the timestamp, `since` held "agent" (so `age_of` printed the
+        # literal word), and the "(sub-agent)" marker vanished. With a null
+        # `.holder` the shift also slid a real value into `$holder`, so the
+        # skip-empty guard below stopped firing on the row it exists for.
+        # US is not IFS whitespace, so empty fields stay empty and stay in place.
+        while IFS=$'\x1f' read -r holder session title since kind; do
+            [[ -z "$holder" || "$holder" = "null" ]] && continue
+            line="  $holder"
+            [[ -n "$WT_BRANCH" ]] && line="$line · on $WT_BRANCH"
+            [[ -n "$title" && "$title" != "null" ]] && line="$line · \"$title\""
+            line="$line · held for $(age_of "$since")"
+            line="$line · session ${session:0:8}"
+            [[ "$kind" = "subagent" ]] && line="$line (sub-agent)"
+            echo -e "${YELLOW}$line${NC}" >&2
+        done < <(jq -r '.[] | [(.holder // ""), (.session // ""), (.title // ""),
+                              (.since // ""), (.kind // "")] | join("\u001f")' <<<"$HOLDERS")
+    fi
+fi
+
+(( COUNT > 0 )) && exit 3
+exit 0

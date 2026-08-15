@@ -80,6 +80,18 @@ Ask if they want to keep the branch or database.
 remove-worktree [--keep-branch] [--keep-db] <create-name>
 ```
 
+**Ask who is in it first.** A worktree is somebody's working state, and the
+board knows whose:
+```bash
+worktree-holder <path-or-branch>     # exit 3 = another live agent is in there
+```
+`remove-worktree` runs this itself and refuses (with the holder's name) rather
+than tearing down under a live agent. If it does refuse, **do not reach for
+`--force`** — tell the user who holds it, and offer to message that agent on the
+board instead. `--force` is for the case where the user, having seen the name,
+says go ahead. The check is advisory by design: it stays quiet when the board is
+unreachable, so a refusal means a genuinely live holder.
+
 Pass the **create-name** — the identifier the worktree was *created* with (see
 "Naming model" below). The script resolves the worktree's *current* branch
 itself and deletes that, so it still works when the branch was switched or
@@ -143,6 +155,18 @@ To clean any of the above across a whole repo in one pass, run
 `prune-worktrees` (dry-run by default; `--prune` to drop orphan DBs + prune port
 entries, add `--remove-dirs` to delete leftover directories). Show the user the
 dry-run output before applying.
+
+## Never rewrite a worktree you do not own
+
+The scripts guard their own destructive steps, but nothing guards raw git. Before
+you run `git rebase`, `git reset --hard`, `git checkout <other-branch>` or
+`git worktree remove` **in a directory that is not this session's own worktree**,
+run `worktree-holder <dir>` and stop if it exits 3. This has gone wrong for real:
+an agent noticed a branch was behind `main`, ran `git rebase origin/main` in the
+worktree carrying it, and left the agent three commits into a review cycle there
+with conflict markers in four files and no idea why. Nothing about that was
+malicious — it simply had no way to know the directory was occupied. Now it has
+one, and using it costs a second.
 
 ## Important notes
 

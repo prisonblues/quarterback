@@ -341,6 +341,22 @@ resolve_postgres_container() {
     return 1
 }
 
+# Print who is live in a directory, if anything can tell us. Purely advisory and
+# purely informational here: create-worktree never reuses an occupied path, so
+# this only enriches the refusal it was already going to make.
+holder_note() {
+    local dir="$1" hb=""
+    # Every step tolerates failure explicitly: this script runs under `set -e`,
+    # where an absent sibling script would abort the run it was meant to inform.
+    hb=$(command -v worktree-holder 2>/dev/null || true)
+    if [[ -z "$hb" && "$0" == */* ]]; then hb="${0%/*}/worktree-holder"; fi
+    [[ -n "$hb" && -x "$hb" ]] || return 0
+    # The "held by" report goes to stderr and the all-clear to stdout, so
+    # dropping stdout prints something only when there is something to say.
+    "$hb" "$dir" >/dev/null || true
+    return 0
+}
+
 # Is this repo container-based? (i.e. is there something to build or compose up)
 detect_dockerized() {
     local root="$1"
@@ -573,6 +589,11 @@ WORKTREE_DIR="$(dirname "$MAIN_REPO")/${PROJECT}-${SAFE_NAME}"
 WORKTREE_DB=""   # set below if an isolated DB copy is created; used in CLAUDE.local.md
 
 if [[ -d "$WORKTREE_DIR" ]]; then
+    # Refusing was already right — the directory is somebody's working state and
+    # this script is not the one to reuse it. What was missing is *whose*: say so
+    # when the board knows, because "already exists" sends you looking for debris
+    # to sweep, and the answer is sometimes an agent still working in it.
+    holder_note "$WORKTREE_DIR"
     die "Worktree directory already exists: $WORKTREE_DIR"
 fi
 
