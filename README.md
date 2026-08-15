@@ -188,12 +188,15 @@ says how much of a window actually reported.
 
 The deployed board version lags the repo until the stack is redeployed, and only the running
 service knows which it is: ask it with `GET /openapi.json` → `.info.version`, for whichever
-instance you care about. (Anything built off this branch says 2.23.0.) A number written here
+instance you care about. (Anything built off this branch says 2.23.0 — v2.24 is harness-side.) A number written here
 instead would be wrong the next time Portainer redeploys, with no diff to catch it.
-Latest release: **v2.23** — a run records which FILES the PR changed and not just how many lines,
-plus the PR's state as of that panel, so the board finally holds what collision ordering needs
-(schema revision 0016). Reading it back as a collision query ships separately — see #101.
-Before it, **v2.21** (harness-side) had each panel member run in its own empty sandbox repo
+Latest release: **v2.24**, harness-side — a new finding now says whether the last fix pass caused it
+or the last round missed it, which were one number before and want opposite remedies. (**v2.22** is
+claimed by a branch not yet merged, which is why the numbering skips it.)
+Before it, **v2.23** had a run record which FILES the PR changed and not just how many lines, plus
+the PR's state as of that panel, so the board finally holds what collision ordering needs (schema
+revision 0016) — reading it back as a collision query ships separately, see #101.
+**v2.21** (harness-side) had each panel member run in its own empty sandbox repo
 rather than in whatever directory the panel was launched from. **v2.20** (also harness-side) had the
 worktree tooling ask who is in a directory before rewriting it, and **v2.19** added the per-reviewer
 cost columns (schema revision 0015) and was the first to move the board since v2.15; **v2.18**
@@ -226,6 +229,9 @@ judge) are harness-side too.
 - **v2.23** — a run records the PR's changed FILES and its state, not just a line count, so "which
   other PRs does this merge disturb" becomes answerable from stored data. NULL and zero are kept
   apart throughout: "nobody counted" is never "it changed nothing".
+- **v2.24** — a new finding records whether the last fix pass introduced it or the last round missed
+  it: two facts with opposite remedies that `new_this_round` collapsed into one, plus the commit each
+  round reviewed and the files it was truncated out of. A signal, not a verdict — nothing gates on it.
 - **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
   object store; wire `landed` refs to a cherry-pick helper.
 
