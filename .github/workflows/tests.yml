@@ -1,0 +1,92 @@
+name: Tests
+
+# Every push and every PR. The repo had no job running pytest at all — the only
+# workflow built an image, pushed it and triggered the deploy — so a commit that
+# broke every test shipped exactly like one that passed (#70).
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  app:
+    name: app suite
+    runs-on: ubuntu-latest
+    services:
+      # The same image and credentials as docker-compose.yml, so a failure here
+      # means the code, not a difference between CI's database and the one the
+      # suite is developed against. Mapped to 5432 rather than compose's 5435:
+      # that port only exists to avoid clashing with a developer's local
+      # Postgres, and DATABASE_URL below names the port explicitly anyway.
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: quarterback
+          POSTGRES_PASSWORD: quarterback
+          POSTGRES_DB: quarterback
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U quarterback"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Run the app suite
+        env:
+          # `dbtarget` takes an explicit DATABASE_URL ahead of the checkout's
+          # .env, which is exactly what a runner needs — there is no .env here.
+          DATABASE_URL: postgresql+asyncpg://quarterback:quarterback@localhost:5432/quarterback
+          # The suite pins everything else the app reads, but this one has to be
+          # empty explicitly: with it set, `reader` authenticates everybody and
+          # the test asserting /stream 401s without auth instead gets a live SSE
+          # stream and hangs until the job times out.
+          BROWSER_DEV_USER: ""
+        # `--extra dev`, the project's own declared group. A bare `uv run pytest`
+        # works on a developer's machine only because their venv already has it,
+        # and `--with pytest` would miss pytest-asyncio, which `asyncio_mode =
+        # "auto"` needs. CI caught exactly this on its first run.
+        run: uv run --extra dev pytest -q
+
+  harness:
+    name: harness suites
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      # This job is the whole point. `pyproject.toml` sets `testpaths = ["tests"]`,
+      # which deliberately keeps a bare `pytest` off harness/ — so these ~370
+      # tests, the entire safety net for the reviewer panel, the epic driver and
+      # the lander, ran only when a human remembered the path. A separate job
+      # rather than a wider `testpaths` because they genuinely are separate
+      # suites with their own conventions, and because none of them needs a
+      # database: only the app suite does.
+      #
+      # DISCOVERED rather than listed, and it FAILS when it finds nothing. A
+      # hardcoded path breaks the day a suite moves, and — worse — the obvious
+      # repair is to let the step skip when the directory is missing, which is a
+      # test job that quietly runs nothing and reports green. That is the exact
+      # failure this repo is organised against; a suite that disappears has to
+      # be as loud as a suite that fails.
+      - name: Run every harness suite
+        run: |
+          set -euo pipefail
+          mapfile -t suites < <(find harness -type d -name tests -not -path '*/node_modules/*' | sort)
+          if [[ ${#suites[@]} -eq 0 ]]; then
+            echo "::error::No test suites found under harness/ — they moved, or this job is now a no-op reporting green."
+            exit 1
+          fi
+          printf 'running %d harness suite(s): %s\n' "${#suites[@]}" "${suites[*]}"
+          for suite in "${suites[@]}"; do
+            echo "--- $suite"
+            uv run --extra dev pytest "$suite" -q
+          done
