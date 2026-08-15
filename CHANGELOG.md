@@ -7,7 +7,7 @@ that number where it was, so the repo can be a version ahead of the service.
 Entries are newest first. Each one says what was broken or missing before it, because that is the
 part that isn't recoverable from the diff.
 
-## v2.24 — the codex seat went looking for the repo instead of reading the diff
+## v2.25 — the codex seat went looking for the repo instead of reading the diff
 
 Harness only; the board's version is unchanged.
 
@@ -76,6 +76,59 @@ setting closes the cwd. With all five settings applied and no shell at all, a ru
 contributor who can add a file to a PR can add an `AGENTS.md` to it, so a seat pointed at the checkout
 under review would take its reviewing instructions from the change it is reviewing. The empty directory is
 the entire defence against that, and it is why the answer is "empty" rather than "a repo the panel trusts."
+
+## v2.24 — a new finding says whether the last fix caused it or the last round missed it
+
+`new_this_round` is binary: did an earlier round of this cycle raise this defect. So a finding new
+to round 2 was one of two very different things, recorded as one number.
+
+Either the round-1 **fix commit created it** — the loop finding its own damage, where the remedy is
+smaller and more conservative fix passes, because more rounds will keep generating more work. Or it
+was sitting in round 1's diff and **round 1 did not see it** — where the remedy is the opposite:
+spend on coverage, more budget, more reviewers, and more rounds genuinely help.
+
+Conflated, neither conclusion was available, including the one an operator has to draw at the cap.
+And the conflated number turns out to carry no information at all: across every payload banked on
+2026-08-15, `new_this_round` is true for **every single finding** — 26 of 26 on PR #75's round 2, 23
+of 23 on #76's. "No round has ever re-raised a finding" is not an approximation in this dataset, it
+is the whole of it, so the one signal there was is a constant.
+
+A round now records, per new finding, `provenance: introduced | missed | missed-unread | unknown`,
+and a `provenance_counts` tally beside it. The report prints the split under the round line, because
+the operator deciding whether to go again is who the distinction is for.
+
+**Nothing recorded which commit a round reviewed, and that had to come first.** The payload's `base`
+holds a branch *name*; the head oid was fetched for the SonarCloud staleness check and then dropped.
+So `head_sha` is now on every payload — including the *skipped* one, since a skipped round is still
+the round the next one baselines against, and a null there would blind the round after it. A
+baseline written before this release yields no SHA, and provenance then reads `unknown` rather than
+attributing against a range it invented.
+
+**`missed-unread` is the bucket that indicts the harness rather than the panel:** a defect in a file
+the earlier round was *truncated out of* is a coverage failure, not a reviewer failure. Truncation is
+a plain prefix cut, so what a round could not read is computed as it runs and banked for the next one
+(`unread_files`). A file counts as unread only if every reviewer that ran was cut on it — one seat
+that read it means the round saw it — and a file *straddling* the cut counts as unread, because a
+reviewer holding half a file's hunks has not read that file. A round that read *nothing* — every seat
+lost, or the PR skipped by title — records no coverage rather than full coverage, since an empty
+unread list read the other way turns every later coverage failure into a reviewer miss.
+
+**It is a signal, not a verdict, and is recorded as one.** A fix can break something at a distance,
+so a defect outside the fix's own lines is evidence of a miss rather than proof of one. Nothing gates
+on it, deliberately: recording that a fixer introduced 22 defects is data, and failing a fix pass for
+it before the signal is calibrated against a few dozen cycles would be acting on a heuristic. What it
+will not do is guess: a branch *rewritten* between rounds makes the compare range span history no fix
+pass wrote, so that range is refused rather than attributed, and so is a finding whose path could name
+two of the changed files. #41 (review the increment) is what would make it exact, at which point a
+finding in the increment is introduced by construction and the line-intersection guess can be retired.
+
+Verified against real history rather than only in tests: replaying PR #75's genuine round 1 → round 2
+(`b1ccc79`…`1538626`) splits its 26 new findings **14 introduced / 12 missed**, which is the point —
+a measure that put everything in one bucket would have been worth nothing.
+
+*(**v2.22** is missing from this file and that is deliberate — see the note under v2.23 below. It was
+written here as "v2.22 and v2.23 are claimed by branches that had not merged yet"; v2.23 has since
+landed, so only v2.22 is still outstanding.)*
 
 ## v2.23 — the board knew how many lines a merge changed, and not which files
 
