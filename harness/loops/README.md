@@ -209,6 +209,13 @@ cwd's repo; `--repo` takes a path or a name under `~/source`.
   edit-only `claude -p` fixes the bump breakage, and the loop pushes back so CI
   re-runs. Removal is in a `finally`. **Idempotent:** if the branch tip is no longer
   a dependabot commit, a fix was already attempted — left for a human.
+- **The agent's account of itself is kept.** "Agent made no edits" is an observation
+  with two opposite explanations — nothing needed fixing, or the agent was stopped
+  from fixing anything — so the line now quotes its last word. A run that exited
+  non-zero, or exited 0 having printed nothing with a cause on stderr, is reported
+  as a *failure* and nothing is pushed; the sweep carries on to the other PRs
+  rather than raising. A run that said nothing anywhere but left real edits has
+  them pushed: the staged diff is the direct evidence, and CI is the gate.
 
 ## Reviewer panel (`panel.py`)
 

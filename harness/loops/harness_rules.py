@@ -32,6 +32,20 @@ A human at the keyboard IS the authorization, and editing the file locally takes
 effect immediately. Unattended runs only honour rules that were merged to the
 default branch. Set HARNESS_UNATTENDED=1 (run-loop.sh does) to select the
 unattended read.
+
+SECOND RESPONSIBILITY: RUNNING HEADLESS CLIs AND READING WHAT THEY SAID.
+
+`run_agent`, `_pump`, and the `*_gist` / `*_failure` / `cli_outcome` readers live
+here too, and they are not about the rules file at all. They are here because
+`epic.py`, `lander.py` and `panel.py` all run headless CLIs unattended and all
+have to answer the same two questions afterwards — did this run happen, and what
+did it say — and three copies of that judgement is how they came to disagree
+about it. This module is the one both concerns already reached, so it is the
+cheapest place for the shared answer rather than a fourth import.
+
+Worth knowing, because "harness rules" does not say it: if you are looking for
+why a loop reported an agent the way it did, it is in this file's second half,
+not in panel.py.
 """
 
 from __future__ import annotations
@@ -41,8 +55,9 @@ import os
 import re
 import subprocess
 import sys
+import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 RULES_FILENAME = ".harness-rules"
 
@@ -571,6 +586,193 @@ def dotenv_is_tracked(root: Path | str) -> bool:
     the token may be the only one available and the run is otherwise fine."""
     r = _git(root, "ls-files", "--error-unmatch", ".env")
     return r.returncode == 0
+
+
+# ------------------------------------------------------ headless agent runs
+#
+# The loops run `claude -p` unattended, from a timer. There is no terminal for
+# an agent's account of itself to land in, so whatever the loop does not capture
+# is not merely unread — it is gone. That matters because the interesting
+# failure EXITS ZERO: a tool the agent needs hits a permission rule headless mode
+# cannot prompt for, it is auto-denied, and the agent finishes tidily having
+# changed nothing. `check=True` sees success. The loop then reports its own
+# no-effect observation ("agent made no edits") — a sentence indistinguishable
+# from "there was nothing to fix", which is the opposite claim (#19, #31).
+#
+# So: capture both streams, and when a run produced no effect, print the best
+# line the agent gave us next to the observation. Capturing must not cost the
+# live log, hence run_agent's pass-through.
+
+
+def tail_gist(text: str, limit: int = 200) -> str:
+    """The END of `text`, collapsed onto one line.
+
+    For stdout the tail is the informative end, not the head: `claude -p` streams
+    its working and finishes with the conclusion, so the last thing it said is
+    the thing worth quoting on a one-line report."""
+    flat = " ".join((text or "").split())
+    return flat if len(flat) <= limit else "…" + flat[-limit:]
+
+
+def agent_gist(proc: subprocess.CompletedProcess) -> str:
+    """The line most likely to explain what a headless agent did, or would not do.
+
+    Which stream to believe depends on WHO is complaining, and the exit code is
+    what says. On a non-zero exit the harness failed, and stderr is where it says
+    so — a rejected flag, an API refusal. On a ZERO exit the agent ran and the
+    explanation is its own final message, on stdout: "I was not permitted to run
+    that tool, so I made no changes" is the entire motivating case for #31, and it
+    is described there and nowhere else.
+
+    Preferring stderr unconditionally lost exactly that case. `claude -p` writes
+    to stderr on a perfectly healthy run — hook output, MCP server warnings, node
+    deprecation notices, this repo's own quarterback lifecycle lines — and
+    `stderr_gist` falls back to the last line when none matches "error", so ANY of
+    that outranked the sentence this function exists to surface. The operator read
+    `agent said: (node:412) [DEP0040] DeprecationWarning` and learned nothing.
+
+    Each side still falls back to the other, so a stream that is empty never costs
+    the account."""
+    out, err = tail_gist(proc.stdout or ""), stderr_gist(proc.stderr or "")
+    return (err or out) if proc.returncode else (out or err)
+
+
+def agent_failure(proc: subprocess.CompletedProcess) -> str:
+    """Why this run must not be read as a completed one — "" if it looks real.
+
+    Two shapes, and `check=True` only ever caught the first:
+      * a non-zero exit;
+      * exit 0 with nothing on stdout, which is #19's signature. A real run always
+        says something, so an empty reply is a failed CLI invocation wearing a
+        success exit code."""
+    if proc.returncode != 0:
+        why = agent_gist(proc)
+        return f"exited {proc.returncode}" + (f" ({why})" if why else "")
+    if not (proc.stdout or "").strip():
+        why = stderr_gist(proc.stderr or "")
+        return "exited 0 having printed nothing" + (f" ({why})" if why else "")
+    return ""
+
+
+#: How much of each stream to KEEP. The pass-through is unaffected — the live
+#: log still gets every byte — but the retained copy exists only so `tail_gist`
+#: can read the last ~200 characters and `agent_failure` can ask whether the
+#: stream was blank. These runs last tens of minutes and a verbose agent emits
+#: tens of MB, all of which was being held for the lifetime of a timer process
+#: to answer two questions about its tail.
+KEEP_TAIL_BYTES = 64 * 1024
+
+
+def _pump(src: TextIO, sink: TextIO, buf: list[str]) -> None:
+    """Copy a child stream to ours line by line, keeping a BOUNDED copy.
+
+    The pass-through is best-effort; the DRAIN is not. If writing to our own
+    stdout fails — a BrokenPipeError because the loop's output went to `| head`
+    or a log consumer exited, an encoding error on odd agent output — this thread
+    must keep reading anyway. It used to die there, with two consequences: `buf`
+    stopped accumulating, so `proc.stdout` became a silent PREFIX of what the
+    agent said and `tail_gist` quoted the middle of a run as its conclusion; and
+    nothing drained the pipe, so the child blocked forever on a full 64 KB buffer
+    while the main thread sat in `proc.wait()` before joining the pumps. A sweep
+    that hangs with no timeout is the worst outcome available here, and it was
+    reachable from a closed pipe.
+    """
+    passthrough = True
+    kept = 0
+    with src:
+        for line in src:
+            buf.append(line)
+            kept += len(line)
+            # Drop from the FRONT, never the back: everything that reads this
+            # buffer wants the end of it. Whole lines first, so a gist never
+            # starts mid-character, and only past the cap, so the overwhelmingly
+            # common short run copies nothing.
+            while kept > KEEP_TAIL_BYTES and len(buf) > 1:
+                kept -= len(buf.pop(0))
+            # One line can exceed the cap on its own — a CLI writing a progress
+            # bar with no newline, or a JSON blob on a single line — and trimming
+            # only whole lines would leave that unbounded, which is the same bug.
+            if kept > KEEP_TAIL_BYTES:
+                buf[-1] = buf[-1][-KEEP_TAIL_BYTES:]
+                kept = len(buf[-1])
+            if not passthrough:
+                continue
+            try:
+                sink.write(line)
+                sink.flush()
+            except (OSError, ValueError, UnicodeError):
+                # Give up on the live log for the rest of the run, never on the
+                # capture. One failed write means the sink is gone, not that the
+                # next line will land.
+                passthrough = False
+
+
+#: How long a headless agent may run before the loop stops waiting. Generous on
+#: purpose — these agents implement features and address review findings, and a
+#: cap that fires on a slow-but-working run costs more than the hang does. It
+#: exists for the wedged case only: a `claude -p` stalled on a network read used
+#: to hold a systemd-timer sweep, and the worktree, containers and isolated
+#: database it created, until a human noticed.
+AGENT_TIMEOUT = 3600
+
+
+def run_agent(args: list[str],
+              cwd: str | Path | None = None,
+              timeout: int | None = AGENT_TIMEOUT) -> subprocess.CompletedProcess:
+    """Run a headless agent, capturing both streams AND passing them through.
+
+    `capture_output=True` alone would buy the diagnosis by diverting the log:
+    whatever the agent writes would stop reaching the journal these runs are read
+    from, and a run that shows nothing until the process exits cannot be told from
+    a wedged one. So each stream is pumped to ours as it arrives AND kept — what
+    lands in the log is exactly what landed there before; capturing only adds a
+    copy. The result is an ordinary CompletedProcess, so callers read `proc.stdout`
+    as if it had been captured the plain way.
+
+    stdin is DEVNULL, as it always was: an unattended agent that decides to ask a
+    question must read EOF rather than inherit a terminal and hang the loop.
+
+    No `check`, and no raise at all — including the one case that never reached a
+    child process. A CLI missing from PATH, or a worktree that isn't there, is the
+    same kind of event as an agent that ran and failed ("this did not happen, here
+    is why"), and a caller that has to handle one shape rather than two is a caller
+    that handles it. It comes back as exit 127 with the errno on stderr; pair this
+    with agent_failure() and every route out of here reports the same way.
+    """
+    try:
+        proc = subprocess.Popen(
+            args, cwd=str(cwd) if cwd else None, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+    except OSError as e:
+        # errno and strerror, not the bare class name: "OSError" sent three people
+        # looking for a crash that was "Argument list too long" (see panel.run_cli).
+        why = " ".join(str(x) for x in (e.errno, e.strerror or e) if x)
+        return subprocess.CompletedProcess(args, 127, "", f"OSError {why}\n")
+    out: list[str] = []
+    err: list[str] = []
+    pumps = [threading.Thread(target=_pump, args=(proc.stdout, sys.stdout, out)),
+             threading.Thread(target=_pump, args=(proc.stderr, sys.stderr, err))]
+    for t in pumps:
+        t.start()
+    # Bounded, unlike the `proc.wait()` this replaces. Every other headless
+    # invocation in the harness bounds itself (epic.triage, panel.run_cli); this
+    # one did not, and it is the one that runs unattended from a timer. The kill
+    # is what lets the pumps finish: they are reading a pipe that only closes
+    # when the child dies, so joining them before killing would hang in the same
+    # place. Reported as a failure with a reason, so `agent_failure` says
+    # "timed out" rather than the caller inferring silence.
+    try:
+        rc = proc.wait(timeout=timeout)
+        timed_out = False
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        rc, timed_out = proc.wait(), True
+    for t in pumps:
+        t.join()
+    if timed_out:
+        err.append(f"agent timed out after {timeout}s and was killed\n")
+        rc = rc or 124
+    return subprocess.CompletedProcess(args, rc, "".join(out), "".join(err))
 
 
 def discover(root: Path | None = None) -> list[Path]:

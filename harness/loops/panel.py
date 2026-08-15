@@ -106,8 +106,10 @@ from typing import NamedTuple
 sys.path.insert(0, str(Path(__file__).parent))
 import harness_rules  # noqa: E402
 # stderr_gist and cli_outcome live with the shared plumbing — how headless CLIs
-# fail is not a panel question — and are re-exported here because they read as
-# part of run_cli's contract at every call site in this file.
+# fail is not a panel question, and the loops that run headless agents with no
+# panel in sight need the same reading of a CLI's complaint (#31). They are
+# re-exported here because they read as part of run_cli's contract at every call
+# site in this file.
 from harness_rules import (DENIAL_MARKERS, REJECTION_MARKERS,  # noqa: E402
                            RepoNotFound, cli_outcome, describe,
                            resolve_repo, stderr_gist)
