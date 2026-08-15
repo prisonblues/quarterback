@@ -20,9 +20,11 @@ other:
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from .conftest import LAPTOP
 
-REPO = "acme/v217repo"
+REPO = "acme/v219repo"
 AGENT = {**LAPTOP, "X-Agent-Instance": "ee55ff"}
 
 
@@ -257,3 +259,68 @@ async def test_a_garbled_duration_is_dropped_the_same_way(client):
     [card] = [c for c in (await detail(client, run["id"]))["reviewers"]
               if c["name"] == "claude"]
     assert card["duration_ms"] is None
+
+
+async def test_a_malformed_telemetry_type_costs_the_number_not_the_whole_record(client):
+    """The sibling of the range case above, and the one that actually 422'd.
+
+    `_count_or_none` and `_cost_or_none` document tolerance for a bool, a
+    non-integral float and a count spelled as a string — but their validators
+    ran AFTER pydantic had coerced against `int | None` / `Decimal | None`, so
+    none of it was reachable and a malformed type took the whole record down.
+    The range case survived only because Python ints are unbounded, which is
+    precisely why the existing test passed while this hole stayed open: one
+    unreadable telemetry number must not cost a caller its findings, its
+    scorecards and its accounts."""
+    run = await record(client, 9451, reviewers={
+        "claude": {"model": "opus", "ran": True,
+                   "input_tokens": 1.5,          # not an integral count
+                   "output_tokens": "unknown",   # not a number at all
+                   "cached_input_tokens": "39217",  # a count spelled as a string
+                   "reasoning_tokens": True,     # a bool is not a count
+                   "cost_usd": "free"},
+    })
+    [card] = [c for c in (await detail(client, run["id"]))["reviewers"]
+              if c["name"] == "claude"]
+    assert card["input_tokens"] is None and card["output_tokens"] is None
+    assert card["reasoning_tokens"] is None and card["cost_usd"] is None
+    assert card["cached_input_tokens"] == 39_217   # the readable one is kept
+    # And the run itself landed, which is the whole point.
+    assert len((await detail(client, run["id"]))["findings"]) == 1
+
+
+async def test_a_measured_failure_does_not_hide_the_partial_coverage_marker(client):
+    """`token_runs` counts every scorecard carrying a figure; `ran` excludes the
+    ones that failed. A member that burned tokens and THEN timed out is in the
+    first and not the second — `review_llm` reports usage on the skip path
+    precisely because that run spent them — so `token_runs` could exceed `ran`.
+
+    The page compares the two to decide whether to say "N of M runs reported",
+    so a measured failure silently suppressed the marker on exactly the group
+    that had one, and the tooltip could read "2 of 1 runs reported". Both counts
+    are out of `runs`, which is the population the sums beside them cover."""
+    # Its own model tier, so the group is these two rows and nothing else:
+    # /review/stats aggregates the whole repo and has no per-PR filter.
+    await record(client, 9452, reviewers={
+        "claude": {"model": "opus-f04", "ran": True, "input_tokens": 100,
+                   "output_tokens": 10},
+    })
+    await record(client, 9453, reviewers={
+        "claude": {"model": "opus-f04", "ran": False, "skip": "claude: timed out",
+                   "input_tokens": 5_000, "output_tokens": 0},
+    })
+    r = row(await stats(client), "claude", "opus-f04")
+    assert r["runs"] == 2 and r["ran"] == 1
+    # The defect condition itself: more measured runs than runs that ran. This
+    # is what makes `token_runs < ran` the wrong comparison for the page, and it
+    # is legitimate — the failed run's spend is in the sum beside it.
+    assert r["token_runs"] == 2 and r["token_runs"] > r["ran"]
+    assert r["token_runs"] <= r["runs"]
+    assert r["input_tokens"] == 5_100
+
+    # The page's half of the same fix. There is no JS test runner here, so this
+    # greps the file that ships — crude, but it is the only thing standing
+    # between a re-edit and a coverage marker that hides itself again.
+    page = (Path(__file__).resolve().parents[1] / "app/static/reviews.html").read_text()
+    assert "r.token_runs < r.ran" not in page, "the page must compare token_runs to runs"
+    assert page.count("r.token_runs < r.runs") == 2

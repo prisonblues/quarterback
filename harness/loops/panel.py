@@ -1184,7 +1184,19 @@ def run_cli(args: list[str] | Callable[[], list[str]], label: str, timeout: int 
         try:
             proc = subprocess.run(argv, capture_output=True, text=True,
                                   timeout=timeout, **feed)
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as e:
+            # A timeout is the most expensive outcome the panel has: the model
+            # read the whole diff and thought about it for the full budget before
+            # being killed. Dropping its stdout here recorded that as costing
+            # NOTHING — and it lands on codex, the one seat whose usage is read
+            # only from stdout. `TimeoutExpired.stdout` carries what was printed
+            # before the kill, as BYTES even under `text=True` (it is filled in by
+            # `_check_timeout`, which never decodes), so it is decoded here.
+            partial = e.stdout
+            if isinstance(partial, bytes):
+                partial = partial.decode("utf-8", "replace")
+            if on_output:
+                on_output(partial)
             return None, f"{label}: timed out after {timeout}s"
         except OSError as e:
             # errno and strerror, not the bare class name: "OSError" sent three
@@ -1713,7 +1725,14 @@ def review_llm(cmd_name: str, model: str, prompt: str,
     # this returns, so a panel that runs all day leaves nothing behind.
     with tempfile.TemporaryDirectory(prefix=f"panel-{cmd_name}-") as tmp:
         tmpdir = Path(tmp)
-        reply_file: Path | None = None
+        #: One reply path per codex ATTEMPT, in the order they were made; empty
+        #: for every other seat. A single shared path let an attempt that wrote
+        #: no `--output-last-message` serve the PREVIOUS attempt's text as its
+        #: own findings, and made the reparse retry a guaranteed no-op for codex
+        #: alone — it re-read the same bytes while still costing a full turn of
+        #: tokens. The reply is the last attempt's, and a file it never wrote is
+        #: no reply rather than whatever happens to be on disk.
+        replies: list[Path] = []
         #: Every session this member opened — one per CLI attempt, because a
         #: pinned id cannot be reused (claude: "Session ID … is already in use")
         #: and reusing pi's would turn the retry into a continuation of the reply
@@ -1751,8 +1770,9 @@ def review_llm(cmd_name: str, model: str, prompt: str,
             def args():
                 return pi_args(model, effort, new_session(), tmpdir)
         else:
-            reply_file = tmpdir / "reply.txt"
-            args = codex_args(model, effort, reply_file)
+            def args():
+                replies.append(tmpdir / f"reply-{len(replies)}.txt")
+                return codex_args(model, effort, replies[-1])
 
         #: Every attempt's stdout, failed ones included — codex reads its usage
         #: from there, and an attempt that burned tokens before exiting non-zero
@@ -1793,11 +1813,15 @@ def review_llm(cmd_name: str, model: str, prompt: str,
             the findings still arrive as plain text and never as an envelope to
             unwrap. If the file is missing the run produced no reply, which the
             caller already handles as empty output.
+
+            The LAST attempt's file, matching `run_cli`, which returns the last
+            attempt's stdout. Reading a fixed path instead meant a failed final
+            attempt inherited an earlier one's reply.
             """
-            if reply_file is None:
+            if not replies:
                 return stdout
             try:
-                return reply_file.read_text()
+                return replies[-1].read_text()
             except OSError:
                 return None
 

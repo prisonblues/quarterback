@@ -229,7 +229,12 @@ def test_codex_findings_come_from_the_file_not_the_event_stream(monkeypatch):
     monkeypatch.setattr(panel.shutil, "which", lambda _: "/usr/bin/codex")
 
     def fake(args, *a, on_output=None, **k):
-        Path(args[args.index("--output-last-message") + 1]).write_text(FINDINGS)
+        # `args` is a thunk for codex now, as it already was for the
+        # session-pinned seats: every attempt gets its own reply path so a
+        # failed one cannot inherit an earlier attempt's text. Resolve it the
+        # way `run_cli` does.
+        argv = args() if callable(args) else args
+        Path(argv[argv.index("--output-last-message") + 1]).write_text(FINDINGS)
         out = codex_stream((90, 10, 20, 4))
         on_output(out)
         return out, None
@@ -407,3 +412,64 @@ def test_antigravity_reviews_exactly_as_before_and_reports_no_tokens(monkeypatch
     run = panel.review_llm("antigravity", "gemini-3-pro", "p")
     assert run.usage is None and len(run.findings) == 1
     assert seen["args"] == panel.antigravity_args("gemini-3-pro", "", "p")
+
+
+def test_a_real_timeout_still_hands_over_what_the_cli_printed():
+    """The existing timeout test stubs `run_cli` and calls the callback by hand,
+    so it covers the plumbing ABOVE `run_cli` and never the line that lost the
+    number. This drives a real subprocess to a real `subprocess.TimeoutExpired`.
+
+    A timeout is the most expensive outcome the panel has — the model read the
+    whole diff and thought for the entire budget before being killed — and codex
+    is the one seat whose usage is read only from stdout, so dropping it here
+    recorded the costliest run as free. `TimeoutExpired.stdout` carries what was
+    printed before the kill, as bytes even under `text=True`."""
+    seen = []
+    script = ("import sys, time; sys.stdout.write('partial output'); "
+              "sys.stdout.flush(); time.sleep(30)")
+    out, err = panel.run_cli([sys.executable, "-c", script],
+                             "codex", timeout=1, on_output=seen.append)
+    assert out is None and "timed out" in err
+    assert seen and "partial output" in (seen[0] or "")
+
+
+def test_each_codex_attempt_gets_its_own_reply_file(monkeypatch):
+    """`--output-last-message` is written by the attempt that gets that far. On
+    one shared path an attempt that wrote nothing served the PREVIOUS attempt's
+    text as its own findings — a stale reply consumed as a later run's answer —
+    and it made the reparse retry a guaranteed no-op for codex alone, since it
+    re-read the same bytes while still costing a full turn of tokens.
+
+    The reply is the LAST attempt's, matching `run_cli`, which returns the last
+    attempt's stdout. A file that attempt never wrote is no reply, rather than
+    whatever happens to be on disk."""
+    seen = []
+
+    def fake(args, *a, on_output=None, **k):
+        # `run_cli` resolves the thunk once per attempt. Resolve it twice to
+        # stand in for a run whose first attempt replied and whose second died
+        # before writing.
+        for _ in range(2):
+            argv = args() if callable(args) else args
+            seen.append(argv[argv.index("--output-last-message") + 1])
+        Path(seen[0]).write_text(FINDINGS)      # only the first attempt replied
+        out = codex_stream((90, 10, 20, 4))
+        if on_output:
+            on_output(out)
+        return out, None
+
+    monkeypatch.setattr(panel.shutil, "which", lambda _: "/usr/bin/codex")
+    monkeypatch.setattr(panel, "run_cli", fake)
+    run = panel.review_llm("codex", "gpt-5.6-luna", "p")
+    assert len(set(seen)) == len(seen), "a fresh path per attempt, never reused"
+    # Four, not two: the last attempt wrote no reply, so the reply is missing
+    # rather than stale, the parse fails, and the reparse retry actually runs.
+    # On a shared path it would have re-read the first attempt's bytes and been
+    # a guaranteed no-op that still cost a turn.
+    assert len(seen) == 4
+    assert run.findings == [], "the last attempt's missing reply is not the first's"
+    assert run.skip and "output" in run.skip
+    # Both turns are charged — 90 twice. A retry that produced nothing still
+    # spent what it spent, and this is the seat whose usage is read only from
+    # stdout, so the losing turn has to count or the flaking seat looks cheap.
+    assert run.usage["input_tokens"] == 180

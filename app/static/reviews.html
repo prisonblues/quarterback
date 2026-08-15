@@ -239,8 +239,8 @@ function tokenTip(r){
   if (r.output_tokens != null) parts.push(`${fmtTok(r.output_tokens)} out`);
   if (r.cached_input_tokens) parts.push(`${fmtTok(r.cached_input_tokens)} cached`);
   if (r.reasoning_tokens) parts.push(`${fmtTok(r.reasoning_tokens)} thinking`);
-  const cover = r.token_runs < r.ran
-    ? ` <span style="color:var(--warn)">(${r.token_runs} of ${r.ran} runs reported)</span>` : "";
+  const cover = r.token_runs < r.runs
+    ? ` <span style="color:var(--warn)">(${r.token_runs} of ${r.runs} runs reported)</span>` : "";
   return `<br>—<br>${parts.join(" · ")}${cover}
     ${r.tokens_per_confirmed ? `<br>${fmtTok(r.tokens_per_confirmed)} tokens per confirmed finding` : ""}
     ${r.cost_usd != null
@@ -265,7 +265,10 @@ function renderLeaderboard(rows, judgedOnly){
     const w = (r.confirmed / max) * 100;
     // "?" where only some of the group's runs reported usage: the number is real
     // but it is not the whole window, and an unmarked partial sum reads as total.
-    const partial = r.token_runs > 0 && r.token_runs < r.ran;
+    // Against `runs`, not `ran`: a member that burned tokens and then timed out
+    // is measured but did not run, so it counts in `token_runs` and not in
+    // `ran` — and comparing the two hid the marker on the very groups with one.
+    const partial = r.token_runs > 0 && r.token_runs < r.runs;
     const g = scale[r.reviewer];
     const cmp = g && g.tiers > 1 && r.tokens_per_run != null;
     return `<tr>

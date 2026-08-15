@@ -67,10 +67,12 @@ usage back out of a pinned session after the run, so a vendor that states no
 figure or a transcript that could not be read loses a number and nothing else.
 ``GET /review/stats`` sums them per (reviewer, model, effort) and says how much of
 the window reported (``token_runs``/``cost_runs``), because a sum over a partly
-instrumented window is a real number about part of it. Compare them only WITHIN a
-vendor — different tokenizers, different cache semantics; duration stays the
-cross-vendor axis. ``cost_usd`` is stored only where the vendor states it, never
-derived from a price table.
+instrumented window is a real number about part of it. Both counts are out of
+``runs`` and not ``ran``: a member that burned tokens and then failed still spent
+them, so the sums include it and the coverage counts have to cover the same rows.
+Compare them only WITHIN a vendor — different tokenizers, different cache
+semantics; duration stays the cross-vendor axis. ``cost_usd`` is stored only
+where the vendor states it, never derived from a price table.
 """
 
 from __future__ import annotations
@@ -157,16 +159,28 @@ def _count_or_none(v: object) -> int | None:
 _MAX_COST = Decimal("999999.999999")
 
 
-def _cost_or_none(v: Decimal | None) -> Decimal | None:
+def _cost_or_none(v: object) -> Decimal | None:
     """A stated cost, if it is a number the column can hold.
 
     ``NaN``/``Infinity`` arrive from a vendor that emitted a JSON non-number and
     are refused here rather than at the driver, where they would take the whole
     record down with them.
+
+    Takes ``object`` and coerces, because it runs ``mode="before"``: the value
+    arrives exactly as the caller spelled it, so ``"free"`` has to become "no
+    cost recorded" here rather than a 422 that loses the whole run. A bool is
+    refused for the same reason :func:`_count_or_none` refuses one — ``True`` is
+    not a price.
     """
-    if v is None or not v.is_finite() or v < 0 or v > _MAX_COST:
+    if v is None or isinstance(v, bool):
         return None
-    return v
+    try:
+        cost = v if isinstance(v, Decimal) else Decimal(str(v))
+    except (ArithmeticError, ValueError, TypeError):
+        return None
+    if not cost.is_finite() or cost < 0 or cost > _MAX_COST:
+        return None
+    return cost
 
 
 def _phrases(v: object) -> list[str]:
@@ -355,15 +369,24 @@ class ReviewerIn(BaseModel):
             return None
         return _phrases(v)
 
+    # `mode="before"`, like every other tolerant validator here, and for the
+    # reason the helpers exist: without it pydantic coerces against
+    # `int | None` / `Decimal | None` FIRST, so a malformed telemetry number
+    # 422s before the helper written to absorb it is ever called. Every
+    # tolerance `_count_or_none` documents — a bool, a non-integral float, a
+    # count spelled as a string — was unreachable. The out-of-range case
+    # survived only because Python ints are unbounded, which is exactly why the
+    # range test passed and the type gap stayed hidden. One unreadable number
+    # must not cost a caller its findings, scorecards and accounts.
     @field_validator("duration_ms", "input_tokens", "output_tokens",
-                     "cached_input_tokens", "reasoning_tokens")
+                     "cached_input_tokens", "reasoning_tokens", mode="before")
     @classmethod
-    def _count(cls, v: int | None) -> int | None:
+    def _count(cls, v: object) -> int | None:
         return _count_or_none(v)
 
-    @field_validator("cost_usd")
+    @field_validator("cost_usd", mode="before")
     @classmethod
-    def _cost(cls, v: Decimal | None) -> Decimal | None:
+    def _cost(cls, v: object) -> Decimal | None:
         return _cost_or_none(v)
 
 
@@ -1131,6 +1154,14 @@ async def review_stats(
                 # Without it a sum over a half-instrumented window reads as the
                 # whole window's spend, and "tokens per run" comes out low by
                 # however many runs said nothing.
+                #
+                # Counted over ALL rows in the group, `ran` or not, because that
+                # is the population the sums beside it cover: a member that
+                # burned tokens and then timed out spent them, so `review_llm`
+                # reports usage on the skip path too. Read against `ran` this
+                # would exceed it — a measured failure is in the numerator and
+                # not the denominator — so the coverage marker suppressed itself
+                # on exactly the groups that had one. Compare it to `runs`.
                 func.count(ReviewReviewer.id)
                     .filter(sa_or(*(c.isnot(None) for c in tok))).label("token_runs"),
                 func.count(ReviewReviewer.id)
