@@ -2980,14 +2980,28 @@ class ReviewScope:
         mine = {f for f in _diff_by_file(diff) if f}
         increment = _diff_subset(by_raw, mine)
         dropped = [f for f in raw_files if f not in mine]
+        # Caveats DEGRADE an increment; they do not describe anything unless the
+        # increment is what the round went on to review. Held back rather than
+        # appended here, because every guard below returns the whole-PR scope and
+        # a note about "the review target" is then an account of a target that was
+        # discarded — beside the fallback note that says the whole PR was read.
+        caveats: list[str] = []
         if dropped:
-            notes.append(
+            # No cause is asserted. A base-branch merge is the usual one, but the
+            # same set arises when the fixer REVERTED a file back to its base
+            # state between the rounds — a normal way to address "this file should
+            # not have been touched" — and `status` is still `ahead` then, so the
+            # rebase caveat does not cover it either. Naming one of the two in the
+            # single place an operator looks for the explanation gets it wrong
+            # half the time.
+            caveats.append(
                 f"the increment {anchor[:8]}...{head[:8]} also touched {len(dropped)} "
-                "file(s) this PR does not — a base-branch merge between the rounds. "
-                "They were left out of the review target")
+                "file(s) this PR does not — a base-branch merge between the rounds, or "
+                "files the fixer reverted out of the PR. They were left out of the "
+                "review target")
         facts = compare_facts(gh_repo, anchor, head)
         said = _count(facts, "files")
-        notes.extend(_range_notes(facts, anchor, head, round_no))
+        caveats.extend(_range_notes(facts, anchor, head, round_no))
         if said > len(raw_files) or said >= COMPARE_FILE_CAP:
             # The one class of degraded range that must not be reviewed anyway. A
             # truncated compare is a 200 with files missing from it: it is smaller
@@ -3042,6 +3056,9 @@ class ReviewScope:
                 f"({problem}) — and without it the context behind the fix cannot be "
                 "shown as the earlier round saw it")
             return whole, notes
+        # Past every fallback: the increment IS the target, so its caveats now
+        # describe something.
+        notes.extend(caveats)
         return cls(scope="increment", diff=diff, increment=increment,
                    prior_diff=prior_diff, since=anchor, round_no=round_no,
                    since_round=since_round), notes
@@ -3104,10 +3121,8 @@ class ReviewScope:
         # form its own tier could produce — so a labelled cut cannot itself push
         # the prompt over.
         if budget is not None:
-            # `p[:-1]` is the widest a tier's marker can get: its numbers are at
-            # their longest when almost all of the tier was sent.
             budget = max(0, budget - len(self._frame(brief, "", "", ""))
-                         - sum(len(_cut_note(p[:-1], p)) for p in parts if p))
+                         - sum(_cut_note_reserve(p) for p in parts if p))
         target, near, far = _fit_parts(parts, budget)
         return (self._frame(brief,
                             target + _cut_note(target, self.increment),
@@ -3163,6 +3178,29 @@ def _cut_note(sent: str, whole: str) -> str:
         return ""
     return (f"\n[cut: {len(sent):,} of {len(whole):,} chars shown — "
             f"{len(whole) - len(sent):,} not sent]")
+
+
+def _cut_note_reserve(whole: str) -> int:
+    """The widest marker :func:`_cut_note` can render for a tier this size,
+    whatever the cut turns out to be — reserved out of a budget before the tiers
+    are allocated, so a labelled cut cannot push the prompt past the ceiling that
+    caused it.
+
+    Not ``len(_cut_note(whole[:-1], whole))``. That reads as the widest case
+    because two of the marker's numbers are at their longest when almost all of
+    the tier was sent, but there is a THIRD, ``whole - sent``, and it is at its
+    longest when ``sent`` is small. No single cut maximises all three: for a
+    1,000,000-char tier the near-whole cut renders 17 digit characters
+    (999,999 / 1,000,000 / 1) while a cut near the middle renders 23. So the
+    bound is taken over the NUMBERS rather than over a guessed cut — none of the
+    three can be wider than ``whole``'s own count.
+
+    Reuses :func:`_cut_note` for the fixed text so the reservation cannot drift
+    from what gets rendered: ``_cut_note("", whole)`` is that text with the sent
+    figure at its narrowest (a single ``0``), which this then widens."""
+    if not whole:
+        return 0
+    return len(_cut_note("", whole)) - len("0") + len(f"{len(whole):,}")
 
 
 _SONAR_SEV = {"BLOCKER": "P1", "CRITICAL": "P1", "MAJOR": "P2", "MINOR": "P3", "INFO": "P3"}
@@ -4349,7 +4387,11 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
         # one function whose rule is that a bad payload costs a `problems` entry.
         members = payload.get("reviewers")
         members = list(members.values()) if isinstance(members, dict) else []
-        cut = any(isinstance(m, dict) and m.get("truncated") for m in members)
+        #: The members that actually recorded something. Kept apart from
+        #: `members` because `reread` below needs POSITIVE evidence, and an empty
+        #: list of records is the shape both "nobody said" cases arrive in.
+        recorded = [m for m in members if isinstance(m, dict)]
+        cut = any(m.get("truncated") for m in recorded)
         if cut:
             b.truncated_rounds.add(was)
         # Two facts about coverage that only matter once a later round stops
@@ -4357,10 +4399,21 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
         # has closed the gaps every earlier round left (resolved after the loop,
         # since an earlier round may not have been seen yet); a round that read
         # NOTHING leaves one that the anchor then advances straight over.
+        #
+        # `reread` takes POSITIVE evidence and nothing less, because one entry in
+        # it erases every earlier round's truncation. `not cut` is false both when
+        # nothing was truncated and when the payload records nothing at all — a
+        # pre-v2.15 payload, a hand-edited `reviewers` that is not a dict, a
+        # skipped round whose `reviewers_ran` is absent so the branch above never
+        # sees it — and the comment on the truncation read already reasons that
+        # "nobody said" is not "nothing happened". So a whole-PR round only counts
+        # as having re-read the PR if at least one seat recorded that it was
+        # there. The conservative direction: an old baseline keeps an inherited
+        # veto standing rather than silently clearing it.
         ran = payload.get("reviewers_ran")
         if isinstance(ran, list) and not ran:
             b.unread_rounds.add(was)
-        elif not cut and str(payload.get("scope") or "pr") == "pr":
+        elif recorded and not cut and str(payload.get("scope") or "pr") == "pr":
             reread.add(was)
         for bucket in ("to_fix", "dismissed", "sonar_findings"):
             for f in payload.get(bucket) or []:
@@ -4375,8 +4428,16 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
     # region since. A whole-PR round with no truncated seat DID re-read it, so the
     # gap it closed is not still open — and a veto that says otherwise asserts
     # something the baselines themselves disprove.
+    #
+    # `unread_rounds` closes the same way and for the same reason. A round nobody
+    # read is a gap the anchor steps over, but a later whole-PR round read the
+    # code it stepped over along with everything else — so a veto saying "that
+    # code has been read by no round of this cycle" states something the baselines
+    # themselves disprove.
     if reread:
-        b.truncated_rounds = {r for r in b.truncated_rounds if r > max(reread)}
+        newest = max(reread)
+        b.truncated_rounds = {r for r in b.truncated_rounds if r > newest}
+        b.unread_rounds = {r for r in b.unread_rounds if r > newest}
     # The commit and the coverage record come from the END of the set rather than
     # from a merge of all of it: `keys` and `titles` are a union over every earlier
     # round ("has anyone raised this before"), while "which commit did the fix pass
@@ -5122,10 +5183,28 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # increment scope: the budget also has to pay for the brief and the section
     # headers, so a budget a little over the target's size still cuts it, and a
     # comparison against the raw budget would report that as untruncated.
-    sent = {n: review.material(b)[1:] for n, b in budgets.items()}
+    composed = {n: review.material(b) for n, b in budgets.items()}
+    sent = {n: composed[n][1:] for n in composed}
     truncated_for = {n: b for n, b in budgets.items()
                      if sent[n][0] < len(review.target)}
     truncated = bool(truncated_for)
+    # A budget below the scoped frame's OWN size cannot be honoured. The brief and
+    # the section headers are over a kilobyte and they are what makes the target
+    # legible as the target; cutting them to fit would hand the reviewer an
+    # unlabelled increment, which is worse than overshooting. So the prompt runs
+    # over — and says so here, because "the budget buys the whole PROMPT" is the
+    # contract everywhere else, and a silent overshoot in exactly the regime where
+    # a small budget was set to protect a small context window is the one place
+    # that contract has to be visible when it cannot be kept.
+    over = [(n, len(composed[n][0]), b) for n, b in sorted(budgets.items())
+            if b is not None and len(composed[n][0]) > b]
+    if review.scope == "increment" and over:
+        notes.append(
+            "the scoped prompt does not fit the budget it was given for "
+            + ", ".join(f"{n} ({got:,} chars against {b:,})" for n, got, b in over)
+            + " — a scoped prompt's brief and section headers are over a kilobyte and "
+              "cannot be cut, so a budget below them buys no diff at all and is still "
+              "exceeded")
     # Context loss is still REPORTED, just not as truncation. Without this the
     # saving is invisible in one direction and so is its cost: nothing else in
     # the payload distinguishes "the whole PR fitted behind the increment" from

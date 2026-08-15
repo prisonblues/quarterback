@@ -224,6 +224,37 @@ def test_the_budget_covers_the_whole_prompt_and_not_just_the_diff_text():
         assert len(scope().material(budget)[0]) <= budget
 
 
+def test_the_reserved_cut_marker_is_the_widest_one_the_tier_could_produce():
+    """The reservation used `_cut_note(p[:-1], p)` on the reasoning that a
+    marker's numbers are longest when almost all of the tier was sent. Two of them
+    are; the third is `whole - sent`, which is longest when `sent` is SMALL, and no
+    single cut maximises all three. A 1,000,000-char tier reserved 17 digit
+    characters against the 23 a cut near the middle renders, so the rendered
+    prompt ran past the budget it was handed."""
+    for whole in (1, 11, 999, 1_000, 1_001, 100_000, 1_000_000):
+        tier = "x" * whole
+        reserved = panel._cut_note_reserve(tier)
+        assert reserved >= max(len(panel._cut_note(tier[:n], tier))
+                               for n in (0, whole // 2, whole - 1))
+    assert panel._cut_note_reserve("") == 0
+
+
+def test_no_budget_that_can_pay_for_the_frame_is_ever_exceeded():
+    """The invariant the reservation exists for, swept rather than sampled: three
+    budgets that happened to miss the digit boundaries passed while the prompt ran
+    over by a couple of characters on the ones in between."""
+    big = scope(increment=INCREMENT, prior_diff=PRIOR,
+                diff=PR + chunk("huge.md", "+pad " * 60_000))
+    for got in (scope(), big):
+        # The smallest budget that can pay for the frame AND the markers — below
+        # it there is nothing left to cut and the overshoot is reported instead
+        # (see the config note about a budget that cannot buy the frame).
+        floor = overhead(got) + sum(panel._cut_note_reserve(p)
+                                    for p in (got.increment, got.near, got.far) if p)
+        for budget in range(floor, floor + 2_000, 7):
+            assert len(got.material(budget)[0]) <= budget, budget
+
+
 def test_a_cut_section_says_how_much_is_missing():
     """Truncation of the TARGET is measured and never asked for — a reviewer
     cannot notice its own. Context is the other way round: a reviewer told the
@@ -533,6 +564,39 @@ def test_every_fallback_says_it_reviewed_the_whole_pr(monkeypatch):
         assert notes and "reviewed the whole PR, not the increment" in notes[-1], kw
 
 
+def test_no_caveat_about_the_increment_survives_a_fallback(monkeypatch):
+    """The caveats were appended before the guards that discard the increment, so
+    a round that re-read the whole PR still said "they were left out of the review
+    target" and "the increment contains 2 merge commit(s)" — about a target it
+    never used, beside the note saying it had read everything. `notes[-1]` was
+    right the whole time and the notes above it were describing a different
+    round."""
+    big = chunk("fix.py", "+x" * len(PR)) + chunk("gone.py", "-was here")
+    got, notes = decide(monkeypatch, increment=big, facts={"merges": 2, "files": 2})
+    assert got.scope == "pr"
+    assert len(notes) == 1 and "reviewed the whole PR" in notes[0]
+    # Nothing was lost when the increment IS used: the same range, under the size
+    # guard's ceiling, still carries both caveats.
+    small = chunk("fix.py", "+the fix") + chunk("gone.py", "-was here")
+    got, notes = decide(monkeypatch, increment=small, facts={"merges": 2, "files": 2})
+    assert got.scope == "increment"
+    assert any("left out of the review target" in n for n in notes)
+    assert any("merge commit(s)" in n for n in notes)
+
+
+def test_the_dropped_files_note_does_not_assert_a_merge_it_cannot_know(monkeypatch):
+    """Files in `anchor...head` that the PR no longer touches are usually a
+    base-branch merge, and are just as often a file the fixer REVERTED back to its
+    base state — a normal way to address "this file should not have been touched",
+    and one where `status` is still `ahead`, so the rebase caveat does not cover it
+    either. The note is the one place an operator looks for the explanation."""
+    reverted = chunk("fix.py", "+the fix") + chunk("gone.py", "-was here")
+    _, notes = decide(monkeypatch, increment=reverted)
+    dropped = [n for n in notes if "left out of the review target" in n]
+    assert len(dropped) == 1
+    assert "reverted out of the PR" in dropped[0]
+
+
 # --------------------------------------------------------------- fetching a range
 
 def _sh(monkeypatch, fn):
@@ -787,6 +851,53 @@ def test_a_malformed_reviewers_block_costs_a_note_not_the_run(tmp_path):
         assert base.truncated_rounds == set() and base.rounds == {1}
 
 
+def test_a_later_whole_pr_round_closes_an_unread_round_too(tmp_path):
+    """`unread_rounds` got none of the treatment `truncated_rounds` got, so a
+    round 1 nobody read stayed a permanent veto even after a round 2 re-read the
+    whole PR clean — asserting "that code has been read by no round of this
+    cycle", which the baselines themselves disprove."""
+    skipped = payload(1, head_sha="1111111111", reviewers_ran=[], reviewed=False)
+    whole = payload(2, head_sha="2222222222", scope="pr",
+                    reviewers={"claude": {"ran": True, "truncated": False}})
+    scoped = payload(2, head_sha="2222222222", scope="increment",
+                     reviewers={"claude": {"ran": True, "truncated": False}})
+    r1 = write(tmp_path, "r1.json", skipped)
+    assert load([r1, write(tmp_path, "r2.json", whole)]).unread_rounds == set()
+    # ...but a scoped round 2 never read what round 1 skipped, so it is still open.
+    assert load([r1, write(tmp_path, "r2b.json", scoped)]).unread_rounds == {1}
+
+
+@pytest.mark.parametrize("silent", [
+    # Pre-v2.15: no per-member record at all.
+    {},
+    # Hand-edited into a shape `.values()` cannot read.
+    {"reviewers": ["claude"]},
+    # A dict, but nothing in it recorded anything.
+    {"reviewers": {}},
+    # A skipped round, whose `reviewers_ran` is absent rather than empty — so the
+    # unread branch never sees it and it fell through to `reread`.
+    {"reviewed": False, "reviewers_ran": None},
+])
+def test_a_round_that_recorded_nothing_does_not_clear_an_earlier_truncation(tmp_path,
+                                                                           silent):
+    """`not cut` is false when nothing was truncated AND when the payload says
+    nothing at all, and one entry in `reread` erases every earlier round's
+    truncation. The comment beside the truncation read already reasons that
+    "nobody said" is not "nothing happened"; clearing a veto needs the stronger
+    evidence, not the weaker."""
+    cut = payload(1, head_sha="1111111111",
+                  reviewers={"claude": {"ran": True, "truncated": True}})
+    r1 = write(tmp_path, "r1.json", cut)
+    quiet = write(tmp_path, "r2.json", payload(2, head_sha="2222222222",
+                                               scope="pr", **silent))
+    assert load([r1, quiet]).truncated_rounds == {1}
+    # A round that DID record a clean read still closes it.
+    loud = write(tmp_path, "r2c.json",
+                 payload(2, head_sha="2222222222", scope="pr",
+                         reviewers={"claude": {"ran": True, "truncated": False}}))
+    assert load([r1, loud]).truncated_rounds == set()
+
+
 # --------------------------------------------------------------- the payload's promises
 
 def test_every_scope_key_has_a_default():
@@ -978,6 +1089,32 @@ def test_a_budget_under_the_target_is_truncation(monkeypatch, tmp_path):
     # off from the increment, which is what it was asked to read.
     assert any(f"of {len(INCREMENT):,} diff chars" in v
                for v in got["round_stop"]["veto"])
+
+
+def test_a_budget_that_cannot_pay_for_the_frame_says_the_prompt_ran_over(monkeypatch,
+                                                                        tmp_path):
+    """The scoped frame is over a kilobyte and cannot be cut — dropping the brief
+    to fit would hand the reviewer an unlabelled increment, which is worse than
+    overshooting. So a budget below it buys no diff at all AND is still exceeded,
+    in exactly the regime where a small budget was set to protect a small context
+    window. Silent, the one contract a caller sets this number for ("the budget
+    buys the whole prompt") would fail where it matters most."""
+    seen = {}
+    cfg = dict(CFG, review_panel={"max_diff_chars": 30})
+    got = _round(monkeypatch, tmp_path, seen, cfg=cfg, baselines=[_baseline(tmp_path)])
+    assert len(seen["prompts"]["claude"]) > 30
+    assert any("does not fit the budget it was given for claude" in n
+               for n in got["config_notes"])
+
+
+def test_a_budget_that_pays_for_the_frame_gets_no_overshoot_note(monkeypatch, tmp_path):
+    """The other half of it: the note is about a budget too small to be honoured,
+    not about every cut round. It fired on a two-character overrun before the cut
+    markers were reserved at their widest."""
+    seen = {}
+    cfg = dict(CFG, review_panel={"max_diff_chars": budget_for_partial_context()})
+    got = _round(monkeypatch, tmp_path, seen, cfg=cfg, baselines=[_baseline(tmp_path)])
+    assert not any("does not fit the budget" in n for n in got["config_notes"])
 
 
 def test_an_inherited_truncation_vetoes_a_scoped_round(monkeypatch, tmp_path):
