@@ -35,7 +35,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from harness_rules import RepoNotFound, describe, resolve_repo  # noqa: E402
+from harness_rules import (  # noqa: E402
+    RepoNotFound, agent_failure, agent_gist, describe, resolve_repo, run_agent,
+)
 
 PANEL = Path(__file__).with_name("panel.py")
 # State must live OUTSIDE the script dir for the same reason (the store is read-only).
@@ -385,11 +387,18 @@ def triage(w: IssueWork, model: str) -> tuple[bool | None, str, str]:
     try:
         proc = subprocess.run(args, capture_output=True, text=True,
                               stdin=subprocess.DEVNULL, timeout=300)
-    except (subprocess.TimeoutExpired, OSError):
-        return None, "untriaged (judge error)", ""
+    except subprocess.TimeoutExpired:
+        return None, "untriaged (judge timed out after 300s)", ""
+    except OSError as e:
+        return None, f"untriaged (judge unrunnable: {e})"[:120], ""
     m = re.search(r"\{.*\}", proc.stdout or "", re.S)
     if not m:
-        return None, "untriaged (no verdict)", ""
+        # An untriaged issue is SKIPPED on --execute, so "no verdict" has to say
+        # whether the judge disagreed or never spoke. Its account was captured
+        # here all along — it was simply never read. (Checked only once parsing
+        # has failed: a run that answers and then exits badly still answered.)
+        why = agent_failure(proc) or f"said: {agent_gist(proc)}"
+        return None, f"untriaged (judge {why})"[:120], ""
     try:
         v = json.loads(m.group(0))
     except json.JSONDecodeError:
@@ -400,12 +409,20 @@ def triage(w: IssueWork, model: str) -> tuple[bool | None, str, str]:
 
 # --------------------------------------------------------------- per-issue pipeline
 
-def claude(skill_cmd: str, cwd: str, perm_mode: str, model: str = "") -> None:
+def claude(skill_cmd: str, cwd: str, perm_mode: str,
+           model: str = "") -> subprocess.CompletedProcess:
+    """Run a skill headless and hand the caller the whole run to judge.
+
+    Returns rather than raising, and captures rather than streaming into the void:
+    the run is unattended, so an agent that was denied a tool and stopped exits 0
+    with its explanation on stdout and nobody reading it (#31). The caller pairs
+    this with agent_failure() and says what happened on the line it was going to
+    print anyway.
+    """
     # model = the tier the judge routed this sub-issue to; empty pins nothing
     # (the CLI's saved default applies, the pre-routing behaviour).
-    subprocess.run(["claude", "-p", skill_cmd, "--permission-mode", perm_mode]
-                   + (["--model", model] if model else []),
-                   cwd=cwd, stdin=subprocess.DEVNULL, check=True)
+    return run_agent(["claude", "-p", skill_cmd, "--permission-mode", perm_mode]
+                     + (["--model", model] if model else []), cwd=cwd)
 
 
 def run_panel(repo_path: str, pr: int) -> None:
@@ -414,8 +431,14 @@ def run_panel(repo_path: str, pr: int) -> None:
     # name and the GitHub name differ.
     # sys.executable, not `uv run`: there is no project to resolve from once this
     # ships to ~/.claude/loops, and panel.py is stdlib-only anyway.
-    subprocess.run([sys.executable, str(PANEL), "--repo", repo_path,
-                    "--pr", str(pr)], check=False)
+    # Uncaptured on purpose — the report IS the output, and it belongs in the log
+    # as it is written. Only the exit code needs interpreting: /review-pr runs next
+    # either way, and a panel that died has left it nothing to work from.
+    rc = subprocess.run([sys.executable, str(PANEL), "--repo", repo_path,
+                         "--pr", str(pr)], check=False).returncode
+    if rc != 0:
+        print(f"    (panel exited {rc} — see its output above; the review that "
+              f"follows may have no findings to act on)")
 
 
 def pr_green(gh_repo: str, pr: int) -> tuple[bool, str]:
@@ -444,6 +467,19 @@ def pr_green(gh_repo: str, pr: int) -> tuple[bool, str]:
     if "pending" in buckets:
         return False, "pending"
     return True, "green"
+
+
+def pr_head_sha(gh_repo: str, pr: int) -> str:
+    """Tip of the PR's head branch — the before/after that says whether a review
+    actually changed anything.
+
+    "" means "could not tell", never "nothing changed": a lookup that failed must
+    not be reported as a review that did nothing."""
+    try:
+        out = gh_json(["pr", "view", str(pr), "--json", "headRefOid"], gh_repo)
+    except (subprocess.CalledProcessError, OSError, json.JSONDecodeError):
+        return ""
+    return str(out.get("headRefOid", "")) if isinstance(out, dict) else ""
 
 
 def worktree_has_new_commit(wt: str, base: str) -> bool:
@@ -741,7 +777,12 @@ def work_issue(cfg: dict, w: IssueWork, execute: bool, base: str | None = None,
                 return WorkResult(w.num, "failed", detail=detail)
             # /fix-issue plans, implements, tests, pushes, opens a PR targeting --base
             # (the epic branch in integration mode). Needs git/gh → bypassPermissions.
-            claude(f"/fix-issue {w.num} --base {base}", wt, perm, w.model)
+            agent = claude(f"/fix-issue {w.num} --base {base}", wt, perm, w.model)
+            if failure := agent_failure(agent):
+                # Not fatal on its own — a run can open its PR and then trip on the
+                # way out — but it is never noise, and if no PR appears this is the
+                # sentence that says why.
+                print(f"  #{w.num}: /fix-issue {failure}")
 
             # P2 — fail loud: /fix-issue must leave a PR to review and stack. If it
             # didn't, this issue FAILS (we never pretend it reached the merge gate) —
@@ -757,6 +798,12 @@ def work_issue(cfg: dict, w: IssueWork, execute: bool, base: str | None = None,
                 detail = (f"committed but /fix-issue opened no PR (pushed {branch}) — "
                           f"open its PR and re-run" if salvaged
                           else "/fix-issue produced no commit and no PR")
+                # The agent's own account of the run, recorded with the failure:
+                # "produced no commit and no PR" says what we observed, never why,
+                # and by the time anyone reads the state file the worktree it
+                # happened in has been torn down.
+                account = failure or f"said: {agent_gist(agent)}"
+                detail += f" — agent {account}"
                 print(f"  #{w.num}: FAILED — {detail}")
                 if state is not None:
                     record(state, w.num, stage="failed", branch=branch,
@@ -777,9 +824,32 @@ def work_issue(cfg: dict, w: IssueWork, execute: bool, base: str | None = None,
         print(f"  #{w.num}: reviewing PR #{pr}")
         run_panel(cfg["path"], pr)
         # /review-pr addresses findings + pushes; merge withheld (human/epic gate).
-        claude(f"/review-pr {pr}", cfg["path"], perm, w.model)
+        before = pr_head_sha(gh_repo, pr)
+        reviewer = claude(f"/review-pr {pr}", cfg["path"], perm, w.model)
+        # A reviewer that never ran must not report as "reviewed": that outcome is
+        # what lets the driver stack the sub-PR into the epic branch, so calling it
+        # reviewed would merge a PR whose findings nobody addressed. The PR itself
+        # survives, and a re-run classifies the issue back into the review stage.
+        if failure := agent_failure(reviewer):
+            detail = f"/review-pr {failure} — findings unaddressed"
+            print(f"  #{w.num}: FAILED — {detail}")
+            if state is not None:
+                record(state, w.num, stage="failed", branch=branch, pr=pr,
+                       lastAction=detail)
+            return WorkResult(w.num, "failed", pr=pr, detail=detail)
+        # A review that pushed nothing is the remaining ambiguous case, and it is
+        # NOT treated as a failure: finding nothing to fix is a legitimate — and by
+        # the last round, expected — outcome. But it is the same shape as a review
+        # that was stopped from fixing anything, so it is reported with the agent's
+        # own account rather than passing as an ordinary review.
+        after = pr_head_sha(gh_repo, pr)
+        pushed = not (before and after and before == after)
+        if not pushed:
+            print(f"  #{w.num}: /review-pr pushed nothing to PR #{pr} — nothing to fix, "
+                  f"or it could not. It said: {agent_gist(reviewer)}")
         if state is not None:
-            record(state, w.num, stage="reviewed", branch=branch, pr=pr, lastAction="reviewed")
+            record(state, w.num, stage="reviewed", branch=branch, pr=pr,
+                   lastAction="reviewed" if pushed else "reviewed (pushed nothing)")
         return WorkResult(w.num, "reviewed", pr=pr)
     finally:
         # P4 — tear down the worktree AND its containers / isolated DB, not just the dir.

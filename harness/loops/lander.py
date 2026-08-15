@@ -24,7 +24,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from harness_rules import RepoNotFound, describe, resolve_repo  # noqa: E402
+from harness_rules import (  # noqa: E402
+    RepoNotFound, agent_failure, agent_gist, describe, resolve_repo, run_agent,
+)
 
 SECURITY_RE = re.compile(r"security|cve|rce|xss|vuln|advisory", re.I)
 VERSION_RE = re.compile(r"\bfrom\s+v?(\d+)\.(\d+)\.(\d+)\b.*?\bto\s+v?(\d+)\.(\d+)\.(\d+)\b", re.I)
@@ -174,8 +176,16 @@ def fix_red(d: Decision, gh_repo: str, repo_path: str, execute: bool) -> None:
         # Headless agent EDITS ONLY (acceptEdits) — no shell/git access needed.
         # The loop owns commit+push, so the agent never gets bash in an unattended
         # loop. CI is the validation gate.
-        subprocess.run(["claude", "-p", prompt, "--permission-mode", "acceptEdits"],
-                       cwd=wt_dir, stdin=subprocess.DEVNULL, check=True)
+        #
+        # run_agent, not `subprocess.run(..., check=True)`: this runs from a timer,
+        # so the agent's account of itself has nowhere to go unless we keep it, and
+        # the failure that matters here exits 0 (see harness_rules #31 note). A
+        # raise would also abandon the remaining PRs over one bad run.
+        agent = run_agent(["claude", "-p", prompt, "--permission-mode", "acceptEdits"],
+                          cwd=wt_dir)
+        if failure := agent_failure(agent):
+            print(f"  #{d.number}: agent FAILED ({failure}) — nothing pushed.")
+            return
         # Commit+push only if the agent actually changed files.
         subprocess.run(["git", "-C", wt_dir, "add", "-A"], check=True)
         has_changes = subprocess.run(
@@ -189,7 +199,14 @@ def fix_red(d: Decision, gh_repo: str, repo_path: str, execute: bool) -> None:
             subprocess.run(["git", "-C", wt_dir, "push", "origin",
                             f"HEAD:{d.head}"], check=True)
         else:
-            print(f"  #{d.number}: agent made no edits — nothing to push.")
+            # "No edits" is an observation, not an explanation, and the two things
+            # it can mean are opposites: nothing needed fixing, or the agent was
+            # stopped from fixing anything. Quote its last word so the operator
+            # can tell which — that sentence is the only record there will be.
+            # (agent_failure above already rejected a run that said nothing, so
+            # there is always a last word to quote here.)
+            print(f"  #{d.number}: agent made no edits — nothing to push. "
+                  f"It said: {agent_gist(agent)}")
     finally:
         # Mandatory cleanup — never leave worktrees behind (see #117 safety rails).
         subprocess.run(["git", "-C", repo_path, "worktree", "remove", "--force",

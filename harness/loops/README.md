@@ -190,6 +190,11 @@ cwd's repo; `--repo` takes a path or a name under `~/source`.
   edit-only `claude -p` fixes the bump breakage, and the loop pushes back so CI
   re-runs. Removal is in a `finally`. **Idempotent:** if the branch tip is no longer
   a dependabot commit, a fix was already attempted — left for a human.
+- **The agent's account of itself is kept.** "Agent made no edits" is an observation
+  with two opposite explanations — nothing needed fixing, or the agent was stopped
+  from fixing anything — so the line now quotes its last word. A run that exited
+  non-zero, or exited 0 having printed nothing, is reported as a *failure* and
+  nothing is pushed; the sweep carries on to the other PRs rather than raising.
 
 ## Reviewer panel (`panel.py`)
 
@@ -292,6 +297,18 @@ has to be updated.
 Per sub-issue: create worktree → `/fix-issue` → CI → panel → `/review-pr` → stop at
 the human merge. Merge is never automatic. Run state in `~/.local/state/loops/`, so a
 killed run resumes instead of re-deriving from GitHub.
+
+Both skill runs are captured (and passed through, so the log stays live). The driver
+already refused to call an issue done without a PR; it now records *why* there wasn't
+one — the agent's own last sentence, which the torn-down worktree took with it before.
+A `/review-pr` that exited non-zero or printed nothing is a **failure**, not a review:
+`reviewed` is the outcome that lets the driver stack the sub-PR into the epic branch,
+so it would otherwise merge a PR whose findings nobody addressed. A re-run sees the
+open PR and retries the review stage. A review that ran and pushed nothing (the PR's
+head SHA is where it was) is *reported* rather than failed — finding nothing to fix is
+legitimate, and by the last round it is the point — but it is reported with the agent's
+own last sentence, because it is the same shape as a review that was stopped from
+fixing anything.
 
 ## Deployment
 

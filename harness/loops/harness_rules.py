@@ -38,8 +38,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
+import sys
+import threading
 from pathlib import Path
+from typing import TextIO
 
 RULES_FILENAME = ".harness-rules"
 
@@ -299,6 +303,135 @@ def dotenv_is_tracked(root: Path | str) -> bool:
     the token may be the only one available and the run is otherwise fine."""
     r = _git(root, "ls-files", "--error-unmatch", ".env")
     return r.returncode == 0
+
+
+# ------------------------------------------------------ headless agent runs
+#
+# The loops run `claude -p` unattended, from a timer. There is no terminal for
+# an agent's account of itself to land in, so whatever the loop does not capture
+# is not merely unread — it is gone. That matters because the interesting
+# failure EXITS ZERO: a tool the agent needs hits a permission rule headless mode
+# cannot prompt for, it is auto-denied, and the agent finishes tidily having
+# changed nothing. `check=True` sees success. The loop then reports its own
+# no-effect observation ("agent made no edits") — a sentence indistinguishable
+# from "there was nothing to fix", which is the opposite claim (#19, #31).
+#
+# So: capture both streams, and when a run produced no effect, print the best
+# line the agent gave us next to the observation. Capturing must not cost the
+# live log, hence run_agent's pass-through.
+
+
+def stderr_gist(stderr: str, limit: int = 200) -> str:
+    """The most INFORMATIVE stderr line, not blindly the last one.
+
+    A CLI's real complaint is routinely followed by teardown noise, and codex is
+    the worst case: a client older than its own models cache logs a decode error
+    ("unknown variant `max`") on every single run, plus websocket teardown lines
+    — so the naive tail reported that housekeeping and buried the sentence that
+    actually explains the failure. Where the line carries a JSON error envelope
+    we lift its `message`, which is how a pinned-model rejection reads as
+    "The 'gpt-5.6-luna' model requires a newer version of Codex" rather than 200
+    characters of serialised envelope."""
+    lines = [ln.strip() for ln in (stderr or "").splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    noise = ("failed to load models cache", "failed to refresh available models",
+             "worker quit with fatal", "failed to connect to websocket")
+    signal = [ln for ln in lines if not any(n in ln for n in noise)] or lines
+    errors = [ln for ln in signal if "error" in ln.lower()]
+    pick = (errors or signal)[-1]
+    msg = re.search(r'"message"\s*:\s*"((?:[^"\\]|\\.){4,400})"', pick)
+    return (msg.group(1) if msg else pick)[:limit]
+
+
+def tail_gist(text: str, limit: int = 200) -> str:
+    """The END of `text`, collapsed onto one line.
+
+    For stdout the tail is the informative end, not the head: `claude -p` streams
+    its working and finishes with the conclusion, so the last thing it said is
+    the thing worth quoting on a one-line report."""
+    flat = " ".join((text or "").split())
+    return flat if len(flat) <= limit else "…" + flat[-limit:]
+
+
+def agent_gist(proc: subprocess.CompletedProcess) -> str:
+    """The line most likely to explain what a headless agent did, or would not do.
+
+    stderr first — that is where the harness itself complains (a rejected flag, an
+    API refusal) — then the tail of stdout, which in `claude -p` is the agent's own
+    final message. The denial that motivated #31 is described THERE and nowhere
+    else, so a stderr-only account would still report the interesting case as
+    silence."""
+    return stderr_gist(proc.stderr or "") or tail_gist(proc.stdout or "")
+
+
+def agent_failure(proc: subprocess.CompletedProcess) -> str:
+    """Why this run must not be read as a completed one — "" if it looks real.
+
+    Two shapes, and `check=True` only ever caught the first:
+      * a non-zero exit;
+      * exit 0 with nothing on stdout, which is #19's signature. A real run always
+        says something, so an empty reply is a failed CLI invocation wearing a
+        success exit code."""
+    if proc.returncode != 0:
+        why = agent_gist(proc)
+        return f"exited {proc.returncode}" + (f" ({why})" if why else "")
+    if not (proc.stdout or "").strip():
+        why = stderr_gist(proc.stderr or "")
+        return "exited 0 having printed nothing" + (f" ({why})" if why else "")
+    return ""
+
+
+def _pump(src: TextIO, sink: TextIO, buf: list[str]) -> None:
+    """Copy a child stream to ours line by line, keeping a copy."""
+    with src:
+        for line in src:
+            buf.append(line)
+            sink.write(line)
+            sink.flush()
+
+
+def run_agent(args: list[str],
+              cwd: str | Path | None = None) -> subprocess.CompletedProcess:
+    """Run a headless agent, capturing both streams AND passing them through.
+
+    `capture_output=True` alone would buy the diagnosis by diverting the log:
+    whatever the agent writes would stop reaching the journal these runs are read
+    from, and a run that shows nothing until the process exits cannot be told from
+    a wedged one. So each stream is pumped to ours as it arrives AND kept — what
+    lands in the log is exactly what landed there before; capturing only adds a
+    copy. The result is an ordinary CompletedProcess, so callers read `proc.stdout`
+    as if it had been captured the plain way.
+
+    stdin is DEVNULL, as it always was: an unattended agent that decides to ask a
+    question must read EOF rather than inherit a terminal and hang the loop.
+
+    No `check`, and no raise at all — including the one case that never reached a
+    child process. A CLI missing from PATH, or a worktree that isn't there, is the
+    same kind of event as an agent that ran and failed ("this did not happen, here
+    is why"), and a caller that has to handle one shape rather than two is a caller
+    that handles it. It comes back as exit 127 with the errno on stderr; pair this
+    with agent_failure() and every route out of here reports the same way.
+    """
+    try:
+        proc = subprocess.Popen(
+            args, cwd=str(cwd) if cwd else None, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+    except OSError as e:
+        # errno and strerror, not the bare class name: "OSError" sent three people
+        # looking for a crash that was "Argument list too long" (see panel.run_cli).
+        why = " ".join(str(x) for x in (e.errno, e.strerror or e) if x)
+        return subprocess.CompletedProcess(args, 127, "", f"OSError {why}\n")
+    out: list[str] = []
+    err: list[str] = []
+    pumps = [threading.Thread(target=_pump, args=(proc.stdout, sys.stdout, out)),
+             threading.Thread(target=_pump, args=(proc.stderr, sys.stderr, err))]
+    for t in pumps:
+        t.start()
+    rc = proc.wait()
+    for t in pumps:
+        t.join()
+    return subprocess.CompletedProcess(args, rc, "".join(out), "".join(err))
 
 
 def discover(root: Path | None = None) -> list[Path]:

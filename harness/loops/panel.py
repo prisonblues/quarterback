@@ -95,7 +95,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 import harness_rules  # noqa: E402
-from harness_rules import RepoNotFound, describe, resolve_repo  # noqa: E402
+# stderr_gist lives in harness_rules because the loops that run headless agents
+# with no panel in sight need the same reading of a CLI's complaint (#31).
+from harness_rules import RepoNotFound, describe, resolve_repo, stderr_gist  # noqa: E402
 
 # Chars of diff handed to a model, when nothing in .harness-rules says otherwise:
 # NONE OF THEM. The whole diff goes to every reviewer unless a repo asks for a
@@ -629,29 +631,6 @@ def is_rejection(stderr: str) -> bool:
     return ('"status":400' in low.replace(" ", "")
             or "invalid_request_error" in low
             or "requires a newer version" in low)
-
-
-def stderr_gist(stderr: str, limit: int = 200) -> str:
-    """The most INFORMATIVE stderr line, not blindly the last one.
-
-    A CLI's real complaint is routinely followed by teardown noise, and codex is
-    the worst case: a client older than its own models cache logs a decode error
-    ("unknown variant `max`") on every single run, plus websocket teardown lines
-    — so the naive tail reported that housekeeping and buried the sentence that
-    actually explains the failure. Where the line carries a JSON error envelope
-    we lift its `message`, which is how a pinned-model rejection reads as
-    "The 'gpt-5.6-luna' model requires a newer version of Codex" rather than 200
-    characters of serialised envelope."""
-    lines = [ln.strip() for ln in (stderr or "").splitlines() if ln.strip()]
-    if not lines:
-        return ""
-    noise = ("failed to load models cache", "failed to refresh available models",
-             "worker quit with fatal", "failed to connect to websocket")
-    signal = [ln for ln in lines if not any(n in ln for n in noise)] or lines
-    errors = [ln for ln in signal if "error" in ln.lower()]
-    pick = (errors or signal)[-1]
-    msg = re.search(r'"message"\s*:\s*"((?:[^"\\]|\\.){4,400})"', pick)
-    return (msg.group(1) if msg else pick)[:limit]
 
 
 def run_cli(args: list[str], label: str, timeout: int = CLI_TIMEOUT,
