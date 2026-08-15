@@ -71,7 +71,15 @@ branch is cut off this base; in multi mode each sub-PR targets it directly. Merg
 trunk stays a human step regardless.
 
 3. The **master triages each sub-issue for doability** — issues an agent can't actually do (e.g.
-   "obtain a content licence") are flagged `blocked` and skipped, not implemented.
+   "obtain a content licence") are flagged `blocked` and skipped, not implemented. A judge that
+   could not rule at all reports `untriaged (…)` naming the cause, never a bare "untriaged": the
+   judge never started (`could not start: …`), ran out of time (`timed out after 300s`), exited
+   non-zero (`judge failed: …` — a non-zero exit means the RUN failed, so its stdout is not a
+   verdict even when it parses), produced nothing (`no verdict: …` quoting the stderr that explains
+   it — a denied tool permission, an unusable model pin), or answered unusably (`no verdict: no JSON
+   in reply` / `bad verdict: malformed JSON`). Stderr is never blamed for a run that replied, since
+   a judge's warm-up chatter is not why its answer was unusable. Untriaged issues are also skipped
+   on `--execute`, like blocked ones, so that reason is the only account of why one was passed over.
 4. If the user asked to `--execute`: this **creates branches/worktrees, runs `/fix-issue` +
    `/review-pr`, and opens PRs**. It is gated on `loops.issue_executor` in the repo's `.harness-rules` and uses
    `headless_permission_mode`. **Confirm with the user and check prerequisites first**, then run

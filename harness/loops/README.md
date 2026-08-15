@@ -26,6 +26,25 @@ optional**; anything omitted falls back to `DEFAULTS` in `harness_rules.py`, whi
 is the safe end of every switch — no auto-merge, no unattended loop, edit-only
 headless agents. A repo with no rules file at all still works.
 
+Two conventions the resolver enforces so a rules file can be read like prose:
+
+- **A key starting with `_` is a comment**, at any depth (`"_": "why this seat is
+  on"`, `"_effort": "…"`). JSON has none of its own, these files exist to be argued
+  with, and comments are stripped before anything reads the config — so they can
+  never be mistaken for a setting.
+- **A name nothing recognises is warned about on stderr and dropped**, loudly and
+  non-fatally, at every level: the top level, each deep block, and the fields
+  inside a reviewer. `reviewers.antigravty` would otherwise be a silent
+  one-vendor-short panel, `reviewers.pi.enabld` a seat left off, `auto_merg` an
+  auto-merge policy quietly on its default, and `loops.issue_executer` a loop
+  switched off by a typo (those defaults are OFF); dropped as well as warned about, so the word
+  "ignored" is true and no consumer iterating the resolved config sees a phantom
+  seat. A warning rather than a hard exit, because a file shared across boxes may
+  name a setting only a newer harness knows — and once per name per process, not
+  once per `resolve_repo`, since epic resolves per run and shells out to panel.py
+  which resolves again. A seat that was RENAMED says so (`gemini` →
+  `antigravity`), which is the one unknown name a fleet file is likely to carry.
+
 This replaced a central `config.json` in the fleet config. That file was a registry
 of personal repos that had to be enrolled by hand before anything would run; the
 plumbing it carried (`path`, `github`, `default_branch`) was derivable from the
@@ -227,6 +246,21 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   arithmetic finds. Separate defects sharing one cause are linked with `related`
   instead of merged, so one decision is fixed once.
 - Reviewers whose prerequisites are missing are reported **SKIPPED**, not failed.
+  A seat whose CLI this box does not carry is reported but does not veto a
+  confident stop: it is absent every round, so it says nothing about the round —
+  otherwise a repo listing a workstation-only vendor would buy every unattended
+  run on a headless box a standing veto. Every other way of not running does veto.
+- **A reviewer that produces nothing is SKIPPED, never counted as an empty review.**
+  A zero exit with empty stdout is a failure for panel members and the master alike,
+  and the skip line quotes the CLI's own stderr, which usually names both the cause
+  and the fix. A blank reply is retried unless that stderr names a settled cause (a
+  refused request, an auto-denied tool permission), which no retry can change.
+  Why it is worth the code: `run_cli`'s docstring in `panel.py`. The neighbouring
+  case — output that is neither empty nor a findings array, e.g. an agent narrating
+  a wait — is *not* a skip, because "no parseable array" would also throw away a
+  reviewer that answered in prose because it had something to say. It is kept as one
+  raw finding and flagged `unstructured`, which the coverage veto states as
+  "returned no structured reply — its coverage is unknown".
 - **Reviewers declare their own coverage.** Each returns `could_not_assess` (areas it
   could not judge — a file the diff omits, a runtime behaviour) and can mark a finding
   `needs_rereview` (fixing it takes a structural change whose result should be read
