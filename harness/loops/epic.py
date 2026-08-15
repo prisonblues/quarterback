@@ -35,7 +35,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from harness_rules import RepoNotFound, describe, resolve_repo, stderr_gist  # noqa: E402
+from harness_rules import (RepoNotFound, cli_failure_gist, describe,  # noqa: E402
+                           resolve_repo)
 
 PANEL = Path(__file__).with_name("panel.py")
 # State must live OUTSIDE the script dir for the same reason (the store is read-only).
@@ -369,22 +370,10 @@ def toposort(work: list[IssueWork], edges: list) -> list[IssueWork]:
     return [by_num[n] for n in out]
 
 
-def judge_gist(proc: subprocess.CompletedProcess, about_the_reply: str) -> str:
-    """Why the triage judge gave no usable verdict, in one clause.
-
-    The gate is the whole point, and porting this from panel.run_cli without it
-    is how you get a confident wrong cause. Stderr is read only when the run has
-    nothing of its own to explain itself with — a blank stdout, or a non-zero
-    exit. A judge that REPLIED, at exit 0, and also logged warm-up chatter has
-    not failed at running; blaming "loaded 3 plugins" for a reply that simply
-    was not JSON puts a fabricated cause on the only line the operator gets for
-    a silently skipped sub-issue. In that case the reply itself is the story, so
-    `about_the_reply` is used instead.
-    """
-    if (proc.stdout or "").strip() and not proc.returncode:
-        return about_the_reply
-    return (stderr_gist(proc.stderr or "", limit=120)
-            or (f"exited {proc.returncode}" if proc.returncode else "no output"))
+# How long the triage judge may take per sub-issue. Named rather than inline
+# because the skip line quotes it: "untriaged (judge timed out after 300s)" has
+# to stay true if the number moves.
+TRIAGE_TIMEOUT = 300
 
 
 def triage(w: IssueWork, model: str) -> tuple[bool | None, str, str]:
@@ -400,22 +389,37 @@ def triage(w: IssueWork, model: str) -> tuple[bool | None, str, str]:
     prompt = TRIAGE_PROMPT.format(n=w.num, title=w.title, body=w.body[:6000],
                                   models=", ".join(choices) or "(default)")
     args = ["claude", "-p", prompt] + (["--model", model] if model else [])
-    try:
-        proc = subprocess.run(args, capture_output=True, text=True,
-                              stdin=subprocess.DEVNULL, timeout=300)
-    except (subprocess.TimeoutExpired, OSError):
-        return None, "untriaged (judge error)", ""
-    # Both failures below silently skip the sub-issue on --execute, so the one
+    # Every failure below silently skips the sub-issue on --execute, so the one
     # line the operator gets has to name a cause: the judge CLI can exit 0 having
     # printed nothing (a tool permission headless mode auto-denied, an unusable
-    # model pin) and say why on stderr, which a bare "no verdict" threw away.
+    # model pin) and say why on stderr, which a bare "no verdict" threw away —
+    # and a launch that never ran at all knows why too.
+    try:
+        proc = subprocess.run(args, capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL, timeout=TRIAGE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return None, f"untriaged (judge timed out after {TRIAGE_TIMEOUT}s)", ""
+    except OSError as e:
+        # errno and strerror, not the bare class name: "OSError" says nothing,
+        # and "Argument list too long" says everything.
+        why = " ".join(str(x) for x in (e.errno, e.strerror or e) if x)[:120]
+        return None, f"untriaged (judge could not start: {why})", ""
+    if proc.returncode:
+        # A non-zero exit means the RUN failed, so whatever reached stdout is not
+        # a verdict even when it parses — the rule the two branches below already
+        # get from cli_failure_gist, applied before anything is parsed rather
+        # than after, since valid-looking JSON printed on the way out would
+        # otherwise be accepted as a real ruling and the failure never reported.
+        return None, f"untriaged (judge failed: {cli_failure_gist(proc, limit=120)})", ""
     m = re.search(r"\{.*\}", proc.stdout or "", re.S)
     if not m:
-        return None, f"untriaged (no verdict: {judge_gist(proc, 'no JSON in reply')})", ""
+        return None, ("untriaged (no verdict: "
+                      f"{cli_failure_gist(proc, 'no JSON in reply', limit=120)})"), ""
     try:
         v = json.loads(m.group(0))
     except json.JSONDecodeError:
-        return None, f"untriaged (bad verdict: {judge_gist(proc, 'malformed JSON')})", ""
+        return None, ("untriaged (bad verdict: "
+                      f"{cli_failure_gist(proc, 'malformed JSON', limit=120)})"), ""
     return (bool(v.get("doable", False)), str(v.get("reason", ""))[:120],
             clamp_model(str(v.get("model", "")), model))
 

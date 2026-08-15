@@ -145,19 +145,75 @@ def test_underscore_keys_are_not_mistaken_for_reviewer_names(repo, capsys):
     assert "unknown reviewer" not in capsys.readouterr().err
 
 
-def test_a_typod_reviewer_name_is_shouted_about(repo, capsys):
+def test_a_typod_reviewer_name_is_shouted_about_and_then_actually_ignored(repo, capsys):
     """The merge is a blind dict update, so `antigravty` is not an error — it
     adds a block nothing reads, and the panel quietly runs one vendor short.
     That silence is the exact failure this harness refuses to have anywhere
-    else, and committed to a file it survives every run until someone counts."""
+    else, and committed to a file it survives every run until someone counts.
+
+    Warned about AND removed. A name only warned about survives into
+    cfg["reviewers"], which makes the word "ignored" false and hands every
+    caller iterating the resolved mapping a phantom seat."""
     write_rules(repo, {"reviewers": {"antigravty": {"enabled": True}}})
     cfg = hr.resolve_repo(str(repo))
     err = capsys.readouterr().err
     assert "unknown reviewer" in err and "antigravty" in err
     assert "antigravity" in err                  # the known names are listed
+    assert "antigravty" not in cfg["reviewers"]
+    assert set(cfg["reviewers"]) == set(hr.DEFAULTS["reviewers"])
     # Non-fatal: a rules file shared across a fleet may name a seat only a newer
     # harness knows about, and hard-failing would make it a version pin.
     assert cfg["reviewers"]["claude"]["enabled"] is True
+
+
+def test_a_typo_in_any_other_block_is_caught_too(repo, capsys):
+    """Not a reviewer-specific failure mode. `loops.issue_executer` merges in as
+    an inert key while the real setting falls back to its default — and for
+    `loops.*` that default is OFF, so a typo silently disables an unattended
+    loop with nothing on stderr to say why it stopped running."""
+    write_rules(repo, {"loops": {"issue_executer": True},
+                       "epic": {"auto_finsh": True},
+                       "review_panel": {"judge_modl": "sonnet"}})
+    cfg = hr.resolve_repo(str(repo))
+    err = capsys.readouterr().err
+    for typo in ("issue_executer", "auto_finsh", "judge_modl"):
+        assert typo in err and typo not in str(cfg)
+    assert "`loops` setting" in err
+    assert cfg["loops"]["issue_executor"] is False        # the real one, untouched
+    assert cfg["review_panel"]["judge_model"] == "opus"
+
+
+def test_a_renamed_seat_is_told_where_it_went(repo, capsys):
+    """`gemini` is the one unknown name a shared fleet rules file is likely to
+    carry, because it was a valid DEFAULTS key until the seat moved to Google's
+    Antigravity CLI. "No reviewer of that name exists" leaves the reader to
+    infer the rename; naming it is one line and the difference between a warning
+    that explains and one that puzzles."""
+    write_rules(repo, {"reviewers": {"gemini": {"enabled": True}}})
+    hr.resolve_repo(str(repo))
+    err = capsys.readouterr().err
+    assert "renamed to 'antigravity'" in err
+
+
+def test_the_warning_is_not_repeated_for_the_same_file(repo, capsys):
+    """resolve_repo runs in panel.py, epic.py and lander.py — epic per run, and
+    it also shells out to panel.py, which resolves again. Undeduped, one typo'd
+    seat prints the same warning several times per epic run and trains the
+    reader to skip exactly the message meant to be loud."""
+    write_rules(repo, {"reviewers": {"antigravty": {"enabled": True}}})
+    hr.resolve_repo(str(repo))
+    assert "antigravty" in capsys.readouterr().err
+    hr.resolve_repo(str(repo))
+    assert capsys.readouterr().err == ""
+
+
+def test_the_unknown_names_are_returned_not_just_printed():
+    """The return value is what resolve_repo drops them by, so it is not
+    decoration — asserted here so it cannot quietly become dead again."""
+    rules = {"reviewers": {"antigravty": {}}, "loops": {"nope": 1}}
+    assert hr.unknown_keys(rules) == {"reviewers": ["antigravty"], "loops": ["nope"]}
+    assert hr.unknown_keys({"reviewers": "not a dict"}) == {}
+    assert hr.unknown_keys({}) == {}
 
 
 def test_known_reviewers_are_silent(repo, capsys):
@@ -166,16 +222,97 @@ def test_known_reviewers_are_silent(repo, capsys):
     assert capsys.readouterr().err == ""
 
 
+def test_every_documented_setting_is_a_known_one(repo, capsys):
+    """The typo sweep validates against DEFAULTS, so DEFAULTS has to carry every
+    key a reader is told they may set — `judge_max_diff_chars` was documented in
+    the README and in DEFAULTS' own comment while being absent from the block,
+    which would now warn about it and drop it."""
+    write_rules(repo, {"review_panel": {"max_diff_chars": 60_000,
+                                        "judge_max_diff_chars": 40_000},
+                       "reviewers": {"claude": {"max_diff_chars": 10_000}}})
+    cfg = hr.resolve_repo(str(repo))
+    assert capsys.readouterr().err == ""
+    assert cfg["review_panel"]["judge_max_diff_chars"] == 40_000
+    # Reviewer FIELDS are one level deeper than the sweep and are not validated:
+    # max_diff_chars is a real per-reviewer override with no DEFAULTS entry.
+    assert cfg["reviewers"]["claude"]["max_diff_chars"] == 10_000
+
+
 def test_defaults_carry_every_seat_the_panel_can_run(repo):
     """The rules files promise that an omitted key falls back to DEFAULTS. That
     is only true of seats DEFAULTS actually has — a repo enabling `antigravity`
-    with no base entry was relying on spelling out every field itself."""
-    assert set(hr.DEFAULTS["reviewers"]) == {
-        "claude", "codex", "antigravity", "pi", "sonarqube"}
+    with no base entry was relying on spelling out every field itself.
+
+    Compared against panel's OWN registry rather than a literal set, because the
+    drift this catches is exactly what the literal cannot see: DEFAULTS said
+    `gemini` long after panel had moved to `antigravity`, so the seat the panel
+    could run was warned about as unknown and the seat only DEFAULTS knew was
+    silently accepted. harness_rules must not import panel — a test is the only
+    place the two registries can be held against each other."""
+    import panel
+
+    assert set(hr.DEFAULTS["reviewers"]) == set(panel.ALL_REVIEWERS)
     write_rules(repo, {"reviewers": {"antigravity": {"model": "gemini-3.7-flash-high"}}})
     cfg = hr.resolve_repo(str(repo))
     assert cfg["reviewers"]["antigravity"]["enabled"] is False    # inherited
     assert cfg["reviewers"]["antigravity"]["model"] == "gemini-3.7-flash-high"
+
+
+# ------------------------------------------------- shared CLI-failure plumbing
+# The behavioural tests live HERE, where the functions live. panel re-exports
+# stderr_gist, and test_panel_reviewer_model.py asserts that re-export is the
+# same object — which is all a re-export owes anyone.
+
+TOO_OLD = (
+    'ERROR: {"type":"error","status":400,"error":{"type":"invalid_request_error",'
+    '"message":"The \'gpt-5.6-luna\' model requires a newer version of Codex. '
+    'Please upgrade to the latest app or CLI and try again."}}'
+)
+
+
+def test_stderr_gist_lifts_the_api_sentence_over_housekeeping():
+    """A codex older than its own models cache logs a decode error on EVERY run;
+    the naive stderr tail reported that and buried the real complaint."""
+    noisy = "\n".join([
+        "ERROR codex_models_manager::cache: failed to load models cache: unknown variant `max`",
+        TOO_OLD,
+        "ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket",
+    ])
+    assert hr.stderr_gist(noisy) == (
+        "The 'gpt-5.6-luna' model requires a newer version of Codex. "
+        "Please upgrade to the latest app or CLI and try again.")
+
+
+def test_stderr_gist_of_nothing_is_nothing():
+    assert hr.stderr_gist("") == "" and hr.stderr_gist("  \n \n") == ""
+
+
+def _proc(stdout="", stderr="", rc=0):
+    return subprocess.CompletedProcess(["cli"], rc, stdout=stdout, stderr=stderr)
+
+
+def test_cli_outcome_names_both_shapes_of_nothing():
+    """A zero exit with empty stdout is a failure, not an empty review: "found
+    nothing" and "produced nothing" are opposite claims a bare "" cannot tell
+    apart."""
+    assert hr.cli_outcome(_proc(stdout="[]")) == ""
+    assert hr.cli_outcome(_proc(stdout="[]", rc=3)) == "exited 3"
+    assert hr.cli_outcome(_proc(stdout="  \n\t")) == "exited 0 but produced no output"
+    assert hr.cli_outcome(_proc()) == "exited 0 but produced no output"
+
+
+def test_cli_failure_gist_reads_stderr_only_when_the_run_explains_nothing():
+    """The gate, in one place, because both drivers need it and two copies of it
+    had already drifted. A CLI that REPLIED at exit 0 and also logged warm-up
+    chatter has not failed at running — blaming "loaded 3 plugins" for a reply
+    that simply was not JSON is a confident wrong cause."""
+    answered = _proc(stdout="prose, not JSON", stderr="loaded 3 plugins")
+    assert hr.cli_failure_gist(answered, "no JSON in reply") == "no JSON in reply"
+    blank = _proc(stderr="error: everything is on fire")
+    assert hr.cli_failure_gist(blank, "no JSON in reply") == "error: everything is on fire"
+    # Nothing on stderr either: the shape of the failure still beats silence.
+    assert hr.cli_failure_gist(_proc(rc=2), "no JSON in reply") == "exited 2"
+    assert hr.cli_failure_gist(_proc()) == "exited 0 but produced no output"
 
 
 # ------------------------------------------------- the two-ref trust boundary

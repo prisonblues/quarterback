@@ -108,6 +108,11 @@ DEFAULTS: dict = {
         # `judge_max_diff_chars` (both inherit this when unset). A cut diff is
         # reported as truncation, naming WHICH reviewers were cut and at what.
         "max_diff_chars": None,
+        # Listed rather than left implicit because DEFAULTS is now also the set
+        # of names this block ACCEPTS (see warn_unknown_keys): a documented key
+        # missing from here would be warned about and dropped as a typo. `None`
+        # and absent mean the same thing to diff_budget — inherit max_diff_chars.
+        "judge_max_diff_chars": None,
     },
     "loops": {
         "dependabot_lander": False,
@@ -136,6 +141,18 @@ _DEEP_BLOCKS = ("reviewers", "review_panel", "loops", "epic")
 # whose name starts with "_" is prose for whoever reads the file next, not a
 # setting. JSON has no comments, and these files exist to be argued with.
 COMMENT_PREFIX = "_"
+
+# Names that MOVED rather than never existing. A rules file shared across the
+# fleet is far likelier to carry a seat's old name than a typo, and "no reviewer
+# of that name exists" is a puzzle where "renamed to 'antigravity'" is an answer.
+_RENAMED: dict[str, dict[str, str]] = {"reviewers": {"gemini": "antigravity"}}
+
+# One warning per (rules file, block, name) per process. resolve_repo is called
+# by panel.py, epic.py and lander.py — epic per run, and it also shells out to
+# panel.py, which resolves again in its own process — so an undeduped warning
+# prints several times per epic run and trains the reader to skip the one
+# message that is supposed to be loud. Rare is what keeps it loud.
+_warned: set[tuple[str, str, str]] = set()
 
 
 class RepoNotFound(Exception):
@@ -234,6 +251,13 @@ def strip_comments(obj: Any) -> Any:
     itself. Stripped once, here, rather than guarded at every read site, because
     the read sites are the part that keeps getting written by someone who has
     never seen this file.
+
+    The depth-unlimited rule carries one constraint on future config shapes: it
+    is right only while every key in this config is a FIXED name. A block that
+    ever maps user-supplied keys — env var names (`_PRIVATE_TOKEN`), per-path
+    settings, a header map — would have its data silently eaten here, because at
+    that point a leading underscore is data rather than prose. Such a block has
+    to opt out (strip its parent, not its contents) rather than inherit this.
     """
     if isinstance(obj, dict):
         return {k: strip_comments(v) for k, v in obj.items()
@@ -243,8 +267,8 @@ def strip_comments(obj: Any) -> Any:
     return obj
 
 
-def warn_unknown_reviewers(rules: dict, provenance: str) -> list[str]:
-    """Shout about a reviewer name nothing will ever read. Returns the names.
+def unknown_keys(rules: dict) -> dict[str, list[str]]:
+    """Names in a rules file that nothing will ever read, per deep block.
 
     The merge below is a blind dict update, so `reviewers.antigravty` is not an
     error — it just adds a block no reviewer looks at, and the panel quietly
@@ -253,20 +277,47 @@ def warn_unknown_reviewers(rules: dict, provenance: str) -> list[str]:
     hard-exits before a diff is even fetched), and it is worse committed to a
     file, where it survives every run until someone counts the reviewers.
 
-    Non-fatal on purpose. A rules file may legitimately name a seat that only a
-    NEWER harness knows about — shared across a fleet of boxes that upgrade at
+    Not reviewer-specific, which is why this sweeps every deep block: the same
+    silence hides `loops.issue_executer`, `epic.auto_finsh` and
+    `review_panel.judge_modl`, and for `loops.*` the default the real setting
+    falls back to is OFF — so a typo quietly disables an unattended loop. Every
+    deep block has a fully-known key set in DEFAULTS, so one sweep does all four.
+    The top level is deliberately NOT swept: `name` lives there and is not in
+    DEFAULTS.
+    """
+    out: dict[str, list[str]] = {}
+    for block in _DEEP_BLOCKS:
+        over, base = rules.get(block), DEFAULTS.get(block, {})
+        if not isinstance(over, dict) or not isinstance(base, dict):
+            continue
+        names = sorted(n for n in over if n not in base)
+        if names:
+            out[block] = names
+    return out
+
+
+def warn_unknown_keys(rules: dict, provenance: str) -> dict[str, list[str]]:
+    """Shout about them, once per name per process. Returns them by block, and
+    the caller DROPS them — the warning says 'ignored', so they have to be.
+
+    Non-fatal on purpose. A rules file may legitimately name a setting that only
+    a NEWER harness knows about — shared across a fleet of boxes that upgrade at
     different times — and hard-failing there would turn every rules file into a
     version pin on every machine that reads it.
     """
-    block = rules.get("reviewers")
-    if not isinstance(block, dict):
-        return []
-    unknown = sorted(n for n in block if n not in DEFAULTS["reviewers"])
-    if unknown:
-        print(f"{RULES_FILENAME} ({provenance}): unknown reviewer "
-              f"{', '.join(repr(u) for u in unknown)} — ignored; no reviewer of "
-              f"that name exists. Known: {', '.join(sorted(DEFAULTS['reviewers']))}",
-              file=sys.stderr)
+    unknown = unknown_keys(rules)
+    for block, names in unknown.items():
+        fresh = [n for n in names if (provenance, block, n) not in _warned]
+        _warned.update((provenance, block, n) for n in names)
+        if not fresh:
+            continue
+        renamed = _RENAMED.get(block, {})
+        named = ", ".join(f"{n!r} (renamed to {renamed[n]!r})" if n in renamed
+                          else repr(n) for n in fresh)
+        noun = "reviewer" if block == "reviewers" else f"`{block}` setting"
+        print(f"{RULES_FILENAME} ({provenance}): unknown {noun} {named} — "
+              f"ignored; nothing reads that name. "
+              f"Known: {', '.join(sorted(DEFAULTS[block]))}", file=sys.stderr)
     return unknown
 
 
@@ -285,7 +336,11 @@ def resolve_repo(spec: str | None, *, from_default_branch: bool | None = None) -
     default_branch = detect_default_branch(root)
     rules, provenance = _read_rules(root, default_branch, from_default_branch)
     rules = strip_comments(rules)
-    warn_unknown_reviewers(rules, provenance)
+    # Warned about AND removed. A name only warned about survives the merge into
+    # cfg["reviewers"], which makes the word "ignored" false and leaves every
+    # caller iterating the resolved mapping looking at a phantom seat.
+    for block, names in warn_unknown_keys(rules, provenance).items():
+        rules[block] = {k: v for k, v in rules[block].items() if k not in names}
 
     cfg = {**DEFAULTS, **rules}
     for block in _DEEP_BLOCKS:
@@ -351,6 +406,46 @@ def stderr_gist(stderr: str, limit: int = 200) -> str:
     pick = (errors or signal)[-1]
     msg = re.search(r'"message"\s*:\s*"((?:[^"\\]|\\.){4,400})"', pick)
     return (msg.group(1) if msg else pick)[:limit]
+
+
+def cli_outcome(proc: subprocess.CompletedProcess) -> str:
+    """The shape of this run's failure, or an empty string if it produced
+    something usable.
+
+    The one definition of "this CLI came back with nothing": a non-zero exit, OR
+    a zero exit with empty/whitespace-only stdout. The second half is the whole
+    point — headless CLIs exit 0 while producing nothing, and "reviewed, found
+    nothing" and "produced nothing" are opposite claims that a bare `""` cannot
+    tell apart.
+
+    It doubles as the gate on reading stderr, which is why both live here rather
+    than being re-derived per driver: stderr is worth reading exactly when the
+    run has nothing of its own to explain itself with. A CLI that delivered its
+    answer AND logged warm-up chatter succeeded, and reporting that chatter is
+    the mirror of the bug.
+    """
+    if proc.returncode:
+        return f"exited {proc.returncode}"
+    if not (proc.stdout or "").strip():
+        return "exited 0 but produced no output"
+    return ""
+
+
+def cli_failure_gist(proc: subprocess.CompletedProcess, about_the_reply: str = "",
+                     limit: int = 200) -> str:
+    """Why a headless CLI run is unusable, in one clause.
+
+    The gate is the whole point, and porting this without it is how you get a
+    confident wrong cause. A CLI that REPLIED, at exit 0, and also logged warm-up
+    chatter has not failed at running; blaming "loaded 3 plugins" for a reply
+    that simply was not JSON puts a fabricated cause on the only line an operator
+    gets for a silently skipped step. In that case the reply itself is the story,
+    so `about_the_reply` is used instead.
+    """
+    outcome = cli_outcome(proc)
+    if not outcome:
+        return about_the_reply
+    return stderr_gist(proc.stderr or "", limit=limit) or outcome
 
 
 def read_dotenv(root: Path | str) -> dict[str, str]:

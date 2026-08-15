@@ -45,12 +45,17 @@ because it had something to say. It is flagged `unstructured`, which the coverag
 "returned no structured reply — its coverage is unknown", so such a round cannot be read as
 evidence of a quiet PR.
 
-Also here, from working on the above: this repo gets its own `.harness-rules` (all four vendors
-pinned and verified by running them), `_`-prefixed keys are stripped as comments at every depth
-before anything reads the config, and a reviewer name nothing recognises is warned about on stderr
-rather than silently producing a panel one vendor short. `harness_rules.DEFAULTS` also learns the
-`antigravity` seat's real name — it still said `gemini`, which `panel.py` has not answered to since
-the seat moved to Google's Antigravity CLI.
+Also here, from working on the above: this repo gets its own `.harness-rules`, with the three seats
+whose slugs are versioned build names pinned and verified by running them, and Claude left on the
+floating `opus` alias precisely because an alias cannot rot — the distinction is the decision, not a
+detail. `_`-prefixed keys are stripped as comments at every depth before anything reads the config,
+and a name nothing recognises — a reviewer, or a setting in any of the four deep blocks — is warned
+about on stderr and dropped, rather than silently producing a panel one vendor short or a loop
+switched off by a typo. A reviewer whose CLI this box does not carry no longer vetoes a confident
+stop either: it is absent every round, so it says nothing about the round.
+`harness_rules.DEFAULTS` also learns the `antigravity` seat's real name — it still said `gemini`,
+which `panel.py` has not answered to since the seat moved to Google's Antigravity CLI, and the
+warning names the rename rather than leaving a fleet rules file to infer it.
 
 No board change: the API and the served version stay at v2.15.
 

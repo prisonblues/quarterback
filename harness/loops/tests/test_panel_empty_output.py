@@ -17,6 +17,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
 
@@ -114,9 +116,10 @@ def test_an_auto_denied_permission_is_not_retried(monkeypatch):
 
     Retrying is not free here. A blank run does NOT fail fast the way a non-zero
     exit does — the observed one burned its whole model call — so three of them
-    is up to 3x600s held against the joined futures of the entire panel, 3x the
-    duration_ms the board's leaderboard ranks this member on, and on the metered
-    `pi` seat, three bills for one answer nobody can use."""
+    is up to three whole `panel.CLI_TIMEOUT`s held against the joined futures of
+    the entire panel, 3x the duration_ms the board's leaderboard ranks this
+    member on, and on the metered `pi` seat, three bills for one answer nobody
+    can use. (Named rather than restated: the number has drifted once already.)"""
     calls = _fake_cli(monkeypatch, ("", DENIED, 0), (FINDINGS, "", 0))
     out, err = panel.run_cli(["agy"], "antigravity (m)", attempts=3)
     assert len(calls) == 1
@@ -151,6 +154,107 @@ def test_a_non_zero_exit_with_no_settled_cause_is_still_retried(monkeypatch):
     calls = _fake_cli(monkeypatch, ("", "429 rate limited\n", 1), (FINDINGS, "", 0))
     out, err = panel.run_cli(["agy"], "antigravity (m)", attempts=3)
     assert len(calls) == 2 and out == FINDINGS and err is None
+
+
+# A rate limit, on a run whose stderr ALSO mentions permissions somewhere — the
+# normal state of a chatty CLI, and the shape a loose predicate turns into a
+# lost vendor. Each of these used to match is_permission_denied outright.
+UNRELATED = [
+    # A real filesystem error, and a transient one as often as not.
+    "EACCES: permission denied, open '/tmp/agy-cache/models.json'\n429 rate limited",
+    # The CLI echoing its own config at startup.
+    'settings: {"permissions.allow": ["Bash(ls:*)"]}\nerror: 429 rate limited',
+    # One optional tool auto-denied, on a run that then dies of something else.
+    "tool WebFetch was auto-denied by policy\nerror: 429 rate limited",
+]
+
+
+@pytest.mark.parametrize("stderr", UNRELATED)
+def test_an_unrelated_permission_error_stays_retryable(monkeypatch, stderr):
+    """The predicate has to prove another attempt is futile, and none of these
+    do. Matching on `permission` and `denied` anywhere in the stream — or a bare
+    `permissions.allow` — claimed all three, and because the short-circuit now
+    also applies to non-zero exits, a reviewer failing on a 429 whose stderr
+    merely MENTIONS a permission lost every remaining attempt: three before that
+    change, one after. That is a whole vendor dropped from the round for a log
+    line."""
+    assert not panel.is_permission_denied(stderr)
+    assert not panel.is_deterministic_failure(stderr)
+    calls = _fake_cli(monkeypatch, ("", stderr, 1), (FINDINGS, "", 0))
+    out, _err = panel.run_cli(["agy"], "antigravity (m)", attempts=3)
+    assert len(calls) == 2 and out == FINDINGS
+
+
+def test_the_denial_must_be_about_a_permission_on_the_same_line():
+    """What the predicate does claim: the observed shape, and the sentence
+    variants of it. A permission word and a headless-denial word, together."""
+    assert panel.is_permission_denied(DENIED)
+    assert panel.is_permission_denied(
+        'a tool required the "write" permission and was auto-denied')
+    assert panel.is_permission_denied(
+        "warming up\nthe run needed a permission headless mode cannot prompt for\ndone")
+    # Both words present, but on different lines and about different things.
+    assert not panel.is_permission_denied(
+        "checking permissions.allow\nunrelated: the socket was auto-denied by the proxy")
+
+
+# ------------------------------------------- a blank reply that was not cheap
+
+class _Clock:
+    """A monotonic clock the fake CLI advances, so an attempt can "take" time
+    without the test taking any."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+
+def _slow_cli(monkeypatch, seconds, *runs):
+    clock = _Clock()
+    monkeypatch.setattr(panel, "time", clock)
+    calls = _fake_cli(monkeypatch, *runs)
+
+    real_run = subprocess.run
+
+    def timed_run(cmd, **kwargs):
+        clock.now += seconds
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", timed_run)
+    return calls
+
+
+def test_a_slow_blank_reply_is_not_retried(monkeypatch):
+    """The retry is for a blank that came back FAST — one that plausibly never
+    reached a model, which is the flake it exists to recover. A blank that spent
+    real time thinking and still said nothing will spend it again, and three of
+    those is the cost the timeout branch already refuses to pay ("it already
+    burned the whole budget"). The elapsed time is the only thing that tells the
+    two apart, and it was not being looked at."""
+    calls = _slow_cli(monkeypatch, panel.BLANK_RETRY_MAX_S + 1,
+                      ("", FLAKE, 0), (FINDINGS, "", 0))
+    out, err = panel.run_cli(["agy"], "antigravity (m)", attempts=3)
+    assert len(calls) == 1 and out is None
+    assert "produced no output" in err and "not retried" in err
+
+
+def test_a_fast_blank_reply_is_still_retried(monkeypatch):
+    """The other side: the flake recovery is the point, and it survives."""
+    calls = _slow_cli(monkeypatch, 1, ("", FLAKE, 0), (FINDINGS, "", 0))
+    out, err = panel.run_cli(["agy"], "antigravity (m)", attempts=3)
+    assert len(calls) == 2 and out == FINDINGS and err is None
+
+
+def test_a_slow_NON_zero_exit_is_still_retried(monkeypatch):
+    """The cap is about blank replies only. A non-zero exit fails fast by
+    definition — whatever the clock says, the CLI decided, so the rate limit
+    that ate one attempt is not a reason to skip the other two."""
+    calls = _slow_cli(monkeypatch, panel.BLANK_RETRY_MAX_S + 1,
+                      ("", "429 rate limited\n", 1), (FINDINGS, "", 0))
+    out, _err = panel.run_cli(["agy"], "antigravity (m)", attempts=3)
+    assert len(calls) == 2 and out == FINDINGS
 
 
 def test_the_two_settled_causes_stay_distinguishable():
@@ -188,6 +292,21 @@ def test_an_empty_reply_never_becomes_an_unstructured_finding(monkeypatch):
     got = panel.review_llm("antigravity", "m", "p")
     assert got.findings == [] and got.skip is not None
     assert got.unstructured is False
+
+
+def test_review_llm_keeps_its_own_guard_against_a_blank_raw_finding(monkeypatch):
+    """The LOCAL half of the guard, tested against a run_cli that breaks the
+    invariant. Today it cannot: run_cli refuses to return whitespace-only stdout.
+    But that invariant lives ~350 lines away in a docstring, and the day it is
+    relaxed — a new caller, a check_output=False variant, a mocked run_cli in
+    some future test — this is all that stands between the judge and an empty
+    finding flagged `unstructured`: a dead reviewer wearing a live one's
+    clothes, which is the failure this whole file exists to kill."""
+    monkeypatch.setattr(panel.shutil, "which", lambda _: "/usr/bin/agy")
+    monkeypatch.setattr(panel, "run_cli", lambda *a, **k: ("   \n", None))
+    got = panel.review_llm("antigravity", "m", "p")
+    assert got.findings == [] and got.unstructured is False
+    assert "produced no output" in got.skip
 
 
 def test_prose_is_still_kept_as_a_raw_finding(monkeypatch):

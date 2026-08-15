@@ -95,9 +95,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 import harness_rules  # noqa: E402
-# stderr_gist lives with the shared plumbing, and is re-exported here because it
-# reads as part of run_cli's contract at every call site in this file.
-from harness_rules import RepoNotFound, describe, resolve_repo, stderr_gist  # noqa: E402
+# stderr_gist and cli_outcome live with the shared plumbing — how headless CLIs
+# fail is not a panel question — and are re-exported here because they read as
+# part of run_cli's contract at every call site in this file.
+from harness_rules import (RepoNotFound, cli_outcome, describe,  # noqa: E402
+                           resolve_repo, stderr_gist)
 
 # Chars of diff handed to a model, when nothing in .harness-rules says otherwise:
 # NONE OF THEM. The whole diff goes to every reviewer unless a repo asks for a
@@ -141,6 +143,21 @@ DEFAULT_MAX_ROUNDS = 2
 # `--print-timeout` (default 5m0s), so the seat that does not read this number
 # silently reviews on a five-minute clock while the report claims thirty.
 CLI_TIMEOUT = 1800
+
+# How long a blank reply may take and still be worth retrying. A zero exit with
+# no output is retried because it is often a flake — but a blank run does NOT
+# fail fast the way a non-zero exit does, so three of them is up to three whole
+# CLI_TIMEOUTs held against the joined futures of the entire panel, which is the
+# exact cost the timeout branch already refuses to pay ("it already burned the
+# whole budget"). A blank that comes back inside a minute plausibly never
+# reached a model at all, which is the flake the retry exists for; one that
+# spent real time thinking and still said nothing will spend it again.
+BLANK_RETRY_MAX_S = 60
+
+# The one skip reason that says nothing about the round: this box does not carry
+# that CLI. Written once because two places have to agree on it — review_llm
+# ends its skip line with it, coverage_veto declines to veto on it.
+CLI_ABSENT = "CLI absent"
 
 # Linux caps ONE argv string at MAX_ARG_STRLEN = 131,072 bytes, independently of
 # the much larger total ARG_MAX; cross it and execve fails with E2BIG before the
@@ -647,12 +664,23 @@ def is_permission_denied(stderr: str) -> bool:
     The observed shape, from `agy` 1.1.12: exit 0, empty stdout, and 'a tool
     required the "command" permission that headless mode cannot prompt for, so
     it was auto-denied' on stderr.
+
+    Matched as a CO-OCCURRENCE ON ONE LINE — a permission word next to a
+    headless-denial word — rather than either token anywhere in the stream, and
+    that narrowness is the point. This predicate now suppresses retries on
+    non-zero exits too, so every over-match costs a reviewer its remaining
+    attempts and the panel a whole vendor for the round. The shapes it must NOT
+    claim: an `EACCES: permission denied` on a temp file (a real error, and a
+    transient one as often as not), a CLI echoing its own `permissions.allow`
+    config at startup, and a log line about one optional tool being auto-denied
+    on a run that then fails for a rate limit — all of which used to match, and
+    turned three attempts into one.
     """
-    low = stderr.lower()
-    return ("auto-denied" in low
-            or "permissions.allow" in low
-            or "cannot prompt for" in low
-            or ("permission" in low and "denied" in low))
+    denial = ("auto-denied", "auto denied", "cannot prompt for")
+    for line in stderr.lower().splitlines():
+        if "permission" in line and any(d in line for d in denial):
+            return True
+    return False
 
 
 def is_deterministic_failure(stderr: str) -> bool:
@@ -709,17 +737,19 @@ def run_cli(args: list[str], label: str, timeout: int = CLI_TIMEOUT,
     on stderr succeeded, and reporting its warm-up noise would be the opposite
     error. A blank reply IS retried when nothing says it would come back blank —
     losing a whole reviewer to one flake costs the panel more than two extra
-    attempts. It is NOT retried when stderr names a settled cause
-    (is_deterministic_failure: a refused request, or a tool the CLI auto-denied),
-    because a missing permission rule is every bit as fixed as a bad model pin,
-    and blank runs do not fail fast the way non-zero exits do — the observed one
-    burned its full model call each time. Three of those is up to three whole
-    CLI_TIMEOUTs (half an hour each) held against the joined futures of the whole
+    attempts. Two things stop that retry: stderr naming a settled cause
+    (is_deterministic_failure — a refused request, or a tool the CLI auto-denied;
+    a missing permission rule is every bit as fixed as a bad model pin), and the
+    attempt having taken longer than BLANK_RETRY_MAX_S. The second is what keeps
+    the flake recovery from inheriting the cost the timeout branch refuses:
+    blank runs do not fail fast the way non-zero exits do, so three SLOW ones is
+    up to three whole CLI_TIMEOUTs held against the joined futures of the whole
     panel, 3x the duration_ms the board's leaderboard is scored on, and on the
     metered `pi` seat, three bills."""
     last = f"{label}: no attempt made"
     feed = {"input": stdin_text} if stdin_text is not None else {"stdin": subprocess.DEVNULL}
     for _ in range(max(1, attempts)):
+        started = time.monotonic()
         try:
             proc = subprocess.run(args, capture_output=True, text=True,
                                   timeout=timeout, **feed)
@@ -732,19 +762,19 @@ def run_cli(args: list[str], label: str, timeout: int = CLI_TIMEOUT,
             why = " ".join(str(x) for x in (e.errno, e.strerror or e) if x)
             last = f"{label}: OSError {why}"[:300]
             continue
-        if proc.returncode != 0:
-            msg = stderr_gist(proc.stderr or "")
-            last = f"{label}: exited {proc.returncode}" + (f" ({msg})" if msg else "")
-            if is_deterministic_failure(proc.stderr or ""):
-                return None, last
-            continue
-        if not (proc.stdout or "").strip():
-            msg = stderr_gist(proc.stderr or "")
-            last = f"{label}: exited 0 but produced no output" + (f" ({msg})" if msg else "")
-            if is_deterministic_failure(proc.stderr or ""):
-                return None, last
-            continue
-        return proc.stdout, None
+        # One branch for both failure shapes on purpose: they differ only in the
+        # sentence, and split they were two copies of the same short-circuit for
+        # the next failure class to have to be added to twice.
+        outcome = cli_outcome(proc)
+        if not outcome:
+            return proc.stdout, None
+        took = time.monotonic() - started
+        msg = stderr_gist(proc.stderr or "")
+        last = f"{label}: {outcome}" + (f" ({msg})" if msg else "")
+        if is_deterministic_failure(proc.stderr or ""):
+            return None, last
+        if not proc.returncode and took >= BLANK_RETRY_MAX_S:
+            return None, f"{last} after {int(took)}s — not retried"
     return None, last
 
 
@@ -1012,7 +1042,7 @@ def review_llm(cmd_name: str, model: str, prompt: str,
         return ReviewerRun(skip=f"{label}: unknown reasoning effort {effort!r} — {expected}",
                            duration_ms=elapsed())
     if not shutil.which(CLI_BIN.get(cmd_name, cmd_name)):
-        return ReviewerRun(skip=f"{label}: CLI absent", duration_ms=elapsed())
+        return ReviewerRun(skip=f"{label}: {CLI_ABSENT}", duration_ms=elapsed())
     # The prompt goes on stdin wherever the CLI will take it there — which is
     # everywhere but `agy`. That is not a style choice: a diff big enough to be
     # worth a panel is big enough to exceed the kernel's per-argument limit, and
@@ -1036,16 +1066,25 @@ def review_llm(cmd_name: str, model: str, prompt: str,
         # Unparseable JSON — give the reviewer one more shot (a common flake is a
         # stray prose preamble the model omits on a retry), then, rather than drop
         # its work, keep the raw reply as a single markdown finding for the judge.
-        # There is no empty-output case to guard here: run_cli only returns stdout
-        # with non-whitespace content, so "produced nothing" has already come back
-        # as a skip reason naming the cause, rather than as a blank raw finding.
         out2, err2 = run_cli(args, label, attempts=1, stdin_text=stdin_text)
         if not err2 and out2:
             retried = parse_reply(cmd_name, out2)
             if retried is not None:
                 return ReviewerRun(retried[0], None, elapsed(), retried[1])
             out = out2
-        return ReviewerRun([_raw_finding(cmd_name, (out or "").strip())], None, elapsed(),
+        text = (out or "").strip()
+        # Unreachable today — run_cli refuses to return whitespace-only stdout —
+        # and kept anyway, because it is the LOCAL half of the guard. The
+        # invariant that makes it dead lives ~350 lines away in a docstring, and
+        # the day it is relaxed (a new caller, a check_output=False variant, a
+        # mocked run_cli in a future test) this line is all that stands between
+        # the judge and a blank finding flagged `unstructured` — a dead reviewer
+        # wearing a live one's clothes, which is the failure this file exists to
+        # kill. Two lines is a cheap place to keep it.
+        if not text:
+            return ReviewerRun(skip=f"{label}: produced no output",
+                               duration_ms=elapsed())
+        return ReviewerRun([_raw_finding(cmd_name, text)], None, elapsed(),
                            unstructured=True)
     return ReviewerRun(parsed[0], None, elapsed(), parsed[1])
 
@@ -2251,11 +2290,29 @@ def coverage_veto(reviewer_meta: dict[str, dict], judge_skip: str | None,
     distinguish them, and they exist to stop a failure being read as convergence.
     They do NOT drive the loop: a truncated reviewer is truncated again next round
     at the same budget, so treating that as a reason to go again is a loop with no
-    exit. It is a reason to stop CLAIMING the PR is clean."""
+    exit. It is a reason to stop CLAIMING the PR is clean.
+
+    The one absence that is not an observation about the round is a reviewer
+    whose CLI this box does not carry — see below."""
     out = []
     for name, meta in sorted(reviewer_meta.items()):
         if not meta.get("ran"):
-            out.append(f"{name} did not run ({meta.get('skip') or 'no reason recorded'})")
+            skip = str(meta.get("skip") or "")
+            # A seat whose CLI is not INSTALLED on this box is a fact about the
+            # host, not about the round: it is absent every round, so vetoing on
+            # it makes `confident` permanently unreachable on the headless
+            # machines — which is where the unattended loops run and where the
+            # signal has to mean something. A repo that lists a workstation-only
+            # vendor would otherwise buy every one of its unattended runs a
+            # standing veto and train the reader to discount all of them. The
+            # skip is still REPORTED (result.skipped carries it, and the header
+            # names who ran); what it is not is evidence a quiet round hid
+            # something. Every other way of not running — a crash, a timeout, a
+            # bad model pin, a CLI that produced nothing — is about THIS run and
+            # still vetoes.
+            if skip.endswith(CLI_ABSENT):
+                continue
+            out.append(f"{name} did not run ({skip or 'no reason recorded'})")
             continue
         if meta.get("truncated"):
             budget = meta.get("max_diff_chars") or 0

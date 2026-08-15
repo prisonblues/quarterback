@@ -598,7 +598,7 @@ def test_a_baseline_that_could_not_be_read_also_costs_the_verdict_its_confidence
 def test_the_veto_names_every_way_a_round_can_look_quiet_without_being_quiet():
     meta = {
         "claude": {"ran": True, "truncated": True, "max_diff_chars": 60_000},
-        "codex": {"ran": False, "skip": "codex (gpt): CLI absent"},
+        "codex": {"ran": False, "skip": "codex (gpt): exited 1 (429 rate limited)"},
         "pi": {"ran": True, "could_not_assess": ["the amendment path"]},
         "antigravity": {"ran": True, "unstructured": True},
     }
@@ -611,6 +611,25 @@ def test_the_veto_names_every_way_a_round_can_look_quiet_without_being_quiet():
     assert "antigravity returned no structured reply" in joined
     assert "not adjudicated" in joined
     assert "2 finding(s) whose reporter said the FIX needs re-reading" in joined
+
+
+def test_a_seat_this_box_does_not_carry_is_reported_without_vetoing():
+    """A reviewer whose CLI is not installed is a fact about the HOST, not about
+    the round: it is absent every round, so a veto on it makes `confident`
+    permanently unreachable on the headless machines — which is exactly where
+    the unattended loops run and where the signal has to mean something. A repo
+    that lists a workstation-only vendor (this one lists two) would otherwise
+    buy every unattended run a standing veto and teach the reader to discount
+    all of them. The skip is still reported; it is just not evidence."""
+    absent = {"antigravity": {"ran": False, "skip": "antigravity (m): CLI absent"},
+              "pi": {"ran": False, "skip": "pi (kimi): CLI absent"},
+              "claude": {"ran": True}}
+    assert panel.coverage_veto(absent, None, 0, 1_000) == []
+    assert panel.round_stop(1, 2, [], [], [])["confident"] is True
+    # Every other way of not running still says something about this round.
+    crashed = {"antigravity": {"ran": False, "skip": "antigravity (m): exited 1 (boom)"}}
+    assert panel.coverage_veto(crashed, None, 0, 1_000) == [
+        "antigravity did not run (antigravity (m): exited 1 (boom))"]
 
 
 def test_a_panel_with_nothing_to_declare_vetoes_nothing():

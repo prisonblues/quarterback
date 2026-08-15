@@ -51,17 +51,17 @@ def test_typo_effort_is_refused_without_spending_a_run(monkeypatch):
     assert "xhigh" in got.skip                      # the valid set is stated, not implied
 
 
-def test_stderr_gist_lifts_the_api_sentence_over_housekeeping():
-    """A codex older than its own models cache logs a decode error on EVERY run;
-    the naive stderr tail reported that and buried the real complaint."""
-    noisy = "\n".join([
-        "ERROR codex_models_manager::cache: failed to load models cache: unknown variant `max`",
-        TOO_OLD,
-        "ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket",
-    ])
-    assert panel.stderr_gist(noisy) == (
-        "The 'gpt-5.6-luna' model requires a newer version of Codex. "
-        "Please upgrade to the latest app or CLI and try again.")
+def test_panel_re_exports_the_shared_cli_failure_plumbing():
+    """`stderr_gist` and `cli_outcome` live in harness_rules — how headless CLIs
+    fail is not a panel question — and are re-exported here because they read as
+    part of run_cli's contract. All a re-export owes anyone is being the same
+    object; the behaviour is tested where the function lives
+    (test_harness_rules.py), so deleting that copy and growing a private one back
+    fails there rather than passing here for the wrong reason."""
+    import harness_rules
+
+    assert panel.stderr_gist is harness_rules.stderr_gist
+    assert panel.cli_outcome is harness_rules.cli_outcome
 
 
 def test_hint_blames_the_pin_not_the_login():

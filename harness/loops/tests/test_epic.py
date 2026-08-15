@@ -8,6 +8,8 @@ integration-only and exercised by a live run, not here.
 from __future__ import annotations
 
 import json
+import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -228,12 +230,21 @@ def test_epic_keeps_panel_at_arms_length():
     two programs, and epic must not depend on the project. Importing panel for
     one generic helper made all of panel's imports load-bearing for the driver
     at module scope. Shared CLI-failure plumbing belongs in harness_rules, which
-    both already import."""
+    both already import.
+
+    Both import spellings are checked, and the substring test that used to stand
+    here caught only one of them: `from panel import stderr_gist` does not
+    contain "import panel", so the exact regression this test describes would
+    have passed it. The attribute check is the one that cannot be spelled
+    around — however the import is written, `panel` would be bound on the
+    module."""
     import harness_rules
 
-    assert epic.stderr_gist is harness_rules.stderr_gist
+    assert epic.cli_failure_gist is harness_rules.cli_failure_gist
+    assert not hasattr(epic, "panel")
     src = Path(epic.__file__).read_text()
-    assert "import panel" not in src
+    assert not re.search(r"^\s*(?:import\s+panel\b|from\s+panel\s+import\b)", src, re.M)
+    assert "import_module(\"panel\")" not in src and "import_module('panel')" not in src
 
 
 # --------------------------------------------------------------- triage verdicts
@@ -298,6 +309,50 @@ def test_triage_bad_verdict_on_a_crash_still_quotes_stderr(monkeypatch):
              stderr="error: the model pin is unusable", rc=1)
     _doable, reason, _impl = epic.triage(mk(1), "opus")
     assert "the model pin is unusable" in reason
+
+
+def test_triage_refuses_a_verdict_from_a_judge_that_exited_non_zero(monkeypatch):
+    """The exit code is checked BEFORE the reply is parsed. A CLI that prints a
+    well-formed verdict on its way out and then fails did not rule — accepting
+    that JSON would send a sub-issue to an executor on the word of a run that
+    crashed, and swallow the stderr saying so. `cli_failure_gist` already applies
+    this rule on the failure paths; the success path never saw it."""
+    monkeypatch.setattr(epic.shutil, "which", lambda _: "/usr/bin/claude")
+    _fake_gh(monkeypatch, stdout=json.dumps(
+        {"doable": True, "reason": "looks fine", "model": "sonnet"}),
+        stderr="error: the model pin is unusable", rc=1)
+    doable, reason, impl = epic.triage(mk(1), "opus")
+    assert doable is None and impl == ""
+    assert "judge failed" in reason and "the model pin is unusable" in reason
+    assert "looks fine" not in reason
+
+
+def test_triage_names_the_timeout_rather_than_a_bare_judge_error(monkeypatch):
+    """A judge that never returned is the same silent --execute skip as one that
+    replied badly, so it gets the same courtesy: the cause, not "judge error"."""
+    monkeypatch.setattr(epic.shutil, "which", lambda _: "/usr/bin/claude")
+
+    def boom(*_a, **_k):
+        raise subprocess.TimeoutExpired(cmd="claude", timeout=epic.TRIAGE_TIMEOUT)
+
+    monkeypatch.setattr(subprocess, "run", boom)
+    doable, reason, impl = epic.triage(mk(1), "opus")
+    assert doable is None and impl == ""
+    assert f"timed out after {epic.TRIAGE_TIMEOUT}s" in reason
+
+
+def test_triage_names_why_the_judge_could_not_be_launched(monkeypatch):
+    """errno and strerror, not the bare class name: "OSError" sends the reader
+    looking for a crash that was "Argument list too long"."""
+    monkeypatch.setattr(epic.shutil, "which", lambda _: "/usr/bin/claude")
+
+    def boom(*_a, **_k):
+        raise OSError(7, "Argument list too long")
+
+    monkeypatch.setattr(subprocess, "run", boom)
+    doable, reason, impl = epic.triage(mk(1), "opus")
+    assert doable is None and impl == ""
+    assert "could not start" in reason and "Argument list too long" in reason
 
 
 def test_triage_reads_a_real_verdict_unchanged(monkeypatch):
