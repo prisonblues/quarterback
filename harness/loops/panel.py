@@ -17,9 +17,21 @@ Reviewers whose prerequisites are missing (codex CLI absent, SONAR* env unset)
 are reported as SKIPPED, not failed — the panel still produces a report.
 
 LLM replies are parsed leniently: a balanced-bracket scan (not a greedy regex)
-pulls the JSON array out of ``` fences or surrounding prose; an unparseable reply
-is retried once, then kept as a single markdown finding rather than dropped — so
-malformed JSON degrades into one ungrouped finding, never a crash or a silent loss.
+pulls the JSON out of ``` fences or surrounding prose, as either the object
+envelope reviewers now return or the bare findings array they used to; an
+unparseable reply is retried once, then kept as a single markdown finding rather
+than dropped — so malformed JSON degrades into one ungrouped finding, never a
+crash or a silent loss.
+
+Reviewers also DECLARE their own coverage — what they could not assess, and which
+of their findings need the fix re-read — and the panel measures what they cannot
+observe (whether the diff they got was truncated). Those are observations, not
+forecasts: asking a model "will another round be needed?" asks it to predict its
+own future findings, and a reviewer that silently produced nothing would answer
+"no" with complete confidence. Rounds are driven mechanically instead — --round
+and --baseline say which findings no earlier round raised, and that plus severity
+decides whether to go again; the declarations only stop a broken round being read
+as a clean one.
 
 Default prints a report. Pass --post to also comment the summary on the PR, or
 --json to emit findings as JSON (consumed by the /panel skill's fix loop);
@@ -41,12 +53,15 @@ Usage:
     python3 ~/.claude/loops/panel.py --pr 734 --reviewers codex
     python3 ~/.claude/loops/panel.py --pr 734 --reviewers claude,codex,antigravity
     python3 ~/.claude/loops/panel.py --pr 734 --post --json-file /tmp/panel.json
+    python3 ~/.claude/loops/panel.py --pr 734 --post --round 2 \
+        --baseline /tmp/panel-r1.json --json-file /tmp/panel-r2.json
 """
 
 from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import re
@@ -74,6 +89,14 @@ from harness_rules import RepoNotFound, describe, resolve_repo  # noqa: E402
 # reads a prefix of the diff and reports confidently on the part it saw.
 MAX_DIFF_CHARS = 60_000
 RAW_DETAIL_CHARS = 4_000  # cap an unparsed reviewer reply kept as a fallback finding
+
+# Panel -> fix -> panel. Two is the default because one is provably not enough:
+# the fixer's own commit is otherwise read by nobody, and structural fixes beget
+# new interactions that no earlier round could have seen because they did not
+# exist until the fix was written. It is a cap on the CALLER's loop, used here
+# only to decide whether a round that still has work left stopped because it was
+# done or because it ran out of rounds.
+DEFAULT_MAX_ROUNDS = 2
 
 # The panel's possible members. LLM reviewers are interchangeable in everything
 # except how their CLI is invoked; sonarqube is a different shape (an API, and a
@@ -109,9 +132,23 @@ Severity: P1 blocks merge (correctness/security) · P2 important (error handling
 logic flaws) · P3 should fix (style, naming, simplifications) · P4 polish (minor consistency).
 Report all of them.
 
-Return ONLY a JSON array (no prose), each item:
-  {{"severity": "P1|P2|P3|P4", "file": "path", "line": <int|null>, "title": "...", "detail": "..."}}
-Empty array only if the diff is genuinely flawless.
+Return ONLY a JSON object (no prose):
+  {{"findings": [{{"severity": "P1|P2|P3|P4", "file": "path", "line": <int|null>,
+                  "title": "...", "detail": "...", "needs_rereview": true|false}}],
+    "could_not_assess": ["..."]}}
+An empty `findings` array only if the diff is genuinely flawless.
+
+The last two keys are OBSERVATIONS about your own pass, not predictions. Do NOT forecast
+whether another review will be needed — you cannot observe findings you have not made.
+
+- `could_not_assess`: things in scope you could not judge from what you were given — a file
+  the diff does not include, a runtime behaviour, a schema you cannot see, a caller you
+  cannot check. One short phrase each; `[]` if you could genuinely assess everything.
+  "I found nothing" and "I could not tell" are different answers and only you know which
+  this was.
+- `needs_rereview` (per finding): true when fixing it takes a STRUCTURAL change whose
+  RESULT should be read again — the fix can create new interactions the current diff does
+  not contain. False for a local edit whose correctness is evident from the fix itself.
 
 PR #{n} ({repo}), base={base}:
 --- DIFF ---
@@ -132,11 +169,21 @@ is exactly what a diverse reviewer is there to catch).
 Mark real=false ONLY when the finding is a genuine FALSE POSITIVE — you re-examined and the code is
 actually correct, or the suggestion would make it worse. When unsure, mark it real.
 
-Return ONLY a JSON array (no prose):
-  [{{"id": <int>, "real": true|false, "severity": "P1|P2|P3|P4", "reason": "..."}}]
+Return ONLY a JSON object (no prose):
+  {{"verdicts": [{{"id": <int>, "real": true|false, "severity": "P1|P2|P3|P4", "reason": "..."}}],
+    "coverage_note": "..."}}
+
+`coverage_note` adjudicates the reviewers' own coverage declarations below — one sentence, or ""
+when there is nothing to say. Where they DISAGREE (one reports clean, another says it could not
+assess an area), that split is more informative than either verdict alone: say which reading you
+believe and what is therefore still unread. Do not average it away, and do not turn it into a
+prediction about further rounds.
 
 Findings:
 {findings}
+
+Coverage declared by the reviewers:
+{coverage}
 --- DIFF ---
 {diff}
 """
@@ -150,6 +197,36 @@ class Finding:
     line: int | None
     title: str
     detail: str = ""
+    #: The reporter's own declaration that fixing this needs a structural change
+    #: whose RESULT should be read again — not a forecast, an observation about
+    #: the shape of the fix. It is what predicts the round-3 class of defect: one
+    #: created by the fixer's own changes meeting, which no earlier round could
+    #: have seen because it did not exist yet.
+    needs_rereview: bool = False
+    #: On a merged group: WHICH members declared it. Attribution the merge would
+    #: otherwise flatten into the representative — and the accuracy of a
+    #: declaration is per reviewer, so a group flag credited to everyone who
+    #: happened to raise the finding makes the member that called it and the
+    #: member that missed it indistinguishable on exactly the statistic that
+    #: separates them.
+    rereview_by: list = field(default_factory=list)
+
+
+@dataclass
+class ReviewerRun:
+    """One panel member's whole turn: what it found, what it could not judge, and
+    what it cost. A tuple grew a fourth member the day reviewers started declaring
+    their own coverage, and a 4-tuple unpacked at three call sites is where the
+    declarations quietly become the duration."""
+
+    findings: list = field(default_factory=list)          # Finding
+    skip: str | None = None
+    duration_ms: int = 0
+    could_not_assess: list = field(default_factory=list)  # str
+    #: The reply had no JSON in it and was kept as one raw finding. Its findings
+    #: are real work, but nothing it might have declared survived the parse — so a
+    #: quiet round that includes one is not evidence of a quiet PR.
+    unstructured: bool = False
 
 
 @dataclass
@@ -175,13 +252,13 @@ def load_repo_cfg(name: str) -> dict:
         sys.exit(str(e))
 
 
-def _balanced_span(text: str, open_ch: str, close_ch: str) -> str | None:
-    """Return the first top-level balanced open_ch..close_ch span (string-aware),
-    or None. Beats a greedy `open.*close` regex: LLMs love to wrap their JSON in
-    prose or ``` fences that ALSO contain brackets, and a greedy match then spans
-    from the first stray bracket to the last, producing invalid JSON. Scanning for
-    a balanced span (and skipping brackets inside JSON string literals) finds the
-    real array/object instead."""
+def _span_at(text: str, open_ch: str, close_ch: str) -> tuple[int, str] | None:
+    """Return (start index, first top-level balanced open_ch..close_ch span),
+    string-aware, or None. Beats a greedy `open.*close` regex: LLMs love to wrap
+    their JSON in prose or ``` fences that ALSO contain brackets, and a greedy
+    match then spans from the first stray bracket to the last, producing invalid
+    JSON. Scanning for a balanced span (and skipping brackets inside JSON string
+    literals) finds the real array/object instead."""
     depth = 0
     start = -1
     in_str = esc = False
@@ -203,49 +280,101 @@ def _balanced_span(text: str, open_ch: str, close_ch: str) -> str | None:
         elif ch == close_ch and depth:
             depth -= 1
             if depth == 0:
-                return text[start:i + 1]
+                return start, text[start:i + 1]
     return None
 
 
-def extract_json_array(raw: str) -> list | None:
-    """Best-effort parse of a JSON array from an LLM reply. Tolerates ``` fences
-    and surrounding prose. Returns the parsed list, or None when no valid array is
-    present (so callers can tell "parsed empty → flawless" apart from "unparseable
-    → retry / keep raw text", rather than silently dropping the reviewer's work)."""
+def extract_json_value(raw: str) -> list | dict | None:
+    """Best-effort parse of the JSON value an LLM meant to return — an object
+    envelope or a bare array — tolerating ``` fences and surrounding prose.
+
+    Which of the two it is, is decided by WHICH STARTS FIRST in the reply, not by
+    trying one shape and falling back. An envelope's `{` precedes its findings
+    `[`; a bare array's `[` precedes its first item's `{`. Preferring one bracket
+    unconditionally would read an envelope's inner array as the whole reply
+    (silently dropping the declarations that ride alongside it) or an array's
+    first element as the envelope.
+
+    Returns None when no valid JSON value is present, so callers can tell
+    "parsed empty → flawless" apart from "unparseable → retry / keep raw text"
+    rather than silently dropping the reviewer's work."""
     if not raw:
         return None
-    for candidate in (_balanced_span(raw, "[", "]"), raw.strip()):
+    spans = [s for s in (_span_at(raw, "{", "}"), _span_at(raw, "[", "]")) if s]
+    spans.sort(key=lambda s: s[0])
+    for candidate in [s[1] for s in spans] + [raw.strip()]:
         if not candidate:
             continue
         try:
             val = json.loads(candidate)
         except json.JSONDecodeError:
             continue
-        if isinstance(val, list):
+        if isinstance(val, (list, dict)):
             return val
     return None
 
 
-def parse_findings(reviewer: str, raw: str) -> list[Finding] | None:
-    """Parse a reviewer's JSON array into Findings. Returns None when the reply has
-    no valid JSON array (caller retries, then falls back to a raw-text finding) —
-    distinct from [] which means the reviewer ran and found nothing."""
-    items = extract_json_array(raw)
-    if items is None:
+def _to_findings(reviewer: str, items: list) -> list[Finding]:
+    return [Finding(
+        reviewer=reviewer,
+        severity=str(it.get("severity", "P3")).upper(),
+        file=str(it.get("file", "?")),
+        line=it.get("line") if isinstance(it.get("line"), int) else None,
+        title=str(it.get("title", "")).strip(),
+        detail=str(it.get("detail", "")).strip(),
+        needs_rereview=bool(it.get("needs_rereview")),
+    ) for it in items if isinstance(it, dict)]
+
+
+def _str_list(val) -> list[str]:
+    """A declaration list, however the model spelled it — a list of phrases, or
+    one string it wrote instead of a one-item list."""
+    if isinstance(val, str):
+        val = [val]
+    if not isinstance(val, list):
+        return []
+    return [s for s in (str(x).strip() for x in val) if s]
+
+
+def parse_reply(reviewer: str, raw: str) -> tuple[list[Finding], list[str]] | None:
+    """Parse a reviewer's reply into (findings, could_not_assess).
+
+    Two shapes are accepted, because the panel's members are four different CLIs
+    and a contract change lands on them at different speeds:
+
+    * ``{"findings": [...], "could_not_assess": [...], "fix_needs_rereview": [i]}``
+      — the current one, which carries the reviewer's own coverage declarations.
+    * a bare ``[...]`` of findings — every reviewer before this, and any model that
+      ignores the envelope. It records no declarations, which is honest: it made
+      none.
+
+    ``fix_needs_rereview`` holds INDEXES into the findings array just returned, so
+    a reviewer needs no id scheme of its own; a per-finding ``needs_rereview``
+    boolean means the same thing and both are honoured.
+
+    Returns None when the reply has no usable JSON at all (caller retries, then
+    keeps the raw text as one finding) — distinct from ([], []) which means the
+    reviewer ran, found nothing, and declared no gaps."""
+    val = extract_json_value(raw)
+    if val is None:
         return None
-    out = []
-    for it in items:
-        if not isinstance(it, dict):
-            continue
-        out.append(Finding(
-            reviewer=reviewer,
-            severity=str(it.get("severity", "P3")).upper(),
-            file=str(it.get("file", "?")),
-            line=it.get("line") if isinstance(it.get("line"), int) else None,
-            title=str(it.get("title", "")).strip(),
-            detail=str(it.get("detail", "")).strip(),
-        ))
-    return out
+    if isinstance(val, list):
+        return _to_findings(reviewer, val), []
+    items = val.get("findings")
+    if not isinstance(items, list):
+        return None
+    # Indexes are into the array the MODEL wrote, which is not the list we keep —
+    # a junk entry among the findings is dropped, and every index after it would
+    # then point one finding too far, flagging its neighbour.
+    kept = [(i, it) for i, it in enumerate(items) if isinstance(it, dict)]
+    findings = _to_findings(reviewer, [it for _, it in kept])
+    at = {sent: n for n, (sent, _) in enumerate(kept)}
+    for i in val.get("fix_needs_rereview") or []:
+        # Bools are ints in Python, and `true` here means nothing — index 1 is not
+        # what a model that wrote a boolean meant.
+        if isinstance(i, int) and not isinstance(i, bool) and i in at:
+            findings[at[i]].needs_rereview = True
+    return findings, _str_list(val.get("could_not_assess"))
 
 
 def _raw_finding(reviewer: str, text: str) -> Finding:
@@ -459,7 +588,7 @@ def antigravity_args(model: str, effort: str, prompt: str) -> list[str]:
 
     Left on the default `--output-format text` rather than `json`: the JSON mode
     wraps the reply in {response, status, usage, ...}, which would hide the
-    findings array inside an escaped string where parse_findings' balanced-bracket
+    findings array inside an escaped string where parse_reply's balanced-bracket
     scan cannot see it. Text mode puts the array straight on stdout, which is what
     every other seat here produces and what the parser is written against.
 
@@ -523,8 +652,8 @@ def select_reviewers(rev: dict, spec: str | None) -> tuple[set[str], str | None]
 
 
 def review_llm(cmd_name: str, model: str, prompt: str,
-               effort: str = "") -> tuple[list[Finding], str | None, int]:
-    """Run a headless LLM CLI reviewer. Returns (findings, skip_reason, duration_ms).
+               effort: str = "") -> ReviewerRun:
+    """Run a headless LLM CLI reviewer. Returns a :class:`ReviewerRun`.
 
     Duration is wall-clock for this member's whole turn — every CLI attempt it
     made, including the reparse retry below, because a reviewer that only lands
@@ -552,9 +681,10 @@ def review_llm(cmd_name: str, model: str, prompt: str,
     if effort and effort not in valid:
         expected = ("expected one of " + ", ".join(valid) if valid
                     else f"{cmd_name} takes no reasoning effort")
-        return [], f"{label}: unknown reasoning effort {effort!r} — {expected}", elapsed()
+        return ReviewerRun(skip=f"{label}: unknown reasoning effort {effort!r} — {expected}",
+                           duration_ms=elapsed())
     if not shutil.which(CLI_BIN.get(cmd_name, cmd_name)):
-        return [], f"{label}: CLI absent", elapsed()
+        return ReviewerRun(skip=f"{label}: CLI absent", duration_ms=elapsed())
     if cmd_name == "claude":
         args = ["claude", "-p", prompt, "--model", model]
     elif cmd_name == "antigravity":
@@ -566,23 +696,25 @@ def review_llm(cmd_name: str, model: str, prompt: str,
     out, err = run_cli(args, label)
     if err:
         err += cli_hint(cmd_name, err, model)
-        return [], err, elapsed()
-    findings = parse_findings(cmd_name, out)
-    if findings is None:
+        return ReviewerRun(skip=err, duration_ms=elapsed())
+    parsed = parse_reply(cmd_name, out)
+    if parsed is None:
         # Unparseable JSON — give the reviewer one more shot (a common flake is a
         # stray prose preamble the model omits on a retry), then, rather than drop
         # its work, keep the raw reply as a single markdown finding for the judge.
         out2, err2 = run_cli(args, label, attempts=1)
         if not err2 and out2:
-            retried = parse_findings(cmd_name, out2)
+            retried = parse_reply(cmd_name, out2)
             if retried is not None:
-                return retried, None, elapsed()
+                return ReviewerRun(retried[0], None, elapsed(), retried[1])
             out = out2
         text = (out or "").strip()
         if not text:
-            return [], f"{label}: no parseable findings and empty output", elapsed()
-        return [_raw_finding(cmd_name, text)], None, elapsed()
-    return findings, None, elapsed()
+            return ReviewerRun(skip=f"{label}: no parseable findings and empty output",
+                               duration_ms=elapsed())
+        return ReviewerRun([_raw_finding(cmd_name, text)], None, elapsed(),
+                           unstructured=True)
+    return ReviewerRun(parsed[0], None, elapsed(), parsed[1])
 
 
 def resolve_token(sonar: dict, repo_path: str = "") -> str:
@@ -958,7 +1090,11 @@ def _key(f: Finding) -> tuple:
 
 def group_findings(llm_findings: list[Finding]) -> list[tuple[Finding, list[str]]]:
     """Dedup findings across reviewers. Returns (representative, [reviewers]).
-    Reviewer count is a *confidence signal*, never a gate."""
+    Reviewer count is a *confidence signal*, never a gate.
+
+    A ``needs_rereview`` declaration survives the merge from ANY reporter: one
+    reviewer seeing that the fix will be structural is the observation, and the
+    others not saying so is not a contradiction of it."""
     groups: dict[tuple, list[Finding]] = {}
     for f in llm_findings:
         groups.setdefault(_key(f), []).append(f)
@@ -966,48 +1102,206 @@ def group_findings(llm_findings: list[Finding]) -> list[tuple[Finding, list[str]
     for grp in groups.values():
         reviewers = sorted({f.reviewer for f in grp})
         rep = min(grp, key=lambda f: f.severity)  # P1 < P2 < P3 lexically
+        # Read before it is written: the representative is one of the group's own
+        # findings, so setting its flag first would credit its reviewer with a
+        # declaration another member made.
+        rep.rereview_by = sorted({f.reviewer for f in grp if f.needs_rereview})
+        rep.needs_rereview = bool(rep.rereview_by)
         out.append((rep, reviewers))
     out.sort(key=lambda e: e[0].severity)
     return out
 
 
 def judge(groups: list[tuple[Finding, list[str]]], diff: str, model: str,
-          budget: int = MAX_DIFF_CHARS) -> tuple[dict[int, dict], str | None]:
-    """The 'master' adjudicates each finding on its merits. Returns
-    (verdicts, skip_reason). skip_reason is None when the judge ran successfully
+          budget: int = MAX_DIFF_CHARS,
+          coverage: dict[str, list[str]] | None = None
+          ) -> tuple[dict[int, dict], str | None, str]:
+    """The 'master' adjudicates each finding on its merits, and rules on the
+    coverage the reviewers declared. Returns (verdicts, skip_reason, coverage_note).
+    skip_reason is None when the judge ran successfully
     (even if it dismissed nothing); otherwise it explains WHY the judge could not
     rule — CLI absent, timeout, crash, or unparseable output — so the caller can
     surface it rather than silently reporting a bare 'unavailable'. A real bug
     from a single reviewer is confirmed; only genuine false positives are dropped
     (style and polish are kept). When the judge can't rule, the caller keeps everything (we never
-    silently suppress a finding). No findings -> ({}, None): nothing to judge."""
+    silently suppress a finding). No findings -> ({}, None, ""): nothing to judge.
+
+    The judge is asked to rule on coverage in the same call — one extra key in the
+    object it already returns, no additional model call. Its own reply may still
+    be the bare verdict array every earlier judge returned, in which case there is
+    simply no coverage note."""
+    declared = {k: v for k, v in (coverage or {}).items() if v}
     if not groups:
-        return {}, None
+        return {}, None, ""
     if not shutil.which("claude"):
-        return {}, "judge: claude CLI absent"
+        return {}, "judge: claude CLI absent", ""
     listing = "\n".join(
         f"[{i}] {f.severity} {f.file}:{f.line or '?'} (via {', '.join(revs)}) — "
         f"{f.title} — {f.detail}"
         for i, (f, revs) in enumerate(groups))
-    prompt = JUDGE_PROMPT.format(findings=listing, diff=diff[:budget])
+    stated = "\n".join(f"- {name}: could not assess {'; '.join(items)}"
+                       for name, items in sorted(declared.items())) \
+        or "- (no reviewer declared a gap in its coverage)"
+    prompt = JUDGE_PROMPT.format(findings=listing, coverage=stated, diff=diff[:budget])
     args = ["claude", "-p", prompt] + (["--model", model] if model else [])
     out, err = run_cli(args, "judge")
     if err:
-        return {}, err
-    parsed = extract_json_array(out)
-    if parsed is None:
-        return {}, "judge: no JSON verdict in output (unparseable)"
+        return {}, err, ""
+    parsed = extract_json_value(out)
+    note = ""
+    if isinstance(parsed, dict):
+        note = str(parsed.get("coverage_note") or "").strip()
+        parsed = parsed.get("verdicts")
+    if not isinstance(parsed, list):
+        return {}, "judge: no JSON verdict in output (unparseable)", note
     verdicts: dict[int, dict] = {}
     for v in parsed:
         if isinstance(v, dict) and isinstance(v.get("id"), int):
             verdicts[v["id"]] = v
-    return verdicts, None
+    return verdicts, None, note
+
+
+# ----------------------------------------------------------------------------- rounds
+
+def finding_key(file: str | None, title: str) -> str:
+    """Identity of the DEFECT, so the same issue raised in round 1 and again in
+    round 2 is one thing seen twice rather than two things.
+
+    File plus a normalised title, deliberately **without** the line: the line
+    moves when the fix above it lands, and an identity that moves links nothing.
+
+    Must stay byte-identical to ``app.api.reviews._derive_key`` (and its SQL twin
+    in the board's migration 0012). The board derives this key for any payload
+    that arrives without one, so a panel that computed it differently would put
+    the local round-over-round diff and the board's cross-run chains on two
+    different notions of "the same finding" — and only one of them would be
+    visible to the person reading the stats."""
+    norm = re.sub(r"[^a-z0-9]+", " ", (title or "").lower()).strip()
+    return hashlib.md5(f"{file or ''}|{norm}".encode(),
+                       usedforsecurity=False).hexdigest()[:16]
+
+
+def load_baseline(paths: list[str]) -> tuple[set[str], int, list[str]]:
+    """Every finding key earlier rounds of this PR already raised, from their
+    ``--json-file`` payloads. Returns (keys, rounds_covered, problems).
+
+    Keyed on what was RAISED, not on what was confirmed: a finding the judge
+    dismissed in round 1 and a reviewer raises again in round 2 is not new
+    information, and counting it as new is how a loop fails to converge.
+
+    A baseline that cannot be read is reported rather than swallowed. Its absence
+    makes every finding look new, which reads as "the fix broke things" — the
+    exact opposite of the truth — so the caller marks the round's verdict
+    unearned instead of quietly believing it."""
+    keys: set[str] = set()
+    rounds = 0
+    problems: list[str] = []
+    for path in paths:
+        try:
+            payload = json.loads(Path(path).read_text())
+        except (OSError, json.JSONDecodeError) as e:
+            problems.append(f"baseline {path} unreadable ({e.__class__.__name__})")
+            continue
+        if not isinstance(payload, dict):
+            problems.append(f"baseline {path} is not a panel payload")
+            continue
+        rounds = max(rounds, int(payload.get("round") or 1))
+        for bucket in ("to_fix", "dismissed", "sonar_findings"):
+            for f in payload.get(bucket) or []:
+                if isinstance(f, dict):
+                    keys.add(str(f.get("key") or "")
+                             or finding_key(f.get("file"), str(f.get("title", ""))))
+    return keys, rounds, problems
+
+
+def coverage_veto(reviewer_meta: dict[str, dict], judge_skip: str | None,
+                  flagged: int, diff_chars: int) -> list[str]:
+    """Reasons a quiet round is not evidence of a quiet PR.
+
+    A counter cannot tell a genuinely dry round from a broken one — a reviewer
+    that read half the diff, one that never ran, and one whose reply did not parse
+    all look identical to "found nothing". These are the observations that
+    distinguish them, and they exist to stop a failure being read as convergence.
+    They do NOT drive the loop: a truncated reviewer is truncated again next round
+    at the same budget, so treating that as a reason to go again is a loop with no
+    exit. It is a reason to stop CLAIMING the PR is clean."""
+    out = []
+    for name, meta in sorted(reviewer_meta.items()):
+        if not meta.get("ran"):
+            out.append(f"{name} did not run ({meta.get('skip') or 'no reason recorded'})")
+            continue
+        if meta.get("truncated"):
+            budget = meta.get("max_diff_chars") or 0
+            out.append(f"{name} saw {budget:,} of {diff_chars:,} diff chars")
+        if meta.get("unstructured"):
+            out.append(f"{name} returned no structured reply — its coverage is unknown")
+        for gap in meta.get("could_not_assess") or []:
+            out.append(f"{name} could not assess: {gap}")
+    if judge_skip:
+        out.append(f"findings were not adjudicated ({judge_skip})")
+    if flagged:
+        out.append(f"{flagged} finding(s) whose reporter said the FIX needs re-reading")
+    return out
+
+
+def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
+               confirmed: list[Finding], veto: list[str],
+               baseline_ok: bool = True, repeated: int = 0) -> dict:
+    """Whether the panel/fix cycle should go again, and what decided it.
+
+    The rule is mechanical on purpose. Asking reviewers to forecast "will another
+    round be needed?" measures the wrong thing — a model that just wrote five
+    findings is primed on problems and says yes, one that found nothing says no,
+    and the vote only re-encodes a finding count already known. So the loop turns
+    on what actually happened:
+
+    1. findings this round that no earlier round raised -> go again;
+    2. a P1/P2 still confirmed -> go again, whatever anyone declared (a blocker
+       raised again is a blocker that was not fixed);
+    3. otherwise dry -> stop.
+
+    The cap ends it either way, and a cap reached with work outstanding is
+    recorded as such rather than as convergence.
+
+    ``repeated`` — findings an earlier round already raised that are STILL
+    confirmed — does not extend the loop (two reviewers can disagree about a P4
+    forever), but it does cost the stop its confidence: the fixer was told about
+    those and they are still there, which is not the same event as nothing being
+    found."""
+    blockers = [f for f in confirmed if f.severity in ("P1", "P2")]
+    if new_keys:
+        stop, reason = False, (f"{len(new_keys)} finding(s) no earlier round raised")
+    elif blockers:
+        stop, reason = False, f"{len(blockers)} P1/P2 still confirmed after the fix"
+    else:
+        stop, reason = True, ("dry — nothing raised that an earlier round had not"
+                              if round_no > 1 else "dry — no findings to fix")
+    capped = False
+    if not stop and round_no >= max_rounds:
+        stop, capped = True, True
+        reason = f"round cap ({max_rounds}) reached — {reason}, unreviewed"
+    if repeated:
+        veto = [*veto, f"{repeated} finding(s) an earlier round already raised are "
+                       "still confirmed — the fix for them did not land"]
+    return {
+        "stop": stop,
+        "reason": reason,
+        # "Nothing left to find" is a claim; "the counter hit zero" is not the
+        # same claim, and the difference is exactly what a reader of a clean
+        # verdict needs to see.
+        "confident": bool(stop and not capped and not veto and baseline_ok),
+        "veto": veto,
+        "round": round_no,
+        "max_rounds": max_rounds,
+    }
 
 
 # ----------------------------------------------------------------------------- run
 
 def run(repo_name: str, pr_number: int, post: bool, json_out: bool = False,
-        reviewers: str | None = None, json_file: str = "", record: bool = True) -> int:
+        reviewers: str | None = None, json_file: str = "", record: bool = True,
+        round_no: int = 1, baseline: list[str] | None = None,
+        max_rounds: int = DEFAULT_MAX_ROUNDS) -> int:
     # Idempotency key for the board record, minted once per process so a retry of
     # the POST cannot double-count the run into the stats. A fresh panel run is a
     # genuinely new observation and gets a new key — re-reviewing a PR after a fix
@@ -1103,22 +1397,27 @@ def run(repo_name: str, pr_number: int, post: bool, json_out: bool = False,
         # repins, a slug retires, --reviewers hand-picks a set).
         reviewer_meta: dict[str, dict] = {}
         for name, fut in tasks.items():
-            finds, skip, duration_ms = fut.result()
+            got = fut.result()
             reviewer_meta[name] = {
                 "model": models[name] or None,
                 "effort": efforts.get(name) or None,
-                "ran": not skip,
-                "skip": skip,
+                "ran": not got.skip,
+                "skip": got.skip,
                 "max_diff_chars": budgets[name],
+                # The mechanical half of "did this reviewer see the whole thing":
+                # checked against the budget rather than asked for, because the
+                # one thing a truncated reviewer cannot notice is the truncation.
                 "truncated": name in truncated_for,
-                "duration_ms": duration_ms,
+                "duration_ms": got.duration_ms,
+                "could_not_assess": got.could_not_assess,
+                "unstructured": got.unstructured,
             }
-            if skip:
-                result.skipped.append(skip)
-                llm_skipped.append(skip)
+            if got.skip:
+                result.skipped.append(got.skip)
+                llm_skipped.append(got.skip)
             else:
                 ran_llm.append(labels[name])
-                llm_findings.extend(finds)
+                llm_findings.extend(got.findings)
         if sonar_future:
             gate, hard, soft, skip = sonar_future.result()
             result.sonar_gate = gate
@@ -1142,8 +1441,9 @@ def run(repo_name: str, pr_number: int, post: bool, json_out: bool = False,
 
     # Dedup, then let the master judge each finding on its merits (no consensus gate).
     groups = group_findings(llm_findings)
-    verdicts, judge_skip = judge(groups, diff, panel.get("judge_model", ""),
-                                 judge_budget)
+    coverage = {n: m.get("could_not_assess") or [] for n, m in reviewer_meta.items()}
+    verdicts, judge_skip, coverage_note = judge(
+        groups, diff, panel.get("judge_model", ""), judge_budget, coverage)
     judged = judge_skip is None and bool(groups)
     to_fix, dismissed = [], []
     for i, (f, revs) in enumerate(groups):
@@ -1157,6 +1457,25 @@ def run(repo_name: str, pr_number: int, post: bool, json_out: bool = False,
             dismissed.append((f, revs, v.get("reason", "")))
     to_fix.sort(key=lambda e: e[0].severity)
 
+    # ---- this round against the ones before it. Mechanical: which findings are
+    # ones no earlier round raised, and does that make the loop done?
+    prior_keys, prior_rounds, baseline_problems = load_baseline(baseline or [])
+    notes.extend(baseline_problems)
+    if prior_keys and round_no == 1:
+        # Not fatal — the diff against the baseline is still right — but the round
+        # number is what the board files this run under, so a re-review recorded
+        # as a first round makes the PR look like it was reviewed twice from
+        # scratch rather than once and then again.
+        notes.append("`--baseline` given with `--round 1` — this run records as a "
+                     "first round; pass the round it actually is")
+    round_keys = {finding_key(f.file, f.title) for f, _, _ in to_fix}
+    new_keys = sorted(round_keys - prior_keys)
+    flagged = sum(1 for f, _, _ in to_fix if f.needs_rereview)
+    veto = coverage_veto(reviewer_meta, judge_skip, flagged, len(diff))
+    stop = round_stop(round_no, max_rounds, new_keys,
+                      [f for f, _, _ in to_fix], veto, not baseline_problems,
+                      repeated=len(round_keys & prior_keys))
+
     def loc(f: Finding) -> str:
         return f"{f.file}:{f.line}" if f.line else f.file
 
@@ -1165,13 +1484,31 @@ def run(repo_name: str, pr_number: int, post: bool, json_out: bool = False,
     # board. One structure, so the fix loop and the stats can never be looking
     # at different accounts of the same review.
     def ser(f: Finding, revs: list[str], reason: str) -> dict:
+        key = finding_key(f.file, f.title)
         return {"severity": f.severity, "file": f.file, "line": f.line,
                 "title": f.title, "detail": f.detail, "reviewers": revs,
-                "reason": reason}
+                "reason": reason,
+                # Sent rather than left to the board to derive: the two recipes
+                # are the same one, and sending it keeps the local round diff and
+                # the board's chains provably on the same identity.
+                "key": key,
+                "new_this_round": key not in prior_keys,
+                "needs_rereview": f.needs_rereview,
+                "rereview_by": list(f.rereview_by)}
     payload = {
         "repo": repo_name, "github": gh_repo, "pr": pr_number,
         "title": title, "base": base, "changed_lines": changed,
         "diff_truncated": truncated,
+        # Where this run sits in the panel -> fix -> panel cycle, and what the
+        # mechanical stopping rule made of it.
+        "round": round_no,
+        "prior_rounds": prior_rounds,
+        "prior_findings": len(prior_keys),
+        "new_findings": len(new_keys),
+        "new_finding_keys": new_keys,
+        "round_stop": stop,
+        "stop_reason": stop["reason"],
+        "coverage_note": coverage_note or None,
         "diff_chars": len(diff),
         "diff_budgets": {**budgets, "judge": judge_budget},
         "config_notes": notes,
@@ -1217,7 +1554,15 @@ def run(repo_name: str, pr_number: int, post: bool, json_out: bool = False,
         return f" _(via {', '.join(revs)}{' ⋆consensus' if len(revs) > 1 else ''})_"
 
     # ---- report
-    lines = [f"## Reviewer panel — PR #{pr_number}", ""]
+    heading = f"## Reviewer panel — PR #{pr_number}"
+    if round_no > 1 or prior_rounds:
+        heading += f" · round {round_no}"
+    lines = [heading, ""]
+    if round_no > 1 or prior_keys:
+        lines.append(f"**Round {round_no}** — re-reviewing after the fix. "
+                     f"{len(new_keys)} of {len(to_fix)} finding(s) here were raised by no "
+                     f"earlier round ({len(prior_keys)} known from {prior_rounds} earlier "
+                     f"round{'s' if prior_rounds != 1 else ''}).")
     ci_txt = {"PASS": "✅ PASS", "FAIL": "❌ FAIL", "PENDING": "⏳ pending",
               "none": "no checks reported", "unknown": "unknown"}.get(ci_status, ci_status)
     lines.append(f"**CI (`gh pr checks`, hard gate):** {ci_txt}")
@@ -1267,7 +1612,12 @@ def run(repo_name: str, pr_number: int, post: bool, json_out: bool = False,
     if to_fix:
         for f, revs, reason in to_fix:
             tail = f" — {reason}" if reason and reason != "unjudged" else ""
-            lines.append(f"- **{f.severity}** `{loc(f)}` — {f.title}{conf(revs)}{tail}")
+            # Only where there IS an earlier round to be new against: on a first
+            # round every finding is new and the marker would be decoration.
+            fresh = " 🆕" if prior_keys and finding_key(f.file, f.title) not in prior_keys else ""
+            again = (" ↻ _fix needs re-reading (" + ", ".join(f.rereview_by) + ")_"
+                     if f.needs_rereview else "")
+            lines.append(f"- **{f.severity}**{fresh} `{loc(f)}` — {f.title}{conf(revs)}{tail}{again}")
     else:
         lines.append("- none")
 
@@ -1284,6 +1634,30 @@ def run(repo_name: str, pr_number: int, post: bool, json_out: bool = False,
     if result.skipped:
         lines.append("\n### Skipped reviewers\n" +
                      "\n".join(f"- {s}" for s in result.skipped))
+
+    # What the reviewers said about their OWN coverage, and what the judge made of
+    # the split. This is the difference between "clean" and "I could not tell",
+    # which no finding count can express — and it is on the PR comment, not just
+    # the terminal, because the person deciding whether a clean verdict was earned
+    # is reading the comment.
+    declared = {n: m["could_not_assess"] for n, m in sorted(reviewer_meta.items())
+                if m.get("could_not_assess")}
+    if declared or coverage_note:
+        lines.append("\n### Coverage declared by the reviewers")
+        for name, gaps in declared.items():
+            lines.append(f"- **{name}** could not assess: " + "; ".join(gaps))
+        if coverage_note:
+            lines.append(f"- _master:_ {coverage_note}")
+
+    verdict = "**stop**" if stop["stop"] else "**go again**"
+    unearned = stop["stop"] and not stop["confident"]
+    lines.append(f"\n**Rounds:** round {round_no} of at most {max_rounds} — {verdict}: "
+                 + stop["reason"]
+                 + (" — a stop, not convergence" if unearned else ""))
+    if stop["veto"]:
+        lines.append("  _why this round's quiet is not evidence of a quiet PR:_")
+        for why in stop["veto"]:
+            lines.append(f"  - ⚠️ {why}")
 
     report = "\n".join(lines)
     print(report)
@@ -1332,9 +1706,25 @@ def main() -> int:
                          "(and --post) — unlike --json, which replaces them")
     ap.add_argument("--no-record", action="store_false", dest="record",
                     help="don't record this run on the quarterback board")
+    ap.add_argument("--round", type=int, default=1, dest="round_no", metavar="N",
+                    help="which panel/fix cycle this is (default 1). Round 2+ is the "
+                         "re-review of the fix commit — the one nobody reads otherwise")
+    ap.add_argument("--baseline", action="append", default=[], metavar="PATH",
+                    help="a previous round's --json-file payload, so this run can say "
+                         "which findings no earlier round raised. Repeatable")
+    ap.add_argument("--max-rounds", type=int, default=DEFAULT_MAX_ROUNDS,
+                    dest="max_rounds", metavar="N",
+                    help=f"the caller's round cap (default {DEFAULT_MAX_ROUNDS}); used to "
+                         "tell a round that stopped because it was done from one that "
+                         "stopped because it ran out")
     args = ap.parse_args()
+    if args.round_no < 1:
+        raise SystemExit("--round: rounds are numbered from 1")
+    if args.max_rounds < 1:
+        raise SystemExit("--max-rounds: at least one round has to run")
     return run(args.repo, args.pr, args.post, args.json_out, args.reviewers,
-               args.json_file, args.record)
+               args.json_file, args.record, args.round_no, args.baseline,
+               args.max_rounds)
 
 
 if __name__ == "__main__":

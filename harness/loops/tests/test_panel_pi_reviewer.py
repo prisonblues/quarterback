@@ -59,8 +59,8 @@ def test_effort_sets_are_per_cli_not_unioned(monkeypatch):
 
     called = []
     monkeypatch.setattr(panel, "run_cli", lambda *a, **k: called.append(a) or (None, None))
-    _, skip, _ms = panel.review_llm("pi", "openrouter/moonshotai/kimi-k3", "p", effort="ultra")
-    assert called == [] and "unknown reasoning effort" in skip and "minimal" in skip
+    got = panel.review_llm("pi", "openrouter/moonshotai/kimi-k3", "p", effort="ultra")
+    assert called == [] and "unknown reasoning effort" in got.skip and "minimal" in got.skip
 
 
 def test_a_cli_with_no_effort_knob_says_so(monkeypatch):
@@ -68,5 +68,5 @@ def test_a_cli_with_no_effort_knob_says_so(monkeypatch):
     naming, not a flag to quietly drop on the floor."""
     called = []
     monkeypatch.setattr(panel, "run_cli", lambda *a, **k: called.append(a) or (None, None))
-    _, skip, _ms = panel.review_llm("claude", "sonnet", "p", effort="high")
-    assert called == [] and "takes no reasoning effort" in skip
+    got = panel.review_llm("claude", "sonnet", "p", effort="high")
+    assert called == [] and "takes no reasoning effort" in got.skip

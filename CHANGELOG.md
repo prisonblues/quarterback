@@ -7,6 +7,38 @@ that number where it was, so the repo can be a version ahead of the service.
 Entries are newest first. Each one says what was broken or missing before it, because that is the
 part that isn't recoverable from the diff.
 
+## v2.14 — the fix gets reviewed, and a run says what it could not see
+
+`/panel-review-pr` ran exactly one round: panel → judge → one fixer → push → stop. The commit
+the fixer wrote was read by nobody, because the panel had reviewed the diff as it was *before*
+the fix. That is not a gap at the edges — structural fixes beget new interactions, and on a real
+PR a mirror added in one file created dual-keyed nodes that an early `return` in another left
+half-stale: a P2 regression of the exact invariant the PR existed to establish, which no earlier
+round could have found because it did not exist until the fixer wrote it.
+
+The cycle is now panel → fix → panel, two rounds by default (`--rounds N` / `--loop` for more),
+and the loop is decided mechanically: findings this round that no earlier round raised, or a
+P1/P2 still confirmed, buy another pass. Reviewers are **not** asked to forecast whether another
+round is needed — that asks a model to predict findings it has not made, and the reviewer that
+silently produced nothing answers "no" with complete confidence.
+
+They are asked for observations instead: `could_not_assess` (what they could not judge, which is
+the difference between "clean" and "I could not tell" — a distinction no finding count can carry)
+and `needs_rereview` per finding (this fix is structural; read its result). The panel measures the
+one thing a reviewer cannot notice about itself, truncation: a 118 KB diff against a 60 KB budget
+had every reviewer confidently reporting on half a PR, invisibly. Declarations never extend the
+loop — a truncated reviewer is truncated again next round — they veto a *false stop*, so a round
+that found nothing because it could not look is no longer recorded as convergence.
+
+All of it reaches the board (`round`, `new_findings`, `stop_reason`, `stop_confident`,
+`could_not_assess`, `rereview_flagged`) and the `/panel` page, so a human can review the review:
+whether a clean verdict was earned, without re-reading a transcript. `GET /review/findings` checks
+each re-review flag against what the following round actually found, which makes **honesty per
+reviewer** measurable for the first time — a member that says "I could not assess X" and is right
+is worth more than one that silently reports clean, and until now nothing distinguished them.
+
+Payloads without any of it record exactly as before, as round 1 with nothing declared.
+
 ## v2.13 — the harness ships with the board
 
 The loops and worktree tooling that produce the board's data lived in a personal NixOS config,

@@ -29,6 +29,22 @@ identity of the *defect*, not of the observation — so the same bug seen in run
 and again in run 7 stays two rows that can be joined (``GET /review/findings``),
 which is what makes "was it actually fixed?" a query. The older payload shape
 (``reviewers: ["codex", "pi"]``, no key) still records exactly as before.
+
+**v2.14 — rounds, and what a run could not see.** Two runs of a PR were two
+unrelated records: nothing said which was the re-review of the other's fix, what
+this round found that the last had not, or what stopped the loop. And a run said
+only what was *found* — a reviewer handed a prefix of the diff, one that never
+ran, and one that had nothing to say all recorded the same zero.
+
+A run now carries its ``round``, ``new_findings``, ``stop_reason`` and
+``stop_confident``; a member carries ``could_not_assess`` (its own declaration)
+alongside the panel-measured ``truncated``; a finding carries ``needs_rereview``,
+per reporter. Together those make the review reviewable: whether a clean verdict
+was *earned* is on the row rather than in a transcript, and a reviewer that says
+"I could not assess X" and turns out to be right becomes distinguishable from one
+that silently reported clean — see ``GET /review/findings``, which checks each
+re-review flag against what the following round actually found. Payloads without
+any of it record exactly as before, as round 1 with nothing declared.
 """
 
 from __future__ import annotations
@@ -101,6 +117,8 @@ class ReportIn(BaseModel):
     #: Verbatim. ``detail`` is accepted as an alias because that is what the
     #: panel calls the same text on an unmerged finding.
     account: str = Field(default="", validation_alias=AliasChoices("account", "detail"))
+    #: This reviewer declared the FIX for this finding needs re-reading.
+    needs_rereview: bool = False
 
     @field_validator("reviewer")
     @classmethod
@@ -148,6 +166,16 @@ class FindingIn(BaseModel):
     #: ``id``s of other findings in this payload that share a cause.
     related: list[str] = Field(default_factory=list)
 
+    #: A reporter declared that fixing this takes a structural change whose result
+    #: should be re-read. ``rereview_by`` names which members said so, for a panel
+    #: that merges before it can send per-reporter accounts; where ``reported_by``
+    #: carries its own flags those win, being the finer grain.
+    needs_rereview: bool = False
+    rereview_by: list[str] = Field(default_factory=list)
+    #: No earlier round of this PR raised this. The panel computes it against the
+    #: baseline it was given; None means it was not asked to.
+    new_this_round: bool | None = None
+
     @field_validator("line")
     @classmethod
     def _line(cls, v: int | None) -> int | None:
@@ -155,7 +183,8 @@ class FindingIn(BaseModel):
 
 
 class ReviewerIn(BaseModel):
-    """A panel member as configured for this run — its brain, not its findings."""
+    """A panel member as configured for this run — its brain, not its findings,
+    plus what it declared about its own coverage."""
 
     model: str | None = None
     effort: str | None = None
@@ -164,6 +193,23 @@ class ReviewerIn(BaseModel):
     max_diff_chars: int | None = None
     truncated: bool | None = None
     duration_ms: int | None = None
+    #: Areas it could not judge. None = not asked (every panel before v2.14);
+    #: [] = asked, and it had nothing to declare. The two must not collapse, or a
+    #: reviewer that was never given the chance to say reads as one that had
+    #: nothing to say.
+    could_not_assess: list[str] | None = None
+
+
+class StopIn(BaseModel):
+    """The panel's mechanical verdict on whether the loop should go again."""
+
+    stop: bool = True
+    reason: str = ""
+    #: Whether stopping was convergence. False when the round was capped, or a
+    #: reviewer was truncated / absent / unparsed / declaring a gap — the cases
+    #: where "no new findings" is a fact about the panel, not about the code.
+    confident: bool = False
+    veto: list[str] = Field(default_factory=list)
 
 
 class ReviewIn(BaseModel):
@@ -191,8 +237,19 @@ class ReviewIn(BaseModel):
     judged: bool = False
     judge_model: str | None = None
     judge_skip: str | None = None
+    coverage_note: str | None = None
     sonar_gate: str | None = None
     ci_status: str | None = None
+
+    #: Where this run sat in the panel -> fix -> panel cycle. Absent = round 1,
+    #: which is what every pre-v2.14 run was.
+    round: int = Field(default=1, ge=1)
+    new_findings: int | None = Field(default=None, ge=0)
+    #: The stopping rule's own account of itself. ``stop_reason`` is accepted flat
+    #: as well, because the panel prints it both ways and a caller reproducing the
+    #: payload by hand should not have to nest one string.
+    round_stop: StopIn | None = None
+    stop_reason: str | None = None
 
     reviewers_selected: list[str] = Field(default_factory=list)
     reviewers_override: str | None = None
@@ -256,6 +313,11 @@ class Prepared:
     reports: list[ReportIn]
     key: str
     related: list[str] = field(default_factory=list)
+    #: Members that declared this finding's fix worth re-reading, finest grain
+    #: first: each reporter's own flag, then the panel's ``rereview_by``, then —
+    #: when the finding is flagged with no attribution at all — everyone credited
+    #: on it, which over-credits but never silently drops the declaration.
+    rereview_by: list[str] = field(default_factory=list)
 
 
 def _prepare(findings: list[tuple[FindingIn, str]]) -> list[Prepared]:
@@ -281,6 +343,19 @@ def _prepare(findings: list[tuple[FindingIn, str]]) -> list[Prepared]:
         reviewers += [r.reviewer for r in reports if r.reviewer not in reviewers]
 
         title = f.title or "(untitled)"
+        # Who declared the fix worth re-reading, finest grain first. A reporter
+        # that sent an account is authoritative about ITSELF — including its
+        # silence, so `rereview_by` may only fill in for members that sent none.
+        # Reading a member's own `false` as "no data" and then crediting it from
+        # the coarser list would manufacture a declaration it did not make.
+        named = {r.reviewer for r in reports}
+        flagged = [r.reviewer for r in reports if r.needs_rereview]
+        flagged += [n for n in f.rereview_by if n in reviewers and n not in named]
+        # A finding flagged with no attribution at all: credit everyone credited
+        # on it. Over-crediting is visible and correctable; dropping the
+        # declaration is neither.
+        if not flagged and f.needs_rereview and not named and not f.rereview_by:
+            flagged = list(reviewers)
         prepared.append(Prepared(
             f=f,
             verdict=verdict,
@@ -288,6 +363,7 @@ def _prepare(findings: list[tuple[FindingIn, str]]) -> list[Prepared]:
             reviewers=reviewers,
             reports=reports,
             key=(f.key or "").strip() or _derive_key(f.file, title),
+            rereview_by=flagged,
         ))
 
     # `related` arrives as the panel's run-local ids; stored as keys so the
@@ -329,7 +405,7 @@ def _scorecards(
     run unless it appears in ``skipped``, whose entries read ``"codex: CLI
     absent"``. Assuming the opposite would file every quiet reviewer as broken.
     """
-    credited = {r for p in findings for r in p.reviewers}
+    credited = {r for p in findings for r in (*p.reviewers, *p.rereview_by)}
     skips = {s.split(":", 1)[0].strip(): s for s in skipped if ":" in s}
     names = sorted(set(cfg) | set(selected) | credited)
 
@@ -337,11 +413,13 @@ def _scorecards(
     # flush, so incrementing a freshly-constructed ORM object would start from
     # None.
     zero = ("raised", "confirmed", "dismissed", "unjudged", "solo", "shared",
-            "sev_stricter", "sev_agree", "sev_looser",
+            "sev_stricter", "sev_agree", "sev_looser", "rereview_flagged",
             *(s.lower() for s in SEVERITIES))
     tally: dict[str, dict[str, int]] = {n: dict.fromkeys(zero, 0) for n in names}
     for p in findings:
         own = {r.reviewer: r for r in p.reports}
+        for name in p.rereview_by:
+            tally[name]["rereview_flagged"] += 1
         for name in p.reviewers:
             t = tally[name]
             t["raised"] += 1
@@ -376,6 +454,7 @@ def _scorecards(
             max_diff_chars=c.max_diff_chars if c else None,
             truncated=c.truncated if c else None,
             duration_ms=c.duration_ms if c else None,
+            could_not_assess=c.could_not_assess if c else None,
             **tally[name],
         ))
     return cards
@@ -421,6 +500,14 @@ async def record_review(
         judged=body.judged,
         judge_model=body.judge_model or None,
         judge_skip=body.judge_skip,
+        coverage_note=body.coverage_note or None,
+        round=body.round,
+        new_findings=body.new_findings,
+        # The nested verdict wins over the flat string: it is the one that also
+        # carries whether the stop was earned, and a payload sending both sends
+        # the same reason twice.
+        stop_reason=(body.round_stop.reason if body.round_stop else body.stop_reason) or None,
+        stop_confident=body.round_stop.confident if body.round_stop else None,
         sonar_gate=body.sonar_gate,
         ci_status=body.ci_status,
         reviewers_selected=body.reviewers_selected or None,
@@ -458,6 +545,8 @@ async def record_review(
                 related=p.related or None,
                 reviewers=p.reviewers or None,
                 n_reviewers=len(p.reviewers),
+                needs_rereview=bool(p.rereview_by) or p.f.needs_rereview,
+                new_this_round=p.f.new_this_round,
             ),
             p.reports,
         )
@@ -469,7 +558,10 @@ async def record_review(
         await session.flush()  # need finding.id for the accounts hanging off it
 
     accounts = 0
-    for finding, reports in rows:
+    # Zipped with the prepared findings rather than looked up by key: two findings
+    # in one payload can share a defect key (the same title raised and dismissed),
+    # and a lookup would then hand one finding's declarations to the other.
+    for p, (finding, reports) in zip(findings, rows, strict=True):
         for r in reports:
             accounts += 1
             session.add(
@@ -479,6 +571,10 @@ async def record_review(
                     severity=(r.severity or "").upper() or None,
                     line=r.line,
                     account=r.account or None,
+                    # A flag the panel attributed via `rereview_by` belongs on the
+                    # reporter's row too — same declaration, arriving by the only
+                    # channel a panel that merges before the judge still has.
+                    needs_rereview=r.needs_rereview or r.reviewer in p.rereview_by,
                 )
             )
 
@@ -504,6 +600,11 @@ def _run_view(r: ReviewRun) -> dict:
         "judged": r.judged,
         "judge_model": r.judge_model,
         "judge_skip": r.judge_skip,
+        "coverage_note": r.coverage_note,
+        "round": r.round,
+        "new_findings": r.new_findings,
+        "stop_reason": r.stop_reason,
+        "stop_confident": r.stop_confident,
         "sonar_gate": r.sonar_gate,
         "ci_status": r.ci_status,
         "reviewers_selected": r.reviewers_selected or [],
@@ -526,6 +627,8 @@ def _card_view(c: ReviewReviewer) -> dict:
         "max_diff_chars": c.max_diff_chars,
         "truncated": c.truncated,
         "duration_ms": c.duration_ms,
+        "could_not_assess": c.could_not_assess,
+        "rereview_flagged": c.rereview_flagged,
         "raised": c.raised,
         "confirmed": c.confirmed,
         "dismissed": c.dismissed,
@@ -545,6 +648,7 @@ def _report_view(r: ReviewFindingReport) -> dict:
         "severity": r.severity,
         "line": r.line,
         "account": r.account,
+        "needs_rereview": r.needs_rereview,
     }
 
 
@@ -560,6 +664,8 @@ def _finding_view(f: ReviewFinding, reports: list[ReviewFindingReport]) -> dict:
         "reason": f.reason,
         "reviewers": f.reviewers or [],
         "related": f.related or [],
+        "needs_rereview": f.needs_rereview,
+        "new_this_round": f.new_this_round,
         "reported_by": [_report_view(r) for r in reports],
     }
 
@@ -704,6 +810,27 @@ async def review_stats(
                 func.sum(ReviewReviewer.sev_agree),
                 func.sum(ReviewReviewer.sev_looser),
                 func.sum(ReviewReviewer.duration_ms),
+                # How often this member reviewed a PREFIX of the diff. A row that
+                # says "12 confirmed" reads differently when half of those runs
+                # only showed it half the change.
+                func.count(ReviewReviewer.id).filter(ReviewReviewer.truncated.is_(True)),
+                # Runs where it said what it could not judge. A member that was
+                # never asked (pre-v2.14) must not read as one that declared
+                # nothing. Deliberately NOT `jsonb_array_length(...) > 0`: this
+                # column holds JSON `null` for "not asked" (SQLAlchemy's JSONB
+                # rendering of a Python None), that function ERRORS on a scalar
+                # rather than returning NULL, and SQL gives no evaluation-order
+                # guarantee that a typeof guard beside it would run first. A
+                # comparison against an empty array is total over every jsonb
+                # value. It is built server-side rather than cast from "[]",
+                # because a Python string bound to a JSONB parameter serialises
+                # to the jsonb *string* `"[]"`, which no array ever equals — so
+                # every row would count as a declared gap.
+                func.count(ReviewReviewer.id).filter(
+                    func.jsonb_typeof(ReviewReviewer.could_not_assess) == "array",
+                    ReviewReviewer.could_not_assess != func.jsonb_build_array(),
+                ),
+                func.sum(ReviewReviewer.rereview_flagged),
             )
             .join(ReviewRun, ReviewRun.id == ReviewReviewer.run_id)
             .where(*filters)
@@ -714,7 +841,8 @@ async def review_stats(
     by_model = []
     for (name, model, effort, runs, skipped, raised, confirmed, dismissed,
          unjudged, solo, p1, p2, p3, p4, avg_ms,
-         shared, stricter, agree, looser, total_ms) in model_rows:
+         shared, stricter, agree, looser, total_ms,
+         truncated_runs, declared_runs, rereview_flagged) in model_rows:
         confirmed, dismissed = int(confirmed or 0), int(dismissed or 0)
         raised = int(raised or 0)
         ruled = confirmed + dismissed
@@ -751,6 +879,14 @@ async def review_stats(
             # Needs `reported_by` severities to be non-null, so it stays None for
             # every pre-v2.11 run rather than reading as perfect disagreement.
             "severity_calibration": round(agree / rated, 3) if rated else None,
+            # The coverage side of a scorecard: how often this member reviewed
+            # only part of the diff, how often it said so about something else,
+            # and how many fixes it asked to have re-read. A reviewer that
+            # reliably declares what it could not see is worth more than one that
+            # silently reports clean, and nothing else here tells them apart.
+            "truncated_runs": truncated_runs,
+            "declared_gaps_runs": declared_runs,
+            "rereview_flagged": int(rereview_flagged or 0),
             "avg_duration_ms": round(float(avg_ms)) if avg_ms is not None else None,
             # The cost side of "is the expensive tier worth it": time spent per
             # finding that survived the judge, not per finding raised.
@@ -840,7 +976,8 @@ async def pr_finding_history(
         )).all()
     )
     if not fetched:
-        return {"repo": repo, "pr": pr, "rounds": 0, "truncated": False,
+        return {"repo": repo, "pr": pr, "rounds": 0, "stopped": None,
+                "stop_confident": None, "truncated": False,
                 "runs": [], "findings": []}
 
     truncated = len(fetched) > limit
@@ -861,6 +998,28 @@ async def pr_finding_history(
     chains: dict[str, list[ReviewFinding]] = {}
     for f in sorted(findings, key=lambda f: order[f.run_id]):
         chains.setdefault(f.finding_key, []).append(f)
+
+    # Was each round's re-review declaration any good? A reviewer that says "the
+    # fix for this needs re-reading" is making a checkable claim, and this is the
+    # check: the round that followed either did raise something new in that file
+    # or it did not. Derived from the record rather than asked for — the declarer
+    # cannot mark its own homework.
+    #
+    # "New" is computed within the traced window, so a finding first raised before
+    # it counts as new here; the run's own `new_findings`, which the panel
+    # computed against its real baseline, is reported alongside for that reason.
+    first_seen = {key: order[obs[0].run_id] for key, obs in chains.items()}
+    flagged_files: dict[int, set[str]] = {}
+    fresh_files: dict[int, set[str]] = {}
+    flagged_counts: dict[int, int] = {}
+    for f in findings:
+        i = order[f.run_id]
+        if f.needs_rereview:
+            flagged_counts[i] = flagged_counts.get(i, 0) + 1
+            if f.file:
+                flagged_files.setdefault(i, set()).add(f.file)
+        if f.file and first_seen[f.finding_key] == i:
+            fresh_files.setdefault(i, set()).add(f.file)
 
     out = []
     for key, obs in chains.items():
@@ -886,6 +1045,7 @@ async def pr_finding_history(
             "last_run": last.run_id,
             "reviewers": reviewers,
             "related": related,
+            "needs_rereview": any(f.needs_rereview for f in obs),
             "observations": [
                 {
                     "run_id": f.run_id,
@@ -901,14 +1061,30 @@ async def pr_finding_history(
         "repo": repo,
         "pr": pr,
         "rounds": len(runs),
+        # What ended the cycle, from the last round that ran — and whether that
+        # was convergence or merely a stop. A PR whose panel gave up at the round
+        # cap, or stopped while a reviewer was reading half the diff, must not
+        # read like one that was reviewed until there was nothing left.
+        "stopped": runs[-1].stop_reason,
+        "stop_confident": runs[-1].stop_confident,
         # More runs exist than the window traced, so `first_run` and a `gone`
         # status describe the window, not the PR's whole history.
         "truncated": truncated,
         "runs": [
             {"id": r.id, "ts": r.ts.isoformat(), "author": r.author, "judged": r.judged,
              "confirmed": r.n_confirmed, "dismissed": r.n_dismissed,
-             "unjudged": r.n_unjudged, "sonar": r.n_sonar}
-            for r in runs
+             "unjudged": r.n_unjudged, "sonar": r.n_sonar,
+             "round": r.round, "new_findings": r.new_findings,
+             "stop_reason": r.stop_reason, "stop_confident": r.stop_confident,
+             # Findings this round declared worth re-reading, and whether the
+             # round that followed found anything where it pointed. None = no
+             # round followed, which is a different answer from "nothing there".
+             "rereview_flagged": flagged_counts.get(i, 0),
+             "rereview_hit": (
+                 None if i + 1 >= len(runs) or not flagged_files.get(i)
+                 else bool(flagged_files[i] & fresh_files.get(i + 1, set()))
+             )}
+            for i, r in enumerate(runs)
         ],
         "findings": out,
     }

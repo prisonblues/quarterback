@@ -41,8 +41,13 @@ work in one command.
 `loops/panel.py` reviews one PR diff with several vendor CLIs at once (Claude, Codex,
 and others per config), deduplicates their findings, and has a master judge rule each one
 real or not. SonarCloud can be wired in as a hard gate alongside them. `/panel` reviews and
-comments; `/panel-review-pr` takes the confirmed findings and has a sub-agent fix every one
-of them.
+comments; `/panel-review-pr` takes the confirmed findings, has a sub-agent fix every one of
+them, and then **panels the fix commit** — one round leaves the fixer's own work read by
+nobody, and a structural fix creates interactions no earlier round could have seen.
+
+Each reviewer also declares what it could *not* assess, and the panel records which of them
+saw only a prefix of the diff. A finding count reports "clean" and "I could not tell" as the
+same zero; those two columns are what tell them apart, on the PR comment and on the board.
 
 This is the piece with the tightest board coupling, and the reason the two halves ship
 together. A panel run is a controlled comparison — one diff, several models, one judge —

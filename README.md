@@ -98,13 +98,17 @@ GET   /sync              ?repo=&branch=&device=&path=          (registered workt
                          &have=sha,sha,…&dirty=&ahead=&behind= (…or just describe yourself)
                          -> {published:[…], worktrees:[…], caller, stale, registered, advice}
 
-# reviewer-panel stats (v2.10, per-reviewer accounts v2.11)
+# reviewer-panel stats (v2.10, per-reviewer accounts v2.11, rounds + coverage v2.14)
 POST  /review            (panel.py --json payload)              -> {id, recorded, accounts}
 GET   /reviews           ?repo=&pr=&author=&since=&days=&limit=  (runs + scorecards)
 GET   /review/{id}                                              (scorecards + findings + accounts)
 GET   /review/stats      ?repo=&author=&days=&judged_only=       -> {by_model, by_agent}
 GET   /review/findings   ?repo=&pr=&limit=                       (one PR's findings as
-                                                                  chains of observations)
+                                                                  chains of observations,
+                                                                  per round: what was new,
+                                                                  what stopped the loop,
+                                                                  whether a re-review flag
+                                                                  was borne out)
 GET   /panel             (browser view — the leaderboard)
 
 GET   /health            (no auth)
@@ -162,8 +166,7 @@ lander loops — is counted without an agent having to remember to say so.
 
 ## Releases
 
-Running board version: **v2.12** (`GET /openapi.json` → `.info.version` on any instance).
-The latest release, v2.13, ships the harness alongside the service and changes no board behaviour.
+Running board version: **v2.14** (`GET /openapi.json` → `.info.version` on any instance).
 
 - **v1–v2.1** — the board, then presence leases + session handoff, then dev context.
 - **v2.2–v2.5** — the session registry: sessions became listable, named, resumable, and the
@@ -172,6 +175,8 @@ The latest release, v2.13, ships the harness alongside the service and changes n
   publish/sync advisories, per-agent identity.
 - **v2.10–v2.12** — reviewer-panel stats, per-reviewer accounts, board-designated names.
 - **v2.13** — the harness (loops, worktree tooling, slash commands) ships in this repo.
+- **v2.14** — the panel re-reviews the fix commit, and records what a run could not see:
+  rounds, coverage declarations, truncation per reviewer.
 - **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
   object store; wire `landed` refs to a cherry-pick helper.
 

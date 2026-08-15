@@ -65,6 +65,27 @@ class ReviewRun(Base):
     )
     judge_model: Mapped[str | None] = mapped_column(Text)
     judge_skip: Mapped[str | None] = mapped_column(Text)
+    #: The judge's ruling on the coverage the reviewers declared — the split
+    #: between "clean" and "could not tell", adjudicated rather than averaged.
+    coverage_note: Mapped[str | None] = mapped_column(Text)
+
+    # Where this run sat in the panel -> fix -> panel cycle (v2.14). A PR's round
+    # COUNT is derivable by counting its runs; what is not derivable is what each
+    # round found that the one before it had not, and what stopped the loop.
+    #: 1 for a first review, 2+ for a re-review of the fix commit.
+    round: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    #: Findings this round that no earlier round raised. NULL where the panel
+    #: never said — "not reported" and "nothing new" are different facts, and
+    #: storing the second for the first is how a pre-v2.14 run reads as converged.
+    new_findings: Mapped[int | None] = mapped_column(Integer)
+    #: What ended the loop, in the panel's words: dry / a P1-P2 still confirmed /
+    #: the round cap. A cap reached with work outstanding is not convergence.
+    stop_reason: Mapped[str | None] = mapped_column(Text)
+    #: Whether that stop was EARNED. False when a reviewer was truncated, absent,
+    #: unparsed, or declared a gap — the cases where a counter reading zero says
+    #: nothing about the code. This is the column that lets a human review the
+    #: review without re-reading the transcript.
+    stop_confident: Mapped[bool | None] = mapped_column(Boolean)
 
     # Hard gates that sit alongside the LLM panel.
     sonar_gate: Mapped[str | None] = mapped_column(Text)
@@ -121,7 +142,23 @@ class ReviewReviewer(Base):
     skip_reason: Mapped[str | None] = mapped_column(Text)
 
     max_diff_chars: Mapped[int | None] = mapped_column(Integer)
+    #: The reviewer read a PREFIX of the diff, at ``max_diff_chars``. Measured by
+    #: the panel, never asked for: the one thing a truncated reviewer cannot
+    #: notice is its own truncation, and a member that saw half the diff must be
+    #: distinguishable from one that saw all of it on every row it contributed to.
     truncated: Mapped[bool | None] = mapped_column(Boolean)
+    #: What this member said it could NOT judge — a file the diff omits, a runtime
+    #: behaviour, a schema it cannot see. An observation, not a forecast, and the
+    #: only thing that separates "clean" from "I could not tell"; a finding count
+    #: reports both as zero. NULL = the member declared nothing (pre-v2.14 panels
+    #: were never asked), [] = it was asked and had no gap.
+    could_not_assess: Mapped[list[Any] | None] = mapped_column(JSONB)
+    #: Findings this member flagged as needing the FIX re-read. With the next
+    #: round's new findings this is the accuracy check on the declaration itself —
+    #: the raw material for honesty per reviewer, which precision cannot show.
+    rereview_flagged: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
     #: Wall-clock for this reviewer's CLI call. Nullable and unset for now — the
     #: panel doesn't time its members yet; the column is here so it can start
     #: without a migration, since duration is the cost proxy that turns
@@ -204,6 +241,17 @@ class ReviewFinding(Base):
     #: Denormalised len(reviewers) so consensus/solo queries don't unnest JSONB.
     n_reviewers: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
 
+    #: A reporter declared that fixing this takes a structural change whose RESULT
+    #: should be re-read. Stored on the finding as well as per reporter
+    #: (:class:`ReviewFindingReport`) because that is the grain the next round is
+    #: checked against: did the round that followed find something here?
+    needs_rereview: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    #: This observation was not raised by any earlier round of the same PR — the
+    #: dry-round counter, per finding. NULL where the panel didn't say.
+    new_this_round: Mapped[bool | None] = mapped_column(Boolean)
+
     __table_args__ = (
         Index("ix_review_findings_run", "run_id"),
         Index("ix_review_findings_verdict", "verdict"),
@@ -236,6 +284,13 @@ class ReviewFindingReport(Base):
     severity: Mapped[str | None] = mapped_column(Text)  # what this reviewer called it
     line: Mapped[int | None] = mapped_column(Integer)  # where this reviewer put it
     account: Mapped[str | None] = mapped_column(Text)  # verbatim, never rewritten
+    #: THIS reviewer said the fix for this finding needs re-reading. Per reporter,
+    #: not per finding, because the declaration's accuracy is per reviewer: a
+    #: group flag credited to everyone who happened to raise the finding makes the
+    #: member that called it and the member that didn't indistinguishable.
+    needs_rereview: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
 
     __table_args__ = (
         UniqueConstraint("finding_id", "reviewer", name="uq_review_report_finding_reviewer"),

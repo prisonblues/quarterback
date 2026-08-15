@@ -1,0 +1,80 @@
+"""v2.14: rounds, coverage declarations, and the re-review flag
+
+A panel run recorded what was found and never what the run could not see. Both
+halves of that are invisible in the old schema: a reviewer handed 60k of a 118k
+diff reported confidently on the half it read and its row looked like everyone
+else's, and a reviewer that could not judge an area had no way to say so — a
+finding count reports "clean" and "I could not tell" as the same zero.
+
+The run also had no place in a sequence. `/panel-review-pr` fixed and pushed
+without re-reviewing, so the fixer's own commit was read by nobody; now that a
+second round exists, "what did THIS round find that the last one had not" and
+"what stopped the loop" are facts worth keeping — a round cap reached with work
+outstanding is not the same event as a dry round, and only one of them is
+convergence.
+
+Existing rows take round 1 and NULL declarations: they were never asked, and
+defaulting them to "nothing to declare" would let pre-v2.14 runs read as
+earned-clean, which is the exact confusion this release exists to remove.
+
+Revision ID: 0014
+Revises: 0013
+Create Date: 2026-08-15
+
+"""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+
+import sqlalchemy as sa
+from alembic import op
+from sqlalchemy.dialects import postgresql
+
+revision: str = "0014"
+down_revision: str | None = "0013"
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
+
+
+def upgrade() -> None:
+    op.add_column("review_runs", sa.Column("coverage_note", sa.Text(), nullable=True))
+    # NOT NULL with a default: every run that exists was a first round, and that
+    # is a fact rather than an unknown.
+    op.add_column(
+        "review_runs",
+        sa.Column("round", sa.Integer(), server_default="1", nullable=False),
+    )
+    # Nullable on purpose: "the panel never said" is not "nothing new".
+    op.add_column("review_runs", sa.Column("new_findings", sa.Integer(), nullable=True))
+    op.add_column("review_runs", sa.Column("stop_reason", sa.Text(), nullable=True))
+    op.add_column("review_runs", sa.Column("stop_confident", sa.Boolean(), nullable=True))
+
+    op.add_column(
+        "review_reviewers",
+        sa.Column("could_not_assess", postgresql.JSONB(astext_type=sa.Text()), nullable=True),
+    )
+    op.add_column(
+        "review_reviewers",
+        sa.Column("rereview_flagged", sa.Integer(), server_default="0", nullable=False),
+    )
+
+    op.add_column(
+        "review_findings",
+        sa.Column("needs_rereview", sa.Boolean(), server_default="false", nullable=False),
+    )
+    op.add_column("review_findings", sa.Column("new_this_round", sa.Boolean(), nullable=True))
+    op.add_column(
+        "review_finding_reports",
+        sa.Column("needs_rereview", sa.Boolean(), server_default="false", nullable=False),
+    )
+
+
+def downgrade() -> None:
+    op.drop_column("review_finding_reports", "needs_rereview")
+    op.drop_column("review_findings", "new_this_round")
+    op.drop_column("review_findings", "needs_rereview")
+    op.drop_column("review_reviewers", "rereview_flagged")
+    op.drop_column("review_reviewers", "could_not_assess")
+    for col in ("stop_confident", "stop_reason", "new_findings", "round", "coverage_note"):
+        op.drop_column("review_runs", col)

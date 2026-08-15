@@ -337,7 +337,8 @@ async def test_history_window_reports_when_it_truncated(client):
 
 async def test_history_of_an_unreviewed_pr_is_empty_not_404(client):
     h = (await client.get(f"/review/findings?repo={REPO}&pr=999999", headers=AGENT_A)).json()
-    assert h == {"repo": REPO, "pr": 999999, "rounds": 0, "truncated": False,
+    assert h == {"repo": REPO, "pr": 999999, "rounds": 0, "stopped": None,
+                 "stop_confident": None, "truncated": False,
                  "runs": [], "findings": []}
 
 

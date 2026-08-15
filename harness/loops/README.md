@@ -178,7 +178,8 @@ cwd's repo; `--repo` takes a path or a name under `~/source`.
 ## Reviewer panel (`panel.py`)
 
 `python3 ~/.claude/loops/panel.py --pr <n>` (report) / `--post` (also comment on the
-PR) / `--json` (findings as JSON, no report).
+PR) / `--json` (findings as JSON, no report) / `--round <r> --baseline <earlier
+round's --json-file>` (a re-review that knows what the earlier rounds raised).
 
 Read-only, so it runs in **any** repo — an unconfigured one just uses the defaults.
 
@@ -192,10 +193,26 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   a filter. Only clear false positives are dismissed, with a recorded reason. If no
   judge is available, nothing is suppressed.
 - Reviewers whose prerequisites are missing are reported **SKIPPED**, not failed.
+- **Reviewers declare their own coverage.** Each returns `could_not_assess` (areas it
+  could not judge — a file the diff omits, a runtime behaviour) and can mark a finding
+  `needs_rereview` (fixing it takes a structural change whose result should be read
+  again). Both are *observations*: reviewers are never asked to forecast whether
+  another round is needed, because that asks a model to predict findings it has not
+  made — and one that silently produced nothing would answer "no" with total
+  confidence. Truncation is measured, not asked for, since a truncated reviewer is the
+  one party that cannot notice it. A bare findings array (any older reviewer) still
+  parses and simply declares nothing.
+- **Rounds are mechanical.** `--round`/`--baseline` make each run say which findings no
+  earlier round raised; `round_stop` in the payload then says go-again (something new,
+  or a P1/P2 still confirmed) or stop (dry / round cap), and whether stopping was
+  *convergence*. The declarations never extend the loop — a truncated reviewer is
+  truncated again next round — they only stop a broken round being reported as clean.
 - **The `/panel` skill (default = fix)** consumes `--json`, checks out the PR branch in
   an isolated worktree, fixes confirmed findings, runs lint + unit tests (**aborts the
   commit on failure**), makes one commit, pushes, and comments the summary.
-  `panel.py` itself stays read-only — the fix/verify/commit lives in the skill.
+  `panel.py` itself stays read-only — the fix/verify/commit lives in the skill, and so
+  does the loop: `/panel-review-pr` runs panel → fix → panel (2 rounds by default,
+  `--rounds N`), so the fixer's own commit is read by somebody.
 
 ## Epic driver (`epic.py`)
 
