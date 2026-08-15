@@ -56,6 +56,23 @@ collapse. ``needs_rereview`` is per reporter where the caller sends
 judge, so a panel run attributes the declaration to the member that made it
 rather than to everyone who happened to raise the same finding. The coarser
 ``rereview_by`` remains for a caller that has only that.
+
+**v2.19 — what each member COST, beside what it found.** A scorecard said what a
+seat found and (since v2.13) how long it took, but never what it spent, so the
+leaderboard could rank a reviewer top on confirmed findings while it was quietly
+the most expensive seat on the panel. A member now carries ``input_tokens``,
+``output_tokens``, ``cached_input_tokens``, ``reasoning_tokens`` and ``cost_usd``,
+all independently optional and all null-means-*not recorded*: the panel reads
+usage back out of a pinned session after the run, so a vendor that states no
+figure or a transcript that could not be read loses a number and nothing else.
+``GET /review/stats`` sums them per (reviewer, model, effort) and says how much of
+the window reported (``token_runs``/``cost_runs``), because a sum over a partly
+instrumented window is a real number about part of it. Both counts are out of
+``runs`` and not ``ran``: a member that burned tokens and then failed still spent
+them, so the sums include it and the coverage counts have to cover the same rows.
+Compare them only WITHIN a vendor — different tokenizers, different cache
+semantics; duration stays the cross-vendor axis. ``cost_usd`` is stored only
+where the vendor states it, never derived from a price table.
 """
 
 from __future__ import annotations
@@ -64,10 +81,12 @@ import hashlib
 import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import func, select
+from sqlalchemy import or_ as sa_or
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import identify, reader
@@ -133,6 +152,35 @@ def _count_or_none(v: object) -> int | None:
     except (TypeError, ValueError):
         return None
     return n if 0 <= n <= _INT32 else None
+
+
+#: Numeric(12, 6) — the largest cost the column can hold. A figure beyond it is
+#: not a panel run's cost, and rounding it in would poison every sum it joins.
+_MAX_COST = Decimal("999999.999999")
+
+
+def _cost_or_none(v: object) -> Decimal | None:
+    """A stated cost, if it is a number the column can hold.
+
+    ``NaN``/``Infinity`` arrive from a vendor that emitted a JSON non-number and
+    are refused here rather than at the driver, where they would take the whole
+    record down with them.
+
+    Takes ``object`` and coerces, because it runs ``mode="before"``: the value
+    arrives exactly as the caller spelled it, so ``"free"`` has to become "no
+    cost recorded" here rather than a 422 that loses the whole run. A bool is
+    refused for the same reason :func:`_count_or_none` refuses one — ``True`` is
+    not a price.
+    """
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        cost = v if isinstance(v, Decimal) else Decimal(str(v))
+    except (ArithmeticError, ValueError, TypeError):
+        return None
+    if not cost.is_finite() or cost < 0 or cost > _MAX_COST:
+        return None
+    return cost
 
 
 def _phrases(v: object) -> list[str]:
@@ -265,8 +313,15 @@ class FindingIn(BaseModel):
 
 
 class ReviewerIn(BaseModel):
-    """A panel member as configured for this run — its brain, not its findings,
-    plus what it declared about its own coverage."""
+    """A panel member as configured for this run — its brain, what it declared
+    about its own coverage, and what it cost.
+
+    The cost fields are all optional and independently so: the panel reads usage
+    back out of a pinned session after the run, and a vendor that states no
+    figure, or a transcript that could not be read, simply sends nothing. Every
+    one of them stays null rather than defaulting to 0 — "not recorded" and
+    "spent nothing" are different claims and only one of them is ever true.
+    """
 
     model: str | None = None
     effort: str | None = None
@@ -287,6 +342,22 @@ class ReviewerIn(BaseModel):
     #: over it, so the board must be able to see it too. None = the panel didn't say.
     unstructured: bool | None = None
 
+    #: EVERY prompt-side token, cache hits included. Vendors disagree about this
+    #: — Claude's own `input_tokens` is the uncached remainder and pi reports
+    #: cache reads beside input rather than inside it — so the panel normalises
+    #: before sending, and these two fields are what the board then means by it.
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    #: The cached slice OF ``input_tokens``, never a sibling to be added to it.
+    cached_input_tokens: int | None = None
+    #: Thinking tokens, which every vendor counts INSIDE ``output_tokens``. Kept
+    #: separately for visibility and never added on top, or the seats that think
+    #: would be charged for it twice.
+    reasoning_tokens: int | None = None
+    #: Only when the **vendor states it**. Never a price-table derivation — see
+    #: the column's docstring.
+    cost_usd: Decimal | None = None
+
     @field_validator("could_not_assess", mode="before")
     @classmethod
     def _gaps(cls, v: object) -> list[str] | None:
@@ -297,6 +368,26 @@ class ReviewerIn(BaseModel):
         if v is None or not isinstance(v, (str, list)):
             return None
         return _phrases(v)
+
+    # `mode="before"`, like every other tolerant validator here, and for the
+    # reason the helpers exist: without it pydantic coerces against
+    # `int | None` / `Decimal | None` FIRST, so a malformed telemetry number
+    # 422s before the helper written to absorb it is ever called. Every
+    # tolerance `_count_or_none` documents — a bool, a non-integral float, a
+    # count spelled as a string — was unreachable. The out-of-range case
+    # survived only because Python ints are unbounded, which is exactly why the
+    # range test passed and the type gap stayed hidden. One unreadable number
+    # must not cost a caller its findings, scorecards and accounts.
+    @field_validator("duration_ms", "input_tokens", "output_tokens",
+                     "cached_input_tokens", "reasoning_tokens", mode="before")
+    @classmethod
+    def _count(cls, v: object) -> int | None:
+        return _count_or_none(v)
+
+    @field_validator("cost_usd", mode="before")
+    @classmethod
+    def _cost(cls, v: object) -> Decimal | None:
+        return _cost_or_none(v)
 
 
 class StopIn(BaseModel):
@@ -628,6 +719,11 @@ def _scorecards(
             duration_ms=c.duration_ms if c else None,
             could_not_assess=c.could_not_assess if c else None,
             unstructured=c.unstructured if c else None,
+            input_tokens=c.input_tokens if c else None,
+            output_tokens=c.output_tokens if c else None,
+            cached_input_tokens=c.cached_input_tokens if c else None,
+            reasoning_tokens=c.reasoning_tokens if c else None,
+            cost_usd=c.cost_usd if c else None,
             **tally[name],
         ))
     return cards
@@ -824,6 +920,13 @@ def _card_view(c: ReviewReviewer) -> dict:
         "could_not_assess": c.could_not_assess,
         "unstructured": c.unstructured,
         "rereview_flagged": c.rereview_flagged,
+        "input_tokens": c.input_tokens,
+        "output_tokens": c.output_tokens,
+        "cached_input_tokens": c.cached_input_tokens,
+        "reasoning_tokens": c.reasoning_tokens,
+        # float, not the Decimal the column holds: JSON has no decimal type, and
+        # a client that sees a quoted string here would have to know to parse it.
+        "cost_usd": float(c.cost_usd) if c.cost_usd is not None else None,
         "raised": c.raised,
         "confirmed": c.confirmed,
         "dismissed": c.dismissed,
@@ -980,35 +1083,45 @@ async def review_stats(
         )
     ).one()
 
+    # Labelled rather than unpacked positionally: this grew to two dozen
+    # aggregates, and a tuple that long is one inserted column away from
+    # silently reporting `dismissed` under `unjudged`.
+    # Every token column, because each is independently optional: a scorecard
+    # carrying only a cached or reasoning figure has still been instrumented, and
+    # counting it as unmeasured would make `token_runs` disagree with the sums
+    # sitting next to it.
+    tok = (ReviewReviewer.input_tokens, ReviewReviewer.output_tokens,
+           ReviewReviewer.cached_input_tokens, ReviewReviewer.reasoning_tokens)
     model_rows = (
         await session.execute(
             select(
-                ReviewReviewer.name,
-                ReviewReviewer.model,
-                ReviewReviewer.effort,
-                func.count(ReviewReviewer.id),
-                func.count(ReviewReviewer.id).filter(ReviewReviewer.ran.is_(False)),
-                func.sum(ReviewReviewer.raised),
-                func.sum(ReviewReviewer.confirmed),
-                func.sum(ReviewReviewer.dismissed),
-                func.sum(ReviewReviewer.unjudged),
-                func.sum(ReviewReviewer.solo),
-                func.sum(ReviewReviewer.p1),
-                func.sum(ReviewReviewer.p2),
-                func.sum(ReviewReviewer.p3),
-                func.sum(ReviewReviewer.p4),
-                func.avg(ReviewReviewer.duration_ms).filter(
-                    ReviewReviewer.duration_ms.isnot(None)
-                ),
-                func.sum(ReviewReviewer.shared),
-                func.sum(ReviewReviewer.sev_stricter),
-                func.sum(ReviewReviewer.sev_agree),
-                func.sum(ReviewReviewer.sev_looser),
-                func.sum(ReviewReviewer.duration_ms),
+                ReviewReviewer.name.label("name"),
+                ReviewReviewer.model.label("model"),
+                ReviewReviewer.effort.label("effort"),
+                func.count(ReviewReviewer.id).label("runs"),
+                func.count(ReviewReviewer.id)
+                    .filter(ReviewReviewer.ran.is_(False)).label("skipped"),
+                func.sum(ReviewReviewer.raised).label("raised"),
+                func.sum(ReviewReviewer.confirmed).label("confirmed"),
+                func.sum(ReviewReviewer.dismissed).label("dismissed"),
+                func.sum(ReviewReviewer.unjudged).label("unjudged"),
+                func.sum(ReviewReviewer.solo).label("solo"),
+                func.sum(ReviewReviewer.p1).label("p1"),
+                func.sum(ReviewReviewer.p2).label("p2"),
+                func.sum(ReviewReviewer.p3).label("p3"),
+                func.sum(ReviewReviewer.p4).label("p4"),
+                func.avg(ReviewReviewer.duration_ms)
+                    .filter(ReviewReviewer.duration_ms.isnot(None)).label("avg_ms"),
+                func.sum(ReviewReviewer.shared).label("shared"),
+                func.sum(ReviewReviewer.sev_stricter).label("stricter"),
+                func.sum(ReviewReviewer.sev_agree).label("agree"),
+                func.sum(ReviewReviewer.sev_looser).label("looser"),
+                func.sum(ReviewReviewer.duration_ms).label("total_ms"),
                 # How often this member reviewed a PREFIX of the diff. A row that
                 # says "12 confirmed" reads differently when half of those runs
                 # only showed it half the change.
-                func.count(ReviewReviewer.id).filter(ReviewReviewer.truncated.is_(True)),
+                func.count(ReviewReviewer.id)
+                    .filter(ReviewReviewer.truncated.is_(True)).label("truncated_runs"),
                 # Runs where it said what it could not judge. A member that was
                 # never asked (pre-v2.15) must not read as one that declared
                 # nothing. Deliberately NOT `jsonb_array_length(...) > 0`: this
@@ -1024,13 +1137,46 @@ async def review_stats(
                 func.count(ReviewReviewer.id).filter(
                     func.jsonb_typeof(ReviewReviewer.could_not_assess) == "array",
                     ReviewReviewer.could_not_assess != func.jsonb_build_array(),
-                ),
+                ).label("declared_runs"),
                 # Runs where its reply did not parse. Those land on
                 # could_not_assess NULL for a reason that is not "never asked",
                 # and a member whose CLI keeps producing unreadable output is a
                 # coverage failure that no other counter here can show.
-                func.count(ReviewReviewer.id).filter(ReviewReviewer.unstructured.is_(True)),
-                func.sum(ReviewReviewer.rereview_flagged),
+                func.count(ReviewReviewer.id)
+                    .filter(ReviewReviewer.unstructured.is_(True)).label("unstructured_runs"),
+                func.sum(ReviewReviewer.rereview_flagged).label("rereview_flagged"),
+                func.sum(ReviewReviewer.input_tokens).label("input_tokens"),
+                func.sum(ReviewReviewer.output_tokens).label("output_tokens"),
+                func.sum(ReviewReviewer.cached_input_tokens).label("cached_input_tokens"),
+                func.sum(ReviewReviewer.reasoning_tokens).label("reasoning_tokens"),
+                func.sum(ReviewReviewer.cost_usd).label("cost_usd"),
+                # How many of these scorecards carried any token figure at all.
+                # Without it a sum over a half-instrumented window reads as the
+                # whole window's spend, and "tokens per run" comes out low by
+                # however many runs said nothing.
+                #
+                # Counted over ALL rows in the group, `ran` or not, because that
+                # is the population the sums beside it cover: a member that
+                # burned tokens and then timed out spent them, so `review_llm`
+                # reports usage on the skip path too. Read against `ran` this
+                # would exceed it — a measured failure is in the numerator and
+                # not the denominator — so the coverage marker suppressed itself
+                # on exactly the groups that had one. Compare it to `runs`.
+                func.count(ReviewReviewer.id)
+                    .filter(sa_or(*(c.isnot(None) for c in tok))).label("token_runs"),
+                func.count(ReviewReviewer.id)
+                    .filter(ReviewReviewer.cost_usd.isnot(None)).label("cost_runs"),
+                # The population `total_tokens` is actually a sum OVER, which is
+                # not `token_runs`. `total_tokens` is input+output only, while
+                # `token_runs` counts a row carrying ANY of the four columns — so
+                # a run that reported only `cached_input_tokens` (legal, and
+                # pinned as "instrumented" by its own test) inflated the
+                # denominator while adding nothing to the numerator, and
+                # `tokens_per_run` understated by up to half. A ratio has to be
+                # over one population; this is the one the numerator comes from.
+                func.count(ReviewReviewer.id).filter(sa_or(
+                    ReviewReviewer.input_tokens.isnot(None),
+                    ReviewReviewer.output_tokens.isnot(None))).label("billable_runs"),
             )
             .join(ReviewRun, ReviewRun.id == ReviewReviewer.run_id)
             .where(*filters)
@@ -1039,30 +1185,46 @@ async def review_stats(
     ).all()
 
     by_model = []
-    for (name, model, effort, runs, skipped, raised, confirmed, dismissed,
-         unjudged, solo, p1, p2, p3, p4, avg_ms,
-         shared, stricter, agree, looser, total_ms,
-         truncated_runs, declared_runs, unstructured_runs, rereview_flagged) in model_rows:
-        confirmed, dismissed = int(confirmed or 0), int(dismissed or 0)
-        raised = int(raised or 0)
+    for r in model_rows:
+        confirmed, dismissed = int(r.confirmed or 0), int(r.dismissed or 0)
+        raised = int(r.raised or 0)
         ruled = confirmed + dismissed
+        runs, skipped = r.runs, r.skipped
         ran = runs - skipped
-        shared = int(shared or 0)
-        stricter, agree, looser = int(stricter or 0), int(agree or 0), int(looser or 0)
+        shared = int(r.shared or 0)
+        stricter, agree, looser = int(r.stricter or 0), int(r.agree or 0), int(r.looser or 0)
         rated = stricter + agree + looser
+        avg_ms, total_ms = r.avg_ms, r.total_ms
         total_ms = int(total_ms) if total_ms is not None else None
+
+        # Sums stay None when nothing in the group reported — "not instrumented"
+        # must not render as a reviewer that spent zero tokens.
+        toks = {k: (int(v) if v is not None else None) for k, v in (
+            ("input_tokens", r.input_tokens),
+            ("output_tokens", r.output_tokens),
+            ("cached_input_tokens", r.cached_input_tokens),
+            ("reasoning_tokens", r.reasoning_tokens),
+        )}
+        # Input + output only. Reasoning is inside `output` for some vendors and
+        # beside it for others, and cached input is a slice of `input`, so adding
+        # either would double-count precisely the seats being compared.
+        billable = [t for t in (toks["input_tokens"], toks["output_tokens"]) if t is not None]
+        total_tokens = sum(billable) if billable else None
+        token_runs, cost_runs, billable_runs = r.token_runs, r.cost_runs, r.billable_runs
+        cost = float(r.cost_usd) if r.cost_usd is not None else None
+
         by_model.append({
-            "reviewer": name,
-            "model": model,
-            "effort": effort,
+            "reviewer": r.name,
+            "model": r.model,
+            "effort": r.effort,
             "runs": runs,
             "ran": ran,
             "skipped_runs": skipped,
             "raised": raised,
             "confirmed": confirmed,
             "dismissed": dismissed,
-            "unjudged": int(unjudged or 0),
-            "solo": int(solo or 0),
+            "unjudged": int(r.unjudged or 0),
+            "solo": int(r.solo or 0),
             # Findings someone else raised too. Its complement is a superset of
             # `solo` — a lone reporter is either the only one who saw it or the
             # only one who was wrong, and precision is what separates those.
@@ -1072,7 +1234,8 @@ async def review_stats(
             # different statement from "everything it raised was wrong".
             "precision": round(confirmed / ruled, 3) if ruled else None,
             "confirmed_per_run": round(confirmed / ran, 2) if ran else None,
-            "p1": int(p1 or 0), "p2": int(p2 or 0), "p3": int(p3 or 0), "p4": int(p4 or 0),
+            "p1": int(r.p1 or 0), "p2": int(r.p2 or 0),
+            "p3": int(r.p3 or 0), "p4": int(r.p4 or 0),
             "sev_stricter": stricter,
             "sev_agree": agree,
             "sev_looser": looser,
@@ -1084,18 +1247,53 @@ async def review_stats(
             # and how many fixes it asked to have re-read. A reviewer that
             # reliably declares what it could not see is worth more than one that
             # silently reports clean, and nothing else here tells them apart.
-            "truncated_runs": truncated_runs,
-            "declared_gaps_runs": declared_runs,
+            "truncated_runs": r.truncated_runs,
+            "declared_gaps_runs": r.declared_runs,
             # Runs whose reply did not parse at all: its findings were kept as one
             # raw block, and anything it might have declared was lost. Reported
             # beside the declarations because it is the reason some of those are
             # null — not because the member had nothing to say.
-            "unstructured_runs": unstructured_runs,
-            "rereview_flagged": int(rereview_flagged or 0),
+            "unstructured_runs": r.unstructured_runs,
+            "rereview_flagged": int(r.rereview_flagged or 0),
             "avg_duration_ms": round(float(avg_ms)) if avg_ms is not None else None,
             # The cost side of "is the expensive tier worth it": time spent per
             # finding that survived the judge, not per finding raised.
-            "ms_per_confirmed": round(total_ms / confirmed) if total_ms and confirmed else None,
+            # `is not None` on the numerator, positivity on the denominator
+            # only. Guarding both on truthiness rendered a genuinely recorded
+            # zero as null — and null means *not recorded* everywhere else in
+            # this feature, never *spent nothing*. A free tier and a fully
+            # cached run a vendor states at $0 are real measurements; the two
+            # states the whole thing is built on collapsed in exactly the
+            # derived fields the page puts in front of a reader.
+            "ms_per_confirmed": (round(total_ms / confirmed)
+                                 if total_ms is not None and confirmed else None),
+
+            # --- tokens (v2.19). Only ever compare these BETWEEN ROWS SHARING A
+            # `reviewer`: different vendors have different tokenizers and
+            # different cache semantics, so a cross-vendor ranking on them is
+            # noise dressed as a measurement. Within a vendor they are the
+            # sharpest form of "is the expensive tier worth it".
+            **toks,
+            "total_tokens": total_tokens,
+            # How much of this group is actually instrumented. A client that
+            # renders the sums without it will present a partial window as a
+            # complete one.
+            "token_runs": token_runs,
+            "cost_runs": cost_runs,
+            # Named in the response, not just used, so a client can see which
+            # population the average is over instead of assuming it matches
+            # `token_runs`. They differ exactly when a run reported a cached or
+            # reasoning figure and neither input nor output.
+            "billable_runs": billable_runs,
+            "tokens_per_run": (round(total_tokens / billable_runs)
+                               if total_tokens is not None and billable_runs else None),
+            "tokens_per_confirmed": (round(total_tokens / confirmed)
+                                     if total_tokens is not None and confirmed else None),
+            # Stated by the vendor or absent — never derived from a price table,
+            # so a null here is "this vendor doesn't say", not "this was free".
+            "cost_usd": cost,
+            "cost_per_confirmed": (round(cost / confirmed, 4)
+                                   if cost is not None and confirmed else None),
         })
     by_model.sort(key=lambda m: (-m["confirmed"], m["reviewer"]))
 
