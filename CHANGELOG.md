@@ -7,6 +7,57 @@ that number where it was, so the repo can be a version ahead of the service.
 Entries are newest first. Each one says what was broken or missing before it, because that is the
 part that isn't recoverable from the diff.
 
+## v2.24 — the codex seat went looking for the repo instead of reading the diff
+
+Harness only; the board's version is unchanged.
+
+Every panel seat is handed the diff in its prompt and an empty `git init`ed sandbox to run in, because
+there is nothing else it should need. `pi` was given `--no-tools` to make that true. codex was not, and
+it used what it had. Measured over seven runs from its own rollouts: the early turns go on `git status`,
+`rg --files` and `find` against a directory with nothing in it, then on up to ten web searches against
+github.com, api.github.com and raw.githubusercontent.com looking for a repo that is private and answers
+none of them. Five of seven runs did the web hunt. The tool phase was a median third of the run and at
+worst 99% of it — still calling tools at 1133s — which is how a review of a diff that was complete in
+the prompt at second zero ran out the 1800s `CLI_TIMEOUT` and cost the panel a whole vendor's eyes.
+
+**The sandbox was never the guard it reads as, and that is the part not recoverable from the diff.**
+`-s read-only` bounds writes; codex grants reads at filesystem *root*, so the model reaches past the cwd
+by passing an absolute `workdir`. One run did: `git show-ref` for every branch in the real checkout, then
+`git show <sha>:harness/loops/panel.py` out of it, plus another agent's files under `/tmp`. That is
+exactly the failure `member_sandbox` was built to stop — a seat reading a tree on a different branch and
+quoting it as the code under review, a plausible wrong answer where the old bug gave a visible one —
+arriving through the tool instead of through the cwd. An empty directory closes the CONFIGURATION channel
+(a `CLAUDE.md` or a hook is resolved from cwd, and an empty cwd has neither) and not the evidence one.
+
+`codex_args` now sets four `-c` overrides unconditionally: `web_search="disabled"`,
+`features.shell_tool=false`, `features.apps=false`, `features.plugins=false`. Not from `.harness-rules` —
+a seat that reviews the diff it was handed is what the panel MEANS by a reviewer, not a preference a repo
+gets to hold.
+
+**Four keys and not two, because two was a measured non-fix.** With only the shell and web overrides the
+seat did not settle down and review; it enumerated the code-mode JS runtime (`ALL_TOOLS` filtered for
+`/exec|command|shell|read/`, then for `github_`) until it reached the *authenticated GitHub connector*,
+and pulled the PR through `github_get_pr_info` / `github_get_pr_diff` instead — 135 connector references
+in one rollout. An app is a credentialed network channel, so disabling web search alone bought nothing.
+The general shape of this seat's problem is that it does not want a particular tool, it wants the code,
+and it will use whatever is left; anything added to codex's default tool surface needs checking against
+that.
+
+Measured on PR #90 (+2286/-27), `--reviewers codex`, gpt-5.6-luna at `max`:
+
+| | outcome | tool calls | reached outside the sandbox | web | connector | findings |
+|---|---|---|---|---|---|---|
+| before | **killed at 1792s** | 65 | 60 | 0 | 0 | none |
+| shell+web off | 1281s | 6 | 0 | 0 | 135 | 13 |
+| all four off | 1242s | 2 | 0 | 0 | 0 | 15 |
+
+550s faster than the run that died, 558s of headroom under the wall, and **more** findings rather than
+fewer — 15 against the 13 the half-fixed run managed, which is the answer to the obvious worry that a
+toolless reviewer is a weaker one. It is not: the tools were never reading the code under review.
+
+The remaining ~20 minutes is the model itself at `max` on a 2,300-line diff, not flailing. `.harness-rules`
+keeps its `effort: max` pin, now that what it buys can actually be seen.
+
 ## v2.23 — the board knew how many lines a merge changed, and not which files
 
 `POST /review` carried `changed_lines: 2032` and no paths. The only file names the board held for a
