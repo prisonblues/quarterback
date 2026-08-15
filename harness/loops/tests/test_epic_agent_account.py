@@ -11,6 +11,7 @@ That outcome is what lets the driver stack a sub-PR into the epic branch, so
 calling it reviewed merges a PR whose findings nobody addressed.
 """
 
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -35,7 +36,7 @@ def new_state():
 
 
 def arrange(monkeypatch, tmp_path, agent, discovered_pr=None, head_shas=None,
-            panelled=True):
+            panelled=True, found=2):
     """Neutralise everything work_issue touches except the agent run itself.
     Returns (cfg, calls) where calls records each skill the driver invoked."""
     calls = []
@@ -51,9 +52,13 @@ def arrange(monkeypatch, tmp_path, agent, discovered_pr=None, head_shas=None,
     monkeypatch.setattr(epic, "worktree_has_new_commit", lambda wt, base: False)
     monkeypatch.setattr(epic, "worktree_dirty", lambda wt: False)
     monkeypatch.setattr(epic, "teardown_worktree", lambda cfg, branch, wt: None)
-    # run_panel reports whether it produced a report; a dead panel leaves
-    # /review-pr nothing to act on, which the merge gate has to be able to see.
-    monkeypatch.setattr(epic, "run_panel", lambda repo_path, pr: panelled)
+    # run_panel reports whether it produced a report AND how many findings it
+    # confirmed. A dead or skipped panel leaves /review-pr nothing to act on; a
+    # report of ZERO findings makes "the reviewer pushed nothing" the expected
+    # outcome rather than an ambiguous one. Default 2, so the tests that care
+    # about the pushed-nothing ambiguity get it without asking.
+    monkeypatch.setattr(epic, "run_panel",
+                        lambda repo_path, pr: (panelled, found if panelled else None))
     # Default: the review pushed something, so the "pushed nothing" line is only
     # exercised by the test that asks for it.
     shas = iter(head_shas or ["sha-before", "sha-after"])
@@ -271,3 +276,68 @@ def test_an_unreadable_head_sha_stays_unknown_rather_than_counting_as_a_push(
 
     assert res.outcome == "reviewed" and res.verified is False
     assert "the head SHA could not be read" in capsys.readouterr().out
+
+
+def test_a_clean_sub_pr_is_verified_and_does_not_halt_the_stack(
+        monkeypatch, tmp_path, capsys):
+    """The happy path, and the one the first version of this gate broke.
+
+    A panel that finds nothing, followed by a reviewer that correctly changes
+    nothing, is the system working — by the last round it is the point. But
+    "pushed nothing" was read as unverified on its own, so an integration epic
+    halted on its first CLEAN sub-PR and demanded a human for the outcome it was
+    hoping for. "Pushed nothing" is only ambiguous when there was something to
+    push, which is what the findings count settles."""
+    cfg, _ = arrange(monkeypatch, tmp_path, ran(out="No findings needed a change."),
+                     head_shas=["same-sha", "same-sha"], found=0)
+    state = new_state()
+
+    res = epic.work_issue(cfg, work(stage="review", pr=99), execute=True, state=state)
+
+    assert res.outcome == "reviewed" and res.verified is True
+    assert "unverified" not in capsys.readouterr().out
+    assert state["issues"]["31"]["lastAction"] == "reviewed"
+
+
+def test_a_panel_that_skipped_is_not_a_panel_that_reviewed(monkeypatch, tmp_path):
+    """`panel.py` exits 0 on a configured title-pattern skip and on other no-op
+    paths, so reading rc==0 as "a report exists" let a SKIPPED panel present as a
+    reviewed one — and the sub-PR then cleared the merge gate having had no
+    findings generated at all, which is exactly what the gate exists to stop.
+
+    The answer now comes from the JSON payload, which only exists when the panel
+    actually produced one and cannot be faked by an exit status."""
+    calls = []
+
+    def fake_run(args, **kw):
+        calls.append(args)
+        # Exit 0, writing nothing — a skip.
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(epic.subprocess, "run", fake_run)
+    reported, found = epic.run_panel(str(tmp_path), 99)
+
+    assert reported is False and found is None
+    assert any("--json-file" in a for a in calls[0]), "asks for the artefact"
+
+
+def test_a_panel_that_wrote_a_report_reports_its_findings(monkeypatch, tmp_path):
+    def fake_run(args, **kw):
+        path = args[args.index("--json-file") + 1]
+        Path(path).write_text(json.dumps({"to_fix": [{"id": "F01"}, {"id": "F02"}]}))
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(epic.subprocess, "run", fake_run)
+    assert epic.run_panel(str(tmp_path), 99) == (True, 2)
+
+
+def test_a_panel_that_ruled_and_then_tripped_keeps_its_findings(monkeypatch, tmp_path):
+    """A report AND a bad exit: the run got far enough to rule and then fell over
+    on the way out. The findings are real and are not thrown away."""
+    def fake_run(args, **kw):
+        path = args[args.index("--json-file") + 1]
+        Path(path).write_text(json.dumps({"to_fix": [{"id": "F01"}]}))
+        return subprocess.CompletedProcess(args, 1)
+
+    monkeypatch.setattr(epic.subprocess, "run", fake_run)
+    assert epic.run_panel(str(tmp_path), 99) == (True, 1)

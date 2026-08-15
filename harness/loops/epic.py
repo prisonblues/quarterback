@@ -29,6 +29,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -455,27 +456,52 @@ def claude(skill_cmd: str, cwd: str, perm_mode: str,
                      + (["--model", model] if model else []), cwd=cwd)
 
 
-def run_panel(repo_path: str, pr: int) -> bool:
-    # Pass the PATH, not the name: the resolver would otherwise look a bare name
-    # up under ~/source, which silently picks the wrong repo when the directory
-    # name and the GitHub name differ.
-    # sys.executable, not `uv run`: there is no project to resolve from once this
-    # ships to ~/.claude/loops, and panel.py is stdlib-only anyway.
-    # Uncaptured on purpose — the report IS the output, and it belongs in the log
-    # as it is written. Only the exit code needs interpreting: /review-pr runs next
-    # either way, and a panel that died has left it nothing to work from.
-    #
-    # Returns whether it produced a report, because "may have no findings to act
-    # on" is not a warning the caller can act on by printing it. `/review-pr` with
-    # nothing to read can still print a plausible no-op reply, pass agent_failure,
-    # and record `reviewed` — the outcome that lets the sub-PR be stacked. So a
-    # dead panel has to reach the merge gate as a fact, not as a log line.
-    rc = subprocess.run([sys.executable, str(PANEL), "--repo", repo_path,
-                         "--pr", str(pr)], check=False).returncode
+def run_panel(repo_path: str, pr: int) -> tuple[bool, int | None]:
+    """Run the panel. Returns (produced_a_report, findings_it_confirmed).
+
+    Pass the PATH, not the name: the resolver would otherwise look a bare name
+    up under ~/source, which silently picks the wrong repo when the directory
+    name and the GitHub name differ. sys.executable, not `uv run`: there is no
+    project to resolve from once this ships to ~/.claude/loops, and panel.py is
+    stdlib-only anyway. The report stays UNCAPTURED — it IS the output and it
+    belongs in the log as it is written.
+
+    The answer comes from the JSON payload, not the exit code, and that is the
+    whole point of the file. A zero exit is not evidence a review happened:
+    panel.py exits 0 on a configured title-pattern skip and on other no-op paths,
+    so reading rc==0 as "a report exists" let a SKIPPED panel present as a
+    reviewed one, and the sub-PR then cleared the merge gate having had no
+    findings generated at all — exactly what the gate exists to stop. An artefact
+    that only exists when the panel actually produced one cannot be faked by an
+    exit status.
+
+    The findings COUNT matters just as much, because "the reviewer pushed
+    nothing" means opposite things either side of it. Zero findings and nothing
+    pushed is the panel working: there was nothing to fix, which by the last
+    round is the point. Findings and nothing pushed is the ambiguous case worth
+    withholding a merge for. Without the count the caller cannot tell them apart,
+    and treating both as suspect halts an integration epic on its first clean
+    sub-PR.
+    """
+    with tempfile.TemporaryDirectory(prefix="epic-panel-") as tmp:
+        payload = Path(tmp) / "panel.json"
+        rc = subprocess.run([sys.executable, str(PANEL), "--repo", repo_path,
+                             "--pr", str(pr), "--json-file", str(payload)],
+                            check=False).returncode
+        try:
+            report = json.loads(payload.read_text())
+        except (OSError, json.JSONDecodeError):
+            report = None
+    if report is None:
+        print(f"    (panel exited {rc} and wrote no report — the review that "
+              f"follows has nothing to act on)")
+        return False, None
+    found = len(report.get("to_fix") or [])
     if rc != 0:
-        print(f"    (panel exited {rc} — see its output above; the review that "
-              f"follows has no findings to act on)")
-    return rc == 0
+        # A report AND a bad exit: the run got far enough to rule on findings and
+        # then tripped. The findings are real, so they are not thrown away.
+        print(f"    (panel exited {rc} but wrote a report with {found} finding(s))")
+    return True, found
 
 
 def pr_green(gh_repo: str, pr: int) -> tuple[bool, str]:
@@ -871,7 +897,7 @@ def work_issue(cfg: dict, w: IssueWork, execute: bool, base: str | None = None,
                 return WorkResult(w.num, "failed", detail=detail)
 
         print(f"  #{w.num}: reviewing PR #{pr}")
-        panelled = run_panel(cfg["path"], pr)
+        panelled, found = run_panel(cfg["path"], pr)
         # /review-pr addresses findings + pushes; merge withheld (human/epic gate).
         before = pr_head_sha(gh_repo, pr)
         reviewer = claude(f"/review-pr {pr}", cfg["path"], perm, w.model)
@@ -913,9 +939,16 @@ def work_issue(cfg: dict, w: IssueWork, execute: bool, base: str | None = None,
         # own account rather than passing as an ordinary review — and it is not
         # auto-merged on that ambiguity. Same for a review with no panel report to
         # work from, and for a head SHA nobody could read.
+        # "Pushed nothing" is only ambiguous when there was something to push.
+        # With a report saying zero findings, a reviewer that changed nothing did
+        # exactly the right thing — that is the panel working, and by the last
+        # round it is the expected outcome. Reading it as unverified halted an
+        # integration epic on its first CLEAN sub-PR and demanded a human for the
+        # happy path.
         why = ("the panel produced no report" if not panelled else
                "the head SHA could not be read" if not known else
-               "it pushed nothing — nothing to fix, or it could not" if not pushed
+               "it pushed nothing against %d finding(s) — nothing it could fix, "
+               "or nothing it would" % found if not pushed and found
                else "")
         if why:
             print(f"  #{w.num}: /review-pr on PR #{pr} is unverified: {why}. "
