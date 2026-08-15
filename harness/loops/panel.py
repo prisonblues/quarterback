@@ -1481,8 +1481,22 @@ def select_reviewers(rev: dict, spec: str | None) -> tuple[set[str], str | None]
 
 
 def _int(v: object) -> int:
-    """A usage figure as an int, or 0 — vendors omit fields they have nothing for."""
-    return v if isinstance(v, int) and not isinstance(v, bool) else 0
+    """A usage figure as an int, or 0 — vendors omit fields they have nothing for.
+
+    An INTEGRAL float counts. `455.0` is ordinary in JSON emitted from a language
+    with one number type, neither codex's nor pi's schema is pinned here, and
+    reading it as 0 was the worst available answer: `found` is set from the
+    presence of the usage dict rather than from a non-zero total, so the run was
+    recorded as instrumented AND free — a zero the board cannot tell from a
+    measured one, which is the single outcome this feature exists to prevent.
+    A fractional figure is still 0: no vendor bills 1.5 tokens, so it is a shape
+    nobody meant and quietly truncating it would invent a number.
+    """
+    if isinstance(v, bool):
+        return 0
+    if isinstance(v, float):
+        return int(v) if v.is_integer() else 0
+    return v if isinstance(v, int) else 0
 
 
 def _jsonl(path: Path) -> list[dict]:
@@ -1560,17 +1574,28 @@ def claude_usage(session_ids: list[str]) -> dict | None:
     inp = out = cached = reasoning = 0
     seen: set[str] = set()
     for session_id in session_ids:
-        files = list(Path.home().glob(f".claude/projects/*/{session_id}.jsonl"))
+        # EVERY match, not `files[0]`. `Path.glob` returns filesystem order, so
+        # one session id resolving under two project slugs made the read
+        # nondeterministic — a different number on different runs, with nothing
+        # to say which. Summing them is safe here because the message-id dedup
+        # below already collapses a record seen twice.
+        files = sorted(Path.home().glob(f".claude/projects/*/{session_id}.jsonl"))
         if not files:
             continue
-        for rec in _jsonl(files[0]):
+        for rec in [r for f in files for r in _jsonl(f)]:
             msg = rec.get("message")
             if rec.get("type") != "assistant" or not isinstance(msg, dict):
                 continue
             u = msg.get("usage")
             if not isinstance(u, dict):
                 continue
-            mid = msg.get("id") or rec.get("requestId") or rec.get("uuid")
+            # A record identifying itself in none of the three ways cannot be
+            # deduped, so it is counted. Falling through to a bare `None` put
+            # one None in `seen` and then skipped EVERY later id-less message in
+            # the turn as its duplicate — the exact inverse of the double-count
+            # this guard was written to stop, and in the direction that flatters
+            # an expensive seat by under-reporting it.
+            mid = msg.get("id") or rec.get("requestId") or rec.get("uuid") or object()
             if mid in seen:
                 continue
             seen.add(mid)
@@ -1609,10 +1634,15 @@ def pi_usage(session_dir: Path, session_ids: list[str]) -> dict | None:
     stated = False
     found = False
     for session_id in session_ids:
+        # EVERY match, not `sorted(files)[0]`. Taking the earliest timestamp
+        # dropped the later, larger half of a turn if pi ever rolled one session
+        # into a second file — under-charging the seat with no signal that
+        # anything was missing. The id is unique, so extra matches are more of
+        # the same session rather than a different one.
         files = sorted(session_dir.glob(f"*_{session_id}.jsonl"))
         if not files:
             continue
-        for rec in _jsonl(files[0]):
+        for rec in [r for f in files for r in _jsonl(f)]:
             msg = rec.get("message")
             if not isinstance(msg, dict) or msg.get("role") != "assistant":
                 continue

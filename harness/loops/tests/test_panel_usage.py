@@ -473,3 +473,55 @@ def test_each_codex_attempt_gets_its_own_reply_file(monkeypatch):
     # spent what it spent, and this is the seat whose usage is read only from
     # stdout, so the losing turn has to count or the flaking seat looks cheap.
     assert run.usage["input_tokens"] == 180
+
+
+def test_a_figure_a_vendor_spelled_as_a_float_is_still_a_figure():
+    """`455.0` is ordinary in JSON emitted from a language with one number type,
+    and neither codex's nor pi's schema is pinned here. Reading it as 0 was the
+    worst available answer: `found` is set from the presence of a usage dict, not
+    from a non-zero total, so the run was recorded as instrumented AND free — a
+    zero the board cannot tell from a measured one. A fractional figure stays 0;
+    no vendor bills 1.5 tokens, and truncating it would invent a number."""
+    assert panel._int(455.0) == 455
+    assert panel._int(1.5) == 0
+    assert panel._int(True) == 0 and panel._int("455") == 0
+    assert panel._int(455) == 455
+
+
+def test_messages_that_identify_themselves_in_no_way_are_all_counted(monkeypatch, tmp_path):
+    """The inverse of the double-count the dedup exists to stop, and the one that
+    flatters an expensive seat. `msg.get("id") or requestId or uuid` fell through
+    to None, so the first id-less assistant message went into `seen` and every
+    later one in the turn was skipped as its duplicate."""
+    sid = "sess-anon"
+    anon = {"type": "assistant", "message": {"usage": {"input_tokens": 10, "output_tokens": 1}}}
+    write_jsonl(tmp_path / ".claude/projects/-slug" / f"{sid}.jsonl", [anon, dict(anon)])
+    monkeypatch.setattr(panel.Path, "home", classmethod(lambda cls: tmp_path))
+    u = panel.claude_usage([sid])
+    assert u["input_tokens"] == 20 and u["output_tokens"] == 2
+
+
+def test_one_session_under_two_slugs_is_read_whole_and_the_same_way_twice(monkeypatch, tmp_path):
+    """`Path.glob` returns filesystem order, so `files[0]` made the read
+    nondeterministic — a different number on different runs with nothing to say
+    which. Every match is read; the message-id dedup keeps a record seen twice
+    from being charged twice."""
+    sid = "sess-two-slugs"
+    write_jsonl(tmp_path / ".claude/projects/-slug-a" / f"{sid}.jsonl",
+                [claude_msg("m1", inp=10, out=5)])
+    write_jsonl(tmp_path / ".claude/projects/-slug-b" / f"{sid}.jsonl",
+                [claude_msg("m1", inp=10, out=5),        # the same message again
+                 claude_msg("m2", inp=20, out=7)])
+    monkeypatch.setattr(panel.Path, "home", classmethod(lambda cls: tmp_path))
+    u = panel.claude_usage([sid])
+    assert u["input_tokens"] == 30 and u["output_tokens"] == 12
+
+
+def test_a_pi_session_rolled_into_a_second_file_is_charged_in_full(tmp_path):
+    """`sorted(files)[0]` deliberately took the EARLIEST timestamp, so the later
+    and larger half of a rolled turn was dropped and the seat under-charged with
+    no signal that anything was missing."""
+    write_jsonl(tmp_path / "2026-01-01T00-00_rolled.jsonl", [pi_record(100, 10)])
+    write_jsonl(tmp_path / "2026-01-01T01-00_rolled.jsonl", [pi_record(200, 20)])
+    u = panel.pi_usage(tmp_path, ["rolled"])
+    assert u["input_tokens"] == 300 and u["output_tokens"] == 30

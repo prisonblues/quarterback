@@ -1247,7 +1247,15 @@ async def review_stats(
             "avg_duration_ms": round(float(avg_ms)) if avg_ms is not None else None,
             # The cost side of "is the expensive tier worth it": time spent per
             # finding that survived the judge, not per finding raised.
-            "ms_per_confirmed": round(total_ms / confirmed) if total_ms and confirmed else None,
+            # `is not None` on the numerator, positivity on the denominator
+            # only. Guarding both on truthiness rendered a genuinely recorded
+            # zero as null — and null means *not recorded* everywhere else in
+            # this feature, never *spent nothing*. A free tier and a fully
+            # cached run a vendor states at $0 are real measurements; the two
+            # states the whole thing is built on collapsed in exactly the
+            # derived fields the page puts in front of a reader.
+            "ms_per_confirmed": (round(total_ms / confirmed)
+                                 if total_ms is not None and confirmed else None),
 
             # --- tokens (v2.19). Only ever compare these BETWEEN ROWS SHARING A
             # `reviewer`: different vendors have different tokenizers and
@@ -1261,14 +1269,15 @@ async def review_stats(
             # complete one.
             "token_runs": token_runs,
             "cost_runs": cost_runs,
-            "tokens_per_run": round(total_tokens / token_runs) if total_tokens and token_runs
-                              else None,
-            "tokens_per_confirmed": round(total_tokens / confirmed) if total_tokens and confirmed
-                                    else None,
+            "tokens_per_run": (round(total_tokens / token_runs)
+                               if total_tokens is not None and token_runs else None),
+            "tokens_per_confirmed": (round(total_tokens / confirmed)
+                                     if total_tokens is not None and confirmed else None),
             # Stated by the vendor or absent — never derived from a price table,
             # so a null here is "this vendor doesn't say", not "this was free".
             "cost_usd": cost,
-            "cost_per_confirmed": round(cost / confirmed, 4) if cost and confirmed else None,
+            "cost_per_confirmed": (round(cost / confirmed, 4)
+                                   if cost is not None and confirmed else None),
         })
     by_model.sort(key=lambda m: (-m["confirmed"], m["reviewer"]))
 
