@@ -1,0 +1,29 @@
+{
+  "_comment": [
+    "MINIMAL — a worktree, symlinks and a port. No database, no containers.",
+    "Copy to .worktree.json in your repo root and edit `project`.",
+    "",
+    "Use this when the repo has no database of its own, or when you are happy",
+    "for every worktree to share one. Nothing here can destroy shared data,",
+    "which is exactly why it is the safe starting point.",
+    "",
+    "symlinks are per-worktree links back to the main checkout, for things too",
+    "big or too local to copy. Omit the key entirely to get the default set",
+    "(.venv, .claude, CLAUDE.md — whichever exist)."
+  ],
+
+  "project": "myapp",
+
+  "base_port": 5690,
+  "app_port": 8000,
+
+  "docker": {
+    "enabled": false
+  },
+
+  "symlinks": [".venv"],
+
+  "workspace": {
+    "enabled": false
+  }
+}

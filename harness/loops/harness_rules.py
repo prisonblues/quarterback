@@ -99,12 +99,15 @@ DEFAULTS: dict = {
             "relocate top-level",
         ],
         "judge_model": "opus",
-        # Chars of diff each model is given. One number stood in for several
-        # different context windows; override per reviewer with
-        # `reviewers.<name>.max_diff_chars`, and the judge with
-        # `judge_max_diff_chars` (both inherit this when unset). Over-budget
-        # diffs are truncated, and the report names WHICH reviewers were cut.
-        "max_diff_chars": 60_000,
+        # Chars of diff each model is given. `null` — the default — means the
+        # whole diff: the number that used to be here was inherited from the
+        # kernel's argv limit and outlived it, and a reviewer handed a prefix
+        # cannot tell, so it reports confidently on the part it saw. Set one only
+        # if a model you run genuinely cannot take the change; override per
+        # reviewer with `reviewers.<name>.max_diff_chars` and the judge with
+        # `judge_max_diff_chars` (both inherit this when unset). A cut diff is
+        # reported as truncation, naming WHICH reviewers were cut and at what.
+        "max_diff_chars": None,
     },
     "loops": {
         "dependabot_lander": False,

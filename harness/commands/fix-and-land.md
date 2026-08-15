@@ -16,7 +16,8 @@ This is the hybrid path: the guardrails of a guided integration merge (lexray's 
    `executor_pr_base` (`test` for lexray, `main`/`master` elsewhere).
 2. **Implement:** run `/fix-issue <issue>` (it plans, implements, tests, pushes a branch, opens a PR
    against the right base). Capture the PR number and the branch checkout it worked in.
-3. **Review:** run the panel — `python3 ~/.claude/loops/panel.py --pr <pr>` — and run
+3. **Review:** run the panel — `python3 ~/.claude/loops/panel.py --pr <pr>`, in the **background**
+   (a slow reviewer outlives the 10-minute foreground Bash cap, which would kill the panel) — and run
    `/review-pr <pr>` to address findings. Repeat review→fix until the panel's **To fix** list is
    empty and CI is green.
 4. **Pre-land gate (mechanical).** Work in the PR branch's checkout, clean tree, `git fetch origin`.

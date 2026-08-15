@@ -114,16 +114,32 @@ Detected from the checkout, **not settable** here: `path`, `github`, `default_br
 - `sonarqube` — deterministic static-analysis **hard gate**. `project_key`,
   `organization` and `host` are non-secret and belong here; the token does not.
 
-`review_panel.max_diff_chars` (default 60,000) — how much of the diff each model
-is given. Override per reviewer with `reviewers.<name>.max_diff_chars` and for
-the master with `review_panel.judge_max_diff_chars`; both inherit the panel value
-when unset. It is per-model because one number was standing in for several
-different context windows. Any positive value is honoured — there is no lower
-sanity bound, deliberately; what surfaces a too-small budget is that the report
-names **which** reviewers were truncated and at what budget (worth knowing when
-two reviewers disagree and only one of them saw the whole change). Only a value
-that cannot be a budget at all — not a number, or `<= 0` — falls back to the
-inherited one, with a ⚠️ config line in the report saying so.
+`review_panel.max_diff_chars` (default: **none — the whole diff**) — how much of
+the diff each model is given. Override per reviewer with
+`reviewers.<name>.max_diff_chars` and for the master with
+`review_panel.judge_max_diff_chars`; both inherit the panel value when unset.
+
+There used to be a 60,000-char default, and it was a fossil: prompts travelled in
+argv, where Linux caps one element at 128 KiB, so a budget was mandatory. Since
+they moved to stdin the only ceiling is the model's own context, and 60k chars is
+about 15k tokens — an order of magnitude under every reviewer the panel runs.
+Truncating when nothing forces it is not a saving, because a truncated reviewer
+cannot notice that it was truncated: it reports on a prefix with full confidence,
+and the errors that produces are *false positives* ("this migration is
+syntactically incomplete" — it was cut mid-file) that then cost a judge call and
+a fixer's attention to disprove.
+
+Set one only if a model you run cannot take the change. Any positive value is
+honoured — there is no lower sanity bound, deliberately; what surfaces a
+too-small budget is that the report names **which** reviewers were truncated and
+at what budget, which is worth knowing when two reviewers disagree and only one
+of them saw the whole change. Only a value that cannot be a budget at all — not a
+number, or `<= 0` — falls back, with a ⚠️ config line in the report saying so.
+
+One seat is capped whatever you configure: `agy` takes its prompt in argv, so the
+kernel bounds it. The panel clamps that seat to what `execve` will carry and
+reports it as ordinary truncation rather than dying at exec — which is what it
+used to do, reporting "LLM reviewers ran: none" as a clean review.
 
 ### The SonarQube token
 
@@ -189,19 +205,33 @@ cwd's repo; `--repo` takes a path or a name under `~/source`.
 ## Reviewer panel (`panel.py`)
 
 `python3 ~/.claude/loops/panel.py --pr <n>` (report) / `--post` (also comment on the
-PR) / `--json` (findings as JSON, no report).
+PR) / `--json` (the run as JSON on stdout — nothing else, progress goes to stderr) /
+`--round <r> --max-rounds <N> --baseline <earlier round's --json-file>` (a re-review that
+knows what the earlier rounds raised, and where it sits in the caller's cycle).
 
 Read-only, so it runs in **any** repo — an unconfigured one just uses the defaults.
 
 - Runs the repo's **enabled** reviewers in parallel over the PR diff: SonarQube (HARD
   quality-gate pass/fail), Claude (SOFT, read-only), Codex (SOFT, different vendor).
-- **Skip patterns:** PRs matching `skip_title_patterns` are skipped entirely.
-  Otherwise all enabled reviewers run — no diff-size de-minimis.
-- **Master judgment, no consensus gate:** findings are deduped (file + nearby line)
-  then a master reviewer judges each on its merits. A real defect flagged by only ONE
-  reviewer is still fixed — agreement shows as a `⋆consensus` confidence marker, never
-  a filter. Only clear false positives are dismissed, with a recorded reason. If no
-  judge is available, nothing is suppressed.
+- **Skip patterns:** PRs matching `skip_title_patterns` are skipped entirely — but that
+  is still a payload, marked `reviewed: false`, on `--json` *and* in `--json-file` (an
+  empty stdout, or a missing baseline, would read as a clean PR). Otherwise all enabled
+  reviewers run — no diff-size de-minimis.
+- **Master judgment, no consensus gate:** a master reviewer judges every finding on
+  its merits. A real defect flagged by only ONE reviewer is still fixed — agreement
+  shows as a `⋆consensus` confidence marker, never a filter. Only clear false
+  positives are dismissed, with a recorded reason. If no judge is available, nothing
+  is suppressed.
+- **Merging happens once, in the judge, and adds rather than replaces.** The judge
+  sees one entry per *reviewer*, merges the entries that are the same defect, and
+  writes a `synthesis`; each reviewer's own title, detail, severity and line ride
+  along in `reported_by`. Dedup upstream of the judge could only keep one
+  reviewer's text and discard the rest — so the point only one reviewer made
+  survived exactly when the merge *failed*, and a better key made the loss worse.
+  Findings are pre-clustered by file and adjacent lines purely as a **hint**; the
+  duplicates that matter are semantic (one defect, two line numbers), which no line
+  arithmetic finds. Separate defects sharing one cause are linked with `related`
+  instead of merged, so one decision is fixed once.
 - Reviewers whose prerequisites are missing are reported **SKIPPED**, not failed.
 - **A reviewer that produces nothing is SKIPPED, never counted as an empty review.**
   A zero exit with empty stdout is a failure for panel members and the master alike,
@@ -209,10 +239,69 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   and the fix. A blank reply is retried unless that stderr names a settled cause (a
   refused request, an auto-denied tool permission), which no retry can change.
   Why it is worth the code: `run_cli`'s docstring in `panel.py`.
-- **The `/panel` skill (default = fix)** consumes `--json`, checks out the PR branch in
-  an isolated worktree, fixes confirmed findings, runs lint + unit tests (**aborts the
-  commit on failure**), makes one commit, pushes, and comments the summary.
-  `panel.py` itself stays read-only — the fix/verify/commit lives in the skill.
+- **Reviewers declare their own coverage.** Each returns `could_not_assess` (areas it
+  could not judge — a file the diff omits, a runtime behaviour) and can mark a finding
+  `needs_rereview` (fixing it takes a structural change whose result should be read
+  again). Both are *observations*: reviewers are never asked to forecast whether
+  another round is needed, because that asks a model to predict findings it has not
+  made — and one that silently produced nothing would answer "no" with total
+  confidence. Truncation is measured, not asked for, since a truncated reviewer is the
+  one party that cannot notice it. A bare findings array (any older reviewer) still
+  parses and simply declares nothing.
+- **Rounds are mechanical.** `--round`/`--baseline` make each run say which findings no
+  earlier round raised; `round_stop` in the payload then says go-again (something new,
+  a P1/P2 still outstanding, or a finding an earlier round raised that is still outstanding
+  — SonarCloud's hard-gate issues included) or stop (dry / round cap), and whether
+  stopping was *convergence*. The declarations never extend the loop — a truncated
+  reviewer is truncated again next round — they only stop a broken round being reported
+  as clean. A round past the first with no `--baseline` is itself a veto: it has nothing
+  to compare against, so its "all new" count means nothing and its stop is unearned.
+- **`--json-file` is a requirement, not a courtesy.** It is the next round's baseline, so
+  a write that fails exits non-zero after the report: carrying on would leave round `r+1`
+  calling every repeated finding new. Every non-error exit writes it, the skip-pattern one
+  included, so "the panel exited 0 and wrote no file" is not a state the caller has to
+  interpret.
+- **`--max-rounds N` is the CALLER's cap**, not a loop panel.py runs: it is the only
+  input that tells a round which stopped because it was done from one which stopped
+  because it ran out, and `/panel-review-pr` passes it on every invocation. Its flag is
+  spelled `--rounds N` on the slash command and `--max-rounds N` here — same number, and
+  `--round <r>` (singular) is a different thing entirely: which round THIS run is.
+  A run given none of the three is a single review and says nothing about rounds — in the
+  report *and* in the payload, whose `round_stop`, `stop_reason` and `new_findings` are
+  null rather than a verdict about a loop nobody is running.
+  A `--round` past `--max-rounds` is rejected rather than recorded.
+- **The `/panel` and `/panel-review-pr` skills** run `panel.py --post` and work from
+  the **PR comment** it leaves: `/panel` stops there (review-only), `/panel-review-pr`
+  hands the confirmed findings to a fixer sub-agent that fixes, verifies and pushes —
+  and then panels the fix commit, 2 rounds by default (`--rounds N`), so the fixer's
+  own work is read by somebody. `panel.py` itself stays read-only either way: the
+  fix/verify/commit lives in the skill, and so does the loop.
+
+### The `--json` payload
+
+One record per **defect**, in `to_fix` / `dismissed` / `sonar_findings`, plus the run's
+own fields (`judged`, `reviewers`, `diff_budgets`, `run_key`, …). A skipped PR emits the
+same keys with empty values and `reviewed: false`, so nothing has to branch on which
+exit produced it.
+
+Each finding record:
+
+| field | what it is |
+|---|---|
+| `id` | run-local (`1609-F03`), and only for resolving `related` **within one payload** — it is a position, so it moves between runs |
+| `key` | the defect's identity **across** runs: file + the reporting reviewers' own words, so a re-review joins the same chain even though the judge re-words its synthesis every time |
+| `synthesis` / `detail` | the merged statement and its body (the board stores these as `title`/`detail`) |
+| `verdict` | `confirmed` \| `dismissed` \| `unjudged` \| `sonar` |
+| `reported_by` | one entry per reviewer: its own `title`, `detail`, `severity`, `line`, and `account` (the two joined, for reading) |
+| `reviewers`, `related`, `rationale` | who reported it, sibling findings from one cause, and the judge's reason |
+| `needs_rereview`, `rereview_by` | a reporter declared that fixing this takes a structural change whose *result* should be read again, and which reporters said so — the declaration the next round is checked against |
+| `new_this_round` | no earlier round of this cycle raised this defect (`--baseline`); `false` on a repeat. A run with no baseline has no earlier round, so every finding is `true` — which is why a round past the first with no `--baseline` is a veto rather than a clean sweep |
+
+**Breaking, v2.14:** the per-finding keys were `title` / `detail` / `reason` with a
+`reviewers` name list. They are now `synthesis` / `detail` / `rationale`, and `id`,
+`key`, `verdict`, `related` and `reported_by` are new. The board accepts both spellings
+(`POST /review` aliases `title`↔`synthesis` and `reason`↔`rationale`); any other consumer
+has to be updated.
 
 ## Epic driver (`epic.py`)
 

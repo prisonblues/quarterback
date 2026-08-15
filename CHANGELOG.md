@@ -7,6 +7,139 @@ that number where it was, so the repo can be a version ahead of the service.
 Entries are newest first. Each one says what was broken or missing before it, because that is the
 part that isn't recoverable from the diff.
 
+## v2.16 — no diff budget by default
+
+The panel gave every reviewer 60,000 chars of diff and no more. That number was inherited from a
+constraint that had already been removed: prompts used to travel in argv, where Linux caps a single
+element at 128 KiB, so a budget was mandatory. v2.14 moved them to stdin. The default outlived its
+reason by a release, and 60k chars is roughly 15k tokens — an order of magnitude under every
+reviewer the panel runs.
+
+Truncating when nothing forces it is not a saving, because the cut is invisible to the one party
+that would report it. A reviewer handed a prefix cannot tell it was handed a prefix, so it reviews
+confidently on what it saw, and the resulting errors are **false positives**: reviewing v2.15's own
+PR, a reviewer reported a migration as "syntactically incomplete" because the file had been cut
+mid-way, and the panel spent a judge call and a fixer's attention proving the file was fine. Two
+later rounds lost ~600 lines of a test file the same way and said so in their coverage declarations.
+Paying for a review of a prefix is worse than paying for a review.
+
+So the whole diff goes to every reviewer unless a repo asks for a cap. A budget larger than a model
+will take now fails loudly — the API refuses the request and the reviewer is reported as degraded,
+with the reason — which is the right way round: a reviewer that could not read the change must look
+different from one that read it and found nothing.
+
+Two seats keep a bound, for reasons that are still real. `agy` takes its prompt in argv, so the
+kernel caps it; the panel clamps that seat to what `execve` will carry and reports it as ordinary
+truncation. And the judge's finding listing keeps its own 40,000-char budget — it is the component
+that grows with the panel's own output. It used to take *what the diff left* under a fixed ceiling,
+which with an uncapped diff drove it straight to its 4,000-char floor, starving the listing on
+exactly the runs where the judge most needs to see every finding.
+
+No board change: the API and the served version stay at v2.15.
+
+## v2.15 — the fix gets reviewed, and a run says what it could not see
+
+`/panel-review-pr` ran exactly one round: panel → judge → one fixer → push → stop. The commit
+the fixer wrote was read by nobody, because the panel had reviewed the diff as it was *before*
+the fix. That is not a gap at the edges — structural fixes beget new interactions, and on a real
+PR a mirror added in one file created dual-keyed nodes that an early `return` in another left
+half-stale: a P2 regression of the exact invariant the PR existed to establish, which no earlier
+round could have found because it did not exist until the fixer wrote it.
+
+The cycle is now panel → fix → panel, two rounds by default (`--rounds N` / `--loop` for more),
+and the loop is decided mechanically: findings this round that no earlier round raised, a P1/P2
+still confirmed, or a finding an earlier round already raised that is *still* confirmed at any
+severity, buy another pass — SonarCloud's hard-gate issues counting exactly like the judged ones,
+since the workflow requires them resolved either way. The round cap is what ends the argument when
+two reviewers disagree about a P4 forever. Reviewers are **not** asked to forecast whether another
+round is needed — that asks a model to predict findings it has not made, and the reviewer that
+silently produced nothing answers "no" with complete confidence.
+
+They are asked for observations instead: `could_not_assess` (what they could not judge, which is
+the difference between "clean" and "I could not tell" — a distinction no finding count can carry)
+and `needs_rereview` per finding (this fix is structural; read its result). The panel measures the
+one thing a reviewer cannot notice about itself, truncation: a 118 KB diff against a 60 KB budget
+had every reviewer confidently reporting on half a PR, invisibly. Declarations never extend the
+loop — a reviewer cut off at its budget is cut off again next round — they veto a *false stop*, so
+a round that found nothing because it could not look is no longer recorded as convergence.
+
+This release was reviewed by the cycle it adds, which is the only evidence for it worth having:
+round 1 raised 33 findings, and round 2 — reading the commit that fixed them — raised 17 more, 16
+of which no earlier round could have seen because they did not exist until the fixer wrote them.
+One of round 1's was a P1 the judge threw out as an artefact of a truncated diff, which is the
+other half of the argument in one line.
+
+All of it reaches the board (`round`, `cycle`, `new_findings`, `stopped`, `stop_reason`,
+`stop_confident`, `stop_veto`, `could_not_assess`, `unstructured`, `rereview_flagged`) and the
+`/panel` page, so a human can review the review: whether a clean verdict was earned, and — from
+`stop_veto` — *why not*, without re-reading a transcript. A round that says "go again" is stored as
+one, so a running cycle is never rendered as a finished one, and a reviewer whose reply did not
+parse is distinguishable from one that was never asked instead of collapsing onto the same null.
+`GET /review/findings` checks each re-review flag against what the following round of the same
+cycle actually found — for the run, and per member in `rereview_by_reviewer`, since the
+declaration rides on the reporter's own row. That makes **honesty per reviewer** measurable for
+the first time: a member that says "I could not assess X" and is right is worth more than one
+that silently reports clean, and until now nothing distinguished them.
+
+"The same cycle" is a stored fact rather than a positional guess: the panel mints a `cycle` id on
+round 1 and every later round inherits it from its earliest baseline, so two agents looping the
+same PR at once cannot have one's round 2 credited to the other's round 1.
+
+Two limits on that number, stated because a measure nobody can calibrate is worse than none. It is
+**file-grain**: the next round raised a confirmed finding in a file this round flagged, which is
+not a claim that the fix caused it. And it is scored over **confirmed findings only**, on both
+sides — a declaration attached to a finding the judge dismissed, or to one nobody adjudicated, is
+not scored as wrong, it is not scored at all.
+
+Attribution itself is exact, because v2.14 put it within reach: a declaration rides on the
+reporter's own entry in `reported_by`, so `rereview_flagged` counts the member that made the call
+rather than everyone who happened to raise the same defect — which is the whole point of a per-
+reviewer honesty measure, and was not possible while a merge kept one representative and discarded
+the rest.
+
+Payloads without any of it record exactly as before, as round 1 with nothing declared.
+
+## v2.14 — the panel merges once, in the judge, without losing what anyone said
+
+v2.11 gave the board somewhere to put each reviewer's own account of a finding, and nothing to put
+there: the panel still merged upstream of its judge, and that merge kept `min(grp, key=severity)`
+and discarded every other reviewer's text. So the leaderboard's consensus and unique-catch columns
+were wrong at source, and a re-review of the same PR produced findings that joined no chain.
+
+The merge now happens in the judge, which is the only step that reads every account and can write a
+new one. It is shown one entry per *reviewer*, merges the entries that are one defect, and returns a
+`synthesis` — with every original riding along in `reported_by`, its reporter's own title, detail,
+severity and line intact as fields rather than welded into one string. Additive, so nothing has to
+be thrown away to merge; and separate defects that share a cause are linked with `related` rather
+than merged, so a decision spread over four files is fixed once. `panel.py --json` and the board
+record are that same canonical list — one record per defect instead of one per reviewer per defect
+(29 rows into 15, on the run that prompted this).
+
+Each finding also carries an explicit `key`, derived from the file and the reporting reviewers' own
+titles, and the board honours a caller's key over the one it derives. That is what makes a re-review
+of the same PR join the chain it belongs to: the board's own fallback keys off the finding's title,
+which is now the judge's freshly-worded synthesis, so an unfixed defect started a new chain on every
+run.
+
+Dedup before the judge was also leaky in both directions — `line // 10` is a grid, not a window, so
+lines 39 and 41 landed in different buckets while 40 and 49 shared one, and `Path(file).name` merged
+same-named files from different directories. It survives only as a *hint* to the judge, now keyed on
+the full path with a real ±10 window. The duplicates that actually recur are semantic (one defect,
+two line numbers cited), which no line arithmetic finds — which is why the ruling belongs to the
+judge and not to the key.
+
+`--json` also stops printing its two-line progress preamble to stdout; that goes to stderr, so the
+payload is parseable without stripping it first. A PR skipped by title pattern now answers with the
+same payload *shape* as a reviewed one (`reviewed: false` and empty lists) rather than a nine-key
+subset that made `payload['judged']` a KeyError on exactly the run the payload exists for.
+
+**Breaking for `--json` consumers:** the per-finding keys `title` / `detail` / `reason` are now
+`synthesis` / `detail` / `rationale`, and `id`, `key`, `verdict`, `related` and `reported_by` are
+new — see `harness/loops/README.md`. Nothing in this repo consumes them (the `/panel` skills work
+from the PR comment), and the board accepts both spellings.
+
+No board change: `POST /review` has accepted this shape since v2.11, and the API stays at v2.12.
+
 ## v2.13 — the harness ships with the board
 
 The loops and worktree tooling that produce the board's data lived in a personal NixOS config,
@@ -17,6 +150,26 @@ They now live in `harness/`, installed as step 2 via `flake.nix` — `packages.h
 home-manager module, with `nix flake check` running the loops' own test suite so a consumer
 pinning a broken revision finds out at build time. Both halves still stand alone: the harness
 no-ops without a board, the service is useful without the harness.
+
+Per-worktree database isolation went with it, and it turned out not to work here. `create-worktree`
+gave each worktree its own Postgres copy and wrote the name into the worktree's `.env`, but the test
+suite set `DATABASE_URL` itself — and pydantic-settings ranks a real environment variable above
+`.env`, so the isolated copy sat unused while `alembic downgrade base` rebuilt the *shared* dev
+database. Provisioning reported success; the loss happened later and silently. `tests/dbtarget.py`
+now resolves the target once (explicit variable → the checkout's `.env` → fallback), announces it as
+the first line of every run including `-q`, and refuses outright when a worktree would rebuild a
+database the main checkout or a sibling worktree is using. `cp .env.example .env` became a
+prerequisite rather than a nicety — it is the file the worktree's own `.env` is derived from — and
+the app's default port moved to 5435 to match it, so a checkout without one no longer points at
+whatever unrelated Postgres owns 5432.
+
+Both halves ship as copyable templates: `harness/templates/` holds three annotated
+`.worktree.json` starting points and `dbtarget.py`, installed by `package.nix`. The guard is
+byte-identical to the copy this repo runs and the same test scenarios run against both, because a
+file that decides what other people's databases are allowed to be destroyed should not be the
+untested copy. Also fixed: a `set -o pipefail` abort in `create-worktree` where a `grep` that
+matched nothing killed the run mid-way — after the worktree existed, with no message, and with the
+fallback branch written directly below it never reached.
 
 No board change: the API and the served version stay at v2.12.
 
