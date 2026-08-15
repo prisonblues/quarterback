@@ -1,4 +1,4 @@
-"""v2.18: what each panel member COST, alongside what it found.
+"""v2.19: what each panel member COST, alongside what it found.
 
 v2.10 recorded findings and v2.13 wired up wall-clock. Neither said what a seat
 spent, so the /panel leaderboard could rank a reviewer top on confirmed findings

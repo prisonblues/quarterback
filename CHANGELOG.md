@@ -7,7 +7,7 @@ that number where it was, so the repo can be a version ahead of the service.
 Entries are newest first. Each one says what was broken or missing before it, because that is the
 part that isn't recoverable from the diff.
 
-## v2.18 — what each reviewer cost, not just what it found
+## v2.19 — what each reviewer cost, not just what it found
 
 The leaderboard could rank a panel member top on confirmed findings while it was quietly the most
 expensive seat on the panel. v2.13 had wired wall-clock, which is the only cost axis comparable
@@ -50,7 +50,7 @@ complete one. The page presents tokens as a within-vendor tier comparison, with 
 drawn only against the same vendor's other tiers, and keeps duration as the cross-vendor axis.
 
 Schema revision **0015**, chained after v2.15's 0014. This one does move the board, so the served
-version goes to 2.18 — v2.16 and v2.17 were both harness-side and left it at v2.15.
+version goes to 2.19 — v2.16 and v2.17 were both harness-side and left it at v2.15.
 
 ## v2.17 — a reviewer that produced nothing has failed, and says why
 

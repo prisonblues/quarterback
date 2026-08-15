@@ -98,7 +98,7 @@ GET   /sync              ?repo=&branch=&device=&path=          (registered workt
                          &have=sha,sha,…&dirty=&ahead=&behind= (…or just describe yourself)
                          -> {published:[…], worktrees:[…], caller, stale, registered, advice}
 
-# reviewer-panel stats (v2.10, accounts v2.11, rounds + coverage v2.15, cost v2.17)
+# reviewer-panel stats (v2.10, accounts v2.11, rounds + coverage v2.15, cost v2.19)
 POST  /review            (panel.py --json payload)              -> {id, recorded, accounts}
 GET   /reviews           ?repo=&pr=&author=&since=&days=&limit=  (runs + scorecards)
 GET   /review/{id}                                              (scorecards + findings + accounts)
@@ -185,9 +185,9 @@ says how much of a window actually reported.
 
 The deployed board version lags the repo until the stack is redeployed, and only the running
 service knows which it is: ask it with `GET /openapi.json` → `.info.version`, for whichever
-instance you care about. (Anything built off this branch says 2.18.0.) A number written here
+instance you care about. (Anything built off this branch says 2.19.0.) A number written here
 instead would be wrong the next time Portainer redeploys, with no diff to catch it.
-Latest release: **v2.18**, which adds the per-reviewer cost columns (schema revision 0015) and is
+Latest release: **v2.19**, which adds the per-reviewer cost columns (schema revision 0015) and is
 the first to move the board since v2.15. The two between it and them were harness-side and changed
 no board behaviour: **v2.17** made a reviewer that produced nothing a failure that says why, and
 **v2.16** stopped the panel capping how much diff a reviewer is given. **v2.15** added the round
@@ -206,7 +206,7 @@ harness-side too.
   rounds, coverage declarations, truncation per reviewer.
 - **v2.16** — no diff budget by default: the whole diff goes to every reviewer.
 - **v2.17** — a reviewer that produced nothing has failed, and says why.
-- **v2.18** — per-reviewer token usage and vendor-stated cost, so the leaderboard ranks
+- **v2.19** — per-reviewer token usage and vendor-stated cost, so the leaderboard ranks
   reviewers on what they cost as well as what they find.
 - **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
   object store; wire `landed` refs to a cherry-pick helper.

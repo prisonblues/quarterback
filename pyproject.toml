@@ -1,6 +1,6 @@
 [project]
 name = "quarterback"
-version = "2.18.0"  # served version lives in app/main.py — keep the two in step
+version = "2.19.0"  # served version lives in app/main.py — keep the two in step
 description = "Cross-device agent coordination + session-sync board"
 requires-python = ">=3.12"
 dependencies = [
