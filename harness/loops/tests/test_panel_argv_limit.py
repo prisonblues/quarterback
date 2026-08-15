@@ -35,7 +35,7 @@ def test_a_reviewer_prompt_is_fed_on_stdin_not_in_argv(name, model, monkeypatch)
     seen = {}
 
     def fake(args, label, timeout=panel.CLI_TIMEOUT, attempts=3, stdin_text=None,
-             on_output=None, replied=None):
+             on_output=None, replied=None, cwd=None):
         # The session-pinned seats pass a thunk, because each attempt needs its
         # own id; run_cli calls it per attempt, so this does the same.
         seen["args"], seen["stdin"] = (args() if callable(args) else args), stdin_text
@@ -56,7 +56,7 @@ def test_the_judge_prompt_is_fed_on_stdin_too(monkeypatch):
     through unadjudicated, which reads like triage rather than like failure."""
     seen = {}
 
-    def fake(args, label, timeout=panel.CLI_TIMEOUT, attempts=3, stdin_text=None):
+    def fake(args, label, timeout=panel.CLI_TIMEOUT, attempts=3, stdin_text=None, cwd=None):
         seen["args"], seen["stdin"] = args, stdin_text
         return "[]", None
 

@@ -236,7 +236,25 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   its merits. A real defect flagged by only ONE reviewer is still fixed — agreement
   shows as a `⋆consensus` confidence marker, never a filter. Only clear false
   positives are dismissed, with a recorded reason. If no judge is available, nothing
-  is suppressed.
+  is suppressed. Agreement takes two reviewers, so on a panel of one the marker is
+  not merely absent but unavailable, and the report says which of those it means.
+- **Every member runs in its own empty sandbox repo**, not in whatever directory the
+  panel was launched from — a seat that inherits the caller's shell is a seat whose
+  participation nothing configures and nothing can reproduce, and codex, which refuses
+  to start outside a git repository, was lost exactly that way. The sandbox is `git
+  init`ed so codex is satisfied, and *empty* rather than the checkout for two reasons:
+  a headless CLI reads its project configuration (CLAUDE.md, `.claude/settings.json`,
+  hooks that execute) from its cwd, and the checkout is on whatever branch it was left
+  on — never the PR's code, which the panel reads as a diff and never checks out. A
+  seat pointed there can quote a different branch as the code under review. The
+  members need no working directory at all; they need a reproducible one.
+- **A short panel says so.** The report states seats filled against seats configured
+  on every run, and calls the panel degraded above the findings when they differ — a
+  weaker review, not a cleaner one. A CLI the host does not carry is exempt (it is a
+  fact about the box, true every run, and `coverage_veto` already treats it that way);
+  it is noted quietly instead. ⋆consensus needs two members that filed, so when only
+  one did the report says agreement was *impossible* rather than letting its absence
+  read as disagreement.
 - **Merging happens once, in the judge, and adds rather than replaces.** The judge
   sees one entry per *reviewer*, merges the entries that are the same defect, and
   writes a `synthesis`; each reviewer's own title, detail, severity and line ride

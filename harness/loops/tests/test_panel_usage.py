@@ -343,6 +343,11 @@ def test_codex_is_charged_for_the_attempts_that_failed_too(monkeypatch):
             self.stdout, self.returncode, self.stderr = out, rc, "flake"
 
     def fake_run(argv, **k):
+        # The member's sandbox repo is set up through the same subprocess.run this
+        # fake replaces (see member_sandbox); it is not an attempt and must not
+        # consume one.
+        if argv[:2] == ["git", "init"]:
+            return Proc("", 0)
         out, rc = attempts.pop(0)
         Path(argv[argv.index("--output-last-message") + 1]).write_text(FINDINGS)
         return Proc(out, rc)
