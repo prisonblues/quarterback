@@ -52,6 +52,12 @@ depends_on: str | Sequence[str] | None = None
 
 def upgrade() -> None:
     op.add_column("review_runs", sa.Column("changed_files_total", sa.Integer(), nullable=True))
+    # The board held no PR state at all, so a collision query could not tell a
+    # live rival from one merged last week and reported both. Recorded per run
+    # because that is the only moment the board talks to GitHub: it is the state
+    # as of that panel, which is the same currency as the file list beside it.
+    op.add_column("review_runs", sa.Column("pr_state", sa.Text(), nullable=True))
+    op.add_column("review_runs", sa.Column("is_draft", sa.Boolean(), nullable=True))
     op.create_table(
         "review_run_files",
         sa.Column("id", sa.BigInteger(), autoincrement=True, nullable=False),
@@ -63,16 +69,22 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id"),
         # A payload repeating a path is a sender bug; letting it through would
         # double that file's weight in every collision count built on this table.
+        # Its B-tree on (run_id, path) is also what serves every run_id-only
+        # lookup, via the leftmost prefix — so no separate index on run_id: that
+        # would be pure storage and write overhead on the largest table this
+        # feature creates.
         sa.UniqueConstraint("run_id", "path", name="uq_review_run_file_run_path"),
     )
-    op.create_index("ix_review_run_files_run", "review_run_files", ["run_id"])
-    # The collision index. Without it, "who else touches app/api/reviews.py"
-    # scans every file of every run ever recorded.
-    op.create_index("ix_review_run_files_path", "review_run_files", ["path"])
+    # The collision index, and (path, run_id) rather than (path) alone: the query
+    # it exists for reads WHERE path IN (…) and wants run_id back, which this
+    # answers from the index without a heap fetch per matching row. Nothing
+    # queries by bare path, so the composite strictly dominates.
+    op.create_index("ix_review_run_files_path", "review_run_files", ["path", "run_id"])
 
 
 def downgrade() -> None:
     op.drop_index("ix_review_run_files_path", table_name="review_run_files")
-    op.drop_index("ix_review_run_files_run", table_name="review_run_files")
     op.drop_table("review_run_files")
+    op.drop_column("review_runs", "is_draft")
+    op.drop_column("review_runs", "pr_state")
     op.drop_column("review_runs", "changed_files_total")

@@ -52,44 +52,57 @@ def test_each_path_carries_its_own_share_of_the_churn():
     deletions come free from the same `gh pr view` call and make that total
     attributable, which is the difference between "this merge is big" and "this
     merge is big IN THE FILE YOUR PR ALSO TOUCHES"."""
-    files, total = panel._changed_files(
+    files, total, dropped = panel._changed_files(
         meta(files=[gh_file("app/api/reviews.py", 120, 4),
                     gh_file("app/models/review.py", 40, 0)], total=2))
     assert files == [
         {"path": "app/api/reviews.py", "additions": 120, "deletions": 4},
         {"path": "app/models/review.py", "additions": 40, "deletions": 0},
     ]
-    assert total == 2
+    assert (total, dropped) == (2, 0)
 
 
 def test_paths_come_back_sorted_so_two_runs_of_one_pr_compare_directly():
-    files, _ = panel._changed_files(
+    files, _, _ = panel._changed_files(
         meta(files=[gh_file("z.py"), gh_file("a.py"), gh_file("m.py")], total=3))
     assert [f["path"] for f in files] == ["a.py", "m.py", "z.py"]
 
 
 def test_a_pr_that_changed_nothing_is_an_empty_list_and_not_an_error():
-    assert panel._changed_files(meta(files=[], total=0)) == ([], 0)
+    """And `total` is 0, not None: GitHub counted and the answer was none. That is
+    knowledge, and the board treats it as such — such a PR is disjoint from
+    everything rather than unanswerable."""
+    assert panel._changed_files(meta(files=[], total=0)) == ([], 0, 0)
 
 
-def test_a_blank_path_is_dropped_rather_than_stored():
-    """A path is the join key of every collision query built on this. An empty
-    one joins to nothing and counts as a file, which is the worst of both."""
-    files, total = panel._changed_files(
+def test_a_blank_path_is_dropped_and_counted_separately():
+    """A path is the join key of every collision query built on this. An empty one
+    joins to nothing and counts as a file, which is the worst of both.
+
+    `dropped` is returned rather than left to be inferred from the arithmetic,
+    because "GitHub paged us short" and "we discarded a malformed row" are two
+    different facts with two different fixes — and the partial-list warning is
+    only about the first. Inferring it fired the truncation warning on any PR
+    with one junk entry (round 1, F16)."""
+    files, total, dropped = panel._changed_files(
         meta(files=[gh_file("real.py"), {"path": "  ", "additions": 0, "deletions": 0}],
              total=2))
     assert [f["path"] for f in files] == ["real.py"]
-    # The TOTAL still says two, because GitHub said two. The list being shorter
-    # than the count is precisely the signal the next test is about.
-    assert total == 2
+    # The TOTAL still says two, because GitHub said two — and `dropped` accounts
+    # for the difference, so nothing has to guess whether the list was truncated.
+    assert (total, dropped) == (2, 1)
 
 
-def test_a_file_missing_its_line_counts_records_zero_not_null():
-    """`gh` states both for every file it returns. A hand-built or future-shaped
-    entry that omits them keeps the path — the collision datum — rather than
-    losing the row over the number that is not the point."""
-    files, _ = panel._changed_files(meta(files=[{"path": "x.py"}], total=1))
-    assert files == [{"path": "x.py", "additions": 0, "deletions": 0}]
+def test_a_file_missing_its_line_counts_stays_null_rather_than_zero():
+    """Rewritten after round 1 (F13): this asserted `0` and was wrong.
+
+    The board's churn columns are nullable on purpose, and the release's whole
+    argument is that "absent" and "zero" are different facts. Recording an
+    unstated count as 0 makes a file GitHub said nothing about indistinguishable
+    from a pure-deletion file — and, worse, made the panel and a hand-rolled
+    caller use two different conventions for the same column."""
+    files, _, _ = panel._changed_files(meta(files=[{"path": "x.py"}], total=1))
+    assert files == [{"path": "x.py", "additions": None, "deletions": None}]
 
 
 # ---- the count is not derived from the list --------------------------------
@@ -99,25 +112,41 @@ def test_the_total_is_githubs_count_and_not_the_lists_length():
     3,000; a caller told only `len(files)` cannot tell a 3,000-file prefix from a
     3,000-file PR, and every collision answer built on the prefix is wrong in the
     direction of "no collision"."""
-    files, total = panel._changed_files(
+    files, total, _ = panel._changed_files(
         meta(files=[gh_file("a.py"), gh_file("b.py")], total=2500))
     assert len(files) == 2
     assert total == 2500
 
 
-def test_an_absent_count_falls_back_to_what_can_be_proved():
-    """An older `gh` without the field. Falling back to the list's own length
-    asserts completeness on no evidence, so the fallback is the one value that
-    makes the two agree by construction rather than by claim — and callers see
-    "these agree", which is all we actually know."""
-    files, total = panel._changed_files(meta(files=[gh_file("a.py")]))
-    assert total == len(files) == 1
+def test_an_unstated_count_is_none_and_never_the_lists_length():
+    """Rewritten after round 1 (F17): this asserted `total == len(files)` under the
+    name "falls back to what can be proved", and agreeing by construction is not
+    proof — it stamps a possibly-truncated list "complete" on no evidence.
+
+    None travels to a NULL column that already means "nobody said", which is the
+    only honest value and the one the collision endpoint can act on."""
+    files, total, _ = panel._changed_files(meta(files=[gh_file("a.py")]))
+    assert len(files) == 1
+    assert total is None
 
 
 def test_no_files_field_at_all_is_no_list_rather_than_no_files():
-    files, total = panel._changed_files(meta())
+    """Rewritten after round 1 (F17): this asserted `total == 0` while its own name
+    said the opposite, and the assertion was what the code did — turning an
+    unknown file list into a known zero-file PR, which `/review/collisions` then
+    cannot report as unanswered."""
+    files, total, dropped = panel._changed_files(meta())
     assert files == []
-    assert total == 0
+    assert total is None
+    assert dropped == 0
+
+
+def test_a_non_numeric_count_degrades_instead_of_killing_the_run():
+    """F18. `int(total)` on an unexpected `gh` shape raised inside `run()` after
+    the PR read and before any review — an uncaught traceback in a neighbourhood
+    written throughout to degrade rather than crash."""
+    assert panel._changed_files(meta(files=[], total="lots"))[1] is None
+    assert panel._changed_files(meta(files=[], total={"n": 3}))[1] is None
 
 
 # ---- the payload -----------------------------------------------------------
@@ -128,7 +157,10 @@ def test_every_payload_carries_the_keys_even_when_the_run_never_got_that_far():
     which exit produced it."""
     defaults = panel._payload_defaults()
     assert defaults["changed_files"] == []
-    assert defaults["changed_files_total"] == 0
+    # None, not 0 (F22). This structure describes a run that never got that far,
+    # so the one thing it must not assert is "this PR changed zero files".
+    assert defaults["changed_files_total"] is None
+    assert defaults["pr_state"] is None and defaults["is_draft"] is None
 
 
 # ---- end to end, on both exits ---------------------------------------------
@@ -146,10 +178,12 @@ META_FILES = [{"path": "app/api/reviews.py", "additions": 120, "deletions": 4},
               {"path": "harness/loops/panel.py", "additions": 8, "deletions": 1}]
 
 
-def _meta_json(title: str, files=META_FILES, total: int = 2) -> str:
+def _meta_json(title: str, files=META_FILES, total: int = 2,
+               state: str = "OPEN", draft: bool = False) -> str:
     return json.dumps({"title": title, "additions": 128, "deletions": 5,
                        "baseRefName": "main", "headRefName": "h",
-                       "headRefOid": "abc", "files": files, "changedFiles": total})
+                       "headRefOid": "abc", "files": files, "changedFiles": total,
+                       "state": state, "isDraft": draft})
 
 
 def test_a_reviewed_run_sends_the_paths_with_the_line_count(monkeypatch, capsys):
@@ -219,3 +253,56 @@ def test_a_complete_list_says_nothing(monkeypatch, capsys):
     panel.run("r", 1704, post=False, json_out=True)
     payload = json.loads(capsys.readouterr().out)
     assert not [n for n in payload["config_notes"] if "file list" in n]
+
+
+def test_the_pr_state_travels_with_the_file_list(monkeypatch, capsys):
+    """Without it a collision query cannot tell a live rival from one merged last
+    week, and reports both. Same `gh pr view` call, one field wider — the state is
+    as of THIS panel, which is why the payload's timestamp matters."""
+    reply = '[{"id":"F1","members":[0],"real":true,"reason":"real"}]'
+    _gh(monkeypatch, _meta_json("fix: a thing", state="OPEN", draft=True),
+        {"codex": {"enabled": True}})
+    monkeypatch.setattr(panel, "review_llm",
+                        lambda *a, **k: panel.ReviewerRun([], None, 5))
+    monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
+    monkeypatch.setattr(panel.shutil, "which", lambda _: "/usr/bin/claude")
+    monkeypatch.setattr(panel, "run_cli", lambda *a, **k: (reply, None))
+    monkeypatch.setattr(panel, "record_run", lambda p: None)
+    panel.run("r", 1705, post=False, json_out=True)
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["pr_state"] == "OPEN" and payload["is_draft"] is True
+
+
+def test_a_skipped_pr_carries_the_partial_list_warning_too(monkeypatch, capsys):
+    """F19, and the reason it was a finding rather than a nitpick: the note was
+    built forty lines BELOW the skip branch's early return, so the one exit this
+    release argues is most likely to be merged unattended was the one exit that
+    said nothing. Four reviewers raised it."""
+    _gh(monkeypatch, _meta_json("Merge test into main", total=3000), {})
+    assert panel.run("r", 1706, post=False, json_out=True) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["reviewed"] is False
+    [note] = [n for n in payload["config_notes"] if "file list came back partial" in n]
+    assert "2 of 3,000" in note
+    assert payload["pr_state"] == "OPEN"
+
+
+def test_a_dropped_entry_does_not_masquerade_as_a_truncated_list(monkeypatch, capsys):
+    """F16. Discarding one junk entry left `total` at GitHub's count, so the
+    arithmetic said "partial" and the run warned that collision queries would
+    under-report — when nothing had been truncated at all. Two different facts,
+    two different fixes, and only one of them is GitHub paging us short."""
+    reply = '[{"id":"F1","members":[0],"real":true,"reason":"real"}]'
+    _gh(monkeypatch, _meta_json("fix: a thing",
+                                files=[*META_FILES, {"path": "   "}], total=3),
+        {"codex": {"enabled": True}})
+    monkeypatch.setattr(panel, "review_llm",
+                        lambda *a, **k: panel.ReviewerRun([], None, 5))
+    monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
+    monkeypatch.setattr(panel.shutil, "which", lambda _: "/usr/bin/claude")
+    monkeypatch.setattr(panel, "run_cli", lambda *a, **k: (reply, None))
+    monkeypatch.setattr(panel, "record_run", lambda p: None)
+    panel.run("r", 1707, post=False, json_out=True)
+    notes = json.loads(capsys.readouterr().out)["config_notes"]
+    assert not [n for n in notes if "came back partial" in n]
+    assert [n for n in notes if "no usable path" in n]

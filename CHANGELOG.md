@@ -26,8 +26,23 @@ files, and which files those are.
 the increment; a collision surface that narrowed with it would report two PRs as no longer colliding
 because one of them had stopped *re-reading* a file it still changes. Reading it off the PR metadata
 makes that true by construction — and it is also why the title-skip path, which never fetches a diff
-at all, still records a complete list. A skipped PR collides with everything it touches, and it is
-the one most likely to be merged unattended.
+at all, still emits a complete list in its payload, warnings included. A skipped PR collides with
+everything it touches, and it is the one most likely to be merged unattended.
+
+> **What the skip path does NOT do is reach the board**, and the first draft of this entry claimed
+> otherwise. It returns before `record_run`, deliberately — no review happened, and recording one
+> would put a row in `review_runs` that every stat in the module would then have to learn to
+> exclude. So a skipped PR's file list is available to `--json` consumers and to the next round's
+> `--baseline`, and `/review/collisions` cannot see it in either direction. Making the board ingest
+> a skip payload as a file-list-only record is a real piece of work with a real decision in it, and
+> it is filed rather than smuggled in here.
+
+**The board also records the PR's state** (`OPEN`/`MERGED`/`CLOSED`, and whether it is a draft),
+from the same call. Without it a collision query has no way to tell a live rival from one merged
+last week and reports both — on a repo landing several a week that is most of the answer, which is
+how an advisory endpoint stops being read. The state is *as of that PR's last panel*, never live:
+the board is told about panels, not about merges, which is why every row here carries its run's
+timestamp beside it.
 
 **`changed_files_total` is GitHub's own count and is deliberately not derived from the list.** `gh`
 pages the files connection and GitHub caps a PR's file list at 3,000, so the two are allowed to
@@ -36,16 +51,37 @@ from the other and a truncated list reads as a complete one, which is this repo'
 a shortfall presenting as a clean result. When they disagree the panel says so above its findings,
 the same treatment v2.21 gave a short panel.
 
-**Three ways of not knowing are kept apart, because collapsing them all fail safe-looking.** A run
-that changed no files has an empty list; a run recorded before this release has no list at all
-(`changed_files_total` is NULL); a PR whose newest run has no list is neither disjoint nor colliding
-but *unanswered*, and `/review/collisions` returns it under `unknown` rather than omitting it. An
-empty `collides` with a silently absent PR reads as "safe to land", which is the most expensive wrong
-answer this endpoint could give.
+**Three ways of not knowing are kept apart, because collapsing them makes every one of them read as
+a clean result.** A run that changed no files has an empty list *and a count of zero*, which is
+knowledge — that PR is disjoint from everything. A run recorded before this release has no list at
+all (`changed_files_total` is NULL). A PR whose newest run has no list is neither disjoint nor
+colliding but *unanswered*, and comes back under `unknown` rather than being omitted, because an
+empty `collides` beside a silently absent PR reads as "safe to land".
+
+Keeping those apart turned out to be harder than saying them. The first implementation defined "has
+a file list" as "has rows in `review_run_files`", which cannot see a legitimately empty one — so a
+zero-file PR 404'd as a subject and came back `unknown` as a rival, the release's own distinction
+broken by the code enforcing it. It also answered for a rival from its newest *file-bearing* run
+rather than its newest run outright, which quotes a stale answer in a confident voice when a later
+round recorded nothing. Both were caught by this PR's own panel round, along with three separate
+places where the panel collapsed "GitHub said nothing" into "zero" — the same absent-versus-zero
+mistake the paragraph above is entirely about.
+
+**What the endpoint does not do is see PRs this board has never panelled.** It answers over the runs
+it holds, so an empty `collides` means "none of the PRs I have seen", never "none exist" — the
+response says so in a `scope` field rather than leaving it to be inferred. Closing that gap needs an
+open-PR list from GitHub on a board read path, which is a decision #80 owns.
 
 The endpoint describes the overlap and does not rank it. Ordering PRs by collision — landing the
 disjoint ones first — needs a policy about what a collision actually costs, and that is #80's. What
 was missing was the datum. Closes #82.
+
+> **There is no v2.22 in this file, and that is deliberate.** It is held by PR #87, which is
+> harness-side and still open; this release took the next free number rather than blocking on it.
+> Recorded here because a number that exists in the sequence and nowhere in the history is exactly
+> the gap this file exists to close — and because it is the fifth release-number collision of the
+> day, two agents having announced v2.23 one second apart. #76's check cannot catch that (both
+> branches are self-consistent); only #46's allocator half can.
 
 ## v2.21 — a panel that lost a seat said nothing about it
 

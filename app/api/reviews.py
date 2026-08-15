@@ -110,6 +110,7 @@ from pydantic import (
 from sqlalchemy import func, select
 from sqlalchemy import or_ as sa_or
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from app.auth import identify, reader
 from app.db import get_session
@@ -441,26 +442,71 @@ class StopIn(BaseModel):
         return _phrases(v)
 
 
+#: A path longer than this is not a path. Bounded because ``ReviewRunFile.path``
+#: is ``Text`` and the sender is trusted only in the sense of being authenticated.
+MAX_PATH_CHARS = 4096
+#: GitHub caps a PR's file list at 3,000; this leaves room above it and still
+#: bounds one request to something a single transaction can hold. A list longer
+#: than this is truncated with a note, never silently — see :class:`ReviewIn`.
+MAX_CHANGED_FILES = 5000
+
+
 class ChangedFileIn(BaseModel):
     """One path the PR touched, with that path's own share of ``changed_lines``.
 
-    A bare string is accepted too, and is the shape a hand-rolled caller reaches
-    for first: ``["a.py", "b.py"]`` records the paths with null churn rather than
-    422-ing the whole payload away. Recording is best-effort here as everywhere
-    else in this module — losing the findings over the shape of a file list would
-    be the wrong trade by a wide margin.
+    **Every field is coerced, never rejected.** This module's rule is that
+    recording is best-effort — a run's findings, scorecards and accounts must not
+    be lost over the shape of its file list — and the first version of this model
+    only honoured that rule for one shape. A bare string was coerced, and then
+    ``additions: -1``, ``path: ""``, ``path: null`` and a numeric entry each 422'd
+    the entire payload, findings included. The leniency was applied to shape and
+    not to values, which is the same thing as not being lenient.
+
+    So: a bare string becomes a path; a negative or non-numeric churn number
+    becomes None ("nobody said") rather than a rejection; anything with no usable
+    path at all is dropped by :func:`record_review` rather than refused here.
+    ``ReviewIn.changed_files`` accepts ``null`` for the same reason.
     """
 
     model_config = ConfigDict(populate_by_name=True)
 
-    path: str = Field(min_length=1)
-    additions: int | None = Field(default=None, ge=0)
-    deletions: int | None = Field(default=None, ge=0)
+    #: May be empty after coercion — `record_review` drops those rows. Validating
+    #: it here would cost the whole run, which is exactly the trade this class
+    #: exists not to make.
+    path: str = ""
+    additions: int | None = None
+    deletions: int | None = None
 
     @model_validator(mode="before")
     @classmethod
-    def _bare_path(cls, v: object) -> object:
-        return {"path": v} if isinstance(v, str) else v
+    def _coerce(cls, v: object) -> object:
+        """``"a.py"`` → ``{"path": "a.py"}``, and anything unusable → droppable."""
+        if isinstance(v, str):
+            return {"path": v}
+        if not isinstance(v, dict):
+            # A number, a list, a null in the array. Not a file, and not worth a
+            # 422 either — it becomes a pathless row and is dropped downstream.
+            return {"path": ""}
+        return {**v, "path": v.get("path") if isinstance(v.get("path"), str) else ""}
+
+    @field_validator("path", mode="after")
+    @classmethod
+    def _bound_path(cls, v: str) -> str:
+        return v[:MAX_PATH_CHARS]
+
+    @field_validator("additions", "deletions", mode="before")
+    @classmethod
+    def _churn(cls, v: object) -> int | None:
+        """A count, or None. Negative and non-numeric both mean "nobody said" —
+        the same NULL the column carries for a caller that sent nothing, because
+        a number that cannot be true is not more informative than no number."""
+        if isinstance(v, bool) or not isinstance(v, (int, float, str)):
+            return None
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            return None
+        return n if n >= 0 else None
 
 
 class ReviewIn(BaseModel):
@@ -486,12 +532,45 @@ class ReviewIn(BaseModel):
     #: round reviews only the increment; narrowing this to it would report two
     #: PRs as no longer colliding because one stopped re-reading a file it still
     #: changes. Absent for every pre-v2.23 run, which is "no list", not "no files".
+    #: ``null`` is accepted and means the empty list — a hand-rolled caller with
+    #: no files to send reaches for it, and every neighbouring field on this model
+    #: is ``| None``. Truncated at :data:`MAX_CHANGED_FILES` with a note rather
+    #: than refused, and never silently: an authenticated sender is not a bounded
+    #: one, and one request should not be able to insert a million rows in a
+    #: single transaction.
     changed_files: list[ChangedFileIn] = Field(default_factory=list)
     #: GitHub's own count of the PR's changed files. NOT derived from
     #: ``len(changed_files)``: `gh` pages that list and GitHub caps it at 3,000,
     #: so the two disagreeing is the only signal a collision query under-reports.
-    changed_files_total: int | None = Field(default=None, ge=0)
+    #: Coerced rather than validated, like everything else here.
+    changed_files_total: int | None = None
+    #: The PR's state as of this panel — `OPEN` / `MERGED` / `CLOSED`. Without it
+    #: a collision query cannot tell a live rival from one merged last week.
+    pr_state: str | None = None
+    is_draft: bool | None = None
     diff_chars: int | None = None
+
+    @field_validator("changed_files", mode="before")
+    @classmethod
+    def _files(cls, v: object) -> object:
+        """``null`` → ``[]``, a non-list → ``[]``, and bounded. Never a 422: the
+        findings in the same payload are worth more than the file list is."""
+        if not isinstance(v, list):
+            return []
+        return v[:MAX_CHANGED_FILES]
+
+    @field_validator("changed_files_total", mode="before")
+    @classmethod
+    def _files_total(cls, v: object) -> int | None:
+        return _count_or_none(v)
+
+    @field_validator("pr_state", mode="before")
+    @classmethod
+    def _state(cls, v: object) -> str | None:
+        """Upper-cased so `open` and `OPEN` are one value — the collision filter
+        compares against it, and a caller spelling it in lower case must not read
+        as a PR whose state nobody stated."""
+        return v.strip().upper() or None if isinstance(v, str) else None
     diff_truncated: bool | None = None
 
     judged: bool = False
@@ -829,6 +908,8 @@ async def record_review(
         # the rows would manufacture agreement between the two numbers whose
         # DISAGREEMENT is the only evidence the list is short.
         changed_files_total=body.changed_files_total,
+        pr_state=body.pr_state,
+        is_draft=body.is_draft,
         diff_chars=body.diff_chars,
         diff_truncated=body.diff_truncated,
         judged=body.judged,
@@ -873,8 +954,18 @@ async def record_review(
     # Deduped on the way in, keeping the first mention of each path. The table's
     # unique constraint would otherwise turn a sender that repeats a path into an
     # IntegrityError that costs the whole run its findings — and this module's
-    # rule is that recording is best-effort. Order is the sender's, so a reader
-    # of one run's files sees them as the panel listed them.
+    # rule is that recording is best-effort.
+    #
+    # Paths are STRIPPED before storing and comparing, which is a real
+    # normalisation and not just tidying: it is what makes `" a.py"` and `"a.py"`
+    # one row rather than an IntegrityError, and a padded path would otherwise
+    # join to nothing in every collision query. Git does permit leading and
+    # trailing whitespace in a path, so this can in principle fold two genuinely
+    # distinct paths together; that trade is taken deliberately, because the
+    # alternative is a silent collision miss on every ordinary padded path.
+    #
+    # No insertion order is preserved or promised: there is no ordinal column and
+    # every reader sorts by path (`GET /review/{id}`, `/review/collisions`).
     seen: set[str] = set()
     for cf in body.changed_files:
         path = cf.path.strip()
@@ -962,6 +1053,9 @@ def _run_view(r: ReviewRun) -> dict:
         # turn every page of `GET /reviews` into a file dump. `GET /review/{id}`
         # carries the list; this is what a run LIST needs to know a list exists.
         "changed_files_total": r.changed_files_total,
+        # As of this run, not live — the run's own `ts` is the staleness signal.
+        "pr_state": r.pr_state,
+        "is_draft": r.is_draft,
         "diff_chars": r.diff_chars,
         "diff_truncated": r.diff_truncated,
         "judged": r.judged,
@@ -1067,6 +1161,34 @@ async def _reports_by_finding(
     for r in rows:
         out.setdefault(r.finding_id, []).append(r)
     return out
+
+
+def _has_file_list(run_id):
+    """Did this run RECORD a file list — as opposed to having files in it?
+
+    The distinction the collision endpoint turns on, and the one the first
+    version got wrong. Keying on "has rows in ``review_run_files``" makes a PR
+    that legitimately changed **zero** files indistinguishable from a run that
+    recorded nothing at all: the first 404s as a subject and comes back as
+    ``unknown`` as a rival, when the true answer is "answered, and disjoint from
+    everything". A known empty list is knowledge.
+
+    So the predicate is ``changed_files_total IS NOT NULL`` — the column that
+    means "the panel counted" — **or** the presence of rows, which covers a
+    caller that sent paths without a count.
+    """
+    # The inner ReviewRun is ALIASED. Without it the subquery references the same
+    # table as the caller's outer query, `ReviewRun.id == run_id` reduces to
+    # `ReviewRun.id == ReviewRun.id`, and the whole predicate is a tautology that
+    # answers True for every run — which is how a PR that recorded nothing at all
+    # stopped 404-ing and started reporting itself as an empty subject.
+    counted = aliased(ReviewRun)
+    return sa_or(
+        select(counted.id)
+        .where(counted.id == run_id, counted.changed_files_total.is_not(None))
+        .exists(),
+        select(ReviewRunFile.id).where(ReviewRunFile.run_id == run_id).exists(),
+    )
 
 
 def _since_clause(since: str | None, days: int | None):
@@ -1703,6 +1825,9 @@ async def pr_collisions(
     since: str | None = Query(None, description="ISO timestamp"),
     days: int | None = Query(30, ge=1, le=3650,
                              description="how far back a rival PR's newest run may be"),
+    include_closed: bool = Query(
+        False, description="also report rivals whose last panel saw them merged or closed"),
+    limit: int = Query(100, ge=1, le=1000, description="max colliding PRs returned"),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     """Which other PRs of this repo touch the files this one does.
@@ -1712,27 +1837,62 @@ async def pr_collisions(
     that this endpoint has no business presuming; what was missing was the datum,
     not the ranking.
 
-    A PR is represented by its most recent run **that recorded a file list**, not
-    simply its most recent run, and that run's ``id``/``ts`` come back with it so
-    a caller can see how stale the answer is. A PR still open whose last panel was
-    Tuesday collides on Tuesday's files; the board is not told about pushes.
+    **Scope, stated because the obvious reading is wider than the truth.** This
+    answers over the PRs *this board has panelled* within the window. A PR nobody
+    ever ran a panel on leaves no row here and cannot be reported at all — not as
+    colliding, not as unknown. The board is a record of what it was told, and
+    nothing tells it that a PR exists. Closing that gap needs an open-PR list from
+    GitHub, which is #80's to decide on; until then an empty ``collides`` means
+    "none of the PRs I have seen", never "none exist".
 
-    ``unknown`` is the half that matters more than it looks. Every run recorded
-    before v2.23 has no file list, and so does any PR that has never been
-    panelled — those PRs are not disjoint from this one, they are *unanswered*.
-    Returning them silently absent would make an empty ``collides`` read as "safe
-    to land", which is exactly the shortfall-as-clean-result failure this codebase
-    keeps finding in itself.
+    Everything the board *has* seen is classified, and the three states are kept
+    apart because collapsing them all fail safe-looking:
+
+    * **``collides``** — a rival whose newest run shares at least one path. Each
+      carries its own ``changed_files_total`` beside the shared ``files``: a rival
+      whose stored list was truncated can share paths it never reported, so a
+      caller must be able to see that its "disjoint" was computed from a prefix.
+    * **``unknown``** — a rival the board cannot answer for: its newest run
+      recorded no file list (every pre-v2.23 run, and any run that never got that
+      far). Neither disjoint nor colliding. Returned with the same shape as a
+      collision, because a bare PR number cannot tell a caller whether the gap is
+      a month-old harness or an hour-old failure.
+    * **absent** — a rival the board answered for, whose files do not overlap.
+
+    A PR is represented by its **newest run outright**, not its newest run that
+    happens to carry files. Preferring an older file-bearing run would answer a
+    stale question with a confident voice: the PR has been panelled since, the
+    later round said nothing about files, and reporting the earlier round's paths
+    hides that. The subject is the one exception, and it is deliberate — see
+    below.
+
+    ``pr_state`` is as of each rival's last panel, so a PR merged after its final
+    round still reads OPEN. That is the same currency as the file list itself,
+    which is why every row carries its run's ``ts``.
     """
-    # The subject's files: its newest run that has any. Falling back through
-    # earlier runs is deliberate — a round that skipped on a title pattern still
-    # records a list, but a pre-v2.23 round does not, and the PR's file set is
-    # better known late than not at all.
-    has_files = select(ReviewRunFile.run_id)
+    # ---- the subject.
+    #
+    # The subject alone falls back through earlier runs to find a file list,
+    # where a rival does not, and the asymmetry is the point rather than an
+    # oversight: a caller naming a PR is asking about THAT PR, and answering
+    # "404, its last round recorded nothing" when an earlier round recorded a
+    # perfectly good list serves nobody. For a rival the same fallback would
+    # silently substitute stale data into an answer nobody asked to be
+    # approximate. The subject's `run_id`/`ts` come back so the fallback is
+    # visible; a rival's staleness would not be.
+    #
+    # It is also unbounded by the window, again deliberately: `days` bounds which
+    # RIVALS are current enough to matter, not how far back the board may look to
+    # learn what the subject itself touches.
     subject_id = await session.scalar(
-        select(func.max(ReviewRun.id)).where(
-            ReviewRun.repo == repo, ReviewRun.pr == pr, ReviewRun.id.in_(has_files)
-        )
+        select(ReviewRun.id)
+        .where(ReviewRun.repo == repo, ReviewRun.pr == pr,
+               _has_file_list(ReviewRun.id))
+        # By timestamp, not by max(id): a surrogate key orders by insertion, and
+        # backfilled or imported runs need not have been inserted in the order
+        # they happened. `id` only breaks ties.
+        .order_by(ReviewRun.ts.desc(), ReviewRun.id.desc())
+        .limit(1)
     )
     if subject_id is None:
         raise HTTPException(
@@ -1740,62 +1900,107 @@ async def pr_collisions(
             f"no run of {repo}#{pr} recorded a changed-file list — nothing to compare",
         )
     subject = await session.get(ReviewRun, subject_id)
-    paths = list((await session.scalars(
-        select(ReviewRunFile.path).where(ReviewRunFile.run_id == subject_id)
-    )).all())
+    assert subject is not None  # selected by id in this same session
 
     cutoff = _since_clause(since, days)
-    others = select(ReviewRun.pr).where(ReviewRun.repo == repo, ReviewRun.pr != pr)
-    if cutoff is not None:
-        others = others.where(ReviewRun.ts >= cutoff)
 
-    # One row per rival PR: its newest file-bearing run. `pr` is grouped on, so
-    # two runs of the same PR can never both answer for it.
-    latest = (
-        select(ReviewRun.pr.label("pr"), func.max(ReviewRun.id).label("run_id"))
-        .where(ReviewRun.repo == repo, ReviewRun.pr != pr, ReviewRun.id.in_(has_files))
+    # ---- every rival's NEWEST run, files or not.
+    #
+    # DISTINCT ON is what makes "newest outright" expressible in one statement:
+    # the older query grouped by pr over runs already filtered to file-bearing
+    # ones, which is what let a stale file list answer over a newer silent round.
+    newest = select(
+        ReviewRun.id.label("run_id"), ReviewRun.pr.label("pr"),
+        ReviewRun.pr_title.label("pr_title"), ReviewRun.ts.label("ts"),
+        ReviewRun.changed_files_total.label("total"),
+        ReviewRun.pr_state.label("pr_state"), ReviewRun.is_draft.label("is_draft"),
+    ).where(ReviewRun.repo == repo, ReviewRun.pr != pr)
+    if cutoff is not None:
+        newest = newest.where(ReviewRun.ts >= cutoff)
+    if not include_closed:
+        # A rival last seen merged or closed is not something this merge can
+        # disturb. NULL is kept: a pre-v2.23 run never stated a state, and
+        # dropping those would silently narrow the population to recent runs.
+        newest = newest.where(sa_or(ReviewRun.pr_state.is_(None),
+                                    ReviewRun.pr_state == "OPEN"))
+    newest = (
+        newest.distinct(ReviewRun.pr)
+        .order_by(ReviewRun.pr, ReviewRun.ts.desc(), ReviewRun.id.desc())
+        .subquery()
     )
-    if cutoff is not None:
-        latest = latest.where(ReviewRun.ts >= cutoff)
-    latest = latest.group_by(ReviewRun.pr).subquery()
 
-    shared = (
-        await session.execute(
-            select(latest.c.pr, latest.c.run_id, ReviewRun.ts, ReviewRun.pr_title,
-                   ReviewRunFile.path)
-            .join(ReviewRunFile, ReviewRunFile.run_id == latest.c.run_id)
-            .join(ReviewRun, ReviewRun.id == latest.c.run_id)
-            .where(ReviewRunFile.path.in_(paths))
-            .order_by(latest.c.pr, ReviewRunFile.path)
-        )
-    ).all() if paths else []
+    # ---- the overlap, as a self-join on path.
+    #
+    # The subject's paths stay in the database rather than being read out and
+    # sent back as up to 3,000 bind parameters — which defeated statement caching
+    # and, on SQLite, exceeds the variable limit outright. `ix_review_run_files_path`
+    # is (path, run_id) precisely to serve this join from the index.
+    mine = aliased(ReviewRunFile)
+    theirs = aliased(ReviewRunFile)
+    shared = (await session.execute(
+        select(newest.c.pr, newest.c.pr_title, newest.c.run_id, newest.c.ts,
+               newest.c.total, newest.c.pr_state, newest.c.is_draft, theirs.path)
+        .join(theirs, theirs.run_id == newest.c.run_id)
+        .join(mine, mine.path == theirs.path)
+        .where(mine.run_id == subject_id)
+        .order_by(newest.c.pr, theirs.path)
+    )).all()
 
     hits: dict[int, dict] = {}
-    for other_pr, run_id, ts, title, path in shared:
+    for other_pr, title, run_id, ts, total, state, draft, path in shared:
         row = hits.setdefault(other_pr, {
             "pr": other_pr, "pr_title": title, "run_id": run_id,
-            "ts": ts.isoformat(), "files": [],
+            "ts": ts.isoformat(), "pr_state": state, "is_draft": draft,
+            # Read against len(files): a rival whose stored list is a prefix may
+            # share paths it never reported, so "these two files" is a floor and
+            # not the whole overlap.
+            "changed_files_total": total, "files": [],
         })
         row["files"].append(path)
 
-    answered = set((await session.scalars(select(latest.c.pr))).all())
-    unknown = sorted(set((await session.scalars(others.distinct())).all()) - answered)
+    # ---- the rivals the board cannot answer for.
+    #
+    # One statement, and over `newest` rather than a second grouped aggregation:
+    # a rival is unanswerable exactly when its newest run carries no file list.
+    unknown = [
+        {"pr": r.pr, "pr_title": r.pr_title, "run_id": r.run_id,
+         "ts": r.ts.isoformat(), "pr_state": r.pr_state, "is_draft": r.is_draft}
+        for r in (await session.execute(
+            select(newest).where(~_has_file_list(newest.c.run_id))
+                          .order_by(newest.c.pr)
+        )).all()
+    ]
 
+    paths = sorted(
+        (await session.scalars(
+            select(ReviewRunFile.path).where(ReviewRunFile.run_id == subject_id)
+        )).all()
+    )
+    # Most shared files first — a description of the overlap, not a
+    # recommendation about it.
+    ranked = sorted(hits.values(), key=lambda h: (-len(h["files"]), h["pr"]))
     return {
         "repo": repo,
         "pr": pr,
         "run_id": subject_id,
-        "ts": subject.ts.isoformat() if subject else None,
-        "files": sorted(paths),
+        "ts": subject.ts.isoformat(),
+        "pr_state": subject.pr_state,
+        "is_draft": subject.is_draft,
+        "files": paths,
         # Read against len(files): GitHub caps a PR's file list at 3,000, and a
         # subject whose own list was truncated under-reports its own collisions.
-        "changed_files_total": subject.changed_files_total if subject else None,
-        # Most shared files first — a description of the overlap, not a
-        # recommendation about it.
-        "collides": sorted(hits.values(), key=lambda h: (-len(h["files"]), h["pr"])),
-        #: PRs of this repo with a run in the window and NO recorded file list.
-        #: Not disjoint — unanswered. Every pre-v2.23 run lands here.
+        "changed_files_total": subject.changed_files_total,
+        "collides": ranked[:limit],
+        # Said, never silent: this repo's rule is that a cap which trims an answer
+        # announces itself, or the trimmed answer reads as the whole one.
+        "collides_dropped": max(0, len(ranked) - limit),
+        #: Rivals whose newest run recorded NO file list. Not disjoint —
+        #: unanswered. Every pre-v2.23 run lands here.
         "unknown": unknown,
+        #: PRs this board has never panelled cannot appear anywhere above, in any
+        #: state. Stated in the response and not only in the docs, because it is
+        #: the one limit a caller cannot discover by reading the numbers.
+        "scope": "PRs this board has panelled within the window",
     }
 
 

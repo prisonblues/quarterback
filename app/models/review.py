@@ -63,6 +63,22 @@ class ReviewRun(Base):
     #: 3,000 — and a collision query over it under-reports. NULL for every run
     #: recorded before the panel sent it, which is NOT the same as zero files.
     changed_files_total: Mapped[int | None] = mapped_column(Integer)
+    #: The PR's state as of THIS panel — `OPEN` / `MERGED` / `CLOSED`, verbatim
+    #: from `gh pr view --json state`. Recorded because the board otherwise holds
+    #: no PR state at all, and a collision query without it reports every PR
+    #: panelled in the window as a live rival, merged ones included: on a repo
+    #: landing several a week the answer is mostly PRs that no longer exist,
+    #: which is how an advisory endpoint stops being read.
+    #:
+    #: **As of the last panel, never live.** The board is told about panels, not
+    #: about merges, so a PR merged after its final round still reads OPEN here.
+    #: That is the same currency as `changed_files` itself, and why every read
+    #: path hands back the run's `ts` beside it. NULL for every pre-v2.23 run.
+    pr_state: Mapped[str | None] = mapped_column(Text)
+    #: A draft PR is open and not landing yet, which is a different thing to
+    #: collide with. Separate from `pr_state` because GitHub's `state` does not
+    #: encode it — a draft's state is `OPEN`.
+    is_draft: Mapped[bool | None] = mapped_column(Boolean)
     diff_chars: Mapped[int | None] = mapped_column(Integer)
     diff_truncated: Mapped[bool | None] = mapped_column(Boolean)
 
@@ -415,9 +431,14 @@ class ReviewRunFile(Base):
         # One row per path per run. A payload that repeats a path is a bug in the
         # sender, and letting it through would double that file's weight in every
         # collision count built on this table.
+        #
+        # Its underlying B-tree on (run_id, path) also serves every run_id-only
+        # lookup through its leftmost prefix, so there is deliberately NO separate
+        # index on run_id: it would be storage and write cost, on the largest
+        # table this feature creates, for a lookup already covered.
         UniqueConstraint("run_id", "path", name="uq_review_run_file_run_path"),
-        Index("ix_review_run_files_run", "run_id"),
-        # The collision index: the query this table exists for reads by PATH and
-        # fans out to runs, not the other way round.
-        Index("ix_review_run_files_path", "path"),
+        # The collision index. (path, run_id), not (path): the query this table
+        # exists for reads by PATH and wants run_id back, which the composite
+        # answers from the index alone rather than a heap fetch per matching row.
+        Index("ix_review_run_files_path", "path", "run_id"),
     )

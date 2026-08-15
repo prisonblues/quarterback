@@ -102,7 +102,8 @@ GET   /sync              ?repo=&branch=&device=&path=          (registered workt
 #                        changed files v2.23)
 POST  /review            (panel.py --json payload)              -> {id, recorded, accounts}
 GET   /reviews           ?repo=&pr=&author=&since=&days=&limit=  (runs + scorecards)
-GET   /review/{id}                                              (scorecards + findings + accounts)
+GET   /review/{id}                                              (scorecards + findings + accounts
+                                                                 + the PR's changed_files)
 GET   /review/stats      ?repo=&author=&days=&judged_only=       -> {by_model, by_agent}
 GET   /review/findings   ?repo=&pr=&limit=                       (one PR's findings as
                                                                   chains of observations,
@@ -110,10 +111,12 @@ GET   /review/findings   ?repo=&pr=&limit=                       (one PR's findi
                                                                   what stopped the loop,
                                                                   whether a re-review flag
                                                                   was borne out)
-GET   /review/collisions ?repo=&pr=&since=&days=                 (which other PRs touch
-                                                                  this one's files, and
-                                                                  which PRs have no file
-                                                                  list to answer with)
+GET   /review/collisions ?repo=&pr=&since=&days=&include_closed=&limit=
+                         -> {files, changed_files_total, pr_state, collides:[{pr, files,
+                            changed_files_total, pr_state, ts}], collides_dropped,
+                            unknown:[{pr, pr_title, run_id, ts}], scope}
+                            (over the PRs this board has PANELLED — one it has never
+                             seen cannot appear in any of those lists)
 GET   /panel             (browser view — the leaderboard)
 
 GET   /health            (no auth)
@@ -195,8 +198,8 @@ instead would be wrong the next time Portainer redeploys, with no diff to catch 
 Latest release: **v2.23** — a run records which FILES the PR changed and not just how many lines, so
 `GET /review/collisions` can say which other PRs a merge disturbs (schema revision 0016).
 Before it, **v2.21** (harness-side) had each panel member run in its own empty sandbox repo
-rather than in whatever directory the panel was launched from, **v2.20** (also harness-side) had the worktree
-tooling ask who is in a directory before rewriting it, and **v2.19** added the per-reviewer
+rather than in whatever directory the panel was launched from. **v2.20** (also harness-side) had the
+worktree tooling ask who is in a directory before rewriting it, and **v2.19** added the per-reviewer
 cost columns (schema revision 0015) and was the first to move the board since v2.15; **v2.18**
 settles a reply carrying several JSON-shaped values by agreement rather than by rank, **v2.17** made
 a reviewer that produced nothing a failure that says why, and **v2.16** stopped the panel capping
