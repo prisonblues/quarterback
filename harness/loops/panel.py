@@ -1502,18 +1502,33 @@ def codex_args(model: str, effort: str, reply_file: Path | None = None) -> list[
     failure member_sandbox exists to prevent, arriving through the tool rather
     than through the cwd. Without a shell there is no workdir to pass.
 
+    **Four keys and not two, because taking away the first two was not enough.**
+    A run carrying only the shell and web overrides went hunting for a third door
+    and found one: code mode leaves a JS runtime whose `ALL_TOOLS` the model can
+    enumerate, and it did — filtering for `/exec|command|shell|read/`, then for
+    `github_` — until it reached the authenticated GitHub CONNECTOR and called
+    `github_get_pr_info` / `github_get_pr_diff` on the PR under review. An app is
+    a network channel with credentials, so disabling web search alone bought
+    nothing; `features.apps=false` and `features.plugins=false` are what close
+    the family. That is the general shape of this seat's problem: it does not
+    want a particular tool, it wants the code, and it will use whatever is left.
+    Anything added to codex's default tool surface needs checking against that.
+
     Set unconditionally rather than from .harness-rules: a seat that reviews the
     diff it was handed is what the panel MEANS by a reviewer, not a preference a
-    repo gets to hold. Verified on codex-cli 0.147.0 — both keys survive
-    `--strict-config`, and a run carrying them reports the shell and web tools as
-    unavailable rather than silently keeping them.
+    repo gets to hold. Verified on codex-cli 0.147.0 — all four keys survive
+    `--strict-config`, and a run carrying them enumerates its own tools and
+    reports that it cannot read a local file, cannot fetch a GitHub PR and has no
+    web access, rather than silently keeping a route to all three.
     """
     # `web_search` is the top-level mode key, which is what also takes away the
     # code-mode `web__run` exposure; `tools.web_search=false` parses too but is
     # the narrower spelling.
     args = ["codex", "exec",
             "-c", 'web_search="disabled"',
-            "-c", "features.shell_tool=false"]
+            "-c", "features.shell_tool=false",
+            "-c", "features.apps=false",
+            "-c", "features.plugins=false"]
     if model:
         args += ["--model", model]
     if effort:

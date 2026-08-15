@@ -26,7 +26,8 @@ TOO_OLD = (
 #: `-c` overrides codex takes instead of a flag. Named so the tests below assert
 #: the model/effort shape without restating it.
 NO_TOOLS = ["codex", "exec", "-c", 'web_search="disabled"',
-            "-c", "features.shell_tool=false"]
+            "-c", "features.shell_tool=false",
+            "-c", "features.apps=false", "-c", "features.plugins=false"]
 
 
 def test_unpinned_codex_passes_no_model_flag():
@@ -55,11 +56,19 @@ def test_codex_seat_can_neither_search_the_web_nor_run_a_shell():
     Asserted for EVERY argv shape, pinned or not, because both are reachable
     from .harness-rules and a seat that keeps its tools on the unpinned path is
     the same lost reviewer.
+
+    The apps/plugins pair is asserted alongside the obvious two because removing
+    only the obvious two is a MEASURED non-fix: the seat enumerated what was left
+    in the code-mode runtime and reached the authenticated GitHub connector
+    instead, which fetches the PR over the network with credentials. Dropping
+    either key reopens that.
     """
     for args in (panel.codex_args("", ""), panel.codex_args("gpt-5.6-luna", "max"),
                  panel.codex_args("gpt-5.6-luna", "max", Path("/tmp/reply.txt"))):
         assert 'web_search="disabled"' in args
         assert "features.shell_tool=false" in args
+        assert "features.apps=false" in args
+        assert "features.plugins=false" in args
 
 
 # ---------------------------------------------------------------- failing cleanly

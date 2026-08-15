@@ -221,7 +221,8 @@ def test_codex_argv_asks_for_the_stream_and_the_plain_text_reply(tmp_path):
     # overrides are the seat's --no-tools; see codex_args.)
     assert panel.codex_args("", "") == [
         "codex", "exec", "-c", 'web_search="disabled"',
-        "-c", "features.shell_tool=false"]
+        "-c", "features.shell_tool=false",
+        "-c", "features.apps=false", "-c", "features.plugins=false"]
 
 
 # ------------------------------------------------- review_llm, end to end
