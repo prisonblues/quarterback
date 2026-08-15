@@ -455,7 +455,7 @@ def claude(skill_cmd: str, cwd: str, perm_mode: str,
                      + (["--model", model] if model else []), cwd=cwd)
 
 
-def run_panel(repo_path: str, pr: int) -> None:
+def run_panel(repo_path: str, pr: int) -> bool:
     # Pass the PATH, not the name: the resolver would otherwise look a bare name
     # up under ~/source, which silently picks the wrong repo when the directory
     # name and the GitHub name differ.
@@ -464,11 +464,18 @@ def run_panel(repo_path: str, pr: int) -> None:
     # Uncaptured on purpose — the report IS the output, and it belongs in the log
     # as it is written. Only the exit code needs interpreting: /review-pr runs next
     # either way, and a panel that died has left it nothing to work from.
+    #
+    # Returns whether it produced a report, because "may have no findings to act
+    # on" is not a warning the caller can act on by printing it. `/review-pr` with
+    # nothing to read can still print a plausible no-op reply, pass agent_failure,
+    # and record `reviewed` — the outcome that lets the sub-PR be stacked. So a
+    # dead panel has to reach the merge gate as a fact, not as a log line.
     rc = subprocess.run([sys.executable, str(PANEL), "--repo", repo_path,
                          "--pr", str(pr)], check=False).returncode
     if rc != 0:
         print(f"    (panel exited {rc} — see its output above; the review that "
-              f"follows may have no findings to act on)")
+              f"follows has no findings to act on)")
+    return rc == 0
 
 
 def pr_green(gh_repo: str, pr: int) -> tuple[bool, str]:
@@ -664,6 +671,15 @@ class WorkResult:
     outcome: str            # done | reviewed | failed | blocked
     pr: int | None = None
     detail: str = ""
+    #: Is this review known to have HAPPENED? `reviewed` is the outcome that lets
+    #: the driver stack a sub-PR into the epic branch, and several routes reach it
+    #: without evidence that anything was reviewed: a panel that died leaves
+    #: `/review-pr` nothing to act on, an agent that was denied its tools exits 0
+    #: saying so, and an unreadable head SHA cannot tell a push from a no-op.
+    #: None of those is a failure — the PR is real and a re-run picks it up — but
+    #: none of them may be auto-merged either, so the gate needs to tell them from
+    #: a review that demonstrably ran.
+    verified: bool = True
 
 
 # ----------------------------------------------------------------- preflight
@@ -855,35 +871,60 @@ def work_issue(cfg: dict, w: IssueWork, execute: bool, base: str | None = None,
                 return WorkResult(w.num, "failed", detail=detail)
 
         print(f"  #{w.num}: reviewing PR #{pr}")
-        run_panel(cfg["path"], pr)
+        panelled = run_panel(cfg["path"], pr)
         # /review-pr addresses findings + pushes; merge withheld (human/epic gate).
         before = pr_head_sha(gh_repo, pr)
         reviewer = claude(f"/review-pr {pr}", cfg["path"], perm, w.model)
-        # A reviewer that never ran must not report as "reviewed": that outcome is
-        # what lets the driver stack the sub-PR into the epic branch, so calling it
-        # reviewed would merge a PR whose findings nobody addressed. The PR itself
-        # survives, and a re-run classifies the issue back into the review stage.
+        # The head is read BEFORE the exit code is judged, because a push is the
+        # stronger evidence and the implement stage two blocks up already says so
+        # about the PR it opens: "a run can open its PR and then trip on the way
+        # out. The exit is worth a line; it is not worth discarding the artifact."
+        # A `/review-pr` that read the report, pushed three fix commits and then
+        # died on teardown or an MCP disconnect was being recorded `failed`, which
+        # aborts the whole epic without --keep-going.
+        after = pr_head_sha(gh_repo, pr)
+        # Three-valued, not two. `""` from either lookup means "could not tell",
+        # which pr_head_sha's own docstring insists is never "nothing changed" —
+        # and collapsing it into `pushed` fed the confident branch straight to
+        # auto-merge on the strength of a failed `gh` call.
+        known = bool(before and after)
+        pushed = known and before != after
         if failure := agent_failure(reviewer):
-            detail = f"/review-pr {failure} — findings unaddressed"
-            print(f"  #{w.num}: FAILED — {detail}")
-            if state is not None:
-                record(state, w.num, stage="failed", branch=branch, pr=pr,
-                       lastAction=detail)
-            return WorkResult(w.num, "failed", pr=pr, detail=detail)
+            if pushed:
+                print(f"  #{w.num}: /review-pr {failure}, but pushed to PR #{pr} "
+                      f"first — keeping the work; the exit is worth a line, not "
+                      f"the artifact.")
+            else:
+                # A reviewer that never ran must not report as "reviewed": that
+                # outcome is what lets the driver stack the sub-PR into the epic
+                # branch, so calling it reviewed would merge a PR whose findings
+                # nobody addressed. The PR itself survives, and a re-run
+                # classifies the issue back into the review stage.
+                detail = f"/review-pr {failure} — findings unaddressed"
+                print(f"  #{w.num}: FAILED — {detail}")
+                if state is not None:
+                    record(state, w.num, stage="failed", branch=branch, pr=pr,
+                           lastAction=detail)
+                return WorkResult(w.num, "failed", pr=pr, detail=detail)
         # A review that pushed nothing is the remaining ambiguous case, and it is
         # NOT treated as a failure: finding nothing to fix is a legitimate — and by
         # the last round, expected — outcome. But it is the same shape as a review
         # that was stopped from fixing anything, so it is reported with the agent's
-        # own account rather than passing as an ordinary review.
-        after = pr_head_sha(gh_repo, pr)
-        pushed = not (before and after and before == after)
-        if not pushed:
-            print(f"  #{w.num}: /review-pr pushed nothing to PR #{pr} — nothing to fix, "
-                  f"or it could not. It said: {agent_gist(reviewer)}")
+        # own account rather than passing as an ordinary review — and it is not
+        # auto-merged on that ambiguity. Same for a review with no panel report to
+        # work from, and for a head SHA nobody could read.
+        why = ("the panel produced no report" if not panelled else
+               "the head SHA could not be read" if not known else
+               "it pushed nothing — nothing to fix, or it could not" if not pushed
+               else "")
+        if why:
+            print(f"  #{w.num}: /review-pr on PR #{pr} is unverified: {why}. "
+                  f"It said: {agent_gist(reviewer)}")
+        action = "reviewed" if not why else f"reviewed (unverified: {why})"
         if state is not None:
             record(state, w.num, stage="reviewed", branch=branch, pr=pr,
-                   lastAction="reviewed" if pushed else "reviewed (pushed nothing)")
-        return WorkResult(w.num, "reviewed", pr=pr)
+                   lastAction=action)
+        return WorkResult(w.num, "reviewed", pr=pr, verified=not why)
     finally:
         # P4 — tear down the worktree AND its containers / isolated DB, not just the dir.
         teardown_worktree(cfg, branch, wt)
@@ -1156,6 +1197,22 @@ def run(repo_name: str, epic: int, execute: bool, max_issues: int | None,
             return 1
         # res.outcome == "reviewed": it has a PR. In integration/auto, merge it into
         # the epic branch when CI is green so the next issue stacks on top.
+        if auto_merge_subs and res.pr and not res.verified:
+            # `reviewed` without evidence that a review happened. Not a failure —
+            # the PR is real and a re-run picks the issue back up in the review
+            # stage — but stacking it into the epic branch would merge a PR whose
+            # findings may never have been generated, let alone addressed. That is
+            # the one thing the auto-merge path must not do on an assumption.
+            print(f"  #{w.num}: PR #{res.pr} reviewed but UNVERIFIED "
+                  f"({res.detail or 'see above'}) — NOT merging into "
+                  f"'{land['epic_branch']}'; left for a human. Stacking may stall.")
+            record(state, w.num, stage="reviewed-unverified", pr=res.pr,
+                   lastAction="not merged: review unverified")
+            if not keep_going:
+                print(f"\n✗ STOP: #{w.num}'s review could not be verified — re-run "
+                      f"it, or merge by hand once you have checked it.")
+                return 1
+            continue
         if auto_merge_subs and res.pr:
             green, status = pr_green(cfg["github"], res.pr)
             if not green:

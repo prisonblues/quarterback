@@ -603,12 +603,24 @@ def tail_gist(text: str, limit: int = 200) -> str:
 def agent_gist(proc: subprocess.CompletedProcess) -> str:
     """The line most likely to explain what a headless agent did, or would not do.
 
-    stderr first — that is where the harness itself complains (a rejected flag, an
-    API refusal) — then the tail of stdout, which in `claude -p` is the agent's own
-    final message. The denial that motivated #31 is described THERE and nowhere
-    else, so a stderr-only account would still report the interesting case as
-    silence."""
-    return stderr_gist(proc.stderr or "") or tail_gist(proc.stdout or "")
+    Which stream to believe depends on WHO is complaining, and the exit code is
+    what says. On a non-zero exit the harness failed, and stderr is where it says
+    so — a rejected flag, an API refusal. On a ZERO exit the agent ran and the
+    explanation is its own final message, on stdout: "I was not permitted to run
+    that tool, so I made no changes" is the entire motivating case for #31, and it
+    is described there and nowhere else.
+
+    Preferring stderr unconditionally lost exactly that case. `claude -p` writes
+    to stderr on a perfectly healthy run — hook output, MCP server warnings, node
+    deprecation notices, this repo's own quarterback lifecycle lines — and
+    `stderr_gist` falls back to the last line when none matches "error", so ANY of
+    that outranked the sentence this function exists to surface. The operator read
+    `agent said: (node:412) [DEP0040] DeprecationWarning` and learned nothing.
+
+    Each side still falls back to the other, so a stream that is empty never costs
+    the account."""
+    out, err = tail_gist(proc.stdout or ""), stderr_gist(proc.stderr or "")
+    return (err or out) if proc.returncode else (out or err)
 
 
 def agent_failure(proc: subprocess.CompletedProcess) -> str:
@@ -629,16 +641,47 @@ def agent_failure(proc: subprocess.CompletedProcess) -> str:
 
 
 def _pump(src: TextIO, sink: TextIO, buf: list[str]) -> None:
-    """Copy a child stream to ours line by line, keeping a copy."""
+    """Copy a child stream to ours line by line, keeping a copy.
+
+    The pass-through is best-effort; the DRAIN is not. If writing to our own
+    stdout fails — a BrokenPipeError because the loop's output went to `| head`
+    or a log consumer exited, an encoding error on odd agent output — this thread
+    must keep reading anyway. It used to die there, with two consequences: `buf`
+    stopped accumulating, so `proc.stdout` became a silent PREFIX of what the
+    agent said and `tail_gist` quoted the middle of a run as its conclusion; and
+    nothing drained the pipe, so the child blocked forever on a full 64 KB buffer
+    while the main thread sat in `proc.wait()` before joining the pumps. A sweep
+    that hangs with no timeout is the worst outcome available here, and it was
+    reachable from a closed pipe.
+    """
+    passthrough = True
     with src:
         for line in src:
             buf.append(line)
-            sink.write(line)
-            sink.flush()
+            if not passthrough:
+                continue
+            try:
+                sink.write(line)
+                sink.flush()
+            except (OSError, ValueError, UnicodeError):
+                # Give up on the live log for the rest of the run, never on the
+                # capture. One failed write means the sink is gone, not that the
+                # next line will land.
+                passthrough = False
+
+
+#: How long a headless agent may run before the loop stops waiting. Generous on
+#: purpose — these agents implement features and address review findings, and a
+#: cap that fires on a slow-but-working run costs more than the hang does. It
+#: exists for the wedged case only: a `claude -p` stalled on a network read used
+#: to hold a systemd-timer sweep, and the worktree, containers and isolated
+#: database it created, until a human noticed.
+AGENT_TIMEOUT = 3600
 
 
 def run_agent(args: list[str],
-              cwd: str | Path | None = None) -> subprocess.CompletedProcess:
+              cwd: str | Path | None = None,
+              timeout: int | None = AGENT_TIMEOUT) -> subprocess.CompletedProcess:
     """Run a headless agent, capturing both streams AND passing them through.
 
     `capture_output=True` alone would buy the diagnosis by diverting the log:
@@ -674,9 +717,24 @@ def run_agent(args: list[str],
              threading.Thread(target=_pump, args=(proc.stderr, sys.stderr, err))]
     for t in pumps:
         t.start()
-    rc = proc.wait()
+    # Bounded, unlike the `proc.wait()` this replaces. Every other headless
+    # invocation in the harness bounds itself (epic.triage, panel.run_cli); this
+    # one did not, and it is the one that runs unattended from a timer. The kill
+    # is what lets the pumps finish: they are reading a pipe that only closes
+    # when the child dies, so joining them before killing would hang in the same
+    # place. Reported as a failure with a reason, so `agent_failure` says
+    # "timed out" rather than the caller inferring silence.
+    try:
+        rc = proc.wait(timeout=timeout)
+        timed_out = False
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        rc, timed_out = proc.wait(), True
     for t in pumps:
         t.join()
+    if timed_out:
+        err.append(f"agent timed out after {timeout}s and was killed\n")
+        rc = rc or 124
     return subprocess.CompletedProcess(args, rc, "".join(out), "".join(err))
 
 

@@ -34,7 +34,8 @@ def new_state():
     return {"epic": 52, "repo": "thing", "issues": {}}
 
 
-def arrange(monkeypatch, tmp_path, agent, discovered_pr=None, head_shas=None):
+def arrange(monkeypatch, tmp_path, agent, discovered_pr=None, head_shas=None,
+            panelled=True):
     """Neutralise everything work_issue touches except the agent run itself.
     Returns (cfg, calls) where calls records each skill the driver invoked."""
     calls = []
@@ -50,7 +51,9 @@ def arrange(monkeypatch, tmp_path, agent, discovered_pr=None, head_shas=None):
     monkeypatch.setattr(epic, "worktree_has_new_commit", lambda wt, base: False)
     monkeypatch.setattr(epic, "worktree_dirty", lambda wt: False)
     monkeypatch.setattr(epic, "teardown_worktree", lambda cfg, branch, wt: None)
-    monkeypatch.setattr(epic, "run_panel", lambda repo_path, pr: None)
+    # run_panel reports whether it produced a report; a dead panel leaves
+    # /review-pr nothing to act on, which the merge gate has to be able to see.
+    monkeypatch.setattr(epic, "run_panel", lambda repo_path, pr: panelled)
     # Default: the review pushed something, so the "pushed nothing" line is only
     # exercised by the test that asks for it.
     shas = iter(head_shas or ["sha-before", "sha-after"])
@@ -116,8 +119,13 @@ def test_a_pr_that_did_appear_is_reviewed_even_if_the_run_exited_badly(
 def test_a_review_that_never_ran_does_not_report_as_reviewed(
         monkeypatch, tmp_path, capsys):
     """'reviewed' is the outcome that lets the driver stack the sub-PR — so a
-    /review-pr that was denied its tools must not produce it."""
-    cfg, _ = arrange(monkeypatch, tmp_path, ran(rc=1, err="Error: tool use denied"))
+    /review-pr that was denied its tools must not produce it.
+
+    The head is unchanged, which is what a denied agent leaves behind — and the
+    two facts together are the failure. A run that failed AFTER pushing is a
+    different case, covered below."""
+    cfg, _ = arrange(monkeypatch, tmp_path, ran(rc=1, err="Error: tool use denied"),
+                     head_shas=["same-sha", "same-sha"])
     state = new_state()
 
     res = epic.work_issue(cfg, work(stage="review", pr=99), execute=True, state=state)
@@ -140,9 +148,13 @@ def test_a_review_that_pushed_nothing_is_reported_but_not_failed(
 
     assert res.outcome == "reviewed"
     out = capsys.readouterr().out
-    assert "/review-pr pushed nothing to PR #99" in out
+    assert "pushed nothing" in out and "PR #99 is unverified" in out
     assert "It said: No findings needed a change." in out
-    assert state["issues"]["31"]["lastAction"] == "reviewed (pushed nothing)"
+    # Reported as reviewed, but NOT as something the auto-merge path may consume:
+    # "found nothing to fix" and "was stopped from fixing anything" are the same
+    # shape from out here, and only one of them is safe to stack.
+    assert res.verified is False
+    assert "unverified" in state["issues"]["31"]["lastAction"]
 
 
 def test_an_unreadable_head_sha_is_not_read_as_a_review_that_did_nothing(
@@ -202,3 +214,60 @@ def test_a_real_verdict_is_unaffected(monkeypatch):
 
     assert doable is True
     assert reason == "clear scope"
+
+
+def test_a_review_that_pushed_and_then_tripped_keeps_its_work(
+        monkeypatch, tmp_path, capsys):
+    """The implement stage two blocks up already refuses to judge by exit code
+    alone — "a run can open its PR and then trip on the way out. The exit is
+    worth a line; it is not worth discarding the artifact." The review stage was
+    judging by exit code alone, and it read the head SHA only AFTER deciding.
+
+    So a /review-pr that read the panel report, pushed three fix commits and then
+    died on teardown or an MCP disconnect was recorded `failed`, which without
+    --keep-going aborts the whole epic. The contradicting evidence was one
+    already-written call away."""
+    cfg, _ = arrange(monkeypatch, tmp_path,
+                     ran(rc=1, out="Pushed 3 fixes.", err="MCP server disconnected"),
+                     head_shas=["before", "after"])
+    state = new_state()
+
+    res = epic.work_issue(cfg, work(stage="review", pr=99), execute=True, state=state)
+
+    assert res.outcome == "reviewed" and res.verified is True
+    assert "keeping the work" in capsys.readouterr().out
+    assert state["issues"]["31"]["stage"] == "reviewed"
+
+
+def test_a_dead_panel_leaves_the_review_unverified(monkeypatch, tmp_path, capsys):
+    """A panel that died leaves /review-pr nothing to act on — but /review-pr can
+    still print a plausible no-op reply, pass agent_failure, and record
+    `reviewed`, which is the outcome that lets the sub-PR be stacked. A PR then
+    reaches the merge gate having had no findings generated at all. Warning about
+    it in the log is not something the gate can act on."""
+    cfg, _ = arrange(monkeypatch, tmp_path, ran(out="Nothing to address."),
+                     head_shas=["before", "after"], panelled=False)
+    state = new_state()
+
+    res = epic.work_issue(cfg, work(stage="review", pr=99), execute=True, state=state)
+
+    assert res.outcome == "reviewed" and res.verified is False
+    assert "the panel produced no report" in capsys.readouterr().out
+
+
+def test_an_unreadable_head_sha_stays_unknown_rather_than_counting_as_a_push(
+        monkeypatch, tmp_path, capsys):
+    """`pushed = not (before and after and before == after)` was true whenever
+    either lookup returned the documented "could not tell" empty string, so a
+    failed `gh` call was recorded as a plain `reviewed` and fed the auto-merge
+    path. pr_head_sha's own docstring says `""` means could not tell, never
+    nothing changed — and the caller collapsed unknown into the confident
+    branch."""
+    cfg, _ = arrange(monkeypatch, tmp_path, ran(out="Addressed the findings."),
+                     head_shas=["before", ""])
+    state = new_state()
+
+    res = epic.work_issue(cfg, work(stage="review", pr=99), execute=True, state=state)
+
+    assert res.outcome == "reviewed" and res.verified is False
+    assert "the head SHA could not be read" in capsys.readouterr().out

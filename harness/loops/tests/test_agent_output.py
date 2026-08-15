@@ -9,6 +9,7 @@ at all), and agent_failure/agent_gist turn the result into the one sentence a
 "nothing happened" line has room for.
 """
 
+import io
 import subprocess
 import sys
 from pathlib import Path
@@ -41,17 +42,31 @@ def test_tail_gist_of_nothing_is_empty():
     assert harness_rules.tail_gist("   \n\n ") == ""
 
 
-def test_agent_gist_prefers_stderr_the_harness_complaint():
-    proc = done(out="I have finished.", err="Error: unknown flag --nope")
+def test_agent_gist_prefers_stderr_when_the_harness_is_the_one_complaining():
+    """A rejected flag is the harness failing, and it exits non-zero saying so."""
+    proc = done(rc=1, out="I have finished.", err="Error: unknown flag --nope")
     assert harness_rules.agent_gist(proc) == "Error: unknown flag --nope"
 
 
-def test_agent_gist_falls_back_to_what_the_agent_itself_said():
-    """The denial in #31 is described on stdout and nowhere else — a stderr-only
-    reading would report the interesting case as silence."""
-    proc = done(out="I was not permitted to run that tool, so I made no changes.")
+def test_agent_gist_prefers_the_agent_when_the_agent_is_the_one_talking():
+    """On a ZERO exit the harness did not fail, so stderr is not the complaint —
+    it is the normal chatter of a healthy `claude -p` run: hook output, MCP
+    warnings, node deprecation notices, this repo's own lifecycle lines. Reading
+    stderr first regardless of exit code handed the operator
+    `agent said: (node:412) [DEP0040] DeprecationWarning` and buried the one
+    sentence that explains the run."""
+    proc = done(out="I was not permitted to run that tool, so I made no changes.",
+                err="(node:412) [DEP0040] DeprecationWarning: punycode is deprecated")
     assert harness_rules.agent_gist(proc) == (
         "I was not permitted to run that tool, so I made no changes.")
+
+
+def test_agent_gist_falls_back_to_whichever_stream_spoke():
+    """Neither preference costs the account when the preferred stream is empty."""
+    assert harness_rules.agent_gist(done(err="something on stderr only")) == \
+        "something on stderr only"
+    assert harness_rules.agent_gist(done(rc=1, out="something on stdout only")) == \
+        "something on stdout only"
 
 
 # ---------------------------------------------------------- did it run?
@@ -146,3 +161,41 @@ def test_run_agent_reports_a_failed_exit_rather_than_raising():
     proc = harness_rules.run_agent(_py("import sys; sys.exit(3)"))
     assert proc.returncode == 3
     assert harness_rules.agent_failure(proc).startswith("exited 3")
+
+
+# ------------------------------------------- the pump, and the wedged agent
+
+def test_a_dead_log_sink_costs_the_live_log_and_never_the_capture(tmp_path):
+    """The pass-through is best-effort; the DRAIN is not.
+
+    A sink that raises — a BrokenPipeError because the loop's output went to
+    `| head`, an encoding error on odd agent output — used to kill the pump
+    thread. `buf` then stopped accumulating, so `proc.stdout` became a silent
+    PREFIX and `tail_gist` quoted the middle of the run as its conclusion; and
+    nothing drained the pipe, so the child blocked forever on a full buffer
+    while the main thread waited in `proc.wait()` before joining the pumps."""
+    class DeadSink:
+        def write(self, _):
+            raise BrokenPipeError(32, "Broken pipe")
+
+        def flush(self):
+            raise BrokenPipeError(32, "Broken pipe")
+
+    buf = []
+    src = io.StringIO("first\nsecond\nthird\n")
+    harness_rules._pump(src, DeadSink(), buf)
+    assert "".join(buf) == "first\nsecond\nthird\n", "every line is still captured"
+
+
+def test_a_wedged_agent_is_killed_and_reported_rather_than_waited_on_forever():
+    """These loops fire from a systemd timer with no terminal, so an agent stalled
+    on a network read used to hold the sweep — and the worktree, containers and
+    isolated database it created — until a human noticed. Every other headless
+    invocation in the harness bounds itself; this is the one that runs unattended."""
+    proc = harness_rules.run_agent(
+        [sys.executable, "-c", "import time; print('working', flush=True); time.sleep(60)"],
+        timeout=1)
+    assert proc.returncode != 0
+    assert "timed out after 1s" in proc.stderr
+    assert "working" in proc.stdout, "what it managed to say is still captured"
+    assert harness_rules.agent_failure(proc), "and it reads as a failure"

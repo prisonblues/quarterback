@@ -99,3 +99,27 @@ def test_real_edits_are_still_committed_and_pushed(monkeypatch, tmp_path, capsys
 
     assert "committing + pushing fix" in capsys.readouterr().out
     assert pushed(calls)
+
+
+def test_a_silent_agent_that_left_a_real_fix_still_gets_it_pushed(
+        monkeypatch, tmp_path, capsys):
+    """The other half of the exit-0-blank shape, and the regression that came
+    with reading it as a failure.
+
+    `agent_failure` fires on exit 0 with empty stdout, and returning there tore
+    the worktree down in the `finally` — so a `claude -p` that edited the
+    lockfile correctly and simply printed nothing (an output-format quirk, a
+    suppressed final message, a hook redirecting stdout) had its fix deleted and
+    the PR stayed red. The old `check=True` path staged, found the edits and
+    pushed them.
+
+    stderr is what separates this from the failing case above: there it named a
+    cause and the staged work is half a fix; here nothing was said anywhere, so
+    the staged diff is the only evidence there is, and CI is the gate."""
+    agent = subprocess.CompletedProcess([], 0, "", "")
+    calls = arrange(monkeypatch, tmp_path, agent, staged_changes=True)
+
+    out = capsys.readouterr().out
+    assert "agent FAILED" not in out
+    assert "pushing them" in out
+    assert any("push" in c for c in calls), "the fix reaches the branch"
