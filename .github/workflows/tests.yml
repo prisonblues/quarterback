@@ -48,7 +48,11 @@ jobs:
           # the test asserting /stream 401s without auth instead gets a live SSE
           # stream and hangs until the job times out.
           BROWSER_DEV_USER: ""
-        run: uv run pytest -q
+        # `--extra dev`, the project's own declared group. A bare `uv run pytest`
+        # works on a developer's machine only because their venv already has it,
+        # and `--with pytest` would miss pytest-asyncio, which `asyncio_mode =
+        # "auto"` needs. CI caught exactly this on its first run.
+        run: uv run --extra dev pytest -q
 
   harness:
     name: harness suites
@@ -84,5 +88,5 @@ jobs:
           printf 'running %d harness suite(s): %s\n' "${#suites[@]}" "${suites[*]}"
           for suite in "${suites[@]}"; do
             echo "--- $suite"
-            uv run --with pytest pytest "$suite" -q
+            uv run --extra dev pytest "$suite" -q
           done
