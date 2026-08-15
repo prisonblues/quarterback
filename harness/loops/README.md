@@ -179,7 +179,10 @@ on no branch and a PR cannot introduce one.
 - `landing` — `auto` suggests integration vs multi from coupling signals; `integration`
   = one epic branch → one PR; `multi` = a PR per sub-issue.
 - `sub_pr_merge` — integration only. `auto` ff-merges each green sub-PR into the epic
-  branch; `gate` holds each at a human merge.
+  branch; `gate` holds each at a human merge. **Defaults to `gate`.** It is the switch
+  that decides whether the review gate merges anything, and that gate has been wrong on
+  its first attempt three rounds running — so it defaults closed, like every other
+  setting that lets an agent act unattended. Turning it on is one line.
 - `auto_finish` — on a `/fix-issue` that pushed nothing, commit+push salvaged work
   rather than failing the issue.
 - `executor_worktree_args` — extra flags for `create-worktree` (e.g. `["--no-docker"]`).

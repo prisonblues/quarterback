@@ -231,7 +231,15 @@ def test_a_review_that_pushed_and_then_tripped_keeps_its_work(
     So a /review-pr that read the panel report, pushed three fix commits and then
     died on teardown or an MCP disconnect was recorded `failed`, which without
     --keep-going aborts the whole epic. The contradicting evidence was one
-    already-written call away."""
+    already-written call away.
+
+    **`verified` is now False on this path, and that assertion is the fix to a
+    bug this test used to hold in place.** Keeping the artifact and calling the
+    review verified are two different decisions, and the branch made both by
+    making neither — it printed its line and fell through, so `why` was never set.
+    A reviewer that fixed the first of five findings and then died therefore
+    auto-merged with four unaddressed, which is exactly the case the unverified
+    flag exists for. The work survives; the merge gate is not cleared by it."""
     cfg, _ = arrange(monkeypatch, tmp_path,
                      ran(rc=1, out="Pushed 3 fixes.", err="MCP server disconnected"),
                      head_shas=["before", "after"])
@@ -239,8 +247,11 @@ def test_a_review_that_pushed_and_then_tripped_keeps_its_work(
 
     res = epic.work_issue(cfg, work(stage="review", pr=99), execute=True, state=state)
 
-    assert res.outcome == "reviewed" and res.verified is True
-    assert "keeping the work" in capsys.readouterr().out
+    assert res.outcome == "reviewed", "the work must not be discarded"
+    assert res.verified is False, "a partial review must not clear the merge gate"
+    out = capsys.readouterr().out
+    assert "keeping the work" in out
+    assert "may have stopped partway" in out
     assert state["issues"]["31"]["stage"] == "reviewed"
 
 
@@ -321,10 +332,22 @@ def test_a_panel_that_skipped_is_not_a_panel_that_reviewed(monkeypatch, tmp_path
     assert any("--json-file" in a for a in calls[0]), "asks for the artefact"
 
 
+def _reviewed(**over) -> str:
+    """A payload from a run that ACTUALLY reviewed, as panel.py emits one.
+
+    Spelled out rather than defaulted, because the difference between this and
+    `{"to_fix": [...]}` is the entire subject of the gate: a skipped run writes a
+    payload too, with these keys at their `_payload_defaults()` values, and the
+    old fixtures modelled "a payload exists" as sufficient — which is precisely
+    the premise three rounds of review kept defeating."""
+    return json.dumps({"reviewed": True, "skip_reason": None, "judged": True,
+                       "reviewers_ran": ["claude (opus)"], "to_fix": [], **over})
+
+
 def test_a_panel_that_wrote_a_report_reports_its_findings(monkeypatch, tmp_path):
     def fake_run(args, **kw):
         path = args[args.index("--json-file") + 1]
-        Path(path).write_text(json.dumps({"to_fix": [{"id": "F01"}, {"id": "F02"}]}))
+        Path(path).write_text(_reviewed(to_fix=[{"id": "F01"}, {"id": "F02"}]))
         return subprocess.CompletedProcess(args, 0)
 
     monkeypatch.setattr(epic.subprocess, "run", fake_run)
@@ -336,8 +359,65 @@ def test_a_panel_that_ruled_and_then_tripped_keeps_its_findings(monkeypatch, tmp
     on the way out. The findings are real and are not thrown away."""
     def fake_run(args, **kw):
         path = args[args.index("--json-file") + 1]
-        Path(path).write_text(json.dumps({"to_fix": [{"id": "F01"}]}))
+        Path(path).write_text(_reviewed(to_fix=[{"id": "F01"}]))
         return subprocess.CompletedProcess(args, 1)
 
     monkeypatch.setattr(epic.subprocess, "run", fake_run)
     assert epic.run_panel(str(tmp_path), 99) == (True, 1)
+
+
+# ---- the premise itself: what counts as "a review happened" -------------------
+#
+# Three rounds of review on this file each replaced one proxy with another — the
+# exit code, then the push, then the payload's existence — and panel.py defeats
+# all three on the same skip path. These pin the answer that has no fourth proxy:
+# the panel's own account of what it did.
+
+def _panel_writing(payload: str):
+    def fake_run(args, **kw):
+        Path(args[args.index("--json-file") + 1]).write_text(payload)
+        return subprocess.CompletedProcess(args, 0)
+    return fake_run
+
+
+def test_a_SKIPPED_panel_is_not_a_review(monkeypatch, tmp_path):
+    """The bug r3 found, and the reason the artefact cannot be the evidence.
+
+    panel.py's title-pattern skip writes a payload and exits 0 (`skipped_payload`
+    -> `write_payload` -> `finish`), and `_payload_defaults()` gives it
+    `to_fix: []`. So the old gate saw a report with zero findings, concluded the
+    reviewer had nothing to fix, and cleared a PR that no reviewer had read."""
+    monkeypatch.setattr(epic.subprocess, "run", _panel_writing(json.dumps({
+        "reviewed": False, "skip_reason": "title matches skip pattern /^chore/",
+        "judged": False, "reviewers_ran": [], "to_fix": []})))
+    assert epic.run_panel(str(tmp_path), 99) == (False, None)
+
+
+def test_a_NO_OP_panel_is_not_a_review_either(monkeypatch, tmp_path):
+    """`skip_reason` is the loud case. `reviewed: False` with no reason is the
+    quiet one — every other exit-0 path that produced no review — and the gate
+    must not need to enumerate them."""
+    monkeypatch.setattr(epic.subprocess, "run", _panel_writing(json.dumps({
+        "reviewed": False, "skip_reason": None, "judged": False,
+        "reviewers_ran": [], "to_fix": []})))
+    assert epic.run_panel(str(tmp_path), 99) == (False, None)
+
+
+def test_a_panel_whose_every_SEAT_was_empty_is_not_a_review(monkeypatch, tmp_path):
+    """`reviewed: True` and nobody filed. A round can start, mark itself reviewed
+    and lose every seat to quota or a bad model pin — and zero findings from zero
+    reviewers is indistinguishable from a clean PR unless the seat list is read.
+    That is #68's disease reaching the merge gate."""
+    monkeypatch.setattr(epic.subprocess, "run", _panel_writing(json.dumps({
+        "reviewed": True, "skip_reason": None, "judged": True,
+        "reviewers_ran": [], "to_fix": []})))
+    assert epic.run_panel(str(tmp_path), 99) == (False, None)
+
+
+def test_a_real_review_that_found_nothing_still_counts(monkeypatch, tmp_path):
+    """The case the gate must NOT refuse, and the reason it reads four keys rather
+    than just counting findings. A clean PR reviewed by a full panel produces zero
+    findings, and by the last round that is the expected outcome — treating it as
+    suspect halts an integration epic on its first clean sub-PR."""
+    monkeypatch.setattr(epic.subprocess, "run", _panel_writing(_reviewed()))
+    assert epic.run_panel(str(tmp_path), 99) == (True, 0)

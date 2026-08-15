@@ -466,14 +466,30 @@ def run_panel(repo_path: str, pr: int) -> tuple[bool, int | None]:
     stdlib-only anyway. The report stays UNCAPTURED — it IS the output and it
     belongs in the log as it is written.
 
-    The answer comes from the JSON payload, not the exit code, and that is the
-    whole point of the file. A zero exit is not evidence a review happened:
-    panel.py exits 0 on a configured title-pattern skip and on other no-op paths,
-    so reading rc==0 as "a report exists" let a SKIPPED panel present as a
-    reviewed one, and the sub-PR then cleared the merge gate having had no
-    findings generated at all — exactly what the gate exists to stop. An artefact
-    that only exists when the panel actually produced one cannot be faked by an
-    exit status.
+    **The answer is the panel's own statement that it reviewed, and nothing else.**
+    Three rounds of review on this file each replaced one proxy for "a review
+    happened" with another, and each was defeated the same way:
+
+      r1  panel.py exited 0                 -> it exits 0 on a title-pattern skip
+      r2  the reviewer pushed a commit      -> a run that fixes 1 of 5 findings
+                                               and then crashes also pushes
+      r3  a --json-file payload exists      -> EVERY exit-0 path writes one,
+                                               skip included (panel.py:3561,
+                                               `write_payload` then `finish`)
+
+    They are the same error three times: an observable side effect standing in
+    for the thing itself. So this reads the payload's own account of the run
+    rather than any consequence of it. `reviewed` is False on every path that did
+    not review, `skip_reason` is non-null only on a skip, `reviewers_ran` is empty
+    when nobody ran, and `judged` is False when nothing adjudicated — all four are
+    `_payload_defaults()` keys, present on every payload panel.py emits, so
+    reading them needs no version check and cannot KeyError.
+
+    There is no fourth proxy to get wrong here, which is the point of doing it
+    this way rather than more carefully: a claim can be false, but it is at least
+    a claim ABOUT the review, made by the only component that knows. Same shape as
+    #43's fix — an answer that has to identify itself rather than be inferred from
+    a score.
 
     The findings COUNT matters just as much, because "the reviewer pushed
     nothing" means opposite things either side of it. Zero findings and nothing
@@ -495,6 +511,16 @@ def run_panel(repo_path: str, pr: int) -> tuple[bool, int | None]:
     if report is None:
         print(f"    (panel exited {rc} and wrote no report — the review that "
               f"follows has nothing to act on)")
+        return False, None
+    # The payload exists; now ask it whether it is a review. A skipped or no-op
+    # run writes one of these too, and used to clear the gate on the strength of
+    # having written it.
+    if not report.get("reviewed") or report.get("skip_reason"):
+        why = report.get("skip_reason") or "the run reported reviewed=false"
+        print(f"    (panel wrote a report but did NOT review this PR: {why})")
+        return False, None
+    if not (report.get("reviewers_ran") or []):
+        print("    (panel reviewed but no reviewer filed — nothing read this diff)")
         return False, None
     found = len(report.get("to_fix") or [])
     if rc != 0:
@@ -915,8 +941,18 @@ def work_issue(cfg: dict, w: IssueWork, execute: bool, base: str | None = None,
         # auto-merge on the strength of a failed `gh` call.
         known = bool(before and after)
         pushed = known and before != after
+        # A crash AFTER pushing keeps the work but does not clear the gate.
+        # Keeping the artifact and calling the review verified are two different
+        # decisions, and this branch used to make both by making neither: it
+        # printed a line and fell through, `why` never got set, and a reviewer
+        # that fixed the first of five findings and then died on teardown
+        # auto-merged with four unaddressed. That is exactly the case the
+        # unverified flag exists for.
+        crashed = ""
         if failure := agent_failure(reviewer):
             if pushed:
+                crashed = (f"the reviewer {failure} after pushing — the review "
+                           f"may have stopped partway")
                 print(f"  #{w.num}: /review-pr {failure}, but pushed to PR #{pr} "
                       f"first — keeping the work; the exit is worth a line, not "
                       f"the artifact.")
@@ -945,7 +981,8 @@ def work_issue(cfg: dict, w: IssueWork, execute: bool, base: str | None = None,
         # round it is the expected outcome. Reading it as unverified halted an
         # integration epic on its first CLEAN sub-PR and demanded a human for the
         # happy path.
-        why = ("the panel produced no report" if not panelled else
+        why = (crashed if crashed else
+               "the panel produced no report" if not panelled else
                "the head SHA could not be read" if not known else
                "it pushed nothing against %d finding(s) — nothing it could fix, "
                "or nothing it would" % found if not pushed and found
