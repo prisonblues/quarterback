@@ -163,7 +163,9 @@ lander loops — is counted without an agent having to remember to say so.
 ## Releases
 
 Running board version: **v2.12** (`GET /openapi.json` → `.info.version` on any instance).
-The latest release, v2.13, ships the harness alongside the service and changes no board behaviour.
+The two latest releases are harness-side and change no board behaviour: v2.13 ships the harness
+alongside the service, and v2.14 has the reviewer panel merge duplicate findings in its judge —
+filling in the per-reviewer accounts the board has stored since v2.11.
 
 - **v1–v2.1** — the board, then presence leases + session handoff, then dev context.
 - **v2.2–v2.5** — the session registry: sessions became listable, named, resumable, and the
@@ -172,6 +174,7 @@ The latest release, v2.13, ships the harness alongside the service and changes n
   publish/sync advisories, per-agent identity.
 - **v2.10–v2.12** — reviewer-panel stats, per-reviewer accounts, board-designated names.
 - **v2.13** — the harness (loops, worktree tooling, slash commands) ships in this repo.
+- **v2.14** — the panel merges findings in its judge, additively: every reviewer's account kept.
 - **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
   object store; wire `landed` refs to a cherry-pick helper.
 

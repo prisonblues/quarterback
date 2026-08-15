@@ -178,24 +178,59 @@ cwd's repo; `--repo` takes a path or a name under `~/source`.
 ## Reviewer panel (`panel.py`)
 
 `python3 ~/.claude/loops/panel.py --pr <n>` (report) / `--post` (also comment on the
-PR) / `--json` (findings as JSON, no report).
+PR) / `--json` (the run as JSON on stdout — nothing else, progress goes to stderr).
 
 Read-only, so it runs in **any** repo — an unconfigured one just uses the defaults.
 
 - Runs the repo's **enabled** reviewers in parallel over the PR diff: SonarQube (HARD
   quality-gate pass/fail), Claude (SOFT, read-only), Codex (SOFT, different vendor).
-- **Skip patterns:** PRs matching `skip_title_patterns` are skipped entirely.
-  Otherwise all enabled reviewers run — no diff-size de-minimis.
-- **Master judgment, no consensus gate:** findings are deduped (file + nearby line)
-  then a master reviewer judges each on its merits. A real defect flagged by only ONE
-  reviewer is still fixed — agreement shows as a `⋆consensus` confidence marker, never
-  a filter. Only clear false positives are dismissed, with a recorded reason. If no
-  judge is available, nothing is suppressed.
+- **Skip patterns:** PRs matching `skip_title_patterns` are skipped entirely (under
+  `--json` that is still a payload, marked `reviewed: false` — an empty stdout would
+  read as a clean PR). Otherwise all enabled reviewers run — no diff-size de-minimis.
+- **Master judgment, no consensus gate:** a master reviewer judges every finding on
+  its merits. A real defect flagged by only ONE reviewer is still fixed — agreement
+  shows as a `⋆consensus` confidence marker, never a filter. Only clear false
+  positives are dismissed, with a recorded reason. If no judge is available, nothing
+  is suppressed.
+- **Merging happens once, in the judge, and adds rather than replaces.** The judge
+  sees one entry per *reviewer*, merges the entries that are the same defect, and
+  writes a `synthesis`; each reviewer's own title, detail, severity and line ride
+  along in `reported_by`. Dedup upstream of the judge could only keep one
+  reviewer's text and discard the rest — so the point only one reviewer made
+  survived exactly when the merge *failed*, and a better key made the loss worse.
+  Findings are pre-clustered by file and adjacent lines purely as a **hint**; the
+  duplicates that matter are semantic (one defect, two line numbers), which no line
+  arithmetic finds. Separate defects sharing one cause are linked with `related`
+  instead of merged, so one decision is fixed once.
 - Reviewers whose prerequisites are missing are reported **SKIPPED**, not failed.
-- **The `/panel` skill (default = fix)** consumes `--json`, checks out the PR branch in
-  an isolated worktree, fixes confirmed findings, runs lint + unit tests (**aborts the
-  commit on failure**), makes one commit, pushes, and comments the summary.
-  `panel.py` itself stays read-only — the fix/verify/commit lives in the skill.
+- **The `/panel` and `/panel-review-pr` skills** run `panel.py --post` and work from
+  the **PR comment** it leaves: `/panel` stops there (review-only), `/panel-review-pr`
+  hands the confirmed findings to a fixer sub-agent that fixes, verifies and pushes.
+  `panel.py` itself stays read-only either way.
+
+### The `--json` payload
+
+One record per **defect**, in `to_fix` / `dismissed` / `sonar_findings`, plus the run's
+own fields (`judged`, `reviewers`, `diff_budgets`, `run_key`, …). A skipped PR emits the
+same keys with empty values and `reviewed: false`, so nothing has to branch on which
+exit produced it.
+
+Each finding record:
+
+| field | what it is |
+|---|---|
+| `id` | run-local (`1609-F03`), and only for resolving `related` **within one payload** — it is a position, so it moves between runs |
+| `key` | the defect's identity **across** runs: file + the reporting reviewers' own words, so a re-review joins the same chain even though the judge re-words its synthesis every time |
+| `synthesis` / `detail` | the merged statement and its body (the board stores these as `title`/`detail`) |
+| `verdict` | `confirmed` \| `dismissed` \| `unjudged` \| `sonar` |
+| `reported_by` | one entry per reviewer: its own `title`, `detail`, `severity`, `line`, and `account` (the two joined, for reading) |
+| `reviewers`, `related`, `rationale` | who reported it, sibling findings from one cause, and the judge's reason |
+
+**Breaking, v2.14:** the per-finding keys were `title` / `detail` / `reason` with a
+`reviewers` name list. They are now `synthesis` / `detail` / `rationale`, and `id`,
+`key`, `verdict`, `related` and `reported_by` are new. The board accepts both spellings
+(`POST /review` aliases `title`↔`synthesis` and `reason`↔`rationale`); any other consumer
+has to be updated.
 
 ## Epic driver (`epic.py`)
 
