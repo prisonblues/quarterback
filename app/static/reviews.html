@@ -239,12 +239,23 @@ function tokenTip(r){
   if (r.output_tokens != null) parts.push(`${fmtTok(r.output_tokens)} out`);
   if (r.cached_input_tokens) parts.push(`${fmtTok(r.cached_input_tokens)} cached`);
   if (r.reasoning_tokens) parts.push(`${fmtTok(r.reasoning_tokens)} thinking`);
-  const cover = r.token_runs < r.runs
-    ? ` <span style="color:var(--warn)">(${r.token_runs} of ${r.runs} runs reported)</span>` : "";
-  return `<br>—<br>${parts.join(" · ")}${cover}
+  const partOf = (n, of) => ` <span style="color:var(--warn)">(${n} of ${of} runs reported)</span>`;
+  const cover = r.token_runs < r.runs ? partOf(r.token_runs, r.runs) : "";
+  // The cost column needs the same qualifier, and for a sharper reason: it is
+  // the one denominated in money. `cost_runs` was computed, shipped, and named
+  // in the endpoint's own docstring, and the page read `token_runs` for both
+  // markers and nothing at all for this one — so a group where the vendor
+  // priced 2 runs of 10 presented that partial sum as the group's spend, which
+  // is the exact failure `token_runs` was introduced to prevent.
+  const costCover = r.cost_runs < r.runs ? partOf(r.cost_runs, r.runs) : "";
+  // `parts` is empty for a group that stated a cost and no tokens, and the token
+  // coverage line then read as a bare "(0 of N runs reported)" under a real
+  // figure, annotating nothing.
+  const tokenLine = parts.length ? `${parts.join(" · ")}${cover}` : "";
+  return `<br>—<br>${tokenLine}
     ${r.tokens_per_confirmed ? `<br>${fmtTok(r.tokens_per_confirmed)} tokens per confirmed finding` : ""}
     ${r.cost_usd != null
-      ? `<br>${fmtUsd(r.cost_usd)} stated by the vendor${
+      ? `<br>${fmtUsd(r.cost_usd)} stated by the vendor${costCover}${
           r.cost_per_confirmed ? ` · ${fmtUsd(r.cost_per_confirmed)} per confirmed` : ""}`
       : "<br><span class='dim'>no cost stated by this vendor</span>"}
     <br><span class="dim">tokens compare this vendor's tiers, not one vendor with another</span>`;

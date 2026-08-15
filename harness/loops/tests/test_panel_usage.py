@@ -15,6 +15,7 @@ cases below assert.
 """
 
 import json
+import subprocess
 import sys
 import uuid
 from pathlib import Path
@@ -525,3 +526,73 @@ def test_a_pi_session_rolled_into_a_second_file_is_charged_in_full(tmp_path):
     write_jsonl(tmp_path / "2026-01-01T01-00_rolled.jsonl", [pi_record(200, 20)])
     u = panel.pi_usage(tmp_path, ["rolled"])
     assert u["input_tokens"] == 300 and u["output_tokens"] == 30
+
+
+def test_a_codex_turn_that_wrote_no_reply_is_retried_not_accepted(monkeypatch):
+    """`--json` cost codex the blank-reply guard, and nothing said so.
+
+    `cli_outcome` asks whether STDOUT is empty, and under `--json` codex's stdout
+    is ALWAYS non-empty — thread.started, item.completed, turn.completed. So the
+    test could never fire for codex again, and with it went run_cli's up-to-3
+    blank-reply retries and the BLANK_RETRY_MAX_S slow-blank rule, on the one
+    seat whose reply lands in a file rather than on stdout. A turn that emitted
+    events and wrote no `--output-last-message` was returned as a SUCCESS.
+
+    That is v2.17's guarantee — "a reviewer that produced nothing has failed, and
+    says why" — silently lost on the seat this release changes most."""
+    attempts = []
+
+    def fake_run(argv, **kw):
+        attempts.append(argv)
+        # Events on stdout, exactly as `--json` produces, and no reply file.
+        return subprocess.CompletedProcess(argv, 0, codex_stream((90, 10, 20, 4)), "")
+
+    monkeypatch.setattr(panel.subprocess, "run", fake_run)
+    out, err = panel.run_cli(["codex", "exec"], "codex", replied=lambda: False)
+
+    assert out is None
+    assert "wrote no reply" in err
+    assert len(attempts) == 3, "the blank-reply retries are alive again"
+
+
+def test_a_seat_whose_stdout_is_its_reply_is_unaffected(monkeypatch):
+    """`replied` is passed only for the file-delivering seat. Everywhere else
+    `cli_outcome`'s stdout test is still exactly the right question, and a second
+    predicate would be a second way to ask it."""
+    def fake_run(argv, **kw):
+        return subprocess.CompletedProcess(argv, 0, "real findings", "")
+
+    monkeypatch.setattr(panel.subprocess, "run", fake_run)
+    out, err = panel.run_cli(["claude", "-p"], "claude")
+    assert out == "real findings" and err is None
+
+
+def test_a_field_the_vendor_never_stated_is_absent_not_a_measured_zero(tmp_path):
+    """The invariant the whole feature rests on — "null means not recorded, never
+    spent nothing" — held per SEAT but not per FIELD, which is what `ReviewerIn`
+    advertises ("all independently optional").
+
+    `_usage` emitted all four keys unconditionally and `_int(u.get(...))` returns
+    0 for an absent key, so pi omitting `reasoning`, or codex omitting the cache
+    figure on a cold turn, both recorded a hard 0 that the board then stored,
+    summed and rendered as a measurement."""
+    write_jsonl(tmp_path / "ts_bare.jsonl",
+                [{"type": "message",
+                  "message": {"role": "assistant", "usage": {"input": 100, "output": 10}}}])
+    u = panel.pi_usage(tmp_path, ["bare"])
+    assert u == {"input_tokens": 100, "output_tokens": 10}
+    assert "reasoning_tokens" not in u and "cached_input_tokens" not in u
+
+    # A turn that DID state them still reports them, zero included: a stated zero
+    # is a measurement and must survive.
+    write_jsonl(tmp_path / "ts_full.jsonl",
+                [pi_record(100, 10, cache_read=0, reasoning=0)])
+    full = panel.pi_usage(tmp_path, ["full"])
+    assert full["reasoning_tokens"] == 0 and full["cached_input_tokens"] == 0
+
+
+def test_codex_omitting_the_cache_figure_reports_nothing_for_it():
+    stream = json.dumps({"type": "turn.completed",
+                         "usage": {"input_tokens": 90, "output_tokens": 20}})
+    u = panel.codex_usage(stream)
+    assert u == {"input_tokens": 90, "output_tokens": 20}

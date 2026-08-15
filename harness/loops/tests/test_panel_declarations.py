@@ -312,7 +312,7 @@ def test_an_ambiguous_reply_lands_in_the_degradation_path_that_already_exists(mo
     calls = []
 
     def fake_run_cli(args, label, timeout=panel.CLI_TIMEOUT, attempts=3, stdin_text=None,
-                     on_output=None):
+                     on_output=None, replied=None):
         calls.append(attempts)
         return raw, None
 
@@ -1071,7 +1071,7 @@ def _judge_returning(monkeypatch, reply):
     seen = {}
 
     def fake_run_cli(args, label, timeout=panel.CLI_TIMEOUT, attempts=3, stdin_text=None,
-                     on_output=None):
+                     on_output=None, replied=None):
         seen["prompt"] = stdin_text
         return reply, None
 
@@ -1603,7 +1603,7 @@ def test_the_judge_gets_the_same_one_shot_reparse_the_reviewers_get(monkeypatch)
     calls = []
 
     def fake_run_cli(args, label, timeout=panel.CLI_TIMEOUT, attempts=3, stdin_text=None,
-                     on_output=None):
+                     on_output=None, replied=None):
         calls.append(attempts)
         return (ambiguous if len(calls) == 1 else settled), None
 

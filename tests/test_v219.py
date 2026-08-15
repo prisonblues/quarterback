@@ -324,3 +324,44 @@ async def test_a_measured_failure_does_not_hide_the_partial_coverage_marker(clie
     page = (Path(__file__).resolve().parents[1] / "app/static/reviews.html").read_text()
     assert "r.token_runs < r.ran" not in page, "the page must compare token_runs to runs"
     assert page.count("r.token_runs < r.runs") == 2
+
+
+async def test_the_average_is_over_the_runs_it_is_an_average_of(client):
+    """`total_tokens` is input+output only, but `token_runs` counts a row
+    carrying ANY of the four columns — so a run that reported only
+    `cached_input_tokens` (legal, and pinned as "instrumented" by its own test)
+    inflated the denominator while adding nothing to the numerator, and
+    `tokens_per_run` understated by up to half.
+
+    All three reviewers raised this independently in round 2, which is why it was
+    left open at the end of round 1 rather than answered twice in a hurry: a ratio
+    has to be over one population, and `billable_runs` names the one the numerator
+    actually comes from."""
+    await record(client, 9460, reviewers={
+        "claude": {"model": "opus-f15", "ran": True,
+                   "input_tokens": 1000, "output_tokens": 100},
+    })
+    await record(client, 9461, reviewers={
+        "claude": {"model": "opus-f15", "ran": True, "cached_input_tokens": 500},
+    })
+    r = row(await stats(client), "claude", "opus-f15")
+
+    assert r["token_runs"] == 2, "both rows are instrumented"
+    assert r["billable_runs"] == 1, "only one contributed to total_tokens"
+    assert r["total_tokens"] == 1100
+    # 1100, not 550: the run that stated only a cache figure is not in the average.
+    assert r["tokens_per_run"] == 1100
+
+
+async def test_the_page_marks_a_partial_cost_window_the_way_it_marks_tokens(client):
+    """`cost_runs` was computed, shipped, and named in this module's own docstring
+    — and the page read `token_runs` for both markers and nothing at all for cost.
+    A group where the vendor priced 2 runs of 10 presented that partial sum as the
+    group's spend: the exact failure `token_runs` exists to prevent, left unfixed
+    for the one column denominated in money.
+
+    No JS runner exists here, so this greps the file that ships."""
+    page = (Path(__file__).resolve().parents[1] / "app/static/reviews.html").read_text()
+    assert "r.cost_runs < r.runs" in page, "cost needs its own coverage marker"
+    # And the token marker must not be reused to annotate cost.
+    assert page.count("r.token_runs < r.runs") == 2

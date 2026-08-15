@@ -1166,6 +1166,17 @@ async def review_stats(
                     .filter(sa_or(*(c.isnot(None) for c in tok))).label("token_runs"),
                 func.count(ReviewReviewer.id)
                     .filter(ReviewReviewer.cost_usd.isnot(None)).label("cost_runs"),
+                # The population `total_tokens` is actually a sum OVER, which is
+                # not `token_runs`. `total_tokens` is input+output only, while
+                # `token_runs` counts a row carrying ANY of the four columns — so
+                # a run that reported only `cached_input_tokens` (legal, and
+                # pinned as "instrumented" by its own test) inflated the
+                # denominator while adding nothing to the numerator, and
+                # `tokens_per_run` understated by up to half. A ratio has to be
+                # over one population; this is the one the numerator comes from.
+                func.count(ReviewReviewer.id).filter(sa_or(
+                    ReviewReviewer.input_tokens.isnot(None),
+                    ReviewReviewer.output_tokens.isnot(None))).label("billable_runs"),
             )
             .join(ReviewRun, ReviewRun.id == ReviewReviewer.run_id)
             .where(*filters)
@@ -1199,7 +1210,7 @@ async def review_stats(
         # either would double-count precisely the seats being compared.
         billable = [t for t in (toks["input_tokens"], toks["output_tokens"]) if t is not None]
         total_tokens = sum(billable) if billable else None
-        token_runs, cost_runs = r.token_runs, r.cost_runs
+        token_runs, cost_runs, billable_runs = r.token_runs, r.cost_runs, r.billable_runs
         cost = float(r.cost_usd) if r.cost_usd is not None else None
 
         by_model.append({
@@ -1269,8 +1280,13 @@ async def review_stats(
             # complete one.
             "token_runs": token_runs,
             "cost_runs": cost_runs,
-            "tokens_per_run": (round(total_tokens / token_runs)
-                               if total_tokens is not None and token_runs else None),
+            # Named in the response, not just used, so a client can see which
+            # population the average is over instead of assuming it matches
+            # `token_runs`. They differ exactly when a run reported a cached or
+            # reasoning figure and neither input nor output.
+            "billable_runs": billable_runs,
+            "tokens_per_run": (round(total_tokens / billable_runs)
+                               if total_tokens is not None and billable_runs else None),
             "tokens_per_confirmed": (round(total_tokens / confirmed)
                                      if total_tokens is not None and confirmed else None),
             # Stated by the vendor or absent — never derived from a price table,

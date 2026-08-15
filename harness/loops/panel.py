@@ -1109,7 +1109,8 @@ def is_deterministic_failure(stderr: str) -> bool:
 
 def run_cli(args: list[str] | Callable[[], list[str]], label: str, timeout: int = CLI_TIMEOUT,
             attempts: int = 3, stdin_text: str | None = None,
-            on_output: Callable[[str | None], None] | None = None) -> tuple[str | None, str | None]:
+            on_output: Callable[[str | None], None] | None = None,
+            replied: Callable[[], bool] | None = None) -> tuple[str | None, str | None]:
     """Run a headless CLI, returning (stdout, error_reason); error_reason is
     None on success. Retries transient failures (non-zero exits such as rate
     limits, and OS errors) up to `attempts` times with no delay — these fail
@@ -1215,6 +1216,17 @@ def run_cli(args: list[str] | Callable[[], list[str]], label: str, timeout: int 
         # sentence, and split they were two copies of the same short-circuit for
         # the next failure class to have to be added to twice.
         outcome = cli_outcome(proc)
+        # `cli_outcome` asks whether STDOUT is empty, which stops being the right
+        # question the moment a seat's stdout is not its reply. codex under
+        # `--json` always prints events (thread.started / item.completed /
+        # turn.completed), so that test can never fire for it again — and with it
+        # went the up-to-3 blank-reply retries and the BLANK_RETRY_MAX_S rule, on
+        # the one seat whose reply lands in a file. That is v2.17's guarantee
+        # ("a reviewer that produced nothing has failed, and says why") silently
+        # lost. `replied` lets such a seat answer the question about the thing
+        # that actually carries its reply.
+        if not outcome and replied is not None and not replied():
+            outcome = "exited 0 but wrote no reply"
         if not outcome:
             return proc.stdout, None
         took = time.monotonic() - started
@@ -1524,7 +1536,7 @@ def _jsonl(path: Path) -> list[dict]:
 
 
 def _usage(inp: int, out: int, cached: int, reasoning: int,
-           cost: float | None = None) -> dict:
+           cost: float | None = None, observed: set[str] | None = None) -> dict:
     """One member's spend, normalised so the four fields mean the same everywhere.
 
     Every vendor slices this differently, so the shape is pinned here rather than
@@ -1543,8 +1555,19 @@ def _usage(inp: int, out: int, cached: int, reasoning: int,
     Even normalised these compare only *within* a vendor: different tokenizers,
     different cache semantics. Duration is the cross-vendor axis.
     """
-    u = {"input_tokens": inp, "output_tokens": out,
-         "cached_input_tokens": cached, "reasoning_tokens": reasoning}
+    # `observed` names the fields the vendor actually stated. Omitted keys are
+    # absent from the payload entirely, so the board stores NULL — "not
+    # recorded" — instead of a measured zero. Without it every reader emitted
+    # all four unconditionally and `_int(u.get(...))` supplied 0 for a key the
+    # vendor never mentioned, so pi omitting `reasoning` or codex omitting the
+    # cache figure on a cold turn both became stated zeroes that /panel then
+    # averaged in as fact. `ReviewerIn` advertises these as "all independently
+    # optional"; this is what makes that true per FIELD and not just per seat.
+    # None means "the caller observed everything it is passing", which is what a
+    # test constructing a full block means.
+    every = ("input_tokens", "output_tokens", "cached_input_tokens", "reasoning_tokens")
+    values = dict(zip(every, (inp, out, cached, reasoning)))
+    u = {k: v for k, v in values.items() if observed is None or k in observed}
     # Only where the VENDOR states it. Never tokens times a price table: a run
     # priced at today's rates is silently wrong when the board is queried in six
     # weeks, and the record is meant to still be true then.
@@ -1572,6 +1595,9 @@ def claude_usage(session_ids: list[str]) -> dict | None:
     streamed reply, which reads as a reviewer costing twice what it did.
     """
     inp = out = cached = reasoning = 0
+    #: Which of the four normalised fields the transcript actually stated. A key
+    #: the vendor never wrote must reach the board as null, not as a measured 0.
+    observed: set[str] = set()
     seen: set[str] = set()
     for session_id in session_ids:
         # EVERY match, not `files[0]`. `Path.glob` returns filesystem order, so
@@ -1606,15 +1632,24 @@ def claude_usage(session_ids: list[str]) -> dict | None:
                     + _int(u.get("cache_creation_input_tokens")) + cache_read)
             cached += cache_read
             out += _int(u.get("output_tokens"))
+            for key, field in (("input_tokens", "input_tokens"),
+                               ("cache_creation_input_tokens", "input_tokens"),
+                               ("cache_read_input_tokens", "input_tokens"),
+                               ("cache_read_input_tokens", "cached_input_tokens"),
+                               ("output_tokens", "output_tokens")):
+                if key in u:
+                    observed.add(field)
             details = u.get("output_tokens_details")
             if isinstance(details, dict):
                 reasoning += _int(details.get("thinking_tokens"))
+                if "thinking_tokens" in details:
+                    observed.add("reasoning_tokens")
     if not seen:
         return None
     # No cost: the transcript states none. `--output-format json` does put one on
     # stdout, but that mode wraps the findings in an envelope, which is the trade
     # this whole approach exists to refuse.
-    return _usage(inp, out, cached, reasoning)
+    return _usage(inp, out, cached, reasoning, observed=observed)
 
 
 def pi_usage(session_dir: Path, session_ids: list[str]) -> dict | None:
@@ -1633,6 +1668,7 @@ def pi_usage(session_dir: Path, session_ids: list[str]) -> dict | None:
     cost = 0.0
     stated = False
     found = False
+    observed: set[str] = set()
     for session_id in session_ids:
         # EVERY match, not `sorted(files)[0]`. Taking the earliest timestamp
         # dropped the later, larger half of a turn if pi ever rolled one session
@@ -1657,13 +1693,21 @@ def pi_usage(session_dir: Path, session_ids: list[str]) -> dict | None:
             cached += cache_read
             out += _int(u.get("output"))
             reasoning += _int(u.get("reasoning"))
+            for key, field in (("input", "input_tokens"), ("cacheRead", "input_tokens"),
+                               ("cacheWrite", "input_tokens"),
+                               ("cacheRead", "cached_input_tokens"),
+                               ("output", "output_tokens"),
+                               ("reasoning", "reasoning_tokens")):
+                if key in u:
+                    observed.add(field)
             c = u.get("cost")
             if isinstance(c, dict) and isinstance(c.get("total"), (int, float)):
                 cost += float(c["total"])
                 stated = True
     if not found:
         return None
-    return _usage(inp, out, cached, reasoning, cost if stated else None)
+    return _usage(inp, out, cached, reasoning, cost if stated else None,
+                  observed=observed)
 
 
 def codex_usage(stdout: str | None) -> dict | None:
@@ -1679,6 +1723,7 @@ def codex_usage(stdout: str | None) -> dict | None:
     that took more than one turn is charged for all of them.
     """
     inp = out = cached = reasoning = 0
+    observed: set[str] = set()
     found = False
     for ln in (stdout or "").splitlines():
         ln = ln.strip()
@@ -1699,7 +1744,13 @@ def codex_usage(stdout: str | None) -> dict | None:
         cached += _int(u.get("cached_input_tokens"))
         out += _int(u.get("output_tokens"))
         reasoning += _int(u.get("reasoning_output_tokens"))
-    return _usage(inp, out, cached, reasoning) if found else None
+        for key, field in (("input_tokens", "input_tokens"),
+                           ("cached_input_tokens", "cached_input_tokens"),
+                           ("output_tokens", "output_tokens"),
+                           ("reasoning_output_tokens", "reasoning_tokens")):
+            if key in u:
+                observed.add(field)
+    return _usage(inp, out, cached, reasoning, observed=observed) if found else None
 
 
 def review_llm(cmd_name: str, model: str, prompt: str,
@@ -1787,6 +1838,10 @@ def review_llm(cmd_name: str, model: str, prompt: str,
         # A thunk, not a fixed argv, for the seats that pin a session: run_cli
         # retries a flake up to three times, and each attempt needs its own id.
         args: list[str] | Callable[[], list[str]]
+        #: Does this seat deliver its reply in a FILE rather than on stdout? Only
+        #: codex does, and it is what makes the stdout-emptiness test the wrong
+        #: question for it.
+        replies_used = cmd_name not in ("claude", "antigravity", "pi")
         if cmd_name == "claude":
             def args():
                 return ["claude", "-p", "--model", model, "--session-id", new_session()]
@@ -1855,7 +1910,13 @@ def review_llm(cmd_name: str, model: str, prompt: str,
             except OSError:
                 return None
 
-        out, err = run_cli(args, label, stdin_text=stdin_text, on_output=collect)
+        # `replied` only for the seat whose stdout is not its reply. For every
+        # other seat `cli_outcome`'s stdout test is still exactly right, and
+        # passing a predicate would be a second way to ask one question.
+        wrote_reply = (lambda: bool(replies) and replies[-1].exists()
+                       and replies[-1].read_text().strip()) if replies_used else None
+        out, err = run_cli(args, label, stdin_text=stdin_text, on_output=collect,
+                           replied=wrote_reply)
         if err:
             err += cli_hint(cmd_name, err, model)
             # A member that burned tokens and then failed still spent them, so
@@ -1871,7 +1932,7 @@ def review_llm(cmd_name: str, model: str, prompt: str,
             # The retry costs another turn, which `usage_of` already counts: it runs
             # under its own fresh session, and its stdout lands in `outputs` too.
             out2, err2 = run_cli(args, label, attempts=1, stdin_text=stdin_text,
-                                 on_output=collect)
+                                 on_output=collect, replied=wrote_reply)
             retry_text = reply_of(out2) if not err2 else None
             if retry_text:
                 retried = parse_reply(cmd_name, retry_text)
