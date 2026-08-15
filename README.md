@@ -98,7 +98,7 @@ GET   /sync              ?repo=&branch=&device=&path=          (registered workt
                          &have=sha,sha,…&dirty=&ahead=&behind= (…or just describe yourself)
                          -> {published:[…], worktrees:[…], caller, stale, registered, advice}
 
-# reviewer-panel stats (v2.10, per-reviewer accounts v2.11, rounds + coverage v2.15)
+# reviewer-panel stats (v2.10, accounts v2.11, rounds + coverage v2.15, cost v2.19)
 POST  /review            (panel.py --json payload)              -> {id, recorded, accounts}
 GET   /reviews           ?repo=&pr=&author=&since=&days=&limit=  (runs + scorecards)
 GET   /review/{id}                                              (scorecards + findings + accounts)
@@ -164,17 +164,36 @@ deliberately *not* an MCP tool: they are recorded by the panel process itself
 (`qb record-review`), so every caller — `/panel-review-pr`, `/panel`, the epic and
 lander loops — is counted without an agent having to remember to say so.
 
+**What a review cost, and what that can honestly be compared against.** Each scorecard carries
+`duration_ms` and, since v2.17, `input_tokens` / `output_tokens` / `cached_input_tokens` /
+`reasoning_tokens` and a `cost_usd` **only where the vendor states one** — never derived from a
+price table, because a run priced at today's rates reads wrong the moment the rates move, and
+these rows are meant to still be true in six weeks. The panel gets the numbers by pinning a
+session id before each reviewer runs and reading usage back out of the session afterwards, so
+every reviewer keeps its plain-text reply: a transcript that cannot be read loses a number,
+whereas a vendor's JSON output mode would put the findings inside an envelope and could lose
+those on every run.
+
+Tokens compare **within one vendor only** — different tokenizers, different cache semantics, and
+only some vendors state a price. `GET /review/stats` therefore groups by (reviewer, model,
+effort), which makes "is the expensive tier worth it" answerable (opus vs sonnet, codex `xhigh`
+vs `medium`) while leaving `duration_ms` as the axis that compares one vendor with another. Any
+of these may be null, which always means *not recorded* and never *spent nothing*; `token_runs`
+says how much of a window actually reported.
+
 ## Releases
 
 The deployed board version lags the repo until the stack is redeployed, and only the running
 service knows which it is: ask it with `GET /openapi.json` → `.info.version`, for whichever
-instance you care about. (Anything built off this branch says 2.15.0.) A number written here
+instance you care about. (Anything built off this branch says 2.19.0.) A number written here
 instead would be wrong the next time Portainer redeploys, with no diff to catch it.
-Latest release: **v2.18**, which is harness-side and changes no board behaviour — the panel settles a
-reply carrying several JSON-shaped values by agreement rather than by rank. v2.17 before it made a
-reviewer that produced nothing a failure that says why. The last release that moved the board was **v2.15**,
-which added the round and coverage columns; v2.13 (shipping the harness) and v2.14 (merging
-findings in the judge) are harness-side too.
+Latest release: **v2.19**, which adds the per-reviewer cost columns (schema revision 0015) and is
+the first to move the board since v2.15. The three between it and them were harness-side and
+changed no board behaviour: **v2.18** settles a reply carrying several JSON-shaped values by
+agreement rather than by rank, **v2.17** made a reviewer that produced nothing a failure that says
+why, and **v2.16** stopped the panel capping how much diff a reviewer is given. **v2.15** added the
+round and coverage columns; v2.13 (shipping the harness) and v2.14 (merging findings in the judge)
+are harness-side too.
 
 - **v1–v2.1** — the board, then presence leases + session handoff, then dev context.
 - **v2.2–v2.5** — the session registry: sessions became listable, named, resumable, and the
@@ -190,6 +209,8 @@ findings in the judge) are harness-side too.
 - **v2.17** — a reviewer that produced nothing has failed, and says why.
 - **v2.18** — a reply holding several JSON values is settled by agreement, not by rank; where the
   candidates disagree the reply is kept as unstructured rather than resolved wrongly.
+- **v2.19** — per-reviewer token usage and vendor-stated cost, so the leaderboard ranks
+  reviewers on what they cost as well as what they find.
 - **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
   object store; wire `landed` refs to a cherry-pick helper.
 

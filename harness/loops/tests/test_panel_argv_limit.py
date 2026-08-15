@@ -34,12 +34,16 @@ def test_a_reviewer_prompt_is_fed_on_stdin_not_in_argv(name, model, monkeypatch)
     slow reviewer, it is a dead one."""
     seen = {}
 
-    def fake(args, label, timeout=panel.CLI_TIMEOUT, attempts=3, stdin_text=None):
-        seen["args"], seen["stdin"] = args, stdin_text
+    def fake(args, label, timeout=panel.CLI_TIMEOUT, attempts=3, stdin_text=None,
+             on_output=None, replied=None):
+        # The session-pinned seats pass a thunk, because each attempt needs its
+        # own id; run_cli calls it per attempt, so this does the same.
+        seen["args"], seen["stdin"] = (args() if callable(args) else args), stdin_text
         return "[]", None
 
     monkeypatch.setattr(panel, "run_cli", fake)
     monkeypatch.setattr(panel.shutil, "which", lambda _c: "/usr/bin/" + _c)
+    monkeypatch.setattr(panel, "claude_usage", lambda _sids: None)
     prompt = "REVIEW THIS DIFF " * 100
     panel.review_llm(name, model, prompt)
     assert seen["stdin"] == prompt

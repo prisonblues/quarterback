@@ -300,18 +300,25 @@ def test_an_ambiguous_reply_lands_in_the_degradation_path_that_already_exists(mo
     """What "not resolved" costs, end to end: one retry, and then the reviewer's
     own words kept as a finding with the round marked as carrying an unstructured
     reply — which is what stops that round being read as a quiet PR. Nothing is
-    dropped and nothing clean is manufactured."""
+    dropped and nothing clean is manufactured.
+
+    Runs on `claude` rather than `codex` because codex is the one seat whose
+    stdout is not its reply: it writes the reply to `--output-last-message` and
+    puts events on stdout. A fake `run_cli` that returns the reply as stdout
+    therefore models every seat but that one, and against codex it exercises the
+    missing-reply-file path instead of the ambiguity this test is about."""
     raw = ('{"findings": [{"title": "the first answer"}]}\n'
            '{"findings": [{"title": "a different one"}]}')
     calls = []
 
-    def fake_run_cli(args, label, timeout=panel.CLI_TIMEOUT, attempts=3, stdin_text=None):
+    def fake_run_cli(args, label, timeout=panel.CLI_TIMEOUT, attempts=3, stdin_text=None,
+                     on_output=None, replied=None):
         calls.append(attempts)
         return raw, None
 
     monkeypatch.setattr(panel.shutil, "which", lambda name: "/usr/bin/" + name)
     monkeypatch.setattr(panel, "run_cli", fake_run_cli)
-    got = panel.review_llm("codex", "gpt-5.6-luna", "p")
+    got = panel.review_llm("claude", "opus", "p")
     assert got.unstructured is True and len(calls) == 2
     assert got.skip is None and "the first answer" in got.findings[0].detail
 
@@ -1063,7 +1070,8 @@ def test_a_panel_with_nothing_to_declare_vetoes_nothing():
 def _judge_returning(monkeypatch, reply):
     seen = {}
 
-    def fake_run_cli(args, label, timeout=panel.CLI_TIMEOUT, attempts=3, stdin_text=None):
+    def fake_run_cli(args, label, timeout=panel.CLI_TIMEOUT, attempts=3, stdin_text=None,
+                     on_output=None, replied=None):
         seen["prompt"] = stdin_text
         return reply, None
 
@@ -1594,7 +1602,8 @@ def test_the_judge_gets_the_same_one_shot_reparse_the_reviewers_get(monkeypatch)
                '"synthesis": "the handle is never closed"}]}')
     calls = []
 
-    def fake_run_cli(args, label, timeout=panel.CLI_TIMEOUT, attempts=3, stdin_text=None):
+    def fake_run_cli(args, label, timeout=panel.CLI_TIMEOUT, attempts=3, stdin_text=None,
+                     on_output=None, replied=None):
         calls.append(attempts)
         return (ambiguous if len(calls) == 1 else settled), None
 
