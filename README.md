@@ -188,11 +188,12 @@ service knows which it is: ask it with `GET /openapi.json` → `.info.version`, 
 instance you care about. (Anything built off this branch says 2.19.0.) A number written here
 instead would be wrong the next time Portainer redeploys, with no diff to catch it.
 Latest release: **v2.19**, which adds the per-reviewer cost columns (schema revision 0015) and is
-the first to move the board since v2.15. The two between it and them were harness-side and changed
-no board behaviour: **v2.17** made a reviewer that produced nothing a failure that says why, and
-**v2.16** stopped the panel capping how much diff a reviewer is given. **v2.15** added the round
-and coverage columns; v2.13 (shipping the harness) and v2.14 (merging findings in the judge) are
-harness-side too.
+the first to move the board since v2.15. The three between it and them were harness-side and
+changed no board behaviour: **v2.18** settles a reply carrying several JSON-shaped values by
+agreement rather than by rank, **v2.17** made a reviewer that produced nothing a failure that says
+why, and **v2.16** stopped the panel capping how much diff a reviewer is given. **v2.15** added the
+round and coverage columns; v2.13 (shipping the harness) and v2.14 (merging findings in the judge)
+are harness-side too.
 
 - **v1–v2.1** — the board, then presence leases + session handoff, then dev context.
 - **v2.2–v2.5** — the session registry: sessions became listable, named, resumable, and the
@@ -206,6 +207,8 @@ harness-side too.
   rounds, coverage declarations, truncation per reviewer.
 - **v2.16** — no diff budget by default: the whole diff goes to every reviewer.
 - **v2.17** — a reviewer that produced nothing has failed, and says why.
+- **v2.18** — a reply holding several JSON values is settled by agreement, not by rank; where the
+  candidates disagree the reply is kept as unstructured rather than resolved wrongly.
 - **v2.19** — per-reviewer token usage and vendor-stated cost, so the leaderboard ranks
   reviewers on what they cost as well as what they find.
 - **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared

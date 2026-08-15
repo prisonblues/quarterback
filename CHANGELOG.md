@@ -51,6 +51,38 @@ drawn only against the same vendor's other tiers, and keeps duration as the cros
 
 Schema revision **0015**, chained after v2.15's 0014. This one does move the board, so the served
 version goes to 2.19 — v2.16 and v2.17 were both harness-side and left it at v2.15.
+## v2.18 — the panel picks a reviewer's answer by agreement, not by rank
+
+A reviewer's reply often holds more than one thing that parses as JSON: models quote the requested
+schema before answering, restate their envelope after it, fence it once and repeat it in prose, or
+write an illustration of what they are about to say. The panel had to pick one, and picking it by
+position was wrong in both directions inside a single release — first-wins handed a review to the
+example in front of it, last-wins handed it to the one behind. Both produce a well-formed, parseable
+**empty** result, which reads on the PR as a reviewer that read the diff and found it flawless.
+
+Ranking replaced position, and ranking is worse. Quantity is not evidence of which value is the
+answer: a model that writes its own illustration — *"e.g. `{"findings": [{"severity": "P2", "file":
+"a.py", "title": "example only"}]}`"* — outranked the genuine `{"findings": [], "could_not_assess":
+[...]}` beside it, so a **fabricated finding** was reported under the reviewer's name and the real
+declaration was thrown away. Content cannot separate an echo from an answer either, because these
+prompts *ask* for the overlapping text: `JUDGE_PROMPT` says an issue id is "a label YOU invent for an
+issue you are returning (`F01`)", so a compliant terse verdict `{"id": "F01", "members": [0], "real":
+true}` was read as a quotation and the judge's entire reply discarded — every finding `unjudged`, the
+round vetoed as not adjudicated.
+
+So nothing chooses any more. The example each prompt ships is read out of the prompt text itself and
+a candidate matching it whole is dropped — positive identification, never a string a candidate merely
+shares with the schema. Whatever remains must agree: one candidate is the answer, several that read
+the same are one answer, several that differ are not resolved. "Read the same" compares what the
+parser will KEEP — parsed findings with their re-review flags resolved, the normalised declaration,
+the judge's ruling as it will be consumed — so `"p1"` and `"P1"`, an omitted `detail` and a
+`fix_needs_rereview` index are one review, not two.
+
+The cost is that more replies land in the retry path: one extra CLI call, then the reviewer's own
+words kept as an unstructured finding and the round marked as carrying one. That path already
+existed and already degrades in the right direction — it keeps the reviewer's work and refuses to
+call the round clean. It is the only rule here that can never manufacture a clean review or a
+finding nobody made, which is the whole reason the parser is careful.
 
 ## v2.17 — a reviewer that produced nothing has failed, and says why
 
