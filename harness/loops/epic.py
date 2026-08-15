@@ -410,16 +410,16 @@ def triage(w: IssueWork, model: str) -> tuple[bool | None, str, str]:
         # get from cli_failure_gist, applied before anything is parsed rather
         # than after, since valid-looking JSON printed on the way out would
         # otherwise be accepted as a real ruling and the failure never reported.
-        return None, f"untriaged (judge failed: {cli_failure_gist(proc, limit=120)})", ""
+        return None, f"untriaged (judge failed: {cli_failure_gist(proc)})", ""
     m = re.search(r"\{.*\}", proc.stdout or "", re.S)
     if not m:
         return None, ("untriaged (no verdict: "
-                      f"{cli_failure_gist(proc, 'no JSON in reply', limit=120)})"), ""
+                      f"{cli_failure_gist(proc, 'no JSON in reply')})"), ""
     try:
         v = json.loads(m.group(0))
     except json.JSONDecodeError:
         return None, ("untriaged (bad verdict: "
-                      f"{cli_failure_gist(proc, 'malformed JSON', limit=120)})"), ""
+                      f"{cli_failure_gist(proc, 'malformed JSON')})"), ""
     return (bool(v.get("doable", False)), str(v.get("reason", ""))[:120],
             clamp_model(str(v.get("model", "")), model))
 
@@ -725,7 +725,10 @@ def work_issue(cfg: dict, w: IssueWork, execute: bool, base: str | None = None,
         print(f"  #{w.num}: done — skip")
         return WorkResult(w.num, "done", w.pr_number)
     if w.stage == "blocked":
-        print(f"  #{w.num}: NOT agent-doable ({w.reason}) — skipping (needs a human)")
+        # "NOT agent-doable" is a RULING, and an untriaged issue has none — the
+        # judge never answered. Both are skipped; only one of them was judged.
+        verdict = "NOT agent-doable" if w.doable is False else "not confirmed doable"
+        print(f"  #{w.num}: {verdict} ({w.reason}) — skipping (needs a human)")
         return WorkResult(w.num, "blocked", detail=w.reason)
 
     if not execute:
@@ -965,7 +968,12 @@ def run(repo_name: str, epic: int, execute: bool, max_issues: int | None,
             for fut in futs:
                 w = futs[fut]
                 w.doable, w.reason, w.model = fut.result()
-                if w.doable is False:
+                # `is not True`, not `is False`: an untriaged sub-issue (doable
+                # is None — the judge timed out, crashed, or printed nothing) has
+                # no doability ruling at all, and handing it to the autonomous
+                # executor is precisely what the reason line it prints says did
+                # not happen. Not confirmed doable means a human looks at it.
+                if w.doable is not True:
                     w.stage = "blocked"
     # review-stage issues skip triage; their /review-pr fix-up runs at the ceiling
     # (only when routing is on — an unrecognised ceiling pins nothing).

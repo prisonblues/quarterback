@@ -49,10 +49,13 @@ Also here, from working on the above: this repo gets its own `.harness-rules`, w
 whose slugs are versioned build names pinned and verified by running them, and Claude left on the
 floating `opus` alias precisely because an alias cannot rot — the distinction is the decision, not a
 detail. `_`-prefixed keys are stripped as comments at every depth before anything reads the config,
-and a name nothing recognises — a reviewer, or a setting in any of the four deep blocks — is warned
-about on stderr and dropped, rather than silently producing a panel one vendor short or a loop
-switched off by a typo. A reviewer whose CLI this box does not carry no longer vetoes a confident
-stop either: it is absent every round, so it says nothing about the round.
+and a name nothing recognises — a top-level setting, a setting in any of the four deep blocks, a
+reviewer, or a field inside a reviewer — is warned about on stderr and dropped, rather than silently
+producing a panel one vendor short, a loop switched off by a typo, or an `auto_merg` that leaves the
+auto-merge switch on its default. A reviewer whose CLI this box does not carry no longer vetoes a confident
+stop either: it is absent every round, so it says nothing about the round. Absence is recorded on the
+reviewer's run rather than read back out of its skip line, and it is exempted only above a floor —
+a box carrying none of the reviewer CLIs cannot record a confident stop, because nobody read the diff.
 `harness_rules.DEFAULTS` also learns the `antigravity` seat's real name — it still said `gemini`,
 which `panel.py` has not answered to since the seat moved to Google's Antigravity CLI, and the
 warning names the rename rather than leaving a fleet rules file to infer it.

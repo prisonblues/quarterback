@@ -183,6 +183,63 @@ def test_a_typo_in_any_other_block_is_caught_too(repo, capsys):
     assert cfg["review_panel"]["judge_model"] == "opus"
 
 
+def test_a_typo_at_the_top_level_is_caught_too(repo, capsys):
+    """The top level is where `auto_merge`, `enabled` and
+    `headless_permission_mode` live, so skipping it left the sweep's blind spot
+    on the block that decides whether PRs get merged unattended: `auto_merg`
+    merges in inert while the real switch falls back to its default, and the
+    only way to find out is to count."""
+    write_rules(repo, {"auto_merg": "all_green", "enabld": False,
+                       "review_panell": {"judge_model": "sonnet"}})
+    cfg = hr.resolve_repo(str(repo))
+    err = capsys.readouterr().err
+    for typo in ("auto_merg", "enabld", "review_panell"):
+        assert typo in err and typo not in cfg
+    assert "top-level setting" in err
+    assert cfg["auto_merge"] == hr.DEFAULTS["auto_merge"]   # the real one, untouched
+    assert cfg["enabled"] is True
+
+
+def test_the_top_level_names_that_are_not_in_defaults_are_still_known(repo, capsys):
+    """`name` and `executor_pr_base` are settable and documented but have no
+    DEFAULTS entry, which is why the top level was skipped rather than swept.
+    They go in the allowlist instead."""
+    write_rules(repo, {"name": "custom", "executor_pr_base": "test"})
+    cfg = hr.resolve_repo(str(repo))
+    assert capsys.readouterr().err == ""
+    assert cfg["name"] == "custom" and cfg["executor_pr_base"] == "test"
+
+
+def test_a_typod_reviewer_field_is_caught_too(repo, capsys):
+    """One level deeper than the seat name, and the quietest failure of the lot:
+    `reviewers.pi.enabld` leaves the seat OFF, and every consumer ignores the
+    key, so the panel runs a vendor short with nothing on stderr."""
+    write_rules(repo, {"reviewers": {"pi": {"enabld": True},
+                                     "codex": {"effrot": "high"},
+                                     "antigravity": {"modle": "gemini-3.7-flash-high"}}})
+    cfg = hr.resolve_repo(str(repo))
+    err = capsys.readouterr().err
+    for typo in ("enabld", "effrot", "modle"):
+        assert typo in err
+    assert "`reviewers.pi` setting" in err
+    assert "enabld" not in cfg["reviewers"]["pi"]
+    assert cfg["reviewers"]["pi"]["enabled"] is False       # the real one, untouched
+    assert cfg["reviewers"]["codex"]["effort"] == ""
+
+
+def test_sonarqube_connection_details_are_known_fields(repo, capsys):
+    """Documented in the loops README and deliberately absent from DEFAULTS —
+    there is no sensible default host, org or project key — so the field sweep
+    has to know them by name, or every configured Sonar seat is warned about and
+    dropped and the hard gate silently stops running."""
+    write_rules(repo, {"reviewers": {"sonarqube": {
+        "enabled": True, "project_key": "acme_myrepo", "organization": "acme",
+        "host": "https://sonarcloud.io", "token_env": "SONARQUBE_TOKEN"}}})
+    cfg = hr.resolve_repo(str(repo))
+    assert capsys.readouterr().err == ""
+    assert cfg["reviewers"]["sonarqube"]["project_key"] == "acme_myrepo"
+
+
 def test_a_renamed_seat_is_told_where_it_went(repo, capsys):
     """`gemini` is the one unknown name a shared fleet rules file is likely to
     carry, because it was a valid DEFAULTS key until the seat moved to Google's
@@ -214,6 +271,11 @@ def test_the_unknown_names_are_returned_not_just_printed():
     assert hr.unknown_keys(rules) == {"reviewers": ["antigravty"], "loops": ["nope"]}
     assert hr.unknown_keys({"reviewers": "not a dict"}) == {}
     assert hr.unknown_keys({}) == {}
+    # The top level and each reviewer's fields have labels of their own, which is
+    # how resolve_repo knows where to drop them from.
+    assert hr.unknown_keys({"auto_merg": "all_green"}) == {hr.TOP_LEVEL: ["auto_merg"]}
+    assert hr.unknown_keys({"reviewers": {"pi": {"enabld": True}}}) == {
+        "reviewers.pi": ["enabld"]}
 
 
 def test_known_reviewers_are_silent(repo, capsys):
@@ -233,8 +295,9 @@ def test_every_documented_setting_is_a_known_one(repo, capsys):
     cfg = hr.resolve_repo(str(repo))
     assert capsys.readouterr().err == ""
     assert cfg["review_panel"]["judge_max_diff_chars"] == 40_000
-    # Reviewer FIELDS are one level deeper than the sweep and are not validated:
-    # max_diff_chars is a real per-reviewer override with no DEFAULTS entry.
+    # Reviewer FIELDS are swept too, so the same rule applies one level deeper:
+    # max_diff_chars is a real per-reviewer override with no DEFAULTS entry, and
+    # the sweep has to allow it by name rather than warn about it.
     assert cfg["reviewers"]["claude"]["max_diff_chars"] == 10_000
 
 
@@ -281,6 +344,24 @@ def test_stderr_gist_lifts_the_api_sentence_over_housekeeping():
     assert hr.stderr_gist(noisy) == (
         "The 'gpt-5.6-luna' model requires a newer version of Codex. "
         "Please upgrade to the latest app or CLI and try again.")
+
+
+# The real thing, from `agy` 1.1.12 — the message the blank-output path exists to
+# surface. Note what it does NOT contain: the word "error".
+DENIED = ('jetski: no output produced — a tool required the "command" permission '
+          "that headless mode cannot prompt for, so it was auto-denied. Add an "
+          "allow-rule under permissions.allow in settings.json.")
+
+
+@pytest.mark.parametrize("order", [(DENIED, "ERROR warmup: could not prime the index"),
+                                   ("ERROR warmup: could not prime the index", DENIED)])
+def test_stderr_gist_prefers_the_settled_cause_over_unrelated_error_noise(order):
+    """The noise filter only knows four housekeeping strings by name, so ANY
+    other line carrying the word "error" used to outrank the sentence that names
+    the remedy — and the denial sentence does not contain "error" at all. On a
+    blank run this is the one line the operator gets, and it has to point at the
+    permission, not at a warm-up that had nothing to do with it."""
+    assert hr.stderr_gist("\n".join(order)) == DENIED
 
 
 def test_stderr_gist_of_nothing_is_nothing():

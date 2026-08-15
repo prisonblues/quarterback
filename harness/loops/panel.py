@@ -98,7 +98,8 @@ import harness_rules  # noqa: E402
 # stderr_gist and cli_outcome live with the shared plumbing — how headless CLIs
 # fail is not a panel question — and are re-exported here because they read as
 # part of run_cli's contract at every call site in this file.
-from harness_rules import (RepoNotFound, cli_outcome, describe,  # noqa: E402
+from harness_rules import (DENIAL_MARKERS, REJECTION_MARKERS,  # noqa: E402
+                           RepoNotFound, cli_outcome, describe,
                            resolve_repo, stderr_gist)
 
 # Chars of diff handed to a model, when nothing in .harness-rules says otherwise:
@@ -155,8 +156,8 @@ CLI_TIMEOUT = 1800
 BLANK_RETRY_MAX_S = 60
 
 # The one skip reason that says nothing about the round: this box does not carry
-# that CLI. Written once because two places have to agree on it — review_llm
-# ends its skip line with it, coverage_veto declines to veto on it.
+# that CLI. The wording is free to change — what coverage_veto branches on is
+# ReviewerRun.absent, not this string.
 CLI_ABSENT = "CLI absent"
 
 # Linux caps ONE argv string at MAX_ARG_STRLEN = 131,072 bytes, independently of
@@ -349,6 +350,12 @@ class ReviewerRun:
     #: are real work, but nothing it might have declared survived the parse — so a
     #: quiet round that includes one is not evidence of a quiet PR.
     unstructured: bool = False
+    #: This box does not carry the reviewer's CLI. Recorded as state rather than
+    #: read back out of `skip` — a message tail is free text, and matching on it
+    #: both lets an installed CLI whose stderr happens to end that way escape the
+    #: coverage veto, and silently restores the veto the moment the absent
+    #: branch's wording gains a suffix.
+    absent: bool = False
 
 
 @dataclass
@@ -645,9 +652,8 @@ def is_rejection(stderr: str) -> bool:
     so it is worth distinguishing from the rate limits and blips that retrying
     exists for. 429 is excluded on purpose: that one IS worth another go."""
     low = stderr.lower()
-    return ('"status":400' in low.replace(" ", "")
-            or "invalid_request_error" in low
-            or "requires a newer version" in low)
+    return (any(m in low for m in REJECTION_MARKERS)
+            or '"status":400' in low.replace(" ", ""))
 
 
 def is_permission_denied(stderr: str) -> bool:
@@ -676,9 +682,8 @@ def is_permission_denied(stderr: str) -> bool:
     on a run that then fails for a rate limit — all of which used to match, and
     turned three attempts into one.
     """
-    denial = ("auto-denied", "auto denied", "cannot prompt for")
     for line in stderr.lower().splitlines():
-        if "permission" in line and any(d in line for d in denial):
+        if "permission" in line and any(d in line for d in DENIAL_MARKERS):
             return True
     return False
 
@@ -1042,7 +1047,8 @@ def review_llm(cmd_name: str, model: str, prompt: str,
         return ReviewerRun(skip=f"{label}: unknown reasoning effort {effort!r} — {expected}",
                            duration_ms=elapsed())
     if not shutil.which(CLI_BIN.get(cmd_name, cmd_name)):
-        return ReviewerRun(skip=f"{label}: {CLI_ABSENT}", duration_ms=elapsed())
+        return ReviewerRun(skip=f"{label}: {CLI_ABSENT}", duration_ms=elapsed(),
+                           absent=True)
     # The prompt goes on stdin wherever the CLI will take it there — which is
     # everywhere but `agy`. That is not a style choice: a diff big enough to be
     # worth a panel is big enough to exceed the kernel's per-argument limit, and
@@ -2310,7 +2316,13 @@ def coverage_veto(reviewer_meta: dict[str, dict], judge_skip: str | None,
             # something. Every other way of not running — a crash, a timeout, a
             # bad model pin, a CLI that produced nothing — is about THIS run and
             # still vetoes.
-            if skip.endswith(CLI_ABSENT):
+            #
+            # Read off the recorded state, never off the skip TEXT: the message
+            # is free-form, so `skip.endswith(CLI_ABSENT)` would let an installed
+            # CLI whose stderr tail happens to read that way skip the veto, and
+            # would silently restore the standing veto the first time this
+            # branch's wording gained a suffix.
+            if meta.get("absent"):
                 continue
             out.append(f"{name} did not run ({skip or 'no reason recorded'})")
             continue
@@ -2321,6 +2333,14 @@ def coverage_veto(reviewer_meta: dict[str, dict], judge_skip: str | None,
             out.append(f"{name} returned no structured reply — its coverage is unknown")
         for gap in meta.get("could_not_assess") or []:
             out.append(f"{name} could not assess: {gap}")
+    # The floor under the absence exemption above. Exempting absent seats one by
+    # one means a box carrying NONE of the reviewer CLIs produces an empty veto
+    # list, and `confident` is `not veto` — a confident stop on a diff nobody
+    # read, which is the strongest wrong signal this file can emit and lands
+    # exactly on the unattended hosts the exemption was added for. At least one
+    # reviewer has to have actually run.
+    if not any(m.get("ran") for m in reviewer_meta.values()):
+        out.append("no reviewer ran — nothing read this diff")
     if judge_skip:
         # Phrased for both halves of the judge's job: on a round with no findings
         # it is the coverage split that went unadjudicated, not the findings.
@@ -2747,6 +2767,10 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 "duration_ms": got.duration_ms,
                 "could_not_assess": got.could_not_assess,
                 "unstructured": got.unstructured,
+                # A fact about the HOST rather than about the round — see
+                # coverage_veto, which is the one consumer that treats it
+                # differently from every other way of not running.
+                "absent": got.absent,
             }
             if got.skip:
                 result.skipped.append(got.skip)

@@ -250,6 +250,25 @@ def test_epic_keeps_panel_at_arms_length():
 # --------------------------------------------------------------- triage verdicts
 # (_fake_gh fakes any subprocess.run, the triage judge included)
 
+# The real thing, from `agy` 1.1.12: 190 characters, and the remedy is the LAST
+# clause. Cut at 120 it ends "…so it was au".
+DENIED = ('jetski: no output produced — a tool required the "command" permission '
+          "that headless mode cannot prompt for, so it was auto-denied. Add an "
+          "allow-rule under permissions.allow in settings.json.")
+
+
+def test_triage_quotes_the_whole_diagnosis_not_its_first_half(monkeypatch):
+    """The gist has to survive intact at the length these messages actually are.
+    epic cut it at 120 chars where panel keeps 200, so the half that names the
+    remedy fell off exactly the line an operator is left with, and the trimmed
+    fixture used elsewhere in this file could not see it."""
+    monkeypatch.setattr(epic.shutil, "which", lambda _: "/usr/bin/claude")
+    _fake_gh(monkeypatch, stdout="", stderr=DENIED)
+    _doable, reason, _impl = epic.triage(mk(1), "opus")
+    assert "auto-denied" in reason
+    assert "permissions.allow in settings.json" in reason
+
+
 def test_triage_no_verdict_names_what_stderr_said(monkeypatch):
     """The judge CLI can exit 0 having printed nothing, and explain itself on
     stderr. `doable=None` skips the sub-issue on --execute, so this one line is
@@ -353,6 +372,53 @@ def test_triage_names_why_the_judge_could_not_be_launched(monkeypatch):
     doable, reason, impl = epic.triage(mk(1), "opus")
     assert doable is None and impl == ""
     assert "could not start" in reason and "Argument list too long" in reason
+
+
+def test_an_untriaged_sub_issue_is_blocked_rather_than_handed_to_the_executor(
+        monkeypatch, capsys):
+    """`doable=None` is the ABSENCE of a ruling, not a permissive one.
+
+    Left at stage 'implement' it lands in `pending`, `plan_entry` gives it
+    `action: implement`, and the autonomous executor opens a worktree, runs
+    /fix-issue and files a PR for an issue no judge ever ruled on — while the
+    reason line beside it says it was passed over. Only a confirmed `doable`
+    gets executed; everything else waits for a human."""
+    monkeypatch.setattr(epic, "load_repo_cfg", lambda name: {
+        "name": "r", "github": "acme/r", "path": "/w", "default_branch": "main",
+        "_rules_from": "test", "loops": {"issue_executor": True}})
+    monkeypatch.setattr(epic, "build_worklist", lambda repo, e: [mk(1), mk(2), mk(3)])
+    monkeypatch.setattr(epic, "gh_json", lambda args, repo: {"title": "an epic"})
+    verdicts = {1: (None, "untriaged (judge timed out after 300s)", ""),
+                2: (False, "needs a licence purchase", ""),
+                3: (True, "self-contained", "sonnet")}
+    monkeypatch.setattr(epic, "triage", lambda w, model: verdicts[w.num])
+
+    assert epic.run("r", 7, execute=False, max_issues=None, json_out=True,
+                    landing="multi") == 0
+    out = capsys.readouterr().out
+    plan = json.loads(out[out.index("{"):])
+    issues = {i["num"]: i for i in plan["issues"]}
+    assert issues[1]["stage"] == "blocked" and issues[1]["action"] == "skip-blocked"
+    assert issues[2]["action"] == "skip-blocked"
+    assert issues[3]["action"] == "implement"
+    assert plan["counts"] == {"total": 3, "workable": 1, "blocked": 2, "phases": 1}
+
+
+def test_an_untriaged_skip_is_not_reported_as_a_doability_ruling(capsys):
+    """Both are skipped; only one of them was judged. "NOT agent-doable" is a
+    verdict, and claiming one the judge never reached is the same silence in the
+    other direction."""
+    untriaged = mk(1, stage="blocked")
+    untriaged.reason = "untriaged (judge timed out after 300s)"
+    epic.work_issue({"path": "/w", "github": "acme/r", "name": "r"},
+                    untriaged, execute=False)
+    assert "not confirmed doable" in capsys.readouterr().out
+
+    ruled = mk(2, stage="blocked")
+    ruled.doable, ruled.reason = False, "needs a licence purchase"
+    epic.work_issue({"path": "/w", "github": "acme/r", "name": "r"},
+                    ruled, execute=False)
+    assert "NOT agent-doable" in capsys.readouterr().out
 
 
 def test_triage_reads_a_real_verdict_unchanged(monkeypatch):

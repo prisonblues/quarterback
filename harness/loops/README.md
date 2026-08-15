@@ -33,9 +33,11 @@ Two conventions the resolver enforces so a rules file can be read like prose:
   with, and comments are stripped before anything reads the config — so they can
   never be mistaken for a setting.
 - **A name nothing recognises is warned about on stderr and dropped**, loudly and
-  non-fatally, in every deep block. `reviewers.antigravty` would otherwise be a
-  silent one-vendor-short panel and `loops.issue_executer` a loop switched off by
-  a typo (those defaults are OFF); dropped as well as warned about, so the word
+  non-fatally, at every level: the top level, each deep block, and the fields
+  inside a reviewer. `reviewers.antigravty` would otherwise be a silent
+  one-vendor-short panel, `reviewers.pi.enabld` a seat left off, `auto_merg` an
+  auto-merge policy quietly on its default, and `loops.issue_executer` a loop
+  switched off by a typo (those defaults are OFF); dropped as well as warned about, so the word
   "ignored" is true and no consumer iterating the resolved config sees a phantom
   seat. A warning rather than a hard exit, because a file shared across boxes may
   name a setting only a newer harness knows — and once per name per process, not

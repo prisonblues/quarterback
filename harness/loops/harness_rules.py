@@ -267,8 +267,60 @@ def strip_comments(obj: Any) -> Any:
     return obj
 
 
+# The label unknown_keys reports TOP-LEVEL names under. Empty on purpose: it
+# cannot collide with a block name, and the drop in resolve_repo addresses a
+# nested block by splitting its label on ".".
+TOP_LEVEL = ""
+
+# Settable at the top level but absent from DEFAULTS, so a sweep validating
+# against DEFAULTS alone would read them as typos: `name` overrides the
+# directory name, `executor_pr_base` is documented in the loops README.
+_EXTRA_TOP_KEYS = {"name", "executor_pr_base"}
+
+# Fields EVERY reviewer block takes on top of the ones its DEFAULTS entry names:
+# the per-reviewer half of review_panel.max_diff_chars.
+_SHARED_REVIEWER_FIELDS = {"max_diff_chars"}
+
+# …and the ones only one reviewer takes. sonarqube's connection details are
+# documented in the loops README and deliberately absent from DEFAULTS, because
+# there is no sensible default host, organization or project key and a blank one
+# merged into every repo's config would read as configured.
+_EXTRA_REVIEWER_FIELDS: dict[str, set[str]] = {
+    "sonarqube": {"host", "host_env", "organization", "project_key",
+                  "token_env", "token_op_ref", "fallback_branch"},
+}
+
+
+def _validated(rules: dict) -> list[tuple[str, dict, set[str]]]:
+    """Every mapping in a rules file whose key set is fully known, as
+    (label, what the file said, the names that mapping may contain).
+
+    One definition, read by all three of: which names are unknown, which names
+    the warning lists as the known ones, and where resolve_repo drops them from.
+    """
+    out = [(TOP_LEVEL, rules, set(DEFAULTS) | _EXTRA_TOP_KEYS)]
+    for block in _DEEP_BLOCKS:
+        over, base = rules.get(block), DEFAULTS.get(block, {})
+        if not isinstance(over, dict) or not isinstance(base, dict):
+            continue
+        out.append((block, over, set(base)))
+        if block != "reviewers":
+            continue
+        # Reviewer FIELDS are one level deeper again, and the failure there is
+        # the quietest of the lot: `reviewers.pi.enabld` leaves a seat off with
+        # nothing on stderr. Only seats DEFAULTS knows are descended into — an
+        # unknown seat is already reported as a whole.
+        for name, fields in base.items():
+            sub = over.get(name)
+            if isinstance(sub, dict) and isinstance(fields, dict):
+                out.append((f"{block}.{name}",
+                            sub, set(fields) | _SHARED_REVIEWER_FIELDS
+                            | _EXTRA_REVIEWER_FIELDS.get(name, set())))
+    return out
+
+
 def unknown_keys(rules: dict) -> dict[str, list[str]]:
-    """Names in a rules file that nothing will ever read, per deep block.
+    """Names in a rules file that nothing will ever read, per block.
 
     The merge below is a blind dict update, so `reviewers.antigravty` is not an
     error — it just adds a block no reviewer looks at, and the panel quietly
@@ -277,22 +329,21 @@ def unknown_keys(rules: dict) -> dict[str, list[str]]:
     hard-exits before a diff is even fetched), and it is worse committed to a
     file, where it survives every run until someone counts the reviewers.
 
-    Not reviewer-specific, which is why this sweeps every deep block: the same
-    silence hides `loops.issue_executer`, `epic.auto_finsh` and
+    Not reviewer-specific, which is why this sweeps every mapping in the file:
+    the same silence hides `loops.issue_executer`, `epic.auto_finsh` and
     `review_panel.judge_modl`, and for `loops.*` the default the real setting
-    falls back to is OFF — so a typo quietly disables an unattended loop. Every
-    deep block has a fully-known key set in DEFAULTS, so one sweep does all four.
-    The top level is deliberately NOT swept: `name` lives there and is not in
-    DEFAULTS.
+    falls back to is OFF — so a typo quietly disables an unattended loop.
+
+    The top level is swept against an explicit allowlist rather than skipped,
+    because that is where `auto_merge`, `enabled` and `headless_permission_mode`
+    live: a mistyped `auto_merg` merges in inert while the real switch falls back
+    to its default, on the block that decides whether PRs get merged unattended.
     """
     out: dict[str, list[str]] = {}
-    for block in _DEEP_BLOCKS:
-        over, base = rules.get(block), DEFAULTS.get(block, {})
-        if not isinstance(over, dict) or not isinstance(base, dict):
-            continue
-        names = sorted(n for n in over if n not in base)
+    for label, over, allowed in _validated(rules):
+        names = sorted(n for n in over if n not in allowed)
         if names:
-            out[block] = names
+            out[label] = names
     return out
 
 
@@ -306,6 +357,7 @@ def warn_unknown_keys(rules: dict, provenance: str) -> dict[str, list[str]]:
     version pin on every machine that reads it.
     """
     unknown = unknown_keys(rules)
+    known = {label: allowed for label, _over, allowed in _validated(rules)}
     for block, names in unknown.items():
         fresh = [n for n in names if (provenance, block, n) not in _warned]
         _warned.update((provenance, block, n) for n in names)
@@ -314,10 +366,12 @@ def warn_unknown_keys(rules: dict, provenance: str) -> dict[str, list[str]]:
         renamed = _RENAMED.get(block, {})
         named = ", ".join(f"{n!r} (renamed to {renamed[n]!r})" if n in renamed
                           else repr(n) for n in fresh)
-        noun = "reviewer" if block == "reviewers" else f"`{block}` setting"
+        noun = ("reviewer" if block == "reviewers"
+                else "top-level setting" if block == TOP_LEVEL
+                else f"`{block}` setting")
         print(f"{RULES_FILENAME} ({provenance}): unknown {noun} {named} — "
               f"ignored; nothing reads that name. "
-              f"Known: {', '.join(sorted(DEFAULTS[block]))}", file=sys.stderr)
+              f"Known: {', '.join(sorted(known[block]))}", file=sys.stderr)
     return unknown
 
 
@@ -340,7 +394,11 @@ def resolve_repo(spec: str | None, *, from_default_branch: bool | None = None) -
     # cfg["reviewers"], which makes the word "ignored" false and leaves every
     # caller iterating the resolved mapping looking at a phantom seat.
     for block, names in warn_unknown_keys(rules, provenance).items():
-        rules[block] = {k: v for k, v in rules[block].items() if k not in names}
+        target = rules
+        for part in (block.split(".") if block else []):
+            target = target[part]
+        for n in names:
+            target.pop(n, None)
 
     cfg = {**DEFAULTS, **rules}
     for block in _DEEP_BLOCKS:
@@ -385,6 +443,25 @@ def describe(cfg: dict) -> str:
 # reach into panel.py for it, which made all of panel's imports load-bearing for
 # a driver that deliberately shells out to panel.py instead of importing it.
 
+# The words a CLI uses when its OWN sandbox refuses a tool the run needed, and
+# when a SERVER refuses the request. Both are settled causes — no retry changes
+# them — and both name a remedy, which is why stderr_gist ranks a line carrying
+# one above a generic `error` line. Defined here rather than in panel.py because
+# panel's is_permission_denied/is_rejection decide the same question about the
+# whole stream, and the ranking and the retry decision must not drift apart.
+DENIAL_MARKERS = ("auto-denied", "auto denied", "cannot prompt for")
+REJECTION_MARKERS = ("invalid_request_error", "requires a newer version")
+
+
+def names_settled_cause(line: str) -> bool:
+    """Does this ONE line name a cause no further attempt can change?"""
+    low = line.lower()
+    if "permission" in low and any(d in low for d in DENIAL_MARKERS):
+        return True
+    return (any(m in low for m in REJECTION_MARKERS)
+            or '"status":400' in low.replace(" ", ""))
+
+
 def stderr_gist(stderr: str, limit: int = 200) -> str:
     """The most INFORMATIVE stderr line, not blindly the last one.
 
@@ -395,15 +472,22 @@ def stderr_gist(stderr: str, limit: int = 200) -> str:
     actually explains the failure. Where the line carries a JSON error envelope
     we lift its `message`, which is how a pinned-model rejection reads as
     "The 'gpt-5.6-luna' model requires a newer version of Codex" rather than 200
-    characters of serialised envelope."""
+    characters of serialised envelope.
+
+    A line naming a SETTLED cause outranks a generic `error` line, because the
+    noise filter below can only drop the four housekeeping strings it knows: on a
+    blank run whose stderr carries a warm-up error and then the permission
+    auto-denial, the denial is what carries the remedy, and taking the last
+    `error` line would quote the warm-up and hide it."""
     lines = [ln.strip() for ln in (stderr or "").splitlines() if ln.strip()]
     if not lines:
         return ""
     noise = ("failed to load models cache", "failed to refresh available models",
              "worker quit with fatal", "failed to connect to websocket")
     signal = [ln for ln in lines if not any(n in ln for n in noise)] or lines
+    settled = [ln for ln in signal if names_settled_cause(ln)]
     errors = [ln for ln in signal if "error" in ln.lower()]
-    pick = (errors or signal)[-1]
+    pick = (settled or errors or signal)[-1]
     msg = re.search(r'"message"\s*:\s*"((?:[^"\\]|\\.){4,400})"', pick)
     return (msg.group(1) if msg else pick)[:limit]
 

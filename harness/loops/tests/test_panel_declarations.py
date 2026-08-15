@@ -621,15 +621,55 @@ def test_a_seat_this_box_does_not_carry_is_reported_without_vetoing():
     that lists a workstation-only vendor (this one lists two) would otherwise
     buy every unattended run a standing veto and teach the reader to discount
     all of them. The skip is still reported; it is just not evidence."""
-    absent = {"antigravity": {"ran": False, "skip": "antigravity (m): CLI absent"},
-              "pi": {"ran": False, "skip": "pi (kimi): CLI absent"},
+    absent = {"antigravity": {"ran": False, "absent": True,
+                              "skip": "antigravity (m): CLI absent"},
+              "pi": {"ran": False, "absent": True, "skip": "pi (kimi): CLI absent"},
               "claude": {"ran": True}}
     assert panel.coverage_veto(absent, None, 0, 1_000) == []
     assert panel.round_stop(1, 2, [], [], [])["confident"] is True
     # Every other way of not running still says something about this round.
-    crashed = {"antigravity": {"ran": False, "skip": "antigravity (m): exited 1 (boom)"}}
+    crashed = {"antigravity": {"ran": False, "skip": "antigravity (m): exited 1 (boom)"},
+               "claude": {"ran": True}}
     assert panel.coverage_veto(crashed, None, 0, 1_000) == [
         "antigravity did not run (antigravity (m): exited 1 (boom))"]
+
+
+def test_a_box_carrying_none_of_the_reviewer_clis_cannot_stop_confidently():
+    """The floor under the exemption above. Absent seats are exempted one at a
+    time, so a host that carries NONE of them produces an empty veto list — and
+    `confident` is `not veto`, so the round reports a confident stop on a diff
+    nobody read. That is the strongest wrong signal the panel can emit, and it
+    lands on exactly the unattended hosts the exemption was added for."""
+    none_ran = {"antigravity": {"ran": False, "absent": True, "skip": "a: CLI absent"},
+                "pi": {"ran": False, "absent": True, "skip": "p: CLI absent"}}
+    veto = panel.coverage_veto(none_ran, None, 0, 1_000)
+    assert veto == ["no reviewer ran — nothing read this diff"]
+    assert panel.round_stop(1, 2, [], [], veto)["confident"] is False
+
+
+def test_absence_is_recorded_state_rather_than_a_message_tail():
+    """The exemption reads `meta["absent"]`, not the end of the skip line.
+
+    Both directions of the message-matching version are wrong. A genuine failure
+    whose composed reason happens to end in those words would escape the veto;
+    and the day the absent branch's message gains a suffix — a hint, an install
+    pointer — the standing veto the exemption exists to remove comes back, with
+    nothing failing to say so."""
+    lookalike = {"codex": {"ran": False, "skip": "codex (gpt): exited 1 — no CLI absent"},
+                 "claude": {"ran": True}}
+    assert panel.coverage_veto(lookalike, None, 0, 1_000) == [
+        "codex did not run (codex (gpt): exited 1 — no CLI absent)"]
+    decorated = {"codex": {"ran": False, "absent": True,
+                           "skip": "codex (gpt): CLI absent — install it first"},
+                 "claude": {"ran": True}}
+    assert panel.coverage_veto(decorated, None, 0, 1_000) == []
+
+
+def test_a_reviewer_whose_cli_is_missing_records_that_as_state(monkeypatch):
+    """Where the flag comes from — the one branch that may set it."""
+    monkeypatch.setattr(panel.shutil, "which", lambda _: None)
+    got = panel.review_llm("antigravity", "m", "p")
+    assert got.absent is True and got.skip.endswith(panel.CLI_ABSENT)
 
 
 def test_a_panel_with_nothing_to_declare_vetoes_nothing():
