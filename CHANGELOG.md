@@ -7,6 +7,44 @@ that number where it was, so the repo can be a version ahead of the service.
 Entries are newest first. Each one says what was broken or missing before it, because that is the
 part that isn't recoverable from the diff.
 
+## v2.21 — a panel that lost a seat said nothing about it
+
+A reviewer went missing and the report read the same. On PR #64 codex exited 1 with "Not inside a
+trusted directory and --skip-git-repo-check was not specified", while two panels launched in the
+same second, from the same command, against the same repo ran it fine. The review that came back
+said `LLM reviewers ran: claude (opus)` and then laid out 23 confirmed findings exactly as a full
+panel would. Its own master had written what that cost — nine self-declared coverage gaps "stand
+unchallenged and unread" — and nothing above the findings said so.
+
+**The cause was not a race, which is what it looked like.** `run_cli` invoked every reviewer with no
+`cwd=`, so each inherited whatever directory the panel process happened to be started from. The
+inputs were not in fact identical: the panels that worked were launched from inside a git checkout
+and the one that failed from a scratch directory under `/tmp`, and codex refuses to start outside a
+repository. So a run's membership was decided by the caller's shell — state nothing configured,
+nothing recorded, and nothing could reproduce. Pinning the cwd to the repo under review satisfies
+that check by construction, verified against an untrusted checkout and an untrusted *worktree*
+(where the `.git` file rather than directory was the open question). No `--skip-git-repo-check`: it
+would buy nothing here and trades a guard for it.
+
+The other half is that a seat can still be lost — to a timeout, a quota, a model pin the CLI
+refuses — so the report has to say it where the findings are read. It now states seats filled
+against seats configured, and calls a short panel degraded above the findings rather than in a
+footer, because under the epic nobody is watching a terminal when it happens. `⋆consensus` gets the
+same treatment: it takes two reviewers to agree, so on a panel of one its absence is structural, and
+"no finding earned consensus" and "there was nobody to agree with" had rendered identically. A
+reader takes the first meaning, which is the pessimistic reading of a review that never had the
+chance to be pessimistic.
+
+This is #19 one level up. That fix stopped a *reviewer* which produced nothing from reading as a
+reviewer that found nothing, and it is the only reason any of this was visible — the lost seat was
+reported loudly, with its real reason. What stayed silent was that the *panel* had degraded.
+
+Not fixed here: the board's reviewer leaderboard has the mirror problem, scoring codex only on the
+rounds it managed to attend. The payload has carried `reviewers_selected` alongside `reviewers_ran`
+all along, so the data is there for whoever takes it.
+
+No board change: the API and the served version stay where they were.
+
 ## v2.20 — nothing asked who was in the worktree
 
 Worktree-per-issue is how several agents work at once, and its isolation is file-level: separate

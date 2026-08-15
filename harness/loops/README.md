@@ -236,7 +236,14 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   its merits. A real defect flagged by only ONE reviewer is still fixed — agreement
   shows as a `⋆consensus` confidence marker, never a filter. Only clear false
   positives are dismissed, with a recorded reason. If no judge is available, nothing
-  is suppressed.
+  is suppressed. Agreement takes two reviewers, so on a panel of one the marker is
+  not merely absent but unavailable, and the report says which of those it means.
+- **Every reviewer runs in the repo under review.** Not in whatever directory the
+  panel was launched from: a seat that inherits the caller's shell is a seat whose
+  participation nothing configures and nothing can reproduce, and codex — which
+  refuses to start outside a git repository — was lost exactly that way. The report
+  states seats filled against seats configured, and says so above the findings when
+  they differ. A short panel is a weaker review, not a cleaner one.
 - **Merging happens once, in the judge, and adds rather than replaces.** The judge
   sees one entry per *reviewer*, merges the entries that are the same defect, and
   writes a `synthesis`; each reviewer's own title, detail, severity and line ride

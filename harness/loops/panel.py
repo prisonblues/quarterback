@@ -1112,13 +1112,32 @@ def is_deterministic_failure(stderr: str) -> bool:
 def run_cli(args: list[str] | Callable[[], list[str]], label: str, timeout: int = CLI_TIMEOUT,
             attempts: int = 3, stdin_text: str | None = None,
             on_output: Callable[[str | None], None] | None = None,
-            replied: Callable[[], bool] | None = None) -> tuple[str | None, str | None]:
+            replied: Callable[[], bool] | None = None,
+            cwd: str | None = None) -> tuple[str | None, str | None]:
     """Run a headless CLI, returning (stdout, error_reason); error_reason is
     None on success. Retries transient failures (non-zero exits such as rate
     limits, and OS errors) up to `attempts` times with no delay — these fail
     fast, so retrying is cheap and recovers the common flake. A full timeout is
     NOT retried (it already burned the whole budget; retrying just doubles the
     wall-clock).
+
+    **`cwd` is the repo under review, and passing it is what makes a seat
+    reproducible.** Without it every reviewer inherited whatever directory the
+    panel process happened to be started from, so a run's membership was decided
+    by ambient state that nothing configured, nothing recorded, and nothing could
+    reproduce. That is not hypothetical: on PR #64 codex exited 1 with "Not
+    inside a trusted directory and --skip-git-repo-check was not specified" while
+    the two panels launched beside it in the same second ran codex fine. The
+    inputs were not in fact identical — those panels were started from inside a
+    git checkout and that one from a scratch directory under /tmp, and codex
+    refuses to start outside a repo. The panel lost a whole vendor's eyes to the
+    caller's shell, and #68 is the report that reads the same either way.
+
+    Pinning it to the repo satisfies that check by construction (`--repo` always
+    resolves to a checkout), which is why codex needs no `--skip-git-repo-check`
+    here — verified against an untrusted checkout AND an untrusted *worktree*,
+    where the `.git` file rather than directory was the open question. The flag
+    would buy nothing and would trade a guard for it.
 
     `stdin_text` is how a prompt reaches a CLI that accepts one there, which is
     the only way to hand a reviewer a diff larger than the kernel's per-argument
@@ -1186,7 +1205,7 @@ def run_cli(args: list[str] | Callable[[], list[str]], label: str, timeout: int 
         started = time.monotonic()
         try:
             proc = subprocess.run(argv, capture_output=True, text=True,
-                                  timeout=timeout, **feed)
+                                  timeout=timeout, cwd=cwd, **feed)
         except subprocess.TimeoutExpired as e:
             # A timeout is the most expensive outcome the panel has: the model
             # read the whole diff and thought about it for the full budget before
@@ -1756,9 +1775,15 @@ def codex_usage(stdout: str | None) -> dict | None:
 
 
 def review_llm(cmd_name: str, model: str, prompt: str,
-               effort: str = "") -> ReviewerRun:
+               effort: str = "", cwd: str | None = None) -> ReviewerRun:
     """Run a headless LLM CLI reviewer. Returns a :class:`ReviewerRun` — what it
     found, what it could not judge, and what it cost.
+
+    `cwd` is the repo under review — see run_cli, where the reason it is a
+    parameter rather than whatever the shell was in is written down. It is
+    threaded rather than read from a module global because the reviewers run
+    concurrently and a global would make the seat depend on run ORDER, which is
+    the same defect wearing different clothes.
 
     Duration is wall-clock for this member's whole turn — every CLI attempt it
     made, including the reparse retry below, because a reviewer that only lands
@@ -1918,7 +1943,7 @@ def review_llm(cmd_name: str, model: str, prompt: str,
         wrote_reply = (lambda: bool(replies) and replies[-1].exists()
                        and replies[-1].read_text().strip()) if replies_used else None
         out, err = run_cli(args, label, stdin_text=stdin_text, on_output=collect,
-                           replied=wrote_reply)
+                           replied=wrote_reply, cwd=cwd)
         if err:
             err += cli_hint(cmd_name, err, model)
             # A member that burned tokens and then failed still spent them, so
@@ -1934,7 +1959,7 @@ def review_llm(cmd_name: str, model: str, prompt: str,
             # The retry costs another turn, which `usage_of` already counts: it runs
             # under its own fresh session, and its stdout lands in `outputs` too.
             out2, err2 = run_cli(args, label, attempts=1, stdin_text=stdin_text,
-                                 on_output=collect, replied=wrote_reply)
+                                 on_output=collect, replied=wrote_reply, cwd=cwd)
             retry_text = reply_of(out2) if not err2 else None
             if retry_text:
                 retried = parse_reply(cmd_name, retry_text)
@@ -2771,7 +2796,8 @@ def _parse_verdicts(parsed: list, flat: list[Finding], pr: int) -> list[Canonica
 
 def adjudicate(clusters: list[list[Finding]], diff: str, model: str, pr: int,
                budget: int | None = DEFAULT_DIFF_BUDGET,
-               coverage: dict[str, list[str]] | None = None
+               coverage: dict[str, list[str]] | None = None,
+               cwd: str | None = None
                ) -> tuple[list[Canonical], str | None, str]:
     """The 'master' rules on every finding, merges the duplicates it finds, AND
     rules on the coverage the reviewers declared about themselves.
@@ -2841,7 +2867,7 @@ def adjudicate(clusters: list[list[Finding]], diff: str, model: str, pr: int,
     # triaged review rather than like a failure.
     prompt = JUDGE_PROMPT.format(findings=listing, coverage=stated, diff=diff_text)
     args = ["claude", "-p"] + (["--model", model] if model else [])
-    out, err = run_cli(args, "judge", stdin_text=prompt)
+    out, err = run_cli(args, "judge", stdin_text=prompt, cwd=cwd)
     if err:
         return unruled(err)
     parsed = extract_json_value(out, "verdicts")
@@ -2856,7 +2882,7 @@ def adjudicate(clusters: list[list[Finding]], diff: str, model: str, pr: int,
         # through `unjudged` and adds the "round was not adjudicated" veto. One
         # more turn keeps the pessimistic rule without paying for it with the
         # whole adjudication.
-        out2, err2 = run_cli(args, "judge", attempts=1, stdin_text=prompt)
+        out2, err2 = run_cli(args, "judge", attempts=1, stdin_text=prompt, cwd=cwd)
         if not err2:
             parsed = extract_json_value(out2, "verdicts")
     note = ""
@@ -3624,7 +3650,8 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         for name in LLM_REVIEWERS:
             if name in selected:
                 tasks[name] = ex.submit(review_llm, name, models[name],
-                                        prompt_for(budgets[name]), efforts.get(name, ""))
+                                        prompt_for(budgets[name]), efforts.get(name, ""),
+                                        cfg["path"])
         sonar_future = None
         if "sonarqube" in selected:
             sonar_future = ex.submit(
@@ -3701,7 +3728,8 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     clusters = cluster_findings(llm_findings)
     coverage = {n: m.get("could_not_assess") or [] for n, m in reviewer_meta.items()}
     findings, judge_skip, coverage_note = adjudicate(
-        clusters, diff, panel.get("judge_model", ""), pr_number, judge_budget, coverage)
+        clusters, diff, panel.get("judge_model", ""), pr_number, judge_budget, coverage,
+        cfg["path"])
     judged = judge_skip is None and bool(findings)
     to_fix = sorted((c for c in findings if c.verdict != "dismissed"),
                     key=lambda c: c.severity)
@@ -3847,9 +3875,27 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         print(json.dumps(payload, indent=2))
         return finish(write_failed)
 
+    # How many LLM seats the run was CONFIGURED to fill, against how many filled.
+    # Both halves are needed and neither is derivable from the other: "claude ran"
+    # is the same sentence whether it was the only seat asked for or the only one
+    # of four that answered, and those are a hand-picked single-vendor read and a
+    # panel that lost three quarters of its eyes.
+    seats_asked = [n for n in LLM_REVIEWERS if n in selected]
+    seats_filled = len(ran_llm)
+    # The consensus signal needs two seats to exist AT ALL. Below that, "no
+    # finding earned ⋆consensus" and "there was nobody to agree with" render
+    # identically, and a reader takes the first meaning — the pessimistic
+    # reading of a review that never had the chance to be pessimistic.
+    consensus_possible = seats_filled > 1
+
     def conf(c: Canonical) -> str:
         revs = c.reviewers
-        return f" _(via {', '.join(revs)}{' ⋆consensus' if len(revs) > 1 else ''})_"
+        if len(revs) > 1:
+            return f" _(via {', '.join(revs)} ⋆consensus)_"
+        # Said per finding rather than once at the top, because this is the line a
+        # reader is looking at when they decide how much a finding is worth.
+        sole = " — sole reviewer, no second opinion" if not consensus_possible else ""
+        return f" _(via {', '.join(revs)}{sole})_"
 
     def accounts(c: Canonical) -> list[str]:
         """What each reviewer actually said, under a MERGED finding.
@@ -3901,7 +3947,32 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                      "No hard gate: publish a PR analysis to get one.")
     else:
         lines.append(f"**SonarCloud:** {gate_txt}")
-    lines.append(f"**LLM reviewers ran:** {', '.join(ran_llm) or 'none'}")
+    # The seat count rides with the reviewer list on EVERY run, not only degraded
+    # ones. A round's finding count is not comparable across different panel
+    # sizes, and the convergence table this repo keeps has been read as if it
+    # were: #32 went 22 -> 43 between rounds and gained a reviewer in the same
+    # step. The number that disambiguates it has to be in the artifact.
+    lines.append(f"**LLM reviewers ran:** {', '.join(ran_llm) or 'none'}"
+                 f" — {seats_filled} of {len(seats_asked)} configured")
+    # The panel-level version of #19's per-reviewer fix. #19 stopped a reviewer
+    # that produced nothing from reading as a reviewer that found nothing; this
+    # stops a PANEL that lost half its seats from reading as a panel that agreed.
+    # A run with empty seats is a materially weaker artifact than a full one and
+    # was presented identically — on PR #64 that meant 23 findings from a single
+    # reviewer, whose own master wrote that nine self-declared coverage gaps
+    # "stand unchallenged and unread", laid out exactly like 23 from a full panel.
+    # It is stated here, above the findings, rather than in a footer: under the
+    # epic (#52) nobody is reading this in a terminal as it happens.
+    if seats_filled < len(seats_asked):
+        lost = len(seats_asked) - seats_filled
+        lines.append(f"  - ⚠️ **panel degraded** — {lost} of {len(seats_asked)} "
+                     f"configured reviewer{'s' if len(seats_asked) != 1 else ''} did not "
+                     "run. Read what follows as a weaker review, not a cleaner one: "
+                     "an empty seat cannot report what it would have found.")
+    if not consensus_possible and seats_asked:
+        lines.append("  - ⚠️ **no ⋆consensus is possible this round** — it takes two "
+                     "reviewers to agree, and one filed. Absence of ⋆consensus below "
+                     "means nobody was there to agree, NOT that nobody agreed.")
     if override_note:
         # Said on the PR, not just in the terminal: a reader of the comment needs
         # to know this panel was hand-picked before reading "reviewed by one".
