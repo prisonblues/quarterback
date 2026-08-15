@@ -10,8 +10,19 @@ from — ambient state nothing configured, nothing recorded and nothing could re
 On PR #64 codex exited 1 with "Not inside a trusted directory and
 --skip-git-repo-check was not specified" while two panels launched in the same second
 ran it fine; those were started from inside a checkout and that one from a scratch
-directory under /tmp. Pinning the cwd to the repo under review satisfies codex's check
-by construction, which is why no `--skip-git-repo-check` appears anywhere here.
+directory under /tmp. Each member now runs in its own empty `git init`ed sandbox,
+which satisfies codex's check by construction — which is why no
+`--skip-git-repo-check` appears anywhere here.
+
+**A sandbox and not the repo under review**, which is the part worth pinning rather
+than merely writing down. The first version of this fix pinned the seats to the
+checkout and a reviewer caught what that costs: a headless CLI reads its project
+configuration from its cwd — CLAUDE.md, `.claude/settings.json`, hooks that execute —
+so the repo under review gains a channel into the reviewer judging it. And it bought
+no access in exchange, because `cfg["path"]` is the main checkout on whatever branch
+it was left on, never the PR's code. A tool-capable seat pointed there can quote a
+different branch as the code under review: a plausible wrong answer replacing a
+visible failure.
 
 The second half is what the report says when it happens anyway — a seat can still be
 lost to a timeout, a quota, or a model pin the CLI refuses. It has to say so above the
@@ -20,6 +31,7 @@ was nobody to agree with".
 """
 
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -41,65 +53,101 @@ ONE_SEAT_CFG = {"github": "acme/board", "path": REPO,
 
 # ---------------------------------------------------------------- where a seat runs
 
-def test_a_reviewer_runs_where_the_panel_says_not_where_the_shell_was(monkeypatch):
-    """The fix for the lost seat: the repo under review reaches the process.
-
-    Asserted on the kwargs `subprocess.run` is actually called with, because every
-    layer above it can hold a correct path and still leave the CLI inheriting the
-    caller's shell — which is precisely how this shipped."""
-    seen = {}
-
+def _record_cwds(monkeypatch, seen: list):
+    """Every CLI invocation's cwd, with the sandbox's own `git init` let through —
+    it is set up via the same `subprocess.run` these tests replace."""
     def fake_run(argv, **kw):
-        seen.update(kw)
+        if argv[:2] == ["git", "init"]:
+            Path(argv[-1]).mkdir(parents=True, exist_ok=True)
+            return type("P", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        seen.append(kw.get("cwd"))
         return type("P", (), {"returncode": 0, "stdout": "[]", "stderr": ""})()
 
     monkeypatch.setattr(panel.shutil, "which", lambda name: "/usr/bin/" + name)
     monkeypatch.setattr(panel.subprocess, "run", fake_run)
-    panel.review_llm("claude", "sonnet", "review this", "", REPO)
-    assert seen["cwd"] == REPO
 
 
-def test_the_judge_runs_there_too(monkeypatch):
-    """The judge is a headless CLI on the same host with the same exposure. It is
-    also the seat whose loss is worst — a judge that dies takes every finding
-    through unadjudicated — so leaving it on the inherited cwd would have kept the
-    defect in the one place it costs most."""
-    seen = {}
+def test_a_reviewer_runs_in_a_sandbox_not_in_the_shell_it_was_launched_from(monkeypatch):
+    """The fix for the lost seat, asserted on the kwargs `subprocess.run` is
+    actually called with: every layer above it can hold a correct path and still
+    leave the CLI inheriting the caller's shell, which is precisely how this
+    shipped. `None` is the failure — that is the value that means "wherever the
+    shell was"."""
+    seen = []
+    _record_cwds(monkeypatch, seen)
+    panel.review_llm("claude", "sonnet", "review this")
+    assert seen and all(c for c in seen), f"a reviewer ran with cwd={seen}"
 
-    def fake_run(argv, **kw):
-        seen.update(kw)
-        return type("P", (), {"returncode": 0, "stdout": "[]", "stderr": ""})()
 
-    monkeypatch.setattr(panel.shutil, "which", lambda name: "/usr/bin/" + name)
-    monkeypatch.setattr(panel.subprocess, "run", fake_run)
+def test_the_reparse_RETRY_gets_a_sandbox_too(monkeypatch):
+    """`review_llm` calls `run_cli` twice — the review and the one-shot reparse —
+    and an assertion that reads only the first would pass with the retry left on
+    the inherited cwd. The retry is the attempt that runs after a flake, which is
+    exactly when a seat can least afford a second failure mode."""
+    seen = []
+    _record_cwds(monkeypatch, seen)
+    # Unparseable both times: forces the retry, so two invocations are recorded.
+    monkeypatch.setattr(panel, "parse_reply", lambda *a, **k: None)
+    panel.review_llm("claude", "sonnet", "review this")
+    assert len(seen) == 2, f"expected review + reparse retry, got {len(seen)}"
+    assert all(c for c in seen)
+
+
+def test_the_judge_and_ITS_retry_run_in_a_sandbox(monkeypatch):
+    """The judge is a headless CLI with the same exposure, and the seat whose loss
+    is worst — a judge that dies takes every finding through unadjudicated — so it
+    is the last place to leave depending on the caller's shell. Its reparse retry
+    is asserted for the same reason as the reviewer's."""
+    seen = []
+    _record_cwds(monkeypatch, seen)
+    monkeypatch.setattr(panel, "extract_json_value", lambda *a, **k: None)
     f = panel.Finding("claude", "P1", "a.py", 1, "title", "detail")
-    panel.adjudicate([[f]], "diff", "sonnet", 34, cwd=REPO)
-    assert seen["cwd"] == REPO
+    panel.adjudicate([[f]], "diff", "sonnet", 34)
+    assert len(seen) == 2, f"expected judge + reparse retry, got {len(seen)}"
+    assert all(c for c in seen)
 
 
-def test_a_whole_run_hands_every_seat_the_repo_it_resolved(monkeypatch, tmp_path,
-                                                           capsys):
-    """End to end, because `run_cli` could always ACCEPT a cwd — what was missing
-    was every caller passing one. The path asserted is the repo the run resolved,
-    not a literal: a panel that pinned some other directory would be reproducible
-    and still wrong."""
-    got = {}
-    _stub_panel(monkeypatch, cfg=TWO_SEAT_CFG)
+def test_the_sandbox_is_not_the_repo_under_review(monkeypatch, tmp_path, capsys):
+    """The design decision, pinned so it cannot be quietly reverted to the first
+    version of this fix. A seat that runs in the checkout reads that repo's
+    CLAUDE.md, `.claude/settings.json` and hooks, and can Read/Grep a tree on a
+    different branch from the diff it was handed."""
+    seen = []
+    _record_cwds(monkeypatch, seen)
+    panel.review_llm("claude", "sonnet", "review this")
+    assert seen and all(c != REPO for c in seen), (
+        f"a seat ran in the repo under review: {seen}")
 
-    def recording_review(name, model, prompt, effort="", cwd=None):
-        got[name] = cwd
-        return panel.ReviewerRun([], None, 10, [])
 
-    def recording_judge(clusters, diff, model, pr, budget=None, coverage=None,
-                        cwd=None):
-        got["judge"] = cwd
-        return ([], None, "")
+def test_the_sandbox_is_a_git_repo_because_that_is_the_whole_point(monkeypatch,
+                                                                   tmp_path):
+    """codex refuses to start outside a git repository, which is the entire reason
+    the cwd cannot simply be an empty temp directory. Asserted on the argv, since
+    that is what makes the seat reproducible rather than lucky."""
+    inits = []
 
-    monkeypatch.setattr(panel, "review_llm", recording_review)
-    monkeypatch.setattr(panel, "adjudicate", recording_judge)
-    assert panel.run("board", 34, post=False, record=False) == 0
-    capsys.readouterr()
-    assert got == {"claude": REPO, "codex": REPO, "judge": REPO}
+    def fake_run(argv, **kw):
+        if argv[:2] == ["git", "init"]:
+            inits.append(argv)
+            Path(argv[-1]).mkdir(parents=True, exist_ok=True)
+            return type("P", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        return type("P", (), {"returncode": 0, "stdout": "[]", "stderr": ""})()
+
+    monkeypatch.setattr(panel.shutil, "which", lambda name: "/usr/bin/" + name)
+    monkeypatch.setattr(panel.subprocess, "run", fake_run)
+    panel.review_llm("codex", "", "review this")
+    assert inits, "the member's sandbox was never made a git repo"
+
+
+def test_a_real_sandbox_is_a_real_repo(tmp_path):
+    """The one test here that runs git rather than mocking it — the mocked tests
+    above all assert plumbing, and plumbing that produces a directory git does not
+    recognise would satisfy every one of them while losing the codex seat."""
+    made = panel.member_sandbox(tmp_path / "cwd")
+    assert (Path(made) / ".git").exists()
+    inside = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"],
+                            cwd=made, capture_output=True, text=True)
+    assert inside.stdout.strip() == "true", inside.stderr
 
 
 # ---------------------------------------------------------------- what a lost seat says
@@ -126,8 +174,7 @@ def _stub_panel(monkeypatch, findings=None, cfg=TWO_SEAT_CFG, runs=None):
     monkeypatch.setattr(panel, "review_llm", review)
 
 
-def _confirm_everything(clusters, diff, model, pr, budget=None, coverage=None,
-                        cwd=None):
+def _confirm_everything(clusters, diff, model, pr, budget=None, coverage=None):
     flat = [f for grp in clusters for f in grp]
     return ([panel.Canonical(id=panel._finding_id(pr, i + 1), severity=f.severity,
                              file=f.file, line=f.line, synthesis=f.title,
@@ -190,3 +237,74 @@ def test_a_deliberate_single_seat_panel_is_still_told_it_has_no_second_opinion(
     assert "1 of 1 configured" in report
     assert "panel degraded" not in report
     assert "no ⋆consensus is possible" in report
+
+
+def test_a_panel_that_lost_EVERY_seat_does_not_claim_one_filed(monkeypatch, capsys):
+    """The zero-seat case, which the first version of this block got wrong in its
+    own new line: it printed "it takes two reviewers to agree, and one filed" on a
+    run where nobody filed, and pointed the reader at "absence of ⋆consensus below"
+    in a report with no LLM findings at all. A false factual claim, in the block
+    added to stop false impressions — so it is pinned rather than merely fixed."""
+    report = _report(monkeypatch, capsys, runs={
+        "claude": panel.ReviewerRun(skip="claude: timed out after 1800s"),
+        "codex": panel.ReviewerRun(skip="codex: exited 1 (quota exhausted)")})
+    assert "0 of 2 configured" in report
+    assert "panel degraded" in report
+    assert "nothing below was reviewed by a panel member" in report
+    assert "and one filed" not in report
+
+
+def test_a_CLI_this_host_does_not_carry_is_not_a_DEGRADED_panel(monkeypatch, capsys):
+    """`coverage_veto` already argues this at length for the veto: a missing CLI is
+    a fact about the HOST, not about the round — it is absent every run, so treating
+    it as degradation prints the warning on every unattended run of a repo that
+    enables a workstation-only vendor, where nothing was lost and nothing could be
+    recovered. That is the alert fatigue the full-panel test above exists to
+    prevent, and it would take the real degraded case down with it.
+
+    Still stated, quietly and separately: "configured but not installed here" is
+    worth knowing, it is just not a degradation."""
+    report = _report(monkeypatch, capsys, runs={
+        "codex": panel.ReviewerRun(skip="codex: CLI absent", absent=True)})
+    assert "1 of 2 configured" in report
+    assert "panel degraded" not in report
+    assert "not installed on this host" in report
+    # It is still a one-seat review, and that half must survive the exemption.
+    assert "no ⋆consensus is possible" in report
+
+
+def test_a_lost_seat_beside_an_absent_one_still_reads_as_degraded(monkeypatch,
+                                                                  capsys):
+    """The exemption is per seat, not a switch: a host missing one CLI while
+    another seat times out has genuinely lost something, and the count must name
+    the seat that was lost rather than both or neither."""
+    cfg = {**TWO_SEAT_CFG,
+           "reviewers": {**TWO_SEAT_CFG["reviewers"],
+                         "pi": {"enabled": True, "model": "", "effort": ""}}}
+    report = _report(monkeypatch, capsys, cfg=cfg, runs={
+        "codex": panel.ReviewerRun(skip="codex: CLI absent", absent=True),
+        "pi": panel.ReviewerRun(skip="pi: timed out after 1800s")})
+    assert "1 of 3 configured" in report
+    assert "**panel degraded** — 1 of 3" in report, "the absent seat was counted as lost"
+    assert "not installed on this host" in report
+
+
+def test_sonarqube_counts_as_somebody_to_agree_WITH(monkeypatch, capsys):
+    """The consensus banner and the ⋆consensus marker have to be counted over the
+    same population, and they were not: sonar's base-branch issues are judged
+    alongside the LLM findings (`llm_findings` takes `soft`), so a canonical
+    finding's `reviewers` can legitimately read ["claude", "sonarqube"]. Counting
+    LLM seats alone let one lone-LLM report stamp ⋆consensus on that finding while
+    declaring two dozen lines above that consensus was impossible — the report
+    contradicting itself in the exact place this was added to stop it."""
+    cfg = {**TWO_SEAT_CFG,
+           "reviewers": {"claude": {"enabled": True, "model": "sonnet"},
+                         "sonarqube": {"enabled": True}}}
+    soft = [panel.Finding("sonarqube", "P3", "a.py", 3, "unused import")]
+    monkeypatch.setattr(panel, "review_sonarqube",
+                        lambda *a, **k: ("no-pr-analysis", [], soft, None))
+    report = _report(monkeypatch, capsys, cfg=cfg)
+    # One LLM seat, but sonarqube also filed — so agreement was possible, and the
+    # banner claiming otherwise would be false.
+    assert "no ⋆consensus is possible" not in report
+    assert "sole reviewer" not in report

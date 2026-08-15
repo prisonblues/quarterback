@@ -21,10 +21,23 @@ unchallenged and unread" — and nothing above the findings said so.
 inputs were not in fact identical: the panels that worked were launched from inside a git checkout
 and the one that failed from a scratch directory under `/tmp`, and codex refuses to start outside a
 repository. So a run's membership was decided by the caller's shell — state nothing configured,
-nothing recorded, and nothing could reproduce. Pinning the cwd to the repo under review satisfies
-that check by construction, verified against an untrusted checkout and an untrusted *worktree*
-(where the `.git` file rather than directory was the open question). No `--skip-git-repo-check`: it
-would buy nothing here and trades a guard for it.
+nothing recorded, and nothing could reproduce.
+
+Each member now runs in its own empty, `git init`ed sandbox, removed with the private temp directory
+it already had. No `--skip-git-repo-check`: an empty repo satisfies codex's check by construction,
+verified against an untrusted checkout, an untrusted *worktree* (where the `.git` file rather than
+directory was the open question) and a bare `git init`.
+
+**Empty rather than the repo under review, and that is the whole design decision.** Pinning the
+seats to the checkout was the first attempt and it traded one defect for two. A headless CLI reads
+its project configuration from its cwd — CLAUDE.md, `.claude/settings.json`, hooks that execute
+commands — so running there hands the repo being reviewed a channel into the reviewer and the judge
+ruling on it, aimed squarely at the untrusted-contributor population the epic exists to read. And it
+bought no access in exchange: `cfg["path"]` is the main checkout on whatever branch it was last left
+on, never the PR's code, which the panel reads as a diff and never checks out. A tool-capable seat
+pointed there can Read and Grep a different branch and quote it as the code under review — a
+plausible wrong answer where the original bug gave a visible failure. The members need no working
+directory at all. They need a reproducible one.
 
 The other half is that a seat can still be lost — to a timeout, a quota, a model pin the CLI
 refuses — so the report has to say it where the findings are read. It now states seats filled
@@ -34,6 +47,18 @@ same treatment: it takes two reviewers to agree, so on a panel of one its absenc
 "no finding earned consensus" and "there was nobody to agree with" had rendered identically. A
 reader takes the first meaning, which is the pessimistic reading of a review that never had the
 chance to be pessimistic.
+
+Three distinctions in that block are what keep it from becoming noise, and the first draft got all
+three wrong. A CLI the host does not carry is **not** a degraded panel — it is absent every run, so
+counting it would print the warning on every unattended run of a repo that enables a
+workstation-only vendor, which is exactly the alert fatigue that takes the real case down with it
+(`coverage_veto` already argues this at length for the veto; the exemption reads the same recorded
+`absent` state rather than the skip text, for the same reason). Sonar's soft findings are judged
+alongside the LLM ones, so a finding can legitimately read `["claude", "sonarqube"]` — counting LLM
+seats alone let one report stamp ⋆consensus on a finding while declaring consensus impossible two
+dozen lines above it. And a panel that lost *every* seat was told "it takes two reviewers to agree,
+and one filed": a false claim about a run where nobody had, in the block written to stop exactly
+that kind of false impression.
 
 This is #19 one level up. That fix stopped a *reviewer* which produced nothing from reading as a
 reviewer that found nothing, and it is the only reason any of this was visible — the lost seat was
