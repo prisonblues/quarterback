@@ -190,10 +190,12 @@ The deployed board version lags the repo until the stack is redeployed, and only
 service knows which it is: ask it with `GET /openapi.json` → `.info.version`, for whichever
 instance you care about. (Anything built off this branch says 2.23.0 — v2.24 is harness-side.) A number written here
 instead would be wrong the next time Portainer redeploys, with no diff to catch it.
-Latest release: **v2.24**, harness-side — a new finding now says whether the last fix pass caused it
+Latest release: **v2.25** (harness-side) — the codex panel seat reviews the diff it was handed
+instead of going looking for the repo, which is what was running the reviews out of their timeout.
+Before it, **v2.24**, also harness-side — a new finding now says whether the last fix pass caused it
 or the last round missed it, which were one number before and want opposite remedies. (**v2.22** is
 claimed by a branch not yet merged, which is why the numbering skips it.)
-Before it, **v2.23** had a run record which FILES the PR changed and not just how many lines, plus
+**v2.23** had a run record which FILES the PR changed and not just how many lines, plus
 the PR's state as of that panel, so the board finally holds what collision ordering needs (schema
 revision 0016) — reading it back as a collision query ships separately, see #101.
 **v2.21** (harness-side) had each panel member run in its own empty sandbox repo
@@ -232,6 +234,10 @@ judge) are harness-side too.
 - **v2.24** — a new finding records whether the last fix pass introduced it or the last round missed
   it: two facts with opposite remedies that `new_this_round` collapsed into one, plus the commit each
   round reviewed and the files it was truncated out of. A signal, not a verdict — nothing gates on it.
+- **v2.25** — the codex panel seat is given no shell, no web search and no app connectors, and its
+  sandbox mode is pinned rather than inherited, so it reviews the diff in its prompt instead of
+  hunting the repo it cannot see. An empty working directory is still what stops a PR instructing
+  its own reviewer through an `AGENTS.md`: no tool setting closes that channel.
 - **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
   object store; wire `landed` refs to a cherry-pick helper.
 
