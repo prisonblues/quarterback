@@ -99,13 +99,15 @@ GET   /sync              ?repo=&branch=&device=&path=          (registered workt
                          -> {published:[…], worktrees:[…], caller, stale, registered, advice}
 
 # reviewer-panel stats (v2.10, accounts v2.11, rounds + coverage v2.15, cost v2.19,
-#                        changed files v2.23)
+#                        changed files v2.23, provenance v2.26)
 POST  /review            (panel.py --json payload)              -> {id, recorded, accounts,
                                                                     changed_files[, dropped]}
 GET   /reviews           ?repo=&pr=&author=&since=&days=&limit=  (runs + scorecards)
 GET   /review/{id}                                              (scorecards + findings + accounts
-                                                                 + the PR's changed_files)
-GET   /review/stats      ?repo=&author=&days=&judged_only=       -> {by_model, by_agent}
+                                                                 + the PR's changed_files
+                                                                 + head_sha/unread_files/provenance)
+GET   /review/stats      ?repo=&author=&days=&judged_only=       -> {by_model, by_agent,
+                                                                     by_provenance}
 GET   /review/findings   ?repo=&pr=&limit=                       (one PR's findings as
                                                                   chains of observations,
                                                                   per round: what was new,
@@ -184,16 +186,36 @@ vs `medium`) while leaving `duration_ms` as the axis that compares one vendor wi
 of these may be null, which always means *not recorded* and never *spent nothing*; `token_runs`
 says how much of a window actually reported.
 
+**Who catches regressions, and who finds what was already there.** Since v2.26 a finding also
+records its *provenance*: did the previous fix pass **introduce** this defect, or did the previous
+round **miss** it (`missed-unread` where that round was truncated out of the file, `unknown` where
+the fix range could not be read)? Those are different competencies wanting opposite remedies —
+self-inflicted findings say make fix passes smaller, missed ones say the earlier round under-read
+and coverage is worth paying for — and a confirmed count cannot see either. `GET /review/stats`
+splits it per (reviewer, model, effort) and again per finding across the window
+(`by_provenance`), and a run now also records the **commit** it reviewed (`head_sha` — `base` is a
+branch *name*) and the files no reviewer read in full.
+
+Read `introduced` as a **floor**, not a count: it needs exact membership in the fix's added lines,
+so a defect introduced by a *deletion* has no added line to sit on, and ordinary reviewer
+line-drift misses the set by a line or two. Both land in `missed`. Null throughout is *not
+recorded* — a run before v2.26, a round 1 with nothing to attribute against, a defect an earlier
+round already raised — and is never the `unknown` bucket, which means the question was asked and
+the answer could not be placed. `provenance_runs` says how much of a window could attribute at all.
+
 ## Releases
 
 The deployed board version lags the repo until the stack is redeployed, and only the running
 service knows which it is: ask it with `GET /openapi.json` → `.info.version`, for whichever
-instance you care about. (Anything built off this branch says 2.23.0 — v2.24 is harness-side.) A number written here
+instance you care about. (Anything built off this branch says 2.26.0.) A number written here
 instead would be wrong the next time Portainer redeploys, with no diff to catch it.
-Latest release: **v2.24**, harness-side — a new finding now says whether the last fix pass caused it
-or the last round missed it, which were one number before and want opposite remedies. (**v2.22** is
-claimed by a branch not yet merged, which is why the numbering skips it.)
-Before it, **v2.23** had a run record which FILES the PR changed and not just how many lines, plus
+Latest release: **v2.26** — the provenance v2.24 computed now reaches the board and the
+leaderboard: which reviewer catches regressions in fresh code and which finds what was already
+there, plus the commit each round reviewed (schema revision 0017). (**v2.22** and **v2.25** are
+claimed by branches not yet merged, which is why the numbering skips them.)
+Before it, **v2.24**, harness-side, had a new finding say whether the last fix pass caused it or the
+last round missed it — one number before, and they want opposite remedies.
+Before that, **v2.23** had a run record which FILES the PR changed and not just how many lines, plus
 the PR's state as of that panel, so the board finally holds what collision ordering needs (schema
 revision 0016) — reading it back as a collision query ships separately, see #101.
 **v2.21** (harness-side) had each panel member run in its own empty sandbox repo
@@ -232,6 +254,11 @@ judge) are harness-side too.
 - **v2.24** — a new finding records whether the last fix pass introduced it or the last round missed
   it: two facts with opposite remedies that `new_this_round` collapsed into one, plus the commit each
   round reviewed and the files it was truncated out of. A signal, not a verdict — nothing gates on it.
+- **v2.26** — that signal reaches the board, which had been discarding all four of its fields on
+  ingest without a word: provenance per finding (the half nothing could reconstruct afterwards),
+  the commit reviewed, the unread files, the round's tally. `GET /review/stats` grows #48's axis —
+  who catches regressions against who finds what was already there — and an unrecognised bucket is
+  now named back to the sender rather than dropped in silence.
 - **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
   object store; wire `landed` refs to a cherry-pick helper.
 

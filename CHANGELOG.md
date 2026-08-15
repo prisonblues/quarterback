@@ -7,6 +7,74 @@ that number where it was, so the repo can be a version ahead of the service.
 Entries are newest first. Each one says what was broken or missing before it, because that is the
 part that isn't recoverable from the diff.
 
+## v2.26 — the provenance v2.24 measured was reaching the board and being thrown away
+
+v2.24 taught the panel to say whether a new finding was **introduced** by the last fix pass or
+**missed** by the last round. It computed that correctly, wrote it to a JSON file on one machine,
+POSTed it to the board — and the board dropped it. `ReviewIn` is declared
+`ConfigDict(populate_by_name=True)` with no `extra=`, so pydantic v2's default `extra="ignore"`
+applied to all four of the fields #89 had added: `head_sha`, `unread_files`, `provenance_counts`
+and the per-finding `provenance`. Four fields, one of them per-finding, and **nothing failed**.
+`qb record-review` exited 0, the run recorded, the response looked ordinary.
+
+That is the whole of #48 and not a detail of it. #48's own text names the payoff — "a new axis for
+the leaderboard: which reviewers find *pre-existing* defects versus which mostly catch regressions
+in fresh code" — and the leaderboard is the board's `/panel` page, reading `review_findings` and
+`GET /review/stats`. So the measurement's stated destination was precisely the half that was not
+built, and the signal was unqueryable from the moment it existed.
+
+All four now land (schema revision **0017**):
+
+- **`review_findings.provenance`** — the irreplaceable one. It is *per finding*, so unlike the
+  rest it can never be reconstructed later from anything the board keeps; every round that ran
+  while it was being dropped is simply gone.
+- **`review_runs.head_sha`** — nothing else in a run identifies a commit at all. `base` holds a
+  branch *name*, which moves, so no round could be replayed against the repo after the fact. #98
+  wants the other end of that range and #80 wants this column outright.
+- **`review_runs.unread_files`** — what that round could not read in full, which is the *next*
+  round's `missed-unread` bucket.
+- **`review_runs.provenance_counts`** — the round's own tally, stored as sent rather than derived
+  from the findings. The panel counts over what the cycle still has to clear; the rows also hold
+  the dismissed ones, so a derivation would quietly disagree with the round's statement about
+  itself — and `{}` ("the question does not arise") is a fact no count over findings can express.
+
+**#48's axis, at the grain #48 asked for it.** `GET /review/stats` gains a `provenance` split per
+(reviewer, model, effort) — of the defects this member found, how many did the previous fix pass
+write and how many had been sitting there all along — tallied onto the scorecard at ingest like
+`p1`..`p4` and `solo`, so it is a `SUM` on the page rather than a three-table join, and so a
+scorecard can never contradict the findings it summarises. Beside it, `by_provenance` gives the
+same split across the window counted once per *finding*, which is the number to read at the cap:
+how much of what this loop found did it inflict on itself. The `/panel` page shows both.
+
+**Null means *not recorded*, never "no provenance",** and this release is mostly an argument about
+that. Three states are kept apart end to end: NULL (nobody said — every pre-v2.26 run), the
+question not arising (a round 1, a run outside a cycle, a defect an earlier round already raised),
+and `unknown` — a real bucket, for a finding that *was* asked about and could not be placed. The
+scorecard counters are the one place they collapse, being NOT NULL like every sibling counter, so
+the stats endpoint publishes `provenance_runs` beside them: how many of a group's runs could
+attribute at all. Read the sums without it and a window of older runs looks like a panel that never
+once caught a regression.
+
+**And a dropped field now says so.** An unrecognised bucket normalises to null — the `pr_state`
+rule, because a value a consumer filters on must never be stored verbatim when it is not one that
+consumer knows — and the names it dropped come back in the response as `provenance_unknown`.
+Shipping a quieter version of this bug as the fix for it would have been a poor joke. It is honest
+about its reach: `qb record-review` prints only the run id today, so nothing *shows* an operator
+that line until #65's drift check reads it — which is exactly the check this gives something to
+read. This release is a live instance of #65's class and an argument for building it; it is not a
+substitute for it.
+
+**Read `introduced` as a floor.** It requires exact membership in the fix range's added lines, so a
+defect the fix pass introduced by *deleting* something — a guard, a null check, an `await` — has no
+added line to sit on, and ordinary reviewer line-drift of a line or two misses the set. Both land in
+`missed`. The bias runs one way and is documented on both sides of the wire rather than corrected,
+because changing the matching rule trades a known bias for an unknown one and nothing gates on the
+answer. #41 (review the increment) is what makes it exact.
+
+**n starts at zero, again.** `marten-tidal` established that for #48 because no banked payload
+carries a `head_sha` to diff against. This is the second, independent reason: even the rounds run
+from today forward recorded nothing durable until now. Nothing here is backfillable.
+
 ## v2.24 — a new finding says whether the last fix caused it or the last round missed it
 
 `new_this_round` is binary: did an earlier round of this cycle raise this defect. So a finding new

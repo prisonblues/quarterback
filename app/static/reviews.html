@@ -261,6 +261,34 @@ function tokenTip(r){
     <br><span class="dim">tokens compare this vendor's tiers, not one vendor with another</span>`;
 }
 
+// The buckets, in the order they are worth reading: what the last fix caused,
+// what the last round missed, what it could not have seen, what could not be
+// placed. Spelled as the panel spells them — one vocabulary from `panel.py`
+// through the payload and the columns to here.
+const PROV = ["introduced", "missed", "missed-unread", "unknown"];
+
+// #48's second axis for one reviewer. Finding a regression somebody just wrote
+// and finding a defect that has sat there for months are different competencies,
+// and the confirmed count in the row cannot tell them apart.
+//
+// Gated on `provenance_runs`, not on the counts. The columns behind them are NOT
+// NULL, so a window of runs recorded before v2.26 reports four zeros that mean
+// "never measured" — rendering those as "0 introduced" would be the page stating
+// a result nobody produced.
+function provTip(r){
+  if (!r.provenance_runs) return "";
+  const p = r.provenance || {};
+  const n = PROV.reduce((a, k) => a + (p[k] || 0), 0);
+  const of = `${r.provenance_runs} run${r.provenance_runs === 1 ? "" : "s"} where the cause could be traced`;
+  if (!n) return `<br><span class="dim">nothing of its own attributed in ${of}</span>`;
+  const rest = [
+    (p["missed-unread"] || 0) ? `${p["missed-unread"]} in a file that round could not read` : "",
+    (p.unknown || 0) ? `${p.unknown} unplaceable` : "",
+  ].filter(Boolean).join(", ");
+  return `<br>across ${of}: <b>${p.introduced || 0}</b> introduced by the last fix,
+    ${p.missed || 0} the last round missed${rest ? ` (${rest})` : ""}`;
+}
+
 function renderLeaderboard(rows, judgedOnly){
   $("lbNote").textContent = (judgedOnly
     ? "— judged runs only, so precision is a real ratio"
@@ -340,6 +368,7 @@ function renderLeaderboard(rows, judgedOnly){
       ${r.rereview_flagged ? `<br>${r.rereview_flagged} fix(es) it asked to have re-read` : ""}
       ${r.avg_duration_ms ? `<br>avg ${Math.round(r.avg_duration_ms / 1000)}s per review` : ""}
       ${r.ms_per_confirmed ? `<br>${Math.round(r.ms_per_confirmed / 1000)}s per confirmed finding` : ""}
+      ${provTip(r)}
       ${tokenTip(r)}`);
   });
 }
@@ -430,6 +459,8 @@ function findingBlock(f){
       <span class="loc">${esc(f.file || "")}${f.line ? ":" + f.line : ""}</span>
       <span>${esc(f.title)}</span>
       <span class="by">${who}${f.reviewers && f.reviewers.length > 1 ? " ⋆" : ""}</span>
+      ${f.provenance ? `<span class="chip dim" title="did the previous fix pass cause this,
+        or did the previous round miss it? a signal, not a verdict">${esc(f.provenance)}</span>` : ""}
       ${n ? `<span class="chip">${n} account${n === 1 ? "" : "s"} ▸</span>` : ""}
     </div>${accountsBlock(f)}`;
 }
@@ -614,6 +645,16 @@ function renderTiles(s){
     ? `since ${s.window.since.slice(0, 10)}`
     : (s.window.first_run ? `since ${s.window.first_run.slice(0, 10)}` : "");
   const top = s.by_model[0];
+  // How much of what this loop found did it inflict on itself? Counted once per
+  // finding rather than once per member that raised it, which is why it comes
+  // from `by_provenance` and not from summing the leaderboard.
+  //
+  // Absent entirely when nothing in the window was attributable — the tile would
+  // otherwise read "0%" over runs where the question was never asked, and that is
+  // the most flattering possible way to say "not measured".
+  const prov = s.by_provenance || {};
+  const traced = PROV.reduce((a, k) => a + (prov[k] || 0), 0);
+  const inflicted = traced ? Math.round(((prov.introduced || 0) / traced) * 100) : null;
   $("tiles").innerHTML = `
     <div class="tile"><div class="n">${s.runs}</div><div class="k">panel runs</div></div>
     <div class="tile"><div class="n">${s.prs}</div><div class="k">PRs reviewed</div></div>
@@ -621,7 +662,10 @@ function renderTiles(s){
     <div class="tile"><div class="n">${s.by_model.reduce((a, m) => a + m.confirmed, 0)}</div>
       <div class="k">confirmed findings</div></div>
     ${top ? `<div class="tile"><div class="n" style="color:${hue(top.reviewer)}">${esc(top.reviewer)}</div>
-      <div class="k">most confirmed${top.model ? " · " + esc(top.model) : ""}</div></div>` : ""}`;
+      <div class="k">most confirmed${top.model ? " · " + esc(top.model) : ""}</div></div>` : ""}
+    ${inflicted == null ? "" : `<div class="tile"><div class="n">${inflicted}%</div>
+      <div class="k">introduced by the previous fix<br>
+        <span class="dim">${prov.introduced || 0} of ${traced} traced · a floor</span></div></div>`}`;
 }
 
 async function load(){
