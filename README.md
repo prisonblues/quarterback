@@ -190,10 +190,12 @@ The deployed board version lags the repo until the stack is redeployed, and only
 service knows which it is: ask it with `GET /openapi.json` → `.info.version`, for whichever
 instance you care about. (Anything built off this branch says 2.23.0.) A number written here
 instead would be wrong the next time Portainer redeploys, with no diff to catch it.
-Latest release: **v2.23** — a run records which FILES the PR changed and not just how many lines,
+Latest release: **v2.24** (harness-side) — the codex panel seat reviews the diff it was handed
+instead of going looking for the repo, which is what was running the reviews out of their timeout.
+Before it, **v2.23** had a run record which FILES the PR changed and not just how many lines,
 plus the PR's state as of that panel, so the board finally holds what collision ordering needs
 (schema revision 0016). Reading it back as a collision query ships separately — see #101.
-Before it, **v2.21** (harness-side) had each panel member run in its own empty sandbox repo
+**v2.21** (harness-side) had each panel member run in its own empty sandbox repo
 rather than in whatever directory the panel was launched from. **v2.20** (also harness-side) had the
 worktree tooling ask who is in a directory before rewriting it, and **v2.19** added the per-reviewer
 cost columns (schema revision 0015) and was the first to move the board since v2.15; **v2.18**
@@ -226,6 +228,10 @@ judge) are harness-side too.
 - **v2.23** — a run records the PR's changed FILES and its state, not just a line count, so "which
   other PRs does this merge disturb" becomes answerable from stored data. NULL and zero are kept
   apart throughout: "nobody counted" is never "it changed nothing".
+- **v2.24** — the codex panel seat is given no shell, no web search and no app connectors, and its
+  sandbox mode is pinned rather than inherited, so it reviews the diff in its prompt instead of
+  hunting the repo it cannot see. An empty working directory is still what stops a PR instructing
+  its own reviewer through an `AGENTS.md`: no tool setting closes that channel.
 - **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
   object store; wire `landed` refs to a cherry-pick helper.
 
