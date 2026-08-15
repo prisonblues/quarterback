@@ -81,6 +81,11 @@ python3 ~/.claude/loops/panel.py --pr <pr> --post
 record the fixer then resolves. Drop `--post` only if the user explicitly asked
 not to comment.)
 
+**Run it in the background** (`run_in_background`), not as a foreground Bash
+call: a reviewer on a top-tier model at high effort can think for 20+ minutes,
+and the foreground Bash timeout caps at 10 — which kills the whole panel, not
+just the slow seat. Poll the background task instead.
+
 **Panel members** default to the repo's `.harness-rules`; pass no `--reviewers`
 unless the user named who should review ("just codex", "codex and antigravity"), then
 add `--reviewers <comma-list>` from `claude`, `codex`, `antigravity`, `sonarqube`. It

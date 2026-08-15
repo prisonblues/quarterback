@@ -75,6 +75,21 @@ from harness_rules import RepoNotFound, describe, resolve_repo  # noqa: E402
 MAX_DIFF_CHARS = 60_000
 RAW_DETAIL_CHARS = 4_000  # cap an unparsed reviewer reply kept as a fallback finding
 
+# How long a reviewer CLI may take. One constant, because two CLIs enforce it:
+# run_cli kills a wedged process at this bound, and `agy` self-aborts at its own
+# `--print-timeout` (default 5m0s), so the seat that does not read this number
+# silently reviews on a five-minute clock while the report claims thirty.
+CLI_TIMEOUT = 1800
+
+# Linux caps ONE argv string at MAX_ARG_STRLEN = 131,072 bytes, independently of
+# the much larger total ARG_MAX; cross it and execve fails with E2BIG before the
+# CLI starts. Every reviewer whose prompt travels on stdin is free of this, and
+# that is all of them but one — `agy` has no stdin path (`-p ""` is "empty
+# prompt", `-p -` reviews the literal string "-"), so its prompt is clamped to
+# fit here and the truncation is reported like any other. The margin is for the
+# rest of the argv and the environment, which share the kernel's accounting.
+ARGV_PROMPT_MAX_BYTES = 120_000
+
 # The panel's possible members. LLM reviewers are interchangeable in everything
 # except how their CLI is invoked; sonarqube is a different shape (an API, and a
 # hard gate), so it is selectable but not iterable with the others.
@@ -329,27 +344,46 @@ def stderr_gist(stderr: str, limit: int = 200) -> str:
     return (msg.group(1) if msg else pick)[:limit]
 
 
-def run_cli(args: list[str], label: str, timeout: int = 600,
-            attempts: int = 3) -> tuple[str | None, str | None]:
+def run_cli(args: list[str], label: str, timeout: int = CLI_TIMEOUT,
+            attempts: int = 3, stdin_text: str | None = None) -> tuple[str | None, str | None]:
     """Run a headless CLI, returning (stdout, error_reason); error_reason is
     None on success. Retries transient failures (non-zero exits such as rate
     limits, and OS errors) up to `attempts` times with no delay — these fail
     fast, so retrying is cheap and recovers the common flake. A full timeout is
     NOT retried (it already burned the whole budget; retrying just doubles the
-    wall-clock). The reason string is specific (timeout / exit code + stderr
+    wall-clock).
+
+    `stdin_text` is how a prompt reaches a CLI that accepts one there, which is
+    the only way to hand a reviewer a diff larger than the kernel's per-argument
+    limit (see ARGV_PROMPT_MAX_BYTES). It does NOT weaken the guard that stdin
+    is otherwise DEVNULL: subprocess writes the string and closes the pipe, so a
+    CLI that decides to prompt for more reads EOF instead of hanging the panel
+    on an inherited terminal.
+
+    The timeout is deliberately generous. It exists to stop a wedged process
+    hanging the panel forever, NOT to bound how long a reviewer may think: at
+    10 minutes codex on a top-tier model at `max` effort routinely lost its
+    seat on real diffs, which costs a whole vendor's eyes to save wall-clock we
+    weren't waiting on anyway — the reviewers run concurrently, so a slow seat
+    only extends the run when it is the slowest one. The reason string is specific (timeout / exit code + stderr
     tail / OSError) so callers can SURFACE why a step degraded instead of
     reporting a bare 'unavailable'. A request the server has REJECTED on its
     merits is not retried either: a bad model pin fails identically all three
     times, so retrying only triples the wait for a certainty."""
     last = f"{label}: no attempt made"
+    feed = {"input": stdin_text} if stdin_text is not None else {"stdin": subprocess.DEVNULL}
     for _ in range(max(1, attempts)):
         try:
             proc = subprocess.run(args, capture_output=True, text=True,
-                                  stdin=subprocess.DEVNULL, timeout=timeout)
+                                  timeout=timeout, **feed)
         except subprocess.TimeoutExpired:
             return None, f"{label}: timed out after {timeout}s"
         except OSError as e:
-            last = f"{label}: {e.__class__.__name__}"
+            # errno and strerror, not the bare class name: "OSError" sent three
+            # people looking for a crash that was "Argument list too long", and
+            # everything needed to name it was already on the exception.
+            why = " ".join(str(x) for x in (e.errno, e.strerror or e) if x)
+            last = f"{label}: OSError {why}"[:300]
             continue
         if proc.returncode != 0:
             msg = stderr_gist(proc.stderr or "")
@@ -410,7 +444,12 @@ def diff_budget(block: dict, key: str, fallback: int, notes: list[str]) -> int:
     Only what cannot be a budget at all is refused: a non-number, or <= 0 (which
     would send an empty diff and produce a confident review of nothing). Those
     fall back and SAY so — silently honouring them reviews a fragment, silently
-    dropping them leaves you believing a budget you never got."""
+    dropping them leaves you believing a budget you never got.
+
+    There is one ceiling this cannot see, and it belongs to the caller: `agy`'s
+    prompt travels in argv, so the kernel caps it however large a budget says
+    (see fit_argv_budget). That clamp is applied per reviewer, after this, and
+    reported the same way — as truncation with a reason, not as a refusal."""
     raw = block.get(key)
     if raw is None or raw == "":
         return fallback
@@ -429,6 +468,32 @@ def diff_budget(block: dict, key: str, fallback: int, notes: list[str]) -> int:
     return n
 
 
+def fit_argv_budget(render, budget: int) -> int:
+    """The largest diff budget <= `budget` whose rendered prompt still fits in one
+    argv element, for the seat whose prompt has nowhere else to go.
+
+    This is the same rule diff_budget follows and the reason it can now keep it:
+    a budget over the kernel's limit USED to be honoured right up to execve and
+    then kill the reviewer with an opaque error. Here it becomes ordinary
+    truncation with the consequence surfaced — the config still wins as far as
+    the machine allows, and the report says where the machine stopped it.
+
+    `render` renders the whole prompt from a budget, because the ceiling applies
+    to the prompt, not the diff: the template counts, and so does the difference
+    between characters and the bytes they encode to (this repo's own comments are
+    full of em dashes, each of which is three bytes and one char).
+
+    Shrinking by the byte overflow converges in one pass — a char is never fewer
+    than one byte, so dropping N chars drops at least N bytes — but the loop is
+    kept for the pathological case where the template alone is near the limit."""
+    for _ in range(8):
+        over = len(render(budget).encode()) - ARGV_PROMPT_MAX_BYTES
+        if over <= 0:
+            return budget
+        budget = max(0, budget - over)
+    return budget
+
+
 def reviewer_label(name: str, model: str, effort: str = "") -> str:
     """`codex (gpt-5.6-luna, high)` — the report says WHICH brain reviewed.
 
@@ -439,11 +504,16 @@ def reviewer_label(name: str, model: str, effort: str = "") -> str:
     return f"{name} ({spec})" if spec else f"{name} (CLI default)"
 
 
-def codex_args(model: str, effort: str, prompt: str) -> list[str]:
+def codex_args(model: str, effort: str) -> list[str]:
     """codex exec argv. Both knobs are optional and independent: effort is a
     `-c` config override rather than a flag, and applies to the CLI's default
-    model just as well as to a pinned one."""
-    args = ["codex", "exec", prompt]
+    model just as well as to a pinned one.
+
+    Takes no prompt: `codex exec` with no positional argument reads its
+    instructions from stdin, which is where the diff goes. The parameter is gone
+    rather than ignored so the argv-limit bug cannot be reintroduced by passing
+    one (see ARGV_PROMPT_MAX_BYTES)."""
+    args = ["codex", "exec"]
     if model:
         args += ["--model", model]
     if effort:
@@ -451,11 +521,30 @@ def codex_args(model: str, effort: str, prompt: str) -> list[str]:
     return args
 
 
-def antigravity_args(model: str, effort: str, prompt: str) -> list[str]:
+def antigravity_args(model: str, effort: str, prompt: str,
+                     timeout: int = CLI_TIMEOUT) -> list[str]:
     """`agy` argv — Google's Antigravity CLI, which replaced gemini-cli in this
-    seat. `-p` is its non-interactive print mode; `--mode plan` is the read-only
-    execution mode, and a reviewer has no business editing the tree it is
-    reviewing — the panel wants an opinion, not a fix.
+    seat. `-p` is its non-interactive print mode.
+
+    This is the ONE seat whose prompt travels in argv: `agy` has no way to read
+    one from anywhere else — not stdin, not a `@file`, not a `--prompt-file`.
+    So it is also the one seat that can hit the kernel's per-argument limit, and
+    the caller clamps its diff to ARGV_PROMPT_MAX_BYTES before rendering.
+
+    `--mode plan` is NOT a sandbox, despite reading like one: with permissions
+    granted, plan mode writes files. What actually keeps this reviewer off the
+    tree is that headless print mode cannot prompt for a tool permission, so any
+    tool needing one is auto-denied — and the diff is in the prompt, so it needs
+    no tool anyway. Plan mode is kept for the narrower thing it does do (biasing
+    it away from proposing edits), not as the guarantee. Anyone adding
+    `--dangerously-skip-permissions` here removes the real guard: measured, that
+    turns the reviewer into an agent that runs the test suite against the dev
+    database and reviews the checkout instead of the diff.
+
+    `--print-timeout` is passed because `agy` otherwise aborts itself at 5m0s
+    while run_cli is still patiently waiting out its own much longer bound — a
+    reviewer that reads as dead when it was only slow. It takes a Go duration,
+    hence the `s` suffix.
 
     Left on the default `--output-format text` rather than `json`: the JSON mode
     wraps the reply in {response, status, usage, ...}, which would hide the
@@ -468,7 +557,7 @@ def antigravity_args(model: str, effort: str, prompt: str) -> list[str]:
     dead reviewer rather than a quietly wrong one. Its effort scale is only
     low/medium/high (see EFFORTS) — narrower than codex's or pi's.
     """
-    args = ["agy", "--mode", "plan", "-p", prompt]
+    args = ["agy", "--mode", "plan", "--print-timeout", f"{timeout}s", "-p", prompt]
     if model:
         args += ["--model", model]
     if effort:
@@ -476,11 +565,11 @@ def antigravity_args(model: str, effort: str, prompt: str) -> list[str]:
     return args
 
 
-def pi_args(model: str, effort: str, prompt: str) -> list[str]:
+def pi_args(model: str, effort: str) -> list[str]:
     """pi argv. `-p` is its non-interactive mode; `--no-tools` is what makes it a
     REVIEWER — pi ships read/bash/edit/write, and a panel member has no business
-    editing the tree it is reviewing (the same reason agy runs in plan mode).
-    The diff is in the prompt, so it needs no tools to do the job.
+    editing the tree it is reviewing. The diff arrives on stdin, so it needs no
+    tools to do the job, and `--no-tools` is a real guarantee that it has none.
 
     `--no-session` keeps a review out of the session store: a panel run is not a
     conversation anyone resumes, and one runs per PR.
@@ -488,8 +577,11 @@ def pi_args(model: str, effort: str, prompt: str) -> list[str]:
     pi reaches many providers, so `model` here is a full `provider/id` pattern
     (`openrouter/moonshotai/kimi-k3`) rather than a bare slug, and its thinking
     level is spelled `--thinking` where codex spells it `model_reasoning_effort`.
-    Same knob, same config key (`effort`), different word on each CLI."""
-    args = ["pi", "-p", "--no-session", "--no-tools", prompt]
+    Same knob, same config key (`effort`), different word on each CLI.
+
+    Takes no prompt, for the same reason codex_args does not: `pi -p` reads it
+    from stdin."""
+    args = ["pi", "-p", "--no-session", "--no-tools"]
     if model:
         args += ["--model", model]
     if effort:
@@ -555,15 +647,21 @@ def review_llm(cmd_name: str, model: str, prompt: str,
         return [], f"{label}: unknown reasoning effort {effort!r} — {expected}", elapsed()
     if not shutil.which(CLI_BIN.get(cmd_name, cmd_name)):
         return [], f"{label}: CLI absent", elapsed()
+    # The prompt goes on stdin wherever the CLI will take it there — which is
+    # everywhere but `agy`. That is not a style choice: a diff big enough to be
+    # worth a panel is big enough to exceed the kernel's per-argument limit, and
+    # in argv that failure lands at execve, before the reviewer exists, as an
+    # error with nothing in it. On stdin there is no such ceiling.
+    stdin_text: str | None = prompt
     if cmd_name == "claude":
-        args = ["claude", "-p", prompt, "--model", model]
+        args = ["claude", "-p", "--model", model]
     elif cmd_name == "antigravity":
-        args = antigravity_args(model, effort, prompt)
+        args, stdin_text = antigravity_args(model, effort, prompt), None
     elif cmd_name == "pi":
-        args = pi_args(model, effort, prompt)
+        args = pi_args(model, effort)
     else:
-        args = codex_args(model, effort, prompt)
-    out, err = run_cli(args, label)
+        args = codex_args(model, effort)
+    out, err = run_cli(args, label, stdin_text=stdin_text)
     if err:
         err += cli_hint(cmd_name, err, model)
         return [], err, elapsed()
@@ -572,7 +670,7 @@ def review_llm(cmd_name: str, model: str, prompt: str,
         # Unparseable JSON — give the reviewer one more shot (a common flake is a
         # stray prose preamble the model omits on a retry), then, rather than drop
         # its work, keep the raw reply as a single markdown finding for the judge.
-        out2, err2 = run_cli(args, label, attempts=1)
+        out2, err2 = run_cli(args, label, attempts=1, stdin_text=stdin_text)
         if not err2 and out2:
             retried = parse_findings(cmd_name, out2)
             if retried is not None:
@@ -989,9 +1087,15 @@ def judge(groups: list[tuple[Finding, list[str]]], diff: str, model: str,
         f"[{i}] {f.severity} {f.file}:{f.line or '?'} (via {', '.join(revs)}) — "
         f"{f.title} — {f.detail}"
         for i, (f, revs) in enumerate(groups))
+    # On stdin, like the reviewers, and for a sharper reason: the judge's prompt
+    # is the only one with a component no budget covers. The findings listing
+    # grows with the panel's output, so a legal judge_max_diff_chars plus a long
+    # panel could cross the argv limit on its own — and a judge that dies takes
+    # every finding through UNADJUDICATED, which reads like a triaged review
+    # rather than like a failure.
     prompt = JUDGE_PROMPT.format(findings=listing, diff=diff[:budget])
-    args = ["claude", "-p", prompt] + (["--model", model] if model else [])
-    out, err = run_cli(args, "judge")
+    args = ["claude", "-p"] + (["--model", model] if model else [])
+    out, err = run_cli(args, "judge", stdin_text=prompt)
     if err:
         return {}, err
     parsed = extract_json_array(out)
@@ -1059,12 +1163,26 @@ def run(repo_name: str, pr_number: int, post: bool, json_out: bool = False,
     budgets = {name: diff_budget(rev.get(name, {}), "max_diff_chars", panel_budget, notes)
                for name in LLM_REVIEWERS if name in selected}
     judge_budget = diff_budget(panel, "judge_max_diff_chars", panel_budget, notes)
-    truncated_for = {n: b for n, b in budgets.items() if len(diff) > b}
-    truncated = bool(truncated_for)
 
     def prompt_for(budget: int) -> str:
         return REVIEW_PROMPT.format(n=pr_number, repo=gh_repo, base=base,
                                     diff=diff[:budget])
+
+    # `agy` is the only reviewer whose prompt must travel in argv, so it is the
+    # only one the kernel can veto. Clamp it to what execve will carry and say
+    # so — the alternative, honouring the number and dying at exec, is how a
+    # panel came to report "LLM reviewers ran: none" as a clean review.
+    if "antigravity" in budgets:
+        fitted = fit_argv_budget(prompt_for, budgets["antigravity"])
+        if fitted < budgets["antigravity"]:
+            notes.append(
+                f"`max_diff_chars`={budgets['antigravity']:,} exceeds what fits in one "
+                f"argv element ({ARGV_PROMPT_MAX_BYTES:,} bytes) — antigravity gets "
+                f"{fitted:,}. It is the one CLI with no way to read a prompt off stdin.")
+            budgets["antigravity"] = fitted
+
+    truncated_for = {n: b for n, b in budgets.items() if len(diff) > b}
+    truncated = bool(truncated_for)
 
     result = PanelResult()
     # Resolved ONCE, so the label in the report cannot drift from the model that
