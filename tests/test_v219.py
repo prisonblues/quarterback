@@ -323,7 +323,9 @@ async def test_a_measured_failure_does_not_hide_the_partial_coverage_marker(clie
     # between a re-edit and a coverage marker that hides itself again.
     page = (Path(__file__).resolve().parents[1] / "app/static/reviews.html").read_text()
     assert "r.token_runs < r.ran" not in page, "the page must compare token_runs to runs"
-    assert page.count("r.token_runs < r.runs") == 2
+    # One use: the tooltip's token sums, whose population IS `token_runs`. The
+    # per-run cell has a different one (`billable_runs`) and its own marker.
+    assert page.count("r.token_runs < r.runs") == 1
 
 
 async def test_the_average_is_over_the_runs_it_is_an_average_of(client):
@@ -363,5 +365,10 @@ async def test_the_page_marks_a_partial_cost_window_the_way_it_marks_tokens(clie
     No JS runner exists here, so this greps the file that ships."""
     page = (Path(__file__).resolve().parents[1] / "app/static/reviews.html").read_text()
     assert "r.cost_runs < r.runs" in page, "cost needs its own coverage marker"
-    # And the token marker must not be reused to annotate cost.
-    assert page.count("r.token_runs < r.runs") == 2
+    # The token sums in the tooltip are annotated over `token_runs` — that IS
+    # their population. The tokens/run CELL is not: it holds
+    # `total_tokens / billable_runs`, so its marker keys on `billable_runs`.
+    # An earlier version of this guard asserted two `token_runs` comparisons and
+    # so pinned the wrong one in place.
+    assert page.count("r.token_runs < r.runs") == 1, "only the token sums use it"
+    assert "r.billable_runs < r.runs" in page, "the per-run cell has its own population"

@@ -279,7 +279,18 @@ function renderLeaderboard(rows, judgedOnly){
     // Against `runs`, not `ran`: a member that burned tokens and then timed out
     // is measured but did not run, so it counts in `token_runs` and not in
     // `ran` — and comparing the two hid the marker on the very groups with one.
-    const partial = r.token_runs > 0 && r.token_runs < r.runs;
+    //
+    // And over `billable_runs`, because this marker gates the tokens/run CELL and
+    // that cell holds `total_tokens / billable_runs`. `billable_runs` exists
+    // precisely because it differs from `token_runs` — a run stating only a
+    // cached or reasoning figure is instrumented but contributes nothing to
+    // `total_tokens` — and the endpoint names it in the response so a client can
+    // see which population the average is over rather than assuming it matches
+    // coverage. Keying on `token_runs` was this page assuming exactly that: a
+    // group with runs=2, token_runs=2, billable_runs=1 rendered its half-group
+    // average with no marker at all. A marker has to be computed over the
+    // population of the number it annotates.
+    const partial = r.billable_runs > 0 && r.billable_runs < r.runs;
     const g = scale[r.reviewer];
     const cmp = g && g.tiers > 1 && r.tokens_per_run != null;
     return `<tr>
