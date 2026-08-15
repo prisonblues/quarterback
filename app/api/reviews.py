@@ -57,7 +57,7 @@ judge, so a panel run attributes the declaration to the member that made it
 rather than to everyone who happened to raise the same finding. The coarser
 ``rereview_by`` remains for a caller that has only that.
 
-**v2.17 — what each member COST, beside what it found.** A scorecard said what a
+**v2.18 — what each member COST, beside what it found.** A scorecard said what a
 seat found and (since v2.13) how long it took, but never what it spent, so the
 leaderboard could rank a reviewer top on confirmed findings while it was quietly
 the most expensive seat on the panel. A member now carries ``input_tokens``,
@@ -1218,7 +1218,7 @@ async def review_stats(
             # finding that survived the judge, not per finding raised.
             "ms_per_confirmed": round(total_ms / confirmed) if total_ms and confirmed else None,
 
-            # --- tokens (v2.17). Only ever compare these BETWEEN ROWS SHARING A
+            # --- tokens (v2.18). Only ever compare these BETWEEN ROWS SHARING A
             # `reviewer`: different vendors have different tokenizers and
             # different cache semantics, so a cross-vendor ranking on them is
             # noise dressed as a measurement. Within a vendor they are the

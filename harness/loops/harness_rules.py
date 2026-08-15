@@ -38,8 +38,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
+import sys
 from pathlib import Path
+from typing import Any
 
 RULES_FILENAME = ".harness-rules"
 
@@ -66,15 +69,21 @@ DEFAULTS: dict = {
         # footnoted, and the report names the model that actually ran.
         # effort: low|medium|high|xhigh|max|ultra (per-model support varies).
         "codex": {"enabled": True, "model": "", "effort": ""},
-        # Off by default, unlike claude/codex: `gemini` is a workstation-only
-        # package (it authenticates against a personal Google account, so it
-        # never reaches sisyphus), and the machines differ in which harnesses
-        # they carry. A repo that wants the third vendor asks for it, rather
-        # than every repo on every box inheriting a reviewer half of them
-        # cannot run. Enable per repo, or reach for it ad hoc with
-        # `panel.py --reviewers claude,codex,gemini`.
-        "gemini": {"enabled": False, "model": ""},
-        # Off by default for the same reason as gemini — `pi` is a workstation
+        # The third vendor, run through Google's Antigravity CLI (`agy` — the
+        # command differs from the reviewer's name; see CLI_BIN in panel.py).
+        # Off by default, unlike claude/codex: it is a workstation-only package
+        # authenticating against a personal Google account, so it never reaches
+        # a headless box, and the machines differ in which harnesses they carry.
+        # A repo that wants the third vendor asks for it, rather than every repo
+        # on every box inheriting a reviewer half of them cannot run. Enable per
+        # repo, or ad hoc with `panel.py --reviewers claude,codex,antigravity`.
+        # `effort` is accepted (low|medium|high, narrower than codex's or pi's)
+        # but left unset here, because agy bakes the reasoning level into the
+        # model slug too — gemini-3.7-flash-high/-medium/-low are three separate
+        # models. Pin it in the slug OR in `effort`, not both; two ways to say
+        # the same thing is how they come to disagree.
+        "antigravity": {"enabled": False, "model": "", "effort": ""},
+        # Off by default for the same reason as antigravity — `pi` is a workstation
         # package, not on every box. It is the widest-reach member when enabled:
         # it fronts many providers, so its `model` is a full provider/id pattern
         # (`openrouter/moonshotai/kimi-k3`), not a bare slug, and that is how the
@@ -99,6 +108,11 @@ DEFAULTS: dict = {
         # `judge_max_diff_chars` (both inherit this when unset). A cut diff is
         # reported as truncation, naming WHICH reviewers were cut and at what.
         "max_diff_chars": None,
+        # Listed rather than left implicit because DEFAULTS is now also the set
+        # of names this block ACCEPTS (see warn_unknown_keys): a documented key
+        # missing from here would be warned about and dropped as a typo. `None`
+        # and absent mean the same thing to diff_budget — inherit max_diff_chars.
+        "judge_max_diff_chars": None,
     },
     "loops": {
         "dependabot_lander": False,
@@ -122,6 +136,23 @@ DEFAULTS: dict = {
 # Blocks merged one level deep rather than replaced wholesale, so a repo can set
 # `reviewers.sonarqube` without having to restate claude and codex.
 _DEEP_BLOCKS = ("reviewers", "review_panel", "loops", "epic")
+
+# The documentation convention every rules file in the fleet leans on: a key
+# whose name starts with "_" is prose for whoever reads the file next, not a
+# setting. JSON has no comments, and these files exist to be argued with.
+COMMENT_PREFIX = "_"
+
+# Names that MOVED rather than never existing. A rules file shared across the
+# fleet is far likelier to carry a seat's old name than a typo, and "no reviewer
+# of that name exists" is a puzzle where "renamed to 'antigravity'" is an answer.
+_RENAMED: dict[str, dict[str, str]] = {"reviewers": {"gemini": "antigravity"}}
+
+# One warning per (rules file, block, name) per process. resolve_repo is called
+# by panel.py, epic.py and lander.py — epic per run, and it also shells out to
+# panel.py, which resolves again in its own process — so an undeduped warning
+# prints several times per epic run and trains the reader to skip the one
+# message that is supposed to be loud. Rare is what keeps it loud.
+_warned: set[tuple[str, str, str]] = set()
 
 
 class RepoNotFound(Exception):
@@ -210,6 +241,140 @@ def _read_rules(root: Path, default_branch: str, from_default_branch: bool) -> t
         raise SystemExit(f"{p} is not valid JSON: {e}")
 
 
+def strip_comments(obj: Any) -> Any:
+    """Drop `_`-prefixed keys, at every depth. A comment is not configuration.
+
+    Left in, a `"_": "why this seat is on"` inside a reviewer block arrives in
+    `cfg["reviewers"]` as a bare STRING alongside the dicts, so the first caller
+    that writes the obvious `for name, r in rev.items(): r.get("enabled")` dies
+    with an AttributeError — on a rules file whose only sin was explaining
+    itself. Stripped once, here, rather than guarded at every read site, because
+    the read sites are the part that keeps getting written by someone who has
+    never seen this file.
+
+    The depth-unlimited rule carries one constraint on future config shapes: it
+    is right only while every key in this config is a FIXED name. A block that
+    ever maps user-supplied keys — env var names (`_PRIVATE_TOKEN`), per-path
+    settings, a header map — would have its data silently eaten here, because at
+    that point a leading underscore is data rather than prose. Such a block has
+    to opt out (strip its parent, not its contents) rather than inherit this.
+    """
+    if isinstance(obj, dict):
+        return {k: strip_comments(v) for k, v in obj.items()
+                if not k.startswith(COMMENT_PREFIX)}
+    if isinstance(obj, list):
+        return [strip_comments(v) for v in obj]
+    return obj
+
+
+# The label unknown_keys reports TOP-LEVEL names under. Empty on purpose: it
+# cannot collide with a block name, and the drop in resolve_repo addresses a
+# nested block by splitting its label on ".".
+TOP_LEVEL = ""
+
+# Settable at the top level but absent from DEFAULTS, so a sweep validating
+# against DEFAULTS alone would read them as typos: `name` overrides the
+# directory name, `executor_pr_base` is documented in the loops README.
+_EXTRA_TOP_KEYS = {"name", "executor_pr_base"}
+
+# Fields EVERY reviewer block takes on top of the ones its DEFAULTS entry names:
+# the per-reviewer half of review_panel.max_diff_chars.
+_SHARED_REVIEWER_FIELDS = {"max_diff_chars"}
+
+# …and the ones only one reviewer takes. sonarqube's connection details are
+# documented in the loops README and deliberately absent from DEFAULTS, because
+# there is no sensible default host, organization or project key and a blank one
+# merged into every repo's config would read as configured.
+_EXTRA_REVIEWER_FIELDS: dict[str, set[str]] = {
+    "sonarqube": {"host", "host_env", "organization", "project_key",
+                  "token_env", "token_op_ref", "fallback_branch"},
+}
+
+
+def _validated(rules: dict) -> list[tuple[str, dict, set[str]]]:
+    """Every mapping in a rules file whose key set is fully known, as
+    (label, what the file said, the names that mapping may contain).
+
+    One definition, read by all three of: which names are unknown, which names
+    the warning lists as the known ones, and where resolve_repo drops them from.
+    """
+    out = [(TOP_LEVEL, rules, set(DEFAULTS) | _EXTRA_TOP_KEYS)]
+    for block in _DEEP_BLOCKS:
+        over, base = rules.get(block), DEFAULTS.get(block, {})
+        if not isinstance(over, dict) or not isinstance(base, dict):
+            continue
+        out.append((block, over, set(base)))
+        if block != "reviewers":
+            continue
+        # Reviewer FIELDS are one level deeper again, and the failure there is
+        # the quietest of the lot: `reviewers.pi.enabld` leaves a seat off with
+        # nothing on stderr. Only seats DEFAULTS knows are descended into — an
+        # unknown seat is already reported as a whole.
+        for name, fields in base.items():
+            sub = over.get(name)
+            if isinstance(sub, dict) and isinstance(fields, dict):
+                out.append((f"{block}.{name}",
+                            sub, set(fields) | _SHARED_REVIEWER_FIELDS
+                            | _EXTRA_REVIEWER_FIELDS.get(name, set())))
+    return out
+
+
+def unknown_keys(rules: dict) -> dict[str, list[str]]:
+    """Names in a rules file that nothing will ever read, per block.
+
+    The merge below is a blind dict update, so `reviewers.antigravty` is not an
+    error — it just adds a block no reviewer looks at, and the panel quietly
+    runs one vendor short with nothing in the report saying so. That is the exact
+    failure this harness refuses to have anywhere else (`--reviewers antigravty`
+    hard-exits before a diff is even fetched), and it is worse committed to a
+    file, where it survives every run until someone counts the reviewers.
+
+    Not reviewer-specific, which is why this sweeps every mapping in the file:
+    the same silence hides `loops.issue_executer`, `epic.auto_finsh` and
+    `review_panel.judge_modl`, and for `loops.*` the default the real setting
+    falls back to is OFF — so a typo quietly disables an unattended loop.
+
+    The top level is swept against an explicit allowlist rather than skipped,
+    because that is where `auto_merge`, `enabled` and `headless_permission_mode`
+    live: a mistyped `auto_merg` merges in inert while the real switch falls back
+    to its default, on the block that decides whether PRs get merged unattended.
+    """
+    out: dict[str, list[str]] = {}
+    for label, over, allowed in _validated(rules):
+        names = sorted(n for n in over if n not in allowed)
+        if names:
+            out[label] = names
+    return out
+
+
+def warn_unknown_keys(rules: dict, provenance: str) -> dict[str, list[str]]:
+    """Shout about them, once per name per process. Returns them by block, and
+    the caller DROPS them — the warning says 'ignored', so they have to be.
+
+    Non-fatal on purpose. A rules file may legitimately name a setting that only
+    a NEWER harness knows about — shared across a fleet of boxes that upgrade at
+    different times — and hard-failing there would turn every rules file into a
+    version pin on every machine that reads it.
+    """
+    unknown = unknown_keys(rules)
+    known = {label: allowed for label, _over, allowed in _validated(rules)}
+    for block, names in unknown.items():
+        fresh = [n for n in names if (provenance, block, n) not in _warned]
+        _warned.update((provenance, block, n) for n in names)
+        if not fresh:
+            continue
+        renamed = _RENAMED.get(block, {})
+        named = ", ".join(f"{n!r} (renamed to {renamed[n]!r})" if n in renamed
+                          else repr(n) for n in fresh)
+        noun = ("reviewer" if block == "reviewers"
+                else "top-level setting" if block == TOP_LEVEL
+                else f"`{block}` setting")
+        print(f"{RULES_FILENAME} ({provenance}): unknown {noun} {named} — "
+              f"ignored; nothing reads that name. "
+              f"Known: {', '.join(sorted(known[block]))}", file=sys.stderr)
+    return unknown
+
+
 def resolve_repo(spec: str | None, *, from_default_branch: bool | None = None) -> dict:
     """Full config for a repo: built-in defaults, overlaid with its
     `.harness-rules`, plus the plumbing (path/github/default_branch) detected
@@ -224,6 +389,16 @@ def resolve_repo(spec: str | None, *, from_default_branch: bool | None = None) -
     root = find_repo(spec)
     default_branch = detect_default_branch(root)
     rules, provenance = _read_rules(root, default_branch, from_default_branch)
+    rules = strip_comments(rules)
+    # Warned about AND removed. A name only warned about survives the merge into
+    # cfg["reviewers"], which makes the word "ignored" false and leaves every
+    # caller iterating the resolved mapping looking at a phantom seat.
+    for block, names in warn_unknown_keys(rules, provenance).items():
+        target = rules
+        for part in (block.split(".") if block else []):
+            target = target[part]
+        for n in names:
+            target.pop(n, None)
 
     cfg = {**DEFAULTS, **rules}
     for block in _DEEP_BLOCKS:
@@ -258,6 +433,103 @@ def describe(cfg: dict) -> str:
     return (f"[{cfg['name']}] {cfg['github']} @ {cfg['default_branch']} — "
             f"rules: {cfg['_rules_from']}"
             + ("  (unattended)" if unattended() else ""))
+
+
+# ------------------------------------------------- shared CLI-failure plumbing
+# Every loop here drives headless vendor CLIs and has to explain, in one line,
+# why one of them came back useless. That reasoning is generic — it is about how
+# CLIs fail, not about panels or epics — so it lives with the other shared
+# plumbing rather than in whichever script needed it first. epic.py used to
+# reach into panel.py for it, which made all of panel's imports load-bearing for
+# a driver that deliberately shells out to panel.py instead of importing it.
+
+# The words a CLI uses when its OWN sandbox refuses a tool the run needed, and
+# when a SERVER refuses the request. Both are settled causes — no retry changes
+# them — and both name a remedy, which is why stderr_gist ranks a line carrying
+# one above a generic `error` line. Defined here rather than in panel.py because
+# panel's is_permission_denied/is_rejection decide the same question about the
+# whole stream, and the ranking and the retry decision must not drift apart.
+DENIAL_MARKERS = ("auto-denied", "auto denied", "cannot prompt for")
+REJECTION_MARKERS = ("invalid_request_error", "requires a newer version")
+
+
+def names_settled_cause(line: str) -> bool:
+    """Does this ONE line name a cause no further attempt can change?"""
+    low = line.lower()
+    if "permission" in low and any(d in low for d in DENIAL_MARKERS):
+        return True
+    return (any(m in low for m in REJECTION_MARKERS)
+            or '"status":400' in low.replace(" ", ""))
+
+
+def stderr_gist(stderr: str, limit: int = 200) -> str:
+    """The most INFORMATIVE stderr line, not blindly the last one.
+
+    A CLI's real complaint is routinely followed by teardown noise, and codex is
+    the worst case: a client older than its own models cache logs a decode error
+    ("unknown variant `max`") on every single run, plus websocket teardown lines
+    — so the naive tail reported that housekeeping and buried the sentence that
+    actually explains the failure. Where the line carries a JSON error envelope
+    we lift its `message`, which is how a pinned-model rejection reads as
+    "The 'gpt-5.6-luna' model requires a newer version of Codex" rather than 200
+    characters of serialised envelope.
+
+    A line naming a SETTLED cause outranks a generic `error` line, because the
+    noise filter below can only drop the four housekeeping strings it knows: on a
+    blank run whose stderr carries a warm-up error and then the permission
+    auto-denial, the denial is what carries the remedy, and taking the last
+    `error` line would quote the warm-up and hide it."""
+    lines = [ln.strip() for ln in (stderr or "").splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    noise = ("failed to load models cache", "failed to refresh available models",
+             "worker quit with fatal", "failed to connect to websocket")
+    signal = [ln for ln in lines if not any(n in ln for n in noise)] or lines
+    settled = [ln for ln in signal if names_settled_cause(ln)]
+    errors = [ln for ln in signal if "error" in ln.lower()]
+    pick = (settled or errors or signal)[-1]
+    msg = re.search(r'"message"\s*:\s*"((?:[^"\\]|\\.){4,400})"', pick)
+    return (msg.group(1) if msg else pick)[:limit]
+
+
+def cli_outcome(proc: subprocess.CompletedProcess) -> str:
+    """The shape of this run's failure, or an empty string if it produced
+    something usable.
+
+    The one definition of "this CLI came back with nothing": a non-zero exit, OR
+    a zero exit with empty/whitespace-only stdout. The second half is the whole
+    point — headless CLIs exit 0 while producing nothing, and "reviewed, found
+    nothing" and "produced nothing" are opposite claims that a bare `""` cannot
+    tell apart.
+
+    It doubles as the gate on reading stderr, which is why both live here rather
+    than being re-derived per driver: stderr is worth reading exactly when the
+    run has nothing of its own to explain itself with. A CLI that delivered its
+    answer AND logged warm-up chatter succeeded, and reporting that chatter is
+    the mirror of the bug.
+    """
+    if proc.returncode:
+        return f"exited {proc.returncode}"
+    if not (proc.stdout or "").strip():
+        return "exited 0 but produced no output"
+    return ""
+
+
+def cli_failure_gist(proc: subprocess.CompletedProcess, about_the_reply: str = "",
+                     limit: int = 200) -> str:
+    """Why a headless CLI run is unusable, in one clause.
+
+    The gate is the whole point, and porting this without it is how you get a
+    confident wrong cause. A CLI that REPLIED, at exit 0, and also logged warm-up
+    chatter has not failed at running; blaming "loaded 3 plugins" for a reply
+    that simply was not JSON puts a fabricated cause on the only line an operator
+    gets for a silently skipped step. In that case the reply itself is the story,
+    so `about_the_reply` is used instead.
+    """
+    outcome = cli_outcome(proc)
+    if not outcome:
+        return about_the_reply
+    return stderr_gist(proc.stderr or "", limit=limit) or outcome
 
 
 def read_dotenv(root: Path | str) -> dict[str, str]:

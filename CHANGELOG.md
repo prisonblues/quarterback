@@ -7,7 +7,7 @@ that number where it was, so the repo can be a version ahead of the service.
 Entries are newest first. Each one says what was broken or missing before it, because that is the
 part that isn't recoverable from the diff.
 
-## v2.17 — what each reviewer cost, not just what it found
+## v2.18 — what each reviewer cost, not just what it found
 
 The leaderboard could rank a panel member top on confirmed findings while it was quietly the most
 expensive seat on the panel. v2.13 had wired wall-clock, which is the only cost axis comparable
@@ -49,7 +49,63 @@ that it stays true later. Every column is nullable and a null always means *not 
 complete one. The page presents tokens as a within-vendor tier comparison, with the comparison bar
 drawn only against the same vendor's other tiers, and keeps duration as the cross-vendor axis.
 
-Schema revision **0015**, chained after v2.15's 0014.
+Schema revision **0015**, chained after v2.15's 0014. This one does move the board, so the served
+version goes to 2.18 — v2.16 and v2.17 were both harness-side and left it at v2.15.
+
+## v2.17 — a reviewer that produced nothing has failed, and says why
+
+`run_cli` read a CLI's stderr only when it exited non-zero, and treated every zero exit as a
+successful run. A headless CLI that exits 0 having printed nothing was therefore recorded as a
+reviewer that ran and found nothing — the opposite claim. Observed against `agy` 1.1.12 on a real
+PR diff: exit 0, `status: SUCCESS`, `response: ""`, because a tool needed a permission headless
+mode cannot prompt for and it was auto-denied. `agy` said exactly that on stderr and named both
+remedies, and the run that had a diagnosis was the one run whose stderr nothing read.
+
+The cost isn't one lost review. The member still appears in the report as having run, `⋆consensus`
+weakens with no indication why, and the board's reviewer leaderboard is fed a false zero — the one
+datum a reviewer comparison has to be able to trust. It gets worse, not better, as reviewers are
+given broader tool permissions, since a mis-scoped permission rule is precisely what produces this
+state.
+
+So a zero exit with empty or whitespace-only stdout is now a failure, its reason quoting the CLI's
+own sentence, and callers may rely on a non-`None` stdout having content. Stderr is read on a zero
+exit **only** when stdout is empty: a CLI that delivered its findings and also logged warm-up noise
+succeeded, and reporting that noise would be the mirror of the bug. A blank reply is retried,
+because unlike a refused request it isn't self-evidently deterministic — unless its stderr names a
+settled cause, of which there are now two, kept distinct because they are fixed in different files:
+a request the server refused (a rotted model pin — `.harness-rules`) and a tool the CLI's own
+sandbox auto-denied (`permissions.allow` in its settings.json). That test now short-circuits a
+non-zero exit as well, where only the server refusal used to.
+
+The judge inherits the fix: an empty verdict reports "produced no output" instead of blaming the
+shape of a reply it never made. `epic.py`'s triage had the same bug in another seat — exit 0 with
+no verdict reported a bare `untriaged (no verdict)` and dropped the stderr explaining it, having
+never looked at the exit code either — and untriaged sub-issues are skipped on `--execute`, so that
+one line is the operator's only account of why one was passed over.
+
+The neighbouring case is deliberately *not* a skip: output that is neither empty nor a findings
+array — an agent narrating a wait, prose where JSON was asked for — is still kept as one raw
+finding, because "no parseable array" would also throw away a reviewer that answered in prose
+because it had something to say. It is flagged `unstructured`, which the coverage veto states as
+"returned no structured reply — its coverage is unknown", so such a round cannot be read as
+evidence of a quiet PR.
+
+Also here, from working on the above: this repo gets its own `.harness-rules`, with the three seats
+whose slugs are versioned build names pinned and verified by running them, and Claude left on the
+floating `opus` alias precisely because an alias cannot rot — the distinction is the decision, not a
+detail. `_`-prefixed keys are stripped as comments at every depth before anything reads the config,
+and a name nothing recognises — a top-level setting, a setting in any of the four deep blocks, a
+reviewer, or a field inside a reviewer — is warned about on stderr and dropped, rather than silently
+producing a panel one vendor short, a loop switched off by a typo, or an `auto_merg` that leaves the
+auto-merge switch on its default. A reviewer whose CLI this box does not carry no longer vetoes a confident
+stop either: it is absent every round, so it says nothing about the round. Absence is recorded on the
+reviewer's run rather than read back out of its skip line, and it is exempted only above a floor —
+a box carrying none of the reviewer CLIs cannot record a confident stop, because nobody read the diff.
+`harness_rules.DEFAULTS` also learns the `antigravity` seat's real name — it still said `gemini`,
+which `panel.py` has not answered to since the seat moved to Google's Antigravity CLI, and the
+warning names the rename rather than leaving a fleet rules file to infer it.
+
+No board change: the API and the served version stay at v2.15.
 
 ## v2.16 — no diff budget by default
 
