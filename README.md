@@ -188,7 +188,8 @@ service knows which it is: ask it with `GET /openapi.json` → `.info.version`, 
 instance you care about. (Anything built off this branch says 2.19.0 — v2.20 is harness-side.) A number written here
 instead would be wrong the next time Portainer redeploys, with no diff to catch it.
 Latest release: **v2.25**, harness-side — a panel round past the first reviews the fix commit rather
-than re-reading the whole PR, with the rest of the PR behind it as context. Before it, **v2.21**
+than re-reading the whole PR, with the PR as the last round saw it behind that as context. (v2.22 to
+v2.24 are held by PRs #87, #88 and #89, still open; this one landed first.) Before them, **v2.21**
 had each panel member run in its own empty sandbox repo
 rather than in whatever directory the panel was launched from, and a panel that lost a seat says so.
 Before that, **v2.20** (also harness-side) had the worktree
@@ -198,6 +199,9 @@ settles a reply carrying several JSON-shaped values by agreement rather than by 
 a reviewer that produced nothing a failure that says why, and **v2.16** stopped the panel capping
 how much diff a reviewer is given. v2.13 (shipping the harness) and v2.14 (merging findings in the
 judge) are harness-side too.
+
+Oldest first, ending with what is next (the prose above and [CHANGELOG.md](CHANGELOG.md) both run
+the other way):
 
 - **v1–v2.1** — the board, then presence leases + session handoff, then dev context.
 - **v2.2–v2.5** — the session registry: sessions became listable, named, resumable, and the
@@ -221,10 +225,11 @@ judge) are harness-side too.
   panel was launched from and not in the repo under review; and a panel that lost a seat says so
   above its findings.
 - **v2.25** — a panel round past the first reviews the increment since the last round's head, not
-  the whole growing PR: the fix commit first, then the PR's other changes to the files it touches,
-  then the rest, with a budget spent in that order so context is what gets dropped. Falls back to
-  the whole PR — and says why — when there is no anchor, when nothing was pushed, or when a
-  base-branch merge makes the range bigger than the PR itself.
+  the whole growing PR: the fix commit first, then the files it touched as they stood before it,
+  then the rest of the PR, with a budget spent in that order so context is what gets dropped. Falls
+  back to the whole PR — and says why — when there is no anchor, when nothing was pushed, when a
+  base-branch merge makes the range bigger than the PR itself, or when GitHub's compare response
+  came back truncated. (v2.22–v2.24 are open PRs, hence the jump.)
 - **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
   object store; wire `landed` refs to a cherry-pick helper.
 

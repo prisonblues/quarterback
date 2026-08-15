@@ -9,6 +9,9 @@ part that isn't recoverable from the diff.
 
 ## v2.25 — a later round reads the fix commit, not the whole PR again
 
+(v2.22, v2.23 and v2.24 have no entry here because their numbers are held by PRs #87, #88 and #89,
+still open. This one landed first; the gap closes when they do.)
+
 A panel/fix cycle exists because nobody reads the fixer's commit (v2.15). Round 2 was then handed
 the entire PR — the fix plus everything rounds before it had already read, ruled on and confirmed —
 and paid for all of it in budget, in wall-clock and in the reviewer's attention, every round.
@@ -21,15 +24,22 @@ that round were overwhelmingly in the last commit, and the reviewers re-read 3,3
 them, losing the tail of the diff on the way.
 
 So a round past the first reviews the **increment** — what changed since the head its baseline
-reviewed — with the rest of the PR behind it as context. Three tiers, and the order is the design:
-the increment, then the PR's other changes to the files the increment touches, then everything else.
-A budget is spent in that order, so what gets dropped is context and never the thing under review.
-That inverts the degradation: the target stays about the size of one fix commit however large the PR
-grows.
+reviewed — with the PR as it stood at that head behind it as context. Three tiers, and the order is
+the design: the increment, then those same files as they were *before* the increment changed them,
+then the rest of the PR. A budget is spent in that order, so what gets dropped is context and never
+the thing under review. That inverts the degradation: the target stays about the size of one fix
+commit however large the PR grows.
+
+The context is fetched as its own `base...anchor` comparison rather than sliced out of the current
+PR diff, and that is not a detail. The fix commit is *part of* the PR, so a near tier cut from the
+PR's current diff for those files contains it — the reviewer would get the target twice, the second
+copy under a header saying an earlier round had already dealt with that code, which is precisely
+what both briefs tell it not to re-report. The header can only be true of material that predates the
+fix.
 
 `--scope pr` keeps the old behaviour, `review_panel.round_scope` sets it per repo, and round 1 is
 always the whole PR. The anchor comes from the baseline payload's new `head_sha`; `--since` overrides
-it. Every fall back to whole-PR scope is written into `config_notes` — a round that says it reviewed
+it. Every fallback to whole-PR scope is written into `config_notes` — a round that says it reviewed
 the increment and in fact re-read the PR would be wrong about the one measurement this exists to
 produce, and invisible in the numbers, because a large `diff_chars` is what those always were.
 
@@ -47,12 +57,30 @@ for. And a size guard falls back to whole-PR scope whenever the increment is sti
 two, because a file filter cannot remove main's changes to a file the PR *also* touches. A round must
 never cost more than it did before scope existed.
 
-One cost is real and is stated rather than hidden: the near tier is the PR's own changes to the files
-the fix touched, so when a fix touches most of a small PR there is little left to leave out and the
-material sent is the PR plus the increment. The reviewer's attention narrows; the token bill does
-not. That is where the seam lives — the defect class this cycle exists to catch is a fix that is
-correct on its own terms and wrong where it meets what was already there — and a note says so on any
-run where it happens.
+The range is then checked against GitHub's own account of it, because three things a compare response
+can be are invisible in the diff it returns. A **truncated** one is a 200 with files missing: smaller
+than the PR, so it clears every guard and becomes the target — half a fix commit reviewed as though
+it were all of it, which is the one failure `truncated` was built for and the one place it cannot
+see. That falls back to the whole PR. A **rebased or force-pushed** range is not a delta from the
+anchor at all (`a...b` is measured from the merge base), so anything the fixer reverted between the
+two heads is in neither tier; that is reviewed anyway and reported. So is a **merge commit** in the
+range: files the PR does not touch are dropped from the target, but main's changes to files it does
+touch cannot be, and a reviewer reads them as the fixer's work.
+
+**Be clear about what shrinks.** The review TARGET shrinks, always, and that is what the change is
+for: the reviewer's attention lands on the fix commit and `diff_chars` measures it. The BILL is a
+separate question. A round still sends its target plus its context, and the context is most of the
+PR, so the total material is in the same range as a whole-PR round — it is smaller than it would be
+with the near tier cut from the current diff, which sent the fix twice, but it is not a saving to
+plan around. Where a fix touches the files that carry most of the PR there is barely any of it left
+to leave out, and a note says so with both numbers on any run where that happens. The reviewer's
+attention narrows; the token bill mostly does not. That is where the seam lives — the defect class
+this cycle exists to catch is a fix that is correct on its own terms and wrong where it meets what
+was already there — and paying for the context is how a reviewer can see it.
+
+The saving that is unambiguous is the one on the far end of a *budget*: with a cap set, the target is
+bought first and whole, so the thing a tight `max_diff_chars` drops is context rather than the tail of
+the fix commit. That is what stopped PR #34's later rounds losing 600 lines of the file under review.
 
 The judge sees exactly what the panel saw, briefed to rule rather than to review: an adjudicator adds
 nothing if it rules "not in the diff" while holding a different diff, and it would do so with the

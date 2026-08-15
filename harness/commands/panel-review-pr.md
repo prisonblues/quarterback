@@ -235,17 +235,24 @@ round 1, missed in round 2 and raised again in round 3 counts as new.
 
 **Round 2+ reviews the fix commit, not the whole PR again** (v2.25), and it gets
 there off the baseline you just passed — `head_sha` in that payload is the anchor,
-so this needs no new flag from you. Two consequences worth knowing when you read
-the result:
+so this needs no new flag from you. Behind the fix commit the reviewers get the PR
+**as it stood at that anchor**, which is what the earlier rounds actually read.
+Three consequences worth knowing when you read the result:
 
 - **`diff_chars` is the increment, not the PR.** It drops sharply at round 2 and
   that is the feature working, not the PR shrinking. `scope` in the payload says
-  which it is; `context_chars` is what was sent alongside.
+  which it is; `context_chars` is the context prepared alongside it.
+- **The target shrinks; the bill mostly does not.** A round still sends its target
+  plus its context, so do not read a small `diff_chars` as a cheap round. What the
+  scoping buys is where the reviewer's attention goes, and — when a budget is set —
+  which end of the material a cut lands on.
 - **Check `config_notes` before believing the round was scoped.** Whenever the
-  anchor is missing, nothing was pushed between the rounds, or a base-branch merge
-  made the range bigger than the PR itself, the panel falls back to reviewing the
-  whole PR and says so there. `scope: "pr"` on a round 2 is that, and it means the
-  round cost what it always used to.
+  anchor is missing, nothing was pushed between the rounds, a fetch failed, GitHub
+  returned a truncated comparison, or a base-branch merge made the range bigger
+  than the PR itself, the panel falls back to reviewing the whole PR and says so
+  there. `scope: "pr"` on a round 2 is that, and it means the round cost what it
+  always used to. The same list carries the caveats on a round that WAS scoped: a
+  rebase between the rounds, or a merge commit inside the range.
 
 Read `round_stop` from the JSON (`jq .round_stop`). It is mechanical and it is
 the decision — do not substitute your own judgement, and do not ask a reviewer

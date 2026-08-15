@@ -1430,6 +1430,35 @@ def diff_budget(block: dict, key: str, fallback: int | None,
     return n
 
 
+def resolve_round_scope(asked: str, panel: dict, notes: list[str]) -> str:
+    """What a round should review: the CLI's answer if it gave one, else the
+    repo's ``review_panel.round_scope``, else the default.
+
+    The config value is checked here because nothing else checks it. ``--scope``
+    goes through argparse's ``choices``, but a repo config is hand-written YAML,
+    and :meth:`ReviewScope.decide` treats every string that is not exactly
+    ``increment`` as ``pr`` — silently, since the fallback branch appends no note.
+    So ``round_scope: incremental`` produced a round 2 that re-read the whole PR,
+    reported ``scope: "pr"``, and said nothing about why, in a feature whose
+    stated contract is that every fallback to whole-PR scope is written down.
+
+    Unset (missing, null or "") is not a mistake and is silent, the same reading
+    :func:`diff_budget` gives an absent budget."""
+    if asked != "auto":
+        return asked
+    want = panel.get("round_scope")
+    if want is None or want == "":
+        return DEFAULT_ROUND_SCOPE
+    if not isinstance(want, str) or want not in ROUND_SCOPES:
+        notes.append(f"`round_scope`={want!r} is not one of "
+                     f"{', '.join(ROUND_SCOPES)} — using {DEFAULT_ROUND_SCOPE}")
+        return DEFAULT_ROUND_SCOPE
+    # `auto` in the config means the same as no config at all: the CLI's `auto` is
+    # already spent by the time it is read, so there is nothing left for it to
+    # defer to.
+    return DEFAULT_ROUND_SCOPE if want == "auto" else want
+
+
 def fit_argv_budget(render, budget: int) -> int:
     """The largest diff budget <= `budget` whose rendered prompt still fits in one
     argv element, for the seat whose prompt has nowhere else to go.
@@ -2164,6 +2193,33 @@ def _ssl_context() -> ssl.SSLContext:
     return ssl.create_default_context()  # last resort: platform default
 
 
+def _diff_header_path(line: str) -> str | None:
+    """The b-side path out of a ``diff --git a/X b/Y`` header, or None when the
+    header will not parse.
+
+    Splitting on the first ``" b/"`` — which both readers of this header used to
+    do — is wrong for a path that CONTAINS " b/": ``a/x b/y.txt b/x b/y.txt``
+    splits at the a-side's own " b/" and keys the file as ``y.txt b/x b/y.txt``'s
+    suffix instead of ``x b/y.txt``. The mis-keyed file then matches no increment
+    file, drops out of the near tier into the far one, and becomes the first thing
+    a tight budget cuts.
+
+    Git writes the same path on both sides for everything except a rename, and
+    that symmetry pins the split without having to guess where the separator is:
+    only one division of ``a/P b/P`` has equal halves. A rename (or a path git
+    chose to quote) falls back to the first ``" b/"``, which is what this always
+    did — no worse than before, and now only for the header shapes the symmetry
+    test cannot settle."""
+    rest = line[len("diff --git "):].strip()
+    if rest.startswith("a/"):
+        # len("a/P b/P") == 2 + n + 3 + n, so n is fixed by the header's length.
+        n = (len(rest) - len("a/") - len(" b/")) // 2
+        if n > 0 and rest == f"a/{rest[2:2 + n]} b/{rest[2:2 + n]}":
+            return rest[2:2 + n]
+    head, sep, tail = rest.partition(" b/")
+    return tail.strip() if sep and head.startswith("a/") else None
+
+
 def _diff_added_lines(diff: str) -> dict[str, set[int]]:
     """Map each changed file (repo-relative, the `b/` side) to the set of line
     numbers it ADDS on the new-file side — the code this PR actually wrote. Used
@@ -2174,8 +2230,7 @@ def _diff_added_lines(diff: str) -> dict[str, set[int]]:
     newln = 0
     for line in diff.splitlines():
         if line.startswith("diff --git "):
-            parts = line.split(" b/", 1)
-            cur = parts[1].strip() if len(parts) == 2 else None
+            cur = _diff_header_path(line)
         elif cur is None or line.startswith(("+++", "---", "\\")):
             continue
         elif line.startswith("@@"):
@@ -2191,9 +2246,15 @@ def _diff_added_lines(diff: str) -> dict[str, set[int]]:
     return out
 
 
+#: The key :func:`_diff_by_file` files anything before the first ``diff --git``
+#: header under. Empty, so it can never collide with a path, and falsy, so the
+#: callers that count FILES can skip it in one word.
+DIFF_PREAMBLE = ""
+
+
 def _diff_by_file(diff: str) -> dict[str, str]:
-    """Split a unified diff into one text chunk per file, keyed the same way
-    :func:`_diff_added_lines` keys it (the ``b/`` side).
+    """Split a unified diff into one text chunk per file, keyed the way
+    :func:`_diff_header_path` keys it (the ``b/`` side).
 
     Used to sort the PR's diff into the files an increment touched and the files
     it did not, so a round reviewing the fix commit can be handed the rest of
@@ -2202,28 +2263,27 @@ def _diff_by_file(diff: str) -> dict[str, str]:
     to catch (#24's motivating bug was a mirror added in one file meeting an early
     ``return`` in another), and that seam is inside the files the fix touched.
 
-    The two functions MUST agree on the key or a file lands in the wrong context
-    tier, which is why the ``" b/"`` split is copied rather than improved: it is
-    ambiguous for a path containing " b/", and fixing that here alone would make
-    the two disagree on exactly the paths it fixed. A header that will not split
-    is keyed by the whole header line instead of being dropped — it then matches
-    no increment file and falls to the outer context tier, which is the harmless
-    direction. (:func:`_diff_added_lines` drops it, which is the harmless
-    direction *there*: a line nobody can attribute scopes no Sonar issue.)"""
+    Nothing is dropped, because the result is joined back into a prompt: a header
+    that will not parse is keyed by the whole header line, and a preamble before
+    the first header is keyed by :data:`DIFF_PREAMBLE`. Both then match no
+    increment file and fall to the outer context tier, which is the harmless
+    direction here — where dropping them would delete text from the reviewer's
+    copy of the PR. (:func:`_diff_added_lines` drops an unparseable header, which
+    is the harmless direction *there*: a line nobody can attribute scopes no
+    Sonar issue. The two need not agree — the near/far tiering matches this
+    function's keys against its own, and nothing matches the two together.)"""
     out: dict[str, list[str]] = {}
-    cur: str | None = None
+    cur = DIFF_PREAMBLE
     for line in diff.splitlines(keepends=True):
         if line.startswith("diff --git "):
-            parts = line.split(" b/", 1)
-            cur = parts[1].strip() if len(parts) == 2 else line.strip()
-            out.setdefault(cur, [])
-        if cur is not None:
-            out[cur].append(line)
+            cur = _diff_header_path(line) or line.strip()
+        out.setdefault(cur, []).append(line)
     return {k: "".join(v) for k, v in out.items()}
 
 
-def _diff_subset(diff: str, keep: set[str]) -> str:
-    """The chunks of ``diff`` for the files in ``keep``, in their original order.
+def _diff_subset(by_file: dict[str, str], keep: set[str]) -> str:
+    """The chunks of an already-split diff for the files in ``keep``, in their
+    original order.
 
     This is what keeps an increment about the PR. A commit range between two
     rounds spans whatever the fixer did INCLUDING a merge of the base branch, and
@@ -2236,8 +2296,12 @@ def _diff_subset(diff: str, keep: set[str]) -> str:
     Restricting to the PR's own files does not make the range perfect — main's
     changes to a file the PR also touches still ride along — but it removes the
     part that is both largest and certainly not the fixer's work. The size guard
-    in :meth:`ReviewScope.decide` covers what is left."""
-    by_file = _diff_by_file(diff)
+    in :meth:`ReviewScope.decide` covers what is left.
+
+    Takes the mapping rather than the text because its caller needs the same
+    split to count what was left out: splitting twice is two partitions of one
+    string that have to agree, and the cheapest way to keep them agreeing is for
+    there to be one."""
     return "".join(by_file[f] for f in by_file if f in keep)
 
 
@@ -2251,14 +2315,25 @@ def _fit_parts(parts: list[str], budget: int | None) -> list[str]:
     Here the review TARGET is always first, so a budget too small to hold
     everything drops context and never the thing under review.
 
-    ``None`` means uncapped and returns the parts whole. Monotone
-    non-decreasing in ``budget``, which :func:`fit_argv_budget` binary-searches
-    over — a non-monotone allocation would make that search return a size that
-    does not fit."""
+    ``None`` means uncapped and returns the parts whole. A budget of zero or
+    less is no capacity and every part gets "" — clamped up front and not only
+    inside the loop, because ``part[:left]`` with a negative ``left`` returns
+    everything BUT the last ``|left|`` characters, which is the opposite of what
+    a caller asking for nothing meant and would hand a reviewer a target with its
+    tail quietly removed.
+
+    The summed allocation is monotone non-decreasing in ``budget``.
+    :func:`fit_argv_budget` shrinks a budget until the RENDERED prompt fits, and
+    the rendered prompt is this plus :func:`_compose`'s frame, where a section's
+    ``[cut: …]`` marker disappears once that section becomes whole — so the
+    rendered length can fall by one marker's width as the budget rises.
+    :meth:`ReviewScope._compose` reserves each marker's width out of the budget
+    before spending it, which bounds that wobble to what a marker occupies and
+    keeps the rendered prompt inside the budget it was given."""
     if budget is None:
         return list(parts)
     out: list[str] = []
-    left = budget
+    left = max(0, budget)
     for part in parts:
         out.append(part[:left])
         left = max(0, left - len(part))
@@ -2266,8 +2341,9 @@ def _fit_parts(parts: list[str], budget: int | None) -> list[str]:
 
 
 def fetch_increment(gh_repo: str, since: str, head: str) -> tuple[str, str]:
-    """The diff between two commits of a PR — what the last fix pass actually
-    wrote — as ``(diff, problem)``, with ``problem`` empty on success.
+    """The diff between two commits — what the last fix pass actually wrote, or
+    (with ``since`` = the base branch) the PR as an earlier round saw it — as
+    ``(diff, problem)``, with ``problem`` empty on success.
 
     Fetched from GitHub's compare API rather than from a checkout ON PURPOSE.
     #75 established that ``cfg["path"]`` is the main checkout sitting on whatever
@@ -2285,18 +2361,153 @@ def fetch_increment(gh_repo: str, since: str, head: str) -> tuple[str, str]:
     the two-dot answer would have been a diff against a commit no longer in the
     history — code the round would report on as though it were new.
 
-    Never raises. A failure here means the round falls back to reviewing the
-    whole PR and says so; it must not kill a review over a scope optimisation."""
+    **Never raises — that is the contract, and `except Exception` is how it is
+    kept.** The caller has no `try` around it, because a scope optimisation must
+    not be able to kill a review that would otherwise have happened. Naming the
+    two obvious families was not enough: ``sh`` runs with ``text=True``, so a diff
+    that is not valid UTF-8 raises ``UnicodeDecodeError`` — a ``ValueError``,
+    caught by neither — and a ``timeout=`` passed through ``sh`` one day would
+    raise ``TimeoutExpired``, a ``SubprocessError``, also caught by neither. The
+    two that get their own branch get a better message, not a different fate."""
+    what = f"the diff {since[:8]}...{head[:8]}"
     try:
         diff = sh(["gh", "api", f"repos/{gh_repo}/compare/{since}...{head}",
                    "-H", "Accept: application/vnd.github.diff"])
     except subprocess.CalledProcessError as e:
         tail = (e.stderr or "").strip().splitlines()
-        return "", (f"could not fetch the diff since {since[:8]} "
+        return "", (f"could not fetch {what} "
                     + (f"({tail[-1][:120]})" if tail else "(gh api failed)"))
-    except OSError as e:
-        return "", f"could not fetch the diff since {since[:8]} ({e.__class__.__name__})"
+    except Exception as e:      # every one of them, per the contract above
+        return "", f"could not fetch {what} ({e.__class__.__name__})"
     return diff, ""
+
+
+#: What GitHub's compare endpoint stops at. Documented as "up to 250 commits" and
+#: "responses that include comparisons of more than 300 files will be truncated",
+#: and the diff media type cannot be paginated, so a range at either ceiling can
+#: come back short with a 200 and no error.
+#: https://docs.github.com/en/rest/commits/commits#compare-two-commits
+COMPARE_FILE_CAP = 300
+
+
+def compare_facts(gh_repo: str, since: str, head: str) -> dict:
+    """The compare endpoint's OWN account of the range it just returned a diff
+    for: ``status``, how many files and commits it covers, and how many of those
+    commits are merges. ``{}`` when it could not be read.
+
+    Fetched because the diff alone cannot answer three questions the review
+    target's honesty rests on, and one wrong answer to any of them is silent:
+
+    - **was it complete?** A truncated compare is a 200 with fewer files in it.
+      It still passes the "smaller than the PR" guard and still looks like a fix
+      commit, so a target missing half the fix would be reviewed as the whole of
+      it. Comparing the file COUNT against the diff we parsed catches that.
+    - **was it an increment at all?** ``a...b`` is measured from the merge base,
+      so after a force-push or a rebase it is not the delta from ``a``: anything
+      the fixer REVERTED between the two heads is in neither. ``status`` says so
+      (``ahead`` is the case the feature is for).
+    - **whose changes are in it?** A merge commit in the range means main's
+      changes to files the PR ALSO touches are in the target, where no file
+      filter can reach them and a reviewer will read them as the fixer's.
+
+    Never raises, for the same reason :func:`fetch_increment` does not: this is
+    an assurance about a scope optimisation, not a review."""
+    try:
+        raw = sh(["gh", "api", f"repos/{gh_repo}/compare/{since}...{head}",
+                  "--jq", "{status: .status, files: (.files // [] | length), "
+                          "commits: (.commits // [] | length), "
+                          "total_commits: (.total_commits // 0), "
+                          "merges: ([.commits // [] | .[] "
+                          "| select((.parents // []) | length > 1)] | length)}"])
+        facts = json.loads(raw)
+    except Exception:           # every one, per the contract above
+        return {}
+    return facts if isinstance(facts, dict) else {}
+
+
+def _range_notes(facts: dict, since: str, head: str, round_no: int) -> list[str]:
+    """What the compare endpoint said about a range this round is still going to
+    review — the caveats that degrade an increment without disqualifying it.
+
+    Neither is inferable from the material a reviewer is handed: a reverted change
+    is absent from it, and a merged-in change looks exactly like the fixer's."""
+    out = []
+    if not facts:
+        # Said rather than swallowed. The increment is still used — the diff came
+        # back and the diff is the thing being reviewed — but the checks below did
+        # not run, and "no caveat" would otherwise read as "checked, nothing wrong".
+        return [f"round {round_no}'s increment was not checked against GitHub's own "
+                f"account of {since[:8]}...{head[:8]} (the compare metadata could not be "
+                "read), so a truncated, rebased or merge-carrying range would not have "
+                "been reported"]
+    status = str(facts.get("status") or "")
+    if status and status != "ahead":
+        out.append(
+            f"the range {since[:8]}...{head[:8]} is `{status}`, not `ahead`: the branch was "
+            "rebased or force-pushed since the anchor, so the target is measured from the "
+            "merge base and anything REVERTED between the two heads is in neither the "
+            "target nor the context")
+    if int(facts.get("merges") or 0):
+        out.append(
+            f"the increment {since[:8]}...{head[:8]} contains "
+            f"{int(facts['merges'])} merge commit(s). Files this PR does not touch were left "
+            "out of the target, but main's changes to files it DOES touch are still in there "
+            "and cannot be told apart from the fixer's")
+    return out
+
+
+def _is_commitish(value: str) -> bool:
+    """Does this look like a SHA — abbreviated or full? Used to decide whether two
+    anchors can be compared by prefix, which is only meaningful for hex."""
+    return bool(re.fullmatch(r"[0-9a-fA-F]{7,40}", value or ""))
+
+
+def _is_ref(value: str) -> bool:
+    """Can this value only address the ref it names?
+
+    Every anchor — ``--since`` and a baseline's ``head_sha`` alike — is
+    interpolated into a REST path (``compare/{since}...{head}``), and a baseline
+    is a file the caller points at. There is no shell, so this is not injection,
+    but ``..`` or a leading ``/`` walks to a different endpoint and a ``?``
+    appends query parameters. Refs are far too permissive a grammar to whitelist
+    (``--since main`` and ``--since v2.24`` are both reasonable), so this refuses
+    only what would leave the endpoint. A well-formed anchor that is simply wrong
+    needs no check: it 404s into the fetch-failed fallback, which explains
+    itself."""
+    return bool(value) and not (
+        value.startswith(("-", "/")) or ".." in value
+        or any(c in value for c in " \t\n?#%"))
+
+
+def _same_commit(a: str, b: str) -> bool:
+    """Are these two the same commit, allowing for one being abbreviated?
+
+    ``--since`` is documented as taking a SHA and git SHAs are routinely written
+    short, so a raw ``==`` against the head misses the unmoved-head case for
+    anyone who typed seven characters — and the round then fetches an empty range
+    and reports "the head moved without the PR's content moving", which is a
+    description of something that did not happen."""
+    a, b = (a or "").strip().lower(), (b or "").strip().lower()
+    if not a or not b:
+        return False
+    if not (_is_commitish(a) and _is_commitish(b)):
+        return a == b
+    n = min(len(a), len(b))
+    return a[:n] == b[:n]
+
+
+def _prior_round(since_round: int | None, round_no: int) -> str:
+    """How to name the round that reviewed the anchor, in text a reviewer or an
+    operator reads.
+
+    Not ``round_no - 1``: :func:`load_baseline` deliberately keeps an older anchor
+    when the newest baseline names no commit, so a round 3 can be anchored on
+    round 1's head. Telling its reviewers "Round 2 reviewed this PR at <round 1's
+    sha>" states a falsehood in the very sentence that defines what they are to
+    treat as already read, to the one audience that cannot check it."""
+    if since_round is None:
+        return "an earlier round"
+    return f"round {since_round}"
 
 
 #: The header a whole-PR round puts above its diff. Unchanged from every release
@@ -2306,9 +2517,9 @@ def fetch_increment(gh_repo: str, since: str, head: str) -> tuple[str, str]:
 PR_SCOPE_HEADER = "--- DIFF ---"
 
 INCREMENT_BRIEF = """This is round {round_no} of a panel -> fix -> panel cycle, and it is scoped.
-Round {prior_round} reviewed this PR at {since8}; a fixer has written more since. What changed
-between them is YOUR REVIEW TARGET and comes first below. The rest of the PR follows it as
-CONTEXT, and the target is where your effort belongs.
+{prior_round} reviewed this PR at {since8}; a fixer has written more since. What changed
+between them is YOUR REVIEW TARGET and comes first below. The PR AS IT STOOD AT {since8}
+follows it as CONTEXT, and the target is where your effort belongs.
 
 Read the context anyway, and read it hardest where the target touches it. What a fix pass
 breaks, it usually breaks at the seam — the new code is correct on its own terms and wrong
@@ -2318,26 +2529,27 @@ what the context does is exactly what this round exists to find.
 **A defect nobody has raised yet is in scope wherever you find it, context included.** Earlier
 rounds read that code; reading it is not the same as being right about it, and they are
 demonstrably wrong about some of it. What is out of scope is re-reporting a defect an earlier
-round already raised — those have been fixed, and the fix is in the target you are reading.
+round already raised — the fix for those is in the target you are reading, not in the context,
+which is why the context does not show it.
 
 If the context you were given is not enough to judge something, say so in `could_not_assess`
 rather than guessing. Being short of context is expected here and saying so is useful; a
 confident answer built on a file you could not see is not."""
 
 JUDGE_INCREMENT_BRIEF = """This round of the panel was SCOPED, and you are seeing what the reviewers saw.
-Round {prior_round} reviewed this PR at {since8}. The reviewers' target was what a fixer has
-written since, shown first below; the rest of the PR follows as context they were told had
-already been reviewed and already fixed.
+{prior_round} reviewed this PR at {since8}. The reviewers' target was what a fixer has
+written since, shown first below; the PR as it stood at {since8} follows as context, which they
+were told an earlier round had read.
 
 Two consequences for your ruling, and they pull in opposite directions:
 
 - A finding about the CONTEXT is not automatically out of scope. A defect in the target that
   is only visible against the code it landed in is precisely what this round was run to find,
   and it should be confirmed on its merits.
-- What is out of scope is a finding an earlier round ALREADY RAISED, which has been fixed and
-  whose fix is in the target. A defect in the context that nobody has raised is NOT out of
-  scope merely for sitting outside the target: earlier rounds read that code, which is not the
-  same as being right about it, and the reviewers were told so."""
+- What is out of scope is a finding an earlier round ALREADY RAISED, whose fix is in the
+  target rather than in the context. A defect in the context that nobody has raised is NOT out
+  of scope merely for sitting outside the target: earlier rounds read that code, which is not
+  the same as being right about it, and the reviewers were told so."""
 
 
 @dataclass
@@ -2356,10 +2568,18 @@ class ReviewScope:
     Three tiers, and the order is the whole design:
 
     1. **the target** — the increment, never cut while anything else is present
-    2. **near context** — the PR's changes in the files the target ALSO touches,
-       because the seam between the fix and the code it landed in is where a fix
-       pass does its damage, and that seam is inside these files
+    2. **near context** — the files the target also touches, AS THEY STOOD AT THE
+       ANCHOR, because the seam between the fix and the code it landed in is where
+       a fix pass does its damage, and that seam is inside these files
     3. **far context** — the rest of the PR, whatever budget survives
+
+    Tier 2 is taken from ``base...anchor`` — the PR as the last round reviewed it
+    — and not from the PR's current diff for those files. Sliced out of the
+    current diff it would CONTAIN the increment, since the fix commit is part of
+    the PR: the target would be sent twice, the second copy under a header saying
+    an earlier round had already dealt with it, which is the one thing both briefs
+    tell a reviewer not to re-report. The header can only be true if the material
+    under it predates the fix.
 
     Under ``"pr"`` scope there is only tier 1 and it is the whole diff, so the
     prompt is byte-identical to the pre-scope one."""
@@ -2369,41 +2589,60 @@ class ReviewScope:
     diff: str = ""
     #: Commits since ``since`` — empty under "pr" scope.
     increment: str = ""
+    #: The PR as of ``since`` (``base...since``) — what the round that anchored
+    #: this one actually read. Empty under "pr" scope.
+    prior_diff: str = ""
     since: str = ""
     round_no: int = 1
-    #: The PR's changes in the files the target also touches (tier 2), and
-    #: everything else (tier 3). Derived, never passed: they are a partition of
-    #: `diff` by `increment`, and letting a caller supply them separately is
-    #: letting the two disagree.
+    #: Which round supplied the anchor, when that is known. Usually
+    #: ``round_no - 1``, but `load_baseline` deliberately keeps an older anchor
+    #: when the newest baseline names no commit, and the brief must not then tell
+    #: the reviewer a round number that did not review that commit.
+    since_round: int | None = None
+    #: The anchor-era changes to the files the target touches (tier 2), and the
+    #: PR's changes to every other file (tier 3). Derived, never passed: they come
+    #: out of `diff` and `prior_diff` keyed by `increment`, and letting a caller
+    #: supply them separately is letting the three disagree.
     near: str = field(default="", init=False)
     far: str = field(default="", init=False)
 
     def __post_init__(self) -> None:
-        by_file = _diff_by_file(self.diff) if self.scope == "increment" else {}
-        touched = set(_diff_by_file(self.increment)) if self.scope == "increment" else set()
-        # Sorted, so two runs of the same round compose the same prompt: dict
-        # order follows the diff, which is stable, but the set difference is not
-        # and an unstable prompt makes two rounds incomparable for no reason.
-        self.near = "".join(by_file[f] for f in sorted(by_file) if f in touched)
-        self.far = "".join(by_file[f] for f in sorted(by_file) if f not in touched)
+        if self.scope != "increment":
+            return
+        # Real file keys only. A preamble is keyed by "" in every mapping, so
+        # leaving it in `touched` would match the PR diff's own preamble and drop
+        # it out of the far tier — text deleted from the reviewer's copy by a
+        # coincidence of keys.
+        touched = {f for f in _diff_by_file(self.increment) if f}
+        # Both comprehensions iterate a dict, which is insertion-ordered, so the
+        # prompt follows the diff's own order — the order `_diff_subset` promises
+        # for the target — and two runs of one round compose the same prompt.
+        # `touched` is only ever an `in` test, and a set is not iterated here.
+        self.near = "".join(v for f, v in _diff_by_file(self.prior_diff).items()
+                            if f in touched)
+        self.far = "".join(v for f, v in _diff_by_file(self.diff).items()
+                           if f not in touched)
 
     @classmethod
     def decide(cls, want: str, round_no: int, diff: str,
-               commits: tuple[str, str], gh_repo: str) -> tuple["ReviewScope", list[str]]:
+               commits: tuple[str, str], gh_repo: str, base: str = "",
+               since_round: int | None = None) -> tuple[ReviewScope, list[str]]:
         """Pick this round's scope and fetch what it needs, as ``(scope, notes)``.
 
         ``commits`` is (the anchor the previous round reviewed, this round's
         head) — the range an increment would cover. The anchor is ``--since`` if
         the caller passed one, else the ``head_sha`` of the latest baseline, else
-        "".
+        "". ``since_round`` is the round that supplied it, when a baseline did;
+        ``base`` is the PR's base branch, which the near context tier is taken
+        from.
 
-        **Every fall back to whole-PR scope produces a note.** A round that says
+        **Every fallback to whole-PR scope produces a note.** A round that says
         it reviewed the increment and in fact re-read the PR is wrong about the
         one measurement this feature exists to produce, and it would be invisible
         in the numbers: ``diff_chars`` would simply be large, which is what it
-        always was. There are four ways to end up back at the whole PR and they
-        are different facts about the cycle, so they are four different
-        sentences rather than one "scope unavailable"."""
+        always was. Each way of ending up back at the whole PR is a different fact
+        about the cycle, so each gets its own sentence rather than one "scope
+        unavailable"."""
         anchor, head = commits
         notes: list[str] = []
         whole = cls(diff=diff, round_no=round_no)
@@ -2412,11 +2651,17 @@ class ReviewScope:
         if round_no <= 1:
             # Not a failure. Round 1 has nothing to be an increment from, and
             # `auto` reaches here on every round 1 of every cycle — so this is
-            # silent unless the caller asked for a range by hand, which is the
-            # one case where they expected something else to happen.
-            if anchor:
+            # silent unless an anchor was supplied, which is the one case where
+            # the caller expected something else to happen. Which SOURCE supplied
+            # it decides the wording: blaming --since for a baseline's `head_sha`
+            # sends the reader looking for a flag they never passed.
+            if anchor and since_round is None:
                 notes.append("--since was passed on round 1, which has no earlier round "
                              "to be an increment from — the whole PR was reviewed")
+            elif anchor:
+                notes.append(f"a baseline for round {since_round} named a head, but this "
+                             "run is round 1 and has no earlier round to be an increment "
+                             "from — the whole PR was reviewed")
             return whole, notes
         if not anchor:
             notes.append(
@@ -2424,15 +2669,16 @@ class ReviewScope:
                 "said which commit it reviewed (`head_sha`). Pass --since <sha>, or a "
                 "baseline written by v2.25 or later")
             return whole, notes
-        if anchor == head:
+        if _same_commit(anchor, head):
             # A fact about the cycle rather than a failure, and a loud one: the
             # caller ran another round without the fixer pushing anything, so
             # there is no fix commit to read. Re-reviewing the PR is the useful
             # thing to do with a round that has already been paid for.
             notes.append(
                 f"round {round_no} reviewed the whole PR, not the increment: the head is "
-                f"still {head[:8]}, the same commit round {round_no - 1} reviewed — "
-                "nothing was pushed between the rounds, so there is no fix commit to read")
+                f"still {head[:8]}, the same commit {_prior_round(since_round, round_no)} "
+                "reviewed — nothing was pushed between the rounds, so there is no fix "
+                "commit to read")
             return whole, notes
         raw, problem = fetch_increment(gh_repo, anchor, head)
         if problem:
@@ -2441,15 +2687,41 @@ class ReviewScope:
             return whole, notes
         # Down to the PR's own files. The range between two rounds also contains
         # whatever base branch the fixer merged in, which is not this PR's change
-        # and not what the round is being run to read.
-        mine = set(_diff_by_file(diff))
-        increment = _diff_subset(raw, mine)
-        dropped = [f for f in _diff_by_file(raw) if f not in mine]
+        # and not what the round is being run to read. Split ONCE: what goes into
+        # the target and what was left out of it are two readings of one string,
+        # and two splits are two partitions that can drift apart.
+        by_raw = _diff_by_file(raw)
+        raw_files = [f for f in by_raw if f]
+        # The PR diff is split here for `mine` and again in `__post_init__` for the
+        # far tier — one extra linear pass, kept on purpose. Threading the mapping
+        # into the constructor is exactly the "letting a caller supply the tiers"
+        # that field's comment refuses, and it would buy a pass next to two `gh
+        # api` round trips.
+        mine = {f for f in _diff_by_file(diff) if f}
+        increment = _diff_subset(by_raw, mine)
+        dropped = [f for f in raw_files if f not in mine]
         if dropped:
             notes.append(
                 f"the increment {anchor[:8]}...{head[:8]} also touched {len(dropped)} "
                 "file(s) this PR does not — a base-branch merge between the rounds. "
                 "They were left out of the review target")
+        facts = compare_facts(gh_repo, anchor, head)
+        said = int(facts.get("files") or 0)
+        notes.extend(_range_notes(facts, anchor, head, round_no))
+        if said > len(raw_files) or said >= COMPARE_FILE_CAP:
+            # The one class of degraded range that must not be reviewed anyway. A
+            # truncated compare is a 200 with files missing from it: it is smaller
+            # than the PR, it passes every guard below, and it becomes the REVIEW
+            # TARGET — a fix commit reviewed as though the half that came back
+            # were all of it, which is the exact failure `truncated` exists to
+            # catch and the one place it cannot see.
+            notes.append(
+                f"round {round_no} reviewed the whole PR, not the increment: GitHub's "
+                f"compare of {anchor[:8]}...{head[:8]} returned {len(raw_files):,} "
+                f"file(s) against the {said:,} it reports for the range, and the endpoint "
+                f"truncates past {COMPARE_FILE_CAP:,} — so the increment cannot be trusted "
+                "to be the whole fix")
+            return whole, notes
         if not increment.strip():
             notes.append(
                 f"round {round_no} reviewed the whole PR, not the increment: the diff "
@@ -2471,8 +2743,28 @@ class ReviewScope:
                 "range bigger than the thing it is a part of, so it is neither cheaper "
                 "nor sharper")
             return whole, notes
+        # The near context tier, and the second `gh api` call this costs. It is
+        # the PR AS OF THE ANCHOR — what the round that anchored this one actually
+        # read — because the alternative, slicing the current PR diff by the files
+        # the fix touched, hands the reviewer the fix commit a second time under a
+        # header saying an earlier round dealt with it already.
+        #
+        # Falls back to the whole PR rather than to a near tier we would have to
+        # mislabel. Reviewing the whole PR is what this round did before v2.25 and
+        # is never wrong, only dearer; a context section whose header is false is
+        # wrong in the direction that suppresses findings.
+        prior_diff, problem = fetch_increment(gh_repo, base, anchor) if base else (
+            "", "no base branch was resolved for the PR")
+        if problem:
+            notes.append(
+                f"round {round_no} reviewed the whole PR, not the increment: the "
+                f"increment was fetched, but the PR as of {anchor[:8]} was not "
+                f"({problem}) — and without it the context behind the fix cannot be "
+                "shown as the earlier round saw it")
+            return whole, notes
         return cls(scope="increment", diff=diff, increment=increment,
-                   since=anchor, round_no=round_no), notes
+                   prior_diff=prior_diff, since=anchor, round_no=round_no,
+                   since_round=since_round), notes
 
     @property
     def target(self) -> str:
@@ -2494,9 +2786,9 @@ class ReviewScope:
         ``truncated`` is still measured and never asked for. But context is
         different: a reviewer told "the rest of the PR is here, minus the tail"
         can put the gap in ``could_not_assess`` and the judge can rule on it,
-        which turns a silent omission into a declared one. The marker costs a
-        hundred-odd chars over budget; ``fit_argv_budget`` searches the RENDERED
-        prompt, so the one seat where that could matter absorbs it."""
+        which turns a silent omission into a declared one. Each marker's width is
+        reserved out of the budget before the tiers are allocated, so a labelled
+        cut cannot push the prompt past the ceiling that caused it."""
         return self._compose(budget, INCREMENT_BRIEF)
 
     def judge_material(self, budget: int | None) -> tuple[str, int, int]:
@@ -2511,23 +2803,75 @@ class ReviewScope:
 
     def _compose(self, budget: int | None, brief_template: str) -> tuple[str, int, int]:
         if self.scope != "increment":
+            # Cut at exactly the budget, with no allowance taken out of it for the
+            # header: `max_diff_chars` has always meant "this many chars of diff"
+            # under whole-PR scope, and a "pr" round's prompt is byte-identical to
+            # what it has always been. The overhead below is a fact about the
+            # scoped prompt, which did not exist before v2.25.
             body = _fit_parts([self.diff], budget)[0]
             return f"{PR_SCOPE_HEADER}\n{body}", len(body), 0
 
-        target, near, far = _fit_parts([self.increment, self.near, self.far], budget)
-        brief = brief_template.format(round_no=self.round_no,
-                                      prior_round=self.round_no - 1,
-                                      since8=self.since[:8] or "the previous round")
+        brief = brief_template.format(
+            round_no=self.round_no,
+            prior_round=_prior_round(self.since_round, self.round_no).capitalize(),
+            since8=self._since8)
+        parts = [self.increment, self.near, self.far]
+        # The budget buys the whole PROMPT, not just the diff text in it. The brief
+        # and the section headers are over a kilobyte, they are added after the
+        # budget has been spent, and they land on the side that matters: a model
+        # whose context window is the reason the budget exists is handed more than
+        # the number said, not less. Each cut marker is reserved too — the widest
+        # form its own tier could produce — so a labelled cut cannot itself push
+        # the prompt over.
+        if budget is not None:
+            # `p[:-1]` is the widest a tier's marker can get: its numbers are at
+            # their longest when almost all of the tier was sent.
+            budget = max(0, budget - len(self._frame(brief, "", "", ""))
+                         - sum(len(_cut_note(p[:-1], p)) for p in parts if p))
+        target, near, far = _fit_parts(parts, budget)
+        return (self._frame(brief,
+                            target + _cut_note(target, self.increment),
+                            near + _cut_note(near, self.near),
+                            far + _cut_note(far, self.far)),
+                len(target), len(near) + len(far))
+
+    @property
+    def _since8(self) -> str:
+        """The anchor as it is written to a reader. One property, so the brief and
+        the target header cannot disagree about it — they used to, and an empty
+        anchor rendered "reviewed this PR at the previous round" above "what
+        changed since  ". `decide` guarantees a non-empty anchor under increment
+        scope, so the fallback is only reachable by constructing a scope by hand,
+        which is exactly when the two lines would be read side by side."""
+        return self.since[:8] or "the previous round"
+
+    def _frame(self, brief: str, target: str, near: str, far: str) -> str:
+        """The composed prompt around three already-cut, already-marked bodies.
+        Also called with empty ones to measure its own overhead, which is why it
+        is one function and not a literal at the call site: an overhead computed
+        from a copy of the layout drifts from the layout.
+
+        A tier that is empty gets no header. An empty far tier is ordinary — a PR
+        whose every file the fix also touched has none — and a labelled section
+        with nothing under it reads as material that went missing."""
         out = [brief, "",
-               f"--- REVIEW TARGET: what changed since {self.since[:8]} ---",
-               target + _cut_note(target, self.increment),
-               "",
-               "--- CONTEXT (already reviewed, already fixed — not the target) ---",
-               "--- the rest of the changes to the files the target touches ---",
-               near + _cut_note(near, self.near),
-               "--- the rest of the PR ---",
-               far + _cut_note(far, self.far)]
-        return "\n".join(out), len(target), len(near) + len(far)
+               f"--- REVIEW TARGET: what changed since {self._since8} ---",
+               target, ""]
+        if self.near or self.far:
+            # Not "already fixed". What an earlier round raised has been fixed, and
+            # that fix is in the TARGET; this is the code it landed in, and the
+            # briefs tell the reviewer in as many words that a defect nobody raised
+            # is still in scope wherever it sits. A header claiming the section is
+            # settled is the highest-salience text in the prompt and would argue
+            # against the paragraph underneath it.
+            out.append(f"--- CONTEXT: this PR as it stood at {self._since8}, which an "
+                       "earlier round read — not the target ---")
+        if self.near:
+            out += ["--- the files the target touches, before the target changed them ---",
+                    near]
+        if self.far:
+            out += ["--- the rest of the PR ---", far]
+        return "\n".join(out)
 
 
 def _cut_note(sent: str, whole: str) -> str:
@@ -2541,7 +2885,7 @@ def _cut_note(sent: str, whole: str) -> str:
             f"{len(whole) - len(sent):,} not sent]")
 
 
-_SONAR_SEV ={"BLOCKER": "P1", "CRITICAL": "P1", "MAJOR": "P2", "MINOR": "P3", "INFO": "P3"}
+_SONAR_SEV = {"BLOCKER": "P1", "CRITICAL": "P1", "MAJOR": "P2", "MINOR": "P3", "INFO": "P3"}
 
 
 def _sonar_findings(issues: list[dict]) -> list[Finding]:
@@ -3460,6 +3804,15 @@ class Baseline:
     #: None for a payload written before the field existed, which is not an error:
     #: the round falls back to reviewing the whole PR, exactly as it did then.
     head_sha: str | None = None
+    #: Which round supplied ``head_sha``. Usually the newest one, but not always —
+    #: see above — and the briefs name that round to the reviewers, so it has to
+    #: travel with the sha rather than being guessed from this run's round number.
+    head_round: int | None = None
+    #: Earlier rounds that recorded a head but produced no reviewer read at all —
+    #: a title-skipped round, or one whose every seat failed. The anchor advances
+    #: over them (a skipped round still moved the head), so a scoped round after
+    #: one starts its increment AFTER code that no model looked at.
+    unread_rounds: set[int] = field(default_factory=set)
     #: Earlier rounds in which some reviewer read only a PREFIX of its target.
     #:
     #: Carried because increment scope makes an old truncation PERMANENT. Under
@@ -3565,6 +3918,8 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
     otherwise be free to record a *confident* verdict about a comparison it never
     made."""
     b = Baseline()
+    #: Rounds that re-read the whole PR with nothing cut — see the end of the loop.
+    reread: set[int] = set()
     want = dict(expect or {})
     if "round" in want:
         # Normalised once, and never raised out of: this function's rule is that a
@@ -3659,24 +4014,56 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
                               "rounds")
             continue
         b.rounds.add(was)
-        # The anchor comes from the LATEST accepted round, and `was >= latest`
-        # rather than `>` so that two payloads for one round (already reported
+        # The anchor comes from the LATEST round that actually SUPPLIED one, which
+        # is not the same as the latest round accepted: `b.rounds` holds every
+        # accepted round, so comparing against its max let a newer payload WITHOUT
+        # a `head_sha` block an older payload that had one, purely by being read
+        # first. The same set of baselines then anchored or did not depending on
+        # the order --baseline listed them.
+        #
+        # `>=` rather than `>` so that two payloads for one round (already reported
         # above as an ambiguity) resolve to the last one listed rather than the
         # first — the same tie-break the caller's own --baseline order implies.
         # A payload with no `head_sha` does not clear an anchor an earlier one
         # supplied: an older round we CAN diff against is worth more than no
         # increment at all, and the fallback to whole-PR scope is still there if
         # nothing in the set names one.
-        if payload.get("head_sha") and was >= max(b.rounds):
-            b.head_sha = str(payload["head_sha"])
+        sha = str(payload.get("head_sha") or "")
+        if sha and not _is_ref(sha):
+            # Checked because the value is interpolated into a REST path and a
+            # baseline is a file the caller points at: `../../` or a `?` in there
+            # addresses a different endpoint entirely. A well-formed anchor that is
+            # simply wrong needs no check — it comes back 404 and lands in the
+            # fetch-failed fallback, which says so.
+            b.problems.append(f"baseline {path} names head_sha {sha!r}, which cannot be a "
+                              "commit or a ref — it was not used as an anchor")
+        elif sha and was >= (b.head_round if b.head_round is not None else -1):
+            b.head_sha, b.head_round = sha, was
         # Read off each member's recorded `truncated`, never off a run-level
         # flag: the run-level one says SOMEBODY was cut, and the question here is
         # whether a gap exists at all, so any member is enough — but it has to be
         # the per-member record, because a payload from a panel where one seat
         # was uncapped and another was not sets the run-level flag either way.
-        if any(isinstance(m, dict) and m.get("truncated")
-               for m in (payload.get("reviewers") or {}).values()):
+        #
+        # The CONTAINER is guarded as well as its members: `or {}` substitutes only
+        # for a falsy value, so a hand-edited baseline whose `reviewers` is a list
+        # or a string went straight into `.values()` and killed the run — in the
+        # one function whose rule is that a bad payload costs a `problems` entry.
+        members = payload.get("reviewers")
+        members = list(members.values()) if isinstance(members, dict) else []
+        cut = any(isinstance(m, dict) and m.get("truncated") for m in members)
+        if cut:
             b.truncated_rounds.add(was)
+        # Two facts about coverage that only matter once a later round stops
+        # re-reading the PR. A round that read the WHOLE PR with nothing truncated
+        # has closed the gaps every earlier round left (resolved after the loop,
+        # since an earlier round may not have been seen yet); a round that read
+        # NOTHING leaves one that the anchor then advances straight over.
+        ran = payload.get("reviewers_ran")
+        if isinstance(ran, list) and not ran:
+            b.unread_rounds.add(was)
+        elif not cut and str(payload.get("scope") or "pr") == "pr":
+            reread.add(was)
         for bucket in ("to_fix", "dismissed", "sonar_findings"):
             for f in payload.get(bucket) or []:
                 if not isinstance(f, dict):
@@ -3686,6 +4073,12 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
                 norm = _norm_title(title)
                 if norm:
                     b.titles.setdefault(norm, set()).add(file or "")
+    # An inherited truncation is only permanent while nothing has re-read the
+    # region since. A whole-PR round with no truncated seat DID re-read it, so the
+    # gap it closed is not still open — and a veto that says otherwise asserts
+    # something the baselines themselves disprove.
+    if reread:
+        b.truncated_rounds = {r for r in b.truncated_rounds if r > max(reread)}
     return b
 
 
@@ -3858,7 +4251,7 @@ def _payload_defaults() -> dict:
         # unless it reads this first.
         "scope": "pr",
         "since_sha": None,
-        # Chars of PR context sent ALONGSIDE the target under increment scope.
+        # Chars of PR context prepared ALONGSIDE the target under increment scope.
         # Separate from `diff_chars` (which is the target) because losing context
         # and losing the thing under review are not the same event: context is
         # the part a reviewer can lose and still know it lost it.
@@ -3889,6 +4282,15 @@ def _payload_defaults() -> dict:
         "dismissed": [],
         "skipped": [],
     }
+
+
+def _rounds_phrase(rounds: list[int]) -> str:
+    """A list of round numbers as a noun phrase: ``round 1``, or ``rounds 1, 2``.
+
+    These land in the veto list, which the operator is told to read as the reason
+    a quiet round is not convergence — so it is one of the more closely-read lines
+    the tool emits, and ``round 1, 2`` reads as a typo in it."""
+    return f"round{'s' if len(rounds) > 1 else ''} {', '.join(str(r) for r in rounds)}"
 
 
 def _veto_gist(text: str, limit: int = 80) -> str:
@@ -4098,6 +4500,13 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     print(f"\n[{repo_name}#{pr_number}] {title[:60]}", file=chatter)
     print(f"  base={base}  changed={changed} lines\n", file=chatter)
 
+    # The head is read BEFORE the diff, and the order is load-bearing. The two are
+    # separate requests, so a push that lands between them makes them disagree —
+    # and this way round the recorded head is the OLDER of the two, so the next
+    # round's increment starts at or before the last commit this round read. It
+    # re-reads a little; it cannot skip anything. Read after the diff, the same
+    # race would record a head ahead of what was reviewed, and the next round's
+    # increment would begin after code no round had seen.
     try:
         diff = sh(["gh", "pr", "diff", str(pr_number), "--repo", gh_repo])
     except subprocess.CalledProcessError as e:
@@ -4115,9 +4524,18 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                           {"repo": repo_name, "github": gh_repo, "pr": pr_number,
                            "round": round_no})
     head_sha = meta["headRefOid"]
-    want_scope = scope if scope != "auto" else panel.get("round_scope", DEFAULT_ROUND_SCOPE)
+    want_scope = resolve_round_scope(scope, panel, notes)
+    # `--since` wins over the baseline, and it is checked here rather than trusted:
+    # the anchor is interpolated into a REST path, and a value carrying `..` or a
+    # query string addresses a different endpoint — a fetch error where one of the
+    # explained fallbacks belongs.
+    if since and not _is_ref(since):
+        notes.append(f"--since {since!r} is not a commit or a ref — it was ignored")
+        since = ""
+    anchor = since or prior.head_sha or ""
     review, scope_notes = ReviewScope.decide(
-        want_scope, round_no, diff, (since or prior.head_sha or "", head_sha), gh_repo)
+        want_scope, round_no, diff, (anchor, head_sha), gh_repo, base,
+        None if since else prior.head_round)
     notes.extend(scope_notes)
 
     # Diff budgets: panel-wide value, then each model's own override. Every
@@ -4170,32 +4588,48 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # of the thing it is reviewing cannot see what it was not given. Counting a
     # trimmed context tier here would make `truncated` fire on almost every
     # increment round and stop meaning anything on the round where it matters.
+    #
+    # Measured by COMPOSING each reviewer's material rather than by comparing its
+    # budget against the target's length. The two are not the same number under
+    # increment scope: the budget also has to pay for the brief and the section
+    # headers, so a budget a little over the target's size still cuts it, and a
+    # comparison against the raw budget would report that as untruncated.
+    sent = {n: review.material(b)[1:] for n, b in budgets.items()}
     truncated_for = {n: b for n, b in budgets.items()
-                     if b is not None and len(review.target) > b}
+                     if sent[n][0] < len(review.target)}
     truncated = bool(truncated_for)
     # Context loss is still REPORTED, just not as truncation. Without this the
     # saving is invisible in one direction and so is its cost: nothing else in
     # the payload distinguishes "the whole PR fitted behind the increment" from
     # "the increment used the entire budget and the reviewer saw no context".
-    short_context = sorted(n for n, b in budgets.items()
-                           if b is not None and len(review.target) <= b < sendable)
+    short_context = sorted(n for n in budgets
+                           if n not in truncated_for
+                           and sent[n][1] < len(review.near) + len(review.far))
     if review.scope == "increment" and short_context:
         notes.append(
             f"{', '.join(short_context)} got the whole target and only part of the PR "
             f"context ({sendable:,} chars of material, budget cut it) — expect "
             "`could_not_assess` entries about code outside the fix commit")
     # Increment scope always shrinks the review TARGET; it does not always shrink
-    # the bill. The near tier is the PR's own changes to the files the fix
-    # touched, so when the fix touches most of the PR there is little to leave
-    # out and the material is the PR plus the increment. That is the price of
-    # reading the seam properly and it is worth paying — but it is a cost, and an
-    # uncapped run should not discover it from an invoice.
-    if review.scope == "increment" and sendable > len(diff):
+    # the bill. The near tier is the anchor-era version of every file the fix
+    # touched, so a fix spread across the files that carry most of the PR leaves
+    # little to leave out. That is the price of reading the seam properly and it
+    # is worth paying — but it is a cost, and an uncapped run should not discover
+    # it from an invoice.
+    #
+    # The condition MEASURES that ("the near tier is most of the context") rather
+    # than restating the arithmetic. It used to be `sendable > len(diff)`, which
+    # was true on every scoped round — near and far were then a partition of the
+    # whole PR, so the material was always the PR plus the target — and it fired
+    # on a one-file fix in a fifty-file PR with a reason that was plainly false of
+    # it.
+    if review.scope == "increment" and len(review.near) > len(review.far):
         notes.append(
             f"scoping this round cut the review target to {len(review.target):,} chars "
-            f"from the PR's {len(diff):,}, but the material sent is {sendable:,} — the "
-            "fix touches most of the PR's files, so nearly all of it is near context. "
-            "The reviewer's attention is narrower; the token bill is not")
+            f"from the PR's {len(diff):,}, but the fix touches the files that carry most "
+            f"of it: {len(review.near):,} of {len(review.near) + len(review.far):,} "
+            f"context chars are the near tier, and {sendable:,} chars go out in all. The "
+            "reviewer's attention is narrower; the token bill is not")
 
     result = PanelResult()
     # Resolved ONCE, so the label in the report cannot drift from the model that
@@ -4303,10 +4737,31 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # version of, and it would do so with the authority of the final call.
     # `budget=None`, because the material arrives already fitted: composing to the
     # judge's budget and THEN cutting to it again would trim the tail a second
-    # time, through the "[cut: …]" marker that says how much is missing.
+    # time, through the "[cut: …]" marker that says how much is missing. Nothing
+    # else is lost by not passing it — `adjudicate` only ever used `budget` to
+    # slice the diff it was handed.
+    #
+    # What the judge was actually given is kept, not discarded: `judge_budget` can
+    # cut the judge's copy at a different point from every reviewer's, and until
+    # this was measured nothing in the round reported or vetoed on it. A judge
+    # short of the material dismisses a finding whose evidence sat in the part it
+    # did not get, and the round records that as convergence.
+    judge_text, judge_target, judge_context = review.judge_material(judge_budget)
+    judge_gaps: list[str] = []
+    if judge_target < len(review.target):
+        judge_gaps.append(
+            f"the judge ruled on {judge_target:,} of the review target's "
+            f"{len(review.target):,} chars (its budget is {judge_budget:,}) — a finding "
+            "about the part it did not get could only be dismissed as unsupported")
+    elif judge_context < len(review.near) + len(review.far):
+        judge_gaps.append(
+            f"the judge saw {judge_context:,} of the "
+            f"{len(review.near) + len(review.far):,} chars of context the panel was "
+            f"offered (its budget is {judge_budget:,}) — it ruled on findings about code "
+            "it was shown less of than the reviewers were")
+    notes.extend(judge_gaps)
     findings, judge_skip, coverage_note = adjudicate(
-        clusters, review.judge_material(judge_budget)[0], panel.get("judge_model", ""),
-        pr_number, None, coverage)
+        clusters, judge_text, panel.get("judge_model", ""), pr_number, None, coverage)
     judged = judge_skip is None and bool(findings)
     to_fix = sorted((c for c in findings if c.verdict != "dismissed"),
                     key=lambda c: c.severity)
@@ -4372,14 +4827,26 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             "defect earlier rounds misjudged, in the part that did not fit, could not have "
             "been raised this round")
     if review.scope == "increment" and prior.truncated_rounds:
-        was = ", ".join(str(r) for r in sorted(prior.truncated_rounds))
+        cut = sorted(prior.truncated_rounds)
         inherited.append(
-            f"round {was} had a truncated reviewer and this round reviewed only the "
-            f"increment since {review.since[:8]} — whatever that round was cut off from "
-            "has now been read by no round of this cycle, and re-reviewing the fix "
-            "commit does not reach it")
-    veto = coverage_veto(reviewer_meta, judge_skip, flagged,
-                         len(review.target)) + inherited + prior.problems
+            f"{_rounds_phrase(cut)} had a truncated reviewer and this round reviewed only "
+            f"the increment since {review.since[:8]} — whatever "
+            f"{'those rounds were' if len(cut) > 1 else 'that round was'} cut off from has "
+            "now been read by no round of this cycle, and re-reviewing the fix commit does "
+            "not reach it")
+    # The anchor advances over a round that read nothing — a title-skipped round
+    # records a head, and so does one whose every seat failed. This round's
+    # increment therefore starts AFTER code the cycle has no read of, and the
+    # payload cannot show that: `scope` and `since_sha` say what was reviewed, not
+    # what was stepped over.
+    if review.scope == "increment" and prior.unread_rounds:
+        skipped = sorted(prior.unread_rounds)
+        inherited.append(
+            f"{_rounds_phrase(skipped)} recorded a head but no reviewer read it, and this "
+            f"round's increment starts after it — that code has been read by no round of "
+            "this cycle")
+    veto = (coverage_veto(reviewer_meta, judge_skip, flagged, len(review.target))
+            + judge_gaps + inherited + prior.problems)
     stop = round_stop(round_no, cap, new_keys, outstanding, veto, not prior.problems,
                       repeated=len({c.key for c in outstanding if not is_new(c)}))
     # Whether a CYCLE exists at all, and the one predicate that decides it — for
@@ -4454,10 +4921,18 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # the answer can now be smaller than the PR, so `scope` must be read
         # beside it. A consumer plotting this across a cycle's rounds without
         # reading `scope` will see a cliff at round 2 and call it a shrinking PR.
+        #
+        # This pair is what the round PREPARED, which is what a reviewer with no
+        # budget was given. It is deliberately not "what each reviewer read":
+        # budgets are per reviewer, so there is no single true number for that —
+        # `reviewers.<name>.max_diff_chars` and `.truncated` carry the per-seat
+        # answer, and a seat that got the whole target and only part of the
+        # context is named in `config_notes`.
         "diff_chars": len(review.target),
-        # Everything sent ALONGSIDE the target: 0 under "pr" scope, where there is
-        # no such thing. This plus `diff_chars` is what a round actually cost in
-        # material, and the pair is the measurement issue #41 exists to produce.
+        # Everything prepared ALONGSIDE the target: 0 under "pr" scope, where
+        # there is no such thing. This plus `diff_chars` is what a round put in
+        # front of an uncapped reviewer, and the pair is the measurement issue #41
+        # exists to produce.
         "context_chars": len(review.near) + len(review.far),
         "diff_budgets": {**budgets, "judge": judge_budget},
         "config_notes": notes,
