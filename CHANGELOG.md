@@ -16,12 +16,18 @@ were wrong at source, and a re-review of the same PR produced findings that join
 
 The merge now happens in the judge, which is the only step that reads every account and can write a
 new one. It is shown one entry per *reviewer*, merges the entries that are one defect, and returns a
-`synthesis` — with every original riding along verbatim in `reported_by`, its reporter's own severity
-and line intact. Additive, so nothing has to be thrown away to merge; and separate defects that share
-a cause are linked with `related` rather than merged, so a decision spread over four files is fixed
-once. `panel.py --json` and the board record are that same canonical list, so the fix loop consumes
-merged findings instead of collapsing an over-counted one by hand (29 rows into 15, on the run that
-prompted this).
+`synthesis` — with every original riding along in `reported_by`, its reporter's own title, detail,
+severity and line intact as fields rather than welded into one string. Additive, so nothing has to
+be thrown away to merge; and separate defects that share a cause are linked with `related` rather
+than merged, so a decision spread over four files is fixed once. `panel.py --json` and the board
+record are that same canonical list — one record per defect instead of one per reviewer per defect
+(29 rows into 15, on the run that prompted this).
+
+Each finding also carries an explicit `key`, derived from the file and the reporting reviewers' own
+titles, and the board honours a caller's key over the one it derives. That is what makes a re-review
+of the same PR join the chain it belongs to: the board's own fallback keys off the finding's title,
+which is now the judge's freshly-worded synthesis, so an unfixed defect started a new chain on every
+run.
 
 Dedup before the judge was also leaky in both directions — `line // 10` is a grid, not a window, so
 lines 39 and 41 landed in different buckets while 40 and 49 shared one, and `Path(file).name` merged
@@ -31,7 +37,14 @@ two line numbers cited), which no line arithmetic finds — which is why the rul
 judge and not to the key.
 
 `--json` also stops printing its two-line progress preamble to stdout; that goes to stderr, so the
-payload is parseable without stripping it first.
+payload is parseable without stripping it first. A PR skipped by title pattern now answers with the
+same payload *shape* as a reviewed one (`reviewed: false` and empty lists) rather than a nine-key
+subset that made `payload['judged']` a KeyError on exactly the run the payload exists for.
+
+**Breaking for `--json` consumers:** the per-finding keys `title` / `detail` / `reason` are now
+`synthesis` / `detail` / `rationale`, and `id`, `key`, `verdict`, `related` and `reported_by` are
+new — see `harness/loops/README.md`. Nothing in this repo consumes them (the `/panel` skills work
+from the PR comment), and the board accepts both spellings.
 
 No board change: `POST /review` has accepted this shape since v2.11, and the API stays at v2.12.
 

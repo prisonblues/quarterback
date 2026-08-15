@@ -194,21 +194,43 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   is suppressed.
 - **Merging happens once, in the judge, and adds rather than replaces.** The judge
   sees one entry per *reviewer*, merges the entries that are the same defect, and
-  writes a `synthesis`; each reviewer's own account, severity and line ride along
-  verbatim in `reported_by`. Dedup upstream of the judge could only keep one
+  writes a `synthesis`; each reviewer's own title, detail, severity and line ride
+  along in `reported_by`. Dedup upstream of the judge could only keep one
   reviewer's text and discard the rest — so the point only one reviewer made
   survived exactly when the merge *failed*, and a better key made the loss worse.
   Findings are pre-clustered by file and adjacent lines purely as a **hint**; the
   duplicates that matter are semantic (one defect, two line numbers), which no line
   arithmetic finds. Separate defects sharing one cause are linked with `related`
-  instead of merged, so the fixer decides once.
+  instead of merged, so one decision is fixed once.
 - Reviewers whose prerequisites are missing are reported **SKIPPED**, not failed.
-- **The `/panel` skill (default = fix)** consumes `--json`, checks out the PR branch in
-  an isolated worktree, fixes confirmed findings, runs lint + unit tests (**aborts the
-  commit on failure**), makes one commit, pushes, and comments the summary.
-  `panel.py` itself stays read-only — the fix/verify/commit lives in the skill.
-  The fixer consumes findings already merged, each carrying every reviewer's account,
-  rather than collapsing an over-counted list by hand as it used to.
+- **The `/panel` and `/panel-review-pr` skills** run `panel.py --post` and work from
+  the **PR comment** it leaves: `/panel` stops there (review-only), `/panel-review-pr`
+  hands the confirmed findings to a fixer sub-agent that fixes, verifies and pushes.
+  `panel.py` itself stays read-only either way.
+
+### The `--json` payload
+
+One record per **defect**, in `to_fix` / `dismissed` / `sonar_findings`, plus the run's
+own fields (`judged`, `reviewers`, `diff_budgets`, `run_key`, …). A skipped PR emits the
+same keys with empty values and `reviewed: false`, so nothing has to branch on which
+exit produced it.
+
+Each finding record:
+
+| field | what it is |
+|---|---|
+| `id` | run-local (`1609-F03`), and only for resolving `related` **within one payload** — it is a position, so it moves between runs |
+| `key` | the defect's identity **across** runs: file + the reporting reviewers' own words, so a re-review joins the same chain even though the judge re-words its synthesis every time |
+| `synthesis` / `detail` | the merged statement and its body (the board stores these as `title`/`detail`) |
+| `verdict` | `confirmed` \| `dismissed` \| `unjudged` \| `sonar` |
+| `reported_by` | one entry per reviewer: its own `title`, `detail`, `severity`, `line`, and `account` (the two joined, for reading) |
+| `reviewers`, `related`, `rationale` | who reported it, sibling findings from one cause, and the judge's reason |
+
+**Breaking, v2.14:** the per-finding keys were `title` / `detail` / `reason` with a
+`reviewers` name list. They are now `synthesis` / `detail` / `rationale`, and `id`,
+`key`, `verdict`, `related` and `reported_by` are new. The board accepts both spellings
+(`POST /review` aliases `title`↔`synthesis` and `reason`↔`rationale`); any other consumer
+has to be updated.
 
 ## Epic driver (`epic.py`)
 
