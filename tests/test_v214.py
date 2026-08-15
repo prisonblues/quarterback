@@ -15,11 +15,15 @@ following round actually found rather than taken on trust.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import sys
 from pathlib import Path
 
+from sqlalchemy import text
+
 from app.api.reviews import _derive_key
+from app.db import engine
 
 from .conftest import LAPTOP
 
@@ -98,7 +102,20 @@ async def test_a_stop_that_was_not_convergence_is_recorded_as_such(client):
         round_stop={"stop": True, "reason": "dry — nothing raised that an earlier round had not",
                     "confident": False, "veto": ["codex saw 60,000 of 118,402 diff chars"]}))
     assert run["round"] == 2 and run["stop_reason"].startswith("dry")
+    assert run["stopped"] is True
     assert run["stop_confident"] is False
+    # ...and WHY it was not convergence, which is the question the column exists
+    # to answer. "not convergence" with the reasons dropped answers half of it.
+    assert run["stop_veto"] == ["codex saw 60,000 of 118,402 diff chars"]
+
+
+async def test_a_round_that_said_go_again_is_not_recorded_as_a_stop(client):
+    """`stop: false` used to be parsed and dropped, leaving the reason string as
+    the only signal — and it reads as a reason to CONTINUE ("1 finding(s) no
+    earlier round raised"), so the board labelled a running cycle finished."""
+    run = await detail(client, await record(client, 6104))   # the default: stop false
+    assert run["stopped"] is False
+    assert run["stop_reason"] == "1 finding(s) no earlier round raised"
 
 
 async def test_an_older_payload_is_a_first_round_that_declared_nothing(client):
@@ -114,8 +131,11 @@ async def test_an_older_payload_is_a_first_round_that_declared_nothing(client):
     run = await detail(client, r.json()["id"])
     assert run["round"] == 1
     assert run["new_findings"] is None and run["stop_reason"] is None
+    assert run["stopped"] is None and run["stop_veto"] == []
     assert run["stop_confident"] is None and run["coverage_note"] is None
+    assert run["cycle"] is None
     assert card(run, "claude")["could_not_assess"] is None
+    assert card(run, "claude")["unstructured"] is None
     assert run["findings"][0]["needs_rereview"] is False
     assert run["findings"][0]["new_this_round"] is None
 
@@ -124,8 +144,10 @@ async def test_a_flat_stop_reason_is_accepted_without_the_nested_verdict(client)
     run = await detail(client, await record(
         client, 6103, round_stop=None, stop_reason="round cap (2) reached"))
     assert run["stop_reason"] == "round cap (2) reached"
-    # Nothing claimed about confidence — the flat field cannot carry it.
-    assert run["stop_confident"] is None
+    # Nothing claimed about confidence, or about whether it stopped at all — the
+    # flat field carries a reason and nothing else, and guessing True from it is
+    # how a round that meant "go again" would read as finished.
+    assert run["stop_confident"] is None and run["stopped"] is None
 
 
 # ---- coverage declarations -------------------------------------------------
@@ -137,6 +159,25 @@ async def test_nothing_to_declare_is_not_the_same_as_never_asked(client):
     run = await detail(client, await record(client, 6110))
     assert card(run, "claude")["could_not_assess"] == []
     assert card(run, "codex")["could_not_assess"] == ["the migration, which the diff omits"]
+
+
+async def test_a_reply_that_did_not_parse_is_not_a_reviewer_that_was_never_asked(client):
+    """An unparsed reply loses everything the member might have declared, so it
+    lands on `could_not_assess: null` — the same cell as a pre-v2.14 reviewer that
+    was never asked. That is the NULL/[] collapse this release exists to prevent,
+    one level up: a coverage failure the honesty stats could not see."""
+    run = await detail(client, await record(client, 6112, reviewers={
+        "claude": {"model": "sonnet", "ran": True, "could_not_assess": []},
+        "codex": {"model": "gpt-5.6", "ran": True, "unstructured": True},
+    }))
+    codex = card(run, "codex")
+    assert codex["unstructured"] is True and codex["could_not_assess"] is None
+    # ...and it is distinguishable from the member that simply had nothing to say.
+    assert card(run, "claude")["unstructured"] is None
+    s = (await client.get(f"/review/stats?repo={REPO}", headers=AGENT)).json()
+    rows = {(m["reviewer"], m["model"]): m for m in s["by_model"]}
+    assert rows[("codex", "gpt-5.6")]["unstructured_runs"] >= 1
+    assert rows[("claude", "sonnet")]["unstructured_runs"] == 0
 
 
 async def test_truncation_is_visible_on_the_row_it_affected(client):
@@ -233,8 +274,10 @@ async def test_a_flag_the_next_round_vindicated_is_recorded_as_a_hit(client):
     first, second = h["runs"]
     assert first["rereview_flagged"] == 1 and first["rereview_hit"] is True
     assert second["round"] == 2 and second["rereview_flagged"] == 0
-    # The last round's stop is the PR's stop.
-    assert h["stopped"].startswith("1 finding") and h["stop_confident"] is False
+    # The last round said "go again", so the cycle has not stopped — its reason is
+    # a reason to continue, and reporting it as `stopped` called it finished.
+    assert h["stopped"] is False
+    assert h["stop_reason"].startswith("1 finding") and h["stop_confident"] is False
 
 
 async def test_a_flag_nothing_followed_up_on_is_recorded_as_a_miss(client):
@@ -275,6 +318,44 @@ async def test_a_later_cycle_is_not_the_answer_to_an_earlier_rounds_flag(client)
     assert h["runs"][0]["rereview_hit"] is None
 
 
+async def test_one_cycles_re_review_is_not_credited_to_anothers_declaration(client):
+    """Two agents looping the same PR interleave: A-r1, B-r1, A-r2. Position plus
+    "round is one more" credits B's declaration with A's re-review, and this number
+    is published as an honesty measure per reviewer — a wrong attribution there is
+    worse than none. The stored cycle id is what makes it a join."""
+    await record(client, 6136, cycle="cycle-A")                       # A round 1
+    await record(client, 6136, cycle="cycle-B", to_fix=[{             # B round 1
+        "severity": "P2", "file": "app/other.py", "title": "b's own finding",
+        "reviewers": ["claude"], "reason": "real", "needs_rereview": True,
+        "new_this_round": True}])
+    await record(client, 6136, cycle="cycle-A", round=2, new_findings=1, to_fix=[{
+        "severity": "P2", "file": "app/sync.py", "title": "dual-keyed node",
+        "reviewers": ["claude"], "reason": "real", "new_this_round": True}])
+    h = (await client.get(f"/review/findings?repo={REPO}&pr=6136", headers=AGENT)).json()
+    a1, b1, a2 = h["runs"]
+    assert a2["cycle"] == "cycle-A" and a2["round"] == 2
+    # A's round 2 answers A's round 1 even though B's run sits between them...
+    assert a1["rereview_hit"] is True
+    # ...and B's declaration is unanswered, not vindicated by somebody else's round.
+    assert b1["rereview_flagged"] == 1 and b1["rereview_hit"] is None
+
+
+async def test_a_finding_older_than_the_window_is_not_new_inside_it(client):
+    """"New" used to be first appearance within the traced window, so a round that
+    fell outside `limit` made a long-standing finding read as fresh — falsely
+    vindicating the re-review flag pointing at its file. The panel already computed
+    the answer against the real baseline, and now that is what counts."""
+    await record(client, 6137)                                  # round 1 flags app/sync.py
+    await record(client, 6137, round=2, new_findings=0, to_fix=[{
+        "severity": "P2", "file": "app/sync.py", "title": "the same defect again",
+        "reviewers": ["claude"], "reason": "real",
+        # First time this KEY appears in the window, but the panel's baseline says
+        # an earlier round already raised it.
+        "new_this_round": False}])
+    h = (await client.get(f"/review/findings?repo={REPO}&pr=6137", headers=AGENT)).json()
+    assert h["runs"][0]["rereview_hit"] is False
+
+
 async def test_a_flag_with_no_round_after_it_is_unanswered_not_wrong(client):
     """None, not False: nobody looked. Scoring an unrun round as a miss would
     punish the reviewer for the workflow stopping."""
@@ -288,6 +369,38 @@ async def test_a_chain_carries_the_declaration_it_was_given(client):
     h = await _two_rounds(client, 6133, "app/sync.py")
     flagged = [c for c in h["findings"] if c["needs_rereview"]]
     assert [c["file"] for c in flagged] == ["app/sync.py"]
+
+
+async def test_a_finding_level_flag_credits_the_members_that_sent_no_account(client):
+    """`reported_by` present, nobody's own flag set, no `rereview_by` — the
+    fallback was gated on there being no accounts at all, so the flag was stored on
+    the finding while no reviewer's `rereview_flagged` counted it and the two views
+    of one declaration disagreed. A member that sent no account is not authoritative
+    about its own silence, so it is the one to credit."""
+    run = await detail(client, await record(client, 6125, to_fix=[{
+        "severity": "P2", "file": "a.py", "title": "structural", "reason": "real",
+        "reviewers": ["claude", "codex"], "needs_rereview": True,
+        "reported_by": [{"reviewer": "claude", "account": "not structural",
+                         "needs_rereview": False}],
+    }]))
+    assert run["findings"][0]["needs_rereview"] is True
+    assert card(run, "codex")["rereview_flagged"] == 1
+    # claude said false about itself, and that stands.
+    assert card(run, "claude")["rereview_flagged"] == 0
+
+
+async def test_a_flag_every_reporter_denied_is_recorded_and_credited_to_nobody(client):
+    """The remaining asymmetry, stated rather than papered over: every credited
+    member sent an account and every one said false, so there is nobody left to
+    credit and filling it in would manufacture a declaration. The finding keeps the
+    caller's flag — a caller contradicting itself, recorded rather than resolved."""
+    run = await detail(client, await record(client, 6126, to_fix=[{
+        "severity": "P2", "file": "a.py", "title": "structural", "reason": "real",
+        "reviewers": ["claude"], "needs_rereview": True,
+        "reported_by": [{"reviewer": "claude", "account": "no", "needs_rereview": False}],
+    }]))
+    assert run["findings"][0]["needs_rereview"] is True
+    assert card(run, "claude")["rereview_flagged"] == 0
 
 
 async def test_a_flag_naming_only_unknown_members_credits_someone(client):
@@ -341,17 +454,42 @@ async def test_coverage_counters_reach_the_leaderboard(client):
 
 # ---- the two halves agree on what a defect IS ------------------------------
 
+KEY_CASES = (("app/sync.py", "half-stale node after the early return"),
+             ("a.py", "Unicode dash — survives the strip!"),
+             (None, ""),
+             ("x.py", "   spaced   out   "),
+             ("b.py", "MiXeD CaSe 42 and_underscores"))
+
+
 def test_the_panel_and_the_board_derive_the_same_defect_key():
     """The panel now sends `key` so the local round-over-round diff and the
     board's cross-run chains are provably the same identity. They are two
     implementations of one recipe (a third lives in migration 0012's SQL), so
     drift between them is silent: the round diff would say "new" about a finding
     the chain says is old, and only one of the two is on screen."""
-    for file, title in (("app/sync.py", "half-stale node after the early return"),
-                        ("a.py", "Unicode dash — survives the strip!"),
-                        (None, ""),
-                        ("x.py", "   spaced   out   ")):
+    for file, title in KEY_CASES:
         assert panel.finding_key(file, title) == _derive_key(file, title)
+
+
+async def test_the_migrations_sql_derives_the_same_defect_key_too():
+    """The third implementation, and the one nobody had checked: migration 0012
+    backfills every pre-v2.11 finding's key in SQL. If its regexp, its `btrim` or
+    its `substr` disagrees with the Python by one character, the old rows join no
+    chain — silently, because a key that links nothing looks exactly like a defect
+    that was only ever seen once. Run against the live database, since the answer
+    depends on Postgres' `lower`/`regexp_replace`, not on our reading of them."""
+    spec = importlib.util.spec_from_file_location(
+        "_m0012",
+        Path(__file__).resolve().parents[1] / "migrations/versions/0012_review_finding_reports.py",
+    )
+    m0012 = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m0012)
+    stmt = text(f"SELECT {m0012._KEY_SQL} FROM "
+                "(VALUES (cast(:file as text), cast(:title as text))) AS t(file, title)")
+    async with engine.connect() as conn:
+        for file, title in KEY_CASES:
+            got = await conn.scalar(stmt, {"file": file, "title": title})
+            assert got == _derive_key(file, title), (file, title)
 
 
 # ---- the two halves, end to end --------------------------------------------
@@ -437,9 +575,18 @@ async def test_a_real_panel_payload_records_and_reads_back(client, monkeypatch, 
     assert r2["round_stop"]["stop"] is True and r2["round_stop"]["confident"] is False
     assert "round cap (2)" in r2["round_stop"]["reason"]
 
+    # Both rounds belong to one cycle, inherited from round 1's payload — so the
+    # board can join them without guessing from adjacency.
+    assert r2["cycle"] == r1["cycle"]
+
     assert (await client.post("/review", json=r2, headers=AGENT)).status_code == 201
     h = (await client.get("/review/findings?repo=acme/e2e&pr=77", headers=AGENT)).json()
     assert h["rounds"] == 2
+    assert {r["cycle"] for r in h["runs"]} == {r1["cycle"]}
+    assert h["stopped"] is True and h["stop_reason"].startswith("round cap (2)")
+    # The panel's veto list survives to the board, which is the only place a
+    # reader can find out WHY the stop was not convergence.
+    assert h["stop_veto"] and any("still confirmed" in v for v in h["stop_veto"])
     # One defect, two observations — not two defects.
     assert len(h["findings"]) == 1 and h["findings"][0]["runs_seen"] == 2
     assert h["stop_confident"] is False

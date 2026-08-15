@@ -17,8 +17,11 @@ half-stale: a P2 regression of the exact invariant the PR existed to establish, 
 round could have found because it did not exist until the fixer wrote it.
 
 The cycle is now panel → fix → panel, two rounds by default (`--rounds N` / `--loop` for more),
-and the loop is decided mechanically: findings this round that no earlier round raised, or a
-P1/P2 still confirmed, buy another pass. Reviewers are **not** asked to forecast whether another
+and the loop is decided mechanically: findings this round that no earlier round raised, a P1/P2
+still confirmed, or a finding an earlier round already raised that is *still* confirmed at any
+severity, buy another pass — SonarCloud's hard-gate issues counting exactly like the judged ones,
+since the workflow requires them resolved either way. The round cap is what ends the argument when
+two reviewers disagree about a P4 forever. Reviewers are **not** asked to forecast whether another
 round is needed — that asks a model to predict findings it has not made, and the reviewer that
 silently produced nothing answers "no" with complete confidence.
 
@@ -30,13 +33,20 @@ had every reviewer confidently reporting on half a PR, invisibly. Declarations n
 loop — a truncated reviewer is truncated again next round — they veto a *false stop*, so a round
 that found nothing because it could not look is no longer recorded as convergence.
 
-All of it reaches the board (`round`, `new_findings`, `stop_reason`, `stop_confident`,
-`could_not_assess`, `rereview_flagged`) and the `/panel` page, so a human can review the review:
-whether a clean verdict was earned, without re-reading a transcript. `GET /review/findings` checks
-each re-review flag against what the following round of the same cycle actually found, which makes
-**honesty per reviewer** measurable for the first time — a member that says "I could not assess X"
-and is right is worth more than one that silently reports clean, and until now nothing
-distinguished them.
+All of it reaches the board (`round`, `cycle`, `new_findings`, `stopped`, `stop_reason`,
+`stop_confident`, `stop_veto`, `could_not_assess`, `unstructured`, `rereview_flagged`) and the
+`/panel` page, so a human can review the review: whether a clean verdict was earned, and — from
+`stop_veto` — *why not*, without re-reading a transcript. A round that says "go again" is stored as
+one, so a running cycle is never rendered as a finished one, and a reviewer whose reply did not
+parse is distinguishable from one that was never asked instead of collapsing onto the same null.
+`GET /review/findings` checks each re-review flag against what the following round of the same
+cycle actually found, which makes **honesty per reviewer** measurable for the first time — a member
+that says "I could not assess X" and is right is worth more than one that silently reports clean,
+and until now nothing distinguished them.
+
+"The same cycle" is a stored fact rather than a positional guess: the panel mints a `cycle` id on
+round 1 and every later round inherits it from its earliest baseline, so two agents looping the
+same PR at once cannot have one's round 2 credited to the other's round 1.
 
 Two limits on that number, stated because a measure nobody can calibrate is worse than none. It is
 **file-grain**: the next round raised a confirmed finding in a file this round flagged, which is

@@ -74,18 +74,38 @@ class ReviewRun(Base):
     # round found that the one before it had not, and what stopped the loop.
     #: 1 for a first review, 2+ for a re-review of the fix commit.
     round: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    #: Which panel -> fix -> panel CYCLE this round belongs to. Every round of one
+    #: cycle carries the same opaque id (the panel inherits it from its earliest
+    #: baseline), so "the re-review of THIS round's declaration" is a join rather
+    #: than the guess "whatever ran next on this PR" — two agents looping the same
+    #: PR interleave, and a positional rule credits one cycle's round 2 to the
+    #: other's round 1. NULL for every run recorded before the panel sent it.
+    cycle: Mapped[str | None] = mapped_column(Text)
     #: Findings this round that no earlier round raised. NULL where the panel
     #: never said — "not reported" and "nothing new" are different facts, and
     #: storing the second for the first is how a pre-v2.14 run reads as converged.
     new_findings: Mapped[int | None] = mapped_column(Integer)
+    #: Whether the cycle actually STOPPED here. A round that ends with findings
+    #: outstanding sends ``stop: false`` and carries a reason for going again, so
+    #: reading the reason as "this is where it stopped" labels a cycle that must
+    #: continue as finished. NULL where the panel didn't say.
+    stopped: Mapped[bool | None] = mapped_column(Boolean)
     #: What ended the loop, in the panel's words: dry / a P1-P2 still confirmed /
     #: the round cap. A cap reached with work outstanding is not convergence.
+    #: Also carries the reason to go AGAIN when ``stopped`` is false — the two are
+    #: told apart by that column, never by the prose.
     stop_reason: Mapped[str | None] = mapped_column(Text)
     #: Whether that stop was EARNED. False when a reviewer was truncated, absent,
     #: unparsed, or declared a gap — the cases where a counter reading zero says
     #: nothing about the code. This is the column that lets a human review the
     #: review without re-reading the transcript.
     stop_confident: Mapped[bool | None] = mapped_column(Boolean)
+    #: WHY it was unearned, verbatim from the panel ("codex saw 60,000 of 118,402
+    #: diff chars", "claude could not assess: the migration"). ``stop_confident``
+    #: says a clean verdict was not evidence; without the reasons the reader has
+    #: no way to judge how badly — which is the question this release exists to
+    #: answer, and the one the operator is told to relay.
+    stop_veto: Mapped[list[Any] | None] = mapped_column(JSONB)
 
     # Hard gates that sit alongside the LLM panel.
     sonar_gate: Mapped[str | None] = mapped_column(Text)
@@ -150,12 +170,20 @@ class ReviewReviewer(Base):
     #: What this member said it could NOT judge — a file the diff omits, a runtime
     #: behaviour, a schema it cannot see. An observation, not a forecast, and the
     #: only thing that separates "clean" from "I could not tell"; a finding count
-    #: reports both as zero. NULL = not asked, or asked and it said nothing (every
-    #: pre-v2.14 panel, and any reviewer whose CLI answers in the old bare-array
-    #: shape); [] = asked, and it had nothing to declare. The two states must not
-    #: collapse — that is the whole point of the column — so this says it the same
-    #: way ``app.api.reviews.ReviewerIn.could_not_assess`` does.
+    #: reports both as zero. NULL = no structured declaration was obtained — the
+    #: member was never asked (every pre-v2.14 panel), its CLI answered in the old
+    #: bare-array shape, or its reply did not parse at all (see ``unstructured``);
+    #: [] = asked, and it had nothing to declare. The two states must not collapse
+    #: — that is the whole point of the column — so this says it the same way
+    #: ``app.api.reviews.ReviewerIn.could_not_assess`` does.
     could_not_assess: Mapped[list[Any] | None] = mapped_column(JSONB)
+    #: This member's reply carried no JSON and was kept as one raw finding. Its
+    #: findings are real work, but nothing it might have declared survived the
+    #: parse — so it lands on NULL ``could_not_assess`` for a reason that has
+    #: nothing to do with never being asked, and only this column tells the two
+    #: apart. Without it an unparsed reviewer is invisible to the honesty stats,
+    #: which is the same NULL/[] collapse one level up. NULL = the panel didn't say.
+    unstructured: Mapped[bool | None] = mapped_column(Boolean)
     #: Findings this member flagged as needing the FIX re-read. With the next
     #: round's new findings this is the accuracy check on the declaration itself —
     #: the raw material for honesty per reviewer, which precision cannot show.

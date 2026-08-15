@@ -343,6 +343,31 @@ def extract_json_value(raw: str) -> list | dict | None:
     return parsed[0] if parsed else None
 
 
+#: Spellings of "yes" a model reaches for when the contract asked for `true`.
+#: Anything else — including "false", "no", "0" and every non-boolean shape — is
+#: NOT a declaration.
+_TRUTHY = frozenset({"true", "yes", "y", "1", "on"})
+
+
+def _flag(val) -> bool:
+    """A declared boolean, from output this parser deliberately treats as imperfect.
+
+    Python truthiness is the wrong rule here: ``bool("false")`` is True, so a
+    lenient model writing ``"needs_rereview": "false"`` would make a declaration
+    it explicitly declined to make — and that flag both vetoes a stop and feeds
+    the per-member honesty count, where a manufactured yes is the one error that
+    cannot be spotted later. Real booleans and conventional boolean strings are
+    honoured; everything else is no.
+    """
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, str):
+        return val.strip().lower() in _TRUTHY
+    if isinstance(val, int):  # 1/0 from a model that sent a number
+        return bool(val)
+    return False
+
+
 def _to_findings(reviewer: str, items: list) -> list[Finding]:
     return [Finding(
         reviewer=reviewer,
@@ -351,7 +376,7 @@ def _to_findings(reviewer: str, items: list) -> list[Finding]:
         line=it.get("line") if isinstance(it.get("line"), int) else None,
         title=str(it.get("title", "")).strip(),
         detail=str(it.get("detail", "")).strip(),
-        needs_rereview=bool(it.get("needs_rereview")),
+        needs_rereview=_flag(it.get("needs_rereview")),
     ) for it in items if isinstance(it, dict)]
 
 
@@ -1281,26 +1306,41 @@ class Baseline:
     """What earlier rounds of THIS PR already raised."""
 
     keys: set[str] = field(default_factory=set)
-    #: normalised title -> the file it was raised against, for the reworded case.
-    titles: dict[str, str] = field(default_factory=dict)
+    #: normalised title -> every file spelling it was raised against, for the
+    #: reworded case. A set rather than one file: the same words about two files
+    #: are two defects, and keeping only the last-seen one loses the other.
+    titles: dict[str, set[str]] = field(default_factory=dict)
     #: Which earlier rounds are actually represented here, not the highest round
     #: label among them: baselines for rounds 1 and 3 are two earlier rounds, and
     #: calling that three invents one nobody ran. ``len(rounds)`` is what prints.
     rounds: set[int] = field(default_factory=set)
+    #: The panel -> fix -> panel CYCLE these baselines came from, inherited from
+    #: the earliest one so every round of a cycle carries the same id. None when
+    #: there was no usable baseline, in which case the run mints its own.
+    cycle: str | None = None
     problems: list[str] = field(default_factory=list)
 
     def raised_before(self, file: str | None, title: str) -> bool:
         """Did an earlier round raise this defect — under this key, or under a
-        near-identical title in the same file?"""
+        near-identical title in the same file?
+
+        "The same file" is suffix-aware, exactly as :func:`_same_file` is for
+        grouping. Reviewers spell paths differently (``reviews.py`` vs
+        ``app/api/reviews.py``) and the representative keeps the longest spelling,
+        so a round where only the short-path reviewer raised the defect hashes to
+        a different key AND used to fail the title check — a persistent defect
+        counted as new, which buys a fix cycle nobody needed.
+        """
         if finding_key(file, title) in self.keys:
             return True
         norm = re.sub(r"[^a-z0-9]+", " ", (title or "").lower()).strip()
         if not norm:
             return False
         return any(
-            was_file == (file or "")
+            _same_file(file or "", was_file)
             and difflib.SequenceMatcher(None, norm, was).ratio() >= REWORD_RATIO
-            for was, was_file in self.titles.items()
+            for was, was_files in self.titles.items()
+            for was_file in was_files
         )
 
 
@@ -1323,9 +1363,35 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
     ``expect`` (``repo``/``github``/``pr``/``round``) is checked against what the
     payload says it is. A baseline from another PR is not a thinner baseline, it
     is a wrong one: its keys would make real findings read as repeated and stop
-    the loop early, so a mismatched payload is REPORTED and its keys dropped."""
+    the loop early, so a mismatched payload is REPORTED and its keys dropped. The
+    identity fields must be PRESENT as well as equal: a hand-edited or truncated
+    payload that omits them is a payload nobody can attribute, and accepting it
+    suppresses this run's findings on the word of a file that never said whose it
+    was. The same goes for a payload whose round is not earlier than this one's —
+    it is reported *and* excluded, since a current or future round's keys make
+    genuinely new findings read as repeated.
+
+    A round past the first with NO baseline at all is itself a problem: every
+    finding then reads as new, ``prior_rounds`` prints zero, and the round would
+    otherwise be free to record a *confident* verdict about a comparison it never
+    made."""
     b = Baseline()
-    want = expect or {}
+    want = dict(expect or {})
+    if "round" in want:
+        # Normalised once, and never raised out of: this function's rule is that a
+        # bad input costs a problems entry, not a review that every reviewer CLI
+        # has already been paid for.
+        try:
+            want["round"] = int(want["round"])
+        except (TypeError, ValueError):
+            del want["round"]
+    if not paths and want.get("round", 1) > 1:
+        b.problems.append(
+            f"round {want['round']} ran with no --baseline — nothing to compare against, "
+            "so every finding here reads as one no earlier round raised")
+    #: (round, cycle) of each usable baseline, so the cycle is inherited from the
+    #: EARLIEST round rather than from whichever path was listed first.
+    cycles: list[tuple[int, str]] = []
     for path in paths:
         try:
             payload = json.loads(Path(path).read_text())
@@ -1335,9 +1401,15 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
         if not isinstance(payload, dict):
             b.problems.append(f"baseline {path} is not a panel payload")
             continue
+        checked = [k for k in ("repo", "github", "pr") if k in want]
+        missing = [k for k in checked if payload.get(k) is None]
         wrong = [f"{k}={payload.get(k)!r} (this run: {want[k]!r})"
-                 for k in ("repo", "github", "pr")
-                 if k in want and payload.get(k) is not None and payload.get(k) != want[k]]
+                 for k in checked if payload.get(k) is not None and payload.get(k) != want[k]]
+        if missing:
+            b.problems.append(f"baseline {path} does not say which review it is from "
+                              f"(no {', '.join(missing)}) — its findings were NOT counted "
+                              "as earlier rounds")
+            continue
         if wrong:
             b.problems.append(f"baseline {path} is another review's — " + ", ".join(wrong)
                               + " — its findings were NOT counted as earlier rounds")
@@ -1351,8 +1423,16 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
         if "round" in want and was >= want["round"]:
             b.problems.append(f"baseline {path} is round {was}, which is not earlier than "
                               f"this run's round {want['round']} — pass the round this "
-                              "run actually is")
+                              "run actually is — its findings were NOT counted as earlier "
+                              "rounds")
+            continue
         b.rounds.add(was)
+        # A cycle id the caller minted, or — for a round 1 that predates the
+        # field — the run_key it recorded itself under, which is unique to that
+        # process and is exactly as stable.
+        got = str(payload.get("cycle") or payload.get("run_key") or "")
+        if got:
+            cycles.append((was, got))
         for bucket in ("to_fix", "dismissed", "sonar_findings"):
             for f in payload.get(bucket) or []:
                 if not isinstance(f, dict):
@@ -1361,7 +1441,9 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
                 b.keys.add(str(f.get("key") or "") or finding_key(file, title))
                 norm = re.sub(r"[^a-z0-9]+", " ", title.lower()).strip()
                 if norm:
-                    b.titles[norm] = file or ""
+                    b.titles.setdefault(norm, set()).add(file or "")
+    if cycles:
+        b.cycle = min(cycles)[1]
     return b
 
 
@@ -1411,21 +1493,25 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     1. findings this round that no earlier round raised -> go again;
     2. a P1/P2 still confirmed -> go again, whatever anyone declared (a blocker
        raised again is a blocker that was not fixed);
-    3. otherwise dry -> stop.
+    3. ``repeated`` — a finding an earlier round already raised that is STILL
+       confirmed, at any severity -> go again. The fixer was told about it and it
+       is still there, and ``/panel-review-pr``'s bar is every confirmed finding
+       fixed, not every P1/P2. This used to only cost the stop its confidence,
+       which ended the cycle with a judge-confirmed defect present and nothing
+       acting on the veto that said so;
+    4. otherwise dry -> stop.
 
-    The cap ends it either way, and a cap reached with work outstanding is
-    recorded as such rather than as convergence.
-
-    ``repeated`` — findings an earlier round already raised that are STILL
-    confirmed — does not extend the loop (two reviewers can disagree about a P4
-    forever), but it does cost the stop its confidence: the fixer was told about
-    those and they are still there, which is not the same event as nothing being
-    found."""
+    The cap is what stops rule 3 running forever when two reviewers disagree
+    about a P4 — the cycle ends either way, and a cap reached with work
+    outstanding is recorded as such rather than as convergence."""
     blockers = [f for f in confirmed if f.severity in ("P1", "P2")]
     if new_keys:
         stop, reason = False, (f"{len(new_keys)} finding(s) no earlier round raised")
     elif blockers:
         stop, reason = False, f"{len(blockers)} P1/P2 still confirmed after the fix"
+    elif repeated:
+        stop, reason = False, (f"{repeated} finding(s) an earlier round already raised "
+                               "are still confirmed")
     else:
         stop, reason = True, ("dry — nothing raised that an earlier round had not"
                               if round_no > 1 else "dry — no findings to fix")
@@ -1624,16 +1710,29 @@ def run(repo_name: str, pr_number: int, post: bool, json_out: bool = False,
                            "round": round_no})
     prior_keys, prior_rounds = prior.keys, len(prior.rounds)
     notes.extend(prior.problems)
+    # Every finding the cycle has to clear, not just the judged ones: Sonar's
+    # hard-gate issues MUST end up resolved (/panel-review-pr §3), so a round
+    # whose only outstanding item is a new or still-open gate issue is not a dry
+    # round. Leaving them out classified exactly that as convergence and ended the
+    # cycle without another fixer.
+    outstanding = [f for f, _, _ in to_fix] + list(result.sonar_findings)
     # Reworded findings count as raised before, not as fresh damage — see
     # Baseline.raised_before.
     seen_before = {finding_key(f.file, f.title): prior.raised_before(f.file, f.title)
-                   for f, _, _ in to_fix}
+                   for f in outstanding}
     new_keys = sorted(k for k, before in seen_before.items() if not before)
     flagged = sum(1 for f, _, _ in to_fix if f.needs_rereview)
-    veto = coverage_veto(reviewer_meta, judge_skip, flagged, len(diff))
-    stop = round_stop(round_no, cap, new_keys,
-                      [f for f, _, _ in to_fix], veto, not prior.problems,
+    # A baseline that could not be read, could not be attributed, or was never
+    # passed is a veto in its own right, not just a lost confidence flag: the
+    # operator is told to LIST the vetoes, and "not convergence" with an empty
+    # list leaves the one question this exists to answer unanswered.
+    veto = coverage_veto(reviewer_meta, judge_skip, flagged, len(diff)) + prior.problems
+    stop = round_stop(round_no, cap, new_keys, outstanding, veto, not prior.problems,
                       repeated=sum(1 for before in seen_before.values() if before))
+    # A cycle's rounds share one id, inherited from the earliest baseline, so the
+    # board can tell "the re-review of THIS declaration" from "whatever ran next
+    # on this PR". Round 1 (and any run with no usable baseline) mints its own.
+    cycle = prior.cycle or run_key
 
     def loc(f: Finding) -> str:
         return f"{f.file}:{f.line}" if f.line else f.file
@@ -1661,6 +1760,7 @@ def run(repo_name: str, pr_number: int, post: bool, json_out: bool = False,
         # Where this run sits in the panel -> fix -> panel cycle, and what the
         # mechanical stopping rule made of it.
         "round": round_no,
+        "cycle": cycle,
         "prior_rounds": prior_rounds,
         "prior_findings": len(prior_keys),
         "new_findings": len(new_keys),
@@ -1689,6 +1789,18 @@ def run(repo_name: str, pr_number: int, post: bool, json_out: bool = False,
         "run_key": run_key,
     }
 
+    # A requested --json-file that could not be written FAILS the run. That file
+    # is the next round's baseline, and without it round r+1 classifies every
+    # repeated finding as new, prints "N of N raised by no earlier round" and
+    # drives a fix pass over work already done. Warning and exiting 0 let the
+    # caller advance the cycle on a baseline that does not exist.
+    #
+    # The failure is raised at the END rather than here: the report, the board
+    # record and the PR comment are the review that has already been paid for,
+    # and throwing them away would push the caller towards re-running the panel —
+    # which the workflow forbids, because each run is an observation and
+    # re-rolling one corrupts the record.
+    write_failed = ""
     if json_file:
         # So a caller can have BOTH the PR comment and the machine-readable run.
         # Without it, --json suppresses the report and the only way to get both
@@ -1696,8 +1808,17 @@ def run(repo_name: str, pr_number: int, post: bool, json_out: bool = False,
         try:
             Path(json_file).write_text(json.dumps(payload, indent=2))
         except OSError as e:
-            print(f"panel: could not write {json_file} ({e.__class__.__name__})",
-                  file=sys.stderr)
+            write_failed = f"{json_file} ({e.__class__.__name__})"
+            print(f"panel: could not write {write_failed}", file=sys.stderr)
+
+    def finish(code: int = 0) -> int:
+        if write_failed:
+            print(f"\npanel: FAILED — the requested --json-file was not written: "
+                  f"{write_failed}. The review above is complete, but the next round "
+                  "has no baseline: fix the path and re-run the CYCLE from round 1 "
+                  "rather than treating this round as done.", file=sys.stderr)
+            return 2
+        return code
 
     if record:
         record_run(payload)
@@ -1707,7 +1828,7 @@ def run(repo_name: str, pr_number: int, post: bool, json_out: bool = False,
     # loop.
     if json_out:
         print(json.dumps(payload, indent=2))
-        return 0
+        return finish()
 
     def conf(revs: list[str]) -> str:
         return f" _(via {', '.join(revs)}{' ⋆consensus' if len(revs) > 1 else ''})_"
@@ -1721,9 +1842,11 @@ def run(repo_name: str, pr_number: int, post: bool, json_out: bool = False,
     # parsed but held no findings is still an earlier round, and used to produce a
     # "· round 1" heading with nothing under it.
     if round_no > 1 or prior_rounds:
+        # Counted over everything the cycle has to clear (Sonar's hard gate
+        # included), so the numerator and the denominator are the same population.
         lines.append(f"**Round {round_no}** — re-reviewing after the fix. "
-                     f"{len(new_keys)} of {len(to_fix)} finding(s) here were raised by no "
-                     f"earlier round ({len(prior_keys)} known from {prior_rounds} earlier "
+                     f"{len(new_keys)} of {len(outstanding)} finding(s) here were raised by "
+                     f"no earlier round ({len(prior_keys)} known from {prior_rounds} earlier "
                      f"round{'s' if prior_rounds != 1 else ''}).")
     ci_txt = {"PASS": "✅ PASS", "FAIL": "❌ FAIL", "PENDING": "⏳ pending",
               "none": "no checks reported", "unknown": "unknown"}.get(ci_status, ci_status)
@@ -1788,7 +1911,10 @@ def run(repo_name: str, pr_number: int, post: bool, json_out: bool = False,
     if result.sonar_findings:
         lines.append(f"\n### SonarCloud issues ({len(result.sonar_findings)}) — part of the gate")
         for f in sorted(result.sonar_findings, key=lambda x: x.severity):
-            lines.append(f"- {f.severity} `{loc(f)}` — {f.title}")
+            # Same 🆕 rule as the judged findings: these count towards the round
+            # diff too, because the gate has to end up clear either way.
+            fresh = " 🆕" if prior_rounds and not prior.raised_before(f.file, f.title) else ""
+            lines.append(f"- {f.severity}{fresh} `{loc(f)}` — {f.title}")
 
     if dismissed:
         lines.append(f"\n### Dismissed by master ({len(dismissed)})")
@@ -1860,7 +1986,7 @@ def run(repo_name: str, pr_number: int, post: bool, json_out: bool = False,
                   f" — the report above is the only copy", file=sys.stderr)
     else:
         print("\n(report only — pass --post to comment on the PR)")
-    return 0
+    return finish()
 
 
 def main() -> int:

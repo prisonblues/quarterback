@@ -205,9 +205,15 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   parses and simply declares nothing.
 - **Rounds are mechanical.** `--round`/`--baseline` make each run say which findings no
   earlier round raised; `round_stop` in the payload then says go-again (something new,
-  or a P1/P2 still confirmed) or stop (dry / round cap), and whether stopping was
-  *convergence*. The declarations never extend the loop — a truncated reviewer is
-  truncated again next round — they only stop a broken round being reported as clean.
+  a P1/P2 still confirmed, or a finding an earlier round raised that is still confirmed
+  — SonarCloud's hard-gate issues included) or stop (dry / round cap), and whether
+  stopping was *convergence*. The declarations never extend the loop — a truncated
+  reviewer is truncated again next round — they only stop a broken round being reported
+  as clean. A round past the first with no `--baseline` is itself a veto: it has nothing
+  to compare against, so its "all new" count means nothing and its stop is unearned.
+- **`--json-file` is a requirement, not a courtesy.** It is the next round's baseline, so
+  a write that fails exits non-zero after the report: carrying on would leave round `r+1`
+  calling every repeated finding new.
 - **`--max-rounds N` is the CALLER's cap**, not a loop panel.py runs: it is the only
   input that tells a round which stopped because it was done from one which stopped
   because it ran out, and `/panel-review-pr` passes it on every invocation. Its flag is

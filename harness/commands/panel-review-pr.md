@@ -103,9 +103,18 @@ Make one private directory for this PR's round payloads first, and keep using it
 for every round:
 
 ```
-rundir=$(mktemp -d)                       # 0700, and a name nobody can predict
+mktemp -d                                 # 0700, and a name nobody can predict
+```
+
+**Read the path it printed and write it out literally from here on** — every Bash
+call is a fresh shell, so a `rundir=$(mktemp -d)` set in one command is gone by
+the next one and `"$rundir/r1.json"` expands to `/r1.json` in §5: the baseline
+fails to load and the round-2 payload lands at the filesystem root. There is no
+shell variable to carry; substitute the actual directory into each command:
+
+```
 python3 ~/.claude/loops/panel.py --pr <pr> --post --round 1 --max-rounds <N> \
-    --json-file "$rundir/r1.json"
+    --json-file /tmp/tmp.AbC123/r1.json          # ← the path mktemp -d printed
 ```
 
 (`--post` comments the panel summary on the PR by default — that is the review
@@ -115,6 +124,11 @@ are NEW rather than the same ones again; without it every reappearing finding
 reads as fresh damage. `<N>` is the round cap from `$ARGS`, and passing it is
 also what tells the panel this run is part of a cycle rather than a one-off
 read.)
+
+**If the panel exits non-zero because it could not write that file, the round did
+not happen for cycle purposes.** The payload is round 2's baseline; without it the
+next round calls every repeated finding new. Fix the path and start the cycle
+again at round 1 rather than carrying on — never re-run this round on its own.
 
 **Not** a fixed `/tmp/panel-<pr>-r<n>.json`. Two reasons, both real on a shared
 host: the panel writes that path with `Path.write_text`, which follows symlinks,
@@ -194,14 +208,18 @@ Once the fixer has **pushed**, run the panel again over the new commit:
 
 ```
 python3 ~/.claude/loops/panel.py --pr <pr> --post --round <r> --max-rounds <N> \
-    --baseline "$rundir/r1.json" [--baseline …each earlier round…] \
-    --json-file "$rundir/r<r>.json"
+    --baseline /tmp/tmp.AbC123/r1.json [--baseline …each earlier round…] \
+    --json-file /tmp/tmp.AbC123/r<r>.json
 ```
 
-(`$rundir` is the `mktemp -d` from §3 — same directory every round. The panel
-checks each baseline's `repo`/`github`/`pr` against the run it is doing and
-refuses to count a payload from another review, so a mis-wired `--baseline`
-shows up as a reported problem rather than as findings that look repeated.)
+(The `/tmp/tmp.AbC123` above stands for the directory `mktemp -d` printed in §3 —
+paste that literal path here, in every round. Shell variables do not survive
+between commands. The panel checks each baseline's `repo`/`github`/`pr` against
+the run it is doing — they must be present *and* match — and refuses to count a
+payload from another review, or one whose round is not earlier than this one's,
+so a mis-wired `--baseline` shows up as a reported problem rather than as
+findings that look repeated. A round past the first with **no** `--baseline` at
+all is reported the same way, and costs the round its confidence.)
 
 Pass **every** earlier round's payload as a `--baseline`, or a finding raised in
 round 1, missed in round 2 and raised again in round 3 counts as new.
@@ -212,15 +230,17 @@ whether another round is needed (that asks a model to predict findings it has no
 made; one that just wrote five says yes, one that silently produced nothing says
 no with complete confidence):
 
-- **`stop: false`** — there are findings no earlier round raised, or a P1/P2 is
-  still confirmed. Fix them (§4 again, with only this round's findings in the
-  brief), then run the panel again as round `r+1`. Repeat until `stop` is true or
-  the cap is reached.
+- **`stop: false`** — there is work outstanding: findings no earlier round raised,
+  a P1/P2 still confirmed, or a finding an earlier round already raised that is
+  *still* confirmed at any severity (the fixer was told and it is still there —
+  and SonarCloud's hard-gate issues count here exactly like the judged ones). Fix
+  them (§4 again, with only this round's findings in the brief), then run the
+  panel again as round `r+1`. Repeat until `stop` is true or the cap is reached.
 - **`stop: true`** — the cycle is done. Note `confident`: **false** means the
   stop was not convergence — a reviewer read a prefix of the diff, never ran,
-  returned nothing parseable or declared a gap; the cap ran out; or a finding an
-  earlier round already raised is *still* confirmed, meaning its fix did not
-  land. The `veto` list says which. Report it as a stop, never as "clean".
+  returned nothing parseable or declared a gap; the cap ran out; or the round had
+  no baseline to compare against. The `veto` list says which. Report it as a stop,
+  never as "clean".
 
 Two things this must NOT do:
 - **Never let a fix ride out unreviewed silently.** At the cap, if the last fix

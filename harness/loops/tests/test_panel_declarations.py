@@ -129,6 +129,25 @@ def test_a_per_finding_flag_means_the_same_thing():
     assert findings[0].needs_rereview is True
 
 
+def test_a_string_no_is_not_a_yes():
+    """This parser deliberately tolerates imperfect LLM JSON, and `bool("false")`
+    is True — so a model spelling the answer out made a declaration it explicitly
+    declined to make. That flag both vetoes a stop and feeds the per-member honesty
+    count, where a manufactured yes cannot be spotted later."""
+    findings, _ = panel.parse_reply("codex", json.dumps({"findings": [
+        {"title": "a", "needs_rereview": "false"},
+        {"title": "b", "needs_rereview": "no"},
+        {"title": "c", "needs_rereview": "0"},
+        {"title": "d", "needs_rereview": None},
+        {"title": "e", "needs_rereview": {"why": "structural"}},
+        {"title": "f", "needs_rereview": "true"},
+        {"title": "g", "needs_rereview": "Yes"},
+        {"title": "h", "needs_rereview": 1},
+        {"title": "i", "needs_rereview": True},
+    ]}))
+    assert [f.title for f in findings if f.needs_rereview] == ["f", "g", "h", "i"]
+
+
 def test_the_flag_survives_the_merge_from_any_reporter():
     """One reviewer seeing that the fix will be structural is the observation;
     the others not saying so is not a contradiction of it."""
@@ -240,10 +259,65 @@ def test_another_prs_baseline_is_reported_and_not_counted(tmp_path):
     assert any("another review's" in p and "pr=99" in p for p in b.problems)
 
 
-def test_a_baseline_that_is_not_earlier_is_reported(tmp_path):
+def test_a_baseline_that_is_not_earlier_is_reported_and_not_counted(tmp_path):
+    """Reported AND excluded, like the cross-PR case. A current or future payload
+    that still loaded made genuinely new findings read as repeated, which ends the
+    loop a round early on findings nobody has fixed."""
     path = _payload(tmp_path, "r2.json", 2, ["x"])
     b = panel.load_baseline([path], THIS_RUN)
     assert any("not earlier than" in p for p in b.problems)
+    assert b.keys == set() and b.rounds == set()
+    assert not b.raised_before("a.py", "x")
+
+
+def test_a_baseline_that_does_not_say_whose_it_is_is_not_believed(tmp_path):
+    """The identity check only rejected fields that were PRESENT and unequal, so a
+    hand-edited or truncated payload omitting them suppressed this run's findings
+    on the word of a file that never said which review it came from."""
+    path = tmp_path / "anon.json"
+    path.write_text(json.dumps({"round": 1, "to_fix": [{"file": "a.py", "title": "x"}]}))
+    b = panel.load_baseline([str(path)], THIS_RUN)
+    assert b.keys == set() and b.rounds == set()
+    assert any("does not say which review" in p for p in b.problems)
+
+
+def test_a_round_two_with_no_baseline_at_all_is_a_problem(tmp_path):
+    """Without one, every finding reads as new, the report prints "N of N raised by
+    no earlier round (0 known from 0 earlier rounds)", and the round would be free
+    to record a CONFIDENT verdict on a comparison it never made."""
+    b = panel.load_baseline([], THIS_RUN)
+    assert any("no --baseline" in p for p in b.problems)
+    # ...and a first round is not missing anything.
+    assert panel.load_baseline([], {**THIS_RUN, "round": 1}).problems == []
+
+
+def test_a_path_spelled_short_is_the_same_defect_as_the_full_one(tmp_path):
+    """Grouping already treats `reviews.py` and `app/api/reviews.py` as one file and
+    keeps the longest spelling. A round where only the short-path reviewer raised
+    the defect hashed to a different key AND failed the exact-file title check, so a
+    persistent defect counted as new and bought a fix cycle nobody needed."""
+    p = tmp_path / "r1.json"
+    p.write_text(json.dumps({
+        "round": 1, "repo": "acme", "github": "acme/board", "pr": 34,
+        "to_fix": [{"file": "app/api/reviews.py", "title": "stop is parsed and discarded"}],
+    }))
+    b = panel.load_baseline([str(p)], THIS_RUN)
+    assert b.raised_before("reviews.py", "stop is parsed and discarded")
+    # Not a licence to merge two distinct files that merely end in the same name.
+    assert not b.raised_before("harness/loops/reviews.py",
+                               "stop is parsed and discarded")
+
+
+def test_a_cycle_is_inherited_from_the_earliest_baseline(tmp_path):
+    """Every round of one cycle carries the same id, so the board can tell "the
+    re-review of THIS declaration" from "whatever ran next on this PR". Taken from
+    the earliest ROUND, not from whichever --baseline was listed first — a round 1
+    that predates the field carries only its run_key, which is the same thing."""
+    r1 = _payload(tmp_path, "r1.json", 1, ["a"], run_key="cyc-1")
+    r2 = _payload(tmp_path, "r2.json", 2, ["b"], cycle="cyc-later", run_key="run-2")
+    assert panel.load_baseline([r2, r1], {**THIS_RUN, "round": 3}).cycle == "cyc-1"
+    # No usable baseline, no inherited cycle — the run mints its own.
+    assert panel.load_baseline([], {**THIS_RUN, "round": 1}).cycle is None
 
 
 def test_earlier_rounds_are_counted_not_guessed_from_the_highest_label(tmp_path):
@@ -309,14 +383,22 @@ def test_a_declaration_vetoes_the_verdict_but_never_extends_the_loop():
     assert d["stop"] is True and d["confident"] is False and d["veto"]
 
 
-def test_a_finding_still_there_after_the_fix_costs_the_stop_its_confidence():
-    """The loop does not go again for a repeated P3 — two reviewers can disagree
-    about one of those forever — but "the fixer was told and it is still there"
-    is not the same event as "nothing was found", and only one of them is a
-    clean bill of health."""
-    d = panel.round_stop(2, 2, [], [_finding("P3")], [], repeated=1)
-    assert d["stop"] is True and d["confident"] is False
+def test_a_finding_still_there_after_the_fix_earns_another_round():
+    """A judge-confirmed P3 the last round already raised is a finding the fixer was
+    told about and did not fix. Recording a veto and stopping anyway ended the cycle
+    with a confirmed defect present — /panel-review-pr's bar is every confirmed
+    finding, not every P1/P2."""
+    d = panel.round_stop(2, 3, [], [_finding("P3")], [], repeated=1)
+    assert d["stop"] is False and "still confirmed" in d["reason"]
     assert any("did not land" in v for v in d["veto"])
+
+
+def test_the_cap_is_what_ends_an_argument_about_a_repeated_p4():
+    """Two reviewers can disagree about a P4 forever, so rule 3 needs a floor. The
+    cap is it — and a cap reached with work outstanding is not convergence."""
+    d = panel.round_stop(2, 2, [], [_finding("P4")], [], repeated=1)
+    assert d["stop"] is True and d["confident"] is False
+    assert "round cap (2)" in d["reason"] and "unreviewed" in d["reason"]
 
 
 def test_a_baseline_that_could_not_be_read_also_costs_the_verdict_its_confidence():
@@ -447,6 +529,97 @@ def test_a_re_review_says_which_round_it_is_and_where_the_loop_stands(monkeypatc
     # The same finding again is not fresh damage, and the ↻/🆕 marker stays off.
     assert "🆕" not in report
     assert "1 finding(s) an earlier round already raised" in report
+
+
+def test_a_round_two_with_no_baseline_says_so_on_the_pr(monkeypatch, capsys, tmp_path):
+    """The operator is told to list the vetoes. A round that never had a baseline
+    cannot claim convergence, and "not convergence" with nothing listed leaves the
+    reader to guess which of the reasons applied."""
+    report, out = _report(monkeypatch, capsys, tmp_path, 2, max_rounds=3)
+    assert "no --baseline" in report
+    payload = json.loads(Path(out).read_text())
+    assert payload["round_stop"]["confident"] is False
+    assert any("no --baseline" in v for v in payload["round_stop"]["veto"])
+
+
+def test_a_cycles_rounds_all_carry_the_same_id(monkeypatch, capsys, tmp_path):
+    """Round 1 mints it, every later round inherits it from its earliest baseline.
+    Without it "the round that answered this declaration" is the guess "whatever
+    ran next on this PR", which credits one cycle's round 2 to another's round 1
+    the moment two agents loop the same PR at once."""
+    _, r1 = _report(monkeypatch, capsys, tmp_path, 1, max_rounds=3)
+    r1_payload = json.loads(Path(r1).read_text())
+    _, r2 = _report(monkeypatch, capsys, tmp_path, 2, baseline=[r1], max_rounds=3)
+    assert json.loads(Path(r2).read_text())["cycle"] == r1_payload["cycle"]
+    # A round 1 of a DIFFERENT cycle over the same PR is not the same cycle.
+    _, other = _report(monkeypatch, capsys, tmp_path, 1, max_rounds=3)
+    assert json.loads(Path(other).read_text())["cycle"] != r1_payload["cycle"]
+
+
+# ---- the hard gate is part of the loop -------------------------------------
+
+SONAR_CFG = {**PANEL_CFG,
+             "reviewers": {**PANEL_CFG["reviewers"], "sonarqube": {"enabled": True}}}
+
+
+def _sonar_round(monkeypatch, tmp_path, round_no, baseline=(), max_rounds=3):
+    """A round whose ONLY outstanding item is a SonarCloud hard-gate issue."""
+    monkeypatch.setattr(panel, "load_repo_cfg", lambda name: SONAR_CFG)
+    monkeypatch.setattr(panel, "sh", lambda args, **kw: (
+        json.dumps({"title": "feat: x", "additions": 3, "deletions": 1,
+                    "baseRefName": "main", "headRefName": "feat/x", "headRefOid": "abc"})
+        if args[:3] == ["gh", "pr", "view"] else "diff --git a/a.py b/a.py\n+x\n"))
+    monkeypatch.setattr(panel, "review_llm",
+                        lambda *a, **k: panel.ReviewerRun([], None, 10, []))
+    monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
+    monkeypatch.setattr(panel, "review_sonarqube", lambda *a, **k: (
+        "ERROR", [panel.Finding("sonarqube", "P2", "a.py", 9, "cognitive complexity 21")],
+        [], None))
+    out = tmp_path / f"s{round_no}.json"
+    assert panel.run("board", 34, post=False, json_file=str(out), record=False,
+                     round_no=round_no, baseline=list(baseline), max_rounds=max_rounds) == 0
+    return str(out), json.loads(out.read_text())
+
+
+def test_a_new_hard_gate_issue_is_not_a_dry_round(monkeypatch, tmp_path):
+    """The gate's issues MUST end up resolved, and they were left out of the round
+    diff entirely — so a round whose only outstanding item was one of them recorded
+    itself as dry and the caller stopped without running another fixer."""
+    _, r1 = _sonar_round(monkeypatch, tmp_path, 1)
+    assert r1["new_findings"] == 1
+    assert r1["round_stop"]["stop"] is False
+
+
+def test_a_hard_gate_issue_still_open_after_the_fix_earns_another_round(monkeypatch,
+                                                                        tmp_path):
+    path, _ = _sonar_round(monkeypatch, tmp_path, 1)
+    _, r2 = _sonar_round(monkeypatch, tmp_path, 2, baseline=[path])
+    assert r2["new_findings"] == 0            # not new — but not resolved either
+    assert r2["round_stop"]["stop"] is False
+    assert "still confirmed" in r2["round_stop"]["reason"]
+
+
+# ---- the baseline the next round needs -------------------------------------
+
+def test_a_json_file_that_could_not_be_written_fails_the_run(monkeypatch, capsys,
+                                                             tmp_path):
+    """That file IS the next round's baseline. Warning and exiting 0 let the caller
+    advance the cycle onto a baseline that does not exist, where every repeated
+    finding reads as new."""
+    monkeypatch.setattr(panel, "load_repo_cfg", lambda name: PANEL_CFG)
+    monkeypatch.setattr(panel, "sh", lambda args, **kw: (
+        json.dumps({"title": "feat: x", "additions": 3, "deletions": 1,
+                    "baseRefName": "main", "headRefName": "feat/x", "headRefOid": "abc"})
+        if args[:3] == ["gh", "pr", "view"] else "diff --git a/a.py b/a.py\n+x\n"))
+    monkeypatch.setattr(panel, "review_llm",
+                        lambda *a, **k: panel.ReviewerRun([], None, 10, []))
+    monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
+    unwritable = tmp_path / "no-such-dir" / "r1.json"
+    assert panel.run("board", 34, post=False, json_file=str(unwritable),
+                     record=False, round_no=1, max_rounds=2) == 2
+    err = capsys.readouterr().err
+    # ...and the review it already paid for is still reported, not thrown away.
+    assert "could not write" in err and "re-run the CYCLE" in err
 
 
 # ---- the CLI's own arguments -----------------------------------------------

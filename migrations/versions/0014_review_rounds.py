@@ -45,15 +45,32 @@ def upgrade() -> None:
         "review_runs",
         sa.Column("round", sa.Integer(), server_default="1", nullable=False),
     )
+    # Which cycle the round belongs to. Nullable: no run recorded before this
+    # migration was part of a cycle anything could name, and inventing one would
+    # let a positional guess read as a stated fact.
+    op.add_column("review_runs", sa.Column("cycle", sa.Text(), nullable=True))
     # Nullable on purpose: "the panel never said" is not "nothing new".
     op.add_column("review_runs", sa.Column("new_findings", sa.Integer(), nullable=True))
+    # `stopped` is the panel's own boolean. Without it the reason string doubles
+    # as the answer, and a round that said "go again" reads as one that stopped.
+    op.add_column("review_runs", sa.Column("stopped", sa.Boolean(), nullable=True))
     op.add_column("review_runs", sa.Column("stop_reason", sa.Text(), nullable=True))
     op.add_column("review_runs", sa.Column("stop_confident", sa.Boolean(), nullable=True))
+    # The reasons a stop was unearned, verbatim. `stop_confident` says a clean
+    # verdict was not evidence; this says why, which is what a reader needs.
+    op.add_column(
+        "review_runs",
+        sa.Column("stop_veto", postgresql.JSONB(astext_type=sa.Text()), nullable=True),
+    )
 
     op.add_column(
         "review_reviewers",
         sa.Column("could_not_assess", postgresql.JSONB(astext_type=sa.Text()), nullable=True),
     )
+    # A reviewer whose reply did not parse lands on could_not_assess NULL, which
+    # is also where a member that was never asked lands. Only this tells them
+    # apart, and an unparsed reviewer is a coverage failure the stats must see.
+    op.add_column("review_reviewers", sa.Column("unstructured", sa.Boolean(), nullable=True))
     op.add_column(
         "review_reviewers",
         sa.Column("rereview_flagged", sa.Integer(), server_default="0", nullable=False),
@@ -75,6 +92,8 @@ def downgrade() -> None:
     op.drop_column("review_findings", "new_this_round")
     op.drop_column("review_findings", "needs_rereview")
     op.drop_column("review_reviewers", "rereview_flagged")
+    op.drop_column("review_reviewers", "unstructured")
     op.drop_column("review_reviewers", "could_not_assess")
-    for col in ("stop_confident", "stop_reason", "new_findings", "round", "coverage_note"):
+    for col in ("stop_veto", "stop_confident", "stop_reason", "stopped", "new_findings",
+                "cycle", "round", "coverage_note"):
         op.drop_column("review_runs", col)

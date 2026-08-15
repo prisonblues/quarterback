@@ -36,10 +36,12 @@ this round found that the last had not, or what stopped the loop. And a run said
 only what was *found* — a reviewer handed a prefix of the diff, one that never
 ran, and one that had nothing to say all recorded the same zero.
 
-A run now carries its ``round``, ``new_findings``, ``stop_reason`` and
-``stop_confident``; a member carries ``could_not_assess`` (its own declaration)
-alongside the panel-measured ``truncated``; a finding carries ``needs_rereview``,
-per reporter. Together those make the review reviewable: whether a clean verdict
+A run now carries its ``round`` and ``cycle``, ``new_findings``, whether it
+``stopped`` and with what ``stop_reason``, ``stop_confident`` and — when the stop
+was unearned — the ``stop_veto`` reasons; a member carries ``could_not_assess``
+(its own declaration) and ``unstructured`` (its reply did not parse) alongside the
+panel-measured ``truncated``; a finding carries ``needs_rereview``, per reporter.
+Together those make the review reviewable: whether a clean verdict
 was *earned* is on the row rather than in a transcript, and a reviewer that says
 "I could not assess X" and turns out to be right becomes distinguishable from one
 that silently reported clean — see ``GET /review/findings``, which checks each
@@ -222,11 +224,17 @@ class ReviewerIn(BaseModel):
     max_diff_chars: int | None = None
     truncated: bool | None = None
     duration_ms: int | None = None
-    #: Areas it could not judge. None = not asked (every panel before v2.14);
-    #: [] = asked, and it had nothing to declare. The two must not collapse, or a
-    #: reviewer that was never given the chance to say reads as one that had
-    #: nothing to say.
+    #: Areas it could not judge. None = no structured declaration was obtained —
+    #: not asked (every panel before v2.14), answered in the old bare-array shape,
+    #: or its reply did not parse (``unstructured``); [] = asked, and it had
+    #: nothing to declare. The two must not collapse, or a reviewer that was never
+    #: given the chance to say reads as one that had nothing to say.
     could_not_assess: list[str] | None = None
+    #: Its reply carried no JSON and was kept as one raw finding. That is why some
+    #: members land on ``could_not_assess: None`` having very much been asked, and
+    #: it is a coverage failure in its own right — the panel already vetoes a stop
+    #: over it, so the board must be able to see it too. None = the panel didn't say.
+    unstructured: bool | None = None
 
 
 class StopIn(BaseModel):
@@ -276,6 +284,10 @@ class ReviewIn(BaseModel):
     #: and rejecting the payload would lose the findings, the scorecards and the
     #: accounts along with the bad integer.
     round: int = 1
+    #: Which panel -> fix -> panel cycle this round belongs to. Opaque and minted
+    #: by the panel; every round of one cycle sends the same value. Absent for
+    #: every pre-v2.14 run, and for a standalone review that is nobody's round 2.
+    cycle: str | None = None
     new_findings: int | None = None
     #: The stopping rule's own account of itself. ``stop_reason`` is accepted flat
     #: as well, because the panel prints it both ways and a caller reproducing the
@@ -360,8 +372,17 @@ class Prepared:
     related: list[str] = field(default_factory=list)
     #: Members that declared this finding's fix worth re-reading, finest grain
     #: first: each reporter's own flag, then the panel's ``rereview_by``, then —
-    #: when the finding is flagged with no attribution at all — everyone credited
-    #: on it, which over-credits but never silently drops the declaration.
+    #: when the finding is flagged with no attribution at all — every credited
+    #: member that sent no account, which over-credits but never silently drops
+    #: the declaration.
+    #:
+    #: It CAN end up empty on a finding whose ``needs_rereview`` is true: when
+    #: every credited member sent an account and every one of them said false. A
+    #: reporter is authoritative about its own silence, so there is nobody left to
+    #: credit, and filling it in would manufacture a declaration nobody made. The
+    #: finding still stores the flag (the caller said so at finding level), so
+    #: ``GET /review/findings`` shows it while no member's ``rereview_flagged``
+    #: counts it — a caller contradicting itself, recorded rather than resolved.
     rereview_by: list[str] = field(default_factory=list)
 
 
@@ -396,15 +417,16 @@ def _prepare(findings: list[tuple[FindingIn, str]]) -> list[Prepared]:
         named = {r.reviewer for r in reports}
         flagged = [r.reviewer for r in reports if r.needs_rereview]
         flagged += [n for n in f.rereview_by if n in reviewers and n not in named]
-        # A finding flagged with nobody creditable: credit everyone credited on
-        # it. Over-crediting is visible and correctable; dropping the declaration
-        # is neither — and "nobody creditable" includes a `rereview_by` naming
-        # only members this finding does not credit (a renamed or retired
-        # reviewer, a typo, a member merged out), which is exactly the case that
-        # used to leave `needs_rereview` stored with no member credited and no
-        # `rereview_flagged` tallied anywhere.
-        if not flagged and f.needs_rereview and not named:
-            flagged = list(reviewers)
+        # A finding flagged with nobody creditable: credit every member that is
+        # not authoritative about its own silence — i.e. everyone credited on the
+        # finding that sent no account. Over-crediting is visible and correctable;
+        # dropping the declaration is neither — and "nobody creditable" includes a
+        # `rereview_by` naming only members this finding does not credit (a
+        # renamed or retired reviewer, a typo, a member merged out), which is
+        # exactly the case that used to leave `needs_rereview` stored with no
+        # member credited and no `rereview_flagged` tallied anywhere.
+        if not flagged and f.needs_rereview:
+            flagged = [n for n in reviewers if n not in named]
         prepared.append(Prepared(
             f=f,
             verdict=verdict,
@@ -510,6 +532,7 @@ def _scorecards(
             truncated=c.truncated if c else None,
             duration_ms=c.duration_ms if c else None,
             could_not_assess=c.could_not_assess if c else None,
+            unstructured=c.unstructured if c else None,
             **tally[name],
         ))
     return cards
@@ -557,12 +580,20 @@ async def record_review(
         judge_skip=body.judge_skip,
         coverage_note=body.coverage_note or None,
         round=body.round,
+        cycle=body.cycle or None,
         new_findings=body.new_findings,
         # The nested verdict wins over the flat string: it is the one that also
         # carries whether the stop was earned, and a payload sending both sends
-        # the same reason twice.
+        # the same reason twice. The flat form can only carry the reason, so a
+        # caller using it says nothing about whether the cycle stopped — NULL,
+        # not a guessed True.
+        stopped=body.round_stop.stop if body.round_stop else None,
         stop_reason=(body.round_stop.reason if body.round_stop else body.stop_reason) or None,
         stop_confident=body.round_stop.confident if body.round_stop else None,
+        # The reasons, not just the verdict. Accepting the list and dropping it
+        # left the board able to say a stop was not convergence and unable to say
+        # why — which is the half an operator is told to relay.
+        stop_veto=(body.round_stop.veto or None) if body.round_stop else None,
         sonar_gate=body.sonar_gate,
         ci_status=body.ci_status,
         reviewers_selected=body.reviewers_selected or None,
@@ -657,9 +688,12 @@ def _run_view(r: ReviewRun) -> dict:
         "judge_skip": r.judge_skip,
         "coverage_note": r.coverage_note,
         "round": r.round,
+        "cycle": r.cycle,
         "new_findings": r.new_findings,
+        "stopped": r.stopped,
         "stop_reason": r.stop_reason,
         "stop_confident": r.stop_confident,
+        "stop_veto": r.stop_veto or [],
         "sonar_gate": r.sonar_gate,
         "ci_status": r.ci_status,
         "reviewers_selected": r.reviewers_selected or [],
@@ -683,6 +717,7 @@ def _card_view(c: ReviewReviewer) -> dict:
         "truncated": c.truncated,
         "duration_ms": c.duration_ms,
         "could_not_assess": c.could_not_assess,
+        "unstructured": c.unstructured,
         "rereview_flagged": c.rereview_flagged,
         "raised": c.raised,
         "confirmed": c.confirmed,
@@ -885,6 +920,11 @@ async def review_stats(
                     func.jsonb_typeof(ReviewReviewer.could_not_assess) == "array",
                     ReviewReviewer.could_not_assess != func.jsonb_build_array(),
                 ),
+                # Runs where its reply did not parse. Those land on
+                # could_not_assess NULL for a reason that is not "never asked",
+                # and a member whose CLI keeps producing unreadable output is a
+                # coverage failure that no other counter here can show.
+                func.count(ReviewReviewer.id).filter(ReviewReviewer.unstructured.is_(True)),
                 func.sum(ReviewReviewer.rereview_flagged),
             )
             .join(ReviewRun, ReviewRun.id == ReviewReviewer.run_id)
@@ -897,7 +937,7 @@ async def review_stats(
     for (name, model, effort, runs, skipped, raised, confirmed, dismissed,
          unjudged, solo, p1, p2, p3, p4, avg_ms,
          shared, stricter, agree, looser, total_ms,
-         truncated_runs, declared_runs, rereview_flagged) in model_rows:
+         truncated_runs, declared_runs, unstructured_runs, rereview_flagged) in model_rows:
         confirmed, dismissed = int(confirmed or 0), int(dismissed or 0)
         raised = int(raised or 0)
         ruled = confirmed + dismissed
@@ -941,6 +981,11 @@ async def review_stats(
             # silently reports clean, and nothing else here tells them apart.
             "truncated_runs": truncated_runs,
             "declared_gaps_runs": declared_runs,
+            # Runs whose reply did not parse at all: its findings were kept as one
+            # raw block, and anything it might have declared was lost. Reported
+            # beside the declarations because it is the reason some of those are
+            # null — not because the member had nothing to say.
+            "unstructured_runs": unstructured_runs,
             "rereview_flagged": int(rereview_flagged or 0),
             "avg_duration_ms": round(float(avg_ms)) if avg_ms is not None else None,
             # The cost side of "is the expensive tier worth it": time spent per
@@ -1021,12 +1066,17 @@ async def pr_finding_history(
     "unused import" in two repos is not one chain.
 
     Each run also carries ``rereview_flagged``/``rereview_hit``. A hit says the
-    round that followed *in the same cycle* (the next run, and only when its
-    round number is this one's plus 1) raised a confirmed finding in a file this
+    round that followed *in the same cycle* (the next run of the same ``cycle``
+    whose round is this one's plus 1) raised a confirmed finding in a file this
     round flagged for re-reading. That is a file-grain coincidence, not a causal
     claim: an unrelated defect in a large flagged file counts, a regression that
     lands in another file does not, and it is worth reading over many rounds
     rather than as a verdict on one.
+
+    ``stopped`` is the last round's own boolean — whether the cycle ended there —
+    with ``stop_reason`` for the words and ``stop_veto`` for the reasons a stop was
+    not convergence. It is not the reason string: that states a reason to go again
+    just as often, so naming the ending after it called a running cycle finished.
     """
     # One over the window, so "there is older history" is a fact rather than the
     # guess "we returned exactly as many as we asked for".
@@ -1040,8 +1090,8 @@ async def pr_finding_history(
     )
     if not fetched:
         return {"repo": repo, "pr": pr, "rounds": 0, "stopped": None,
-                "stop_confident": None, "truncated": False,
-                "runs": [], "findings": []}
+                "stop_reason": None, "stop_confident": None, "stop_veto": [],
+                "truncated": False, "runs": [], "findings": []}
 
     truncated = len(fetched) > limit
     runs = list(reversed(fetched[:limit]))  # chronological: a chain reads left to right
@@ -1074,9 +1124,12 @@ async def pr_finding_history(
     # file scores as a hit, and a regression that surfaces in another file scores
     # as a miss. It is a signal over many rounds, not a verdict on one.
     #
-    # "New" is computed within the traced window, so a finding first raised before
-    # it counts as new here; the run's own `new_findings`, which the panel
-    # computed against its real baseline, is reported alongside for that reason.
+    # "New" is the finding's own `new_this_round` wherever the panel said — it was
+    # computed against the real baseline, which is the whole cycle rather than this
+    # window. Only where it is null does this fall back to first appearance INSIDE
+    # the window, and that fallback is what made a long-standing finding read as
+    # fresh whenever the round that first raised it fell outside `limit`, falsely
+    # vindicating the re-review flag that pointed at its file.
     # Only findings that survived the judge count as new: a false positive the
     # judge threw out is not the flagged fix being borne out, and admitting it is
     # the one thing that would make this number uninformative. Sonar's hard-gate
@@ -1091,21 +1144,33 @@ async def pr_finding_history(
             flagged_counts[i] = flagged_counts.get(i, 0) + 1
             if f.file:
                 flagged_files.setdefault(i, set()).add(f.file)
-        if (f.file and first_seen[f.finding_key] == i
-                and f.verdict not in ("dismissed", "sonar")):
+        fresh = f.new_this_round if f.new_this_round is not None else (
+            first_seen[f.finding_key] == i)
+        if f.file and fresh and f.verdict not in ("dismissed", "sonar"):
             fresh_files.setdefault(i, set()).add(f.file)
 
     def followed_by(i: int) -> int | None:
         """The run that re-reviewed run ``i``'s fix, if the record says there was
-        one: the next run in the window, and only when its round number is this
-        one's plus 1. Position alone credited whatever ran next — a standalone
-        `/panel` read, or a new cycle restarting at round 1 — as the answer to an
-        earlier round's declaration, and this number is presented as an honesty
-        measure, where a wrong attribution is worse than none.
+        one: the next round of the SAME cycle.
+
+        Where both runs name their cycle this is exact — the next run of that
+        cycle whose round is this one's plus 1, wherever it sits among interleaved
+        cycles on the same PR. Where the cycle is null (every run recorded before
+        the panel sent it) it falls back to the old positional rule: the adjacent
+        run, and only when its round is this one's plus 1. That fallback is what
+        can misattribute — A-r1, B-r1, A-r2 credits B's declaration with A's
+        re-review — which is why the panel now mints a cycle id at all; this
+        number is published as an honesty measure per reviewer, and a wrong
+        attribution there is worse than none.
         """
+        this = runs[i]
+        if this.cycle:
+            want = (this.round or 1) + 1
+            return next((j for j in range(i + 1, len(runs))
+                         if runs[j].cycle == this.cycle and runs[j].round == want), None)
         if i + 1 >= len(runs):
             return None
-        return i + 1 if runs[i + 1].round == (runs[i].round or 1) + 1 else None
+        return i + 1 if runs[i + 1].round == (this.round or 1) + 1 else None
 
     out = []
     for key, obs in chains.items():
@@ -1151,8 +1216,19 @@ async def pr_finding_history(
         # was convergence or merely a stop. A PR whose panel gave up at the round
         # cap, or stopped while a reviewer was reading half the diff, must not
         # read like one that was reviewed until there was nothing left.
-        "stopped": runs[-1].stop_reason,
+        #
+        # `stopped` is the panel's own boolean, spelled the same way it is on
+        # ``GET /review/{id}``. It used to be the reason STRING, which reads as a
+        # reason to go again just as often ("N finding(s) no earlier round
+        # raised") — so a cycle that explicitly must continue was labelled
+        # finished by the field that names the ending.
+        "stopped": runs[-1].stopped,
+        "stop_reason": runs[-1].stop_reason,
         "stop_confident": runs[-1].stop_confident,
+        # WHY the stop was unearned, in the panel's words. "not convergence" with
+        # no reasons attached is the question this feature exists to answer left
+        # unanswered.
+        "stop_veto": runs[-1].stop_veto or [],
         # More runs exist than the window traced, so `first_run` and a `gone`
         # status describe the window, not the PR's whole history.
         "truncated": truncated,
@@ -1160,8 +1236,9 @@ async def pr_finding_history(
             {"id": r.id, "ts": r.ts.isoformat(), "author": r.author, "judged": r.judged,
              "confirmed": r.n_confirmed, "dismissed": r.n_dismissed,
              "unjudged": r.n_unjudged, "sonar": r.n_sonar,
-             "round": r.round, "new_findings": r.new_findings,
-             "stop_reason": r.stop_reason, "stop_confident": r.stop_confident,
+             "round": r.round, "cycle": r.cycle, "new_findings": r.new_findings,
+             "stopped": r.stopped, "stop_reason": r.stop_reason,
+             "stop_confident": r.stop_confident, "stop_veto": r.stop_veto or [],
              # Findings this round declared worth re-reading, and whether the
              # round that followed found anything where it pointed — file-grain,
              # over confirmed findings only. None = no round followed it in this

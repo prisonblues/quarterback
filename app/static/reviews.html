@@ -235,6 +235,7 @@ function renderLeaderboard(rows, judgedOnly){
            (${r.sev_stricter} rated worse, ${r.sev_looser} milder)`}<br>
       ran in ${r.ran} of ${r.runs} runs${r.skipped_runs ? ` (${r.skipped_runs} skipped)` : ""}
       ${r.truncated_runs ? `<br>saw only part of the diff in ${r.truncated_runs} of them` : ""}
+      ${r.unstructured_runs ? `<br>answered unparseably in ${r.unstructured_runs} of them` : ""}
       ${r.declared_gaps_runs ? `<br>said what it could not assess in ${r.declared_gaps_runs}` : ""}
       ${r.rereview_flagged ? `<br>${r.rereview_flagged} fix(es) it asked to have re-read` : ""}
       ${r.avg_duration_ms ? `<br>avg ${Math.round(r.avg_duration_ms / 1000)}s per review` : ""}
@@ -267,8 +268,11 @@ function truncMark(c){
 // different in the list, not only once you open it.
 function coverageMarks(cards){
   const cut = cards.filter(c => c.truncated).map(c => c.name);
-  const gaps = cards.filter(c => (c.could_not_assess || []).length);
-  const gapTip = gaps.map(c => `${c.name}: ${c.could_not_assess.join(" · ")}`).join(" | ");
+  // A member whose reply did not parse declared nothing it may have wanted to,
+  // so it belongs beside the declared gaps rather than under a silent null.
+  const gaps = cards.filter(c => (c.could_not_assess || []).length || c.unstructured);
+  const gapTip = gaps.map(c => `${c.name}: ${c.unstructured ? "reply did not parse"
+      : c.could_not_assess.join(" · ")}`).join(" | ");
   return (cut.length ? ` <span style="color:var(--warn)"
       title="read a prefix of the diff: ${esc(cut.join(", "))}">✂</span>` : "")
     + (gaps.length ? ` <span style="color:var(--warn)"
@@ -376,13 +380,24 @@ async function renderHistory(box, repo, pr){
     return `<div class="dim">r${r.round || 1}: ${
       r.new_findings == null ? "new count not recorded" : `${r.new_findings} new`}${
       r.rereview_flagged ? ` · ${r.rereview_flagged} flagged for re-review${hit}` : ""}${
-      r.stop_reason ? ` · ${esc(r.stop_reason)}` : ""}</div>`;
+      r.stop_reason ? ` · ${r.stopped === false ? "go again" : "stop"}: ${esc(r.stop_reason)}` : ""}${
+      (r.stop_veto || []).length ? ` <span style="color:var(--warn)"
+        title="${esc(r.stop_veto.join(" | "))}">⚠ ${r.stop_veto.length} veto</span>` : ""}</div>`;
   }).join("");
+  // The ending comes from the panel's own boolean, never from the reason string:
+  // that reads as a reason to GO AGAIN just as often ("2 finding(s) no earlier
+  // round raised"), and printing it under "stopped:" called a running cycle
+  // finished.
+  const why = (h.stop_veto || []).length
+    ? ` <span class="dim" title="${esc(h.stop_veto.join(" | "))}">(${h.stop_veto.length} veto)</span>` : "";
+  const ending = h.stopped === false
+    ? ` · <span style="color:var(--warn)">not stopped: ${esc(h.stop_reason || "another round is due")}</span>`
+    : h.stop_reason ? ` · stopped: ${esc(h.stop_reason)}${
+        h.stop_confident === false
+          ? ' <span style="color:var(--warn)">(not convergence)</span>' + why : ""}` : "";
   box.innerHTML = `<div class="dim" style="margin:4px 0 6px">
       ${h.rounds} run${h.rounds === 1 ? "" : "s"} on this PR${h.truncated ? " (window truncated)" : ""}
-      · <b>gone</b> = raised earlier, not in the latest run${
-        h.stopped ? ` · stopped: ${esc(h.stopped)}${
-          h.stop_confident === false ? ' <span style="color:var(--warn)">(not convergence)</span>' : ""}` : ""}
+      · <b>gone</b> = raised earlier, not in the latest run${ending}
     </div>${rounds}<div style="margin-top:6px">${chains}</div>`;
 }
 
@@ -404,7 +419,10 @@ async function toggleRun(tr){
       <td class="dim">${c.truncated ? `${truncMark(c)} saw ${c.max_diff_chars?.toLocaleString()} chars`
                                     : "saw whole diff"}</td>
       <td class="dim" style="white-space:normal;text-align:left">${
-        c.could_not_assess == null ? "<span title='this panel was never asked'>—</span>"
+        c.unstructured ? `<span style="color:var(--warn)"
+            title="its reply carried no JSON — anything it declared was lost in the parse"
+            >reply did not parse</span>`
+        : c.could_not_assess == null ? "<span title='this panel was never asked'>—</span>"
         : c.could_not_assess.length ? esc(c.could_not_assess.join(" · "))
         : "nothing"}</td>
       <td class="dim">${c.rereview_flagged || 0}</td>
@@ -413,10 +431,15 @@ async function toggleRun(tr){
   // The run's own verdict on itself, above the findings: whether it stopped
   // because there was nothing left, and what the judge made of the coverage the
   // reviewers declared.
+  // The vetoes are listed, not counted: "not convergence" without them tells the
+  // reader a clean verdict was not evidence and nothing about how badly.
+  const vetoes = (r.stop_veto || []).length
+    ? `<ul style="margin:4px 0 0 18px;padding:0">${
+        r.stop_veto.map(v => `<li>${esc(v)}</li>`).join("")}</ul>` : "";
   const stop = r.stop_reason
     ? `<div style="margin-top:8px;color:${r.stop_confident === false ? "var(--warn)" : "var(--muted)"}">
-         round ${r.round || 1} · ${esc(r.stop_reason)}${
-           r.stop_confident === false ? " — not convergence" : ""}</div>` : "";
+         round ${r.round || 1} · ${r.stopped === false ? "go again" : "stop"}: ${esc(r.stop_reason)}${
+           r.stop_confident === false ? " — not convergence" : ""}${vetoes}</div>` : "";
   const note = r.coverage_note
     ? `<div class="dim" style="margin-top:4px">master on coverage: ${esc(r.coverage_note)}</div>` : "";
   row.innerHTML = `<td colspan="9">
