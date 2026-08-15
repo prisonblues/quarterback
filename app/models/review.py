@@ -6,6 +6,7 @@ from typing import Any
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    CheckConstraint,
     DateTime,
     ForeignKey,
     Index,
@@ -65,6 +66,47 @@ class ReviewRun(Base):
     )
     judge_model: Mapped[str | None] = mapped_column(Text)
     judge_skip: Mapped[str | None] = mapped_column(Text)
+    #: The judge's ruling on the coverage the reviewers declared — the split
+    #: between "clean" and "could not tell", adjudicated rather than averaged.
+    coverage_note: Mapped[str | None] = mapped_column(Text)
+
+    # Where this run sat in the panel -> fix -> panel cycle (v2.15). A PR's round
+    # COUNT is derivable by counting its runs; what is not derivable is what each
+    # round found that the one before it had not, and what stopped the loop.
+    #: 1 for a first review, 2+ for a re-review of the fix commit.
+    round: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    #: Which panel -> fix -> panel CYCLE this round belongs to. Every round of one
+    #: cycle carries the same opaque id (the panel inherits it from its earliest
+    #: baseline), so "the re-review of THIS round's declaration" is a join rather
+    #: than the guess "whatever ran next on this PR" — two agents looping the same
+    #: PR interleave, and a positional rule credits one cycle's round 2 to the
+    #: other's round 1. NULL for every run recorded before the panel sent it.
+    cycle: Mapped[str | None] = mapped_column(Text)
+    #: Findings this round that no earlier round raised. NULL where the panel
+    #: never said — "not reported" and "nothing new" are different facts, and
+    #: storing the second for the first is how a pre-v2.15 run reads as converged.
+    new_findings: Mapped[int | None] = mapped_column(Integer)
+    #: Whether the cycle actually STOPPED here. A round that ends with findings
+    #: outstanding sends ``stop: false`` and carries a reason for going again, so
+    #: reading the reason as "this is where it stopped" labels a cycle that must
+    #: continue as finished. NULL where the panel didn't say.
+    stopped: Mapped[bool | None] = mapped_column(Boolean)
+    #: What ended the loop, in the panel's words: dry / a P1-P2 still outstanding /
+    #: the round cap. A cap reached with work outstanding is not convergence.
+    #: Also carries the reason to go AGAIN when ``stopped`` is false — the two are
+    #: told apart by that column, never by the prose.
+    stop_reason: Mapped[str | None] = mapped_column(Text)
+    #: Whether that stop was EARNED. False when a reviewer was truncated, absent,
+    #: unparsed, or declared a gap — the cases where a counter reading zero says
+    #: nothing about the code. This is the column that lets a human review the
+    #: review without re-reading the transcript.
+    stop_confident: Mapped[bool | None] = mapped_column(Boolean)
+    #: WHY it was unearned, verbatim from the panel ("codex saw 60,000 of 118,402
+    #: diff chars", "claude could not assess: the migration"). ``stop_confident``
+    #: says a clean verdict was not evidence; without the reasons the reader has
+    #: no way to judge how badly — which is the question this release exists to
+    #: answer, and the one the operator is told to relay.
+    stop_veto: Mapped[list[Any] | None] = mapped_column(JSONB)
 
     # Hard gates that sit alongside the LLM panel.
     sonar_gate: Mapped[str | None] = mapped_column(Text)
@@ -88,6 +130,11 @@ class ReviewRun(Base):
         Index("ix_review_runs_repo_pr", "repo", "pr"),
         Index("ix_review_runs_ts", "ts"),
         Index("ix_review_runs_author", "author"),
+        # The API is not the only writer, and a round 0 or a negative count breaks
+        # run ordering and the published statistics (see migration 0014).
+        CheckConstraint('"round" >= 1', name="ck_review_runs_round_positive"),
+        CheckConstraint("new_findings >= 0",
+                        name="ck_review_runs_new_findings_non_negative"),
     )
 
 
@@ -121,7 +168,34 @@ class ReviewReviewer(Base):
     skip_reason: Mapped[str | None] = mapped_column(Text)
 
     max_diff_chars: Mapped[int | None] = mapped_column(Integer)
+    #: The reviewer read a PREFIX of the diff, at ``max_diff_chars``. Measured by
+    #: the panel, never asked for: the one thing a truncated reviewer cannot
+    #: notice is its own truncation, and a member that saw half the diff must be
+    #: distinguishable from one that saw all of it on every row it contributed to.
     truncated: Mapped[bool | None] = mapped_column(Boolean)
+    #: What this member said it could NOT judge — a file the diff omits, a runtime
+    #: behaviour, a schema it cannot see. An observation, not a forecast, and the
+    #: only thing that separates "clean" from "I could not tell"; a finding count
+    #: reports both as zero. NULL = no structured declaration was obtained — the
+    #: member was never asked (every pre-v2.15 panel), its CLI answered in the old
+    #: bare-array shape, or its reply did not parse at all (see ``unstructured``);
+    #: [] = asked, and it had nothing to declare. The two states must not collapse
+    #: — that is the whole point of the column — so this says it the same way
+    #: ``app.api.reviews.ReviewerIn.could_not_assess`` does.
+    could_not_assess: Mapped[list[Any] | None] = mapped_column(JSONB)
+    #: This member's reply carried no JSON and was kept as one raw finding. Its
+    #: findings are real work, but nothing it might have declared survived the
+    #: parse — so it lands on NULL ``could_not_assess`` for a reason that has
+    #: nothing to do with never being asked, and only this column tells the two
+    #: apart. Without it an unparsed reviewer is invisible to the honesty stats,
+    #: which is the same NULL/[] collapse one level up. NULL = the panel didn't say.
+    unstructured: Mapped[bool | None] = mapped_column(Boolean)
+    #: Findings this member flagged as needing the FIX re-read. With the next
+    #: round's new findings this is the accuracy check on the declaration itself —
+    #: the raw material for honesty per reviewer, which precision cannot show.
+    rereview_flagged: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
     #: Wall-clock for this reviewer's CLI call. Nullable and unset for now — the
     #: panel doesn't time its members yet; the column is here so it can start
     #: without a migration, since duration is the cost proxy that turns
@@ -157,6 +231,8 @@ class ReviewReviewer(Base):
     __table_args__ = (
         UniqueConstraint("run_id", "name", name="uq_review_reviewer_run_name"),
         Index("ix_review_reviewers_name_model", "name", "model"),
+        CheckConstraint("rereview_flagged >= 0",
+                        name="ck_review_reviewers_rereview_flagged_non_negative"),
     )
 
 
@@ -204,6 +280,17 @@ class ReviewFinding(Base):
     #: Denormalised len(reviewers) so consensus/solo queries don't unnest JSONB.
     n_reviewers: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
 
+    #: A reporter declared that fixing this takes a structural change whose RESULT
+    #: should be re-read. Stored on the finding as well as per reporter
+    #: (:class:`ReviewFindingReport`) because that is the grain the next round is
+    #: checked against: did the round that followed find something here?
+    needs_rereview: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    #: This observation was not raised by any earlier round of the same PR — the
+    #: dry-round counter, per finding. NULL where the panel didn't say.
+    new_this_round: Mapped[bool | None] = mapped_column(Boolean)
+
     __table_args__ = (
         Index("ix_review_findings_run", "run_id"),
         Index("ix_review_findings_verdict", "verdict"),
@@ -224,6 +311,12 @@ class ReviewFindingReport(Base):
     ``severity``/``line`` are *this reviewer's own*, which differ from the
     judge's and are the raw material for calibration stats; "confirmed findings
     where pi was the sole reporter" becomes a join rather than a JSONB unnest.
+
+    Fed by callers that send ``reported_by``, ``panel.py`` among them: its merge
+    lives in the judge, which writes a new synthesis and keeps every member's own
+    report beside it. An older payload that sends reviewer NAMES only leaves this
+    table empty for its run — the finding's own ``rereview_by`` then carries what
+    attribution there is, and the calibration counters stay at zero.
     """
 
     __tablename__ = "review_finding_reports"
@@ -236,6 +329,13 @@ class ReviewFindingReport(Base):
     severity: Mapped[str | None] = mapped_column(Text)  # what this reviewer called it
     line: Mapped[int | None] = mapped_column(Integer)  # where this reviewer put it
     account: Mapped[str | None] = mapped_column(Text)  # verbatim, never rewritten
+    #: THIS reviewer said the fix for this finding needs re-reading. Per reporter,
+    #: not per finding, because the declaration's accuracy is per reviewer: a
+    #: group flag credited to everyone who happened to raise the finding makes the
+    #: member that called it and the member that didn't indistinguishable.
+    needs_rereview: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
 
     __table_args__ = (
         UniqueConstraint("finding_id", "reviewer", name="uq_review_report_finding_reviewer"),

@@ -178,15 +178,18 @@ cwd's repo; `--repo` takes a path or a name under `~/source`.
 ## Reviewer panel (`panel.py`)
 
 `python3 ~/.claude/loops/panel.py --pr <n>` (report) / `--post` (also comment on the
-PR) / `--json` (the run as JSON on stdout — nothing else, progress goes to stderr).
+PR) / `--json` (the run as JSON on stdout — nothing else, progress goes to stderr) /
+`--round <r> --max-rounds <N> --baseline <earlier round's --json-file>` (a re-review that
+knows what the earlier rounds raised, and where it sits in the caller's cycle).
 
 Read-only, so it runs in **any** repo — an unconfigured one just uses the defaults.
 
 - Runs the repo's **enabled** reviewers in parallel over the PR diff: SonarQube (HARD
   quality-gate pass/fail), Claude (SOFT, read-only), Codex (SOFT, different vendor).
-- **Skip patterns:** PRs matching `skip_title_patterns` are skipped entirely (under
-  `--json` that is still a payload, marked `reviewed: false` — an empty stdout would
-  read as a clean PR). Otherwise all enabled reviewers run — no diff-size de-minimis.
+- **Skip patterns:** PRs matching `skip_title_patterns` are skipped entirely — but that
+  is still a payload, marked `reviewed: false`, on `--json` *and* in `--json-file` (an
+  empty stdout, or a missing baseline, would read as a clean PR). Otherwise all enabled
+  reviewers run — no diff-size de-minimis.
 - **Master judgment, no consensus gate:** a master reviewer judges every finding on
   its merits. A real defect flagged by only ONE reviewer is still fixed — agreement
   shows as a `⋆consensus` confidence marker, never a filter. Only clear false
@@ -203,10 +206,43 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   arithmetic finds. Separate defects sharing one cause are linked with `related`
   instead of merged, so one decision is fixed once.
 - Reviewers whose prerequisites are missing are reported **SKIPPED**, not failed.
+- **Reviewers declare their own coverage.** Each returns `could_not_assess` (areas it
+  could not judge — a file the diff omits, a runtime behaviour) and can mark a finding
+  `needs_rereview` (fixing it takes a structural change whose result should be read
+  again). Both are *observations*: reviewers are never asked to forecast whether
+  another round is needed, because that asks a model to predict findings it has not
+  made — and one that silently produced nothing would answer "no" with total
+  confidence. Truncation is measured, not asked for, since a truncated reviewer is the
+  one party that cannot notice it. A bare findings array (any older reviewer) still
+  parses and simply declares nothing.
+- **Rounds are mechanical.** `--round`/`--baseline` make each run say which findings no
+  earlier round raised; `round_stop` in the payload then says go-again (something new,
+  a P1/P2 still outstanding, or a finding an earlier round raised that is still outstanding
+  — SonarCloud's hard-gate issues included) or stop (dry / round cap), and whether
+  stopping was *convergence*. The declarations never extend the loop — a truncated
+  reviewer is truncated again next round — they only stop a broken round being reported
+  as clean. A round past the first with no `--baseline` is itself a veto: it has nothing
+  to compare against, so its "all new" count means nothing and its stop is unearned.
+- **`--json-file` is a requirement, not a courtesy.** It is the next round's baseline, so
+  a write that fails exits non-zero after the report: carrying on would leave round `r+1`
+  calling every repeated finding new. Every non-error exit writes it, the skip-pattern one
+  included, so "the panel exited 0 and wrote no file" is not a state the caller has to
+  interpret.
+- **`--max-rounds N` is the CALLER's cap**, not a loop panel.py runs: it is the only
+  input that tells a round which stopped because it was done from one which stopped
+  because it ran out, and `/panel-review-pr` passes it on every invocation. Its flag is
+  spelled `--rounds N` on the slash command and `--max-rounds N` here — same number, and
+  `--round <r>` (singular) is a different thing entirely: which round THIS run is.
+  A run given none of the three is a single review and says nothing about rounds — in the
+  report *and* in the payload, whose `round_stop`, `stop_reason` and `new_findings` are
+  null rather than a verdict about a loop nobody is running.
+  A `--round` past `--max-rounds` is rejected rather than recorded.
 - **The `/panel` and `/panel-review-pr` skills** run `panel.py --post` and work from
   the **PR comment** it leaves: `/panel` stops there (review-only), `/panel-review-pr`
-  hands the confirmed findings to a fixer sub-agent that fixes, verifies and pushes.
-  `panel.py` itself stays read-only either way.
+  hands the confirmed findings to a fixer sub-agent that fixes, verifies and pushes —
+  and then panels the fix commit, 2 rounds by default (`--rounds N`), so the fixer's
+  own work is read by somebody. `panel.py` itself stays read-only either way: the
+  fix/verify/commit lives in the skill, and so does the loop.
 
 ### The `--json` payload
 
@@ -225,6 +261,8 @@ Each finding record:
 | `verdict` | `confirmed` \| `dismissed` \| `unjudged` \| `sonar` |
 | `reported_by` | one entry per reviewer: its own `title`, `detail`, `severity`, `line`, and `account` (the two joined, for reading) |
 | `reviewers`, `related`, `rationale` | who reported it, sibling findings from one cause, and the judge's reason |
+| `needs_rereview`, `rereview_by` | a reporter declared that fixing this takes a structural change whose *result* should be read again, and which reporters said so — the declaration the next round is checked against |
+| `new_this_round` | no earlier round of this cycle raised this defect (`--baseline`); `false` on a repeat. A run with no baseline has no earlier round, so every finding is `true` — which is why a round past the first with no `--baseline` is a veto rather than a clean sweep |
 
 **Breaking, v2.14:** the per-finding keys were `title` / `detail` / `reason` with a
 `reviewers` name list. They are now `synthesis` / `detail` / `rationale`, and `id`,

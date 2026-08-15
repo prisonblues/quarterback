@@ -98,13 +98,17 @@ GET   /sync              ?repo=&branch=&device=&path=          (registered workt
                          &have=sha,sha,…&dirty=&ahead=&behind= (…or just describe yourself)
                          -> {published:[…], worktrees:[…], caller, stale, registered, advice}
 
-# reviewer-panel stats (v2.10, per-reviewer accounts v2.11)
+# reviewer-panel stats (v2.10, per-reviewer accounts v2.11, rounds + coverage v2.15)
 POST  /review            (panel.py --json payload)              -> {id, recorded, accounts}
 GET   /reviews           ?repo=&pr=&author=&since=&days=&limit=  (runs + scorecards)
 GET   /review/{id}                                              (scorecards + findings + accounts)
 GET   /review/stats      ?repo=&author=&days=&judged_only=       -> {by_model, by_agent}
 GET   /review/findings   ?repo=&pr=&limit=                       (one PR's findings as
-                                                                  chains of observations)
+                                                                  chains of observations,
+                                                                  per round: what was new,
+                                                                  what stopped the loop,
+                                                                  whether a re-review flag
+                                                                  was borne out)
 GET   /panel             (browser view — the leaderboard)
 
 GET   /health            (no auth)
@@ -162,10 +166,13 @@ lander loops — is counted without an agent having to remember to say so.
 
 ## Releases
 
-Running board version: **v2.12** (`GET /openapi.json` → `.info.version` on any instance).
-The two latest releases are harness-side and change no board behaviour: v2.13 ships the harness
-alongside the service, and v2.14 has the reviewer panel merge duplicate findings in its judge —
-filling in the per-reviewer accounts the board has stored since v2.11.
+The deployed board version lags the repo until the stack is redeployed, and only the running
+service knows which it is: ask it with `GET /openapi.json` → `.info.version`, for whichever
+instance you care about. (Anything built off this branch says 2.15.0.) A number written here
+instead would be wrong the next time Portainer redeploys, with no diff to catch it.
+Latest release: **v2.15**, which adds the round and coverage columns. The two before it are
+harness-side and change no board behaviour: v2.13 ships the harness alongside the service, and
+v2.14 has the panel merge duplicate findings in its judge.
 
 - **v1–v2.1** — the board, then presence leases + session handoff, then dev context.
 - **v2.2–v2.5** — the session registry: sessions became listable, named, resumable, and the
@@ -175,6 +182,8 @@ filling in the per-reviewer accounts the board has stored since v2.11.
 - **v2.10–v2.12** — reviewer-panel stats, per-reviewer accounts, board-designated names.
 - **v2.13** — the harness (loops, worktree tooling, slash commands) ships in this repo.
 - **v2.14** — the panel merges findings in its judge, additively: every reviewer's account kept.
+- **v2.15** — the panel re-reviews the fix commit, and records what a run could not see:
+  rounds, coverage declarations, truncation per reviewer.
 - **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
   object store; wire `landed` refs to a cherry-pick helper.
 

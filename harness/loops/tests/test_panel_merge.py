@@ -38,7 +38,7 @@ def test_a_severity_the_panel_does_not_count_is_normalised_where_it_arrives():
     representative pick, headed the fix list, and counted in no severity bucket
     on the board. Normalised on the way in, so no comparison downstream has to
     defend itself — including the judge's own fallback to the reviewer's call."""
-    parsed = panel.parse_findings("codex", json.dumps([
+    parsed, _ = panel.parse_reply("codex", json.dumps([
         {"severity": "BLOCKER", "file": "a.py", "title": "t"},
         {"severity": " p1 ", "file": "a.py", "title": "u"},
         {"file": "a.py", "title": "v"},
@@ -47,8 +47,8 @@ def test_a_severity_the_panel_does_not_count_is_normalised_where_it_arrives():
 
 
 def test_an_unreadable_severity_cannot_win_the_representative_pick():
-    a = panel.parse_findings("codex", '[{"severity":"BLOCKER","file":"a.py","title":"a"}]')[0]
-    b = panel.parse_findings("pi", '[{"severity":"P2","file":"a.py","title":"b"}]')[0]
+    a = panel.parse_reply("codex", '[{"severity":"BLOCKER","file":"a.py","title":"a"}]')[0][0]
+    b = panel.parse_reply("pi", '[{"severity":"P2","file":"a.py","title":"b"}]')[0][0]
     [c] = judged([{"id": "F1", "members": [0, 1]}], [a, b])
     assert (c.severity, c.synthesis) == ("P2", "b")
 
@@ -384,7 +384,7 @@ def test_junk_in_the_judge_reply_is_skipped_not_fatal():
 def test_an_absent_judge_keeps_every_finding_with_its_account(monkeypatch):
     monkeypatch.setattr(panel.shutil, "which", lambda _: None)
     a, b = find(reviewer="codex", line=39), find(reviewer="claude", line=41)
-    out, skip = panel.adjudicate(panel.cluster_findings([a, b]), "diff", "", 1609)
+    out, skip, _ = panel.adjudicate(panel.cluster_findings([a, b]), "diff", "", 1609)
     assert "claude CLI absent" in skip
     assert [c.verdict for c in out] == ["unjudged", "unjudged"]
     assert [c.reported_by[0].reviewer for c in out] == ["codex", "claude"]
@@ -394,20 +394,20 @@ def test_an_absent_judge_keeps_every_finding_with_its_account(monkeypatch):
 def test_an_unparseable_judge_reply_keeps_every_finding(monkeypatch):
     monkeypatch.setattr(panel.shutil, "which", lambda _: "/usr/bin/claude")
     monkeypatch.setattr(panel, "run_cli", lambda *a, **k: ("I have thoughts.", None))
-    out, skip = panel.adjudicate(clusters_of(find()), "diff", "", 1)
+    out, skip, _ = panel.adjudicate(clusters_of(find()), "diff", "", 1)
     assert "unparseable" in skip and [c.verdict for c in out] == ["unjudged"]
 
 
 def test_a_dead_judge_reports_why_and_suppresses_nothing(monkeypatch):
     monkeypatch.setattr(panel.shutil, "which", lambda _: "/usr/bin/claude")
     monkeypatch.setattr(panel, "run_cli", lambda *a, **k: (None, "judge: timed out after 600s"))
-    out, skip = panel.adjudicate(clusters_of(find(), find(reviewer="pi")), "diff", "", 1)
+    out, skip, _ = panel.adjudicate(clusters_of(find(), find(reviewer="pi")), "diff", "", 1)
     assert skip == "judge: timed out after 600s" and len(out) == 2
 
 
 def test_no_findings_is_not_a_judge_failure(monkeypatch):
     monkeypatch.setattr(panel.shutil, "which", lambda _: None)
-    assert panel.adjudicate([], "diff", "", 1) == ([], None)
+    assert panel.adjudicate([], "diff", "", 1) == ([], None, "")
 
 
 # --------------------------------------------------------------- what the judge is shown
@@ -468,7 +468,7 @@ def test_a_cluster_of_empty_groups_is_not_a_judge_failure(monkeypatch):
     """The listing used to be built before the empty check — harmless, but it
     meant the "nothing to judge" answer came from a prompt nobody would send."""
     monkeypatch.setattr(panel.shutil, "which", lambda _: None)
-    assert panel.adjudicate([[]], "diff", "", 1) == ([], None)
+    assert panel.adjudicate([[]], "diff", "", 1) == ([], None, "")
 
 
 # ------------------------------------------------------------------- the payload shape
@@ -490,7 +490,8 @@ def run_panel(monkeypatch, judge_reply, findings, capsys, json_out=False, sonar=
     monkeypatch.setattr(panel, "sh", lambda args, **k: meta if "view" in args else "diff")
     per_reviewer = {"codex": findings[:1], "claude": findings[1:]}
     monkeypatch.setattr(panel, "review_llm",
-                        lambda name, *a, **k: (per_reviewer.get(name, []), None, 5))
+                        lambda name, *a, **k: panel.ReviewerRun(
+                            per_reviewer.get(name, []), None, 5))
     monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
     monkeypatch.setattr(panel.shutil, "which", lambda _: "/usr/bin/claude")
     monkeypatch.setattr(panel, "run_cli", lambda *a, **k: (judge_reply, None))
@@ -511,7 +512,8 @@ def test_json_mode_puts_nothing_but_the_payload_on_stdout(monkeypatch, capsys):
     meta = ('{"title":"t","additions":1,"deletions":0,"baseRefName":"main",'
             '"headRefName":"h","headRefOid":"abc"}')
     monkeypatch.setattr(panel, "sh", lambda args, **k: meta if "view" in args else "diff")
-    monkeypatch.setattr(panel, "review_llm", lambda *a, **k: ([find()], None, 5))
+    monkeypatch.setattr(panel, "review_llm",
+                        lambda *a, **k: panel.ReviewerRun([find()], None, 5))
     monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
     monkeypatch.setattr(panel.shutil, "which", lambda _: "/usr/bin/claude")
     monkeypatch.setattr(panel, "run_cli", lambda *a, **k: (reply, None))
@@ -692,11 +694,14 @@ def test_the_serialised_finding_is_the_canonical_record():
         "reported_by": [
             {"reviewer": "codex", "severity": "P2", "line": 213,
              "title": "double render", "detail": "twice",
-             "account": "double render — twice"},
+             "account": "double render — twice", "needs_rereview": False},
             {"reviewer": "pi", "severity": "P3", "line": 44,
-             "title": "rebuild", "detail": "", "account": "rebuild"},
+             "title": "rebuild", "detail": "", "account": "rebuild",
+             "needs_rereview": False},
         ],
         "reviewers": ["codex", "pi"],
+        "needs_rereview": False,
+        "rereview_by": [],
         "related": [],
         "rationale": "why",
     }

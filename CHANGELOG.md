@@ -7,6 +7,68 @@ that number where it was, so the repo can be a version ahead of the service.
 Entries are newest first. Each one says what was broken or missing before it, because that is the
 part that isn't recoverable from the diff.
 
+## v2.15 — the fix gets reviewed, and a run says what it could not see
+
+`/panel-review-pr` ran exactly one round: panel → judge → one fixer → push → stop. The commit
+the fixer wrote was read by nobody, because the panel had reviewed the diff as it was *before*
+the fix. That is not a gap at the edges — structural fixes beget new interactions, and on a real
+PR a mirror added in one file created dual-keyed nodes that an early `return` in another left
+half-stale: a P2 regression of the exact invariant the PR existed to establish, which no earlier
+round could have found because it did not exist until the fixer wrote it.
+
+The cycle is now panel → fix → panel, two rounds by default (`--rounds N` / `--loop` for more),
+and the loop is decided mechanically: findings this round that no earlier round raised, a P1/P2
+still confirmed, or a finding an earlier round already raised that is *still* confirmed at any
+severity, buy another pass — SonarCloud's hard-gate issues counting exactly like the judged ones,
+since the workflow requires them resolved either way. The round cap is what ends the argument when
+two reviewers disagree about a P4 forever. Reviewers are **not** asked to forecast whether another
+round is needed — that asks a model to predict findings it has not made, and the reviewer that
+silently produced nothing answers "no" with complete confidence.
+
+They are asked for observations instead: `could_not_assess` (what they could not judge, which is
+the difference between "clean" and "I could not tell" — a distinction no finding count can carry)
+and `needs_rereview` per finding (this fix is structural; read its result). The panel measures the
+one thing a reviewer cannot notice about itself, truncation: a 118 KB diff against a 60 KB budget
+had every reviewer confidently reporting on half a PR, invisibly. Declarations never extend the
+loop — a reviewer cut off at its budget is cut off again next round — they veto a *false stop*, so
+a round that found nothing because it could not look is no longer recorded as convergence.
+
+This release was reviewed by the cycle it adds, which is the only evidence for it worth having:
+round 1 raised 33 findings, and round 2 — reading the commit that fixed them — raised 17 more, 16
+of which no earlier round could have seen because they did not exist until the fixer wrote them.
+One of round 1's was a P1 the judge threw out as an artefact of a truncated diff, which is the
+other half of the argument in one line.
+
+All of it reaches the board (`round`, `cycle`, `new_findings`, `stopped`, `stop_reason`,
+`stop_confident`, `stop_veto`, `could_not_assess`, `unstructured`, `rereview_flagged`) and the
+`/panel` page, so a human can review the review: whether a clean verdict was earned, and — from
+`stop_veto` — *why not*, without re-reading a transcript. A round that says "go again" is stored as
+one, so a running cycle is never rendered as a finished one, and a reviewer whose reply did not
+parse is distinguishable from one that was never asked instead of collapsing onto the same null.
+`GET /review/findings` checks each re-review flag against what the following round of the same
+cycle actually found — for the run, and per member in `rereview_by_reviewer`, since the
+declaration rides on the reporter's own row. That makes **honesty per reviewer** measurable for
+the first time: a member that says "I could not assess X" and is right is worth more than one
+that silently reports clean, and until now nothing distinguished them.
+
+"The same cycle" is a stored fact rather than a positional guess: the panel mints a `cycle` id on
+round 1 and every later round inherits it from its earliest baseline, so two agents looping the
+same PR at once cannot have one's round 2 credited to the other's round 1.
+
+Two limits on that number, stated because a measure nobody can calibrate is worse than none. It is
+**file-grain**: the next round raised a confirmed finding in a file this round flagged, which is
+not a claim that the fix caused it. And it is scored over **confirmed findings only**, on both
+sides — a declaration attached to a finding the judge dismissed, or to one nobody adjudicated, is
+not scored as wrong, it is not scored at all.
+
+Attribution itself is exact, because v2.14 put it within reach: a declaration rides on the
+reporter's own entry in `reported_by`, so `rereview_flagged` counts the member that made the call
+rather than everyone who happened to raise the same defect — which is the whole point of a per-
+reviewer honesty measure, and was not possible while a merge kept one representative and discarded
+the rest.
+
+Payloads without any of it record exactly as before, as round 1 with nothing declared.
+
 ## v2.14 — the panel merges once, in the judge, without losing what anyone said
 
 v2.11 gave the board somewhere to put each reviewer's own account of a finding, and nothing to put
