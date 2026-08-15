@@ -364,6 +364,30 @@ def test_a_baseline_that_does_not_say_whose_it_is_is_not_believed(tmp_path):
     assert any("does not say which review" in p for p in b.problems)
 
 
+def test_a_baseline_written_from_another_checkout_is_the_same_review(tmp_path):
+    """`repo` is the local directory's name, not the review's. /panel-review-pr's
+    parallel mode gives every PR a throwaway worktree, so round 1 writing
+    "quarterback-feat-issue-24" and round 2 asking as "quarterback" is the normal
+    case — and rejecting the baseline for it would blame the review for where it
+    was run. `github` + `pr` are what name a review."""
+    path = tmp_path / "elsewhere.json"
+    path.write_text(json.dumps({
+        "round": 1, "repo": "board-worktree-r1", "github": "acme/board", "pr": 34,
+        "to_fix": [_serialised("a.py", "real bug")],
+    }))
+    b = panel.load_baseline([str(path)], THIS_RUN)
+    assert b.problems == [] and b.rounds == {1}
+    assert b.raised_before(_canonical("a.py", "real bug"))
+    # ...but a baseline from a different PR is still a wrong baseline, not a
+    # thinner one.
+    other = tmp_path / "other-pr.json"
+    other.write_text(json.dumps({
+        "round": 1, "repo": "acme", "github": "acme/board", "pr": 99,
+        "to_fix": [_serialised("a.py", "real bug")],
+    }))
+    assert panel.load_baseline([str(other)], THIS_RUN).keys == set()
+
+
 def test_a_round_two_with_no_baseline_at_all_is_a_problem(tmp_path):
     """Without one, every finding reads as new, the report prints "N of N raised by
     no earlier round (0 known from 0 earlier rounds)", and the round would be free

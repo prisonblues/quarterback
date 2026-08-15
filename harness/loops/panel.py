@@ -2039,7 +2039,7 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
     ``round``, which used to raise out of ``run()`` and kill a review after the
     diff had been fetched and every reviewer CLI had been paid for.
 
-    ``expect`` (``repo``/``github``/``pr``/``round``) is checked against what the
+    ``expect`` (``github``/``pr``/``round``) is checked against what the
     payload says it is. A baseline from another PR is not a thinner baseline, it
     is a wrong one: its keys would make real findings read as repeated and stop
     the loop early, so a mismatched payload is REPORTED and its keys dropped. An
@@ -2096,7 +2096,15 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
         # Only the fields whose expected value is KNOWN. `k in want` would check a
         # key the caller passed as None, and then reject every payload for not
         # matching a value nobody has.
-        checked = [k for k in ("repo", "github", "pr") if want.get(k) is not None]
+        # `github` + `pr` and nothing else: those name the REVIEW, which is what
+        # a baseline has to be from. `repo` is the local checkout's directory
+        # name, so the same review run from a worktree and from the main
+        # checkout ("quarterback-feat-issue-24" and "quarterback") disagrees on
+        # it — and /panel-review-pr's own parallel mode gives every PR a
+        # throwaway worktree, so that is the normal case rather than a corner.
+        # Checking it would reject a baseline for having been written somewhere
+        # else, which is not a property of the review at all.
+        checked = [k for k in ("github", "pr") if want.get(k) is not None]
         missing = [k for k in checked if payload.get(k) is None]
         wrong = [f"{k}={payload.get(k)!r} (this run: {want[k]!r})"
                  for k in checked if payload.get(k) is not None and payload.get(k) != want[k]]
