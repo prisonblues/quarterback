@@ -1,4 +1,4 @@
-"""v2.14: what each panel member COST, alongside what it found.
+"""v2.17: what each panel member COST, alongside what it found.
 
 v2.10 recorded findings and v2.13 wired up wall-clock. Neither said what a seat
 spent, so the /panel leaderboard could rank a reviewer top on confirmed findings
@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from .conftest import LAPTOP
 
-REPO = "acme/v214repo"
+REPO = "acme/v217repo"
 AGENT = {**LAPTOP, "X-Agent-Instance": "ee55ff"}
 
 

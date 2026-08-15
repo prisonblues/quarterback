@@ -27,6 +27,10 @@ panel just adds independent reviewers + hard CI/Sonar gates on top of that bar.
    python3 ~/.claude/loops/panel.py --pr <pr> --post --reviewers codex          # single-vendor read
    python3 ~/.claude/loops/panel.py --pr <pr> --post --reviewers claude,codex,antigravity
    ```
+   **Run it in the background** (`run_in_background`), not as a foreground Bash call. A reviewer on
+   a top-tier model at high effort can think for 20+ minutes, and the foreground Bash timeout caps
+   at 10 — which kills the whole panel, not just the slow seat, and reads afterwards as a panel that
+   never ran. Poll the background task instead.
 4. **Two or more PRs → one sub-agent per PR, run in parallel.** Give each `general-purpose`
    sub-agent one PR and the same step-2/3 instructions, and **launch them in a single message** or
    they will not run concurrently. Cap at **4 at a time**, queueing the rest: each panel already runs
@@ -38,7 +42,10 @@ panel just adds independent reviewers + hard CI/Sonar gates on top of that bar.
    an unreadable PR or a dead reviewer CLI is that agent's report to make, and the rest run to
    completion.
 5. Show the user the output: **To fix** (master-confirmed, any reviewer count), **Dismissed by
-   master**, **SonarCloud issues**, and any skipped reviewers. Confirm whether the summary was
+   master**, **SonarCloud issues**, any skipped reviewers, and the **Coverage declared** block —
+   what each reviewer said it could not assess, and any reviewer the panel truncated. A clean
+   panel whose reviewers each read half the diff is not a clean PR, and the finding list alone
+   cannot tell you which one you got. Confirm whether the summary was
    posted to the PR. If the panel ran on a hand-picked set, say so — "reviewed by codex alone" is a
    materially weaker claim than "reviewed by the panel", and the reader of the PR comment can't tell
    the difference from the findings. For a multi-PR run, give that block per PR plus a
@@ -47,7 +54,9 @@ panel just adds independent reviewers + hard CI/Sonar gates on top of that bar.
 
 Notes:
 - Posts the summary as a PR comment by default. This is review-only — it never edits code or
-  merges; pass `--no-post` for a silent read-only run.
+  merges; pass `--no-post` for a silent read-only run. It reviews the PR **as it is now**: use
+  `/panel-review-pr` when the fix that follows should itself be reviewed, which is what its
+  rounds are for.
 - First run needs `op signin` once (the SonarCloud token then caches), `codex login` for the Codex
   reviewer and `agy` auth for the Antigravity one; missing reviewers are reported as skipped, not fatal.
 - `antigravity` is off unless a repo's `.harness-rules` enables it — its CLI (`agy`) is workstation-only (personal

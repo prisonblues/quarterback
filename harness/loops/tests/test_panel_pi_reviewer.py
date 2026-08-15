@@ -23,16 +23,16 @@ SID = "panel-test"
 SDIR = Path("/tmp/panel-test-session")
 
 
-def pi_args(model="", effort="", prompt="p"):
+def pi_args(model="", effort=""):
     """pi_args with this test module's fixed session, which every call needs."""
-    return panel.pi_args(model, effort, prompt, SID, SDIR)
+    return panel.pi_args(model, effort, SID, SDIR)
 
 
 def test_a_reviewer_may_not_edit_the_tree_it_reviews():
     """pi ships read/bash/edit/write. The panel wants an opinion, not a fix — and
-    the diff is in the prompt, so it needs no tools to form one. This is pi's
-    equivalent of agy's `--mode plan`."""
-    assert "--no-tools" in pi_args(prompt="review this")
+    the diff arrives on stdin, so it needs no tools to form one. Unlike agy's
+    `--mode plan`, this one is a real guarantee."""
+    assert "--no-tools" in pi_args()
 
 
 def test_a_review_is_not_a_conversation():
@@ -82,12 +82,12 @@ def test_effort_is_one_config_key_spelled_differently_per_cli():
     """`effort` in .harness-rules -> `--thinking` here, `model_reasoning_effort`
     on codex. Same knob, so it keeps the same config name."""
     assert pi_args(effort="high")[-2:] == ["--thinking", "high"]
-    assert panel.codex_args("", "high", "p")[-2:] == ["-c", "model_reasoning_effort=high"]
+    assert panel.codex_args("", "high")[-2:] == ["-c", "model_reasoning_effort=high"]
 
 
 def test_unpinned_pi_passes_neither_flag():
     assert pi_args() == ["pi", "-p", "--session-id", SID, "--session-dir", str(SDIR),
-                         "--no-tools", "p"]
+                         "--no-tools"]
 
 
 def test_effort_sets_are_per_cli_not_unioned(monkeypatch):
@@ -99,8 +99,8 @@ def test_effort_sets_are_per_cli_not_unioned(monkeypatch):
 
     called = []
     monkeypatch.setattr(panel, "run_cli", lambda *a, **k: called.append(a) or (None, None))
-    skip = panel.review_llm("pi", "openrouter/moonshotai/kimi-k3", "p", effort="ultra").skip
-    assert called == [] and "unknown reasoning effort" in skip and "minimal" in skip
+    got = panel.review_llm("pi", "openrouter/moonshotai/kimi-k3", "p", effort="ultra")
+    assert called == [] and "unknown reasoning effort" in got.skip and "minimal" in got.skip
 
 
 def test_a_cli_with_no_effort_knob_says_so(monkeypatch):
@@ -108,5 +108,5 @@ def test_a_cli_with_no_effort_knob_says_so(monkeypatch):
     naming, not a flag to quietly drop on the floor."""
     called = []
     monkeypatch.setattr(panel, "run_cli", lambda *a, **k: called.append(a) or (None, None))
-    skip = panel.review_llm("claude", "sonnet", "p", effort="high").skip
-    assert called == [] and "takes no reasoning effort" in skip
+    got = panel.review_llm("claude", "sonnet", "p", effort="high")
+    assert called == [] and "takes no reasoning effort" in got.skip

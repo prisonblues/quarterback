@@ -212,11 +212,12 @@ def test_codex_stdout_without_usage_reports_nothing():
 
 def test_codex_argv_asks_for_the_stream_and_the_plain_text_reply(tmp_path):
     f = tmp_path / "reply.txt"
-    args = panel.codex_args("gpt-5.6-luna", "high", "p", f)
+    args = panel.codex_args("gpt-5.6-luna", "high", f)
     assert args[-3:] == ["--json", "--output-last-message", str(f)]
     # The old shape is still what an unmetered call produces, so nothing else
-    # that builds codex argv had to change.
-    assert panel.codex_args("", "", "p") == ["codex", "exec", "p"]
+    # that builds codex argv had to change. (The prompt itself goes on stdin —
+    # `codex exec` with no positional argument reads it there.)
+    assert panel.codex_args("", "") == ["codex", "exec"]
 
 
 # ------------------------------------------------- review_llm, end to end

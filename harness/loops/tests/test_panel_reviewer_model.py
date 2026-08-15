@@ -24,17 +24,17 @@ TOO_OLD = (
 
 def test_unpinned_codex_passes_no_model_flag():
     """Empty == the CLI's own default, which is the global default: no --model."""
-    assert panel.codex_args("", "", "review this") == ["codex", "exec", "review this"]
+    assert panel.codex_args("", "") == ["codex", "exec"]
 
 
 def test_model_and_effort_are_independent():
     """Effort is a `-c` override, not a flag, and applies to the default model
     too — so someone can raise reasoning without pinning a slug that will rot."""
-    assert panel.codex_args("", "high", "p")[-2:] == ["-c", "model_reasoning_effort=high"]
-    assert panel.codex_args("gpt-5.6-luna", "", "p") == [
-        "codex", "exec", "p", "--model", "gpt-5.6-luna"]
-    assert panel.codex_args("gpt-5.6-luna", "high", "p") == [
-        "codex", "exec", "p", "--model", "gpt-5.6-luna",
+    assert panel.codex_args("", "high")[-2:] == ["-c", "model_reasoning_effort=high"]
+    assert panel.codex_args("gpt-5.6-luna", "") == [
+        "codex", "exec", "--model", "gpt-5.6-luna"]
+    assert panel.codex_args("gpt-5.6-luna", "high") == [
+        "codex", "exec", "--model", "gpt-5.6-luna",
         "-c", "model_reasoning_effort=high"]
 
 
@@ -45,11 +45,10 @@ def test_typo_effort_is_refused_without_spending_a_run(monkeypatch):
     it downstream and report it as an opaque non-zero exit."""
     called = []
     monkeypatch.setattr(panel, "run_cli", lambda *a, **k: called.append(a) or (None, None))
-    run = panel.review_llm("codex", "gpt-5.6-luna", "p", effort="hi")
-    finds, skip = run.findings, run.skip
-    assert finds == [] and called == []
-    assert "unknown reasoning effort" in skip and "'hi'" in skip
-    assert "xhigh" in skip                      # the valid set is stated, not implied
+    got = panel.review_llm("codex", "gpt-5.6-luna", "p", effort="hi")
+    assert got.findings == [] and called == []
+    assert "unknown reasoning effort" in got.skip and "'hi'" in got.skip
+    assert "xhigh" in got.skip                      # the valid set is stated, not implied
 
 
 def test_stderr_gist_lifts_the_api_sentence_over_housekeeping():

@@ -98,13 +98,17 @@ GET   /sync              ?repo=&branch=&device=&path=          (registered workt
                          &have=sha,sha,…&dirty=&ahead=&behind= (…or just describe yourself)
                          -> {published:[…], worktrees:[…], caller, stale, registered, advice}
 
-# reviewer-panel stats (v2.10, accounts v2.11, per-reviewer cost v2.14)
+# reviewer-panel stats (v2.10, accounts v2.11, rounds + coverage v2.15, cost v2.17)
 POST  /review            (panel.py --json payload)              -> {id, recorded, accounts}
 GET   /reviews           ?repo=&pr=&author=&since=&days=&limit=  (runs + scorecards)
 GET   /review/{id}                                              (scorecards + findings + accounts)
 GET   /review/stats      ?repo=&author=&days=&judged_only=       -> {by_model, by_agent}
 GET   /review/findings   ?repo=&pr=&limit=                       (one PR's findings as
-                                                                  chains of observations)
+                                                                  chains of observations,
+                                                                  per round: what was new,
+                                                                  what stopped the loop,
+                                                                  whether a re-review flag
+                                                                  was borne out)
 GET   /panel             (browser view — the leaderboard)
 
 GET   /health            (no auth)
@@ -161,7 +165,7 @@ deliberately *not* an MCP tool: they are recorded by the panel process itself
 lander loops — is counted without an agent having to remember to say so.
 
 **What a review cost, and what that can honestly be compared against.** Each scorecard carries
-`duration_ms` and, since v2.14, `input_tokens` / `output_tokens` / `cached_input_tokens` /
+`duration_ms` and, since v2.17, `input_tokens` / `output_tokens` / `cached_input_tokens` /
 `reasoning_tokens` and a `cost_usd` **only where the vendor states one** — never derived from a
 price table, because a run priced at today's rates reads wrong the moment the rates move, and
 these rows are meant to still be true in six weeks. The panel gets the numbers by pinning a
@@ -179,7 +183,14 @@ says how much of a window actually reported.
 
 ## Releases
 
-Running board version: **v2.14** (`GET /openapi.json` → `.info.version` on any instance).
+The deployed board version lags the repo until the stack is redeployed, and only the running
+service knows which it is: ask it with `GET /openapi.json` → `.info.version`, for whichever
+instance you care about. (Anything built off this branch says 2.17.0.) A number written here
+instead would be wrong the next time Portainer redeploys, with no diff to catch it.
+Latest release: **v2.17**, which adds the per-reviewer cost columns (schema revision 0015). Before
+it, v2.16 was harness-side and changed no board behaviour — the panel stopped capping how much
+diff a reviewer is given — and **v2.15** added the round and coverage columns; v2.13 (shipping the
+harness) and v2.14 (merging findings in the judge) are harness-side too.
 
 - **v1–v2.1** — the board, then presence leases + session handoff, then dev context.
 - **v2.2–v2.5** — the session registry: sessions became listable, named, resumable, and the
@@ -188,7 +199,11 @@ Running board version: **v2.14** (`GET /openapi.json` → `.info.version` on any
   publish/sync advisories, per-agent identity.
 - **v2.10–v2.12** — reviewer-panel stats, per-reviewer accounts, board-designated names.
 - **v2.13** — the harness (loops, worktree tooling, slash commands) ships in this repo.
-- **v2.14** — per-reviewer token usage and vendor-stated cost, so the leaderboard ranks
+- **v2.14** — the panel merges findings in its judge, additively: every reviewer's account kept.
+- **v2.15** — the panel re-reviews the fix commit, and records what a run could not see:
+  rounds, coverage declarations, truncation per reviewer.
+- **v2.16** — no diff budget by default: the whole diff goes to every reviewer.
+- **v2.17** — per-reviewer token usage and vendor-stated cost, so the leaderboard ranks
   reviewers on what they cost as well as what they find.
 - **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
   object store; wire `landed` refs to a cherry-pick helper.
@@ -279,23 +294,39 @@ imports = [ inputs.quarterback.homeManagerModules.default ];
 programs.quarterback-harness.enable = true;
 ```
 
+This repo's own `.worktree.json` is the worked example of the isolation half: a Postgres
+copy per worktree, Docker left off (the compose file here is tracked, and the Docker path
+writes its own), and `tests/dbtarget.py` making the test suite honour the worktree's
+database rather than rebuilding the shared one. `harness/templates/` has copyable versions
+of both for other repos.
+
 ## Development
 
 ```bash
 # One-time: local dev env
 uv venv --python 3.12 .venv && uv pip install -e '.[dev]'
 
+# One-time: local config. Also the file create-worktree copies into a new
+# worktree and repoints at that worktree's own database, so worktree DB
+# isolation depends on it existing.
+cp .env.example .env
+
 # Postgres for tests / local run (host port 5435)
 docker compose up -d postgres
 
-# Migrate + run the API locally
-export DATABASE_URL=postgresql+asyncpg://quarterback:quarterback@localhost:5435/quarterback
-export API_TOKENS=laptop:dev-laptop-token,server:dev-server-token
+# Migrate + run the API locally (.env supplies DATABASE_URL and API_TOKENS)
 .venv/bin/alembic upgrade head
 .venv/bin/uvicorn app.main:app --reload
 
-# Tests (integration — needs the postgres container up)
+# Tests. The database-backed ones need the postgres container up; the suite
+# rebuilds the schema, so it DESTROYS every row in its target database. The
+# first line of every run — `-q` included — names that database. It is this
+# checkout's .env, or DATABASE_URL=… to pin another.
 .venv/bin/pytest -q
+
+# The guard deciding which database that may be, and the rest of the pure unit
+# tests, need no Postgres at all:
+.venv/bin/pytest -q tests/test_dbtarget.py
 
 # Full stack in containers (app on host port 5681, migrations run on boot)
 docker compose up -d --build
@@ -338,10 +369,13 @@ mcp/          FastMCP wrapper: whoami + board_* + lease/handoff/session + active
               + subagent_start/end + report_git/find_commit + publish/sync_status
               (gitctx.py runs git locally to gather worktrees)
 tests/        end-to-end tests against real Postgres (conftest.py shared fixtures)
+  dbtarget.py      which database the suite may rebuild; refuses a worktree
+                   pointed at the main checkout's data
 harness/      step 2 of the install — the workflow the board coordinates
   loops/           panel.py (reviewer panel), epic.py, lander.py, harness_rules.py
   commands/        Claude Code slash commands (/panel, /fix-issue, /wt, …)
   bin/             create-worktree, remove-worktree, prune-worktrees
+  templates/       copyable .worktree.json starting points + dbtarget.py (the DB guard)
   package.nix      the derivation; hm-module.nix wires it into ~/.claude
 flake.nix     packages.harness, homeManagerModules.default, checks (runs the loops tests)
 ```

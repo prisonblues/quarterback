@@ -1,4 +1,4 @@
-"""v2.14: per-reviewer token usage — the cost half of the scorecard
+"""v2.17: per-reviewer token usage — the cost half of the scorecard
 
 v2.10 recorded what each panel member *found* and v2.13's `duration_ms` recorded
 how long it took. Neither says what it cost, so the /panel leaderboard could rank
@@ -21,8 +21,12 @@ reads). It is deliberately never derived from a price table — a run priced at
 today's rates is silently wrong when queried in six weeks, and the whole point of
 this table is that it stays true later.
 
-Revision ID: 0014
-Revises: 0013
+The revision number and the release number are unrelated counters: this is schema
+revision **0015** and it ships in product version **v2.17**. It chains after 0014
+(the v2.15 review rounds), which landed on main while this branch was open.
+
+Revision ID: 0015
+Revises: 0014
 Create Date: 2026-08-15
 
 """
@@ -34,8 +38,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0014"
-down_revision: str | None = "0013"
+revision: str = "0015"
+down_revision: str | None = "0014"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

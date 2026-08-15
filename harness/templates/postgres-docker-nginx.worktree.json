@@ -1,0 +1,62 @@
+{
+  "_comment": [
+    "FULL STACK — per-worktree containers behind an nginx sub-path, plus an",
+    "isolated database copy. The heaviest option and the most complete: each",
+    "worktree is reachable at http://localhost:<nginx.main_port>/<branch>/ as",
+    "well as on its own port.",
+    "",
+    "Only use this when docker-compose.yml is NOT tracked in git: create-worktree",
+    "generates one in the worktree and would overwrite a committed file.",
+    "",
+    "PREREQUISITE: a .env in the main checkout. It is both the source of the",
+    "database credentials and the env_file the generated compose service reads.",
+    "",
+    "docker.network_default is the network the main stack already runs on — the",
+    "worktree's containers join it so they can reach Postgres by service name.",
+    "network_pattern is the fallback lookup when that exact name is absent.",
+    "",
+    "nginx.config is a file included by your local nginx; it needs a line reading",
+    "'# END WORKTREE ROUTES' inside the server block, which is where route blocks",
+    "are inserted. Without that marker nothing is written and the script says so.",
+    "",
+    "worker describes a background queue container: 'none' for web-only. The",
+    "queue_env var is rewritten per worktree so jobs don't cross branches."
+  ],
+
+  "project": "myapp",
+  "framework": "django",
+
+  "base_port": 5690,
+  "app_port": 8000,
+
+  "docker": {
+    "enabled": true,
+    "network_pattern": "myapp.*default",
+    "network_default": "myapp_default"
+  },
+
+  "database": {
+    "engine": "postgresql",
+    "container": "auto",
+    "url_env": "DATABASE_URL"
+  },
+
+  "nginx": {
+    "config": "/etc/nginx/conf.d/myapp-worktrees.conf",
+    "container": "auto",
+    "main_port": 8080
+  },
+
+  "worker": {
+    "type": "celery",
+    "container_prefix": "myapp-worker",
+    "queue_env": "CELERY_QUEUE",
+    "command": "celery -A myapp worker -Q ${CELERY_QUEUE}"
+  },
+
+  "symlinks": [".venv", ".claude", "CLAUDE.md"],
+
+  "workspace": {
+    "enabled": false
+  }
+}

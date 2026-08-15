@@ -25,7 +25,10 @@ stdenvNoCC.mkDerivation {
 
     mkdir -p $out/bin $out/share/quarterback-harness
     install -m 0755 bin/* $out/bin/
-    cp -r loops commands $out/share/quarterback-harness/
+    # templates/ ships alongside them: create-worktree does nothing for a repo
+    # until that repo has a .worktree.json, so an installed harness that omits
+    # the starting points makes the user go back to the source tree for them.
+    cp -r loops commands templates $out/share/quarterback-harness/
     install -m 0644 worktree.example.json README.md $out/share/quarterback-harness/
 
     runHook postInstall
