@@ -59,7 +59,7 @@ def test_the_judge_prompt_is_fed_on_stdin_too(monkeypatch):
     monkeypatch.setattr(panel, "run_cli", fake)
     monkeypatch.setattr(panel.shutil, "which", lambda _c: "/usr/bin/claude")
     f = panel.Finding("claude", "P1", "a.py", 1, "title", "detail")
-    panel.judge([(f, ["claude"])], "DIFFDIFFDIFF", "sonnet")
+    panel.adjudicate([[f]], "DIFFDIFFDIFF", "sonnet", 1)
     assert "DIFFDIFFDIFF" in seen["stdin"]
     assert not any("DIFFDIFFDIFF" in a for a in seen["args"])
 
