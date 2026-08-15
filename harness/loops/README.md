@@ -125,7 +125,14 @@ Detected from the checkout, **not settable** here: `path`, `github`, `default_br
 `review_panel.max_diff_chars` (default: **none — the whole diff**) — how much of
 the diff each model is given. Override per reviewer with
 `reviewers.<name>.max_diff_chars` and for the master with
-`review_panel.judge_max_diff_chars`; both inherit the panel value when unset.
+`review_panel.judge_max_diff_chars`; both inherit the panel value when unset. Since
+v2.23 that budget buys the review target first and the PR context with whatever is left
+(see rounds, below), so on a scoped round it is no longer the target that a tight budget
+cuts.
+
+`review_panel.round_scope` (default: **`increment`**) — whether a round past the first
+reads the fix commit or the whole PR again. `pr` restores the pre-v2.23 behaviour for a
+repo whose PRs are small enough that re-reading them costs nothing.
 
 There used to be a 60,000-char default, and it was a fossil: prompts travelled in
 argv, where Linux caps one element at 128 KiB, so a budget was mandatory. Since
@@ -222,7 +229,9 @@ cwd's repo; `--repo` takes a path or a name under `~/source`.
 `python3 ~/.claude/loops/panel.py --pr <n>` (report) / `--post` (also comment on the
 PR) / `--json` (the run as JSON on stdout — nothing else, progress goes to stderr) /
 `--round <r> --max-rounds <N> --baseline <earlier round's --json-file>` (a re-review that
-knows what the earlier rounds raised, and where it sits in the caller's cycle).
+knows what the earlier rounds raised, and where it sits in the caller's cycle) /
+`--scope pr|increment|auto` + `--since <sha>` (what a later round reads — see below;
+`auto` is the default and needs no flag).
 
 Read-only, so it runs in **any** repo — an unconfigured one just uses the defaults.
 
@@ -298,6 +307,23 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   reviewer is truncated again next round — they only stop a broken round being reported
   as clean. A round past the first with no `--baseline` is itself a veto: it has nothing
   to compare against, so its "all new" count means nothing and its stop is unearned.
+- **A round past the first reviews the INCREMENT, not the whole PR** (v2.23). The target is
+  what changed since the head its baseline reviewed (`head_sha` in the payload; `--since`
+  overrides it), and the rest of the PR follows as context in two tiers: the PR's other
+  changes to the files the increment touches, then everything else. A budget is spent in
+  that order, so what a tight budget drops is context and never the thing under review —
+  which is the point, since a loop that re-reads the whole PR every round inflates its own
+  input until it truncates itself. `--scope pr` restores the old behaviour and
+  `review_panel.round_scope` sets it per repo; round 1 is always the whole PR.
+  **Every fall back to whole-PR scope lands in `config_notes`** — no anchor, nothing pushed
+  between the rounds, a failed fetch, or a base-branch merge that makes the range bigger
+  than the PR (measured: PR #62's raw round-to-round range was 92,415 chars against a
+  45,370-char PR, so the range is first cut to the PR's own files and then rejected outright
+  if it is still the larger). A round that claimed the increment and re-read the PR would be
+  wrong about the only thing this measures, and invisible in the numbers.
+  One caveat: scope makes an earlier round's truncation **permanent** — round 2 never returns
+  to what round 1 was cut off from — so a scoped round that inherits one vetoes its own
+  confident stop.
 - **`--json-file` is a requirement, not a courtesy.** It is the next round's baseline, so
   a write that fails exits non-zero after the report: carrying on would leave round `r+1`
   calling every repeated finding new. Every non-error exit writes it, the skip-pattern one
@@ -325,6 +351,16 @@ One record per **defect**, in `to_fix` / `dismissed` / `sonar_findings`, plus th
 own fields (`judged`, `reviewers`, `diff_budgets`, `run_key`, …). A skipped PR emits the
 same keys with empty values and `reviewed: false`, so nothing has to branch on which
 exit produced it.
+
+Run-level fields worth knowing about because their meaning is conditional:
+
+| field | what it is |
+|---|---|
+| `head_sha` | the commit this round reviewed. Sent so the NEXT round can anchor its increment on it — a payload that does not say which commit it was about cannot be one. Present on the skip exit too, since a skipped round still moved the head |
+| `scope` | `pr` \| `increment` — what this round actually reviewed. Recorded rather than inferred from the round number, because scope falls back to `pr` whenever the anchor is missing or the range is unusable, so "round 2" does not imply "increment" |
+| `since_sha` | the anchor the increment was taken from; null under `pr` scope |
+| `diff_chars` | the size of the **review target** — the whole PR under `pr` scope, the increment under `increment`. Read `scope` beside it: plotting this across a cycle's rounds without doing so shows a cliff at round 2 and reads as a shrinking PR |
+| `context_chars` | everything sent *alongside* the target; 0 under `pr` scope. With `diff_chars` this is what the round cost in material |
 
 Each finding record:
 

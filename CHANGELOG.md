@@ -7,6 +7,64 @@ that number where it was, so the repo can be a version ahead of the service.
 Entries are newest first. Each one says what was broken or missing before it, because that is the
 part that isn't recoverable from the diff.
 
+## v2.23 — a later round reads the fix commit, not the whole PR again
+
+A panel/fix cycle exists because nobody reads the fixer's commit (v2.15). Round 2 was then handed
+the entire PR — the fix plus everything rounds before it had already read, ruled on and confirmed —
+and paid for all of it in budget, in wall-clock and in the reviewer's attention, every round.
+
+**The loop was inflating its own input.** PR #34's four rounds went 1,675 lines to 4,140, and its
+diff 140 KB to 292 KB, *because it was being reviewed*: each round found defects in the previous
+round's fix commit at about one per fix, and each fix made the next round's reading longer. By the
+last round both reviewers declared they could not read ~600 lines of one test file. The 22 findings
+that round were overwhelmingly in the last commit, and the reviewers re-read 3,300 lines to reach
+them, losing the tail of the diff on the way.
+
+So a round past the first reviews the **increment** — what changed since the head its baseline
+reviewed — with the rest of the PR behind it as context. Three tiers, and the order is the design:
+the increment, then the PR's other changes to the files the increment touches, then everything else.
+A budget is spent in that order, so what gets dropped is context and never the thing under review.
+That inverts the degradation: the target stays about the size of one fix commit however large the PR
+grows.
+
+`--scope pr` keeps the old behaviour, `review_panel.round_scope` sets it per repo, and round 1 is
+always the whole PR. The anchor comes from the baseline payload's new `head_sha`; `--since` overrides
+it. Every fall back to whole-PR scope is written into `config_notes` — a round that says it reviewed
+the increment and in fact re-read the PR would be wrong about the one measurement this exists to
+produce, and invisible in the numbers, because a large `diff_chars` is what those always were.
+
+**The obvious implementation is wrong, and only measuring it showed that.** A commit range between
+two rounds spans everything the fixer did, *including a merge of the base branch* — which on this
+repo is the normal case rather than a corner, since landing six PRs in a day took eleven integration
+merges (#80). Measured on PR #62, the raw range between two of its own round heads was **92,415 chars
+against a 45,370-char PR**: the "increment" was twice the size of the whole thing, carrying
+`flake.nix`, the worktree scripts and the README that main had gained in between. Left alone it would
+have made rounds more expensive while reporting them as cheaper.
+
+Two things stop that. The range is cut down to the PR's own files, which on #62 takes it from 19
+files to 5 and the target to 17,075 chars — 62% off the PR, which is the saving the whole change is
+for. And a size guard falls back to whole-PR scope whenever the increment is still the larger of the
+two, because a file filter cannot remove main's changes to a file the PR *also* touches. A round must
+never cost more than it did before scope existed.
+
+One cost is real and is stated rather than hidden: the near tier is the PR's own changes to the files
+the fix touched, so when a fix touches most of a small PR there is little left to leave out and the
+material sent is the PR plus the increment. The reviewer's attention narrows; the token bill does
+not. That is where the seam lives — the defect class this cycle exists to catch is a fix that is
+correct on its own terms and wrong where it meets what was already there — and a note says so on any
+run where it happens.
+
+The judge sees exactly what the panel saw, briefed to rule rather than to review: an adjudicator adds
+nothing if it rules "not in the diff" while holding a different diff, and it would do so with the
+authority of the final call.
+
+**One caveat travels with the saving, and it vetoes a confident stop.** Increment scope makes an
+earlier round's truncation permanent. Under whole-PR scope a region round 1 was cut off from is read
+again by round 2; under increment scope round 2 reads only the fix commit and never returns, so a
+cycle can now converge — nothing new, nothing outstanding — over code that no round in it ever read.
+The baseline carries which rounds were truncated, and a scoped round that inherits one says its quiet
+is not evidence about that region.
+
 ## v2.21 — a panel that lost a seat said nothing about it
 
 A reviewer went missing and the report read the same. On PR #64 codex exited 1 with "Not inside a

@@ -233,6 +233,20 @@ all is reported the same way, and costs the round its confidence.)
 Pass **every** earlier round's payload as a `--baseline`, or a finding raised in
 round 1, missed in round 2 and raised again in round 3 counts as new.
 
+**Round 2+ reviews the fix commit, not the whole PR again** (v2.23), and it gets
+there off the baseline you just passed — `head_sha` in that payload is the anchor,
+so this needs no new flag from you. Two consequences worth knowing when you read
+the result:
+
+- **`diff_chars` is the increment, not the PR.** It drops sharply at round 2 and
+  that is the feature working, not the PR shrinking. `scope` in the payload says
+  which it is; `context_chars` is what was sent alongside.
+- **Check `config_notes` before believing the round was scoped.** Whenever the
+  anchor is missing, nothing was pushed between the rounds, or a base-branch merge
+  made the range bigger than the PR itself, the panel falls back to reviewing the
+  whole PR and says so there. `scope: "pr"` on a round 2 is that, and it means the
+  round cost what it always used to.
+
 Read `round_stop` from the JSON (`jq .round_stop`). It is mechanical and it is
 the decision — do not substitute your own judgement, and do not ask a reviewer
 whether another round is needed (that asks a model to predict findings it has not
