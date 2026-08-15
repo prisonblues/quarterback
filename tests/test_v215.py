@@ -746,7 +746,7 @@ def _panel_round(monkeypatch, tmp_path, round_no, title, baseline=()):
     """One panel run with every process it would spawn replaced — the reviewers,
     the judge, the CI check — so what is under test is the payload the panel
     builds, not the CLIs."""
-    def fake_review(name, model, prompt, effort=""):
+    def fake_review(name, model, prompt, effort="", cwd=None):
         if name == "codex":
             return panel.ReviewerRun(
                 [panel.Finding("codex", "P2", "app/sync.py", 12, title,
@@ -757,7 +757,7 @@ def _panel_round(monkeypatch, tmp_path, round_no, title, baseline=()):
         # and had no gap.
         return panel.ReviewerRun([], None, 800, None)
 
-    def fake_adjudicate(clusters, diff, model, pr, budget=None, coverage=None):
+    def fake_adjudicate(clusters, diff, model, pr, budget=None, coverage=None, cwd=None):
         """The judge confirms what it was shown, keeping every reporter's own
         report on the record — which is where the per-reviewer declarations the
         board scores live."""
