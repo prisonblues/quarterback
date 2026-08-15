@@ -1,0 +1,145 @@
+"""A release number is one fact written in several files, and nothing checked they agree.
+
+#46's smaller half. Two branches once claimed v2.14 at the same time — each correctly,
+from what it could see, since `main` was on v2.13 when both forked — and the rename cost
+a pass across `CHANGELOG.md`, `README.md`'s release list, `pyproject.toml`, `app/main.py`,
+a migration docstring, two module docstrings and a test filename. The docstrings and the
+filename were missed on the first pass and caught by a reviewer, because nothing ties them
+together. On 2026-08-15 it happened four more times in one day, and a `pyproject.toml` at
+2.15.0 shipped for several commits beside an `app/main.py` at 2.14.0.
+
+Allocation (a board that hands out the next free number) is the issue's larger half and
+needs a board. This needs nothing, and it catches the class: a number that disagrees with
+itself, a heading claimed twice, a release whose entry was written but never listed.
+
+**What is deliberately NOT asserted: that the served version matches the newest release.**
+It routinely does not, and correctly — v2.16, v2.17, v2.18, v2.20 and v2.21 are all
+harness-side and each left the served version where it was. That looks like five missed
+bumps and is none, which is exactly why a check that got this wrong would be worse than no
+check: it would be loud, wrong every second release, and switched off within a week. What
+IS asserted is the direction — the served version may lag the newest release, never lead
+it, because nothing but a mistake gets a board release into `app/main.py` before its entry
+exists.
+"""
+
+from __future__ import annotations
+
+import re
+import tomllib
+from pathlib import Path
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+#: Releases are named with two components (`v2.20`); the packaged and served versions carry
+#: three (`2.20.0`). So they are compared at the grain the CHANGELOG actually uses, which
+#: also means a hypothetical patch release does not have to invent a heading of its own.
+Release = tuple[int, int]
+
+
+def _release(text: str) -> Release:
+    """`v2.20` -> (2, 20). The earliest two releases are spelled `v1` and `v2` with no
+    minor at all, which is why the minor defaults rather than being unpacked."""
+    major, _, minor = text.lstrip("v").partition(".")
+    return int(major), int(minor.split(".")[0] or 0)
+
+
+def _fmt(r: Release) -> str:
+    return f"v{r[0]}.{r[1]}"
+
+
+@pytest.fixture(scope="module")
+def changelog_releases() -> list[Release]:
+    """Every `## vX.Y` heading, in the order the file lists them (newest first)."""
+    text = (REPO_ROOT / "CHANGELOG.md").read_text()
+    found = re.findall(r"^## (v\d+(?:\.\d+)?)", text, flags=re.MULTILINE)
+    assert found, "CHANGELOG.md has no release headings — the parser is wrong, not the file"
+    return [_release(v) for v in found]
+
+
+@pytest.fixture(scope="module")
+def packaged_version() -> Release:
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
+    return _release(data["project"]["version"])
+
+
+@pytest.fixture(scope="module")
+def served_version() -> Release:
+    """The version `GET /openapi.json` reports, read out of the source rather than by
+    importing the app: the assertion is that these two FILES agree, and an import would
+    resolve the same value through whichever one happened to win."""
+    text = (REPO_ROOT / "app" / "main.py").read_text()
+    m = re.search(r"FastAPI\([^)]*version=\"(\d+\.\d+(?:\.\d+)?)\"", text)
+    assert m, "app/main.py has no FastAPI(version=...) — the parser is wrong, not the file"
+    return _release(m.group(1))
+
+
+def test_the_packaged_and_served_versions_agree(packaged_version, served_version):
+    """The one that actually shipped broken. These two have no reason to ever differ:
+    `pyproject.toml`'s own comment says "keep the two in step", which is a convention
+    with nothing enforcing it."""
+    assert packaged_version == served_version, (
+        f"pyproject.toml says {_fmt(packaged_version)} and app/main.py serves "
+        f"{_fmt(served_version)} — a release bumped one and not the other")
+
+
+def test_no_release_number_is_claimed_twice(changelog_releases):
+    """The collision itself, as it looks once it is in the file.
+
+    Two branches taking the same number surfaced as a merge conflict in CHANGELOG.md,
+    which is the LUCKY case — git caught it. Two branches whose entries land without
+    conflicting, or a merge that keeps both (this repo has had one: `stderr_gist` ended
+    up defined twice in harness_rules.py and the second silently won), produce a repo
+    where a version number means two things and nothing says so."""
+    seen, dupes = set(), []
+    for r in changelog_releases:
+        if r in seen:
+            dupes.append(_fmt(r))
+        seen.add(r)
+    assert not dupes, f"CHANGELOG.md claims {', '.join(dupes)} more than once"
+
+
+def test_the_changelog_is_newest_first(changelog_releases):
+    """The file says so in its own header, and the tests below read position 0 as "the
+    newest release". An entry inserted in the wrong place would quietly make every one
+    of them assert something else."""
+    assert changelog_releases == sorted(changelog_releases, reverse=True), (
+        "CHANGELOG.md headings are not in descending order: "
+        + ", ".join(_fmt(r) for r in changelog_releases[:6]))
+
+
+def test_the_served_version_is_a_release_that_exists(served_version, changelog_releases):
+    assert served_version in changelog_releases, (
+        f"app/main.py serves {_fmt(served_version)}, which has no CHANGELOG entry")
+
+
+def test_the_served_version_never_leads_the_newest_release(served_version,
+                                                           changelog_releases):
+    """It may lag — most releases are harness-side and leave it alone. Leading is the
+    error: a board change bumped the version and its entry was never written."""
+    newest = changelog_releases[0]
+    assert served_version <= newest, (
+        f"app/main.py serves {_fmt(served_version)} but the newest release is "
+        f"{_fmt(newest)} — a board version was bumped ahead of its CHANGELOG entry")
+
+
+def test_the_readme_names_the_newest_release_as_the_latest(changelog_releases):
+    """README's prose is one of the eight places, and the one most often left behind —
+    it was left behind by the very commit that added this test's sibling."""
+    newest = changelog_releases[0]
+    text = (REPO_ROOT / "README.md").read_text()
+    m = re.search(r"Latest release: \*\*(v\d+\.\d+)\*\*", text)
+    assert m, "README.md has no 'Latest release: **vX.Y**' line"
+    assert _release(m.group(1)) == newest, (
+        f"README.md calls {m.group(1)} the latest release; the CHANGELOG's newest is "
+        f"{_fmt(newest)}")
+
+
+def test_the_readme_release_list_has_an_entry_for_the_newest_release(changelog_releases):
+    """The bulleted history below the prose, which is a second place and drifts
+    independently of the first."""
+    newest = _fmt(changelog_releases[0])
+    text = (REPO_ROOT / "README.md").read_text()
+    assert re.search(rf"^- \*\*{re.escape(newest)}\*\* —", text, flags=re.MULTILINE), (
+        f"README.md's release list has no `- **{newest}** —` entry")
