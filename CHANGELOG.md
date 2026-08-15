@@ -46,17 +46,20 @@ All of it reaches the board (`round`, `cycle`, `new_findings`, `stopped`, `stop_
 one, so a running cycle is never rendered as a finished one, and a reviewer whose reply did not
 parse is distinguishable from one that was never asked instead of collapsing onto the same null.
 `GET /review/findings` checks each re-review flag against what the following round of the same
-cycle actually found, which makes **honesty per reviewer** measurable for the first time — a member
-that says "I could not assess X" and is right is worth more than one that silently reports clean,
-and until now nothing distinguished them.
+cycle actually found — for the run, and per member in `rereview_by_reviewer`, since the
+declaration rides on the reporter's own row. That makes **honesty per reviewer** measurable for
+the first time: a member that says "I could not assess X" and is right is worth more than one
+that silently reports clean, and until now nothing distinguished them.
 
 "The same cycle" is a stored fact rather than a positional guess: the panel mints a `cycle` id on
 round 1 and every later round inherits it from its earliest baseline, so two agents looping the
 same PR at once cannot have one's round 2 credited to the other's round 1.
 
-One limit on that number, stated because a measure nobody can calibrate is worse than none: it is
-**file-grain**. The next round raised a confirmed finding in a file this round flagged, which is
-not a claim that the fix caused it.
+Two limits on that number, stated because a measure nobody can calibrate is worse than none. It is
+**file-grain**: the next round raised a confirmed finding in a file this round flagged, which is
+not a claim that the fix caused it. And it is scored over **confirmed findings only**, on both
+sides — a declaration attached to a finding the judge dismissed, or to one nobody adjudicated, is
+not scored as wrong, it is not scored at all.
 
 Attribution itself is exact, because v2.14 put it within reach: a declaration rides on the
 reporter's own entry in `reported_by`, so `rereview_flagged` counts the member that made the call

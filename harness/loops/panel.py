@@ -387,13 +387,22 @@ def extract_json_value(raw: str) -> list | dict | None:
     envelope or a bare array — tolerating ``` fences and surrounding prose.
 
     EVERY top-level `{...}` and `[...]` span is tried, and the envelope wins over
-    position: the first span that parses into an object carrying one of
-    :data:`ENVELOPE_KEYS` is the reply, whatever preceded it. Position alone is
-    not enough, and got this wrong in the one case that matters — a prose `{...}`
-    before the envelope fails to parse, and the next span by offset is the
-    envelope's own INNER findings array, which parses cleanly and silently drops
-    every declaration riding alongside it. A non-empty array is preferred next,
-    so a bare findings array behind a prose object is not lost either.
+    position: a span that parses into an object carrying one of
+    :data:`ENVELOPE_KEYS` *whose value is a list* is the reply, whatever preceded
+    it. Position alone is not enough, and got this wrong in the one case that
+    matters — a prose `{...}` before the envelope fails to parse, and the next
+    span by offset is the envelope's own INNER findings array, which parses
+    cleanly and silently drops every declaration riding alongside it. A non-empty
+    array is preferred next, so a bare findings array behind a prose object is not
+    lost either; an object carrying an envelope key but not a list under it is
+    prose ABOUT the schema and comes last.
+
+    Among equally-shaped candidates the LAST one wins, not the first. Echoing the
+    requested schema before answering is ordinary model behaviour, and an echoed
+    example is a well-formed envelope carrying an empty `findings` — accepted
+    first, it replaces the real reply with a clean "found nothing", which is the
+    one wrong answer this function must never produce silently. Whatever the model
+    wrote last is its answer; the schema it quoted on the way there is not.
 
     Returns None when no valid JSON value is present, so callers can tell
     "parsed empty → flawless" apart from "unparseable → retry / keep raw text"
@@ -411,13 +420,26 @@ def extract_json_value(raw: str) -> list | dict | None:
             continue
         if isinstance(val, (list, dict)):
             parsed.append(val)
-    for val in parsed:
-        if isinstance(val, dict) and any(k in val for k in ENVELOPE_KEYS):
+
+    def envelope(val, shaped: bool) -> bool:
+        # `shaped` also requires the envelope key to hold a LIST, which is what
+        # the contract asks for. A sentence about the schema ("set `findings` to
+        # an array of objects") parses as an object carrying the key and a string,
+        # and that is not an answer — so a real array elsewhere in the reply beats
+        # it, and it only wins over nothing at all.
+        return isinstance(val, dict) and any(
+            k in val and (not shaped or isinstance(val[k], list)) for k in ENVELOPE_KEYS)
+
+    for val in reversed(parsed):
+        if envelope(val, shaped=True):
             return val
-    for val in parsed:
+    for val in reversed(parsed):
         if isinstance(val, list) and val:
             return val
-    return parsed[0] if parsed else None
+    for val in reversed(parsed):
+        if envelope(val, shaped=False):
+            return val
+    return parsed[-1] if parsed else None
 
 
 def _severity(raw, fallback: str) -> str:
@@ -1846,13 +1868,23 @@ def adjudicate(clusters: list[list[Finding]], diff: str, model: str, pr: int,
         return unruled(err)
     parsed = extract_json_value(out)
     note = ""
-    if isinstance(parsed, dict):
-        note = str(parsed.get("coverage_note") or "").strip()
-        parsed = parsed.get("verdicts")
+    reply = parsed if isinstance(parsed, dict) else None
+    if reply is not None:
+        note = str(reply.get("coverage_note") or "").strip()
+        parsed = reply.get("verdicts")
     if not isinstance(parsed, list):
-        # With nothing to adjudicate, a reply that carries only the coverage note
-        # is a complete answer — not a judge that failed to rule.
-        if not flat:
+        # With nothing to adjudicate, a reply that carries the coverage answer is
+        # a complete answer — not a judge that failed to rule.
+        #
+        # "Carries the coverage answer" is checked, not assumed from there being
+        # no findings. Prose, a crash-truncated reply, an object with neither key
+        # — all of them used to land here as skip_reason=None, so `coverage_veto`
+        # added no "the round was not adjudicated" entry and the round recorded a
+        # CONFIDENT clean verdict on a judge that produced nothing. That is the
+        # inversion of the guarantee this release exists for, and it fires on
+        # precisely the round where the coverage split most needed adjudicating.
+        answered = reply is not None and (bool(note) or "verdicts" in reply)
+        if not flat and answered:
             return [], None, note
         return unruled("judge: no JSON verdict in output (unparseable)", note)
     return _parse_verdicts(parsed, flat, pr), None, note
@@ -1880,6 +1912,45 @@ def _same_file(a: str, b: str) -> bool:
 #: them as one defect reworded. Deliberately high: this only ever has to absorb
 #: "unused import" vs "import is unused", never two genuinely different defects.
 REWORD_RATIO = 0.85
+
+#: Words that never distinguish one defect from another, so a title that has one
+#: and a title that does not are still candidates for the same defect. Content
+#: words are what this list must leave alone: "not" and "never" are deliberately
+#: absent, since "is closed" and "is never closed" are two different defects.
+_TITLE_NOISE = frozenset(
+    "a an the of in on at to by is it its as be or and for with this that".split())
+
+
+def _stem(word: str) -> str:
+    """A word reduced past the endings a rewrite changes without changing the
+    subject — "import"/"imports", "query"/"queries". Crude on purpose: it only has
+    to make two spellings of one noun agree, and over-stemming two DIFFERENT words
+    into one is the failure that costs a finding, so nothing here shortens a word
+    to fewer than three characters."""
+    for suffix, repl in (("ies", "y"), ("es", ""), ("s", "")):
+        if word.endswith(suffix) and len(word) - len(suffix) >= 3:
+            return word[:len(word) - len(suffix)] + repl
+    return word
+
+
+def _same_words(a: str, b: str) -> bool:
+    """Do two normalised titles differ only in how they are WORDED?
+
+    A character-similarity ratio alone cannot answer that. Findings share long
+    boilerplate and differ in one short noun — "the N+1 query in the user loop"
+    against "…in the order loop" is 0.93 alike and two different defects — and
+    calling those one repeat drops the second from ``new_findings`` without ever
+    briefing the fixer on it. A false "new" costs a wasted round; a false "already
+    raised" costs a defect, so the ambiguous case goes to "new".
+
+    So the two must carry the same content words, up to word order and a plural:
+    a word one title has and the other does not names something the other does not
+    talk about, and that is a different defect however alike the two strings read.
+    """
+    def words(text: str) -> set[str]:
+        return {_stem(w) for w in text.split() if w not in _TITLE_NOISE}
+
+    return words(a) == words(b)
 
 
 @dataclass
@@ -1913,6 +1984,13 @@ class Baseline:
         as having broken something. "The same file" is suffix-aware
         (:func:`_same_file`), since a round where only the short-path reviewer
         raised the defect hashes to a different key too.
+
+        The fallback is deliberately hard to trigger. Its two failures are not
+        symmetric: a wrong "new" buys a round nobody needed, while a wrong
+        "already raised" deletes a finding from the fixer's brief and can end the
+        cycle on a defect nobody was told about. So a high character ratio is only
+        the cheap pre-filter, and :func:`_same_words` — the two titles carrying the
+        same content words, up to word order and a plural — is what decides.
         """
         if finding.key in self.keys:
             return True
@@ -1922,6 +2000,7 @@ class Baseline:
         return any(
             _same_file(finding.file or "", was_file)
             and difflib.SequenceMatcher(None, norm, was).ratio() >= REWORD_RATIO
+            and _same_words(norm, was)
             for was, was_files in self.titles.items()
             for was_file in was_files
         )
@@ -1963,13 +2042,24 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
     ``expect`` (``repo``/``github``/``pr``/``round``) is checked against what the
     payload says it is. A baseline from another PR is not a thinner baseline, it
     is a wrong one: its keys would make real findings read as repeated and stop
-    the loop early, so a mismatched payload is REPORTED and its keys dropped. The
-    identity fields must be PRESENT as well as equal: a hand-edited or truncated
-    payload that omits them is a payload nobody can attribute, and accepting it
-    suppresses this run's findings on the word of a file that never said whose it
-    was. The same goes for a payload whose round is not earlier than this one's —
-    it is reported *and* excluded, since a current or future round's keys make
+    the loop early, so a mismatched payload is REPORTED and its keys dropped. An
+    identity field the CALLER knows must be present as well as equal: a
+    hand-edited or truncated payload that omits it is a payload nobody can
+    attribute, and accepting it suppresses this run's findings on the word of a
+    file that never said whose it was. A field the caller does not know (``None``
+    in ``expect``) is not checked at all — testing key *presence* instead made
+    ``{"repo": None}`` reject every baseline ever written, which silently
+    no-opped the whole round diff for any caller that did not resolve its repo
+    name. The same reported-and-excluded rule covers a payload whose round is not
+    earlier than this one's, since a current or future round's keys make
     genuinely new findings read as repeated.
+
+    All usable baselines must belong to ONE cycle, and the earliest of them names
+    it. Two concurrent cycles on a PR have unrelated keys and titles; merging them
+    into one history classifies findings only the other cycle raised as repeats,
+    which can suppress a fix round — the exact confusion the ``cycle`` id was
+    minted to prevent, so a payload from a different cycle is reported and
+    excluded like any other wrong baseline.
 
     A round past the first with NO baseline at all is itself a problem: every
     finding then reads as new, ``prior_rounds`` prints zero, and the round would
@@ -1989,9 +2079,11 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
         b.problems.append(
             f"round {want['round']} ran with no --baseline — nothing to compare against, "
             "so every finding here reads as one no earlier round raised")
-    #: (round, cycle) of each usable baseline, so the cycle is inherited from the
-    #: EARLIEST round rather than from whichever path was listed first.
-    cycles: list[tuple[int, str]] = []
+    #: (round, cycle, path, payload) of each baseline that passed identity and
+    #: ordering. Collected before anything is merged, because which cycle the run
+    #: belongs to is a property of the SET — the earliest round names it, and the
+    #: rest are checked against that.
+    usable: list[tuple[int, str, str, dict]] = []
     for path in paths:
         try:
             payload = json.loads(Path(path).read_text())
@@ -2001,7 +2093,10 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
         if not isinstance(payload, dict):
             b.problems.append(f"baseline {path} is not a panel payload")
             continue
-        checked = [k for k in ("repo", "github", "pr") if k in want]
+        # Only the fields whose expected value is KNOWN. `k in want` would check a
+        # key the caller passed as None, and then reject every payload for not
+        # matching a value nobody has.
+        checked = [k for k in ("repo", "github", "pr") if want.get(k) is not None]
         missing = [k for k in checked if payload.get(k) is None]
         wrong = [f"{k}={payload.get(k)!r} (this run: {want[k]!r})"
                  for k in checked if payload.get(k) is not None and payload.get(k) != want[k]]
@@ -2026,13 +2121,37 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
                               "run actually is — its findings were NOT counted as earlier "
                               "rounds")
             continue
-        b.rounds.add(was)
         # A cycle id the caller minted, or — for a round 1 that predates the
         # field — the run_key it recorded itself under, which is unique to that
-        # process and is exactly as stable.
-        got = str(payload.get("cycle") or payload.get("run_key") or "")
-        if got:
-            cycles.append((was, got))
+        # process and is exactly as stable. "" for a payload that says neither,
+        # which conflicts with nothing and inherits whatever the set decides.
+        usable.append((was, str(payload.get("cycle") or payload.get("run_key") or ""),
+                       path, payload))
+
+    # The cycle named by the EARLIEST round that names one, keyed on the round
+    # alone rather than by min() over the whole tuple: min() fell through to
+    # comparing opaque hex ids whenever two baselines shared a round, so the winner
+    # was lexicographic — neither earliest nor first, contradicting the rule
+    # written beside it. Keyed this way, min() keeps the first at that round.
+    named = [e for e in usable if e[1]]
+    b.cycle = min(named, key=lambda e: e[0])[1] if named else None
+    distinct_rounds = {e[0] for e in usable}
+    if len(distinct_rounds) != len(usable):
+        # Two payloads for one round is not fatal — their keys are still findings
+        # an earlier round raised — but `rounds` then under-counts, and the cycle
+        # was inherited from one of two equals, so the ambiguity is stated rather
+        # than resolved in silence.
+        b.problems.append(f"{len(usable)} baselines cover {len(distinct_rounds)} round(s) — "
+                          "two payloads for one round, so which of them named the cycle "
+                          "was arbitrary")
+    for was, got, path, payload in usable:
+        if got and b.cycle and got != b.cycle:
+            b.problems.append(f"baseline {path} is from cycle {got}, not this run's "
+                              f"{b.cycle} — a concurrent cycle's findings would read as "
+                              "repeats here — its findings were NOT counted as earlier "
+                              "rounds")
+            continue
+        b.rounds.add(was)
         for bucket in ("to_fix", "dismissed", "sonar_findings"):
             for f in payload.get(bucket) or []:
                 if not isinstance(f, dict):
@@ -2042,8 +2161,6 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
                 norm = _norm_title(title)
                 if norm:
                     b.titles.setdefault(norm, set()).add(file or "")
-    if cycles:
-        b.cycle = min(cycles)[1]
     return b
 
 
@@ -2080,9 +2197,18 @@ def coverage_veto(reviewer_meta: dict[str, dict], judge_skip: str | None,
 
 
 def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
-               confirmed: list[Canonical], veto: list[str],
+               outstanding: list[Canonical], veto: list[str],
                baseline_ok: bool = True, repeated: int = 0) -> dict:
     """Whether the panel/fix cycle should go again, and what decided it.
+
+    ``outstanding`` is every finding the cycle still has to clear, which is wider
+    than "confirmed" and deliberately so: it holds anything the judge did not
+    dismiss (including the ``unjudged`` findings of a round whose judge crashed)
+    plus Sonar's hard-gate issues, which nobody adjudicates at all. A P2 nobody
+    ruled on is not a reason to STOP. The parameter used to be called
+    ``confirmed``, and the word reached the PR comment: a reader reconciling
+    "still confirmed after the fix" against a round with no judge was told
+    something untrue about how the verdict was reached.
 
     The rule is mechanical on purpose. Asking reviewers to forecast "will another
     round be needed?" measures the wrong thing — a model that just wrote five
@@ -2091,27 +2217,27 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     on what actually happened:
 
     1. findings this round that no earlier round raised -> go again;
-    2. a P1/P2 still confirmed -> go again, whatever anyone declared (a blocker
+    2. a P1/P2 still outstanding -> go again, whatever anyone declared (a blocker
        raised again is a blocker that was not fixed);
     3. ``repeated`` — a finding an earlier round already raised that is STILL
-       confirmed, at any severity -> go again. The fixer was told about it and it
-       is still there, and ``/panel-review-pr``'s bar is every confirmed finding
-       fixed, not every P1/P2. This used to only cost the stop its confidence,
-       which ended the cycle with a judge-confirmed defect present and nothing
-       acting on the veto that said so;
+       outstanding, at any severity -> go again. The fixer was told about it and
+       it is still there, and ``/panel-review-pr``'s bar is every finding fixed,
+       not every P1/P2. This used to only cost the stop its confidence, which
+       ended the cycle with a judge-confirmed defect present and nothing acting on
+       the veto that said so;
     4. otherwise dry -> stop.
 
     The cap is what stops rule 3 running forever when two reviewers disagree
     about a P4 — the cycle ends either way, and a cap reached with work
     outstanding is recorded as such rather than as convergence."""
-    blockers = [c for c in confirmed if c.severity in ("P1", "P2")]
+    blockers = [c for c in outstanding if c.severity in ("P1", "P2")]
     if new_keys:
         stop, reason = False, (f"{len(new_keys)} finding(s) no earlier round raised")
     elif blockers:
-        stop, reason = False, f"{len(blockers)} P1/P2 still confirmed after the fix"
+        stop, reason = False, f"{len(blockers)} P1/P2 still outstanding after the fix"
     elif repeated:
         stop, reason = False, (f"{repeated} finding(s) an earlier round already raised "
-                               "are still confirmed")
+                               "are still outstanding")
     else:
         stop, reason = True, ("dry — nothing raised that an earlier round had not"
                               if round_no > 1 else "dry — no findings to fix")
@@ -2121,7 +2247,7 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
         reason = f"round cap ({max_rounds}) reached — {reason}, unreviewed"
     if repeated:
         veto = [*veto, f"{repeated} finding(s) an earlier round already raised are "
-                       "still confirmed — the fix for them did not land"]
+                       "still outstanding — the fix for them did not land"]
     return {
         "stop": stop,
         "reason": reason,
@@ -2182,6 +2308,56 @@ def _payload_defaults() -> dict:
     }
 
 
+def _veto_gist(text: str, limit: int = 80) -> str:
+    """The identifying head of a veto that is also a config note — enough to say
+    WHICH note without repeating its full text on the PR comment. The problem
+    strings put their consequence after an em-dash, so the head is the fact."""
+    head = text.split(" — ", 1)[0].strip()
+    return head if len(head) <= limit else head[:limit - 1] + "…"
+
+
+def write_payload(json_file: str, payload: dict) -> str:
+    """Write a run payload where ``--json-file`` asked for it.
+
+    Returns "" on success (or when nothing was asked for), else a description of
+    the failure for :func:`finish` to fail the run with. Shared by every non-error
+    exit, because the file is the NEXT round's baseline and a caller told "the
+    round did not happen unless the panel wrote that file" must get that answer
+    from the skip-pattern exit too."""
+    if not json_file:
+        return ""
+    try:
+        Path(json_file).write_text(json.dumps(payload, indent=2))
+    except OSError as e:
+        failed = f"{json_file} ({e.__class__.__name__})"
+        print(f"panel: could not write {failed}", file=sys.stderr)
+        return failed
+    return ""
+
+
+def finish(write_failed: str, code: int = 0) -> int:
+    """The exit code, failing the run when the requested ``--json-file`` was not
+    written.
+
+    Without that file round r+1 classifies every repeated finding as new, prints
+    "N of N raised by no earlier round" and drives a fix pass over work already
+    done. Warning and exiting 0 let the caller advance the cycle on a baseline
+    that does not exist.
+
+    Reported at the END of a run rather than at the write: the report, the board
+    record and the PR comment are a review that has already been paid for, and
+    throwing them away would push the caller towards re-running the panel — which
+    the workflow forbids, because each run is an observation and re-rolling one
+    corrupts the record."""
+    if write_failed:
+        print(f"\npanel: FAILED — the requested --json-file was not written: "
+              f"{write_failed}. The review above is complete, but the next round "
+              "has no baseline: fix the path and re-run the CYCLE from round 1 "
+              "rather than treating this round as done.", file=sys.stderr)
+        return 2
+    return code
+
+
 def fit_comment(report: str, limit: int = COMMENT_CHARS) -> str:
     """The report, cut to fit a GitHub comment (65,536 chars, hard).
 
@@ -2194,7 +2370,14 @@ def fit_comment(report: str, limit: int = COMMENT_CHARS) -> str:
 
     The round verdict is the one block a cut is taken AROUND rather than through:
     it sits at the foot of the report, it is what the caller of a cycle acts on,
-    and a truncation from the end would drop precisely it."""
+    and a truncation from the end would drop precisely it.
+
+    Reserved, not exempt. The verdict block carries one veto line per reviewer per
+    declared gap, from free text a model wrote, so it is unbounded in principle —
+    and reserving all of it clamped the SLICE rather than the RESULT, returning
+    `cut + tail` over the limit and losing the whole comment to a hard API
+    rejection. When the block alone will not fit it is cut from its own end, which
+    keeps the mechanical verdict (its first line) and drops the vetoes."""
     if len(report) <= limit:
         return report
     note = ("\n\n_Per-reviewer accounts omitted — the full report exceeds GitHub's "
@@ -2204,12 +2387,19 @@ def fit_comment(report: str, limit: int = COMMENT_CHARS) -> str:
         return trimmed + note
     cut = ("\n\n_…report truncated at GitHub's comment limit. The full run is in "
            "`--json` and on the board._")
+    if limit <= len(cut):
+        # No room for even the marker: the caller asked for a length no honest
+        # report fits in, so give it the report's own first characters.
+        return trimmed[:max(0, limit)]
     head, sep, tail = trimmed.partition("\n\n" + ROUNDS_HEADING)
     tail = sep + tail if sep else ""
-    return head[:max(0, limit - len(cut) - len(tail))] + cut + tail
+    room = limit - len(cut)
+    if len(tail) > room:
+        tail = tail[:room - 1] + "…"
+    return head[:room - len(tail)] + cut + tail
 
 
-def run(repo_name: str, pr_number: int, post: bool, json_out: bool = False,
+def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = False,
         reviewers: str | None = None, json_file: str = "", record: bool = True,
         round_no: int = 1, baseline: list[str] | None = None,
         max_rounds: int | None = None) -> int:
@@ -2226,6 +2416,14 @@ def run(repo_name: str, pr_number: int, post: bool, json_out: bool = False,
     # loop is data, not a duplicate.
     run_key = uuid.uuid4().hex
     cfg = load_repo_cfg(repo_name)
+    # The name RESOLVED from the checkout, never the argument. `--repo` is
+    # optional — `panel.py --pr N` in a repo is the documented single-PR form —
+    # and the unresolved None went straight into the payload as `"repo": null`.
+    # A payload that does not say which review it is from cannot be a baseline:
+    # round 2 discarded round 1 as unattributable, called every finding new, and
+    # could never record a confident stop. The whole round diff no-opped for
+    # anyone who did not pass a flag they were never told to pass.
+    repo_name = cfg.get("name") or repo_name
     gh_repo = cfg["github"]
     rev = cfg["reviewers"]
     panel = cfg["review_panel"]
@@ -2254,21 +2452,28 @@ def run(repo_name: str, pr_number: int, post: bool, json_out: bool = False,
         if re.search(pat, title, re.I):
             print(f"[{repo_name}#{pr_number}] '{title[:50]}' matches skip pattern "
                   f"/{pat}/ — not worth panel review. Skipping.", file=chatter)
+            # A consumer gets a payload on every non-error exit, or "reviewed
+            # and found nothing" and "never reviewed at all" arrive as the
+            # same empty stdout — and the second one silently reads as a
+            # clean PR. Same SHAPE as a reviewed run, too, so reading any
+            # other key of it is not a KeyError. Not recorded on the board:
+            # no review happened.
+            skipped_payload = {
+                **_payload_defaults(),
+                "repo": repo_name, "github": gh_repo, "pr": pr_number,
+                "title": title, "base": base,
+                "skip_reason": f"title matches skip pattern /{pat}/",
+                "run_key": run_key,
+            }
+            # --json-file is honoured here too, and its failure fails the run the
+            # same way. The caller is told "if the panel could not write that file
+            # the round did not happen", and it then feeds the file to the next
+            # round as `--baseline`: a skipped PR that exited 0 leaving no file
+            # gave that caller no signal at all.
+            failed = write_payload(json_file, skipped_payload)
             if json_out:
-                # A consumer gets a payload on every non-error exit, or "reviewed
-                # and found nothing" and "never reviewed at all" arrive as the
-                # same empty stdout — and the second one silently reads as a
-                # clean PR. Same SHAPE as a reviewed run, too, so reading any
-                # other key of it is not a KeyError. Not recorded on the board:
-                # no review happened.
-                print(json.dumps({
-                    **_payload_defaults(),
-                    "repo": repo_name, "github": gh_repo, "pr": pr_number,
-                    "title": title, "base": base,
-                    "skip_reason": f"title matches skip pattern /{pat}/",
-                    "run_key": run_key,
-                }, indent=2))
-            return 0
+                print(json.dumps(skipped_payload, indent=2))
+            return finish(failed)
     print(f"\n[{repo_name}#{pr_number}] {title[:60]}", file=chatter)
     print(f"  base={base}  changed={changed} lines\n", file=chatter)
 
@@ -2444,6 +2649,14 @@ def run(repo_name: str, pr_number: int, post: bool, json_out: bool = False,
     veto = coverage_veto(reviewer_meta, judge_skip, flagged, len(diff)) + prior.problems
     stop = round_stop(round_no, cap, new_keys, outstanding, veto, not prior.problems,
                       repeated=len({c.key for c in outstanding if not is_new(c)}))
+    # Whether a CYCLE exists at all, and the one predicate that decides it — for
+    # the report's Rounds block and for the payload alike. They used to disagree:
+    # the report suppressed the block for a review-only run while the payload sent
+    # `round_stop` regardless, so `record_review` stored a `/panel` read with
+    # findings as `stopped: false` (the board shows a cycle mid-flight that nothing
+    # will advance) and one without as `stopped: true, stop_confident: true` — a
+    # confident-convergence record for a PR that had no cycle.
+    cycle_run = bool(in_cycle or prior_rounds)
     # A cycle's rounds share one id, inherited from the earliest baseline, so the
     # board can tell "the re-review of THIS declaration" from "whatever ran next
     # on this PR". Round 1 (and any run with no usable baseline) mints its own.
@@ -2473,10 +2686,16 @@ def run(repo_name: str, pr_number: int, post: bool, json_out: bool = False,
         "cycle": cycle,
         "prior_rounds": prior_rounds,
         "prior_findings": len(prior_keys),
-        "new_findings": len(new_keys),
-        "new_finding_keys": new_keys,
-        "round_stop": stop,
-        "stop_reason": stop["reason"],
+        # Gated on there being a cycle, exactly as the report's Rounds block is.
+        # For a review-only run `len(new_keys)` is every finding — the vacuous
+        # count "raised by no earlier round" when there was no earlier round — and
+        # `round_stop` is a verdict about a loop nobody is running. None rather
+        # than 0, because the board's column already means "the panel did not
+        # say", and a zero there is a claim.
+        "new_findings": len(new_keys) if cycle_run else None,
+        "new_finding_keys": new_keys if cycle_run else [],
+        "round_stop": stop if cycle_run else None,
+        "stop_reason": stop["reason"] if cycle_run else None,
         "coverage_note": coverage_note or None,
         "diff_chars": len(diff),
         "diff_budgets": {**budgets, "judge": judge_budget},
@@ -2502,36 +2721,11 @@ def run(repo_name: str, pr_number: int, post: bool, json_out: bool = False,
         "run_key": run_key,
     }
 
-    # A requested --json-file that could not be written FAILS the run. That file
-    # is the next round's baseline, and without it round r+1 classifies every
-    # repeated finding as new, prints "N of N raised by no earlier round" and
-    # drives a fix pass over work already done. Warning and exiting 0 let the
-    # caller advance the cycle on a baseline that does not exist.
-    #
-    # The failure is raised at the END rather than here: the report, the board
-    # record and the PR comment are the review that has already been paid for,
-    # and throwing them away would push the caller towards re-running the panel —
-    # which the workflow forbids, because each run is an observation and
-    # re-rolling one corrupts the record.
-    write_failed = ""
-    if json_file:
-        # So a caller can have BOTH the PR comment and the machine-readable run.
-        # Without it, --json suppresses the report and the only way to get both
-        # was to review the PR twice — several CLI invocations, for a copy.
-        try:
-            Path(json_file).write_text(json.dumps(payload, indent=2))
-        except OSError as e:
-            write_failed = f"{json_file} ({e.__class__.__name__})"
-            print(f"panel: could not write {write_failed}", file=sys.stderr)
-
-    def finish(code: int = 0) -> int:
-        if write_failed:
-            print(f"\npanel: FAILED — the requested --json-file was not written: "
-                  f"{write_failed}. The review above is complete, but the next round "
-                  "has no baseline: fix the path and re-run the CYCLE from round 1 "
-                  "rather than treating this round as done.", file=sys.stderr)
-            return 2
-        return code
+    # So a caller can have BOTH the PR comment and the machine-readable run.
+    # Without --json-file, --json suppresses the report and the only way to get
+    # both was to review the PR twice — several CLI invocations, for a copy. A
+    # requested file that could not be written FAILS the run (see `finish`).
+    write_failed = write_payload(json_file, payload)
 
     if record:
         record_run(payload)
@@ -2541,7 +2735,7 @@ def run(repo_name: str, pr_number: int, post: bool, json_out: bool = False,
     # either without checking which exit it came from.
     if json_out:
         print(json.dumps(payload, indent=2))
-        return finish()
+        return finish(write_failed)
 
     def conf(c: Canonical) -> str:
         revs = c.reviewers
@@ -2579,7 +2773,7 @@ def run(repo_name: str, pr_number: int, post: bool, json_out: bool = False,
                      f"{len(new_keys)} of {len(outstanding)} finding(s) here were raised by "
                      f"no earlier round ({len(prior_keys)} known from {prior_rounds} earlier "
                      f"round{'s' if prior_rounds != 1 else ''}).")
-    ci_txt ={"PASS": "✅ PASS", "FAIL": "❌ FAIL", "PENDING": "⏳ pending",
+    ci_txt = {"PASS": "✅ PASS", "FAIL": "❌ FAIL", "PENDING": "⏳ pending",
               "none": "no checks reported", "unknown": "unknown"}.get(ci_status, ci_status)
     lines.append(f"**CI (`gh pr checks`, hard gate):** {ci_txt}")
     if ci_failing:
@@ -2686,7 +2880,7 @@ def run(repo_name: str, pr_number: int, post: bool, json_out: bool = False,
     # panel.py by hand) that printed "round 1 of at most 2 — go again" promised a
     # round nothing would run, and counted every finding of a first review as one
     # "no earlier round raised" — which is vacuously all of them.
-    if in_cycle or prior_rounds:
+    if cycle_run:
         lines.append(f"\n{ROUNDS_HEADING} round {round_no} of at most {cap} — {verdict}: "
                      + stop["reason"]
                      + (" — a stop, not convergence" if unearned else ""))
@@ -2696,8 +2890,19 @@ def run(repo_name: str, pr_number: int, post: bool, json_out: bool = False,
                              "evidence of a quiet PR:"), "- ⚠️ "
     if stop["veto"]:
         lines.append(veto_head)
+        # A baseline problem is deliberately BOTH a config note (what went wrong)
+        # and a veto (why the quiet does not count), and the payload carries it in
+        # both roles on purpose — `config_notes` never reaches the board, so the
+        # veto list is the record's only copy. On the PR comment, though, printing
+        # the same sentence twice reads as two problems. The second appearance is
+        # rendered as a pointer to the first.
+        was_a_note = set(notes)
         for why in stop["veto"]:
-            lines.append(f"{bullet}{why}")
+            if why in was_a_note:
+                lines.append(f"{bullet}{_veto_gist(why)} — _the config note above, "
+                             "which is also why this round's quiet does not count_")
+            else:
+                lines.append(f"{bullet}{why}")
 
     report = "\n".join(lines)
     print(report)
@@ -2727,7 +2932,7 @@ def run(repo_name: str, pr_number: int, post: bool, json_out: bool = False,
                   f" — the report above is the only copy", file=sys.stderr)
     else:
         print("\n(report only — pass --post to comment on the PR)")
-    return finish()
+    return finish(write_failed)
 
 
 def main() -> int:
@@ -2767,13 +2972,19 @@ def main() -> int:
         raise SystemExit("--round: rounds are numbered from 1")
     if args.max_rounds is not None and args.max_rounds < 1:
         raise SystemExit("--max-rounds: at least one round has to run")
-    if args.max_rounds is not None and args.round_no > args.max_rounds:
-        # Otherwise the run records an impossible position ("round 5 of at most
-        # 2") and hits the cap branch on the spot, writing "round cap (2) reached"
-        # into a round 5's stop reason. The copy-paste that produces it is cheap
-        # to catch here and corrupts cycle metadata everywhere else.
+    # Checked against the EFFECTIVE cap, not only against an explicit one. The
+    # default is the cap `run()` actually applies, so `--round 3` with no
+    # --max-rounds used to pass this guard and then hit the cap branch on the
+    # spot — writing "round cap (2) reached … unreviewed" into a round 3 and
+    # printing "round 3 of at most 2". That is precisely the corrupted cycle
+    # metadata this guard exists to prevent, leaking through the one spelling it
+    # did not cover.
+    cap = DEFAULT_MAX_ROUNDS if args.max_rounds is None else args.max_rounds
+    if args.round_no > cap:
+        default_note = "" if args.max_rounds is not None else \
+            " (the default, since --max-rounds was not passed)"
         raise SystemExit(f"--round {args.round_no} is past --max-rounds "
-                         f"{args.max_rounds}: raise the cap, or pass the round "
+                         f"{cap}{default_note}: raise the cap, or pass the round "
                          "this run actually is")
     return run(args.repo, args.pr, args.post, args.json_out, args.reviewers,
                args.json_file, args.record, args.round_no, args.baseline,

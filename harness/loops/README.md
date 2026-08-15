@@ -186,9 +186,10 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
 
 - Runs the repo's **enabled** reviewers in parallel over the PR diff: SonarQube (HARD
   quality-gate pass/fail), Claude (SOFT, read-only), Codex (SOFT, different vendor).
-- **Skip patterns:** PRs matching `skip_title_patterns` are skipped entirely (under
-  `--json` that is still a payload, marked `reviewed: false` — an empty stdout would
-  read as a clean PR). Otherwise all enabled reviewers run — no diff-size de-minimis.
+- **Skip patterns:** PRs matching `skip_title_patterns` are skipped entirely — but that
+  is still a payload, marked `reviewed: false`, on `--json` *and* in `--json-file` (an
+  empty stdout, or a missing baseline, would read as a clean PR). Otherwise all enabled
+  reviewers run — no diff-size de-minimis.
 - **Master judgment, no consensus gate:** a master reviewer judges every finding on
   its merits. A real defect flagged by only ONE reviewer is still fixed — agreement
   shows as a `⋆consensus` confidence marker, never a filter. Only clear false
@@ -216,7 +217,7 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   parses and simply declares nothing.
 - **Rounds are mechanical.** `--round`/`--baseline` make each run say which findings no
   earlier round raised; `round_stop` in the payload then says go-again (something new,
-  a P1/P2 still confirmed, or a finding an earlier round raised that is still confirmed
+  a P1/P2 still outstanding, or a finding an earlier round raised that is still outstanding
   — SonarCloud's hard-gate issues included) or stop (dry / round cap), and whether
   stopping was *convergence*. The declarations never extend the loop — a truncated
   reviewer is truncated again next round — they only stop a broken round being reported
@@ -224,13 +225,17 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   to compare against, so its "all new" count means nothing and its stop is unearned.
 - **`--json-file` is a requirement, not a courtesy.** It is the next round's baseline, so
   a write that fails exits non-zero after the report: carrying on would leave round `r+1`
-  calling every repeated finding new.
+  calling every repeated finding new. Every non-error exit writes it, the skip-pattern one
+  included, so "the panel exited 0 and wrote no file" is not a state the caller has to
+  interpret.
 - **`--max-rounds N` is the CALLER's cap**, not a loop panel.py runs: it is the only
   input that tells a round which stopped because it was done from one which stopped
   because it ran out, and `/panel-review-pr` passes it on every invocation. Its flag is
   spelled `--rounds N` on the slash command and `--max-rounds N` here — same number, and
   `--round <r>` (singular) is a different thing entirely: which round THIS run is.
-  A run given none of the three is a single review and says nothing about rounds.
+  A run given none of the three is a single review and says nothing about rounds — in the
+  report *and* in the payload, whose `round_stop`, `stop_reason` and `new_findings` are
+  null rather than a verdict about a loop nobody is running.
   A `--round` past `--max-rounds` is rejected rather than recorded.
 - **The `/panel` and `/panel-review-pr` skills** run `panel.py --post` and work from
   the **PR comment** it leaves: `/panel` stops there (review-only), `/panel-review-pr`

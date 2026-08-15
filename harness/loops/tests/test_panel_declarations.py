@@ -18,6 +18,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
 
@@ -48,6 +50,29 @@ def test_the_envelope_carries_findings_and_declarations():
     findings, gaps = panel.parse_reply("codex", raw)
     assert [f.title for f in findings] == ["leak"]
     assert gaps == ["the migration, which is not in the diff"]
+
+
+def test_a_schema_echoed_before_the_answer_is_not_the_answer():
+    """Quoting the requested shape and then answering is ordinary model behaviour,
+    and the echo is a well-formed envelope carrying an empty `findings`. Taking the
+    FIRST one replaced a real review with a clean "found nothing" — silently, since
+    a quoted example parses perfectly. Whatever the model wrote last is its answer."""
+    raw = ('I will reply as {"findings": [], "could_not_assess": []}.\n\n'
+           'Here it is:\n'
+           '{"findings": [{"severity": "P1", "file": "a.py", "title": "boom"}], '
+           '"could_not_assess": ["the migration"]}')
+    findings, gaps = panel.parse_reply("codex", raw)
+    assert [f.title for f in findings] == ["boom"]
+    assert gaps == ["the migration"]
+
+
+def test_a_sentence_about_the_schema_is_not_an_envelope():
+    """`{"findings": "an array of objects"}` carries the key and no answer. The
+    real reply — a bare array here — must win over it."""
+    raw = ('{"findings": "an array of objects, severity P1..P4"}\n'
+           '[{"severity": "P2", "file": "a.py", "title": "the real one"}]')
+    findings, _ = panel.parse_reply("codex", raw)
+    assert [f.title for f in findings] == ["the real one"]
 
 
 def test_a_bare_array_declares_nothing_which_is_not_declaring_clean():
@@ -372,10 +397,56 @@ def test_a_cycle_is_inherited_from_the_earliest_baseline(tmp_path):
     the earliest ROUND, not from whichever --baseline was listed first — a round 1
     that predates the field carries only its run_key, which is the same thing."""
     r1 = _payload(tmp_path, "r1.json", 1, ["a"], run_key="cyc-1")
-    r2 = _payload(tmp_path, "r2.json", 2, ["b"], cycle="cyc-later", run_key="run-2")
-    assert panel.load_baseline([r2, r1], {**THIS_RUN, "round": 3}).cycle == "cyc-1"
+    r2 = _payload(tmp_path, "r2.json", 2, ["b"], cycle="cyc-1", run_key="run-2")
+    b = panel.load_baseline([r2, r1], {**THIS_RUN, "round": 3})
+    assert b.cycle == "cyc-1" and b.rounds == {1, 2} and b.problems == []
     # No usable baseline, no inherited cycle — the run mints its own.
     assert panel.load_baseline([], {**THIS_RUN, "round": 1}).cycle is None
+
+
+def test_a_baseline_from_another_cycle_is_reported_and_not_counted(tmp_path):
+    """Two agents looping one PR at once produce two cycles, and their keys are
+    unrelated. Merged into one history, a finding only the OTHER cycle raised reads
+    as a repeat here — which can suppress the fix round it needed. The stored cycle
+    id exists precisely to make that checkable, and this was the one place the
+    stored fact went unchecked."""
+    mine = _payload(tmp_path, "r1.json", 1, ["a"], cycle="cyc-A")
+    theirs = _payload(tmp_path, "other.json", 2, ["b"], cycle="cyc-B")
+    b = panel.load_baseline([mine, theirs], {**THIS_RUN, "round": 3})
+    assert b.cycle == "cyc-A" and b.rounds == {1}
+    assert any("cycle cyc-B" in p for p in b.problems)
+    assert b.raised_before(_canonical("a.py", "a"))
+    assert not b.raised_before(_canonical("a.py", "b"))
+
+
+def test_two_baselines_for_one_round_say_so_rather_than_picking_by_hex(tmp_path):
+    """`min((round, cycle))` fell through to comparing opaque hex ids when two
+    payloads shared a round, so the winner was lexicographic — neither the earliest
+    nor the first listed, and contradicting the rule written beside it. The tie is
+    now taken in order, and the ambiguity is reported rather than resolved in
+    silence."""
+    first = _payload(tmp_path, "a.json", 1, ["a"], cycle="zzz")
+    second = _payload(tmp_path, "b.json", 1, ["b"], cycle="zzz")
+    b = panel.load_baseline([first, second], THIS_RUN)
+    assert b.cycle == "zzz"
+    assert any("two payloads for one round" in p for p in b.problems)
+
+
+def test_a_baseline_is_not_rejected_for_an_identity_this_run_cannot_supply(tmp_path):
+    """The check tested key PRESENCE, so `{"repo": None}` — what the documented
+    `panel.py --pr N` invocation produced before --repo resolved a default —
+    rejected EVERY baseline for "not saying which review it is from". Round 2 then
+    loaded nothing, called every finding new and could never record a confident
+    stop: the round diff silently no-opped for the workflow it documents."""
+    path = _payload(tmp_path, "r1.json", 1, ["real bug"])
+    b = panel.load_baseline([path], {**THIS_RUN, "repo": None})
+    assert b.problems == [] and b.rounds == {1}
+    assert b.raised_before(_canonical("a.py", "real bug"))
+    # ...and a field the caller DOES know is still required to be present.
+    anon = tmp_path / "anon.json"
+    anon.write_text(json.dumps({"round": 1, "to_fix": [_serialised("a.py", "x")]}))
+    assert any("does not say which review" in p
+               for p in panel.load_baseline([str(anon)], THIS_RUN).problems)
 
 
 def test_earlier_rounds_are_counted_not_guessed_from_the_highest_label(tmp_path):
@@ -400,6 +471,20 @@ def test_a_reworded_finding_is_the_same_defect_as_far_as_the_round_diff_goes(tmp
     assert not b.raised_before(_canonical("a.py", "session is never closed"))
     # ...nor the same words about another file.
     assert not b.raised_before(_canonical("b.py", "unused import in the header"))
+
+
+def test_one_material_word_apart_is_two_defects_however_alike_the_titles_read(tmp_path):
+    """Findings share long boilerplate and differ in one noun. A character ratio
+    puts these at 0.93, and calling the second a repeat drops it from
+    `new_findings` and out of the fixer's brief entirely — a lost defect, which is
+    strictly worse than the wasted round a false "new" costs."""
+    path = _payload(tmp_path, "r1.json", 1, ["the N+1 query in the user loop"])
+    b = panel.load_baseline([path], THIS_RUN)
+    assert b.raised_before(_canonical("a.py", "the N+1 query in the user loop"))
+    assert not b.raised_before(_canonical("a.py", "the N+1 query in the order loop"))
+    # ...and a genuinely reworded title is still absorbed, which is the whole
+    # reason the fallback exists.
+    assert b.raised_before(_canonical("a.py", "The N+1 queries in the user loop!"))
 
 
 # ---- the stopping rule -----------------------------------------------------
@@ -447,7 +532,7 @@ def test_a_finding_still_there_after_the_fix_earns_another_round():
     with a confirmed defect present — /panel-review-pr's bar is every confirmed
     finding, not every P1/P2."""
     d = panel.round_stop(2, 3, [], [_confirmed("P3")], [], repeated=1)
-    assert d["stop"] is False and "still confirmed" in d["reason"]
+    assert d["stop"] is False and "still outstanding" in d["reason"]
     assert any("did not land" in v for v in d["veto"])
 
 
@@ -526,6 +611,23 @@ def test_a_coverage_only_reply_is_not_a_judge_that_failed_to_rule(monkeypatch):
     assert skip is None and note == "nothing unread"
 
 
+def test_a_coverage_only_round_whose_judge_said_nothing_is_not_adjudicated(monkeypatch):
+    """The findings path calls an unparseable reply a judge that failed to rule;
+    the coverage-only path returned skip_reason=None for ANY unusable reply — prose,
+    a crash-truncated answer, an object carrying neither key. `coverage_veto` then
+    added no "the round was not adjudicated" entry and, with no other veto,
+    `round_stop` recorded `stop: true, confident: true`: a confident clean verdict
+    on a judge that produced nothing, in the one round where the split most needed
+    adjudicating."""
+    for reply in ("I had a look and it all seems fine, honestly.",
+                  json.dumps({"summary": "fine"}),
+                  '{"verdicts": [{"id": 1'):
+        _judge_returning(monkeypatch, reply)
+        findings, skip, note = panel.adjudicate([], "diff", "", 34,
+                                                coverage={"codex": ["the migration"]})
+        assert findings == [] and skip and "unparseable" in skip, reply
+
+
 def test_nothing_found_and_nothing_declared_needs_no_judge(monkeypatch):
     monkeypatch.setattr(panel, "run_cli", lambda *a, **k: (_ for _ in ()).throw(
         AssertionError("the judge must not run with nothing to rule on")))
@@ -550,18 +652,27 @@ def _fake_adjudicate(clusters, diff, model, pr, budget=None, coverage=None):
              for i, f in enumerate(flat)], None, "")
 
 
-def _report(monkeypatch, capsys, tmp_path, round_no, baseline=(), max_rounds=None):
-    """One whole panel run with every process it would spawn replaced, so what is
-    under test is the report it writes on the PR."""
-    monkeypatch.setattr(panel, "load_repo_cfg", lambda name: PANEL_CFG)
+def _stub_panel(monkeypatch, findings=None, title="feat: x", cfg=PANEL_CFG):
+    """Every process a run would spawn, replaced — so what is under test is what
+    the panel itself builds, not the CLIs."""
+    if findings is None:
+        findings = [panel.Finding("claude", "P3", "a.py", 3, "unused import")]
+    monkeypatch.setattr(panel, "load_repo_cfg", lambda name: cfg)
     monkeypatch.setattr(panel, "sh", lambda args, **kw: (
-        json.dumps({"title": "feat: x", "additions": 3, "deletions": 1,
+        json.dumps({"title": title, "additions": 3, "deletions": 1,
                     "baseRefName": "main", "headRefName": "feat/x", "headRefOid": "abc"})
         if args[:3] == ["gh", "pr", "view"] else "diff --git a/a.py b/a.py\n+x\n"))
-    monkeypatch.setattr(panel, "review_llm", lambda *a, **k: panel.ReviewerRun(
-        [panel.Finding("claude", "P3", "a.py", 3, "unused import")], None, 10, []))
+    monkeypatch.setattr(panel, "review_llm",
+                        lambda *a, **k: panel.ReviewerRun(list(findings), None, 10, []))
     monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
     monkeypatch.setattr(panel, "adjudicate", _fake_adjudicate)
+
+
+def _report(monkeypatch, capsys, tmp_path, round_no, baseline=(), max_rounds=None,
+            findings=None, title="feat: x", cfg=PANEL_CFG):
+    """One whole panel run, so what is under test is the report it writes on the
+    PR and the payload it writes beside it."""
+    _stub_panel(monkeypatch, findings, title, cfg)
     out = tmp_path / f"r{round_no}.json"
     assert panel.run("board", 34, post=False, json_file=str(out), record=False,
                      round_no=round_no, baseline=list(baseline),
@@ -575,10 +686,29 @@ def test_a_review_only_run_does_not_promise_a_round_nobody_will_run(monkeypatch,
     loop. A plain `/panel` read used to comment "round 1 of at most 2 — go
     again", telling the reader a re-review was coming when nothing would run it —
     with a "no earlier round raised" count that is vacuously every finding."""
-    report, _ = _report(monkeypatch, capsys, tmp_path, 1)
+    report, out = _report(monkeypatch, capsys, tmp_path, 1)
     assert "**Rounds:**" not in report and "go again" not in report
     assert "· round 1" not in report
     assert "unused import" in report
+    # ...and the PAYLOAD says the same thing, which is the copy the board keeps.
+    # It used to carry `round_stop` regardless, so `record_review` stored a plain
+    # `/panel` read as a cycle mid-flight ("not stopped: 1 finding(s) no earlier
+    # round raised") that nothing would ever advance.
+    payload = json.loads(Path(out).read_text())
+    assert payload["round_stop"] is None and payload["stop_reason"] is None
+    # None, not 0: "the panel did not say" is the column's own state, and the
+    # count would be the vacuous "every finding, against no earlier round".
+    assert payload["new_findings"] is None and payload["new_finding_keys"] == []
+
+
+def test_a_review_only_run_that_found_nothing_records_no_convergence(monkeypatch,
+                                                                     capsys, tmp_path):
+    """The other half of it: with no findings the payload said `stopped: true,
+    stop_confident: true, "dry — no findings to fix"` — a confident-convergence
+    record on the board for a PR that had no cycle at all."""
+    _, out = _report(monkeypatch, capsys, tmp_path, 1, findings=[])
+    payload = json.loads(Path(out).read_text())
+    assert payload["round_stop"] is None and payload["stop_reason"] is None
 
 
 def test_a_first_round_inside_a_cycle_still_reports_where_the_loop_stands(monkeypatch,
@@ -642,6 +772,36 @@ def test_the_round_verdict_survives_a_report_cut_to_fit_a_comment():
     assert fitted.endswith(verdict) and "truncated" in fitted
 
 
+def test_a_verdict_block_too_long_to_reserve_is_cut_rather_than_overflowing():
+    """The tail was reserved whole and only the head was sliced, so `max(0, …)`
+    clamped the SLICE and not the RESULT: a run with many vetoes returned a comment
+    LONGER than the limit, and `--post` loses the whole thing to a hard API
+    rejection. The verdict line survives; the veto list is what gets cut."""
+    verdict = ("\n\n**Rounds:** round 2 of at most 2 — **stop**: dry, unreviewed\n"
+               + "\n".join(f"  - ⚠️ codex could not assess area {i}" for i in range(4_000)))
+    report = ("## Reviewer panel — PR #1\n\n### To fix\n"
+              + "\n".join(f"- **P2** `a.py:{i}` — issue {i}" for i in range(5_000))
+              + verdict)
+    assert len(verdict) > panel.COMMENT_CHARS       # the tail alone does not fit
+    fitted = panel.fit_comment(report)
+    assert len(fitted) <= panel.COMMENT_CHARS
+    assert "**Rounds:** round 2 of at most 2 — **stop**" in fitted
+
+
+def test_a_baseline_problem_is_not_printed_twice_on_the_pr(monkeypatch, capsys, tmp_path):
+    """It is deliberately both a config note and a veto — the payload needs both,
+    since `config_notes` never reaches the board and the veto list is its only
+    copy — but a reader of the comment saw the same sentence in two places and read
+    it as two problems. The second appearance points at the first."""
+    report, out = _report(monkeypatch, capsys, tmp_path, 2, max_rounds=3)
+    assert report.count("nothing to compare against") == 1
+    assert "the config note above" in report
+    # ...and the payload still carries it in both roles, in full.
+    payload = json.loads(Path(out).read_text())
+    assert any("no --baseline" in n for n in payload["config_notes"])
+    assert any("nothing to compare against" in v for v in payload["round_stop"]["veto"])
+
+
 # ---- the hard gate is part of the loop -------------------------------------
 
 SONAR_CFG = {**PANEL_CFG,
@@ -682,7 +842,9 @@ def test_a_hard_gate_issue_still_open_after_the_fix_earns_another_round(monkeypa
     _, r2 = _sonar_round(monkeypatch, tmp_path, 2, baseline=[path])
     assert r2["new_findings"] == 0            # not new — but not resolved either
     assert r2["round_stop"]["stop"] is False
-    assert "still confirmed" in r2["round_stop"]["reason"]
+    # "outstanding", not "confirmed": a hard-gate issue is never adjudicated, and
+    # the reason string ends up on the PR comment.
+    assert "still outstanding" in r2["round_stop"]["reason"]
 
 
 # ---- the baseline the next round needs -------------------------------------
@@ -708,6 +870,44 @@ def test_a_json_file_that_could_not_be_written_fails_the_run(monkeypatch, capsys
     assert "could not write" in err and "re-run the CYCLE" in err
 
 
+SKIP_CFG = {**PANEL_CFG, "review_panel": {"skip_title_patterns": [r"^chore\("]}}
+
+
+def test_a_skipped_pr_still_writes_the_baseline_the_caller_was_promised(monkeypatch,
+                                                                       capsys, tmp_path):
+    """`--json-file` was honoured on every exit but this one, which returned 0 with
+    no file. The caller is told "if the panel could not write that file the round
+    did not happen", and then feeds the file to the next round as `--baseline`: a
+    skipped PR left it no signal and no baseline at all."""
+    _stub_panel(monkeypatch, title="chore(deps): bump x", cfg=SKIP_CFG)
+    out = tmp_path / "skip.json"
+    assert panel.run("board", 34, post=False, json_file=str(out), record=False) == 0
+    payload = json.loads(out.read_text())
+    assert payload["reviewed"] is False and "skip pattern" in payload["skip_reason"]
+    assert payload["round_stop"] is None
+
+
+def test_a_skipped_pr_whose_baseline_could_not_be_written_fails_too(monkeypatch,
+                                                                    capsys, tmp_path):
+    """Same contract as a reviewed run: exit non-zero, so the orchestrator does not
+    advance the cycle onto a baseline that does not exist."""
+    _stub_panel(monkeypatch, title="chore(deps): bump x", cfg=SKIP_CFG)
+    unwritable = tmp_path / "no-such-dir" / "skip.json"
+    assert panel.run("board", 34, post=False, json_file=str(unwritable),
+                     record=False) == 2
+    assert "could not write" in capsys.readouterr().err
+
+
+def test_the_repo_a_payload_names_is_the_one_it_resolved(monkeypatch, capsys, tmp_path):
+    """`--repo` has no argparse default, so the documented `panel.py --pr N` wrote
+    `"repo": null` — a payload nobody can attribute, which round 2 then discarded
+    as "does not say which review it is from". The whole round diff no-opped for
+    the invocation the workflow prescribes."""
+    _, out = _report(monkeypatch, capsys, tmp_path, 1,
+                     cfg={**PANEL_CFG, "name": "board"}, max_rounds=2)
+    assert json.loads(Path(out).read_text())["repo"] == "board"
+
+
 # ---- the CLI's own arguments -----------------------------------------------
 
 def test_a_round_past_the_cap_is_rejected_rather_than_recorded(monkeypatch):
@@ -715,9 +915,25 @@ def test_a_round_past_the_cap_is_rejected_rather_than_recorded(monkeypatch):
     branch on the spot, writing "round cap (2) reached" into a round 5."""
     monkeypatch.setattr(sys, "argv",
                         ["panel.py", "--pr", "1", "--round", "5", "--max-rounds", "2"])
-    try:
+    with pytest.raises(SystemExit, match="past --max-rounds"):
         panel.main()
-    except SystemExit as e:
-        assert "past --max-rounds" in str(e)
-    else:
-        raise AssertionError("--round past --max-rounds should not be accepted")
+
+
+def test_a_round_past_the_DEFAULT_cap_is_rejected_too(monkeypatch):
+    """The guard used to fire only when --max-rounds was spelled out, and the cap
+    `run()` applies is the default when it is not. So `--round 3` alone passed
+    validation and took the cap branch on the spot, writing "round cap (2)
+    reached — …, unreviewed" into a round 3 and printing "round 3 of at most 2" —
+    the exact corrupted metadata the guard exists to prevent."""
+    monkeypatch.setattr(sys, "argv", ["panel.py", "--pr", "1", "--round", "3"])
+    with pytest.raises(SystemExit, match="past --max-rounds 2"):
+        panel.main()
+
+
+def test_the_round_the_default_cap_allows_is_still_accepted(monkeypatch):
+    """Round 2 with no --max-rounds is the ordinary re-review, and the tighter
+    guard must not refuse it. It gets past validation and dies on the repo instead,
+    which is as far as this test can go without a checkout."""
+    monkeypatch.setattr(sys, "argv", ["panel.py", "--pr", "1", "--round", "2"])
+    monkeypatch.setattr(panel, "run", lambda *a, **k: 0)
+    assert panel.main() == 0

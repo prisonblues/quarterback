@@ -1,4 +1,4 @@
-"""v2.14: rounds, and what a run could not see.
+"""v2.15: rounds, and what a run could not see.
 
 Two runs of one PR used to be two unrelated records — nothing said which was the
 re-review of the other's fix, what this round found that the last had not, or
@@ -30,7 +30,7 @@ from .conftest import LAPTOP
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "harness" / "loops"))
 import panel
 
-REPO = "acme/v214repo"
+REPO = "acme/v215repo"
 AGENT = {**LAPTOP, "X-Agent-Instance": "d14d14"}
 
 
@@ -48,6 +48,10 @@ def payload(pr: int, **over) -> dict:
                       "could_not_assess": ["the migration, which the diff omits"]},
         },
         "round": 1,
+        # Every panel run mints one, and the re-review check now REQUIRES it: the
+        # positional fallback it replaced credited one cycle's round 2 to another
+        # cycle's round 1 whenever two agents looped the same PR.
+        "cycle": "cyc-1",
         "new_findings": 1,
         "round_stop": {"stop": False, "reason": "1 finding(s) no earlier round raised",
                        "confident": False, "veto": ["codex saw 60,000 of 118,402 diff chars"]},
@@ -120,9 +124,9 @@ async def test_a_round_that_said_go_again_is_not_recorded_as_a_stop(client):
 
 async def test_an_older_payload_is_a_first_round_that_declared_nothing(client):
     """Recorded exactly as before: round 1, and NULL rather than zero everywhere
-    the panel was never asked — a pre-v2.14 run must not read as earned-clean."""
+    the panel was never asked — a pre-v2.15 run must not read as earned-clean."""
     body = {k: v for k, v in payload(6102).items()
-            if k not in ("round", "new_findings", "round_stop", "coverage_note")}
+            if k not in ("round", "cycle", "new_findings", "round_stop", "coverage_note")}
     body["reviewers"] = {"claude": {"model": "sonnet", "ran": True}}
     body["to_fix"] = [{"severity": "P3", "file": "a.py", "title": "x",
                        "reviewers": ["claude"], "reason": "real"}]
@@ -163,7 +167,7 @@ async def test_nothing_to_declare_is_not_the_same_as_never_asked(client):
 
 async def test_a_reply_that_did_not_parse_is_not_a_reviewer_that_was_never_asked(client):
     """An unparsed reply loses everything the member might have declared, so it
-    lands on `could_not_assess: null` — the same cell as a pre-v2.14 reviewer that
+    lands on `could_not_assess: null` — the same cell as a pre-v2.15 reviewer that
     was never asked. That is the NULL/[] collapse this release exists to prevent,
     one level up: a coverage failure the honesty stats could not see."""
     run = await detail(client, await record(client, 6112, reviewers={
@@ -356,6 +360,90 @@ async def test_a_finding_older_than_the_window_is_not_new_inside_it(client):
     assert h["runs"][0]["rereview_hit"] is False
 
 
+async def test_a_cycle_less_pair_is_unanswered_rather_than_guessed_at(client):
+    """The positional fallback took the adjacent run whenever the cycle was null
+    and its round was one more. A-r1 followed by B-r2 — two agents, two cycles,
+    nobody naming one — then credited B's findings as the answer to A's
+    declaration. This number is published as an honesty measure, so an unknown
+    attribution is null, not a guess. Nothing real is lost: the flag column and the
+    cycle id shipped in the same release."""
+    await record(client, 6138, cycle=None)
+    await record(client, 6138, cycle=None, round=2, new_findings=1,
+                 to_fix=[{"severity": "P2", "file": "app/sync.py",
+                          "title": "somebody else's finding", "reviewers": ["claude"],
+                          "reason": "real", "new_this_round": True}])
+    h = (await client.get(f"/review/findings?repo={REPO}&pr=6138", headers=AGENT)).json()
+    assert h["runs"][0]["rereview_flagged"] == 1
+    assert h["runs"][0]["rereview_hit"] is None
+
+
+async def test_a_flag_the_judge_never_ruled_on_is_not_a_scorable_prediction(client):
+    """The two halves of one measurement used different populations. `flagged`
+    counted every verdict including `dismissed`, so a declaration attached to a
+    finding the judge threw out inflated `rereview_flagged` and put its file where
+    it could only register as a miss — scoring a reviewer as having predicted
+    wrongly when it had made no scorable prediction at all."""
+    await record(client, 6139, judged=False, to_fix=[{
+        "severity": "P2", "file": "app/sync.py", "title": "nobody ruled on this",
+        "reviewers": ["codex"], "reason": "unjudged", "needs_rereview": True,
+        "rereview_by": ["codex"]}])
+    await record(client, 6139, round=2, new_findings=1, to_fix=[{
+        "severity": "P2", "file": "app/sync.py", "title": "something new here",
+        "reviewers": ["claude"], "reason": "real", "new_this_round": True}])
+    h = (await client.get(f"/review/findings?repo={REPO}&pr=6139", headers=AGENT)).json()
+    assert h["runs"][0]["rereview_flagged"] == 0
+    assert h["runs"][0]["rereview_hit"] is None
+    # The scorecard still records that codex made the call — the run-level
+    # measurement is about what was SCORABLE, not about what was said.
+    run = await detail(client, h["runs"][0]["id"])
+    assert card(run, "codex")["rereview_flagged"] == 1
+
+
+async def test_an_unjudged_finding_does_not_vindicate_the_flag_that_pointed_at_it(client):
+    """The docstring says only findings that survived the judge count as new, and
+    the page repeats it, but the predicate admitted `unjudged` — so a round 2 whose
+    judge crashed vindicated every flag round 1 aimed at those files, on the
+    strength of findings nobody ruled on."""
+    await record(client, 6141)                     # round 1 flags app/sync.py
+    await record(client, 6141, round=2, new_findings=1, judged=False, to_fix=[{
+        "severity": "P2", "file": "app/sync.py", "title": "the judge died on this one",
+        "reviewers": ["claude"], "reason": "unjudged", "new_this_round": True}])
+    h = (await client.get(f"/review/findings?repo={REPO}&pr=6141", headers=AGENT)).json()
+    assert h["runs"][0]["rereview_flagged"] == 1
+    assert h["runs"][0]["rereview_hit"] is False
+
+
+async def test_the_re_review_check_is_answered_per_member_that_made_it(client):
+    """Run-level, the honest and the quiet member are indistinguishable on exactly
+    the statistic that separates them: two members flagging different files get one
+    boolean between them. The declaration rides on the reporter's own row, so who
+    was borne out is answerable."""
+    await record(client, 6142, to_fix=[
+        {"severity": "P2", "file": "app/sync.py", "title": "the mirror is structural",
+         "reason": "real", "new_this_round": True,
+         "reported_by": [
+             {"reviewer": "codex", "severity": "P2", "account": "read the result",
+              "needs_rereview": True},
+             {"reviewer": "claude", "severity": "P2", "account": "no need"}]},
+        {"severity": "P3", "file": "app/other.py", "title": "and this one too",
+         "reason": "real", "new_this_round": True,
+         "reported_by": [{"reviewer": "claude", "severity": "P3", "account": "structural",
+                          "needs_rereview": True}]},
+    ])
+    await record(client, 6142, round=2, new_findings=1, to_fix=[{
+        "severity": "P2", "file": "app/sync.py", "title": "dual-keyed node",
+        "reviewers": ["claude"], "reason": "real", "new_this_round": True}])
+    h = (await client.get(f"/review/findings?repo={REPO}&pr=6142", headers=AGENT)).json()
+    r1 = h["runs"][0]
+    assert r1["rereview_flagged"] == 2 and r1["rereview_hit"] is True
+    # codex pointed at app/sync.py and the next round found something there;
+    # claude pointed at app/other.py and it did not. One run, two answers.
+    assert r1["rereview_by_reviewer"] == {
+        "codex": {"flagged": 1, "hit": True},
+        "claude": {"flagged": 1, "hit": False},
+    }
+
+
 async def test_a_flag_with_no_round_after_it_is_unanswered_not_wrong(client):
     """None, not False: nobody looked. Scoring an unrun round as a miss would
     punish the reviewer for the workflow stopping."""
@@ -431,6 +519,72 @@ async def test_a_garbled_round_costs_the_number_not_the_whole_record(client):
     assert run["round"] == 1               # rounds are numbered from 1
     assert run["new_findings"] is None     # "the panel did not say", not "none"
     assert len(run["findings"]) == 1       # ...and the review itself survived
+
+
+async def test_a_fractional_count_is_not_believed_rather_than_truncated(client):
+    """`int(1.9)` is 1. Silently changing a caller's meaning is a different failure
+    from the documented "a value that cannot be believed becomes None", and this is
+    the helper that defines that policy."""
+    r = await client.post("/review", json=payload(6151, round=2.7, new_findings=1.9),
+                          headers=AGENT)
+    assert r.status_code == 201, r.text
+    run = await detail(client, r.json()["id"])
+    assert run["round"] == 1 and run["new_findings"] is None
+
+
+async def test_a_declaration_spelled_as_a_string_costs_nothing(client):
+    """This module's rule is that ingest is best-effort: a hand-rolled caller must
+    not lose its findings, its scorecards and its accounts to one badly-spelled
+    field. `could_not_assess` and `veto` were the only strictly-typed ones, and a
+    bare string is exactly the shape `panel.py::_str_list` tolerates on the way
+    in."""
+    r = await client.post("/review", json=payload(
+        6152,
+        # Its own repo: the leaderboard aggregates per repo, and a coerced
+        # declaration here would otherwise show up as one claude really made.
+        repo=f"{REPO}-coercion",
+        reviewers={"claude": {"model": "sonnet", "ran": True,
+                              "could_not_assess": "the migration"},
+                   "codex": {"model": "gpt-5.6", "ran": True, "could_not_assess": 7}},
+        round_stop={"stop": True, "reason": "capped", "confident": False,
+                    "veto": "round cap (2) reached"}), headers=AGENT)
+    assert r.status_code == 201, r.text
+    run = await detail(client, r.json()["id"])
+    assert card(run, "claude")["could_not_assess"] == ["the migration"]
+    # An unreadable shape is "no declaration obtained" — NULL — not [], which
+    # would claim the member was asked and had nothing to say.
+    assert card(run, "codex")["could_not_assess"] is None
+    assert run["stop_veto"] == ["round cap (2) reached"]
+    assert len(run["findings"]) == 1
+
+
+async def test_an_empty_veto_is_not_the_same_as_no_panel_having_said(client):
+    """`veto or None` collapsed "the panel ran the stopping rule and found nothing
+    to veto" onto "no panel ever said" — the same NULL/[] collapse this release
+    argues at length must not happen to `could_not_assess`, one field over."""
+    ran = await record(client, 6153, round_stop={
+        "stop": True, "reason": "dry", "confident": True, "veto": []})
+    async with engine.connect() as conn:
+        stored = await conn.scalar(
+            text("SELECT stop_veto FROM review_runs WHERE id = :i"), {"i": ran})
+    assert stored == []
+    # ...and a run whose caller sent no verdict at all still stores NULL.
+    plain = await record(client, 6154, round_stop=None)
+    async with engine.connect() as conn:
+        assert await conn.scalar(
+            text("SELECT stop_veto FROM review_runs WHERE id = :i"), {"i": plain}) is None
+
+
+async def test_a_duplicated_name_in_rereview_by_is_one_declaration(client):
+    """`rereview_by: ["codex", "codex"]` — trivially produced by a caller merging
+    two reviewer lists — tallied two flags for one finding, and nothing behind it
+    catches the repeat: these names create no report rows for the (finding,
+    reviewer) constraint to reject."""
+    run = await detail(client, await record(client, 6155, to_fix=[{
+        "severity": "P2", "file": "a.py", "title": "structural", "reason": "real",
+        "reviewers": ["codex"], "needs_rereview": True,
+        "rereview_by": ["codex", "codex"]}]))
+    assert card(run, "codex")["rereview_flagged"] == 1
 
 
 # ---- the stats side --------------------------------------------------------
@@ -605,7 +759,7 @@ async def test_a_real_panel_payload_records_and_reads_back(client, monkeypatch, 
     assert h["stopped"] is True and h["stop_reason"].startswith("round cap (2)")
     # The panel's veto list survives to the board, which is the only place a
     # reader can find out WHY the stop was not convergence.
-    assert h["stop_veto"] and any("still confirmed" in v for v in h["stop_veto"])
+    assert h["stop_veto"] and any("still outstanding" in v for v in h["stop_veto"])
     # One defect, two observations — not two defects.
     assert len(h["findings"]) == 1 and h["findings"][0]["runs_seen"] == 2
     assert h["stop_confident"] is False

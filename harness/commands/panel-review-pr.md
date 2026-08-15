@@ -129,6 +129,8 @@ read.)
 not happen for cycle purposes.** The payload is round 2's baseline; without it the
 next round calls every repeated finding new. Fix the path and start the cycle
 again at round 1 rather than carrying on — never re-run this round on its own.
+Every non-error exit writes it, including a PR skipped by title pattern (its
+payload is marked `reviewed: false`), so exit 0 always means the file is there.
 
 **Not** a fixed `/tmp/panel-<pr>-r<n>.json`. Two reasons, both real on a shared
 host: the panel writes that path with `Path.write_text`, which follows symlinks,
@@ -158,7 +160,7 @@ From its output collect:
   coverage, surface it.
 - **Coverage declared** — per reviewer, what it said it could not assess, plus
   any reviewer the panel reports as truncated. These are what separate "clean"
-  from "I could not tell"; carry them to §7 rather than dropping them.
+  from "I could not tell"; carry them to §6 rather than dropping them.
 - **Rounds** — the `**Rounds:**` line (also `round_stop` in the JSON): whether
   the cycle should go again and whether stopping would be convergence.
 
@@ -236,8 +238,8 @@ made; one that just wrote five says yes, one that silently produced nothing says
 no with complete confidence):
 
 - **`stop: false`** — there is work outstanding: findings no earlier round raised,
-  a P1/P2 still confirmed, or a finding an earlier round already raised that is
-  *still* confirmed at any severity (the fixer was told and it is still there —
+  a P1/P2 still outstanding, or a finding an earlier round already raised that is
+  *still* outstanding at any severity (the fixer was told and it is still there —
   and SonarCloud's hard-gate issues count here exactly like the judged ones). Fix
   them (§4 again, with only this round's findings in the brief), then run the
   panel again as round `r+1`. Repeat until `stop` is true or the cap is reached.

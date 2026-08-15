@@ -1,4 +1,4 @@
-"""v2.14: rounds, coverage declarations, and the re-review flag
+"""v2.15: rounds, coverage declarations, and the re-review flag
 
 A panel run recorded what was found and never what the run could not see. Both
 halves of that are invisible in the old schema: a reviewer handed 60k of a 118k
@@ -14,8 +14,12 @@ outstanding is not the same event as a dry round, and only one of them is
 convergence.
 
 Existing rows take round 1 and NULL declarations: they were never asked, and
-defaulting them to "nothing to declare" would let pre-v2.14 runs read as
+defaulting them to "nothing to declare" would let pre-v2.15 runs read as
 earned-clean, which is the exact confusion this release exists to remove.
+
+The revision number and the release number are unrelated counters: this is schema
+revision **0014** and it ships in product version **v2.15**. (v2.14 is the release
+that moved the panel's merge into its judge and changed no schema.)
 
 Revision ID: 0014
 Revises: 0013

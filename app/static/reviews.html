@@ -371,15 +371,25 @@ async function renderHistory(box, repo, pr){
   // A hit is the declaration BORNE OUT, so it reads as the good outcome: --warn
   // is this page's mark for something wrong with the review (unjudged, truncated,
   // did not run, not convergence) and must not also mean "the reviewer was right".
-  const hitTitle = "file-grain: the next round in this cycle raised a confirmed "
-    + "finding in a file this round flagged — not a claim that the fix caused it";
+  const hitTitle = "file-grain, over confirmed findings on both sides: the next round in this "
+    + "cycle raised a confirmed finding in a file this round flagged — not a claim that the "
+    + "fix caused it";
+  // Per member as well as per run: the declaration rides on the reporter's own
+  // row, so who was borne out is answerable, and "honesty per reviewer" is the
+  // claim this page makes. A member appears only where the payload carried
+  // per-reporter accounts — nothing else on the record says who declared what.
+  const byMember = r => Object.entries(r.rereview_by_reviewer || {})
+    .map(([name, m]) => `${esc(name)} ${m.hit == null ? "—" : m.hit ? "✓" : "✗"}`)
+    .join(", ");
   const rounds = h.runs.map(r => {
     const hit = r.rereview_hit == null ? "" :
       r.rereview_hit ? ` <span style="color:var(--good)" title="${hitTitle}">→ the next round found something there</span>`
                      : ` <span class="dim" title="${hitTitle}">→ the next round found nothing there</span>`;
+    const who = byMember(r);
     return `<div class="dim">r${r.round || 1}: ${
       r.new_findings == null ? "new count not recorded" : `${r.new_findings} new`}${
-      r.rereview_flagged ? ` · ${r.rereview_flagged} flagged for re-review${hit}` : ""}${
+      r.rereview_flagged ? ` · ${r.rereview_flagged} flagged for re-review${hit}${
+        who ? ` <span title="per member that declared it: ✓ borne out, ✗ not, — nothing followed">(${who})</span>` : ""}` : ""}${
       r.stop_reason ? ` · ${r.stopped === false ? "go again" : "stop"}: ${esc(r.stop_reason)}` : ""}${
       (r.stop_veto || []).length ? ` <span style="color:var(--warn)"
         title="${esc(r.stop_veto.join(" | "))}">⚠ ${r.stop_veto.length} veto</span>` : ""}</div>`;

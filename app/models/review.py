@@ -69,7 +69,7 @@ class ReviewRun(Base):
     #: between "clean" and "could not tell", adjudicated rather than averaged.
     coverage_note: Mapped[str | None] = mapped_column(Text)
 
-    # Where this run sat in the panel -> fix -> panel cycle (v2.14). A PR's round
+    # Where this run sat in the panel -> fix -> panel cycle (v2.15). A PR's round
     # COUNT is derivable by counting its runs; what is not derivable is what each
     # round found that the one before it had not, and what stopped the loop.
     #: 1 for a first review, 2+ for a re-review of the fix commit.
@@ -83,14 +83,14 @@ class ReviewRun(Base):
     cycle: Mapped[str | None] = mapped_column(Text)
     #: Findings this round that no earlier round raised. NULL where the panel
     #: never said — "not reported" and "nothing new" are different facts, and
-    #: storing the second for the first is how a pre-v2.14 run reads as converged.
+    #: storing the second for the first is how a pre-v2.15 run reads as converged.
     new_findings: Mapped[int | None] = mapped_column(Integer)
     #: Whether the cycle actually STOPPED here. A round that ends with findings
     #: outstanding sends ``stop: false`` and carries a reason for going again, so
     #: reading the reason as "this is where it stopped" labels a cycle that must
     #: continue as finished. NULL where the panel didn't say.
     stopped: Mapped[bool | None] = mapped_column(Boolean)
-    #: What ended the loop, in the panel's words: dry / a P1-P2 still confirmed /
+    #: What ended the loop, in the panel's words: dry / a P1-P2 still outstanding /
     #: the round cap. A cap reached with work outstanding is not convergence.
     #: Also carries the reason to go AGAIN when ``stopped`` is false — the two are
     #: told apart by that column, never by the prose.
@@ -171,7 +171,7 @@ class ReviewReviewer(Base):
     #: behaviour, a schema it cannot see. An observation, not a forecast, and the
     #: only thing that separates "clean" from "I could not tell"; a finding count
     #: reports both as zero. NULL = no structured declaration was obtained — the
-    #: member was never asked (every pre-v2.14 panel), its CLI answered in the old
+    #: member was never asked (every pre-v2.15 panel), its CLI answered in the old
     #: bare-array shape, or its reply did not parse at all (see ``unstructured``);
     #: [] = asked, and it had nothing to declare. The two states must not collapse
     #: — that is the whole point of the column — so this says it the same way
