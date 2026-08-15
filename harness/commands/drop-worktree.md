@@ -22,7 +22,11 @@ WT_DIR=$(cat "$MARKER" 2>/dev/null)
 - If the marker is missing/empty (this session never entered a worktree), don't
   guess — run `git worktree list`, show the user the linked worktrees, and ask
   (AskUserQuestion) which one to drop (or confirm there's nothing to do). Set
-  `WT_DIR` to their choice.
+  `WT_DIR` to their choice. **Then check it is not somebody else's:**
+  `worktree-holder "$WT_DIR"` — exit 3 means a live agent is working in it. Say
+  who and stop; picking from a list is exactly how you end up dropping another
+  agent's worktree. (Your own worktree always passes: the check knows this
+  session's marker is yours.)
 - Guard: if `WT_DIR` resolves to the **main checkout**
   (`git rev-parse --show-toplevel` from a fresh shell), STOP — there's no
   worktree to drop.

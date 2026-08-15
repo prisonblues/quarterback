@@ -7,6 +7,49 @@ that number where it was, so the repo can be a version ahead of the service.
 Entries are newest first. Each one says what was broken or missing before it, because that is the
 part that isn't recoverable from the diff.
 
+## v2.20 — nothing asked who was in the worktree
+
+Worktree-per-issue is how several agents work at once, and its isolation is file-level: separate
+directories, separate databases, separate ports, so nobody edits the same file as anybody else. It
+has never had a story for two agents deciding to operate on the same *directory*, which is the
+collision left once every other one is solved.
+
+It happened. An agent held `~/source/quarterback-feat-issue-24` and was three commits into a review
+cycle when a second agent, seeing the branch was behind `main`, ran `git rebase origin/main` inside
+it. The holder found its branch checked out at somebody else's commit with conflict markers in four
+files, and had to reconstruct from the reflog whether its own work still existed. It did, because
+the branch happened to be pushed — luck, not design. Nothing about the second agent's reasoning was
+wrong: a branch was behind, it did the obvious thing, and it had no way to know the directory was
+occupied.
+
+`worktree-holder` is that way. `remove-worktree` now refuses and names the holder rather than
+tearing down under a live agent (`--force` overrides). `prune-worktrees` reports a held directory
+under its own heading and keeps it out of the leftover list entirely, so `--remove-dirs` cannot
+`rm -rf` it — and the container sweep, which takes its evidence of a dead worktree straight from
+that list, inherits the protection. `create-worktree` already refused an existing directory; it now
+says *whose* it is, because "already exists" sends you looking for debris and the answer is
+sometimes an agent still working.
+
+**The board could not answer this, and the reason is the interesting part.** The issue assumed it
+could — `/lease` carries a `cwd`, `/active?cwd=` filters on it, so "who is in this worktree" looked
+like a query that already worked. It does not. A lease records the directory its agent was
+*launched* in, and the shell cwd resets between tool calls, so an agent handed a worktree by
+`/fix-issue` still reports `cwd=~/src/proj` and `branch=main`. Checked against the live board while
+building this: six agents in this repo, three of them working in different worktrees, all six
+indistinguishable. The missing half was local all along — the session marker `/fix-issue` writes to
+`~/.cache/claude-code/session-cwd/<session-id>` *is* the worktree path. So the check unions the two:
+the markers say which sessions were handed this worktree, the board says which of those is still
+alive and who holds it. Marker without a live lease is a finished session, of which there are
+hundreds; live lease without a marker is an agent that really did start in the directory.
+
+Advisory, not a lock, and deliberately so. Exit 3 (a named, live holder) is the only answer that
+stops anything; "could not tell" is its own exit code so a board that is down never makes a worktree
+unusable, and `--force` always wins. The failure worth preventing is the *silent* rewrite, not the
+deliberate one. Agents typing raw `git rebase` in someone else's worktree stay out of reach — the
+slash commands tell the model to ask first, and tooling cannot guard a command it was not asked to
+run.
+
+No board change: the API and the served version stay where they were.
 ## v2.19 — what each reviewer cost, not just what it found
 
 The leaderboard could rank a panel member top on confirmed findings while it was quietly the most

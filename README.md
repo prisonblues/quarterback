@@ -185,15 +185,15 @@ says how much of a window actually reported.
 
 The deployed board version lags the repo until the stack is redeployed, and only the running
 service knows which it is: ask it with `GET /openapi.json` → `.info.version`, for whichever
-instance you care about. (Anything built off this branch says 2.19.0.) A number written here
+instance you care about. (Anything built off this branch says 2.19.0 — v2.20 is harness-side.) A number written here
 instead would be wrong the next time Portainer redeploys, with no diff to catch it.
-Latest release: **v2.19**, which adds the per-reviewer cost columns (schema revision 0015) and is
-the first to move the board since v2.15. The three between it and them were harness-side and
-changed no board behaviour: **v2.18** settles a reply carrying several JSON-shaped values by
-agreement rather than by rank, **v2.17** made a reviewer that produced nothing a failure that says
-why, and **v2.16** stopped the panel capping how much diff a reviewer is given. **v2.15** added the
-round and coverage columns; v2.13 (shipping the harness) and v2.14 (merging findings in the judge)
-are harness-side too.
+Latest release: **v2.20**, which is harness-side and changes no board behaviour — the worktree
+tooling asks who is in a directory before rewriting it. Before it, **v2.19** added the per-reviewer
+cost columns (schema revision 0015) and was the first to move the board since v2.15; **v2.18**
+settles a reply carrying several JSON-shaped values by agreement rather than by rank, **v2.17** made
+a reviewer that produced nothing a failure that says why, and **v2.16** stopped the panel capping
+how much diff a reviewer is given. v2.13 (shipping the harness) and v2.14 (merging findings in the
+judge) are harness-side too.
 
 - **v1–v2.1** — the board, then presence leases + session handoff, then dev context.
 - **v2.2–v2.5** — the session registry: sessions became listable, named, resumable, and the
@@ -211,6 +211,8 @@ are harness-side too.
   candidates disagree the reply is kept as unstructured rather than resolved wrongly.
 - **v2.19** — per-reviewer token usage and vendor-stated cost, so the leaderboard ranks
   reviewers on what they cost as well as what they find.
+- **v2.20** — the worktree tooling asks who is in a directory before rewriting it: an advisory
+  holder check, unioning the board's live leases with the local session markers.
 - **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
   object store; wire `landed` refs to a cherry-pick helper.
 
@@ -380,8 +382,11 @@ tests/        end-to-end tests against real Postgres (conftest.py shared fixture
 harness/      step 2 of the install — the workflow the board coordinates
   loops/           panel.py (reviewer panel), epic.py, lander.py, harness_rules.py
   commands/        Claude Code slash commands (/panel, /fix-issue, /wt, …)
-  bin/             create-worktree, remove-worktree, prune-worktrees
+  bin/             create-worktree, remove-worktree, prune-worktrees,
+                   worktree-holder (who is live in a worktree — asked before
+                   anything destroys one)
+  tests/           the worktree-tooling suite (pytest driving the bash)
   templates/       copyable .worktree.json starting points + dbtarget.py (the DB guard)
   package.nix      the derivation; hm-module.nix wires it into ~/.claude
-flake.nix     packages.harness, homeManagerModules.default, checks (runs the loops tests)
+flake.nix     packages.harness, homeManagerModules.default, checks (runs the harness tests)
 ```

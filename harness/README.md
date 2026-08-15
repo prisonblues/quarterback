@@ -13,7 +13,7 @@ board reconnects them.**
 - `commands/` — Claude Code slash commands (`/panel`, `/panel-review-pr`, `/review-pr`,
   `/fix-issue`, `/epic`, `/lander`, `/wt`, `/drop-worktree`, `/tree-shake`, …)
 - `bin/` — the bash the worktree commands drive (`create-worktree`, `remove-worktree`,
-  `prune-worktrees`)
+  `prune-worktrees`, `worktree-holder`)
 - `worktree.example.json` — per-repo config, annotated with quarterback's own values
 
 Neither half needs the other. The loops run with no board configured (recording is
@@ -129,6 +129,56 @@ it is the only one that is dry-run by default.
 The commands are thin, guarded drivers over these. The scripts hold the deterministic
 logic on purpose: a model deciding *which* worktree to destroy is fine, a model
 hand-rolling `docker rm` / `dropdb` / `rm -rf` is not.
+
+### `worktree-holder` — is somebody else in there?
+
+The fourth script answers one question: **which live agent is working in this
+directory?** It is what the other three consult before they destroy something.
+
+```bash
+worktree-holder ../myapp-fix-issue-42     # or a branch name
+#   exit 0  nobody else — free, or held only by this session
+#   exit 3  held by another live agent (who, since when, doing what)
+#   exit 4  could not tell — no board configured or reachable
+```
+
+Worktree isolation is file-level: separate directories, databases and ports, so two
+agents never edit the same file. It has never had a story for two agents deciding to
+operate on the same *directory*, and that is the collision left once every other one is
+solved. It happened here: one agent was three commits into a review cycle in
+`~/source/quarterback-feat-issue-24` when another, seeing the branch was behind `main`,
+ran `git rebase origin/main` inside it. The holder found its branch at somebody else's
+commit with conflict markers in four files. Nothing about that was unreasonable — the
+second agent had no way to know the directory was occupied.
+
+**The board could not answer it either, and the reason is worth knowing.** A lease
+records the directory its agent was *launched* in, and the shell cwd resets between tool
+calls, so an agent handed a worktree by `/fix-issue` still reports `cwd=~/src/proj` and
+`branch=main`. Every live agent in a repo looks identical on the board no matter which
+worktree it is really in. The missing half is local: the session marker `/fix-issue`
+writes to `~/.cache/claude-code/session-cwd/<session-id>`, whose contents *are* the
+worktree path. `worktree-holder` unions the two — the markers say which sessions were
+handed this worktree, the board says which of those is still alive and who holds it —
+and adds anyone whose lease cwd is the worktree itself.
+
+**Advisory, never a lock.** Exit 3 is a reason for a script to refuse and name the
+holder, not a reason a worktree becomes unusable: `remove-worktree --force` always wins,
+leases expire on their own, and "could not tell" is a distinct exit code precisely so a
+board that is down never stops anyone working. The failure being prevented is the
+*silent* rewrite, not the deliberate one.
+
+Where it is wired in:
+
+| Script | What it does with the answer |
+|---|---|
+| `remove-worktree` | Refuses before destroying anything, names the holder, suggests `--force` |
+| `prune-worktrees` | Reports a held directory separately and never counts it as a leftover, so `--remove-dirs` cannot `rm -rf` it (and the container sweep, which takes its evidence from that list, inherits the protection) |
+| `create-worktree` | Already refused an existing directory; now says *whose* it is, because "already exists" sends you looking for debris and the answer is sometimes an agent still working |
+
+Agents typing raw `git rebase` / `git reset --hard` in someone else's worktree remain
+out of reach, and that is accepted: the slash commands that drive worktree teardown
+(`/wt`, `/drop-worktree`, `/tree-shake`) tell the model to ask first, and an agent
+running raw git was never going to be caught by tooling it did not invoke.
 
 ## How it works
 
@@ -271,7 +321,10 @@ specifically because of this workflow:
   store, so cherry-picking between them is purely a *discovery* problem: which SHA exists
   where, and what does it do. That is what `find_commit` answers.
 - **`GET /active?cwd=`** — "who is live in this directory?" The directories in question are
-  worktrees. Ask before you dive in.
+  worktrees. Ask before you dive in — but ask through `worktree-holder`, not directly: a
+  lease carries the dir its agent was *launched* in, so this query finds an agent started
+  inside a worktree and misses one handed a worktree mid-session, which is most of them.
+  `worktree-holder` unions it with the local session markers to get the whole answer.
 - **`GET /overlap` / the `peers` tool** — leases carry repo and branch, so the board can rank
   live peers by subject overlap and point you at the agent already on your problem. Without
   it, worktree isolation means you would never have met.
@@ -324,8 +377,9 @@ cp harness/commands/*.md ~/.claude/commands/
 ### Requirements
 
 `git`, `jq`, `bash`, and Python 3 (standard library only — the loops import nothing
-third-party). `gh` for anything that talks to GitHub, which is most of it. `docker` and a
-database client only if your repo uses them. The reviewer CLIs the panel drives (`claude`,
+third-party). `gh` for anything that talks to GitHub, which is most of it. `curl` for
+`worktree-holder` (without it the check reports "could not tell" and the scripts carry
+on). `docker` and a database client only if your repo uses them. The reviewer CLIs the panel drives (`claude`,
 `codex`, …) are needed only for the reviewers you actually enable — a missing one is
 reported as skipped, not fatal.
 
@@ -334,6 +388,13 @@ reported as skipped, not fatal.
 The panel looks for a `qb` CLI to record runs. With none on `PATH`, it no-ops silently and
 everything else works unchanged. Point `qb` at your board to light up `GET /review/stats`
 and the board's `/panel` page.
+
+`worktree-holder` reads the same per-host site config — `QUARTERBACK_BASE_URL` and
+`QUARTERBACK_TOKEN_CMD` from `${XDG_CONFIG_HOME:-~/.config}/quarterback/config`, either
+overridable from the environment — but reads it directly rather than through `qb`, so the
+occupancy check works whether or not that CLI is installed. There is deliberately **no
+default board URL**: unset means this machine has not been told which board it belongs to,
+and guessing would point the query at somebody else's.
 
 ## Caveats
 
