@@ -468,7 +468,17 @@ def test_the_panel_and_the_board_derive_the_same_defect_key():
     drift between them is silent: the round diff would say "new" about a finding
     the chain says is old, and only one of the two is on screen."""
     for file, title in KEY_CASES:
-        assert panel.finding_key(file, title) == _derive_key(file, title)
+        # The panel keys a defect off the reporters' own titles, so the recipe is
+        # fed a reviewer's report rather than a bare string.
+        reports = [panel.Finding("codex", "P2", file or "", 7, title, "detail")]
+        # Compared against the board's whole ingest path, not against
+        # `_derive_key` alone: `_prepare` substitutes "(untitled)" for a missing
+        # title BEFORE deriving, and migration 0012 keys off the column that
+        # substitution wrote. A test that skips it measures a call the board
+        # never makes, and reports drift where there is none — which is exactly
+        # how someone "fixes" the panel into producing a key no other
+        # implementation can reach.
+        assert panel._defect_key(file or "", reports) == _derive_key(file, title or "(untitled)")
 
 
 async def test_the_migrations_sql_derives_the_same_defect_key_too():
@@ -527,13 +537,22 @@ def _panel_round(monkeypatch, tmp_path, round_no, title, baseline=()):
         # and had no gap.
         return panel.ReviewerRun([], None, 800, None)
 
+    def fake_adjudicate(clusters, diff, model, pr, budget=None, coverage=None):
+        """The judge confirms what it was shown, keeping every reporter's own
+        report on the record — which is where the per-reviewer declarations the
+        board scores live."""
+        reports = [f for grp in clusters for f in grp]
+        return ([panel.Canonical(id=panel._finding_id(pr, 1), severity="P2",
+                                 file="app/sync.py", line=12, synthesis=title,
+                                 verdict="confirmed", detail="detail",
+                                 reported_by=reports, rationale="real")],
+                None, "codex is right that the migration is unread")
+
     monkeypatch.setattr(panel, "load_repo_cfg", lambda name: PANEL_CFG)
     monkeypatch.setattr(panel, "sh", _fake_sh)
     monkeypatch.setattr(panel, "review_llm", fake_review)
     monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
-    monkeypatch.setattr(panel, "judge", lambda *a, **k: (
-        {0: {"id": 0, "real": True, "severity": "P2", "reason": "real"}},
-        None, "codex is right that the migration is unread"))
+    monkeypatch.setattr(panel, "adjudicate", fake_adjudicate)
     out = tmp_path / f"r{round_no}.json"
     assert panel.run("e2e", 77, post=False, json_file=str(out), record=False,
                      round_no=round_no, baseline=list(baseline), max_rounds=2) == 0

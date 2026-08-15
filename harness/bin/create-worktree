@@ -60,13 +60,37 @@ step() {
 
 die() { echo -e "${RED}Error: $1${NC}" >&2; exit 1; }
 
+# grep where "matched nothing" is an answer, not a failure. Under
+# `set -euo pipefail` a plain `VAR=$(... | grep ... | head -1)` kills the whole
+# run the moment grep finds nothing: grep exits 1, pipefail carries that status
+# out of the command substitution, and set -e aborts mid-script — so the
+# fallback branch written directly under the assignment, the one whose entire
+# job is to handle "nothing matched", is never reached. A blanket `|| true`
+# stops the abort but overshoots, because it swallows grep's status 2 as well.
+# Status 2 means an invalid regex or unreadable input, and several of these
+# patterns come straight from the repo's .worktree.json — a typo there would
+# then present as "no Docker image found, will build from Dockerfile" instead of
+# as the config error it is. So: 1 is empty output, anything above 1 is fatal.
+grep_ok() {
+    local out rc=0
+    out=$(grep "$@") || rc=$?
+    (( rc > 1 )) && die "grep failed (status $rc): $*"
+    [[ -n "$out" ]] && printf '%s\n' "$out"
+    # Explicit, because the test above leaves status 1 when there was no match,
+    # which would re-introduce the very abort this function exists to prevent.
+    return 0
+}
+
 # Read a value from a .env file, handling quotes and whitespace
 # Usage: env_val "VAR_NAME" "/path/to/.env"
 env_val() {
     local var="$1" file="$2"
     [[ -f "$file" ]] || return 0
     local line
-    line=$(grep "^[[:space:]]*${var}[[:space:]]*=" "$file" 2>/dev/null | head -1 || true)
+    # No `2>/dev/null` here any more: the `[[ -f ]]` above already covers the
+    # missing-file noise it was for, and suppressing stderr would also hide
+    # grep_ok's explanation of why it is aborting.
+    line=$(grep_ok "^[[:space:]]*${var}[[:space:]]*=" "$file" | head -1)
     [[ -z "$line" ]] && return 0
     local val
     # Strip everything up to and including first =
@@ -182,7 +206,7 @@ detect_project_name() {
     # Try pyproject.toml name field
     if [[ -f "$root/pyproject.toml" ]]; then
         local name
-        name=$(grep -E '^name[[:space:]]*=' "$root/pyproject.toml" | head -1 | sed 's/.*=[[:space:]]*"\(.*\)".*/\1/' 2>/dev/null)
+        name=$(grep_ok -E '^name[[:space:]]*=' "$root/pyproject.toml" | head -1 | sed 's/.*=[[:space:]]*"\(.*\)".*/\1/' 2>/dev/null)
         if [[ -n "$name" ]]; then
             echo "$name"
             return
@@ -245,20 +269,26 @@ detect_worker_type() {
 }
 
 detect_docker_network() {
-    local project="$1"
-    docker network ls --format '{{.Name}}' 2>/dev/null | grep -iE "${project}.*web|${project}.*app" | head -1
+    local project="$1" names
+    # Captured, not piped: see the SIGPIPE/pipefail note in port_available().
+    names=$(docker network ls --format '{{.Name}}' 2>/dev/null || true)
+    grep_ok -iE "${project}.*web|${project}.*app" <<<"$names" | head -1
 }
 
 detect_docker_image() {
-    local project="$1"
-    docker images --format '{{.Repository}}' 2>/dev/null | grep -iE "^${project}" | head -1
+    local project="$1" names
+    names=$(docker images --format '{{.Repository}}' 2>/dev/null || true)
+    grep_ok -iE "^${project}" <<<"$names" | head -1
 }
 
 detect_nginx_config() {
     local root="$1"
     # Look for nginx config files
     local conf
-    conf=$(find "$root/nginx" -name "*.conf" -type f 2>/dev/null | head -1)
+    # `|| true` because find exits 1 when $root/nginx doesn't exist at all, and
+    # under pipefail that would abort the run instead of falling through to the
+    # empty return below — a repo without an nginx/ dir is the normal case here.
+    conf=$(find "$root/nginx" -name "*.conf" -type f 2>/dev/null | head -1 || true)
     if [[ -n "$conf" ]]; then
         # Return relative path
         echo "${conf#$root/}"
@@ -268,7 +298,9 @@ detect_nginx_config() {
 }
 
 detect_nginx_container() {
-    docker ps --format '{{.Names}}' 2>/dev/null | grep -iE 'nginx' | head -1
+    local names
+    names=$(docker ps --format '{{.Names}}' 2>/dev/null || true)
+    grep_ok -iE 'nginx' <<<"$names" | head -1
 }
 
 # Does <conf> already hold a worktree block for exactly <create-name>? A
@@ -294,8 +326,8 @@ nginx_block_present() {
 postgres_container_candidates() {
     local names
     names=$(docker ps --format '{{.Names}}' 2>/dev/null || true)
-    grep -iE 'postgres|pgdb|_db' <<<"$names" | grep -vE '^[0-9a-f]{16,}_' || true
-    grep -iE 'postgres|pgdb|_db' <<<"$names" | grep -E '^[0-9a-f]{16,}_' || true
+    grep_ok -iE 'postgres|pgdb|_db' <<<"$names" | grep_ok -vE '^[0-9a-f]{16,}_'
+    grep_ok -iE 'postgres|pgdb|_db' <<<"$names" | grep_ok -E '^[0-9a-f]{16,}_'
 }
 
 resolve_postgres_container() {
@@ -890,7 +922,14 @@ elif [[ "$SHARED_DB" = false && "$DB_ENGINE" = "postgresql" ]]; then
     # main DB name as its exact value (a non-standard var we didn't rewrite, or a
     # URL we missed), warn — because if the app reads it, this worktree runs
     # against shared data and migrations WILL corrupt it.
-    residual=$(grep -nE "=[\"']?${MAIN_DB_NAME}[\"']?[[:space:]]*\$" "$WORKTREE_DIR/.env" 2>/dev/null | grep -vE '://' || true)
+    # MAIN_DB_NAME goes into the regex, so a DB name carrying regex metacharacters
+    # is a real status-2 case and must be reported, not read as "nothing residual".
+    # The -v pass exits 1 whenever it filters everything out, which is the normal
+    # clean result — grep_ok is what keeps that from ending the run here.
+    residual=""
+    if [[ -f "$WORKTREE_DIR/.env" ]]; then
+        residual=$(grep_ok -nE "=[\"']?${MAIN_DB_NAME}[\"']?[[:space:]]*\$" "$WORKTREE_DIR/.env" | grep_ok -vE '://')
+    fi
     if [[ -n "$residual" ]]; then
         echo -e "  ${RED}WARNING: these .env entries still equal the main DB name '${MAIN_DB_NAME}':${NC}"
         echo "$residual" | sed 's/^/      /'
@@ -1107,7 +1146,9 @@ if [[ "$SKIP_DOCKER" = false ]]; then
         NETWORK_NAME="$NETWORK_DEFAULT"
         echo -e "  ${GREEN}$NETWORK_NAME${NC}"
     else
-        NETWORK_NAME=$(grep -iE "$NETWORK_PATTERN" <<<"$DOCKER_NETWORKS" | head -1)
+        # grep_ok, not `|| true`: the pattern comes from the repo's config, so a
+        # bad one has to be reported rather than fall through to the default.
+        NETWORK_NAME=$(grep_ok -iE "$NETWORK_PATTERN" <<<"$DOCKER_NETWORKS" | head -1)
         if [[ -z "$NETWORK_NAME" ]]; then
             NETWORK_NAME="$NETWORK_DEFAULT"
             echo -e "  ${YELLOW}Not found, using default: $NETWORK_NAME${NC}"
@@ -1120,7 +1161,12 @@ if [[ "$SKIP_DOCKER" = false ]]; then
     step "Detecting Docker images..."
     USE_BUILD=true
     if [[ -n "$IMAGE_PATTERN" ]]; then
-        APP_IMAGE=$(docker images --format '{{.Repository}}' 2>/dev/null | grep -E "^${IMAGE_PATTERN}$" | head -1)
+        # Same shape as the network detection above, and the same reasoning: no
+        # image built yet is the ordinary first-run case and must reach the
+        # "will build from Dockerfile" branch below, while a bad
+        # docker.image_pattern in .worktree.json must not masquerade as it.
+        DOCKER_IMAGES=$(docker images --format '{{.Repository}}' 2>/dev/null || true)
+        APP_IMAGE=$(grep_ok -E "^${IMAGE_PATTERN}$" <<<"$DOCKER_IMAGES" | head -1)
     else
         APP_IMAGE=$(detect_docker_image "$PROJECT")
     fi

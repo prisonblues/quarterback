@@ -241,6 +241,17 @@ async def test_board_cursor_read_ignores_window(client):
     assert gap in [p["id"] for p in caught_up]
 
 
+async def test_suite_runs_without_the_browser_auth_bypass():
+    # Asserted directly because the symptom is otherwise a hang, not a failure:
+    # with a dev user configured, `reader` authenticates everyone, so the next
+    # test gets a live SSE stream instead of a 401 and blocks forever on a
+    # transport that buffers whole responses. conftest pins this off; a checkout
+    # .env setting BROWSER_DEV_USER must not reach the suite.
+    from app.config import settings
+
+    assert not settings.browser_dev_user
+
+
 async def test_stream_requires_auth(client):
     # A 401 is a complete (non-streaming) response, so it's safe over ASGITransport.
     r = await client.get("/stream")

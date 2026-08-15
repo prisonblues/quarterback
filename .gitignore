@@ -2,6 +2,9 @@
 __pycache__/
 *.py[cod]
 .venv/
+# …and as a bare name too: in a worktree .venv is a *symlink* to the main
+# checkout's, and a trailing-slash pattern only matches real directories.
+.venv
 venv/
 *.egg-info/
 .pytest_cache/
@@ -15,3 +18,8 @@ venv/
 logs/
 pgdata/
 CLAUDE.local.md
+
+# Worktree bookkeeping: the main checkout's port ledger and a worktree's own
+# port. Both are per-machine state written by create-worktree.
+.worktree-ports
+.worktree-port

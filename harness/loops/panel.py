@@ -13,6 +13,14 @@ is a confidence signal, not a filter. Reviewers apply the full /review-pr bar
 (correctness, security, tests, docs, related code, craft — P1–P4); only genuine
 false positives are dropped, so style and polish findings are kept, not filtered.
 
+The master also MERGES the duplicates, and that is the only place a merge happens.
+Deduping upstream of it could only pick one reviewer's text and discard the rest,
+so a better key made the loss worse: the observation only one reviewer made
+survived precisely when the merge FAILED. The judge instead writes a synthesis and
+every reviewer's own title and detail ride along beside it (`reported_by`), so
+merging is additive, attribution is a field rather than an inference, and the fix
+loop and the board consume one canonical record instead of re-deriving it.
+
 Reviewers whose prerequisites are missing (codex CLI absent, SONAR* env unset)
 are reported as SKIPPED, not failed — the panel still produces a report.
 
@@ -36,8 +44,9 @@ none of --round/--baseline/--max-rounds is a single review and says nothing abou
 rounds, rather than promising a re-review nothing will run.
 
 Default prints a report. Pass --post to also comment the summary on the PR, or
---json to emit findings as JSON (consumed by the /panel skill's fix loop);
---json-file writes that JSON *and* keeps the report.
+--json to emit the whole run as JSON on stdout instead (progress goes to stderr,
+so the payload parses without a preamble to strip); --json-file writes that same
+JSON *and* keeps the report.
 
 Every run is recorded on the quarterback board (`qb record-review`, best-effort —
 a down board never fails a review) so which model finds the real issues, and
@@ -95,6 +104,10 @@ from harness_rules import RepoNotFound, describe, resolve_repo  # noqa: E402
 # reads a prefix of the diff and reports confidently on the part it saw.
 MAX_DIFF_CHARS = 60_000
 RAW_DETAIL_CHARS = 4_000  # cap an unparsed reviewer reply kept as a fallback finding
+# How far apart two findings in one file can be and still be offered to the judge
+# as "possibly the same observation". A hint only — see cluster_findings.
+CLUSTER_WINDOW = 10
+ACCOUNT_CHARS = 240  # per-reviewer account shown under a merged finding in the report
 
 # Panel -> fix -> panel. Two is the default because one is provably not enough:
 # the fixer's own commit is otherwise read by nobody, and structural fixes beget
@@ -103,6 +116,46 @@ RAW_DETAIL_CHARS = 4_000  # cap an unparsed reviewer reply kept as a fallback fi
 # only to decide whether a round that still has work left stopped because it was
 # done or because it ran out of rounds.
 DEFAULT_MAX_ROUNDS = 2
+
+# How long a reviewer CLI may take. One constant, because two CLIs enforce it:
+# run_cli kills a wedged process at this bound, and `agy` self-aborts at its own
+# `--print-timeout` (default 5m0s), so the seat that does not read this number
+# silently reviews on a five-minute clock while the report claims thirty.
+CLI_TIMEOUT = 1800
+
+# Linux caps ONE argv string at MAX_ARG_STRLEN = 131,072 bytes, independently of
+# the much larger total ARG_MAX; cross it and execve fails with E2BIG before the
+# CLI starts. Every reviewer whose prompt travels on stdin is free of this, and
+# that is all of them but one — `agy` has no stdin path (`-p ""` is "empty
+# prompt", `-p -` reviews the literal string "-"), so its prompt is clamped to
+# fit here and the truncation is reported like any other. The margin is for the
+# rest of the argv and the environment, which share the kernel's accounting.
+ARGV_PROMPT_MAX_BYTES = 120_000
+# The severities everything downstream counts in. A value outside this set is not
+# a stricter or a looser call, it is an unreadable one — it would reach the
+# board's leaderboard as a bucket nothing counts, and it sorts wherever its first
+# letter falls (a reviewer answering "BLOCKER" would head the fix list on a
+# lexical accident). Normalised where a severity ENTERS the panel, so no
+# downstream comparison has to defend itself.
+SEVERITIES = ("P1", "P2", "P3", "P4")
+
+# Prompts go to the CLIs as a single argv entry, and Linux caps ONE argument at
+# MAX_ARG_STRLEN (128 KiB) however generous ARG_MAX is — so a big listing plus a
+# big diff is an E2BIG, not a slow run. The judge's prompt is the one that grows
+# with the review (one line per reviewer account, each up to RAW_DETAIL_CHARS),
+# so it gets a budget: the diff keeps its configured share and the listing takes
+# what is left under this ceiling.
+ARGV_BUDGET = 100_000
+MAX_LISTING_CHARS = 40_000    # fallback share for the judge's finding listing
+LISTING_ACCOUNT_CHARS = 1_200  # one account's share of that listing
+
+# GitHub rejects an issue comment over 65,536 characters. The report grows with
+# the per-reviewer accounts, so `--post` needs a guard: a review that succeeded
+# must not be lost to a comment that was one account too long.
+COMMENT_CHARS = 65_000
+#: The report's last block, and the one a cycle's caller acts on — named because
+#: `fit_comment` cuts around it rather than through it.
+ROUNDS_HEADING = "**Rounds:**"
 
 # The panel's possible members. LLM reviewers are interchangeable in everything
 # except how their CLI is invoked; sonarqube is a different shape (an API, and a
@@ -162,22 +215,47 @@ PR #{n} ({repo}), base={base}:
 """
 
 JUDGE_PROMPT = """You are the lead reviewer ("master") making the FINAL call on review findings for
-a pull request diff, held to the standard "nothing left to improve". The findings below come from
-several independent reviewers (Claude, Codex, SonarCloud). For EACH finding, decide on the merits
-whether it is a REAL issue worth fixing.
+a pull request diff, held to the standard "nothing left to improve". The reports below come from
+several independent reviewers (Claude, Codex, SonarCloud), listed ONE PER REVIEWER — so the same
+defect appears once for each reviewer that spotted it, often citing different lines and describing
+it differently. You do two things: MERGE the reports that are the same defect, and rule on each
+resulting issue.
 
-The bar is completeness, not triage. Keep every genuine finding — correctness, security, error
-handling, test gaps, docs, naming, style, simplifications, and polish ALL count and all get fixed.
-"Not worth the churn" and "could do later" are NOT valid reasons to dismiss. A genuine issue flagged
-by only ONE reviewer MUST be marked real — never dismiss it just because the others missed it (that
-is exactly what a diverse reviewer is there to catch).
+TWO KINDS OF ID, do not mix them. A REPORT id is the bare number in brackets at the start of each
+line below ([0], [1], ...): those are what `members` lists, as INTEGERS — `"members": [0, 3]`.
+An ISSUE id is a label YOU invent for an issue you are returning ("F01"): that is what `id` holds
+and what `related` points at. Never put an "F.." label in `members`, and never put a report number
+in `related` — a `members` entry that is not a report number merges nothing.
 
-Mark real=false ONLY when the finding is a genuine FALSE POSITIVE — you re-examined and the code is
+MERGING. Group reports by the DEFECT, not by position: two reviewers pointing at lines 100 and 41
+of one file may well be describing one bug, and two findings on the same line may be two bugs.
+Write a `synthesis` that states the merged issue INCLUDING every point any of its reports made —
+where one reviewer noticed something the others did not, that observation must appear in your
+synthesis. Never drop a point because only one reviewer made it; that is exactly the reviewer
+diversity the panel exists for. Each report id belongs to exactly ONE issue.
+
+Separate defects that share one CAUSE (one design decision showing up in four files) are NOT
+merged — list each other issue's id in `related` so they get fixed as one decision.
+
+RULING. The bar is completeness, not triage. Keep every genuine issue — correctness, security,
+error handling, test gaps, docs, naming, style, simplifications, and polish ALL count and all get
+fixed. "Not worth the churn" and "could do later" are NOT valid reasons to dismiss. A genuine issue
+flagged by only ONE reviewer MUST be marked real — never dismiss it because the others missed it.
+
+Mark real=false ONLY when the issue is a genuine FALSE POSITIVE — you re-examined and the code is
 actually correct, or the suggestion would make it worse. When unsure, mark it real.
 
-Return ONLY a JSON object (no prose):
-  {{"verdicts": [{{"id": <int>, "real": true|false, "severity": "P1|P2|P3|P4", "reason": "..."}}],
-    "coverage_note": "..."}}
+Return ONLY a JSON object (no prose), with one `verdicts` entry per REAL-WORLD ISSUE,
+covering every report id:
+  {{"verdicts": [{{"id": "F01",
+                  "members": [<the bracketed report NUMBERS merged into this issue, e.g. 0, 3>],
+                  "real": true|false,
+                  "severity": "P1|P2|P3|P4",
+                  "file": "path", "line": <int|null>,
+                  "synthesis": "the merged statement of the issue",
+                  "related": ["F03"],
+                  "reason": "why real or a false positive"}}],
+   "coverage_note": "..."}}
 
 `coverage_note` adjudicates the reviewers' own coverage declarations below — one sentence, or ""
 when there is nothing to say. Where they DISAGREE (one reports clean, another says it could not
@@ -185,7 +263,7 @@ assess an area), that split is more informative than either verdict alone: say w
 believe and what is therefore still unread. Do not average it away, and do not turn it into a
 prediction about further rounds.
 
-Findings:
+Reports:
 {findings}
 
 Coverage declared by the reviewers:
@@ -208,14 +286,13 @@ class Finding:
     #: the shape of the fix. It is what predicts the round-3 class of defect: one
     #: created by the fixer's own changes meeting, which no earlier round could
     #: have seen because it did not exist yet.
+    #:
+    #: Per REPORTER, and it stays that way all the way to the board: the accuracy
+    #: of a declaration is a property of the member that made it, so a flag
+    #: credited to everyone who happened to raise the same defect makes the member
+    #: that called it and the member that missed it indistinguishable on exactly
+    #: the statistic that separates them (see :attr:`Canonical.rereview_by`).
     needs_rereview: bool = False
-    #: On a merged group: WHICH members declared it. Attribution the merge would
-    #: otherwise flatten into the representative — and the accuracy of a
-    #: declaration is per reviewer, so a group flag credited to everyone who
-    #: happened to raise the finding makes the member that called it and the
-    #: member that missed it indistinguishable on exactly the statistic that
-    #: separates them.
-    rereview_by: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -343,6 +420,19 @@ def extract_json_value(raw: str) -> list | dict | None:
     return parsed[0] if parsed else None
 
 
+def _severity(raw, fallback: str) -> str:
+    """A severity if it is one of ``SEVERITIES``, else the caller's fallback.
+
+    Used at both ends: on the way IN from a reviewer (whose fallback is the
+    panel's default) and on the way in from the judge (whose fallback is the
+    reviewers' own call, a real answer that beats a made-up one). Normalising at
+    parse time is what makes the judge-side fallback trustworthy — an
+    unnormalised `'BLOCKER'` would otherwise sort before `'P1'`, win
+    ``min(accounts, ...)``, head the fix list and count in no bucket at all."""
+    sev = str(raw or "").strip().upper()
+    return sev if sev in SEVERITIES else fallback
+
+
 #: Spellings of "yes" a model reaches for when the contract asked for `true`.
 #: Anything else — including "false", "no", "0" and every non-boolean shape — is
 #: NOT a declaration.
@@ -371,7 +461,7 @@ def _flag(val) -> bool:
 def _to_findings(reviewer: str, items: list) -> list[Finding]:
     return [Finding(
         reviewer=reviewer,
-        severity=str(it.get("severity", "P3")).upper(),
+        severity=_severity(it.get("severity"), "P3"),
         file=str(it.get("file", "?")),
         line=it.get("line") if isinstance(it.get("line"), int) else None,
         title=str(it.get("title", "")).strip(),
@@ -439,6 +529,15 @@ def parse_reply(reviewer: str, raw: str) -> tuple[list[Finding], list[str] | Non
     declared = val.get("could_not_assess")
     gaps = _str_list(declared) if isinstance(declared, (list, str)) else None
     return findings, gaps
+
+
+def parse_findings(reviewer: str, raw: str) -> list[Finding] | None:
+    """Just the findings out of a reviewer's reply, for a caller with no use for
+    what it declared. Returns None when the reply has no usable JSON (the caller
+    retries, then falls back to a raw-text finding) — distinct from [], which
+    means the reviewer ran and found nothing."""
+    parsed = parse_reply(reviewer, raw)
+    return None if parsed is None else parsed[0]
 
 
 def _raw_finding(reviewer: str, text: str) -> Finding:
@@ -522,27 +621,46 @@ def stderr_gist(stderr: str, limit: int = 200) -> str:
     return (msg.group(1) if msg else pick)[:limit]
 
 
-def run_cli(args: list[str], label: str, timeout: int = 600,
-            attempts: int = 3) -> tuple[str | None, str | None]:
+def run_cli(args: list[str], label: str, timeout: int = CLI_TIMEOUT,
+            attempts: int = 3, stdin_text: str | None = None) -> tuple[str | None, str | None]:
     """Run a headless CLI, returning (stdout, error_reason); error_reason is
     None on success. Retries transient failures (non-zero exits such as rate
     limits, and OS errors) up to `attempts` times with no delay — these fail
     fast, so retrying is cheap and recovers the common flake. A full timeout is
     NOT retried (it already burned the whole budget; retrying just doubles the
-    wall-clock). The reason string is specific (timeout / exit code + stderr
+    wall-clock).
+
+    `stdin_text` is how a prompt reaches a CLI that accepts one there, which is
+    the only way to hand a reviewer a diff larger than the kernel's per-argument
+    limit (see ARGV_PROMPT_MAX_BYTES). It does NOT weaken the guard that stdin
+    is otherwise DEVNULL: subprocess writes the string and closes the pipe, so a
+    CLI that decides to prompt for more reads EOF instead of hanging the panel
+    on an inherited terminal.
+
+    The timeout is deliberately generous. It exists to stop a wedged process
+    hanging the panel forever, NOT to bound how long a reviewer may think: at
+    10 minutes codex on a top-tier model at `max` effort routinely lost its
+    seat on real diffs, which costs a whole vendor's eyes to save wall-clock we
+    weren't waiting on anyway — the reviewers run concurrently, so a slow seat
+    only extends the run when it is the slowest one. The reason string is specific (timeout / exit code + stderr
     tail / OSError) so callers can SURFACE why a step degraded instead of
     reporting a bare 'unavailable'. A request the server has REJECTED on its
     merits is not retried either: a bad model pin fails identically all three
     times, so retrying only triples the wait for a certainty."""
     last = f"{label}: no attempt made"
+    feed = {"input": stdin_text} if stdin_text is not None else {"stdin": subprocess.DEVNULL}
     for _ in range(max(1, attempts)):
         try:
             proc = subprocess.run(args, capture_output=True, text=True,
-                                  stdin=subprocess.DEVNULL, timeout=timeout)
+                                  timeout=timeout, **feed)
         except subprocess.TimeoutExpired:
             return None, f"{label}: timed out after {timeout}s"
         except OSError as e:
-            last = f"{label}: {e.__class__.__name__}"
+            # errno and strerror, not the bare class name: "OSError" sent three
+            # people looking for a crash that was "Argument list too long", and
+            # everything needed to name it was already on the exception.
+            why = " ".join(str(x) for x in (e.errno, e.strerror or e) if x)
+            last = f"{label}: OSError {why}"[:300]
             continue
         if proc.returncode != 0:
             msg = stderr_gist(proc.stderr or "")
@@ -567,6 +685,16 @@ def record_run(payload: dict) -> None:
     one, deliberately disjoint, and qb-env's rule is that an unset URL is an
     error and never a guess. Re-deriving that in Python is how review data ends
     up on another island's board.
+
+    What is recorded is the canonical finding list, not counts: each issue with
+    its synthesis, every reporter's account, the run's `related` links, and a
+    `key` per finding. The board scopes those keys by (repo, PR), so a later run
+    of the same PR — a re-review after a fix, a reviewer recovered after a
+    timeout — joins each finding to the earlier observation of the same defect
+    rather than starting a fresh chain. The key is derived from the reviewers'
+    own words (see :func:`_defect_key`) precisely so it survives the judge
+    re-wording its synthesis between runs, which the board's own fallback
+    derivation would not.
 
     Never raises and never blocks the review: telemetry that can fail a run that
     already succeeded is worse than no telemetry.
@@ -603,7 +731,12 @@ def diff_budget(block: dict, key: str, fallback: int, notes: list[str]) -> int:
     Only what cannot be a budget at all is refused: a non-number, or <= 0 (which
     would send an empty diff and produce a confident review of nothing). Those
     fall back and SAY so — silently honouring them reviews a fragment, silently
-    dropping them leaves you believing a budget you never got."""
+    dropping them leaves you believing a budget you never got.
+
+    There is one ceiling this cannot see, and it belongs to the caller: `agy`'s
+    prompt travels in argv, so the kernel caps it however large a budget says
+    (see fit_argv_budget). That clamp is applied per reviewer, after this, and
+    reported the same way — as truncation with a reason, not as a refusal."""
     raw = block.get(key)
     if raw is None or raw == "":
         return fallback
@@ -622,6 +755,32 @@ def diff_budget(block: dict, key: str, fallback: int, notes: list[str]) -> int:
     return n
 
 
+def fit_argv_budget(render, budget: int) -> int:
+    """The largest diff budget <= `budget` whose rendered prompt still fits in one
+    argv element, for the seat whose prompt has nowhere else to go.
+
+    This is the same rule diff_budget follows and the reason it can now keep it:
+    a budget over the kernel's limit USED to be honoured right up to execve and
+    then kill the reviewer with an opaque error. Here it becomes ordinary
+    truncation with the consequence surfaced — the config still wins as far as
+    the machine allows, and the report says where the machine stopped it.
+
+    `render` renders the whole prompt from a budget, because the ceiling applies
+    to the prompt, not the diff: the template counts, and so does the difference
+    between characters and the bytes they encode to (this repo's own comments are
+    full of em dashes, each of which is three bytes and one char).
+
+    Shrinking by the byte overflow converges in one pass — a char is never fewer
+    than one byte, so dropping N chars drops at least N bytes — but the loop is
+    kept for the pathological case where the template alone is near the limit."""
+    for _ in range(8):
+        over = len(render(budget).encode()) - ARGV_PROMPT_MAX_BYTES
+        if over <= 0:
+            return budget
+        budget = max(0, budget - over)
+    return budget
+
+
 def reviewer_label(name: str, model: str, effort: str = "") -> str:
     """`codex (gpt-5.6-luna, high)` — the report says WHICH brain reviewed.
 
@@ -632,11 +791,16 @@ def reviewer_label(name: str, model: str, effort: str = "") -> str:
     return f"{name} ({spec})" if spec else f"{name} (CLI default)"
 
 
-def codex_args(model: str, effort: str, prompt: str) -> list[str]:
+def codex_args(model: str, effort: str) -> list[str]:
     """codex exec argv. Both knobs are optional and independent: effort is a
     `-c` config override rather than a flag, and applies to the CLI's default
-    model just as well as to a pinned one."""
-    args = ["codex", "exec", prompt]
+    model just as well as to a pinned one.
+
+    Takes no prompt: `codex exec` with no positional argument reads its
+    instructions from stdin, which is where the diff goes. The parameter is gone
+    rather than ignored so the argv-limit bug cannot be reintroduced by passing
+    one (see ARGV_PROMPT_MAX_BYTES)."""
+    args = ["codex", "exec"]
     if model:
         args += ["--model", model]
     if effort:
@@ -644,11 +808,30 @@ def codex_args(model: str, effort: str, prompt: str) -> list[str]:
     return args
 
 
-def antigravity_args(model: str, effort: str, prompt: str) -> list[str]:
+def antigravity_args(model: str, effort: str, prompt: str,
+                     timeout: int = CLI_TIMEOUT) -> list[str]:
     """`agy` argv — Google's Antigravity CLI, which replaced gemini-cli in this
-    seat. `-p` is its non-interactive print mode; `--mode plan` is the read-only
-    execution mode, and a reviewer has no business editing the tree it is
-    reviewing — the panel wants an opinion, not a fix.
+    seat. `-p` is its non-interactive print mode.
+
+    This is the ONE seat whose prompt travels in argv: `agy` has no way to read
+    one from anywhere else — not stdin, not a `@file`, not a `--prompt-file`.
+    So it is also the one seat that can hit the kernel's per-argument limit, and
+    the caller clamps its diff to ARGV_PROMPT_MAX_BYTES before rendering.
+
+    `--mode plan` is NOT a sandbox, despite reading like one: with permissions
+    granted, plan mode writes files. What actually keeps this reviewer off the
+    tree is that headless print mode cannot prompt for a tool permission, so any
+    tool needing one is auto-denied — and the diff is in the prompt, so it needs
+    no tool anyway. Plan mode is kept for the narrower thing it does do (biasing
+    it away from proposing edits), not as the guarantee. Anyone adding
+    `--dangerously-skip-permissions` here removes the real guard: measured, that
+    turns the reviewer into an agent that runs the test suite against the dev
+    database and reviews the checkout instead of the diff.
+
+    `--print-timeout` is passed because `agy` otherwise aborts itself at 5m0s
+    while run_cli is still patiently waiting out its own much longer bound — a
+    reviewer that reads as dead when it was only slow. It takes a Go duration,
+    hence the `s` suffix.
 
     Left on the default `--output-format text` rather than `json`: the JSON mode
     wraps the reply in {response, status, usage, ...}, which would hide the
@@ -661,7 +844,7 @@ def antigravity_args(model: str, effort: str, prompt: str) -> list[str]:
     dead reviewer rather than a quietly wrong one. Its effort scale is only
     low/medium/high (see EFFORTS) — narrower than codex's or pi's.
     """
-    args = ["agy", "--mode", "plan", "-p", prompt]
+    args = ["agy", "--mode", "plan", "--print-timeout", f"{timeout}s", "-p", prompt]
     if model:
         args += ["--model", model]
     if effort:
@@ -669,11 +852,11 @@ def antigravity_args(model: str, effort: str, prompt: str) -> list[str]:
     return args
 
 
-def pi_args(model: str, effort: str, prompt: str) -> list[str]:
+def pi_args(model: str, effort: str) -> list[str]:
     """pi argv. `-p` is its non-interactive mode; `--no-tools` is what makes it a
     REVIEWER — pi ships read/bash/edit/write, and a panel member has no business
-    editing the tree it is reviewing (the same reason agy runs in plan mode).
-    The diff is in the prompt, so it needs no tools to do the job.
+    editing the tree it is reviewing. The diff arrives on stdin, so it needs no
+    tools to do the job, and `--no-tools` is a real guarantee that it has none.
 
     `--no-session` keeps a review out of the session store: a panel run is not a
     conversation anyone resumes, and one runs per PR.
@@ -681,8 +864,11 @@ def pi_args(model: str, effort: str, prompt: str) -> list[str]:
     pi reaches many providers, so `model` here is a full `provider/id` pattern
     (`openrouter/moonshotai/kimi-k3`) rather than a bare slug, and its thinking
     level is spelled `--thinking` where codex spells it `model_reasoning_effort`.
-    Same knob, same config key (`effort`), different word on each CLI."""
-    args = ["pi", "-p", "--no-session", "--no-tools", prompt]
+    Same knob, same config key (`effort`), different word on each CLI.
+
+    Takes no prompt, for the same reason codex_args does not: `pi -p` reads it
+    from stdin."""
+    args = ["pi", "-p", "--no-session", "--no-tools"]
     if model:
         args += ["--model", model]
     if effort:
@@ -749,15 +935,21 @@ def review_llm(cmd_name: str, model: str, prompt: str,
                            duration_ms=elapsed())
     if not shutil.which(CLI_BIN.get(cmd_name, cmd_name)):
         return ReviewerRun(skip=f"{label}: CLI absent", duration_ms=elapsed())
+    # The prompt goes on stdin wherever the CLI will take it there — which is
+    # everywhere but `agy`. That is not a style choice: a diff big enough to be
+    # worth a panel is big enough to exceed the kernel's per-argument limit, and
+    # in argv that failure lands at execve, before the reviewer exists, as an
+    # error with nothing in it. On stdin there is no such ceiling.
+    stdin_text: str | None = prompt
     if cmd_name == "claude":
-        args = ["claude", "-p", prompt, "--model", model]
+        args = ["claude", "-p", "--model", model]
     elif cmd_name == "antigravity":
-        args = antigravity_args(model, effort, prompt)
+        args, stdin_text = antigravity_args(model, effort, prompt), None
     elif cmd_name == "pi":
-        args = pi_args(model, effort, prompt)
+        args = pi_args(model, effort)
     else:
-        args = codex_args(model, effort, prompt)
-    out, err = run_cli(args, label)
+        args = codex_args(model, effort)
+    out, err = run_cli(args, label, stdin_text=stdin_text)
     if err:
         err += cli_hint(cmd_name, err, model)
         return ReviewerRun(skip=err, duration_ms=elapsed())
@@ -766,7 +958,7 @@ def review_llm(cmd_name: str, model: str, prompt: str,
         # Unparseable JSON — give the reviewer one more shot (a common flake is a
         # stray prose preamble the model omits on a retry), then, rather than drop
         # its work, keep the raw reply as a single markdown finding for the judge.
-        out2, err2 = run_cli(args, label, attempts=1)
+        out2, err2 = run_cli(args, label, attempts=1, stdin_text=stdin_text)
         if not err2 and out2:
             retried = parse_reply(cmd_name, out2)
             if retried is not None:
@@ -1147,109 +1339,511 @@ def review_ci(gh_repo: str, pr_number: int) -> tuple[str, list[str], str | None]
 
 # ----------------------------------------------------------------------------- synthesis
 
-def _key(f: Finding) -> tuple:
-    """Dedup bucket: same file + nearby line (±10) is treated as one issue.
+def cluster_findings(llm_findings: list[Finding]) -> list[list[Finding]]:
+    """Cluster findings that are plainly the same observation, as a HINT for the
+    judge — never as the decision about what is a duplicate.
 
-    The file is the BASENAME, because reviewers spell paths differently (one
-    quotes the repo-relative path, another just the file). :func:`_same_file`
-    then splits the bucket back apart where two different files share a name —
-    the representative's full path becomes this round's :func:`finding_key`, so
-    merging ``app/api/reviews.py`` with ``harness/loops/reviews.py`` would hand
-    one file's defect the other's identity."""
-    return (Path(f.file).name, (f.line or 0) // 10)
+    Same file, and lines within ``CLUSTER_WINDOW`` of a neighbour already in the
+    cluster. Two details matter, because the previous version got both wrong:
 
+    * It is a real window over sorted lines, not ``line // 10``. A fixed grid is
+      not a distance: lines 39 and 41 (two apart) landed in different buckets
+      while 40 and 49 (nine apart) shared one, so whether two findings merged
+      depended on where they fell relative to arbitrary multiples of ten.
+    * It keys on the full path, not ``Path(f.file).name``. Same-named files in
+      different directories (``api/tests/test_x.py`` and ``web/tests/test_x.py``)
+      are not the same file, and merging them is the opposite error.
 
-def _same_file(a: str, b: str) -> bool:
-    """Do two path spellings name the same file? Equal, or one a path-suffix of
-    the other (``reviews.py`` vs ``app/api/reviews.py``) — but never two distinct
-    paths that merely end in the same basename."""
-    if a == b:
-        return True
-    return a.endswith("/" + b) or b.endswith("/" + a)
+    What no line arithmetic can catch is the case that actually recurs: two
+    reviewers describing ONE defect and citing lines 100 and 41 for it. That is
+    a semantic judgement, which is why this only pre-clusters and the judge
+    decides — see :func:`adjudicate`.
 
-
-def group_findings(llm_findings: list[Finding]) -> list[tuple[Finding, list[str]]]:
-    """Dedup findings across reviewers. Returns (representative, [reviewers]).
-    Reviewer count is a *confidence signal*, never a gate.
-
-    A ``needs_rereview`` declaration survives the merge from ANY reporter: one
-    reviewer seeing that the fix will be structural is the observation, and the
-    others not saying so is not a contradiction of it.
-
-    The representative is the lowest severity, then the lowest title — a
-    deterministic tie-break rather than whichever member happened to be listed
-    first, because its title becomes the round's :func:`finding_key` and an
-    identity that changes when a member drops out links nothing."""
-    buckets: dict[tuple, list[list[Finding]]] = {}
+    Findings with no line at all cluster per file: it is the most that can be
+    said about them positionally, and the judge sees them individually anyway.
+    """
+    by_file: dict[str, list[Finding]] = {}
     for f in llm_findings:
-        groups = buckets.setdefault(_key(f), [])
-        for grp in groups:
-            if _same_file(grp[0].file, f.file):
-                grp.append(f)
-                break
-        else:
-            groups.append([f])
-    out = []
-    for groups in buckets.values():
-        for grp in groups:
-            reviewers = sorted({f.reviewer for f in grp})
-            rep = min(grp, key=lambda f: (f.severity, f.title))  # P1 < P2 < P3 lexically
-            # The most specific spelling of the path the group agreed on, so the
-            # key does not depend on which member wrote the shortest one.
-            rep.file = max((f.file for f in grp), key=len)
-            # Read before it is written: the representative is one of the group's
-            # own findings, so setting its flag first would credit its reviewer
-            # with a declaration another member made.
-            rep.rereview_by = sorted({f.reviewer for f in grp if f.needs_rereview})
-            rep.needs_rereview = bool(rep.rereview_by)
-            out.append((rep, reviewers))
-    out.sort(key=lambda e: e[0].severity)
+        by_file.setdefault(f.file, []).append(f)
+    out: list[list[Finding]] = []
+    for findings in by_file.values():
+        # Sort is stable, so reviewers keep their arrival order within a line.
+        ordered = sorted(findings, key=lambda f: (f.line is not None, f.line or 0))
+        cur: list[Finding] = []
+        last: int | None = None
+        for f in ordered:
+            if cur and (f.line is None) == (last is None) and (
+                    last is None or f.line - last <= CLUSTER_WINDOW):
+                cur.append(f)
+            else:
+                if cur:
+                    out.append(cur)
+                cur = [f]
+            last = f.line
+        if cur:
+            out.append(cur)
+    out.sort(key=lambda grp: min(f.severity for f in grp))
     return out
 
 
-def judge(groups: list[tuple[Finding, list[str]]], diff: str, model: str,
-          budget: int = MAX_DIFF_CHARS,
-          coverage: dict[str, list[str]] | None = None
-          ) -> tuple[dict[int, dict], str | None, str]:
-    """The 'master' adjudicates each finding on its merits, and rules on the
-    coverage the reviewers declared. Returns (verdicts, skip_reason, coverage_note).
-    skip_reason is None when the judge ran successfully
-    (even if it dismissed nothing); otherwise it explains WHY the judge could not
-    rule — CLI absent, timeout, crash, or unparseable output — so the caller can
-    surface it rather than silently reporting a bare 'unavailable'. A real bug
-    from a single reviewer is confirmed; only genuine false positives are dropped
-    (style and polish are kept). When the judge can't rule, the caller keeps everything (we never
-    silently suppress a finding).
+def _account(f: Finding) -> str:
+    """One reviewer's account of a finding, joined for READING: title — detail.
 
-    Neither findings NOR declarations -> ({}, None, ""): there is nothing to rule
-    on. Declarations with no findings still run: that is the round where "clean
-    versus could-not-tell" most needs adjudicating — two members saying they
-    could not read the migration while a third reports clean is a split, and a
-    finding count of zero says nothing about it.
+    A presentation field, and only that. The structured pair travels beside it
+    (``title``/``detail`` per report in :meth:`Canonical.as_dict`), because a
+    consumer cannot split this string back apart — an em dash is a punctuation
+    mark reviewers use — and the panel promises the account is kept, not that it
+    is recoverable from a rendering of it. This is the text that used to be
+    discarded when a positional merge chose a representative, taking with it the
+    observations only one reviewer made."""
+    return " — ".join(x for x in (f.title, f.detail) if x)
 
-    The judge is asked to rule on coverage in the same call — one extra key in the
-    object it already returns, no additional model call. Its own reply may still
-    be the bare verdict array every earlier judge returned, in which case there is
-    simply no coverage note."""
+
+def _fold_reports(reports: list[Finding]) -> list[dict]:
+    """The accounts as they are SERIALISED: one entry per reviewer.
+
+    A judge may merge two findings from the same reviewer — that is the panel's
+    own motivating example (one defect, two line numbers) — and the board stores
+    accounts under a ``(finding, reviewer)`` uniqueness constraint, keeping the
+    first and dropping the rest. So a reviewer's several accounts are joined
+    here, where nothing is lost, rather than at ingest, where the second one
+    would vanish. Its severity is the worst it gave and its line the first."""
+    order: dict[str, list[Finding]] = {}
+    for f in reports:
+        order.setdefault(f.reviewer, []).append(f)
+    out = []
+    for reviewer, group in order.items():
+        head = group[0]
+        bodies = [head.detail] + [_account(f) for f in group[1:]]
+        out.append({
+            "reviewer": reviewer,
+            "severity": min(f.severity for f in group),
+            "line": next((f.line for f in group if f.line is not None), None),
+            "title": head.title,
+            "detail": "\n\n".join(b for b in bodies if b),
+            "account": "\n\n".join(_account(f) for f in group),
+            # THIS reviewer's own re-review declaration, which is the grain the
+            # board scores it at: a member that called the structural fix and one
+            # that missed it are the same row otherwise.
+            "needs_rereview": any(f.needs_rereview for f in group),
+        })
+    return out
+
+
+_NOT_WORD = re.compile(r"[^a-z0-9]+")
+
+
+def _norm_title(title: str) -> str:
+    """A title reduced to the words in it, which is what the defect key hashes and
+    what the round diff compares. Must match ``app/api/reviews.py::_derive_key``
+    and migration 0012's SQL, character for character."""
+    return _NOT_WORD.sub(" ", (title or "").lower()).strip()
+
+
+def _key_from_title(file: str | None, title: str) -> str:
+    """The defect key for a title already chosen — the recipe itself, shared by
+    :func:`_defect_key` and the round baselines, which read a title back out of a
+    payload rather than off a Finding."""
+    return hashlib.md5(f"{file or ''}|{_norm_title(title)}".encode(),
+                       usedforsecurity=False).hexdigest()[:16]
+
+
+def _defect_title(reports: list[Finding]) -> str:
+    """The reporters' own words that identify the defect: the lexicographically
+    first of their titles, so it does not move with report ordering, with which
+    reviewer the judge picked as representative, or with a severity re-call.
+
+    A finding no reporter titled keys on ``"(untitled)"`` rather than on the
+    empty string, because that is the value the BOARD would arrive at: its
+    ingest defaults a missing title to that stand-in *before* deriving a key
+    (``_prepare``), and migration 0012's SQL keys off the stored column, which
+    holds the same. The empty string is the intuitive choice and the wrong one —
+    it produces a key no other implementation can reach, so an untitled finding
+    would start a fresh chain every run."""
+    titles = sorted(f.title.strip() for f in reports if f.title.strip())
+    return titles[0] if titles else "(untitled)"
+
+
+def _defect_key(file: str, reports: list[Finding]) -> str:
+    """A stable identity for the DEFECT, sent with the finding.
+
+    The board derives one when a caller sends none — file plus a normalised
+    title — and the title it would use is the judge's freshly-worded synthesis,
+    which is re-written on every run. Deriving it here from reviewer-authored
+    text instead is what lets a re-review of the same PR join the same chain
+    ("was this actually fixed?"), rather than starting a new one because the
+    judge chose different words for the same bug.
+
+    The title used is the lexicographically first of the reporters' own titles
+    (see :func:`_defect_title`). Best-effort by nature — a reviewer that re-words
+    its own title still breaks the chain, which is what
+    :meth:`Baseline.raised_before` exists to absorb — but the reviewers' words are
+    the most stable text a run produces.
+
+    The hash MUST match ``app/api/reviews.py::_derive_key`` (and migration
+    0012's SQL): a run that sends this key and an older run that let the board
+    derive one only join if the two agree. "Agree" means against the board's
+    whole path, not against that one function — its ingest defaults an untitled
+    finding to ``"(untitled)"`` before deriving, so comparing with a raw
+    ``_derive_key(file, "")`` measures a call the board never makes and
+    "fixing" the mismatch is how the two silently diverge."""
+    return _key_from_title(file, _defect_title(reports))
+
+
+def _finding_id(pr: int, n: int) -> str:
+    """``1609-F03`` — this finding, in this run. Run-LOCAL by construction: the
+    numbering follows output position, so the same defect gets a different number
+    on any rerun whose ordering, grouping or dismissals differ. It exists to
+    resolve `related` within one payload, which is why the defect's own identity
+    is a separate field (see :func:`_defect_key`)."""
+    return f"{pr}-F{n:02d}"
+
+
+@dataclass
+class Canonical:
+    """One real issue, as the judge settled it — the panel's only finding record.
+
+    Merging is ADDITIVE: ``synthesis`` is the judge's new merged statement and
+    ``reported_by`` carries every reviewer's original report beside it — its own
+    title and detail as fields, not welded into one string, so a consumer gets
+    back what the reviewer wrote rather than a rendering of it.
+    Nothing a reviewer wrote is dropped to make a merge, which is what a
+    representative-and-discard dedup did and why tightening its key would have
+    made the loss worse rather than better.
+    """
+
+    id: str
+    severity: str
+    file: str
+    line: int | None
+    #: The one-line statement of the issue: the judge's merged one where it
+    #: merged, else the reporting reviewer's own title. A line, never a body —
+    #: the board stores it as the finding's `title` and derives from it, so a
+    #: 4 KB unparsed-reply dump belongs in `detail`, not here.
+    synthesis: str
+    #: confirmed | dismissed | unjudged | sonar (the hard gate's own issues,
+    #: which never reach the judge)
+    verdict: str
+    #: The body behind the synthesis. The judge writes one merged sentence and no
+    #: body, so a merged record takes the worst report's — every reporter's own
+    #: text rides along in `reported_by` either way.
+    detail: str = ""
+    reported_by: list[Finding] = field(default_factory=list)
+    related: list[str] = field(default_factory=list)
+    rationale: str = ""
+
+    @property
+    def reviewers(self) -> list[str]:
+        """Who reported it, in arrival order. Attribution is a FIELD here, not an
+        inference from a merge that already threw the evidence away."""
+        return list(dict.fromkeys(f.reviewer for f in self.reported_by))
+
+    @property
+    def key(self) -> str:
+        """This defect's identity across runs — see :func:`_defect_key`."""
+        return _defect_key(self.file, self.reported_by)
+
+    @property
+    def rereview_by(self) -> list[str]:
+        """Which members declared that fixing this needs the RESULT read again.
+
+        Derived, not stored: every reporter's own :class:`Finding` is right here,
+        so the attribution is simply read off it. The merge used to reconstruct
+        this onto a representative finding — carefully, because the
+        representative was one of the group's own members and setting its flag
+        first would have credited its reviewer with somebody else's
+        declaration. There is nothing to reconstruct now, and nothing to get
+        wrong."""
+        return sorted({f.reviewer for f in self.reported_by if f.needs_rereview})
+
+    @property
+    def needs_rereview(self) -> bool:
+        """Did ANY reporter say so. One reviewer seeing that the fix will be
+        structural is the observation; the others not saying so is not a
+        contradiction of it."""
+        return any(f.needs_rereview for f in self.reported_by)
+
+    def as_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "key": self.key,
+            "severity": self.severity,
+            "file": self.file,
+            "line": self.line,
+            "synthesis": self.synthesis,
+            "detail": self.detail,
+            "verdict": self.verdict,
+            "reported_by": _fold_reports(self.reported_by),
+            "reviewers": self.reviewers,
+            "needs_rereview": self.needs_rereview,
+            "rereview_by": self.rereview_by,
+            "related": self.related,
+            "rationale": self.rationale,
+        }
+
+
+def _unmerged(f: Finding, pr: int, n: int, verdict: str, rationale: str = "") -> Canonical:
+    """A single reviewer's finding as a canonical record, no judge involved.
+
+    Its title and detail stay in their own fields rather than being joined into
+    the synthesis: the board stores the synthesis as the finding's title and
+    keys off it, so joining them would put a whole detail body — up to
+    RAW_DETAIL_CHARS of it, for an unparsed reply — into a title column and into
+    the defect key."""
+    return Canonical(id=_finding_id(pr, n), severity=f.severity, file=f.file,
+                     line=f.line, synthesis=f.title, verdict=verdict,
+                     detail=f.detail, reported_by=[f], rationale=rationale)
+
+
+def _judge_listing(clusters: list[list[Finding]],
+                   budget: int = MAX_LISTING_CHARS) -> tuple[str, list[Finding]]:
+    """The findings as the judge sees them: one numbered line per REVIEWER
+    account, with the pre-clustering offered as a hint underneath.
+
+    Individually, because the judge cannot merge what it was shown already
+    merged — the previous listing gave it one line per positional bucket, so the
+    duplicates it *did* spot (its own output said "duplicate of [12]") were ones
+    it had no verb to act on. Returns (listing, flat) where `flat[i]` is the
+    finding the judge knows as `[i]`.
+
+    Budgeted, because the whole prompt is ONE argv entry and Linux caps that at
+    128 KiB: a panel of four reviewers each allowed RAW_DETAIL_CHARS would
+    otherwise fail the review outright with E2BIG. Long accounts are cut first,
+    then whole lines — and `flat` still holds every finding, numbered as the
+    judge sees it, so an omitted report is simply never claimed and survives as
+    unjudged rather than disappearing."""
+    flat: list[Finding] = []
+    groups: list[range] = []
+    for grp in clusters:
+        start = len(flat)
+        flat.extend(grp)
+        if len(grp) > 1:
+            groups.append(range(start, len(flat)))
+
+    lines: list[str] = []
+    used = 0
+    for i, f in enumerate(flat):
+        said = _account(f)
+        if len(said) > LISTING_ACCOUNT_CHARS:
+            said = said[:LISTING_ACCOUNT_CHARS] + " …[account truncated]"
+        line = (f"[{i}] {f.severity} {f.file}:{f.line or '?'} "
+                f"(reported by {f.reviewer}) — {said}")
+        if used + len(line) + 1 > budget:
+            break
+        lines.append(line)
+        used += len(line) + 1
+    shown = len(lines)
+
+    hints = [", ".join(f"[{i}]" for i in rng if i < shown) for rng in groups]
+    hints = [h for h in hints if "], [" in h]
+    if hints:
+        lines.append("\nSame file and adjacent lines (a hint, not a ruling — merge only "
+                     "if they are genuinely the same defect): " + "; ".join(hints))
+    if shown < len(flat):
+        lines.append(f"\n({len(flat) - shown} further report(s) omitted — the listing "
+                     f"hit its {budget:,}-character budget. They are KEPT as unjudged "
+                     "findings; rule only on what is above.)")
+    return "\n".join(lines), flat
+
+
+def _member_ids(raw) -> list[int]:
+    """The report ids a verdict merges, as the ints they plainly are.
+
+    A digit string and an integral float are both taken at face value: an LLM
+    quoting `"members": ["0", "1"]`, or a JSON `2.0` that Python parses as a
+    float, has told us exactly which report it meant, and dropping either would
+    silently un-merge the finding. A non-integral float is not a report id, so
+    it is dropped like any other junk."""
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for m in raw:
+        if isinstance(m, bool):
+            continue
+        if isinstance(m, int):
+            out.append(m)
+        elif isinstance(m, float) and m.is_integer():
+            out.append(int(m))
+        elif isinstance(m, str) and m.strip().isdigit():
+            out.append(int(m.strip()))
+    return out
+
+
+def _ruling(raw) -> str:
+    """The judge's verdict on one issue, from its ``real`` flag.
+
+    Only ``real: false`` dismisses. The flag used to be read for truthiness, so
+    `0`, `""` and `[]` — the shapes a malformed reply takes — silently dismissed
+    findings, which is the one thing this module promises never to do. An absent
+    flag still confirms (the judge listed the issue; it merely omitted the
+    field); anything else is a ruling we cannot read, and an unreadable ruling is
+    no ruling."""
+    if raw is False:
+        return "dismissed"
+    if raw is True or raw is None:
+        return "confirmed"
+    return "unjudged"
+
+
+def _parse_verdicts(parsed: list, flat: list[Finding], pr: int) -> list[Canonical]:
+    """Turn the judge's reply into canonical findings.
+
+    Defensive in one direction only: a malformed reply must never SUPPRESS a
+    finding. Records naming no valid account are dropped (they attribute to
+    nobody and would credit a reviewer that said nothing); an account claimed
+    twice stays with the first record that claimed it, since two canonical
+    findings sharing one account would double-count it in every per-reviewer
+    statistic; and anything the judge never mentioned survives as its own
+    unjudged record.
+
+    A dropped verdict is SAID (on stderr), never merely dropped: a judge that
+    answers with `"members": ["F01"]` — its own issue labels where report numbers
+    belong — loses every merge it made, and without a word about it the run reads
+    exactly like one where the judge found no duplicates.
+    """
+    out: list[Canonical] = []
+    claimed: set[int] = set()
+    links: list[tuple[Canonical, str | None, list]] = []   # (record, judge's id, its `related`)
+    dropped: list[str] = []
+    for v in parsed:
+        if not isinstance(v, dict):
+            continue
+        # dict.fromkeys: one verdict listing the same report twice must not
+        # credit its reviewer twice.
+        members = list(dict.fromkeys(
+            i for i in _member_ids(v.get("members"))
+            if 0 <= i < len(flat) and i not in claimed))
+        if not members:
+            if v.get("members"):
+                dropped.append(f"{v.get('id') or '?'}: members={v.get('members')!r}")
+            continue
+        claimed.update(members)
+        accounts = [flat[i] for i in members]
+        rep = min(accounts, key=lambda f: f.severity)      # P1 < P2 < P3 lexically
+        # The judge writes a one-line synthesis and no body, so the body is the
+        # worst report's own. Falling back to the whole joined account instead
+        # would put a detail — up to RAW_DETAIL_CHARS of it — in the synthesis,
+        # which the board stores as the title.
+        synthesis = str(v.get("synthesis") or v.get("title") or "").strip()
+        c = Canonical(
+            id=_finding_id(pr, len(out) + 1),
+            severity=_severity(v.get("severity"), rep.severity),
+            file=str(v.get("file") or rep.file),
+            line=v.get("line") if isinstance(v.get("line"), int) else rep.line,
+            synthesis=synthesis or rep.title,
+            verdict=_ruling(v.get("real")),
+            detail=rep.detail,
+            reported_by=accounts,
+            rationale=str(v.get("reason") or v.get("rationale") or "").strip(),
+        )
+        out.append(c)
+        rel = v.get("related")
+        links.append((c, str(v["id"]) if v.get("id") is not None else None,
+                      rel if isinstance(rel, list) else []))
+
+    if dropped:
+        print(f"panel: judge verdict(s) named no valid report id and were dropped "
+              f"(their findings are kept, unjudged): {'; '.join(dropped)}",
+              file=sys.stderr)
+
+    # `related` is resolved from the judge's own ids to ours, and only within
+    # this reply: a link to something that is not here names nothing.
+    #
+    # An id the judge used TWICE resolves to nothing rather than to whichever
+    # record happened to be built last: a link is a claim about which finding,
+    # and a wrong one sends the fixer to unrelated code. Ids are compared as
+    # strings, so `1` and `"1"` are one identifier — which is the point, since
+    # the judge that writes both means one issue; a genuine clash is caught here
+    # as the duplicate it looks like.
+    seen: dict[str, str | None] = {}
+    for c, jid, _ in links:
+        if jid is not None:
+            seen[jid] = None if jid in seen else c.id
+    ambiguous = sorted(k for k, v in seen.items() if v is None)
+    if ambiguous:
+        print(f"panel: judge reused issue id(s) {', '.join(ambiguous)} — `related` "
+              "links naming them left unresolved", file=sys.stderr)
+    by_judge_id = {k: v for k, v in seen.items() if v}
+    for c, _, rel in links:
+        c.related = sorted({by_judge_id[str(r)] for r in rel
+                            if str(r) in by_judge_id} - {c.id})
+
+    # Never suppress: a finding the judge skipped is kept, unruled.
+    for i, f in enumerate(flat):
+        if i not in claimed:
+            out.append(_unmerged(f, pr, len(out) + 1, "unjudged", "unjudged"))
+    return out
+
+
+def adjudicate(clusters: list[list[Finding]], diff: str, model: str, pr: int,
+               budget: int = MAX_DIFF_CHARS,
+               coverage: dict[str, list[str]] | None = None
+               ) -> tuple[list[Canonical], str | None, str]:
+    """The 'master' rules on every finding, merges the duplicates it finds, AND
+    rules on the coverage the reviewers declared about themselves.
+
+    Returns (canonical findings, skip_reason, coverage_note). skip_reason is None
+    when the judge ran (even if it dismissed nothing); otherwise it explains WHY
+    it could not rule — CLI absent, timeout, crash, unparseable output — so the
+    caller can surface that rather than a bare 'unavailable'.
+
+    The coverage ruling is one extra key in the object the judge already returns,
+    so it costs no additional model call — and its own reply may still be the
+    bare verdict array an earlier judge returned, in which case there is simply
+    no coverage note.
+
+    Declarations with no findings still run the judge: that is the round where
+    "clean versus could-not-tell" most needs adjudicating — two members saying
+    they could not read the migration while a third reports clean is a split, and
+    a finding count of zero says nothing about it.
+
+    Merging lives here because this is the only step that reads every account and
+    can write a new one. Upstream, dedup could only ever pick a survivor and
+    discard the rest; the judge can say what the reviewers jointly found, and the
+    originals ride along untouched in ``reported_by``.
+
+    A real bug from a single reviewer is confirmed; only genuine false positives
+    are dismissed (style and polish are kept). When the judge can't rule, every
+    finding is returned unmerged and unjudged — nothing is silently suppressed.
+    Neither findings NOR declarations -> ([], None, ""): nothing to rule on.
+    """
     declared = {k: v for k, v in (coverage or {}).items() if v}
-    if not groups and not declared:
-        return {}, None, ""
-    if not shutil.which("claude"):
-        return {}, "judge: claude CLI absent", ""
-    listing = "\n".join(
-        f"[{i}] {f.severity} {f.file}:{f.line or '?'} (via {', '.join(revs)}) — "
-        f"{f.title} — {f.detail}"
-        for i, (f, revs) in enumerate(groups)) \
-        or ("- (no findings this round — there is nothing to adjudicate but the "
-            "coverage below; return an empty `verdicts` array)")
+    if not any(clusters) and not declared:
+        return [], None, ""
+    # The listing takes what the diff leaves under ARGV_BUDGET. That ceiling is
+    # no longer the kernel's — since #38 this prompt goes on stdin, where there
+    # is none — but the sharing rule it encodes still earns its place: the
+    # listing is the component that grows with the panel's output, so without a
+    # share it is the diff that gets squeezed out of the model's CONTEXT
+    # instead. Same arithmetic, a budget that is now about the model rather than
+    # about execve.
+    diff_text = diff[:budget]
     stated = "\n".join(f"- {name}: could not assess {'; '.join(items)}"
                        for name, items in sorted(declared.items())) \
         or "- (no reviewer declared a gap in its coverage)"
-    prompt = JUDGE_PROMPT.format(findings=listing, coverage=stated, diff=diff[:budget])
-    args = ["claude", "-p", prompt] + (["--model", model] if model else [])
-    out, err = run_cli(args, "judge")
+    listing, flat = _judge_listing(
+        clusters,
+        max(4_000, ARGV_BUDGET - len(diff_text) - len(JUDGE_PROMPT) - len(stated)))
+    listing = listing or ("- (no findings this round — there is nothing to adjudicate "
+                          "but the coverage below; return an empty `verdicts` array)")
+
+    def unruled(reason: str, note: str = "") -> tuple[list[Canonical], str, str]:
+        return [_unmerged(f, pr, i + 1, "unjudged", "unjudged")
+                for i, f in enumerate(flat)], reason, note
+
+    if not shutil.which("claude"):
+        return unruled("judge: claude CLI absent")
+    # On stdin, like the reviewers, and for a sharper reason: the judge's prompt
+    # is the only one with a component no budget could cover. The findings
+    # listing grows with the panel's output, so a legal judge_max_diff_chars
+    # plus a long panel used to cross the argv limit on its own — and a judge
+    # that dies takes every finding through UNADJUDICATED, which reads like a
+    # triaged review rather than like a failure.
+    prompt = JUDGE_PROMPT.format(findings=listing, coverage=stated, diff=diff_text)
+    args = ["claude", "-p"] + (["--model", model] if model else [])
+    out, err = run_cli(args, "judge", stdin_text=prompt)
     if err:
-        return {}, err, ""
+        return unruled(err)
     parsed = extract_json_value(out)
     note = ""
     if isinstance(parsed, dict):
@@ -1258,41 +1852,28 @@ def judge(groups: list[tuple[Finding, list[str]]], diff: str, model: str,
     if not isinstance(parsed, list):
         # With nothing to adjudicate, a reply that carries only the coverage note
         # is a complete answer — not a judge that failed to rule.
-        if not groups:
-            return {}, None, note
-        return {}, "judge: no JSON verdict in output (unparseable)", note
-    verdicts: dict[int, dict] = {}
-    for v in parsed:
-        if isinstance(v, dict) and isinstance(v.get("id"), int):
-            verdicts[v["id"]] = v
-    return verdicts, None, note
+        if not flat:
+            return [], None, note
+        return unruled("judge: no JSON verdict in output (unparseable)", note)
+    return _parse_verdicts(parsed, flat, pr), None, note
 
 
 # ----------------------------------------------------------------------------- rounds
 
-def finding_key(file: str | None, title: str) -> str:
-    """Identity of the DEFECT, so the same issue raised in round 1 and again in
-    round 2 is one thing seen twice rather than two things.
+def _same_file(a: str, b: str) -> bool:
+    """Do two path spellings name the same file? Equal, or one a path-suffix of
+    the other (``reviews.py`` vs ``app/api/reviews.py``) — but never two distinct
+    paths that merely end in the same basename.
 
-    File plus a normalised title, deliberately **without** the line: the line
-    moves when the fix above it lands, and an identity that moves links nothing.
-
-    Must stay byte-identical to ``app.api.reviews._derive_key`` (and its SQL twin
-    in the board's migration 0012). The board derives this key for any payload
-    that arrives without one, so a panel that computed it differently would put
-    the local round-over-round diff and the board's cross-run chains on two
-    different notions of "the same finding" — and only one of them would be
-    visible to the person reading the stats.
-
-    Known limitation, and the reason :func:`Baseline.raised_before` exists: the
-    title is whichever group member won the merge, so a defect described one way
-    in round 1 and another way in round 2 hashes to two different keys. Rewording
-    must not turn a persistent defect into a new one, so the ROUND diff matches
-    on the key OR on a near-identical title in the same file; the board's chains
-    stay on the exact key, because that is the identity it shares with the SQL."""
-    norm = re.sub(r"[^a-z0-9]+", " ", (title or "").lower()).strip()
-    return hashlib.md5(f"{file or ''}|{norm}".encode(),
-                       usedforsecurity=False).hexdigest()[:16]
+    Reviewers spell paths differently, and round 1 may have recorded a defect
+    under the short spelling and round 2 under the long one. Clustering does NOT
+    use this — it keys on the full path, deliberately (see
+    :func:`cluster_findings`) — and the two rules agree where it matters: neither
+    will ever treat ``api/tests/test_x.py`` and ``web/tests/test_x.py`` as one
+    file."""
+    if a == b:
+        return True
+    return a.endswith("/" + b) or b.endswith("/" + a)
 
 
 #: How alike two titles for the same file must read before the round diff treats
@@ -1320,28 +1901,41 @@ class Baseline:
     cycle: str | None = None
     problems: list[str] = field(default_factory=list)
 
-    def raised_before(self, file: str | None, title: str) -> bool:
+    def raised_before(self, finding: Canonical) -> bool:
         """Did an earlier round raise this defect — under this key, or under a
         near-identical title in the same file?
 
-        "The same file" is suffix-aware, exactly as :func:`_same_file` is for
-        grouping. Reviewers spell paths differently (``reviews.py`` vs
-        ``app/api/reviews.py``) and the representative keeps the longest spelling,
-        so a round where only the short-path reviewer raised the defect hashes to
-        a different key AND used to fail the title check — a persistent defect
-        counted as new, which buys a fix cycle nobody needed.
+        The key is the finding's own (:func:`_defect_key`), so this compares the
+        identity the payload carries rather than re-deriving one. The title
+        fallback is for the reviewer that re-words its own report between rounds:
+        the key is built from the reporters' words, so any rewording would
+        otherwise land a persistent defect in `new_findings` and report the fix
+        as having broken something. "The same file" is suffix-aware
+        (:func:`_same_file`), since a round where only the short-path reviewer
+        raised the defect hashes to a different key too.
         """
-        if finding_key(file, title) in self.keys:
+        if finding.key in self.keys:
             return True
-        norm = re.sub(r"[^a-z0-9]+", " ", (title or "").lower()).strip()
+        norm = _norm_title(_defect_title(finding.reported_by))
         if not norm:
             return False
         return any(
-            _same_file(file or "", was_file)
+            _same_file(finding.file or "", was_file)
             and difflib.SequenceMatcher(None, norm, was).ratio() >= REWORD_RATIO
             for was, was_files in self.titles.items()
             for was_file in was_files
         )
+
+
+def _baseline_title(f: dict) -> str:
+    """The title an earlier round's serialised finding is identified by: the same
+    lexicographically-first reporter title :func:`_defect_key` hashed, read back
+    out of the payload. Falls back to the judge's synthesis for a record that
+    carries no accounts, which is the most that can be said about it."""
+    titles = sorted(t for t in (str(r.get("title", "")).strip()
+                                for r in f.get("reported_by") or []
+                                if isinstance(r, dict)) if t)
+    return titles[0] if titles else str(f.get("synthesis") or "")
 
 
 def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
@@ -1351,6 +1945,12 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
     Keyed on what was RAISED, not on what was confirmed: a finding the judge
     dismissed in round 1 and a reviewer raises again in round 2 is not new
     information, and counting it as new is how a loop fails to converge.
+
+    The key is READ from the payload rather than re-derived: the panel has sent
+    one with every finding since the merge moved into the judge, and it is the
+    same identity the board chains runs on. A payload that carries none (a
+    hand-written baseline, a record from before the field) falls back to the same
+    recipe over the reporters' titles.
 
     A baseline that cannot be read is reported rather than swallowed. Its absence
     makes every finding look new, which reads as "the fix broke things" — the
@@ -1437,9 +2037,9 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
             for f in payload.get(bucket) or []:
                 if not isinstance(f, dict):
                     continue
-                file, title = f.get("file"), str(f.get("title", ""))
-                b.keys.add(str(f.get("key") or "") or finding_key(file, title))
-                norm = re.sub(r"[^a-z0-9]+", " ", title.lower()).strip()
+                file, title = f.get("file"), _baseline_title(f)
+                b.keys.add(str(f.get("key") or "") or _key_from_title(file, title))
+                norm = _norm_title(title)
                 if norm:
                     b.titles.setdefault(norm, set()).add(file or "")
     if cycles:
@@ -1480,7 +2080,7 @@ def coverage_veto(reviewer_meta: dict[str, dict], judge_skip: str | None,
 
 
 def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
-               confirmed: list[Finding], veto: list[str],
+               confirmed: list[Canonical], veto: list[str],
                baseline_ok: bool = True, repeated: int = 0) -> dict:
     """Whether the panel/fix cycle should go again, and what decided it.
 
@@ -1504,7 +2104,7 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     The cap is what stops rule 3 running forever when two reviewers disagree
     about a P4 — the cycle ends either way, and a cap reached with work
     outstanding is recorded as such rather than as convergence."""
-    blockers = [f for f in confirmed if f.severity in ("P1", "P2")]
+    blockers = [c for c in confirmed if c.severity in ("P1", "P2")]
     if new_keys:
         stop, reason = False, (f"{len(new_keys)} finding(s) no earlier round raised")
     elif blockers:
@@ -1536,6 +2136,78 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
 
 
 # ----------------------------------------------------------------------------- run
+
+def _payload_defaults() -> dict:
+    """Every key a run payload carries, valued as "this run never got that far".
+
+    One shape on every non-error exit, because the skip-pattern path emits a
+    payload too: a consumer reading `payload['judged']` or `payload['run_key']`
+    should not have to know which exit produced it. It used to be a hand-written
+    literal of nine keys against this one's two dozen, so the skipped PR — the
+    case that payload exists FOR — was the one that raised KeyError."""
+    return {
+        "changed_lines": 0,
+        "reviewed": False,
+        "skip_reason": None,
+        # Where a run sits in the panel -> fix -> panel cycle. Defaulted here too,
+        # so the skipped PR answers `payload['round_stop']` with "no cycle ran"
+        # rather than with a KeyError.
+        "round": 1,
+        "cycle": None,
+        "prior_rounds": 0,
+        "prior_findings": 0,
+        "new_findings": 0,
+        "new_finding_keys": [],
+        "round_stop": None,
+        "stop_reason": None,
+        "coverage_note": None,
+        "diff_truncated": False,
+        "diff_chars": 0,
+        "diff_budgets": {},
+        "config_notes": [],
+        "sonar_gate": "skipped",
+        "ci_status": "unknown",
+        "ci_failing": [],
+        "judged": False,
+        "judge_model": None,
+        "judge_skip": None,
+        "reviewers_ran": [],
+        "reviewers": {},
+        "reviewers_selected": [],
+        "reviewers_override": None,
+        "to_fix": [],
+        "sonar_findings": [],
+        "dismissed": [],
+        "skipped": [],
+    }
+
+
+def fit_comment(report: str, limit: int = COMMENT_CHARS) -> str:
+    """The report, cut to fit a GitHub comment (65,536 chars, hard).
+
+    The per-reviewer accounts are the part that grows without bound — one block
+    per reporter per merged finding — so they go first and the verdicts survive;
+    a report still over the limit is cut with a marker. The terminal copy is
+    never trimmed, and neither are `--json` or the board record: this is about
+    what `--post` can physically send, and a review that succeeded must not be
+    lost to a comment one account too long.
+
+    The round verdict is the one block a cut is taken AROUND rather than through:
+    it sits at the foot of the report, it is what the caller of a cycle acts on,
+    and a truncation from the end would drop precisely it."""
+    if len(report) <= limit:
+        return report
+    note = ("\n\n_Per-reviewer accounts omitted — the full report exceeds GitHub's "
+            "comment limit. They are intact in `--json` and on the board._")
+    trimmed = "\n".join(ln for ln in report.splitlines() if not ln.startswith("  - _"))
+    if len(trimmed) + len(note) <= limit:
+        return trimmed + note
+    cut = ("\n\n_…report truncated at GitHub's comment limit. The full run is in "
+           "`--json` and on the board._")
+    head, sep, tail = trimmed.partition("\n\n" + ROUNDS_HEADING)
+    tail = sep + tail if sep else ""
+    return head[:max(0, limit - len(cut) - len(tail))] + cut + tail
+
 
 def run(repo_name: str, pr_number: int, post: bool, json_out: bool = False,
         reviewers: str | None = None, json_file: str = "", record: bool = True,
@@ -1572,14 +2244,33 @@ def run(repo_name: str, pr_number: int, post: bool, json_out: bool = False,
     title, base = meta["title"], meta["baseRefName"]
     changed = meta["additions"] + meta["deletions"]
 
+    # Progress goes to stderr in --json mode, so stdout is the payload and only
+    # the payload: it is a machine-readable artifact, and a consumer that has to
+    # strip a two-line preamble before parsing is one preamble away from breaking.
+    chatter = sys.stderr if json_out else sys.stdout
+
     # Title-pattern skip (merges/promotes/format-the-world — not worth LLM review)
     for pat in panel.get("skip_title_patterns", []):
         if re.search(pat, title, re.I):
             print(f"[{repo_name}#{pr_number}] '{title[:50]}' matches skip pattern "
-                  f"/{pat}/ — not worth panel review. Skipping.")
+                  f"/{pat}/ — not worth panel review. Skipping.", file=chatter)
+            if json_out:
+                # A consumer gets a payload on every non-error exit, or "reviewed
+                # and found nothing" and "never reviewed at all" arrive as the
+                # same empty stdout — and the second one silently reads as a
+                # clean PR. Same SHAPE as a reviewed run, too, so reading any
+                # other key of it is not a KeyError. Not recorded on the board:
+                # no review happened.
+                print(json.dumps({
+                    **_payload_defaults(),
+                    "repo": repo_name, "github": gh_repo, "pr": pr_number,
+                    "title": title, "base": base,
+                    "skip_reason": f"title matches skip pattern /{pat}/",
+                    "run_key": run_key,
+                }, indent=2))
             return 0
-    print(f"\n[{repo_name}#{pr_number}] {title[:60]}")
-    print(f"  base={base}  changed={changed} lines\n")
+    print(f"\n[{repo_name}#{pr_number}] {title[:60]}", file=chatter)
+    print(f"  base={base}  changed={changed} lines\n", file=chatter)
 
     try:
         diff = sh(["gh", "pr", "diff", str(pr_number), "--repo", gh_repo])
@@ -1599,12 +2290,26 @@ def run(repo_name: str, pr_number: int, post: bool, json_out: bool = False,
     budgets = {name: diff_budget(rev.get(name, {}), "max_diff_chars", panel_budget, notes)
                for name in LLM_REVIEWERS if name in selected}
     judge_budget = diff_budget(panel, "judge_max_diff_chars", panel_budget, notes)
-    truncated_for = {n: b for n, b in budgets.items() if len(diff) > b}
-    truncated = bool(truncated_for)
 
     def prompt_for(budget: int) -> str:
         return REVIEW_PROMPT.format(n=pr_number, repo=gh_repo, base=base,
                                     diff=diff[:budget])
+
+    # `agy` is the only reviewer whose prompt must travel in argv, so it is the
+    # only one the kernel can veto. Clamp it to what execve will carry and say
+    # so — the alternative, honouring the number and dying at exec, is how a
+    # panel came to report "LLM reviewers ran: none" as a clean review.
+    if "antigravity" in budgets:
+        fitted = fit_argv_budget(prompt_for, budgets["antigravity"])
+        if fitted < budgets["antigravity"]:
+            notes.append(
+                f"`max_diff_chars`={budgets['antigravity']:,} exceeds what fits in one "
+                f"argv element ({ARGV_PROMPT_MAX_BYTES:,} bytes) — antigravity gets "
+                f"{fitted:,}. It is the one CLI with no way to read a prompt off stdin.")
+            budgets["antigravity"] = fitted
+
+    truncated_for = {n: b for n, b in budgets.items() if len(diff) > b}
+    truncated = bool(truncated_for)
 
     result = PanelResult()
     # Resolved ONCE, so the label in the report cannot drift from the model that
@@ -1685,23 +2390,25 @@ def run(repo_name: str, pr_number: int, post: bool, json_out: bool = False,
         if ci_skip:
             result.skipped.append(ci_skip)
 
-    # Dedup, then let the master judge each finding on its merits (no consensus gate).
-    groups = group_findings(llm_findings)
+    # Pre-cluster as a hint, then let the master MERGE the duplicates and rule on
+    # each issue in one step (no consensus gate). Dedup cannot happen upstream of
+    # the judge without discarding what the other reviewers said — see adjudicate.
+    clusters = cluster_findings(llm_findings)
     coverage = {n: m.get("could_not_assess") or [] for n, m in reviewer_meta.items()}
-    verdicts, judge_skip, coverage_note = judge(
-        groups, diff, panel.get("judge_model", ""), judge_budget, coverage)
-    judged = judge_skip is None and bool(groups)
-    to_fix, dismissed = [], []
-    for i, (f, revs) in enumerate(groups):
-        v = verdicts.get(i)
-        if v is None:                       # no verdict → keep it (never suppress)
-            to_fix.append((f, revs, "" if judged else "unjudged"))
-        elif v.get("real", True):
-            f.severity = str(v.get("severity", f.severity)).upper()
-            to_fix.append((f, revs, v.get("reason", "")))
-        else:
-            dismissed.append((f, revs, v.get("reason", "")))
-    to_fix.sort(key=lambda e: e[0].severity)
+    findings, judge_skip, coverage_note = adjudicate(
+        clusters, diff, panel.get("judge_model", ""), pr_number, judge_budget, coverage)
+    judged = judge_skip is None and bool(findings)
+    to_fix = sorted((c for c in findings if c.verdict != "dismissed"),
+                    key=lambda c: c.severity)
+    dismissed = [c for c in findings if c.verdict == "dismissed"]
+    # Sonar's hard-gate issues never reach the judge, so each is a canonical
+    # record of its own single account — numbered after the judged ones, since
+    # `related` is resolved against ids that must be unique across the payload.
+    sonar = [Canonical(id=_finding_id(pr_number, len(findings) + i + 1),
+                       severity=f.severity, file=f.file, line=f.line,
+                       synthesis=f.title, verdict="sonar", reported_by=[f],
+                       rationale=f.detail)          # the Sonar rule that fired
+             for i, f in enumerate(result.sonar_findings)]
 
     # ---- this round against the ones before it. Mechanical: which findings are
     # ones no earlier round raised, and does that make the loop done?
@@ -1710,52 +2417,55 @@ def run(repo_name: str, pr_number: int, post: bool, json_out: bool = False,
                            "round": round_no})
     prior_keys, prior_rounds = prior.keys, len(prior.rounds)
     notes.extend(prior.problems)
+    seen_before: dict[str, bool] = {}
+
+    def is_new(c: Canonical) -> bool:
+        """Did no earlier round raise this? One predicate for the round diff, the
+        🆕 marker and the serialised `new_this_round`, so the payload cannot
+        disagree with the report about which findings are fresh. Memoised: the
+        reworded-title fallback is a sequence comparison against every title the
+        baseline holds."""
+        if c.key not in seen_before:
+            seen_before[c.key] = prior.raised_before(c)
+        return not seen_before[c.key]
+
     # Every finding the cycle has to clear, not just the judged ones: Sonar's
     # hard-gate issues MUST end up resolved (/panel-review-pr §3), so a round
     # whose only outstanding item is a new or still-open gate issue is not a dry
     # round. Leaving them out classified exactly that as convergence and ended the
     # cycle without another fixer.
-    outstanding = [f for f, _, _ in to_fix] + list(result.sonar_findings)
-    # Reworded findings count as raised before, not as fresh damage — see
-    # Baseline.raised_before.
-    seen_before = {finding_key(f.file, f.title): prior.raised_before(f.file, f.title)
-                   for f in outstanding}
-    new_keys = sorted(k for k, before in seen_before.items() if not before)
-    flagged = sum(1 for f, _, _ in to_fix if f.needs_rereview)
+    outstanding = to_fix + sonar
+    new_keys = sorted({c.key for c in outstanding if is_new(c)})
+    flagged = sum(1 for c in to_fix if c.needs_rereview)
     # A baseline that could not be read, could not be attributed, or was never
     # passed is a veto in its own right, not just a lost confidence flag: the
     # operator is told to LIST the vetoes, and "not convergence" with an empty
     # list leaves the one question this exists to answer unanswered.
     veto = coverage_veto(reviewer_meta, judge_skip, flagged, len(diff)) + prior.problems
     stop = round_stop(round_no, cap, new_keys, outstanding, veto, not prior.problems,
-                      repeated=sum(1 for before in seen_before.values() if before))
+                      repeated=len({c.key for c in outstanding if not is_new(c)}))
     # A cycle's rounds share one id, inherited from the earliest baseline, so the
     # board can tell "the re-review of THIS declaration" from "whatever ran next
     # on this PR". Round 1 (and any run with no usable baseline) mints its own.
     cycle = prior.cycle or run_key
 
-    def loc(f: Finding) -> str:
-        return f"{f.file}:{f.line}" if f.line else f.file
+    def loc(x: Canonical | Finding) -> str:
+        return f"{x.file}:{x.line}" if x.line else x.file
 
     # ---- the run, as data. Built on every path, not just --json: it is what
     # --json prints, what --json-file writes, and what gets recorded on the
     # board. One structure, so the fix loop and the stats can never be looking
-    # at different accounts of the same review.
-    def ser(f: Finding, revs: list[str], reason: str) -> dict:
-        key = finding_key(f.file, f.title)
-        return {"severity": f.severity, "file": f.file, "line": f.line,
-                "title": f.title, "detail": f.detail, "reviewers": revs,
-                "reason": reason,
-                # Sent rather than left to the board to derive: the two recipes
-                # are the same one, and sending it keeps the local round diff and
-                # the board's chains provably on the same identity.
-                "key": key,
-                "new_this_round": not prior.raised_before(f.file, f.title),
-                "needs_rereview": f.needs_rereview,
-                "rereview_by": list(f.rereview_by)}
+    # at different accounts of the same review — and one finding record per
+    # defect, carrying every reviewer's own report, so a consumer reads the merge
+    # instead of re-deriving it from an over-counted list.
     payload = {
+        **_payload_defaults(),
         "repo": repo_name, "github": gh_repo, "pr": pr_number,
         "title": title, "base": base, "changed_lines": changed,
+        # Always True in a payload the BOARD sees — the skip path returns before
+        # `record_run` because no review happened. It is here for `--json`
+        # consumers, which get both shapes and need to tell them apart.
+        "reviewed": True,
         "diff_truncated": truncated,
         # Where this run sits in the panel -> fix -> panel cycle, and what the
         # mechanical stopping rule made of it.
@@ -1781,10 +2491,13 @@ def run(repo_name: str, pr_number: int, post: bool, json_out: bool = False,
         "reviewers": reviewer_meta,
         "reviewers_selected": sorted(selected),
         "reviewers_override": override_note,
-        "to_fix": [ser(f, revs, reason) for f, revs, reason in to_fix],
-        "sonar_findings": [ser(f, [f.reviewer], f.detail)
-                           for f in result.sonar_findings],
-        "dismissed": [ser(f, revs, reason) for f, revs, reason in dismissed],
+        # `new_this_round` is added HERE rather than on the record: it is a fact
+        # about this run's comparison against a baseline, not a property of the
+        # defect, and a Canonical that carried it would have to be told about a
+        # baseline to know its own shape.
+        "to_fix": [{**c.as_dict(), "new_this_round": is_new(c)} for c in to_fix],
+        "sonar_findings": [{**c.as_dict(), "new_this_round": is_new(c)} for c in sonar],
+        "dismissed": [{**c.as_dict(), "new_this_round": is_new(c)} for c in dismissed],
         "skipped": result.skipped,
         "run_key": run_key,
     }
@@ -1823,32 +2536,50 @@ def run(repo_name: str, pr_number: int, post: bool, json_out: bool = False,
     if record:
         record_run(payload)
 
-    # ---- machine-readable mode: emit findings as JSON, no report/post.
-    # The /panel skill consumes this to drive its fix → verify → commit → push
-    # loop.
+    # ---- machine-readable mode: the whole run as JSON, no report/post. Same
+    # shape as the skip-pattern exit's payload, so a consumer can read any key of
+    # either without checking which exit it came from.
     if json_out:
         print(json.dumps(payload, indent=2))
         return finish()
 
-    def conf(revs: list[str]) -> str:
+    def conf(c: Canonical) -> str:
+        revs = c.reviewers
         return f" _(via {', '.join(revs)}{' ⋆consensus' if len(revs) > 1 else ''})_"
+
+    def accounts(c: Canonical) -> list[str]:
+        """What each reviewer actually said, under a MERGED finding.
+
+        The synthesis is the judge's statement of the issue; these are the
+        reports it was made from, and they are shown because one reviewer
+        routinely makes a point the others didn't. Truncated here (the whole
+        report is a PR comment) but kept whole in `--json` and on the board."""
+        if len(c.reported_by) < 2:
+            return []
+        out = []
+        for f in c.reported_by:
+            said = _account(f)
+            cut = said[:ACCOUNT_CHARS] + ("…" if len(said) > ACCOUNT_CHARS else "")
+            out.append(f"  - _{f.reviewer}_ ({f.severity} `{loc(f)}`): {cut}")
+        return out
 
     # ---- report
     heading = f"## Reviewer panel — PR #{pr_number}"
-    if round_no > 1 or prior_rounds:
-        heading += f" · round {round_no}"
-    lines = [heading, ""]
     # One predicate for the heading and the summary beneath it: a baseline that
     # parsed but held no findings is still an earlier round, and used to produce a
     # "· round 1" heading with nothing under it.
-    if round_no > 1 or prior_rounds:
+    in_rounds = round_no > 1 or bool(prior_rounds)
+    if in_rounds:
+        heading += f" · round {round_no}"
+    lines = [heading, ""]
+    if in_rounds:
         # Counted over everything the cycle has to clear (Sonar's hard gate
         # included), so the numerator and the denominator are the same population.
         lines.append(f"**Round {round_no}** — re-reviewing after the fix. "
                      f"{len(new_keys)} of {len(outstanding)} finding(s) here were raised by "
                      f"no earlier round ({len(prior_keys)} known from {prior_rounds} earlier "
                      f"round{'s' if prior_rounds != 1 else ''}).")
-    ci_txt = {"PASS": "✅ PASS", "FAIL": "❌ FAIL", "PENDING": "⏳ pending",
+    ci_txt ={"PASS": "✅ PASS", "FAIL": "❌ FAIL", "PENDING": "⏳ pending",
               "none": "no checks reported", "unknown": "unknown"}.get(ci_status, ci_status)
     lines.append(f"**CI (`gh pr checks`, hard gate):** {ci_txt}")
     if ci_failing:
@@ -1877,7 +2608,7 @@ def run(repo_name: str, pr_number: int, post: bool, json_out: bool = False,
     # is the failure mode worth shouting about.
     for skip in llm_skipped:
         lines.append(f"  - ⚠️ **not reviewed** — {skip}")
-    if not groups:
+    if not findings:
         judge_txt = ("ruled on coverage only — no findings to judge" if coverage_note
                      else "n/a — no findings to judge")
     elif judged:
@@ -1896,30 +2627,39 @@ def run(repo_name: str, pr_number: int, post: bool, json_out: bool = False,
 
     lines.append(f"\n### To fix ({len(to_fix)}) — master-confirmed, any reviewer count")
     if to_fix:
-        for f, revs, reason in to_fix:
-            tail = f" — {reason}" if reason and reason != "unjudged" else ""
+        for c in to_fix:
+            tail = f" — {c.rationale}" if c.rationale and c.rationale != "unjudged" else ""
+            rel = f" _(same decision as {', '.join(c.related)})_" if c.related else ""
+            # Said per finding, not only in the header: the rationale is blank
+            # for these, so an unruled finding otherwise renders identically to
+            # an adjudicated one under a header naming the judge.
+            unruled = " _(unjudged — the master never ruled on this one)_" \
+                if c.verdict == "unjudged" else ""
             # Only where there IS an earlier round to be new against: on a first
             # round every finding is new and the marker would be decoration.
-            fresh = (" 🆕" if prior_rounds and not prior.raised_before(f.file, f.title)
-                     else "")
-            again = (" ↻ _fix needs re-reading (" + ", ".join(f.rereview_by) + ")_"
-                     if f.needs_rereview else "")
-            lines.append(f"- **{f.severity}**{fresh} `{loc(f)}` — {f.title}{conf(revs)}{tail}{again}")
+            fresh = " 🆕" if prior_rounds and is_new(c) else ""
+            again = (" ↻ _fix needs re-reading (" + ", ".join(c.rereview_by) + ")_"
+                     if c.needs_rereview else "")
+            lines.append(f"- **{c.severity}**{fresh} `{loc(c)}` [{c.id}] — {c.synthesis}"
+                         f"{conf(c)}{unruled}{tail}{rel}{again}")
+            lines += accounts(c)
     else:
         lines.append("- none")
 
-    if result.sonar_findings:
-        lines.append(f"\n### SonarCloud issues ({len(result.sonar_findings)}) — part of the gate")
-        for f in sorted(result.sonar_findings, key=lambda x: x.severity):
+    if sonar:
+        lines.append(f"\n### SonarCloud issues ({len(sonar)}) — part of the gate")
+        for c in sorted(sonar, key=lambda x: x.severity):
             # Same 🆕 rule as the judged findings: these count towards the round
             # diff too, because the gate has to end up clear either way.
-            fresh = " 🆕" if prior_rounds and not prior.raised_before(f.file, f.title) else ""
-            lines.append(f"- {f.severity}{fresh} `{loc(f)}` — {f.title}")
+            fresh = " 🆕" if prior_rounds and is_new(c) else ""
+            lines.append(f"- {c.severity}{fresh} `{loc(c)}` — {c.synthesis}")
 
     if dismissed:
         lines.append(f"\n### Dismissed by master ({len(dismissed)})")
-        for f, revs, reason in dismissed:
-            lines.append(f"- ~~{f.severity} `{loc(f)}` — {f.title}~~{conf(revs)} — {reason}")
+        for c in dismissed:
+            lines.append(f"- ~~{c.severity} `{loc(c)}` — {c.synthesis}~~"
+                         f"{conf(c)} — {c.rationale}")
+            lines += accounts(c)
 
     if result.skipped:
         lines.append("\n### Skipped reviewers\n" +
@@ -1947,7 +2687,7 @@ def run(repo_name: str, pr_number: int, post: bool, json_out: bool = False,
     # round nothing would run, and counted every finding of a first review as one
     # "no earlier round raised" — which is vacuously all of them.
     if in_cycle or prior_rounds:
-        lines.append(f"\n**Rounds:** round {round_no} of at most {cap} — {verdict}: "
+        lines.append(f"\n{ROUNDS_HEADING} round {round_no} of at most {cap} — {verdict}: "
                      + stop["reason"]
                      + (" — a stop, not convergence" if unearned else ""))
         veto_head, bullet = "  _why this round's quiet is not evidence of a quiet PR:_", "  - ⚠️ "
@@ -1971,7 +2711,8 @@ def run(repo_name: str, pr_number: int, post: bool, json_out: bool = False,
         # but it degrades the run, it doesn't void it.
         try:
             proc = subprocess.run(["gh", "pr", "comment", str(pr_number), "--repo",
-                                   gh_repo, "--body", report], capture_output=True,
+                                   gh_repo, "--body", fit_comment(report)],
+                                  capture_output=True,
                                   text=True, stdin=subprocess.DEVNULL, timeout=120)
             if proc.returncode == 0:
                 print(f"\n(posted panel summary to {gh_repo}#{pr_number})")
@@ -1995,7 +2736,7 @@ def main() -> int:
     ap.add_argument("--pr", required=True, type=int)
     ap.add_argument("--post", action="store_true", help="post summary as a PR comment")
     ap.add_argument("--json", action="store_true", dest="json_out",
-                    help="emit findings as JSON (for the /panel fix loop); no report/post")
+                    help="emit the whole run as JSON on stdout; no report/post")
     ap.add_argument("--reviewers", metavar="LIST",
                     help="comma-separated panel members to run instead of the repo's "
                          f"configured set ({', '.join(ALL_REVIEWERS)}); e.g. "

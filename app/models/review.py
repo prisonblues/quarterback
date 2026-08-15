@@ -304,11 +304,11 @@ class ReviewFindingReport(Base):
     judge's and are the raw material for calibration stats; "confirmed findings
     where pi was the sole reporter" becomes a join rather than a JSONB unnest.
 
-    Fed by callers that send ``reported_by``. ``panel.py`` does not yet — it
-    merges a group down to one representative before it serialises — so for panel
-    runs this table stays empty, the finding's own ``rereview_by`` attribution
-    carries the declaration instead, and the calibration counters stay at zero.
-    Issue #26 is where the panel starts sending the accounts.
+    Fed by callers that send ``reported_by``, ``panel.py`` among them: its merge
+    lives in the judge, which writes a new synthesis and keeps every member's own
+    report beside it. An older payload that sends reviewer NAMES only leaves this
+    table empty for its run — the finding's own ``rereview_by`` then carries what
+    attribution there is, and the calibration counters stay at zero.
     """
 
     __tablename__ = "review_finding_reports"

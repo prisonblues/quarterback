@@ -50,8 +50,10 @@ at file grain. Payloads without any of it record exactly as before, as round 1
 with nothing declared: ``could_not_assess`` is NULL for a member that said
 nothing and ``[]`` only for one that was asked and had no gap, and the two never
 collapse. ``needs_rereview`` is per reporter where the caller sends
-``reported_by``; ``panel.py`` merges before it serialises, so its runs attribute
-at the coarser ``rereview_by`` grain until issue #26.
+``reported_by`` — which ``panel.py`` now does, the merge having moved into the
+judge, so a panel run attributes the declaration to the member that made it
+rather than to everyone who happened to raise the same finding. The coarser
+``rereview_by`` remains for a caller that has only that.
 """
 
 from __future__ import annotations
@@ -179,12 +181,12 @@ class FindingIn(BaseModel):
     #: it) but does not replace it: a panel may list a member that contributed no
     #: text, and every older panel sends names only.
     #:
-    #: ``panel.py`` does not send this yet — it merges a group down to one
-    #: representative and discards each member's severity, line and detail before
-    #: serialising (issue #26 is where that changes). So for panel runs the finest
-    #: attribution that arrives is ``rereview_by`` below, and the calibration
-    #: counters, which need a reporter's own severity, stay at zero. Callers that
-    #: do send accounts — and the tests — exercise the finer path.
+    #: ``panel.py`` sends this: merging happens in its judge, which writes a new
+    #: synthesis and keeps every member's own severity, line, title and detail
+    #: beside it. So a panel run arrives at the finest attribution, and the
+    #: calibration counters — which need a reporter's own severity — are fed.
+    #: An older payload with names only still records; ``rereview_by`` below is
+    #: the coarser grain that remains for it.
     reported_by: list[ReportIn] = Field(default_factory=list)
 
     #: The panel's id for this finding *within this run* (e.g. ``"1609-F03"``).
@@ -198,7 +200,7 @@ class FindingIn(BaseModel):
     related: list[str] = Field(default_factory=list)
 
     #: A reporter declared that fixing this takes a structural change whose result
-    #: should be re-read. ``rereview_by`` names which members said so, for a panel
+    #: should be re-read. ``rereview_by`` names which members said so, for a caller
     #: that merges before it can send per-reporter accounts; where ``reported_by``
     #: carries its own flags those win, being the finer grain.
     needs_rereview: bool = False

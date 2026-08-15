@@ -138,6 +138,11 @@ is world-readable while it sits there. Separately the name is scoped by PR
 number alone, so two repos reviewing their own PR #34 overwrite each other's
 baseline and round 2 silently diffs against the wrong PR.
 
+**Run it in the background** (`run_in_background`), not as a foreground Bash
+call: a reviewer on a top-tier model at high effort can think for 20+ minutes,
+and the foreground Bash timeout caps at 10 — which kills the whole panel, not
+just the slow seat. Poll the background task instead.
+
 **Panel members** default to the repo's `.harness-rules`; pass no `--reviewers`
 unless the user named who should review ("just codex", "codex and antigravity"), then
 add `--reviewers <comma-list>` from `claude`, `codex`, `antigravity`, `sonarqube`. It

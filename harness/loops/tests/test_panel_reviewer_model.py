@@ -24,17 +24,17 @@ TOO_OLD = (
 
 def test_unpinned_codex_passes_no_model_flag():
     """Empty == the CLI's own default, which is the global default: no --model."""
-    assert panel.codex_args("", "", "review this") == ["codex", "exec", "review this"]
+    assert panel.codex_args("", "") == ["codex", "exec"]
 
 
 def test_model_and_effort_are_independent():
     """Effort is a `-c` override, not a flag, and applies to the default model
     too — so someone can raise reasoning without pinning a slug that will rot."""
-    assert panel.codex_args("", "high", "p")[-2:] == ["-c", "model_reasoning_effort=high"]
-    assert panel.codex_args("gpt-5.6-luna", "", "p") == [
-        "codex", "exec", "p", "--model", "gpt-5.6-luna"]
-    assert panel.codex_args("gpt-5.6-luna", "high", "p") == [
-        "codex", "exec", "p", "--model", "gpt-5.6-luna",
+    assert panel.codex_args("", "high")[-2:] == ["-c", "model_reasoning_effort=high"]
+    assert panel.codex_args("gpt-5.6-luna", "") == [
+        "codex", "exec", "--model", "gpt-5.6-luna"]
+    assert panel.codex_args("gpt-5.6-luna", "high") == [
+        "codex", "exec", "--model", "gpt-5.6-luna",
         "-c", "model_reasoning_effort=high"]
 
 

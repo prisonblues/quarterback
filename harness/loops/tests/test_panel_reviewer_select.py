@@ -75,11 +75,23 @@ def test_a_repo_missing_a_reviewer_block_entirely_is_fine():
 
 # ----------------------------------------------------------- antigravity argv
 
-def test_antigravity_runs_headless_and_read_only():
-    """-p is the non-interactive mode; plan is the read-only one. A reviewer
-    that can edit the tree it reviews is a bug, not a feature."""
-    args = panel.antigravity_args("", "", "review this")
-    assert args == ["agy", "--mode", "plan", "-p", "review this"]
+def test_antigravity_runs_headless_with_the_prompt_in_argv():
+    """-p is the non-interactive mode, and this is the ONE seat whose prompt has
+    to travel in argv — agy reads one from nowhere else."""
+    args = panel.antigravity_args("", "", "review this", timeout=1800)
+    assert args == ["agy", "--mode", "plan", "--print-timeout", "1800s",
+                    "-p", "review this"]
+
+
+def test_antigravity_is_told_the_same_deadline_the_panel_is_waiting():
+    """agy self-aborts at its own --print-timeout (default 5m0s) regardless of
+    how long run_cli is prepared to wait. Unset, the seat reviews on a
+    five-minute clock while the report claims the panel's full budget."""
+    args = panel.antigravity_args("", "", "p", timeout=900)
+    assert args[args.index("--print-timeout") + 1] == "900s"
+    assert panel.antigravity_args("", "", "p")[
+        panel.antigravity_args("", "", "p").index("--print-timeout") + 1
+    ] == f"{panel.CLI_TIMEOUT}s"
 
 
 def test_antigravity_pins_model_and_effort():
