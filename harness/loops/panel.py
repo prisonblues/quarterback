@@ -396,63 +396,131 @@ def _spans(text: str, open_ch: str, close_ch: str) -> list[tuple[int, str]]:
 #: was asked for, rather than some other object that happens to parse.
 ENVELOPE_KEYS = ("findings", "verdicts")
 
+#: The coverage declaration that rides alongside each envelope: a reviewer's
+#: `could_not_assess`, the judge's `coverage_note`. These are the ONLY fields
+#: that declare anything. Everything else an envelope carries is structure
+#: (`fix_needs_rereview` holds INDEXES into the findings array) or a key the
+#: model invented, and counting those made "how much a candidate says" a measure
+#: of verbosity: `"summary": "I reviewed the diff"` outscored a real declaration.
+DECLARATION_KEYS = {"findings": "could_not_assess", "verdicts": "coverage_note"}
+
+#: The literal strings :data:`REVIEW_PROMPT` and :data:`JUDGE_PROMPT` use to
+#: stand in for a value the model is meant to write.
+#:
+#: They are here because an echo of the schema AS GIVEN is NOT empty: our own
+#: prompts ship `"could_not_assess": ["..."]`, `"coverage_note": "..."` and one
+#: fully populated example finding. Read literally, an echo therefore declares a
+#: coverage gap of "..." and reports a P3 in a file called "path" — enough to
+#: outrank the real answer beside it, put a nonsense caveat in the PR comment and
+#: cost the round its confidence. A candidate carrying these is quoting the
+#: request, not answering it.
+#:
+#: Kept beside the prompts, and pinned to their actual text by
+#: `test_every_stand_in_the_prompts_ship_is_declared`, so the two cannot drift.
+SCHEMA_PLACEHOLDERS = frozenset({
+    "...", "path", "P1|P2|P3|P4", "F01", "F03",
+    "the merged statement of the issue", "why real or a false positive",
+})
+
 #: Returned by :func:`_richest` when two DIFFERENT candidates say equally much
 #: and nothing else separates them. Distinct from None, which means "no candidate
 #: of this shape at all": one says the reply cannot be read, the other says keep
-#: looking.
-AMBIGUOUS = object()
+#: looking. Named rather than a bare ``object()`` so that a caller who forgets
+#: the ``is`` check gets `AMBIGUOUS` in its traceback, not `<object object at
+#: 0x...>`.
+_AMBIGUOUS = type("Ambiguous", (), {"__repr__": lambda self: "AMBIGUOUS"})()
 
 
-def _reported(val) -> tuple[int, int]:
-    """How much a candidate actually says: the findings it reports, and how much
-    everything else in it declares (see :func:`_declared`).
-
-    A property of the value rather than of where the model chose to put it, which
-    is the whole point — an echoed schema is empty by construction and a real
-    reply usually is not. The second number settles what the first cannot: a
-    review that found nothing but declared an area it could not assess says more
-    than an echoed empty envelope, and that declaration is exactly what stops a
-    quiet round being read as a clean one.
-
-    Findings are counted the way :func:`_to_findings` keeps them — objects only.
-    A declaration list is a list of PHRASES, and counting its strings as findings
-    would let `could_not_assess` outweigh the review sitting beside it."""
+def _texts(val: object) -> list[str]:
+    """Every string anywhere inside a value, in order — the text a candidate
+    actually carries, whatever it nested it in."""
+    if isinstance(val, str):
+        return [val]
+    if isinstance(val, dict):
+        val = list(val.values())
     if isinstance(val, list):
-        return sum(isinstance(it, dict) for it in val), 0
-    key = next((k for k in ENVELOPE_KEYS if isinstance(val.get(k), list)), None)
-    return (sum(isinstance(it, dict) for it in val[key]) if key else 0,
-            sum(_declared(v) for k, v in val.items() if k != key))
+        return [t for v in val for t in _texts(v)]
+    return []
 
 
-def _declared(val) -> int:
-    """What one declaration says: its items if it is a list, or 1 for a non-empty
-    string. Both shapes are in the contracts — `could_not_assess` is a list of
-    phrases and the judge's `coverage_note` is one sentence — and a rule that only
-    counted lists let a judge that ruled on no findings and wrote a real coverage
-    note tie with a trailing empty echo, which then replaced the note with ""."""
-    if isinstance(val, list):
-        return len(val)
-    return 1 if isinstance(val, str) and val.strip() else 0
+def _placeholder(val: object) -> bool:
+    """Whether a value is the schema's own stand-in rather than an answer: the
+    string `"..."`, or a whole example finding/verdict object whose every string
+    is one of :data:`SCHEMA_PLACEHOLDERS`.
+
+    A value with no text in it at all is not judged a stand-in — only text can
+    say that, and a finding carrying nothing but a line number is a (poor) answer
+    rather than a quotation."""
+    texts = _texts(val)
+    return bool(texts) and all(t.strip() in SCHEMA_PLACEHOLDERS for t in texts)
 
 
-def _richest(candidates: list):
-    """The candidate that says the most, AMBIGUOUS when two different ones say
-    equally much, or None when there are no candidates at all.
+def _is_answer(item: object) -> bool:
+    """Whether one entry of a findings/verdicts array is an answer: an object,
+    and not the example the prompt itself ships."""
+    return isinstance(item, dict) and not _placeholder(item)
 
-    Candidates that say NOTHING do not tie ambiguously: they all report the same
-    absence, so there is no answer to lose by taking the last — and degrading a
-    genuinely flawless review into "unparseable" would buy a second CLI call and
-    a coverage veto for a reply that was perfectly clear.
 
-    Nor do identical values. A model that prints its envelope twice — once inside
-    a ``` fence and once out — has said one thing, not two."""
-    if not candidates:
+def _read(val: list | dict) -> tuple[list[dict], list[str] | None, list[int], bool]:
+    """A candidate as :func:`parse_reply` will read it: the findings it reports,
+    the coverage it declares (None when it never engaged with the question), the
+    re-review indexes riding alongside them, and whether any of it is the schema
+    quoted back.
+
+    Meaning, not shape — two spellings of one answer are one answer.
+    :func:`_str_list` accepts `could_not_assess: "the migration"` and
+    `["the migration"]` as the same declaration, and comparing raw values called
+    them two different answers and threw a perfectly readable reply into the
+    retry path.
+
+    Findings are counted the way :func:`_to_findings` keeps them — objects only,
+    stand-ins excluded. A declaration is a list of PHRASES, and counting its
+    strings as findings would let `could_not_assess` outweigh the review beside
+    it."""
+    obj = val if isinstance(val, dict) else {}
+    key = next((k for k in ENVELOPE_KEYS if isinstance(obj.get(k), list)), None)
+    items = obj[key] if key else (val if isinstance(val, list) else [])
+    declared = obj.get(DECLARATION_KEYS[key]) if key else None
+    flags = obj.get("fix_needs_rereview")
+    return ([it for it in items if _is_answer(it)],
+            _declaration(declared),
+            sorted({i for i in flags if isinstance(i, int) and not isinstance(i, bool)})
+            if isinstance(flags, list) else [],
+            any(_placeholder(x) for x in list(items) + _texts(declared)))
+
+
+def _rank(read: tuple[list[dict], list[str] | None, list[int], bool]) -> tuple[int, ...]:
+    """How much a candidate says, as a sort key over what :func:`_read` read.
+
+    Findings first: that is the answer. Declarations settle what findings cannot
+    — a review that found nothing but named an area it could not assess says more
+    than an empty envelope, and that declaration is exactly what stops a quiet
+    round being read as a clean one. Then whether it engaged at all: `[]` ("asked,
+    and had nothing to declare") outranks a candidate that never mentions the key,
+    the null-versus-`[]` distinction the rest of this module is built to keep.
+    Last, and only among candidates that are otherwise level, a candidate quoting
+    the prompt's stand-ins loses to one that quotes nothing."""
+    findings, declared, _, quoting = read
+    return len(findings), len(declared or ()), int(declared is not None), int(not quoting)
+
+
+def _richest(candidates: list[list | dict]) -> list | dict | object | None:
+    """The candidate that says the most, :data:`_AMBIGUOUS` when two that MEAN
+    different things say equally much, or None when there are no candidates.
+
+    Candidates that mean the same thing never tie ambiguously. A model that
+    prints its envelope twice — once inside a ``` fence and once out — has said
+    one thing, not two; so have two candidates that report the same absence, and
+    degrading a genuinely flawless review into "unparseable" would buy a second
+    CLI call and a coverage veto for a reply that was perfectly clear."""
+    ranked = [(_rank(read), read, c) for read, c in ((_read(v), v) for v in candidates)]
+    if not ranked:
         return None
-    best = max(_reported(c) for c in candidates)
-    top = [c for c in candidates if _reported(c) == best]
-    if any(best) and any(c != top[-1] for c in top):
-        return AMBIGUOUS
-    return top[-1]
+    best = max(rank for rank, _, _ in ranked)
+    top = [(read, c) for rank, read, c in ranked if rank == best]
+    if any(read != top[-1][0] for read, _ in top):
+        return _AMBIGUOUS
+    return top[-1][1]
 
 
 def extract_json_value(raw: str) -> list | dict | None:
@@ -479,10 +547,20 @@ def extract_json_value(raw: str) -> list | dict | None:
     answers and then explains itself — *"for reference, the shape I used was
     `{"findings": []}`"* — had its findings replaced by the trailing empty example.
     Both produce the same artefact, a well-formed parseable EMPTY result, which is
-    the one wrong answer this function must never manufacture silently. An echoed
-    schema is empty by construction; a real answer usually is not, so how much a
-    candidate says settles it (see :func:`_reported`) and fails safe when it does
-    not — a genuinely empty review loses nothing by being compared with an echo.
+    the one wrong answer this function must never manufacture silently. So how
+    much a candidate says settles it (see :func:`_rank`), and it fails safe when
+    it cannot — a genuinely empty review loses nothing by being compared with an
+    echo.
+
+    An echo is empty only once the schema's own stand-ins are discounted, which
+    they are (:data:`SCHEMA_PLACEHOLDERS`): the prompts in this file ship
+    `"could_not_assess": ["..."]` and a populated example finding, so a model that
+    quotes the request back produces a candidate that is textually full and says
+    nothing. Reading those literally was the same bug wearing the opposite mask —
+    the echo outranking the answer instead of following it. A candidate that is
+    NOTHING but stand-ins is dropped outright rather than ranked, so it cannot win
+    its tier over an answer in a lower one; a reply holding nothing else is
+    unreadable, which is the truthful answer and the one that retries.
 
     When two DIFFERENT candidates say equally much, nothing in the reply says
     which one is the answer, so it is not resolved: the reply is reported as
@@ -506,7 +584,13 @@ def extract_json_value(raw: str) -> list | dict | None:
             val = json.loads(candidate)
         except json.JSONDecodeError:
             continue
-        if isinstance(val, (list, dict)):
+        # A value that is nothing BUT the schema quoted back is not a candidate at
+        # all. Discounting its stand-ins while still ranking it would leave a
+        # well-shaped echo beating a real answer sitting one tier down — the
+        # requested envelope always outranks the bare array a model reached for
+        # instead — and would put a P3 in a file called "path" in the report if it
+        # were the only thing the reply contained.
+        if isinstance(val, (list, dict)) and not _placeholder(val):
             parsed.append(val)
 
     def envelope(val, shaped: bool) -> bool:
@@ -518,21 +602,23 @@ def extract_json_value(raw: str) -> list | dict | None:
         return isinstance(val, dict) and any(
             k in val and (not shaped or isinstance(val[k], list)) for k in ENVELOPE_KEYS)
 
-    # Shape first, then how much was reported. The tiers are what keep an
-    # envelope's own INNER findings array — a top-level `[...]` span in its own
-    # right — from beating the envelope it belongs to, which would drop every
-    # declaration riding alongside it.
+    # Shape first, then how much was reported — every tier by the same rule, so
+    # the file does not hold two contradictory answers to one question. The tiers
+    # are what keep an envelope's own INNER findings array — a top-level `[...]`
+    # span in its own right — from beating the envelope it belongs to, which
+    # would drop every declaration riding alongside it. The last two can only
+    # ever win when nothing better exists: a prose object ABOUT the schema, then
+    # any JSON at all.
     for tier in ([v for v in parsed if envelope(v, shaped=True)],
-                 [v for v in parsed if isinstance(v, list) and v]):
+                 [v for v in parsed if isinstance(v, list) and v],
+                 [v for v in parsed if envelope(v, shaped=False)],
+                 parsed):
         pick = _richest(tier)
-        if pick is AMBIGUOUS:
+        if pick is _AMBIGUOUS:
             return None
         if pick is not None:
             return pick
-    for val in reversed(parsed):
-        if envelope(val, shaped=False):
-            return val
-    return parsed[-1] if parsed else None
+    return None
 
 
 def _severity(raw, fallback: str) -> str:
@@ -587,17 +673,42 @@ def _to_findings(reviewer: str, items: list) -> list[Finding]:
         title=str(it.get("title", "")).strip(),
         detail=str(it.get("detail", "")).strip(),
         needs_rereview=_flag(it.get("needs_rereview")),
-    ) for it in items if isinstance(it, dict)]
+    ) for it in items if _is_answer(it)]
 
 
 def _str_list(val) -> list[str]:
     """A declaration list, however the model spelled it — a list of phrases, or
-    one string it wrote instead of a one-item list."""
+    one string it wrote instead of a one-item list.
+
+    A non-string ITEM is dropped, not stringified: `could_not_assess:
+    [{"area": "the migration"}]` used to become the Python repr
+    `"{'area': 'the migration'}"`, which `/panel` then printed verbatim as words a
+    reviewer had written, and a null or a nested list counted as a declared gap
+    that says nothing. `app/api/reviews.py::_phrases` has always dropped them and
+    documents itself as mirroring this function; the two now agree."""
     if isinstance(val, str):
         val = [val]
     if not isinstance(val, list):
         return []
-    return [s for s in (str(x).strip() for x in val) if s]
+    return [s for s in (x.strip() for x in val if isinstance(x, str)) if s]
+
+
+def _declaration(val) -> list[str] | None:
+    """The coverage a candidate declares, or None when it never engaged with the
+    question.
+
+    Present-and-empty is "asked, and had nothing to declare"; absent — or a value
+    no declaration can be read out of — is "said nothing", and collapsing the two
+    would let a reviewer that never engaged read as one that engaged and reported
+    clean. A declaration made ONLY of the schema's stand-ins is the second kind:
+    `"could_not_assess": ["..."]` is :data:`REVIEW_PROMPT` quoted back, not an
+    area the reviewer could not read, and recording it as one put `could not
+    assess: ...` in the PR comment and cost the round its confidence."""
+    if not isinstance(val, (list, str)):
+        return None
+    phrases = _str_list(val)
+    kept = [p for p in phrases if not _placeholder(p)]
+    return kept if kept or not phrases else None
 
 
 def parse_reply(reviewer: str, raw: str) -> tuple[list[Finding], list[str] | None] | None:
@@ -623,11 +734,11 @@ def parse_reply(reviewer: str, raw: str) -> tuple[list[Finding], list[str] | Non
     Returns None when the reply has no usable JSON at all (caller retries, then
     keeps the raw text as one finding) — distinct from ``([], None)``/``([], [])``
     which mean the reviewer ran and found nothing. A findings array the model
-    filled with something OTHER than objects — a list of sentences, most often —
-    is the first kind and not the second: every entry is dropped by
-    :func:`_to_findings`, and reporting the empty remainder would turn a reply
-    this parser could not read into a reviewer that read the diff and found it
-    flawless."""
+    filled with something OTHER than an answer — a list of sentences most often,
+    or the example finding from the prompt quoted back — is the first kind and not
+    the second: every entry is dropped by :func:`_to_findings`, and reporting the
+    empty remainder would turn a reply this parser could not read into a reviewer
+    that read the diff and found it flawless."""
     val = extract_json_value(raw)
     if val is None:
         return None
@@ -640,7 +751,13 @@ def parse_reply(reviewer: str, raw: str) -> tuple[list[Finding], list[str] | Non
     # Indexes are into the array the MODEL wrote, which is not the list we keep —
     # a junk entry among the findings is dropped, and every index after it would
     # then point one finding too far, flagging its neighbour.
-    kept = [(i, it) for i, it in enumerate(items) if isinstance(it, dict)]
+    kept = [(i, it) for i, it in enumerate(items) if _is_answer(it)]
+    # A findings array with nothing readable in it takes the declaration beside it
+    # down too. That loses a `could_not_assess` the model stated plainly, which is
+    # a real cost and recorded here so it is not mistaken for an oversight: the
+    # caller retries and then marks the round `unstructured`, which vetoes it
+    # harder than the declaration would have, so nothing is read as cleaner than
+    # it was — and half a reply is not evidence about which half was mis-typed.
     if items and not kept:
         return None
     findings = _to_findings(reviewer, [it for _, it in kept])
@@ -650,13 +767,7 @@ def parse_reply(reviewer: str, raw: str) -> tuple[list[Finding], list[str] | Non
         # what a model that wrote a boolean meant.
         if isinstance(i, int) and not isinstance(i, bool) and i in at:
             findings[at[i]].needs_rereview = True
-    # Present-and-empty is "asked, and had nothing to declare"; absent (or a
-    # value of a shape no declaration can be read out of) is "said nothing".
-    # Collapsing the two would let a reviewer that never engaged with the
-    # coverage question read as one that engaged and reported clean.
-    declared = val.get("could_not_assess")
-    gaps = _str_list(declared) if isinstance(declared, (list, str)) else None
-    return findings, gaps
+    return findings, _declaration(val.get("could_not_assess"))
 
 
 def _raw_finding(reviewer: str, text: str) -> Finding:
@@ -1971,7 +2082,12 @@ def adjudicate(clusters: list[list[Finding]], diff: str, model: str, pr: int,
     note = ""
     reply = parsed if isinstance(parsed, dict) else None
     if reply is not None:
+        # `"coverage_note": "..."` is what JUDGE_PROMPT asks with, not an answer to
+        # it. Printed in the PR comment it reads as a coverage ruling nobody made.
+        # (A reply that is nothing BUT the schema never gets here — those are not
+        # candidates at all — but a real ruling can still carry the stand-in note.)
         note = str(reply.get("coverage_note") or "").strip()
+        note = "" if _placeholder(note) else note
         parsed = reply.get("verdicts")
     if not isinstance(parsed, list):
         # With nothing to adjudicate, a reply that carries the coverage answer is
