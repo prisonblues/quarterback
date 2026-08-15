@@ -39,18 +39,25 @@ the earlier round was *truncated out of* is a coverage failure, not a reviewer f
 a plain prefix cut, so what a round could not read is computed as it runs and banked for the next one
 (`unread_files`). A file counts as unread only if every reviewer that ran was cut on it — one seat
 that read it means the round saw it — and a file *straddling* the cut counts as unread, because a
-reviewer holding half a file's hunks has not read that file.
+reviewer holding half a file's hunks has not read that file. A round that read *nothing* — every seat
+lost, or the PR skipped by title — records no coverage rather than full coverage, since an empty
+unread list read the other way turns every later coverage failure into a reviewer miss.
 
 **It is a signal, not a verdict, and is recorded as one.** A fix can break something at a distance,
 so a defect outside the fix's own lines is evidence of a miss rather than proof of one. Nothing gates
 on it, deliberately: recording that a fixer introduced 22 defects is data, and failing a fix pass for
-it before the signal is calibrated against a few dozen cycles would be acting on a heuristic. #41
-(review the increment) is what would make it exact, at which point a finding in the increment is
-introduced by construction and the line-intersection guess can be retired.
+it before the signal is calibrated against a few dozen cycles would be acting on a heuristic. What it
+will not do is guess: a branch *rewritten* between rounds makes the compare range span history no fix
+pass wrote, so that range is refused rather than attributed, and so is a finding whose path could name
+two of the changed files. #41 (review the increment) is what would make it exact, at which point a
+finding in the increment is introduced by construction and the line-intersection guess can be retired.
 
 Verified against real history rather than only in tests: replaying PR #75's genuine round 1 → round 2
 (`b1ccc79`…`1538626`) splits its 26 new findings **14 introduced / 12 missed**, which is the point —
 a measure that put everything in one bucket would have been worth nothing.
+
+*(The jump from v2.21 is deliberate and not a gap in this file: **v2.22** and **v2.23** are claimed
+by branches that had not merged when this one was written.)*
 
 ## v2.21 — a panel that lost a seat said nothing about it
 

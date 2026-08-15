@@ -185,10 +185,11 @@ says how much of a window actually reported.
 
 The deployed board version lags the repo until the stack is redeployed, and only the running
 service knows which it is: ask it with `GET /openapi.json` → `.info.version`, for whichever
-instance you care about. (Anything built off this branch says 2.19.0 — v2.20 is harness-side.) A number written here
+instance you care about. (Anything built off this branch says 2.19.0 — v2.20 onward are harness-side.) A number written here
 instead would be wrong the next time Portainer redeploys, with no diff to catch it.
 Latest release: **v2.24**, harness-side — a new finding now says whether the last fix pass caused it
-or the last round missed it, which were one number before and want opposite remedies.
+or the last round missed it, which were one number before and want opposite remedies. (v2.22 and
+v2.23 are claimed by branches not yet merged, which is why the numbering jumps.)
 Before it, **v2.21** had each panel member run in its own empty sandbox repo rather than in whatever
 directory the panel was launched from, and made a panel that lost a seat say so; **v2.20** had the worktree
 tooling ask who is in a directory before rewriting it, and **v2.19** added the per-reviewer

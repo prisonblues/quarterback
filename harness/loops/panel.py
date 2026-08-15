@@ -97,6 +97,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from collections import Counter
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -2144,21 +2145,87 @@ def _ssl_context() -> ssl.SSLContext:
     return ssl.create_default_context()  # last resort: platform default
 
 
+def _unquote_path(tok: str) -> str:
+    r"""Git's C-quoted path form (`"a/w\303\251ird.py"`) back to the real path.
+
+    Git quotes a path — in the `diff --git` header and on the `---`/`+++` lines
+    alike — whenever it holds a non-ASCII byte, a quote, a backslash or a control
+    character, escaping the bytes in octal. Left quoted, such a file is spelled
+    one way here and another way by every reviewer that reports a finding in it,
+    and :func:`_same_file` then matches neither spelling against the other.
+    """
+    if len(tok) < 2 or not (tok.startswith('"') and tok.endswith('"')):
+        return tok
+    try:
+        return (tok[1:-1].encode("utf-8").decode("unicode_escape")
+                .encode("latin-1").decode("utf-8"))
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        return tok[1:-1]  # not the escaping git uses; the quotes still come off
+
+
+def _diff_file_path(line: str) -> str | None:
+    """The repo-relative new-side path a diff header line names, or None where it
+    names none — a `+++ /dev/null` deletion, a header nothing can parse.
+
+    ONE parser for `diff --git a/… b/…` and for `+++ b/…`, shared by
+    :func:`_diff_added_lines` and :func:`_diff_files_cut` because
+    :func:`_provenance` compares one's keys against the other's members through
+    :func:`_same_file`: two spellings of "what a path is" would misattribute in
+    silence rather than fail. `+++` is the reliable anchor, carrying ONE path so
+    nothing has to be guessed about where it ends; the `diff --git` header is
+    parsed as well only so a file has a name before its `+++` line arrives, which
+    matters when a budget cuts between the two.
+    """
+    if line.startswith("+++ "):
+        tok = _unquote_path(line[4:].strip())
+        return tok[2:] if tok.startswith("b/") else None
+    if not line.startswith("diff --git "):
+        return None
+    rest = line[len("diff --git "):].strip()
+    # `a/P b/P`, where both sides are the SAME path. Git does not quote a plain
+    # space, so `diff --git a/x b/y.py b/x b/y.py` splits at the wrong ` b/`
+    # whichever end you start from — but the two halves are equal in length, so
+    # the split point is arithmetic rather than a guess.
+    if len(rest) > 5 and (len(rest) - 5) % 2 == 0:
+        half = (len(rest) - 5) // 2
+        a_side, b_side = rest[:2 + half], rest[2 + half:]
+        if a_side.startswith("a/") and b_side == " b/" + a_side[2:]:
+            return a_side[2:]
+    # A rename (`a/old b/new`), or a quoted path. Quoted, both sides are quoted
+    # and the separator between them is unambiguous. Unquoted, the first ` b/` is
+    # the best guess left, and a path containing one is misread until the `+++`
+    # line corrects it.
+    if rest.startswith('"') and rest.endswith('"') and '" "' in rest:
+        tok = _unquote_path('"' + rest.rsplit('" "', 1)[1])
+        return tok[2:] if tok.startswith("b/") else None
+    _, sep, tail = rest.partition(" b/")
+    return tail.strip() if sep else None
+
+
 def _diff_added_lines(diff: str) -> dict[str, set[int]]:
     """Map each changed file (repo-relative, the `b/` side) to the set of line
     numbers it ADDS on the new-file side — the code this PR actually wrote. Used
     to scope SonarCloud's main-branch issues down to the PR's own lines (its
-    "new code" view) rather than every pre-existing issue in a touched file."""
+    "new code" view) rather than every pre-existing issue in a touched file, and
+    to place a finding inside (or outside) the fix range for :func:`_provenance`.
+    """
     out: dict[str, set[int]] = {}
     cur = None
     newln = 0
+    in_hunk = False
     for line in diff.splitlines():
         if line.startswith("diff --git "):
-            parts = line.split(" b/", 1)
-            cur = parts[1].strip() if len(parts) == 2 else None
-        elif cur is None or line.startswith(("+++", "---", "\\")):
+            cur, in_hunk = _diff_file_path(line), False
+        elif line.startswith("+++ ") and not in_hunk:
+            # The authoritative spelling, once it arrives. Gated on `in_hunk`
+            # because an ADDED line reading `++ x` is spelled `+++ x` in a diff
+            # and is content, not a header — past the first `@@` it falls through
+            # to the `+` branch below and is counted, which is what it is.
+            cur = _diff_file_path(line) or cur
+        elif cur is None or line.startswith(("---", "\\")):
             continue
         elif line.startswith("@@"):
+            in_hunk = True
             m = re.search(r"\+(\d+)", line)
             newln = int(m.group(1)) if m else 0
         elif line.startswith("+"):
@@ -2188,39 +2255,130 @@ def _diff_files_cut(diff: str, budget: int | None) -> set[str]:
     themselves: the question a later round actually asks is "could the earlier
     round see this file at all", and a per-line char offset would imply a
     precision the prefix cut does not have.
+
+    A budget of 0 names EVERY file in the diff, which is what a round that read
+    nothing at all has to record — no seat ran, or every seat died. The empty set
+    says the opposite, that the round read all of it, and would hand the next
+    round a `missed` for every defect in a diff nobody ever saw.
     """
     if budget is None or len(diff) <= budget:
         return set()
     out: set[str] = set()
     cur = None
     off = 0
+    in_hunk = False
     for line in diff.splitlines(keepends=True):
         if line.startswith("diff --git "):
-            parts = line.split(" b/", 1)
-            cur = parts[1].strip() if len(parts) == 2 else None
+            cur, in_hunk = _diff_file_path(line), False
+        elif line.startswith("@@"):
+            in_hunk = True
+        elif line.startswith("+++ ") and not in_hunk:
+            cur = _diff_file_path(line) or cur
         if cur is not None and off + len(line) > budget:
             out.add(cur)
         off += len(line)
     return out
 
 
-def _fix_range_diff(gh_repo: str, base_sha: str | None, head_sha: str | None) -> str | None:
-    """The diff of everything that landed BETWEEN two rounds — i.e. the fix pass
-    whose damage (or thoroughness) provenance is trying to attribute.
+#: How long provenance waits on the compare API, and how much of a range it will
+#: hold. Nothing gates on provenance, so a slow or enormous range degrades to
+#: "unknown" rather than making a round wait on it or keeping it all in memory.
+FIX_RANGE_TIMEOUT_S = 60
+FIX_RANGE_MAX_CHARS = 2_000_000
 
-    Returns None rather than raising whenever the range cannot be read: a
-    force-push that orphaned the earlier head, a baseline written before
-    `head_sha` was recorded, an API refusal. Provenance is a signal and not a
-    verdict, so an unreadable range has to degrade to "unknown" and leave the
-    rest of the round untouched — the alternative is a round that dies because
-    an attribution nobody gates on could not be computed.
+#: Only what attribution reads: the ancestry verdict and the per-file patches.
+#: The compare response also carries every commit in the range and a dozen URLs
+#: per file, and none of that is ever looked at.
+_FIX_RANGE_JQ = "{status: .status, files: [(.files // [])[] | {filename, patch}]}"
+
+
+def _fix_range_diff(gh_repo: str, base_sha: str | None,
+                    head_sha: str | None) -> tuple[str | None, str | None]:
+    """The diff of everything that landed BETWEEN two rounds — i.e. the fix pass
+    whose damage (or thoroughness) provenance is trying to attribute — as
+    `(diff, None)`; or `(None, why)` when there is no range to read.
+
+    It never raises. A force-push that orphaned the earlier head, a baseline
+    written before `head_sha` was recorded, no `gh` on PATH, an API refusal, a
+    range too large to hold: provenance is a signal and not a verdict, so all of
+    them have to degrade to "unknown" and leave the rest of the round untouched.
+    The alternative is a round that dies because an attribution nobody gates on
+    could not be computed. The REASON comes back with the None because the four
+    of them read very differently to an operator — "the branch was rewritten"
+    and "nothing landed between rounds" are not the same news.
+
+    Read as JSON rather than as a raw diff for the `status` field, which is the
+    only thing that can tell a rewritten branch from a linear one: `compare/a...b`
+    is the THREE-dot form, so GitHub diffs *merge-base(a, b) → b*. On a branch
+    that only ever grew between rounds that is exactly the fix range; on one that
+    was rebased or force-pushed it is every line the PR ever added, which would
+    read as the fixer having written all of it. GitHub calls that case `diverged`
+    and it is refused here. Two-dot is not an option — this endpoint 404s on it.
+
+    Two biases remain and are written down rather than fixed. Merging the base
+    branch INTO the PR between rounds leaves the old head an ancestor of the new
+    one (status `ahead`, correctly), so main's own commits fall inside the range
+    and their lines are attributed to the fix pass — `introduced` then
+    over-counts. And the compare endpoint returns at most 300 files, so a fix
+    pass wider than that is attributed on the first 300 and the rest read as
+    `missed`. #41 (review the increment) is what removes the guess altogether.
     """
-    if not (gh_repo and base_sha and head_sha) or base_sha == head_sha:
-        return None
+    if not gh_repo:
+        return None, "no GitHub repo is configured for this run"
+    if not base_sha:
+        return None, ("the baseline does not record which commit it reviewed "
+                      "(written before `head_sha` existed)")
+    if not head_sha:
+        return None, "this round did not record the commit it reviewed"
+    span = f"{base_sha[:8]}..{head_sha[:8]}"
+    if base_sha == head_sha:
+        # Not a failure and not worth an API call to be told nothing changed —
+        # but told apart from one, or the operator goes looking for a GitHub
+        # fault that never happened.
+        return None, f"no commit landed between rounds (head unchanged at {head_sha[:8]})"
     try:
-        return sh(["gh", "api", f"repos/{gh_repo}/compare/{base_sha}...{head_sha}",
-                   "-H", "Accept: application/vnd.github.v3.diff"])
-    except subprocess.CalledProcessError:
+        got = json.loads(sh(["gh", "api", f"repos/{gh_repo}/compare/{base_sha}...{head_sha}",
+                             "--jq", _FIX_RANGE_JQ], timeout=FIX_RANGE_TIMEOUT_S))
+    except (OSError, subprocess.SubprocessError, ValueError) as e:
+        # Widened past CalledProcessError deliberately: no `gh` on PATH is an
+        # OSError, a hung call is a TimeoutExpired, a truncated body is a
+        # ValueError, and each of them would otherwise take down a whole review
+        # round over an attribution nothing gates on.
+        return None, f"could not read the range {span} ({type(e).__name__})"
+    if not isinstance(got, dict):
+        return None, f"the compare API answered {span} with something that is not an object"
+    if got.get("status") == "diverged":
+        return None, (f"{span} have diverged — the branch was rewritten between rounds, so "
+                      "the range would span commits no fix pass wrote")
+    out: list[str] = []
+    size = 0
+    for f in got.get("files") or []:
+        name, patch = f.get("filename"), f.get("patch")
+        if not (name and patch):
+            continue  # binary, or too large for the API to send a patch for
+        body = patch.rstrip("\n")
+        chunk = f"diff --git a/{name} b/{name}\n{body}\n"
+        size += len(chunk)
+        if size > FIX_RANGE_MAX_CHARS:
+            return None, (f"the range {span} is larger than {FIX_RANGE_MAX_CHARS:,} chars — "
+                          "not attributed, rather than held whole in memory")
+        out.append(chunk)
+    if not out:
+        # An empty compare — a revert that nets to nothing, an empty commit — is
+        # "no range", not "a range with no added lines". The second reading calls
+        # every new finding `missed`, confidently and with nothing to say so.
+        return None, f"the range {span} changed no line this can attribute against"
+    return "".join(out), None
+
+
+def _head_sha_now(gh_repo: str, pr_number: int) -> str | None:
+    """The PR's head commit, re-read. None if it cannot be had — the caller only
+    uses it to notice that the head MOVED, and "could not tell" has to leave the
+    earlier answer standing rather than erase it."""
+    try:
+        return json.loads(sh(["gh", "pr", "view", str(pr_number), "--repo", gh_repo,
+                              "--json", "headRefOid"])).get("headRefOid") or None
+    except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
         return None
 
 
@@ -2231,7 +2389,7 @@ PROVENANCE = ("introduced", "missed", "missed-unread", "unknown")
 
 
 def _provenance(file: str, line: int | None, added: dict[str, set[int]],
-                unread: set[str], have_range: bool) -> str:
+                unread: set[str], have_range: bool, all_unread: bool = False) -> str:
     """Did the previous round's FIX introduce this defect, or did that round MISS it?
 
     The two are one number today (`new_this_round`), and they want opposite
@@ -2249,19 +2407,25 @@ def _provenance(file: str, line: int | None, added: dict[str, set[int]],
 
     `missed-unread` is the honest bucket for a defect in a file the earlier round
     was truncated out of — a coverage failure rather than a reviewer failure, and
-    the one bucket that indicts the harness instead of the panel.
+    the one bucket that indicts the harness instead of the panel. `all_unread`
+    says that round read NOTHING (it was skipped, or lost every seat), which is
+    the same failure with no file list to name it by.
     """
     if not have_range:
         return "unknown"
-    if line is not None and any(line in lines for f, lines in added.items()
-                                if _same_file(file, f)):
+    # Which changed files this finding's path spelling could name. More than one
+    # and nothing can be said: the suffix rule that lets `panel.py` match
+    # `harness/loops/panel.py` also lets it match a second tree's copy, and a
+    # coin toss between two files is not a measurement.
+    hits = [f for f in added if _same_file(file, f)]
+    if line is not None and len(hits) == 1 and line in added[hits[0]]:
         return "introduced"
-    # Checked before the unplaceable case: "the earlier round could not see this
+    # Checked before the unplaceable cases: "the earlier round could not see this
     # file" is a better answer than "we could not place it", and a finding with
     # no line in an unread file is still squarely a coverage failure.
-    if any(_same_file(file, f) for f in unread):
+    if all_unread or any(_same_file(file, f) for f in unread):
         return "missed-unread"
-    if line is None:
+    if line is None or len(hits) > 1:
         return "unknown"
     return "missed"
 
@@ -3183,6 +3347,13 @@ class Baseline:
     #: Files that preceding round could not read in full (:func:`_diff_files_cut`).
     #: A new finding in one of them is a coverage failure, not a reviewer miss.
     unread_files: set[str] = field(default_factory=set)
+    #: That round REVIEWED nothing — it was skipped. It still banks a head_sha
+    #: (the next round's fix range has to start somewhere) but its empty
+    #: `unread_files` then means "no coverage recorded", not "read everything":
+    #: taken the second way, a skip anywhere in a cycle silently converts every
+    #: later coverage failure into a reviewer miss, and erases the truncation
+    #: record of the last round that did read something.
+    read_nothing: bool = False
     problems: list[str] = field(default_factory=list)
 
     def raised_before(self, finding: Canonical) -> bool:
@@ -3228,6 +3399,26 @@ def _baseline_title(f: dict) -> str:
                                 for r in f.get("reported_by") or []
                                 if isinstance(r, dict)) if t)
     return titles[0] if titles else str(f.get("synthesis") or "")
+
+
+#: What a commit id may look like coming off disk. The bound is on the SHAPE —
+#: hex, and nothing else — because that is the whole of what this has to refuse:
+#: a `/`, a `..` or a `?` in a baseline's SHA re-points the compare API path it
+#: is spliced into at another repo's history, whose diff then attributes this
+#: round's findings. A length floor would buy nothing on top of that (no hex
+#: string of any length can re-point a path) and would reject the short
+#: abbreviations git itself hands out.
+_SHA_RE = re.compile(r"[0-9a-fA-F]{1,64}")
+
+
+def _mtime(path: str) -> float:
+    """Last-modified time, or 0 for a path that no longer reads. Used only to
+    break a tie between two baselines claiming one round, never to decide
+    anything on its own."""
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0.0
 
 
 def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
@@ -3364,8 +3555,9 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
         # than resolved in silence.
         b.problems.append(f"{len(usable)} baselines cover {len(distinct_rounds)} round(s) — "
                           "two payloads for one round, so which of them named the cycle "
-                          "was arbitrary")
-    accepted: list[tuple[int, dict]] = []
+                          "was arbitrary, and the commit and coverage record provenance "
+                          "attributes against came from the last-written of them")
+    accepted: list[tuple[int, str, dict]] = []
     for was, got, path, payload in usable:
         if got and b.cycle and got != b.cycle:
             b.problems.append(f"baseline {path} is from cycle {got}, not this run's "
@@ -3374,7 +3566,7 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
                               "rounds")
             continue
         b.rounds.add(was)
-        accepted.append((was, payload))
+        accepted.append((was, path, payload))
         for bucket in ("to_fix", "dismissed", "sonar_findings"):
             for f in payload.get(bucket) or []:
                 if not isinstance(f, dict):
@@ -3389,10 +3581,36 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
     # them: `keys` and `titles` are a union over every earlier round ("has anyone
     # raised this before"), while "which commit did the fix pass start from" has
     # exactly one right answer and the earlier rounds' answers are stale.
+    #
+    # Ties on the round number are broken by mtime and then by path, so which of
+    # two payloads for one round supplies the fix range is decided by which was
+    # written last rather than by the order a caller happened to pass them in.
     if accepted:
-        latest = max(accepted, key=lambda e: e[0])[1]
-        b.head_sha = str(latest.get("head_sha") or "") or None
-        b.unread_files = {str(f) for f in (latest.get("unread_files") or []) if f}
+        _, path, latest = max(accepted, key=lambda e: (e[0], _mtime(e[1]), e[1]))
+        # Validated rather than trusted: this string is interpolated into an API
+        # path (`repos/{repo}/compare/{a}...{b}`), and a hand-edited or corrupted
+        # baseline carrying a `/`, a `..` or a query string would re-point the
+        # request at other history whose diff then attributes this round's
+        # findings. Absent already degrades cleanly to "unknown", so refusing a
+        # value that cannot be a commit costs nothing.
+        sha = latest.get("head_sha") or None
+        if sha is not None and not (isinstance(sha, str) and _SHA_RE.fullmatch(sha)):
+            b.problems.append(f"baseline {path} records head_sha {sha!r}, which is not a "
+                              "commit id — provenance reads `unknown` rather than "
+                              "attributing against whatever that names")
+            sha = None
+        b.head_sha = sha
+        # Same care the findings buckets above take with a non-dict: a bare
+        # string here iterates into a set of single characters, and `_same_file`
+        # would then suffix-match those against real paths.
+        unread = latest.get("unread_files") or []
+        if not isinstance(unread, list):
+            b.problems.append(f"baseline {path} records unread_files as a "
+                              f"{type(unread).__name__}, not a list — that round's coverage "
+                              "record is ignored")
+            unread = []
+        b.unread_files = {f for f in unread if f and isinstance(f, str)}
+        b.read_nothing = not latest.get("reviewed")
     return b
 
 
@@ -3551,11 +3769,16 @@ def _payload_defaults() -> dict:
         # provenance cannot be computed at all rather than computed badly.
         "head_sha": None,
         # What this round could not read in full, for the NEXT round's
-        # `missed-unread` bucket. See :func:`_diff_files_cut`.
+        # `missed-unread` bucket. See :func:`_diff_files_cut`. Empty on a payload
+        # whose `reviewed` is false means "no coverage at all", not "read
+        # everything" — a skipped round never fetched a diff to name files from,
+        # and the reader tells the two apart by `reviewed` (see `Baseline`).
         "unread_files": [],
         # Per-round tally of the buckets below, so a consumer gets the shape of a
-        # round without walking every finding. Empty outside a cycle, where the
-        # question does not arise.
+        # round without walking every finding. Empty where the question does not
+        # arise — outside a cycle, or in a cycle's round 1, which has no earlier
+        # round to attribute against. All-zero is a different statement: a round
+        # that could have attributed and had nothing to attribute.
         "provenance_counts": {},
         # Where a run sits in the panel -> fix -> panel cycle. Defaulted here too,
         # so the skipped PR answers `payload['round_stop']` with "no cycle ran"
@@ -3777,6 +4000,13 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 # where that round's fix range has to start. Left null, a skip
                 # anywhere in a cycle would blind provenance for the round after it.
                 "head_sha": head_sha,
+                # Zeroed rather than left `{}` when there ARE earlier rounds:
+                # `{}` is the shape for a round where the question does not arise,
+                # and a skipped round 3 of a cycle is not that — it attributed
+                # nothing because it reviewed nothing, which a consumer must be
+                # able to tell from "not a cycle run".
+                "provenance_counts": ({b: 0 for b in PROVENANCE}
+                                      if skip_prior.rounds else {}),
                 "round": round_no,
                 "cycle": skip_prior.cycle,
                 "prior_rounds": len(skip_prior.rounds),
@@ -3811,6 +4041,19 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # Diff budgets: panel-wide value, then each model's own override. Every
     # reviewer used to get the same 60k prefix regardless of its context window.
     notes: list[str] = []
+    # Time-of-check/time-of-use: `headRefOid` was read from the PR metadata BEFORE
+    # the diff was fetched, so a push landing in between leaves the payload naming
+    # one commit while the reviewers read another — and the next round then
+    # attributes its findings to a range that never produced the diff anyone
+    # reviewed. Re-read beside the diff and take the later answer: the diff is
+    # what was reviewed, and it came from whatever head was current when it was
+    # fetched. "Could not tell" leaves the earlier answer standing.
+    moved_to = _head_sha_now(gh_repo, pr_number)
+    if moved_to and moved_to != head_sha:
+        notes.append(f"the PR head moved from {head_sha[:8]} to {moved_to[:8]} while this "
+                     "round was fetching the diff — the diff reviewed is the newer one, so "
+                     "that is the commit recorded")
+        head_sha = moved_to
     panel_budget = diff_budget(panel, "max_diff_chars", DEFAULT_DIFF_BUDGET, notes)
     # Only for the reviewers actually running: a budget warning about a model
     # this run never asked for is noise, and a "truncated for antigravity" footnote
@@ -3878,6 +4121,11 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
 
         llm_findings: list[Finding] = []
         ran_llm: list[str] = []
+        # The same seats as `ran_llm`, under their BARE names. `ran_llm` holds
+        # display labels (`claude (opus)`) for the report, and everything keyed by
+        # reviewer — `budgets`, `models`, `efforts` — is keyed by the bare name.
+        # Looking one up with the other returns None for every seat, silently.
+        ran_names: list[str] = []
         llm_skipped: list[str] = []
         # Which brain each member actually used. Findings carry the bare vendor
         # name for attribution, which is the right grain for a report and the
@@ -3915,6 +4163,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 llm_skipped.append(got.skip)
             else:
                 ran_llm.append(labels[name])
+                ran_names.append(name)
                 llm_findings.extend(got.findings)
         if sonar_future:
             gate, hard, soft, skip = sonar_future.result()
@@ -4011,22 +4260,44 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # only if EVERY reviewer that ran was cut on it: one seat that read it means
     # the ROUND saw it, and blaming coverage for a defect some reviewer could
     # plainly see would let the panel off the hook for its own miss.
-    cut = [_diff_files_cut(diff, budgets.get(n)) for n in ran_llm]
-    unread_files = sorted(set.intersection(*cut)) if cut else []
-    # Attribution needs both ends of the fix range. `prior.head_sha` is None for
-    # any baseline written before it was recorded, and `_fix_range_diff` returns
-    # None for a range GitHub cannot serve (a force-push orphaning the old head),
-    # so both degrade to "unknown" rather than to a wrong answer.
-    attributable = bool(cycle_run and prior_rounds)
-    fix_diff = _fix_range_diff(gh_repo, prior.head_sha, head_sha) if attributable else None
+    #
+    # Keyed on the BARE names of the seats that ran, not on `ran_llm`, which
+    # holds the report's display labels: `budgets.get("claude (opus)")` is None
+    # for every seat, every cut set comes back empty, and `unread_files` was
+    # therefore empty on every run this ever made — the `missed-unread` bucket
+    # unreachable in production while 487 unit tests, which call the helpers
+    # directly with correct inputs, stayed green over it.
+    no_budget = [n for n in ran_names if n not in budgets]
+    if no_budget:
+        notes.append("no diff budget is recorded for " + ", ".join(sorted(no_budget))
+                     + " — those seats are left out of the unread-file record rather than "
+                       "silently emptying it")
+    cut = [_diff_files_cut(diff, budgets[n]) for n in ran_names if n in budgets]
+    # No seat read anything, so nothing was read: every file is unread. The empty
+    # set says the opposite — that the round read all of it — and would hand the
+    # next round a `missed` for every defect in a diff nobody ever saw.
+    unread_files = (sorted(set.intersection(*cut)) if cut
+                    else sorted(_diff_files_cut(diff, 0)))
+    # Attribution needs both ends of the fix range, and `_fix_range_diff` says why
+    # when it has none: a baseline written before `head_sha` was recorded, a
+    # head that never moved, a branch rewritten between rounds, an API refusal.
+    # All of them degrade to "unknown" rather than to a wrong answer.
+    #
+    # `cycle_run` is `in_cycle or prior_rounds`, so `cycle_run and prior_rounds`
+    # only ever meant `prior_rounds`: round 1 has no earlier round to attribute
+    # against whether it is in a cycle or not.
+    attributable = bool(prior_rounds)
+    fix_diff, no_range_why = (_fix_range_diff(gh_repo, prior.head_sha, head_sha)
+                              if attributable else (None, None))
+    # ONE predicate for "is there a range", used by the added lines, by the note
+    # and by the attribution itself. Two of them disagreed over an EMPTY compare:
+    # truthiness called it no range, `fix_diff is not None` called it a readable
+    # range with no added lines — and that reading labels every new finding
+    # `missed`, confidently, with no note to say the range was empty.
     fix_added = _diff_added_lines(fix_diff) if fix_diff else {}
-    if attributable and fix_diff is None:
-        notes.append(
-            "provenance unavailable: " + (
-                "the baseline does not record which commit it reviewed (written before "
-                "`head_sha` existed)" if not prior.head_sha
-                else f"could not read the range {prior.head_sha[:8]}..{(head_sha or '')[:8]}")
-            + " — new findings are recorded as `unknown`, not attributed")
+    if attributable and not fix_diff:
+        notes.append(f"provenance unavailable: {no_range_why} — new findings are recorded "
+                     "as `unknown`, not attributed")
 
     def provenance_of(c: Canonical) -> str | None:
         """None where the question does not arise — outside a cycle, in round 1,
@@ -4037,8 +4308,15 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         board's column already means "the panel did not say"."""
         if not attributable or not is_new(c):
             return None
-        return _provenance(c.file or "", c.line, fix_added,
-                           prior.unread_files, fix_diff is not None)
+        return _provenance(c.file or "", c.line, fix_added, prior.unread_files,
+                           bool(fix_diff), all_unread=prior.read_nothing)
+
+    # Counted over `outstanding` — the findings the cycle actually has to clear —
+    # so the tally matches `new_findings` rather than roping in the dismissed
+    # ones, which no fixer will ever touch. ONE pass rather than one per bucket:
+    # `provenance_of` walks `fix_added` through `_same_file` on every call.
+    tally = Counter(provenance_of(c) for c in outstanding)
+    provenance_counts = {b: tally.get(b, 0) for b in PROVENANCE} if attributable else {}
     # A cycle's rounds share one id, inherited from the earliest baseline, so the
     # board can tell "the re-review of THIS declaration" from "whatever ran next
     # on this PR". Only a round 1 of an actual cycle MINTS one.
@@ -4118,13 +4396,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                             "provenance": provenance_of(c)} for c in sonar],
         "dismissed": [{**c.as_dict(), "new_this_round": is_new(c),
                        "provenance": provenance_of(c)} for c in dismissed],
-        # Counted over `outstanding` — the findings the cycle actually has to
-        # clear — so the tally matches `new_findings` above rather than roping in
-        # the dismissed ones, which no fixer will ever touch.
-        "provenance_counts": {
-            bucket: sum(1 for c in outstanding if provenance_of(c) == bucket)
-            for bucket in PROVENANCE
-        } if attributable else {},
+        "provenance_counts": provenance_counts,
         "skipped": result.skipped,
         "run_key": run_key,
     }
@@ -4235,13 +4507,16 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # smaller next pass, findings the last round missed argue for more
         # coverage, and the two read identically as a count.
         pc = payload["provenance_counts"]
-        if any(pc.values()):
-            detail = [f"**{pc['introduced']} introduced** by the last fix pass",
-                      f"**{pc['missed']} missed** by the last round"]
-            if pc["missed-unread"]:
-                detail.append(f"{pc['missed-unread']} in files that round could not read")
-            if pc["unknown"]:
-                detail.append(f"{pc['unknown']} unattributable")
+        # Only the buckets with something in them, and nothing at all when the
+        # only populated bucket is `unknown`. Leading with "**0 introduced**,
+        # **0 missed**" under a config note explaining that nothing could be
+        # attributed reads as a bolded claim about the fix pass, and a false one.
+        phrasing = {"introduced": "**{n} introduced** by the last fix pass",
+                    "missed": "**{n} missed** by the last round",
+                    "missed-unread": "{n} in files that round could not read",
+                    "unknown": "{n} unattributable"}
+        if any(pc.get(b) for b in PROVENANCE if b != "unknown"):
+            detail = [t.format(n=pc[b]) for b, t in phrasing.items() if pc.get(b)]
             lines.append("  - of those: " + ", ".join(detail)
                          + ". A signal, not a verdict — a fix can break something at a "
                            "distance, so `missed` is evidence rather than proof.")
