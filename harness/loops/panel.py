@@ -396,6 +396,64 @@ def _spans(text: str, open_ch: str, close_ch: str) -> list[tuple[int, str]]:
 #: was asked for, rather than some other object that happens to parse.
 ENVELOPE_KEYS = ("findings", "verdicts")
 
+#: Returned by :func:`_richest` when two DIFFERENT candidates say equally much
+#: and nothing else separates them. Distinct from None, which means "no candidate
+#: of this shape at all": one says the reply cannot be read, the other says keep
+#: looking.
+AMBIGUOUS = object()
+
+
+def _reported(val) -> tuple[int, int]:
+    """How much a candidate actually says: the findings it reports, and how much
+    everything else in it declares (see :func:`_declared`).
+
+    A property of the value rather than of where the model chose to put it, which
+    is the whole point — an echoed schema is empty by construction and a real
+    reply usually is not. The second number settles what the first cannot: a
+    review that found nothing but declared an area it could not assess says more
+    than an echoed empty envelope, and that declaration is exactly what stops a
+    quiet round being read as a clean one.
+
+    Findings are counted the way :func:`_to_findings` keeps them — objects only.
+    A declaration list is a list of PHRASES, and counting its strings as findings
+    would let `could_not_assess` outweigh the review sitting beside it."""
+    if isinstance(val, list):
+        return sum(isinstance(it, dict) for it in val), 0
+    key = next((k for k in ENVELOPE_KEYS if isinstance(val.get(k), list)), None)
+    return (sum(isinstance(it, dict) for it in val[key]) if key else 0,
+            sum(_declared(v) for k, v in val.items() if k != key))
+
+
+def _declared(val) -> int:
+    """What one declaration says: its items if it is a list, or 1 for a non-empty
+    string. Both shapes are in the contracts — `could_not_assess` is a list of
+    phrases and the judge's `coverage_note` is one sentence — and a rule that only
+    counted lists let a judge that ruled on no findings and wrote a real coverage
+    note tie with a trailing empty echo, which then replaced the note with ""."""
+    if isinstance(val, list):
+        return len(val)
+    return 1 if isinstance(val, str) and val.strip() else 0
+
+
+def _richest(candidates: list):
+    """The candidate that says the most, AMBIGUOUS when two different ones say
+    equally much, or None when there are no candidates at all.
+
+    Candidates that say NOTHING do not tie ambiguously: they all report the same
+    absence, so there is no answer to lose by taking the last — and degrading a
+    genuinely flawless review into "unparseable" would buy a second CLI call and
+    a coverage veto for a reply that was perfectly clear.
+
+    Nor do identical values. A model that prints its envelope twice — once inside
+    a ``` fence and once out — has said one thing, not two."""
+    if not candidates:
+        return None
+    best = max(_reported(c) for c in candidates)
+    top = [c for c in candidates if _reported(c) == best]
+    if any(best) and any(c != top[-1] for c in top):
+        return AMBIGUOUS
+    return top[-1]
+
 
 def extract_json_value(raw: str) -> list | dict | None:
     """Best-effort parse of the JSON value an LLM meant to return — an object
@@ -412,12 +470,27 @@ def extract_json_value(raw: str) -> list | dict | None:
     lost either; an object carrying an envelope key but not a list under it is
     prose ABOUT the schema and comes last.
 
-    Among equally-shaped candidates the LAST one wins, not the first. Echoing the
-    requested schema before answering is ordinary model behaviour, and an echoed
-    example is a well-formed envelope carrying an empty `findings` — accepted
-    first, it replaces the real reply with a clean "found nothing", which is the
-    one wrong answer this function must never produce silently. Whatever the model
-    wrote last is its answer; the schema it quoted on the way there is not.
+    Among equally-shaped candidates the one that REPORTS THE MOST wins — not the
+    first, and not the last. Position is a property of how the model chose to
+    narrate, not of which value is the answer, and picking by it was wrong in both
+    directions inside one release. First-wins broke on echo-then-answer: a model
+    quoting the requested schema before answering had its example accepted and its
+    real findings dropped. Last-wins broke on answer-then-echo: a model that
+    answers and then explains itself — *"for reference, the shape I used was
+    `{"findings": []}`"* — had its findings replaced by the trailing empty example.
+    Both produce the same artefact, a well-formed parseable EMPTY result, which is
+    the one wrong answer this function must never manufacture silently. An echoed
+    schema is empty by construction; a real answer usually is not, so how much a
+    candidate says settles it (see :func:`_reported`) and fails safe when it does
+    not — a genuinely empty review loses nothing by being compared with an echo.
+
+    When two DIFFERENT candidates say equally much, nothing in the reply says
+    which one is the answer, so it is not resolved: the reply is reported as
+    unstructured (None). That path already exists and already degrades well — the
+    caller retries once, then keeps the raw text as a finding and marks the round
+    as carrying an unstructured reply. Preserving the uncertainty is strictly
+    better than resolving it wrongly, and it is the only outcome here that cannot
+    manufacture a clean review.
 
     Returns None when no valid JSON value is present, so callers can tell
     "parsed empty → flawless" apart from "unparseable → retry / keep raw text"
@@ -445,12 +518,17 @@ def extract_json_value(raw: str) -> list | dict | None:
         return isinstance(val, dict) and any(
             k in val and (not shaped or isinstance(val[k], list)) for k in ENVELOPE_KEYS)
 
-    for val in reversed(parsed):
-        if envelope(val, shaped=True):
-            return val
-    for val in reversed(parsed):
-        if isinstance(val, list) and val:
-            return val
+    # Shape first, then how much was reported. The tiers are what keep an
+    # envelope's own INNER findings array — a top-level `[...]` span in its own
+    # right — from beating the envelope it belongs to, which would drop every
+    # declaration riding alongside it.
+    for tier in ([v for v in parsed if envelope(v, shaped=True)],
+                 [v for v in parsed if isinstance(v, list) and v]):
+        pick = _richest(tier)
+        if pick is AMBIGUOUS:
+            return None
+        if pick is not None:
+            return pick
     for val in reversed(parsed):
         if envelope(val, shaped=False):
             return val
@@ -544,12 +622,18 @@ def parse_reply(reviewer: str, raw: str) -> tuple[list[Finding], list[str] | Non
 
     Returns None when the reply has no usable JSON at all (caller retries, then
     keeps the raw text as one finding) — distinct from ``([], None)``/``([], [])``
-    which mean the reviewer ran and found nothing."""
+    which mean the reviewer ran and found nothing. A findings array the model
+    filled with something OTHER than objects — a list of sentences, most often —
+    is the first kind and not the second: every entry is dropped by
+    :func:`_to_findings`, and reporting the empty remainder would turn a reply
+    this parser could not read into a reviewer that read the diff and found it
+    flawless."""
     val = extract_json_value(raw)
     if val is None:
         return None
     if isinstance(val, list):
-        return _to_findings(reviewer, val), None
+        findings = _to_findings(reviewer, val)
+        return (findings, None) if findings or not val else None
     items = val.get("findings")
     if not isinstance(items, list):
         return None
@@ -557,6 +641,8 @@ def parse_reply(reviewer: str, raw: str) -> tuple[list[Finding], list[str] | Non
     # a junk entry among the findings is dropped, and every index after it would
     # then point one finding too far, flagging its neighbour.
     kept = [(i, it) for i, it in enumerate(items) if isinstance(it, dict)]
+    if items and not kept:
+        return None
     findings = _to_findings(reviewer, [it for _, it in kept])
     at = {sent: n for n, (sent, _) in enumerate(kept)}
     for i in val.get("fix_needs_rereview") or []:

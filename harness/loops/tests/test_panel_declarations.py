@@ -56,7 +56,7 @@ def test_a_schema_echoed_before_the_answer_is_not_the_answer():
     """Quoting the requested shape and then answering is ordinary model behaviour,
     and the echo is a well-formed envelope carrying an empty `findings`. Taking the
     FIRST one replaced a real review with a clean "found nothing" — silently, since
-    a quoted example parses perfectly. Whatever the model wrote last is its answer."""
+    a quoted example parses perfectly."""
     raw = ('I will reply as {"findings": [], "could_not_assess": []}.\n\n'
            'Here it is:\n'
            '{"findings": [{"severity": "P1", "file": "a.py", "title": "boom"}], '
@@ -66,10 +66,121 @@ def test_a_schema_echoed_before_the_answer_is_not_the_answer():
     assert gaps == ["the migration"]
 
 
+def test_a_schema_echoed_AFTER_the_answer_is_not_the_answer_either():
+    """The mirror, and the one the fix for the case above created: a model that
+    answers and then explains itself has its findings silently replaced by the
+    trailing empty example. Position is a property of how the model narrated, not
+    of which value is the answer — and the panel talks to four CLIs whose habits
+    differ, so preamble and postamble are both ordinary. Neither direction may
+    manufacture a clean "found nothing"."""
+    raw = ('{"findings": [{"severity": "P1", "file": "a.py", "title": "boom"}], '
+           '"could_not_assess": ["the migration"]}\n\n'
+           'For reference, the shape I used was '
+           '{"findings": [], "could_not_assess": []}.')
+    findings, gaps = panel.parse_reply("codex", raw)
+    assert [f.title for f in findings] == ["boom"]
+    assert gaps == ["the migration"]
+
+
+def test_the_judge_is_picked_the_same_way():
+    """`verdicts` is an envelope key too, and the judge runs the same parser. An
+    echo taken as its answer rules on nothing — which sends every finding through
+    as `unjudged` while the round reports a judge that answered."""
+    raw = ('{"verdicts": [{"id": "F01", "members": [0], "real": true}], '
+           '"coverage_note": "the migration is unread"}\n'
+           'Shape used: {"verdicts": [], "coverage_note": ""}')
+    val = panel.extract_json_value(raw)
+    assert [v["id"] for v in val["verdicts"]] == ["F01"]
+    assert val["coverage_note"] == "the migration is unread"
+
+
+def test_a_coverage_note_beats_an_echo_that_notes_nothing():
+    """The judge's answer to a round with nothing to adjudicate is a sentence, not
+    a list — so counting only list items let a real `coverage_note` tie with a
+    trailing empty echo and be replaced by "". That note is the whole answer on
+    the round where the reviewers' coverage split most needs adjudicating."""
+    answer = '{"verdicts": [], "coverage_note": "the migration is unread"}'
+    echo = '{"verdicts": [], "coverage_note": ""}'
+    for raw in (f"Shape: {echo}\n{answer}", f"{answer}\nShape used: {echo}"):
+        assert panel.extract_json_value(raw)["coverage_note"] == "the migration is unread", raw
+
+
+def test_a_declaration_beats_an_echo_that_declares_nothing():
+    """Length of `findings` cannot separate a flawless review from an empty echo,
+    and one of them still carries an answer: "I found nothing AND could not read
+    the migration" is the declaration that stops a quiet round reading as a clean
+    one. It must survive an echo on either side of it."""
+    answer = '{"findings": [], "could_not_assess": ["the migration"]}'
+    echo = '{"findings": [], "could_not_assess": []}'
+    for raw in (f"I will reply as {echo}.\n{answer}", f"{answer}\nThe shape was {echo}."):
+        findings, gaps = panel.parse_reply("codex", raw)
+        assert findings == [] and gaps == ["the migration"], raw
+
+
+def test_two_different_answers_are_not_resolved_by_position():
+    """Nothing in a reply carrying two equally-shaped, equally-full envelopes says
+    which is the answer. Picking either is a bet on prose style, and one of the two
+    bets loses a whole review — so the reply is reported as unstructured instead.
+    That path retries once and then keeps the raw text as a finding, which
+    preserves the uncertainty rather than resolving it wrongly."""
+    raw = ('{"findings": [{"title": "the first answer"}]}\n'
+           '{"findings": [{"title": "a different one"}]}')
+    assert panel.parse_reply("codex", raw) is None
+
+
+def test_an_ambiguous_reply_lands_in_the_degradation_path_that_already_exists(monkeypatch):
+    """What "not resolved" costs, end to end: one retry, and then the reviewer's
+    own words kept as a finding with the round marked as carrying an unstructured
+    reply — which is what stops that round being read as a quiet PR. Nothing is
+    dropped and nothing clean is manufactured."""
+    raw = ('{"findings": [{"title": "the first answer"}]}\n'
+           '{"findings": [{"title": "a different one"}]}')
+    calls = []
+
+    def fake_run_cli(args, label, timeout=panel.CLI_TIMEOUT, attempts=3, stdin_text=None):
+        calls.append(attempts)
+        return raw, None
+
+    monkeypatch.setattr(panel.shutil, "which", lambda name: "/usr/bin/" + name)
+    monkeypatch.setattr(panel, "run_cli", fake_run_cli)
+    got = panel.review_llm("codex", "gpt-5.6-luna", "p")
+    assert got.unstructured is True and len(calls) == 2
+    assert got.skip is None and "the first answer" in got.findings[0].detail
+
+
+def test_one_answer_printed_twice_is_not_an_ambiguity():
+    """Fencing the envelope and then repeating it is one answer, not two — and
+    degrading it would cost a second CLI call and the round its confidence."""
+    envelope = '{"findings": [{"title": "boom"}], "could_not_assess": ["the migration"]}'
+    raw = f'```json\n{envelope}\n```\n\nAgain, in full:\n{envelope}'
+    findings, gaps = panel.parse_reply("pi", raw)
+    assert [f.title for f in findings] == ["boom"] and gaps == ["the migration"]
+
+
+def test_a_review_that_genuinely_found_nothing_is_not_degraded():
+    """Two empty candidates report the same absence, so there is no answer to lose
+    by taking one — and calling it ambiguous would buy a retry and a coverage veto
+    for a reply that was perfectly clear."""
+    raw = ('I will reply as {"findings": [], "could_not_assess": []}.\n'
+           '{"findings": [], "could_not_assess": []}')
+    assert panel.parse_reply("claude", raw) == ([], [])
+
+
 def test_a_sentence_about_the_schema_is_not_an_envelope():
     """`{"findings": "an array of objects"}` carries the key and no answer. The
     real reply — a bare array here — must win over it."""
     raw = ('{"findings": "an array of objects, severity P1..P4"}\n'
+           '[{"severity": "P2", "file": "a.py", "title": "the real one"}]')
+    findings, _ = panel.parse_reply("codex", raw)
+    assert [f.title for f in findings] == ["the real one"]
+
+
+def test_a_list_of_phrases_does_not_outweigh_the_review_beside_it():
+    """A declaration list holds PHRASES and a findings array holds objects, so a
+    rule that counted raw items would let a two-phrase `could_not_assess` beat a
+    one-finding answer — and a list of strings survives `_to_findings` as nothing
+    at all, which is the clean "found nothing" this parser must never invent."""
+    raw = ('{"findings": "an array of objects", "could_not_assess": ["a", "b"]}\n'
            '[{"severity": "P2", "file": "a.py", "title": "the real one"}]')
     findings, _ = panel.parse_reply("codex", raw)
     assert [f.title for f in findings] == ["the real one"]
@@ -139,6 +250,22 @@ def test_unparseable_is_still_none_so_the_caller_can_retry():
     # An object that isn't the envelope has no findings to take.
     assert panel.parse_reply("codex", '{"verdict": "looks fine"}') is None
     assert panel.parse_reply("codex", "[]") == ([], None)
+
+
+def test_findings_that_are_not_objects_are_unreadable_not_absent():
+    """A model that answers with a list of SENTENCES has reviewed the diff and
+    said so; every entry is dropped by `_to_findings`, and reporting the empty
+    remainder records the one thing that must never be manufactured — a reviewer
+    that read the diff and found it flawless. Unreadable is the truthful answer,
+    and it keeps the sentences: the caller retries and then holds the raw reply as
+    a finding."""
+    assert panel.parse_reply("codex", '["the migration is unread", "x is leaky"]') is None
+    assert panel.parse_reply("codex", json.dumps(
+        {"findings": ["x is leaky"], "could_not_assess": ["the migration"]})) is None
+    # ...and a findings array with one usable entry among the junk is still a
+    # review, which is the distinction the existing index arithmetic rests on.
+    findings, _ = panel.parse_reply("codex", json.dumps({"findings": [None, {"title": "x"}]}))
+    assert [f.title for f in findings] == ["x"]
 
 
 # ---- the re-review declaration ---------------------------------------------
