@@ -238,3 +238,133 @@ def test_a_range_that_github_cannot_serve_is_none_not_a_crash():
     # An unmoved head is not a fix pass, and asking GitHub to compare a commit
     # with itself buys an API call to be told nothing changed.
     assert panel._fix_range_diff("acme/board", "aaaa1111", "aaaa1111") is None
+
+
+# --------------------------------------------------------------------------
+# The wiring, end to end
+#
+# The helpers above are unit-tested, but the interesting failures live in run():
+# whether `head_sha` reaches the payload, whether the fix range is taken between
+# the RIGHT two commits, and whether a repeat is left unasked rather than
+# attributed. `tests/test_v215.py` drives a full cycle already, but its double
+# returns one `headRefOid` for every round — so the head never moves, the range
+# is empty by the guard, and every finding there is `unknown`. That is correct
+# behaviour and no cover at all for the path that does the work.
+# --------------------------------------------------------------------------
+
+PR_DIFF = (
+    "diff --git a/app/sync.py b/app/sync.py\n"
+    "@@ -1,1 +1,2 @@\n"
+    "+mirror = {}\n"
+)
+
+#: The fix pass: two lines added at 11 and 12 of app/sync.py. A finding on one of
+#: those was introduced by it; one anywhere else was not.
+FIX_DIFF = (
+    "diff --git a/app/sync.py b/app/sync.py\n"
+    "@@ -10,0 +11,2 @@\n"
+    "+introduced_by_the_fix()\n"
+    "+and_this_one_too()\n"
+)
+
+CFG = {
+    "github": "acme/e2e",
+    "path": "/tmp/acme-e2e",
+    "reviewers": {"claude": {"enabled": True, "model": "sonnet"}},
+    "review_panel": {},
+}
+
+
+def _panel_round(monkeypatch, tmp_path, round_no, findings, head, baseline=()):
+    """One panel run with every subprocess replaced, so what is under test is the
+    payload the panel builds rather than any CLI."""
+    def fake_sh(args, **kw):
+        if args[:3] == ["gh", "pr", "view"]:
+            return json.dumps({"title": "feat: mirror", "additions": 20,
+                               "deletions": 2, "baseRefName": "main",
+                               "headRefName": "feat/x", "headRefOid": head})
+        # The compare call provenance makes — matched on the API path so a
+        # change of spelling fails this test rather than silently falling
+        # through to the PR diff and attributing against the wrong thing.
+        if args[:2] == ["gh", "api"] and "/compare/" in args[2]:
+            return FIX_DIFF
+        return PR_DIFF
+
+    def fake_review(name, model, prompt, effort=""):
+        return panel.ReviewerRun(
+            [panel.Finding("claude", "P2", f, ln, t, "detail")
+             for f, ln, t in findings], None, 800, None)
+
+    def fake_adjudicate(clusters, diff, model, pr, budget=None, coverage=None):
+        return ([panel.Canonical(id=panel._finding_id(pr, i + 1), severity="P2",
+                                 file=f.file, line=f.line, synthesis=f.title,
+                                 verdict="confirmed", detail="detail",
+                                 reported_by=[f], rationale="real")
+                 for i, grp in enumerate(clusters) for f in grp], None, "")
+
+    monkeypatch.setattr(panel, "load_repo_cfg", lambda name: CFG)
+    monkeypatch.setattr(panel, "sh", fake_sh)
+    monkeypatch.setattr(panel, "review_llm", fake_review)
+    monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
+    monkeypatch.setattr(panel, "adjudicate", fake_adjudicate)
+    out = tmp_path / f"r{round_no}.json"
+    assert panel.run("e2e", 77, post=False, json_file=str(out), record=False,
+                     round_no=round_no, baseline=list(baseline), max_rounds=2) == 0
+    return str(out), json.loads(out.read_text())
+
+
+def test_a_round_records_the_commit_it_reviewed(monkeypatch, tmp_path):
+    """Round 1 has nothing to attribute against, but it must still bank the SHA —
+    it is the far end of the NEXT round's fix range."""
+    _, r1 = _panel_round(monkeypatch, tmp_path, 1,
+                   [("app/sync.py", 11, "a stale mirror")], head="aaa111")
+    assert r1["head_sha"] == "aaa111"
+    # Nothing to attribute in round 1: there is no earlier fix pass.
+    assert r1["provenance_counts"] == {}
+    assert all(f["provenance"] is None for f in r1["to_fix"])
+
+
+def test_round_two_splits_its_new_findings_by_where_they_came_from(monkeypatch, tmp_path):
+    """The whole point, through the real `run()`: two defects new to round 2, one
+    on a line the fix wrote and one nowhere near it, must not read the same."""
+    r1_path, _ = _panel_round(monkeypatch, tmp_path, 1,
+                        [("app/sync.py", 11, "a stale mirror")], head="aaa111")
+    _, r2 = _panel_round(monkeypatch, tmp_path, 2,
+                   [("app/sync.py", 11, "the fix left a dangling handle"),
+                    ("app/sync.py", 90, "an unrelated defect nobody saw")],
+                   head="bbb222", baseline=[r1_path])
+
+    assert r2["head_sha"] == "bbb222"
+    got = {f["synthesis"]: f["provenance"] for f in r2["to_fix"]}
+    assert got["the fix left a dangling handle"] == "introduced"
+    assert got["an unrelated defect nobody saw"] == "missed"
+    assert r2["provenance_counts"]["introduced"] == 1
+    assert r2["provenance_counts"]["missed"] == 1
+
+
+def test_a_repeat_is_not_asked_rather_than_answered_unknown(monkeypatch, tmp_path):
+    """A defect an earlier round already raised predates the fix pass under
+    attribution, so it has no provenance — `null`, not `unknown`. Recorded as
+    `unknown` it would inflate the unattributable bucket with findings nobody
+    ever intended to attribute, and make an honest measurement look broken."""
+    title = "a stale mirror"
+    r1_path, _ = _panel_round(monkeypatch, tmp_path, 1,
+                        [("app/sync.py", 11, title)], head="aaa111")
+    _, r2 = _panel_round(monkeypatch, tmp_path, 2, [("app/sync.py", 11, title)],
+                   head="bbb222", baseline=[r1_path])
+    repeat = r2["to_fix"][0]
+    assert repeat["new_this_round"] is False
+    assert repeat["provenance"] is None
+
+
+def test_an_unmoved_head_attributes_nothing(monkeypatch, tmp_path):
+    """No fix pass ran between the rounds, so there is no range and nothing to
+    blame it for. This is the case `tests/test_v215.py`'s double happens to
+    exercise, and it must degrade to `unknown` rather than to `missed`."""
+    r1_path, _ = _panel_round(monkeypatch, tmp_path, 1,
+                        [("app/sync.py", 11, "a stale mirror")], head="aaa111")
+    _, r2 = _panel_round(monkeypatch, tmp_path, 2,
+                   [("app/sync.py", 11, "something else entirely")],
+                   head="aaa111", baseline=[r1_path])
+    assert r2["to_fix"][0]["provenance"] == "unknown"
+    assert any("provenance unavailable" in n for n in r2["config_notes"])
