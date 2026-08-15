@@ -97,12 +97,29 @@ sys.path.insert(0, str(Path(__file__).parent))
 import harness_rules  # noqa: E402
 from harness_rules import RepoNotFound, describe, resolve_repo  # noqa: E402
 
-# Chars of diff handed to a model, when nothing in .harness-rules says otherwise.
-# It is a per-MODEL budget (review_panel.max_diff_chars, overridable per reviewer
-# and for the judge), because 60k is one number standing in for several different
-# context windows — and the cost of getting it wrong is invisible: the reviewer
-# reads a prefix of the diff and reports confidently on the part it saw.
-MAX_DIFF_CHARS = 60_000
+# Chars of diff handed to a model, when nothing in .harness-rules says otherwise:
+# NONE OF THEM. The whole diff goes to every reviewer unless a repo asks for a
+# cap (review_panel.max_diff_chars, overridable per reviewer and for the judge).
+#
+# There was a 60,000-char default here, inherited from a constraint that no
+# longer exists: the prompt used to travel in argv, where Linux caps a single
+# element at 128 KiB. Since prompts moved to stdin the only ceiling is the
+# model's own context, and 60k chars is ~15k tokens — an order of magnitude
+# under every reviewer this panel runs.
+#
+# It was never a neutral saving. A truncated reviewer cannot notice that it was
+# truncated, so it reports confidently on a prefix, and the failure is BIASED
+# TOWARDS FALSE POSITIVES: on the review that removed this default, a reviewer
+# reported a migration as "syntactically incomplete" because the file was cut
+# mid-way, and the panel spent a judge call and a fixer's attention proving the
+# file was fine. Two other rounds lost ~600 lines of a test file to the same cut.
+# Paying for a review of a prefix is worse than paying for a review.
+#
+# A budget larger than a model will take now fails LOUDLY — the API refuses the
+# request and the reviewer is reported as degraded, with the reason. That is the
+# right way round: a reviewer that could not read the change must look different
+# from one that read it and found nothing, which is the whole argument of v2.15.
+DEFAULT_DIFF_BUDGET: int | None = None
 RAW_DETAIL_CHARS = 4_000  # cap an unparsed reviewer reply kept as a fallback finding
 # How far apart two findings in one file can be and still be offered to the judge
 # as "possibly the same observation". A hint only — see cluster_findings.
@@ -139,14 +156,12 @@ ARGV_PROMPT_MAX_BYTES = 120_000
 # downstream comparison has to defend itself.
 SEVERITIES = ("P1", "P2", "P3", "P4")
 
-# Prompts go to the CLIs as a single argv entry, and Linux caps ONE argument at
-# MAX_ARG_STRLEN (128 KiB) however generous ARG_MAX is — so a big listing plus a
-# big diff is an E2BIG, not a slow run. The judge's prompt is the one that grows
-# with the review (one line per reviewer account, each up to RAW_DETAIL_CHARS),
-# so it gets a budget: the diff keeps its configured share and the listing takes
-# what is left under this ceiling.
-ARGV_BUDGET = 100_000
-MAX_LISTING_CHARS = 40_000    # fallback share for the judge's finding listing
+# The judge's prompt holds the one component that grows with the review itself —
+# one line per reviewer account, each up to RAW_DETAIL_CHARS — so the listing
+# gets a budget of its own. It is no longer a share of anything: the diff's
+# ceiling was the kernel's while prompts travelled in argv, and on stdin the two
+# stopped competing for it.
+MAX_LISTING_CHARS = 40_000     # the judge's finding listing
 LISTING_ACCOUNT_CHARS = 1_200  # one account's share of that listing
 
 # GitHub rejects an issue comment over 65,536 characters. The report grows with
@@ -733,9 +748,10 @@ def record_run(payload: dict) -> None:
         print(f"panel: {note[-1]}", file=sys.stderr)
 
 
-def diff_budget(block: dict, key: str, fallback: int, notes: list[str]) -> int:
+def diff_budget(block: dict, key: str, fallback: int | None,
+                notes: list[str]) -> int | None:
     """How much diff one model is given, from config, with the inherited value as
-    the fallback.
+    the fallback. ``None`` — the default — means the whole diff, uncut.
 
     Any positive value is honoured — the config wins, and the CONSEQUENCE is what
     gets surfaced: an under-budget diff is reported as truncated, per reviewer,
@@ -758,6 +774,7 @@ def diff_budget(block: dict, key: str, fallback: int, notes: list[str]) -> int:
     raw = block.get(key)
     if raw is None or raw == "":
         return fallback
+    said = f"{fallback:,}" if fallback is not None else "the whole diff"
     n = None
     if not isinstance(raw, bool) and isinstance(raw, (int, str)):
         try:
@@ -765,10 +782,10 @@ def diff_budget(block: dict, key: str, fallback: int, notes: list[str]) -> int:
         except ValueError:
             n = None
     if n is None:
-        notes.append(f"`{key}`={raw!r} is not a number — using {fallback:,}")
+        notes.append(f"`{key}`={raw!r} is not a number — using {said}")
         return fallback
     if n <= 0:
-        notes.append(f"`{key}`={n:,} would send no diff at all — using {fallback:,}")
+        notes.append(f"`{key}`={n:,} would send no diff at all — using {said}")
         return fallback
     return n
 
@@ -1794,7 +1811,7 @@ def _parse_verdicts(parsed: list, flat: list[Finding], pr: int) -> list[Canonica
 
 
 def adjudicate(clusters: list[list[Finding]], diff: str, model: str, pr: int,
-               budget: int = MAX_DIFF_CHARS,
+               budget: int | None = DEFAULT_DIFF_BUDGET,
                coverage: dict[str, list[str]] | None = None
                ) -> tuple[list[Canonical], str | None, str]:
     """The 'master' rules on every finding, merges the duplicates it finds, AND
@@ -1828,20 +1845,22 @@ def adjudicate(clusters: list[list[Finding]], diff: str, model: str, pr: int,
     declared = {k: v for k, v in (coverage or {}).items() if v}
     if not any(clusters) and not declared:
         return [], None, ""
-    # The listing takes what the diff leaves under ARGV_BUDGET. That ceiling is
-    # no longer the kernel's — since #38 this prompt goes on stdin, where there
-    # is none — but the sharing rule it encodes still earns its place: the
-    # listing is the component that grows with the panel's output, so without a
-    # share it is the diff that gets squeezed out of the model's CONTEXT
-    # instead. Same arithmetic, a budget that is now about the model rather than
-    # about execve.
-    diff_text = diff[:budget]
+    # The listing and the diff no longer share one ceiling. They did while the
+    # prompt travelled in argv and the two genuinely competed for the kernel's
+    # 128 KiB; on stdin they compete only for the model's context, and the diff
+    # has no cap by default. Subtracting an uncapped diff from a fixed ceiling
+    # drove the listing straight to its 4,000-char floor — starving the one
+    # component that is unbounded in the panel's OWN output, on exactly the runs
+    # (many findings, big diff) where the judge most needs to see all of them.
+    #
+    # So each gets its own budget: the diff whatever was configured for it, the
+    # listing MAX_LISTING_CHARS. A capped diff leaves the listing more room than
+    # it asks for either way, so there is nothing left for the old arithmetic.
+    diff_text = diff if budget is None else diff[:budget]
     stated = "\n".join(f"- {name}: could not assess {'; '.join(items)}"
                        for name, items in sorted(declared.items())) \
         or "- (no reviewer declared a gap in its coverage)"
-    listing, flat = _judge_listing(
-        clusters,
-        max(4_000, ARGV_BUDGET - len(diff_text) - len(JUDGE_PROMPT) - len(stated)))
+    listing, flat = _judge_listing(clusters, MAX_LISTING_CHARS)
     listing = listing or ("- (no findings this round — there is nothing to adjudicate "
                           "but the coverage below; return an empty `verdicts` array)")
 
@@ -2537,7 +2556,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # Diff budgets: panel-wide value, then each model's own override. Every
     # reviewer used to get the same 60k prefix regardless of its context window.
     notes: list[str] = []
-    panel_budget = diff_budget(panel, "max_diff_chars", MAX_DIFF_CHARS, notes)
+    panel_budget = diff_budget(panel, "max_diff_chars", DEFAULT_DIFF_BUDGET, notes)
     # Only for the reviewers actually running: a budget warning about a model
     # this run never asked for is noise, and a "truncated for antigravity" footnote
     # under a claude-only panel is a lie.
@@ -2545,24 +2564,33 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                for name in LLM_REVIEWERS if name in selected}
     judge_budget = diff_budget(panel, "judge_max_diff_chars", panel_budget, notes)
 
-    def prompt_for(budget: int) -> str:
+    def prompt_for(budget: int | None) -> str:
         return REVIEW_PROMPT.format(n=pr_number, repo=gh_repo, base=base,
-                                    diff=diff[:budget])
+                                    diff=diff if budget is None else diff[:budget])
 
     # `agy` is the only reviewer whose prompt must travel in argv, so it is the
     # only one the kernel can veto. Clamp it to what execve will carry and say
     # so — the alternative, honouring the number and dying at exec, is how a
     # panel came to report "LLM reviewers ran: none" as a clean review.
+    #
+    # It is also the only seat an UNCAPPED budget can still cut, which is why the
+    # clamp starts from the diff's own length when there is no budget: "no cap"
+    # means "as much as this machine can hand over", and on this one seat that is
+    # a smaller number than on the others. The note says so in chars of the diff
+    # rather than in config terms, since there is no config value to blame.
     if "antigravity" in budgets:
-        fitted = fit_argv_budget(prompt_for, budgets["antigravity"])
-        if fitted < budgets["antigravity"]:
+        asked = budgets["antigravity"]
+        fitted = fit_argv_budget(prompt_for, len(diff) if asked is None else asked)
+        if fitted < (len(diff) if asked is None else asked):
             notes.append(
-                f"`max_diff_chars`={budgets['antigravity']:,} exceeds what fits in one "
-                f"argv element ({ARGV_PROMPT_MAX_BYTES:,} bytes) — antigravity gets "
-                f"{fitted:,}. It is the one CLI with no way to read a prompt off stdin.")
+                f"antigravity gets {fitted:,} of {len(diff):,} diff chars — its prompt "
+                f"travels in argv and the kernel caps one element at "
+                f"{ARGV_PROMPT_MAX_BYTES:,} bytes. It is the only reviewer with no way "
+                "to read a prompt off stdin.")
             budgets["antigravity"] = fitted
 
-    truncated_for = {n: b for n, b in budgets.items() if len(diff) > b}
+    truncated_for = {n: b for n, b in budgets.items()
+                     if b is not None and len(diff) > b}
     truncated = bool(truncated_for)
 
     result = PanelResult()

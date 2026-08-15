@@ -7,6 +7,36 @@ that number where it was, so the repo can be a version ahead of the service.
 Entries are newest first. Each one says what was broken or missing before it, because that is the
 part that isn't recoverable from the diff.
 
+## v2.16 — no diff budget by default
+
+The panel gave every reviewer 60,000 chars of diff and no more. That number was inherited from a
+constraint that had already been removed: prompts used to travel in argv, where Linux caps a single
+element at 128 KiB, so a budget was mandatory. v2.14 moved them to stdin. The default outlived its
+reason by a release, and 60k chars is roughly 15k tokens — an order of magnitude under every
+reviewer the panel runs.
+
+Truncating when nothing forces it is not a saving, because the cut is invisible to the one party
+that would report it. A reviewer handed a prefix cannot tell it was handed a prefix, so it reviews
+confidently on what it saw, and the resulting errors are **false positives**: reviewing v2.15's own
+PR, a reviewer reported a migration as "syntactically incomplete" because the file had been cut
+mid-way, and the panel spent a judge call and a fixer's attention proving the file was fine. Two
+later rounds lost ~600 lines of a test file the same way and said so in their coverage declarations.
+Paying for a review of a prefix is worse than paying for a review.
+
+So the whole diff goes to every reviewer unless a repo asks for a cap. A budget larger than a model
+will take now fails loudly — the API refuses the request and the reviewer is reported as degraded,
+with the reason — which is the right way round: a reviewer that could not read the change must look
+different from one that read it and found nothing.
+
+Two seats keep a bound, for reasons that are still real. `agy` takes its prompt in argv, so the
+kernel caps it; the panel clamps that seat to what `execve` will carry and reports it as ordinary
+truncation. And the judge's finding listing keeps its own 40,000-char budget — it is the component
+that grows with the panel's own output. It used to take *what the diff left* under a fixed ceiling,
+which with an uncapped diff drove it straight to its 4,000-char floor, starving the listing on
+exactly the runs where the judge most needs to see every finding.
+
+No board change: the API and the served version stay at v2.15.
+
 ## v2.15 — the fix gets reviewed, and a run says what it could not see
 
 `/panel-review-pr` ran exactly one round: panel → judge → one fixer → push → stop. The commit
