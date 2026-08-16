@@ -221,7 +221,13 @@ dispatcher is exactly what the board exists to remove.
 qb-seat 3                  # seat 3, in this directory
 qb-seat 3 --dry-run        # print the environment, cwd and brief; start nothing
 qb-seat 3 --model opus     # anything else is passed through to the agent
+qb-seat 3 -- --dry-run     # …and everything after -- is passed through untouched
 ```
+
+`--dry-run` and `--help` are taken from anywhere in the arguments, not only from the
+position above: everything after the seat number goes to the agent verbatim, and a
+misplaced `--dry-run` that started five agents would be the one mistake this flag exists
+to prevent. `--` is the way to hand either word on to the agent anyway.
 
 A multiplexer supplies the panes and its layout says `qb-seat 1` … `qb-seat n`; this
 supplies what goes in one. It is deliberately thin, because everything that would make it
@@ -234,10 +240,11 @@ The brief is **identical for every seat** — *read the board, claim an unclaime
 atomically, work it, release on exit* — and that is the design rather than an omission. A
 spawner that reads the plan and hands seat 1 the first item is hub-and-spoke with a hub
 that runs once, at t=0, and then stops existing. Override it wholesale with
-`QB_SEAT_BRIEF` if a fleet wants a different one; the seat number is the only thing that
-differs between panes. It also tells a seat to **stop after one item**, because a seat
-that re-claims when it finishes turns the fleet into a drain, and nothing yet bounds how
-much work a fleet may take on.
+`QB_SEAT_BRIEF` if a fleet wants a different one — or set it to the empty string for a
+pane that should come up waiting rather than working, which starts the agent with no
+prompt at all. The seat number is the only thing that differs between panes. It also
+tells a seat to **stop after one item**, because a seat that re-claims when it finishes
+turns the fleet into a drain, and nothing yet bounds how much work a fleet may take on.
 
 **Why the instance is per seat and never host-wide.** The lifecycle hook keys its ask-poll
 cursor on `QUARTERBACK_INSTANCE` (`qb-asks-<agent>-<instance>`), so one value exported for
@@ -278,15 +285,33 @@ identity — from its side they are indistinguishable by construction. They then
 ask-poll cursor, and whichever polls first swallows the other's mail: the exact bug the
 per-seat instance exists to prevent, one level down, and invisible because both seats
 otherwise work. So the check is local, where the panes actually are. `qb-seat` records its
-pid in `$XDG_RUNTIME_DIR/qb-seat-<n>.pid` and exits **3** if a live process already holds
-that number. A marker left by a seat that died is taken over rather than honoured, and
+pid in `$XDG_RUNTIME_DIR/qb-seat-<n>.pid` — or, on a machine with no `XDG_RUNTIME_DIR`
+(macOS, most containers, ssh onto a box with no systemd user session), in
+`${TMPDIR:-/tmp}/qb-seat-<uid>-<n>.pid`, where the uid is in the name because `/tmp` is
+shared and a marker there is not. It exits **3** if a live process already holds that
+number. A marker left by a seat that died is taken over rather than honoured, and
 `QB_SEAT_FORCE=1` overrides the refusal for a pid that has since been reused by something
-unrelated.
+unrelated — noisily, on stderr, because being wrong about that is the shared-inbox bug
+with nothing on screen.
+
+The marker is **claimed atomically**, by hard-linking a fully written temp file into
+place, and it is claimed *before* the board call rather than after it. That is not
+fastidiousness: the case the guard exists for is a layout, a layout starts all n panes in
+the same instant, and look-then-write loses that race by construction — every pane sees a
+free seat while the one that got there first is still several seconds deep in registering
+its name. Measured on the check-then-write version: twelve panes started as seat 1 left
+between six and twelve agents running, all sharing one identity. Hard-linking leaves one.
 
 **Best-effort by construction.** No board configured, no token, no `curl`, no network: the
-registration is skipped in silence and the seat starts anyway. A seat that refused to run
-because a cosmetic name could not be reserved would cost more than the name is worth — the
-same bargain `qb-stage` strikes, and the panel's board recording before that.
+registration is skipped and the seat starts anyway. A seat that refused to run because a
+cosmetic name could not be reserved would cost more than the name is worth — the same
+bargain `qb-stage` strikes, and the panel's board recording before that. Two things it is
+*not* silent about, because both are worth a line before the rest of the session goes
+wrong the same way: a board that answered **401** (a revoked token, or the other island's
+token — the lifecycle hooks are about to be refused identically) and a board that did not
+answer at all (fine on a laptop, and said differently). The token itself goes to `curl` on
+stdin, never in argv, where any local process could read it out of `/proc` for the life of
+the call.
 
 What it deliberately does **not** do: create a worktree (under self-selection a seat does
 not know its branch until it has claimed something, and `/fix-issue` owns that path and its
@@ -295,10 +320,18 @@ per-branch database), assign work, or drive the agent past starting it.
 | Variable | Default | What it does |
 |---|---|---|
 | `QB_SEAT_REPO` | the pane's cwd | Where the seat works; the layout normally sets the cwd instead |
-| `QB_SEAT_BRIEF` | the built-in brief | Replaces it wholesale |
+| `QB_SEAT_BRIEF` | the built-in brief | Replaces it wholesale; empty means no brief at all |
 | `QB_SEAT_CLAUDE` | `claude` | The agent to start |
-| `QB_SEAT_FORCE` | unset | Start anyway when this seat number looks already taken |
-| `QUARTERBACK_BASE_URL`, `QUARTERBACK_TOKEN` / `QUARTERBACK_TOKEN_CMD` | from `~/.config/quarterback/config` | The board to register the name with |
+| `QB_SEAT_FORCE` | unset | Start anyway when this seat number looks already taken. Truthy values only (`1`, `yes`, `true`, `on`) — `QB_SEAT_FORCE=0` leaves the guard on |
+| `QUARTERBACK_BASE_URL`, `QUARTERBACK_TOKEN` / `QUARTERBACK_TOKEN_CMD` | from the config file | The board to register the name with |
+| `QUARTERBACK_CONFIG` | `$XDG_CONFIG_HOME/quarterback/config`, else `~/.config/quarterback/config` | Where those three are read from when the environment does not supply them. Sourced in a subshell, and only those three are read back out of it, so nothing else the file sets can reach the seat or the agent |
+
+The environment beats the file variable by variable — except the *credential*, which is
+taken as a set: a `QUARTERBACK_TOKEN_CMD` in the environment means the file's static
+`QUARTERBACK_TOKEN` is not used at all. Best-of-each would authenticate one island's board
+with the other island's credential, which is the exact failure the per-host config exists
+to prevent. A config file that *errors* is reported and then ignored entirely, rather than
+half-applied and passed over in silence.
 
 ## How it works
 

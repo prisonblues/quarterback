@@ -16,7 +16,10 @@ Run: pytest harness/tests
 
 import json
 import os
+import shlex
 import subprocess
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -49,22 +52,34 @@ def fake_bin(tmp_path):
     return _install
 
 
+def _fake_agent_body(record):
+    """The body of a fake agent that records how it was started, then exits 0.
+
+    It records its OWN pid, because that is an invariant and not a detail: qb-seat
+    execs, so the pid in the pane marker is the pid of the process that became the
+    agent. A refactor that backgrounded the agent instead would still write a
+    marker, still hold a plausible number, and still be wrong.
+    """
+    return (
+        "#!/usr/bin/env bash\n"
+        "export FAKE_AGENT_PID=$$\n"
+        'python3 -c "\n'
+        "import json, os, sys\n"
+        f"json.dump({{'args': sys.argv[1:], 'cwd': os.getcwd(),\n"
+        "  'pid': int(os.environ['FAKE_AGENT_PID']),\n"
+        "  'leaked': os.environ.get('QB_SEAT_LEAKED'),\n"
+        "  'instance': os.environ.get('QUARTERBACK_INSTANCE')},\n"
+        f"  open({str(record)!r}, 'w'))\n"
+        '" "$@"\n'
+    )
+
+
 @pytest.fixture
 def agent(fake_bin, tmp_path):
     """A fake agent binary that records how it was started, then exits 0."""
     record = tmp_path / "agent.json"
-    fake_bin(
-        "claude",
-        "#!/usr/bin/env bash\n"
-        'python3 -c "\n'
-        "import json, os, sys\n"
-        f"json.dump({{'args': sys.argv[1:], 'cwd': os.getcwd(),\n"
-        "  'instance': os.environ.get('QUARTERBACK_INSTANCE')},\n"
-        f"  open({str(record)!r}, 'w'))\n"
-        '" "$@"\n',
-    )
-    agent_started = record
-    return agent_started
+    fake_bin("claude", _fake_agent_body(record))
+    return record
 
 
 @pytest.fixture
@@ -80,7 +95,7 @@ def runtime_dir(tmp_path):
 def run(repo, fake_bin, tmp_path, runtime_dir):
     """Invoke qb-seat with a board that is deliberately absent unless asked for."""
 
-    def _run(*args, env=None, cwd=None):
+    def _run(*args, env=None, cwd=None, unset=()):
         environ = {**os.environ, "PATH": f"{fake_bin.dir}:{os.environ['PATH']}"}
         for leaked in (
             "QUARTERBACK_BASE_URL",
@@ -90,6 +105,7 @@ def run(repo, fake_bin, tmp_path, runtime_dir):
             "QB_SEAT_REPO",
             "QB_SEAT_BRIEF",
             "QB_SEAT_CLAUDE",
+            "QB_SEAT_LEAKED",
         ):
             environ.pop(leaked, None)
         # Never the developer's own config: a test that reads it would talk to
@@ -98,6 +114,8 @@ def run(repo, fake_bin, tmp_path, runtime_dir):
         environ["XDG_RUNTIME_DIR"] = str(runtime_dir)
         environ.pop("QB_SEAT_FORCE", None)
         environ.update(env or {})
+        for gone in unset:
+            environ.pop(gone, None)
         return subprocess.run(
             [str(QB_SEAT), *args],
             env=environ,
@@ -175,6 +193,16 @@ def test_a_directory_that_is_not_a_repository_is_refused(run, tmp_path):
     assert "not a git repository" in result.stderr
 
 
+def test_a_bare_repository_is_refused(run, tmp_path):
+    """`rev-parse --git-dir` succeeds in a bare repo, and a seat started in one
+    has nowhere to edit a file — which fails much later and much less clearly."""
+    bare = tmp_path / "bare.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+    result = run("1", "--dry-run", cwd=bare)
+    assert result.returncode == 2
+    assert "bare git repository" in result.stderr
+
+
 def test_a_working_directory_that_does_not_exist_is_refused(run, tmp_path):
     result = run("1", "--dry-run", env={"QB_SEAT_REPO": str(tmp_path / "gone")})
     assert result.returncode == 2
@@ -225,7 +253,24 @@ def test_extra_arguments_are_passed_through_ahead_of_the_brief(run, agent):
     run("1", "--model", "opus")
     args = json.loads(agent.read_text())["args"]
     assert args[:2] == ["--model", "opus"]
-    assert len(args) == 3
+    assert len(args) == 4  # …plus the -- terminator and the brief
+
+
+def test_an_argument_with_a_space_in_it_arrives_as_one_argument(run, agent):
+    """Word-splitting a pass-through is silent and total: the agent gets two
+    arguments it half-recognises rather than the one it was handed."""
+    run("1", "--append-system-prompt", "be terse", "--add-dir", "/tmp/a b")
+    args = json.loads(agent.read_text())["args"]
+    assert args[:4] == ["--append-system-prompt", "be terse", "--add-dir", "/tmp/a b"]
+
+
+def test_arguments_after_a_double_dash_are_not_read_as_ours(run, agent):
+    """--dry-run and --help are harvested from anywhere, which leaves no way to
+    pass either word ON to the agent. `--` is that way."""
+    result = run("1", "--", "--dry-run", "--help")
+    assert result.returncode == 0
+    args = json.loads(agent.read_text())["args"]
+    assert args[:2] == ["--dry-run", "--help"]
 
 
 def test_every_seat_gets_the_same_brief_but_its_own_number(run):
@@ -248,7 +293,33 @@ def test_the_brief_tells_the_seat_to_claim_before_it_works(run):
 
 def test_the_brief_can_be_replaced_wholesale(run, agent):
     run("1", env={"QB_SEAT_BRIEF": "do the other thing"})
-    assert json.loads(agent.read_text())["args"] == ["do the other thing"]
+    assert json.loads(agent.read_text())["args"] == ["--", "do the other thing"]
+
+
+def test_a_brief_that_starts_with_a_dash_is_still_a_brief(run, agent):
+    """It is a wholesale override, and `--help` is about the first thing anybody
+    overrides it with while trying the thing out."""
+    run("1", env={"QB_SEAT_BRIEF": "--help"})
+    args = json.loads(agent.read_text())["args"]
+    assert args == ["--", "--help"]
+
+
+def test_an_empty_brief_means_no_brief_at_all(run, agent):
+    """`:-` cannot tell "unset" from "set to nothing", so a layout that wants a
+    pane to come up waiting rather than working got the full built-in brief —
+    the one value a wholesale override could not express."""
+    run("1", env={"QB_SEAT_BRIEF": ""})
+    assert json.loads(agent.read_text())["args"] == []
+
+
+def test_qb_seat_claude_chooses_the_agent(run, agent, fake_bin, tmp_path):
+    """The knob exists so a fleet can start something that is not on PATH as
+    `claude`; getting it wrong starts the wrong binary rather than failing."""
+    other_record = tmp_path / "other-agent.json"
+    fake_bin("other-agent", _fake_agent_body(other_record))
+    assert run("1", env={"QB_SEAT_CLAUDE": "other-agent"}).returncode == 0
+    assert not agent.exists()
+    assert json.loads(other_record.read_text())["instance"] == "seat-1"
 
 
 # ---- --dry-run --------------------------------------------------------------
@@ -268,7 +339,43 @@ def test_dry_run_is_honoured_anywhere_in_the_arguments(run, agent):
 
 def test_dry_run_shows_the_command_it_would_run(run):
     out = run("1", "--dry-run", "--model", "opus").stdout
-    assert "command:  claude --model opus <brief>" in out
+    assert "command:  claude --model opus -- <brief>" in out
+
+
+def test_dry_run_with_no_arguments_shows_no_argument(run):
+    """`printf ' %q' "$@"` with nothing to print still applies the format once,
+    with the missing argument as the empty string — so the dry run showed a
+    `claude ''` that it would never really pass."""
+    out = run("1", "--dry-run").stdout
+    assert "command:  claude -- <brief>" in out
+    assert "''" not in out
+
+
+def test_help_is_honoured_after_the_seat_number(run, agent):
+    """--dry-run is harvested from anywhere because a misplaced one would
+    otherwise start the very agent it was meant to stop. `qb-seat 1 --help`
+    started one too."""
+    result = run("1", "--help")
+    assert result.returncode == 0
+    assert "qb-seat <n>" in result.stdout
+    assert not agent.exists()
+
+
+def test_the_usage_text_is_found_by_marker_and_not_by_line_number(run):
+    """Addressed as `sed -n '4,15p'`, --help printed whatever happened to be on
+    those twelve lines: the first paragraph added to the top of the file breaks
+    it silently, and nothing anywhere fails."""
+    out = run("--help").stdout
+    for expected in (
+        "qb-seat <n> [agent args…]",
+        "qb-seat <n> --dry-run",
+        "qb-seat <n> -- [args…]",
+        "qb-seat -h|--help",
+        "Exit codes",
+    ):
+        assert expected in out
+    assert ":usage" not in out
+    assert "WHAT THIS IS FOR" not in out
 
 
 # ---- registering the name with the board ------------------------------------
@@ -276,24 +383,40 @@ def test_dry_run_shows_the_command_it_would_run(run):
 
 @pytest.fixture
 def board(fake_bin, tmp_path):
-    """A fake curl that records the request and answers with a chosen identity."""
-    calls = tmp_path / "curl.args"
+    """A fake curl that records the request and answers with a chosen identity.
 
-    def _board(agent_identity="zeus/seat-1"):
+    It emulates the two parts of the call qb-seat actually depends on: the config
+    fed in on stdin, which is where the credential goes and where it has to stay,
+    and the ``--write-out`` status code appended to the body.
+    """
+    calls = tmp_path / "curl.args"
+    stdin = tmp_path / "curl.stdin"
+
+    def _board(agent_identity="zeus/seat-1", status="200", body=None):
+        if body is None:
+            body = f'{{"agent":"{agent_identity}","machine":"zeus"}}'
         fake_bin(
             "curl",
             "#!/usr/bin/env bash\n"
             f'printf "%s\\n" "$@" >> {calls}\n'
-            f"printf '%s' '{{\"agent\":\"{agent_identity}\",\"machine\":\"zeus\"}}'\n",
+            f"cat >> {stdin}\n"
+            f"printf '%s' {shlex.quote(body)}\n"
+            f"printf '\\n%s' {shlex.quote(status)}\n",
         )
         return calls
 
     _board.calls = calls
+    _board.stdin = stdin
     return _board
 
 
 def _sent(calls):
     return calls.read_text() if calls.exists() else ""
+
+
+def _fed(board):
+    """What went in on curl's stdin — the config carrying the credential."""
+    return board.stdin.read_text() if board.stdin.exists() else ""
 
 
 def test_no_board_configured_means_no_call_and_no_complaint(run, board, agent):
@@ -320,8 +443,20 @@ def test_the_name_is_requested_at_first_contact(run, board, agent):
     sent = _sent(calls)
     assert "X-Agent-Key: seat-3" in sent
     assert "X-Agent-Name: seat-3" in sent
-    assert "Authorization: Bearer t0ken" in sent
     assert "https://board.example/whoami" in sent
+    assert "Authorization: Bearer t0ken" in _fed(board)
+
+
+def test_the_token_is_never_put_on_the_command_line(run, board, agent):
+    """Every argument a process is started with is readable by any local process
+    for the life of the call, in ps and in /proc/<pid>/cmdline."""
+    calls = board()
+    run(
+        "1",
+        env={"QUARTERBACK_BASE_URL": "https://board.example", "QUARTERBACK_TOKEN": "s3cret"},
+    )
+    assert "s3cret" not in _sent(calls)
+    assert "Authorization: Bearer s3cret" in _fed(board)
 
 
 def test_a_trailing_slash_on_the_base_url_does_not_double(run, board, agent):
@@ -334,7 +469,7 @@ def test_a_trailing_slash_on_the_base_url_does_not_double(run, board, agent):
 
 
 def test_the_token_command_is_used_when_no_token_is_set(run, board, agent):
-    calls = board()
+    board()
     run(
         "1",
         env={
@@ -342,7 +477,40 @@ def test_the_token_command_is_used_when_no_token_is_set(run, board, agent):
             "QUARTERBACK_TOKEN_CMD": "printf 'from-cmd\\nignored-second-line'",
         },
     )
-    assert "Authorization: Bearer from-cmd" in _sent(calls)
+    assert "Authorization: Bearer from-cmd" in _fed(board)
+
+
+def test_a_token_command_that_prints_crlf_does_not_break_the_header(run, board, agent):
+    """A secret manager reached across a Windows-shaped boundary prints CRLF, and
+    a bare \\r left on the end goes into the middle of an Authorization header."""
+    board()
+    run(
+        "1",
+        env={
+            "QUARTERBACK_BASE_URL": "https://board.example",
+            "QUARTERBACK_TOKEN_CMD": "printf 'from-cmd\\r\\nsecond'",
+        },
+    )
+    fed = _fed(board)
+    assert "Authorization: Bearer from-cmd" in fed
+    assert "\r" not in fed
+
+
+def test_a_token_command_that_hangs_does_not_hold_up_the_seat(run, board, agent):
+    """A token command is a secret manager as often as not, and one that decides
+    to prompt holds up the seat, not just the cosmetic name it was asked for."""
+    board()
+    started = time.monotonic()
+    result = run(
+        "1",
+        env={
+            "QUARTERBACK_BASE_URL": "https://board.example",
+            "QUARTERBACK_TOKEN_CMD": "sleep 60",
+        },
+    )
+    assert result.returncode == 0
+    assert time.monotonic() - started < 30
+    assert agent.exists()
 
 
 def test_a_board_configured_only_in_the_config_file_is_still_used(run, board, agent, tmp_path):
@@ -365,7 +533,9 @@ def test_the_config_file_cannot_overwrite_a_board_named_in_the_environment(
     fleet spans deliberately disjoint boards, so a base URL quietly replaced by a
     config file is how a seat posts to the wrong island."""
     config = tmp_path / "config"
-    config.write_text('QUARTERBACK_BASE_URL=https://wrong-island.example\nQUARTERBACK_TOKEN_CMD="printf t"\n')
+    config.write_text(
+        'QUARTERBACK_BASE_URL=https://wrong-island.example\nQUARTERBACK_TOKEN_CMD="printf t"\n'
+    )
     calls = board()
     run(
         "1",
@@ -381,7 +551,7 @@ def test_a_token_command_in_the_environment_survives_the_config_file(run, board,
     credential from the file is still the wrong pair."""
     config = tmp_path / "config"
     config.write_text('QUARTERBACK_TOKEN_CMD="printf from-file"\n')
-    calls = board()
+    board()
     run(
         "1",
         env={
@@ -390,15 +560,79 @@ def test_a_token_command_in_the_environment_survives_the_config_file(run, board,
             "QUARTERBACK_TOKEN_CMD": "printf from-env",
         },
     )
-    assert "Authorization: Bearer from-env" in _sent(calls)
+    assert "Authorization: Bearer from-env" in _fed(board)
 
 
 def test_a_token_in_the_environment_survives_the_config_file(run, board, agent, tmp_path):
     config = tmp_path / "config"
-    config.write_text('QUARTERBACK_BASE_URL=https://board.example\nQUARTERBACK_TOKEN=from-file\n')
-    calls = board()
+    config.write_text("QUARTERBACK_BASE_URL=https://board.example\nQUARTERBACK_TOKEN=from-file\n")
+    board()
     run("1", env={"QUARTERBACK_CONFIG": str(config), "QUARTERBACK_TOKEN": "from-env"})
-    assert "Authorization: Bearer from-env" in _sent(calls)
+    assert "Authorization: Bearer from-env" in _fed(board)
+
+
+def test_a_token_command_in_the_environment_beats_a_static_token_in_the_file(
+    run, board, agent, tmp_path
+):
+    """The credential is taken as a set, not variable by variable. With a token
+    COMMAND in the environment there is no static token to compare against, so
+    best-of-each quietly authenticates one island's board with the other's
+    credential — the mix-up the per-host config exists to prevent."""
+    config = tmp_path / "config"
+    config.write_text(
+        "QUARTERBACK_BASE_URL=https://from-file.example\nQUARTERBACK_TOKEN=from-file\n"
+    )
+    board()
+    run(
+        "1",
+        env={
+            "QUARTERBACK_CONFIG": str(config),
+            "QUARTERBACK_TOKEN_CMD": "printf from-env-cmd",
+        },
+    )
+    fed = _fed(board)
+    assert "Authorization: Bearer from-env-cmd" in fed
+    assert "from-file" not in fed
+
+
+def test_a_config_file_that_errors_is_not_read_as_an_absent_one(run, board, agent, tmp_path):
+    """`. config || true` leaves whatever the file set before the error in play
+    and starts an unregistered seat in silence — two things wrong at once, and
+    the silence is the one that costs an afternoon."""
+    config = tmp_path / "config"
+    config.write_text(
+        "QUARTERBACK_BASE_URL=https://from-file.example\n"
+        'QUARTERBACK_TOKEN="unterminated\n'
+        "QUARTERBACK_TOKEN=never-reached\n"
+    )
+    calls = board()
+    result = run("1", env={"QUARTERBACK_CONFIG": str(config)})
+    assert result.returncode == 0
+    assert "could not be read" in result.stderr
+    assert _sent(calls) == ""
+    assert agent.exists()
+
+
+def test_the_config_file_cannot_reach_the_agent_or_rename_the_seat(run, agent, tmp_path):
+    """A config file is an unrestricted shell script, and sourcing it in this
+    shell means everything it sets it keeps: the instance the marker and the
+    dry-run output still claim, and anything it exports, straight into the
+    agent."""
+    config = tmp_path / "config"
+    config.write_text("QUARTERBACK_INSTANCE=hijacked\nexport QB_SEAT_LEAKED=yes\n")
+    assert run("1", env={"QUARTERBACK_CONFIG": str(config)}).returncode == 0
+    started = json.loads(agent.read_text())
+    assert started["instance"] == "seat-1"
+    assert started["leaked"] is None
+
+
+def test_no_home_does_not_stop_the_seat(run, agent, tmp_path):
+    """A container, a systemd unit with no User=, `env -i`: any of them can leave
+    HOME unset, and merely spelling the default config path under `set -u` would
+    then end a seat over a registration documented as best-effort."""
+    result = run("1", unset=("HOME", "QUARTERBACK_CONFIG", "XDG_CONFIG_HOME"))
+    assert result.returncode == 0
+    assert json.loads(agent.read_text())["instance"] == "seat-1"
 
 
 def test_no_token_anywhere_means_no_call(run, board, agent):
@@ -427,6 +661,30 @@ def test_the_expected_name_is_reported_silently(run, board, agent):
     assert result.stderr == ""
 
 
+def test_a_name_with_a_json_escape_in_it_is_not_warned_about(run, board, agent):
+    """The reply is read with sed, which does not decode JSON: `zeus\\u002fseat-1`
+    IS zeus/seat-1, and comparing the undecoded form warns about our own parser
+    rather than about the name."""
+    board(body=r'{"agent":"zeus\u002fseat-1","machine":"zeus"}')
+    result = run(
+        "1", env={"QUARTERBACK_BASE_URL": "https://board.example", "QUARTERBACK_TOKEN": "t"}
+    )
+    assert result.returncode == 0
+    assert result.stderr == ""
+
+
+def test_a_board_that_answers_with_a_bare_name_is_not_warned_about(run, board, agent):
+    """Matched as `!= */seat-N`, a reply with no slash in it warns every seat on
+    every start — and three lines nobody needs on every start is how an operator
+    learns to skip the one message here that means something."""
+    board("seat-1")
+    result = run(
+        "1", env={"QUARTERBACK_BASE_URL": "https://board.example", "QUARTERBACK_TOKEN": "t"}
+    )
+    assert result.returncode == 0
+    assert result.stderr == ""
+
+
 def test_a_board_that_is_down_does_not_stop_the_seat(run, fake_bin, agent):
     """No network is a normal state for a laptop and must not cost a seat."""
     fake_bin("curl", "#!/usr/bin/env bash\nexit 7\n")
@@ -434,12 +692,39 @@ def test_a_board_that_is_down_does_not_stop_the_seat(run, fake_bin, agent):
         "2", env={"QUARTERBACK_BASE_URL": "https://board.example", "QUARTERBACK_TOKEN": "t"}
     )
     assert result.returncode == 0
+    assert "did not answer" in result.stderr
     assert json.loads(agent.read_text())["instance"] == "seat-2"
 
 
-def test_a_reply_that_is_not_json_does_not_stop_the_seat(run, fake_bin, agent):
-    """An html error page from a reverse proxy is the realistic version of this."""
-    fake_bin("curl", "#!/usr/bin/env bash\nprintf '<html>502</html>'\n")
+def test_a_board_that_refuses_the_token_says_so(run, board, agent):
+    """A revoked token, or the other island's token: the seat still starts, but
+    the lifecycle hooks are about to be refused the same way for the rest of the
+    session, quietly, and this is the one place anybody is looking."""
+    board(status="401", body='{"detail":"unauthorized"}')
+    result = run(
+        "1", env={"QUARTERBACK_BASE_URL": "https://board.example", "QUARTERBACK_TOKEN": "stale"}
+    )
+    assert result.returncode == 0
+    assert "401" in result.stderr
+    assert agent.exists()
+
+
+def test_a_reply_that_is_not_json_does_not_stop_the_seat(run, board, agent):
+    """An html error page from a reverse proxy is the realistic version of this,
+    and it arrives with a status code that says more than the body does."""
+    board(status="502", body="<html>502 Bad Gateway</html>")
+    result = run(
+        "1", env={"QUARTERBACK_BASE_URL": "https://board.example", "QUARTERBACK_TOKEN": "t"}
+    )
+    assert result.returncode == 0
+    assert "502" in result.stderr
+    assert agent.exists()
+
+
+def test_a_success_with_no_name_in_it_is_passed_over_in_silence(run, board, agent):
+    """A 200 whose body has no agent field is a board we do not understand, not a
+    name we disagree with."""
+    board(status="200", body='{"machine":"zeus"}')
     result = run(
         "1", env={"QUARTERBACK_BASE_URL": "https://board.example", "QUARTERBACK_TOKEN": "t"}
     )
@@ -479,12 +764,22 @@ def test_a_seat_running_elsewhere_does_not_block_this_one(run, agent, runtime_di
         live.wait()
 
 
+def _never_live_pid():
+    """A pid that cannot be running, rather than one that merely is not.
+
+    The reaped pid of a process this test started is recycled on a busy machine,
+    and then the marker looks live for a reason that has nothing to do with what
+    is being tested."""
+    try:
+        return int(Path("/proc/sys/kernel/pid_max").read_text().strip()) + 1
+    except OSError:
+        return 2**30
+
+
 def test_a_marker_left_by_a_seat_that_ended_is_taken_over(run, agent, runtime_dir):
     """A seat that dies leaves its marker behind — nothing cleans it up, and a
     pane that could never be restarted would be worse than the collision."""
-    dead = subprocess.Popen(["true"])
-    dead.wait()
-    (runtime_dir / "qb-seat-1.pid").write_text(str(dead.pid))
+    (runtime_dir / "qb-seat-1.pid").write_text(str(_never_live_pid()))
     assert run("1", env={"XDG_RUNTIME_DIR": str(runtime_dir)}).returncode == 0
 
 
@@ -494,21 +789,107 @@ def test_a_corrupt_marker_does_not_block_the_seat(run, agent, runtime_dir):
 
 
 def test_the_refusal_can_be_overridden(run, agent, runtime_dir):
-    """For a marker whose pid has since been reused by something unrelated."""
+    """For a marker whose pid has since been reused by something unrelated — and
+    not in silence, because the override is an assertion rather than a check and
+    being wrong about it is the shared-inbox bug with nothing on screen."""
     live = subprocess.Popen(["sleep", "30"])
     try:
         (runtime_dir / "qb-seat-1.pid").write_text(str(live.pid))
         result = run("1", env={"XDG_RUNTIME_DIR": str(runtime_dir), "QB_SEAT_FORCE": "1"})
         assert result.returncode == 0
+        assert "QB_SEAT_FORCE is set, starting anyway" in result.stderr
+        assert (runtime_dir / "qb-seat-1.pid").read_text() != str(live.pid)
     finally:
         live.kill()
         live.wait()
 
 
-def test_starting_a_seat_records_the_pane_it_is_in(run, agent, runtime_dir):
+@pytest.mark.parametrize("value", ["0", "false", "no", "off", ""])
+def test_the_override_needs_a_truthy_value(run, agent, runtime_dir, value):
+    """Tested for non-emptiness, `QB_SEAT_FORCE=0` from a layout that spells
+    "off" that way turns the guard ON."""
+    live = subprocess.Popen(["sleep", "30"])
+    try:
+        (runtime_dir / "qb-seat-1.pid").write_text(str(live.pid))
+        result = run("1", env={"XDG_RUNTIME_DIR": str(runtime_dir), "QB_SEAT_FORCE": value})
+        assert result.returncode == 3
+        assert not agent.exists()
+    finally:
+        live.kill()
+        live.wait()
+
+
+def test_starting_a_seat_records_the_pid_of_the_agent_itself(run, agent, runtime_dir):
+    """Not just "a number": qb-seat execs, so the marker holds the pid of the
+    process that BECAME the agent. A refactor that backgrounded the agent instead
+    would still write a marker and still hold a plausible number."""
     run("5", env={"XDG_RUNTIME_DIR": str(runtime_dir)})
     marker = runtime_dir / "qb-seat-5.pid"
-    assert marker.read_text().isdigit()
+    assert marker.read_text() == str(json.loads(agent.read_text())["pid"])
+
+
+def test_panes_started_at_the_same_instant_leave_exactly_one_seat(
+    run, fake_bin, tmp_path, runtime_dir
+):
+    """The case the guard exists for is a layout, and a layout starts all n panes
+    at once. Look-then-write loses that race by construction: every pane sees a
+    free seat, and the one that got there first is still several seconds deep in
+    registering the name with the board when the rest decide it is theirs."""
+    starts = tmp_path / "starts"
+    fake_bin(
+        "claude",
+        f'#!/usr/bin/env bash\nprintf "%s\\n" "$$" >> {starts}\nsleep 2\n',
+    )
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = [f.result() for f in [pool.submit(run, "1") for _ in range(8)]]
+    codes = [r.returncode for r in results]
+    assert codes.count(0) == 1, codes
+    assert codes.count(3) == 7, codes
+    assert len(starts.read_text().split()) == 1
+
+
+def test_an_unwritable_marker_directory_costs_the_guard_and_not_the_seat(run, agent, tmp_path):
+    """Best-effort, and said out loud: a seat that cannot be guarded still starts,
+    but nothing on this machine can now tell whether another pane is it."""
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o500)
+    try:
+        result = run("1", env={"XDG_RUNTIME_DIR": str(locked)})
+        assert result.returncode == 0
+        assert "unguarded" in result.stderr
+        assert agent.exists()
+    finally:
+        locked.chmod(0o700)
+
+
+def test_a_marker_path_pointed_at_something_else_is_not_written_through(
+    run, agent, tmp_path, runtime_dir
+):
+    """The fallback marker lives in a shared directory, so the path can be
+    somebody else's symlink by the time we get to it. link(2) does not follow one
+    at the destination, which is most of why it is the primitive here."""
+    target = tmp_path / "precious"
+    target.write_text("do not overwrite me")
+    (runtime_dir / "qb-seat-1.pid").symlink_to(target)
+    result = run("1", env={"XDG_RUNTIME_DIR": str(runtime_dir)})
+    assert result.returncode == 0
+    assert target.read_text() == "do not overwrite me"
+    marker = runtime_dir / "qb-seat-1.pid"
+    assert not marker.is_symlink()
+    assert marker.read_text() == str(json.loads(agent.read_text())["pid"])
+
+
+def test_the_marker_falls_back_to_a_per_user_path(run, agent, tmp_path):
+    """macOS has no XDG_RUNTIME_DIR, and neither do most containers. /tmp is
+    shared, so an unqualified name there means the first user to start seat 3
+    owns the marker for everyone: the second user's seat cannot write it, cannot
+    remove it, and reads `kill -0` refusing on a live pid as proof it is dead."""
+    tmpdir = tmp_path / "tmp"
+    tmpdir.mkdir()
+    result = run("7", env={"TMPDIR": str(tmpdir)}, unset=("XDG_RUNTIME_DIR",))
+    assert result.returncode == 0
+    assert (tmpdir / f"qb-seat-{os.getuid()}-7.pid").exists()
 
 
 def test_a_dry_run_is_told_about_a_collision_but_leaves_no_marker(run, agent, runtime_dir):
