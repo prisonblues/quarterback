@@ -204,6 +204,34 @@ async def test_an_abbreviated_prior_announcement_still_suppresses(client):
         assert await origin.poll_cycle(db, gh) == []
 
 
+async def test_cis_own_announce_payload_suppresses_the_poll(client):
+    # The composition test for #143 + #145. The two above assert the dedup against
+    # payloads this file made up; this one asserts it against the bytes
+    # `announce-board.yml` actually sends, which are neither shape exactly: the
+    # commit ref carries the full slug while the *repo* ref carries only the
+    # basename (`$r|split("/")|last`), and that repo ref is the one
+    # `already_announced` reads. If the two mechanisms ever drift apart, they
+    # drift here, and the symptom is a checkout told it is two commits behind
+    # when it is one.
+    repo, new = "prisonblues/composed", _sha("z")
+    await _register(client, repo, head=OLD, device="watch-composed", path="/src/composed")
+    await client.post(
+        "/post",
+        json={
+            "type": "published",
+            "summary": "Merge pull request #143 from prisonblues/fix/issue-125-127",
+            "refs": [
+                {"kind": "commit", "value": new, "repo": repo},
+                {"kind": "repo", "value": repo.split("/")[-1]},
+                {"kind": "branch", "value": "main"},
+            ],
+        },
+        headers=SERVER,
+    )
+    async with _github({repo: new}) as gh, async_session() as db:
+        assert await origin.poll_cycle(db, gh) == []
+
+
 async def test_a_second_cycle_over_an_unchanged_head_says_nothing(client):
     repo, new = "prisonblues/quiet", _sha("c")
     await _register(client, repo, head=OLD, device="watch-quiet", path="/src/quiet")
