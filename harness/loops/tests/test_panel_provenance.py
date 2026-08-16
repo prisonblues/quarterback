@@ -32,6 +32,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
+from conftest import gh_stub  # noqa: E402
+
+
+
 
 
 TWO_FILES = (
@@ -596,23 +600,15 @@ def _panel_round(monkeypatch, tmp_path, round_no, findings, head, baseline=(),
                  cfg=None, compare=None, moves_to=None):
     """One panel run with every subprocess replaced, so what is under test is the
     payload the panel builds rather than any CLI."""
-    views = []
-
-    def fake_sh(args, **kw):
-        if args[:3] == ["gh", "pr", "view"]:
-            views.append(args)
-            # The head is re-read after the diff is fetched. `moves_to` makes it
-            # move in that window, which is the race the re-read exists for.
-            oid = moves_to if (moves_to and len(views) > 1) else head
-            return json.dumps({"title": "feat: mirror", "additions": 20,
-                               "deletions": 2, "baseRefName": "main",
-                               "headRefName": "feat/x", "headRefOid": oid})
-        # The compare call provenance makes — matched on the API path so a
-        # change of spelling fails this test rather than silently falling
-        # through to the PR diff and attributing against the wrong thing.
-        if args[:2] == ["gh", "api"] and "/compare/" in args[2]:
-            return FIX_COMPARE if compare is None else compare
-        return PR_DIFF
+    # One shared double (conftest.gh_stub) rather than a bespoke one: it knows
+    # every `gh` call panel.py makes, so a call added later is answered here
+    # instead of falling through and degrading the round in silence (128-F09).
+    fake_sh = gh_stub(
+        meta={"title": "feat: mirror", "additions": 20, "deletions": 2,
+              "headRefOid": head},
+        head_moves_to=moves_to,
+        compare=FIX_COMPARE if compare is None else compare,
+        diff=PR_DIFF)
 
     def fake_review(name, model, prompt, effort=""):
         # Only the first seat files, so two seats do not produce two canonical

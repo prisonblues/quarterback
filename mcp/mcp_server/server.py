@@ -393,6 +393,154 @@ def release_lease(ctx: Context, lease_id: str) -> dict:
 
 
 @mcp.tool()
+def claim(ctx: Context, kind: str, key: str, ttl: int = 3600,
+          session: str | None = None, note: str | None = None) -> dict:
+    """Claim a shared resource before you touch it — landing, or anything two agents can want at once.
+
+    ADVISORY, not a lock. It cannot stop a merge: a human in the GitHub UI or an
+    agent not on this board lands regardless. What it removes is collisions
+    between agents that ask, which is the failure that actually happens here.
+
+    Fails with a conflict naming the current holder, their session and what they
+    said they were doing — so a refusal is somebody to talk to, not a wall.
+    Re-claiming something your own machine holds is a renew.
+
+    Args:
+        kind: What sort of resource. Use "merge" for landing a branch.
+        key: The resource, namespaced by you — e.g. "prisonblues/quarterback:main".
+        ttl: Seconds until the claim lapses without a renew (default 3600).
+        session: Your session id, so a peer can reach you.
+        note: One line on what you are doing with it. Send this — it is what the
+            next agent is shown instead of a bare refusal.
+
+    Returns the claim incl. claim_id; remember it to renew or release.
+    """
+    try:
+        return _get_client(ctx).claim({"kind": kind, "key": key, "ttl": ttl,
+                                       "session": session, "note": note})
+    except httpx.HTTPStatusError as e:
+        _raise(e, "claim")
+
+
+@mcp.tool()
+def renew_claim(ctx: Context, claim_id: str) -> dict:
+    """Extend a claim you hold. Re-take via `claim` if it already lapsed — an expired
+    claim is never revived, because somebody else may already hold the key."""
+    try:
+        return _get_client(ctx).renew_claim(claim_id)
+    except httpx.HTTPStatusError as e:
+        _raise(e, "renew_claim")
+
+
+@mcp.tool()
+def release_claim(ctx: Context, claim_id: str) -> dict:
+    """Let go of a claim (idempotent). Do this the moment you land, or the next agent
+    waits out your whole TTL for nothing."""
+    try:
+        return _get_client(ctx).release_claim(claim_id)
+    except httpx.HTTPStatusError as e:
+        _raise(e, "release_claim")
+
+
+@mcp.tool()
+def claims(ctx: Context, kind: str | None = None, key: str | None = None,
+           holder: str | None = None) -> dict:
+    """What is claimed right now, by whom, and why. Read before you queue behind something."""
+    try:
+        return _get_client(ctx).claims({"kind": kind, "key": key, "holder": holder})
+    except httpx.HTTPStatusError as e:
+        _raise(e, "claims")
+
+
+@mcp.tool()
+def claim_release_number(ctx: Context, repo: str, after: str | None = None,
+                         branch: str | None = None, ttl: int = 3600,
+                         session: str | None = None, note: str | None = None) -> dict:
+    """Ask the board for the next free release number, and hold it. Do NOT pick one yourself.
+
+    Reading `main` and taking "the next free number" is how this repo produced
+    nine collisions in two days: every agent was correct from what it could see,
+    and two of them announced the same number one second apart. Announcing does
+    not force the next agent to look — asking does, because the number comes from
+    the board that just handed out the last one.
+
+    Pass `after` as the highest release YOU can see in your checkout. The board
+    cannot read a CHANGELOG and you cannot see a claim that is not yet in a file,
+    so the allocation is the maximum of both, plus one.
+
+    Release it when your PR merges, or let it lapse — either way the number is
+    never re-issued, because your branch may have shipped it.
+
+    Args:
+        repo: The repo the number belongs to, e.g. "prisonblues/quarterback".
+        after: Highest version you can see locally ("2.31" or "2.31.0").
+        branch: Your branch, recorded so others can see what is landing soon.
+        ttl: Seconds until the claim lapses (default 3600). Renew for long work.
+        session: Your session id — also what makes a retry idempotent rather than
+            spending a second number.
+        note: One line on what the release is.
+
+    Returns the allocated `version` plus a claim_id.
+    """
+    try:
+        return _get_client(ctx).claim_release({
+            "repo": repo, "after": after, "branch": branch, "ttl": ttl,
+            "session": session, "note": note})
+    except httpx.HTTPStatusError as e:
+        _raise(e, "claim_release_number")
+
+
+@mcp.tool()
+def reclaim_release_number(ctx: Context, repo: str, claim_id: str,
+                           after: str | None = None, ttl: int = 3600,
+                           session: str | None = None, note: str | None = None) -> dict:
+    """Renumber: give up the release number you hold and take the next free one, in ONE step.
+
+    Use this instead of releasing and then claiming again. **The renumber is
+    where this repo's collisions actually happened** — both of them were
+    renumbers off an earlier collision, because picking a number feels like a
+    decision and replacing one feels like bookkeeping, so nobody re-reads. A
+    release followed by a claim leaves you holding nothing in between, and that
+    window is widest exactly when the namespace is contended, which is the only
+    time anyone renumbers.
+
+    If the allocation fails you keep the number you had — better than a CHANGELOG
+    full of a number you no longer own with nothing to replace it.
+
+    Args:
+        repo: The repo, e.g. "prisonblues/quarterback".
+        claim_id: The claim you are giving up (from `claim_release_number`).
+        after: Highest version you can now see — usually the number that just
+            landed on you and forced the renumber.
+        ttl: Seconds until the new claim lapses (default 3600).
+        session: Your session id.
+        note: One line on what the release is.
+
+    Returns the new `version` plus `gave_up`, so you can check the swap against
+    what you have already written into your files.
+    """
+    try:
+        return _get_client(ctx).reclaim_release({
+            "repo": repo, "claim_id": claim_id, "after": after, "ttl": ttl,
+            "session": session, "note": note})
+    except httpx.HTTPStatusError as e:
+        _raise(e, "reclaim_release_number")
+
+
+@mcp.tool()
+def releases(ctx: Context, repo: str) -> dict:
+    """Every release number the board has handed out for a repo, and who holds what.
+
+    Also the answer to "what is landing soon", which nothing else here can tell
+    you. Reading it is not claiming it — use `claim_release_number` for that.
+    """
+    try:
+        return _get_client(ctx).releases(repo)
+    except httpx.HTTPStatusError as e:
+        _raise(e, "releases")
+
+
+@mcp.tool()
 def active(
     ctx: Context,
     cwd: str | None = None,

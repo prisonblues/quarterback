@@ -28,6 +28,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
+from conftest import gh_stub  # noqa: E402
+
+
+
 
 
 def meta(files=None, total=None, **over) -> dict:
@@ -170,8 +174,7 @@ def _gh(monkeypatch, meta_json: str, reviewers: dict) -> None:
         "github": "o/r", "path": "/tmp/r", "reviewers": reviewers,
         "review_panel": {"skip_title_patterns": ["^Merge "]},
     })
-    monkeypatch.setattr(panel, "sh",
-                        lambda args, **k: meta_json if "view" in args else "diff")
+    monkeypatch.setattr(panel, "sh", gh_stub(meta=json.loads(meta_json), diff="diff"))
 
 
 META_FILES = [{"path": "app/api/reviews.py", "additions": 120, "deletions": 4},

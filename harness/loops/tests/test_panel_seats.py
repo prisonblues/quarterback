@@ -37,6 +37,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
+from conftest import gh_stub  # noqa: E402
+
+
+
 
 REPO = "/tmp/acme-board"
 
@@ -193,10 +197,10 @@ def _stub_panel(monkeypatch, findings=None, cfg=TWO_SEAT_CFG, runs=None):
     if findings is None:
         findings = [panel.Finding("claude", "P3", "a.py", 3, "unused import")]
     monkeypatch.setattr(panel, "load_repo_cfg", lambda name: cfg)
-    monkeypatch.setattr(panel, "sh", lambda args, **kw: (
-        json.dumps({"title": "feat: x", "additions": 3, "deletions": 1,
-                    "baseRefName": "main", "headRefName": "feat/x", "headRefOid": "abc"})
-        if args[:3] == ["gh", "pr", "view"] else "diff --git a/a.py b/a.py\n+x\n"))
+    monkeypatch.setattr(panel, "sh", gh_stub(
+        meta={"title": "feat: x", "additions": 3, "deletions": 1,
+              "headRefOid": "abc"},
+        diff="diff --git a/a.py b/a.py\n+x\n"))
     monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
     monkeypatch.setattr(panel, "adjudicate", _confirm_everything)
 
