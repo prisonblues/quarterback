@@ -7,6 +7,78 @@ that number where it was, so the repo can be a version ahead of the service.
 Entries are newest first. Each one says what was broken or missing before it, because that is the
 part that isn't recoverable from the diff.
 
+## v2.27 — one question to the panel, when a whole round was never the question
+
+A fix's premise had no cheap challenger. The only thing that reviewed a fix was a full panel round:
+twenty minutes, every seat reading the entire diff, thirty-odd findings back when what was needed
+was one answer to one question.
+
+So a premise went unchallenged until the next round, and on PR #62 that cost three of them. Each
+round trusted a fresh proxy for *"did a review actually happen?"* — the exit code, then the push,
+then the payload artefact — and each proxy was killed by the round after it. Every one of those is a
+yes/no question about one branch of `panel.py`, answerable in a minute by anyone willing to read it.
+None of them needed a diff review, and all three cost a full round.
+
+`panel.py --ask "<premise>" [--context <path[:first-last]> ...]` puts that question to the enabled
+seats. **No diff, no clustering, no judge — the vote is the output.** Each seat answers `holds` /
+`fails` / `cannot tell` with one line of reason, and the run reports the tally. It is fast because
+of what it does not do: a reviewer is slow here because it reads a whole PR and thinks about
+everything in it, and a premise plus the one function it rests on is a small prompt and a short
+reply.
+
+**It is deliberately not a gate.** It exits 0 on every verdict, `fails` included. This is a check a
+fixer runs before committing, not another thing that must pass — making it mandatory turns a
+one-minute question into a required wait, and a required wait gets skipped.
+
+Four decisions in it are worth more than the feature:
+
+- **`cannot tell` is a first-class answer, and an unreadable reply is not it.** One is a seat saying
+  its context did not settle the question — it counts toward the quorum and never toward the
+  threshold. The other is a seat whose answer we do not have, and it counts for neither. Collapsing
+  them is #68's panel-of-one arriving through a side door: a tally reading "nobody objected" over
+  seats that never spoke.
+- **The asker cannot be the only seat.** `--asker` says which seat the agent running the challenge
+  is, detected from Claude Code's environment specifically — an agent on another vendor's CLI has to
+  pass `--asker` itself, and the run says so in its notes when nothing was detected rather than
+  leaving the guard quietly off. A tally whose only voter is the asker comes back `unchallenged` —
+  which is where the premise started. An agent putting its own premise to itself has confirmed
+  nothing, and reporting it as `holds` is worse than reporting nothing, because it carries a panel's
+  authority.
+- **Nothing picks between candidate answers.** A reply holding two different legal verdicts is
+  unreadable, not an opportunity to guess which the model meant — the same rule v2.18 settled for
+  reviews, for the same reason.
+- **Quorum, threshold and the context budget are configuration** (`review_panel.ask_quorum` /
+  `ask_threshold`, both 2, and `ask_max_context_chars`, 60,000 — a total across all `--context`
+  material, clamped and said in the notes when it bites, because `--context` was unbounded before
+  and an ask that reads half a repo is not the cheap thing it exists to be). So "1 of 1 says it
+  holds" reports as unchallenged rather than as agreement. They are named for the ask because that
+  is all they govern today; #78 generalises the same primitives to a round's verdict, where they
+  decide what gets merged.
+
+**An ask will not read a secret, even one that lives in the repo.** `--context` is confined to the
+repo under review, and that was the only filter on it — which is backwards, because the repo under
+review is where the credentials are. `--context .git/config` is contained, readable, and on an https
+remote it is a personal access token, shipped to four third-party CLIs in a prompt whose reply is a
+place it can come back out. So `.git/` is refused outright, along with the files that are nothing but
+credentials by the names they always have (`.env` and `.env.*`, `.envrc`, `.npmrc`, `.netrc`,
+`.pgpass`, `.pypirc`, `id_rsa`/`id_ed25519`, and `.pem`/`.key`/`.p12`/`.pfx` key material). Each
+refusal is a stated `context_problem` naming why, like every other spec that did not become context.
+It is a denylist of names and not a secret scanner: it closes the routes an agent composing a command
+line actually types.
+
+One implementation runs a seat now, not two: the sandbox, the pinned sessions, the retry policy, the
+usage read-back and the four CLIs' argv moved into `run_seat`, and a round and an ask differ only in
+how they read the reply. A second copy would have been a second place for a seat to silently stop
+running, which is the whole of #68.
+
+**The board half is not here.** `qb record-ask` is called best-effort and says so once when this
+host's `qb` does not have it: `qb` lives in the fleet's own repo, and the row it writes is #77's
+shape to define, since #77 is what will read it. The payload is complete on stdout and in
+`--json-file` regardless.
+
+Harness-side: the board is untouched, so the served version stays at 2.23.0. (v2.22, v2.25 and v2.26
+are claimed by branches not yet merged, which is why the entries below skip from here to v2.24 —
+nothing is missing.)
 ## v2.26 — the provenance v2.24 measured was reaching the board and being thrown away
 
 v2.24 taught the panel to say whether a new finding was **introduced** by the last fix pass or

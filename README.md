@@ -225,16 +225,20 @@ half of the panel↔board drift check #65 asks for.
 
 The deployed board version lags the repo until the stack is redeployed, and only the running
 service knows which it is: ask it with `GET /openapi.json` → `.info.version`, for whichever
-instance you care about. (Anything built off this branch says 2.26.0.) A number written here
-instead would be wrong the next time Portainer redeploys, with no diff to catch it.
-Latest release: **v2.26** — the provenance v2.24 computed now reaches the board and the
-leaderboard: which reviewer catches regressions in fresh code and which finds what was already
-there, plus the commit each round reviewed (schema revision 0017). (**v2.22** is claimed by a
-branch not yet merged, which is why the numbering skips it.)
-Before it, **v2.25** (harness-side) had the codex panel seat review the diff it was handed instead
-of going looking for the repo, which is what was running the reviews out of their timeout.
-Before that, **v2.24**, also harness-side — a new finding says whether the last fix pass caused it
-or the last round missed it, which were one number before and want opposite remedies.
+instance you care about. (Anything built off this branch says 2.26.0 — v2.27 is harness-side.) A
+number written here instead would be wrong the next time Portainer redeploys, with no diff to catch
+it.
+Latest release: **v2.27**, harness-side — `panel.py --ask` puts one premise to the seats and reports
+the tally, with no diff, no judge and no gate, so a fix's assumption can be challenged in a minute
+instead of in a twenty-minute round. (**v2.22** is claimed by a branch not yet merged, which is why
+the numbering skips it.)
+Before it, **v2.26** had the provenance v2.24 computed reach the board and the leaderboard: which
+reviewer catches regressions in fresh code and which finds what was already there, plus the commit
+each round reviewed (schema revision 0017).
+Before that, **v2.25** (harness-side) had the codex panel seat review the diff it was handed instead
+of going looking for the repo, which is what was running the reviews out of their timeout, and
+**v2.24**, also harness-side — a new finding says whether the last fix pass caused it or the last
+round missed it, which were one number before and want opposite remedies.
 **v2.23** had a run record which FILES the PR changed and not just how many lines, plus
 the PR's state as of that panel, so the board finally holds what collision ordering needs (schema
 revision 0016) — reading it back as a collision query ships separately, see #101.
@@ -283,6 +287,10 @@ judge) are harness-side too.
   the commit reviewed, the unread files, the round's tally. `GET /review/stats` grows #48's axis —
   who catches regressions against who finds what was already there — and an unrecognised bucket is
   now named back to the sender rather than dropped in silence.
+- **v2.27** — `panel.py --ask "<premise>"` challenges one assumption with one question to the seats:
+  no diff, no judge, the vote is the output, and it gates nothing. `cannot tell` counts toward the
+  quorum and never toward the answer, and a tally whose only voter is the agent that wrote the
+  premise reports as unchallenged rather than as agreement.
 - **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
   object store; wire `landed` refs to a cherry-pick helper.
 

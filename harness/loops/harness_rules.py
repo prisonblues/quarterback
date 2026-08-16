@@ -128,6 +128,30 @@ DEFAULTS: dict = {
         # missing from here would be warned about and dropped as a typo. `None`
         # and absent mean the same thing to diff_budget — inherit max_diff_chars.
         "judge_max_diff_chars": None,
+        # `panel.py --ask` — the cheap premise check. How many seats must have
+        # ANSWERED for the tally to mean anything (quorum), and how many must
+        # have said the same thing for it to be that answer (threshold). Two of
+        # each: one seat agreeing with the agent that wrote the premise is not a
+        # challenge, and the default panel is two seats, so the default is "both
+        # of them".
+        #
+        # Named for the ask, not `quorum`/`threshold`, and deliberately so. #78
+        # generalises the same two primitives to a ROUND's verdict — where they
+        # govern what gets merged — and a bare name claimed here would be a key
+        # whose name promises more than anything reads. #78 renames these into
+        # its own scheme; until then they say exactly what they do.
+        "ask_quorum": 2,
+        "ask_threshold": 2,
+        # How much `--context` material an ask may hand its seats IN TOTAL,
+        # across every spec. `--context` had no ceiling at all, and an ask's
+        # entire claim on anyone's attention is that it is the cheap check: one
+        # spec naming a generated file, or a 5,700-line module, built a
+        # multi-megabyte prompt and shipped a copy of it to every vendor on the
+        # panel — the #117 cost shape reappearing on the path advertised as
+        # costing a minute. 60,000 chars is ~15k tokens: comfortably a large
+        # function and its neighbours, and nowhere near a file nobody meant to
+        # send. Over budget is CLAMPED and said, per spec, like a round's diff.
+        "ask_max_context_chars": 60_000,
     },
     "loops": {
         "dependabot_lander": False,
