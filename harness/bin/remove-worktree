@@ -477,10 +477,47 @@ cd "$MAIN_REPO"
 # differ from the create-name arg if the branch was switched/forked after
 # creation. Fall back to the arg when we couldn't resolve one.
 DEL_BRANCH="${RESOLVED_BRANCH:-$BRANCH_NAME}"
+
+# The repo's default branch, which must survive a worktree teardown. Local
+# lookups only: this runs after the directory is already gone, and a teardown
+# that needs the network to decide whether to keep `main` would delete it on a
+# train. `origin/HEAD` is a local cache and can be stale or absent (a bare
+# `git clone --branch` never sets it), so fall back to whichever common name
+# actually exists, then to the literal names. Mirrors detect_default_branch in
+# harness_rules.py, minus its ls-remote step.
+default_branch() {
+    local ref
+    ref=$(git symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null || true)
+    if [[ -n "$ref" ]]; then
+        echo "${ref##*/}"
+        return
+    fi
+    local name
+    for name in main master; do
+        if git rev-parse --verify --quiet "refs/remotes/origin/$name" >/dev/null 2>&1; then
+            echo "$name"
+            return
+        fi
+    done
+    echo "main"
+}
+DEFAULT_BRANCH=$(default_branch)
+
 if [[ "$KEEP_BRANCH" = true ]]; then
     echo -e "${YELLOW}Keeping branch (--keep-branch)${NC}"
 elif ! git show-ref --verify --quiet "refs/heads/$DEL_BRANCH"; then
     echo -e "${YELLOW}Branch not found: $DEL_BRANCH${NC}"
+# A worktree parked on the DEFAULT branch is the case this guard exists for, and
+# it is not hypothetical: a worktree created for an issue and later switched to
+# `main` reaches here with DEL_BRANCH=main, no other worktree holding it, and
+# `git branch -d` refusing only because main is not merged into HEAD — so the
+# `|| git branch -D` below force-deletes the repo's trunk as a side effect of
+# tidying up. Recoverable from the remote, and silent, which is the bad
+# combination. Deleting the default branch is never what a teardown means; there
+# is deliberately no flag to override this, because --keep-branch already says
+# "leave the branch alone" for anyone who wants that outcome on purpose.
+elif [[ "$DEL_BRANCH" = "$DEFAULT_BRANCH" || "$DEL_BRANCH" = "main" || "$DEL_BRANCH" = "master" ]]; then
+    echo -e "${YELLOW}Refusing to delete the default branch: $DEL_BRANCH${NC}"
 elif git worktree list 2>/dev/null | grep -qF "[$DEL_BRANCH]"; then
     echo -e "${YELLOW}Branch still used by another worktree, skipping: $DEL_BRANCH${NC}"
 elif git branch -d "$DEL_BRANCH" 2>/dev/null || git branch -D "$DEL_BRANCH" 2>/dev/null; then
