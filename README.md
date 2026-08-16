@@ -225,10 +225,10 @@ half of the panel↔board drift check #65 asks for.
 
 The deployed board version lags the repo until the stack is redeployed, and only the running
 service knows which it is: ask it with `GET /openapi.json` → `.info.version`, for whichever
-instance you care about. (Anything built off this branch says 2.34.0.) A
+instance you care about. (Anything built off this branch says 2.41.0.) A
 number written here instead would be wrong the next time Portainer redeploys, with no diff to catch
 it.
-Latest release: **v2.34** — the origin-moved signal stops answering "in sync" when what it means is
+Latest release: **v2.41** — the origin-moved signal stops answering "in sync" when what it means is
 "I didn't look". A repo with nothing on the published line scored `stale: false`, which reads as a
 clean bill; `/sync` now reports `comparable` and says so out loud when it holds no signal at all.
 And the CI announce moved off the back of the image build, which had been quietly eating the
@@ -353,7 +353,7 @@ the other way):
   suite settles — and each of those is a `coverage_veto` line, which costs the ROUND its confident
   stop. CI is now read before the seats are dispatched rather than concurrently with them, which is
   why its answer could never have reached their prompt before.
-- **v2.34** — the origin-moved signal (#125, #127). Every staleness verdict is a comparison against
+- **v2.41** — the origin-moved signal (#125, #127). Every staleness verdict is a comparison against
   the `published` line, so a repo with nothing on that line got `stale: false` — "we didn't look"
   wearing the same face as "you're current". `/sync` now returns `comparable`, and breaks silence
   when both signals are absent. The companion issue blamed GitHub-side merges for emitting nothing;

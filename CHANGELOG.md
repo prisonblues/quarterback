@@ -7,7 +7,7 @@ that number where it was, so the repo can be a version ahead of the service.
 Entries are newest first. Each one says what was broken or missing before it, because that is the
 part that isn't recoverable from the diff.
 
-## v2.34 — "in sync" and "I didn't look" were the same answer
+## v2.41 — "in sync" and "I didn't look" were the same answer
 
 #125 and #127 were filed as two halves of one blindness: the origin-moved signal is only as fresh as
 the last time somebody happened to fetch (#125), and a GitHub-side merge emits no `published` at all

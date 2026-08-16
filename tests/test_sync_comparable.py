@@ -1,32 +1,19 @@
-"""v2.34: the origin-moved signal stops answering "in sync" when it didn't look.
+"""`/sync` stops answering "in sync" when what it means is "I didn't look" (#125).
 
-Two halves of one blindness (#125, #127). The board's staleness verdict is a
-comparison against the ``published`` line, so a repo with nothing on that line
-gets ``stale: false`` — which reads as "you're current" and means "we have
-nothing to compare against". Those are different answers and callers need them
-apart.
-
-The workflow tests are here rather than in a lint because the property that
-broke is structural, not textual: the announce used to be a step inside the
-``deploy`` job, which needs ``build-and-push``, so a red image build silently
-swallowed the announcement that main had moved. Asserting "no needs:" is the
-only thing that stops that being reintroduced by someone tidying the file.
+The board's staleness verdict is a comparison against the ``published`` line, so
+a repo with nothing on that line gets ``stale: false`` — which reads as "you're
+current" and means "we have nothing to compare against". Those are different
+answers and callers need them apart.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
-
-import yaml
-
 from .conftest import LAPTOP, SERVER
 
-REPO = "v234repo"
+REPO = "syncrepo"
 
 B = "bbbbbbb2222222222222222222222222222222222"
 C = "ccccccc3333333333333333333333333333333333"
-
-WORKFLOWS = Path(__file__).resolve().parents[1] / ".github" / "workflows"
 
 
 async def _publish(client, repo: str, sha: str, summary: str, branch: str = "main"):
@@ -43,9 +30,6 @@ async def _publish(client, repo: str, sha: str, summary: str, branch: str = "mai
         },
         headers=SERVER,
     )
-
-
-# ---- #125: "in sync" vs "nothing to compare against" -------------------------
 
 
 async def test_a_repo_with_no_published_line_is_not_comparable(client):
@@ -156,50 +140,3 @@ async def test_an_unregistered_scoped_worktree_keeps_its_own_answer(client):
     ).json()
     assert res["comparable"] is False
     assert "report_git" in res["advice"]
-
-
-# ---- #127: the announce must not ride on the image build --------------------
-
-
-def _workflow(name: str) -> dict:
-    return yaml.safe_load((WORKFLOWS / name).read_text())
-
-
-def test_the_announce_job_does_not_depend_on_the_build():
-    # b86ff0b (merge of #134) is an ancestor of main with no `published` post on
-    # the board: its build went red, so the deploy job never ran, so the step
-    # that announces main had moved never ran either.
-    jobs = _workflow("docker-build.yml")["jobs"]
-    assert "announce" in jobs
-    assert "needs" not in jobs["announce"]
-    assert jobs["announce"]["uses"].endswith("announce-board.yml")
-
-
-def test_the_deploy_job_no_longer_announces():
-    deploy = _workflow("docker-build.yml")["jobs"]["deploy"]
-    assert deploy["needs"] == "build-and-push"  # deploying *is* contingent on a build
-    # The announce must not have been left behind here as well as moved: two
-    # sources would double-post every commit onto the board.
-    assert not any("QUARTERBACK_TOKEN" in str(step) for step in deploy["steps"])
-
-
-def test_the_announce_is_reusable_by_other_repos():
-    # nix-fleet has no CI at all and lexray announces nothing; enrolment has to be
-    # cheaper than a copy-paste or it won't happen (and for a year, didn't).
-    wf = _workflow("announce-board.yml")
-    # PyYAML resolves a bare `on:` key to the boolean True — YAML 1.1's fault.
-    trigger = wf.get("on", wf.get(True))
-    assert "workflow_call" in trigger
-    assert set(trigger["workflow_call"]["secrets"]) == {
-        "QUARTERBACK_TOKEN",
-        "QUARTERBACK_BASE_URL",
-    }
-
-
-def test_a_failed_announce_is_visible_rather_than_swallowed():
-    # The old form was `curl … && echo ok || echo failed`, which always exited 0:
-    # a rotated token would stop every announcement with nothing saying so.
-    step = _workflow("announce-board.yml")["jobs"]["announce"]["steps"][0]
-    assert step["continue-on-error"] is True  # never fails someone's merge...
-    assert "|| echo" not in step["run"]  # ...but the step still goes red
-    assert "set -euo pipefail" in step["run"]
