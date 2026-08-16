@@ -748,7 +748,7 @@ async def test_the_database_refuses_a_bare_refutation_too(client):
     # One transaction per attempt: a failed statement aborts its transaction, so
     # a loop inside one `begin()` fails the second case on the FIRST case's
     # rollback state rather than on the constraint.
-    for note in ("NULL", "''", "'   '"):
+    for note in ("NULL", "''", "'   '", r"E'\t'", r"E'\n'"):
         with pytest.raises(IntegrityError) as caught:
             async with engine.begin() as conn:
                 await conn.execute(text(
@@ -756,6 +756,17 @@ async def test_the_database_refuses_a_bare_refutation_too(client):
                     "(repo, pr, finding_key, outcome, note, set_by) VALUES "
                     f"('acme/direct', 1, 'k', 'refuted', {note}, 'laptop/hand')"))
         assert "ck_review_finding_outcomes_refuted_note" in str(caught.value)
+
+    # ...and it must refuse WHITESPACE, not letters. The first cut of the
+    # character set spelled vertical tab `\v`, which Postgres does not define —
+    # an undefined escape keeps the character, so the set contained the letter
+    # `v` and a note of "v" was trimmed to empty and refused. A rule about
+    # whitespace must not quietly decide that a letter is not evidence.
+    async with engine.begin() as conn:
+        await conn.execute(text(
+            "INSERT INTO review_finding_outcomes "
+            "(repo, pr, finding_key, outcome, note, set_by) VALUES "
+            "('acme/direct', 2, 'k', 'refuted', 'v', 'laptop/hand')"))
 
 
 async def test_two_writers_updating_one_row_do_not_lose_an_edit(client):

@@ -644,16 +644,22 @@ class ReviewFindingOutcome(Base):
         #   null straight through — the exact row the rule exists to refuse.
         # * `btrim` with an explicit character set, because single-argument
         #   `btrim` strips ORDINARY SPACES ONLY: a note of one tab satisfied it.
+        # * vertical tab is spelled `\013` and NOT `\v`. Postgres' escape strings
+        #   do not define `\v`, and an undefined escape drops the backslash and
+        #   keeps the character — so `E'\v'` is the LETTER v (ascii 118, measured,
+        #   not read off a doc page). The set would have trimmed v's off both ends
+        #   and refused a note of "v" as empty: a rule about whitespace quietly
+        #   deciding a letter of the alphabet does not count as evidence.
         # * they mirror the API's two required-field rules exactly, so a row this
         #   service would refuse cannot arrive by another door.
         CheckConstraint(
             r"outcome <> 'refuted' OR (note IS NOT NULL "
-            r"AND btrim(note, E' \t\n\r\f\v') <> '')",
+            r"AND btrim(note, E' \t\n\r\f\013') <> '')",
             name="ck_review_finding_outcomes_refuted_note",
         ),
         CheckConstraint(
             "outcome <> 'superseded' OR (superseded_by IS NOT NULL "
-            r"AND btrim(superseded_by, E' \t\n\r\f\v') <> '')",
+            r"AND btrim(superseded_by, E' \t\n\r\f\013') <> '')",
             name="ck_review_finding_outcomes_superseded_by",
         ),
         CheckConstraint("revisions >= 0", name="ck_review_finding_outcomes_revisions"),

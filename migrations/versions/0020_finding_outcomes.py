@@ -71,6 +71,17 @@ outcome. Every clause of those two constraints earns its place:
   through, which is the row the rule exists to refuse.
 * `btrim` is given an explicit character set, because single-argument `btrim`
   strips ORDINARY SPACES ONLY — a note consisting of one tab satisfied it.
+* vertical tab in that set is `\013` and not `\v`. Postgres' escape strings do
+  not define `\v`; an undefined escape drops the backslash and keeps the
+  character, so `E'\v'` is the letter **v** (ascii 118, measured against the
+  database rather than read off a page). The first cut of this constraint would
+  have trimmed v's off both ends and refused a note of `"v"` as empty.
+
+**This revision is edited in place rather than amended by an 0021, and that is
+only correct because it has never been applied outside the branch that
+introduces it.** A migration already applied somewhere is immutable — editing it
+leaves those databases without the change and no record that they lack it. The
+day this one lands, the rule reverts to the usual one.
 
 **The vocabulary is spelled out here rather than imported from
 `app.api.reviews.OUTCOMES`, deliberately.** A migration is a snapshot of what the
@@ -131,12 +142,12 @@ def upgrade() -> None:
         ),
         sa.CheckConstraint(
             r"outcome <> 'refuted' OR (note IS NOT NULL "
-            r"AND btrim(note, E' \t\n\r\f\v') <> '')",
+            r"AND btrim(note, E' \t\n\r\f\013') <> '')",
             name="ck_review_finding_outcomes_refuted_note",
         ),
         sa.CheckConstraint(
             "outcome <> 'superseded' OR (superseded_by IS NOT NULL "
-            r"AND btrim(superseded_by, E' \t\n\r\f\v') <> '')",
+            r"AND btrim(superseded_by, E' \t\n\r\f\013') <> '')",
             name="ck_review_finding_outcomes_superseded_by",
         ),
         sa.CheckConstraint("revisions >= 0", name="ck_review_finding_outcomes_revisions"),
