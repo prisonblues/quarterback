@@ -227,11 +227,13 @@ The deployed board version lags the repo until the stack is redeployed, and only
 service knows which it is: ask it with `GET /openapi.json` → `.info.version`, for whichever
 instance you care about. (Anything built off this branch says 2.26.0.) A number written here
 instead would be wrong the next time Portainer redeploys, with no diff to catch it.
-Latest release: **v2.26** — the provenance v2.24 computed now reaches the board and the
+Latest release: **v2.28** (repo tooling) — `scripts/migration_reconcile.py`, so two branches both
+minting migration `0018` is caught and renumbered before it lands rather than after. (**v2.22** and
+**v2.27** are claimed by branches not yet merged, which is why the numbering skips them.)
+Before it, **v2.26** — the provenance v2.24 computed now reaches the board and the
 leaderboard: which reviewer catches regressions in fresh code and which finds what was already
-there, plus the commit each round reviewed (schema revision 0017). (**v2.22** is claimed by a
-branch not yet merged, which is why the numbering skips it.)
-Before it, **v2.25** (harness-side) had the codex panel seat review the diff it was handed instead
+there, plus the commit each round reviewed (schema revision 0017).
+Before that, **v2.25** (harness-side) had the codex panel seat review the diff it was handed instead
 of going looking for the repo, which is what was running the reviews out of their timeout.
 Before that, **v2.24**, also harness-side — a new finding says whether the last fix pass caused it
 or the last round missed it, which were one number before and want opposite remedies.
@@ -283,6 +285,13 @@ judge) are harness-side too.
   the commit reviewed, the unread files, the round's tally. `GET /review/stats` grows #48's axis —
   who catches regressions against who finds what was already there — and an unrecognised bucket is
   now named back to the sender rather than dropped in silence.
+- **v2.28** — repo tooling: `scripts/migration_reconcile.py` decides, from the migration files at
+  two git refs and never from a live database, whether a branch's migrations land on a single
+  Alembic head. `migrations/versions/` is hand-numbered, so two agents both writing `0018` collide
+  on the revision **id** and not only on the filename — git conflicts on neither, and a graph-only
+  reconciler calls that merge clean. It renumbers the branch's chain instead, tells a collision
+  apart from a rewrite of already-merged history by asking git for the merge base, and reports the
+  prose that still names the old number rather than editing it.
 - **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
   object store; wire `landed` refs to a cherry-pick helper.
 
