@@ -520,6 +520,111 @@ class ReviewFindingReport(Base):
     )
 
 
+class ReviewFindingOutcome(Base):
+    """What actually happened to a defect after the judge ruled on it (v2.37).
+
+    A finding's life used to end at the judge. ``verdict`` is set once, at review
+    time, by a judge with no more access to the answer than the reviewer that
+    raised it — and then ``/review/stats`` ranked reviewers on it. On PR #64
+    three of six judge-confirmed P2s were simply wrong (``install -m 0755 bin/*``
+    does glob; ``CLAUDE_CODE_SESSION_ID`` is exported; line 34 *is* the last help
+    line), all three conditionals from a reviewer that had declared it could not
+    assess the condition. They sit in the board indistinguishable from the real
+    ones, so the leaderboard rewards a confident wrong finding — confidence is
+    what the judge can see and correctness is not.
+
+    This is the terminal state, set by whoever ACTED on the finding rather than
+    by whoever ruled on it. ``refuted`` is the one that pays for the feature, and
+    it is also the cheapest to capture: the refutation is already being written,
+    in the PR comment and the fix commit's message, in prose where nothing can
+    count it.
+
+    **Per DEFECT, not per observation** — one row per (repo, pr, finding_key),
+    which is why this is its own table rather than a column on
+    :class:`ReviewFinding`. A defect raised in rounds 2, 3 and 4 is three finding
+    rows and one thing that happened to it; a column would fan one refutation out
+    over however many rounds happened to raise it, and the number of rounds
+    correlates with exactly the PRs this measure is about. It also keeps the
+    finding rows immutable: what a round said is a fact about that round, and
+    later knowledge is a different fact with a different author.
+
+    ``set_by`` is the board identity that recorded it and ``attested_by`` is the
+    human who signed it off, NULL where nobody did. #77 is explicit that an agent
+    must not mark its own findings ``refuted`` unattended — that is a
+    self-grading loop, #40's constraint for the same reason — and the API cannot
+    tell a fixer from a reviewer, so the record carries who said it and
+    ``GET /review/stats`` publishes the attested split beside the raw one rather
+    than pretending the guard was enforced.
+    """
+
+    __tablename__ = "review_finding_outcomes"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    #: Scoped the way ``finding_key`` is scoped — by (repo, pr) — because that is
+    #: what makes a key identify a defect at all. Not a foreign key to a run: the
+    #: outcome outlives any one round, and pinning it to the run that happened to
+    #: raise the defect first would delete the outcome with that run.
+    repo: Mapped[str] = mapped_column(Text, nullable=False)
+    pr: Mapped[int] = mapped_column(Integer, nullable=False)
+    finding_key: Mapped[str] = mapped_column(Text, nullable=False)
+
+    #: One of :data:`app.api.reviews.OUTCOMES` — fixed | refuted | deferred |
+    #: superseded. Constrained in the database as well as at ingest: this table
+    #: feeds a published precision figure, and an unknown value would silently
+    #: leave the numerator while still counting as coverage.
+    outcome: Mapped[str] = mapped_column(Text, nullable=False)
+    #: Why — required by the API for ``refuted`` and optional otherwise. A bare
+    #: `refuted` flag is a confident assertion with nothing behind it, which is
+    #: the failure this whole feature exists to measure, arriving one level up.
+    note: Mapped[str | None] = mapped_column(Text)
+    #: Where a ``deferred`` finding went: an issue ref. #66, #69, #72, #74 and the
+    #: backlogs after them park findings in a markdown list with no state at all,
+    #: and this is the state.
+    deferred_to: Mapped[str | None] = mapped_column(Text)
+    #: The ``finding_key`` that replaced this one, for ``superseded``. Kept apart
+    #: from ``deferred_to`` rather than sharing one "ref" column: two readings of
+    #: one field is how a tool ends up guessing which it was looking at.
+    superseded_by: Mapped[str | None] = mapped_column(Text)
+
+    #: The board identity that recorded this — an agent or a human at a terminal.
+    set_by: Mapped[str] = mapped_column(Text, nullable=False)
+    session: Mapped[str | None] = mapped_column(Text)
+    #: The human who signed it off. NULL = unattended, which is a fact reported
+    #: rather than a request refused: refusing it would leave the refutation
+    #: exactly where it is today, in prose nothing counts.
+    attested_by: Mapped[str | None] = mapped_column(Text)
+
+    #: How many times this outcome has been REPLACED. A terminal state that moves
+    #: is legitimate (a deferred finding is later fixed) and a silent flip is not:
+    #: with ``prior_outcome`` this says an answer changed and what it was, so a
+    #: window whose precision improved after the fact can be told from one whose
+    #: refutations were quietly rewritten.
+    revisions: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    prior_outcome: Mapped[str | None] = mapped_column(Text)
+
+    ts: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        # One terminal outcome per defect. A second row for the same key would
+        # make "what happened to this?" a question with two answers, and every
+        # count over the table a double count.
+        #
+        # Its B-tree on (repo, pr, finding_key) is also the read path: the stats
+        # join matches all three columns and the chain view looks up by (repo,
+        # pr), which the leftmost prefix serves. No separate index — the same
+        # argument `ReviewRunFile` records for its own unique constraint.
+        UniqueConstraint("repo", "pr", "finding_key", name="uq_review_finding_outcome"),
+        CheckConstraint(
+            "outcome IN ('fixed', 'refuted', 'deferred', 'superseded')",
+            name="ck_review_finding_outcomes_vocabulary",
+        ),
+        CheckConstraint("revisions >= 0", name="ck_review_finding_outcomes_revisions"),
+    )
+
+
 class ReviewRunFile(Base):
     """One path the reviewed PR touched, with that path's share of the churn.
 

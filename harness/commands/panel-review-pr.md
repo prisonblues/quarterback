@@ -227,6 +227,48 @@ with these overrides:
   Re-briefing it with round 1's list has it re-examine work already done and
   buries the new finding — which is the one the round existed to catch.
 
+## 4b. Record what actually happened to each finding
+
+Once the fixer has pushed, say what became of every finding it was given. This is
+the half the judge cannot know: it ruled at review time with no more access to
+the answer than the reviewer it was ruling on, so without this the board scores a
+confident wrong finding exactly like a real one. On PR #64 three of six
+judge-confirmed P2s were plainly wrong — the `installPhase` it said enumerated
+three scripts does `install -m 0755 bin/*` and globs — and they are still in the
+board as confirmed.
+
+```bash
+jq -c '{repo: .github, pr: .pr, outcomes: [...]}' r<r>.json   # keys are in the round payload
+printf '%s' "$payload" | qb record-outcome
+```
+
+The `key` of each finding is in the round's `--json-file` payload (`.to_fix[].key`),
+which is the same identity the board chains observations by — so an outcome
+recorded now attaches to every round that raised the defect, including the ones
+still to come.
+
+One of four per finding:
+
+- **`fixed`** — the fixer changed the code and the finding is answered.
+- **`refuted`** — it was not a defect. **Requires a `note`, and the note is the
+  point**: you are already writing the refutation into the PR comment and the fix
+  commit, in prose nothing can count. A bare `refuted` is the same
+  confident-assertion-with-nothing-behind-it the release exists to measure.
+- **`deferred`** — real, not now. Put where it went in `deferred_to`.
+- **`superseded`** — a later finding replaced it; name that finding's key in
+  `superseded_by`.
+
+**Do not mark your own findings `refuted` unattended.** That is a self-grading
+loop and #40's constraint applies for the same reason. The board cannot tell a
+fixer from a reviewer, so it does not refuse — it records `set_by` from your
+token, marks the row unattested, and `/panel` shows the split. When a human has
+confirmed the refutation, send `attested_by`; when one has not, record it anyway
+(an unattested refutation on the board beats one in a comment nothing reads) and
+say so in the relay.
+
+Re-reporting is safe: a repeat of the same outcome only enriches it, and a change
+of answer is kept with what it changed from.
+
 ## 5. Re-review the fix commit — the round that used to be skipped
 
 Once the fixer has **pushed**, run the panel again over the new commit:
