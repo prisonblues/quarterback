@@ -229,11 +229,13 @@ instance you care about. (Anything built off this branch says 2.26.0.) A number 
 instead would be wrong the next time Portainer redeploys, with no diff to catch it.
 Latest release: **v2.26** — the provenance v2.24 computed now reaches the board and the
 leaderboard: which reviewer catches regressions in fresh code and which finds what was already
-there, plus the commit each round reviewed (schema revision 0017). (**v2.22** and **v2.25** are
-claimed by branches not yet merged, which is why the numbering skips them.)
-Before it, **v2.24**, harness-side, had a new finding say whether the last fix pass caused it or the
-last round missed it — one number before, and they want opposite remedies.
-Before that, **v2.23** had a run record which FILES the PR changed and not just how many lines, plus
+there, plus the commit each round reviewed (schema revision 0017). (**v2.22** is claimed by a
+branch not yet merged, which is why the numbering skips it.)
+Before it, **v2.25** (harness-side) had the codex panel seat review the diff it was handed instead
+of going looking for the repo, which is what was running the reviews out of their timeout.
+Before that, **v2.24**, also harness-side — a new finding says whether the last fix pass caused it
+or the last round missed it, which were one number before and want opposite remedies.
+**v2.23** had a run record which FILES the PR changed and not just how many lines, plus
 the PR's state as of that panel, so the board finally holds what collision ordering needs (schema
 revision 0016) — reading it back as a collision query ships separately, see #101.
 **v2.21** (harness-side) had each panel member run in its own empty sandbox repo
@@ -272,6 +274,10 @@ judge) are harness-side too.
 - **v2.24** — a new finding records whether the last fix pass introduced it or the last round missed
   it: two facts with opposite remedies that `new_this_round` collapsed into one, plus the commit each
   round reviewed and the files it was truncated out of. A signal, not a verdict — nothing gates on it.
+- **v2.25** — the codex panel seat is given no shell, no web search and no app connectors, and its
+  sandbox mode is pinned rather than inherited, so it reviews the diff in its prompt instead of
+  hunting the repo it cannot see. An empty working directory is still what stops a PR instructing
+  its own reviewer through an `AGENTS.md`: no tool setting closes that channel.
 - **v2.26** — that signal reaches the board, which had been discarding all four of its fields on
   ingest without a word: provenance per finding (the half nothing could reconstruct afterwards),
   the commit reviewed, the unread files, the round's tally. `GET /review/stats` grows #48's axis —
