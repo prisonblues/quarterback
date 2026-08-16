@@ -8,6 +8,7 @@ which are awkward to reproduce with one.
 
 from __future__ import annotations
 
+import shlex
 import shutil
 import subprocess
 import sys
@@ -105,10 +106,19 @@ def holder_stub(tmp_path, monkeypatch):
     # "could not run worktree-holder" instead of the verdict it was given.
     bash = shutil.which("bash") or "/bin/sh"
 
-    def set_exit(code: int, message: str = "held by zeus/other-agent") -> None:
+    #: What worktree-holder really prints when a worktree is held: a generic
+    #: headline, and the holder on the lines AFTER it. Reproduced because a
+    #: one-line stub let a bug through — the code kept only the first line, which
+    #: is the line with nothing in it a person can act on.
+    held_output = (
+        "worktree-holder: /some/worktree is held by another live agent\n"
+        '  zeus/other-agent · on feat/x · "Investigating" · held for 4m · session abcd1234\n'
+    )
+
+    def set_exit(code: int, message: str = held_output) -> None:
         script.write_text(
             f"#!{bash}\n"
-            f'[ "$1" = "--quiet" ] || echo "{message}" >&2\n'
+            f'[ "$1" = "--quiet" ] || printf %s {shlex.quote(message)} >&2\n'
             f"exit {code}\n"
         )
         script.chmod(0o755)

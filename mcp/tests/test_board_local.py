@@ -35,10 +35,17 @@ def advance_origin(work):
 
 
 def test_a_held_worktree_is_refused_and_the_holder_is_named(git_repo, holder_stub):
-    holder_stub(3, "held by zeus/other-agent")
+    """Named, not merely reported held — the holder is the only actionable part.
+
+    worktree-holder leads with a generic headline and puts who / on what branch /
+    for how long on the lines after it, so a refusal that kept one line kept the
+    line with nothing in it.
+    """
+    holder_stub(3)
     outcome = local.check_free(str(git_repo))
     assert not outcome.ok
     assert "zeus/other-agent" in outcome.message
+    assert "feat/x" in outcome.message and "held for 4m" in outcome.message
 
 
 def test_could_not_tell_is_refused_rather_than_read_as_free(git_repo, holder_stub):
@@ -191,3 +198,22 @@ def test_only_this_devices_worktrees_that_still_exist_are_offered(tmp_path):
         {"device": "zeus", "path": None},
     ]
     assert local.local_worktrees(registered, "zeus") == [{"device": "zeus", "path": str(here)}]
+
+
+# -- git that will not run ---------------------------------------------
+
+
+def test_a_git_that_cannot_be_launched_is_a_refusal_not_an_exception(git_repo, monkeypatch):
+    """These run in a background worker; an exception there says nothing to anyone."""
+    monkeypatch.setenv("PATH", "/nonexistent")
+    outcome = local.check_clean(str(git_repo))
+    assert not outcome.ok and "could not run git" in outcome.message
+
+
+def test_a_git_that_hangs_past_the_timeout_is_a_refusal(git_repo, holder_stub, monkeypatch):
+    holder_stub(0)
+    monkeypatch.setattr(local, "_GIT_TIMEOUT", 0.001)
+    outcome = local.pull(str(git_repo))
+    # The message, not just the verdict: a bare `not ok` here would also pass if
+    # the refusal came from some unrelated check further down.
+    assert not outcome.ok and "timed out" in outcome.message

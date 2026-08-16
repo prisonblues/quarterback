@@ -46,12 +46,27 @@ class Outcome:
 
 
 def _git(path: str, *args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["git", "-C", path, *args],
-        capture_output=True,
-        text=True,
-        timeout=_GIT_TIMEOUT,
-    )
+    """Run git, and turn a failure to *launch* it into a failed run.
+
+    A missing git, an unreadable directory, or a `git pull` that hangs past the
+    timeout would otherwise raise out of a check and up through the Textual
+    worker that called it — so the one place designed to say "refusing, and
+    here is why" would instead say nothing at all. Every caller already handles
+    a non-zero return code; this makes those the only outcome there is.
+    """
+    try:
+        return subprocess.run(
+            ["git", "-C", path, *args],
+            capture_output=True,
+            text=True,
+            timeout=_GIT_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            args, 1, "", f"git {args[0]} timed out after {_GIT_TIMEOUT}s"
+        )
+    except OSError as e:
+        return subprocess.CompletedProcess(args, 1, "", f"could not run git: {e}")
 
 
 def _first_line(text: str, fallback: str) -> str:
@@ -83,8 +98,12 @@ def check_free(path: str) -> Outcome:
     except (OSError, subprocess.SubprocessError) as e:
         return Outcome(False, f"could not run worktree-holder ({e}) — refusing")
     if proc.returncode == _HELD:
-        who = _first_line(proc.stderr, "another live agent")
-        return Outcome(False, f"held by another live agent — refusing.\n{who}")
+        # The WHOLE warning, not its first line. worktree-holder leads with a
+        # generic "<path> is held by another live agent" and puts who, on what
+        # branch, for how long, on the lines after it — so taking one line threw
+        # away the only part of the refusal a person can act on.
+        who = (proc.stderr or "").strip() or "another live agent (no detail given)"
+        return Outcome(False, f"refusing — {who}")
     if proc.returncode == _CANNOT_TELL:
         return Outcome(False, "could not tell whether anyone is here (board unreachable) — refusing")
     if proc.returncode != 0:

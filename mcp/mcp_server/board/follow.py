@@ -159,7 +159,14 @@ def _tail(
         try:
             backlog = _backlog(client, tail, types, to, presence)
         except httpx.HTTPStatusError as e:
-            return _fatal(e, err)
+            # Only a rejected token is fatal here. A 5xx on the backlog fetch is
+            # the same transient outage the stream loop below reconnects
+            # through, and treating it as fatal made a board restarting during
+            # startup kill a tail that would have recovered a second later.
+            if e.response.status_code in (401, 403):
+                return _fatal(e, err)
+            print(f"qb board: backlog unavailable (HTTP {e.response.status_code})", file=err)
+            backlog = []
         except httpx.HTTPError as e:
             print(f"qb board: {e}", file=err, flush=True)
             backlog = []

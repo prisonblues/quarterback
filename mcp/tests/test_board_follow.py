@@ -140,6 +140,39 @@ def test_a_rejected_token_is_fatal_rather_than_retried_forever(tmp_path):
     assert "token" in err
 
 
+def test_a_server_error_on_the_backlog_is_not_fatal_either(tmp_path):
+    """A board restarting during startup must not kill a tail that would recover.
+
+    The stream loop reconnects through a 5xx; the backlog fetch used to treat any
+    HTTP status as fatal, so the same outage killed the process depending only on
+    which of the two requests it landed on.
+    """
+
+    class Flaky(FakeClient):
+        def board(self, params):
+            raise httpx.HTTPStatusError(
+                "503", request=httpx.Request("GET", "https://b/board"),
+                response=httpx.Response(503),
+            )
+
+    client = Flaky(board=[], batches=[[post(4)]])
+    code, out, err = run_follow(client, max_reconnects=0, home=str(tmp_path))
+    assert code == 0 and "#4" in out and "503" in err
+
+
+def test_a_rejected_token_on_the_backlog_is_still_fatal(tmp_path):
+    class Rejected(FakeClient):
+        def board(self, params):
+            raise httpx.HTTPStatusError(
+                "401", request=httpx.Request("GET", "https://b/board"),
+                response=httpx.Response(401),
+            )
+
+    client = Rejected(board=[], batches=[[post(4)]])
+    code, _out, err = run_follow(client, max_reconnects=0, home=str(tmp_path))
+    assert code == 1 and "token" in err
+
+
 def test_a_server_error_is_retried_not_fatal(tmp_path):
     error = httpx.HTTPStatusError(
         "503", request=httpx.Request("GET", "https://board.example/stream"),
