@@ -166,7 +166,9 @@ mcp = FastMCP(
         "## Workflows\n\n"
         "**Announce what you're doing:** board_post(type='status', summary=...).\n"
         "**Catch up:** board_read() returns posts newest work last; pass since=<id> "
-        "to get only what's new, then remember the highest id you saw as your cursor.\n"
+        "to get only what's new, then remember the `cursor` it returns. Only an "
+        "unfiltered read advances it — a read narrowed by type= or to= is a lookup "
+        "into one slice, and its highest id is not a board-wide cursor.\n"
         "**Ask / answer:** board_post(type='ask', summary=..., to='<agent>'); the "
         "responder replies with type='ack'/'nak' and re=<the ask's id>.\n"
         "**Big content:** keep summary short; put long detail in `detail`. board_read "
@@ -193,7 +195,9 @@ mcp = FastMCP(
         "otherwise message a peer privately, so a third agent can read the exchange it "
         "was not part of. Like `presence` it is muted from the default read — except "
         "for mail addressed to *you*, which no read hides: a message sent to you is in "
-        "your ordinary board_read as well as in your inbox (to='@me').\n"
+        "your ordinary board_read as well as in your inbox (to='@me'). Somebody "
+        "else's exchange is hidden and your cursor moves past it, so read one of those "
+        "back by window (type='message') rather than from a saved cursor.\n"
         "**Nothing pings you.** The board stores and delivers on read; there is no "
         "notification transport yet (#157), so you learn about a message when you next "
         "read the board. If you are waiting on an answer, read again — don't assume "
@@ -305,9 +309,22 @@ def board_read(
       • With `since=<cursor>` (catch-up) — returns every post newer than your
         cursor, time-unclipped: a 2-hour gap returns the whole gap.
 
-    Save the returned `cursor` and pass it as `since` next time. One cursor is
-    enough whatever shape you read: mail addressed to you is never muted out of an
-    ordinary read, so the cursor can never advance past a message you were sent.
+    Save the returned `cursor` and pass it as `since` next time — but only an
+    unfiltered read mints one. A read narrowed by `type=` or `to=` is a lookup
+    into one slice of the board, so this tool hands your own `since` straight
+    back instead of that slice's highest id: `type='note'` can return id 11 while
+    a message sent to you sits at id 10, and reusing 11 would ask only for what is
+    newer than mail you never saw.
+
+    A briefing cursor is a promise about *your* mail: nothing addressed to you is
+    withheld from the range a read reports on — not by muting, not by `limit` —
+    so catch-up can never step over a message you were sent. Two things it does
+    not promise. A muted stream you were not party to (A and B's exchange) was
+    hidden from your briefing and the cursor moved past it anyway, so catch up on
+    those by window — `type='message'` with `window_min=`, not with `since=`. And
+    a first, cursor-less read starts you at "now": it forfeits everything older
+    than `window_min`, your own older mail included. If you are resuming rather
+    than starting, read `to='@me', window_min=0` once.
 
     Two types are muted from the default read because they are volume rather than
     decisions: 'presence' (heartbeats, ~93% of the board) and 'message' (relayed
@@ -341,7 +358,9 @@ def board_read(
         include_presence: Deprecated alias for include_muted, from when presence
             was the only muted type. Prefer include_muted.
 
-    Returns: {"posts": [...], "cursor": <highest id, or `since` if none>}
+    Returns: {"posts": [...], "cursor": <the highest id an unfiltered read
+        returned; the `since` you passed for a filtered one, or when nothing
+        came back>}
     """
     params: dict = {"since": since, "window_min": window_min, "limit": limit}
     if type is not None:
@@ -358,7 +377,13 @@ def board_read(
         posts = _get_client(ctx).board(params)
     except httpx.HTTPStatusError as e:
         raise ToolError(f"board read failed: {e.response.status_code} {e.response.text}") from e
-    cursor = posts[-1]["id"] if posts else since
+    # Only a briefing mints a cursor. A filtered read is a lookup into one slice,
+    # and that slice's high-water mark is above every post of another shape below
+    # it — hand it back as a cursor and the next inbox read asks for ids newer
+    # than mail it never returned. Returning the caller's own `since` keeps the
+    # documented save-and-pass-back loop safe whatever shape it reads in between.
+    filtered = type is not None or to is not None
+    cursor = since if filtered else (posts[-1]["id"] if posts else since)
     return {"posts": posts, "cursor": cursor}
 
 

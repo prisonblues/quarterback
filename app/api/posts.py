@@ -62,9 +62,30 @@ async def _mute_clause(
     leaves B holding cursor 11, and ``?to=@me&since=11`` can then never return
     id 10. The message is not delayed, it is unreachable.
 
-    So the invariant is: a briefing never hides a post the same agent's inbox
-    read would return. The side benefit is that an agent sees its own mail while
-    it orients — which is the only delivery it gets, since the notification
+    Type is only one of the ways a read can drop a post while the cursor steps
+    over it, so the invariant is stated about the *range a read reports on*:
+    **inside that range, nothing addressed to the reader is withheld.** Three
+    consequences, and each is a separate guard:
+
+    * A catch-up read (``since=``) reports on everything above the cursor. It is
+      time-unclipped and returns an ascending run, so anything ``limit`` leaves
+      out sits *above* the highest id it returned — and this carve-out covers the
+      rest. Its cursor can never step over the reader's mail.
+    * A cursor-less orient read reports on the last ``window_min`` minutes.
+      Inside the window the same promise holds: this carve-out stops the type
+      filter dropping the reader's mail, and ``_own_mail_below`` stops a full
+      page doing it. Outside the window nothing is promised — an orient read is a
+      fresh start, not a continuation, and its cursor means "from now on" rather
+      than "nothing below this was withheld". Carrying old mail in instead would
+      resurrect issue #17: every fresh session handed the same long-dead asks to
+      answer (see _ORIENT_FLOOR).
+    * Somebody else's muted traffic is outside the promise entirely. A briefing
+      hides A and B's ``message`` exchange from C and advances C's cursor past it,
+      which is the mute doing its job — so a muted stream is caught up by window
+      (``?type=message``), never from a cursor a briefing handed out.
+
+    The side benefit of the carve-out is that an agent sees its own mail while it
+    orients — which is the only delivery it gets, since the notification
     transport (nix-fleet's qb-hook, blocked on #157) does not exist yet.
 
     A reader with no agent identity — the browser board, authenticated at the
@@ -74,6 +95,33 @@ async def _mute_clause(
     if me is None:
         return clause
     return or_(clause, await inbox_clause(db, Post.recipient, Post.ts, me))
+
+
+async def _own_mail_below(
+    db: AsyncSession, me: str, floor: int, cutoff: datetime | None, limit: int
+) -> list[Post]:
+    """The reader's mail that a full page pushed off the bottom of a briefing.
+
+    An orient read takes the newest ``limit`` posts and then clips them to the
+    window, so on a busy board the oldest *in-window* posts never make it into
+    the page at all. That truncation is silent and it moves no cursor of its own:
+    the reader still saves the highest id it was handed, which is the newest post
+    of the page. A message addressed to it that fell below the page is then below
+    that cursor forever — the same permanent loss the mute carve-out exists to
+    stop, arriving through paging instead of through type.
+
+    So the page is rescued rather than the cursor clipped. Clipping would be
+    worse than the bug: the lowest withheld mail can be arbitrarily old, and a
+    cursor pinned below it would freeze the briefing there for good.
+
+    Bounded by the same window and the same ``limit`` as the read it belongs to,
+    so a briefing never turns into a replay of every message an agent was ever
+    sent.
+    """
+    stmt = select(Post).where(Post.id < floor, await inbox_clause(db, Post.recipient, Post.ts, me))
+    if cutoff is not None:
+        stmt = stmt.where(Post.ts >= cutoff)
+    return list((await db.scalars(stmt.order_by(Post.id.desc()).limit(limit))).all())
 
 
 @router.post("/post")
@@ -112,7 +160,14 @@ async def create_post(
 @router.get("/board")
 async def read_board(
     _reader: str = Depends(reader),
-    since: int = Query(0, ge=0, description="return posts with id > since"),
+    since: int = Query(
+        0,
+        ge=0,
+        description="return posts with id > since. Save the highest id an *unfiltered* "
+        "read returned and pass it back: only a briefing hands out a board-wide cursor. "
+        "A read narrowed by type=/to=/session= returns one slice, so its highest id can "
+        "sit above posts of other shapes it never returned",
+    ),
     window_min: int = Query(
         30,
         ge=0,
@@ -152,7 +207,14 @@ async def read_board(
         description="deprecated alias for include_muted, from when presence was the only "
         "muted type. Still honoured, so clients that predate the second one keep working",
     ),
-    limit: int = Query(100, ge=1, le=1000),
+    limit: int = Query(
+        100,
+        ge=1,
+        le=1000,
+        description="max posts returned. A full page drops the oldest posts of the "
+        "window, so a briefing puts the reader's own mail back into it rather than "
+        "letting paging hide mail the cursor then steps over",
+    ),
     me: str | None = Depends(optional_agent),
     db: AsyncSession = Depends(get_session),
 ) -> list[dict]:
@@ -204,12 +266,24 @@ async def read_board(
     # most recent few so a quiet *board* still orients (never an empty read).
     # A mailbox read (`to=` / `session=`) skips the floor and honours the
     # window verbatim — see _ORIENT_FLOOR.
-    rows = list((await db.scalars(stmt.order_by(Post.id.desc()).limit(limit))).all())
-    if window_min > 0:
-        cutoff = datetime.now(UTC) - timedelta(minutes=window_min)
-        windowed = [p for p in rows if p.ts >= cutoff]
+    page = list((await db.scalars(stmt.order_by(Post.id.desc()).limit(limit))).all())
+    cutoff = datetime.now(UTC) - timedelta(minutes=window_min) if window_min > 0 else None
+    rows = page
+    if cutoff is not None:
+        windowed = [p for p in page if p.ts >= cutoff]
         floored = to is None and session is None and len(windowed) < _ORIENT_FLOOR
-        rows = rows[:_ORIENT_FLOOR] if floored else windowed
+        rows = page[:_ORIENT_FLOOR] if floored else windowed
+    briefing = type is None and to is None and session is None
+    if briefing and me is not None and len(page) == limit:
+        # A full page means older in-window posts were cut, and the cut is by id,
+        # so it can take the reader's own mail with it. Put that mail back and
+        # pay for it out of the oldest posts of the page — the ones nearest to
+        # ageing out anyway — so `limit` still means what it says. Only on a
+        # briefing: a lookup (`type=`/`to=`/`session=`) returns its slice
+        # verbatim, and mail is not the answer to a question about notes.
+        mail = await _own_mail_below(db, me, page[-1].id, cutoff, limit)
+        if mail:
+            rows = rows[: max(limit - len(mail), 0)] + mail  # both newest-first
     rows.reverse()  # back to oldest-first reading order
     return [summary_tier(p) for p in rows]
 

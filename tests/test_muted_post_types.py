@@ -23,7 +23,8 @@ So the properties under test are:
   cursor. A briefing that hid your mail would still advance that cursor past it, and the
   `to=@me&since=<cursor>` read meant to fetch it asks only for what is newer — so the
   message is not delayed, it is gone. A briefing therefore never hides a post the same
-  agent's inbox would return.
+  agent's inbox would return — for the range that briefing reports on, which is the part
+  the last bullet is careful about.
 * **Never muted from a session's own record.** `session=` is a lookup too; dropping
   `message` there loses that session's half of every exchange it had. Only `presence`
   stays muted.
@@ -32,11 +33,24 @@ So the properties under test are:
 * **The exchange is findable by a third agent.** That is the entire point of #155.
 * **`presence` still behaves.** The mute moved from `!=` to a list; pin the old case.
 * **`include_presence` still works.** It is the deprecated spelling of `include_muted`.
+* **The cursor's real reach.** Type is not the only filter that can drop a post while the
+  cursor steps over it — the orient window does it by time, `limit` does it by paging, and
+  `?type=` does it by shape. So the tests below pin both halves: what is promised (nothing
+  addressed to you is withheld from the range a read reports on, muting and paging
+  included) and what is not (a lookup's high-water mark, a muted stream you were not party
+  to, and history older than a cursor-less read's window). Everything above sets
+  `window_min=0`, which is exactly why none of it could see the time and paging cases.
 """
 
 from __future__ import annotations
 
+import ast
+from pathlib import Path
+
 import pytest
+from sqlalchemy import text
+
+from app.db import engine
 
 from .conftest import DESKTOP, LAPTOP, SERVER
 
@@ -81,6 +95,37 @@ async def whoami(client, headers) -> str:
     r = await client.get("/whoami", headers=headers)
     assert r.status_code == 200, r.text
     return r.json()["agent"]
+
+
+async def backdate(post_id: int, minutes: int) -> None:
+    """Age a post out of the orient window — the suite can't wait 30 wall-clock minutes."""
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE posts SET ts = now() - make_interval(mins => :m) WHERE id = :id"),
+            {"m": minutes, "id": post_id},
+        )
+
+
+#: `mcp/` is a separate distribution the app suite cannot import (see test_post_type_drift
+#: for the same problem and the same answer), so the tool's half of the cursor rule is read
+#: out of its source.
+_MCP_SERVER = Path(__file__).resolve().parent.parent / "mcp" / "mcp_server" / "server.py"
+
+
+def mcp_function(name: str) -> ast.FunctionDef:
+    for node in ast.parse(_MCP_SERVER.read_text(encoding="utf-8")).body:
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    raise AssertionError(f"no def {name} in {_MCP_SERVER}")
+
+
+def assigned_value(fn: ast.FunctionDef, name: str) -> ast.expr:
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == name for t in node.targets
+        ):
+            return node.value
+    raise AssertionError(f"{fn.name} assigns no {name}")
 
 
 async def test_message_is_an_accepted_type(client):
@@ -204,6 +249,141 @@ async def test_a_single_cursor_cannot_lose_a_directed_message(client):
         "the briefing advanced the cursor past a message addressed to this agent, "
         "so the inbox read that cursor feeds can never reach it again"
     )
+
+
+async def test_a_full_page_cannot_truncate_the_readers_own_mail(client):
+    """The same loss as muting, arriving through paging.
+
+    An orient read takes the newest `limit` posts and clips them to the window, so on a
+    busy board the oldest in-window posts never reach the page. The reader still saves the
+    highest id it was handed, so a message that fell below the page sits below that cursor
+    for good — and `?to=@me&since=<cursor>` asks only for what is newer. The mute carve-out
+    does nothing here: the post is dropped by position, not by type.
+    """
+    desktop = await whoami(client, DESKTOP)
+    mine = await post(client, headers=LAPTOP, type="message", to=desktop, summary="for you")
+    for i in range(6):
+        await post(client, headers=LAPTOP, type="note", summary=f"decision {i}")
+
+    briefing = await board(client, headers=DESKTOP, limit=5)
+    assert len(briefing) <= 5, "putting the mail back must fit inside limit, not append past it"
+    assert mine in ids(briefing), "a full page pushed the reader's own mail off its briefing"
+
+    cursor = max(ids(briefing))
+    inbox = ids(await board(client, headers=DESKTOP, to="@me", since=cursor))
+    assert mine in ids(briefing) | inbox, (
+        "the briefing's cursor stepped over mail the page truncated, so the inbox read "
+        "that cursor feeds can never reach it again"
+    )
+
+
+async def test_the_default_window_carries_live_mail_and_forfeits_only_the_rest(client):
+    """The carve-out under the *default* window, which every test above disables.
+
+    The window is a third way to drop a directed post while the cursor moves past it, and
+    setting `window_min=0` hides all of it. Inside the window the promise holds. Outside
+    it the read forfeits history on purpose — an orient read is a fresh start, not a
+    continuation, and floating old mail into it is issue #17, every fresh session handed
+    the same long-dead asks to answer. So the contract is that the forfeited mail stays
+    reachable by the two documented routes instead: the inbox, and a kept cursor.
+    """
+    desktop = await whoami(client, DESKTOP)
+    stale = await post(client, headers=LAPTOP, type="message", to=desktop, summary="90 min ago")
+    await backdate(stale, 90)
+    live = await post(client, headers=LAPTOP, type="message", to=desktop, summary="just now")
+    # Fill the window past the orient floor: a quiet board surfaces the last few posts
+    # whatever their age, which would put the stale one back for the wrong reason.
+    for i in range(10):
+        await post(client, headers=LAPTOP, type="note", summary=f"live decision {i}")
+
+    briefing = ids(await board(client, headers=DESKTOP))  # the default 30-minute window
+    assert live in briefing, "mail inside the window must survive the default read, not just 0"
+    assert stale not in briefing, "an orient read reports its window, not all of history"
+
+    assert stale in ids(await board(client, headers=DESKTOP, to="@me", window_min=0)), (
+        "the inbox is the documented way to pick up mail older than a briefing's window"
+    )
+    assert stale in ids(await board(client, headers=DESKTOP, since=stale - 1)), (
+        "and a kept cursor is the other: catch-up is time-unclipped, so it must not "
+        "re-apply the window it exists to escape"
+    )
+
+
+async def test_a_type_filtered_reads_high_water_mark_is_not_a_cursor(client):
+    """`?type=` returns one slice of the board, so its highest id is not a board cursor.
+
+    Reading `?type=note` can return id 11 while a message to the reader sits at id 10; reuse
+    11 as `since` for the inbox and the message is below it forever. The board cannot fix
+    that from inside the filtered read — an explicit type filter is honoured verbatim, and
+    that is the whole point of it. The rule is instead that such a read does not mint a
+    cursor, so pin both halves: the slice really does jump the mail, and the unfiltered
+    briefing the rule sends you to does not.
+    """
+    desktop = await whoami(client, DESKTOP)
+    msg = await post(client, headers=LAPTOP, type="message", to=desktop, summary="for you")
+    note = await post(client, headers=LAPTOP, type="note", summary="a decision")
+
+    one_slice = ids(await board(client, headers=DESKTOP, type="note", window_min=0))
+    assert note in one_slice
+    assert msg not in one_slice, "a type filter is honoured verbatim — mail included"
+    assert max(one_slice) > msg, "so its high-water mark sits above mail it never returned"
+
+    briefing = ids(await board(client, headers=DESKTOP, window_min=0))
+    assert {msg, note} <= briefing, "the unfiltered briefing is the read that does mint a cursor"
+
+
+def test_the_board_read_tool_mints_a_cursor_only_from_a_briefing():
+    """The tool is the only place in this repo where a cursor is actually minted.
+
+    `board_read` used to hand back the highest id of whatever it read, and its docstring
+    promised that one cursor was enough whatever shape you read. For a filtered read that
+    was false, and silently: the caller follows the documented save-and-pass-back loop and
+    loses the mail underneath. A filtered read now returns the caller's own `since`.
+    """
+    fn = mcp_function("board_read")
+    filtered = assigned_value(fn, "filtered")
+    named = {n.id for n in ast.walk(filtered) if isinstance(n, ast.Name)}
+    assert {"type", "to"} <= named, "the lookup test no longer looks at both filters"
+
+    cursor = assigned_value(fn, "cursor")
+    assert isinstance(cursor, ast.IfExp), "the cursor advances unconditionally again"
+    assert isinstance(cursor.test, ast.Name) and cursor.test.id == "filtered"
+    assert isinstance(cursor.body, ast.Name) and cursor.body.id == "since", (
+        "a filtered read must hand back the caller's own cursor, not the slice's"
+    )
+
+    doc = ast.get_docstring(fn) or ""
+    assert "whatever shape you read" not in doc, "the overclaim is back in the tool's docs"
+
+
+async def test_a_muted_stream_is_caught_up_by_window_not_by_a_briefing_cursor(client):
+    """The third agent's saved cursor — the read #155 exists to enable, done wrong.
+
+    C is party to none of A and B's exchange, so C's briefing mutes it and advances C's
+    cursor past it anyway. That is the mute doing its job: un-muting other people's
+    conversation for everyone is the feature going away. What follows is that a muted
+    stream cannot be caught up from a briefing cursor — `?type=message&since=<cursor>` asks
+    only for ids newer than posts C never saw — and must be read by window instead.
+    """
+    laptop, desktop = await whoami(client, LAPTOP), await whoami(client, DESKTOP)
+    opener = await post(client, headers=LAPTOP, type="message", to=desktop, summary="did it land?")
+    reply = await post(
+        client, headers=DESKTOP, type="message", to=laptop, re=opener, summary="yes, on main"
+    )
+    later = await post(client, headers=LAPTOP, type="note", summary="a decision")
+
+    briefing = ids(await board(client, headers=SERVER, window_min=0))
+    assert later in briefing
+    assert not {opener, reply} & briefing, "a briefing carries mail, and this is not C's"
+    cursor = max(briefing)  # what the documented pattern tells C to save
+
+    missed = ids(await board(client, headers=SERVER, type="message", since=cursor))
+    assert not {opener, reply} & missed, (
+        "if a briefing cursor did reach a muted stream, the documented advice to read one "
+        "by window instead is wrong and belongs deleted rather than followed"
+    )
+    by_window = ids(await board(client, headers=SERVER, type="message", window_min=0))
+    assert {opener, reply} <= by_window, "the documented way back into a muted stream"
 
 
 async def test_the_unmuted_inbox_is_still_addressed_not_broadcast(client):
