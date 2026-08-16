@@ -143,6 +143,7 @@ without letting one page of runs serialise a few million path strings.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import re
 from collections.abc import Mapping
@@ -160,9 +161,10 @@ from pydantic import (
     model_validator,
 )
 from sqlalchemy import and_ as sa_and
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy import or_ as sa_or
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import undefer
 
 from app.auth import identify, reader
 from app.db import get_session
@@ -307,6 +309,12 @@ PROVENANCE = ("introduced", "missed", "missed-unread", "unknown")
 #: trailing ``…`` so a reader is never told a truncated name is the whole one.
 MAX_BUCKET_ECHO = 64
 
+#: C0 and C1 control characters, which no bucket name, path or commit id contains
+#: and which an echoed value must never carry into a log line. Newline and
+#: carriage return forge log entries; the C1 range covers the single-byte ANSI
+#: escapes as well as ESC itself. See :func:`_echo`.
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
 #: How many distinct unrecognised names one response will list. ``MAX_BUCKET_ECHO``
 #: bounds each name and nothing bounded the COUNT, so a tally with ten thousand
 #: junk keys — or a payload whose findings each spell a different one — was sorted
@@ -386,8 +394,20 @@ def _echo(v: object) -> str:
     reader as a whole one. Two names agreeing in their first
     :data:`MAX_BUCKET_ECHO` characters still report once, marked; that is a
     bounded echo doing its job, not a lost signal.
+
+    **Control characters are replaced, not merely trimmed**, and that is the
+    security half rather than tidiness. This value is caller-supplied and it
+    reaches the service log, so a bare ``.strip()`` — which only touches the ends
+    — let an embedded newline forge a whole extra log line: a sender posting
+    ``provenance: "x\\nreview ingest dropped fields: run=1 repo=…"`` writes its own
+    entry into the log #65's drift check is meant to read, which is a signal
+    corrupting the exact record it exists to leave. ANSI escapes are the same
+    class one step down, against whoever reads the log in a terminal. Replaced
+    with ``␦`` rather than deleted: something unprintable arrived, and a reader
+    of a drift signal should see that it did.
     """
     s = v.strip() if isinstance(v, str) else str(v)
+    s = _CONTROL_RE.sub("␦", s)
     return s[:MAX_BUCKET_ECHO] + "…" if len(s) > MAX_BUCKET_ECHO else s
 
 
@@ -1668,15 +1688,48 @@ async def record_review(
     # the reader this signal exists for, would have had nothing left to read. One
     # line per run, and only when something was actually dropped: a line per
     # ordinary run is noise, and noise is how a real drop goes unread.
+    #
+    # Emitted as ONE json object rather than interpolated fields, because every
+    # string in it is caller-supplied and this line is a record something else is
+    # meant to read. `json.dumps` escapes the newline that would otherwise forge a
+    # second entry — `_echo` already replaces control characters at the source,
+    # but `repo` reaches the same line and travels no such path, so the escaping
+    # has to be here as well as there. It also makes the line parseable, which is
+    # what #65's check wants of it.
     if dropped:
-        _log.warning("review ingest dropped fields: run=%s repo=%s pr=%s author=%s %s",
-                     run.id, body.repo, body.pr, author, dropped)
+        _log.warning("review ingest dropped fields: %s",
+                     json.dumps({"run": run.id, "repo": body.repo, "pr": body.pr,
+                                 "author": author, **dropped}, default=str))
     return {**recorded, **dropped}
 
 
 # ------------------------------------------------------------------ read paths
 
-def _run_view(r: ReviewRun) -> dict:
+#: How many paths a run's ``unread_files`` holds, computed in SQL so the column
+#: itself never has to be fetched — see :attr:`ReviewRun.unread_files`, which is
+#: deferred for exactly this.
+#:
+#: ``case`` rather than a bare ``jsonb_array_length``, and guarded the same way
+#: ``declared_runs`` guards its comparison one endpoint down: that function raises
+#: on a jsonb value that is not an array rather than returning NULL, and this API
+#: is not the only thing that can write the column. A non-array reads as "nobody
+#: said", which is the honest answer for a value this board cannot interpret, and
+#: it cannot take a whole page of runs down with it.
+_UNREAD_COUNT = case(
+    (func.jsonb_typeof(ReviewRun.unread_files) == "array",
+     func.jsonb_array_length(ReviewRun.unread_files)),
+    else_=None,
+)
+
+
+def _run_view(r: ReviewRun, unread_count: int | None) -> dict:
+    """One run as the list and detail views publish it.
+
+    ``unread_count`` is passed in rather than read off ``r``: the column is
+    deferred, so touching it here would either refetch every path the count
+    exists to avoid or — under async SQLAlchemy, which cannot lazy-load — raise.
+    Callers get it from :data:`_UNREAD_COUNT` in their own query.
+    """
     return {
         "id": r.id,
         "ts": r.ts.isoformat(),
@@ -1689,22 +1742,28 @@ def _run_view(r: ReviewRun) -> dict:
         # The commit this round read, which `base` (a branch name) cannot say.
         "head_sha": r.head_sha,
         # The COUNT, not the paths — the same trade `changed_files_total` makes
-        # two lines down, and for the same reason. The list is a run column rather
-        # than a child table, so including it costs no extra query, but query
-        # count is not the cost `changed_files` was kept out of this view for:
-        # response size is. `unread_files` is bounded only by MAX_CHANGED_FILES
-        # entries of MAX_PATH_CHARS each, so `GET /reviews?limit=500` could
-        # serialise millions of path strings. "Bounded by what one round could not
-        # read" is a fact about a real panel and not a bound this ingest enforces
-        # on an authenticated-but-unbounded sender, which is precisely why the cap
-        # exists. `GET /review/{id}` carries the list.
+        # two lines down, and for the same reason. The cost `changed_files` was
+        # kept out of this view for is response SIZE: `unread_files` is bounded
+        # only by MAX_CHANGED_FILES entries of MAX_PATH_CHARS each, so
+        # `GET /reviews?limit=500` could serialise millions of path strings.
+        # "Bounded by what one round could not read" is a fact about a real panel
+        # and not a bound this ingest enforces on an authenticated-but-unbounded
+        # sender, which is precisely why the cap exists. `GET /review/{id}`
+        # carries the list.
+        #
+        # And the count is computed in SQL (:data:`_UNREAD_COUNT`) against a
+        # DEFERRED column, because the first version of this argument only saved
+        # the serialisation: `len(r.unread_files)` still had Postgres ship every
+        # path of every row to the app before Python counted them. A defence
+        # against a page of file dumps that still transfers the file dump is a
+        # comment, not a defence.
         #
         # Unmasked in the sense that matters, like `stop_veto` further down: NULL
         # here means the panel never said and 0 means it said nothing was cut, so
         # the three states survive into the list view rather than being folded
         # into one by the read path — which is the collapse the storage side is
         # built to prevent.
-        "unread_files_count": None if r.unread_files is None else len(r.unread_files),
+        "unread_files_count": unread_count,
         # Four integer keys at most, so this one rides everywhere: it is the
         # round's own statement about its attribution and the thing a reader needs
         # beside every per-finding bucket.
@@ -1897,7 +1956,9 @@ async def list_reviews(
     session: AsyncSession = Depends(get_session),
 ) -> list[dict]:
     """Recorded panel runs, newest first."""
-    stmt = select(ReviewRun)
+    # The run, plus its unread-path COUNT computed in the database. The column
+    # itself is deferred and deliberately not fetched here — see `_run_view`.
+    stmt = select(ReviewRun, _UNREAD_COUNT)
     if repo is not None:
         stmt = stmt.where(ReviewRun.repo == repo)
     if pr is not None:
@@ -1910,9 +1971,11 @@ async def list_reviews(
         stmt = stmt.where(ReviewRun.ts >= cutoff)
     stmt = stmt.order_by(ReviewRun.ts.desc(), ReviewRun.id.desc()).limit(limit)
 
-    runs = list((await session.scalars(stmt)).all())
-    if not runs:
+    rows = list((await session.execute(stmt)).all())
+    if not rows:
         return []
+    runs = [r for r, _ in rows]
+    unread_counts = {r.id: n for r, n in rows}
     cards = list(
         (await session.scalars(
             select(ReviewReviewer).where(ReviewReviewer.run_id.in_([r.id for r in runs]))
@@ -1922,7 +1985,8 @@ async def list_reviews(
     by_run: dict[int, list[dict]] = {}
     for c in cards:
         by_run.setdefault(c.run_id, []).append(_card_view(c, run_by_id[c.run_id]))
-    return [{**_run_view(r), "reviewers": sorted(by_run.get(r.id, []), key=lambda c: c["name"])}
+    return [{**_run_view(r, unread_counts[r.id]),
+             "reviewers": sorted(by_run.get(r.id, []), key=lambda c: c["name"])}
             for r in runs]
 
 
@@ -2414,14 +2478,20 @@ async def pr_finding_history(
     """
     # One over the window, so "there is older history" is a fact rather than the
     # guess "we returned exactly as many as we asked for".
-    fetched = list(
-        (await session.scalars(
-            select(ReviewRun)
+    # Runs plus their unread-path counts, the count in SQL against a deferred
+    # column — same reason as `list_reviews`: this endpoint traces up to `limit`
+    # runs, and fetching every path of each to call `len()` on it is the transfer
+    # the count exists to avoid.
+    fetched_rows = list(
+        (await session.execute(
+            select(ReviewRun, _UNREAD_COUNT)
             .where(ReviewRun.repo == repo, ReviewRun.pr == pr)
             .order_by(ReviewRun.ts.desc(), ReviewRun.id.desc())
             .limit(limit + 1)
         )).all()
     )
+    fetched = [r for r, _ in fetched_rows]
+    unread_counts = {r.id: n for r, n in fetched_rows}
     if not fetched:
         return {"repo": repo, "pr": pr, "rounds": 0, "stopped": None,
                 "stop_reason": None, "stop_confident": None, "stop_veto": [],
@@ -2627,8 +2697,7 @@ async def pr_finding_history(
             {"id": r.id, "ts": r.ts.isoformat(), "author": r.author, "judged": r.judged,
              "head_sha": r.head_sha,
              "provenance_counts": r.provenance_counts,
-             "unread_files_count": (None if r.unread_files is None
-                                    else len(r.unread_files)),
+             "unread_files_count": unread_counts[r.id],
              "confirmed": r.n_confirmed, "dismissed": r.n_dismissed,
              "unjudged": r.n_unjudged, "sonar": r.n_sonar,
              "round": r.round, "cycle": r.cycle, "new_findings": r.new_findings,
@@ -2654,7 +2723,15 @@ async def get_review(
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     """One run in full — scorecards plus every finding and its verdict."""
-    run = await session.get(ReviewRun, run_id)
+    # `undefer`, explicitly: this is the ONE endpoint that publishes the unread
+    # paths, and the column is deferred so the list views never pay for them.
+    # Async SQLAlchemy cannot lazy-load, so without this the attribute access
+    # below raises `MissingGreenlet` rather than quietly issuing a second query —
+    # which is the failure mode worth having, since it cannot go unnoticed.
+    run = await session.scalar(
+        select(ReviewRun).where(ReviewRun.id == run_id)
+        .options(undefer(ReviewRun.unread_files))
+    )
     if run is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"no review run {run_id}")
     cards = list(
@@ -2680,7 +2757,10 @@ async def get_review(
         )).all()
     )
     return {
-        **_run_view(run),
+        # The count is `len()` here and not `_UNREAD_COUNT`: this is the one
+        # caller that has already paid to load the list, so counting it in SQL
+        # would be a second trip for a number already in hand.
+        **_run_view(run, None if run.unread_files is None else len(run.unread_files)),
         # The paths themselves, here and not in the run LIST — exactly where
         # `changed_files` lives and for the same reason: one run's worth of paths
         # is a fair payload, a page of them is a file dump. `_run_view` carries

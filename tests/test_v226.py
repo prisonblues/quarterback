@@ -34,6 +34,7 @@ itself) — the second counts a finding two seats agreed on once, the first twic
 
 from __future__ import annotations
 
+import json
 import logging
 
 from .conftest import LAPTOP
@@ -324,9 +325,82 @@ async def test_a_drop_is_logged_and_not_only_returned(client, caplog):
     with caplog.at_level(logging.WARNING, logger="app.review"):
         run = await record(client, 9345, head_sha="HEAD",
                            to_fix=[finding("odd", provenance="regressed")])
-    line = "\n".join(r.getMessage() for r in caplog.records)
-    assert f"run={run['id']}" in line
-    assert "regressed" in line and "HEAD" in line
+    assert len(caplog.records) == 1, "one line per run, not one per dropped field"
+    # Parsed, not substring-matched: the line is a json object precisely so the
+    # check that reads it does not have to scrape prose, and a test that only
+    # greps would pass on a line no parser could take.
+    logged = json.loads(caplog.records[0].getMessage().split(": ", 1)[1])
+    assert logged["run"] == run["id"]
+    assert logged["head_sha_dropped"] == "HEAD"
+    assert logged["provenance_unknown"] == ["regressed"]
+
+
+async def test_a_sender_cannot_forge_a_line_in_the_log_it_is_recorded_in(client, caplog):
+    """Round 2, P2. The drop line is caller-supplied text in the record #65 reads,
+    and `.strip()` only touches the ends: an embedded newline wrote a second,
+    fabricated entry into the very log the signal exists to leave. A drift check
+    reading a forged line is worse than one reading nothing.
+
+    Both halves are pinned. `_echo` replaces control characters at the source, and
+    the line is emitted as one json object so `repo` — caller-supplied, reaching
+    the same line, and travelling through no `_echo` — is escaped too."""
+    forged = "review ingest dropped fields: {\"run\": 1, \"repo\": \"acme/other\"}"
+    with caplog.at_level(logging.WARNING, logger="app.review"):
+        await record(client, 9346,
+                     repo="acme/v226forge\n" + forged,
+                     to_fix=[finding("odd", provenance="x\n" + forged)])
+    assert len(caplog.records) == 1, "a newline must not become a second record"
+    msg = caplog.records[0].getMessage()
+    assert "\n" not in msg, "the whole entry is one physical line"
+    logged = json.loads(msg.split(": ", 1)[1])
+    # The newline survives as an escape inside the value, where a reader can see
+    # it arrived — never as a line break that ends the record early.
+    assert "\n" not in logged["provenance_unknown"][0]
+    assert "␦" in logged["provenance_unknown"][0], "replaced, not silently deleted"
+    assert logged["repo"].startswith("acme/v226forge")
+
+
+async def test_the_run_list_counts_unread_paths_without_fetching_them(client, caplog):
+    """Round 2, P2. `unread_files_count` was `len(r.unread_files)` in Python, so
+    Postgres still shipped every path of every row and only the JSON serialisation
+    was saved — a defence against a page of file dumps that still transfers the
+    file dump. The count is now `jsonb_array_length` against a deferred column.
+
+    Pinned behaviourally: the column is deferred, so if any list view goes back to
+    reading the attribute, async SQLAlchemy raises `MissingGreenlet` rather than
+    quietly re-fetching. The three states still have to survive the change."""
+    measured = await record(client, 9347, unread_files=["a.py", "b.py", "c.py"])
+    clean = await record(client, 9348, unread_files=[])
+    silent = await record(client, 9349)
+
+    r = await client.get("/reviews", params={"repo": REPO, "pr": 9347}, headers=AGENT)
+    assert r.status_code == 200, r.text
+    row = r.json()[0]
+    assert row["unread_files_count"] == 3
+    assert "unread_files" not in row, "the paths stay off the list view"
+
+    counts = {}
+    for pr in (9347, 9348, 9349):
+        got = await client.get("/reviews", params={"repo": REPO, "pr": pr}, headers=AGENT)
+        counts[pr] = got.json()[0]["unread_files_count"]
+    # 3 / 0 / null — "measured, nothing cut" is still not "never measured".
+    assert counts == {9347: 3, 9348: 0, 9349: None}
+
+    # ...and the detail endpoint, the one caller that undefers, still has the list.
+    assert (await detail(client, measured["id"]))["unread_files"] == ["a.py", "b.py", "c.py"]
+    assert (await detail(client, clean["id"]))["unread_files"] == []
+    assert (await detail(client, silent["id"]))["unread_files"] is None
+
+
+async def test_the_findings_endpoint_counts_unread_paths_the_same_way(client):
+    """The same deferred-column trap, one endpoint over: `/review/findings` builds
+    its own run summaries and had its own copy of the Python `len()`."""
+    await record(client, 9351, head_sha=SHA, unread_files=["x.py", "y.py"],
+                 to_fix=[finding("something", provenance="missed")])
+    r = await client.get("/review/findings", params={"repo": REPO, "pr": 9351},
+                         headers=AGENT)
+    assert r.status_code == 200, r.text
+    assert r.json()["runs"][0]["unread_files_count"] == 2
 
 
 async def test_an_ordinary_run_logs_nothing(client, caplog):

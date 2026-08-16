@@ -77,7 +77,20 @@ class ReviewRun(Base):
     #: exists to carry per-path churn and answer a by-path collision query, and
     #: this list has neither. It is read whole, per run, by whatever computes the
     #: next round's provenance.
-    unread_files: Mapped[list[Any] | None] = mapped_column(JSONB)
+    #:
+    #: **Deferred**, and that is load-bearing rather than tidy. The list views
+    #: publish only a count, and the first cut of that computed it in Python as
+    #: ``len(r.unread_files)`` — which meant Postgres still shipped every path of
+    #: every row to the app and only the JSON serialisation was saved. The read
+    #: path's stated defence did not hold on the read path it was written for. The
+    #: count is now ``jsonb_array_length`` in the query and this column is not
+    #: fetched at all unless somebody asks for the paths.
+    #:
+    #: Consequence for callers: async SQLAlchemy cannot lazy-load, so reading
+    #: ``run.unread_files`` off a run this session did not undefer raises
+    #: ``MissingGreenlet`` rather than quietly issuing a second query.
+    #: ``GET /review/{id}`` asks with ``undefer()``; nothing else should need to.
+    unread_files: Mapped[list[Any] | None] = mapped_column(JSONB, deferred=True)
     #: The panel's own tally of :data:`app.api.reviews.PROVENANCE` buckets over
     #: the findings the cycle still has to clear, verbatim (v2.26).
     #:
