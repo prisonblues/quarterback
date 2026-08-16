@@ -1,0 +1,329 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+# qb-seat — start one seat of the fleet: a real session, with its own board
+# identity, told to claim its own work.
+#
+# Usage: qb-seat <n> [agent args…]   start seat n in this directory
+#        qb-seat <n> --dry-run       print what it would run, start nothing
+#        qb-seat -h|--help           this text
+#
+# Exit codes:
+#   0  --help, or --dry-run
+#   2  a seat number that is not 1-99, or a directory that is not a git repo
+#   3  this seat number is already running in another pane on this machine
+#   *  otherwise this process is REPLACED by the agent and exits as it does
+#
+# WHAT THIS IS FOR. Five agents on one machine is five terminals, five `cd`s and
+# a human reading the plan out loud to each of them — and that human is the part
+# that does not scale. A multiplexer supplies the panes; this supplies what goes
+# in one. It is deliberately the thinnest thing that can turn a pane into a
+# working seat, because everything that would otherwise make it thick already
+# exists somewhere better: identity, presence, lease renewal, publish-on-push and
+# transcript push all arrive from the lifecycle hooks, and the worktree with its
+# isolated database arrives from /fix-issue.
+#
+# So the whole job is three lines of real work — name the seat, enter the repo,
+# start the agent on a brief — and a list of things not to do:
+#
+#   * It does NOT create a worktree. Under self-selection a seat does not know
+#     its branch until it has claimed something, and /fix-issue already provisions
+#     one per issue with the per-branch `<project>_<branch>` database that came
+#     with PR #30. A spawner that pre-made one would be guessing.
+#   * It does NOT dispatch. A spawner that reads the plan and hands seat 1 the
+#     first item is hub-and-spoke with a hub that runs once, at t=0, and then
+#     stops existing. Every seat gets the SAME brief and self-selects.
+#   * It does NOT drive the agent past starting it. That line is not ours to
+#     move: the board coordinates work, it does not operate the machine.
+#
+# WHY THE INSTANCE IS PER SEAT AND NEVER HOST-WIDE. The lifecycle hook keys its
+# ask-poll cursor on QUARTERBACK_INSTANCE (`qb-asks-<agent>-<instance>`), so one
+# value exported for the whole box gives n seats ONE inbox cursor between them:
+# whichever seat polls first advances it past everyone else's mail, and the other
+# n-1 never see an ask addressed to them. Set per seat it is the opposite — a
+# stable, typeable identity (`zeus/seat-3`, not `zeus/a4f81c2e`) that survives the
+# seat being restarted in the same pane, because the board hands a returning key
+# its old name back.
+#
+# WHY IT REGISTERS THE NAME ITSELF, BEFORE STARTING ANYTHING. Since v2.12 the
+# board DESIGNATES the name half of an identity: a client sends an opaque key and
+# is allocated two words. `QUARTERBACK_INSTANCE=seat-3` is honoured as a *request*
+# (`X-Agent-Name`) — but only by the MCP server, and only if it is the first
+# thing to touch the board for this key. The lifecycle hook sends the same value
+# as a bare key with no name request, it fires on SessionStart, and allocation is
+# first-contact-wins: whoever gets there first fixes the name for the whole
+# session. So the seat that was meant to be `zeus/seat-3` comes up as
+# `zeus/glacier-mist` about as often as not, which loses exactly the property the
+# per-seat instance was for. One HTTP call before exec settles it: the row is
+# created with the requested name, and every process that follows resolves to it.
+#
+# Addressing is unaffected either way and always was — the board resolves
+# `machine/key` as a permanent alias, so an ask sent to `zeus/seat-3` arrives even
+# when the board is calling the seat something else. This is about the name a
+# human types and reads on a status bar, which is the entire reason to number
+# seats rather than let them be hex.
+#
+# BEST-EFFORT BY CONSTRUCTION. No board configured, no token, no curl, no
+# network: the registration is skipped in silence and the seat still starts. A
+# seat that refuses to run because a cosmetic name could not be reserved would
+# have cost more than the name is worth — the same bargain qb-stage strikes
+# beside it, and the panel's board recording before that.
+
+SEAT_NAME_PREFIX="seat-"
+CLAUDE_BIN="${QB_SEAT_CLAUDE:-claude}"
+
+# The brief. Identical for every seat — that is the design, not an omission: the
+# moment one seat is told something another is not, there is a dispatcher again.
+# Overridable wholesale with QB_SEAT_BRIEF so the layout that owns the fleet can
+# retune it without a release here.
+#
+# It stops after one item on purpose. A seat that re-claims when it finishes turns
+# the fleet into a drain, which is the eventual shape and is NOT safe yet: nothing
+# yet bounds how much work a fleet may take on, and #80 measures integration cost
+# as quadratic in open PRs. Batch now, drain when the appetite gates land.
+default_brief() {
+    cat <<EOF
+You are seat $SEAT on this machine — one of several agents working this repo in
+parallel, as peers. Nobody is going to hand you work; you take it.
+
+1. Call whoami, then read the board to see what the rest of the fleet is doing.
+2. Pick ONE unclaimed item: the shared plan on the board if it has one, otherwise
+   an open issue nobody has claimed or is discussing. Prefer the top of the plan —
+   the ordering in it is reasoned and is not visible in the issue list.
+3. Take it ATOMICALLY before you touch anything, with a work claim on the board
+   (kind='work', key='<owner>/<repo>#<number>'). A conflict means another seat got
+   there first: do not negotiate and do not ask a human — take the next item.
+4. Work it with /fix-issue <number>. That owns the worktree and its database; do
+   not create one yourself.
+5. When it is done, post a 'done', release your claim, and stop. Do not pick up a
+   second item unless someone asks you to.
+
+Never assign work to another seat, and never work an item another seat holds. If
+you need something from a peer, post an ask addressed to it and carry on.
+EOF
+}
+
+usage() { sed -n '4,15p' "$0" | sed 's/^# \{0,1\}//'; }
+
+case "${1-}" in
+    -h|--help)
+        usage
+        exit 0
+        ;;
+    "")
+        printf 'qb-seat: need a seat number\n\n' >&2
+        usage >&2
+        exit 2
+        ;;
+esac
+
+SEAT="$1"
+shift
+
+# 1-99. The cap is not a statement about how many seats a fleet may have — it is
+# a typo guard, sized so the name stays short enough to type and to fit on a
+# status bar. #80's integration ceiling is the real limit on seat count, and it
+# is far below 99.
+if [[ ! "$SEAT" =~ ^[1-9][0-9]?$ ]]; then
+    printf 'qb-seat: %s is not a seat number — expected 1-99\n' "$SEAT" >&2
+    exit 2
+fi
+
+SEAT_NAME="$SEAT_NAME_PREFIX$SEAT"
+
+# Where the seat works. The layout that declares the panes is the natural place
+# for this (zellij and tmux both set a per-pane cwd), so the default is simply
+# "here"; QB_SEAT_REPO is for a caller that has no such control.
+REPO="${QB_SEAT_REPO:-$PWD}"
+
+# --dry-run is taken from anywhere in the argument list rather than only in the
+# position the usage shows. Everything after the seat number is passed through to
+# the agent verbatim, so a misplaced one would otherwise be handed to it — and
+# starting n agents is precisely the thing somebody reaches for --dry-run to
+# avoid doing by accident.
+DRY_RUN=""
+PASS_THROUGH=()
+for arg in "$@"; do
+    if [[ "$arg" == "--dry-run" ]]; then
+        DRY_RUN=1
+    else
+        PASS_THROUGH+=("$arg")
+    fi
+done
+set -- ${PASS_THROUGH+"${PASS_THROUGH[@]}"}
+
+if [[ ! -d "$REPO" ]]; then
+    printf 'qb-seat: %s is not a directory\n' "$REPO" >&2
+    exit 2
+fi
+
+# A seat's whole brief is "claim an issue and work it", and every step of that —
+# /fix-issue, the worktree, the branch, the PR — needs a repository. A pane whose
+# cwd is wrong is the likely cause, and it is much cheaper to say so here than to
+# have an agent discover it three tool calls in and improvise.
+if ! git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
+    printf 'qb-seat: %s is not a git repository — check the pane'\''s cwd\n' "$REPO" >&2
+    exit 2
+fi
+
+# ---- one pane per seat -------------------------------------------------------
+
+# Two panes started as the same seat is the failure this script exists to prevent,
+# arriving one level down: they export the same QUARTERBACK_INSTANCE, so they send
+# the same key, so the board hands them ONE identity and one ask-poll cursor — and
+# whichever polls first swallows the other's mail, which is precisely the bug a
+# per-seat instance was for. The board cannot see it: from its side the two panes
+# are indistinguishable by construction. Nothing else looks either, and both seats
+# work, so it is invisible until a peer's ask goes unanswered.
+#
+# So it is caught here, locally, where the panes actually are. The marker holds
+# the pid of the process that becomes the agent (we exec, so it stays this pid),
+# in the per-user runtime directory that is already scoped to one login.
+SEAT_MARKER="${XDG_RUNTIME_DIR:-/tmp}/qb-seat-$SEAT.pid"
+
+# Refuses rather than warns: a warning scrolls off the top of a pane in seconds,
+# and the cost of being wrong is a seat that quietly shares an inbox for hours.
+# Renumbering the pane is the fix; QB_SEAT_FORCE is there for a marker left by a
+# pid that has since been reused by something unrelated.
+check_seat_is_free() {
+    local holder
+    [[ -r "$SEAT_MARKER" ]] || return 0
+    holder=$(cat "$SEAT_MARKER" 2>/dev/null)
+    [[ "$holder" =~ ^[0-9]+$ ]] || return 0
+    kill -0 "$holder" 2>/dev/null || return 0   # stale: the seat ended, take it
+    [[ -z "${QB_SEAT_FORCE:-}" ]] || return 0
+    printf 'qb-seat: seat %s is already running here (pid %s).\n' "$SEAT" "$holder" >&2
+    printf '         Two panes on one seat number share a board identity AND an ask\n' >&2
+    printf '         cursor, so one of them silently eats the other'\''s mail. Give this\n' >&2
+    printf '         pane a different number, or set QB_SEAT_FORCE=1 if that pid is not\n' >&2
+    printf '         really a seat.\n' >&2
+    return 1
+}
+
+# ---- name registration (best-effort; see the header) ------------------------
+
+# The site's board configuration, on the contract the fleet's wrappers already
+# share: environment first, then a per-host config file. Referenced by variable
+# and by config path, never by the path of another repo's script.
+#
+# Environment beats the file, and that is restored explicitly rather than assumed,
+# because sourcing sets every variable the file names — not only the ones we were
+# missing. The fleet spans deliberately disjoint boards (a work island whose hosts
+# must never talk to the personal one), and an env var overwritten by a config
+# file is how a seat would end up posting to the wrong one. That is the exact
+# failure the per-host config was introduced to prevent.
+load_board_config() {
+    local config="${QUARTERBACK_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/quarterback/config}"
+    local env_url="${QUARTERBACK_BASE_URL:-}" env_token="${QUARTERBACK_TOKEN:-}"
+    local env_token_cmd="${QUARTERBACK_TOKEN_CMD:-}"
+    if [[ -z "$env_url" || -z "$env_token" ]] && [[ -r "$config" ]]; then
+        # shellcheck disable=SC1090
+        . "$config" || true
+    fi
+    # Every variable we read, not just the two we were missing: a token command
+    # replaced by the file authenticates against the URL the environment chose
+    # with the credential the file chose, which is the same island mix-up by
+    # another route.
+    [[ -n "$env_url" ]] && QUARTERBACK_BASE_URL="$env_url"
+    [[ -n "$env_token" ]] && QUARTERBACK_TOKEN="$env_token"
+    [[ -n "$env_token_cmd" ]] && QUARTERBACK_TOKEN_CMD="$env_token_cmd"
+    return 0
+}
+
+# Token precedence mirrors the wrappers': an explicit token wins, otherwise the
+# per-site command that prints one. A site with neither does not pre-register,
+# which is a fine outcome — it just gets a board-designated name.
+board_token() {
+    if [[ -n "${QUARTERBACK_TOKEN:-}" ]]; then
+        printf '%s' "$QUARTERBACK_TOKEN"
+        return 0
+    fi
+    [[ -n "${QUARTERBACK_TOKEN_CMD:-}" ]] || return 1
+    local token
+    token=$(eval "$QUARTERBACK_TOKEN_CMD" 2>/dev/null) || return 1
+    token="${token%%$'\n'*}"
+    [[ -n "$token" ]] || return 1
+    printf '%s' "$token"
+}
+
+# Ask the board for this seat's name and report what it actually says. The read
+# back is the point: the request is honoured only when the name is free, so a
+# second pane started as the same seat number is told rather than left to look
+# identical to the first one on the board.
+register_seat_name() {
+    local url token identity
+    load_board_config
+    url="${QUARTERBACK_BASE_URL:-}"
+    [[ -n "$url" ]] || return 0
+    command -v curl >/dev/null 2>&1 || return 0
+    token=$(board_token) || return 0
+
+    identity=$(curl -sS --max-time 5 \
+        -H "Authorization: Bearer $token" \
+        -H "X-Agent-Key: $SEAT_NAME" \
+        -H "X-Agent-Name: $SEAT_NAME" \
+        "${url%/}/whoami" 2>/dev/null) || return 0
+
+    # Parsed without jq — this must work on a box that has not got it, and the
+    # field is a plain string the board controls.
+    identity=$(printf '%s' "$identity" | sed -n 's/.*"agent"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+    [[ -n "$identity" ]] || return 0
+
+    # What this catches is a key that was already bound to a designated name on
+    # an earlier run — a seat started by hand before this script existed, say.
+    # Allocation hands a returning key the name it had, and a request cannot
+    # override one that exists, so the seat keeps the two words it was given.
+    # Not fatal, and not an addressing problem: `<machine>/seat-N` is the key,
+    # which the board resolves as a permanent alias for as long as the row lives.
+    #
+    # It does NOT catch two panes started as the same seat — they send the same
+    # key, so the board hands them the same identity and cannot tell them apart.
+    # That one is only visible locally, which is what the pane marker is for.
+    if [[ "$identity" != */"$SEAT_NAME" ]]; then
+        printf 'qb-seat: the board calls this seat %s, not .../%s — it was named on an\n' \
+            "$identity" "$SEAT_NAME" >&2
+        printf '         earlier run and keeps that name. Addressing is unaffected: %s\n' \
+            "$SEAT_NAME" >&2
+        printf '         and %s both reach it.\n' "$identity" >&2
+    fi
+    return 0
+}
+
+# ---- start the seat ----------------------------------------------------------
+
+# Exported, not passed: the hook and the MCP server are separate processes that
+# both have to arrive at this same identity, and the environment is the only
+# thing they share.
+export QUARTERBACK_INSTANCE="$SEAT_NAME"
+
+BRIEF="${QB_SEAT_BRIEF:-$(default_brief)}"
+
+# Checked even for --dry-run, which is read-only and is exactly when you want to
+# be told; only the marker itself waits until something is actually started.
+check_seat_is_free || exit 3
+
+if [[ -n "$DRY_RUN" ]]; then
+    printf 'cwd:      %s\n' "$REPO"
+    printf 'instance: %s\n' "$QUARTERBACK_INSTANCE"
+    printf 'command:  %s' "$CLAUDE_BIN"
+    printf ' %q' "$@"
+    printf ' <brief>\n\n'
+    printf '%s\n' "$BRIEF"
+    exit 0
+fi
+
+register_seat_name
+
+# Written with tee for the reason the session markers beside it are: a `>`
+# redirect is refused by the dcg pre-tool guard, so the obvious form is the one
+# that silently does not run when an agent is the caller. Best-effort — a
+# read-only runtime dir costs the duplicate check, not the seat.
+mkdir -p "$(dirname "$SEAT_MARKER")" 2>/dev/null
+printf '%s' "$$" | tee "$SEAT_MARKER" >/dev/null 2>&1
+
+cd "$REPO" || exit 2
+
+# exec, so the pane holds the agent itself and not a shell wrapping it: a human
+# attaching to this seat to interrupt or redirect it should reach the agent, and
+# closing the pane should signal the agent rather than a parent that outlives it.
+exec "$CLAUDE_BIN" "$@" "$BRIEF"

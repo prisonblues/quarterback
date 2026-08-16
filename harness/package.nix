@@ -21,8 +21,10 @@ stdenvNoCC.mkDerivation {
   # (which reference them by path), and the commands are read by Claude Code out
   # of ~/.claude. Only `bin/` holds genuine CLI entry points — the worktree
   # scripts, which must land in one directory together because each finds
-  # `worktree-holder` as a sibling of $0 when it is not otherwise on PATH, and
-  # `qb-stage`, which the slash commands call by name and so needs PATH.
+  # `worktree-holder` as a sibling of $0 when it is not otherwise on PATH,
+  # `qb-stage`, which the slash commands call by name and so needs PATH, and
+  # `qb-seat`, which a multiplexer layout names as the command for each pane —
+  # a layout is data on another machine, so it can only refer to it by name.
   installPhase = ''
     runHook preInstall
 
