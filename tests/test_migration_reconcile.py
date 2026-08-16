@@ -366,25 +366,22 @@ def test_rewriting_a_missing_assignment_raises_rather_than_writing_nothing():
 # ---------------------------------------------------------------------------
 
 
+#: An identity for every command, not just `commit`. A CI runner has no global
+#: user.email, so anything that writes a commit object fails with exit 128 there while
+#: passing on a workstation that happens to have one — `merge` included, which is how
+#: this file first went red on CI and green locally.
+_IDENT = ("-c", "user.email=t@example.invalid", "-c", "user.name=test")
+
+
 def _git(repo: Path, *args: str) -> str:
     return subprocess.run(
-        ["git", "-C", str(repo), *args], capture_output=True, text=True, check=True
+        ["git", "-C", str(repo), *_IDENT, *args], capture_output=True, text=True, check=True
     ).stdout
 
 
 def _commit(repo: Path, message: str) -> None:
     _git(repo, "add", "-A")
-    _git(
-        repo,
-        "-c",
-        "user.email=t@example.invalid",
-        "-c",
-        "user.name=test",
-        "commit",
-        "-q",
-        "-m",
-        message,
-    )
+    _git(repo, "commit", "-q", "-m", message)
 
 
 def _write(repo: Path, name: str, rev_id: str, down: str | None, col: str) -> None:
