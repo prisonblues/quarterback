@@ -278,8 +278,19 @@ require_qb_seat
 #
 # -x/-y because a detached session is 80x24, in which a 25% split is six lines and
 # a fourth seat does not fit at all. tmux resizes to the client on attach.
+# qb-seat's own knobs have to be forwarded explicitly. A pane's environment comes
+# from the tmux SERVER, and the server is usually one that was already running
+# for something else — so `QB_SEAT_AGENT=... qb-seats` would otherwise set a
+# variable in this process that no seat ever sees, and start the real agent while
+# reporting nothing wrong. Found exactly that way: a smoke test meant to run a
+# harmless stand-in launched two live agent sessions instead.
+seat_env=()
+for v in QB_SEAT_AGENT QB_SEAT_AGENT_ARGS QB_SEAT_BRIEF; do
+  [ -n "${!v:-}" ] && seat_env+=(-e "$v=${!v}")
+done
+
 tmux new-session -d -s "$SESSION" -n seats -c "$REPO" -x 240 -y 60 \
-  -e QB_SEATS=1 -e FLEET_NO_MOTD=1
+  -e QB_SEATS=1 -e FLEET_NO_MOTD=1 ${seat_env[@]+"${seat_env[@]}"}
 
 # Never a shared instance: strip any inherited value from the session
 # environment, so nothing a seat spawns can pick one up. qb-seat sets its own.

@@ -148,6 +148,18 @@ def test_no_inherited_instance_reaches_a_seat(screen):
     assert "leaked-host-wide" not in "\n".join(lines)
 
 
+def test_qb_seat_knobs_reach_the_panes(screen):
+    """A pane's environment comes from the tmux SERVER, usually one that was
+    already running for something else. Without explicit forwarding,
+    `QB_SEAT_AGENT=... qb-seats` sets a variable no seat ever sees — and starts
+    the REAL agent while reporting nothing wrong. That is how this was found.
+    """
+    screen.env["QB_SEAT_AGENT"] = "some-stand-in"
+    screen("-n", "1")
+    env = screen.tmux("show-environment", "-t", "t").stdout
+    assert "QB_SEAT_AGENT=some-stand-in" in env
+
+
 def test_the_inherited_instance_is_stripped_from_the_session(screen):
     """Panes split off later must not pick one up either."""
     screen("-n", "1")
