@@ -427,6 +427,26 @@ Two things to know before you run it:
 branch until it has claimed), does not assign work, and does not drive the agents past
 starting them.
 
+#### The dash — WORK IN PROGRESS
+
+`qb-dash-tui` is a fourth pane for the right-hand side: fleet state, where the board pane
+along the bottom (the **tape**) is the event stream. Who is alive and on what, who holds
+which claim and for how long, and every open PR with its CI verdict. Rows are clickable —
+a seat jumps the tmux cursor to that seat's pane, a claim shows its note, a PR opens on
+GitHub. `qb-dash` is the same three views rendered without interaction, for a terminal that
+will not forward mouse events.
+
+Not wired into `qb-seats` yet, and not packaged: both scripts import `mcp_server`, `rich`
+and `textual`, which today means the environment belonging to `qb-board` (#110). Bring one
+up beside a running screen with `harness/dev/seats-extras.sh <session> <width>`, which also
+relabels the board pane — that script hardcodes local checkout paths behind
+`QB_MCP_CHECKOUT` and is developer scaffolding, not something to ship.
+
+Adding the dash also needs a wider `pane-border-format` than `qb-seats` sets: its own
+prints `board` for any pane with no seat number, so a second unlabelled pane claims that
+name. The dev script widens it to fall through to a `@qb_label` option; that belongs in
+`qb-seats` proper once this settles.
+
 ## How it works
 
 - **Layout.** A worktree is a *sibling* of the main checkout: `../<project>-<branch>`, with

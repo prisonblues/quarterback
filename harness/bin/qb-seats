@@ -243,7 +243,11 @@ if [ "$ACTION" = add ]; then
   # fold it back into the row. This is the tmux answer to zellij's
   # `override-layout --retain-existing-terminal-panes`: one command, no teardown,
   # the seats already working left alone.
-  pane=$(tmux split-window -h -P -F '#{pane_id}' -t "$SESSION:seats.0" -c "$REPO")
+  # By pane ID, never `seats.0`: pane numbering starts whereever the user's
+  # pane-base-index says, and a config setting it to 1 — a common one — leaves
+  # every `.0` target failing with "can't find pane: 0".
+  first_seat=$(seat_panes | awk 'NR == 1 { print $1 }')
+  pane=$(tmux split-window -h -P -F '#{pane_id}' -t "$first_seat" -c "$REPO")
   tmux set-option -p -t "$pane" @qb_seat "$next"
   tmux select-layout -t "$pane" -E 2>/dev/null || true
   start_seat "$pane" "$next"
@@ -314,7 +318,7 @@ first=$(tmux list-panes -t "$SESSION:seats" -F '#{pane_id}')
 tmux set-option -p -t "$first" @qb_seat 1
 i=2
 while [ "$i" -le "$SEATS" ]; do
-  pane=$(tmux split-window -h -P -F '#{pane_id}' -t "$SESSION:seats.0" -c "$REPO")
+  pane=$(tmux split-window -h -P -F '#{pane_id}' -t "$first" -c "$REPO")
   tmux set-option -p -t "$pane" @qb_seat "$i"
   i=$((i + 1))
 done
@@ -325,7 +329,7 @@ tmux select-layout -t "$SESSION:seats" even-horizontal
 # window rather than only the pane it was taken from. It drops to a shell rather
 # than closing if the follower dies, so a board outage does not silently leave a
 # screen with no board on it.
-tmux split-window -v -f -l "$BOARD_SIZE" -t "$SESSION:seats.0" -c "$REPO" \
+tmux split-window -v -f -l "$BOARD_SIZE" -t "$first" -c "$REPO" \
   "$(printf '%s; exec %q -i' "$(board_cmd)" "$SH")"
 
 # Seats last, once every pane exists and its shell has had the time it took to
