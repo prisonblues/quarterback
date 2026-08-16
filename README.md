@@ -248,6 +248,9 @@ round missed it, which were one number before and want opposite remedies.
 **v2.23** had a run record which FILES the PR changed and not just how many lines, plus
 the PR's state as of that panel, so the board finally holds what collision ordering needs (schema
 revision 0016) — reading it back as a collision query ships separately, see #101.
+**v2.22** (harness-side, and out of sequence — written before v2.23 and landed after it) stopped
+the panel's judge being the same model as a seat it rules on, and had `create-worktree` turn on
+`rerere` so one conflict is resolved once rather than once per worktree.
 **v2.21** (harness-side) had each panel member run in its own empty sandbox repo
 rather than in whatever directory the panel was launched from. **v2.20** (also harness-side) had the
 worktree tooling ask who is in a directory before rewriting it, and **v2.19** added the per-reviewer
@@ -281,10 +284,11 @@ the other way):
 - **v2.21** — each panel member runs in its own empty sandbox repo, not in whatever directory the
   panel was launched from and not in the repo under review; and a panel that lost a seat says so
   above its findings.
-- **v2.23** — (there is no v2.22: PR #87 holds that number and is still open.) A run records the
-  PR's changed FILES and its state, not just a line count, so "which other PRs does this merge
-  disturb" becomes answerable from stored data. NULL and zero are kept apart throughout: "nobody
-  counted" is never "it changed nothing".
+- **v2.22** — the panel's judge is no longer the same model as a seat it rules on, and
+  `create-worktree` turns on `rerere` so one conflict is resolved once, not once per worktree.
+- **v2.23** — a run records the PR's changed FILES and its state, not just a line count, so "which
+  other PRs does this merge disturb" becomes answerable from stored data. NULL and zero are kept
+  apart throughout: "nobody counted" is never "it changed nothing".
 - **v2.24** — a new finding records whether the last fix pass introduced it or the last round missed
   it: two facts with opposite remedies that `new_this_round` collapsed into one, plus the commit each
   round reviewed and the files it was truncated out of. A signal, not a verdict — nothing gates on it.

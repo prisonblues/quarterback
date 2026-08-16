@@ -64,8 +64,8 @@ a shared contract without touching this PR's files can still invalidate a findin
 
 ## v2.28 — a later round reads the fix commit, not the whole PR again
 
-(There is no v2.22 entry: that number is held by PR #87, which is harness-side and still open.
-v2.23 and v2.24 are below — both landed via #89, which carried the work #88 was closed in favour of.)
+(v2.22 is below, out of sequence: it was written before v2.23 and landed after it. v2.23 and v2.24
+are below too — both landed via #89, which carried the work #88 was closed in favour of.)
 
 A panel/fix cycle exists because nobody reads the fixer's commit (v2.15). Round 2 was then handed
 the entire PR — the fix plus everything rounds before it had already read, ruled on and confirmed —
@@ -523,6 +523,105 @@ What was missing was the datum. Closes #82.
 > the gap this file exists to close — and because it is the fifth release-number collision of the
 > day, two agents having announced v2.23 one second apart. #76's check cannot catch that (both
 > branches are self-consistent); only #46's allocator half can.
+
+## v2.22 — the judge was one of the parties, and every worktree re-resolved the same conflict
+
+Two defaults, both cheap, both fixing something a day of dogfooding actually ran into. Harness-side
+only: the served version is unchanged by this release.
+
+**Round 1 of the panel found the cheap half of both defaults wrong, and one of the two documented
+guarantees was simply not true.** `rerere.autoUpdate` was left *absent* rather than set, and absent
+is not off: a user carrying `autoUpdate=true` in their global config got exactly the silent staging
+this entry promises cannot happen, with nothing having looked. It is now written to `false` beside
+`rerere.enabled`, for a repo that had decided neither. The probe reads `--type=bool`, because
+`git config --get` exits 0 for *any* value — so a repo with `rerere.enabled=banana` was treated as
+having decided, and git then refuses every merge in every worktree with "bad boolean config value".
+And the write is guarded: it ran unguarded under `set -euo pipefail`, so a held `config.lock` — which
+parallel loops contend for on a shared common git dir — aborted worktree creation after the banner
+and before any worktree existed. Verified against the pre-fix block rather than argued: exit 255 on
+a held lock, `banana` left in place, effective `autoUpdate` reading `true`.
+
+**The guarantee that survives is narrower than it was written.** "A replayed resolution is left
+unstaged, so you have to look at it" holds for a human at a terminal. `epic.py` and `lander.py` both
+run a blanket `git add -A` in their worktrees, which stages a replayed resolution whatever
+`autoUpdate` says — so on the unattended path an answer given once by hand in one branch can be
+committed unread in another. Documented here and in `harness/README.md`, and filed rather than
+guessed at: the fix is explicit staging in those two loops, or rerere scoped away from loop-driven
+worktrees, and neither belongs in a release about defaults.
+
+**The ceiling's wiring is now called by a test rather than inferred from one.** The first version
+asserted relationships between `DEFAULTS` literals, which cannot catch a typo'd key or a restored
+fallback — the two ways this change actually breaks. `resolve_ceiling()` is lifted out of `run()`
+and covered directly, including the case review got wrong: the obvious `x or DEFAULT` form collapses
+"absent" and "explicitly empty" together, turning a repo that asked for *no* model routing back on at
+the top tier. Absent → default, `""` → off, `null` → off.
+
+**And repos that had tuned `judge_model` were tuning two things.** One of them was undocumented, so a
+repo that set `judge_model: sonnet` to keep unattended implementation cheap kept its custom judge and
+silently picked up the new `opus` ceiling. "Epic behaviour is unchanged" is true for repos on the
+default and only for them; `harness/loops/README.md` now says so where the key is described.
+
+**`review_panel.judge_model` was `opus`, and so is `reviewers.claude.model`.** The panel's
+adjudicator was therefore the same brain as one of the seats it rules on, by default, in every repo.
+On 2026-08-15 four judge-confirmed findings turned out plainly wrong on inspection — `64-F02`,
+`64-F03`, `64-F04`, `32-F06` — and all four were raised by claude and confirmed by an `opus` judge.
+n=4, so the mechanism is the argument and not the sample; a model asked to rule on its own reasoning
+tends to find it sound. The harness already held this exact principle one level down, in the README
+line telling you to set `claude.model` to a different model than the PR author because same-model
+self-review is the weak case. The judge is that argument applied upward, and nothing applied it.
+
+**The default is now `sonnet`, and getting there took both rounds.** It was `fable` when this entry
+was first written — upward rather than sideways, on the grounds that the judge's job did not get any
+easier and `clamp_model` states this repo's tie-break as failing toward capability. Round 1 said that
+bought an availability gamble (`fable` wants a recent CLI, is not on every plan, can be
+org-disabled, may want credits, and the panel does no preflight) and round 2 said the same thing
+again from the cost side, on a judge that runs for every reviewed PR in a harness whose
+`skip_title_patterns` exist because one release-merge came to about $750. A premise attacked twice
+is the one to delete rather than patch (#67): the requirement was INDEPENDENCE, and `fable` was one
+implementation of it carrying two risks nobody had measured. `sonnet` is not `reviewers.claude.model`
+either, is available wherever the CLI runs at all, and is cheaper than the `opus` judge it replaces
+rather than dearer. The capability argument was never evidence — the four wrong findings above were
+confirmed by an `opus` judge, so capability is not what was failing. A repo that wants the most
+capable adjudicator sets `judge_model: fable` and gets it. **This is only a default**: pinning both keys to the same model still works and
+still says nothing. The enforcement half — refuse to run when the judge's model matches an enabled
+seat's — is `judge_independent` in #78 and is not implemented here.
+
+**Changing it exposed a coupling that was only ever true by accident.** `epic.py` read
+`review_panel.judge_model` as its *tier ceiling* when `--model` was not passed: the model that
+adjudicates a panel doubling as the most capable model an epic may spend on implementing a
+sub-issue. Those are two different questions that happened to have the same answer while both were
+`opus`, and a judge deliberately unlike a seat is exactly what breaks that. Left alone, this
+release would have quietly routed every unattended sub-issue's implementation at the top tier. The
+ceiling is now its own setting, `epic.model_ceiling`, defaulting to `opus` — which is what the old
+fallback resolved to, so epic behaviour is unchanged.
+
+**`git rerere` is off, so git forgets every conflict resolution the moment it is made.** That is the
+wrong default for work shaped like this one: a single merge into `main` produces the *same* conflict
+in every open branch, landing six PRs took eleven integration merges, and the CHANGELOG version
+narrative above was resolved by hand four separate times in four worktrees — same hunks, same
+answer. `create-worktree` now sets `rerere.enabled` for the repo, once, and only when nobody has set
+it either way, so a repo that turned it off stays off. Worktrees share the common git dir, so
+`rr-cache` is shared across every worktree of a repo with no further configuration: resolve once,
+replay in the other nine. Verified end to end — with rerere off the second branch gets raw conflict
+markers, with it on the same merge in a *worktree* prints `Resolved 'CHANGELOG.md' using previous
+resolution` and the resolved content is there.
+
+`rerere.autoUpdate` is **pinned to false** when this script is the thing turning rerere on, and that
+is the interesting half. (It was left *unset* in this entry's first draft, on the reasoning that
+absent and off are the same thing. They are not: a user carrying `autoUpdate=true` globally got
+exactly the staging described below as impossible. Round 1 caught it; round 2 then caught the pin
+being written from a probe that read every config scope while the write only ever touched the local
+one, so a user with `rerere.enabled=true` in `~/.gitconfig` skipped the block entirely and never got
+the pin at all. The two keys are now decided independently, each against every scope, and neither
+overwrites a value somebody set.) rerere matches on
+the conflict text, so it replays last time's answer without knowing whether the right answer changed
+— and the file it helps most with is the one where the correct resolution depends on which release
+numbers are in flight. With autoUpdate off the merge still stops and the file is left unstaged, so a
+replayed resolution has to be read and staged by hand. It is git's previous answer, not a ruling
+about this merge.
+
+Closes #81. #78 keeps the rest of its constitution: quorum, threshold, `judge_independent`,
+segregation of duties, materiality, reserved matters, audit.
 
 ## v2.21 — a panel that lost a seat said nothing about it
 
