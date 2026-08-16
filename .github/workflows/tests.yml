@@ -90,3 +90,35 @@ jobs:
             echo "--- $suite"
             uv run --extra dev pytest "$suite" -q
           done
+
+  mcp:
+    name: mcp + board client
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      # mcp/ had no CI job at all until the board client landed there (#110), so
+      # the MCP server and the HTTP client every other piece of tooling talks to
+      # the board through were the two things in this repo nothing tested. It is
+      # its own project (mcp/pyproject.toml) with its own dependency set, hence a
+      # third job rather than another path in one of the two above.
+      #
+      # `--extra tui` installs Textual: the full-screen half skips itself without
+      # it (`pytest.importorskip`), and a job that silently ran two thirds of the
+      # suite is the same failure the harness job's comment above is about.
+      - name: Run the mcp suite
+        run: |
+          set -euo pipefail
+          # git identity: the local-action tests build real repositories, because
+          # every refusal they check is a claim about what git actually reports.
+          git config --global user.email "ci@example.invalid"
+          git config --global user.name "CI"
+          git config --global init.defaultBranch main
+          # Run from mcp/ so pytest's rootdir is that project and its own ini
+          # applies — `asyncio_mode = "auto"`, without which every pilot-driven
+          # test is skipped as an un-awaited coroutine and the job reports green.
+          cd mcp
+          uv run --extra dev --extra tui pytest -q

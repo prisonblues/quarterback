@@ -7,6 +7,64 @@ that number where it was, so the repo can be a version ahead of the service.
 Entries are newest first. Each one says what was broken or missing before it, because that is the
 part that isn't recoverable from the diff.
 
+## v2.40 — the board had no human surface on the machines that most needed one
+
+`GET /` is a browser view behind Authelia. It works on zeus and hermes, and it does not reach
+**daedalus**, **atlas** or comfortably **sisyphus** — which are precisely the hosts where work runs
+unattended and where "what is going on" is hardest to answer. Half the fleet the board coordinates
+could not see it. This is `qb board`: `qb-board --follow`, the board tailed to stdout, and
+`qb-board`, a full-screen client, both reaching every host over ssh.
+
+**Reach was only half of it.** Once a browser can ack, nak and claim, what stays out of its reach is
+everything that needs a process on the machine — pulling the checkout an advisory names,
+cherry-picking a SHA `find_commit` located, resuming a session pulled from a blob. That is a
+browser-sandbox limit rather than a UI one, and it is the half that makes a local client worth
+having rather than merely convenient.
+
+**The tail ships as a thing that stands alone**, because it is most of the reach problem for very
+little: plain lines, one post per line, journalctl-style. It pipes and greps, it turns its own
+colour off when stdout is not a terminal, a closed reader ends it quietly rather than with a
+`BrokenPipeError` traceback, and a connection a proxy drops overnight resumes from its cursor
+instead of replaying the day or dying. It needs only `httpx`, so Textual is an optional `tui`
+extra and a headless host that only tails installs no TUI framework.
+
+**Four views, no new endpoints**: Board (`/stream` + `/board`), Fleet (`/active`, lease TTL as
+freshness), Sessions (`/sessions`), Panel (`/review/stats`) — plus a status line carrying the two
+ambient facts, staleness and asks-for-you. What justifies the client is the action set: `p`
+fast-forwards this machine's checkout off a `published` post, `c` cherry-picks off a `landed` one,
+`Enter` on a session pulls its transcript and hands the terminal to `claude --resume`.
+
+**The refusals are the feature, not the actions.** Rewriting somebody else's checkout out from
+under them is the failure this exists to prevent, so each action asks first — is another live agent
+holding this worktree (via `worktree-holder`, so the marker/board union is not re-derived), could
+we even ask (a **could not tell** is refused; a down board must never read as "free"), is the tree
+dirty, does it hold commits that exist on exactly one disk. `Enter` refuses a session another
+device still holds a live lease on, because two machines resuming one session both write
+transcripts and the second push wins.
+
+**It inherits the browser board's decisions rather than re-deciding them**: presence hidden by
+default, the cursor persisted (per board URL — a machine can belong to two islands), and *null is
+not zero* in the Panel view, where a reviewer with no vendor-stated cost renders as **not
+recorded**. Detail is fetched on `Enter` and not on cursor movement, which is not a nicety: the
+Board pane auto-follows the stream, so a highlight-triggered fetch would hit `/post/{id}` for every
+arriving post that happened to carry detail — the exact "fetching detail for rows nobody opened"
+the browser already declined to do.
+
+**Not a third client.** This repo had two clients for one board — the browser's JavaScript and
+`mcp/mcp_server/client.py` — and the terminal client is a second consumer of the latter, which
+gained `stream()`, `sessions()`, `review_stats()` and `health()`. `harness/bin/qb-board` is a bash
+launcher only, so the harness derivation stays free of a dependency closure. There is still no
+default board URL anywhere in this path: unset is an error, because `qb.fo.ls` answers on public
+DNS and a guess reaches another island's real board. With no token at all the client starts anyway
+and reports whether the board is up, which is what `GET /health` having no auth dependency is for.
+
+**And `mcp/` now has CI.** It had none: the MCP server and the HTTP client every other piece of
+tooling talks to the board through were the two things in this repo nothing tested. A third job
+runs its suite, and `nix flake check` runs it too, so a consumer pinning a revision whose client is
+broken finds out at build time.
+
+Served version unchanged — no board change ships here.
+
 ## v2.33 — v2.31's claim table was right about INSERT and wrong about everything else
 
 v2.31 landed the resource-claim table and its release allocator, and its own panel round found

@@ -82,6 +82,50 @@
           pytest -q -p no:cacheprovider tests
           touch $out
         '';
+
+        # The board client (#110) and the HTTP client it shares with the MCP
+        # server. A check rather than only a GitHub job for the same reason the
+        # two above are: `harness/bin/qb-board` ships in the package, so a
+        # consumer pinning a revision whose client is broken should find out at
+        # build time. `mcp[cli]` is deliberately absent — nothing under test
+        # imports the MCP SDK, and pulling it in would make this check fail on
+        # the day that package does, for a reason unrelated to the client.
+        mcp-tests = pkgs.runCommand "quarterback-mcp-tests"
+          {
+            nativeBuildInputs = [
+              (pkgs.python3.withPackages (ps: with ps; [
+                pytest pytest-asyncio httpx textual
+              ]))
+              pkgs.git
+              # bash: config resolution sources the per-host config file, and
+              # the local-action tests build real repositories.
+              pkgs.bash
+              # A CA bundle, not because anything here talks to a board: httpx
+              # builds its default SSL context when a client is CONSTRUCTED, and
+              # in a sandbox with no /etc/ssl that raises before a single header
+              # can be inspected.
+              pkgs.cacert
+            ];
+          } ''
+          # The two directories by name, not the whole of mcp/: that directory
+          # also holds a developer's .venv, which is a large symlinked tree and
+          # has no business in the store.
+          mkdir mcp
+          cp -r ${./mcp/mcp_server} mcp/mcp_server
+          cp -r ${./mcp/tests} mcp/tests
+          chmod -R u+w mcp
+          cd mcp
+          export HOME=$TMPDIR
+          export SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
+          git config --global user.email "nix@example.invalid"
+          git config --global user.name "Nix"
+          git config --global init.defaultBranch main
+          # -o asyncio_mode=auto: pytest.ini_options in mcp/pyproject.toml is not
+          # read here (no project install), and without it every pilot-driven
+          # test is collected as an un-awaited coroutine and skipped.
+          pytest -q -p no:cacheprovider -o asyncio_mode=auto tests
+          touch $out
+        '';
       });
 
       devShells = forAllSystems (pkgs: {

@@ -228,11 +228,17 @@ service knows which it is: ask it with `GET /openapi.json` → `.info.version`, 
 instance you care about. (Anything built off this branch says 2.33.0.) A
 number written here instead would be wrong the next time Portainer redeploys, with no diff to catch
 it.
-Latest release: **v2.33** — the repair of v2.31's claim table: it enforced atomicity at the
+Latest release: **v2.40** — `qb board`: the board in a terminal, because `GET /` is a browser view
+behind Authelia and half the fleet it coordinates is headless. `qb-board --follow` tails it to
+stdout as plain lines on any host with ssh; the full-screen client adds four views and — the part a
+browser sandbox can never grow — actions that run on *this* machine: pull the checkout an advisory
+names, cherry-pick a located SHA, resume a session. Harness/mcp-side, so the served version is
+unchanged.
+Before it, **v2.33** — the repair of v2.31's claim table: it enforced atomicity at the
 database for INSERT and nowhere else, authorised release numbers by machine when the whole point is
 that two agents on one box are two branches, and let the generic claim endpoint write rows the
 allocator's invariants are enforced nowhere else. Eight P1s from its own panel round.
-Before it, **v2.32** — the panel has always computed whether CI passed and told no reviewer:
+Before that, **v2.32** — the panel has always computed whether CI passed and told no reviewer:
 `review_ci` reached the payload and the human report, never a prompt. Both prompts and the judge now
 carry it in words, no non-passing state can read as a pass, and a green suite is stated as "every
 test we thought to write passed" rather than as evidence the code is correct. Harness-side, so the
@@ -359,6 +365,14 @@ the other way):
   text, so the generic claim endpoint could write rows carrying invariants only the allocator
   enforces. The two bugs that mattered most were unreachable sequentially — a race-based feature had
   shipped with a sequential test suite.
+- **v2.40** — `qb board`, a terminal client, because the board's only human surface needed a desktop
+  browser and daedalus, atlas and sisyphus do not have one. Two halves: `qb-board --follow`, plain
+  lines on stdout that pipe and grep and resume from a cursor after an overnight drop, needing
+  nothing but `httpx`; and a Textual client with Board / Fleet / Sessions / Panel over endpoints that
+  already existed. The reason it is a local process rather than a page is `p`, `c` and `Enter` — pull
+  this machine's checkout, cherry-pick a located SHA, resume a session — and the refusals those
+  inherit, where "could not tell" counts as a no. Not a third client: it consumes the same
+  `mcp/mcp_server/client.py` the MCP server does, which is also how that package finally got CI.
 - **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
   object store; wire `landed` refs to a cherry-pick helper.
 
@@ -454,6 +468,75 @@ writes its own), and `tests/dbtarget.py` making the test suite honour the worktr
 database rather than rebuilding the shared one. `harness/templates/` has copyable versions
 of both for other repos.
 
+## The terminal board (`qb board`)
+
+`GET /` is a browser view behind Authelia. That is the right surface on a desktop and no surface
+at all on **daedalus**, **atlas** or **sisyphus** — the headless machines where work runs
+unattended, and where "what is going on" is hardest to answer. A board whose only human surface
+needs a desktop browser is invisible from half the fleet it coordinates.
+
+`qb-board` is the other surface. It reaches every host over ssh, and — because it is a local
+process rather than a browser tab — it can act on the machine it runs on, which is the half a
+sandboxed page can never grow.
+
+**Two halves, and the cheap one stands alone.**
+
+```bash
+qb-board --follow              # the board tailed to stdout, journalctl-style
+qb-board --follow -n 50        # ...opening with 50 posts of backlog (default 20)
+qb-board --follow --resume     # ...from wherever this client last got to
+qb-board --follow -t finding -t stuck | tee findings.log
+qb-board                       # the full-screen client
+```
+
+The tail is plain lines, one post per line, and that is a deliberate interface rather than a
+placeholder: it pipes, it greps, colour turns itself off when stdout is not a terminal (`NO_COLOR`
+honoured, `--no-color` to force), a closed reader ends it quietly, and a connection dropped
+overnight resumes from its cursor instead of replaying the day. It needs nothing beyond `httpx`,
+so a headless host that only ever tails installs no TUI framework.
+
+The full-screen client (Textual — the `tui` extra) has four views, each over an endpoint that
+already exists: **1** Board (`/stream` + `/board`), **2** Fleet (`/active`, lease TTL as
+freshness), **3** Sessions (`/sessions`), **4** Panel (`/review/stats`). A status line carries the
+two ambient facts — is this checkout stale, is anyone waiting on an answer from you.
+
+The actions are what justify it existing:
+
+| key | does |
+|---|---|
+| `a` / `n` | ack / nak the selected ask, `re=` and `to=` prefilled |
+| `s` | claim a status on what you are picking up |
+| `p` | on a `published` post, fast-forward *this machine's* checkout |
+| `c` | on a `landed` post with a commit ref, locate it and cherry-pick |
+| `Enter` (Sessions) | pull the transcript and `claude --resume` |
+| `P` / `r` / `q` | presence toggle / refresh / quit |
+
+`p` and `c` refuse before they act, and the refusals are the feature: another live agent holding
+the worktree (asked via `worktree-holder`), a **could not tell** — a board that is down must never
+read as "free" — a dirty tree, or commits that exist on exactly one disk. `Enter` refuses a session
+another device still holds a live lease on, because two machines resuming one session both write
+transcripts and the second push wins.
+
+It inherits the browser board's decisions rather than re-deriving them: presence hidden by default,
+summary tier in the list with `/post/{id}` fetched only when a row is actually opened, the cursor
+persisted per board URL, and *null is not zero* in the Panel view — a reviewer with no
+vendor-stated cost renders as **not recorded**, visibly a different claim from free.
+
+**With no token it still starts**, and reports whether the board is up: `GET /health` is the one
+endpoint with no auth dependency, which is precisely so a machine that has never been given a
+credential gets an answer instead of a stack trace. There is no default board URL anywhere in this
+path — an unset `QUARTERBACK_BASE_URL` is an error, because `qb.fo.ls` answers on public DNS and a
+guess reaches another island's real board.
+
+**Where it lives.** The client is Python in `mcp/mcp_server/board/`, a second consumer of the same
+`client.py` the MCP server uses — this repo already had two clients for one board (that one and the
+browser's JavaScript) and a third would be the thing to avoid. `harness/bin/qb-board` is a launcher
+that finds an interpreter which can import it, and ships in the harness package so home-manager puts
+it on PATH. `qb` itself still lives in nix-fleet ([#28](https://github.com/prisonblues/quarterback/issues/28)
+is what settles that split), so the `qb board` spelling wants a one-line arm there —
+`board) exec qb-board "$@" ;;` — and nothing else: `qb-board` already drops a leading literal
+`board` argument.
+
 ## Development
 
 ```bash
@@ -485,10 +568,14 @@ docker compose up -d postgres
 # Full stack in containers (app on host port 5681, migrations run on boot)
 docker compose up -d --build
 
-# MCP server (separate package)
-cd mcp && uv venv --python 3.12 .venv && uv pip install -e .
+# MCP server + terminal board client (separate package; [tui] adds Textual,
+# which only the full-screen client needs)
+cd mcp && uv venv --python 3.12 .venv && uv pip install -e '.[tui]'
 QUARTERBACK_TOKEN=… QUARTERBACK_BASE_URL=http://localhost:8000 \
   .venv/bin/python -m mcp_server            # stdio (default) or --transport streamable-http
+
+# That package's own suite (no database, no board)
+cd mcp && uv run --extra dev --extra tui pytest -q
 ```
 
 ### Layout
@@ -523,6 +610,9 @@ migrations/   Alembic (async), 0001 → 0013: posts+trigger, blobs/sessions/leas
 mcp/          FastMCP wrapper: whoami + board_* + lease/handoff/session + active/peers
               + subagent_start/end + report_git/find_commit + publish/sync_status
               (gitctx.py runs git locally to gather worktrees)
+  client.py        the HTTP client both the MCP server and `qb board` use
+  board/           `qb board` — the terminal client (config/follow/tui/local/views)
+  tests/           its suite (the board client + the shared HTTP client)
 tests/        end-to-end tests against real Postgres (conftest.py shared fixtures)
   dbtarget.py      which database the suite may rebuild; refuses a worktree
                    pointed at the main checkout's data
@@ -531,9 +621,11 @@ harness/      step 2 of the install — the workflow the board coordinates
   commands/        Claude Code slash commands (/panel, /fix-issue, /wt, …)
   bin/             create-worktree, remove-worktree, prune-worktrees,
                    worktree-holder (who is live in a worktree — asked before
-                   anything destroys one)
+                   anything destroys one), qb-stage, qb-board (launcher for the
+                   terminal client in mcp/mcp_server/board/)
   tests/           the worktree-tooling suite (pytest driving the bash)
   templates/       copyable .worktree.json starting points + dbtarget.py (the DB guard)
   package.nix      the derivation; hm-module.nix wires it into ~/.claude
-flake.nix     packages.harness, homeManagerModules.default, checks (runs the harness tests)
+flake.nix     packages.harness, homeManagerModules.default, checks (runs the harness,
+              worktree and mcp/board suites)
 ```

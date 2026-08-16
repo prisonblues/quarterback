@@ -1,12 +1,31 @@
 [project]
 name = "quarterback-mcp"
-version = "0.1.0"
-description = "MCP wrapper for the quarterback coordination board"
+version = "0.2.0"
+description = "MCP wrapper and terminal client for the quarterback coordination board"
 requires-python = ">=3.12"
 dependencies = [
     "mcp[cli]>=1.27.0",
     "httpx>=0.28.0",
 ]
+
+[project.optional-dependencies]
+# The full-screen client only. `qb board --follow` — the half that has to run on
+# every headless host — needs nothing beyond httpx, so Textual is an extra rather
+# than a dependency: a box that only ever tails the board should not have to
+# install a TUI framework to do it.
+tui = ["textual>=1.0"]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "textual>=1.0",
+]
+
+[project.scripts]
+# `qb board` is the fleet's verb, but `qb` lives in nix-fleet (issue #28 settles
+# where it ends up). This console script is the implementation; the `qb-board`
+# shim in harness/bin puts it on PATH, and it accepts a leading literal `board`
+# so a one-line `board) exec qb-board "$@"` arm in `qb` is all that is needed.
+qb-board = "mcp_server.board.__main__:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -14,3 +33,9 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["mcp_server"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The full-screen client is driven through Textual's own async pilot, which is
+# the only way to assert on a running app rather than on the code around it.
+asyncio_mode = "auto"

@@ -14,7 +14,9 @@ board reconnects them.**
   `/fix-issue`, `/epic`, `/lander`, `/wt`, `/drop-worktree`, `/tree-shake`, …)
 - `bin/` — the bash the worktree commands drive (`create-worktree`, `remove-worktree`,
   `prune-worktrees`, `worktree-holder`), plus `qb-stage`, which records the workflow
-  stage a session is in for the statusline
+  stage a session is in for the statusline, and `qb-board`, which launches the
+  terminal board client (`qb-board --follow` tails the board to stdout on any host
+  with ssh; see the repo README)
 - `worktree.example.json` — per-repo config, annotated with quarterback's own values
 
 Neither half needs the other. The loops run with no board configured (recording is
@@ -435,7 +437,18 @@ cp harness/commands/*.md ~/.claude/commands/
 `git`, `jq`, `bash`, and Python 3 (standard library only — the loops import nothing
 third-party). `gh` for anything that talks to GitHub, which is most of it. `curl` for
 `worktree-holder` (without it the check reports "could not tell" and the scripts carry
-on). `docker` and a database client only if your repo uses them. The reviewer CLIs the panel drives (`claude`,
+on). `docker` and a database client only if your repo uses them.
+
+`qb-board` is the one exception to the stdlib-only rule, and it is an exception in
+where the code lives rather than in this directory: the launcher here is bash, and what
+it launches is `mcp_server.board` from `mcp/` — a second consumer of the HTTP client the
+MCP server already uses, rather than a third client for one board. So it needs an
+interpreter that can import that package (`$QUARTERBACK_REPO/mcp/.venv`, a sibling
+checkout, or any `python3` you installed it into; `QB_BOARD_PYTHON` overrides), which
+means `httpx`. The full-screen client additionally needs Textual, an optional `tui`
+extra — `qb-board --follow` does not, so a headless host that only tails the board
+installs no TUI framework. Absent either, it says which and how, and the rest of the
+harness is unaffected. The reviewer CLIs the panel drives (`claude`,
 `codex`, …) are needed only for the reviewers you actually enable — a missing one is
 reported as skipped, not fatal.
 
@@ -445,10 +458,11 @@ The panel looks for a `qb` CLI to record runs. With none on `PATH`, it no-ops si
 everything else works unchanged. Point `qb` at your board to light up `GET /review/stats`
 and the board's `/panel` page.
 
-`worktree-holder` reads the same per-host site config — `QUARTERBACK_BASE_URL` and
-`QUARTERBACK_TOKEN_CMD` from `${XDG_CONFIG_HOME:-~/.config}/quarterback/config`, either
-overridable from the environment — but reads it directly rather than through `qb`, so the
-occupancy check works whether or not that CLI is installed. There is deliberately **no
+`worktree-holder` and `qb-board` read the same per-host site config —
+`QUARTERBACK_BASE_URL` and `QUARTERBACK_TOKEN_CMD` from
+`${XDG_CONFIG_HOME:-~/.config}/quarterback/config`, either overridable from the
+environment — but read it directly rather than through `qb`, so the occupancy check and
+the board client work whether or not that CLI is installed. There is deliberately **no
 default board URL**: unset means this machine has not been told which board it belongs to,
 and guessing would point the query at somebody else's.
 

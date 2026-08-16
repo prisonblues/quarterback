@@ -4,6 +4,13 @@
 # imports. So this derivation copies rather than compiles, and its only real job
 # is deciding what lands on PATH and what merely lands in the store.
 #
+# `bin/qb-board` is bash for that reason and no other: the terminal board client
+# it launches is Python with real dependencies (httpx, and Textual for the
+# full-screen half), and lives in mcp/ beside the HTTP client it reuses. Building
+# it here would mean either a second copy of that client or a dependency closure
+# this derivation is deliberately without, so the launcher resolves an
+# interpreter at runtime and says so plainly when it cannot find one.
+#
 # Deliberately NOT wrapped with a PATH of git/jq/gh/docker/psql. Those are the
 # HOST's tools by definition: create-worktree clones the host's database, drives
 # the host's docker, and edits the host's nginx. Pinning a docker or psql from
@@ -21,8 +28,10 @@ stdenvNoCC.mkDerivation {
   # (which reference them by path), and the commands are read by Claude Code out
   # of ~/.claude. Only `bin/` holds genuine CLI entry points — the worktree
   # scripts, which must land in one directory together because each finds
-  # `worktree-holder` as a sibling of $0 when it is not otherwise on PATH, and
-  # `qb-stage`, which the slash commands call by name and so needs PATH.
+  # `worktree-holder` as a sibling of $0 when it is not otherwise on PATH;
+  # `qb-stage`, which the slash commands call by name and so needs PATH; and
+  # `qb-board`, which is a thing a human types on a headless box, which is the
+  # whole point of it existing.
   installPhase = ''
     runHook preInstall
 
