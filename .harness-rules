@@ -39,5 +39,12 @@
       "enabled": false,
       "_": "No SonarCloud project covers this repo, so the panel runs with no hard gate and every finding is a soft one judged on its merits. Stated explicitly rather than omitted: the default is off too, but a reader of this file should not have to guess whether the absence was a decision or an oversight."
     }
+  },
+
+  "epic": {
+    "sub_pr_merge": "gate",
+    "_": "Whether the epic driver merges a reviewed sub-PR into the epic branch by itself, or holds each at a human merge. Stated explicitly for the same reason as sonarqube above — the default is `gate` too, and a reader should not have to guess whether that was a decision. It was.",
+    "_why_off": "This is the switch that decides whether the merge gate merges anything, and that gate has now been wrong on its first attempt three rounds running: it read a zero exit as a review, then a push as a review, then the existence of a --json-file payload as a review. panel.py defeats all three — it exits 0, and writes a payload, on a title-pattern skip. The current fix reads the panel's own `reviewed`/`skip_reason`/`reviewers_ran` instead, which has no fourth proxy to get wrong; but 'we got it right this time' is what the previous three said, and defaulting closed makes a fourth mistake cost a printed line rather than an unreviewed merge.",
+    "_when_to_flip": "When #78 lands `escalate_on` and `quorum` beside it, so the gate is governed rather than merely correct — and ideally when #77 can show that a confirmed finding survived contact with the code. Flipping it is one line and needs no code change."
   }
 }

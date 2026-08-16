@@ -128,6 +128,30 @@ DEFAULTS: dict = {
         # missing from here would be warned about and dropped as a typo. `None`
         # and absent mean the same thing to diff_budget — inherit max_diff_chars.
         "judge_max_diff_chars": None,
+        # `panel.py --ask` — the cheap premise check. How many seats must have
+        # ANSWERED for the tally to mean anything (quorum), and how many must
+        # have said the same thing for it to be that answer (threshold). Two of
+        # each: one seat agreeing with the agent that wrote the premise is not a
+        # challenge, and the default panel is two seats, so the default is "both
+        # of them".
+        #
+        # Named for the ask, not `quorum`/`threshold`, and deliberately so. #78
+        # generalises the same two primitives to a ROUND's verdict — where they
+        # govern what gets merged — and a bare name claimed here would be a key
+        # whose name promises more than anything reads. #78 renames these into
+        # its own scheme; until then they say exactly what they do.
+        "ask_quorum": 2,
+        "ask_threshold": 2,
+        # How much `--context` material an ask may hand its seats IN TOTAL,
+        # across every spec. `--context` had no ceiling at all, and an ask's
+        # entire claim on anyone's attention is that it is the cheap check: one
+        # spec naming a generated file, or a 5,700-line module, built a
+        # multi-megabyte prompt and shipped a copy of it to every vendor on the
+        # panel — the #117 cost shape reappearing on the path advertised as
+        # costing a minute. 60,000 chars is ~15k tokens: comfortably a large
+        # function and its neighbours, and nowhere near a file nobody meant to
+        # send. Over budget is CLAMPED and said, per spec, like a round's diff.
+        "ask_max_context_chars": 60_000,
     },
     "loops": {
         "dependabot_lander": False,
@@ -136,7 +160,27 @@ DEFAULTS: dict = {
     },
     "epic": {
         "landing": "auto",
-        "sub_pr_merge": "auto",
+        # `gate` (hold each sub-PR at a human merge) until a repo opts in, on the
+        # same principle as approved authors (#63/#56): anything that lets an agent
+        # ACT without a human defaults closed. It also makes this module's own
+        # docstring true — DEFAULTS claims to be "the safe end of every switch: no
+        # auto-merge, no unattended loop", and `auto` was the one switch that
+        # contradicted it.
+        #
+        # This is the setting that decides whether the merge gate above it merges
+        # anything, and that gate has now been wrong on its first attempt
+        # three times running — each round replacing one proxy for "the review
+        # happened" with another (exit code, then the push, then the payload's
+        # existence). The current fix reads the panel's own declaration instead
+        # and has no fourth proxy to get wrong, but "we got it right this time" is
+        # what the last three said. Defaulting closed makes a fourth mistake cost
+        # a printed line instead of an unreviewed merge.
+        #
+        # Not a claim that auto-merge is wrong, and not permanent: #78 is where it
+        # becomes a governed setting with `escalate_on`/`quorum` beside it, and a
+        # repo that wants it back says so in one line. Until then this is the safe
+        # end of the switch, which is the end an unexercised gate belongs on.
+        "sub_pr_merge": "gate",
         "auto_finish": False,
         "executor_worktree_args": [],
         "min_free_mb": 2048,

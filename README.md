@@ -99,13 +99,24 @@ GET   /sync              ?repo=&branch=&device=&path=          (registered workt
                          -> {published:[…], worktrees:[…], caller, stale, registered, advice}
 
 # reviewer-panel stats (v2.10, accounts v2.11, rounds + coverage v2.15, cost v2.19,
-#                        changed files v2.23)
-POST  /review            (panel.py --json payload)              -> {id, recorded, accounts,
-                                                                    changed_files[, dropped]}
-GET   /reviews           ?repo=&pr=&author=&since=&days=&limit=  (runs + scorecards)
+#                        changed files v2.23, provenance v2.26)
+POST  /review            (panel.py --json payload)              -> {id, recorded, findings,
+                                                                    accounts, changed_files
+                                                                    [, changed_files_dropped]
+                                                                    [, unread_files_dropped]
+                                                                    [, head_sha_dropped]
+                                                                    [, provenance_unknown]
+                                                                    [, provenance_counts_unusable]
+                                                                    [, unreadable_fields]}
+                          the bracketed keys appear only when something was dropped, and are the
+                          machine-readable drift signal #65 reads; every one is logged too
+GET   /reviews           ?repo=&pr=&author=&since=&days=&limit=  (runs + scorecards,
+                                                                  unread_files as a count)
 GET   /review/{id}                                              (scorecards + findings + accounts
-                                                                 + the PR's changed_files)
-GET   /review/stats      ?repo=&author=&days=&judged_only=       -> {by_model, by_agent}
+                                                                 + the PR's changed_files
+                                                                 + head_sha/unread_files/provenance)
+GET   /review/stats      ?repo=&author=&days=&judged_only=       -> {by_model, by_agent,
+                                                                     by_provenance}
 GET   /review/findings   ?repo=&pr=&limit=                       (one PR's findings as
                                                                   chains of observations,
                                                                   per round: what was new,
@@ -184,23 +195,57 @@ vs `medium`) while leaving `duration_ms` as the axis that compares one vendor wi
 of these may be null, which always means *not recorded* and never *spent nothing*; `token_runs`
 says how much of a window actually reported.
 
+**Who catches regressions, and who finds what was already there.** Since v2.26 a finding also
+records its *provenance*: did the previous fix pass **introduce** this defect, or did the previous
+round **miss** it (`missed-unread` where that round was truncated out of the file, `unknown` where
+the fix range could not be read)? Those are different competencies wanting opposite remedies —
+self-inflicted findings say make fix passes smaller, missed ones say the earlier round under-read
+and coverage is worth paying for — and a confirmed count cannot see either. `GET /review/stats`
+splits it per (reviewer, model, effort) and again per finding across the window
+(`by_provenance`), and a run now also records the **commit** it reviewed (`head_sha` — `base` is a
+branch *name*) and the files no reviewer read in full.
+
+Read `introduced` as a **floor**, not a count: it needs exact membership in the fix's added lines,
+so a defect introduced by a *deletion* has no added line to sit on, and ordinary reviewer
+line-drift misses the set by a line or two. Both land in `missed`. Null throughout is *not
+recorded* — a run before v2.26, a round 1 with nothing to attribute against, a defect an earlier
+round already raised — and is never the `unknown` bucket, which means the question was asked and
+the answer could not be placed. `provenance_runs` says how much of a window could attribute at all,
+and counts only judged runs: the per-member counters are tallied over confirmed findings, so an
+unjudged run can only contribute zeros to the sums it annotates.
+
+**Anything the ingest drops is named back and logged.** An unrecognised bucket, a `head_sha` that
+cannot be a commit id, an unread path over the cap or unreadable, a known bucket carrying an
+unbelievable count, a field whose value is not the shape that field takes: each comes back in the
+`POST /review` response under its own key and goes to the service log, because a response nobody
+stores is not a record and `qb record-review` prints only the run id. That is the machine-readable
+half of the panel↔board drift check #65 asks for.
+
 ## Releases
 
 The deployed board version lags the repo until the stack is redeployed, and only the running
 service knows which it is: ask it with `GET /openapi.json` → `.info.version`, for whichever
-instance you care about. (Anything built off this branch says 2.23.0 — v2.24 is harness-side.) A number written here
-instead would be wrong the next time Portainer redeploys, with no diff to catch it.
+instance you care about. (Anything built off this branch says 2.26.0 — v2.27 and v2.28 are
+harness-side.) A number written here instead would be wrong the next time Portainer redeploys, with
+no diff to catch it.
 Latest release: **v2.28**, harness-side — a panel round past the first reviews the fix commit rather
-than re-reading the whole PR, with the PR as the last round saw it behind that as context. (**v2.22**
-is claimed by PR #87, still open, which is why the numbering skips it.) Before it, **v2.24** had a new
-finding say whether the last fix pass caused it or the last round missed it — one number before, and
-two facts wanting opposite remedies — and **v2.23** had a run record which FILES the PR changed and
-not just how many lines, plus the PR's state as of that panel, so the board finally holds what
-collision ordering needs (schema revision 0016); reading it back as a collision query ships
-separately, see #101. **v2.21** (harness-side) had each panel member run in its own empty sandbox repo
-rather than in whatever directory the panel was launched from, and a panel that lost a seat says so.
-**v2.20** (also harness-side) had the worktree tooling ask who is in a directory before rewriting it,
-and **v2.19** added the per-reviewer
+than re-reading the whole PR, with the PR as the last round saw it behind that as context.
+(**v2.22** is claimed by PR #87, still open, which is why the numbering skips it.)
+Before it, **v2.27** put one premise to the seats and reported the tally, with no diff, no judge and
+no gate, so a fix's assumption can be challenged in a minute instead of in a twenty-minute round,
+and **v2.26** had the provenance v2.24 computed reach the board and the leaderboard: which
+reviewer catches regressions in fresh code and which finds what was already there, plus the commit
+each round reviewed (schema revision 0017).
+Before that, **v2.25** (harness-side) had the codex panel seat review the diff it was handed instead
+of going looking for the repo, which is what was running the reviews out of their timeout, and
+**v2.24**, also harness-side — a new finding says whether the last fix pass caused it or the last
+round missed it, which were one number before and want opposite remedies.
+**v2.23** had a run record which FILES the PR changed and not just how many lines, plus
+the PR's state as of that panel, so the board finally holds what collision ordering needs (schema
+revision 0016) — reading it back as a collision query ships separately, see #101.
+**v2.21** (harness-side) had each panel member run in its own empty sandbox repo
+rather than in whatever directory the panel was launched from. **v2.20** (also harness-side) had the
+worktree tooling ask who is in a directory before rewriting it, and **v2.19** added the per-reviewer
 cost columns (schema revision 0015) and was the first to move the board since v2.15; **v2.18**
 settles a reply carrying several JSON-shaped values by agreement rather than by rank, **v2.17** made
 a reviewer that produced nothing a failure that says why, and **v2.16** stopped the panel capping
@@ -238,6 +283,19 @@ the other way):
 - **v2.24** — a new finding records whether the last fix pass introduced it or the last round missed
   it: two facts with opposite remedies that `new_this_round` collapsed into one, plus the commit each
   round reviewed and the files it was truncated out of. A signal, not a verdict — nothing gates on it.
+- **v2.25** — the codex panel seat is given no shell, no web search and no app connectors, and its
+  sandbox mode is pinned rather than inherited, so it reviews the diff in its prompt instead of
+  hunting the repo it cannot see. An empty working directory is still what stops a PR instructing
+  its own reviewer through an `AGENTS.md`: no tool setting closes that channel.
+- **v2.26** — that signal reaches the board, which had been discarding all four of its fields on
+  ingest without a word: provenance per finding (the half nothing could reconstruct afterwards),
+  the commit reviewed, the unread files, the round's tally. `GET /review/stats` grows #48's axis —
+  who catches regressions against who finds what was already there — and an unrecognised bucket is
+  now named back to the sender rather than dropped in silence.
+- **v2.27** — `panel.py --ask "<premise>"` challenges one assumption with one question to the seats:
+  no diff, no judge, the vote is the output, and it gates nothing. `cannot tell` counts toward the
+  quorum and never toward the answer, and a tally whose only voter is the agent that wrote the
+  premise reports as unchallenged rather than as agreement.
 - **v2.28** — a panel round past the first reviews the increment since the last round's head, not
   the whole growing PR: the fix commit first, then the files it touched as they stood before it,
   then the rest of the PR, with a budget spent in that order so context is what gets dropped. Falls
