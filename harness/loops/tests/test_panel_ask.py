@@ -403,6 +403,44 @@ def test_a_symlink_out_of_the_repo_is_refused(repo, tmp_path):
     assert "outside" in _said(problems)
 
 
+def test_the_repos_own_git_store_is_refused(repo):
+    """Containment was the ONLY filter, and it is the wrong one on its own: the
+    repo under review is where the credentials are. `.git/config` carries the
+    access token on every https remote that was cloned with one, and an ask ships
+    its context to four third-party CLIs."""
+    (repo / ".git").mkdir()
+    (repo / ".git" / "config").write_text(
+        "[remote \"origin\"]\n\turl = https://x-access-token:ghp_realtoken@github.com/me/r\n")
+    problems = []
+    assert panel.read_context(repo, [".git/config"], problems) == []
+    assert "was refused" in _said(problems) and "`.git/`" in _said(problems)
+    assert "access token" in _said(problems) and problems[0].spec == ".git/config"
+
+
+@pytest.mark.parametrize("name", [".env", ".env.production", ".envrc", ".npmrc",
+                                  ".netrc", ".pypirc", "id_ed25519", "deploy.pem",
+                                  "server.key"])
+def test_the_usual_secret_files_are_refused_and_say_why(repo, name):
+    """A short denylist of names, not a secret scanner — it closes the routes an
+    agent composing a `--context` actually types. A refusal is a stated problem
+    like every other spec that did not become context, so a false positive costs
+    one visible sentence."""
+    (repo / name).write_text("SECRET_KEY=hunter2\n")
+    problems = []
+    assert panel.read_context(repo, [name], problems) == []
+    assert "was refused" in _said(problems)
+
+
+def test_a_file_that_merely_mentions_a_secret_is_still_read(repo):
+    """The denylist is names and never content — claiming otherwise would be a
+    scanner this is not, and refusing every file with `key` in it would make
+    `--context` useless on the module that reads the config."""
+    (repo / "sub" / "keys.py").write_text("API_KEY = os.environ['API_KEY']\n")
+    problems = []
+    got = panel.read_context(repo, ["sub/keys.py"], problems)
+    assert problems == [] and got[0].path == "sub/keys.py"
+
+
 def test_a_file_that_is_not_text_is_a_problem_and_not_a_wall_of_replacements(repo):
     """`errors="replace"` guaranteed the read SUCCEEDED, so `--context
     assets/logo.png` reached every seat's prompt as U+FFFD and the asker was
@@ -553,6 +591,27 @@ def test_the_budget_is_a_total_across_every_spec(repo):
     assert problems[-1].spec == "odd:dir/b.py"
 
 
+def test_a_clamped_range_reports_the_lines_the_seats_actually_saw(repo):
+    """`_budgeted` used to replace only the text, so `sub/a.py:1-20` cut to 20
+    chars still serialised `{"first": 1, "last": 20}` and rendered as
+    `sub/a.py:1-20`. The payload then held two records disagreeing about what was
+    read, and the wide one is the one an audit answers from."""
+    problems = []
+    got = panel.read_context(repo, ["sub/a.py:1-20"], problems, budget=20)
+    assert len(got[0].text) == 20
+    # 20 chars of "line 1\nline 2\n…" is lines 1-3, the third of them partly.
+    assert (got[0].first, got[0].last) == (1, 3)
+    assert got[0].text.count("\n") == 2
+    assert "the seats got 20 of" in _said(problems)
+
+
+def test_a_clamped_whole_file_keeps_no_range_at_all(repo):
+    """Nothing to correct: a spec with no range asked for none, and inventing one
+    here would claim a precision the clamp does not have."""
+    got = panel.read_context(repo, ["sub/a.py"], [], budget=20)
+    assert (got[0].first, got[0].last) == (None, None) and len(got[0].text) == 20
+
+
 def test_an_unbudgeted_read_is_the_whole_file(repo):
     got = panel.read_context(repo, ["sub/a.py"], [], budget=None)
     assert got[0].text == (repo / "sub" / "a.py").read_text()
@@ -577,6 +636,16 @@ def test_a_clamped_block_never_cuts_a_delimiter_in_half(repo):
     assert "odd:dir/b.py" not in block
     for line in block.splitlines():
         assert not line.startswith("--- CONTEXT") or line.endswith("---")
+
+
+@pytest.mark.parametrize("budget", [0, -1])
+def test_a_budget_that_leaves_nothing_still_says_there_is_nothing(repo, budget):
+    """It returned "" — no header, no sentence — so the prompt ended straight
+    after `--- PREMISE ---`. The seat was neither given material nor told there
+    was none, which is the one condition that invites an answer from memory."""
+    read = panel.read_context(repo, ["sub/a.py"], [])
+    assert panel._context_block(read, budget) == panel._context_block([])
+    assert "None was given" in panel._context_block(read, budget)
 
 
 # ---- one seat's turn --------------------------------------------------------
@@ -664,6 +733,33 @@ def test_one_seat_implementation_serves_the_review_and_the_ask(monkeypatch):
     assert len(panel.review_llm("claude", "opus", "p").findings) == 1
     _seat(monkeypatch, ANSWER)
     assert panel.ask_llm("claude", "opus", "p").verdict == "fails"
+
+
+def test_a_review_neither_attempt_could_read_is_kept_as_an_unstructured_finding(monkeypatch):
+    """The review path's half of the shared seat, and the reason the two questions
+    can share one: an ask has nothing to keep from an unreadable reply, while a
+    round keeps the raw text as one finding for the judge — half a review is still
+    worth reading. Moving `run_seat` out from under `review_llm` had to preserve
+    that exactly, and nothing was pinning it."""
+    _seat(monkeypatch, "Here are my thoughts, in prose:", "still prose, no JSON")
+    got = panel.review_llm("claude", "opus", "p")
+    assert got.unstructured is True and got.skip is None
+    assert len(got.findings) == 1 and got.findings[0].reviewer == "claude"
+    # The RETRY's text, matching run_cli, which returns the last attempt's stdout.
+    assert "still prose" in got.findings[0].detail
+    # Nothing it might have declared survived the parse, so a quiet round holding
+    # one of these is not evidence of a quiet PR.
+    assert got.could_not_assess is None
+
+
+def test_a_review_that_produced_nothing_is_a_skip_and_not_a_blank_finding(monkeypatch):
+    """"said nothing" and "said something we could not read" are different
+    accounts on this path too — and a blank finding flagged `unstructured` is a
+    dead reviewer wearing a live one's clothes, which is the whole of #68."""
+    _seat(monkeypatch, "   ")
+    got = panel.review_llm("claude", "opus", "p")
+    assert got.findings == [] and got.unstructured is False
+    assert "produced no output" in got.skip
 
 
 def test_run_seat_without_a_parser_never_retries(monkeypatch):
@@ -1031,6 +1127,37 @@ def test_a_caller_that_is_not_the_command_line_still_gets_the_guard(monkeypatch,
     assert payload["asker"] == "claude" and payload["verdict"] == "unchallenged"
 
 
+@pytest.mark.parametrize("spelled", ["Claude", "CLAUDE", "claude "])
+def test_however_a_caller_spells_the_asker_the_guard_still_fires(monkeypatch, cfg,
+                                                                 tmp_path, spelled):
+    """The SECOND hole found in this one guard. `main()` normalised `--asker` and
+    `ask()` did not, so a skill or a loop passing `"Claude"` compared a
+    lower-cased seat key against a string it could never equal — and a premise an
+    agent put to itself came back `holds` with a panel's authority. Normalised at
+    the single point an asker enters `ask()`, so no spelling can lose it."""
+    monkeypatch.setattr(panel, "record_ask", lambda payload: None)
+    monkeypatch.setattr(panel, "ask_llm", lambda *a, **k: panel.SeatAnswer("holds", "sure"))
+    out = tmp_path / "ask.json"
+    panel.ask(cfg["path"], "p", [], reviewers="claude", json_file=str(out), asker=spelled)
+    payload = json.loads(out.read_text())
+    assert payload["asker"] == "claude" and payload["verdict"] == "unchallenged"
+
+
+def test_an_asker_no_seat_answers_to_is_refused_and_said(monkeypatch, cfg, tmp_path):
+    """`"claude-code"` is not a seat, so it can never match a vote — a guard that
+    cannot fire. Carrying it silently is what made the hole invisible; it is
+    recorded as no asker and the run says so."""
+    monkeypatch.setattr(panel, "record_ask", lambda payload: None)
+    monkeypatch.setattr(panel, "ask_llm", lambda *a, **k: panel.SeatAnswer("holds", "sure"))
+    out = tmp_path / "ask.json"
+    panel.ask(cfg["path"], "p", [], reviewers="claude", json_file=str(out),
+              asker="claude-code")
+    payload = json.loads(out.read_text())
+    assert payload["asker"] is None
+    assert any("is not one of" in n and "guard is inactive" in n
+               for n in payload["config_notes"])
+
+
 def test_the_asker_that_is_not_a_seat_claims_no_vote(monkeypatch, cfg, capsys):
     """`--reviewers codex --asker claude` asserted "its own answer is one vote
     and cannot be the only one" of a seat with no vote at all on this ask."""
@@ -1099,6 +1226,44 @@ def test_the_seat_whose_prompt_travels_in_argv_is_clamped_and_said(monkeypatch, 
                for n in payload["config_notes"])
     # Cut through the content, never through a delimiter.
     assert "--- CONTEXT: big.py ---" in prompts["antigravity"]
+
+
+def test_a_prompt_that_cannot_fit_argv_at_all_skips_the_seat_rather_than_execve(
+        monkeypatch, cfg, tmp_path):
+    """The fitting only takes CONTEXT out, and the premise and the template have
+    no budget — so a long premise leaves a prompt over the ceiling with nothing
+    left to cut. `fit_argv_budget` returning 0 is not the same claim as "it
+    fits", and the oversized argv used to go to execve and die there with an
+    opaque error and no note at all."""
+    monkeypatch.setattr(panel, "ARGV_PROMPT_MAX_BYTES", 200)
+    monkeypatch.setattr(panel, "record_ask", lambda payload: None)
+    ran = []
+
+    def seat(name, model, prompt, effort=""):
+        ran.append(name)
+        return panel.SeatAnswer("holds", "r")
+
+    monkeypatch.setattr(panel, "ask_llm", seat)
+    out = tmp_path / "ask.json"
+    panel.ask(cfg["path"], "q" * 500, [], reviewers="antigravity,claude",
+              json_file=str(out), asker="")
+    # Not run at all: a CLI invocation on a prompt known not to survive exec.
+    assert ran == ["claude"]
+    seat_row = json.loads(out.read_text())["answers"]["antigravity"]
+    assert seat_row["verdict"] is None and "argv ceiling" in seat_row["skip"]
+
+
+def test_the_seat_that_could_not_be_run_is_shown_as_one(monkeypatch, cfg, capsys):
+    """A skip is the panel's idiom for a seat that did not run, and the report
+    shows it beside the seats that did rather than quietly dropping the column."""
+    monkeypatch.setattr(panel, "ARGV_PROMPT_MAX_BYTES", 200)
+    monkeypatch.setattr(panel, "record_ask", lambda payload: None)
+    monkeypatch.setattr(panel, "ask_llm", lambda *a, **k: panel.SeatAnswer("holds", "r"))
+    panel.ask(cfg["path"], "q" * 500, [], reviewers="antigravity", asker="")
+    out = capsys.readouterr().out
+    assert "did not answer" in out and "argv ceiling" in out
+    # It could not be run, so nothing was challenged.
+    assert "UNCHALLENGED" in out
 
 
 # ---- the command line -------------------------------------------------------

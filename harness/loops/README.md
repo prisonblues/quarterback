@@ -383,9 +383,20 @@ $ panel.py --ask "panel.py exits non-zero when it skips a PR on a title pattern"
   U+FFFD), a malformed range (said as a range and not as a path), and a file past the
   4 MB read ceiling. A file whose own name ends in `:12` wins over reading line 12 of a
   file called something else; an exact repeat of a spec is read once. A range past the end,
-  and anything over `ask_max_context_chars`, is clamped and said. With no context at all
-  the prompt says so, which is what keeps `cannot tell` available instead of inviting an
-  answer from memory.
+  and anything over `ask_max_context_chars`, is clamped and said — and the range the report
+  and the payload carry is the one the seats actually got, not the one that was typed. With
+  no context at all (or none of it left after a clamp) the prompt says so, which is what
+  keeps `cannot tell` available instead of inviting an answer from memory.
+- **Containment was never the whole rule, so an ask refuses to read a secret.** Being
+  inside the repo under review is exactly the case where `--context .git/config` hands a
+  personal access token to four third-party CLIs, since every seat's reply is a place its
+  prompt can come back out. `.git/` is refused outright, as are the files that are nothing
+  but credentials by the names they always have — `.env` (and `.env.*`), `.envrc`,
+  `.npmrc`, `.netrc`, `.pgpass`, `.pypirc`, `id_rsa`/`id_ed25519` and friends, and anything
+  ending `.pem`, `.key`, `.p12` or `.pfx`. Each refusal is a stated `context_problem`
+  naming why, like every other spec that did not become context. It is a denylist of names
+  and not a secret scanner: it closes the routes an agent composing a command line actually
+  types, and says nothing about a token pasted into a source file.
 - **`--json` / `--json-file`** emit the ask's own payload: `kind: "ask"`, the premise, the
   `context` actually read (spec, path, line range, chars), the specs that did NOT become
   context as `context_problems` (`{spec, problem}` — machine-readable, so "was this verdict

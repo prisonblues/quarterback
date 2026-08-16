@@ -55,6 +55,17 @@ Four decisions in it are worth more than the feature:
   is all they govern today; #78 generalises the same primitives to a round's verdict, where they
   decide what gets merged.
 
+**An ask will not read a secret, even one that lives in the repo.** `--context` is confined to the
+repo under review, and that was the only filter on it — which is backwards, because the repo under
+review is where the credentials are. `--context .git/config` is contained, readable, and on an https
+remote it is a personal access token, shipped to four third-party CLIs in a prompt whose reply is a
+place it can come back out. So `.git/` is refused outright, along with the files that are nothing but
+credentials by the names they always have (`.env` and `.env.*`, `.envrc`, `.npmrc`, `.netrc`,
+`.pgpass`, `.pypirc`, `id_rsa`/`id_ed25519`, and `.pem`/`.key`/`.p12`/`.pfx` key material). Each
+refusal is a stated `context_problem` naming why, like every other spec that did not become context.
+It is a denylist of names and not a secret scanner: it closes the routes an agent composing a command
+line actually types.
+
 One implementation runs a seat now, not two: the sandbox, the pinned sessions, the retry policy, the
 usage read-back and the four CLIs' argv moved into `run_seat`, and a round and an ask differ only in
 how they read the reply. A second copy would have been a second place for a seat to silently stop

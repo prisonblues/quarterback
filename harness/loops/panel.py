@@ -1809,7 +1809,13 @@ def fit_argv_budget(render, budget: int) -> int:
     fits. The loop is kept for the pathological case where the template alone is
     near the limit, and for a `render` whose length is not linear in its budget —
     an ask's is not, since a budget below a section's length drops the sections
-    after it whole."""
+    after it whole.
+
+    **The result is always between 0 and `budget`, and 0 does not mean "it
+    fits".** When the template and the premise are over the ceiling on their own
+    there is nothing left to take out, and this returns 0 having failed — so a
+    caller must measure the rendered prompt rather than trust the reduction.
+    `ask()` does exactly that, and skips the seat with the reason said."""
     for _ in range(8):
         over = len(render(budget).encode()) - ARGV_PROMPT_MAX_BYTES
         if over <= 0:
@@ -5420,6 +5426,26 @@ _RANGE = re.compile(r"^(\d{1,9})(?:-(\d{1,9}))?$")
 #: does not look like a file that was read.
 ASK_CONTEXT_FILE_MAX_BYTES = 4_000_000
 
+#: Directories an ask will not read out of, however contained they are.
+#: Containment answers "is this the repo under review?" and nothing else — and
+#: the repo under review is precisely where the credentials are. `.git/config`
+#: carries a personal access token in the remote URL on every https clone that
+#: was authenticated once, and `.git/` holds every blob the working tree no
+#: longer does, so a secret deleted a year ago is still readable through it.
+ASK_SECRET_DIRS = frozenset({".git"})
+
+#: Files that are nothing but secrets, by the names they are always given. Short
+#: and exact on purpose: this is a denylist, not a secret scanner, and it is not
+#: claimed to be one. It closes the routes an agent composing a `--context`
+#: actually types, and every refusal is a stated :class:`ContextProblem`, so a
+#: false positive costs one visible sentence and a miss costs no more than the
+#: containment check alone already did.
+ASK_SECRET_FILES = frozenset({".env", ".envrc", ".npmrc", ".netrc", ".pgpass",
+                              ".pypirc", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"})
+
+#: Extensions that are key material whatever the file is called.
+ASK_SECRET_SUFFIXES = (".pem", ".key", ".p12", ".pfx")
+
 
 class AskContext(NamedTuple):
     """One `--context` argument, resolved and read."""
@@ -5544,6 +5570,34 @@ def _read_confined(root: Path, resolved: Path, limit: int) -> bytes:
             fh.close()
 
 
+def _secret_context(rel: Path) -> str | None:
+    """Why an ask will not read this repo-relative path, or None to read it.
+
+    Containment is not the whole rule. `is_relative_to(root)` answers one
+    question — "is this the repo under review?" — and the answer being yes is
+    exactly the case where `--context .git/config` hands a PAT to four
+    third-party CLIs, because a seat's reply is a place its prompt can come back
+    out. `.env`, `.envrc`, `.npmrc` and committed key material are the same
+    shape: readable, contained, and not context for a premise.
+
+    Named components, not content: this refuses the files that ARE credentials,
+    and says nothing about a token pasted into a source file. It is the cheap
+    half of the rule and is documented as such (see `harness/loops/README.md`)."""
+    parts = rel.parts
+    if not parts:
+        return None
+    for part in parts:
+        if part in ASK_SECRET_DIRS:
+            return (f"it is inside `{part}/` — the repo's own object store, where "
+                    "`config` carries the access token an https remote was cloned with")
+    name = parts[-1]
+    if name in ASK_SECRET_FILES or name.startswith(".env."):
+        return f"`{name}` is a credentials file, not context for a premise"
+    if rel.suffix in ASK_SECRET_SUFFIXES:
+        return f"`{rel.suffix}` files are key material"
+    return None
+
+
 def read_context(root: Path, specs: list[str], problems: list[ContextProblem],
                  budget: int | None = None) -> list[AskContext]:
     """The files (or line ranges) an ask hands its seats, read from the repo under
@@ -5555,6 +5609,12 @@ def read_context(root: Path, specs: list[str], problems: list[ContextProblem],
     seat's reply is a place its contents could come back out. Resolution follows
     symlinks before the containment test for the same reason `write_payload`
     opens `O_NOFOLLOW` — a link inside the repo is not a file inside the repo.
+
+    **And containment is not the whole rule**, because the repo under review is
+    where the credentials live: `--context .git/config` is contained, readable,
+    and on an https remote it is a personal access token. So `.git/` and the
+    usual secret filenames are refused too — see :func:`_secret_context`, which
+    states each refusal as a problem naming why.
 
     A spec that cannot be read is a PROBLEM and never a silent omission. A seat
     given less context than the asker believes it has will answer `cannot tell`
@@ -5605,6 +5665,13 @@ def read_context(root: Path, specs: list[str], problems: list[ContextProblem],
             problems.append(ContextProblem(
                 spec, f"`--context {spec}` is outside {root} — an ask reads the "
                       "repo under review and nothing else"))
+            continue
+        secret = _secret_context(resolved.relative_to(root))
+        if secret:
+            problems.append(ContextProblem(
+                spec, f"`--context {spec}` was refused: {secret}. An ask hands its "
+                      "context to four third-party CLIs, so being inside the repo is "
+                      "not on its own a reason to read a file"))
             continue
         if not resolved.is_file():
             # Saying where paths are anchored, because the plausible mistake is
@@ -5698,7 +5765,14 @@ def _budgeted(ctx: AskContext, budget: int | None, used: int,
     it is exactly the failure this feature exists to make cheap to notice.
 
     None when nothing at all was left, because a section with no content in it is
-    a header telling the seats a file was supplied when it was not."""
+    a header telling the seats a file was supplied when it was not.
+
+    **`last` moves with the text.** Left at the range that was ASKED for, a
+    clamped `sub/a.py:1-200` still serialised `{"first": 1, "last": 200}` and
+    rendered as `` `sub/a.py:1-200` `` while the seats saw ten lines — two
+    records in one payload disagreeing about what was read, and the wide one is
+    the one #77's board row ("was this verdict reached with all the context the
+    asker intended?") would answer from."""
     if budget is None:
         return ctx
     left = budget - used
@@ -5714,7 +5788,15 @@ def _budgeted(ctx: AskContext, budget: int | None, used: int,
             ctx.spec, f"`--context {ctx.spec}`: the seats got {left:,} of {whole:,} chars "
                       f"— the {budget:,}-char context budget "
                       "(`review_panel.ask_max_context_chars`) stopped it"))
-        return ctx._replace(text=ctx.text[:left])
+        cut = ctx.text[:left]
+        # The last line the seats saw any of, counted from the text they got: a
+        # cut landing mid-line still showed them that line's beginning, and
+        # reporting the line before it would be the same lie in the other
+        # direction. `first` is untouched — where the range starts is not what
+        # the clamp changed. A whole-file spec has no range to correct.
+        kept = cut.count("\n") + (0 if cut.endswith("\n") else 1)
+        last = None if ctx.first is None else ctx.first + kept - 1
+        return ctx._replace(text=cut, last=last)
     return ctx
 
 
@@ -5723,6 +5805,13 @@ def _context_chars(contexts: list[AskContext]) -> int:
     about, and the one :func:`_context_block` cuts. Not the length of the
     assembled block, which also counts delimiters that no clamp may touch."""
     return sum(len(c.text) for c in contexts)
+
+
+#: What goes where the context would have been when there is none — and it is a
+#: sentence rather than an empty string on purpose. See :func:`_context_block`.
+NO_CONTEXT = ("\n--- CONTEXT ---\nNone was given. Answer from the premise's own terms, "
+              "and where those do not settle it answer \"cannot tell\" — you have "
+              "nothing to check it against and must not answer from memory.\n")
 
 
 def _context_block(contexts: list[AskContext], budget: int | None = None) -> str:
@@ -5734,7 +5823,9 @@ def _context_block(contexts: list[AskContext], budget: int | None = None) -> str
     `--- CONTEXT: path ---` line and hands a seat a prompt whose last section has
     a half-written header on it. Every delimiter that is emitted is whole, and a
     section the budget leaves nothing for is dropped with its header rather than
-    announced as a file that was supplied.
+    announced as a file that was supplied. A budget that leaves nothing of ANY
+    of them falls through to the no-context sentence below, because that is what
+    the seat is looking at.
 
     An ask with no context is legitimate — some premises are settled by their own
     terms — but a model handed a bare assertion and no material will reach for
@@ -5742,10 +5833,6 @@ def _context_block(contexts: list[AskContext], budget: int | None = None) -> str
     confidence from nothing. Saying out loud that it was given nothing is what
     makes `cannot tell` the available answer rather than a gap it has to invent
     its way across."""
-    if not contexts:
-        return ("\n--- CONTEXT ---\nNone was given. Answer from the premise's own terms, "
-                "and where those do not settle it answer \"cannot tell\" — you have "
-                "nothing to check it against and must not answer from memory.\n")
     out = []
     left = budget
     for c in contexts:
@@ -5756,7 +5843,13 @@ def _context_block(contexts: list[AskContext], budget: int | None = None) -> str
             left -= len(text)
         where = f"{c.path}:{c.first}-{c.last}" if c.first else c.path
         out.append(f"\n--- CONTEXT: {where} ---\n{text}\n")
-    return "".join(out)
+    # No sections is no sections, whether nothing was given or the budget left
+    # nothing of what was. Returning "" for the second ended the prompt straight
+    # after `--- PREMISE ---`: no material, and — worse — not the sentence above
+    # either, so the one seat that can reach a zero budget (antigravity, whose
+    # prompt travels in argv) was invited to answer from memory by a prompt that
+    # never told it there was nothing to read.
+    return "".join(out) or NO_CONTEXT
 
 
 #: The ask's declared defaults — read from where they are declared and
@@ -5848,7 +5941,9 @@ def ask(repo_name: str | None, premise: str, contexts: list[str] | None = None,
     `asker` is `None` for "work it out" and a seat name (or "") for a caller that
     already has. It used to default to "" — no asker, guard off — so every caller
     but `main()` silently lost the self-challenge rule, which is the one rule
-    this feature is built around."""
+    this feature is built around. **Whatever a caller passes is normalised and
+    checked in here**, not at the command line: how a name is spelled must not be
+    able to turn the guard off. See the comment at the point it arrives."""
     run_key = uuid.uuid4().hex
     cfg = load_repo_cfg(repo_name)
     repo_name = cfg.get("name") or repo_name
@@ -5888,8 +5983,17 @@ def ask(repo_name: str | None, premise: str, contexts: list[str] | None = None,
                      "it, so this ask cannot come back as anything but unchallenged or "
                      "unresolved")
 
-    # The asker, and the two ways it can be missing. Detected here rather than
-    # only in main(), so a caller that is not the command line keeps the guard.
+    # **The one place an asker enters this function** — detected, normalised and
+    # checked here, not at the command line, because that is the only shape of
+    # fix this guard has not already been through twice. It was first lost by
+    # `ask()` not detecting an asker at all (every caller but `main()` ran with
+    # the guard off); it was lost again by `ask()` taking whatever spelling a
+    # caller passed, so `"Claude"` or `"claude "` compared a lower-cased seat key
+    # against a string that could never equal it and a premise put to itself came
+    # back `holds`. A third route in would be a third silent hole, so `main()`'s
+    # strip/lower and its seat-name check live HERE and `main()` is one more
+    # caller. Anything that is not a seat is refused rather than carried: a name
+    # the tally cannot match is a guard that does not fire, and it says so.
     detected = detected_asker()
     if asker is None:
         asker = detected
@@ -5898,10 +6002,18 @@ def ask(repo_name: str | None, premise: str, contexts: list[str] | None = None,
                          "this run. Only Claude Code's environment says which seat is "
                          "running a command; an agent on another vendor's CLI has to pass "
                          "`--asker <seat>` itself")
-    elif not asker and detected:
-        notes.append(f"`--asker ''` was passed while {detected}'s environment is present — "
-                     "the self-challenge guard is off by request, so this tally may rest "
-                     "entirely on the agent that wrote the premise")
+    else:
+        given = str(asker)
+        asker = asking_seat(given)
+        if asker and asker not in LLM_REVIEWERS:
+            notes.append(f"asker {given!r} is not one of {', '.join(LLM_REVIEWERS)} — the "
+                         "self-challenge guard is inactive for this run, because a name no "
+                         "seat answers to can never match a vote. Recorded as no asker")
+            asker = ""
+        elif not asker and detected:
+            notes.append(f"`--asker ''` was passed while {detected}'s environment is "
+                         "present — the self-challenge guard is off by request, so this "
+                         "tally may rest entirely on the agent that wrote the premise")
 
     context_budget = _ask_rule(panel, "ask_max_context_chars", notes)
     context_problems: list[ContextProblem] = []
@@ -5928,6 +6040,8 @@ def ask(repo_name: str | None, premise: str, contexts: list[str] | None = None,
     # per seat made N copies of every context file to no end.
     base = prompt_for(None)
     prompts = dict.fromkeys(seats, base)
+
+    answers: dict[str, SeatAnswer] = {}
     # `agy`'s prompt travels in argv and the kernel caps one element, whatever is
     # in it — a premise is small but a `--context` file need not be. Same clamp,
     # same report, as the diff gets on a round. The seat is `antigravity`
@@ -5940,12 +6054,33 @@ def ask(repo_name: str | None, premise: str, contexts: list[str] | None = None,
                          "— its prompt travels in argv and the kernel caps one element "
                          f"at {ARGV_PROMPT_MAX_BYTES:,} bytes")
             prompts["antigravity"] = prompt_for(fitted)
+        # The fitting only ever takes CONTEXT out, and the premise and the
+        # ASK_PROMPT template have no budget at all — so a long premise leaves a
+        # prompt still over the ceiling with nothing left to cut, and
+        # `fit_argv_budget` returning 0 is not the same claim as "it fits". Asked
+        # of the RENDERED prompt rather than inferred from the reduction, because
+        # the alternative is what used to happen: the oversized argv went to
+        # execve, `agy` died there with an opaque error, and no note said why.
+        # A stated skip is the panel's idiom for a seat that could not be run,
+        # and it keeps the seat's absence in the tally instead of in a traceback.
+        over = len(prompts["antigravity"].encode()) - ARGV_PROMPT_MAX_BYTES
+        if over > 0:
+            label = reviewer_label("antigravity", models["antigravity"],
+                                   efforts.get("antigravity", ""))
+            answers["antigravity"] = SeatAnswer(skip=(
+                f"{label}: its prompt is {over:,} bytes over the "
+                f"{ARGV_PROMPT_MAX_BYTES:,}-byte argv ceiling with no context left to cut "
+                "— `agy` takes a prompt only as one argv element, and the premise alone "
+                "does not fit in one"))
 
-    answers: dict[str, SeatAnswer] = {}
-    if seats:
-        with ThreadPoolExecutor(max_workers=len(seats)) as ex:
+    # Only the seats that still need running. A seat the argv check above already
+    # settled has its answer, and starting a CLI for a prompt known not to
+    # survive exec would spend a turn to arrive at the same skip.
+    to_run = [n for n in seats if n not in answers]
+    if to_run:
+        with ThreadPoolExecutor(max_workers=len(to_run)) as ex:
             tasks = {n: ex.submit(ask_llm, n, models[n], prompts[n], efforts.get(n, ""))
-                     for n in seats}
+                     for n in to_run}
             for n, fut in tasks.items():
                 try:
                     answers[n] = fut.result()
