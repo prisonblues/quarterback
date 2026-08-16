@@ -38,6 +38,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
+from conftest import UNSET, gh_stub, pr_meta  # noqa: E402
 
 
 REF_BODY = json.dumps({"ref": "refs/heads/main",
@@ -122,11 +123,6 @@ def test_every_way_the_call_can_fail_is_a_None_and_not_a_crash(monkeypatch):
 # end to end: what a round records
 # --------------------------------------------------------------------------
 
-#: Distinguishes "the caller said nothing" from "the caller said None", so a test
-#: can ask for a re-read that FAILS as well as one that returns something new.
-_UNSET = object()
-
-
 PR_DIFF = ("diff --git a/a.py b/a.py\n"
            "index 1111111..2222222 100644\n"
            "--- a/a.py\n"
@@ -140,7 +136,7 @@ CFG = {"github": "acme/board", "path": "/tmp/repo",
 
 
 def _run(monkeypatch, tmp_path, title="feat: a thing", merge_base="0ddba5e0",
-         base_tip=REF_BODY, cfg=None, moves_to=None, merge_base_after=_UNSET):
+         base_tip=REF_BODY, cfg=None, moves_to=None, merge_base_after=UNSET):
     """One panel run with every subprocess replaced, so what is under test is the
     payload rather than any CLI. `base_tip` is the raw body the ref call returns,
     so a test can make that one call fail without touching the others.
@@ -151,33 +147,15 @@ def _run(monkeypatch, tmp_path, title="feat: a thing", merge_base="0ddba5e0",
     The three reads are told apart by their `--json` field list: the opening
     metadata read asks for many fields, `_head_sha_now` asks for `headRefOid`
     alone and `_merge_base_now` for `baseRefOid` alone."""
+    # conftest.gh_stub knows every `gh` call panel.py makes, so this module no
+    # longer has to. That is the point of it: the base-tip read below landed with
+    # only one module's stub swept, and 48 tests in five others spent hours
+    # emitting a note about a failure that never happened (128-F09).
     calls = []
-    views = []
-
-    def fake_sh(args, **kw):
-        calls.append(args)
-        if args[:3] == ["gh", "pr", "view"]:
-            if args[-1] == "headRefOid":
-                views.append(args)
-                return json.dumps({"headRefOid": moves_to or "aaa111"})
-            if args[-1] == "baseRefOid":
-                if isinstance(merge_base_after, BaseException):
-                    raise merge_base_after
-                return json.dumps(
-                    {} if merge_base_after is None
-                    else {"baseRefOid": merge_base
-                          if merge_base_after is _UNSET else merge_base_after})
-            meta = {"title": title, "additions": 20, "deletions": 2,
-                    "baseRefName": "main", "headRefName": "feat/x",
-                    "headRefOid": "aaa111"}
-            if merge_base is not None:
-                meta["baseRefOid"] = merge_base
-            return json.dumps(meta)
-        if args[:2] == ["gh", "api"] and "/git/ref/heads/" in args[2]:
-            if isinstance(base_tip, BaseException):
-                raise base_tip
-            return base_tip
-        return PR_DIFF
+    fake_sh = gh_stub(meta=pr_meta(title=title, head="aaa111", merge_base=merge_base),
+                      merge_base=merge_base, merge_base_after=merge_base_after,
+                      head_moves_to=moves_to, base_tip=base_tip,
+                      diff=PR_DIFF, calls=calls)
 
     def fake_review(name, model, prompt, effort=""):
         return panel.ReviewerRun([], None, 800, None)
