@@ -7,7 +7,7 @@ that number where it was, so the repo can be a version ahead of the service.
 Entries are newest first. Each one says what was broken or missing before it, because that is the
 part that isn't recoverable from the diff.
 
-## v2.34 — the board asks GitHub, because the way `main` usually moves tells nobody
+## v2.42 — the board asks GitHub, because the way `main` usually moves tells nobody
 
 The publish reflex is a `PostToolUse` hook watching `Bash` for a `git push`. It is a good design
 and it is complete for a local push. `gh pr merge` and the green button do no local push: the merge

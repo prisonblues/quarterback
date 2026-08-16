@@ -1,4 +1,4 @@
-"""v2.34 — the origin watch: a merge nobody pushed still reaches the board (#127).
+"""The origin watch: a merge nobody pushed still reaches the board (#127).
 
 The gap these cover: `gh pr merge` and the green button create the merge commit
 server-side, so no machine runs a command the publish hook can see, and the

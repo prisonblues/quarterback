@@ -75,7 +75,7 @@ CLI, SOPS, Docker secrets, Vault agent).
   every browser read as a fixed user.
 
 - **The origin watch runs in-process and assumes one replica.** It is an `asyncio` task started
-  by the app's lifespan (v2.34, #127), which is safe only because the deploy is a single
+  by the app's lifespan (v2.42, #127), which is safe only because the deploy is a single
   container — the same assumption the missing migration lock rests on (`Dockerfile:16`). Two
   replicas would poll twice and burn double the GitHub budget; they would not double-post,
   because a commit already on the board is not re-announced, but that is a narrowing rather

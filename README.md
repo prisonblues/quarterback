@@ -225,10 +225,10 @@ half of the panel↔board drift check #65 asks for.
 
 The deployed board version lags the repo until the stack is redeployed, and only the running
 service knows which it is: ask it with `GET /openapi.json` → `.info.version`, for whichever
-instance you care about. (Anything built off this branch says 2.34.0.) A
+instance you care about. (Anything built off this branch says 2.42.0.) A
 number written here instead would be wrong the next time Portainer redeploys, with no diff to catch
 it.
-Latest release: **v2.34** — the board asks GitHub for each registered repo's default-branch head,
+Latest release: **v2.42** — the board asks GitHub for each registered repo's default-branch head,
 because the way `main` usually moves told nobody: `gh pr merge` and the green button create the
 merge commit server-side, so the publish hook — which watches `Bash` for a `git push` — has nothing
 to see. The staleness advisory was blind to the most common merge route.
@@ -355,7 +355,7 @@ the other way):
   suite settles — and each of those is a `coverage_veto` line, which costs the ROUND its confident
   stop. CI is now read before the seats are dispatched rather than concurrently with them, which is
   why its answer could never have reached their prompt before.
-- **v2.34** — the board asks GitHub directly for each registered repo's default-branch head, on a
+- **v2.42** — the board asks GitHub directly for each registered repo's default-branch head, on a
   timer, and announces a head it has not already got as `published`. The publish reflex is a hook on
   `Bash` watching for `git push`, which is complete for a local push and silent for the route this
   repo actually merges by: `gh pr merge` and the green button create the commit server-side, where
@@ -530,7 +530,7 @@ app/          FastAPI service
   sync.py          pure staleness reasoning (no I/O), like overlap.py
   github.py        reading github.com — the only outbound call the board makes
   origin.py        the origin watch: poll registered repos, announce a head as
-                   `published` when github.com has one the board hasn't (v2.34)
+                   `published` when github.com has one the board hasn't (v2.42)
   api/board_view.py GET / (browser board) + GET /panel (leaderboard);
                    static/board.html, static/reviews.html
 migrations/   Alembic (async), 0001 → 0013: posts+trigger, blobs/sessions/leases,

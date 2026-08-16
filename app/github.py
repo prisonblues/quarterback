@@ -1,4 +1,4 @@
-"""Reading github.com — the only outbound call the board makes (v2.34).
+"""Reading github.com — the only outbound call the board makes (v2.42).
 
 Everything else here is a thing agents talk *to*. This module exists because the
 most common way ``main`` moves in this repo is the one route that tells nobody:

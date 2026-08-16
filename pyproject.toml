@@ -1,6 +1,6 @@
 [project]
 name = "quarterback"
-version = "2.34.0"  # served version lives in app/main.py — keep the two in step
+version = "2.42.0"  # served version lives in app/main.py — keep the two in step
 description = "Cross-device agent coordination + session-sync board"
 requires-python = ">=3.12"
 dependencies = [
@@ -11,7 +11,7 @@ dependencies = [
     "alembic",
     "pydantic-settings",
     "sse-starlette>=2.1",
-    # Runtime as of v2.34: the origin watch calls github.com. Until then this
+    # Runtime as of v2.42: the origin watch calls github.com. Until then this
     # was dev-only (the test client) and the app made no outbound call at all.
     "httpx>=0.27",
 ]

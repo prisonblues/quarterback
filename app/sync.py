@@ -21,7 +21,7 @@ MIN_SHA = 7
 # indexed query.
 #
 # Two things read it and they must agree: ``GET /sync`` decides staleness within
-# this window, and the origin poller (v2.34) suppresses a re-announcement within
+# this window, and the origin poller (v2.42) suppresses a re-announcement within
 # it. A poller scanning shallower than the consumer would double-announce a
 # commit the consumer can still see; scanning deeper would suppress one it
 # cannot. Same number, one definition.

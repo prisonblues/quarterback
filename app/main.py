@@ -32,7 +32,7 @@ _app_logger.addHandler(_handler)
 
 @contextlib.asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-    """Run the origin watch alongside the app (v2.34, #127).
+    """Run the origin watch alongside the app (v2.42, #127).
 
     Safe as an in-process task only because the deploy is a single container —
     see the note at Dockerfile:16. Two replicas would poll twice; they would not
@@ -55,7 +55,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
                 await task
 
 
-app = FastAPI(title="quarterback", version="2.34.0", lifespan=lifespan)
+app = FastAPI(title="quarterback", version="2.42.0", lifespan=lifespan)
 app.include_router(whoami_router)
 app.include_router(posts_router)
 app.include_router(stream_router)

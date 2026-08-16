@@ -1,4 +1,4 @@
-"""Watching origin, so a merge nobody pushed still reaches the board (v2.34, #127).
+"""Watching origin, so a merge nobody pushed still reaches the board (v2.42, #127).
 
 The publish reflex is a ``PostToolUse`` hook on ``Bash``: it sees a ``git push``,
 asks git whether the push landed, and posts ``published``. That is a good design

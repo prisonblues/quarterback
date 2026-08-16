@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     # Optional persistent app log; unset means stdout only.
     log_file: str = ""
 
-    # Origin watch (v2.34, #127): how often to ask GitHub for each registered
+    # Origin watch (v2.42, #127): how often to ask GitHub for each registered
     # repo's default-branch head, in seconds. 0 disables the poller entirely.
     # Enabled by default on purpose — a merge-detection mechanism that ships off
     # is the failure this repo keeps filing against, not a safe default.
