@@ -3028,6 +3028,26 @@ def _head_sha_now(gh_repo: str, pr_number: int) -> str | None:
         return None
 
 
+def _merge_base_now(gh_repo: str, pr_number: int) -> str | None:
+    """The PR's merge base, re-read. None if it cannot be had.
+
+    Only called when the head has been seen to move mid-round. `baseRefOid` is
+    recomputed by GitHub on every push to the head branch, so a head that moved
+    may have taken the merge base with it — and on this repo the usual reason a
+    head moves is a merge of the base branch into the PR, which is precisely the
+    push that moves it. Pairing a re-stamped head with a merge base computed for
+    the commit before it yields a range nothing ever reviewed.
+
+    Bounded like its siblings: an attribution nothing gates on must never be able
+    to stall a panel."""
+    try:
+        return json.loads(sh(["gh", "pr", "view", str(pr_number), "--repo", gh_repo,
+                              "--json", "baseRefOid"],
+                             timeout=FIX_RANGE_TIMEOUT_S)).get("baseRefOid") or None
+    except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
+        return None
+
+
 def _base_tip_now(gh_repo: str, base_ref: str) -> str | None:
     """The LIVE tip of the base branch. None if it cannot be had.
 
@@ -5786,6 +5806,30 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                      "which of the two produced it cannot be told from here; the later commit "
                      "is recorded, and provenance against this round is that much less certain")
         head_sha = moved_to
+        # `merge_base` came off the metadata read before the round started, and
+        # GitHub recomputes `baseRefOid` on every push to the head branch. Leaving
+        # it would pair a re-stamped right end with a left end computed for the
+        # commit it replaced — and the pair being replayable is this release's
+        # whole claim. Worse, the common reason a head moves here is a merge of
+        # the base branch INTO the PR (~1.8 integration merges per PR landed on
+        # this repo, #80), which is exactly the case that moves the merge base:
+        # the stored range would then start before an integration merge its right
+        # end contains, and it is a range no round ever reviewed.
+        #
+        # One extra call, on a path that fires rarely, and only when something has
+        # already gone irregular. If it fails, the pair is not silently mismatched
+        # — the note says which end is stale, because "unknown" and "stale" want
+        # different treatment from whatever reads this later.
+        moved_meta = _merge_base_now(gh_repo, pr_number)
+        if moved_meta and moved_meta != merge_base:
+            notes.append(f"the merge base moved with it, from {merge_base[:8] if merge_base else '?'} "
+                         f"to {moved_meta[:8]} — both ends are re-read, so the recorded range is "
+                         "the one that exists now rather than a pair straddling the push")
+            merge_base = moved_meta
+        elif moved_meta is None:
+            notes.append("the merge base could not be re-read after the head moved, so the "
+                         "recorded base end is the one computed for the EARLIER head — treat "
+                         "the pair as a range that may never have been reviewed as such")
     # The base end (#98), read here rather than above the skip branch: this is one
     # more API round trip and the skip path exists to be cheap, never fetches a
     # diff, and never reaches the board — so a base tip recorded there would have
