@@ -32,18 +32,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
+from conftest import gh_stub  # noqa: E402
 
 
-#: The base branch's live tip, as `gh api repos/…/git/ref/heads/…` returns it.
-#: Every reviewed round reads this (#98). A stub that does not answer it does not
-#: fail — `_base_tip_now` swallows the error and the round appends "the tip of
-#: base branch could not be read" to `config_notes`. That is a note about a
-#: failure that never happened, and it goes unnoticed because these modules
-#: assert on other things; it was found by instrumenting the note, not by a red
-#: test (128-F09). Answer it, so what is in `config_notes` is what the panel
-#: actually decided.
-def _base_tip(sha: str = "basetip0000000000000000000000000000000a") -> str:
-    return json.dumps({"object": {"sha": sha}})
 
 
 
@@ -609,29 +600,15 @@ def _panel_round(monkeypatch, tmp_path, round_no, findings, head, baseline=(),
                  cfg=None, compare=None, moves_to=None):
     """One panel run with every subprocess replaced, so what is under test is the
     payload the panel builds rather than any CLI."""
-    views = []
-
-    def fake_sh(args, **kw):
-        if args[:3] == ["gh", "pr", "view"]:
-            views.append(args)
-            # The head is re-read after the diff is fetched. `moves_to` makes it
-            # move in that window, which is the race the re-read exists for.
-            oid = moves_to if (moves_to and len(views) > 1) else head
-            return json.dumps({"title": "feat: mirror", "additions": 20,
-                               "deletions": 2, "baseRefName": "main",
-                               "headRefName": "feat/x", "headRefOid": oid})
-        # The compare call provenance makes — matched on the API path so a
-        # change of spelling fails this test rather than silently falling
-        # through to the PR diff and attributing against the wrong thing.
-        if args[:2] == ["gh", "api"] and "/compare/" in args[2]:
-            return FIX_COMPARE if compare is None else compare
-        # The base-tip read (#98) every reviewed round makes. Answered here for
-        # the same reason the PR-view call is: left unanswered it degrades to a
-        # `config_notes` entry saying the base tip could not be read, which is a
-        # note that never happened (128-F09).
-        if args[:2] == ["gh", "api"] and "/git/ref/heads/" in args[2]:
-            return _base_tip()
-        return PR_DIFF
+    # One shared double (conftest.gh_stub) rather than a bespoke one: it knows
+    # every `gh` call panel.py makes, so a call added later is answered here
+    # instead of falling through and degrading the round in silence (128-F09).
+    fake_sh = gh_stub(
+        meta={"title": "feat: mirror", "additions": 20, "deletions": 2,
+              "headRefOid": head},
+        head_moves_to=moves_to,
+        compare=FIX_COMPARE if compare is None else compare,
+        diff=PR_DIFF)
 
     def fake_review(name, model, prompt, effort=""):
         # Only the first seat files, so two seats do not produce two canonical

@@ -28,18 +28,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
+from conftest import gh_stub  # noqa: E402
 
 
-#: The base branch's live tip, as `gh api repos/…/git/ref/heads/…` returns it.
-#: Every reviewed round reads this (#98). A stub that does not answer it does not
-#: fail — `_base_tip_now` swallows the error and the round appends "the tip of
-#: base branch could not be read" to `config_notes`. That is a note about a
-#: failure that never happened, and it goes unnoticed because these modules
-#: assert on other things; it was found by instrumenting the note, not by a red
-#: test (128-F09). Answer it, so what is in `config_notes` is what the panel
-#: actually decided.
-def _base_tip(sha: str = "basetip0000000000000000000000000000000a") -> str:
-    return json.dumps({"object": {"sha": sha}})
 
 
 
@@ -183,9 +174,7 @@ def _gh(monkeypatch, meta_json: str, reviewers: dict) -> None:
         "github": "o/r", "path": "/tmp/r", "reviewers": reviewers,
         "review_panel": {"skip_title_patterns": ["^Merge "]},
     })
-    monkeypatch.setattr(panel, "sh",
-                        lambda args, **k: meta_json if "view" in args
-                        else _base_tip() if "/git/ref/heads/" in args[-1] else "diff")
+    monkeypatch.setattr(panel, "sh", gh_stub(meta=json.loads(meta_json), diff="diff"))
 
 
 META_FILES = [{"path": "app/api/reviews.py", "additions": 120, "deletions": 4},
