@@ -237,7 +237,9 @@ Previously: **v2.31** — the board allocates release numbers and merge claims a
 resource-keyed lease table (schema revision 0019). Announcing a number on the board was falsified as
 a remedy nine times in two days: every agent was correct from what it could see, and an announcement
 does not force the next one to look. Asking does. Advisory, never a lock — it cannot stop a merge,
-only tell you who is already landing. (**v2.30** is claimed by PR #123, still open.)
+only tell you who is already landing. Before it, **v2.30** (repo tooling) — `scripts/migration_reconcile.py`, so two branches
+both minting migration `0018` is caught before it lands rather than after: renumbered when the
+branch's migrations are one linear chain, and stopped when they are not.
 Before it, **v2.29** — a panel round records both ends of what it was judged against, not just
 the commit it read: the merge base its diff was built from, and the base branch's tip at the time
 (schema revision 0018). The two are separate because GitHub's `baseRefOid` is the merge base, and a
@@ -327,11 +329,10 @@ the other way):
   base branch cannot move a common ancestor — PR #87 held one value across ten commits of `main` —
   so a staleness check resting on it alone would report "the review still stands" in exactly the
   case it exists to catch. Stamped and published; what a moved base MEANS is #96's verdict.
-- **v2.32** — reviewers are told whether CI passed. The panel already computed it on every round and
-  discarded it before anyone reviewed, so seats spent `could_not_assess` entries on questions a green
-  suite settles — and each of those is a `coverage_veto` line, which costs the ROUND its confident
-  stop. CI is now read before the seats are dispatched rather than concurrently with them, which is
-  why its answer could never have reached their prompt before.
+- **v2.30** — `scripts/migration_reconcile.py`: two branches both minting migration `0018` is caught
+  before it lands rather than after. Git conflicts on neither (the filenames differ) and a graph-only
+  reconciler calls the merge CLEAN, so the wrong answer was the reassuring one. Renumber-and-relink
+  when the branch's migrations are one linear chain; stop when they are not.
 - **v2.31** — release numbers and merge claims become an ALLOCATION rather than an announcement, off
   one resource-keyed lease table with passive expiry (schema revision 0019). Nine collisions in two
   days made the case: two agents announced the same number one second apart, both correct from what
@@ -342,6 +343,11 @@ the other way):
   that branch may have shipped it. Renumbering is one atomic call rather than a release and a claim —
   both of the collisions that prompted this were renumbers off an earlier one, and doing it in two
   steps reopens the race in the exact window where the namespace is most contended.
+- **v2.32** — reviewers are told whether CI passed. The panel already computed it on every round and
+  discarded it before anyone reviewed, so seats spent `could_not_assess` entries on questions a green
+  suite settles — and each of those is a `coverage_veto` line, which costs the ROUND its confident
+  stop. CI is now read before the seats are dispatched rather than concurrently with them, which is
+  why its answer could never have reached their prompt before.
 - **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
   object store; wire `landed` refs to a cherry-pick helper.
 

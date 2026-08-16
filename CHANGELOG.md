@@ -127,6 +127,65 @@ allocate v0.1 over the top of a live series.
 #46's smaller half (the check that the number agrees with itself across four files) shipped in v2.21;
 this is its larger half. Schema revision **0019**.
 
+## v2.30 — two branches could both write migration 0018 and the merge looked clean
+
+`migrations/versions/` is a hand-numbered linear chain: `0017_review_provenance.py` declares
+`revision = "0017"` and `down_revision = "0016"`. Several agents work this repo at once, so the
+first two branches to need a schema change both read the chain, both see `0017`, and both write
+`0018`. Each was correct at the moment it looked — the same shape as the six release-number
+collisions in #46, on a namespace where the cost is higher.
+
+It costs two things at once, and only the first is the well-known one:
+
+* **Two Alembic heads.** `alembic upgrade head` refuses to run, and the deployed database is left
+  unable to advance.
+* **A duplicate revision id**, which is the half specific to numbering revisions by hand. The
+  filenames differ (`0018_run_files.py` and `0018_base_sha.py`), so git conflicts on neither and
+  both land. What arrives on `main` is two different migrations claiming one revision id.
+
+The second is worse than it sounds, because the obvious tool reports it as safe. lexray solved the
+two-heads problem with `scripts/migration_reconcile.py` and lexray's revisions are hash-named, so
+two branches there can never pick the same id — the case does not exist and nothing looks for it.
+Run that reconciler against this graph and it answers **noop, merge is graph-clean**: id `0018` is
+present at both refs with the same `down_revision`, so nothing appears rewritten, and the branch's
+real work is excluded from the "new migrations" set as already-present. The reassuring answer is
+the wrong one, and it is the answer a caller gets by porting the donor unchanged.
+
+So this release adds quarterback's own `scripts/migration_reconcile.py`, with the three verbs
+lexray's has — `preflight`, `apply`, `heads` — so a pre-land gate (#96) can treat both repos
+identically, and one resolution lexray's does not have:
+
+* **renumber-and-relink.** The contested migration is renamed onto the next free chain position,
+  its `revision` and `down_revision` are rewritten, and the integration ref's own copy is left
+  exactly where it is. `apply` writes the working tree and never commits.
+* **collision separated from rewrite.** Same id with differing content is ambiguous on its own: it
+  is either two branches minting one number, or one branch editing a migration that is already
+  merged. They want opposite treatment — renumber the first, refuse the second, and renumbering a
+  rewrite would fork one migration into two. The revisions present at the **merge base** separate
+  them, so the tool asks git rather than guessing. With no merge base to consult it falls back to
+  file paths and assumes a shared path is a rewrite, which is the conservative half.
+* **a number that is merely behind is treated as a collision that has not happened yet.** A branch
+  holding `0018` while the integration head is already `0020` has no contested id today and the
+  same defect: its number no longer states its position. Same resolution, one merge earlier.
+* **prose is reported, never rewritten.** A migration's docstring quotes its own number, and so
+  does the CHANGELOG. Renumbering leaves both stale. `preflight` and `apply` print every such line
+  with its file and line number; neither edits it. The tool rewrites assignments it can parse.
+* **a collision the tool cannot renumber stops, rather than falling back to a merge.** `alembic
+  merge heads` adds a merge revision; it renumbers nothing, so it cannot turn two migrations
+  claiming `0018` into two ids. When the branch's migrations are not one linear chain, or an id in
+  the contested chain carries no number to work from, that is a STOP for a human — offering the
+  merge fallback there would be a GO on a graph that is still broken.
+* **a duplicate that has already landed is refused at the door.** Once both `0018`s are on one ref,
+  every structure keyed by revision id folds them into a single node: heads come back as one, the
+  merge reads clean, and `alembic upgrade head` then refuses to load the graph. Reading the
+  migrations at a ref makes id-uniqueness structural — two files claiming one id is an error there,
+  not a check some later caller might forget.
+
+Everything is computed from the migration files **at a git ref, never from a live database**. The
+deployed board is at whatever revision the last Portainer deploy left it and no local database need
+agree, so a resolution valid only from one starting revision is not a resolution.
+
+Repo tooling: the board schema is untouched and the served version stays 2.26.0.
 ## v2.29 — a round said which commit it read and never which one it was judged against
 
 v2.26 gave a run its `head_sha` and its own migration named what was still missing: "#98 wants the
