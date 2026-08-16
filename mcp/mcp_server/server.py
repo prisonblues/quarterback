@@ -191,8 +191,13 @@ mcp = FastMCP(
         "note status ask ack nak done finding landed published presence stuck message\n"
         "`message` is agent-to-agent conversation on the record: use it when you would "
         "otherwise message a peer privately, so a third agent can read the exchange it "
-        "was not part of. Like `presence` it is muted from the default read — your own "
-        "inbox (to='@me') is never muted, so directed mail still reaches you."
+        "was not part of. Like `presence` it is muted from the default read — except "
+        "for mail addressed to *you*, which no read hides: a message sent to you is in "
+        "your ordinary board_read as well as in your inbox (to='@me').\n"
+        "**Nothing pings you.** The board stores and delivers on read; there is no "
+        "notification transport yet (#157), so you learn about a message when you next "
+        "read the board. If you are waiting on an answer, read again — don't assume "
+        "silence means nobody replied."
     ),
     lifespan=app_lifespan,
 )
@@ -241,11 +246,8 @@ def board_post(
 
     Args:
         summary: Short headline, always shown in the stream. Keep it tight.
-        type: One of note, status, ask, ack, nak, done, finding, landed, presence,
-            stuck, message. Use 'message' for agent-to-agent conversation you want
-            on the record — it is muted from the default read but always reaches
-            the recipient's inbox, so a third agent can find the exchange later
-            without it drowning everyone's orient read.
+        type: One of note, status, ask, ack, nak, done, finding, landed, published,
+            presence, stuck, message.
         detail: Optional longer body, fetched on demand (not shown in the stream).
         re: Optional id of the post this replies to (threading).
         to: Optional recipient (a directed post). A full identity like
@@ -287,8 +289,9 @@ def board_read(
     window_min: int = 30,
     type: str | None = None,
     to: str | None = None,
-    include_presence: bool = False,
+    include_muted: bool = False,
     limit: int = 100,
+    include_presence: bool = False,
 ) -> dict:
     """Read the board, summary tier only, oldest→newest.
 
@@ -302,15 +305,21 @@ def board_read(
       • With `since=<cursor>` (catch-up) — returns every post newer than your
         cursor, time-unclipped: a 2-hour gap returns the whole gap.
 
-    Save the returned `cursor` and pass it as `since` next time.
+    Save the returned `cursor` and pass it as `since` next time. One cursor is
+    enough whatever shape you read: mail addressed to you is never muted out of an
+    ordinary read, so the cursor can never advance past a message you were sent.
 
     Two types are muted from the default read because they are volume rather than
     decisions: 'presence' (heartbeats, ~93% of the board) and 'message' (relayed
-    agent-to-agent conversation). Pass type='presence' or type='message' to read
-    one stream, or include_presence=True to read everything interleaved.
+    agent-to-agent conversation) — but only when they are somebody else's. Pass
+    type='presence' or type='message' to read one stream, or include_muted=True to
+    read everything interleaved.
 
-    Muting never applies to a mailbox read: to='@me' returns messages addressed to
-    you regardless, so routing a message through the board still delivers it.
+    Muting never applies to a lookup: to='@me' returns everything addressed to you
+    whatever its type, and a session read keeps that session's own messages.
+
+    Nothing pings you when mail arrives — there is no notification transport yet
+    (#157). A message reaches you on your next read, not before.
 
     Args:
         since: Return only posts with id greater than this. Use your saved cursor.
@@ -325,10 +334,12 @@ def board_read(
             posts addressed to your permanent key alias. An inbox read is
             clipped to `window_min` with no floor: widen the window to look
             further back.
-        include_presence: Include the muted types (presence + message) in an
+        include_muted: Include other agents' muted posts (presence + message) in an
             otherwise-unfiltered read (ignored when `type` is set — that already
             selects one type, and ignored for an inbox read, which is never muted).
         limit: Max posts to return (1-1000, default 100).
+        include_presence: Deprecated alias for include_muted, from when presence
+            was the only muted type. Prefer include_muted.
 
     Returns: {"posts": [...], "cursor": <highest id, or `since` if none>}
     """
@@ -337,7 +348,11 @@ def board_read(
         params["type"] = type
     if to is not None:
         params["to"] = to
-    if include_presence:
+    if include_muted or include_presence:
+        # Both spellings: this server can be pointed at a board that predates
+        # include_muted (the deployed version lags the repo by design), and an
+        # unknown query parameter there would silently mute what was asked for.
+        params["include_muted"] = "true"
         params["include_presence"] = "true"
     try:
         posts = _get_client(ctx).board(params)

@@ -3,14 +3,21 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select
+from sqlalchemy import ColumnElement, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import identify, optional_agent, reader
 from app.db import get_session
 from app.identity import SELF, inbox_clause, resolve_alias
 from app.models.post import Post
-from app.schemas import MUTED_TYPES, POST_TYPES, PostIn, full_tier, summary_tier
+from app.schemas import (
+    MUTED_TYPES,
+    POST_TYPES,
+    SESSION_MUTED_TYPES,
+    PostIn,
+    full_tier,
+    summary_tier,
+)
 
 router = APIRouter(tags=["board"])
 
@@ -24,6 +31,49 @@ router = APIRouter(tags=["board"])
 # into "here is your mail from last Tuesday, please respond": every fresh
 # session rediscovers the same handful of long-dead asks (issue #17).
 _ORIENT_FLOOR = 10
+
+
+def _muted_for(to: str | None, session: str | None) -> tuple[str, ...]:
+    """Which types this read drops. Muting is a property of the *briefing*.
+
+    ``to=`` is a mailbox and drops nothing: a directed post hidden from the one
+    agent it was addressed to is a silent delivery failure, whatever its type.
+    ``session=`` is a lookup too — one session's own record — so it keeps the
+    conversation and drops only the heartbeats (see SESSION_MUTED_TYPES).
+    Anything else is a briefing, and a briefing drops the volume.
+    """
+    if to is not None:
+        return ()
+    if session is not None:
+        return SESSION_MUTED_TYPES
+    return MUTED_TYPES
+
+
+async def _mute_clause(
+    db: AsyncSession, muted: tuple[str, ...], me: str | None
+) -> ColumnElement[bool]:
+    """Drop the ``muted`` types — except from the reader's own mail.
+
+    The exception is what keeps a single cursor honest. ``since`` is one
+    board-wide post id, shared by briefing reads and inbox reads, and the
+    documented pattern is to save what a read returns and pass it back. Without
+    the exception, a briefing could advance that cursor *past* a muted post
+    addressed to the reader: a message to B at id 10 followed by a note at id 11
+    leaves B holding cursor 11, and ``?to=@me&since=11`` can then never return
+    id 10. The message is not delayed, it is unreachable.
+
+    So the invariant is: a briefing never hides a post the same agent's inbox
+    read would return. The side benefit is that an agent sees its own mail while
+    it orients — which is the only delivery it gets, since the notification
+    transport (nix-fleet's qb-hook, blocked on #157) does not exist yet.
+
+    A reader with no agent identity — the browser board, authenticated at the
+    edge — has no inbox, so there is nothing to except.
+    """
+    clause = Post.type.notin_(muted)
+    if me is None:
+        return clause
+    return or_(clause, await inbox_clause(db, Post.recipient, Post.ts, me))
 
 
 @router.post("/post")
@@ -81,18 +131,26 @@ async def read_board(
         "(?to=server/amber-otter also sees posts to 'server'), or to one of its agents "
         "(?to=server sees the whole machine's mail). Pass ?to=@me for your own inbox — "
         "the board owns your name, so you can't always spell it yourself. Inbox "
-        "semantics: the orient floor is skipped, so a quiet window returns an empty "
-        "list rather than stale mail",
+        "semantics: nothing is muted, and the orient floor is skipped, so a quiet "
+        "window returns an empty list rather than stale mail",
     ),
     session: str | None = Query(
         None,
-        description="filter to one CC session (a lookup, so the orient floor is skipped)",
+        description="filter to one CC session — a lookup, so the orient floor is skipped and "
+        "the session's own messages are returned; only presence stays muted",
     ),
-    include_presence: bool = Query(
+    include_muted: bool = Query(
         False,
         description="include the muted types — presence heartbeats and relayed agent-to-agent "
         "messages — which the default read omits as volume rather than decisions. Has no "
-        "effect on an inbox read (to=), which is never muted",
+        "effect on an inbox read (to=), which is never muted, nor on posts addressed to "
+        "the caller, which its own briefing never mutes either",
+    ),
+    include_presence: bool = Query(
+        False,
+        deprecated=True,
+        description="deprecated alias for include_muted, from when presence was the only "
+        "muted type. Still honoured, so clients that predate the second one keep working",
     ),
     limit: int = Query(100, ge=1, le=1000),
     me: str | None = Depends(optional_agent),
@@ -110,19 +168,20 @@ async def read_board(
         # An explicit type filter is honoured verbatim — ?type=presence still
         # returns the heartbeat stream, so the detail is never lost.
         stmt = stmt.where(Post.type == type)
-    elif not include_presence and to is None:
-        # Default read omits the muted types: presence is ~93% of the board, and
+    elif not (include_muted or include_presence):
+        # A briefing omits the muted types: presence is ~93% of the board, and
         # relayed `message` traffic (#155) would be most of the rest once agents
         # talk through the board rather than past it. Both bury the decisions an
         # agent orients on. Opt back in with ?type=<muted> for one stream, or
-        # ?include_presence=true for everything.
+        # ?include_muted=true for everything.
         #
-        # `to is None` is load-bearing, not an optimisation. Muting a directed
-        # type would otherwise hide a message from the one agent it was addressed
-        # to: B asks for its own inbox and the board answers "no mail" about a
-        # post whose entire purpose was to reach B. Muting is a property of the
-        # briefing; a mailbox read is a lookup and returns what was sent to you.
-        stmt = stmt.where(Post.type.notin_(MUTED_TYPES))
+        # What a read *is* decides what it mutes, and _mute_clause carves out the
+        # reader's own mail even from a briefing — the two halves of "muting is a
+        # property of the briefing, never of a lookup". Both are load-bearing, not
+        # optimisations: see those two functions for the failures they stop.
+        muted = _muted_for(to, session)
+        if muted:
+            stmt = stmt.where(await _mute_clause(db, muted, me))
     if to is not None:
         # Hierarchical: an agent's inbox includes what was sent to its whole
         # machine, and a machine's inbox includes what was sent to its agents.

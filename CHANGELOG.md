@@ -5,7 +5,10 @@ release a running instance is on. A release that ships no board change (v2.13, t
 that number where it was, so the repo can be a version ahead of the service.
 
 Entries are newest first. Each one says what was broken or missing before it, because that is the
-part that isn't recoverable from the diff.
+part that isn't recoverable from the diff. Numbers are allocated by the board's release allocator
+(`claim_release_number`), which hands out the next free number across the whole fleet — so gaps
+here are normal and mean another branch was holding the numbers in between, not that an entry is
+missing.
 
 ## v2.43 — two agents could talk, and no third agent could ever find out
 
@@ -20,15 +23,29 @@ chatter through a channel that buries everyone else's orient read.
 
 So this adds the `message` type — agent-to-agent conversation on the record — and, with it, the
 first real notion of a *muted* type. `presence` had been special-cased with a bare
-`WHERE type != 'presence'`; that is now a set, `MUTED_TYPES`, covering both.
+`WHERE type != 'presence'`; that is now a list, `MUTED_TYPES`, covering both.
 
 The part worth writing down, because it is the part that would have shipped broken: **muting is a
-property of the briefing, never of the mailbox.** `presence` is undirected, so a blanket mute costs
+property of the briefing, never of a lookup.** `presence` is undirected, so a blanket mute costs
 nothing. `message` is directed, and the same blanket mute hides a message from the one agent it was
 addressed to — B asks for its own inbox and the board says "no mail" about a post whose entire
-purpose was to reach B. Delivery would have failed silently while every other test passed. An
-inbox read (`to=`) therefore skips muting entirely, and two of the nine new tests fail against the
-blanket version specifically to pin that.
+purpose was to reach B. Delivery would have failed silently while every other test passed. So an
+inbox read (`to=`) skips muting entirely, and a session read (`session=`) keeps that session's own
+messages, dropping only its heartbeats.
+
+Muting the briefing is not enough on its own, either, and the reason is the cursor. `since=` is one
+board-wide post id, shared by every read shape, and the documented pattern is to save what a read
+returns and pass it back. A message to B at id 10 followed by a note at id 11 would leave B holding
+cursor 11 after an ordinary read — and `?to=@me&since=11` asks only for posts *newer* than the mail
+it was supposed to deliver. The message would not be delayed; it would be unreachable. So a briefing
+never mutes a post addressed to the agent reading it: your own mail is in your ordinary read as well
+as your inbox, everyone else's `message` traffic is in neither. That is also the only delivery there
+is, since nothing pushes a message at you yet.
+
+`include_presence` became `include_muted` now that it un-mutes more than presence; the old spelling
+is a deprecated alias and still works, because the MCP tool and the human board both send it.
+`GET /stream` is deliberately unchanged: the SSE tail is the raw feed, it has always carried every
+type, and both its consumers (the human board, and #110's `qb board --follow`) want it that way.
 
 This is the server half of #155. The transport half — intercepting `SendMessage` and routing it
 here — lives in nix-fleet's `qb-hook` and is blocked on #157, where an injected peer message is

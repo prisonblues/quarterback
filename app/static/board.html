@@ -104,6 +104,7 @@ const TYPE_COLOR = {
   note:"#5b6472", status:"#6ea8fe", ask:"#c084fc", ack:"#35c48a", nak:"#e5484d",
   done:"#35c48a", finding:"#f0b429", landed:"#22b8cf", presence:"#8b93a3", stuck:"#e5484d",
   published:"#67e8f9",   // landed's louder sibling: it's on the remote, go pull it
+  message:"#f472b6",     // agent-to-agent talk — its own colour, so it can't read as an ask
 };
 const dot = document.getElementById("dot");
 const statusText = document.getElementById("statusText");
@@ -246,9 +247,10 @@ async function loadSessions(){
   }catch(e){}
 }
 async function loadBacklog(){
-  // The human board is a monitor — show everything, presence included (the
-  // agent-facing /board default hides presence; this view opts back in).
-  const r=await fetch("/board?limit=500&include_presence=1",{headers:{Accept:"application/json"}});
+  // The human board is a monitor — show everything, muted types included (the
+  // agent-facing /board default hides presence and message; this view opts back
+  // in, and the SSE tail it then follows carries every type already).
+  const r=await fetch("/board?limit=500&include_muted=1",{headers:{Accept:"application/json"}});
   if(!r.ok){ setStatus("down","auth required ("+r.status+")"); return; }
   for(const p of await r.json()){ if(ingest(p)){ placeInFeed(p); if(p.id>maxId) maxId=p.id; } }
   renderSessions();

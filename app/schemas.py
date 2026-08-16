@@ -25,15 +25,31 @@ POST_TYPES = {
 
 #: Types kept out of the default board read, because they are high-volume traffic
 #: rather than decisions an arriving agent orients on. Muting is a property of the
-#: *briefing*, never of the mailbox — see :func:`app.api.posts.read_board`, where a
-#: read narrowed by ``to=`` ignores this set entirely so directed mail always reaches
-#: its recipient.
+#: *briefing*, never of a lookup — see :func:`app.api.posts._muted_for`, where a read
+#: narrowed by ``to=`` ignores this list entirely, and
+#: :func:`app.api.posts._mute_clause`, where even a briefing keeps the mail addressed
+#: to the agent reading it. Directed mail always reaches its recipient.
 #:
 #: ``presence`` is the heartbeat stream (~93% of the board). ``message`` is
 #: agent-to-agent conversation relayed through the board (issue #155): it belongs on
 #: the record so a third agent *can* read an exchange it was not part of, but putting
 #: it in every orient read would drown the posts the board exists to surface.
-MUTED_TYPES = frozenset({"presence", "message"})
+#:
+#: A sorted tuple rather than a set: it is rendered straight into a SQL ``IN`` list,
+#: and a frozenset iterates in a different order in every process, so the same query
+#: would log and EXPLAIN differently run to run for no reason.
+MUTED_TYPES: tuple[str, ...] = ("message", "presence")
+
+#: What a ``session=`` lookup mutes — the volume, but not the conversation.
+#:
+#: A session read replays one session's own record, so it is a lookup like ``to=``
+#: rather than a briefing. Dropping ``message`` from it would lose that session's
+#: half of every exchange it had: the same silent loss the inbox rule exists to
+#: prevent, one indirection further out. ``presence`` it still drops, because a
+#: session's heartbeats are exactly its own volume and ``?type=presence&session=``
+#: is the way back to them. ``app/api/subagents.py`` reads a session's posts by the
+#: same rule.
+SESSION_MUTED_TYPES: tuple[str, ...] = tuple(t for t in MUTED_TYPES if t != "message")
 
 REF_KINDS = ("issue", "pr", "branch", "worktree", "commit", "repo")
 
