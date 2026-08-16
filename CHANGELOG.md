@@ -39,11 +39,19 @@ stamper would *not* rewrite is a refusal, not a shrug.
 **Two branches can still stamp the same number, and the tool's job is to make that impossible to
 miss rather than impossible.** Once `apply` has run the placeholder is gone, so there is no
 automatic re-stamp — what there is instead is detection of both shapes the collision takes: a
-release number declared twice in one CHANGELOG (what "keep both sides" leaves behind, and a
-perfectly clean merge otherwise), and a branch carrying a number that already exists at the base
-under a different title. `preflight`, `apply` and `check` all refuse on those, and the message says
-the repair: put your entry back to `## vNEXT` and run `apply` again. Two tokens, because nothing
-else on the branch was ever written in terms of the number.
+release number declared twice (what "keep both sides" leaves behind, and a perfectly clean merge
+otherwise), and a branch carrying a number it ADDED which already exists at the base. `preflight`
+and `apply` refuse on both. `check` refuses on the first only, over CHANGELOG headings and README
+bullets alike, because it deliberately takes no base ref — the guard runs on an integration branch
+that may have no upstream configured, and one that errored on a missing ref would report the same
+exit code as the defect it looks for. The message says the repair: put your entry back to
+`## vNEXT` and run `apply` again. Two tokens, because nothing else on the branch was ever written
+in terms of the number.
+
+Whether a number was *added* by the branch is asked of the fork point rather than of the heading
+text. Text equality is wrong in both directions: two branches that both wrote a boilerplate title
+share a number and read as no collision, while fixing a typo in an entry that shipped last month
+reads as one.
 
 This is not a second allocator, and #46/#99's `POST /release/claim` is untouched — and is now
 described for what it is, an announcement rather than a reservation: the stamper does not read it,

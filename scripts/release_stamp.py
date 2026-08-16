@@ -20,9 +20,15 @@ because `origin/main` is sitting right there:
     release_stamp.py apply                # rewrite the worktree (never commits)
     release_stamp.py check                # is anything unstamped? (the post-merge guard)
 
-The number is `max(release headings at --onto) + 1`, or `(major + 1).0` under `--major`,
-which is the one part a tool cannot infer. It is computed from the CHANGELOG at a git ref
-and from nothing else — not from a live board, not from the local checkout's own history.
+The number is `max(release headings at --onto) + 1`. It is computed from the CHANGELOG at a
+git ref and from nothing else — not from a live board, not from the local checkout's own
+history.
+
+`--major` is the one part no ref can answer. Whether v3 or v2.34 follows v2.33 is a statement
+about what the release MEANS, so it is an explicit flag and never an inference: `apply
+--major` stamps `(major + 1).0` — v2.33 becomes v3, and the served version becomes 3.0.0. The
+flag has to exist, or the next major gets hand-written outside this mechanism and the
+placeholder convention is quietly opted out of on the one release that most needs it.
 
 ## When two branches stamp the same number
 
@@ -33,8 +39,11 @@ pretend otherwise; what it does instead is make the collision impossible to miss
 
   * both branches carry `## v2.34`, the merge conflicts on the CHANGELOG, you keep both
     sides, and `preflight`/`apply`/`check` all refuse on the duplicate heading;
-  * or you have not merged yet, and `preflight`/`apply` refuse because the number your
-    branch carries already exists at `--onto` under a different title.
+  * or you have not merged yet, and `preflight`/`apply` refuse because a number this branch
+    ADDED — one its fork point did not have — already exists at `--onto`. Asked that way
+    round, editing a released entry's title is not a collision and a shared boilerplate
+    title is not a free pass; `check` cannot ask it at all, because it deliberately takes no
+    base ref, so `check` sees the duplicate-heading shape and only that one.
 
 Either way the repair is: put YOUR entry back to `## vNEXT` (and its README bullet back to
 `- **vNEXT** — …`), then run `apply` again. Two tokens, because nothing else in the branch
@@ -54,8 +63,17 @@ human coordinate; do not rely on it to keep a number free.
 
 Only tracked **markdown**, and only where a release is NAMED:
 
-  * a heading — `## vNEXT — …`
-  * a bold run — `- **vNEXT** — …`, `**vNEXT.**`, `**vNEXT — …**`
+  * a heading of any level — `## vNEXT — …`, `#### vNEXT — …`
+  * a bold run, in all three of markdown's spellings for it — `**vNEXT**`, `__vNEXT__`,
+    `***vNEXT***` — with anything or nothing after the token: `**vNEXT.**` and
+    `- **vNEXT — …**` are both legal. An author who writes the underscore spelling has
+    written a real placeholder, not a mistake, and refusing it would stop a correct branch
+    over a punctuation preference.
+
+`*vNEXT*` (single asterisk) is EMPHASIS, not a bold run, and is a refusal rather than a site:
+it does not read as a release entry, and one character is too small a difference to guess
+across. `**vNEXT.1**` is a refusal too — three-component versions are not something this tool
+knows how to number, so it will not stamp half of one and leave the `.1` behind.
 
 Occurrences inside a fenced block or an inline code span are documentation OF this
 mechanism (this file's own README section writes ``vNEXT`` a dozen times) and are left
@@ -100,6 +118,8 @@ import json
 import re
 import subprocess
 import sys
+import tomllib
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -128,6 +148,14 @@ _V = rf"v(\d+)(?:\.(\d+))?{_END}"
 _HEADING = re.compile(rf"^##[ \t]+{_V}", re.MULTILINE)
 _HEADING_PLACEHOLDER = re.compile(rf"^##[ \t]+{PLACEHOLDER}{_END}", re.MULTILINE)
 
+#: `- **v2.33** — …` in the README's release list. The bold run has to CLOSE immediately after
+#: the number, which is what keeps the roadmap-style `- **v3 (next)** —` and range entries like
+#: `- **v1 to v2.1** —` out: they are not a release the tool stamped, and reading them as one
+#: would report a duplicate against an entry that has not shipped. `check` scans these because
+#: the bullets are stamped independently of the headings — a merge that kept both sides of the
+#: README list and only one side of the CHANGELOG is a duplicate nothing else could see.
+_README_BULLET = re.compile(rf"^-[ \t]+\*\*{_V}\*\*", re.MULTILINE)
+
 #: Where a placeholder is legal, and therefore where it gets rewritten: a markdown heading
 #: of any level, or the opening of a bold run. Group 1 is the token itself, so the rewrite
 #: is a span replacement and the surrounding syntax is never reconstructed.
@@ -152,34 +180,72 @@ _SITE = re.compile(
     re.MULTILINE,
 )
 
-#: Any mention at all, for the "you wrote it somewhere I will not rewrite" check. Bounded the
-#: same way as a site rather than by `\b`, so the two agree about where a token starts and
-#: ends — a mention `_SITE` can see but `_MENTION` cannot is one that neither stamps nor stops.
+#: Any mention at all, for the "you wrote it somewhere I will not rewrite" check.
+#:
+#: NOT bounded identically to `_SITE`, and the difference is load-bearing rather than an
+#: oversight: `_SITE_END` also rejects `.\d`, this one does not. That asymmetry is the whole
+#: reason `**vNEXT.1**` is a LOOSE MENTION — a placeholder written in a shape nothing will
+#: rewrite, which is a refusal with a line number — instead of a token neither pattern can
+#: see, which would ship the literal string. Making the two patterns agree would delete that
+#: refusal silently, so do not "fix" this into symmetry.
 _MENTION = re.compile(rf"(?<![0-9A-Za-z]){PLACEHOLDER}(?![0-9A-Za-z])")
 
-#: `version = "2.33.0"`, keeping whatever trails it (there is a comment). Scoped by the
-#: caller to pyproject.toml's `[project]` table — see `project_table`, which explains why a
-#: file-wide search is the wrong thing.
-_PYPROJECT_VERSION = re.compile(r'(?m)^(version[ \t]*=[ \t]*")\d+\.\d+\.\d+(")')
+#: `version = "2.33.0"` or `version = '2.33.0'`, keeping whatever trails it (there is a
+#: comment). TOML gives basic and literal strings equal standing, and a file using the
+#: single-quoted spelling was invisible here — reported as "0 version lines" about a file
+#: whose version is present and correct. The closing quote is a backreference, so the two
+#: spellings cannot be mixed. Scoped by the caller to pyproject.toml's `[project]` table —
+#: see `project_table`, which explains why a file-wide search is the wrong thing.
+_PYPROJECT_VERSION = re.compile(
+    r"(?m)^(version[ \t]*=[ \t]*(?P<q>[\"']))(?P<v>\d+\.\d+\.\d+)(?P=q)"
+)
 
-#: The header line of any TOML table, used to bound `[project]`.
-_TOML_TABLE = re.compile(r"(?m)^[ \t]*\[")
+#: The header line of any TOML table, used to bound `[project]`. A bare `^[ \t]*\[` also
+#: matches a continuation line of a wrapped array whose element starts with `[`, which would
+#: end the `[project]` span early and report "0 version lines" about a correct file — so the
+#: whole header shape is required: brackets that close, on a line with nothing after them but
+#: an optional comment. `pyproject_versions` cross-checks the answer against `tomllib`
+#: anyway, because a regex over raw text cannot see that a `[project]`-looking line is really
+#: the inside of a multi-line string.
+_TOML_KEY = r"(?:[A-Za-z0-9_-]+|\"[^\"\n]*\"|'[^'\n]*')"
+_TOML_TABLE = re.compile(
+    rf"(?m)^[ \t]*\[\[?[ \t]*{_TOML_KEY}(?:[ \t]*\.[ \t]*{_TOML_KEY})*[ \t]*\]\]?"
+    r"[ \t]*(?:#.*)?$"
+)
 _PROJECT_TABLE = re.compile(r"(?m)^[ \t]*\[project\][ \t]*(?:#.*)?$")
 
-#: One argument of a call, with quoted strings and one level of parens treated as ATOMS.
+#: One Python string literal, every spelling, as a single ATOM. Escapes are honoured: a
+#: `description="… version=\"8.8.8\" …"` whose atom ended at the escaped quote would let the
+#: text inside the literal read as a real keyword argument, and `--serve` would rewrite prose
+#: while leaving the served version where it was — and report success.
+_STR = (
+    r'"""(?:\\[\s\S]|(?!""")[^\\])*"""'
+    r"|'''(?:\\[\s\S]|(?!''')[^\\])*'''"
+    r'|"(?:\\[\s\S]|[^"\\\n])*"'
+    r"|'(?:\\[\s\S]|[^'\\\n])*'"
+)
+
+#: One argument of a call, with string literals and one level of parens treated as ATOMS.
 #: That is what keeps a comma — or the literal text `version="1.0.0"` — inside a `title=` or
 #: `description=` string from reading as a real keyword argument. A `[^()]`-style scan cannot
 #: tell the two apart and would bump a version buried in a docstring while reporting success.
-_ARG = r'(?:"[^"\n]*"|\'[^\'\n]*\'|\([^()]*\)|[^()"\'\n])'
+#:
+#: Newlines are NOT excluded. Excluding them made the atom unable to cross a line, which broke
+#: the canonical Black/Ruff-formatted call — `FastAPI(\n    title=…,\n    version="X.Y.Z",\n)`
+#: — outright: the tool refused a file whose version literal was plainly there. Quoted strings
+#: being atoms is what makes the scan safe; the line boundary was never doing that work.
+_ARG = rf"(?:{_STR}|\((?:{_STR}|[^()])*\)|[^()\"'])"
 
 #: `app = FastAPI(… version="2.33.0" …)`. Bounded to that call's own parentheses, tolerating
-#: one level of nesting, and needing no DOTALL — the same shape (and the same reasoning)
-#: as the fixture in harness/tests/test_release_numbers.py, which explains at length why a
-#: lazy `.*?` version of this silently latches onto the next version literal in the file.
-#: `version` must sit at the start of the call or immediately after a comma, so it is the
-#: keyword argument and not a substring of an earlier one.
+#: one level of nesting and any amount of line-wrapping — the same shape (and the same
+#: reasoning) as the fixture in harness/tests/test_release_numbers.py, which explains at
+#: length why a lazy `.*?` version of this silently latches onto the next version literal in
+#: the file. `version` must sit at the start of the call or immediately after a comma, so it
+#: is the keyword argument and not a substring of an earlier one; the `\s*` after the opening
+#: paren is what lets "the start of the call" be the next LINE, which is where a formatter
+#: puts it.
 _SERVED_VERSION = re.compile(
-    rf'(?m)^app[ \t]*=[ \t]*FastAPI\((?:{_ARG}*?,\s*)?version[ \t]*=[ \t]*"(\d+\.\d+\.\d+)"'
+    rf'(?m)^app[ \t]*=[ \t]*FastAPI\(\s*(?:{_ARG}*?,\s*)?version[ \t]*=[ \t]*"(\d+\.\d+\.\d+)"'
 )
 
 
@@ -205,6 +271,7 @@ class Plan:
     loose: list[Site] = field(default_factory=list)
     untracked: list[Site] = field(default_factory=list)
     symlinked: list[str] = field(default_factory=list)
+    unreadable: list[str] = field(default_factory=list)
     serves: bool = False
     serves_reason: str = ""
     served_from: str = ""
@@ -228,6 +295,7 @@ class Plan:
                 {"path": s.path, "line": s.line, "text": s.text} for s in self.untracked
             ],
             "symlinked": self.symlinked,
+            "unreadable": self.unreadable,
             "serves": self.serves,
             "serves_reason": self.serves_reason,
             "served_from": self.served_from or None,
@@ -262,6 +330,22 @@ def _write(path: Path, text: str, what: str) -> None:
         path.write_text(text, encoding="utf-8")
     except OSError as e:
         raise StampError(f"cannot write {what}: {e.strerror or e}") from e
+
+
+def _linked(repo: Path, rel: str) -> bool:
+    """True if `rel` — or any directory between it and the repo root — is a symlink.
+
+    Checking only the leaf was the whole guard for a while, and it does not hold: a symlinked
+    `app/` or `docs/` passes a leaf-only test and every read and write below it lands wherever
+    the link points, which is the exact escape the leaf check exists to prevent. The repo root
+    itself is `Path.resolve()`d by the commands, so the walk starts inside the repository.
+    """
+    cur = repo
+    for part in Path(rel).parts:
+        cur = cur / part
+        if cur.is_symlink():
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------- git
@@ -326,6 +410,27 @@ def resolve(repo: Path, ref: str) -> str:
     return _git(repo, "rev-parse", "--verify", f"{ref}^{{commit}}").strip()
 
 
+def merge_base(repo: Path, onto: str) -> str:
+    """The commit this branch forked from, as a SHA.
+
+    Run through a raw `subprocess` rather than `_git`, because `git merge-base` exits 1 when
+    there is no common ancestor and `_git` turns any non-zero exit into "git merge-base failed:
+    <stderr>" — which is empty in that case. The sentence below is the one a reader can act
+    on, and routing through `_git` made it unreachable.
+    """
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "merge-base", onto, "HEAD"],
+        capture_output=True, text=True, check=False,
+    )
+    out = proc.stdout.split()
+    if proc.returncode != 0 or not out:
+        raise StampError(
+            f"{onto} and HEAD have no common ancestor, so there is no base to compute this "
+            "branch's changes against. Fetch the ref you are actually merging into"
+        )
+    return out[0]
+
+
 def changed_paths(repo: Path, onto: str) -> list[str]:
     """Everything this branch changes relative to `onto`, INCLUDING the working tree.
 
@@ -340,19 +445,13 @@ def changed_paths(repo: Path, onto: str) -> list[str]:
     because somebody else's release did. That is the inference deciding to bump the served
     version, so getting it backwards ships a version bump nobody wrote.
 
-    `merge-base` without `--all` prints exactly one SHA even for a criss-cross history with
-    several best common ancestors — git picks one rather than listing them — so there is no
-    multi-line case to handle. `split()[0]` anyway: a one-token guard is cheaper than the
-    next reader re-deriving that, and the failure it forecloses (a two-line string handed to
-    `git diff`) surfaces as `fatal: ambiguous argument` rather than as anything readable.
+    `merge_base` takes the first token for a reason worth knowing here: `merge-base` without
+    `--all` prints exactly one SHA even for a criss-cross history with several best common
+    ancestors — git picks one rather than listing them — so there is no multi-line case, and
+    the guard is there because a two-line string handed to `git diff` surfaces as
+    `fatal: ambiguous argument` rather than as anything readable.
     """
-    out = _git(repo, "merge-base", onto, "HEAD").split()
-    if not out:
-        raise StampError(
-            f"{onto} and HEAD have no common ancestor, so there is no base to compute this "
-            "branch's changes against. Fetch the ref you are actually merging into"
-        )
-    base = out[0]
+    base = merge_base(repo, onto)
     diff = _git(repo, "diff", "--name-only", base).split("\n")
     untracked = _git(repo, "ls-files", "--others", "--exclude-standard").split("\n")
     return sorted({p for p in [*diff, *untracked] if p})
@@ -402,6 +501,33 @@ def duplicates_in(text: str, where: str = "") -> list[Release]:
     return sorted({r for r in found if found.count(r) > 1})
 
 
+def bullet_releases(text: str, where: str = "") -> list[Release]:
+    """Every `- **vX[.Y]**` release bullet in the README's list, in file order."""
+    masked = mask_code(text, where)
+    return [release(m.group(1), m.group(2)) for m in _README_BULLET.finditer(masked)]
+
+
+def duplicates_by_file(repo: Path) -> dict[str, list[Release]]:
+    """Repeated release numbers, per file, across both places a release is declared.
+
+    CHANGELOG.md headings AND README.md bullets, because the two are stamped independently
+    and a "keep both sides" merge can leave the duplicate in either. Checking only the
+    CHANGELOG meant two identical README bullets with one clean heading printed `clean: true`
+    from the guard whose entire purpose is catching that merge — while the repo's own
+    invariant suite treated both files as carrying release numbers.
+    """
+    out: dict[str, list[Release]] = {}
+    for path, parse in (("CHANGELOG.md", releases_in), ("README.md", bullet_releases)):
+        full = repo / path
+        if _linked(repo, path) or not full.exists():
+            continue
+        found = parse(_read(full, path), path)
+        dupes = sorted({r for r in found if found.count(r) > 1})
+        if dupes:
+            out[path] = dupes
+    return out
+
+
 def next_release(text: str, major_bump: bool = False, where: str = "") -> Release:
     """One past the highest heading in `text`.
 
@@ -437,8 +563,19 @@ def next_release(text: str, major_bump: bool = False, where: str = "") -> Releas
 #: Indentation is not bounded to CommonMark's three spaces: this repo's command docs put
 #: fenced blocks inside numbered list items, where they are legitimately indented further,
 #: and reading one of those as prose is a worse error than reading a four-space indented
-#: block's stray backticks as a fence.
-_FENCE = re.compile(r"^[ \t]*(`{3,}|~{3,})[ \t]*(.*)$")
+#: block's stray backticks as a fence. The corollary, and it is a real limitation: an
+#: INDENTED code block (four spaces, no fence) is not masked, so a `**vNEXT**` inside one is
+#: a rewritable site. Masking those instead would unstamp every nested list bullet in this
+#: repo's docs, which is the larger error — write fenced blocks, not indented ones.
+#:
+#: A fence may also carry a container prefix: `> ``` ` inside a blockquote, or `- ``` ` as the
+#: first line of a list item. Both are ordinary markdown, and a masker that did not see them
+#: read the block's contents as prose — so a fenced EXAMPLE of a release heading, quoted in a
+#: review comment, would have been stamped as a live placeholder.
+_FENCE = re.compile(
+    r"^(?P<prefix>[ \t]*(?:>[ \t]*)*(?:[-*+][ \t]+|\d+[.)][ \t]+)?)"
+    r"(?P<marker>`{3,}|~{3,})[ \t]*(?P<info>.*)$"
+)
 
 
 def mask_code(text: str, where: str = "") -> str:
@@ -456,17 +593,22 @@ def mask_code(text: str, where: str = "") -> str:
     largest silent blast radius in this file, and the only honest end for it is loud.
     """
     out = list(text)
-    pos, fence, opened_at = 0, None, 0
+    pos, fence, quote, opened_at = 0, None, 0, 0
     for line_no, line in enumerate(text.split("\n"), start=1):
         m = _FENCE.match(line)
-        marker, info = (m.group(1), m.group(2)) if m else (None, "")
+        marker = m.group("marker") if m else None
+        info = m.group("info") if m else ""
+        depth = m.group("prefix").count(">") if m else 0
         inside = fence is not None
         if fence is None:
             if marker:
-                fence, opened_at = marker, line_no
-        # A closer is the same character, at least as long, and carries no info string —
-        # CommonMark's rule, and what makes a longer outer fence able to contain a shorter one.
-        elif marker and marker[0] == fence[0] and len(marker) >= len(fence) and not info:
+                fence, quote, opened_at = marker, depth, line_no
+        # A closer is the same character, at least as long, carries no info string, and sits
+        # at the same blockquote depth — CommonMark's rules, and between them what makes a
+        # longer outer fence able to contain a shorter one and a quoted example unable to
+        # close the block that is quoting it.
+        elif (marker and marker[0] == fence[0] and len(marker) >= len(fence)
+              and not info and depth == quote):
             fence = None
         if inside or marker:  # the fence lines themselves are blanked too
             for i in range(pos, pos + len(line)):
@@ -507,15 +649,21 @@ def _line_of(text: str, offset: int) -> tuple[int, str]:
     return line_no, text[start : end if end != -1 else len(text)].strip()
 
 
-def scan_paths(repo: Path, paths: list[str], skipped: list[str] | None = None
-               ) -> tuple[list[Site], list[Site]]:
+def scan_paths(repo: Path, paths: list[str], skipped: list[str] | None = None,
+               unreadable: list[str] | None = None) -> tuple[list[Site], list[Site]]:
     """(rewritable sites, loose mentions) across the given markdown files.
 
-    Symlinks are not followed. Git tracks a symlink as its target path, so `write_text`
-    through one lands wherever it points — outside the repo, if that is where it points —
-    and a release stamp is not a thing to apply to a file this repo does not own. Skipped
-    paths are appended to `skipped` rather than dropped: the caller reports them, because
-    the failure that matters here is the quiet one.
+    Symlinks are not followed, and neither is a symlinked PARENT. Git tracks a symlink as its
+    target path, so `write_text` through one lands wherever it points — outside the repo, if
+    that is where it points — and a release stamp is not a thing to apply to a file this repo
+    does not own. Skipped paths are appended to `skipped` rather than dropped: the caller
+    reports them, because the failure that matters here is the quiet one.
+
+    `unreadable`, when given, downgrades a per-file refusal (not UTF-8, unterminated fence) to
+    a recorded skip. Tracked markdown passes None and keeps the refusal, because a tracked
+    file in that state stops the release. UNtracked markdown passes a list, because the module
+    contract says untracked markdown is never a STOP — a scratchpad with a stray byte in it
+    must not be able to refuse every branch in the repo.
     """
     sites: list[Site] = []
     loose: list[Site] = []
@@ -524,16 +672,22 @@ def scan_paths(repo: Path, paths: list[str], skipped: list[str] | None = None
         # Symlink BEFORE exists(): `Path.exists()` follows the link and answers False for a
         # broken one, so testing it first drops a broken tracked symlink with no record at
         # all — the same quiet skip this accounting exists to prevent, one edge case along.
-        if full.is_symlink():
+        if _linked(repo, path):
             if skipped is not None:
                 skipped.append(path)
             continue
         if not full.exists():  # deleted in the worktree but still in the index
             continue
-        text = _read(full, path)
-        if PLACEHOLDER not in text:
+        try:
+            text = _read(full, path)
+            if PLACEHOLDER not in text:
+                continue
+            masked = mask_code(text, path)
+        except StampError as e:
+            if unreadable is None:
+                raise
+            unreadable.append(f"{path}: {e}")
             continue
-        masked = mask_code(text, path)
         taken = set()
         for m in _SITE.finditer(masked):
             line_no, line = _line_of(text, m.start(1))
@@ -548,6 +702,17 @@ def scan_paths(repo: Path, paths: list[str], skipped: list[str] | None = None
 
 def scan(repo: Path, skipped: list[str] | None = None) -> tuple[list[Site], list[Site]]:
     return scan_paths(repo, tracked_markdown(repo), skipped)
+
+
+def scan_untracked(repo: Path, skipped: list[str], unreadable: list[str]) -> list[Site]:
+    """Untracked markdown, reported and never stamped — and never a STOP, either.
+
+    One helper because `build_plan` and `cmd_check` both do this and drifted apart: `check`
+    threading no accumulator was how a symlinked untracked file vanished from both commands'
+    output at once, which is the skipped-and-quiet outcome the whole accounting exists to end.
+    """
+    sites, loose = scan_paths(repo, untracked_markdown(repo), skipped, unreadable)
+    return sites + loose
 
 
 def stamp_text(text: str, version: str, where: str = "") -> tuple[str, int]:
@@ -565,21 +730,22 @@ def stamp_text(text: str, version: str, where: str = "") -> tuple[str, int]:
 def _served_files(repo: Path) -> tuple[Path, Path]:
     """The two files that carry the version `GET /openapi.json` reports.
 
-    Refused if either is a symlink, for exactly the reason markdown symlinks are refused:
-    git stores a symlink as its target path, so writing through one lands wherever it
-    points. The markdown scan has always guarded this; these two were read and written with
-    `read_text`/`write_text` and no check at all, which made `--serve` the one way to write
-    outside the repo through a path the repo does not own.
+    Refused if either is a symlink, or sits under one, for exactly the reason markdown
+    symlinks are refused: git stores a symlink as its target path, so writing through one
+    lands wherever it points. The markdown scan has always guarded this; these two were read
+    and written with `read_text`/`write_text` and no check at all, which made `--serve` the
+    one way to write outside the repo through a path the repo does not own. A symlinked
+    `app/` gets there just as well as a symlinked `app/main.py`, so the whole path is walked.
     """
-    main_py, pyproject = repo / "app" / "main.py", repo / "pyproject.toml"
-    for path, name in ((main_py, "app/main.py"), (pyproject, "pyproject.toml")):
-        if path.is_symlink():
+    for name in ("app/main.py", "pyproject.toml"):
+        if _linked(repo, name):
             raise StampError(
-                f"{name} is a symlink. The served version is written in place, and writing "
-                "through a link puts a release stamp wherever it points — which may not be "
-                "this repository. Replace it with a real file, or pass --no-serve"
+                f"{name} is a symlink, or sits under one. The served version is written in "
+                "place, and writing through a link puts a release stamp wherever it points — "
+                "which may not be this repository. Replace it with a real file, or pass "
+                "--no-serve"
             )
-    return main_py, pyproject
+    return repo / "app" / "main.py", repo / "pyproject.toml"
 
 
 def project_table(text: str) -> tuple[int, int] | None:
@@ -589,6 +755,10 @@ def project_table(text: str) -> tuple[int, int] | None:
     The package version is `[project].version` specifically, and the day `[project]` stops
     having one — reworked to a dynamic version, say — a file-wide search does not report
     that, it reports `[tool.something]`'s version instead and bumps it, successfully.
+
+    A span, not a value, because the rewrite is applied by byte offset to the original text —
+    which is what keeps comments and formatting exactly as they were. `declared_version` is
+    the one that answers what the version IS, and `pyproject_versions` makes the two agree.
     """
     m = _PROJECT_TABLE.search(text)
     if not m:
@@ -597,13 +767,65 @@ def project_table(text: str) -> tuple[int, int] | None:
     return m.end(), nxt.start() if nxt else len(text)
 
 
+def declared_version(text: str) -> str | None:
+    """`[project].version` as a real TOML parser reads it, or None if there is not one.
+
+    The line matching above is a regex over raw text and cannot see TOML's own structure: a
+    multi-line string containing lines that look like `[project]` and `version = "9.9.9"` is
+    indistinguishable from the real table, so the tool could rewrite prose inside a string
+    literal and report success. Parsing settles it. The regex still does the LOCATING, because
+    `tomllib` gives values and not offsets and a rewrite that reformatted the file would be a
+    worse tool; this exists so the two answers can be required to match.
+    """
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as e:
+        raise StampError(
+            f"pyproject.toml is not valid TOML ({e}). The served version is written into it, "
+            "and this tool will not rewrite a file it cannot parse"
+        ) from e
+    project = data.get("project")
+    if not isinstance(project, dict):
+        return None
+    version = project.get("version")
+    return version if isinstance(version, str) else None
+
+
 def pyproject_versions(text: str) -> list[re.Match[str]]:
-    """Every `version = "X.Y.Z"` line inside `[project]`, and nowhere else."""
+    """Every `version = "X.Y.Z"` line inside `[project]`, and nowhere else.
+
+    Cross-checked against `declared_version`: if the one line matched is not the value TOML
+    resolves `[project].version` to, then the line found is not the package version — the
+    span was bounded by something that only looks like a table header, or the text is inside
+    a multi-line string — and rewriting it would move the wrong number while reporting
+    success. That is a refusal with a sentence, not a silent zero.
+    """
     span = project_table(text)
     if span is None:
         return []
     start, end = span
-    return list(_PYPROJECT_VERSION.finditer(text[start:end]))
+    found = list(_PYPROJECT_VERSION.finditer(text[start:end]))
+    try:
+        declared = declared_version(text)
+    except StampError:
+        # Not parseable at all. When one line matched, the parse error IS the answer; when
+        # the count is already wrong, "expected exactly 1" names the thing to look at — two
+        # `version =` keys in one table is itself the parse error, said more usefully.
+        if len(found) == 1:
+            raise
+        return found
+    if declared is None:
+        return found  # `[project]` with no version — the caller's message says exactly that
+    if len(found) != 1 or found[0].group("v") != declared:
+        detail = (f"the line matched inside it says {found[0].group('v')!r}"
+                  if len(found) == 1 else f"{len(found)} lines there match")
+        raise StampError(
+            f"pyproject.toml's `[project]` table resolves to version {declared!r}, but "
+            f"{detail}. This tool rewrites that line by byte offset and will not guess which "
+            "text is the package version — look for a multi-line string, a line that only "
+            "looks like a table header, or a version that is not three components"
+        )
+    return found
 
 
 def placeholder_at_ref(repo: Path, ref: str) -> list[str]:
@@ -615,9 +837,15 @@ def placeholder_at_ref(repo: Path, ref: str) -> list[str]:
     number the unstamped entry is going to want. One `git grep` over the ref rather than a
     `git show` per file, then the real masking on the candidates, so a fenced example of
     the convention is not mistaken for a live placeholder.
+
+    `-z`, like every other path-reading git call in this file. Newline-separated output splits
+    a legal path containing a newline into two, and both halves then go to `git show` — which
+    fails with a generic git error instead of the readable sentence this function exists to
+    produce. The `ref:path` prefix survives `-z` (only the RECORD separator becomes NUL), so
+    the split on the first colon still holds.
     """
     proc = subprocess.run(
-        ["git", "-C", str(repo), "grep", "-I", "--name-only", "-e", PLACEHOLDER,
+        ["git", "-C", str(repo), "grep", "-I", "-z", "--name-only", "-e", PLACEHOLDER,
          ref, "--", _MARKDOWN],
         capture_output=True, text=True, check=False,
     )
@@ -628,7 +856,7 @@ def placeholder_at_ref(repo: Path, ref: str) -> list[str]:
             f"git grep at {ref} failed: {proc.stderr.strip() or 'no output'}"
         )
     found = []
-    for line in proc.stdout.split("\n"):
+    for line in proc.stdout.split("\0"):
         if not line:
             continue
         path = line.split(":", 1)[1] if ":" in line else line
@@ -638,7 +866,7 @@ def placeholder_at_ref(repo: Path, ref: str) -> list[str]:
     return sorted(found)
 
 
-def _collision(branch_text: str, onto: str, onto_text: str) -> None:
+def _collision(repo: Path, branch_text: str, onto: str, onto_text: str) -> None:
     """Refuse when this branch's release number is one somebody else has already used.
 
     This is the failure the whole file exists to remove, arriving by the one door the
@@ -647,17 +875,28 @@ def _collision(branch_text: str, onto: str, onto_text: str) -> None:
     placeholder left — the branch says `## v2.34`, `apply` has nothing to rewrite, and
     without this it would print `noop:` and exit 0 on the exact state it was written to catch.
 
-    Two shapes, because the collision surfaces differently depending on whether the branch
-    has taken the merge yet:
+    Three shapes, because the collision surfaces differently depending on whether the branch
+    has taken the merge yet, and because the base can already be in the state too:
 
       * duplicate headings in the branch's own CHANGELOG — the "keep both sides" resolution
         of the conflict, which is the right resolution for the prose and the wrong one for
         the number;
-      * the same number at the branch and at `onto` under a different title — the branch has
-        not merged yet, and the number it stamped has since been handed to someone else.
+      * the same duplicate already present at `onto` — the branch inherited a bad merge and
+        would compound it by stamping on top; the repair is on the base, not here;
+      * a release number this BRANCH ADDED which also exists at `onto` — the branch has not
+        merged yet, and the number it stamped has since been handed to someone else.
 
-    Both repair the same way, and the message says how: put THIS branch's entry back to the
-    placeholder and run `apply` again.
+    "Added by this branch" is the load-bearing part of the third, and it is answered by the
+    merge base rather than by comparing heading TEXT. Text equality gets it wrong in both
+    directions: two genuinely different releases that happen to share a boilerplate title read
+    as no collision at all, while fixing a typo in a released entry's title — rewrapping it,
+    normalising an em dash — reads as one, with a repair message ("put your entry back to
+    `## vNEXT`") that is nonsense for an entry that shipped a year ago. What the merge base
+    answers is the actual question: is this number one this branch is claiming, or one it
+    inherited and is merely editing?
+
+    The repair message says how: put THIS branch's entry back to the placeholder and run
+    `apply` again.
     """
     repair = (
         f"Put THIS branch's entry back to `## {PLACEHOLDER} — …` (and its README bullet back "
@@ -675,24 +914,67 @@ def _collision(branch_text: str, onto: str, onto_text: str) -> None:
             f"wrong for the heading, since one number cannot describe two releases. {repair}"
         )
 
-    onto_titles = dict(release_headings(onto_text, f"{onto}:CHANGELOG.md"))
+    at_base = duplicates_in(onto_text, f"{onto}:CHANGELOG.md")
+    if at_base:
+        named = ", ".join(fmt(r) for r in at_base)
+        raise StampError(
+            f"{onto} itself declares {named} more than once — a "
+            '"keep both sides" merge landed there without being caught. Numbering on top of '
+            f"that compounds it. Fix {onto} first: one of those entries has to go back to "
+            f"`## {PLACEHOLDER} — …` and be re-stamped."
+        )
+
+    inherited = _releases_at_fork(repo, onto)
+    if inherited is None:
+        # No CHANGELOG.md at the merge base, so nothing here can tell which numbers this
+        # branch claimed and which it inherited. Refusing on every shared number would stop
+        # a correct branch; the duplicate checks above still hold, and `check` on main still
+        # catches the state this one is for.
+        return
+    theirs = dict(release_headings(onto_text, f"{onto}:CHANGELOG.md"))
     for rel, line in release_headings(branch_text, "CHANGELOG.md"):
-        theirs = onto_titles.get(rel)
-        if theirs is not None and theirs != line:
-            raise StampError(
-                f"this branch's CHANGELOG says `{line}` and {onto} says `{theirs}` — the same "
-                f"release number for two different releases. Whoever landed first took "
-                f"{fmt(rel)}. {repair}"
-            )
+        if rel in inherited or rel not in theirs:
+            continue
+        raise StampError(
+            f"this branch's CHANGELOG adds `{line}` and {onto} already has "
+            f"`{theirs[rel]}` — the same release number for two different releases. Whoever "
+            f"landed first took {fmt(rel)}. {repair}"
+        )
+
+
+def _releases_at_fork(repo: Path, onto: str) -> set[Release] | None:
+    """Release numbers already in CHANGELOG.md at the commit this branch forked from.
+
+    None when there is no merge base, or the merge base has no CHANGELOG.md at all — a repo
+    that only just grew one, or histories with no common ancestor. That is "cannot tell"
+    rather than "none", and the caller treats it as such: refusing on every shared number
+    would stop a correct branch over a question this could not answer.
+    """
+    try:
+        base = merge_base(repo, onto)
+    except StampError:
+        return None
+    if not _git_ok(repo, "cat-file", "-e", f"{base}:CHANGELOG.md"):
+        return None
+    return set(releases_in(_git(repo, "show", f"{base}:CHANGELOG.md"), f"{base}:CHANGELOG.md"))
 
 
 def build_plan(repo: Path, onto: str, serve: bool | None, major: bool = False) -> Plan:
     plan = Plan()
     plan.sites, plan.loose = scan(repo, plan.symlinked)
-    untracked_sites, untracked_loose = scan_paths(repo, untracked_markdown(repo))
-    plan.untracked = untracked_sites + untracked_loose
+    plan.untracked = scan_untracked(repo, plan.symlinked, plan.unreadable)
 
     changelog = repo / "CHANGELOG.md"
+    # Guarded like every other file this tool reads or writes. The markdown scan already
+    # skipped a symlinked CHANGELOG.md and said so, but this read went straight through it —
+    # so the release number could be computed from a file outside the repository that would
+    # then never be written to. `check` guards its own read of this file for the same reason.
+    if _linked(repo, "CHANGELOG.md"):
+        raise StampError(
+            "CHANGELOG.md is a symlink, or sits under one. The release number is read from "
+            "that file and the stamp is written back into it, and a link points wherever it "
+            "points — which may not be this repository. Replace it with a real file"
+        )
     if not changelog.exists():
         raise StampError("no CHANGELOG.md in this repo")
     branch_text = _read(changelog, "CHANGELOG.md")
@@ -707,30 +989,54 @@ def build_plan(repo: Path, onto: str, serve: bool | None, major: bool = False) -
             "and guessing which is which is exactly the judgement this tool refuses to make"
         )
 
-    # The ref is resolved to a SHA once, here, and every later question is asked of the SHA.
-    # `git merge-base origin/main HEAD` and `git show origin/main:CHANGELOG.md` re-resolve
-    # the NAME, so a push landing mid-run would have the number computed against one base
-    # and the served-version inference against another, silently.
-    onto_sha = resolve(repo, onto)
-    onto_text = _show(repo, onto_sha, "CHANGELOG.md", onto)
-    _collision(branch_text, onto, onto_text)
-
-    if not plan.sites:
-        # A noop, not a failure — and reached before the loose-mention refusal on purpose.
-        # A stray `vNEXT` in running prose in some unrelated tracked doc is a defect in that
-        # doc, and `check` fails on it the moment it reaches main; making it stop every
-        # branch in the repo, including the ones shipping no release at all, is how a gate
-        # that is right in principle gets switched off in practice. `_warn_skipped` still
-        # names it, so it is skipped-and-mentioned rather than skipped-and-quiet.
-        return plan
-
-    if plan.loose:
-        where = "; ".join(f"{s.path}:{s.line}" for s in plan.loose[:4])
+    # A loose mention IN THE CHANGELOG is a release entry written in a shape nothing will
+    # rewrite — `## vNEXT.1`, say — and it refuses whether or not there is anything else to
+    # stamp, because there is no other file that could be carrying the real entry. A loose
+    # mention anywhere else is a defect in that doc, not in this branch's release, and is
+    # warned about instead: making one stray word in one tracked doc refuse every branch in
+    # the repo is how a gate that is right in principle gets switched off in practice.
+    def _refuse_loose(sites: list[Site]) -> None:
+        where = "; ".join(f"{s.path}:{s.line}" for s in sites[:4])
         raise StampError(
             f"{PLACEHOLDER} appears where it will not be rewritten ({where}). A placeholder "
             "is only stamped in a heading or a bold run — put it in one, or in backticks if "
             "you meant to write ABOUT the placeholder rather than to claim a release"
         )
+
+    loose_here = [s for s in plan.loose if s.path == "CHANGELOG.md"]
+    nothing_to_do = not plan.sites and not loose_here and not headings
+
+    # The ref is resolved to a SHA once, here, and every later question is asked of the SHA.
+    # `git merge-base origin/main HEAD` and `git show origin/main:CHANGELOG.md` re-resolve
+    # the NAME, so a push landing mid-run would have the number computed against one base
+    # and the served-version inference against another, silently.
+    #
+    # A branch with nothing to stamp does not need the ref to EXIST, though. `fix-and-land`
+    # documents running `apply` unconditionally because it is a noop on a branch that ships
+    # no release, and it wires exit 2 straight to a HOLD — so a fresh clone, a fork off
+    # `origin/develop`, or a CI checkout that only fetched the PR head must not turn every
+    # such branch into a hold. The collision check still runs whenever the ref IS resolvable,
+    # which is the case it exists for.
+    try:
+        onto_sha = resolve(repo, onto)
+        onto_text = _show(repo, onto_sha, "CHANGELOG.md", onto)
+    except StampError:
+        if not nothing_to_do:
+            raise
+        return plan
+
+    # Outside that guard on purpose: a collision is a real refusal and must not be swallowed
+    # by the "nothing to stamp" case, since a branch that has ALREADY stamped is exactly the
+    # state with no placeholder left and the one this check exists for.
+    _collision(repo, branch_text, onto, onto_text)
+
+    if not plan.sites:
+        if loose_here:
+            _refuse_loose(loose_here)
+        return plan
+
+    if plan.loose:
+        _refuse_loose(plan.loose)
 
     if not headings:
         where = ", ".join(f"{s.path}:{s.line}" for s in plan.sites[:4])
@@ -838,13 +1144,14 @@ def build_plan(repo: Path, onto: str, serve: bool | None, major: bool = False) -
 
 
 def _show(repo: Path, ref: str, path: str, named: str | None = None) -> str:
-    """`ref:path`, with a sentence rather than a git error when either is missing."""
+    """`ref:path`, with a sentence rather than a git error when the file is missing.
+
+    The REF's existence is not re-checked: the only caller passes a SHA `resolve()` has
+    already verified with the identical `rev-parse --verify`, so a second one was a
+    subprocess per run guarding a branch nothing could reach. `named` stays, because the
+    message below has to name the ref the operator typed rather than the SHA it became.
+    """
     label = named or ref
-    if not _git_ok(repo, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"):
-        raise StampError(
-            f"ref {label!r} does not exist here. Fetch it first — the number this tool hands "
-            "out is only correct relative to the ref you are merging into"
-        )
     if not _git_ok(repo, "cat-file", "-e", f"{ref}:{path}"):
         raise StampError(
             f"{label} has no {path}. The release number is read from that file at that ref "
@@ -887,12 +1194,23 @@ def cmd_apply(args: argparse.Namespace) -> int:
     # a re-run. This does not survive the machine losing power mid-loop, and is not trying
     # to — what it removes is the failure that actually happens, which is the tool itself
     # refusing on file four after rewriting files one to three.
+    # The plan is a snapshot, and the files are re-read here. A hook, an editor or a
+    # concurrent agent can change one in between, and a count that no longer matches the plan
+    # means the tool is about to write a release it did not plan — so it refuses rather than
+    # quietly dropping the file, which produced a successful, partially-stamped release with
+    # nothing anywhere reporting what had been skipped.
+    planned = Counter(s.path for s in plan.sites)
     edits: list[tuple[str, Path, str]] = []
-    for path in sorted({s.path for s in plan.sites}):
+    for path in sorted(planned):
         full = repo / path
         new_text, count = stamp_text(_read(full, path), version, path)
-        if count:
-            edits.append((path, full, new_text))
+        if count != planned[path]:
+            raise StampError(
+                f"{path} was planned with {planned[path]} `{PLACEHOLDER}` site(s) and now has "
+                f"{count} — it changed between planning and writing. Nothing was written; "
+                "re-run `apply` against the tree as it is now"
+            )
+        edits.append((path, full, new_text))
 
     if plan.serves:
         main_py, pyproject = _served_files(repo)
@@ -904,7 +1222,7 @@ def cmd_apply(args: argparse.Namespace) -> int:
         m = found[0]
         at = offset + m.start()
         edits.append(("pyproject.toml", pyproject,
-                      original[:at] + m.group(1) + plan.served_to + m.group(2)
+                      original[:at] + m.group(1) + plan.served_to + m.group("q")
                       + original[offset + m.end():]))
 
         text = _read(main_py, "app/main.py")
@@ -937,6 +1255,20 @@ def _write_all(edits: list[tuple[str, Path, str]]) -> list[str]:
     Best-effort, and said plainly rather than claimed as a transaction: if restoring a file
     also fails, the message names every path that was already written, because at that point
     the only useful thing this tool can do is tell you exactly what to look at.
+
+    EVERY snapshot is restored, including the one for the file whose own write raised.
+    `write_text` opens in mode `w`, which truncates before it writes a byte, so a failure
+    part way through — ENOSPC, EIO, a quota — leaves that file empty or half written while
+    it is still absent from `written`. Restoring only `originals[:len(written)]` skipped
+    exactly that file and then reported "nothing was written; the worktree is as you left
+    it", which was false in the one scenario this helper exists to handle. The permission
+    test passes either way, because a read-only file fails at open() before truncation — so
+    the failure with real data loss in it was the untested one.
+
+    A snapshot whose file still matches it is skipped rather than rewritten, which is what
+    keeps the read-only case honest: nothing there was written, and re-writing it would fail
+    and turn a clean refusal into a "rolling back left … rewritten" that names a file nobody
+    touched.
     """
     originals: list[tuple[Path, str]] = []
     written: list[str] = []
@@ -947,8 +1279,10 @@ def _write_all(edits: list[tuple[str, Path, str]]) -> list[str]:
             written.append(path)
     except StampError as e:
         failed = []
-        for full, text in reversed(originals[: len(written)]):
+        for full, text in reversed(originals):
             try:
+                if full.read_bytes() == text.encode("utf-8"):
+                    continue
                 full.write_text(text, encoding="utf-8")
             except OSError:
                 failed.append(str(full))
@@ -977,14 +1311,23 @@ def cmd_check(args: argparse.Namespace) -> int:
     """
     repo = Path(args.repo).resolve()
     symlinked: list[str] = []
+    unreadable: list[str] = []
     sites, loose = scan(repo, symlinked)
-    untracked_sites, untracked_loose = scan_paths(repo, untracked_markdown(repo))
-    untracked = untracked_sites + untracked_loose
+    untracked = scan_untracked(repo, symlinked, unreadable)
     bad = sites + loose
 
-    changelog = repo / "CHANGELOG.md"
-    dupes = duplicates_in(_read(changelog, "CHANGELOG.md"), "CHANGELOG.md") \
-        if changelog.exists() and not changelog.is_symlink() else []
+    # A symlinked CHANGELOG.md used to make `dupes` unconditionally empty, so `clean` could
+    # still be true and this command printed "no repeated release number" about a file it had
+    # never opened — the same "clean over a file it did not read" shape the tracked-symlink
+    # accounting was added to end, one level up. It is a refusal now: the guard cannot do its
+    # job on a CHANGELOG that lives outside the repository, and saying so is the honest end.
+    if _linked(repo, "CHANGELOG.md"):
+        raise StampError(
+            "CHANGELOG.md is a symlink, or sits under one, so the duplicate-number check has "
+            "no file in this repository to read. Replace it with a real file — a guard that "
+            "cannot read the CHANGELOG cannot report on it"
+        )
+    dupes = duplicates_by_file(repo)
 
     clean = not bad and not dupes
     if args.json:
@@ -992,13 +1335,15 @@ def cmd_check(args: argparse.Namespace) -> int:
             "clean": clean,
             "sites": [{"path": s.path, "line": s.line, "text": s.text} for s in sites],
             "loose": [{"path": s.path, "line": s.line, "text": s.text} for s in loose],
-            "duplicates": [fmt(r) for r in dupes],
+            "duplicates": sorted({fmt(r) for rels in dupes.values() for r in rels}),
+            "duplicates_by_file": {p: [fmt(r) for r in rels] for p, rels in dupes.items()},
             # Present whether or not anything was skipped, and present for the same reason
             # `preflight --json` carries them: a CI consumer of this command has no other
             # field to inspect, and a file dropped without a key to report it in is
             # skipped-and-quiet, which is how the literal string reaches a reader.
             "untracked": [{"path": s.path, "line": s.line, "text": s.text} for s in untracked],
             "symlinked": sorted(symlinked),
+            "unreadable": sorted(unreadable),
         }, indent=2))
         return 0 if clean else 2
 
@@ -1006,11 +1351,12 @@ def cmd_check(args: argparse.Namespace) -> int:
     # threading no accumulator was the whole bug: a tracked markdown SYMLINK was dropped
     # with no record at all, and the guard whose one job is catching the literal string
     # printed "clean" over a file it had not read.
-    _warn_skipped(Plan(untracked=untracked, symlinked=sorted(symlinked)))
+    _warn_skipped(Plan(untracked=untracked, symlinked=sorted(symlinked),
+                       unreadable=sorted(unreadable)))
 
     if clean:
         print(f"clean: no unstamped `{PLACEHOLDER}` and no repeated release number in "
-              "tracked markdown.")
+              "CHANGELOG.md or the README release list.")
         return 0
     if bad:
         print(f"STOP: {len(bad)} unstamped `{PLACEHOLDER}` placeholder(s):", file=sys.stderr)
@@ -1022,8 +1368,9 @@ def cmd_check(args: argparse.Namespace) -> int:
               "which is the ref carrying the unstamped entry — then push the result. Until "
               "then this ref documents a version that does not exist.", file=sys.stderr)
     if dupes:
-        print("STOP: release number(s) declared twice in CHANGELOG.md: "
-              + ", ".join(fmt(r) for r in dupes), file=sys.stderr)
+        for path, rels in dupes.items():
+            print(f"STOP: release number(s) declared twice in {path}: "
+                  + ", ".join(fmt(r) for r in rels), file=sys.stderr)
         print("\nTwo branches were stamped the same number and the merge kept both sides. "
               "One of those entries has to be renumbered: put it back to "
               f"`## {PLACEHOLDER} — …` (and its README bullet with it) and run "
@@ -1042,6 +1389,15 @@ def _warn_skipped(plan: Plan) -> None:
     if plan.symlinked:
         print("warning: symlinked markdown, not read and not stamped: "
               + ", ".join(plan.symlinked), file=sys.stderr)
+    if plan.unreadable:
+        # Untracked only. A tracked file in this state still refuses — but the module
+        # contract says untracked markdown is never a STOP, and a scratchpad with a stray
+        # byte or an unclosed fence in it must not be able to hold up every branch in the
+        # repo. Named rather than dropped, for the usual reason.
+        print("warning: untracked markdown this tool could not read, so it was not "
+              "scanned:", file=sys.stderr)
+        for why in plan.unreadable:
+            print(f"  {why}", file=sys.stderr)
 
 
 def _report(plan: Plan, onto: str, *, applied: bool) -> None:

@@ -16,6 +16,7 @@ See test_designated_names.py for the naming, aliasing and allocation that replac
 
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 
@@ -99,18 +100,125 @@ def test_valid_key_rejects_separators_and_empties():
 
 # ---- the suite asking the board for names, seen from above ------------------
 
-#: A header dict that requests a name outright — a splat of one of conftest's machine
-#: constants, and somewhere in the same braces an X-Agent-Name key with a literal value.
-#: The machine is captured too, because names are claimed per machine and two files may ask
-#: different boxes for the same label without ever meeting. ``[^{}]`` cannot cross a brace, so
-#: a match is confined to one dict literal and the machine is genuinely the one it was written
-#: with. Only lowercase hyphenated literals match: a name built from a variable (``me["name"]``)
-#: is out of scope by construction, and rightly so — that is a name the board handed out, not
-#: one this suite chose. A malformed literal such as ``"Not A Name"`` is out of scope too; it
-#: exists to be rejected, so it never claims anything.
-REQUESTED_NAME = re.compile(
-    r"\{\*\*(?P<machine>[A-Z][A-Z0-9_]*)[^{}]*?\"X-Agent-Name\"\s*:\s*\"(?P<name>[a-z0-9-]+)\""
-)
+#: A machine constant as conftest spells them: LAPTOP, SERVER, DESKTOP.
+MACHINE_CONST = re.compile(r"[A-Z][A-Z0-9_]*\Z")
+
+
+def _stem_derived(node: ast.expr, stem: str) -> str | None:
+    """The value of ``Path(__file__).stem`` (plus any ``.replace``s) for a module, else None.
+
+    A name derived from the filename is the shape this module uses, so it has to be
+    resolvable or the module that motivated the whole check contributes nothing to it.
+    """
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "replace"
+        and len(node.args) == 2
+        and all(isinstance(a, ast.Constant) and isinstance(a.value, str) for a in node.args)
+    ):
+        base = _stem_derived(node.func.value, stem)
+        old, new = (arg.value for arg in node.args if isinstance(arg, ast.Constant))
+        return None if base is None else base.replace(old, new)
+    if isinstance(node, ast.Attribute) and node.attr == "stem":
+        call = node.value
+        return stem if (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Name)
+            and call.func.id == "Path"
+            and len(call.args) == 1
+            and isinstance(call.args[0], ast.Name)
+            and call.args[0].id == "__file__"
+        ) else None
+    return None
+
+
+def _module_constants(tree: ast.Module, stem: str) -> tuple[dict[str, str], dict[str, ast.Dict]]:
+    """Top-level ``NAME = <str>`` and ``NAME = {...}`` bindings, strings resolved."""
+    strings: dict[str, str] = {}
+    dicts: dict[str, ast.Dict] = {}
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
+            target, value = stmt.targets[0], stmt.value
+        elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
+            target, value = stmt.target, stmt.value
+        else:
+            continue
+        if not isinstance(target, ast.Name):
+            continue
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            strings[target.id] = value.value
+        elif (derived := _stem_derived(value, stem)) is not None:
+            strings[target.id] = derived
+        elif isinstance(value, ast.Dict):
+            dicts[target.id] = value
+    return strings, dicts
+
+
+def _machines(node: ast.Dict, dicts: dict[str, ast.Dict], seen: frozenset[str]) -> set[str]:
+    """The machine constants a header dict splats, following splats of local dicts."""
+    found: set[str] = set()
+    for key, value in zip(node.keys, node.values, strict=True):
+        if key is not None:  # a splat is a None key
+            continue
+        if isinstance(value, ast.Dict):
+            found |= _machines(value, dicts, seen)
+        elif isinstance(value, ast.Name) and MACHINE_CONST.match(value.id):
+            nested = value.id in dicts and value.id not in seen
+            found |= (
+                _machines(dicts[value.id], dicts, seen | {value.id}) if nested else set()
+            ) or {value.id}
+    return found
+
+
+def requested_names(source: str, stem: str) -> set[tuple[str, str]]:
+    """The ``(machine, name)`` pairs a test module asks the board to designate for it.
+
+    A request is a dict literal that splats a machine constant and carries an
+    ``X-Agent-Name`` key. The machine is part of the pair because names are claimed per
+    machine, so two files may ask different boxes for the same label without ever meeting.
+
+    This reads the parsed module rather than its text, so key order, quote style, padding,
+    nesting depth and any braces in between are all irrelevant — they were the gaps in the
+    regex this replaced, and each was a shape a future module could have written by accident.
+    Values are resolved through top-level constants, including a name derived from the
+    filename (this module's own shape), so a derived name and a literal spelling of the same
+    string collide as they should.
+
+    Out of scope, deliberately: a name the board handed out (``me["name"]``, an f-string, any
+    call), which this suite did not choose and cannot claim twice; a literal ``valid_name``
+    rejects, such as ``"Not A Name"``, which exists to be 400ed and so claims nothing; and a
+    dict that spells its ``Authorization`` header out inline instead of splatting a machine
+    constant, which leaves no machine to key the claim on. A module that does not parse raises
+    here rather than being skipped — it could not have been collected either.
+    """
+    tree = ast.parse(source)
+    strings, dicts = _module_constants(tree, stem)
+    claims: set[tuple[str, str]] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Dict):
+            continue
+        for key, value in zip(node.keys, node.values, strict=True):
+            if not (isinstance(key, ast.Constant) and key.value == "X-Agent-Name"):
+                continue
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                name = value.value
+            elif isinstance(value, ast.Name):
+                name = strings.get(value.id, "")
+            else:
+                continue
+            if valid_name(name):
+                claims |= {(machine, name) for machine in _machines(node, dicts, frozenset())}
+    return claims
+
+
+def _claims_across_the_suite() -> dict[tuple[str, str], list[str]]:
+    """Every ``(machine, name)`` any test module asks for, and which files ask for it."""
+    claimed: dict[tuple[str, str], list[str]] = {}
+    for path in sorted(Path(__file__).parent.glob("test_*.py")):
+        for pair in sorted(requested_names(path.read_text(encoding="utf-8"), path.stem)):
+            claimed.setdefault(pair, []).append(path.name)
+    return claimed
 
 
 def test_this_module_derives_a_name_the_board_will_accept():
@@ -125,7 +233,7 @@ def test_this_module_derives_a_name_the_board_will_accept():
 
 
 def test_no_two_test_modules_request_the_same_designated_name():
-    """No name literal may appear in two files, which is the collision LAPTOP_A had.
+    """No two files may ask for one name, which is the collision LAPTOP_A had.
 
     A designated name is claimed once per machine: the first module to ask gets it, and every
     later asker is quietly handed something else. So a file that asserts on the name it asked
@@ -134,19 +242,73 @@ def test_no_two_test_modules_request_the_same_designated_name():
     was wrong with either file in isolation, and nothing in either file could have noticed.
     Only a view across the whole suite can, which is what this is.
 
-    A file using several literals of its own is fine; test_designated_names.py legitimately
+    A file using several names of its own is fine; test_designated_names.py legitimately
     asks for both ``deploy`` and ``shadowme``, and they do not compete with each other.
+    A derived name counts as an asker: this module's own is in there, so a file hard-coding
+    ``test-agent-identity`` against LAPTOP is the original bug again and fails here.
     """
-    claimed: dict[tuple[str, str], set[str]] = {}
-    for path in sorted(Path(__file__).parent.glob("test_*.py")):
-        for match in REQUESTED_NAME.finditer(path.read_text(encoding="utf-8")):
-            claimed.setdefault((match["machine"], match["name"]), set()).add(path.name)
-
-    clashes = {where: sorted(files) for where, files in claimed.items() if len(files) > 1}
+    claimed = _claims_across_the_suite()
+    clashes = {where: files for where, files in claimed.items() if len(files) > 1}
     assert not clashes, (
         "two modules request the same designated name; whichever is collected second is "
         f"handed a different one: {clashes}"
     )
+
+
+def test_a_request_is_seen_however_the_dict_is_written():
+    """Every shape the text scan that came before missed, all meaning one claim.
+
+    That scan wanted the splat first, double quotes, no padding and no brace in between;
+    a dict written any other way was silently unscanned, so a real clash spelled the wrong
+    way passed green — the same shape of hole as the bug the check exists to catch. These
+    are all one dict to Python, so they are all one claim here.
+    """
+    shapes = {
+        "reversed": 'H = {"X-Agent-Name": "deploy", **LAPTOP}',
+        "single-quoted": "H = {'X-Agent-Name': 'deploy', **LAPTOP}",
+        "padded": 'H = { **LAPTOP , "X-Agent-Name" : "deploy" }',
+        "brace in between": 'H = {**LAPTOP, "X-Agent-Key": f"{k}-1", "X-Agent-Name": "deploy"}',
+        "nested in a call": 'def t():\n    go(h={**LAPTOP, "X-Agent-Name": "deploy"})',
+        "name via a constant": 'N = "deploy"\nH = {**LAPTOP, "X-Agent-Name": N}',
+        "splat of a local header": (
+            'BASE = {**LAPTOP, "X-Agent-Key": "k"}\nH = {**BASE, "X-Agent-Name": "deploy"}'
+        ),
+    }
+    seen = {label: requested_names(src, "test_x") for label, src in shapes.items()}
+    assert seen == {label: {("LAPTOP", "deploy")} for label in shapes}
+
+    # Those shapes are quoted source, not requests: a text scan would have booked seven
+    # claims on this file's behalf. Parsing only sees dicts the module actually builds.
+    assert _claims_across_the_suite()[("LAPTOP", "deploy")] == ["test_designated_names.py"]
+
+
+def test_a_derived_name_claims_as_loudly_as_a_literal():
+    """The module that motivated the check has to be inside it.
+
+    LAPTOP_A's name is derived from the filename rather than written out, and a scan that
+    only understood literals could not see it — leaving the one module with a history of
+    clashing as the one module that could not clash. A literal elsewhere spelling the same
+    string is the original bug exactly, one side derived.
+    """
+    derived = (
+        'AGENT_NAME = Path(__file__).stem.replace("_", "-")\n'
+        'H = {**LAPTOP, "X-Agent-Name": AGENT_NAME}'
+    )
+    assert requested_names(derived, "test_thing") == {("LAPTOP", "test-thing")}
+    literal = 'H = {**LAPTOP, "X-Agent-Name": "test-thing"}'
+    assert requested_names(literal, "test_other") == requested_names(derived, "test_thing")
+
+    assert _claims_across_the_suite()[("LAPTOP", AGENT_NAME)] == [Path(__file__).name]
+
+
+def test_names_the_board_chose_and_names_it_would_reject_claim_nothing():
+    """The documented exclusions, asserted rather than promised."""
+    out_of_scope = (
+        'H = {**SERVER, "X-Agent-Name": me["name"]}',        # the board's name, not ours
+        'H = {**SERVER, "X-Agent-Name": "Not A Name"}',      # exists to be 400ed
+        'H = {"Authorization": "Bearer x", "X-Agent-Name": "deploy"}',  # no machine to key on
+    )
+    assert [requested_names(src, "test_x") for src in out_of_scope] == [set(), set(), set()]
 
 
 # ---- the caller's key becomes an identity -----------------------------------

@@ -9,6 +9,15 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Top level, so it covers every job rather than one of them. These jobs read the
+# checkout and report; nothing here writes to the repository. Without this the
+# workflow inherits whatever the repository's default token permissions are — a
+# setting this file does not control, which an org or repo admin can widen without
+# touching this file, and which would then apply to the two jobs that run arbitrary
+# test code.
+permissions:
+  contents: read
+
 jobs:
   app:
     name: app suite
@@ -112,11 +121,6 @@ jobs:
     # will not happen. Require `app suite` and `harness suites`, which do run there.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    # It reads a file out of the checkout and reports; nothing else. The workflow
-    # inherits whatever the repository's default token permissions are, which is a
-    # setting this file does not control and can widen without anyone touching it.
-    permissions:
-      contents: read
     steps:
       - uses: actions/checkout@v4
 

@@ -92,14 +92,29 @@ def _fmt(r: Release) -> str:
     return f"v{r[0]}" if r[1] == 0 else f"v{r[0]}.{r[1]}"
 
 
+#: Ends a version, and does it with `(?![\w.])` rather than `\b` for the reason the stamper's
+#: own `_END` gives: `\b` fires between a digit and a dot, so `## v2.33.1` would be read here
+#: as release v2.33 — truncating a three-component heading to two and putting a number into
+#: the ordering and duplicate checks that nobody wrote. The stamper refuses such a heading as
+#: unparseable, and this suite exists to agree with the stamper about what a release heading
+#: is, so a heading it will not number must not match here either.
+_END = r"(?![\w.])"
+
 #: `v2.20`, `v3` — a minor is optional, because this repo spells its major-only releases
 #: without one. Both README patterns share it with the CHANGELOG's, so v3 cannot fail
 #: two assertions on a correctly-updated repo.
-_V = r"v\d+(?:\.\d+)?"
+_V = rf"v\d+(?:\.\d+)?{_END}"
 
 #: The token a branch writes instead of a number, until `scripts/release_stamp.py` resolves
 #: it. Spelled here rather than imported from the script: see the docstring.
 PLACEHOLDER = "vNEXT"
+
+
+#: A fence line: three or more backticks or tildes, then whatever info string follows. Both
+#: groups are load-bearing — see the closer rule in `_without_fenced_blocks` — and the
+#: indentation is unbounded rather than CommonMark's three spaces, because this repo's command
+#: docs fence blocks inside numbered list items where they are legitimately indented further.
+_FENCE = re.compile(r"^[ \t]*(`{3,}|~{3,})[ \t]*(.*)$")
 
 
 def _without_fenced_blocks(text: str) -> str:
@@ -125,30 +140,34 @@ def _without_fenced_blocks(text: str) -> str:
     describe positions in the file a reader would open.
     """
     out = list(text)
-    pos, fence = 0, None
-    for line in text.split("\n"):
-        opener = re.match(r"(`{3,}|~{3,})", line.lstrip())
-        marker = opener.group(1) if opener else None
+    pos, fence, opened_at = 0, None, 0
+    for line_no, line in enumerate(text.split("\n"), start=1):
+        m = _FENCE.match(line)
+        marker, info = (m.group(1), m.group(2)) if m else (None, "")
         inside = fence is not None
         if fence is None:
-            fence = marker
-        elif marker and marker[0] == fence[0] and len(marker) >= len(fence):
-            # A closing fence is the same character and AT LEAST as long as the opener, which
-            # is CommonMark's rule and matters here: the README fences a ```` ```md ```` sample
-            # containing its own ``` lines, and a length-blind close would end the block on the
-            # first of them and leave the rest of the sample looking like prose.
+            if marker:
+                fence, opened_at = marker, line_no
+        elif marker and marker[0] == fence[0] and len(marker) >= len(fence) and not info:
+            # A closing fence is the same character, AT LEAST as long as the opener, and
+            # carries no info string. All three conditions are CommonMark's, all three are the
+            # stamper's, and each matters here: the README fences a ```` ```md ```` sample
+            # containing its own ``` lines, so a length-blind close would end the block on the
+            # first of them, and an info-blind close would end an outer ``` block on an inner
+            # ```py — either way the rest of the sample reads as prose and a `## vNEXT` in it
+            # is counted as a real unstamped entry that the stamper, masking correctly, ignores.
             fence = None
         if inside or marker:  # the fence lines themselves are blanked too
             out[pos:pos + len(line)] = "\0" * len(line)
         pos += len(line) + 1
     # A fence left open blanks every remaining line, which would make a real unstamped entry
     # below it invisible to every assertion here at once — the same silent hole the stamper
-    # refuses on, and the reason to refuse rather than mask a best effort. Loud, and it says
-    # which fence, because "your CHANGELOG is fine and this suite went red" is not a failure
-    # anybody can act on.
+    # refuses on, and the reason to refuse rather than mask a best effort. Loud, and it names
+    # the line the fence was opened on, because "your CHANGELOG is fine and this suite went
+    # red" is not a failure anybody can act on, and neither is a marker that occurs forty times.
     assert fence is None, (
-        f"a `{fence}` code fence is opened and never closed, so everything below it reads as "
-        "code — including any release heading. Close the fence")
+        f"a `{fence}` code fence is opened at line {opened_at} and never closed, so everything "
+        "below it reads as code — including any release heading. Close the fence")
     return "".join(out)
 
 
@@ -320,7 +339,7 @@ def test_an_unstamped_entry_is_at_the_top(changelog_prose, changelog_releases):
     placeholder = re.search(rf"^## {PLACEHOLDER}\b", changelog_prose, flags=re.MULTILINE)
     if not placeholder:
         pytest.skip("nothing unstamped — this branch is not writing a release")
-    first_numbered = re.search(rf"^## {_V}\b", changelog_prose, flags=re.MULTILINE)
+    first_numbered = re.search(rf"^## {_V}", changelog_prose, flags=re.MULTILINE)
     assert first_numbered and placeholder.start() < first_numbered.start(), (
         f"CHANGELOG.md's `## {PLACEHOLDER}` entry sits below "
         f"{_fmt(changelog_releases[0])} — an unreleased entry belongs above every released one")
@@ -377,6 +396,17 @@ def test_no_test_file_is_named_after_a_release():
         + ", ".join(named))
 
 
+def _readme_bullet(release_name: str) -> re.Pattern[str]:
+    """The README's own list entry for one release, in whatever punctuation style it is
+    written: `- **v2.33** — …`, `- **v2.33**: …`, `- **v2.33**`.
+
+    The closing `**` right after the number is still required, and is what keeps this
+    specific: the list's collapsed range entries and its `- **v3 (next)** —` do not match,
+    and neither does a three-component `- **v2.33.1** —`, so a README listing something
+    adjacent to the newest release cannot satisfy the assertion instead of it."""
+    return re.compile(rf"^- \*\*{re.escape(release_name)}\*\*", re.MULTILINE)
+
+
 def test_the_readme_release_list_has_an_entry_for_the_newest_release(changelog_releases,
                                                                      readme_prose):
     """The bulleted history below the prose, which is a second place and drifts
@@ -387,10 +417,16 @@ def test_the_readme_release_list_has_an_entry_for_the_newest_release(changelog_r
     session registry…`, `- **v1–v2.1** —` — so asserting a bullet per release would fail
     on a README that is doing exactly what it is supposed to. The docstring's claim is
     scoped to match: what this catches is a release written up and never listed, which
-    is the mistake that happens on the day of the release."""
+    is the mistake that happens on the day of the release.
+
+    No separator is required after the bold run, for the reason
+    `test_the_changelog_and_the_readme_are_unstamped_together` gives: the stamper rewrites
+    `**vNEXT` followed by anything, so `- **v2.34**: …` is a bullet it stamps and this repo
+    accepts. Demanding the em dash here would have failed a correctly-listed release on its
+    punctuation alone, and said the bullet did not exist while it sat in the file."""
     newest = _fmt(changelog_releases[0])
-    assert re.search(rf"^- \*\*{re.escape(newest)}\*\* —", readme_prose, flags=re.MULTILINE), (
-        f"README.md's release list has no `- **{newest}** —` entry")
+    assert _readme_bullet(newest).search(readme_prose), (
+        f"README.md's release list has no `- **{newest}**` entry")
 
 
 #: A release bullet and only a release bullet: `- **v2.33** — …`. Anchoring the closing `**`
@@ -434,3 +470,56 @@ def test_no_release_number_appears_twice(changelog_releases, readme_prose):
         + "; ".join(filter(None, [
             f"CHANGELOG.md headings for {', '.join(in_changelog)}" if in_changelog else "",
             f"README.md bullets for {', '.join(in_readme)}" if in_readme else ""])))
+
+
+# --------------------------------------------------------------- the helpers themselves
+#
+# Everything above reads the real CHANGELOG.md and README.md, which is this suite's whole
+# argument and also its blind spot: a helper that stops matching what the stamper matches
+# stays green for as long as the repo happens to be in a shape the loosened helper still
+# accepts, and goes wrong on the one day a release is written in the shape it lost. Each
+# test below pins a rule where this file and `scripts/release_stamp.py` had already drifted
+# apart, on text written here rather than on whatever the repo currently contains.
+
+
+def test_a_three_component_heading_is_not_read_as_a_release():
+    """`## v2.33.1` is a heading the stamper refuses to number. Parsed here as v2.33 it would
+    be a release nobody wrote — duplicating the real v2.33 in the collision checks, or landing
+    out of order in the newest-first check."""
+    text = "## v2.33.1 — a patch\n\n## v2.33 — the release\n"
+    assert re.findall(rf"^## ({_V})", text, flags=re.MULTILINE) == ["v2.33"]
+    assert not _README_RELEASE_BULLET.findall("- **v2.33.1** — a patch\n")
+    assert _README_RELEASE_BULLET.findall("- **v2.33** — the release\n") == ["v2.33"]
+
+
+def test_a_release_bullet_is_found_whatever_punctuation_follows_it():
+    """The em dash is this README's house style and not a rule the stamper enforces."""
+    for line in ("- **v2.34** — the release\n", "- **v2.34**: the release\n",
+                 "- **v2.34** - the release\n", "- **v2.34**\n"):
+        assert _readme_bullet("v2.34").search(line), line
+    for line in ("- **v2.34.1** — a patch\n", "- **v2.34 (next)** — not this release\n",
+                 "- **v2.340** — a later release\n"):
+        assert not _readme_bullet("v2.34").search(line), line
+
+
+def test_an_inner_info_fence_does_not_close_an_outer_block():
+    """A closer carries no info string, which is CommonMark's rule and `mask_code`'s. Without
+    it a ```` ```py ```` inside a ```` ``` ```` sample ends the block early, and this suite
+    reads the rest of the sample as prose while the stamper reads it as code."""
+    text = ("```\n"
+            "## vNEXT — a sample entry\n"
+            "```py\n"
+            "## v9.9 — still inside the sample\n"
+            "```\n"
+            "\n"
+            "## v9.8 — real prose below the block\n")
+    masked = _without_fenced_blocks(text)
+    assert len(masked) == len(text), "offsets into the masked text must still find the file"
+    assert PLACEHOLDER not in masked and "v9.9" not in masked
+    assert "## v9.8" in masked
+
+
+def test_an_unclosed_fence_says_which_line_opened_it():
+    """The marker alone does not locate anything in a file with forty fences in it."""
+    with pytest.raises(AssertionError, match="line 3"):
+        _without_fenced_blocks("intro\n\n```md\n## vNEXT — a sample entry\n")

@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -62,6 +64,19 @@ MAIN_PY = '''from fastapi import FastAPI
 app = FastAPI(title="quarterback", lifespan=make_lifespan(), version="{version}")
 '''
 
+#: The shape a formatter produces the moment the call grows a third argument, and the one the
+#: repo will have the day somebody runs `ruff format` over `app/main.py`. It is a fixture
+#: rather than an inline string because "the tool works on single-line calls only" is not a
+#: property anybody would choose, and nothing said so out loud until it stopped working.
+MAIN_PY_WRAPPED = '''from fastapi import FastAPI
+
+app = FastAPI(
+    title="quarterback",
+    lifespan=make_lifespan(),
+    version="{version}",
+)
+'''
+
 
 def entry(version: str, body: str = "did a thing.", title: str = "a release") -> str:
     return f"## {version} — {title}\n\n{body}\n\n"
@@ -91,8 +106,17 @@ def write(repo: Path, path: str, text: str) -> None:
     full.write_text(text)
 
 
+#: chmod means nothing to root, and this stack's CI and dev containers both run as it. A test
+#: whose subject is "the tool refuses when it cannot write" would otherwise report a rollback
+#: bug when the real difference is the user id, which is the least legible failure available.
+not_root = pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="root ignores file mode bits, so an unwritable file is not unwritable",
+)
+
+
 @pytest.fixture(autouse=True)
-def hermetic_git(monkeypatch, tmp_path: Path):
+def hermetic_git(monkeypatch, tmp_path: Path) -> None:
     """No developer's global git config reaches these repos.
 
     The subject under test is git behaviour, which makes the usual "it works on my machine"
@@ -107,7 +131,6 @@ def hermetic_git(monkeypatch, tmp_path: Path):
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(empty))
     monkeypatch.setenv("GIT_CONFIG_SYSTEM", str(empty))
     monkeypatch.delenv("GIT_CONFIG_COUNT", raising=False)
-    return empty
 
 
 @pytest.fixture
@@ -955,6 +978,7 @@ def test_markdown_that_is_not_utf8_is_a_stop_not_a_traceback(repo, capsys):
     assert "## vNEXT — a release" in (repo / "CHANGELOG.md").read_text()
 
 
+@not_root
 def test_an_unwritable_file_leaves_the_tree_as_it_was(repo, capsys):
     """Precomputing the edits removes the failure where the TOOL refuses on file four. It
     does nothing about a permission error on file four, which is the same half-applied
@@ -1062,3 +1086,469 @@ def test_a_noop_apply_still_reports_a_written_key(repo, capsys):
     """A schema with two shapes is one the caller discovers the second of in production."""
     assert run(repo, "apply", "--onto", "main", "--json") == 0
     assert json.loads(capsys.readouterr().out)["written"] == []
+
+
+# ---------------------------------------------------------------------------
+# the rollback, at the two failures that lose data
+# ---------------------------------------------------------------------------
+
+
+def test_the_file_whose_own_write_failed_is_restored_too(tmp_path, monkeypatch):
+    """`write_text` opens in mode `w`, which truncates before it writes a byte. A failure part
+    way through — a full disk, an I/O error, a quota — therefore leaves THAT file empty while
+    it is still absent from the written list, and a rollback that skipped it went on to report
+    "nothing was written; the worktree is as you left it" over a file it had just emptied.
+
+    The permission test above cannot catch this: a read-only file fails at open(), before
+    truncation, so the one failure mode with real data loss in it was the untested one."""
+    doomed = tmp_path / "doomed.md"
+    doomed.write_text("the original\n")
+
+    def truncate_then_fail(path: Path, text: str, what: str) -> None:
+        path.write_text("")  # what mode 'w' does before the disk says no
+        raise rs.StampError(f"cannot write {what}: No space left on device")
+
+    monkeypatch.setattr(rs, "_write", truncate_then_fail)
+    with pytest.raises(rs.StampError) as e:
+        rs._write_all([("doomed.md", doomed, "## v2.34 — a release\n")])
+
+    assert doomed.read_text() == "the original\n"
+    assert "nothing was written" in str(e.value)
+
+
+def test_a_rollback_that_cannot_restore_says_which_file_it_left(tmp_path, monkeypatch):
+    """The other end of the same helper, and the branch nothing exercised. When putting a file
+    back fails too, "nothing was written" is a lie and the only useful thing left is the list
+    of paths to look at — so the message names them and says the release is half stamped."""
+    kept = tmp_path / "sub"
+    kept.mkdir()
+    first, second = kept / "first.md", tmp_path / "second.md"
+    first.write_text("first original\n")
+    second.write_text("second original\n")
+    real_write = rs._write
+
+    def fail_on_the_second(path: Path, text: str, what: str) -> None:
+        if path == second:
+            shutil.rmtree(kept)  # the first file's directory goes away mid-run
+            raise rs.StampError(f"cannot write {what}: Input/output error")
+        real_write(path, text, what)
+
+    monkeypatch.setattr(rs, "_write", fail_on_the_second)
+    with pytest.raises(rs.StampError) as e:
+        rs._write_all([("first.md", first, "stamped\n"), ("second.md", second, "stamped\n")])
+
+    message = str(e.value)
+    assert "rolling back left" in message and "first.md" in message
+    assert "half stamped" in message
+    assert "nothing was written" not in message
+
+
+# ---------------------------------------------------------------------------
+# the served version, when the call is not on one line
+# ---------------------------------------------------------------------------
+
+
+def test_a_multi_line_fastapi_call_is_still_bumped(repo):
+    """The canonical formatter output — `FastAPI(\\n    title=…,\\n    version="X.Y.Z",\\n)` —
+    and for a while the one shape the tool could not read. Excluding newlines from the
+    argument atom made every wrapped call report "no version literal to bump" about a file
+    that plainly had one, which blocked `--serve` on a repo whose only crime was running
+    `ruff format`. Quoted strings being atoms is what makes the scan safe; the line boundary
+    was never doing that work."""
+    place(repo)
+    write(repo, "app/main.py", MAIN_PY_WRAPPED.format(version="2.33.0"))
+    write(repo, "app/routes.py", "# a board change\n")
+    assert run(repo, "apply", "--onto", "main") == 0
+    assert 'version="2.34.0",' in (repo / "app" / "main.py").read_text()
+
+
+def test_a_version_first_in_a_multi_line_call_is_bumped(repo):
+    """`version` on the line straight after the paren, with no comma before it — the optional
+    "everything up to a comma" group has to be skippable across a newline, not only against
+    the paren itself."""
+    place(repo)
+    write(repo, "app/main.py",
+          'from fastapi import FastAPI\n\napp = FastAPI(\n    version="2.33.0",\n'
+          '    title="quarterback",\n)\n')
+    write(repo, "app/routes.py", "# a board change\n")
+    assert run(repo, "apply", "--onto", "main") == 0
+    assert 'version="2.34.0",' in (repo / "app" / "main.py").read_text()
+
+
+def test_an_escaped_quote_in_a_title_does_not_desynchronise_the_scan(repo):
+    r"""`title="ends\", version=\"8.8.8\" here"` is ONE string. A quoted-string atom with no
+    escape handling ends at the escaped quote, so the atom boundary and the real string
+    boundary come apart and everything after them is read as the wrong kind of thing — here
+    the whole call stopped matching, and the tool refused a file whose version literal was
+    plainly present. The same desynchronisation the other way round reads text inside the
+    literal as a real keyword argument."""
+    place(repo)
+    write(repo, "app/main.py",
+          'from fastapi import FastAPI\n\n'
+          'app = FastAPI(title="ends\\", version=\\"8.8.8\\" here", version="2.33.0")\n')
+    write(repo, "app/routes.py", "# a board change\n")
+    assert run(repo, "apply", "--onto", "main") == 0
+    text = (repo / "app" / "main.py").read_text()
+    assert 'version="2.34.0")' in text
+    assert 'version=\\"8.8.8\\"' in text  # the prose inside the literal is untouched
+
+
+def test_a_single_quoted_package_version_is_found(repo):
+    """TOML gives basic and literal strings equal standing. A `version = '2.33.0'` was
+    invisible to the line matcher, so the tool reported "0 version lines in [project]" about a
+    file whose version is present, correct, and spelled the other legal way."""
+    place(repo)
+    write(repo, "pyproject.toml",
+          "[project]\nname = \"quarterback\"\nversion = '2.33.0'\n")
+    write(repo, "app/routes.py", "# a board change\n")
+    assert run(repo, "apply", "--onto", "main") == 0
+    assert "version = '2.34.0'" in (repo / "pyproject.toml").read_text()
+
+
+def test_a_bracketed_continuation_line_does_not_end_the_project_table(repo):
+    """`^[ \\t]*\\[` matches a wrapped array element that happens to start with `[`, which cut
+    the `[project]` span short — and the user got "0 version lines in [project]" about a file
+    whose version sits two lines below the truncation."""
+    place(repo)
+    write(repo, "pyproject.toml",
+          '[project]\nname = "quarterback"\nmatrix = [\n  ["a", "b"]\n]\n'
+          'version = "2.33.0"\n')
+    write(repo, "app/routes.py", "# a board change\n")
+    assert run(repo, "apply", "--onto", "main") == 0
+    assert 'version = "2.34.0"' in (repo / "pyproject.toml").read_text()
+
+
+def test_a_version_inside_a_multiline_toml_string_is_not_the_package_version(repo, capsys):
+    """A regex over raw text cannot see that a `[project]`-looking line is inside a multi-line
+    string, so the tool could rewrite prose in a `description` and report success. `tomllib`
+    can see it, so the two answers are required to agree — and when they do not, this refuses
+    rather than picking one."""
+    place(repo)
+    write(repo, "pyproject.toml",
+          '[project]\nname = "quarterback"\ndescription = """\n'
+          '[project]\nversion = "9.9.9"\n"""\nversion = "2.33.0"\n')
+    write(repo, "app/routes.py", "# a board change\n")
+    assert run(repo, "apply", "--onto", "main") == 2
+    assert "will not guess which text is the package version" in capsys.readouterr().err
+    assert 'version = "9.9.9"' in (repo / "pyproject.toml").read_text()  # untouched
+
+
+def test_a_pyproject_that_is_not_toml_is_a_stop_not_a_traceback(repo, capsys):
+    place(repo)
+    write(repo, "pyproject.toml", '[project]\nname = "quarterback\nversion = "2.33.0"\n')
+    write(repo, "app/routes.py", "# a board change\n")
+    assert run(repo, "apply", "--onto", "main") == 2
+    assert "not valid TOML" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# the collision detector, and what it is NOT allowed to refuse
+# ---------------------------------------------------------------------------
+
+
+def test_editing_a_released_entrys_title_is_not_a_collision(repo):
+    """The check compares against the FORK POINT, not against heading text, and this is why.
+    Comparing text made every edit to a shipped entry — fixing a typo, rewrapping a long
+    title, normalising an em dash — read as "two branches took v2.32", with a repair message
+    telling the author to put an entry that shipped weeks ago back to `## vNEXT`. The question
+    that matters is whether the branch CLAIMED the number or inherited it."""
+    place(repo)
+    text = (repo / "CHANGELOG.md").read_text()
+    write(repo, "CHANGELOG.md", text.replace("## v2.32 — a release", "## v2.32 — a relase"))
+
+    assert run(repo, "apply", "--onto", "main") == 0
+    assert "## v2.34 — a release" in (repo / "CHANGELOG.md").read_text()
+
+
+def test_a_docs_only_branch_may_edit_a_released_title(repo, capsys):
+    """The same shape with nothing to stamp at all. `fix-and-land` runs `apply`
+    unconditionally and wires exit 2 straight to a HOLD, so a branch that only fixes a
+    CHANGELOG typo must reach the noop rather than the refusal."""
+    text = (repo / "CHANGELOG.md").read_text()
+    write(repo, "CHANGELOG.md", text.replace("## v2.32 — a release", "## v2.32 — a relase"))
+    assert run(repo, "apply", "--onto", "main") == 0
+    assert "noop" in capsys.readouterr().out
+
+
+def test_two_releases_sharing_a_title_still_collide(repo, capsys):
+    """The mirror of the test above, and why heading text cannot be the proxy in the other
+    direction either: two branches that both wrote a boilerplate title got identical heading
+    lines, `theirs != line` was false, and one number describing two releases passed straight
+    through the check built to stop it."""
+    place(repo)
+    assert run(repo, "apply", "--onto", "main") == 0
+    commit(repo, "work, stamped v2.34")
+
+    git(repo, "checkout", "-q", "main")
+    text = (repo / "CHANGELOG.md").read_text()
+    write(repo, "CHANGELOG.md",
+          text.replace("## v2.33", entry("v2.34", "somebody else's body.") + "## v2.33", 1))
+    commit(repo, "somebody else landed v2.34 first, under the same title")
+    git(repo, "checkout", "-q", "work")
+
+    assert run(repo, "apply", "--onto", "main") == 2
+    assert "the same release number for two different releases" in capsys.readouterr().err
+
+
+def test_a_base_that_already_declares_a_number_twice_is_a_stop(repo, capsys):
+    """A branch that has not taken the merge yet cannot see the duplicate in its own file, so
+    scanning only `branch_text` left the base's invalid state undetected — and stamping on top
+    of it compounds it. The repair belongs on the base, and the message says so rather than
+    telling this branch to put its entry back."""
+    git(repo, "checkout", "-q", "main")
+    text = (repo / "CHANGELOG.md").read_text()
+    write(repo, "CHANGELOG.md",
+          text.replace("## v2.33", entry("v2.33", "and somebody else's.") + "## v2.33", 1))
+    commit(repo, "a keep-both-sides merge nobody caught")
+    git(repo, "checkout", "-q", "work")
+    place(repo)
+
+    assert run(repo, "preflight", "--onto", "main") == 2
+    err = capsys.readouterr().err
+    assert "main itself declares v2.33 more than once" in err
+
+
+# ---------------------------------------------------------------------------
+# what a branch with nothing to stamp is allowed to need
+# ---------------------------------------------------------------------------
+
+
+def test_a_branch_with_nothing_to_stamp_needs_no_resolvable_base(repo, capsys):
+    """`fix-and-land` says to run `apply` unconditionally because it is a noop on a branch
+    that ships no release, and wires exit 2 straight to a HOLD. Resolving the ref before the
+    no-op return made that false on a fresh clone, a fork off another default branch, or a CI
+    checkout that only fetched the PR head: every branch in the repo became a hold."""
+    assert run(repo, "apply", "--onto", "origin/never-fetched") == 0
+    assert "noop" in capsys.readouterr().out
+
+
+def test_a_branch_with_something_to_stamp_still_needs_one(repo, capsys):
+    """The other half of the same rule, and the reason it is scoped rather than dropped: a
+    number handed out against a ref that does not exist is a guess."""
+    place(repo)
+    assert run(repo, "apply", "--onto", "origin/never-fetched") == 2
+    assert "does not exist here" in capsys.readouterr().err
+
+
+def test_a_placeholder_heading_nothing_can_rewrite_is_a_stop_on_its_own(repo, capsys):
+    """`## vNEXT.1` matches neither the heading placeholder nor a rewritable site, but it does
+    match a loose mention — so with no other site anywhere it landed in the no-op return and
+    `apply` printed `noop:` over an unstampable release placeholder sitting in the CHANGELOG.
+
+    A loose mention in CHANGELOG.md is a release entry written in a shape nothing will
+    rewrite, and refuses on its own; one anywhere else is a defect in that doc and is warned
+    about, because making one stray word refuse every branch in the repo is how a gate that is
+    right in principle gets switched off in practice."""
+    write(repo, "CHANGELOG.md",
+          CHANGELOG_HEAD + "## vNEXT.1 — a patch\n\ndid a thing.\n\n" + entry("v2.33"))
+    assert run(repo, "apply", "--onto", "main") == 2
+    assert "will not be rewritten" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# paths this tool refuses to write through
+# ---------------------------------------------------------------------------
+
+
+def test_a_symlinked_parent_directory_is_not_written_through(repo, capsys, tmp_path):
+    """The leaf check was the whole guard, and it does not hold: a symlinked `app/` passes a
+    leaf-only test on `app/main.py` and the served-version write then lands wherever the link
+    points — which is the exact escape the leaf check exists to prevent, one directory up."""
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    (outside / "main.py").write_text(MAIN_PY.format(version="2.33.0"))
+    shutil.rmtree(repo / "app")
+    (repo / "app").symlink_to(outside)
+    place(repo)
+
+    assert run(repo, "apply", "--onto", "main", "--serve") == 2
+    assert "app/main.py is a symlink, or sits under one" in capsys.readouterr().err
+    assert 'version="2.33.0"' in (outside / "main.py").read_text()
+    assert "## vNEXT — a release" in (repo / "CHANGELOG.md").read_text()
+
+
+def test_a_symlinked_changelog_is_a_stop_rather_than_a_number_from_outside(repo, capsys,
+                                                                          tmp_path):
+    """The markdown scan skipped a symlinked CHANGELOG.md and said so, but the read that
+    computes the release number went straight through it — so the number could come from a
+    file outside the repository that would then never be written to."""
+    outside = tmp_path / "outside.md"
+    outside.write_text(CHANGELOG_HEAD + entry("v9.9"))
+    (repo / "CHANGELOG.md").unlink()
+    (repo / "CHANGELOG.md").symlink_to(outside)
+    place(repo, changelog=False)
+    assert run(repo, "preflight", "--onto", "main") == 2
+    assert "CHANGELOG.md is a symlink" in capsys.readouterr().err
+
+
+def test_check_refuses_rather_than_calling_a_symlinked_changelog_clean(repo, capsys,
+                                                                      tmp_path):
+    """`dupes` was unconditionally empty for a symlinked CHANGELOG, so `clean` could still be
+    true and the guard printed "no repeated release number" about a file it never opened —
+    the same "clean over a file it did not read" shape the symlink accounting exists to end."""
+    outside = tmp_path / "outside.md"
+    outside.write_text(CHANGELOG_HEAD + entry("v2.33") + entry("v2.33"))
+    (repo / "CHANGELOG.md").unlink()
+    (repo / "CHANGELOG.md").symlink_to(outside)
+    assert run(repo, "check") == 2
+    assert "CHANGELOG.md is a symlink" in capsys.readouterr().err
+
+
+def test_an_untracked_symlink_is_reported_rather_than_dropped(repo, capsys, tmp_path):
+    """Both scans of untracked markdown passed no accumulator, so an untracked symlink
+    vanished from the text output and from the JSON `symlinked` field of both commands at
+    once — which is the skipped-and-quiet outcome the whole accounting exists to end."""
+    outside = tmp_path / "outside.md"
+    outside.write_text("## vNEXT — somebody else's document\n")
+    (repo / "scratch.md").symlink_to(outside)
+
+    assert run(repo, "check", "--json") == 0
+    assert json.loads(capsys.readouterr().out)["symlinked"] == ["scratch.md"]
+
+    place(repo)
+    assert run(repo, "preflight", "--onto", "main", "--json") == 0
+    assert json.loads(capsys.readouterr().out)["symlinked"] == ["scratch.md"]
+
+
+def test_untracked_markdown_that_cannot_be_read_is_not_a_stop(repo, capsys):
+    """The module contract says untracked markdown is never a STOP, only reported — and the
+    scan of it went through the same refusing reader as tracked markdown, so a scratchpad
+    that was not UTF-8, or had a fence left open, aborted the whole release."""
+    place(repo)
+    (repo / "notes.md").write_bytes(b"# notes\n\n\xff\xfe vNEXT\n")
+    (repo / "open-fence.md").write_text("# notes\n\n```md\n## vNEXT — a scratch entry\n")
+
+    assert run(repo, "apply", "--onto", "main") == 0
+    err = capsys.readouterr().err
+    assert "notes.md" in err and "open-fence.md" in err
+    assert "## v2.34 — a release" in (repo / "CHANGELOG.md").read_text()
+
+
+def test_tracked_markdown_that_cannot_be_read_still_is(repo, capsys):
+    """The asymmetry is the point: a tracked file in that state ships with the release."""
+    place(repo)
+    (repo / "broken.md").write_bytes(b"# notes\n\n\xff\xfe vNEXT\n")
+    commit(repo, "a latin-1 tracked doc")
+    assert run(repo, "apply", "--onto", "main") == 2
+    assert "broken.md is not valid UTF-8" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# the guard, over both files that carry a number
+# ---------------------------------------------------------------------------
+
+
+def test_check_fails_on_a_readme_bullet_declared_twice(repo, capsys):
+    """README bullets are stamped independently of the CHANGELOG headings, so a merge that
+    kept both sides of the release LIST and one side of the CHANGELOG leaves a duplicate
+    number nothing else can see. `check` computing duplicates from the CHANGELOG alone printed
+    `clean: true` on exactly that state — while the repo's own invariant suite treated both
+    files as carrying release numbers."""
+    write(repo, "README.md", readme(["v2.32", "v2.33", "v2.33"]))
+    assert run(repo, "check") == 2
+    err = capsys.readouterr().err
+    assert "README.md" in err and "v2.33" in err
+
+    assert run(repo, "check", "--json") == 2
+    out = json.loads(capsys.readouterr().out)
+    assert out["duplicates"] == ["v2.33"]
+    assert out["duplicates_by_file"] == {"README.md": ["v2.33"]}
+
+
+def test_a_roadmap_bullet_is_not_a_released_number(repo):
+    """`- **v3 (next)** — …` names what is coming, not what shipped. Reading it as a release
+    would report a duplicate the day v3 is actually stamped, against an entry that is not one
+    — so the bold run has to close immediately after the number."""
+    write(repo, "README.md",
+          readme(["v2.32", "v2.33"]) + "- **v3 (next)** — a roadmap entry.\n")
+    assert run(repo, "check") == 0
+    assert rs.bullet_releases("- **v3 (next)** — a roadmap entry.\n") == []
+    assert rs.bullet_releases("- **v3** — a release.\n") == [(3, 0)]
+
+
+# ---------------------------------------------------------------------------
+# drift between planning and writing
+# ---------------------------------------------------------------------------
+
+
+def test_a_file_that_changed_under_the_plan_is_a_stop(repo, capsys, monkeypatch):
+    """Every rewrite is computed before any of them is written, which means the files are read
+    twice. A hook, an editor or a concurrent agent between the two reads used to have its
+    file silently dropped from the edit list — producing a successful, partially stamped
+    release with nothing anywhere reporting what had been skipped."""
+    place(repo)
+    real_read = rs._read
+    reads: list[str] = []
+
+    def drift(path: Path, what: str) -> str:
+        # On the SECOND read of README.md — the one `cmd_apply` does after planning — the
+        # bullet has gone, which is what a hook or a concurrent editor looks like from here.
+        text = real_read(path, what)
+        reads.append(what)
+        if what == "README.md" and reads.count("README.md") == 2:
+            path.write_text(text.replace("- **vNEXT** — a release.\n", ""))
+            return path.read_text()
+        return text
+
+    monkeypatch.setattr(rs, "_read", drift)
+    assert run(repo, "apply", "--onto", "main") == 2
+    err = capsys.readouterr().err
+    assert "changed between planning and writing" in err
+    assert "## vNEXT — a release" in (repo / "CHANGELOG.md").read_text()
+
+
+# ---------------------------------------------------------------------------
+# masking, at the container prefixes
+# ---------------------------------------------------------------------------
+
+
+def test_a_fence_inside_a_blockquote_is_still_a_fence():
+    """A quoted example — a review comment pasted into a doc, say — is documentation of the
+    convention exactly as an unquoted one is. A masker that could not see the `> ` prefix read
+    the block's contents as prose and would have stamped the example."""
+    text = "# doc\n\n> ```md\n> ## vNEXT — an example\n> ```\n\nreal prose\n"
+    assert "vNEXT" not in rs.mask_code(text)
+
+
+def test_a_fence_opening_a_list_item_is_still_a_fence():
+    text = "# doc\n\n- ```md\n  ## vNEXT — an example\n  ```\n\nreal prose\n"
+    assert "vNEXT" not in rs.mask_code(text)
+
+
+def test_a_quoted_fence_does_not_close_an_unquoted_one():
+    """Closing on any same-character marker let a quoted ``` inside a block end it, leaving
+    everything below unmasked — a real `## vNEXT` there is then invisible to the stamper and
+    to `check` at once, since both mask through this one function."""
+    text = "# doc\n\n```md\n> ```\n## vNEXT — an example\n```\n\nreal prose\n"
+    assert "vNEXT" not in rs.mask_code(text)
+
+
+# ---------------------------------------------------------------------------
+# git edges that must not surface as a git error
+# ---------------------------------------------------------------------------
+
+
+def test_no_common_ancestor_says_so_rather_than_failing_as_git(repo, capsys, tmp_path):
+    """`git merge-base` exits non-zero when there is no common ancestor, and routing it
+    through the generic runner turned that into "git merge-base failed:" with an empty stderr
+    — while the sentence written for this case sat downstream, unreachable."""
+    place(repo)
+    git(repo, "checkout", "-q", "--orphan", "unrelated")
+    write(repo, "CHANGELOG.md", CHANGELOG_HEAD + entry("vNEXT") + entry("v2.33"))
+    commit(repo, "an unrelated history")
+    assert run(repo, "preflight", "--onto", "main") == 2
+    assert "no common ancestor" in capsys.readouterr().err
+
+
+def test_a_path_with_a_newline_in_it_does_not_break_the_base_scan(repo, capsys):
+    """`git grep --name-only` without `-z` splits a legal path containing a newline into two,
+    and both halves then go to `git show` — which fails with a generic git error rather than
+    the readable sentence this scan exists to produce. Every other path-reading git call in
+    the file already used `-z`."""
+    git(repo, "checkout", "-q", "main")
+    write(repo, "odd\nname.md", "# odd\n\n**vNEXT** — the half-stamped one.\n")
+    commit(repo, "a path with a newline in it")
+    git(repo, "checkout", "-q", "work")
+    place(repo)
+    assert run(repo, "preflight", "--onto", "main") == 2
+    assert "itself carries an unstamped" in capsys.readouterr().err

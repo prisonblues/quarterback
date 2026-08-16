@@ -256,11 +256,17 @@ never an inference: `apply --major` stamps `v3`, and the plan says which kind of
 
 Two branches that stamp in the same minute get the same number, and nothing can prevent that —
 what the tool does instead is make it impossible to miss. Once `apply` has run the placeholder is
-gone, so there is no automatic re-stamp and none is claimed; `preflight`, `apply` and `check` all
-refuse, either on the duplicate heading a "keep both sides" merge leaves behind or on the branch
-carrying a number that now exists at `origin/main` under a different title. The repair is in the
-message: put *your* entry back to `## vNEXT` and its bullet back to `- **vNEXT** — …`, then run
-`apply` again. Two tokens, because nothing else on the branch was ever written in terms of the
+gone, so there is no automatic re-stamp and none is claimed; what there is instead is a refusal on
+each of the two shapes the collision takes. `preflight` and `apply` refuse on both: the duplicate
+number a "keep both sides" merge leaves behind, and a number this branch *added* which already
+exists at `origin/main`. `check` sees the first only — it deliberately takes no base ref, so there
+is no `origin/main` for it to compare against, and it reads CHANGELOG headings and README bullets
+for a repeated number. The repair is in the message: put *your* entry back to `## vNEXT` and its
+bullet back to `- **vNEXT** — …`, then run `apply` again.
+
+"A number this branch added" is asked of the fork point, not of the heading text. Editing a
+released entry — fixing a typo, rewrapping a long title — is not a collision, and two branches
+that both wrote the same boilerplate title still are one. Two tokens, because nothing else on the branch was ever written in terms of the
 number — which is what "cheap to redo" actually buys. PR #90 was renumbered three times without one
 line of its behaviour changing, which is the cost this removes.
 
@@ -368,8 +374,10 @@ full — including what was broken before it, which is the part no diff recovers
   CHANGELOG and made every release rewrite the same lines of the same two files, so two branches
   conflicted whether or not their numbers collided. Test files are named after their subject
   rather than their release, which was the one site git could not resolve by keeping both sides.
-- **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
-  object store; wire `landed` refs to a cherry-pick helper.
+- **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
+  shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
+  roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps
+  the real one, and nothing in the tool renames a roadmap entry.
 
 ## Stack
 
