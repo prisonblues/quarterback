@@ -142,6 +142,16 @@ DEFAULTS: dict = {
         # its own scheme; until then they say exactly what they do.
         "ask_quorum": 2,
         "ask_threshold": 2,
+        # How much `--context` material an ask may hand its seats IN TOTAL,
+        # across every spec. `--context` had no ceiling at all, and an ask's
+        # entire claim on anyone's attention is that it is the cheap check: one
+        # spec naming a generated file, or a 5,700-line module, built a
+        # multi-megabyte prompt and shipped a copy of it to every vendor on the
+        # panel — the #117 cost shape reappearing on the path advertised as
+        # costing a minute. 60,000 chars is ~15k tokens: comfortably a large
+        # function and its neighbours, and nowhere near a file nobody meant to
+        # send. Over budget is CLAMPED and said, per spec, like a round's diff.
+        "ask_max_context_chars": 60_000,
     },
     "loops": {
         "dependabot_lander": False,

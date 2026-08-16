@@ -189,16 +189,17 @@ says how much of a window actually reported.
 The deployed board version lags the repo until the stack is redeployed, and only the running
 service knows which it is: ask it with `GET /openapi.json` → `.info.version`, for whichever
 instance you care about. (Anything built off this branch says 2.23.0 — v2.24 and v2.27 are
-harness-side.) A number written here
-instead would be wrong the next time Portainer redeploys, with no diff to catch it.
+harness-side.) A number written here instead would be wrong the next time Portainer redeploys,
+with no diff to catch it.
 Latest release: **v2.27**, harness-side — `panel.py --ask` puts one premise to the seats and reports
 the tally, with no diff, no judge and no gate, so a fix's assumption can be challenged in a minute
 instead of in a twenty-minute round. (**v2.22**, **v2.25** and **v2.26** are claimed by branches not
 yet merged, which is why the numbering skips them.)
 Before it, **v2.24** made a new finding say whether the last fix pass caused it or the last round
-missed it, which were one number before and want opposite remedies, and **v2.23** had a run record which FILES the PR changed and not just how many lines, plus
-the PR's state as of that panel, so the board finally holds what collision ordering needs (schema
-revision 0016) — reading it back as a collision query ships separately, see #101.
+missed it, which were one number before and want opposite remedies. **v2.23** had a run record which
+FILES the PR changed and not just how many lines, plus the PR's state as of that panel, so the board
+finally holds what collision ordering needs (schema revision 0016) — reading it back as a collision
+query ships separately, see #101.
 **v2.21** (harness-side) had each panel member run in its own empty sandbox repo
 rather than in whatever directory the panel was launched from. **v2.20** (also harness-side) had the
 worktree tooling ask who is in a directory before rewriting it, and **v2.19** added the per-reviewer

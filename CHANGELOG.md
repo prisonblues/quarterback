@@ -38,17 +38,22 @@ Four decisions in it are worth more than the feature:
   them is #68's panel-of-one arriving through a side door: a tally reading "nobody objected" over
   seats that never spoke.
 - **The asker cannot be the only seat.** `--asker` says which seat the agent running the challenge
-  is, detected from the environment when a coding agent is running it, and a tally whose only voter
-  is the asker comes back `unchallenged` — which is where the premise started. An agent putting its
-  own premise to itself has confirmed nothing, and reporting it as `holds` is worse than reporting
-  nothing, because it carries a panel's authority.
+  is, detected from Claude Code's environment specifically — an agent on another vendor's CLI has to
+  pass `--asker` itself, and the run says so in its notes when nothing was detected rather than
+  leaving the guard quietly off. A tally whose only voter is the asker comes back `unchallenged` —
+  which is where the premise started. An agent putting its own premise to itself has confirmed
+  nothing, and reporting it as `holds` is worse than reporting nothing, because it carries a panel's
+  authority.
 - **Nothing picks between candidate answers.** A reply holding two different legal verdicts is
   unreadable, not an opportunity to guess which the model meant — the same rule v2.18 settled for
   reviews, for the same reason.
-- **Quorum and threshold are configuration** (`review_panel.ask_quorum` / `ask_threshold`, both 2),
-  so "1 of 1 says it holds" reports as unchallenged rather than as agreement. They are named for the
-  ask because that is all they govern today; #78 generalises the same two primitives to a round's
-  verdict, where they decide what gets merged.
+- **Quorum, threshold and the context budget are configuration** (`review_panel.ask_quorum` /
+  `ask_threshold`, both 2, and `ask_max_context_chars`, 60,000 — a total across all `--context`
+  material, clamped and said in the notes when it bites, because `--context` was unbounded before
+  and an ask that reads half a repo is not the cheap thing it exists to be). So "1 of 1 says it
+  holds" reports as unchallenged rather than as agreement. They are named for the ask because that
+  is all they govern today; #78 generalises the same primitives to a round's verdict, where they
+  decide what gets merged.
 
 One implementation runs a seat now, not two: the sandbox, the pinned sessions, the retry policy, the
 usage read-back and the four CLIs' argv moved into `run_seat`, and a round and an ask differ only in
@@ -60,7 +65,9 @@ host's `qb` does not have it: `qb` lives in the fleet's own repo, and the row it
 shape to define, since #77 is what will read it. The payload is complete on stdout and in
 `--json-file` regardless.
 
-Harness-side: the board is untouched, so the served version stays at 2.23.0.
+Harness-side: the board is untouched, so the served version stays at 2.23.0. (v2.22, v2.25 and v2.26
+are claimed by branches not yet merged, which is why the entries below skip from here to v2.24 —
+nothing is missing.)
 
 ## v2.24 — a new finding says whether the last fix caused it or the last round missed it
 

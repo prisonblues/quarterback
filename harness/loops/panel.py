@@ -233,6 +233,15 @@ ALL_REVIEWERS = LLM_REVIEWERS + ("sonarqube",)
 # command, not the thing having the opinion.
 CLI_BIN = {"antigravity": "agy"}
 
+# Reviewer name -> the model used when its config says nothing, where that is not
+# simply "whatever the CLI defaults to". Only claude has one: its CLI's own
+# default is the account's top model, which is the wrong seat to spend by
+# accident, so the panel pins `sonnet` and the others send no --model at all.
+# One map because the round and the ask both resolve models and used to spell
+# this exception inline, in two places, as a second line that rebuilt one entry
+# of the dict just built above it.
+SEAT_MODEL_DEFAULTS = {"claude": "sonnet"}
+
 REVIEW_PROMPT = """You are reviewing a pull request diff to the same exhaustive standard as a
 senior reviewer whose bar is "nothing left to improve". The marginal cost of completeness is
 near zero: report EVERYTHING you spot, across every dimension below — do NOT self-censor a
@@ -355,7 +364,8 @@ Return ONLY a JSON object (no prose):
 - "cannot tell" — the material does not settle it. Say in `reason` what you would need to see.
 
 `reason` is ONE line: what decided it, not an essay. There is no severity, no file, and no
-findings array — a reply carrying those is an answer to a question nobody asked.
+findings array — a reply carrying a findings array is an answer to a question nobody asked, and
+is not read as an answer to this one.
 
 --- PREMISE ---
 {premise}
@@ -1094,6 +1104,44 @@ _ASK_ALIASES = {"cannot tell": "cannot tell", "cant tell": "cannot tell",
 #: so the payload and the board carry the same text the reader saw.
 ASK_REASON_CHARS = 400
 
+#: Keys that make a reply a REVIEW rather than an answer. The prompt forbids them
+#: in those words ("a reply carrying a findings array is an answer to a question
+#: nobody asked"), and until this list existed the prompt said one thing and the
+#: parser accepted another: `{"verdict": "holds", "findings": [...]}` was read as
+#: a clean answer. Only the array is refused, not every review-shaped word — a
+#: seat that mentions a file in its `reason` has still answered THIS question,
+#: and rejecting it would cost a retry and then a real verdict.
+_REVIEW_SHAPED = ("findings",)
+
+
+def _cut(text: str, limit: int) -> str:
+    """`text` at `limit` chars, ELLIPSISED when it did not fit.
+
+    One helper for both places an ask shortens a model's words, because the
+    marker is the whole point: a reader of the report or the payload cannot
+    otherwise tell a reason that was cut from one the seat finished."""
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def _ask_reason(val: object) -> str:
+    """A seat's stated reason as one bounded line, whatever shape it arrived in.
+
+    A model that answers `{"verdict": "fails", "reason": ["line 10 is wrong"]}`
+    has given its justification; reading only `str` dropped it and left the seat
+    voting for no stated reason at all. The verdict was never in doubt, so the
+    reason is rendered rather than discarded."""
+    if val is None or isinstance(val, bool):
+        return ""
+    if isinstance(val, str):
+        said = val
+    elif isinstance(val, (list, tuple)):
+        said = " ".join(_ask_reason(v) for v in val)
+    elif isinstance(val, (int, float)):
+        said = str(val)
+    else:
+        said = json.dumps(val, default=str)
+    return " ".join(said.split())
+
 
 class Answer(NamedTuple):
     """One seat's reply to `--ask`: a verdict from :data:`ASK_VERDICTS` and the
@@ -1120,6 +1168,20 @@ def _ask_verdict(val: object) -> str | None:
     return _ASK_ALIASES.get(said)
 
 
+def _one_verdict(pairs: list[tuple[str, object]]) -> dict:
+    """`json.loads`'s object hook, refusing an object that states its verdict
+    twice.
+
+    The default keeps the LAST of duplicate keys, silently, which is exactly the
+    resolution :func:`parse_answer` refuses everywhere else: a reply saying both
+    `holds` and `fails` is one this file will not choose between. Raising here
+    makes the candidate unreadable, which is the same answer two conflicting
+    objects in one reply already get."""
+    if sum(1 for k, _ in pairs if k == "verdict") > 1:
+        raise ValueError("two verdicts in one object")
+    return dict(pairs)
+
+
 def parse_answer(raw: str | None) -> Answer | None:
     """Read a seat's reply to a premise challenge, or None when it cannot be read.
 
@@ -1136,23 +1198,29 @@ def parse_answer(raw: str | None) -> Answer | None:
     before agreement is tested; a reply holding two DIFFERENT legal verdicts does
     not, because nothing here is willing to choose which of them the model meant.
     Picking one would be how a `holds` gets recorded for a seat that also wrote
-    `fails`."""
+    `fails`. That rule holds WITHIN one object too: `json.loads` keeps the last
+    of two identical keys, so `{"verdict":"holds","verdict":"fails"}` used to be
+    recorded as `fails` — one reply carrying two conflicting legal answers,
+    resolved by a detail of the JSON parser. :func:`_one_verdict` refuses it
+    instead, which is the same refusal two conflicting objects already get."""
     if not raw:
         return None
     seen: list[Answer] = []
     for _, text in _spans(raw, "{", "}"):
         try:
-            val = json.loads(text)
-        except json.JSONDecodeError:
+            val = json.loads(text, object_pairs_hook=_one_verdict)
+        except ValueError:
+            # JSONDecodeError for malformed JSON, plain ValueError for the
+            # duplicate-key refusal — both mean this candidate is not an answer.
             continue
         if not isinstance(val, dict):
+            continue
+        if any(isinstance(val.get(k), list) for k in _REVIEW_SHAPED):
             continue
         verdict = _ask_verdict(val.get("verdict"))
         if verdict is None:
             continue
-        reason = val.get("reason")
-        reason = " ".join(str(reason).split()) if isinstance(reason, str) else ""
-        seen.append(Answer(verdict, reason[:ASK_REASON_CHARS]))
+        seen.append(Answer(verdict, _cut(_ask_reason(val.get("reason")), ASK_REASON_CHARS)))
     if not seen:
         return None
     # Agreement on the VERDICT alone: two candidates that say `fails` for
@@ -1183,9 +1251,16 @@ class SeatAnswer:
     """
 
     verdict: str | None = None
+    #: The seat's own one-line justification for `verdict`. Only ever that — what
+    #: an UNREADABLE reply said goes in `gist`, because a consumer rendering
+    #: `reason` without also branching on `unreadable` would otherwise show a
+    #: model's rambling preamble as though the seat had stated it as its reason.
     reason: str = ""
     skip: str | None = None
     unreadable: bool = False
+    #: The head of a reply that carried no verdict — WHAT the seat said, not why
+    #: it said it. Empty for every seat that answered.
+    gist: str = ""
     duration_ms: int = 0
     usage: dict | None = None
     absent: bool = False
@@ -1224,9 +1299,10 @@ def ask_tally(answers: dict[str, SeatAnswer], quorum: int, threshold: int,
     and #40's refusal to let a reviewer act on its own finding unattended.
 
     A split that reaches the threshold BOTH ways is `unresolved`, not the first
-    branch tested. That is only reachable with `ask_threshold: 1`, which is a
-    repo asking for a lower bar and not for the tie to be broken by the order
-    this function happens to check things in.
+    branch tested. It needs `len(seats) >= 2 * threshold` — so the DEFAULT
+    configuration reaches it on a four-seat panel that splits two against two,
+    and it is not the `ask_threshold: 1` curiosity it was once described as.
+    Either way the tie is not broken by the order this function checks things in.
     """
     voted = {n: a for n, a in answers.items() if a.verdict}
     counts = {v: sum(1 for a in voted.values() if a.verdict == v) for v in ASK_VERDICTS}
@@ -1610,9 +1686,12 @@ def record_run(payload: dict) -> None:
         print(f"panel: {note[-1]}", file=sys.stderr)
 
 
-#: `qb`'s exit code for a subcommand it does not have. Its usage branch is the
-#: only place it exits 2, and telling that apart from a board that answered badly
-#: is what keeps :func:`record_ask` quiet on a host whose `qb` predates the ask.
+#: `qb`'s exit code for a subcommand it does not have — and for several other
+#: things. It exits 2 from its usage branch, and also on a payload it cannot read
+#: on stdin and on argument validation, so this code is a HINT and never a
+#: diagnosis. :func:`record_ask` says which it thinks it is and quotes what `qb`
+#: actually said, so a misread is self-correcting rather than a confident wrong
+#: sentence about a program that lives in another repo.
 QB_NO_SUBCOMMAND = 2
 
 
@@ -1631,8 +1710,17 @@ def record_ask(payload: dict) -> None:
     half lands: a `qb` that does not know the subcommand says so once, on stderr,
     and the ask itself is untouched. A challenge is a minute of two models'
     attention — it must never fail because the recorder is a release behind, and
-    the payload is on stdout and in `--json-file` either way."""
+    the payload is on stdout and in `--json-file` either way.
+
+    Best-effort is not the same as silent. Every failure says so, because a
+    recorder that fails with no output was previously indistinguishable from one
+    that worked — and the exit-2 branch HEDGES, because 2 is not `qb`'s private
+    signal for "no such subcommand" (see :data:`QB_NO_SUBCOMMAND`). What `qb`
+    said is quoted either way, so a wrong guess corrects itself in front of the
+    reader rather than hiding the real error."""
     if not shutil.which("qb"):
+        print("panel: ask not recorded — no `qb` on this host; the payload is "
+              "complete either way", file=sys.stderr)
         return
     try:
         proc = subprocess.run(["qb", "record-ask"], input=json.dumps(payload),
@@ -1640,10 +1728,17 @@ def record_ask(payload: dict) -> None:
     except (OSError, subprocess.SubprocessError) as e:
         print(f"panel: ask not recorded ({e.__class__.__name__})", file=sys.stderr)
         return
+    said = (proc.stderr or proc.stdout or "").strip().splitlines()
+    quoted = f" — `qb` said: {said[0]}" if said else ""
     if proc.returncode == QB_NO_SUBCOMMAND:
-        print("panel: ask not recorded — this host's `qb` has no `record-ask` "
-              "(the board half of #79); the payload is complete either way",
-              file=sys.stderr)
+        print("panel: ask not recorded — this host's `qb` most likely has no "
+              "`record-ask` yet (the board half of #77), though it also exits 2 on "
+              f"a payload or an argument it refuses; the payload is complete "
+              f"either way{quoted}", file=sys.stderr)
+        return
+    if proc.returncode:
+        print(f"panel: ask not recorded — `qb record-ask` exited "
+              f"{proc.returncode}{quoted}", file=sys.stderr)
         return
     note = (proc.stdout or proc.stderr or "").strip().splitlines()
     if note:
@@ -1707,9 +1802,14 @@ def fit_argv_budget(render, budget: int) -> int:
     between characters and the bytes they encode to (this repo's own comments are
     full of em dashes, each of which is three bytes and one char).
 
-    Shrinking by the byte overflow converges in one pass — a char is never fewer
-    than one byte, so dropping N chars drops at least N bytes — but the loop is
-    kept for the pathological case where the template alone is near the limit."""
+    `budget` is counted in CHARACTERS and the ceiling in BYTES, deliberately and
+    safely: subtracting a byte overflow from a character budget over-shrinks (a
+    char is never fewer than one byte, so dropping N chars drops at least N
+    bytes), which converges in one pass and errs on the side of a prompt that
+    fits. The loop is kept for the pathological case where the template alone is
+    near the limit, and for a `render` whose length is not linear in its budget —
+    an ask's is not, since a budget below a section's length drops the sections
+    after it whole."""
     for _ in range(8):
         over = len(render(budget).encode()) - ARGV_PROMPT_MAX_BYTES
         if over <= 0:
@@ -2121,6 +2221,16 @@ def codex_usage(stdout: str | None) -> dict | None:
     return _usage(inp, out, cached, reasoning, observed=observed) if found else None
 
 
+#: What a seat's `parse` is allowed to hand back: an ask's :class:`Answer`, or a
+#: round's (findings, declared) pair. Spelled out rather than left as `object`
+#: because both call sites immediately take it apart — `review_llm` unpacks the
+#: pair, `ask_llm` reads `.verdict` — and `object` erased the one thing a checker
+#: could have verified. A parser returning a third shape is a bug, and the
+#: annotation is where it is now visible; :func:`ask_llm` also narrows at runtime
+#: so it would surface as an unreadable reply rather than an AttributeError.
+SeatParsed = Answer | tuple[list[Finding], list[str] | None]
+
+
 class SeatTurn(NamedTuple):
     """One seat's turn at a headless CLI — everything that happened to the
     PROCESS, and nothing about what the reply meant.
@@ -2143,7 +2253,7 @@ class SeatTurn(NamedTuple):
     #: parser was given). None is "unreadable", never "read, and it said
     #: nothing" — the caller's parser owns that distinction and every one of them
     #: is written to keep it.
-    parsed: object | None = None
+    parsed: SeatParsed | None = None
     #: Why this seat produced nothing at all. Mutually exclusive with a reply.
     skip: str | None = None
     duration_ms: int = 0
@@ -2152,7 +2262,7 @@ class SeatTurn(NamedTuple):
 
 
 def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
-             parse: Callable[[str], object | None] | None = None) -> SeatTurn:
+             parse: Callable[[str], SeatParsed | None] | None = None) -> SeatTurn:
     """Put one question to a headless LLM CLI and return what came back.
 
     `parse` reads the reply, and returning None from it means "I could not read
@@ -2409,7 +2519,11 @@ def ask_llm(cmd_name: str, model: str, prompt: str, effort: str = "") -> SeatAns
     if turn.skip:
         return SeatAnswer(skip=turn.skip, duration_ms=turn.duration_ms,
                           usage=turn.usage, absent=turn.absent)
-    if turn.parsed is not None:
+    # Narrowed rather than trusted: `parse_answer` is the only parser this call
+    # passes, so anything else is a bug — and a bug that surfaces as an
+    # unreadable reply is one this function already knows how to report, where an
+    # AttributeError would take the whole ask down with it.
+    if isinstance(turn.parsed, Answer):
         return SeatAnswer(turn.parsed.verdict, turn.parsed.reason,
                           duration_ms=turn.duration_ms, usage=turn.usage)
     # Same guard, and the same reasoning, as the review path's: a seat that said
@@ -2419,7 +2533,11 @@ def ask_llm(cmd_name: str, model: str, prompt: str, effort: str = "") -> SeatAns
     if not (turn.reply or "").strip():
         return SeatAnswer(skip=f"{label}: produced no output",
                           duration_ms=turn.duration_ms, usage=turn.usage)
-    return SeatAnswer(unreadable=True, reason=_ask_gist(turn.reply or ""),
+    # In `gist`, never in `reason`: a quote of what the seat said is not the seat
+    # stating a reason, and one key carrying both is how a rambling preamble ends
+    # up rendered as a justification by any consumer that reads `reason` without
+    # also branching on `unreadable`.
+    return SeatAnswer(unreadable=True, gist=_ask_gist(turn.reply or ""),
                       duration_ms=turn.duration_ms, usage=turn.usage)
 
 
@@ -2429,7 +2547,7 @@ def _ask_gist(reply: str, limit: int = 120) -> str:
     the difference between a model that reviewed the context and one that
     answered in prose."""
     first = next((ln.strip() for ln in reply.splitlines() if ln.strip()), "")
-    return first if len(first) <= limit else first[:limit - 1] + "…"
+    return _cut(first, limit)
 
 
 def resolve_token(sonar: dict, repo_path: str = "") -> str:
@@ -4641,8 +4759,8 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # actually ran (the fallbacks live here, not in two places). Effort is a
     # knob codex, pi and antigravity share (spelled differently on each CLI, and
     # over a different scale — see EFFORTS); claude takes its own default reasoning.
-    models = {n: rev.get(n, {}).get("model", "") for n in LLM_REVIEWERS}
-    models["claude"] = rev.get("claude", {}).get("model", "sonnet")
+    models = {n: rev.get(n, {}).get("model", SEAT_MODEL_DEFAULTS.get(n, ""))
+              for n in LLM_REVIEWERS}
     efforts = {n: rev.get(n, {}).get("effort", "") for n in EFFORTS}
     labels = {n: reviewer_label(n, models[n], efforts.get(n, "")) for n in LLM_REVIEWERS}
 
@@ -5286,8 +5404,21 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
 # ----------------------------------------------------------------------------- ask
 
 #: `path`, `path:12`, `path:3500-3560`. Anchored, so a colon inside a path
-#: (`odd:dir/x.py`) is a path and not a malformed range.
-_RANGE = re.compile(r"^(\d+)(?:-(\d+))?$")
+#: (`odd:dir/x.py`) is a path and not a malformed range. Digits are bounded
+#: because `int()` REFUSES a string of more than 4,300 digits (CPython's
+#: integer-from-string limit) with a ValueError — a `--context x:9999…` long
+#: enough to trip it would have crashed the command rather than been reported as
+#: the nonsense it is. Nine digits is past any file anyone will read.
+_RANGE = re.compile(r"^(\d{1,9})(?:-(\d{1,9}))?$")
+
+#: The most one `--context` file will be READ from disk, whatever the char budget
+#: then does with it. A separate ceiling from `ask_max_context_chars` because it
+#: bounds a different cost: the budget bounds what the seats are SENT (and so
+#: what is paid for), this bounds what is materialised in memory to slice a range
+#: out of. A source file this big is not context for a premise either way, and it
+#: is said rather than silently cut, so a stale spec against a generated file
+#: does not look like a file that was read.
+ASK_CONTEXT_FILE_MAX_BYTES = 4_000_000
 
 
 class AskContext(NamedTuple):
@@ -5301,19 +5432,63 @@ class AskContext(NamedTuple):
     text: str
 
 
-def _context_spec(spec: str) -> tuple[str, int | None, int | None]:
-    """Split `path[:first[-last]]`. A bare `path:12` is the single line 12."""
+class ContextProblem(NamedTuple):
+    """A `--context` spec that did not become context, and why.
+
+    The spec is kept BESIDE the sentence rather than only inside it, because
+    "was this verdict reached with all the context the asker intended?" is a
+    question the payload has to be able to answer without string-matching prose —
+    and that distinction (an answer from missing material, versus an answer from
+    unclear material) is the whole reason this feature exists."""
+
+    spec: str
+    problem: str
+
+
+def _readable_file(path: Path) -> bool:
+    """Is `path` a file right now — a question asked only to DISAMBIGUATE a spec,
+    never to decide a read. Every containment check still runs afterwards."""
+    try:
+        return path.is_file()
+    except OSError:
+        return False
+
+
+def _context_spec(spec: str, root: Path | None = None) -> tuple[str, int | None, int | None,
+                                                                str | None]:
+    """Split `path[:first[-last]]` into (path, first, last, problem). A bare
+    `path:12` is the single line 12.
+
+    **An existing file wins over a line range.** `--context config:2024` names the
+    file `config:2024` when that file is there, and line 2024 of `config` when it
+    is not. Without that test the range reading was unconditional, so a file whose
+    own name ends in `:digits` could never be selected — and, worse, a repo
+    holding both `config` and `config:2024` silently read line 2024 of the wrong
+    one. There is no escaping syntax (`./notes:12` does not help), so the
+    filesystem is the tie-breaker.
+
+    A tail that is not a range, after a path that IS a file, is a bad RANGE and
+    said so: `sub/a.py:abc` used to be reported as `sub/a.py:abc` not being a
+    file, which is accurate and points at the wrong half of what was typed."""
     head, sep, tail = spec.rpartition(":")
-    m = _RANGE.match(tail) if sep else None
+    if not sep:
+        return spec, None, None, None
+    if root is not None and _readable_file(root / spec):
+        return spec, None, None, None
+    m = _RANGE.match(tail)
     if not m:
-        return spec, None, None
+        if root is not None and head and _readable_file(root / head):
+            return spec, None, None, (f"`--context {spec}`: {tail!r} is not a line range "
+                                      "— expected N or N-M, counting from 1")
+        return spec, None, None, None
     first = int(m.group(1))
-    return head, first, int(m.group(2)) if m.group(2) else first
+    return head, first, int(m.group(2)) if m.group(2) else first, None
 
 
-def _read_confined(root: Path, resolved: Path) -> str:
-    """Read `resolved` by walking DOWN from a descriptor on `root`, refusing a
-    symlink at every step.
+def _read_confined(root: Path, resolved: Path, limit: int) -> bytes:
+    """Read at most `limit` + 1 bytes of `resolved` by walking DOWN from a
+    descriptor on `root`, refusing a symlink at every step — the ROOT's own open
+    included.
 
     The containment test in :func:`read_context` states the rule; this enforces
     it. Resolving a path and then opening it by that path are two traversals of
@@ -5327,11 +5502,25 @@ def _read_confined(root: Path, resolved: Path) -> str:
     test — so a spec naming a link inside the repo still reads its target, and the
     walk sees only real directories. `O_NOFOLLOW` firing here means a component
     turned into a symlink AFTER it was checked, which is the race and nothing
-    else, and the caller is told so in those words."""
+    else, and the caller is told so in those words.
+
+    The ROOT is opened `O_NOFOLLOW` too, and it is the step that used not to be:
+    every component below it was anchored to a descriptor while the first was
+    still opened by pathname, so a repo root (or an ancestor of it) replaced
+    between `resolve()` and this call redirected the whole walk out of the tree
+    that was checked. `root` is itself resolved by the caller, so its last
+    component is not a symlink and the flag narrows nothing reachable by typing —
+    it closes the same race one step higher up.
+
+    Bytes, not text, and bounded: what is on disk decides whether this is context
+    at all (see :func:`read_context`, which refuses what does not decode), and
+    `errors="replace"` would have turned a PNG into a wall of U+FFFD that reads
+    as a successful read. `limit` + 1 so the caller can tell "exactly `limit`"
+    from "more than `limit`" without a stat that would race the read."""
     parts = resolved.relative_to(root).parts
     if not parts:
         raise IsADirectoryError(errno.EISDIR, "the repo root is not a file", str(root))
-    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         for part in parts[:-1]:
             nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
@@ -5340,11 +5529,23 @@ def _read_confined(root: Path, resolved: Path) -> str:
         leaf = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
     finally:
         os.close(fd)
-    with os.fdopen(leaf, encoding="utf-8", errors="replace") as fh:
-        return fh.read()
+    # `leaf` is a raw descriptor until fdopen adopts it, and fdopen can fail
+    # (MemoryError, a bad encoding name) — leaving it open forever in a caller
+    # that is not a one-shot CLI. Closed by hand on exactly that path, and by the
+    # file object on every other.
+    fh = None
+    try:
+        fh = os.fdopen(leaf, "rb")
+        return fh.read(limit + 1)
+    finally:
+        if fh is None:
+            os.close(leaf)
+        else:
+            fh.close()
 
 
-def read_context(root: Path, specs: list[str], problems: list[str]) -> list[AskContext]:
+def read_context(root: Path, specs: list[str], problems: list[ContextProblem],
+                 budget: int | None = None) -> list[AskContext]:
     """The files (or line ranges) an ask hands its seats, read from the repo under
     review.
 
@@ -5359,28 +5560,61 @@ def read_context(root: Path, specs: list[str], problems: list[str]) -> list[AskC
     given less context than the asker believes it has will answer `cannot tell`
     about a question the asker thinks it supplied the answer to, and the asker
     will read that as the code being unclear rather than as the file being
-    missing."""
+    missing.
+
+    **`budget` bounds what the seats are sent, and the clamp is SAID.** An ask is
+    the cheap check — that is its entire claim on anyone's attention — and
+    `--context` had no ceiling at all: one spec naming a generated file, or this
+    5,700-line module, built a multi-megabyte prompt and shipped a copy of it to
+    every vendor on the panel. That is the #117 cost shape (one release-merge
+    ≈ $750) reappearing on the path advertised as costing a minute. So the total
+    is capped like a round's diff is, per the same rule and with the same
+    reporting: the config wins as far as it can, and where it was cut the report
+    says which spec and by how much."""
     root = root.resolve()
     out: list[AskContext] = []
+    used = 0
+    #: Exact repeats only. `--context a.py --context a.py` is one request typed
+    #: twice — it read the file twice and formatted two identical sections into
+    #: every seat's prompt, which is tokens spent on nothing in the one feature
+    #: whose argument is that it is cheap. Overlapping ranges are left alone:
+    #: `a.py:1-40` beside `a.py:20-30` is a legible thing to ask for.
+    seen: set[str] = set()
     for spec in specs:
-        path, first, last = _context_spec(spec)
+        if spec in seen:
+            continue
+        seen.add(spec)
+        path, first, last, bad_range = _context_spec(spec, root)
+        if bad_range:
+            problems.append(ContextProblem(spec, bad_range))
+            continue
         if not path.strip():
-            problems.append(f"`--context {spec}` names no file")
+            problems.append(ContextProblem(spec, f"`--context {spec}` names no file"))
             continue
         try:
             resolved = (root / path).resolve()
-        except OSError as e:
-            problems.append(f"`--context {spec}` could not be resolved ({e.__class__.__name__})")
+        except (OSError, RuntimeError, ValueError) as e:
+            # RuntimeError is a symlink loop, ValueError an embedded NUL or
+            # another path the OS will not take — both reach here off a command
+            # line an agent composed, and neither is worth a traceback that loses
+            # the other seats' answers and the payload with them.
+            problems.append(ContextProblem(
+                spec, f"`--context {spec}` could not be resolved ({e.__class__.__name__})"))
             continue
         if not resolved.is_relative_to(root):
-            problems.append(f"`--context {spec}` is outside {root} — an ask reads the "
-                            "repo under review and nothing else")
+            problems.append(ContextProblem(
+                spec, f"`--context {spec}` is outside {root} — an ask reads the "
+                      "repo under review and nothing else"))
             continue
         if not resolved.is_file():
-            problems.append(f"`--context {spec}` is not a file in {root}")
+            # Saying where paths are anchored, because the plausible mistake is
+            # an agent running this from `harness/loops/` and typing `panel.py`.
+            problems.append(ContextProblem(
+                spec, f"`--context {spec}` is not a file in {root} — `--context` "
+                      "paths are relative to the repo root, not to the cwd"))
             continue
         try:
-            text = _read_confined(root, resolved)
+            data = _read_confined(root, resolved, ASK_CONTEXT_FILE_MAX_BYTES)
         except OSError as e:
             # ELOOP or ENOTDIR from the walk means the tree changed under it —
             # a directory that was checked is now a symlink (Linux answers a
@@ -5391,37 +5625,116 @@ def read_context(root: Path, specs: list[str], problems: list[str]) -> list[AskC
             why = ("a component of the path changed after it was checked — it is "
                    "now a symlink, or no longer a directory"
                    if e.errno in (errno.ELOOP, errno.ENOTDIR) else e.__class__.__name__)
-            problems.append(f"`--context {spec}` could not be read ({why})")
+            problems.append(ContextProblem(spec, f"`--context {spec}` could not be read ({why})"))
             continue
         rel = str(resolved.relative_to(root))
-        lines = text.splitlines()
+        if len(data) > ASK_CONTEXT_FILE_MAX_BYTES:
+            problems.append(ContextProblem(
+                spec, f"`--context {spec}`: {rel} is over {ASK_CONTEXT_FILE_MAX_BYTES:,} "
+                      "bytes — larger than an ask will read, and not context for a premise"))
+            continue
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            # `errors="replace"` guaranteed this read SUCCEEDED, so `--context
+            # assets/logo.png` became a wall of U+FFFD in every seat's prompt and
+            # the asker was never told. A file that is not text is a stated
+            # problem, like every other spec that did not become context.
+            problems.append(ContextProblem(
+                spec, f"`--context {spec}`: {rel} is not UTF-8 text — an ask hands its "
+                      "seats source, not bytes"))
+            continue
+        if "\x00" in text:
+            problems.append(ContextProblem(
+                spec, f"`--context {spec}`: {rel} carries NUL bytes — an ask hands its "
+                      "seats source, not bytes"))
+            continue
+        #: Newlines KEPT, so a range is a substring of the whole file rather than
+        #: a re-joining of it. `path` and `path:1-N` over the same N lines used to
+        #: differ by one character (and so by one in the payload's `chars`),
+        #: which is nothing to a seat and confusing to anyone diffing two
+        #: payloads. `len()` is unchanged — keepends splits at the same points.
+        lines = text.splitlines(keepends=True)
         if first is None:
-            out.append(AskContext(spec, rel, None, None, text))
+            kept = _budgeted(AskContext(spec, rel, None, None, text),
+                             budget, used, problems)
+            if kept is not None:
+                out.append(kept)
+                used += len(kept.text)
             continue
         if first < 1:
-            problems.append(f"`--context {spec}`: lines are numbered from 1")
+            problems.append(ContextProblem(spec, f"`--context {spec}`: lines are numbered from 1"))
             continue
         if first > len(lines):
-            problems.append(f"`--context {spec}`: {rel} has {len(lines):,} lines")
+            problems.append(ContextProblem(
+                spec, f"`--context {spec}`: {rel} has {len(lines):,} lines"))
             continue
         if last < first:
-            problems.append(f"`--context {spec}`: the range ends before it starts")
+            problems.append(ContextProblem(
+                spec, f"`--context {spec}`: the range ends before it starts"))
             continue
         if last > len(lines):
             # Clamped and SAID, rather than clamped quietly: "3500-3560" against a
             # 3,510-line file is usually a stale line number, and a seat answering
             # from ten lines where the asker meant sixty is the failure this whole
             # feature exists to make cheap to notice.
-            problems.append(f"`--context {spec}`: {rel} has {len(lines):,} lines — "
-                            f"the seats got {first}-{len(lines)}")
+            problems.append(ContextProblem(
+                spec, f"`--context {spec}`: {rel} has {len(lines):,} lines — "
+                      f"the seats got {first}-{len(lines)}"))
             last = len(lines)
-        out.append(AskContext(spec, rel, first, last, "\n".join(lines[first - 1:last])))
+        kept = _budgeted(AskContext(spec, rel, first, last, "".join(lines[first - 1:last])),
+                         budget, used, problems)
+        if kept is not None:
+            out.append(kept)
+            used += len(kept.text)
     return out
 
 
-def _context_block(contexts: list[AskContext]) -> str:
+def _budgeted(ctx: AskContext, budget: int | None, used: int,
+              problems: list[ContextProblem]) -> AskContext | None:
+    """`ctx` cut to what is left of the ask's context budget, saying so when it
+    cut anything — the same shape as the line-range clamp above it, and for the
+    same reason: a seat answering from a fragment of what the asker meant to hand
+    it is exactly the failure this feature exists to make cheap to notice.
+
+    None when nothing at all was left, because a section with no content in it is
+    a header telling the seats a file was supplied when it was not."""
+    if budget is None:
+        return ctx
+    left = budget - used
+    whole = len(ctx.text)
+    if left <= 0:
+        problems.append(ContextProblem(
+            ctx.spec, f"`--context {ctx.spec}`: the {budget:,}-char context budget "
+                      "(`review_panel.ask_max_context_chars`) was spent by the specs "
+                      "before it — the seats got none of this one"))
+        return None
+    if whole > left:
+        problems.append(ContextProblem(
+            ctx.spec, f"`--context {ctx.spec}`: the seats got {left:,} of {whole:,} chars "
+                      f"— the {budget:,}-char context budget "
+                      "(`review_panel.ask_max_context_chars`) stopped it"))
+        return ctx._replace(text=ctx.text[:left])
+    return ctx
+
+
+def _context_chars(contexts: list[AskContext]) -> int:
+    """How much CONTENT the seats are being handed — the quantity a budget is
+    about, and the one :func:`_context_block` cuts. Not the length of the
+    assembled block, which also counts delimiters that no clamp may touch."""
+    return sum(len(c.text) for c in contexts)
+
+
+def _context_block(contexts: list[AskContext], budget: int | None = None) -> str:
     """The context as the seats see it, or the sentence that goes where it would
     have been.
+
+    `budget` cuts the FILE CONTENT, section by section, and never the assembled
+    block: slicing the finished string is how a clamp lands in the middle of a
+    `--- CONTEXT: path ---` line and hands a seat a prompt whose last section has
+    a half-written header on it. Every delimiter that is emitted is whole, and a
+    section the budget leaves nothing for is dropped with its header rather than
+    announced as a file that was supplied.
 
     An ask with no context is legitimate — some premises are settled by their own
     terms — but a model handed a bare assertion and no material will reach for
@@ -5434,19 +5747,37 @@ def _context_block(contexts: list[AskContext]) -> str:
                 "and where those do not settle it answer \"cannot tell\" — you have "
                 "nothing to check it against and must not answer from memory.\n")
     out = []
+    left = budget
     for c in contexts:
+        if left is not None and left <= 0:
+            break
+        text = c.text if left is None else c.text[:left]
+        if left is not None:
+            left -= len(text)
         where = f"{c.path}:{c.first}-{c.last}" if c.first else c.path
-        out.append(f"\n--- CONTEXT: {where} ---\n{c.text}\n")
+        out.append(f"\n--- CONTEXT: {where} ---\n{text}\n")
     return "".join(out)
 
 
-def _ask_rule(panel: dict, key: str, fallback: int, notes: list[str]) -> int:
-    """A tally rule as a positive int, saying so when the config is not one.
+#: The ask's declared defaults — read from where they are declared and
+#: documented, rather than spelled a second time here. See :func:`_ask_rule`.
+ASK_DEFAULTS = harness_rules.DEFAULTS["review_panel"]
+
+
+def _ask_rule(panel: dict, key: str, notes: list[str]) -> int:
+    """A tally rule (or the context budget) as a positive int, saying so when the
+    config is not one.
 
     Same discipline as :func:`diff_budget`: what cannot be the thing at all falls
     back and is reported, because silently honouring `ask_quorum: 0` would let a
     tally of nobody decide, and silently dropping it would leave you believing a
-    rule you never got."""
+    rule you never got.
+
+    The fallback comes from :data:`harness_rules.DEFAULTS`, which is where the
+    default is declared and documented. Passing it in meant every call site
+    spelled the number a second time, so a default changed in the file that
+    documents it would go on being ignored by the file that applies it."""
+    fallback = ASK_DEFAULTS[key]
     raw = panel.get(key)
     if raw is None or raw == "":
         return fallback
@@ -5470,6 +5801,13 @@ def _ask_rule(panel: dict, key: str, fallback: int, notes: list[str]) -> int:
 #: these into every command it runs, so an agent that asks does not have to
 #: remember to declare itself; forgetting is precisely how a premise gets
 #: "confirmed" by the model that wrote it.
+#:
+#: **This is Claude Code's environment and only Claude Code's.** codex, pi and
+#: `agy` export nothing this file can recognise as "seat X is running me", so an
+#: agent driven by one of them gets no asker and the self-challenge guard does
+#: not fire. That is not silent any more: :func:`ask` says in its notes that
+#: nothing was detected, because a guard believed to be on and quietly off is
+#: worse than one known to need `--asker`.
 ASKER_ENV = {"CLAUDE_CODE_SESSION_ID": "claude", "CLAUDECODE": "claude"}
 
 
@@ -5479,16 +5817,23 @@ def asking_seat(explicit: str | None) -> str:
     `--asker ''` is an explicit "nobody" — for a human at a terminal, where there
     is no agent and so no self-challenge to guard against. It is honoured, since
     the alternative is a person unable to turn off a rule that does not apply to
-    them; it is the one hole in this, and it is one an agent has to type."""
+    them; it is the one hole in this, and it is one an agent has to type — and
+    typing it while an agent's environment is present is now reported, so the
+    hole cannot be used quietly."""
     if explicit is not None:
         return explicit.strip().lower()
+    return detected_asker()
+
+
+def detected_asker() -> str:
+    """The seat :data:`ASKER_ENV` says is running this, or "" for nobody."""
     return next((seat for var, seat in ASKER_ENV.items() if os.environ.get(var)), "")
 
 
 def ask(repo_name: str | None, premise: str, contexts: list[str] | None = None,
         reviewers: str | None = None, pr_number: int | None = None,
         json_out: bool = False, json_file: str = "", record: bool = True,
-        asker: str = "") -> int:
+        asker: str | None = None) -> int:
     """Put one premise to the panel's seats and print what they said.
 
     No diff, no clustering, no judge. A round already votes on fixes — that is
@@ -5498,7 +5843,12 @@ def ask(repo_name: str | None, premise: str, contexts: list[str] | None = None,
 
     **Not a gate.** It exits 0 on every verdict, including `fails`. Making it a
     pass/fail step turns a one-minute question into a required wait, and a
-    required wait gets skipped."""
+    required wait gets skipped.
+
+    `asker` is `None` for "work it out" and a seat name (or "") for a caller that
+    already has. It used to default to "" — no asker, guard off — so every caller
+    but `main()` silently lost the self-challenge rule, which is the one rule
+    this feature is built around."""
     run_key = uuid.uuid4().hex
     cfg = load_repo_cfg(repo_name)
     repo_name = cfg.get("name") or repo_name
@@ -5509,45 +5859,84 @@ def ask(repo_name: str | None, premise: str, contexts: list[str] | None = None,
     chatter = sys.stderr if json_out else sys.stdout
 
     notes: list[str] = []
-    if "sonarqube" in selected:
+    if "sonarqube" in selected and reviewers:
         # Selectable for a review, and meaningless here: it is a scanner with a
         # rule set, not a correspondent. Said rather than silently dropped —
         # `--reviewers claude,sonarqube` otherwise looks like a two-seat ask.
+        # Only when it was ASKED for, though: firing on the resolved set put a
+        # permanent warning about a seat nobody tried to ask on every ask in
+        # every repo that merely enables sonarqube for its reviews.
         notes.append("sonarqube cannot be asked a question — it scans code against a "
                      "rule set and has no reply to give. Not a seat on this ask.")
     seats = [n for n in LLM_REVIEWERS if n in selected]
-    quorum = _ask_rule(panel, "ask_quorum", 2, notes)
-    threshold = _ask_rule(panel, "ask_threshold", 2, notes)
-    if threshold > quorum:
-        # Not corrected, because both numbers are somebody's decision — but a
-        # threshold no quorum can reach makes every ask `unresolved` forever, and
-        # that reads as an indecisive panel rather than as a config error.
-        notes.append(f"`ask_threshold` ({threshold}) is above `ask_quorum` ({quorum}) — "
-                     "an ask that meets quorum can still never reach the threshold")
+    quorum = _ask_rule(panel, "ask_quorum", notes)
+    threshold = _ask_rule(panel, "ask_threshold", notes)
+    # The unsatisfiable configuration is a rule above the SEAT COUNT, not a
+    # threshold above the quorum. Quorum is a minimum, not a maximum: with
+    # `ask_quorum: 2`, `ask_threshold: 3` and four seats, three agreeing seats
+    # reach the threshold and the ask resolves — so the warning that used to be
+    # here fired on configurations that work, and named an invariant that is not
+    # one. What can never be reached is a rule no number of seats can satisfy: a
+    # one-seat repo with the default quorum of 2 returns `unchallenged` forever,
+    # having run and paid for the seat first, and that reads as "nobody checked"
+    # rather than as a config that could not have been met.
+    unreachable = [f"`ask_{k}` ({v})" for k, v in (("quorum", quorum), ("threshold", threshold))
+                   if v > len(seats)]
+    if unreachable:
+        notes.append(f"{' and '.join(unreachable)} above the {len(seats)} seat"
+                     f"{'s' if len(seats) != 1 else ''} on this ask — no answer can reach "
+                     "it, so this ask cannot come back as anything but unchallenged or "
+                     "unresolved")
 
-    read = read_context(Path(cfg["path"]), contexts or [], notes)
+    # The asker, and the two ways it can be missing. Detected here rather than
+    # only in main(), so a caller that is not the command line keeps the guard.
+    detected = detected_asker()
+    if asker is None:
+        asker = detected
+        if not asker:
+            notes.append("no asker was detected — the self-challenge guard is inactive for "
+                         "this run. Only Claude Code's environment says which seat is "
+                         "running a command; an agent on another vendor's CLI has to pass "
+                         "`--asker <seat>` itself")
+    elif not asker and detected:
+        notes.append(f"`--asker ''` was passed while {detected}'s environment is present — "
+                     "the self-challenge guard is off by request, so this tally may rest "
+                     "entirely on the agent that wrote the premise")
+
+    context_budget = _ask_rule(panel, "ask_max_context_chars", notes)
+    context_problems: list[ContextProblem] = []
+    read = read_context(Path(cfg["path"]), contexts or [], context_problems, context_budget)
     context = _context_block(read)
 
     print(f"\n[{repo_name}] premise challenge — {len(seats)} seat"
           f"{'s' if len(seats) != 1 else ''}", file=chatter)
     print(f"  {premise[:120]}\n", file=chatter)
 
-    models = {n: rev.get(n, {}).get("model", "") for n in LLM_REVIEWERS}
-    models["claude"] = rev.get("claude", {}).get("model", "sonnet")
+    models = {n: rev.get(n, {}).get("model", SEAT_MODEL_DEFAULTS.get(n, ""))
+              for n in LLM_REVIEWERS}
     efforts = {n: rev.get(n, {}).get("effort", "") for n in EFFORTS}
 
     def prompt_for(budget: int | None) -> str:
+        # The budget cuts the file CONTENT inside the block, never the assembled
+        # block — see _context_block. Slicing the finished string is how a clamp
+        # lands halfway through a `--- CONTEXT: … ---` delimiter.
         return ASK_PROMPT.format(premise=premise,
-                                 context=context if budget is None else context[:budget])
+                                 context=context if budget is None
+                                 else _context_block(read, budget))
 
-    prompts = {n: prompt_for(None) for n in seats}
+    # One prompt, shared: it is the same string for every seat, and building it
+    # per seat made N copies of every context file to no end.
+    base = prompt_for(None)
+    prompts = dict.fromkeys(seats, base)
     # `agy`'s prompt travels in argv and the kernel caps one element, whatever is
     # in it — a premise is small but a `--context` file need not be. Same clamp,
-    # same report, as the diff gets on a round.
+    # same report, as the diff gets on a round. The seat is `antigravity`
+    # everywhere it is named; `agy` is only the command it runs (see CLI_BIN).
     if "antigravity" in prompts:
-        fitted = fit_argv_budget(prompt_for, len(context))
-        if fitted < len(context):
-            notes.append(f"antigravity gets {fitted:,} of {len(context):,} context chars "
+        whole = _context_chars(read)
+        fitted = fit_argv_budget(prompt_for, whole)
+        if fitted < whole:
+            notes.append(f"antigravity gets {fitted:,} of {whole:,} context chars "
                          "— its prompt travels in argv and the kernel caps one element "
                          f"at {ARGV_PROMPT_MAX_BYTES:,} bytes")
             prompts["antigravity"] = prompt_for(fitted)
@@ -5557,7 +5946,19 @@ def ask(repo_name: str | None, premise: str, contexts: list[str] | None = None,
         with ThreadPoolExecutor(max_workers=len(seats)) as ex:
             tasks = {n: ex.submit(ask_llm, n, models[n], prompts[n], efforts.get(n, ""))
                      for n in seats}
-            answers = {n: fut.result() for n, fut in tasks.items()}
+            for n, fut in tasks.items():
+                try:
+                    answers[n] = fut.result()
+                except Exception as e:  # noqa: BLE001 - one seat never takes the ask down
+                    # `run_seat` does filesystem work — a sandbox, temp dirs, an
+                    # `os.open` — and ENOSPC or a permission error on any of it
+                    # raises outside the err-string path. Re-raised here it took
+                    # the whole ask with it: every other seat's finished answer
+                    # discarded, no tally, no payload, no --json-file, and a
+                    # traceback where the documented exit-0 report should be. The
+                    # seat is recorded as not having answered, which is what
+                    # happened, and the tally stays honest about it.
+                    answers[n] = SeatAnswer(skip=f"{n}: raised {e.__class__.__name__} — {e}")
 
     tally = ask_tally(answers, quorum, threshold, asker)
     payload = {
@@ -5570,6 +5971,13 @@ def ask(repo_name: str | None, premise: str, contexts: list[str] | None = None,
         "premise": premise,
         "context": [{"spec": c.spec, "path": c.path, "first": c.first, "last": c.last,
                      "chars": len(c.text)} for c in read],
+        # The specs that did NOT become context, machine-readably. "Was this
+        # verdict reached with all the context the asker intended?" is the
+        # question a later audit (and #77's board row) has to be able to answer,
+        # and it could only be answered by string-matching English out of
+        # `config_notes` — where these did not belong in the first place: a
+        # missing file is not a repo whose configuration wants tuning.
+        "context_problems": [{"spec": p.spec, "problem": p.problem} for p in context_problems],
         "asker": asker or None,
         "verdict": tally.verdict,
         "verdict_reason": tally.reason,
@@ -5579,23 +5987,38 @@ def ask(repo_name: str | None, premise: str, contexts: list[str] | None = None,
         "counts": tally.counts,
         "seats_selected": sorted(selected),
         "seats_override": override_note,
-        "answers": {n: {"verdict": a.verdict, "reason": a.reason, "skip": a.skip,
-                        "unreadable": a.unreadable, "absent": a.absent,
+        # Usage FIRST, so a telemetry key that happens to collide with a primary
+        # field (`model`, `verdict`, `reason`, `duration_ms`, …) cannot overwrite
+        # what the seat actually answered. Still spread rather than nested,
+        # matching the round: a seat whose usage could not be read contributes no
+        # keys at all, so the board stores nulls and renders "not recorded"
+        # instead of a zero it would average in as a free reviewer.
+        "answers": {n: {**(a.usage or {}),
+                        "verdict": a.verdict, "reason": a.reason, "gist": a.gist or None,
+                        "skip": a.skip, "unreadable": a.unreadable, "absent": a.absent,
                         "model": models[n] or None, "effort": efforts.get(n) or None,
-                        "duration_ms": a.duration_ms, **(a.usage or {})}
+                        "duration_ms": a.duration_ms}
                     for n, a in sorted(answers.items())},
         "config_notes": notes,
         "run_key": run_key,
     }
     write_failed = write_payload(json_file, payload)
-    if record:
+    # Not recorded when the local artefact could not be written. The run is about
+    # to exit non-zero through `finish(write_failed)`, and a board row for a run
+    # its caller was told had failed is two records that disagree about whether
+    # this ask happened. (`run()` has the same shape on the review path and is
+    # left alone here — it is not what this change is about.)
+    if record and not write_failed:
         record_ask(payload)
     if json_out:
         print(json.dumps(payload, indent=2))
         return finish(write_failed)
 
+    # Separated, because "demo#62" reads as one token. The round's heading spells
+    # it `PR #<n>` (see `heading` in run()), and one spelling across both reports
+    # is one less thing for a reader to parse.
     lines = [f"## Premise challenge — {repo_name}"
-             + (f"#{pr_number}" if pr_number else ""), ""]
+             + (f", PR #{pr_number}" if pr_number else ""), ""]
     lines.append(f"**Premise:** {premise}")
     if read:
         lines.append("**Context:** " + ", ".join(
@@ -5605,12 +6028,22 @@ def ask(repo_name: str | None, premise: str, contexts: list[str] | None = None,
     lines.append("**Seats:** " + (", ".join(reviewer_label(n, models[n], efforts.get(n, ""))
                                             for n in seats) or "none"))
     if asker:
-        lines.append(f"**Asked by:** {asker} — its own answer is one vote and cannot be "
-                     "the only one")
+        # Only the seats on THIS ask have a vote to be the only one, so
+        # `--reviewers codex --asker claude` gets the other sentence: the first
+        # asserts something untrue of the run it is describing.
+        lines.append(f"**Asked by:** {asker}" + (
+            " — its own answer is one vote and cannot be the only one" if asker in seats
+            else " — not a seat on this ask, so it has no vote here"))
     if override_note:
         lines.append(f"  - {override_note}")
     for note in notes:
         lines.append(f"  - ⚠️ config: {note}")
+    # Kept apart from the config notes, and labelled for what they are: a reader
+    # told that a missing file is a "config" problem goes looking for a key that
+    # does not exist, and the remedy for a context that never got read is a
+    # different one entirely.
+    for problem in context_problems:
+        lines.append(f"  - ⚠️ context: {problem.problem}")
     lines.append("")
 
     # One column per seat, whether or not it answered, because the absences are
@@ -5625,7 +6058,7 @@ def ask(repo_name: str | None, premise: str, contexts: list[str] | None = None,
         elif a.unreadable:
             lines.append(f"    {name.ljust(width)}  ⚠️ no verdict — its reply could not be "
                          "read as one, and is NOT counted as `cannot tell`"
-                         + (f" (it said: {a.reason})" if a.reason else ""))
+                         + (f" (it said: {a.gist})" if a.gist else ""))
         else:
             lines.append(f"    {name.ljust(width)}  ⚠️ did not answer — {a.skip}")
     arrow = {"holds": "the premise HOLDS", "fails": "the premise FAILS",
@@ -5655,12 +6088,15 @@ def main() -> int:
     ap.add_argument("--context", action="append", default=[], metavar="PATH[:A-B]",
                     help="a file (or line range) from the repo under review to hand the "
                          "seats with the premise, e.g. harness/loops/panel.py:3500-3560. "
-                         "Repeatable. --ask only")
+                         "Paths are relative to the REPO ROOT, not to the cwd. Repeatable, "
+                         "and capped in total by review_panel.ask_max_context_chars. "
+                         "--ask only")
     ap.add_argument("--asker", metavar="SEAT", default=None,
                     help="which seat the agent running this challenge IS, so its own "
                          f"vote cannot be the only one ({', '.join(LLM_REVIEWERS)}). "
-                         "Detected from the environment when a coding agent is running "
-                         "this; pass an empty string to say there is no asker. --ask only")
+                         "Detected from CLAUDE CODE's environment only — an agent on any "
+                         "other CLI must pass this itself or the guard does not fire. "
+                         "Pass an empty string to say there is no asker. --ask only")
     ap.add_argument("--post", action="store_true", help="post summary as a PR comment")
     ap.add_argument("--json", action="store_true", dest="json_out",
                     help="emit the whole run as JSON on stdout; no report/post")
@@ -5695,6 +6131,12 @@ def main() -> int:
                          "review and reports no rounds. `/panel-review-pr` spells it "
                          "--rounds N and passes it here on every invocation")
     args = ap.parse_args()
+    # Validated at the edge, on both paths. A review would have GitHub refuse it
+    # eventually; an ask fetches nothing, so nothing else ever looks at this
+    # number — `--ask p --pr -5` put `"pr": -5` in the payload as a link for the
+    # board to render.
+    if args.pr is not None and args.pr < 1:
+        raise SystemExit("--pr: pull requests are numbered from 1")
     # The ask is settled before the round flags are validated, because it accepts
     # none of them: an ask that reached those checks would be answering a question
     # about a cycle it is not part of.
@@ -5715,7 +6157,13 @@ def main() -> int:
             raise SystemExit(f"--asker: unknown seat {asker!r} — expected one of "
                              f"{', '.join(LLM_REVIEWERS)}, or '' for no asker")
         return ask(args.repo, args.ask.strip(), args.context, args.reviewers,
-                   args.pr, args.json_out, args.json_file, args.record, asker)
+                   args.pr, args.json_out, args.json_file, args.record,
+                   # The NORMALISED value when one was typed, None when none was.
+                   # `ask` needs the difference: "nobody, and I mean it" is a
+                   # person at a terminal, while "nothing was detected" is an
+                   # agent whose CLI this file cannot recognise, and only the
+                   # second is worth a note in the report.
+                   asker if args.asker is not None else None)
     if args.pr is None:
         raise SystemExit("--pr is required — or pass --ask to challenge one premise "
                          "instead of reviewing a PR")
