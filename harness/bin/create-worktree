@@ -749,36 +749,76 @@ cd "$MAIN_REPO"
 # CHANGELOG's version narrative, where the correct resolution depends on which
 # releases are in flight).
 #
-# Pinned rather than left absent, because "absent" is not the same as "off": a
-# user with `rerere.autoUpdate=true` in their global or system config gets
-# exactly the staging this block's docs promise cannot happen, and nothing here
-# would have looked. Written only alongside `rerere.enabled`, so a repo that
-# decided either key for itself is still left alone.
+# The pin is written only when THIS script is the thing turning rerere on, and it
+# never overwrites a value somebody set. Round 2 found the two halves disagreeing
+# about scope, which is the defect worth remembering: `git config --get` reads
+# system+global+local, while a bare `git config <k> <v>` writes local. So a probe
+# that says "somebody decided this" was answering about a different file from the
+# one being written, and a user with `rerere.enabled=true` in ~/.gitconfig — a
+# normal thing for someone who likes rerere — skipped the block entirely and never
+# got the pin the docs promise them.
 #
-# NOT closed by that pin, and worth knowing before you trust the "you will see
+# So the two keys are decided independently, each against every scope:
+#   * enabled unset anywhere  -> turn it on, locally
+#   * autoUpdate unset anywhere AND we are the one enabling -> pin it false
+#   * either already set, in any scope -> leave it, and say so if the promise
+#     cannot be kept
+# `--type=bool` on both probes, so a set-but-invalid value counts as undecided
+# rather than as a decision: plain `--get` exits 0 for any value at all, including
+# ones git then refuses at merge time with "bad boolean config value".
+#
+# NOT closed by any of this, and worth knowing before you trust the "you will see
 # it" half: `epic.py:593` and `lander.py:197` both run a blanket `git add -A` in
-# a worktree, which stages a replayed resolution whether or not autoUpdate is
-# off. rerere is a hazard for unattended merge loops in a way it is not for a
+# a worktree, which stages a replayed resolution whether or not autoUpdate is off
+# (#124). rerere is a hazard for unattended merge loops in a way it is not for a
 # human at a terminal, and only the human half is closed here.
-#
-# `--type=bool` on the probe, so a set-but-invalid value counts as undecided
-# rather than as a decision: `git config --get` exits 0 for any value at all,
-# including ones git then refuses at merge time with "bad boolean config value".
-if ! git config --get --type=bool rerere.enabled >/dev/null 2>&1; then
-    if git config rerere.enabled true && git config rerere.autoUpdate false; then
-        echo -e "  ${GREEN}rerere enabled${NC} for this repo — conflict resolutions are now"
-        echo -e "  remembered and replayed across its worktrees. Read a replayed one before"
-        echo -e "  committing it: it is git's last answer, not necessarily this one's."
-    else
-        # Never fail worktree creation over a convenience default — the same
-        # choice the remote refresh below makes explicitly, and for the same
-        # reason. A held `config.lock` (parallel loops share this common git
-        # dir), a read-only `.git/config` or a HOME-less environment all reach
-        # here, and none of them is a reason to have no worktree.
-        echo -e "  ${YELLOW}could not enable rerere${NC} for this repo (config not writable?)" >&2
-        echo -e "  — carrying on; conflicts will just be resolved by hand as before." >&2
+# >>> rerere (extracted verbatim by harness/tests/test_create_worktree_rerere.py)
+rerere_is_on=false
+rerere_is_ours=false
+if git config --get --type=bool rerere.enabled >/dev/null 2>&1; then
+    # Somebody decided, in some scope. Their call, and we do not fight it.
+    if [[ "$(git config --get --type=bool rerere.enabled)" = "true" ]]; then
+        rerere_is_on=true
+    fi
+elif git config rerere.enabled true; then
+    rerere_is_on=true
+    rerere_is_ours=true
+else
+    echo -e "  ${YELLOW}could not enable rerere${NC} for this repo (config not writable?)" >&2
+    echo -e "  — carrying on; conflicts will just be resolved by hand as before." >&2
+fi
+
+# Reached whoever turned rerere on, which is the half round 2 found missing: this
+# used to hang off the same `if` as the enable, so a user with rerere already on
+# globally was never looked at — and they are exactly the population the docs
+# promise the unstaged guarantee to.
+if [[ "$rerere_is_on" = true ]]; then
+    if git config --get --type=bool rerere.autoUpdate >/dev/null 2>&1; then
+        if [[ "$(git config --get --type=bool rerere.autoUpdate)" = "true" ]]; then
+            echo -e "  ${YELLOW}rerere is on and autoUpdate is true${NC} — replayed resolutions" >&2
+            echo -e "  WILL be staged for you, so you can commit git's previous answer without" >&2
+            echo -e "  reading it. Set rerere.autoUpdate=false to get the merge to stop instead." >&2
+        fi
+    elif [[ "$rerere_is_ours" = true ]]; then
+        # Pinned only when nobody expressed a preference in any scope, and only
+        # when WE are the one turning the feature on: the promise is ours to keep,
+        # not theirs to have overwritten. Guarded on its own rather than chained
+        # with `&&` — the config.lock contention this exists for is per `git
+        # config` invocation, so "enabled written, pin not" is reachable in
+        # precisely the motivating case.
+        if ! git config rerere.autoUpdate false; then
+            echo -e "  ${YELLOW}rerere enabled, but autoUpdate could not be pinned${NC} — a replayed" >&2
+            echo -e "  resolution may be staged without being read." >&2
+        fi
     fi
 fi
+
+if [[ "$rerere_is_ours" = true ]]; then
+    echo -e "  ${GREEN}rerere enabled${NC} for this repo — conflict resolutions are now"
+    echo -e "  remembered and replayed across its worktrees. Read a replayed one before"
+    echo -e "  committing it: it is git's last answer, not necessarily this one's."
+fi
+# <<< rerere
 
 step "Creating git worktree and branch..."
 

@@ -558,7 +558,7 @@ def test_the_documented_judge_default_is_the_one_that_ships():
     a default-vs-loader drift — if both move together it stays green — and after
     the de-hardcoding above nothing else in the suite asserts that the model the
     READMEs name is the model that loads."""
-    assert hr.DEFAULTS["review_panel"]["judge_model"] == "fable"
+    assert hr.DEFAULTS["review_panel"]["judge_model"] == "sonnet"
 
 
 def test_the_judge_is_not_the_same_model_as_a_seat():

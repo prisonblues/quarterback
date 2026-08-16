@@ -98,7 +98,7 @@ Detected from the checkout, **not settable** here: `path`, `github`, `default_br
 | `dependabot_author` | Author filter for the lander (`app/dependabot`). |
 | `reviewers` | Which reviewers run — see below. |
 | `review_panel.skip_title_patterns` | Regexes for PRs not worth LLM review (merge/promote/release/format-the-world). These drove a cost blow-up in #117 — one release-merge ≈ $750. |
-| `review_panel.judge_model` | Claude model for the master judge (`""` = the harness default, `fable`) — deliberately **not** `reviewers.claude.model`; see below. |
+| `review_panel.judge_model` | Claude model for the master judge — `sonnet`, deliberately **not** `reviewers.claude.model`; see below. An explicit `""` is passed through as empty and lets the CLI pick, which is NOT the same as omitting the key (that gets the default). |
 | `review_panel.ask_quorum` / `ask_threshold` | `--ask`'s tally rules: how many seats must have **answered** for the vote to mean anything, and how many must have said the same thing for it to be that answer. Both **2** — one seat agreeing with the agent that wrote the premise is not a challenge. A rule above the number of seats on the ask is warned about: it can never be met. |
 | `review_panel.ask_max_context_chars` | Total `--context` material one ask may hand its seats, across every spec. **60,000** (~15k tokens). Over budget is clamped and SAID, per spec — an ask's whole claim is that it is the cheap check, and unbounded context is the #117 cost shape on the path advertised as costing a minute. |
 | `loops` | `dependabot_lander` / `stacked_driver` / `issue_executor` — which loops may run. |
@@ -124,29 +124,40 @@ Detected from the checkout, **not settable** here: `path`, `github`, `default_br
 - `sonarqube` — deterministic static-analysis **hard gate**. `project_key`,
   `organization` and `host` are non-secret and belong here; the token does not.
 
-`review_panel.judge_model` (default: **`fable`**) — the model that adjudicates what
+`review_panel.judge_model` (default: **`sonnet`**) — the model that adjudicates what
 the seats found. It is deliberately not `opus`, which is `reviewers.claude.model`: the
 adjudicator should not be the same brain as a seat it rules on, which is the note above
 about `claude.model` applied one level up. The evidence is one day's worth and small —
 on 2026-08-15 four judge-confirmed findings turned out plainly wrong on inspection, and
 all four were raised by claude and confirmed by an `opus` judge — so the mechanism is the
-argument, not the sample. `fable` rather than `sonnet` because the judge's job did not get
-easier; `clamp_model` already states this repo's tie-break as failing toward capability.
+argument, not the sample.
+
+**Why `sonnet` and not `fable`, which this started as.** The first version chose `fable`
+on a tie-break — the judge's job did not get easier, and `clamp_model` states this repo's
+preference as failing toward capability. Both review rounds then attacked that from two
+directions. `fable` is **not universally available**: it wants a recent Claude Code, is
+not on every plan, can be organization-disabled and may want credits, and the panel does
+no availability preflight — so an installation without access gets an unadjudicated round
+every single time (loudly: `judge_skip` feeds the coverage veto and the report says "all
+findings KEPT unjudged", so it degrades visibly rather than silently — but it degrades).
+And it is the **priciest model in the panel**, on a run that happens for every reviewed
+PR, in a file whose `skip_title_patterns` exist because one release-merge came to about
+$750.
+
+A premise attacked twice is the one to delete rather than patch. The requirement is
+**independence** — the adjudicator must not be the brain that raised the finding — and
+`sonnet` meets it outright: it is not `reviewers.claude.model`, it runs wherever the CLI
+runs, and it is *cheaper* than the `opus` judge it replaces rather than dearer. The
+capability argument was never evidence either way: the four wrong findings above were
+confirmed by an `opus` judge, so capability is not what was failing.
+
+**Want the most capable adjudicator? Set `judge_model: fable`.** That is what the key is
+for. What a default should not do is make that trade on every repo's behalf, silently.
 
 This is only the default. **Pinning both keys to the same model still works and says
 nothing** — the enforcement half (`judge_independent`: refuse to run when the judge's
 model matches an enabled seat's) is [#78](https://github.com/prisonblues/quarterback/issues/78)
 and is not implemented.
-
-**Two costs of that default, neither of them free.** `fable` is not universally
-available: it needs a recent Claude Code, is not on every plan, can be disabled for an
-organization, and may want credits — and the panel does no availability preflight, so an
-installation without access loses its judge on every run rather than falling back. And it
-is now the most expensive model in the panel by default, on a run that happens for every
-reviewed PR, in a harness whose `skip_title_patterns` exist because one release-merge came
-to about $750. Independence was purchasable at `sonnet` too and was decided on a
-capability tie-break rather than a measurement. **If either bites, pin `judge_model`** —
-that is what the key is for, and doing so costs you only the independence default.
 
 `review_panel.max_diff_chars` (default: **none — the whole diff**) — how much of
 the diff each model is given. Override per reviewer with

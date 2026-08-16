@@ -118,8 +118,11 @@ def resolve_ceiling(cfg: dict, model: str | None) -> str:
     top tier — which is why it is not written that way."""
     if model:
         return model
-    ceiling = cfg.get("epic", {}).get("model_ceiling",
-                                      DEFAULTS["epic"]["model_ceiling"])
+    # `cfg.get("epic") or {}`, not `cfg.get("epic", {})`: an explicit `"epic": null`
+    # in a rules file returns None from the second form and raises AttributeError
+    # on the .get below — a crash, on a config that parses.
+    ceiling = (cfg.get("epic") or {}).get("model_ceiling",
+                                         DEFAULTS["epic"]["model_ceiling"])
     return "" if ceiling is None else ceiling
 
 

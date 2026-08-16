@@ -515,9 +515,19 @@ tends to find it sound. The harness already held this exact principle one level 
 line telling you to set `claude.model` to a different model than the PR author because same-model
 self-review is the weak case. The judge is that argument applied upward, and nothing applied it.
 
-The default is now `fable`. Upward rather than to `sonnet` because the judge's job did not get any
-easier, and `clamp_model` already states this repo's tie-break as failing toward capability rather
-than cheapness. **This is only a default**: pinning both keys to the same model still works and
+**The default is now `sonnet`, and getting there took both rounds.** It was `fable` when this entry
+was first written — upward rather than sideways, on the grounds that the judge's job did not get any
+easier and `clamp_model` states this repo's tie-break as failing toward capability. Round 1 said that
+bought an availability gamble (`fable` wants a recent CLI, is not on every plan, can be
+org-disabled, may want credits, and the panel does no preflight) and round 2 said the same thing
+again from the cost side, on a judge that runs for every reviewed PR in a harness whose
+`skip_title_patterns` exist because one release-merge came to about $750. A premise attacked twice
+is the one to delete rather than patch (#67): the requirement was INDEPENDENCE, and `fable` was one
+implementation of it carrying two risks nobody had measured. `sonnet` is not `reviewers.claude.model`
+either, is available wherever the CLI runs at all, and is cheaper than the `opus` judge it replaces
+rather than dearer. The capability argument was never evidence — the four wrong findings above were
+confirmed by an `opus` judge, so capability is not what was failing. A repo that wants the most
+capable adjudicator sets `judge_model: fable` and gets it. **This is only a default**: pinning both keys to the same model still works and
 still says nothing. The enforcement half — refuse to run when the judge's model matches an enabled
 seat's — is `judge_independent` in #78 and is not implemented here.
 
@@ -541,7 +551,14 @@ replay in the other nine. Verified end to end — with rerere off the second bra
 markers, with it on the same merge in a *worktree* prints `Resolved 'CHANGELOG.md' using previous
 resolution` and the resolved content is there.
 
-`rerere.autoUpdate` is deliberately **not** set, and that is the interesting half. rerere matches on
+`rerere.autoUpdate` is **pinned to false** when this script is the thing turning rerere on, and that
+is the interesting half. (It was left *unset* in this entry's first draft, on the reasoning that
+absent and off are the same thing. They are not: a user carrying `autoUpdate=true` globally got
+exactly the staging described below as impossible. Round 1 caught it; round 2 then caught the pin
+being written from a probe that read every config scope while the write only ever touched the local
+one, so a user with `rerere.enabled=true` in `~/.gitconfig` skipped the block entirely and never got
+the pin at all. The two keys are now decided independently, each against every scope, and neither
+overwrites a value somebody set.) rerere matches on
 the conflict text, so it replays last time's answer without knowing whether the right answer changed
 — and the file it helps most with is the one where the correct resolution depends on which release
 numbers are in flight. With autoUpdate off the merge still stops and the file is left unstaged, so a

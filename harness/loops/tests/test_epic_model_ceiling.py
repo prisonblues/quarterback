@@ -13,6 +13,7 @@ fallback to `judge_model`, or the expression being dropped. Those are wiring, an
 wiring has to be called. Hence `resolve_ceiling`, and hence these.
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -84,3 +85,68 @@ def test_the_documented_tiers_are_the_ones_the_constant_holds():
     assert hr.DEFAULTS["epic"]["model_ceiling"] in epic.MODEL_TIERS
     assert epic.allowed_models("fable") == ["sonnet", "opus", "fable"]
     assert epic.allowed_models("sonnet") == ["sonnet"]
+
+
+# ------------------------------------------------ through the real load path
+
+def _repo(tmp_path, name):
+    """A checkout `resolve_repo` will accept: it insists on an `origin` remote,
+    because the harness addresses repos as `gh --repo owner/name`."""
+    import subprocess
+
+    repo = tmp_path / name
+    repo.mkdir()
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(tmp_path),
+           "GIT_CONFIG_GLOBAL": str(tmp_path / ".gitconfig"),
+           "GIT_CONFIG_SYSTEM": str(tmp_path / ".gitconfig-system"),
+           "GIT_AUTHOR_NAME": "T", "GIT_AUTHOR_EMAIL": "t@example.com",
+           "GIT_COMMITTER_NAME": "T", "GIT_COMMITTER_EMAIL": "t@example.com"}
+    (tmp_path / ".gitconfig").write_text("")
+    (tmp_path / ".gitconfig-system").write_text("")
+
+    def git(*args):
+        subprocess.run(["git", "-C", str(repo), *args], check=True, env=env,
+                       capture_output=True)
+
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True, env=env)
+    git("commit", "-q", "--allow-empty", "-m", "init")
+    git("remote", "add", "origin", "https://github.com/acme/proj.git")
+    return repo
+
+def test_a_real_rules_file_reaches_resolve_ceiling_with_the_default_merged_in(tmp_path):
+    """Everything above builds `cfg` by hand, which cannot catch the assumption the
+    whole design rests on: that `epic` is deep-merged, so a repo declaring an
+    `epic` block without `model_ceiling` still gets the default. Round 2 was right
+    that nothing exercised it — and no reviewer could confirm `_DEEP_BLOCKS`'
+    membership from the diff either, which is the same gap seen from outside.
+
+    So this one goes through `resolve_repo`: a real rules file, a real merge, and
+    the resolution called on the result."""
+    import json
+
+    repo = _repo(tmp_path, "repo")
+
+    # An epic block that says something ELSE — the case that would lose model
+    # routing entirely if `epic` were ever dropped from _DEEP_BLOCKS.
+    (repo / hr.RULES_FILENAME).write_text(json.dumps({"epic": {"auto_finish": True}}))
+    cfg = hr.resolve_repo(str(repo))
+    assert cfg["epic"]["auto_finish"] is True
+    assert epic.resolve_ceiling(cfg, None) == hr.DEFAULTS["epic"]["model_ceiling"]
+
+    # And an explicit ceiling in a real file survives the merge unchanged.
+    (repo / hr.RULES_FILENAME).write_text(
+        json.dumps({"epic": {"model_ceiling": "sonnet"}}))
+    assert epic.resolve_ceiling(hr.resolve_repo(str(repo)), None) == "sonnet"
+
+
+def test_the_judge_model_a_real_rules_file_sets_does_not_move_the_ceiling(tmp_path):
+    """The regression this PR exists to prevent, asserted through the loader
+    rather than through a hand-built dict."""
+    import json
+
+    repo = _repo(tmp_path, "repo2")
+    (repo / hr.RULES_FILENAME).write_text(
+        json.dumps({"review_panel": {"judge_model": "fable"}}))
+    cfg = hr.resolve_repo(str(repo))
+    assert cfg["review_panel"]["judge_model"] == "fable"
+    assert epic.resolve_ceiling(cfg, None) == hr.DEFAULTS["epic"]["model_ceiling"]

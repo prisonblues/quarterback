@@ -30,23 +30,25 @@ SCRIPT = Path(__file__).resolve().parents[1] / "bin" / "create-worktree"
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="git not on PATH")
 
-# The block's first line, and the `fi` at the same indent that closes it. Anchored
-# on the probe rather than on a comment, because a comment is the part most likely
-# to be rewritten by the next person to touch this.
-_START = re.compile(r"^if ! git config --get --type=bool rerere\.enabled", re.M)
+# Explicit sentinels rather than a pattern over the code. Round 1's version
+# anchored on the probe's exact text, and round 2's fix rewrote that probe — which
+# would have left this suite extracting nothing and passing about it. A marker is
+# the one thing a refactor cannot silently change the meaning of.
+_START = "# >>> rerere"
+_END = "# <<< rerere"
 
 
 def rerere_block() -> str:
     """The rerere stanza, lifted out of create-worktree as it actually ships."""
     src = SCRIPT.read_text()
-    m = _START.search(src)
-    assert m, ("the rerere block is gone from create-worktree, or its probe was "
-               "rewritten — this test is now asserting nothing, so fix the anchor "
-               "rather than deleting the test")
-    tail = src[m.start():]
-    end = re.search(r"^fi$", tail, re.M)
-    assert end, "no closing `fi` at column 0 after the rerere probe"
-    return tail[:end.end()]
+    assert _START in src and _END in src, (
+        f"the {_START} / {_END} markers are gone from create-worktree, so this "
+        "suite is asserting nothing — fix the markers rather than deleting the test")
+    # Drop the remainder of the marker's own line — it carries a comment, and
+    # bash would try to run it.
+    block = src.split(_START, 1)[1].split("\n", 1)[1].split(_END, 1)[0]
+    assert "rerere.enabled" in block, "the markers no longer bracket the rerere block"
+    return block
 
 
 def run_block(repo: Path, home: Path) -> subprocess.CompletedProcess:
@@ -126,12 +128,64 @@ def test_a_repo_that_already_turned_it_on_is_left_alone(repo, home):
 
 def test_a_replayed_resolution_is_left_unstaged(repo, home):
     """The documented guarantee — 'read it before committing it' — is exactly
-    `rerere.autoUpdate=false`, and it is now WRITTEN rather than left absent. A
-    user with autoUpdate on globally used to get the staging the docs promise
-    cannot happen, with nothing here having looked."""
-    (home / ".gitconfig").write_text("[rerere]\n\tautoUpdate = true\n")
+    `rerere.autoUpdate=false`, and it is WRITTEN rather than left absent when
+    nobody has expressed a preference. Absent is not off: git's default is off,
+    but a user carrying `autoUpdate=true` in a global config gets the staging the
+    docs promise cannot happen, and the first version of this block never looked."""
     assert run_block(repo, home).returncode == 0
     assert cfg(repo, "rerere.autoUpdate") == "false"
+
+
+def test_an_explicit_global_autoUpdate_is_warned_about_not_overwritten(repo, home):
+    """Where round 1 and round 2 disagreed, and the settled answer. Round 1 pinned
+    `false` unconditionally; round 2 pointed out that a user who set `autoUpdate`
+    deliberately — in any scope — has expressed a decision, and a worktree helper
+    is not the thing that gets to overrule it.
+
+    So the pin is only written when nobody has decided. When somebody has decided
+    the *other* way, the unstaged guarantee genuinely does not hold here, and the
+    block says so rather than letting this script's own docs be a lie about it."""
+    (home / ".gitconfig").write_text("[rerere]\n\tautoUpdate = true\n")
+    r = run_block(repo, home)
+    assert r.returncode == 0
+    assert cfg(repo, "rerere.autoUpdate") is None, "their choice was overwritten"
+    assert "autoUpdate is true" in r.stderr, (
+        "rerere was turned on into a config that stages replayed resolutions, and "
+        "nothing said so")
+
+
+def test_a_global_enabled_true_still_gets_the_autoUpdate_promise_checked(repo, home):
+    """The arrangement the first version of this suite did not cover, and the
+    realistic one: nobody sets `autoUpdate` globally without also setting
+    `enabled`. The probe reads system+global+local while a bare `git config` write
+    touches only local — so a user who likes rerere and turned it on in
+    `~/.gitconfig` skipped this block entirely and never got the pin, while the
+    docs promised them a replayed resolution would be left unstaged.
+
+    The block does not fight them for `enabled` — their choice, any scope, stands.
+    What it must not do is claim the unstaged guarantee while `autoUpdate=true` is
+    in force, so it says so on stderr."""
+    (home / ".gitconfig").write_text(
+        "[rerere]\n\tenabled = true\n\tautoUpdate = true\n")
+    r = run_block(repo, home)
+    assert r.returncode == 0
+    effective = subprocess.run(["git", "-C", str(repo), "config", "--get",
+                                "--type=bool", "rerere.autoUpdate"],
+                               capture_output=True, text=True, env=isolated_env(home))
+    if effective.stdout.strip() == "true":
+        assert "autoUpdate" in r.stderr, (
+            "rerere is on and autoUpdate is true, so a replayed resolution WILL be "
+            "staged — the docs promise the opposite, and saying nothing makes them a lie")
+
+
+def test_an_explicit_autoUpdate_is_never_clobbered(repo, home):
+    """`enabled` unset but `autoUpdate` explicitly set is a decision, and the block
+    only ever writes the pin when nobody has expressed one."""
+    subprocess.run(["git", "-C", str(repo), "config", "rerere.autoUpdate", "true"],
+                   check=True, env=isolated_env(home))
+    assert run_block(repo, home).returncode == 0
+    assert cfg(repo, "rerere.enabled") == "true"     # we did enable it
+    assert cfg(repo, "rerere.autoUpdate") == "true"  # and left their choice alone
 
 
 def test_a_set_but_invalid_value_counts_as_undecided(repo, home):
@@ -176,6 +230,10 @@ def test_linked_worktrees_share_the_resolution_cache(repo, home):
     assert Path(common).resolve() == (repo / ".git").resolve()
     # And the setting itself reaches the linked worktree, which is what makes the
     # replay happen there at all.
-    r = subprocess.run(["git", "-C", str(linked), "config", "--get", "rerere.enabled"],
-                       capture_output=True, text=True)
-    assert r.stdout.strip() == "true"
+    r = subprocess.run(["git", "-C", str(linked), "config", "--local", "--get",
+                        "rerere.enabled"], capture_output=True, text=True,
+                       env=isolated_env(home))
+    assert r.stdout.strip() == "true", (
+        "--local and the isolated env are both load-bearing here: without them a "
+        "developer's own global rerere.enabled=true makes this pass against a block "
+        "that wrote nothing at all")
