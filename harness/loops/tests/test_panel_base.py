@@ -229,3 +229,58 @@ def test_a_skipped_round_keeps_the_free_end_and_buys_nothing(monkeypatch, tmp_pa
     assert payload["merge_base"] == "0ddba5e0"
     assert payload["base_sha"] is None
     assert not any("/git/ref/heads/" in a[2] for a in calls if a[:2] == ["gh", "api"])
+
+
+# ------------------------------- the head moving takes the merge base with it
+
+def test_merge_base_is_re_read_when_the_head_moves(monkeypatch):
+    """Round 1 of #128's panel: `head_sha` was re-stamped when the head moved
+    mid-round while `merge_base` kept the value GitHub computed for the commit it
+    replaced — so the recorded pair was a range no round ever reviewed.
+
+    It is not a corner case here. GitHub recomputes `baseRefOid` on every push to
+    the head branch, and the usual reason a head moves on this repo is a merge of
+    the base branch INTO the PR (~1.8 integration merges per PR landed, #80),
+    which is exactly the push that moves it. The stored range would then begin
+    before an integration merge that its right end contains."""
+    seen = []
+
+    def fake(args, **kw):
+        seen.append(args)
+        return json.dumps({"baseRefOid": "bbbbbbbb2222"})
+
+    monkeypatch.setattr(panel, "sh", fake)
+    assert panel._merge_base_now("acme/board", 128) == "bbbbbbbb2222"
+    assert any("baseRefOid" in " ".join(a) for a in seen), \
+        "asked GitHub for the wrong field"
+
+
+def test_the_merge_base_re_read_is_bounded_like_its_siblings(monkeypatch):
+    """On the critical path of a round, for a stamp nothing gates on. A hung `gh`
+    must not be able to stall the panel."""
+    seen = {}
+
+    def fake(args, **kw):
+        seen.update(kw)
+        return json.dumps({"baseRefOid": "b" * 12})
+
+    monkeypatch.setattr(panel, "sh", fake)
+    panel._merge_base_now("acme/board", 128)
+    assert seen.get("timeout") == panel.FIX_RANGE_TIMEOUT_S
+
+
+def test_every_way_the_merge_base_re_read_can_fail_is_a_None(monkeypatch):
+    """Same surface as its siblings, and the same reason: `sh` runs with
+    `check=True`, so a missing binary is a FileNotFoundError rather than a
+    CalledProcessError. A None here means "could not tell", and the caller says
+    so in `config_notes` rather than pairing two ends that do not belong
+    together."""
+    for exc in (subprocess.CalledProcessError(1, "gh"),
+                FileNotFoundError("gh"),
+                subprocess.TimeoutExpired("gh", 60)):
+        monkeypatch.setattr(panel, "sh", _sh_raising(exc))
+        assert panel._merge_base_now("acme/board", 128) is None, exc
+    monkeypatch.setattr(panel, "sh", lambda *a, **k: "not json")
+    assert panel._merge_base_now("acme/board", 128) is None
+    monkeypatch.setattr(panel, "sh", lambda *a, **k: json.dumps({}))
+    assert panel._merge_base_now("acme/board", 128) is None
