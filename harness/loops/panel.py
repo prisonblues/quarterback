@@ -2979,6 +2979,37 @@ def _head_sha_now(gh_repo: str, pr_number: int) -> str | None:
         return None
 
 
+def _base_tip_now(gh_repo: str, base_ref: str) -> str | None:
+    """The LIVE tip of the base branch. None if it cannot be had.
+
+    The one field in this pair that actually moves, and the reason it needs its
+    own call. `gh pr view --json baseRefOid` looks like the answer and is not:
+    it reports the **merge base**, recomputed only when the head branch is
+    pushed, and a merge base cannot move when the base branch advances — a
+    common ancestor is unaffected by commits added to one side of it. Measured
+    rather than assumed: PR #87 sat at `baseRefOid=88643c14` while `main` took
+    ten commits, and `git merge-base` against `main` still answered `88643c14`
+    afterwards.
+
+    So a staleness check built on `baseRefOid` alone reads "unmoved, the review
+    still stands" in exactly the case it exists to catch. Both ends are recorded
+    because they answer different questions: `merge_base` is what the diff under
+    review was built FROM, this is what the branch would be merged INTO.
+
+    `git/ref/heads/…` rather than `commits/…`: it returns one object of a few
+    hundred bytes where the commits endpoint ships the whole commit including its
+    file list. Bounded and swallowed like :func:`_head_sha_now` — it runs on the
+    critical path of every round, and nothing gates on it."""
+    if not base_ref:
+        return None
+    try:
+        got = json.loads(sh(["gh", "api", f"repos/{gh_repo}/git/ref/heads/{base_ref}"],
+                            timeout=FIX_RANGE_TIMEOUT_S))
+        return (got.get("object") or {}).get("sha") or None
+    except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
+        return None
+
+
 #: The buckets :func:`_provenance` sorts a new finding into. `unknown` is a real
 #: answer and not a failure — it is what an unreadable fix range or an
 #: unplaceable finding honestly leaves.
@@ -4475,6 +4506,23 @@ def _payload_defaults() -> dict:
         # round needs it to diff the fix pass that ran in between — without it,
         # provenance cannot be computed at all rather than computed badly.
         "head_sha": None,
+        # The other end of the range, and the two are NOT interchangeable (#98).
+        #
+        # `merge_base` is the commit this round's diff was built FROM: `gh pr
+        # diff` is the three-dot diff, so the reviewers read `merge_base...head`
+        # and nothing else in the payload named that commit. It moves only when
+        # the PR merges its base in or is rebased.
+        #
+        # `base_sha` is the live tip of the base branch at review time — what the
+        # PR would be merged INTO. It is the end that moves on its own, and the
+        # only one a staleness check can be built on. Recording just the merge
+        # base would produce a check that reports "unmoved" however far the base
+        # ran away; see :func:`_base_tip_now` for the measurement behind that.
+        #
+        # Null on both means the panel did not say. Neither is ever derived from
+        # the other.
+        "merge_base": None,
+        "base_sha": None,
         # What this round could not read in full, for the NEXT round's
         # `missed-unread` bucket. See :func:`_diff_files_cut`. Empty on a payload
         # whose `reviewed` is false means "no coverage at all", not "read
@@ -4660,8 +4708,8 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     try:
         meta = json.loads(sh(["gh", "pr", "view", str(pr_number), "--repo", gh_repo,
                               "--json", "title,additions,deletions,baseRefName,"
-                                        "headRefName,headRefOid,files,changedFiles,"
-                                        "state,isDraft"]))
+                                        "baseRefOid,headRefName,headRefOid,files,"
+                                        "changedFiles,state,isDraft"]))
     except subprocess.CalledProcessError as e:
         tail = (e.stderr or "").strip().splitlines()
         # `gh pr view --json` rejects the WHOLE command on a field it does not
@@ -4680,6 +4728,12 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # is carried into the payload now because the next round needs it to tell a
     # defect its own fix pass created from one this round simply missed.
     head_sha = meta["headRefOid"]
+    # The base end of the same range (#98). `baseRefOid` is the MERGE BASE — the
+    # commit `gh pr diff`'s three-dot diff is built from — and not the base
+    # branch's tip, which is why the tip is fetched separately below rather than
+    # read off this call. `.get`, not `[...]`: every other key here is required
+    # because the run cannot proceed without it, and a base commit is not that.
+    merge_base = meta.get("baseRefOid") or None
     changed = meta["additions"] + meta["deletions"]
     # Same call that already produced `changed`, three fields wider — so the board
     # gets the paths behind the number, and the PR's state, without a second
@@ -4742,6 +4796,11 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 # where that round's fix range has to start. Left null, a skip
                 # anywhere in a cycle would blind provenance for the round after it.
                 "head_sha": head_sha,
+                # Free off the metadata this path already fetched. `base_sha` is
+                # NOT here and is left at its null default: reading the base
+                # branch's tip is a second API call, and this path is the one
+                # that exists to cost nothing and is never recorded on the board.
+                "merge_base": merge_base,
                 # Zeroed rather than left `{}` when there ARE earlier rounds:
                 # `{}` is the shape for a round where the question does not arise,
                 # and a skipped round 3 of a cycle is not that — it attributed
@@ -4814,6 +4873,22 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                      "which of the two produced it cannot be told from here; the later commit "
                      "is recorded, and provenance against this round is that much less certain")
         head_sha = moved_to
+    # The base end (#98), read here rather than above the skip branch: this is one
+    # more API round trip and the skip path exists to be cheap, never fetches a
+    # diff, and never reaches the board — so a base tip recorded there would have
+    # no consumer to be worth the call. A skipped payload keeps `merge_base`,
+    # which is free off the metadata already fetched, and leaves this null.
+    #
+    # No note when the two differ. `base_sha != merge_base` is the ordinary state
+    # of every PR whose base gained a commit after it forked, so a warning there
+    # would fire on almost every run and be trained away — the same reasoning
+    # `unread_files` records for not warning about its own dedup. What the base's
+    # movement MEANS is a verdict, and the verdict belongs to #96.
+    base_sha = _base_tip_now(gh_repo, base)
+    if base_sha is None:
+        notes.append(f"the tip of base branch '{base}' could not be read, so this round "
+                     "records what its diff was built from and not what the PR would be "
+                     "merged into — a later staleness check has one end of the range only")
     panel_budget = diff_budget(panel, "max_diff_chars", DEFAULT_DIFF_BUDGET, notes)
     # Only for the reviewers actually running: a budget warning about a model
     # this run never asked for is noise, and a "truncated for antigravity" footnote
@@ -5122,6 +5197,11 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         "repo": repo_name, "github": gh_repo, "pr": pr_number,
         "title": title, "base": base, "changed_lines": changed,
         "head_sha": head_sha,
+        # Both ends of the range this round was judged against (#98). `merge_base`
+        # is what the diff was built from; `base_sha` is where the base branch had
+        # got to while it was being read.
+        "merge_base": merge_base,
+        "base_sha": base_sha,
         "unread_files": unread_files,
         "changed_files": changed_files, "changed_files_total": changed_files_total,
         "pr_state": pr_state, "is_draft": is_draft,

@@ -225,14 +225,19 @@ half of the panel↔board drift check #65 asks for.
 
 The deployed board version lags the repo until the stack is redeployed, and only the running
 service knows which it is: ask it with `GET /openapi.json` → `.info.version`, for whichever
-instance you care about. (Anything built off this branch says 2.26.0 — v2.27 is harness-side.) A
+instance you care about. (Anything built off this branch says 2.29.0.) A
 number written here instead would be wrong the next time Portainer redeploys, with no diff to catch
 it.
-Latest release: **v2.27**, harness-side — `panel.py --ask` puts one premise to the seats and reports
+Latest release: **v2.29** — a panel round records both ends of what it was judged against, not just
+the commit it read: the merge base its diff was built from, and the base branch's tip at the time
+(schema revision 0018). The two are separate because GitHub's `baseRefOid` is the merge base, and a
+merge base does not move when the base branch does — so the obvious single-field version of this
+check could only ever answer "unmoved". (**v2.22** and **v2.28** are claimed by branches not yet
+merged, which is why the numbering skips them.)
+Before it, **v2.27**, harness-side — `panel.py --ask` puts one premise to the seats and reports
 the tally, with no diff, no judge and no gate, so a fix's assumption can be challenged in a minute
-instead of in a twenty-minute round. (**v2.22** is claimed by a branch not yet merged, which is why
-the numbering skips it.)
-Before it, **v2.26** had the provenance v2.24 computed reach the board and the leaderboard: which
+instead of in a twenty-minute round.
+Before that, **v2.26** had the provenance v2.24 computed reach the board and the leaderboard: which
 reviewer catches regressions in fresh code and which finds what was already there, plus the commit
 each round reviewed (schema revision 0017).
 Before that, **v2.25** (harness-side) had the codex panel seat review the diff it was handed instead
@@ -291,6 +296,12 @@ judge) are harness-side too.
   no diff, no judge, the vote is the output, and it gates nothing. `cannot tell` counts toward the
   quorum and never toward the answer, and a tally whose only voter is the agent that wrote the
   premise reports as unchallenged rather than as agreement.
+- **v2.29** — a round records what it was judged AGAINST, which was a branch name before: the merge
+  base its diff was built from and the base branch's tip at review time (schema revision 0018). Two
+  fields rather than one because GitHub's `baseRefOid` is the merge base, and adding commits to a
+  base branch cannot move a common ancestor — PR #87 held one value across ten commits of `main` —
+  so a staleness check resting on it alone would report "the review still stands" in exactly the
+  case it exists to catch. Stamped and published; what a moved base MEANS is #96's verdict.
 - **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
   object store; wire `landed` refs to a cherry-pick helper.
 

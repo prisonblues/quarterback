@@ -138,6 +138,30 @@ four integers. The unread PATHS are on ``GET /review/{id}`` only, exactly where
 ``changed_files`` lives; the list views carry ``unread_files_count`` instead,
 which still separates "measured, nothing cut" (0) from "never measured" (null)
 without letting one page of runs serialise a few million path strings.
+
+**v2.29 — the other end of the range, and why it is two fields.** v2.26 recorded
+which commit a round read and left what it was judged AGAINST as a branch name.
+#98 proposed closing that with GitHub's ``baseRefOid``, compared later against
+the PR's current ``baseRefOid``. That comparison cannot fire: ``baseRefOid`` is
+the **merge base**, recomputed when the head branch is pushed and never when the
+base branch advances, because a common ancestor is not moved by commits added to
+one side of it. PR #87 held ``88643c14`` across ten commits of ``main``, REST
+``.base.sha`` agreed, and ``git merge-base`` against the moved ``main`` still
+answered ``88643c14``. A check written that way reports "the review still
+stands" exactly when the base has run away underneath it.
+
+So ``merge_base`` and ``base_sha`` are separate columns and mean different
+things: the first is what the reviewed diff was built from (``gh pr diff`` is the
+three-dot diff, so the seats read ``merge_base...head_sha``), the second is the
+base branch's tip at review time — the end that moves on its own. Neither is
+derived from the other, and a run that could not read one stores null there
+rather than the other one standing in.
+
+This release stamps and publishes them and deliberately draws no conclusion from
+them. Whether a moved base makes a review stale is #96's verdict, and #98 states
+the asymmetry it has to keep: proving staleness is cheap, proving freshness is
+not, so a base that moved without touching the PR's files is "no overlap
+detected" and never "the review is current".
 """
 
 from __future__ import annotations
@@ -883,6 +907,14 @@ class ReviewIn(BaseModel):
     #: no round could ever be replayed against the repo. Coerced to a plausible
     #: commit id or dropped — see :func:`_sha_or_none`.
     head_sha: str | None = None
+    #: The base end of that range, as two fields rather than one, because the
+    #: field #98 named for the job reports the merge base and a merge base cannot
+    #: move when the base branch does. ``merge_base`` is what the reviewed diff
+    #: was built from; ``base_sha`` is the base branch's tip at review time, and
+    #: is the only one of the two a staleness check can rest on. Both coerced or
+    #: dropped by :func:`_sha_or_none`, and neither ever derived from the other.
+    merge_base: str | None = None
+    base_sha: str | None = None
     #: Paths no reviewer that ran read in full. NULL (the field absent) is "the
     #: panel did not say"; ``[]`` is "it said, and nothing was cut"; a non-empty
     #: value nothing usable could be read from is NULL too, and says so in the
@@ -911,6 +943,12 @@ class ReviewIn(BaseModel):
     #: A run sent ``"HEAD"`` and a run sent nothing both store NULL, and only this
     #: tells the sender which of the two it just recorded.
     head_sha_dropped: str | None = None
+    #: The same for the base end. Reported separately rather than folded into one
+    #: "a commit id was dropped" flag: a producer that sends a good head and a
+    #: garbled base has one bug, and a reader told only that *something* was
+    #: refused has to guess which field to go and look at.
+    merge_base_dropped: str | None = None
+    base_sha_dropped: str | None = None
     #: Tally keys that are not a bucket this board knows.
     provenance_counts_unknown: list[str] = Field(default_factory=list)
     #: Tally keys that ARE a known bucket and whose count could not be believed —
@@ -982,6 +1020,7 @@ class ReviewIn(BaseModel):
         counts = v.get("provenance_counts")
         _, unusable = _unread_paths(unread)
         head = v.get("head_sha")
+        merge_base, base_sha = v.get("merge_base"), v.get("base_sha")
         return {**v,
                 "changed_files_sent": len(files) if isinstance(files, list) else 0,
                 # A bare string is one path — a shape `_unread_paths` explicitly
@@ -993,6 +1032,14 @@ class ReviewIn(BaseModel):
                 "unread_files_unusable": unusable,
                 "head_sha_dropped": (_echo(head) if head is not None
                                      and _sha_or_none(head) is None else None),
+                # The base end, each named on its own. A run sent a garbled
+                # `base_sha` records NULL there, which is the same value a run
+                # that sent nothing records — the distinction #93 was filed over,
+                # now on the field a pre-land verdict will read.
+                "merge_base_dropped": (_echo(merge_base) if merge_base is not None
+                                       and _sha_or_none(merge_base) is None else None),
+                "base_sha_dropped": (_echo(base_sha) if base_sha is not None
+                                     and _sha_or_none(base_sha) is None else None),
                 # Keys this board has no column for. Named rather than dropped: a
                 # bucket the panel has started sending and the board silently
                 # ignores is #93 happening again, one release later.
@@ -1025,9 +1072,14 @@ class ReviewIn(BaseModel):
                         ("provenance_counts", counts, isinstance(counts, Mapping)),
                     ) if val is not None and not ok)}
 
-    @field_validator("head_sha", mode="before")
+    @field_validator("head_sha", "merge_base", "base_sha", mode="before")
     @classmethod
-    def _head_sha(cls, v: object) -> str | None:
+    def _commit_id(cls, v: object) -> str | None:
+        """Every commit id on this model, coerced by one rule.
+
+        Listed on one validator rather than three copies: the head end and the
+        base end have to agree about what a commit id IS, or a range assembled
+        from them at read time compares a normalised value against a raw one."""
         return _sha_or_none(v)
 
     @field_validator("unread_files", mode="before")
@@ -1459,6 +1511,13 @@ async def record_review(
         # stored AS SENT, NULL included: a run that says nothing about its
         # coverage is not a run that read everything.
         head_sha=body.head_sha,
+        # The base end of the same range, both halves stored AS SENT. `base_sha`
+        # is the base branch's tip and `merge_base` is what the diff was built
+        # from; neither is backfilled from the other, because a merge base
+        # standing in for a tip is exactly the substitution that makes a
+        # staleness check unable to fire.
+        merge_base=body.merge_base,
+        base_sha=body.base_sha,
         unread_files=body.unread_files,
         # The panel's own tally, not a count over the rows below. The two have
         # different populations by design (see the column's docstring), and `{}`
@@ -1641,6 +1700,13 @@ async def record_review(
     # across.
     if body.head_sha_dropped is not None:
         dropped["head_sha_dropped"] = body.head_sha_dropped
+    # ...and the base end, each named rather than one flag for "a commit id was
+    # refused". These two are what a pre-land verdict resolves against the repo,
+    # so a producer sending a base it thinks was stored has to be told it was not.
+    if body.merge_base_dropped is not None:
+        dropped["merge_base_dropped"] = body.merge_base_dropped
+    if body.base_sha_dropped is not None:
+        dropped["base_sha_dropped"] = body.base_sha_dropped
     # Every provenance bucket this board did not recognise, from the findings and
     # from the run's own tally, named rather than swallowed.
     #
@@ -1741,6 +1807,12 @@ def _run_view(r: ReviewRun, unread_count: int | None) -> dict:
         "base": r.base_branch,
         # The commit this round read, which `base` (a branch name) cannot say.
         "head_sha": r.head_sha,
+        # ...and both ends of what it was judged against. Two scalars, so they
+        # ride the list view where the path lists deliberately do not: the whole
+        # point of them is to be compared against the repo's CURRENT base without
+        # first fetching each run one at a time.
+        "merge_base": r.merge_base,
+        "base_sha": r.base_sha,
         # The COUNT, not the paths — the same trade `changed_files_total` makes
         # two lines down, and for the same reason. The cost `changed_files` was
         # kept out of this view for is response SIZE: `unread_files` is bounded
@@ -2696,6 +2768,12 @@ async def pr_finding_history(
             # `GET /review/{id}` has the list.
             {"id": r.id, "ts": r.ts.isoformat(), "author": r.author, "judged": r.judged,
              "head_sha": r.head_sha,
+             # The base end beside it, for the same reason `head_sha` is here: a
+             # round is only replayable, and its empty To-fix list only still
+             # true, relative to a base — and this endpoint is where a finding is
+             # traced to the fix that caused it. Two strings per run.
+             "merge_base": r.merge_base,
+             "base_sha": r.base_sha,
              "provenance_counts": r.provenance_counts,
              "unread_files_count": unread_counts[r.id],
              "confirmed": r.n_confirmed, "dismissed": r.n_dismissed,

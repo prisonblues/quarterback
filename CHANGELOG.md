@@ -7,6 +7,57 @@ that number where it was, so the repo can be a version ahead of the service.
 Entries are newest first. Each one says what was broken or missing before it, because that is the
 part that isn't recoverable from the diff.
 
+## v2.29 — a round said which commit it read and never which one it was judged against
+
+v2.26 gave a run its `head_sha` and its own migration named what was still missing: "#98 wants the
+other end of that range". A panel round's most consequential output is an empty **To fix** list, and
+that claim is only true relative to a base. The payload named the base with a branch *name*, which
+moves — so at merge time nothing could ask whether the base had moved since the review, and if it
+had, whether the movement touched anything the review looked at. The PR merges on a review that
+expired, and nobody gets an error. On this repo that is not a hypothetical: it runs ~1.8 integration
+merges per PR landed (#80).
+
+**The field the issue named for the job cannot do it, and finding that out is most of this release.**
+#98 proposed storing GitHub's `baseRefOid` as `base_sha` and having the pre-land check compare it
+against the PR's *current* `baseRefOid` — unmoved meaning the review still stands. But `baseRefOid`
+is the **merge base**, and a merge base is a common ancestor: commits added to one side of it do not
+move it. GitHub recomputes it when the HEAD branch is pushed, never when the base branch advances.
+
+Measured on this repo rather than argued from the docs. PR #87 sat at `baseRefOid = 88643c14` from
+20:34 while `main` took ten commits; REST `.base.sha` agreed; and `git merge-base origin/main
+origin/fix/issue-81`, computed against the moved `main` afterwards, still answered `88643c14`. Ten
+commits of base movement, zero movement in the field the check would have read. Three more PRs
+matched, and the two that did move their `baseRefOid` moved it by merging `main` INTO themselves —
+the branch acting, never the base. So the check as specified would answer *unmoved, the review still
+stands* precisely when `main` had run away underneath a clean panel verdict: not a failure recording
+as a success, but a staleness detector whose only possible output is **fresh**.
+
+So both ends are recorded, as two fields that mean different things (schema revision **0018**):
+
+- **`review_runs.merge_base`** — the commit the reviewed diff was built FROM. `gh pr diff` is the
+  three-dot diff, so the seats read `merge_base...head_sha` and nothing in the payload had ever
+  named the left-hand side. Free off metadata `panel.py` already fetches, and it moves only when the
+  PR merges its base in or is rebased.
+- **`review_runs.base_sha`** — the live tip of the base branch at review time: what the PR would be
+  merged INTO. The end that moves on its own, and therefore the only one a staleness check can rest
+  on. It costs its own lookup (`git/ref/heads/…`, a few hundred bytes, not the commits endpoint's
+  whole file list), which is why the title-skip path does not pay for one — that path never reaches
+  the board, so a base tip recorded there would have no consumer.
+
+Neither is ever derived from the other, and their disagreement is not a defect: `base_sha !=
+merge_base` is the ordinary state of every PR whose base gained a commit after it forked. Warning on
+it would fire on nearly every run and be trained away, so the panel does not. NULL keeps its v2.26
+meaning throughout — **not recorded**, never "no base" — and a run whose base tip could not be read
+says so in `config_notes` instead of inventing a value. A garbled commit id is refused by the same
+`_sha_or_none` the head end uses and named back in the 201 as `merge_base_dropped` /
+`base_sha_dropped`, because a sender that thinks it stored a base must not be left believing it.
+
+**This release stamps and publishes; it draws no conclusion.** Whether a moved base makes a review
+stale is #96's verdict, and #98 states the asymmetry that verdict has to keep: proving staleness is
+cheap and proving freshness is not, so a base that moved without touching the PR's files is "no
+overlap detected" and never "the review is current". Files are a proxy — a base commit that changes
+a shared contract without touching this PR's files can still invalidate a finding.
+
 ## v2.27 — one question to the panel, when a whole round was never the question
 
 A fix's premise had no cheap challenger. The only thing that reviewed a fix was a full panel round:

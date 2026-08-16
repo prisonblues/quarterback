@@ -63,6 +63,28 @@ class ReviewRun(Base):
     #: of that same range; #80 wants this column to reason about what a merge
     #: actually moved. NULL for every run recorded before the board stored it.
     head_sha: Mapped[str | None] = mapped_column(Text)
+    #: The commit the reviewed diff was built FROM (v2.29) — the merge base.
+    #: ``gh pr diff`` is the three-dot diff, so the seats read
+    #: ``merge_base...head_sha`` and until now nothing named the left-hand side.
+    #: It moves when the PR merges its base in or is rebased, which is the branch
+    #: acting; base branch movement cannot touch it.
+    merge_base: Mapped[str | None] = mapped_column(Text)
+    #: The live tip of ``base_branch`` at review time (v2.29) — what the PR would
+    #: be merged INTO, as opposed to what it was diffed from.
+    #:
+    #: **The two are separate columns because the obvious single field cannot do
+    #: this job.** #98 proposed storing GitHub's ``baseRefOid`` and comparing it
+    #: later against the PR's current ``baseRefOid``; that field is the merge
+    #: base, and a merge base is a common ancestor, so commits landing on the base
+    #: branch cannot move it. PR #87 held one value across ten commits of ``main``
+    #: and ``git merge-base`` still agreed with it afterwards. A staleness check
+    #: built on it can only ever answer "unmoved".
+    #:
+    #: So this is the end that moves, and the one a pre-land check (#96) compares
+    #: against the base branch's tip at LAND time. NULL where the panel could not
+    #: read it — it costs its own lookup, and the skip path deliberately does not
+    #: pay for one — never zero, never the merge base standing in.
+    base_sha: Mapped[str | None] = mapped_column(Text)
     #: Paths NO reviewer that ran read in full — the round's own coverage hole,
     #: banked for the NEXT round's ``missed-unread`` bucket. A file only lands
     #: here if every seat was truncated out of it: one seat that read it means the
