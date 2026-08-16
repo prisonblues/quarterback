@@ -99,6 +99,8 @@ Detected from the checkout, **not settable** here: `path`, `github`, `default_br
 | `reviewers` | Which reviewers run — see below. |
 | `review_panel.skip_title_patterns` | Regexes for PRs not worth LLM review (merge/promote/release/format-the-world). These drove a cost blow-up in #117 — one release-merge ≈ $750. |
 | `review_panel.judge_model` | Claude model for the master judge (`""` = default). |
+| `review_panel.ask_quorum` / `ask_threshold` | `--ask`'s tally rules: how many seats must have **answered** for the vote to mean anything, and how many must have said the same thing for it to be that answer. Both **2** — one seat agreeing with the agent that wrote the premise is not a challenge. A rule above the number of seats on the ask is warned about: it can never be met. |
+| `review_panel.ask_max_context_chars` | Total `--context` material one ask may hand its seats, across every spec. **60,000** (~15k tokens). Over budget is clamped and SAID, per spec — an ask's whole claim is that it is the cheap check, and unbounded context is the #117 cost shape on the path advertised as costing a minute. |
 | `loops` | `dependabot_lander` / `stacked_driver` / `issue_executor` — which loops may run. |
 | `epic` | Epic-driver settings — see below. |
 
@@ -125,7 +127,18 @@ Detected from the checkout, **not settable** here: `path`, `github`, `default_br
 `review_panel.max_diff_chars` (default: **none — the whole diff**) — how much of
 the diff each model is given. Override per reviewer with
 `reviewers.<name>.max_diff_chars` and for the master with
-`review_panel.judge_max_diff_chars`; both inherit the panel value when unset.
+`review_panel.judge_max_diff_chars`; both inherit the panel value when unset. Since
+v2.28 that budget buys the review target first and the PR context with whatever is left
+(see rounds, below), so on a scoped round it is no longer the target that a tight budget
+cuts. On a scoped round the budget also covers the brief and the section headers around
+the diff — a little over a kilobyte — because the ceiling that matters is the model's
+context window, and the prompt is what lands in it. Under `pr` scope it means chars of
+diff, exactly as it always has.
+
+`review_panel.round_scope` (default: **`increment`**) — whether a round past the first
+reads the fix commit or the whole PR again. `pr` restores the pre-v2.28 behaviour for a
+repo whose PRs are small enough that re-reading them costs nothing. Anything else is a
+typo, and lands in `config_notes` saying so rather than quietly turning scoping off.
 
 There used to be a 60,000-char default, and it was a fossil: prompts travelled in
 argv, where Linux caps one element at 128 KiB, so a budget was mandatory. Since
@@ -225,7 +238,10 @@ cwd's repo; `--repo` takes a path or a name under `~/source`.
 `python3 ~/.claude/loops/panel.py --pr <n>` (report) / `--post` (also comment on the
 PR) / `--json` (the run as JSON on stdout — nothing else, progress goes to stderr) /
 `--round <r> --max-rounds <N> --baseline <earlier round's --json-file>` (a re-review that
-knows what the earlier rounds raised, and where it sits in the caller's cycle).
+knows what the earlier rounds raised, and where it sits in the caller's cycle) /
+`--scope pr|increment|auto` + `--since <sha>` (what a later round reads — see below;
+`auto` is the default and needs no flag) /
+`--ask "<premise>"` (one question to the seats instead of a review — see below).
 
 Read-only, so it runs in **any** repo — an unconfigured one just uses the defaults.
 
@@ -301,6 +317,35 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   reviewer is truncated again next round — they only stop a broken round being reported
   as clean. A round past the first with no `--baseline` is itself a veto: it has nothing
   to compare against, so its "all new" count means nothing and its stop is unearned.
+- **A round past the first reviews the INCREMENT, not the whole PR** (v2.28). The target is
+  what changed since the head its baseline reviewed (`head_sha` in the payload; `--since`
+  overrides it), and behind it comes the PR **as it stood at that head**, in two tiers: the
+  files the increment touched as they were before it touched them, then the rest of the PR.
+  A budget is spent in that order, so what a tight budget drops is context and never the
+  thing under review — which is the point, since a loop that re-reads the whole PR every
+  round inflates its own input until it truncates itself. `--scope pr` restores the old
+  behaviour and `review_panel.round_scope` sets it per repo; round 1 is always the whole PR.
+  The near tier is fetched as its own `base...anchor` comparison, not sliced out of the
+  current PR diff: the fix commit is part of that diff, so slicing it would send the target
+  twice and label the copy as code an earlier round had already dealt with.
+  **Every fallback to whole-PR scope lands in `config_notes`** — no anchor, nothing pushed
+  between the rounds, a failed fetch (of the increment or of the context behind it), a
+  truncated compare response, or a base-branch merge that makes the range bigger than the PR
+  (measured: PR #62's raw round-to-round range was 92,415 chars against a 45,370-char PR, so
+  the range is first cut to the PR's own files and then rejected outright if it is still the
+  larger). A round that claimed the increment and re-read the PR would be wrong about the
+  only thing this measures, and invisible in the numbers. Two degraded-but-usable cases are
+  reported rather than refused: a range that is not a fast-forward from the anchor (a
+  rebase or force-push, where a reverted change is in neither tier) and one carrying a merge
+  commit (main's changes to files the PR also touches cannot be filtered out of the target).
+  What shrinks is the **target**, always. The material sent is target plus context, so the
+  token bill is in the same range as a whole-PR round; a note with both numbers says so on
+  any round where the near tier is most of the context.
+  One caveat: scope makes an earlier round's truncation **permanent** — round 2 never returns
+  to what round 1 was cut off from — so a scoped round that inherits one vetoes its own
+  confident stop, until a later whole-PR round with nothing truncated closes the gap. A round
+  that recorded a head but ran no reviewer at all (a title skip, or every seat failing)
+  vetoes the round after it the same way: the anchor steps over code nobody read.
 - **`--json-file` is a requirement, not a courtesy.** It is the next round's baseline, so
   a write that fails exits non-zero after the report: carrying on would leave round `r+1`
   calling every repeated finding new. Every non-error exit writes it, the skip-pattern one
@@ -321,6 +366,96 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   and then panels the fix commit, 2 rounds by default (`--rounds N`), so the fixer's
   own work is read by somebody. `panel.py` itself stays read-only either way: the
   fix/verify/commit lives in the skill, and so does the loop.
+
+### The premise check (`--ask`)
+
+`python3 ~/.claude/loops/panel.py --ask "<premise>" [--context <path[:first-last]> …]
+[--pr N] [--asker <seat>]` — one question to the enabled seats instead of a review.
+**No diff, no clustering, no judge: the vote is the output.**
+
+```
+$ panel.py --ask "panel.py exits non-zero when it skips a PR on a title pattern" \
+           --context harness/loops/panel.py:3500-3560
+    claude  fails       — the skip branch calls finish(failed) and returns 0
+    codex   fails       — write_payload then `return finish(...)`; exit 0 on that path
+    pi      cannot tell — did not locate the skip branch in the given range
+
+→ the premise FAILS — 2 of 3 say the premise FAILS (quorum 2, threshold 2)
+```
+
+- **It is not a gate.** Exit 0 on every verdict, `fails` included. A fixer runs it before
+  committing; making it mandatory turns a one-minute question into a required wait, and a
+  required wait gets skipped. It takes none of a round's flags (`--post`, `--round`,
+  `--baseline`, `--max-rounds`) and says so rather than ignoring them — there is no diff to
+  post about and no cycle for a baseline to be part of.
+- **`cannot tell` is an answer, and an unreadable reply is not that answer.** A seat whose
+  context did not settle the question counts toward the **quorum** and never toward the
+  **threshold**; a seat whose reply carried no verdict counts toward neither and is shown
+  as such, with the head of what it did say. Folding the second into the first is #68's
+  panel-of-one through a side door: a tally reading "nobody objected" over seats that
+  never spoke.
+- **The asker cannot be the only seat.** `--asker` names the seat the agent running the
+  challenge is (pass `--asker ''` for a human at a terminal). A tally whose only voter is
+  the asker is `unchallenged` — where the premise started — never `holds`.
+  **Detection is Claude Code's environment and only Claude Code's**: nothing codex, pi or
+  `agy` exports says which seat is running a command, so an agent on one of those has to
+  pass `--asker` itself. The run says so in its notes when nothing was detected, and says
+  so again when `--asker ''` turned the guard off while an agent's environment was
+  present — a guard believed to be on and quietly off is worse than one known to need a
+  flag.
+- **Nothing picks between candidate answers.** Two different legal verdicts in one reply is
+  an unreadable reply, not a chance to guess which the model meant; an unreadable reply
+  buys exactly one retry, the same as a review's. The schema's own example is refused by
+  the same check that refuses a typo, because it spells the verdict as the union of the
+  three legal values.
+- **Verdicts:** `holds` / `fails` (threshold reached, one way only), `unresolved` (the seats
+  looked and did not agree), `unchallenged` (too few answered, or only the asker did).
+  `review_panel.ask_quorum` and `ask_threshold` govern it, both 2 — so "1 of 1 says it
+  holds" reports as unchallenged rather than as agreement. Named for the ask because that
+  is all they govern today; #78 generalises the same primitives to a round's verdict.
+  A rule above the seat count is warned about, because it can never be met and the ask
+  still runs (and pays for) every seat first. A threshold above the quorum is fine: quorum
+  is a minimum, so three agreeing seats reach `ask_threshold: 3` under `ask_quorum: 2`.
+- **`--context` is confined to the repo under review**, symlinks resolved before the
+  containment test and the file then read by walking down from a descriptor on the repo
+  root — the root's own open included — because resolving a path and re-opening it by that
+  path are two traversals of one string, and a component that changes between them would
+  pass the check and read elsewhere. Paths are relative to the **repo root**, not to the
+  cwd, and the problem message says so. A spec that cannot be read is a stated problem
+  rather than a silent omission — a seat given less context than the asker believes it has
+  answers `cannot tell` about a question the asker thinks it supplied the answer to. That
+  covers a file that is not UTF-8 text or carries NULs (a PNG used to arrive as a wall of
+  U+FFFD), a malformed range (said as a range and not as a path), and a file past the
+  4 MB read ceiling. A file whose own name ends in `:12` wins over reading line 12 of a
+  file called something else; an exact repeat of a spec is read once. A range past the end,
+  and anything over `ask_max_context_chars`, is clamped and said — and the range the report
+  and the payload carry is the one the seats actually got, not the one that was typed. With
+  no context at all (or none of it left after a clamp) the prompt says so, which is what
+  keeps `cannot tell` available instead of inviting an answer from memory.
+- **Containment was never the whole rule, so an ask refuses to read a secret.** Being
+  inside the repo under review is exactly the case where `--context .git/config` hands a
+  personal access token to four third-party CLIs, since every seat's reply is a place its
+  prompt can come back out. `.git/` is refused outright, as are the files that are nothing
+  but credentials by the names they always have — `.env` (and `.env.*`), `.envrc`,
+  `.npmrc`, `.netrc`, `.pgpass`, `.pypirc`, `id_rsa`/`id_ed25519` and friends, and anything
+  ending `.pem`, `.key`, `.p12` or `.pfx`. Each refusal is a stated `context_problem`
+  naming why, like every other spec that did not become context. It is a denylist of names
+  and not a secret scanner: it closes the routes an agent composing a command line actually
+  types, and says nothing about a token pasted into a source file.
+- **`--json` / `--json-file`** emit the ask's own payload: `kind: "ask"`, the premise, the
+  `context` actually read (spec, path, line range, chars), the specs that did NOT become
+  context as `context_problems` (`{spec, problem}` — machine-readable, so "was this verdict
+  reached with all the context the asker intended?" is answerable without matching prose,
+  and kept out of `config_notes`, which is about the repo's configuration), every seat's
+  `verdict` and `reason` — plus `gist` for a reply that carried no verdict, which is what
+  the seat SAID and never why — and the tally with its rules. Per-seat token usage is
+  spread into the same object but written first, so a telemetry key can never overwrite the
+  answer. Recording on the board goes through `qb record-ask`, best-effort and never
+  fatal: `qb` ships in the fleet's own repo and the row it writes is #77's to define, so on
+  a host whose `qb` predates it the ask says so once and is otherwise untouched. Every
+  other recording failure is reported too, and a run whose `--json-file` could not be
+  written is not recorded at all — it is about to exit non-zero, and a board row for it
+  would be two records disagreeing about whether the ask happened.
 
 ### The `--json` payload
 
@@ -356,6 +491,15 @@ Note that `gh pr view --json` **fails the whole command** on a field it does not
 rather than omitting it, so there is no graceful degradation on an older `gh` — the run
 exits before any review. `panel.py` needs a `gh` carrying `files`, `changedFiles`, `state`
 and `isDraft`.
+
+Run-level fields worth knowing about because their meaning is conditional:
+
+| field | what it is |
+|---|---|
+| `scope` | `pr` \| `increment` — what this round actually reviewed. Recorded rather than inferred from the round number, because scope falls back to `pr` whenever the anchor is missing or the range is unusable, so "round 2" does not imply "increment" |
+| `since_sha` | the anchor the increment was taken from; null under `pr` scope |
+| `diff_chars` | the size of the **review target** — the whole PR under `pr` scope, the increment under `increment`. Read `scope` beside it: plotting this across a cycle's rounds without doing so shows a cliff at round 2 and reads as a shrinking PR |
+| `context_chars` | everything prepared *alongside* the target; 0 under `pr` scope. With `diff_chars` this is what an uncapped reviewer was given. Neither is a per-reviewer number — budgets are, so a seat that got less says so in `reviewers.<name>.max_diff_chars` and `.truncated`, and a seat that got the whole target and only part of the context is named in `config_notes` |
 
 Each finding record:
 
@@ -402,7 +546,7 @@ Run-level fields it depends on:
 
 | field | what it is |
 |---|---|
-| `head_sha` | **v2.24.** The commit this round reviewed. Recorded because nothing else identified one — `base` holds a branch *name* — and the next round needs it as one end of the fix range. Re-read straight after the diff is fetched, which narrows the mid-round-push window without closing it: a push can land either side of the fetch and nothing can tell which, so a move is reported as a move (`config_notes`) rather than as a claim about which commit produced the diff, and the later commit is recorded because it is where the next round's fix range starts. Present on the **skipped** payload too: a skipped round is still the round the next one baselines against |
+| `head_sha` | **v2.24.** The commit this round reviewed. Recorded because nothing else identified one — `base` holds a branch *name* — and the next round needs it twice over: as one end of the fix range, and (**v2.28**) as the anchor its increment is taken from. Re-read straight after the diff is fetched, which narrows the mid-round-push window without closing it: a push can land either side of the fetch and nothing can tell which, so a move is reported as a move (`config_notes`) rather than as a claim about which commit produced the diff, and the later commit is recorded because it is where the next round's fix range starts. Present on the **skipped** payload too: a skipped round is still the round the next one baselines against |
 | `unread_files` | **v2.24.** Files no reviewer that ran read in full, for the next round's `missed-unread`. A file counts as unread only if *every* running reviewer was cut on it, and a file straddling the cut counts as unread — half a file's hunks is not a read file. Empty on a payload whose `reviewed` is `false` means *no coverage at all* (a skipped round never fetched a diff to name files from), not "read everything" — the consumer tells the two apart by `reviewed` |
 | `provenance_counts` | **v2.24.** The per-round tally over the findings the cycle has to clear, so a consumer gets the shape of a round without walking every finding. `{}` where the question does not arise — outside a cycle, or in a cycle's round 1, which has no earlier round to attribute against. All-zero is the other statement: a round that could have attributed and had nothing to, which is what a **skipped** in-cycle round sends |
 

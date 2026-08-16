@@ -7,7 +7,7 @@ that number where it was, so the repo can be a version ahead of the service.
 Entries are newest first. Each one says what was broken or missing before it, because that is the
 part that isn't recoverable from the diff.
 
-## v2.28 — two branches could both write migration 0018 and the merge looked clean
+## v2.29 — two branches could both write migration 0018 and the merge looked clean
 
 `migrations/versions/` is a hand-numbered linear chain: `0017_review_provenance.py` declares
 `revision = "0017"` and `down_revision = "0016"`. Several agents work this repo at once, so the
@@ -57,6 +57,187 @@ agree, so a resolution valid only from one starting revision is not a resolution
 
 Repo tooling: the board schema is untouched and the served version stays 2.26.0.
 
+One thing happened while this was being written that belongs in the entry rather than in a PR
+comment. It was authored as **v2.28**, announced as v2.28 on the board *before any code existed* —
+which is the practice the earlier collisions argue for, and the only one available until #99's
+allocator lands — and #90 renumbered into v2.28 an hour later and merged first. That is the eighth
+release-number collision, and the first where the number was claimed in advance and taken anyway.
+It is the same failure this release fixes for migrations, on the neighbouring namespace: announcing
+a claim is not making one, and a claim that is not atomic is not a claim. #99's resource-keyed
+lease serves `kind=release, key=<repo>` from the same table as the merge claim, which is why #46
+should not build a second allocator.
+
+## v2.28 — a later round reads the fix commit, not the whole PR again
+
+(There is no v2.22 entry: that number is held by PR #87, which is harness-side and still open.
+v2.23 and v2.24 are below — both landed via #89, which carried the work #88 was closed in favour of.)
+
+A panel/fix cycle exists because nobody reads the fixer's commit (v2.15). Round 2 was then handed
+the entire PR — the fix plus everything rounds before it had already read, ruled on and confirmed —
+and paid for all of it in budget, in wall-clock and in the reviewer's attention, every round.
+
+**The loop was inflating its own input.** PR #34's four rounds went 1,675 lines to 4,140, and its
+diff 140 KB to 292 KB, *because it was being reviewed*: each round found defects in the previous
+round's fix commit at about one per fix, and each fix made the next round's reading longer. By the
+last round both reviewers declared they could not read ~600 lines of one test file. The 22 findings
+that round were overwhelmingly in the last commit, and the reviewers re-read 3,300 lines to reach
+them, losing the tail of the diff on the way.
+
+So a round past the first reviews the **increment** — what changed since the head its baseline
+reviewed — with the PR as it stood at that head behind it as context. Three tiers, and the order is
+the design: the increment, then those same files as they were *before* the increment changed them,
+then the rest of the PR. A budget is spent in that order, so what gets dropped is context and never
+the thing under review. That inverts the degradation: the target stays about the size of one fix
+commit however large the PR grows.
+
+The context is fetched as its own `base...anchor` comparison rather than sliced out of the current
+PR diff, and that is not a detail. The fix commit is *part of* the PR, so a near tier cut from the
+PR's current diff for those files contains it — the reviewer would get the target twice, the second
+copy under a header saying an earlier round had already dealt with that code, which is precisely
+what both briefs tell it not to re-report. The header can only be true of material that predates the
+fix.
+
+`--scope pr` keeps the old behaviour, `review_panel.round_scope` sets it per repo, and round 1 is
+always the whole PR. The anchor comes from the baseline payload's new `head_sha`; `--since` overrides
+it. Every fallback to whole-PR scope is written into `config_notes` — a round that says it reviewed
+the increment and in fact re-read the PR would be wrong about the one measurement this exists to
+produce, and invisible in the numbers, because a large `diff_chars` is what those always were.
+
+**The obvious implementation is wrong, and only measuring it showed that.** A commit range between
+two rounds spans everything the fixer did, *including a merge of the base branch* — which on this
+repo is the normal case rather than a corner, since landing six PRs in a day took eleven integration
+merges (#80). Measured on PR #62, the raw range between two of its own round heads was **92,415 chars
+against a 45,370-char PR**: the "increment" was twice the size of the whole thing, carrying
+`flake.nix`, the worktree scripts and the README that main had gained in between. Left alone it would
+have made rounds more expensive while reporting them as cheaper.
+
+Two things stop that. The range is cut down to the PR's own files, which on #62 takes it from 19
+files to 5 and the target to 17,075 chars — 62% off the PR, which is the saving the whole change is
+for. And a size guard falls back to whole-PR scope whenever the increment is still the larger of the
+two, because a file filter cannot remove main's changes to a file the PR *also* touches. A round must
+never cost more than it did before scope existed.
+
+The range is then checked against GitHub's own account of it, because three things a compare response
+can be are invisible in the diff it returns. A **truncated** one is a 200 with files missing: smaller
+than the PR, so it clears every guard and becomes the target — half a fix commit reviewed as though
+it were all of it, which is the one failure `truncated` was built for and the one place it cannot
+see. That falls back to the whole PR. A **rebased or force-pushed** range is not a delta from the
+anchor at all (`a...b` is measured from the merge base), so anything the fixer reverted between the
+two heads is in neither tier; that is reviewed anyway and reported. So is a **merge commit** in the
+range: files the PR does not touch are dropped from the target, but main's changes to files it does
+touch cannot be, and a reviewer reads them as the fixer's work.
+
+**Be clear about what shrinks.** The review TARGET shrinks, always, and that is what the change is
+for: the reviewer's attention lands on the fix commit and `diff_chars` measures it. The BILL is a
+separate question. A round still sends its target plus its context, and the context is most of the
+PR, so the total material is in the same range as a whole-PR round — it is smaller than it would be
+with the near tier cut from the current diff, which sent the fix twice, but it is not a saving to
+plan around. Where a fix touches the files that carry most of the PR there is barely any of it left
+to leave out, and a note says so with both numbers on any run where that happens. The reviewer's
+attention narrows; the token bill mostly does not. That is where the seam lives — the defect class
+this cycle exists to catch is a fix that is correct on its own terms and wrong where it meets what
+was already there — and paying for the context is how a reviewer can see it.
+
+The saving that is unambiguous is the one on the far end of a *budget*: with a cap set, the target is
+bought first and whole, so the thing a tight `max_diff_chars` drops is context rather than the tail of
+the fix commit. That is what stopped PR #34's later rounds losing 600 lines of the file under review.
+
+The judge sees exactly what the panel saw, briefed to rule rather than to review: an adjudicator adds
+nothing if it rules "not in the diff" while holding a different diff, and it would do so with the
+authority of the final call.
+
+**A scoped round can still raise a defect nobody has raised, wherever it sits.** The obvious rule —
+"the context has already been reviewed, do not report it" — makes a pre-existing defect
+structurally unfindable, and #48's `missed` bucket then reads zero by construction rather than by
+measurement. On PR #75's real round 1 to round 2 that bucket was 12 of 26: twelve defects that sat
+in round 1's diff and round 1 did not see. Suppressing them would not re-attribute them, it would
+make them invisible, and the loop would look converged because it had stopped looking. So what is
+out of scope is a defect an earlier round *already raised* — which is fixed, and whose fix is in
+the target. Earlier rounds read the rest; reading it is not the same as being right about it, and
+both briefs say so.
+
+That is also why context the budget cut is a **veto** and not merely a note: the context is the only
+part of the PR a scoped round can find a pre-existing defect in, so a round that could not see all of
+it must not report the resulting quiet as convergence.
+
+**One more caveat, and it vetoes a confident stop too.** Increment scope makes an
+earlier round's truncation permanent. Under whole-PR scope a region round 1 was cut off from is read
+again by round 2; under increment scope round 2 reads only the fix commit and never returns, so a
+cycle can now converge — nothing new, nothing outstanding — over code that no round in it ever read.
+The baseline carries which rounds were truncated, and a scoped round that inherits one says its quiet
+is not evidence about that region.
+## v2.27 — one question to the panel, when a whole round was never the question
+
+A fix's premise had no cheap challenger. The only thing that reviewed a fix was a full panel round:
+twenty minutes, every seat reading the entire diff, thirty-odd findings back when what was needed
+was one answer to one question.
+
+So a premise went unchallenged until the next round, and on PR #62 that cost three of them. Each
+round trusted a fresh proxy for *"did a review actually happen?"* — the exit code, then the push,
+then the payload artefact — and each proxy was killed by the round after it. Every one of those is a
+yes/no question about one branch of `panel.py`, answerable in a minute by anyone willing to read it.
+None of them needed a diff review, and all three cost a full round.
+
+`panel.py --ask "<premise>" [--context <path[:first-last]> ...]` puts that question to the enabled
+seats. **No diff, no clustering, no judge — the vote is the output.** Each seat answers `holds` /
+`fails` / `cannot tell` with one line of reason, and the run reports the tally. It is fast because
+of what it does not do: a reviewer is slow here because it reads a whole PR and thinks about
+everything in it, and a premise plus the one function it rests on is a small prompt and a short
+reply.
+
+**It is deliberately not a gate.** It exits 0 on every verdict, `fails` included. This is a check a
+fixer runs before committing, not another thing that must pass — making it mandatory turns a
+one-minute question into a required wait, and a required wait gets skipped.
+
+Four decisions in it are worth more than the feature:
+
+- **`cannot tell` is a first-class answer, and an unreadable reply is not it.** One is a seat saying
+  its context did not settle the question — it counts toward the quorum and never toward the
+  threshold. The other is a seat whose answer we do not have, and it counts for neither. Collapsing
+  them is #68's panel-of-one arriving through a side door: a tally reading "nobody objected" over
+  seats that never spoke.
+- **The asker cannot be the only seat.** `--asker` says which seat the agent running the challenge
+  is, detected from Claude Code's environment specifically — an agent on another vendor's CLI has to
+  pass `--asker` itself, and the run says so in its notes when nothing was detected rather than
+  leaving the guard quietly off. A tally whose only voter is the asker comes back `unchallenged` —
+  which is where the premise started. An agent putting its own premise to itself has confirmed
+  nothing, and reporting it as `holds` is worse than reporting nothing, because it carries a panel's
+  authority.
+- **Nothing picks between candidate answers.** A reply holding two different legal verdicts is
+  unreadable, not an opportunity to guess which the model meant — the same rule v2.18 settled for
+  reviews, for the same reason.
+- **Quorum, threshold and the context budget are configuration** (`review_panel.ask_quorum` /
+  `ask_threshold`, both 2, and `ask_max_context_chars`, 60,000 — a total across all `--context`
+  material, clamped and said in the notes when it bites, because `--context` was unbounded before
+  and an ask that reads half a repo is not the cheap thing it exists to be). So "1 of 1 says it
+  holds" reports as unchallenged rather than as agreement. They are named for the ask because that
+  is all they govern today; #78 generalises the same primitives to a round's verdict, where they
+  decide what gets merged.
+
+**An ask will not read a secret, even one that lives in the repo.** `--context` is confined to the
+repo under review, and that was the only filter on it — which is backwards, because the repo under
+review is where the credentials are. `--context .git/config` is contained, readable, and on an https
+remote it is a personal access token, shipped to four third-party CLIs in a prompt whose reply is a
+place it can come back out. So `.git/` is refused outright, along with the files that are nothing but
+credentials by the names they always have (`.env` and `.env.*`, `.envrc`, `.npmrc`, `.netrc`,
+`.pgpass`, `.pypirc`, `id_rsa`/`id_ed25519`, and `.pem`/`.key`/`.p12`/`.pfx` key material). Each
+refusal is a stated `context_problem` naming why, like every other spec that did not become context.
+It is a denylist of names and not a secret scanner: it closes the routes an agent composing a command
+line actually types.
+
+One implementation runs a seat now, not two: the sandbox, the pinned sessions, the retry policy, the
+usage read-back and the four CLIs' argv moved into `run_seat`, and a round and an ask differ only in
+how they read the reply. A second copy would have been a second place for a seat to silently stop
+running, which is the whole of #68.
+
+**The board half is not here.** `qb record-ask` is called best-effort and says so once when this
+host's `qb` does not have it: `qb` lives in the fleet's own repo, and the row it writes is #77's
+shape to define, since #77 is what will read it. The payload is complete on stdout and in
+`--json-file` regardless.
+
+Harness-side: the board is untouched, so the served version stays at 2.23.0. (v2.22, v2.25 and v2.26
+are claimed by branches not yet merged, which is why the entries below skip from here to v2.24 —
+nothing is missing.)
 ## v2.26 — the provenance v2.24 measured was reaching the board and being thrown away
 
 v2.24 taught the panel to say whether a new finding was **introduced** by the last fix pass or
