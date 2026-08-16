@@ -210,6 +210,53 @@ out of reach, and that is accepted: the slash commands that drive worktree teard
 (`/wt`, `/drop-worktree`, `/tree-shake`) tell the model to ask first, and an agent
 running raw git was never going to be caught by tooling it did not invoke.
 
+### `qb-seats` and `qb-seat` — the agent screen
+
+Working a plan in parallel takes N terminals and a human dispatcher: open a terminal, `cd`,
+run the agent, say what to work on, repeat. The dispatching human is the part that does not
+scale, and it is the part the board exists to remove. `qb-seats` replaces the terminals.
+
+```
+qb-seats              # 2 seats plus the board, in the current repo
+qb-seats -n 1         # one seat
+qb-seats --staged     # built, each seat waiting on Enter
+qb-seats --add        # add a seat to a running screen
+ssh box -t qb-seats   # reattach from anywhere
+```
+
+One tmux session: N panes each running `qb-seat <n>`, and one full-width pane along the
+bottom running `qb-board --follow`. Every seat gets the **same** brief — read the board,
+claim one unclaimed item atomically, work it, release — and self-selects. Nothing reads the
+plan on the agents' behalf and nothing assigns.
+
+**Why real sessions and not sub-agents.** Sub-agents are a star: one orchestrator holds the
+plan, fans out, and every result funnels back through one context window. Children are
+anonymous, cannot be addressed mid-flight, and die on return with their context discarded.
+Seats are a mesh — identities that outlive the run, findings that persist as posts, no
+orchestrator to lose, and one property the star cannot offer at any price: **you can attach
+to one seat, interrupt it and redirect it, while the others keep running.**
+
+**`seats.enable` in the home-manager module** adds tmux, the one runtime dependency the
+harness cannot assume. It is off by default: enabling the harness is something you do for
+every host you own, and a seat screen is something you want on one of them.
+
+Two things to know before you run it:
+
+- **Your shell rc must not do anything interactive.** A seat pane starts a shell and the
+  command is typed into it, so an rc file that greets you, animates, or reads stdin will
+  swallow it. `QB_SEATS=1` is exported into every pane precisely so an rc can detect a seat
+  and skip that. This is not theoretical — it cost five minutes per seat on the machine
+  this was written for, where the greeter was an animation that ran until a keypress.
+- **`QUARTERBACK_INSTANCE` must be per seat, never host-wide.** The board takes it as the
+  agent *key*, so two seats sharing one are not two agents with muddled inboxes — they are
+  **one agent**: one history, one presence, one lease, holding each other's claims
+  legitimately. `qb-seat` sets its own and `qb-seats` strips any inherited value; nothing in
+  your shell profile should set it.
+
+`qb-seats` deliberately does not create worktrees (a self-selecting seat does not know its
+branch until it has claimed), does not assign work, and does not drive the agents past
+starting them.
+
 ## How it works
 
 - **Layout.** A worktree is a *sibling* of the main checkout: `../<project>-<branch>`, with

@@ -1,0 +1,325 @@
+#!/usr/bin/env bash
+# qb-seats — one command, one screen: N agent seats plus the board, in tmux.
+#
+# Usage: qb-seats [-n N] [-C DIR] [-s NAME]   bring up (or reattach to) a screen
+#        qb-seats --staged                    build it with each seat awaiting Enter
+#        qb-seats --add                       add one seat to a running screen
+#        qb-seats --kill                      tear the screen down
+#        qb-seats -h|--help                   this text
+#
+# Exit codes:
+#   0  screen is up, or was reattached, added to, or killed
+#   1  cannot proceed (no tmux, no qb-seat, no repo, no such session)
+#   2  malformed arguments — a caller bug, and says so
+#
+# WHAT THIS IS FOR. Working a plan in parallel took five terminals and a human
+# dispatcher: open a terminal, cd, run the agent, say what to work on, repeat.
+# The dispatching human is the part that does not scale, and it is the part the
+# board exists to remove — the plan records who is on what because somebody read
+# it out to each agent that asked.
+#
+# The alternative already to hand is sub-agents, and it is the wrong shape.
+# Sub-agents are a star: one orchestrator holds the plan, fans out, and every
+# result funnels back through one context window. Children are anonymous, cannot
+# address each other or be addressed mid-flight, die on return, and their context
+# is discarded. Seats are a mesh instead — real sessions in real shells, each
+# with an identity that outlives the run, findings that persist as posts rather
+# than a string collapsed into a parent's summary, and no orchestrator to lose.
+#
+# And one property the star cannot offer at any price: A HUMAN CAN ATTACH TO ONE
+# SEAT, interrupt it and redirect it, without touching the others. Most of what
+# follows exists to protect that.
+#
+# WHAT IT IS. A layout. It arranges panes and starts one process in each. Every
+# seat runs `qb-seat <n>` (its sibling in this directory), which is where a
+# seat's identity and brief live. The screen knows nothing about either.
+#
+# WHAT IT DELIBERATELY DOES NOT DO:
+#
+#   * No worktrees. Under self-selection a seat does not know its branch until it
+#     has claimed something, and create-worktree is already driven per issue by
+#     the loop that takes it, with the database isolation that implies. A screen
+#     that made worktrees up front would be guessing.
+#   * No dispatch. It does not read the plan, does not pick items, does not hand
+#     seat 3 a different brief from seat 1. A spawner that assigns is hub-and-
+#     spoke with a hub that runs once at t=0, and removing the dispatcher is the
+#     entire point. Every seat gets the same brief and self-selects.
+#   * No driving. It starts the agents. After that the panes are just panes.
+#   * No second board client. The board pane runs `qb-board`; if that grows a
+#     filter, the filter goes there. The moment this script parses board JSON to
+#     decide what to show, it has become the thing we agreed not to build.
+#   * No shared QUARTERBACK_INSTANCE. See below — this one is correctness.
+#
+# ONE SHARED QUARTERBACK_INSTANCE IS NOT AN INCONVENIENCE, IT IS ONE AGENT.
+# The value is sent as X-Agent-Instance and the board takes it as the agent KEY.
+# Two seats sharing one are therefore not two agents with muddled inboxes; they
+# are a single agent with one history, one presence, one lease, and — once work
+# claims are atomic — holding each other's claims perfectly legitimately, because
+# they are the same holder. So this script unsets the variable before starting
+# the server, and marks it for removal from the session environment, which covers
+# every pane split off later. qb-seat sets its own, per seat.
+#
+# WHY TMUX AND NOT ZELLIJ. zellij's case is real — declarative KDL layouts,
+# `start_suspended`, and `override-layout --retain-existing-terminal-panes`. It
+# still went the other way, for four reasons:
+#
+#   1. The declarative advantage does not survive this requirement. KDL layouts
+#      take no parameters and the seat count is a runtime argument, so N panes
+#      means generating the layout anyway.
+#   2. zellij 0.44.3's stock keybindings break the property above. Ctrl+p, n, s,
+#      o, t, h, b, g and q are bound under `shared_except "<mode>" "locked"`,
+#      which INCLUDES normal mode: they fire while you are typing into a pane and
+#      never reach the program in it. Agent CLIs are Ctrl-chord TUIs and Ctrl+h
+#      is backspace. A multiplexer that swallows the interrupt keys is the wrong
+#      one for a screen whose whole purpose is being able to interrupt one seat.
+#   3. Both zellij features worth having have one-line tmux equivalents, and both
+#      are here: --staged for start_suspended, --add for override-layout.
+#   4. tmux is likelier to be the multiplexer a consumer already has, and the
+#      SSH-durability argument for running agents inside one is the same either
+#      way: the work lives on the box, so the link is disposable.
+#
+#   Reversible: neither tool needs a plugin under this design, and the board pane
+#   and the seat wrapper are identical under both.
+#
+# WHY THE DEFAULT IS 2. Integration cost grows quadratically in open PRs, which
+# is the real ceiling on any autonomous backlog drain — not how many agents a
+# monitor fits. Raise it with -n once you have measured your own merge pressure.
+set -euo pipefail
+
+PROG=${0##*/}
+SH=${SHELL:-/bin/bash}          # the shell a seat drops back to when it exits
+
+# Before anything else, and see the header: two seats sharing this value are ONE
+# agent on the board. Dropping it here means neither the tmux server nor the
+# first pane can inherit one from whatever shell launched this; the
+# `set-environment -r` further down covers every pane split off afterwards.
+unset QUARTERBACK_INSTANCE
+
+SEATS=2                 # the integration ceiling, not the monitor's width
+REPO=""                 # default: the git repo you ran this from
+SESSION=""              # default: seats-<repo basename>
+STAGED=0                # 1 = pane waits on Enter before starting its agent
+BOARD_SIZE="25%"        # board pane height, bottom of the window, full width
+ACTION="up"
+
+usage() {
+  cat <<EOF
+usage: $PROG [-n N] [-C DIR] [-s NAME] [--staged] [--add] [--kill]
+
+  -n N        number of seats (default $SEATS)
+  -C DIR      repo the seats run in (default: the git root of \$PWD)
+  -s NAME     tmux session name (default: seats-<repo basename>)
+  --staged    build the screen with each seat waiting on Enter, so the layout
+              can be eyeballed before N agents start claiming
+  --add       add one seat to an already-running screen and reflow
+  --kill      kill the screen
+
+Environment:
+  QB_SEATS_BOARD   command for the board pane, overriding the default
+EOF
+}
+
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+
+# ---- the board pane ---------------------------------------------------------
+# A process, nothing more — which is what keeps the swap cheap if the follower
+# is ever replaced. `qb-board --follow` tails the board to stdout the way
+# journalctl -f tails a unit.
+#
+# When it is not installed the pane says so and drops to a shell, rather than
+# this script growing its own board reader. A screen with an empty board pane and
+# an honest explanation is better than one carrying a second, worse client.
+board_cmd() {
+  if [ -n "${QB_SEATS_BOARD:-}" ]; then printf '%s' "$QB_SEATS_BOARD"; return; fi
+  if command -v qb-board >/dev/null 2>&1; then
+    printf 'qb-board --follow'
+  else
+    printf 'printf %%s\\\\n %q' \
+      "board pane: qb-board is not on PATH, so there is nothing to follow here yet.
+Set QB_SEATS_BOARD to run something else in this pane."
+  fi
+}
+
+# ---- where the seats work ---------------------------------------------------
+default_repo() {
+  git rev-parse --show-toplevel 2>/dev/null \
+    || die "not in a git repo — run this from one, or pass -C DIR"
+}
+
+# ---- tmux helpers -----------------------------------------------------------
+have_session() { tmux has-session -t "=$SESSION" 2>/dev/null; }
+
+attach() {
+  if [ -n "${TMUX:-}" ]; then
+    tmux switch-client -t "=$SESSION"
+  elif [ -t 0 ]; then
+    tmux attach-session -t "=$SESSION"
+  else
+    # No terminal to attach to (a script, a unit, a CI check). The screen is up
+    # regardless — say how to reach it rather than failing.
+    printf '%s: %s is up — tmux attach -t %s\n' "$PROG" "$SESSION" "$SESSION"
+  fi
+}
+
+# Seats are identified by a pane option, not by index or title: the index shifts
+# when a pane is added, and the agent in the pane rewrites the title.
+seat_panes() {
+  tmux list-panes -t "$SESSION:seats" -F '#{pane_id} #{@qb_seat}' \
+    | awk '$2 != "" { print $1, $2 }' | sort -k2 -n
+}
+
+# Start a seat by TYPING its command into the pane's shell.
+#
+# This looks like the lazy option and is in fact the only correct one. The pane
+# has to hold a real interactive shell that OWNS the terminal, because the
+# property this whole screen exists for is: attach to one seat, interrupt the
+# agent, redirect it. If the agent is instead the pane's own process — say
+# `split-window "qb-seat 1; exec $SHELL -i"` — then Ctrl-C goes to the whole
+# foreground group, bash abandons the rest of the command list, and THE PANE
+# CLOSES. You interrupt a seat and lose it, which is the exact opposite of the
+# requirement. That is not hypothetical: this script did it that way until the
+# test suite caught it, and hand-testing had missed it because a stub that is
+# already an interactive shell survives a Ctrl-C that a real agent would not.
+#
+# Typed into a live shell, the same Ctrl-C returns you to a prompt in the repo,
+# every time, whatever the agent does with the signal.
+#
+# The keys are not racing the shell's startup: tmux writes them into the pane's
+# pty, where they wait until something reads them. The one thing that breaks that
+# is an rc file which reads stdin itself before the prompt — see QB_SEATS below,
+# which is exactly that bug and its fix.
+#
+# --staged is the equivalent of zellij's `start_suspended`, and better: the
+# command is typed but not entered, so it can be read, edited, or abandoned.
+start_seat() {
+  local pane=$1 n=$2
+  tmux send-keys -t "$pane" "qb-seat $n"
+  [ "$STAGED" -eq 1 ] || tmux send-keys -t "$pane" C-m
+}
+
+require_qb_seat() {
+  command -v qb-seat >/dev/null 2>&1 \
+    || die "qb-seat is not on PATH — it installs alongside this script (harness/bin)"
+}
+
+# ---- args -------------------------------------------------------------------
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -n) SEATS=${2:-}; shift 2 ;;
+    -C) REPO=${2:-}; shift 2 ;;
+    -s) SESSION=${2:-}; shift 2 ;;
+    --staged) STAGED=1; shift ;;
+    --add)  ACTION="add";  shift ;;
+    --kill) ACTION="kill"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage >&2; exit 2 ;;
+  esac
+done
+
+case "$SEATS" in ''|*[!0-9]*) usage >&2; exit 2 ;; esac
+[ "$SEATS" -ge 1 ] || { usage >&2; exit 2; }
+
+command -v tmux >/dev/null 2>&1 \
+  || die "tmux is not installed (home-manager: programs.quarterback-harness.seats.enable)"
+
+[ -n "$REPO" ] || REPO=$(default_repo)
+REPO=$(cd -P "$REPO" 2>/dev/null && pwd) || die "no such directory: $REPO"
+[ -n "$SESSION" ] || SESSION="seats-${REPO##*/}"
+
+if [ "$ACTION" = kill ]; then
+  have_session || die "no session $SESSION"
+  tmux kill-session -t "=$SESSION"
+  exit 0
+fi
+
+if [ "$ACTION" = add ]; then
+  have_session || die "no session $SESSION — start it with $PROG first"
+  require_qb_seat
+  # Highest seat number in use, plus one — not a count, so a seat whose pane was
+  # closed does not hand its number to the next one and collide on the board.
+  next=$(seat_panes | awk '{ n = $2 + 0; if (n > m) m = n } END { print m + 1 }')
+  # Reflow the seat ROW only: -E spreads the target pane and its neighbours. The
+  # board was split off full-width, so even-horizontal on the whole window would
+  # fold it back into the row. This is the tmux answer to zellij's
+  # `override-layout --retain-existing-terminal-panes`: one command, no teardown,
+  # the seats already working left alone.
+  pane=$(tmux split-window -h -P -F '#{pane_id}' -t "$SESSION:seats.0" -c "$REPO")
+  tmux set-option -p -t "$pane" @qb_seat "$next"
+  tmux select-layout -t "$pane" -E 2>/dev/null || true
+  start_seat "$pane" "$next"
+  printf '%s: added seat %s to %s\n' "$PROG" "$next" "$SESSION"
+  exit 0
+fi
+
+# ---- build the screen -------------------------------------------------------
+if have_session; then
+  # Reattach. This is the path an ssh session takes, and it must never rebuild.
+  attach
+  exit 0
+fi
+
+require_qb_seat
+
+# QB_SEATS is a contract with the user's shell rc, and it is not cosmetic — on
+# the machine this was written for it is the difference between a screen that
+# starts and one that does not. That host's rc greeted interactive shells with an
+# ANIMATION which ran until a keypress, giving up after five minutes. Every seat
+# therefore sat in it for five minutes before its agent started, and the first
+# key sent to a pane was consumed dismissing the greeter rather than reaching the
+# agent. Both were measured, and both are exactly the "no per-seat human input"
+# property this screen is supposed to deliver.
+#
+# So: if QB_SEATS is set, your rc file is running inside a seat pane and should
+# skip anything interactive — greeters, animations, prompts, `read`. FLEET_NO_MOTD
+# is set alongside it for the fleet whose rc already had an opt-out under that
+# name; it is inert anywhere else.
+#
+# -e sets these on the SESSION, so every pane split off later inherits them.
+#
+# -x/-y because a detached session is 80x24, in which a 25% split is six lines and
+# a fourth seat does not fit at all. tmux resizes to the client on attach.
+tmux new-session -d -s "$SESSION" -n seats -c "$REPO" -x 240 -y 60 \
+  -e QB_SEATS=1 -e FLEET_NO_MOTD=1
+
+# Never a shared instance: strip any inherited value from the session
+# environment, so nothing a seat spawns can pick one up. qb-seat sets its own.
+tmux set-environment -t "=$SESSION" -r QUARTERBACK_INSTANCE
+
+# Label the panes. Two seats are indistinguishable once both are printing, and
+# being able to address ONE of them is the whole point.
+tmux set-option -w -t "$SESSION:seats" pane-border-status top
+tmux set-option -w -t "$SESSION:seats" pane-border-format \
+  ' #{?@qb_seat,seat #{@qb_seat},board} #{?pane_active,*,} '
+
+first=$(tmux list-panes -t "$SESSION:seats" -F '#{pane_id}')
+tmux set-option -p -t "$first" @qb_seat 1
+i=2
+while [ "$i" -le "$SEATS" ]; do
+  pane=$(tmux split-window -h -P -F '#{pane_id}' -t "$SESSION:seats.0" -c "$REPO")
+  tmux set-option -p -t "$pane" @qb_seat "$i"
+  i=$((i + 1))
+done
+tmux select-layout -t "$SESSION:seats" even-horizontal
+
+# The board, on the same screen as the seats — full width along the bottom, so
+# long summaries are read rather than wrapped. -f makes the split span the whole
+# window rather than only the pane it was taken from. It drops to a shell rather
+# than closing if the follower dies, so a board outage does not silently leave a
+# screen with no board on it.
+tmux split-window -v -f -l "$BOARD_SIZE" -t "$SESSION:seats.0" -c "$REPO" \
+  "$(printf '%s; exec %q -i' "$(board_cmd)" "$SH")"
+
+# Seats last, once every pane exists and its shell has had the time it took to
+# build the rest of the screen to reach a prompt.
+while read -r pane n; do start_seat "$pane" "$n"; done < <(seat_panes)
+
+# awk rather than `head -1`, which would close the pipe under `set -o pipefail`
+# and abort the script on SIGPIPE just as the screen finished building.
+tmux select-pane -t "$(seat_panes | awk 'NR == 1 { print $1 }')"
+
+if [ "$STAGED" -eq 1 ]; then
+  printf '%s: %s seat(s) staged in %s — press Enter in each pane to start it\n' \
+    "$PROG" "$SEATS" "$SESSION"
+fi
+
+attach
