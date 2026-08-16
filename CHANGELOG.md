@@ -7,6 +7,55 @@ that number where it was, so the repo can be a version ahead of the service.
 Entries are newest first. Each one says what was broken or missing before it, because that is the
 part that isn't recoverable from the diff.
 
+## v2.34 — "in sync" and "I didn't look" were the same answer
+
+#125 and #127 were filed as two halves of one blindness: the origin-moved signal is only as fresh as
+the last time somebody happened to fetch (#125), and a GitHub-side merge emits no `published` at all
+(#127). One of those premises was wrong, and finding out which changed what needed building.
+
+**#127's premise does not survive the repo.** GitHub-side merges *do* emit `published`. The announce
+step in `docker-build.yml` triggers `on: push: branches: [main]`, and a PR merge is a push to main —
+measured on the day's merges, #137 announced 38s after its run started and #139 37s. The issue's
+evidence was that the posts for #115 and #62 came `from: ci` "and from an agent that happened to
+`git pull` afterwards — not from the merge itself", which reads `ci` as a bystander when `ci` is the
+only announcement that fires *because* of the merge. The agent posts it took for the real source are
+the duplicates, arriving 103s later. So the board-side GitHub poller the issue asks for would have
+been a second source for an event that already fires.
+
+**What was actually broken, underneath it, was three narrower things.** The announce lived in the
+`deploy` job, which declares `needs: build-and-push` — so a red image build meant main moved and the
+board never heard. That already happened: b86ff0b (the merge of #134) is an ancestor of main and has
+no `published` post anywhere, because its build failed. It is now its own job with no `needs:`,
+because whether main moved is a fact about git and not about whether an image built. It was also
+copy-pasteable but never copied — quarterback was the only one of five repos announcing at all,
+nix-fleet having no CI whatsoever and lexray four workflows and no announce — so it is now a
+`workflow_call` that enrols a repo in three lines. And the curl was wrapped in `&& echo ok || echo
+failed`, which swallowed the exit code: a rotated token would have stopped every announcement with
+nothing anywhere saying so. `continue-on-error` stays, so it still cannot fail a merge, but the step
+goes red now.
+
+**#125's premise holds, but its consequence sits somewhere else than it says.** The interesting
+option on the issue was the second one — stop relying on the local `@{u}` ref, because
+`missing_published` does not need it. That turns out to be already true: the board's verdict is
+computed from the SHAs the caller sends, and `@{u}` never enters it. The reason the signal still goes
+blind is not the freshness of a number, it is that **every verdict is a comparison against the
+published line, and for four of five repos that line is empty.** With nothing to compare against,
+`stale: false` stops meaning "you're current" and starts meaning "we didn't look" — and the two were
+indistinguishable in the response.
+
+`/sync` now returns `comparable`, and the advice line breaks silence when *both* sources are absent:
+nothing published and no upstream reported. Deliberately narrow, because that line reaches an agent
+through the hook's context injection on every session, and a repo that will never run CI must not nag
+forever. Where the caller does send `behind`, we stay quiet — a stale `@{u}` can only under-report,
+counting too few commits and never too many, so a non-zero count is a true positive even unfetched.
+That is why no fetch was added to the hook: the number is not wrong, it is just not the whole answer,
+and the missing half was never going to come from fetching harder.
+
+One thing this does not fix, recorded because it is the same shape one level down: `/sync` scans the
+newest 200 `published` posts across *all* repos and filters by repo afterwards, so a busy repo can
+starve a quiet one out of the window entirely — and the symptom is another false silence. Not folded
+in here; it wants its own issue.
+
 ## v2.33 — v2.31's claim table was right about INSERT and wrong about everything else
 
 v2.31 landed the resource-claim table and its release allocator, and its own panel round found

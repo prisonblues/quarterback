@@ -73,39 +73,11 @@ jobs:
             || { echo "Failed to trigger deploy"; exit 1; }
           echo "Deploy triggered successfully"
 
-      # Announce the commit on the quarterback board so peers learn their checkout
-      # went stale. The lifecycle hook covers a local `git push`, but a PR merged
-      # on GitHub is nobody's push — which is exactly how most work reaches main,
-      # so without this the branch peers care about is the one never announced.
-      # Best-effort: announcing is not worth failing a green deploy over.
-      # The "skip when unconfigured" guard is inside the script, not a step-level
-      # `if:`: the `secrets` context is not available there, and referencing it
-      # fails the WHOLE workflow at validation time — no jobs, no build, no deploy,
-      # and a 0s "workflow file issue" run that says nothing about which line.
-      - name: Announce on the coordination board
-        continue-on-error: true
-        env:
-          QUARTERBACK_TOKEN: ${{ secrets.QUARTERBACK_TOKEN }}
-          # Also a secret: the agent host is a private deployment, not a public API.
-          QUARTERBACK_BASE_URL: ${{ secrets.QUARTERBACK_BASE_URL }}
-          # Via env, never inlined into the script: a commit message is attacker-
-          # controlled text and `${{ }}` interpolation would make it executable.
-          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
-          COMMIT_SHA: ${{ github.sha }}
-          BRANCH: ${{ github.ref_name }}
-          REPO: ${{ github.repository }}
-        run: |
-          [ -n "$QUARTERBACK_TOKEN" ] && [ -n "$QUARTERBACK_BASE_URL" ] \
-            || { echo "board not configured; skipping"; exit 0; }
-          summary=$(printf '%s' "$COMMIT_MESSAGE" | head -1 | cut -c1-120)
-          [ -n "$summary" ] || summary="pushed ${COMMIT_SHA:0:7}"
-          body=$(jq -nc --arg s "$summary" --arg c "$COMMIT_SHA" --arg b "$BRANCH" --arg r "$REPO" \
-            '{type:"published", summary:$s,
-              refs:[{kind:"commit", value:$c, repo:$r},
-                    {kind:"repo", value:($r|split("/")|last)},
-                    {kind:"branch", value:$b}]}')
-          curl -sf --max-time 10 -X POST "${QUARTERBACK_BASE_URL%/}/post" \
-            -H "Authorization: Bearer $QUARTERBACK_TOKEN" \
-            -H "Content-Type: application/json" -d "$body" \
-            && echo "Announced ${COMMIT_SHA:0:7} on the board" \
-            || echo "Board announce failed (non-fatal)"
+  # Deliberately NOT `needs: build-and-push`. Whether main moved is a fact about
+  # git, not about whether an image built — and coupling the two lost a real
+  # announcement: b86ff0b (merge of #134) is an ancestor of main and has no
+  # `published` post on the board, because its build went red and this never ran.
+  # See .github/workflows/announce-board.yml for the rest of the reasoning.
+  announce:
+    uses: ./.github/workflows/announce-board.yml
+    secrets: inherit

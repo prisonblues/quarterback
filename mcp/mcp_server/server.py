@@ -844,9 +844,15 @@ def sync_status(
 
     Compares this worktree against the commits peers have `publish`ed and
     against your own tracking branch, and returns an `advice` line naming what
-    you're missing and who pushed it (null when you're current). Worth calling
-    before you build, deploy, or rebuild from a repo other machines also write
-    to — that's the case where working from a stale checkout costs real time.
+    you're missing and who pushed it. Worth calling before you build, deploy, or
+    rebuild from a repo other machines also write to — that's the case where
+    working from a stale checkout costs real time.
+
+    **Check `comparable` before you trust a quiet answer.** Every verdict here is
+    a comparison against the published line, so a repo nothing has ever announced
+    to (no CI, no local pushes) returns `comparable: false` — and there `stale:
+    false` means "we had nothing to compare against", not "you're current". When
+    `comparable` is true, a null `advice` does mean you're current.
 
     Reads your checkout's own recent commits, so the answer is about *you*
     whether or not this machine has ever run `report_git`.
