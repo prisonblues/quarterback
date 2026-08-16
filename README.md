@@ -225,14 +225,15 @@ half of the panel↔board drift check #65 asks for.
 
 The deployed board version lags the repo until the stack is redeployed, and only the running
 service knows which it is: ask it with `GET /openapi.json` → `.info.version`, for whichever
-instance you care about. (Anything built off this branch says 2.26.0 — v2.27 is harness-side.) A
-number written here instead would be wrong the next time Portainer redeploys, with no diff to catch
-it.
-Latest release: **v2.27**, harness-side — `panel.py --ask` puts one premise to the seats and reports
-the tally, with no diff, no judge and no gate, so a fix's assumption can be challenged in a minute
-instead of in a twenty-minute round. (**v2.22** is claimed by a branch not yet merged, which is why
-the numbering skips it.)
-Before it, **v2.26** had the provenance v2.24 computed reach the board and the leaderboard: which
+instance you care about. (Anything built off this branch says 2.26.0 — v2.27 and v2.28 are
+harness-side.) A number written here instead would be wrong the next time Portainer redeploys, with
+no diff to catch it.
+Latest release: **v2.28**, harness-side — a panel round past the first reviews the fix commit rather
+than re-reading the whole PR, with the PR as the last round saw it behind that as context.
+(**v2.22** is claimed by PR #87, still open, which is why the numbering skips it.)
+Before it, **v2.27** put one premise to the seats and reported the tally, with no diff, no judge and
+no gate, so a fix's assumption can be challenged in a minute instead of in a twenty-minute round,
+and **v2.26** had the provenance v2.24 computed reach the board and the leaderboard: which
 reviewer catches regressions in fresh code and which finds what was already there, plus the commit
 each round reviewed (schema revision 0017).
 Before that, **v2.25** (harness-side) had the codex panel seat review the diff it was handed instead
@@ -250,6 +251,9 @@ settles a reply carrying several JSON-shaped values by agreement rather than by 
 a reviewer that produced nothing a failure that says why, and **v2.16** stopped the panel capping
 how much diff a reviewer is given. v2.13 (shipping the harness) and v2.14 (merging findings in the
 judge) are harness-side too.
+
+Oldest first, ending with what is next (the prose above and [CHANGELOG.md](CHANGELOG.md) both run
+the other way):
 
 - **v1–v2.1** — the board, then presence leases + session handoff, then dev context.
 - **v2.2–v2.5** — the session registry: sessions became listable, named, resumable, and the
@@ -272,9 +276,10 @@ judge) are harness-side too.
 - **v2.21** — each panel member runs in its own empty sandbox repo, not in whatever directory the
   panel was launched from and not in the repo under review; and a panel that lost a seat says so
   above its findings.
-- **v2.23** — a run records the PR's changed FILES and its state, not just a line count, so "which
-  other PRs does this merge disturb" becomes answerable from stored data. NULL and zero are kept
-  apart throughout: "nobody counted" is never "it changed nothing".
+- **v2.23** — (there is no v2.22: PR #87 holds that number and is still open.) A run records the
+  PR's changed FILES and its state, not just a line count, so "which other PRs does this merge
+  disturb" becomes answerable from stored data. NULL and zero are kept apart throughout: "nobody
+  counted" is never "it changed nothing".
 - **v2.24** — a new finding records whether the last fix pass introduced it or the last round missed
   it: two facts with opposite remedies that `new_this_round` collapsed into one, plus the commit each
   round reviewed and the files it was truncated out of. A signal, not a verdict — nothing gates on it.
@@ -291,6 +296,12 @@ judge) are harness-side too.
   no diff, no judge, the vote is the output, and it gates nothing. `cannot tell` counts toward the
   quorum and never toward the answer, and a tally whose only voter is the agent that wrote the
   premise reports as unchallenged rather than as agreement.
+- **v2.28** — a panel round past the first reviews the increment since the last round's head, not
+  the whole growing PR: the fix commit first, then the files it touched as they stood before it,
+  then the rest of the PR, with a budget spent in that order so context is what gets dropped. Falls
+  back to the whole PR — and says why — when there is no anchor, when nothing was pushed, when a
+  base-branch merge makes the range bigger than the PR itself, or when GitHub's compare response
+  came back truncated.
 - **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
   object store; wire `landed` refs to a cherry-pick helper.
 
