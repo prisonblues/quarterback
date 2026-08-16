@@ -14,15 +14,31 @@ itself, a heading claimed twice, a new release whose entry was written but never
 
 **Scope, stated because the paragraph above names more than this enforces.** The four sites
 asserted here are `pyproject.toml`, `app/main.py`, `CHANGELOG.md` and `README.md` — the ones
-that decide what a running instance reports and what a reader is told is current. The
-docstrings and filenames from that first collision (`migrations/versions/0015_*.py`,
-`app/api/reviews.py`, `tests/test_v219.py`, and a `v2.19` inside a README code comment) are
-NOT asserted and can still drift silently. They are prose about which release added a
-feature, not claims about which release this is, so a check would have to encode "does this
-sentence still describe history correctly" — and a `tests/test_vNNN.py` rule would be wrong
-outright, since a harness-side release ships no app test file at all. Narrow and honest
-beats broad and noisy: this suite's whole argument is that a check which fires on a
-correctly-updated repo gets switched off.
+that decide what a running instance reports and what a reader is told is current. Docstrings
+naming the release that added a feature (`migrations/versions/0015_*.py`, `app/api/reviews.py`)
+are NOT asserted and can still drift: they are prose about history, so a check would have to
+encode "does this sentence still describe the past correctly". Narrow and honest beats broad
+and noisy — this suite's whole argument is that a check which fires on a correctly-updated
+repo gets switched off.
+
+**Two things changed under this file's feet, and it now asserts both.**
+
+*A branch no longer writes a number at all* (#122). It writes the `vNEXT` placeholder and
+`scripts/release_stamp.py` resolves it against the ref being merged into, so a repo in this
+suite's sights is legitimately in one of two states: released, or carrying exactly one
+unstamped entry. Both are asserted, and the placeholder assertions are here rather than
+delegated to the stamper for the same reason the version regexes are duplicated below — this
+suite checks the FILES, and a check that ran the tool would agree with the tool by
+construction rather than agree with the repo.
+
+*The filename rule flipped.* An earlier version of this docstring argued that a
+`tests/test_vNNN.py` rule "would be wrong outright, since a harness-side release ships no app
+test file at all" — which is true of the rule it was rejecting (every release must have one)
+and not of the rule now enforced (no test file may be NAMED after one). That distinction cost
+something to learn: two branches taking the same number both add `tests/test_v234.py`, and
+two branches adding the same path with different contents is not a conflict git can resolve
+by keeping both sides. Test files are named after their subject now, and
+`test_no_test_file_is_named_after_a_release` keeps them that way.
 
 **Why it lives under `harness/` rather than in `tests/`.** It reads four text files and needs
 nothing else, but `tests/conftest.py` resolves `DATABASE_URL`, imports the app and can raise
@@ -80,12 +96,30 @@ def _fmt(r: Release) -> str:
 #: two assertions on a correctly-updated repo.
 _V = r"v\d+(?:\.\d+)?"
 
+#: The token a branch writes instead of a number, until `scripts/release_stamp.py` resolves
+#: it. Spelled here rather than imported from the script: see the docstring.
+PLACEHOLDER = "vNEXT"
+
 
 @pytest.fixture(scope="module")
-def changelog_releases() -> list[Release]:
-    """Every `## vX[.Y]` heading, in the order the file lists them (newest first)."""
-    text = (REPO_ROOT / "CHANGELOG.md").read_text()
-    found = re.findall(rf"^## ({_V})", text, flags=re.MULTILINE)
+def changelog_text() -> str:
+    return (REPO_ROOT / "CHANGELOG.md").read_text()
+
+
+@pytest.fixture(scope="module")
+def readme_text() -> str:
+    return (REPO_ROOT / "README.md").read_text()
+
+
+@pytest.fixture(scope="module")
+def changelog_releases(changelog_text) -> list[Release]:
+    """Every `## vX[.Y]` heading, in the order the file lists them (newest first).
+
+    The `## vNEXT` heading is deliberately not in here. Every test below reads position 0 as
+    "the newest release that exists", and an unstamped entry is the one thing that is not one
+    — folding it in would make `served <= newest` pass against a release nothing has shipped.
+    """
+    found = re.findall(rf"^## ({_V})", changelog_text, flags=re.MULTILINE)
     assert found, "CHANGELOG.md has no release headings — the parser is wrong, not the file"
     return [_release(v) for v in found]
 
@@ -188,38 +222,74 @@ def test_the_served_version_never_leads_the_newest_release(served_version,
         f"{_fmt(newest)} — a board version was bumped ahead of its CHANGELOG entry")
 
 
-def test_the_readme_names_the_newest_release_as_the_latest(changelog_releases):
-    """README's prose is one of the eight places, and the one most often left behind —
-    it was left behind by the very commit that added this test's sibling."""
-    newest = changelog_releases[0]
-    text = (REPO_ROOT / "README.md").read_text()
-    m = re.search(rf"Latest release: \*\*({_V})\*\*", text)
-    assert m, "README.md has no 'Latest release: **vX[.Y]**' line"
-    assert _release(m.group(1)) == newest, (
-        f"README.md calls {m.group(1)} the latest release; the CHANGELOG's newest is "
-        f"{_fmt(newest)}")
+#: Two assertions used to live here and no longer can, because the prose they read is
+#: deliberately gone (#122). "Latest release: **vX** — …" restated the previous four
+#: releases in fresh prose every time, which is why merging two branches meant WRITING a
+#: paragraph rather than keeping both sides of one; and "(Anything built off this branch
+#: says X.Y.Z)" was a fourth copy of a version the README's own argument says to read from
+#: `GET /openapi.json`. Deleting the copies is what removes the drift — a test that
+#: asserted them accurately was still a test whose subject should not have existed.
 
 
-def test_the_readme_prose_names_the_version_this_branch_serves(served_version):
-    """A THIRD copy of the full version sits in README's deploy paragraph — "(Anything
-    built off this branch says 2.19.0 …)". It drifts like the others and is likelier to
-    be missed, being parenthetical prose rather than a labelled field: a board bump can
-    leave it stale while the latest-release line and the bullet are both updated, and
-    every other assertion here still passes.
+def test_at_most_one_release_is_unstamped(changelog_text):
+    """A branch ships one release, so there is at most one placeholder.
 
-    Anchored on that paragraph's own wording rather than on a bare `says (\\d+\\.\\d+\\.\\d+)`.
-    The loose pattern took the first match anywhere in the file and landed on the right
-    line only by luck — README already carries two other "says" sentences and a `v2.19` in
-    a code comment. One new sentence pairing "says" with a dotted triple, or a reordering
-    of the deploy section, silently retargets the assertion: it then fails pointing at the
-    wrong paragraph, or passes while the real one drifts."""
-    text = (REPO_ROOT / "README.md").read_text()
-    m = re.search(r"built off this branch says (\d+\.\d+\.\d+)", text)
-    assert m, ("README.md has no 'Anything built off this branch says X.Y.Z' sentence — the "
-               "deploy paragraph was reworded, or it stopped naming a version")
-    assert m.group(1) == served_version, (
-        f"README.md says this branch serves {m.group(1)}; app/main.py serves "
-        f"{served_version}")
+    Two `## vNEXT` headings cannot both become one number, and choosing between them is
+    exactly the judgement nothing here is entitled to make. It is also the shape a bad merge
+    leaves behind: two branches whose entries were kept side by side, which under the old
+    convention would have been two different numbers and is now visibly one question."""
+    found = re.findall(rf"^## {PLACEHOLDER}\b.*$", changelog_text, flags=re.MULTILINE)
+    assert len(found) <= 1, (
+        f"CHANGELOG.md has {len(found)} unstamped entries: "
+        + " | ".join(f.strip() for f in found))
+
+
+def test_an_unstamped_entry_is_at_the_top(changelog_text, changelog_releases):
+    """The file is newest first and an unreleased entry is newer than everything in it.
+
+    Stamped where it sits below a numbered heading, it would be a number out of order in a
+    file every other test here reads by position — and `test_the_changelog_is_newest_first`
+    would then fail on the release AFTER the mistake, pointing at the wrong commit."""
+    placeholder = re.search(rf"^## {PLACEHOLDER}\b", changelog_text, flags=re.MULTILINE)
+    if not placeholder:
+        pytest.skip("nothing unstamped — this branch is not writing a release")
+    first_numbered = re.search(rf"^## {_V}\b", changelog_text, flags=re.MULTILINE)
+    assert first_numbered and placeholder.start() < first_numbered.start(), (
+        f"CHANGELOG.md's `## {PLACEHOLDER}` entry sits below "
+        f"{_fmt(changelog_releases[0])} — an unreleased entry belongs above every released one")
+
+
+def test_the_changelog_and_the_readme_are_unstamped_together(changelog_text, readme_text):
+    """Half a release entry is the failure this catches: a README bullet stamped with a
+    number whose CHANGELOG section does not exist, or an entry written up and never listed.
+
+    Both directions, because they fail on different days. The bullet without the entry is
+    the release-day mistake; the entry without the bullet is the one the old convention
+    made every time, since the bullet lived under a paragraph that had to be rewritten by
+    hand and the hand sometimes stopped there."""
+    in_changelog = bool(re.search(rf"^## {PLACEHOLDER}\b", changelog_text, flags=re.MULTILINE))
+    in_readme = bool(re.search(rf"^- \*\*{PLACEHOLDER}\*\* —", readme_text, flags=re.MULTILINE))
+    assert in_changelog == in_readme, (
+        f"CHANGELOG.md {'has' if in_changelog else 'has no'} `## {PLACEHOLDER}` entry but "
+        f"README.md {'has' if in_readme else 'has no'} `- **{PLACEHOLDER}** —` bullet")
+
+
+def test_no_test_file_is_named_after_a_release():
+    """`tests/test_v234.py` is a release number a branch had to guess before landing, and
+    two branches guessing the same one add the same PATH with different contents — which
+    git does not conflict on the way it conflicts on a heading, and cannot resolve by
+    keeping both sides. Whichever lands second clobbers the other's suite or presents a
+    reviewer with a choice between two unrelated files that happen to share a name.
+
+    Every suite in the repo, not just `tests/` — the harness ones are written by the same
+    hands on the same day and drift the same way."""
+    named = sorted(
+        str(p.relative_to(REPO_ROOT))
+        for p in REPO_ROOT.rglob("test_v[0-9]*.py")
+        if ".venv" not in p.parts and "node_modules" not in p.parts)
+    assert not named, (
+        "test files are named after their subject, not the release that shipped them: "
+        + ", ".join(named))
 
 
 def test_the_readme_release_list_has_an_entry_for_the_newest_release(changelog_releases):

@@ -225,59 +225,49 @@ half of the panel↔board drift check #65 asks for.
 
 The deployed board version lags the repo until the stack is redeployed, and only the running
 service knows which it is: ask it with `GET /openapi.json` → `.info.version`, for whichever
-instance you care about. (Anything built off this branch says 2.33.0.) A
-number written here instead would be wrong the next time Portainer redeploys, with no diff to catch
-it.
-Latest release: **v2.33** — the repair of v2.31's claim table: it enforced atomicity at the
-database for INSERT and nowhere else, authorised release numbers by machine when the whole point is
-that two agents on one box are two branches, and let the generic claim endpoint write rows the
-allocator's invariants are enforced nowhere else. Eight P1s from its own panel round.
-Before it, **v2.32** — the panel has always computed whether CI passed and told no reviewer:
-`review_ci` reached the payload and the human report, never a prompt. Both prompts and the judge now
-carry it in words, no non-passing state can read as a pass, and a green suite is stated as "every
-test we thought to write passed" rather than as evidence the code is correct. Harness-side, so the
-served version is unchanged.
-Previously: **v2.31** — the board allocates release numbers and merge claims atomically, off one
-resource-keyed lease table (schema revision 0019). Announcing a number on the board was falsified as
-a remedy nine times in two days: every agent was correct from what it could see, and an announcement
-does not force the next one to look. Asking does. Advisory, never a lock — it cannot stop a merge,
-only tell you who is already landing. Before it, **v2.30** (repo tooling) — `scripts/migration_reconcile.py`, so two branches
-both minting migration `0018` is caught before it lands rather than after: renumbered when the
-branch's migrations are one linear chain, and stopped when they are not.
-Before it, **v2.29** — a panel round records both ends of what it was judged against, not just
-the commit it read: the merge base its diff was built from, and the base branch's tip at the time
-(schema revision 0018). The two are separate because GitHub's `baseRefOid` is the merge base, and a
-merge base does not move when the base branch does — so the obvious single-field version of this
-check could only ever answer "unmoved". (**v2.22** is claimed by PR #87, still open, which is why
-the numbering skips it.)
-Before that, **v2.28**, harness-side — a panel round past the first reviews the fix commit rather
-than re-reading the whole PR, with the PR as the last round saw it behind that as context.
-Before that, **v2.27** put one premise to the seats and reported the tally, with no diff, no judge and
-no gate, so a fix's assumption can be challenged in a minute instead of in a twenty-minute round,
-and **v2.26** had the provenance v2.24 computed reach the board and the leaderboard: which
-reviewer catches regressions in fresh code and which finds what was already there, plus the commit
-each round reviewed (schema revision 0017).
-Before that, **v2.25** (harness-side) had the codex panel seat review the diff it was handed instead
-of going looking for the repo, which is what was running the reviews out of their timeout, and
-**v2.24**, also harness-side — a new finding says whether the last fix pass caused it or the last
-round missed it, which were one number before and want opposite remedies.
-**v2.23** had a run record which FILES the PR changed and not just how many lines, plus
-the PR's state as of that panel, so the board finally holds what collision ordering needs (schema
-revision 0016) — reading it back as a collision query ships separately, see #101.
-**v2.22** (harness-side, and out of sequence — written before v2.23 and landed after it) stopped
-the panel's judge being the same model as a seat it rules on, and had `create-worktree` turn on
-`rerere` so one conflict is resolved once rather than once per worktree.
-**v2.21** (harness-side) had each panel member run in its own empty sandbox repo
-rather than in whatever directory the panel was launched from. **v2.20** (also harness-side) had the
-worktree tooling ask who is in a directory before rewriting it, and **v2.19** added the per-reviewer
-cost columns (schema revision 0015) and was the first to move the board since v2.15; **v2.18**
-settles a reply carrying several JSON-shaped values by agreement rather than by rank, **v2.17** made
-a reviewer that produced nothing a failure that says why, and **v2.16** stopped the panel capping
-how much diff a reviewer is given. v2.13 (shipping the harness) and v2.14 (merging findings in the
-judge) are harness-side too.
+instance you care about. A number written here instead would be wrong the next time Portainer
+redeploys, with no diff to catch it — which is why the sentence that used to name this branch's
+own version has gone too. It was a fourth copy of a number that already lives in
+`pyproject.toml` and `app/main.py`, and it drifted exactly like the others.
 
-Oldest first, ending with what is next (the prose above and [CHANGELOG.md](CHANGELOG.md) both run
-the other way):
+### A branch never picks its own number
+
+Write `## vNEXT — <title>` at the top of [CHANGELOG.md](CHANGELOG.md) and `- **vNEXT** — …` at
+the end of the list below. Name no number, in either file. Whoever lands first gets the next one:
+
+```bash
+git fetch origin
+scripts/release_stamp.py preflight        # what it would take, read-only
+scripts/release_stamp.py apply            # rewrites the placeholder; commits nothing
+```
+
+`apply` reads the highest `## vX.Y` heading in the CHANGELOG **at the ref you are merging into**,
+adds one, and writes it into every heading and bold run carrying the placeholder — across all
+tracked markdown, so `harness/loops/README.md` is stamped by the same pass and cannot be the file
+somebody forgets. It moves `pyproject.toml` and `app/main.py` as well, but only when the branch
+changed `app/` or `migrations/`: most releases here are harness-side and correctly leave the served
+version where it was, and `--serve` / `--no-serve` override the inference for the release that
+proves it wrong.
+
+Two branches that stamp in the same minute get the same number, and the second one to reach the
+merge conflicts on the CHANGELOG, re-stamps against the moved base, and gets the next. That is the
+design and not a hole in it: the number is cheap to redo precisely because nothing else on the
+branch was ever written in terms of it. PR #90 was renumbered three times without one line of its
+behaviour changing, which is the cost this removes. Ten collisions in two days made the case, and
+the tenth landed an hour after the board's allocator shipped and worked — two agents simply did not
+call it, because a lock that has to be remembered is a lock that will be forgotten. `POST
+/release/claim` (#46, #99) is still there for a caller that wants to announce a number in advance;
+nothing in this flow needs one.
+
+For the same reason **test files are named after what they test, not after the release that shipped
+them** — `tests/test_resource_claims.py`, never `tests/test_v231.py`. A version in a filename is a
+number that has to be guessed before landing, and two branches guessing the same one add the same
+PATH, which git cannot resolve by keeping both sides the way it can a conflicting heading.
+
+### Every release, oldest first
+
+Ending with what is next ([CHANGELOG.md](CHANGELOG.md) runs the other way, and has each one in
+full — including what was broken before it, which is the part no diff recovers):
 
 - **v1–v2.1** — the board, then presence leases + session handoff, then dev context.
 - **v2.2–v2.5** — the session registry: sessions became listable, named, resumable, and the
@@ -359,10 +349,14 @@ the other way):
   text, so the generic claim endpoint could write rows carrying invariants only the allocator
   enforces. The two bugs that mattered most were unreachable sequentially — a race-based feature had
   shipped with a sequential test suite.
+- **vNEXT** — a branch stops naming its own release number: it writes `vNEXT`, and
+  `scripts/release_stamp.py` resolves it against the ref being merged into. The narrative
+  paragraph that restated the last four releases in fresh prose is gone — it duplicated the
+  CHANGELOG and made every release rewrite the same lines of the same two files, so two branches
+  conflicted whether or not their numbers collided. Test files are named after their subject
+  rather than their release, which was the one site git could not resolve by keeping both sides.
 - **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
   object store; wire `landed` refs to a cherry-pick helper.
-
-**[CHANGELOG.md](CHANGELOG.md)** has each release in full, including what was broken before it.
 
 ## Stack
 

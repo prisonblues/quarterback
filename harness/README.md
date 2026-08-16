@@ -139,9 +139,16 @@ configuration, and a conflict resolved by hand in one tree is replayed in the re
 
 The part to know before it surprises you: **a replayed resolution is git's answer from
 last time, not a judgement about this merge.** rerere matches on the conflict text, so
-the same hunks get the same answer even when the right answer has changed — a CHANGELOG
-version narrative being the obvious case, since the correct resolution there depends on
-which releases happen to be in flight. `rerere.autoUpdate` is therefore pinned to
+the same hunks get the same answer even when the right answer has changed. The example
+this used to give — a CHANGELOG version narrative, whose correct resolution depends on
+which releases happen to be in flight — has stopped being one, and it is worth saying why
+rather than quietly swapping it: quarterback's branches no longer write a release number
+at all (`scripts/release_stamp.py`, #122), so the CHANGELOG conflict that remains is two
+`vNEXT` headings whose answer is always keep-both, and the README narrative that had to be
+*rewritten* by hand is deleted. That removes the case; it does not remove the class. A
+replayed resolution is still last time's answer, and the merge that made this rule worth
+having had three prose conflicts where keep-both was right and a fourth, in `panel.py`,
+where it was not. `rerere.autoUpdate` is therefore pinned to
 `false`: the merge still stops, the file is left **unstaged** with the previous answer
 in it, and you have to look at it and `git add` it yourself. Read a replayed resolution;
 do not trust it. Turn the whole thing off for a repo with `git config rerere.enabled

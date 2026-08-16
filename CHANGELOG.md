@@ -7,6 +7,56 @@ that number where it was, so the repo can be a version ahead of the service.
 Entries are newest first. Each one says what was broken or missing before it, because that is the
 part that isn't recoverable from the diff.
 
+A release in flight has no number. Write `## vNEXT — <title>` here, name no version anywhere, and
+run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
+you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
+
+## vNEXT — a branch stops guessing which release it will be
+
+Every release rewrote the same lines of the same two files, so two open branches conflicted on
+`CHANGELOG.md` and `README.md` whether or not their numbers collided. Landing four PRs in one
+morning produced three hand-resolved prose conflicts, and PR #90 was renumbered three times
+(v2.23 → v2.25 → v2.28) without one line of its behaviour changing.
+
+**The routine conflict was camouflage for the rare real one.** #90's merge carried four conflicts:
+three prose files where "keep both sides" is always right, and `panel.py`, where it was not — #117
+had made `--round` a sentinel while #90 still passed `args.round_no` straight through, so the
+reflex the other three trained would have passed `None` into a signature that says `int`. It merged
+clean either way; only reading it caught it. A conflict resolved by reflex three times a day trains
+the reflex, and the volume of routine is what makes the camouflage work.
+
+**The number is now stamped at land, not chosen at write.** A branch writes `## vNEXT` and
+`- **vNEXT** — …`; `scripts/release_stamp.py` reads the highest heading in the CHANGELOG *at the
+ref being merged into*, adds one, and writes it into every heading and bold run across all tracked
+markdown — so `harness/loops/README.md` is stamped by the same pass rather than being the file
+somebody forgets. `pyproject.toml` and `app/main.py` move with it, but only when the branch changed
+`app/` or `migrations/`, because most releases here are harness-side and correctly leave the served
+version alone; the inference is always reported and `--serve`/`--no-serve` override it. Placeholders
+inside code spans are documentation of the mechanism and are left alone; a placeholder written
+anywhere the stamper would *not* rewrite is a refusal, not a shrug. Two branches that stamp at once
+get the same number and the second re-stamps after the conflict — which is the point, since nothing
+else on the branch was ever written in terms of the number.
+
+This is not a second allocator, and #46/#99's `POST /release/claim` is untouched. The tenth
+collision happened an hour after that allocator shipped and worked: both branches simply did not
+call it. **A lock that has to be remembered is a lock that will be forgotten, and a placeholder
+cannot be got wrong** — that is the whole argument for doing it this way round.
+
+**README stops restating the CHANGELOG.** The "Latest release / Before it / Before that" paragraph
+re-wrote the previous four releases in fresh prose every time, which is why merging two branches
+meant *writing* a paragraph rather than keeping both sides of one. It is deleted; the oldest-first
+list, which appends one bullet, stays. The parenthetical naming this branch's served version goes
+with it — a fourth copy of a number the README's own argument says should be read from
+`GET /openapi.json`.
+
+**Test files are named after what they test.** Sixteen `tests/test_vNNN.py` became
+`test_resource_claims.py`, `test_finding_provenance.py`, `test_round_baseline.py` and so on. This
+was the site that failed hardest and was in none of the reports: two branches taking the same number
+both add `tests/test_v234.py`, which is the same PATH with different contents — not a text conflict
+git can resolve by keeping both sides, but a choice between two unrelated suites that happen to
+share a name. `harness/tests/test_release_numbers.py` now enforces the naming rule, tolerates the
+placeholder, and has dropped the two assertions about README prose that no longer exists.
+
 ## v2.33 — v2.31's claim table was right about INSERT and wrong about everything else
 
 v2.31 landed the resource-claim table and its release allocator, and its own panel round found

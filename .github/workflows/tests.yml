@@ -90,3 +90,24 @@ jobs:
             echo "--- $suite"
             uv run --extra dev pytest "$suite" -q
           done
+
+  stamped:
+    name: no unstamped release on main
+    # `main` only, and that is the whole design rather than an optimisation. An
+    # unstamped `## vNEXT` is the CORRECT state of every branch in flight — the
+    # placeholder is what stops two branches picking the same number — and becomes
+    # a defect at exactly one moment: when it lands. A check running on pull_request
+    # would fire on every release PR in the repo and be switched off within a week,
+    # which is the failure mode `harness/tests/test_release_numbers.py` was written
+    # around and this job is not going to re-invent.
+    #
+    # It is a guard, not the mechanism: `release_stamp.py apply` is meant to run
+    # before the merge, and this is what makes forgetting it visible in the minutes
+    # after rather than in whatever document a reader hits the literal string in.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check every release on main carries a number
+        run: python3 scripts/release_stamp.py check

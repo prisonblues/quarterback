@@ -11,7 +11,7 @@ v2.12 changed *who picks* that second half — the board designates it now, rath
 than the client deriving it — so these tests no longer hard-code the agent half;
 they ask ``/whoami`` for it. What v2.9 established is unchanged: two agents on
 one machine are two identities, and a lease is still owned by the box.
-See test_v212 for the naming, aliasing and allocation that replaced it.
+See test_designated_names.py for the naming, aliasing and allocation that replaced it.
 """
 
 from __future__ import annotations
@@ -25,7 +25,15 @@ REPO = "v29repo"
 # Two agents on one machine — the case that used to collapse to one identity.
 SERVER_A = {**SERVER, "X-Agent-Key": "f5ca7491"}
 SERVER_B = {**SERVER, "X-Agent-Key": "938fca68"}
-LAPTOP_A = {**LAPTOP, "X-Agent-Key": "deploykey", "X-Agent-Name": "deploy"}
+# The requested name is incidental here — nothing below asserts it — but it has to be
+# unique across the whole session, not just this file. A designated name is claimed once
+# per machine, so a second file asking `laptop` for the same one is handed a different name
+# and its assertion fails, in whichever of the two files happens to run second. That is what
+# it did: this constant and `test_designated_names.py`'s NAMED both asked for `deploy`, and
+# the collision was invisible for as long as the version-numbered filenames happened to sort
+# the file that asserts on the name first. Renaming the files off their release numbers
+# reordered collection and surfaced it — which is the argument for the rename in miniature.
+LAPTOP_A = {**LAPTOP, "X-Agent-Key": "deploykey", "X-Agent-Name": "deploy-a"}
 
 
 async def ident(client, headers) -> str:

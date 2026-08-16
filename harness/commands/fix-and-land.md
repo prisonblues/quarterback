@@ -71,9 +71,23 @@ This is the hybrid path: the guardrails of a guided integration merge (lexray's 
    `max(both) + 1`, keeping the branch's descriptive comment — **never take the branch's number
    blindly**.
 
-   **4c. Push whatever 4a/4b produced to the PR branch.** Those commits are mechanical (a
-   `down_revision` line, a version counter, a generated merge migration) and need no re-review; a
-   MERGE-path merge commit brings in `$BASE` changes already reviewed on their own PRs.
+   **4c. Release number** (if `scripts/release_stamp.py` exists):
+   ```bash
+   python3 scripts/release_stamp.py apply --onto origin/$BASE
+   ```
+   A branch that ships a release writes `vNEXT` and names no number, so this is where the number
+   is decided — against `$BASE` **as it stands now**, which is the only moment the answer is
+   knowable. It is a noop on a branch that ships no release, so run it unconditionally rather than
+   guessing whether this one does. Exit 0 = stamped or nothing to stamp; **exit 2 = HOLD** and read
+   the message: every refusal is a release entry in a shape the tool will not guess about (two
+   unstamped entries, an entry below a released one, a placeholder somewhere nothing rewrites), and
+   guessing is what this whole mechanism exists to stop. `apply` writes and does not commit, so
+   commit what it produced. Re-run it if the branch takes a later merge from `$BASE` — the number
+   is computed from the base and a moved base can move it.
+
+   **4d. Push whatever 4a/4b/4c produced to the PR branch.** Those commits are mechanical (a
+   `down_revision` line, a version counter, a release number the tool chose) and need no
+   re-review; a MERGE-path merge commit brings in `$BASE` changes already reviewed on their own PRs.
 5. **Confidence gate — MERGE only if ALL hold:**
    - `gh pr checks <pr>` is **green** (never merge on red/pending CI) — **re-checked after the
      step-4 push**, since that push restarts CI and any earlier green is stale,
