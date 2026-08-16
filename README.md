@@ -228,7 +228,12 @@ service knows which it is: ask it with `GET /openapi.json` → `.info.version`, 
 instance you care about. (Anything built off this branch says 2.31.0.) A
 number written here instead would be wrong the next time Portainer redeploys, with no diff to catch
 it.
-Latest release: **v2.31** — the board allocates release numbers and merge claims atomically, off one
+Latest release: **v2.32** — the panel has always computed whether CI passed and told no reviewer:
+`review_ci` reached the payload and the human report, never a prompt. Both prompts and the judge now
+carry it in words, no non-passing state can read as a pass, and a green suite is stated as "every
+test we thought to write passed" rather than as evidence the code is correct. Harness-side, so the
+served version is unchanged.
+Previously: **v2.31** — the board allocates release numbers and merge claims atomically, off one
 resource-keyed lease table (schema revision 0019). Announcing a number on the board was falsified as
 a remedy nine times in two days: every agent was correct from what it could see, and an announcement
 does not force the next one to look. Asking does. Advisory, never a lock — it cannot stop a merge,
@@ -322,6 +327,11 @@ the other way):
   base branch cannot move a common ancestor — PR #87 held one value across ten commits of `main` —
   so a staleness check resting on it alone would report "the review still stands" in exactly the
   case it exists to catch. Stamped and published; what a moved base MEANS is #96's verdict.
+- **v2.32** — reviewers are told whether CI passed. The panel already computed it on every round and
+  discarded it before anyone reviewed, so seats spent `could_not_assess` entries on questions a green
+  suite settles — and each of those is a `coverage_veto` line, which costs the ROUND its confident
+  stop. CI is now read before the seats are dispatched rather than concurrently with them, which is
+  why its answer could never have reached their prompt before.
 - **v2.31** — release numbers and merge claims become an ALLOCATION rather than an announcement, off
   one resource-keyed lease table with passive expiry (schema revision 0019). Nine collisions in two
   days made the case: two agents announced the same number one second apart, both correct from what

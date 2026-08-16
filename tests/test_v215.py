@@ -757,7 +757,7 @@ def _panel_round(monkeypatch, tmp_path, round_no, title, baseline=()):
         # and had no gap.
         return panel.ReviewerRun([], None, 800, None)
 
-    def fake_adjudicate(clusters, diff, model, pr, budget=None, coverage=None):
+    def fake_adjudicate(clusters, diff, model, pr, budget=None, coverage=None, ci=""):
         """The judge confirms what it was shown, keeping every reporter's own
         report on the record — which is where the per-reviewer declarations the
         board scores live."""
