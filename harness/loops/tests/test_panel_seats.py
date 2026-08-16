@@ -37,6 +37,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
+import panel_core  # noqa: E402  — `sh` is defined here since #129
+import panel_seats  # noqa: E402  — these seats moved here in #129
 from conftest import gh_stub  # noqa: E402
 
 
@@ -91,7 +93,7 @@ def test_the_reparse_RETRY_gets_a_sandbox_too(monkeypatch):
     seen = []
     _record_cwds(monkeypatch, seen)
     # Unparseable both times: forces the retry, so two invocations are recorded.
-    monkeypatch.setattr(panel, "parse_reply", lambda *a, **k: None)
+    monkeypatch.setattr(panel_seats, "parse_reply", lambda *a, **k: None)
     panel.review_llm("claude", "sonnet", "review this")
     assert len(seen) == 2, f"expected review + reparse retry, got {len(seen)}"
     assert all(c for c in seen)
@@ -104,7 +106,7 @@ def test_the_judge_and_ITS_retry_run_in_a_sandbox(monkeypatch):
     is asserted for the same reason as the reviewer's."""
     seen = []
     _record_cwds(monkeypatch, seen)
-    monkeypatch.setattr(panel, "extract_json_value", lambda *a, **k: None)
+    monkeypatch.setattr(panel_core, "extract_json_value", lambda *a, **k: None)
     f = panel.Finding("claude", "P1", "a.py", 1, "title", "detail")
     panel.adjudicate([[f]], "diff", "sonnet", 34)
     assert len(seen) == 2, f"expected judge + reparse retry, got {len(seen)}"
@@ -197,7 +199,7 @@ def _stub_panel(monkeypatch, findings=None, cfg=TWO_SEAT_CFG, runs=None):
     if findings is None:
         findings = [panel.Finding("claude", "P3", "a.py", 3, "unused import")]
     monkeypatch.setattr(panel, "load_repo_cfg", lambda name: cfg)
-    monkeypatch.setattr(panel, "sh", gh_stub(
+    monkeypatch.setattr(panel_core, "sh", gh_stub(
         meta={"title": "feat: x", "additions": 3, "deletions": 1,
               "headRefOid": "abc"},
         diff="diff --git a/a.py b/a.py\n+x\n"))

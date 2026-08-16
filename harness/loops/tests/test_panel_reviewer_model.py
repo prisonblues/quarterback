@@ -12,6 +12,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
+import panel_seats  # noqa: E402  — run_cli lives here since #129
 
 TOO_OLD = (
     'ERROR: {"type":"error","status":400,"error":{"type":"invalid_request_error",'
@@ -82,7 +83,7 @@ def test_typo_effort_is_refused_without_spending_a_run(monkeypatch):
     """A config error is answered as one, before three CLI invocations discover
     it downstream and report it as an opaque non-zero exit."""
     called = []
-    monkeypatch.setattr(panel, "run_cli", lambda *a, **k: called.append(a) or (None, None))
+    monkeypatch.setattr(panel_seats, "run_cli", lambda *a, **k: called.append(a) or (None, None))
     got = panel.review_llm("codex", "gpt-5.6-luna", "p", effort="hi")
     assert got.findings == [] and called == []
     assert "unknown reasoning effort" in got.skip and "'hi'" in got.skip

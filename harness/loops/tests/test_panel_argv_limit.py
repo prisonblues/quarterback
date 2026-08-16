@@ -15,6 +15,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
+import panel_seats  # noqa: E402  — run_cli lives here since #129
 
 # ------------------------------------------------------- the limit is real
 
@@ -41,9 +42,9 @@ def test_a_reviewer_prompt_is_fed_on_stdin_not_in_argv(name, model, monkeypatch)
         seen["args"], seen["stdin"] = (args() if callable(args) else args), stdin_text
         return "[]", None
 
-    monkeypatch.setattr(panel, "run_cli", fake)
+    monkeypatch.setattr(panel_seats, "run_cli", fake)
     monkeypatch.setattr(panel.shutil, "which", lambda _c: "/usr/bin/" + _c)
-    monkeypatch.setattr(panel, "claude_usage", lambda _sids: None)
+    monkeypatch.setattr(panel_seats, "claude_usage", lambda _sids: None)
     prompt = "REVIEW THIS DIFF " * 100
     panel.review_llm(name, model, prompt)
     assert seen["stdin"] == prompt
@@ -60,7 +61,7 @@ def test_the_judge_prompt_is_fed_on_stdin_too(monkeypatch):
         seen["args"], seen["stdin"] = args, stdin_text
         return "[]", None
 
-    monkeypatch.setattr(panel, "run_cli", fake)
+    monkeypatch.setattr(panel_seats, "run_cli", fake)
     monkeypatch.setattr(panel.shutil, "which", lambda _c: "/usr/bin/claude")
     f = panel.Finding("claude", "P1", "a.py", 1, "title", "detail")
     panel.adjudicate([[f]], "DIFFDIFFDIFF", "sonnet", 1)

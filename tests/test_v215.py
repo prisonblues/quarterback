@@ -29,6 +29,7 @@ from .conftest import LAPTOP
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "harness" / "loops"))
 import panel
+import panel_core  # noqa: E402  — `sh` is defined here since #129
 
 REPO = "acme/v215repo"
 AGENT = {**LAPTOP, "X-Agent-Instance": "d14d14"}
@@ -769,7 +770,13 @@ def _panel_round(monkeypatch, tmp_path, round_no, title, baseline=()):
                 None, "codex is right that the migration is unread")
 
     monkeypatch.setattr(panel, "load_repo_cfg", lambda name: PANEL_CFG)
-    monkeypatch.setattr(panel, "sh", _fake_sh)
+    # Patched through `panel` rather than on a separately-imported panel_core:
+    # `run()` calls `panel_core.sh(...)`, and this guarantees the object being
+    # patched is the one it resolves. A second import of the same module name is
+    # normally the same object — but "normally" is how the doubles in this split
+    # went silently inert once, and a stub that does not apply here spawns a real
+    # `gh` against a repo that does not exist (#129).
+    monkeypatch.setattr(panel.panel_core, "sh", _fake_sh)
     monkeypatch.setattr(panel, "review_llm", fake_review)
     monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
     monkeypatch.setattr(panel, "adjudicate", fake_adjudicate)

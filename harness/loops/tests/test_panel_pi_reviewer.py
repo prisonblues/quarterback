@@ -12,6 +12,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
+import panel_seats  # noqa: E402  — run_cli lives here since #129
 
 
 def test_pi_is_a_panel_member():
@@ -66,7 +67,7 @@ def test_a_reviews_session_never_reaches_the_users_store(monkeypatch):
         assert seen["dir"].is_dir()          # it exists while the CLI runs
         return "[]", None
 
-    monkeypatch.setattr(panel, "run_cli", capture)
+    monkeypatch.setattr(panel_seats, "run_cli", capture)
     panel.review_llm("pi", "openrouter/moonshotai/kimi-k3", "p")
     assert not seen["dir"].exists()          # and is gone once the member returns
 
@@ -98,7 +99,7 @@ def test_effort_sets_are_per_cli_not_unioned(monkeypatch):
     assert "ultra" in panel.CODEX_EFFORTS and "ultra" not in panel.PI_EFFORTS
 
     called = []
-    monkeypatch.setattr(panel, "run_cli", lambda *a, **k: called.append(a) or (None, None))
+    monkeypatch.setattr(panel_seats, "run_cli", lambda *a, **k: called.append(a) or (None, None))
     got = panel.review_llm("pi", "openrouter/moonshotai/kimi-k3", "p", effort="ultra")
     assert called == [] and "unknown reasoning effort" in got.skip and "minimal" in got.skip
 
@@ -107,6 +108,6 @@ def test_a_cli_with_no_effort_knob_says_so(monkeypatch):
     """claude takes no reasoning level. Setting one is a config error worth
     naming, not a flag to quietly drop on the floor."""
     called = []
-    monkeypatch.setattr(panel, "run_cli", lambda *a, **k: called.append(a) or (None, None))
+    monkeypatch.setattr(panel_seats, "run_cli", lambda *a, **k: called.append(a) or (None, None))
     got = panel.review_llm("claude", "sonnet", "p", effort="high")
     assert called == [] and "takes no reasoning effort" in got.skip

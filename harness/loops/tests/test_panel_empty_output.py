@@ -21,6 +21,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
+import panel_seats  # noqa: E402  — run_cli lives here since #129
 
 # The real thing, from `agy` 1.1.12. It names the cause and both remedies — all
 # of which used to be discarded because the exit code was zero.
@@ -213,7 +214,7 @@ class _Clock:
 
 def _slow_cli(monkeypatch, seconds, *runs):
     clock = _Clock()
-    monkeypatch.setattr(panel, "time", clock)
+    monkeypatch.setattr(panel_seats, "time", clock)
     calls = _fake_cli(monkeypatch, *runs)
 
     real_run = subprocess.run
@@ -303,7 +304,7 @@ def test_review_llm_keeps_its_own_guard_against_a_blank_raw_finding(monkeypatch)
     finding flagged `unstructured`: a dead reviewer wearing a live one's
     clothes, which is the failure this whole file exists to kill."""
     monkeypatch.setattr(panel.shutil, "which", lambda _: "/usr/bin/agy")
-    monkeypatch.setattr(panel, "run_cli", lambda *a, **k: ("   \n", None))
+    monkeypatch.setattr(panel_seats, "run_cli", lambda *a, **k: ("   \n", None))
     got = panel.review_llm("antigravity", "m", "p")
     assert got.findings == [] and got.unstructured is False
     assert "produced no output" in got.skip

@@ -23,6 +23,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
+import panel_core  # noqa: E402  — `sh` is defined here since #129
+import panel_seats  # noqa: E402  — run_cli lives here since #129
 from conftest import gh_stub  # noqa: E402
 
 
@@ -322,7 +324,7 @@ def test_an_ambiguous_reply_lands_in_the_degradation_path_that_already_exists(mo
         return raw, None
 
     monkeypatch.setattr(panel.shutil, "which", lambda name: "/usr/bin/" + name)
-    monkeypatch.setattr(panel, "run_cli", fake_run_cli)
+    monkeypatch.setattr(panel_seats, "run_cli", fake_run_cli)
     got = panel.review_llm("claude", "opus", "p")
     assert got.unstructured is True and len(calls) == 2
     assert got.skip is None and "the first answer" in got.findings[0].detail
@@ -1081,7 +1083,7 @@ def _judge_returning(monkeypatch, reply):
         return reply, None
 
     monkeypatch.setattr(panel.shutil, "which", lambda name: "/usr/bin/" + name)
-    monkeypatch.setattr(panel, "run_cli", fake_run_cli)
+    monkeypatch.setattr(panel_seats, "run_cli", fake_run_cli)
     return seen
 
 
@@ -1145,7 +1147,7 @@ def test_a_coverage_only_round_whose_judge_said_nothing_is_not_adjudicated(monke
 
 
 def test_nothing_found_and_nothing_declared_needs_no_judge(monkeypatch):
-    monkeypatch.setattr(panel, "run_cli", lambda *a, **k: (_ for _ in ()).throw(
+    monkeypatch.setattr(panel_seats, "run_cli", lambda *a, **k: (_ for _ in ()).throw(
         AssertionError("the judge must not run with nothing to rule on")))
     assert panel.adjudicate([], "diff", "", 34, coverage={"claude": []}) == ([], None, "")
 
@@ -1174,7 +1176,7 @@ def _stub_panel(monkeypatch, findings=None, title="feat: x", cfg=PANEL_CFG):
     if findings is None:
         findings = [panel.Finding("claude", "P3", "a.py", 3, "unused import")]
     monkeypatch.setattr(panel, "load_repo_cfg", lambda name: cfg)
-    monkeypatch.setattr(panel, "sh", gh_stub(
+    monkeypatch.setattr(panel_core, "sh", gh_stub(
         meta={"title": title, "additions": 3, "deletions": 1, "headRefOid": "abc"},
         diff="diff --git a/a.py b/a.py\n+x\n"))
     monkeypatch.setattr(panel, "review_llm",
@@ -1326,7 +1328,7 @@ SONAR_CFG = {**PANEL_CFG,
 def _sonar_round(monkeypatch, tmp_path, round_no, baseline=(), max_rounds=3):
     """A round whose ONLY outstanding item is a SonarCloud hard-gate issue."""
     monkeypatch.setattr(panel, "load_repo_cfg", lambda name: SONAR_CFG)
-    monkeypatch.setattr(panel, "sh", gh_stub(
+    monkeypatch.setattr(panel_core, "sh", gh_stub(
         meta={"title": "feat: x", "additions": 3, "deletions": 1, "headRefOid": "abc"},
         diff="diff --git a/a.py b/a.py\n+x\n"))
     monkeypatch.setattr(panel, "review_llm",
@@ -1369,7 +1371,7 @@ def test_a_json_file_that_could_not_be_written_fails_the_run(monkeypatch, capsys
     advance the cycle onto a baseline that does not exist, where every repeated
     finding reads as new."""
     monkeypatch.setattr(panel, "load_repo_cfg", lambda name: PANEL_CFG)
-    monkeypatch.setattr(panel, "sh", gh_stub(
+    monkeypatch.setattr(panel_core, "sh", gh_stub(
         meta={"title": "feat: x", "additions": 3, "deletions": 1, "headRefOid": "abc"},
         diff="diff --git a/a.py b/a.py\n+x\n"))
     monkeypatch.setattr(panel, "review_llm",
@@ -1610,7 +1612,7 @@ def test_the_judge_gets_the_same_one_shot_reparse_the_reviewers_get(monkeypatch)
         return (ambiguous if len(calls) == 1 else settled), None
 
     monkeypatch.setattr(panel.shutil, "which", lambda name: "/usr/bin/" + name)
-    monkeypatch.setattr(panel, "run_cli", fake_run_cli)
+    monkeypatch.setattr(panel_seats, "run_cli", fake_run_cli)
     leak = panel.Finding("codex", "P2", "a.py", 1, "leak", "")
     out, skip, _ = panel.adjudicate([[leak]], "diff", "", 34)
     assert len(calls) == 2 and calls[1] == 1, "one extra attempt, not another three"
