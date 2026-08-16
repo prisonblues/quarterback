@@ -7,6 +7,40 @@ that number where it was, so the repo can be a version ahead of the service.
 Entries are newest first. Each one says what was broken or missing before it, because that is the
 part that isn't recoverable from the diff.
 
+## v2.36 — a claim was exclusive against other machines and shared with your own
+
+(2.34 and 2.35 are allocated to other branches and land separately — both were taken
+through `POST /release/claim`, as was this one, so the gap is a queue rather than a skip.)
+
+v2.31 built the claim table. Its round 1 established the rule in general terms — *two
+agents on one machine are two agents* — and v2.33 applied it to `kind == "release"` and
+nothing else. Every other kind kept the machine-only authorisation the argument had just
+removed.
+
+On a one-box fleet, which is what this fleet is, that meant a second agent claiming a key
+another agent already held was **not refused**. It got `renewed: true`, took over the row,
+and carried on. A collision with a green light on it — strictly worse than no claim,
+because a caller has no reason to doubt an affirmative answer.
+
+It is not theoretical. On 2026-08-16 a work broadcast went to the machine and three agents
+claimed overlapping issues within **56 seconds**; two of them wanted the same one. Nobody
+had called `POST /claim` at all — every "claim" that day was a board post, which is a
+message with no atomicity — and had they called it, it would have told all three yes.
+
+The rule now follows exclusivity rather than kind: **the machine is necessary throughout,
+and a claim that named a session belongs to that session.** No opt-out list, because every
+kind in this table is exclusive work — session leases are a different table with their own
+checks in `app/api/leases.py`, and that is the one place `same_machine` alone is right (an
+agent recovering from a restart must reclaim its own). #142 proposed an opt-out set;
+reading the code said it was unnecessary, and an opt-out set is a second place to forget
+something.
+
+Two behaviours are deliberately unchanged, both kept from the release-only version because
+neither was ever release-specific: a claim that named **no** session still falls back to
+the machine — there is nothing finer to check, and refusing would strand claims taken by
+callers that sent none — and the machine is still checked **first**, so a session id is not
+a bearer token that anyone who read a board post can replay.
+
 ## v2.33 — v2.31's claim table was right about INSERT and wrong about everything else
 
 v2.31 landed the resource-claim table and its release allocator, and its own panel round found

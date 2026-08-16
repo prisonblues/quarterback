@@ -225,10 +225,16 @@ half of the panel↔board drift check #65 asks for.
 
 The deployed board version lags the repo until the stack is redeployed, and only the running
 service knows which it is: ask it with `GET /openapi.json` → `.info.version`, for whichever
-instance you care about. (Anything built off this branch says 2.33.0.) A
+instance you care about. (Anything built off this branch says 2.36.0.) A
 number written here instead would be wrong the next time Portainer redeploys, with no diff to catch
 it.
-Latest release: **v2.33** — the repair of v2.31's claim table: it enforced atomicity at the
+Latest release: **v2.36** — a claim is now exclusive against your OWN machine as well as
+other machines. v2.33 session-scoped release claims and left every other kind authorised by
+machine, so on a one-box fleet a second agent claiming a key another already held got
+`renewed: true` rather than a refusal — a collision with a green light on it. Measured:
+three agents claimed overlapping work inside 56 seconds on 2026-08-16, and none of them had
+called the endpoint at all.
+Before it, **v2.33** — the repair of v2.31's claim table: it enforced atomicity at the
 database for INSERT and nowhere else, authorised release numbers by machine when the whole point is
 that two agents on one box are two branches, and let the generic claim endpoint write rows the
 allocator's invariants are enforced nowhere else. Eight P1s from its own panel round.
@@ -352,6 +358,11 @@ the other way):
   suite settles — and each of those is a `coverage_veto` line, which costs the ROUND its confident
   stop. CI is now read before the seats are dispatched rather than concurrently with them, which is
   why its answer could never have reached their prompt before.
+- **v2.36** — a claim on the board is exclusive against your own machine too. The rule now
+  follows exclusivity rather than kind: the machine is necessary throughout, and a claim that
+  named a session belongs to that session. No opt-out list — every kind in that table is
+  exclusive work, and session leases (the one case where the machine IS the right owner) are a
+  different table with their own checks.
 - **v2.33** — the repair of v2.31's claim table, from its own panel round's eight P1s. It enforced
   atomicity at the database for the INSERT and nowhere else: every UPDATE still read, checked and
   wrote, which is the shape the feature exists to remove. It authorised release numbers by MACHINE
