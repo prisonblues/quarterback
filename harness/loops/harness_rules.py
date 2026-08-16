@@ -113,7 +113,43 @@ DEFAULTS: dict = {
             "adopt ruff", "format-the-world", "deduplicate", "consolidate",
             "relocate top-level",
         ],
-        "judge_model": "opus",
+        # NOT `opus`, which is `reviewers.claude.model` — the adjudicator must
+        # not be the same brain as a seat it rules on. On 2026-08-15 four
+        # judge-confirmed findings turned out plainly wrong on inspection
+        # (64-F02/F03/F04, 32-F06) and all four were raised by claude and
+        # confirmed by an opus judge; n=4, so the mechanism is the argument
+        # rather than the sample. The README already says the same thing one
+        # level down — "set claude.model to a different model than the PR
+        # author; same-model self-review is the weak case (#117)".
+        # `sonnet`, NOT `fable`, and the reversal is the point. Round 1 of #87
+        # chose `fable` on a tie-break — `clamp_model` fails toward capability —
+        # and rounds 1 and 2 then both attacked that choice from two different
+        # directions: `fable` is not universally available (it wants a recent
+        # CLI, is not on every plan, can be org-disabled, may want credits) and
+        # it is the priciest model in the panel, on a run that happens for every
+        # reviewed PR, in a harness whose `skip_title_patterns` exist because one
+        # release-merge came to about $750.
+        #
+        # A premise raised twice is the signal to delete it rather than patch it
+        # (#67). The requirement here is INDEPENDENCE — the adjudicator must not
+        # be the brain that raised the finding — and `fable` was one
+        # implementation of it that also bought an availability gamble and a cost
+        # rise nobody measured. `sonnet` satisfies the requirement outright: it
+        # is not `reviewers.claude.model` (`opus`), it is available wherever the
+        # CLI runs at all, and it is cheaper than the `opus` judge it replaces
+        # rather than dearer. The capability argument was never evidence — the
+        # four wrong findings below were confirmed by an `opus` judge, so
+        # capability was not what was failing.
+        #
+        # A repo that wants the most capable adjudicator still sets
+        # `judge_model: fable` and gets it. What it does not get is that choice
+        # made silently on its behalf, on every repo, by a default.
+        #
+        # The full rule this is the default half of — refuse to run when
+        # judge_model matches any enabled seat's model — is #78's
+        # `judge_independent`, and is not here yet: a repo that pins both to one
+        # model still gets today's behaviour, silently.
+        "judge_model": "sonnet",
         # Chars of diff each model is given. `null` — the default — means the
         # whole diff: the number that used to be here was inherited from the
         # kernel's argv limit and outlived it, and a reviewer handed a prefix
@@ -184,6 +220,14 @@ DEFAULTS: dict = {
         "auto_finish": False,
         "executor_worktree_args": [],
         "min_free_mb": 2048,
+        # Highest tier the epic may spend on a sub-issue when `--model` is not
+        # passed: the triage judge runs here and routes each issue to this tier
+        # or a lesser one (sonnet < opus < fable). `opus` is what the fallback
+        # to review_panel.judge_model used to resolve to, kept deliberately —
+        # this is a spending ceiling and inherits nothing from who adjudicates.
+        # Anything not in MODEL_TIERS (including "") turns model routing off
+        # altogether, which stays available to a repo that asks for it by name.
+        "model_ceiling": "opus",
         # Left at a path that will not exist in a repo without alembic, so the
         # linear-heads guard returns None and no-ops. Do NOT "clear" this to "":
         # Path(repo)/"" IS the repo root, so an empty value makes the guard think

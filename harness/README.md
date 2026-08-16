@@ -131,6 +131,35 @@ The commands are thin, guarded drivers over these. The scripts hold the determin
 logic on purpose: a model deciding *which* worktree to destroy is fine, a model
 hand-rolling `docker rm` / `dropdb` / `rm -rf` is not.
 
+**`create-worktree` also turns on `git rerere` for the repo, once, if nobody has set
+it either way.** This is the setting whose value scales with the number of worktrees:
+one merge into the default branch produces the *same* conflict in every open branch,
+and worktrees share the repo's common git dir — so `rr-cache` is shared with no further
+configuration, and a conflict resolved by hand in one tree is replayed in the rest.
+
+The part to know before it surprises you: **a replayed resolution is git's answer from
+last time, not a judgement about this merge.** rerere matches on the conflict text, so
+the same hunks get the same answer even when the right answer has changed — a CHANGELOG
+version narrative being the obvious case, since the correct resolution there depends on
+which releases happen to be in flight. `rerere.autoUpdate` is therefore pinned to
+`false`: the merge still stops, the file is left **unstaged** with the previous answer
+in it, and you have to look at it and `git add` it yourself. Read a replayed resolution;
+do not trust it. Turn the whole thing off for a repo with `git config rerere.enabled
+false` — the script only ever sets it when it is unset, so that decision sticks.
+
+**Written rather than left absent, because absent is not off.** A user with
+`rerere.autoUpdate=true` in their global config got exactly the silent staging the
+paragraph above says cannot happen, and nothing looked. The pair is written together and
+only for a repo that had decided neither, so a repo that made its own choice keeps it.
+
+**And that guarantee covers a human at a terminal, not an unattended loop.** It rests on
+nothing staging the file for you — but `epic.py` and `lander.py` both run a blanket
+`git add -A` in their worktrees after making changes, which stages a replayed resolution
+whether or not `autoUpdate` is off. So on the loop-driven path, an answer given once by
+hand in one branch can be committed unread in another. That is not closed here: it wants
+either explicit staging in those two loops or rerere scoped away from loop-driven
+worktrees, and it is filed rather than guessed at.
+
 ### `worktree-holder` — is somebody else in there?
 
 The fourth script answers one question: **which live agent is working in this
