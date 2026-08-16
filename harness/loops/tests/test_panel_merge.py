@@ -19,6 +19,19 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
 
+
+#: The base branch's live tip, as `gh api repos/…/git/ref/heads/…` returns it.
+#: Every reviewed round reads this (#98). A stub that does not answer it does not
+#: fail — `_base_tip_now` swallows the error and the round appends "the tip of
+#: base branch could not be read" to `config_notes`. That is a note about a
+#: failure that never happened, and it goes unnoticed because these modules
+#: assert on other things; it was found by instrumenting the note, not by a red
+#: test (128-F09). Answer it, so what is in `config_notes` is what the panel
+#: actually decided.
+def _base_tip(sha: str = "basetip0000000000000000000000000000000a") -> str:
+    return json.dumps({"object": {"sha": sha}})
+
+
 F = panel.Finding
 
 
@@ -487,7 +500,8 @@ def run_panel(monkeypatch, judge_reply, findings, capsys, json_out=False, sonar=
     })
     meta = ('{"title":"t","additions":1,"deletions":0,"baseRefName":"main",'
             '"headRefName":"h","headRefOid":"abc"}')
-    monkeypatch.setattr(panel, "sh", lambda args, **k: meta if "view" in args else "diff")
+    monkeypatch.setattr(panel, "sh", lambda args, **k: meta if "view" in args
+                        else _base_tip() if "/git/ref/heads/" in args[-1] else "diff")
     per_reviewer = {"codex": findings[:1], "claude": findings[1:]}
     monkeypatch.setattr(panel, "review_llm",
                         lambda name, *a, **k: panel.ReviewerRun(
@@ -511,7 +525,8 @@ def test_json_mode_puts_nothing_but_the_payload_on_stdout(monkeypatch, capsys):
     })
     meta = ('{"title":"t","additions":1,"deletions":0,"baseRefName":"main",'
             '"headRefName":"h","headRefOid":"abc"}')
-    monkeypatch.setattr(panel, "sh", lambda args, **k: meta if "view" in args else "diff")
+    monkeypatch.setattr(panel, "sh", lambda args, **k: meta if "view" in args
+                        else _base_tip() if "/git/ref/heads/" in args[-1] else "diff")
     monkeypatch.setattr(panel, "review_llm",
                         lambda *a, **k: panel.ReviewerRun([find()], None, 5))
     monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
@@ -533,7 +548,8 @@ def test_a_skipped_pr_still_answers_json_mode(monkeypatch, capsys):
     })
     meta = ('{"title":"Merge test into main","additions":1,"deletions":0,'
             '"baseRefName":"main","headRefName":"h","headRefOid":"abc"}')
-    monkeypatch.setattr(panel, "sh", lambda args, **k: meta)
+    monkeypatch.setattr(panel, "sh", lambda args, **k:
+                        _base_tip() if "/git/ref/heads/" in args[-1] else meta)
     assert panel.run("r", 1609, post=False, json_out=True) == 0
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
@@ -596,7 +612,8 @@ def test_a_skipped_pr_answers_with_the_same_payload_SHAPE_as_a_reviewed_one(
     })
     meta = ('{"title":"Merge test into main","additions":1,"deletions":0,'
             '"baseRefName":"main","headRefName":"h","headRefOid":"abc"}')
-    monkeypatch.setattr(panel, "sh", lambda args, **k: meta)
+    monkeypatch.setattr(panel, "sh", lambda args, **k:
+                        _base_tip() if "/git/ref/heads/" in args[-1] else meta)
     assert panel.run("r", 1609, post=False, json_out=True) == 0
     skipped = json.loads(capsys.readouterr().out)
 
