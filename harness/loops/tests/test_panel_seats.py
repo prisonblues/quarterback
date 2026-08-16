@@ -38,6 +38,19 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
 
+
+#: The base branch's live tip, as `gh api repos/…/git/ref/heads/…` returns it.
+#: Every reviewed round reads this (#98). A stub that does not answer it does not
+#: fail — `_base_tip_now` swallows the error and the round appends "the tip of
+#: base branch could not be read" to `config_notes`. That is a note about a
+#: failure that never happened, and it goes unnoticed because these modules
+#: assert on other things; it was found by instrumenting the note, not by a red
+#: test (128-F09). Answer it, so what is in `config_notes` is what the panel
+#: actually decided.
+def _base_tip(sha: str = "basetip0000000000000000000000000000000a") -> str:
+    return json.dumps({"object": {"sha": sha}})
+
+
 REPO = "/tmp/acme-board"
 
 # Two seats, so a lost one is a DEGRADED panel rather than the whole panel. A
@@ -196,7 +209,9 @@ def _stub_panel(monkeypatch, findings=None, cfg=TWO_SEAT_CFG, runs=None):
     monkeypatch.setattr(panel, "sh", lambda args, **kw: (
         json.dumps({"title": "feat: x", "additions": 3, "deletions": 1,
                     "baseRefName": "main", "headRefName": "feat/x", "headRefOid": "abc"})
-        if args[:3] == ["gh", "pr", "view"] else "diff --git a/a.py b/a.py\n+x\n"))
+        if args[:3] == ["gh", "pr", "view"]
+        else _base_tip() if "/git/ref/heads/" in args[-1]
+        else "diff --git a/a.py b/a.py\n+x\n"))
     monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
     monkeypatch.setattr(panel, "adjudicate", _confirm_everything)
 

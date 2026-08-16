@@ -34,6 +34,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
 
 
+#: The base branch's live tip, as `gh api repos/…/git/ref/heads/…` returns it.
+#: Every reviewed round reads this (#98). A stub that does not answer it does not
+#: fail — `_base_tip_now` swallows the error and the round appends "the tip of
+#: base branch could not be read" to `config_notes`. That is a note about a
+#: failure that never happened, and it goes unnoticed because these modules
+#: assert on other things; it was found by instrumenting the note, not by a red
+#: test (128-F09). Answer it, so what is in `config_notes` is what the panel
+#: actually decided.
+def _base_tip(sha: str = "basetip0000000000000000000000000000000a") -> str:
+    return json.dumps({"object": {"sha": sha}})
+
+
+
 TWO_FILES = (
     "diff --git a/a.py b/a.py\n"
     "index 1111111..2222222 100644\n"
@@ -612,6 +625,12 @@ def _panel_round(monkeypatch, tmp_path, round_no, findings, head, baseline=(),
         # through to the PR diff and attributing against the wrong thing.
         if args[:2] == ["gh", "api"] and "/compare/" in args[2]:
             return FIX_COMPARE if compare is None else compare
+        # The base-tip read (#98) every reviewed round makes. Answered here for
+        # the same reason the PR-view call is: left unanswered it degrades to a
+        # `config_notes` entry saying the base tip could not be read, which is a
+        # note that never happened (128-F09).
+        if args[:2] == ["gh", "api"] and "/git/ref/heads/" in args[2]:
+            return _base_tip()
         return PR_DIFF
 
     def fake_review(name, model, prompt, effort=""):

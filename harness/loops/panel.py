@@ -3010,6 +3010,22 @@ def _fix_range_diff(gh_repo: str, base_sha: str | None,
     return "".join(out), None
 
 
+def _commit_id(value: object) -> str | None:
+    """A commit id off a JSON response, or None if it is not one.
+
+    The three readers below all ended in `.get("…") or None`, which keeps
+    whatever the response held so long as it was truthy. A malformed or changed
+    API shape can therefore hand back a number or an object, and the callers
+    format what they get with `value[:8]` — so a bad response raises `TypeError`
+    at the diagnostic, outside each helper's own `except`, and takes down a round
+    whose entire purpose is to degrade gracefully (128-F13).
+
+    Typed at the boundary rather than at the four format sites, because the
+    invariant is "these functions return a commit id or nothing" and a check per
+    caller is one caller away from being forgotten."""
+    return value if isinstance(value, str) and value else None
+
+
 def _head_sha_now(gh_repo: str, pr_number: int) -> str | None:
     """The PR's head commit, re-read. None if it cannot be had — the caller only
     uses it to notice that the head MOVED, and "could not tell" has to leave the
@@ -3021,9 +3037,10 @@ def _head_sha_now(gh_repo: str, pr_number: int) -> str | None:
     attribution nothing gates on. `SubprocessError` already covers the
     `TimeoutExpired` that then arrives."""
     try:
-        return json.loads(sh(["gh", "pr", "view", str(pr_number), "--repo", gh_repo,
-                              "--json", "headRefOid"],
-                             timeout=FIX_RANGE_TIMEOUT_S)).get("headRefOid") or None
+        return _commit_id(
+            json.loads(sh(["gh", "pr", "view", str(pr_number), "--repo", gh_repo,
+                           "--json", "headRefOid"],
+                          timeout=FIX_RANGE_TIMEOUT_S)).get("headRefOid"))
     except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
         return None
 
@@ -3041,9 +3058,10 @@ def _merge_base_now(gh_repo: str, pr_number: int) -> str | None:
     Bounded like its siblings: an attribution nothing gates on must never be able
     to stall a panel."""
     try:
-        return json.loads(sh(["gh", "pr", "view", str(pr_number), "--repo", gh_repo,
-                              "--json", "baseRefOid"],
-                             timeout=FIX_RANGE_TIMEOUT_S)).get("baseRefOid") or None
+        return _commit_id(
+            json.loads(sh(["gh", "pr", "view", str(pr_number), "--repo", gh_repo,
+                           "--json", "baseRefOid"],
+                          timeout=FIX_RANGE_TIMEOUT_S)).get("baseRefOid"))
     except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
         return None
 
@@ -3076,7 +3094,7 @@ def _base_tip_now(gh_repo: str, base_ref: str) -> str | None:
     try:
         got = json.loads(sh(["gh", "api", f"repos/{gh_repo}/git/ref/heads/{base_ref}"],
                             timeout=FIX_RANGE_TIMEOUT_S))
-        return (got.get("object") or {}).get("sha") or None
+        return _commit_id((got.get("object") or {}).get("sha"))
     except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
         return None
 
@@ -5827,9 +5845,32 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                          "the one that exists now rather than a pair straddling the push")
             merge_base = moved_meta
         elif moved_meta is None:
-            notes.append("the merge base could not be re-read after the head moved, so the "
-                         "recorded base end is the one computed for the EARLIER head — treat "
-                         "the pair as a range that may never have been reviewed as such")
+            # DROP it rather than keep the earlier head's answer (128-F12). Keeping
+            # it stores a merge_base/head_sha pair that no programmatic consumer can
+            # tell from a good one — the prose note below is not readable by #96,
+            # which is the consumer this release exists to serve, and a
+            # plausible-but-wrong range is worse than an absent one: the first is
+            # acted on, the second is noticed. The board already treats a commit id
+            # it will not store as null-plus-an-echo rather than as a best guess
+            # (`merge_base_dropped`, app/api/reviews.py), and this is the same
+            # judgement one layer up.
+            #
+            # Null is expressible today and costs no schema change, which is why it
+            # is this rather than a new `merge_base_stale` field: adding a payload
+            # field means adding it board-side too or it is silently dropped on
+            # ingest (#93, #65), and that is a migration this round cannot carry.
+            if merge_base is None:
+                # Nothing was ever recorded, so "the one computed for the EARLIER
+                # head" would name a commit that never existed (128-F11).
+                notes.append("the merge base could not be read before or after the head moved, "
+                             "so this round records neither end of its base — a later staleness "
+                             "check has nothing to anchor against")
+            else:
+                notes.append(f"the merge base could not be re-read after the head moved, so the "
+                             f"base end computed for the earlier head ({merge_base[:8]}) is "
+                             "DROPPED rather than paired with the new head — the range is "
+                             "recorded as unknown, not as one that was never reviewed")
+            merge_base = None
     # The base end (#98), read here rather than above the skip branch: this is one
     # more API round trip and the skip path exists to be cheap, never fetches a
     # diff, and never reaches the board — so a base tip recorded there would have

@@ -122,6 +122,11 @@ def test_every_way_the_call_can_fail_is_a_None_and_not_a_crash(monkeypatch):
 # end to end: what a round records
 # --------------------------------------------------------------------------
 
+#: Distinguishes "the caller said nothing" from "the caller said None", so a test
+#: can ask for a re-read that FAILS as well as one that returns something new.
+_UNSET = object()
+
+
 PR_DIFF = ("diff --git a/a.py b/a.py\n"
            "index 1111111..2222222 100644\n"
            "--- a/a.py\n"
@@ -135,15 +140,33 @@ CFG = {"github": "acme/board", "path": "/tmp/repo",
 
 
 def _run(monkeypatch, tmp_path, title="feat: a thing", merge_base="0ddba5e0",
-         base_tip=REF_BODY, cfg=None):
+         base_tip=REF_BODY, cfg=None, moves_to=None, merge_base_after=_UNSET):
     """One panel run with every subprocess replaced, so what is under test is the
     payload rather than any CLI. `base_tip` is the raw body the ref call returns,
-    so a test can make that one call fail without touching the others."""
+    so a test can make that one call fail without touching the others.
+
+    `moves_to` makes the head move mid-round — the race the re-read exists for —
+    and `merge_base_after` is what the re-read then answers, so the moved-head
+    path can be driven through `run()` rather than only at the helper (128-F03).
+    The three reads are told apart by their `--json` field list: the opening
+    metadata read asks for many fields, `_head_sha_now` asks for `headRefOid`
+    alone and `_merge_base_now` for `baseRefOid` alone."""
     calls = []
+    views = []
 
     def fake_sh(args, **kw):
         calls.append(args)
         if args[:3] == ["gh", "pr", "view"]:
+            if args[-1] == "headRefOid":
+                views.append(args)
+                return json.dumps({"headRefOid": moves_to or "aaa111"})
+            if args[-1] == "baseRefOid":
+                if isinstance(merge_base_after, BaseException):
+                    raise merge_base_after
+                return json.dumps(
+                    {} if merge_base_after is None
+                    else {"baseRefOid": merge_base
+                          if merge_base_after is _UNSET else merge_base_after})
             meta = {"title": title, "additions": 20, "deletions": 2,
                     "baseRefName": "main", "headRefName": "feat/x",
                     "headRefOid": "aaa111"}
@@ -284,3 +307,73 @@ def test_every_way_the_merge_base_re_read_can_fail_is_a_None(monkeypatch):
     assert panel._merge_base_now("acme/board", 128) is None
     monkeypatch.setattr(panel, "sh", lambda *a, **k: json.dumps({}))
     assert panel._merge_base_now("acme/board", 128) is None
+
+
+# --------------------------------------------------------------------------
+# end to end: the moved-head path, through run()
+#
+# The helpers above are unit-tested, and that was all the cover this path had
+# (128-F03): every assertion sat on `_merge_base_now` itself, so deleting
+# `merge_base = moved_meta` from run() left the whole file green while silently
+# reintroducing the pair-straddling-the-push bug this release exists to prevent.
+# These drive run() so the wiring is pinned, not just the callee.
+# --------------------------------------------------------------------------
+
+def test_a_head_that_moves_re_reads_the_base_and_records_the_NEW_one(monkeypatch, tmp_path):
+    """The wiring 128-F03 found unpinned. `merge_base` must be the one belonging
+    to the head that is recorded, not the one read before the push landed."""
+    payload, _ = _run(monkeypatch, tmp_path, merge_base="0ddba5e0",
+                      moves_to="bbb222", merge_base_after="feed1234")
+    assert payload["head_sha"] == "bbb222"
+    assert payload["merge_base"] == "feed1234"
+    assert any("the merge base moved with it" in n for n in payload["config_notes"])
+
+
+def test_a_base_that_could_not_be_re_read_is_DROPPED_not_kept(monkeypatch, tmp_path):
+    """128-F12. Keeping the earlier head's base stores a merge_base/head_sha pair
+    that no programmatic consumer can tell from a good one — and #96 is exactly
+    such a consumer. A plausible-but-wrong range is worse than an absent one: the
+    first gets acted on, the second gets noticed."""
+    payload, _ = _run(monkeypatch, tmp_path, merge_base="0ddba5e0",
+                      moves_to="bbb222", merge_base_after=None)
+    assert payload["head_sha"] == "bbb222"
+    assert payload["merge_base"] is None, "the stale base must not survive the push"
+    assert any("DROPPED" in n for n in payload["config_notes"])
+
+
+def test_a_base_that_was_never_read_says_so_honestly(monkeypatch, tmp_path):
+    """128-F11. With no base recorded before the move either, the note must not
+    claim the recorded end is 'the one computed for the EARLIER head' — there was
+    no earlier one, and a diagnostic that names a commit that never existed sends
+    the next reader looking for it."""
+    payload, _ = _run(monkeypatch, tmp_path, merge_base=None,
+                      moves_to="bbb222", merge_base_after=None)
+    assert payload["merge_base"] is None
+    notes = " ".join(payload["config_notes"])
+    assert "neither end" in notes
+    assert "EARLIER head" not in notes
+
+
+def test_a_re_read_that_agrees_is_a_no_op(monkeypatch, tmp_path):
+    """The common case — a push that does not move the merge base. No note, and
+    the base survives; a warning here would fire on ordinary pushes and be
+    trained away."""
+    payload, _ = _run(monkeypatch, tmp_path, merge_base="0ddba5e0",
+                      moves_to="bbb222", merge_base_after="0ddba5e0")
+    assert payload["merge_base"] == "0ddba5e0"
+    assert not any("merge base" in n and "moved with it" in n
+                   for n in payload["config_notes"])
+
+
+def test_a_malformed_commit_id_costs_the_field_and_not_the_round(monkeypatch, tmp_path):
+    """128-F13. The ids come off a JSON response and were used as `value[:8]` in
+    the diagnostics, so a truthy non-string — a number, an object, anything a
+    changed or malformed API shape can produce — raised TypeError outside each
+    helper's own except and took down a round whose whole purpose is to degrade
+    gracefully. Typed at the boundary now, so a bad shape reads as 'could not
+    tell'."""
+    for bad in (12345, {"sha": "x"}, ["aaa111"], True):
+        payload, _ = _run(monkeypatch, tmp_path, merge_base="0ddba5e0",
+                          moves_to="bbb222", merge_base_after=bad)
+        assert payload["merge_base"] is None, bad
+        assert payload["head_sha"] == "bbb222", bad
