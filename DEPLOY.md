@@ -60,7 +60,7 @@ container rather than putting them in the compose file:
 | `API_TOKENS` (or `API_TOKENS_FILE`) | `laptop:<tok>,desktop:<tok>,server:<tok>` — one `name:token` pair per machine |
 | `DATABASE_URL` | `postgresql+asyncpg://quarterback:<pw>@db:5432/quarterback` |
 | `POSTGRES_PASSWORD` (db) | must equal the password inside `DATABASE_URL` |
-| `GITHUB_TOKEN` (or `GITHUB_TOKEN_FILE`) | optional; raises the origin watch's GitHub budget from 60/hour to 5000 |
+| `GITHUB_TOKEN` (or `GITHUB_TOKEN_FILE`) | required to watch any private repo; also raises the GitHub budget from 60/hour to 5000. Fine-grained PAT, `Contents: Read-only` |
 | `GITHUB_POLL_SECONDS` | optional; origin-watch interval, default 300. `0` disables it |
 
 Generate one token per machine (`openssl rand -hex 32`) and give each machine only its own.
@@ -81,7 +81,25 @@ CLI, SOPS, Docker secrets, Vault agent).
   because a commit already on the board is not re-announced, but that is a narrowing rather
   than a lock. Add leader election here at the same time as the migration lock.
 
-- **Without a token the poller shares a 60-calls/hour ceiling with everything else on the
+- **Without a token the poller cannot see a private repo at all, and says so only in a log
+  line.** GitHub answers 404 rather than 403 for a private repo read anonymously — deliberately,
+  so the API does not confirm the repo exists — and the poller cannot tell that from a repo that
+  was renamed or deleted, so it backs the repo off and stops asking. The registration stays,
+  `/sync` keeps answering, and nothing anywhere says the watch is not running. This matters
+  because it is not the edge case: of the 46 repos on this account 42 are private — only
+  `quarterback`, `miniflux`, `cassoulet` and `aicollider` are public — and the private set
+  includes `nix-fleet`, `selfhost` and `lexray`, the CI-less ones that are the whole reason #127
+  wanted a board-side poll rather than a workflow. **Treat the token as required, not optional.**
+
+- **Scope it to reading, and to the repos you actually watch.** A fine-grained PAT with
+  *Repository access: only select repositories* and the single permission **Contents:
+  Read-only** is everything the poller uses — it reads `GET /repos/{owner}/{name}` for the
+  default branch and `GET /repos/{owner}/{name}/commits/{branch}` for its head, and makes no
+  other outbound call. A classic PAT also works, but its narrowest useful scope is `repo`, which
+  grants read *and write* across every repo the account can see; there is no reason to hand the
+  board that.
+
+- **Without a token the poller also shares a 60-calls/hour ceiling with everything else on the
   egress IP.** That was measured, not assumed: a conditional request answered `304` still
   costs a unit, so ETags would not have bought headroom. The poller reads
   `X-RateLimit-Remaining` off each response and sits out the rest of the window below 10.

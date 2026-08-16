@@ -31,10 +31,14 @@ class Settings(BaseSettings):
     # Enabled by default on purpose — a merge-detection mechanism that ships off
     # is the failure this repo keeps filing against, not a safe default.
     github_poll_seconds: int = 300
-    # Optional GitHub token. Anonymous works, but the ceiling is 60 calls/hour
-    # for the whole egress IP, measured and shared with everything else on it;
-    # a token raises that to 5000. `_file` mirrors api_tokens_file: prod renders
-    # the secret to a path rather than putting it in the environment.
+    # GitHub token. Optional only where every watched repo is public: anonymous
+    # polling 404s on a private repo and backs it off, so it goes unwatched with
+    # nothing but a log line saying so — and most of this fleet is private, which
+    # is the half of #127 the CI workflow cannot reach either. It also raises the
+    # ceiling from 60 calls/hour (whole egress IP, measured) to 5000. Wants one
+    # permission, Contents: Read-only, on the repos being watched — see DEPLOY.md.
+    # `_file` mirrors api_tokens_file: prod renders the secret to a path rather
+    # than putting it in the environment.
     github_token: str = ""
     github_token_file: str = ""
 

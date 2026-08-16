@@ -47,6 +47,19 @@ else on the egress IP — so a token is strongly preferred, and the poller reads
 off every response and sits out the rest of the window rather than discovering the wall by being
 throttled.
 
+**A token is required, not preferred, and that is the decision this release makes.** The board did
+not hold a GitHub credential before and now does, so it is worth being exact about why the earlier
+framing — "optional, raises 60/hour to 5000" — undersold it. Read anonymously, a private repo
+answers `404`, not `403`: GitHub declines to confirm it exists. The poller cannot tell that from a
+repo that was renamed or deleted, so it backs the repo off and stops asking, the registration stays,
+`/sync` keeps answering, and nothing says the watch is not running. 42 of this account's 46 repos
+are private, `nix-fleet` and `selfhost` and `lexray` among them — which are the CI-less repos that
+are the entire reason this is a board-side poll rather than #143's workflow. Untokened, the feature
+would appear to work and would watch almost nothing. The 404 path now names the missing credential
+in the log rather than leaving a bare status code, and `DEPLOY.md` specifies the scope: a
+fine-grained PAT limited to the watched repos with the single permission `Contents: Read-only`,
+which is the whole of what the two calls here read.
+
 Honest limits, recorded here rather than found later: the poller is in-process and assumes the
 single-container deploy, the same assumption the absent migration lock rests on; it learns each
 repo's default branch once per process; and it only watches repos some worktree has registered, so

@@ -88,6 +88,19 @@ async def _get(client: httpx.AsyncClient, path: str) -> dict | None:
         with contextlib.suppress(ValueError):
             _remaining = int(raw)
 
+    if response.status_code == 404 and not settings.github_token_value:
+        # GitHub returns 404 rather than 403 for a private repo read anonymously,
+        # so it is indistinguishable from renamed-or-deleted — and the caller
+        # backs the repo off either way. Untokened, that is how the whole private
+        # half of the fleet would go unwatched with nothing saying why, so name
+        # the likely cause rather than leaving a bare 404 in the log.
+        log.warning(
+            "github GET %s -> 404 with no token configured; a private repo is "
+            "indistinguishable from a missing one without credentials (see DEPLOY.md)",
+            path,
+        )
+        return None
+
     if response.status_code != 200:
         # 403/429 with the budget at zero is the throttle, not a broken path.
         log.warning(

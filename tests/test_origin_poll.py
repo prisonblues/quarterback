@@ -361,6 +361,25 @@ async def test_a_registration_nobody_has_refreshed_in_a_month_is_not_polled(clie
         assert repo not in await origin.watched_repos(db)
 
 
+async def test_an_untokened_404_names_the_credential_as_the_likely_cause(client, caplog):
+    # 42 of this account's 46 repos are private, and anonymously a private repo
+    # 404s exactly like a deleted one — so an untokened deploy watches nothing
+    # that matters and the only trace is this line. A bare "-> 404" would send
+    # whoever reads it looking for a renamed repo.
+    repo = "prisonblues/private-ish"
+    await _register(client, repo, head=OLD, device="watch-private", path="/src/priv")
+
+    def not_found(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"message": "Not Found"})
+
+    transport = httpx.MockTransport(not_found)
+    with caplog.at_level("WARNING", logger="app.github"):
+        async with httpx.AsyncClient(transport=transport) as gh, async_session() as db:
+            assert await origin.poll_cycle(db, gh) == []
+    assert "no token configured" in caplog.text
+    assert "DEPLOY.md" in caplog.text
+
+
 async def test_a_transport_error_is_swallowed_rather_than_killing_the_cycle(client):
     await _register(client, REPO, head=OLD, device="watch-broken")
 
