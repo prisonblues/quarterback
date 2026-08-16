@@ -9,6 +9,14 @@ part that isn't recoverable from the diff.
 
 ## v2.38 — the allocator had two namespaces for one repo, and it issued 2.36 twice
 
+**About the gap between this and v2.33.** 2.34 to 2.37 were claimed and none of them shipped a
+release, which is itself the evidence for this entry. #150 measured where they went: 2.34 was taken
+as a board post rather than through the allocator, because `/run/op-secrets` is root-only from an
+agent shell and that agent could not reach it at all; 2.35 was allocated under `nameWithOwner`; 2.36
+was allocated **twice**, once under each spelling, 28 minutes apart; and 2.37 was the renumber off
+that collision. A number is spent when it is claimed, not when it ships — that is the point of an
+allocator — so the CHANGELOG skips four.
+
 v2.31 exists because announcing a release number was falsified nine times in two days: every agent
 was correct from what it could see, and an announcement does not force the next one to look. An
 allocation does — the number comes from asking. On 2026-08-16 the allocator itself produced the

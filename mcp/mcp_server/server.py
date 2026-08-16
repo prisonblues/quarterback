@@ -411,8 +411,11 @@ def claim(ctx: Context, kind: str, key: str, ttl: int = 3600,
             The repo half is canonicalised to lowercased `owner/name` when the
             board can identify it, so "quarterback#142" and
             "prisonblues/quarterback#142" are ONE claim rather than two agents
-            each certain they hold it. A key naming no repo is stored as sent.
-            The response carries `key_as_given` when the two differ.
+            each certain they hold it. A key naming no repo, or one naming a repo
+            this board has never seen, is stored exactly as sent. Both the
+            success and the 409 carry `key_as_given` when the two differ — read
+            it on the 409 especially, or "held by somebody else" will name a key
+            you did not send.
         ttl: Seconds until the claim lapses without a renew (default 3600).
         session: Your session id, so a peer can reach you.
         note: One line on what you are doing with it. Send this — it is what the
@@ -459,7 +462,13 @@ def release_claim(ctx: Context, claim_id: str, session: str | None = None) -> di
 @mcp.tool()
 def claims(ctx: Context, kind: str | None = None, key: str | None = None,
            holder: str | None = None) -> dict:
-    """What is claimed right now, by whom, and why. Read before you queue behind something."""
+    """What is claimed right now, by whom, and why. Read before you queue behind something.
+
+    `key` goes through the same canonicaliser `claim` writes with, and matches
+    every spelling of it, so looking a claim up by the string you claimed with
+    finds the row whichever spelling it is stored under. The `key` in each result
+    is the stored one, which may not be the one you asked with.
+    """
     try:
         return _get_client(ctx).claims({"kind": kind, "key": key, "holder": holder})
     except httpx.HTTPStatusError as e:
@@ -499,7 +508,10 @@ def claim_release_number(ctx: Context, repo: str, after: str | None = None,
             spending a second number.
         note: One line on what the release is.
 
-    Returns the allocated `version` plus a claim_id.
+    Returns the allocated `version` plus a claim_id, and the `repo` the number
+    was actually taken under — plus `repo_as_given` when that is not the string
+    you sent. Read it: the number is only meaningful with its namespace, and a
+    spelling quietly drifting is how two floors happened in the first place.
     """
     try:
         return _get_client(ctx).claim_release({
@@ -538,8 +550,12 @@ def reclaim_release_number(ctx: Context, repo: str, claim_id: str,
         session: Your session id.
         note: One line on what the release is.
 
-    Returns the new `version` plus `gave_up`, so you can check the swap against
-    what you have already written into your files.
+    Returns the new `version` plus `gave_up` and `gave_up_key`, so you can check
+    the swap against what you have already written into your files. `gave_up` is
+    null when the old key carried no version this board can read, which a
+    pre-v2.38 row can; `gave_up_key` says which row was let go regardless. As
+    with `claim_release_number`, `repo` comes back canonical and `repo_as_given`
+    appears when that differs from what you sent.
     """
     try:
         return _get_client(ctx).reclaim_release({
@@ -559,7 +575,13 @@ def releases(ctx: Context, repo: str) -> dict:
     `repo` goes through the same canonicaliser the allocator uses, so this list
     cannot disagree with what allocation would do. That mattered: #148 was found
     by reading the numbers back under one spelling and not seeing one that was
-    known to be held.
+    known to be held. The canonical `repo` comes back, with `repo_as_given` when
+    it differs from what you sent.
+
+    `highest_known` can be HIGHER than every version listed, and that is an
+    answer rather than a bug: numbers still keyed on a pre-v2.38 spelling cannot
+    be attributed to an owner, so they raise the floor without being listed as
+    this repo's.
     """
     try:
         return _get_client(ctx).releases(repo)

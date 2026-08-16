@@ -32,16 +32,25 @@ The properties under test:
 
 from __future__ import annotations
 
+import importlib.util
+import uuid
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
 from sqlalchemy import text
 
 from app.db import engine
 from app.repokey import (
     LeaseRow,
+    canonical_key_of,
     canonical_repo,
+    identified_repo,
+    known_repos_from,
     like_escape,
+    lookup_name,
     name_half,
     plan_rewrites,
     repo_basename,
@@ -77,15 +86,21 @@ async def seed_review_run(repo: str) -> None:
             {"a": "zeus/fern-hazel", "r": repo})
 
 
-async def seed_legacy_release(key: str) -> None:
-    """A release row keyed the pre-v2.38 way, which no endpoint can write now."""
+async def seed_legacy_release(key: str, *, holder="zeus", session=None) -> str:
+    """A release row keyed the pre-v2.38 way, which no endpoint can write now.
+
+    Returns its claim id, so a test can renumber off it — the one thing the
+    holder of a stranded number actually needs to do.
+    """
     now = datetime.now(UTC)
     async with engine.begin() as conn:
-        await conn.execute(
+        row = await conn.execute(
             text("INSERT INTO resource_leases "
-                 "(id, kind, key, holder, ttl_seconds, acquired_at, expires_at) "
-                 "VALUES (gen_random_uuid(), 'release', :k, 'zeus', 3600, :t, :e)"),
-            {"k": key, "t": now, "e": now + timedelta(hours=1)})
+                 "(id, kind, key, holder, session, ttl_seconds, acquired_at, expires_at) "
+                 "VALUES (gen_random_uuid(), 'release', :k, :h, :s, 3600, :t, :e) "
+                 "RETURNING id"),
+            {"k": key, "h": holder, "s": session, "t": now, "e": now + timedelta(hours=1)})
+        return str(row.scalar_one())
 
 
 # ------------------------------------------------------ reading a repo string
@@ -95,13 +110,16 @@ async def seed_legacy_release(key: str) -> None:
     "prisonblues/quarterback",
     "PrisonBlues/Quarterback",
     "prisonblues/quarterback.git",
+    "prisonblues/quarterback.GIT",
+    "prisonblues/Quarterback.Git",
     "prisonblues/quarterback/",
-    "/prisonblues/quarterback",
     "https://github.com/prisonblues/quarterback",
     "https://github.com/prisonblues/quarterback.git",
     "git@github.com:prisonblues/quarterback.git",
     "ssh://git@github.com/prisonblues/quarterback",
+    "git+ssh://git@github.com/prisonblues/quarterback.git",
     "github.com/prisonblues/quarterback",
+    "192.168.1.10/prisonblues/quarterback",
 ])
 def test_every_spelling_of_one_repo_lands_on_one_key(given):
     """Callers derive repo identity from `git remote get-url`, so a URL reaching
@@ -115,6 +133,13 @@ def test_every_spelling_of_one_repo_lands_on_one_key(given):
     "quarterback",          # the basename: a lookup key, not a namespace
     "group/sub/repo",       # not GitHub's grammar; guessing which two is a guess
     "../etc/passwd",        # a segment that cannot start a repo name
+    "my_owner/repo",        # a GitHub owner cannot contain `_` — a repo name can
+    "my.owner/repo",        # nor `.`, which is what makes a dotted head a host
+    "github.com/quarterback",   # a host and a BASENAME, not an owner and a name
+    "/prisonblues/quarterback",  # an absolute path is a path
+    "/etc/passwd",
+    "file:///etc/passwd",   # every scheme accepted was every scheme laundered
+    "svn://host/acme/repo",
     "",
     "/",
 ])
@@ -122,11 +147,43 @@ def test_a_string_that_is_not_owner_slash_name_is_not_canonicalised(given):
     assert canonical_repo(given) is None
 
 
+def test_a_path_cannot_launder_itself_into_an_identity():
+    """`canonical_repo('/etc/passwd')` and `canonical_repo('file:///etc/passwd')`
+    both used to answer `etc/passwd`: the parser stripped leading slashes and
+    accepted every URI scheme while throwing the authority away. A real remote
+    always carries a git scheme or scp syntax, so refusing both costs nothing."""
+    assert canonical_repo("/etc/passwd") is None
+    assert canonical_repo("file:///etc/passwd") is None
+    assert repo_basename("/passwd") is None
+    # ...and the host is still discarded for the schemes that ARE git's, which is
+    # deliberate and stated in the module docstring: this board is single-forge.
+    assert canonical_repo("git@bitbucket.org:acme/thing") == "acme/thing"
+    assert canonical_repo("https://gitlab.com/acme/thing") == "acme/thing"
+
+
+def test_a_two_segment_host_is_a_host_and_not_an_owner():
+    """`github.com/quarterback` canonicalised with `github.com` as its owner,
+    because the host strip only ran at three segments or more. GitHub owners
+    cannot contain a dot, so a dotted leading segment is never an owner — at two
+    segments exactly as much as at three."""
+    assert canonical_repo("github.com/quarterback") is None
+    assert repo_basename("github.com/quarterback") == "quarterback"
+    assert repo_basename("192.168.1.10/quarterback") == "quarterback"
+    # A repo NAME may carry the dot an owner may not.
+    assert canonical_repo("acme/repo.io") == "acme/repo.io"
+    assert canonical_repo("acme/my_repo") == "acme/my_repo"
+
+
 def test_the_basename_is_read_back_as_a_lookup_key():
     assert repo_basename("quarterback") == "quarterback"
     assert repo_basename("Quarterback.git") == "quarterback"
+    assert repo_basename("Quarterback.GIT") == "quarterback", "the fold comes first"
     assert repo_basename("prisonblues/quarterback") is None
     assert name_half("prisonblues/quarterback") == "quarterback"
+    assert lookup_name("prisonblues/quarterback") == "quarterback"
+    assert lookup_name("Quarterback") == "quarterback"
+    assert lookup_name("portainer-stack-189") == "portainer-stack-189"
+    assert lookup_name("/etc/passwd") is None
 
 
 @pytest.mark.parametrize("key,head,rest", [
@@ -138,9 +195,29 @@ def test_the_basename_is_read_back_as_a_lookup_key():
     # remote must not be sliced at it — `git` is not a repo head.
     ("git@github.com:acme/thing", "git@github.com:acme/thing", ""),
     ("https://github.com/acme/thing", "https://github.com/acme/thing", ""),
+    # ...but the separator AFTER the authority is still the separator. Returning
+    # any key containing `://` or `@` whole left these opaque to the migration
+    # and to every prefix scan, so the number in them could be issued again.
+    ("https://github.com/acme/thing:2.36", "https://github.com/acme/thing", ":2.36"),
+    ("git@github.com:acme/thing#142", "git@github.com:acme/thing", "#142"),
+    ("ssh://git@github.com/acme/thing:main", "ssh://git@github.com/acme/thing", ":main"),
+    # An `@` with no colon in front of it is a resource separator, not an
+    # authority: any convention using it used to opt out of the fix silently.
+    ("acme/thing@v1.2", "acme/thing", "@v1.2"),
 ])
 def test_a_key_splits_at_the_resource_and_not_at_a_host(key, head, rest):
     assert split_repo_head(key) == (head, rest)
+
+
+def test_a_url_key_is_the_same_release_as_the_plain_one():
+    """The whole reason `split_repo_head` has to parse the authority: a legacy
+    `https://github.com/acme/repo:2.36` that nothing can slice is a number no
+    scan can see, and a number no scan can see is a number handed out twice."""
+    assert canonical_repo(split_repo_head("https://github.com/acme/repo:2.36")[0]) \
+        == "acme/repo"
+    assert version_tail("https://github.com/acme/repo:2.36") == "2.36"
+    assert canonical_key_of("https://github.com/acme/repo:2.36", {"acme/repo"}) \
+        == "acme/repo:2.36"
 
 
 def test_the_version_is_read_off_the_end_not_off_a_known_prefix():
@@ -160,12 +237,46 @@ def test_like_wildcards_in_a_repo_name_are_escaped():
 
 def test_a_basename_expands_only_when_exactly_one_owner_answers_to_it():
     known = {"acme/thing", "other/thing", "acme/lonely"}
+    # Candidates are for refusals only, so a success is `(repo, [])` however it
+    # was reached — the two elements never both carry information.
     assert resolve_against("acme/thing", known) == ("acme/thing", [])
-    assert resolve_against("lonely", known) == ("acme/lonely", ["acme/lonely"])
+    assert resolve_against("lonely", known) == ("acme/lonely", [])
     # Two owners: a refusal that names the choices, never a pick.
     repo, candidates = resolve_against("thing", known)
     assert repo is None and candidates == ["acme/thing", "other/thing"]
     assert resolve_against("unknown", known) == (None, [])
+
+
+def test_a_repo_the_board_has_never_seen_is_not_identified():
+    """`resolve_against` accepts any `owner/name`, which is right where the caller
+    declared the field to be a repo. `identified_repo` does not, which is right
+    where the string is the caller's own vocabulary: without the second rule any
+    two-segment key was "a repo", so `Prod/Blue:resource` was quietly rewritten
+    to `prod/blue:resource` and two distinct resources became one claim."""
+    known = {"acme/thing"}
+    assert identified_repo("acme/thing", known) == "acme/thing"
+    assert identified_repo("Acme/Thing", known) == "acme/thing"
+    assert identified_repo("thing", known) == "acme/thing"
+    assert identified_repo("prod/blue", known) is None
+    assert canonical_key_of("Prod/Blue:resource", known) == "Prod/Blue:resource"
+    assert canonical_key_of("Thing:main", known) == "acme/thing:main"
+
+
+def test_the_expansion_table_is_built_only_from_what_it_is_given():
+    """The table used to be every `resource_leases` key regardless of kind, so a
+    legal `kind='deploy', key='attacker/thing#1'` minted the repo identity
+    `attacker/thing` — and a later release request for the bare basename `thing`
+    was routed to it, or refused as ambiguous, which is a denial of service on
+    somebody else's basename. Both remaining sources are written by machinery
+    rather than by asking."""
+    assert known_repos_from(["acme/thing", "acme/other:2.1", "acme/x#7"]) == {
+        "acme/thing", "acme/other", "acme/x"}
+    # Rows that name no repo, and non-strings, are simply not repos.
+    assert known_repos_from(["portainer-stack-189", None, "/etc/passwd"]) == set()
+    # A full remote URL in `review_runs.repo` still resolves — the old pattern
+    # `%/name` matched neither that nor a trailing slash.
+    assert known_repos_from(["https://github.com/acme/thing.git", "acme/thing/"]) == {
+        "acme/thing"}
 
 
 # ------------------------------------------------------------ the collision
@@ -222,6 +333,126 @@ async def test_a_number_stranded_under_the_old_spelling_still_raises_the_floor(c
 
     got = await took(client, "acme/nsfour", session="s-legacy")
     assert got["version"] == "2.10", "the legacy row is part of this repo's history"
+
+
+async def test_a_legacy_row_in_the_remotes_own_case_still_raises_the_floor(client):
+    """`qb-hook` takes the origin remote's basename verbatim and repo names are
+    commonly mixed case, so the rows 0020 leaves alone are exactly the ones most
+    likely to be capitalised. A case-SENSITIVE legacy clause could not see
+    `NsCase:2.9` at all: the number fell out of the floor and the allocator
+    re-issued it — the failure this release exists to prevent, in the one code
+    path written specifically to prevent it."""
+    await seed_review_run("acme/nscase")
+    await seed_legacy_release("NsCase:2.9")
+
+    got = await took(client, "acme/nscase", session="s-case")
+    assert got["version"] == "2.10"
+
+
+async def test_a_legacy_row_raises_the_floor_and_belongs_to_nobody(client):
+    """The bare-basename bucket is unattributable by construction: `nsown:2.9`
+    could be either owner's. Reading it into the floor is conservative and right;
+    reading it into an OWNERSHIP answer hands one owner the other's live claim as
+    its own idempotent allocation, and lists a neighbour's numbers as this
+    repo's. So `highest_known` may exceed every version listed, and that gap is
+    the honest answer rather than a bug."""
+    await seed_review_run("acme/nsown")
+    await seed_legacy_release("nsown:2.9", holder="laptop", session="s-own")
+
+    r = await client.get("/releases", params={"repo": "acme/nsown"}, headers=LAPTOP)
+    body = r.json()
+    assert body["releases"] == [], "an unattributable row is not this repo's"
+    assert body["highest_known"] == "2.9", "...but it may still be taken"
+
+    got = await took(client, "acme/nsown", session="s-own")
+    assert got["version"] == "2.10", "not handed back as this session's own claim"
+    assert got["renewed"] is False
+
+
+async def test_one_repos_underscore_does_not_raise_anothers_floor(client):
+    """`_` is a LIKE wildcard and legal in a repo name, so `acme/ns_wild` matched
+    `acme/nsxwild` — one repo's allocation floor raised by another's (v2.33's
+    F19). Asserted end to end here, not only over the escaper."""
+    await seed_review_run("acme/ns_wild")
+    await seed_review_run("acme/nsxwild")
+    for _ in range(3):
+        await took(client, "acme/nsxwild")
+
+    got = await took(client, "acme/ns_wild")
+    assert got["version"] == "0.1"
+
+
+# ---------------------------------------- what a generic claim must not be able to do
+
+
+async def test_a_generic_claim_cannot_mint_a_repo_identity(client):
+    """The expansion table used to be every claim key regardless of kind, so a
+    perfectly legal `kind='deploy', key='attacker/nspoison#1'` taught the board
+    that `attacker/nspoison` is a repo — and the next release request for the
+    bare basename was routed into it, or refused as ambiguous, which is a denial
+    of service on somebody else's basename."""
+    minted = await claim(client, "deploy", "attacker/nspoison#1")
+    assert minted.status_code == 200, minted.text
+
+    r = await alloc(client, "nspoison", headers=DESKTOP)
+    assert r.status_code == 400, r.text
+    assert r.json()["detail"]["candidates"] == [], "nothing was minted to choose from"
+
+
+async def test_a_two_segment_key_the_board_cannot_identify_is_left_alone(client):
+    """A generic key is the caller's own vocabulary, and "any two segments is a
+    repo" broke that promise invisibly: `Prod/Blue:resource` came back as
+    `prod/blue:resource`, so two genuinely distinct resources differing only in
+    case became one claim."""
+    r = await claim(client, "deploy", "Prod/Blue:resource")
+    assert r.status_code == 200, r.text
+    assert r.json()["key"] == "Prod/Blue:resource"
+    assert "key_as_given" not in r.json()
+
+
+async def test_a_bare_row_and_its_canonical_twin_cannot_both_be_live(client):
+    """**This release's own bug, arriving through the door it deliberately left
+    open.** A key whose head the board cannot yet identify is stored as sent —
+    correctly. But the board's knowledge grows, and once a review run makes that
+    basename resolvable the same request canonicalises. Checking only the
+    canonical key at that point never sees the bare row still sitting there, so
+    both spellings go live and two agents are each told they hold #9."""
+    mine = await claim(client, "work", "nstwin#9", note="mine")
+    assert mine.status_code == 200, mine.text
+    assert mine.json()["key"] == "nstwin#9", "stored as sent while unidentifiable"
+
+    await seed_review_run("acme/nstwin")
+
+    theirs = await claim(client, "work", "acme/nstwin#9", headers=DESKTOP)
+    assert theirs.status_code == 409, theirs.text
+    d = theirs.json()["detail"]
+    assert d["key"] == "nstwin#9", "the row that is actually held"
+    assert d["key_as_given"] == "acme/nstwin#9", \
+        "the error is the response a caller reads; it has to connect the two"
+
+    again = await claim(client, "work", "acme/nstwin#9", note="second")
+    assert again.status_code == 200, again.text
+    assert again.json()["claim_id"] == mine.json()["claim_id"], "one row, not two"
+
+
+async def test_a_lookup_finds_a_generic_key_and_treats_a_wildcard_literally(client):
+    await claim(client, "deploy", "portainer-stack-190", note="hyphens")
+    await claim(client, "deploy", "portainer_stack_190", note="underscores")
+
+    r = await client.get("/claims", params={"key": "portainer_stack_190"},
+                         headers=LAPTOP)
+    assert [c["key"] for c in r.json()["claims"]] == ["portainer_stack_190"]
+
+
+async def test_a_lookup_by_either_spelling_finds_a_row_stored_under_the_other(client):
+    """The mirror of `_first_held`: a row taken before the board could identify
+    the repo is still keyed on the bare name, and a reader told the resource is
+    free while somebody is visibly holding it is the whole failure again."""
+    await claim(client, "merge", "nsboth:main", note="landing")
+    await seed_review_run("acme/nsboth")
+
+    r = await client.get("/claims", params={"key": "acme/nsboth:main"}, headers=LAPTOP)
+    assert [c["key"] for c in r.json()["claims"]] == ["nsboth:main"]
 
 
 # ------------------------------------------------------ refusing, not guessing
@@ -314,8 +545,78 @@ async def test_a_renumber_off_a_legacy_key_is_not_refused_as_another_repos(clien
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["gave_up"] == "2.41"
+    assert body["gave_up_key"] == "acme/nsreclaim:2.41"
     assert body["version"] == "2.42"
     assert body["repo"] == "acme/nsreclaim"
+
+
+async def test_the_holder_of_a_stranded_number_can_still_renumber(client):
+    """**A regression this release introduced into the endpoint that exists to
+    get a caller off a collision.** 0020 leaves a basename it cannot expand
+    exactly where it is, and the only spelling that names such a claim is the
+    stranded one — which resolving `repo` up front rejected with a 400, while any
+    resolvable spelling 409'd because the old head resolves to nothing. The
+    pre-v2.38 test was `old.key.startswith(f"{repo}:")`, which accepted this
+    exact call."""
+    claim_id = await seed_legacy_release("nsstrand:1.4", holder="laptop",
+                                         session="s-strand")
+    r = await client.post("/release/reclaim", headers=LAPTOP, json={
+        "repo": "nsstrand", "claim_id": claim_id, "session": "s-strand"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["gave_up"] == "1.4"
+    assert body["gave_up_key"] == "nsstrand:1.4"
+    assert body["version"] == "1.5"
+    assert body["key"] == "nsstrand:1.5", "the legacy bucket, deliberately"
+
+
+async def test_a_stranded_number_can_be_renumbered_under_a_named_owner(client):
+    """The other half: the caller CAN name the owner the board could not infer,
+    and then the new number is taken in the canonical namespace. The floor still
+    reads the legacy bucket, so it cannot land back on the number being left."""
+    claim_id = await seed_legacy_release("nsadopt:1.4", holder="laptop",
+                                         session="s-adopt")
+    r = await client.post("/release/reclaim", headers=LAPTOP, json={
+        "repo": "acme/nsadopt", "claim_id": claim_id, "session": "s-adopt"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["repo"] == "acme/nsadopt"
+    assert body["version"] == "1.5"
+    assert body["key"] == "acme/nsadopt:1.5"
+
+
+async def test_the_old_claim_settles_a_basename_the_caller_cannot_expand(client):
+    """The mirror case: the caller sends a basename two owners answer to, and the
+    claim it is holding already says which. Refusing that with "say which" when
+    the caller has already proved which is a question with a known answer."""
+    await seed_review_run("owner-a/nspin")
+    await seed_review_run("owner-b/nspin")
+    held = await took(client, "owner-a/nspin", session="s-pin")
+
+    r = await client.post("/release/reclaim", headers=LAPTOP, json={
+        "repo": "nspin", "claim_id": held["claim_id"], "session": "s-pin"})
+    assert r.status_code == 200, r.text
+    assert r.json()["repo"] == "owner-a/nspin"
+    assert r.json()["repo_as_given"] == "nspin"
+
+
+async def test_a_renumber_naming_a_genuinely_different_repo_is_still_refused(client):
+    """The ownership check is what the fallback must not cost. Two repos with
+    different names never match, whichever of them the board can expand."""
+    await seed_review_run("acme/nsmine")
+    await seed_review_run("acme/nsother")
+    held = await took(client, "acme/nsmine", session="s-mine")
+
+    r = await client.post("/release/reclaim", headers=LAPTOP, json={
+        "repo": "acme/nsother", "claim_id": held["claim_id"], "session": "s-mine"})
+    assert r.status_code == 409, r.text
+    assert "another repo" in r.json()["detail"]["error"]
+
+    strand = await seed_legacy_release("nselse:1.4", holder="laptop", session="s-else")
+    r = await client.post("/release/reclaim", headers=LAPTOP, json={
+        "repo": "acme/nsmine", "claim_id": strand, "session": "s-else"})
+    assert r.status_code == 409, r.text
+    assert "another repo" in r.json()["detail"]["error"]
 
 
 # ------------------------------------------------------- rewriting the history
@@ -417,3 +718,143 @@ def test_a_collision_between_two_kinds_is_not_a_collision():
     ]
     plans = plan_rewrites(rows, {"acme/thing"})
     assert [(p.new_key, p.release) for p in plans] == [("acme/thing:main", False)]
+
+
+# --------------------------------- the migration, against a real database (0020)
+
+
+def _load_0020():
+    """Import revision 0020 by path — `migrations/versions` is not a package."""
+    path = (Path(__file__).resolve().parents[1] / "migrations" / "versions"
+            / "0020_canonical_repo_keys.py")
+    spec = importlib.util.spec_from_file_location("_rev0020", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _apply_0020(sync_conn):
+    """Run `upgrade()` the way alembic does: `op.get_bind()` needs a real context."""
+    ctx = MigrationContext.configure(sync_conn)
+    with Operations.context(ctx):
+        _load_0020().upgrade()
+
+
+_MIG_BASE = datetime(2026, 8, 16, tzinfo=UTC)
+
+
+def _mig_row(key, *, kind="release", at, note=None, expired=False, released=False):
+    return {
+        "id": uuid.uuid4(), "kind": kind, "key": key, "holder": "zeus/one",
+        "session": None, "note": note, "ttl": 3600,
+        "acquired": _MIG_BASE + timedelta(hours=at),
+        "expires": _MIG_BASE - timedelta(hours=1) if expired
+        else datetime.now(UTC) + timedelta(hours=8),
+        "released": _MIG_BASE + timedelta(hours=at) if released else None,
+    }
+
+
+#: One row per property the revision's docstring asserts and no test could see.
+_MIG_ROWS = {
+    "plain": _mig_row("migre:2.32", at=1),
+    "cased": _mig_row("Acme/MigRe:2.33", at=2, note="thirty three"),
+    "already": _mig_row("acme/migre:2.35", at=3),
+    "gone": _mig_row("migre:2.31", at=0, released=True),
+    "stranded": _mig_row("migmystery:1.4", at=1),
+    # Expired, unswept, and on a key NOTHING is being rewritten onto. Its
+    # `released_at` must survive: an unscoped sweep stamped a fresh one over the
+    # only record of when the claim actually died.
+    "bystander": _mig_row("portainer-migstack", kind="deploy", at=1, expired=True),
+    # The collision the revision exists for: two live rows, one number.
+    "winner": _mig_row("acme/migcol:2.36", at=1),
+    "loser": _mig_row("migcol:2.36", at=2, note="nimbus"),
+    # The order case. The EARLIER row has to move onto a key the LATER one is
+    # still holding, so applying rewrites before releases hits the unique index
+    # and Postgres aborts the migration — the abort no unit test can observe.
+    "mover": _mig_row("migord:2.40", at=1),
+    "displaced": _mig_row("acme/migord:2.40", at=2),
+    # An expired-but-unswept row squatting on a seat a rewrite lands on. The
+    # index cannot test `expires_at`, so this must be swept or the rewrite fails.
+    "squatter": _mig_row("acme/migexp:2.50", at=1, expired=True),
+    "arriving": _mig_row("migexp:2.50", at=2),
+}
+
+
+async def test_the_migration_upgrade_runs_against_a_real_database(_schema):
+    """**Every other migration test here plans over hand-built rows, so what the
+    revision actually does to a database was asserted only in prose.** Whether
+    the pre-sweep frees the seats the planner assumes are free; whether one
+    `SET key = ..., released_at = ...` really does escape the partial unique
+    index — the crux of the whole design; what `coalesce(note || ' — ', '')`
+    writes for a NULL note and for a set one; whether `_known_repos` returns what
+    the planner expects. `test_every_release_is_planned_before_any_rewrite` says
+    getting the order wrong "aborts the whole migration", and this is the only
+    test that can watch Postgres do it.
+
+    Runs inside a transaction that is always rolled back, so the rest of the
+    suite's rows are read (and rewritten, and put back) rather than damaged.
+    """
+    async with engine.connect() as conn:
+        trans = await conn.begin()
+        try:
+            for repo in ("acme/migre", "acme/migcol", "acme/migord", "acme/migexp"):
+                await conn.execute(
+                    text("INSERT INTO review_runs (author, repo, pr) "
+                         "VALUES ('zeus/fern-hazel', :r, 1)"), {"r": repo})
+            await conn.execute(
+                text("INSERT INTO resource_leases "
+                     "(id, kind, key, holder, session, note, ttl_seconds, "
+                     " acquired_at, expires_at, released_at) "
+                     "VALUES (:id, :kind, :key, :holder, :session, :note, :ttl, "
+                     "        :acquired, :expires, :released)"),
+                list(_MIG_ROWS.values()))
+
+            await conn.run_sync(_apply_0020)
+
+            got = {
+                name: (await conn.execute(
+                    text("SELECT key, note, released_at, lapsed FROM resource_leases "
+                         "WHERE id = :id"), {"id": row["id"]})).one()
+                for name, row in _MIG_ROWS.items()
+            }
+        finally:
+            await trans.rollback()
+
+    # Rewritten, released rows included: history has to carry the number or the
+    # floor forgets it was handed out.
+    assert got["plain"].key == "acme/migre:2.32"
+    assert got["cased"].key == "acme/migre:2.33"
+    assert got["already"].key == "acme/migre:2.35"
+    assert got["gone"].key == "acme/migre:2.31"
+    assert got["gone"].released_at is not None, "a released row stays released"
+
+    # Left exactly as it is, because guessing at an owner is the third namespace.
+    assert got["stranded"].key == "migmystery:1.4"
+
+    # The scoped sweep: an expired row nothing is landing on keeps its own state.
+    assert got["bystander"].key == "portainer-migstack"
+    assert got["bystander"].released_at is None
+    assert got["bystander"].lapsed is False
+
+    # The collision. One canonical key, two rows, exactly one still held — which
+    # is only representable because the loser leaves the index's predicate in the
+    # same statement that moves its key.
+    assert got["winner"].key == "acme/migcol:2.36"
+    assert got["winner"].released_at is None
+    assert got["loser"].key == "acme/migcol:2.36"
+    assert got["loser"].released_at is not None
+    assert got["loser"].lapsed is False, "the board took it; the holder did not vanish"
+    assert got["loser"].note.startswith("nimbus — released by 0020 (#148)"), \
+        "an existing note is kept and the reason appended"
+
+    # ...and with no note to append to, no dangling separator.
+    assert got["displaced"].released_at is not None
+    assert got["displaced"].note.startswith("released by 0020 (#148)")
+    assert got["mover"].key == "acme/migord:2.40"
+    assert got["mover"].released_at is None, "the earlier claim keeps the seat"
+
+    # The squatter was swept so the rewrite could land on its key.
+    assert got["squatter"].released_at is not None
+    assert got["squatter"].lapsed is True
+    assert got["arriving"].key == "acme/migexp:2.50"
+    assert got["arriving"].released_at is None

@@ -233,6 +233,8 @@ fleet sends two of them for one repo (`qb-hook` takes the remote's basename, `gh
 `nameWithOwner`), so it kept two floors and issued 2.36 twice with `claimed: true` on both. Keys are
 now canonicalised to lowercased `owner/name`; a bare basename is expanded when exactly one owner
 answers to it and refused when none or several do. Schema revision 0020 rewrites the history.
+(2.34–2.37 have no entries because none of them shipped: a number is spent when it is claimed, and
+those four were spent on the collision this release fixes — see the v2.38 CHANGELOG entry.)
 Before it, **v2.33** — the repair of v2.31's claim table: it enforced atomicity at the
 database for INSERT and nowhere else, authorised release numbers by machine when the whole point is
 that two agents on one box are two branches, and let the generic claim endpoint write rows the
