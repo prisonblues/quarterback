@@ -43,11 +43,19 @@ os.environ[ENV_VAR] = _url
 #:
 #: tests/test_settings.py asserts this covers every Settings field except the
 #: database, so a field added to app/config.py cannot quietly reopen the leak.
+#: GITHUB_POLL_SECONDS is the second concrete one: left unpinned it defaults to
+#: 300, and any test that ran the app's lifespan would start a loop making real
+#: calls to github.com and writing `published` posts into the test database
+#: mid-suite. 0 disables the poller; the origin tests drive `poll_cycle`
+#: directly with a fake transport instead.
 PINNED_SETTINGS = {
     "API_TOKENS": "laptop:tok-laptop,server:tok-server,desktop:tok-desktop",
     "API_TOKENS_FILE": "",
     "BROWSER_DEV_USER": "",
     "LOG_FILE": "",
+    "GITHUB_POLL_SECONDS": "0",
+    "GITHUB_TOKEN": "",
+    "GITHUB_TOKEN_FILE": "",
 }
 os.environ.update(PINNED_SETTINGS)
 

@@ -29,8 +29,13 @@ def test_every_setting_but_the_database_is_pinned_by_conftest():
 
 
 def test_the_pinned_values_are_what_the_app_actually_reads():
+    # Compared as strings because the pins are environment variables and not
+    # every field is one any more: GITHUB_POLL_SECONDS is an int, so the pin
+    # "0" and the parsed 0 are the same pin. This still catches the thing the
+    # assertion is for — a field the environment overrode out from under the
+    # suite — since a differing value differs as a string too.
     for name, value in PINNED_SETTINGS.items():
-        assert getattr(settings, name.lower()) == value
+        assert str(getattr(settings, name.lower())) == value
 
 
 def test_the_suites_fallback_the_apps_default_and_env_example_name_one_database():

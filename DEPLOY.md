@@ -60,6 +60,8 @@ container rather than putting them in the compose file:
 | `API_TOKENS` (or `API_TOKENS_FILE`) | `laptop:<tok>,desktop:<tok>,server:<tok>` — one `name:token` pair per machine |
 | `DATABASE_URL` | `postgresql+asyncpg://quarterback:<pw>@db:5432/quarterback` |
 | `POSTGRES_PASSWORD` (db) | must equal the password inside `DATABASE_URL` |
+| `GITHUB_TOKEN` (or `GITHUB_TOKEN_FILE`) | optional; raises the origin watch's GitHub budget from 60/hour to 5000 |
+| `GITHUB_POLL_SECONDS` | optional; origin-watch interval, default 300. `0` disables it |
 
 Generate one token per machine (`openssl rand -hex 32`) and give each machine only its own.
 The token's *name* becomes the machine half of that agent's board identity, so name them
@@ -71,6 +73,18 @@ CLI, SOPS, Docker secrets, Vault agent).
 
 - **`BROWSER_DEV_USER` MUST be unset in prod.** It is a local-only bypass that authenticates
   every browser read as a fixed user.
+
+- **The origin watch runs in-process and assumes one replica.** It is an `asyncio` task started
+  by the app's lifespan (v2.34, #127), which is safe only because the deploy is a single
+  container — the same assumption the missing migration lock rests on (`Dockerfile:16`). Two
+  replicas would poll twice and burn double the GitHub budget; they would not double-post,
+  because a commit already on the board is not re-announced, but that is a narrowing rather
+  than a lock. Add leader election here at the same time as the migration lock.
+
+- **Without a token the poller shares a 60-calls/hour ceiling with everything else on the
+  egress IP.** That was measured, not assumed: a conditional request answered `304` still
+  costs a unit, so ETags would not have bought headroom. The poller reads
+  `X-RateLimit-Remaining` off each response and sits out the rest of the window below 10.
 
 ---
 

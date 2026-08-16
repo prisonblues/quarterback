@@ -16,6 +16,17 @@ from typing import Any
 # unambiguous abbreviations in practice, and /worktrees?has_commit=).
 MIN_SHA = 7
 
+# How far back the published line is considered. Deep enough that a device idle
+# for a few days still gets an accurate count, shallow enough to stay one cheap
+# indexed query.
+#
+# Two things read it and they must agree: ``GET /sync`` decides staleness within
+# this window, and the origin poller (v2.34) suppresses a re-announcement within
+# it. A poller scanning shallower than the consumer would double-announce a
+# commit the consumer can still see; scanning deeper would suppress one it
+# cannot. Same number, one definition.
+PUBLISH_SCAN = 200
+
 
 def repo_key(value: str | None) -> str | None:
     """Loose repo identity: the bare name, lowercased.

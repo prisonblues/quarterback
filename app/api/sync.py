@@ -8,14 +8,13 @@ from app.auth import reader
 from app.db import get_session
 from app.models.post import Post
 from app.models.worktree import Worktree
-from app.sync import MIN_SHA, advice, ref_value, repo_key, worktree_state
+from app.sync import MIN_SHA, PUBLISH_SCAN, advice, ref_value, repo_key, worktree_state
 
 router = APIRouter(tags=["sync"])
 
-# How far back the published line is considered. Deep enough that a device idle
-# for a few days still gets an accurate count, shallow enough to stay one cheap
-# indexed query.
-_PUBLISH_SCAN = 200
+#: Kept as a module name for the existing callers below; defined in app.sync so
+#: the origin poller reasons about the same window (see the note there).
+_PUBLISH_SCAN = PUBLISH_SCAN
 
 
 def _published_entries(posts: list[Post], repo: str) -> list[dict]:

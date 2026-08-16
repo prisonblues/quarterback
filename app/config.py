@@ -26,7 +26,29 @@ class Settings(BaseSettings):
     # Optional persistent app log; unset means stdout only.
     log_file: str = ""
 
+    # Origin watch (v2.34, #127): how often to ask GitHub for each registered
+    # repo's default-branch head, in seconds. 0 disables the poller entirely.
+    # Enabled by default on purpose — a merge-detection mechanism that ships off
+    # is the failure this repo keeps filing against, not a safe default.
+    github_poll_seconds: int = 300
+    # Optional GitHub token. Anonymous works, but the ceiling is 60 calls/hour
+    # for the whole egress IP, measured and shared with everything else on it;
+    # a token raises that to 5000. `_file` mirrors api_tokens_file: prod renders
+    # the secret to a path rather than putting it in the environment.
+    github_token: str = ""
+    github_token_file: str = ""
+
     model_config = {"env_file": ".env", "extra": "ignore"}
+
+    @property
+    def github_token_value(self) -> str:
+        """The token itself, from the file when one is configured."""
+        if self.github_token_file:
+            try:
+                return Path(self.github_token_file).read_text().strip()
+            except OSError:
+                return ""
+        return self.github_token.strip()
 
     @property
     def token_map(self) -> dict[str, str]:

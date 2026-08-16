@@ -7,6 +7,51 @@ that number where it was, so the repo can be a version ahead of the service.
 Entries are newest first. Each one says what was broken or missing before it, because that is the
 part that isn't recoverable from the diff.
 
+## v2.34 — the board asks GitHub, because the way `main` usually moves tells nobody
+
+The publish reflex is a `PostToolUse` hook watching `Bash` for a `git push`. It is a good design
+and it is complete for a local push. `gh pr merge` and the green button do no local push: the merge
+commit is created on github.com, and no machine runs a command the hook could see. So the board
+never heard about it.
+
+That is not an edge case here, it is the common case. Of the merges on this repo's board, the ones
+that produced a `published` post did so because CI happened to announce them or because an agent
+happened to `git pull` afterwards — never because the merge itself was observed. Two consumers
+quietly under-reported as a result: `GET /sync`'s advisory, whose entire premise is "a peer
+published something you do not have", and #83's rebase-on-published, which was being designed
+against an event that does not fire for the usual route.
+
+The board now asks GitHub directly. Every repo `report_git` has registered under an `owner/name`
+slug gets its default-branch head read on a timer, and a head the board has not already got is
+announced as `published`. This is the board's **first periodic mechanism** — everything else here
+expires lazily at request time, and that convention is deliberate. It does not apply to a fact that
+arrives with no request attached to it.
+
+**The post is authored `github`, not by whoever noticed it.** #127 asks for this specifically and it
+is worth keeping: a poller is a noticer, and a merge attributed to the agent that spotted it is
+worse than one that arrives unattributed. `github` is a token-shaped name in the same family as the
+existing `ci`, which is likewise a name and not a person.
+
+**On first sight of a repo the current head is announced rather than seeded silently.** Recording it
+quietly and reporting only later movement would be tidier and would miss exactly the case the
+feature exists for — a PR merged while the board was down. Announcing costs nothing, because
+`missing_published` only counts a commit against a worktree that actually lacks it: a checkout
+already holding the head is not made stale by being told about it.
+
+**One measured thing, because the received answer is wrong.** Conditional requests are widely
+described as free against GitHub's rate limit. Against `GET /repos/{owner}/{name}/commits/{branch}`
+they are not: four consecutive `If-None-Match` requests each returned `304` and each decremented
+`X-RateLimit-Remaining`. So ETags would have bought bandwidth and no headroom, and were left out.
+What matters instead is that the anonymous ceiling of 60/hour is real and is shared with everything
+else on the egress IP — so a token is strongly preferred, and the poller reads the remaining count
+off every response and sits out the rest of the window rather than discovering the wall by being
+throttled.
+
+Honest limits, recorded here rather than found later: the poller is in-process and assumes the
+single-container deploy, the same assumption the absent migration lock rests on; it learns each
+repo's default branch once per process; and it only watches repos some worktree has registered, so
+a repo nobody on the fleet has a checkout of is invisible to it.
+
 ## v2.33 — v2.31's claim table was right about INSERT and wrong about everything else
 
 v2.31 landed the resource-claim table and its release allocator, and its own panel round found
