@@ -183,6 +183,40 @@ def run(args: list[str], cwd: str | None = None) -> subprocess.CompletedProcess:
 
 
 @dataclass
+class BaseRef:
+    """The base branch, and whether we actually managed to look at it.
+
+    Threaded into the repo-local guardrails rather than left implicit, because
+    those two facts are one fact: a migration or cache-version verdict computed
+    against a stale ``origin/<base>`` is confidently wrong in the direction that
+    lands, and a `git fetch` whose failure went unread leaves exactly that with
+    nothing on the report saying so.
+    """
+
+    name: str
+    #: Was `origin/<name>` refreshed just now?
+    fresh: bool = True
+    #: If not — was that the caller's explicit `--no-fetch` (a warning) or a
+    #: failure (an error)? The distinction is who is responsible for it.
+    chosen: bool = False
+    why: str = ""
+
+    @property
+    def ref(self) -> str:
+        return f"origin/{self.name}"
+
+    @property
+    def quoted(self) -> str:
+        """The ref as it must appear inside an emitted shell command.
+
+        `actions` are strings a loop is told to run verbatim, and a git refname
+        may legally contain `;`, `$` and backticks. An unquoted branch name in a
+        command this file hands over is an injection into a shell it does not own.
+        """
+        return shlex.quote(self.ref)
+
+
+@dataclass
 class Action:
     """One mechanical command a RECONCILE needs, and what it touches."""
 
@@ -429,8 +463,15 @@ def check_ci(pr: dict) -> Check:
     elif state == "pending":
         c.reasons.append("CI has not finished; a pending check is not a green one")
     elif state == "none":
-        c.warnings.append("the PR has no checks at all — nothing mechanical is "
-                          "verifying this change")
+        # Not a warning, for the same reason an unreadable board is not a skip:
+        # no CI signal is the absence of evidence, and this file's whole rule is
+        # that absence never reads as clean. A workflow that failed to trigger and
+        # a repo that has no CI look identical from here, and only one of them is
+        # safe. A repo genuinely without CI says so once, in writing.
+        c.reasons.append("the PR has no checks at all — nothing mechanical is "
+                         "verifying this change. If this repo genuinely has no CI, "
+                         'say so with `"preland": {"disabled_checks": ["ci"]}` in '
+                         ".harness-rules rather than reading silence as green")
     c.status = "failed" if c.reasons else "passed"
     return c
 
@@ -453,7 +494,15 @@ def check_review(repo: str, pr: dict) -> Check:
                          '["review"]}` in .harness-rules if this repo is not '
                          "board-enrolled")
         return c
-    if not isinstance(rows, list) or not rows:
+    if not isinstance(rows, list):
+        # Distinguished from "no rounds" rather than folded into it: both HOLD,
+        # but one of them sends someone to run the panel and the other to look at
+        # the board, and a wrong instruction is worse than none.
+        c.status, c.summary = "error", "review state unreadable"
+        c.reasons.append("the board answered /reviews with something that is not a "
+                         "list of rounds, so what the panel said cannot be read")
+        return c
+    if not rows:
         c.status, c.summary = "failed", "never reviewed"
         c.reasons.append("no panel round is recorded for this PR — a change the "
                          "panel never saw must not sail through for want of an "
@@ -485,8 +534,14 @@ def _judge_round(c: Check, latest: dict, pr: dict) -> Check:
     if latest.get("stopped") is not True:
         c.reasons.append("the round did not stop: " +
                          (latest.get("stop_reason") or "it recorded no stopping verdict"))
-    confirmed = latest.get("confirmed") or 0
-    if confirmed:
+    confirmed = latest.get("confirmed")
+    if not isinstance(confirmed, int):
+        # NOT `or 0`. A count the board did not send is an unknown number of
+        # unresolved findings, and coercing it to zero is the one arithmetic in
+        # this file that could wave a defective PR through.
+        c.reasons.append("the round recorded no confirmed-finding count, so how much "
+                         "it found is unknown — and unknown is not zero")
+    elif confirmed:
         c.reasons.append(f"{confirmed} judge-confirmed finding(s) are unresolved")
     gate = (latest.get("sonar_gate") or "").upper()
     if gate == "ERROR":
@@ -540,7 +595,14 @@ def check_merge_claim(repo: str, pr: dict, mine: str) -> Check:
         c.reasons.append(f"{err}. Cannot tell whether another agent is landing "
                          f"{key!r}")
         return c
-    claims = (body or {}).get("claims", []) if isinstance(body, dict) else []
+    claims = body.get("claims") if isinstance(body, dict) else None
+    if not isinstance(claims, list):
+        # An answer this cannot parse is not an empty claim set. Reading it as one
+        # would report "unclaimed" about a namespace it never managed to look at.
+        c = Check("merge_claim", "error", "claims unreadable")
+        c.reasons.append("the board answered /claims with something that is not a "
+                         f"claim list, so who holds {key!r} is unknown")
+        return c
     others = [cl for cl in claims if cl.get("holder") != mine]
     c = Check("merge_claim", "passed", "unclaimed" if not claims else "claimed",
               detail={"key": key, "claims": claims})
@@ -555,7 +617,7 @@ def check_merge_claim(repo: str, pr: dict, mine: str) -> Check:
     return c
 
 
-def check_migrations(root: str, base: str) -> Check:
+def check_migrations(root: str, base: BaseRef, versions: str = "") -> Check:
     """Exactly one migration head after this lands, per the repo's own tool.
 
     The tool chooses the action and this never overrides it: relink vs merge
@@ -563,10 +625,17 @@ def check_migrations(root: str, base: str) -> Check:
     a merge node) that a caller re-deciding would be re-deciding blind.
     """
     script = "scripts/migration_reconcile.py"
-    if not (Path(root) / script).exists():
-        return Check("migrations", "skipped-absent", f"no {script} in this repo")
+    c = _detected(root, script, base, "migrations")
+    if c is not None:
+        return c
     argv = ["uv", "run", "python", script, "preflight", "--json",
-            "--onto", f"origin/{base}", "--branch", "HEAD"]
+            "--onto", base.ref, "--branch", "HEAD"]
+    # The reconciler's own default is `migrations/versions`, and a repo whose
+    # migrations live elsewhere would otherwise be analysed as having none —
+    # which reports NOOP, the cleanest possible answer, about a directory nobody
+    # looked in.
+    if versions:
+        argv += ["--versions-path", versions]
     proc = run(argv, cwd=root)
     try:
         plan = json.loads(proc.stdout)
@@ -575,47 +644,110 @@ def check_migrations(root: str, base: str) -> Check:
         c.reasons.append(f"`{shlex.join(argv)}` exited {proc.returncode} without JSON: "
                          f"{(proc.stderr or proc.stdout or '').strip()[:200]}")
         return c
-    return _migration_plan(plan, base)
+    return _migration_plan(plan, base, proc.returncode)
 
 
-def _migration_plan(plan: dict, base: str) -> Check:
+def _migration_plan(plan: dict, base: BaseRef, code: int) -> Check:
     """The reconciler's `action`, as a check. One branch per action it can emit,
     and an unknown action HOLDs — a new action name must not read as noop."""
     action = (plan.get("action") or "").lower()
     c = Check("migrations", "passed", f"{action.upper() or 'UNKNOWN'}",
-              detail={"action": action, "reason": plan.get("reason"),
+              detail={"action": action, "reason": plan.get("reason"), "exit_code": code,
                       "merged_single_head": plan.get("merged_single_head")})
-    onto = f"origin/{base}"
+    disagreement = _plan_disagrees(plan, action, code)
+    if disagreement:
+        c.status = "error"
+        c.reasons.append(disagreement)
+        return c
     if action == "noop":
         return c
     if action in ("relink", "renumber"):
         c.status = "reconcile"
         c.actions.append(Action(
-            f"uv run python scripts/migration_reconcile.py apply --onto {onto} "
+            f"uv run python scripts/migration_reconcile.py apply --onto {base.quoted} "
             "--branch HEAD",
-            plan.get("reason") or f"{action} the branch's migrations onto {onto}",
+            plan.get("reason") or f"{action} the branch's migrations onto {base.ref}",
             _plan_files(plan)))
         c.actions.append(Action(
             "git add migrations/versions && git commit -m "
-            f"'fix(migrations): rebase onto {base} head'",
+            f"'fix(migrations): rebase onto {base.name} head'",
             "apply writes the files and deliberately does not commit them"))
         return c
     if action == "merge":
         c.status = "reconcile"
         c.actions.append(Action(
-            f"git merge {onto}",
+            f"git merge {base.quoted}",
             "relink is unsafe here, so the two heads have to meet on the branch. "
             "HOLD instead if a conflict is not mechanically obvious — resolving "
             "product code by guess is the judgement this loop must not make"))
         c.actions.append(Action(
-            "uv run flask db merge heads -m 'merge branch and base heads'",
+            # `alembic`, not `flask db` — the wrapper the prose inherited from a
+            # Flask repo, which does not exist in an app that drives alembic
+            # directly. Flask-Migrate delegates to this same command, so the
+            # alembic form is the one that works in both.
+            "uv run alembic merge heads -m 'merge branch and base heads'",
             "generate the merge migration, then re-run preland to re-verify one head"))
         return c
     c.status = "failed"
     c.reasons.append(
         (f"the reconciler says STOP: {plan.get('reason')}" if action == "stop"
          else f"the reconciler returned an action this check does not know ({action!r})")
-        + f" — {base} must be reconciled first, and that is not this PR's job")
+        + f" — {base.name} must be reconciled first, and that is not this PR's job")
+    return c
+
+
+def _plan_disagrees(plan: dict, action: str, code: int) -> str:
+    """Why the reconciler's plan and its exit code cannot both be trusted, or "".
+
+    Two independent statements of the same answer, and reading only one of them
+    is how a non-zero exit carrying a `noop` plan would have been accepted as
+    clean. Compared against the plan's OWN `exit_code` rather than a copy of its
+    action-to-code table, because a second copy of that table is a thing that
+    drifts.
+    """
+    stated = plan.get("exit_code")
+    if isinstance(stated, int) and stated != code:
+        return (f"the reconciler's plan says exit {stated} and the process exited "
+                f"{code} — the two disagree, so neither can be acted on")
+    if stated is None and action == "noop" and code:
+        return (f"the reconciler reported NOOP and exited {code} — a clean plan does "
+                "not come back non-zero")
+    return ""
+
+
+def _detected(root: str, script: str, base: BaseRef, name: str) -> Check | None:
+    """The capability answer for a repo-local guardrail, or None to carry on.
+
+    Capability detection reads the BRANCH's tree, which is the whole point — but
+    it also means a branch that DELETES the guardrail hands itself
+    `skipped-absent`, switching off the check by the very diff the check exists
+    to read. So an absence only counts as a skip when the base does not have the
+    script either.
+    """
+    if (Path(root) / script).exists():
+        return _stale(base, name)
+    on_base = run(["git", "-C", root, "cat-file", "-e", f"{base.ref}:{script}"])
+    if on_base.returncode:
+        return Check(name, "skipped-absent", f"no {script} in this repo")
+    c = Check(name, "failed", "the guardrail was removed")
+    c.reasons.append(f"{base.ref} has {script} and this branch does not — a branch "
+                     "cannot switch off the guardrail that is reading it")
+    return c
+
+
+def _stale(base: BaseRef, name: str) -> Check | None:
+    """The check's answer when the base could not be refreshed, or None to run it.
+
+    Only a FAILED fetch stops a check. `--no-fetch` is the caller's own choice and
+    is noted once on the run instead (see :func:`payload`) — a warning repeated on
+    every base-dependent check would be three copies of one fact.
+    """
+    if base.fresh or base.chosen:
+        return None
+    c = Check(name, "error", "the base ref is stale")
+    c.reasons.append(f"{base.ref} could not be refreshed ({base.why}) — a verdict "
+                     "computed against a stale base is confidently wrong in the "
+                     "direction that lands")
     return c
 
 
@@ -634,7 +766,7 @@ def _plan_files(plan: dict) -> list[str]:
     return sorted({f for f in files if isinstance(f, str) and f})
 
 
-def check_sw_version(root: str, base: str) -> Check:
+def check_sw_version(root: str, base: BaseRef) -> Check:
     """The service-worker cache-bust counter still goes up.
 
     One hand-maintained global that every branch edits, so parallel branches
@@ -642,9 +774,10 @@ def check_sw_version(root: str, base: str) -> Check:
     deployed — which breaks cache invalidation silently rather than failing.
     """
     script = "scripts/check_sw_version.py"
-    if not (Path(root) / script).exists():
-        return Check("sw_version", "skipped-absent", f"no {script} in this repo")
-    argv = ["uv", "run", "python", script, "--base", f"origin/{base}"]
+    c = _detected(root, script, base, "sw_version")
+    if c is not None:
+        return c
+    argv = ["uv", "run", "python", script, "--base", base.ref]
     proc = run(argv, cwd=root)
     said = ((proc.stdout or "") + (proc.stderr or "")).strip()
     c = Check("sw_version", "passed", said.splitlines()[-1][:120] if said else "OK",
@@ -658,7 +791,7 @@ def check_sw_version(root: str, base: str) -> Check:
     if proc.returncode == 1 and "no plain SERVICE_WORKER_VERSION" not in said:
         c.status = "reconcile"
         c.actions.append(Action(
-            f"uv run python {script} --base origin/{base} --fix",
+            f"uv run python {script} --base {base.quoted} --fix",
             "rewrites the counter to max(base, head) + 1 — never take the "
             "branch's number blindly", ["the service-worker version file"]))
         c.actions.append(Action("git commit -am 'chore: bump service worker version'",
@@ -708,6 +841,28 @@ def read_pr(repo: str, number: int | None, root: str) -> dict:
         raise SystemExit(f"preland: `gh pr view` returned no usable JSON ({e})") from e
 
 
+def refresh_base(root: str, name: str, fetch: bool = True) -> BaseRef:
+    """Bring `origin/<name>` up to date, and say whether it worked.
+
+    The one write this script makes, and it writes only a remote-tracking ref —
+    no working tree, no branch. It is here because the alternative is worse than
+    the side effect: the migration and cache-version guardrails are answers about
+    the gap between this branch and the base, and a base last fetched yesterday
+    produces a confident NOOP about a head that moved this morning.
+
+    The result is RETURNED rather than discarded. A fetch whose failure went
+    unread is the stale base with nothing saying so, which is the failure this
+    call exists to prevent, arriving through the call itself.
+    """
+    if not fetch:
+        return BaseRef(name, fresh=False, chosen=True)
+    proc = run(["git", "-C", root, "fetch", "origin", name])
+    if proc.returncode:
+        why = (proc.stderr or proc.stdout or "").strip().splitlines()
+        return BaseRef(name, fresh=False, why=why[-1][:160] if why else "no output")
+    return BaseRef(name)
+
+
 def disabled_checks(cfg: dict, skip: list[str]) -> dict[str, str]:
     """{check name: the status it reports} for every check turned off.
 
@@ -730,21 +885,23 @@ def disabled_checks(cfg: dict, skip: list[str]) -> dict[str, str]:
     return off
 
 
-def gather(cfg: dict, pr: dict, off: dict[str, str], mine: str) -> list[Check]:
+def gather(cfg: dict, pr: dict, base: BaseRef, off: dict[str, str],
+           mine: str = "") -> list[Check]:
     """Every check, in report order, with the disabled ones still present.
 
     A check that did not run is REPORTED as not having run. Dropping it would
     leave a payload whose `checks` reads clean because the failing guardrail is
     simply not in it.
     """
-    repo, root, base = cfg["github"], cfg["path"], pr["baseRefName"]
+    repo, root = cfg["github"], cfg["path"]
+    versions = (cfg.get("epic") or {}).get("migrations_dir") or ""
     how = {
         "pr_state": lambda: check_pr_state(pr),
         "checkout": lambda: check_checkout(root, pr),
         "ci": lambda: check_ci(pr),
         "review": lambda: check_review(repo, pr),
         "merge_claim": lambda: check_merge_claim(repo, pr, mine),
-        "migrations": lambda: check_migrations(root, base),
+        "migrations": lambda: check_migrations(root, base, versions),
         "sw_version": lambda: check_sw_version(root, base),
     }
     return [Check(name, off[name], f"turned off ({off[name].split('-')[1]})")
@@ -773,21 +930,27 @@ def _guarded(name: str, check: Callable[[], Check]) -> Check:
         return c
 
 
-def payload(cfg: dict, pr: dict, checks: list[Check]) -> dict:
+def payload(cfg: dict, pr: dict, checks: list[Check], base: BaseRef) -> dict:
     """The machine-readable answer. `verdict`, `actions` and `reasons` are the
     three fields the issue asked for; `checks` is the audit trail that says which
     guardrails actually ran, which is the question prose could never answer."""
     v = verdict_of(checks)
+    # Run-level, not per-check: `--no-fetch` is one fact about the run, and
+    # repeating it on each base-dependent check would be three copies of it.
+    run_notes = ([] if base.fresh or not base.chosen else
+                 [f"{base.ref} was not refreshed (--no-fetch), so the migration and "
+                  "cache-version verdicts read whatever the last fetch left there"])
     return {
         "verdict": v,
         "exit_code": EXIT[v],
         "repo": cfg["github"],
         "pr": pr["number"],
         "branch": pr["headRefName"],
-        "base": pr["baseRefName"],
+        "base": base.name,
+        "base_fresh": base.fresh,
         "head_sha": pr["headRefOid"],
         "reasons": [r for c in checks for r in c.reasons],
-        "warnings": [w for c in checks for w in c.warnings],
+        "warnings": [*run_notes, *(w for c in checks for w in c.warnings)],
         "actions": [a.as_dict() for c in checks for a in c.actions],
         "checks": {c.name: c.as_dict() for c in checks},
     }
@@ -840,13 +1003,10 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(str(e)) from e
     off = disabled_checks(cfg, args.skip)
     pr = read_pr(cfg["github"], args.pr, cfg["path"])
-    if not args.no_fetch:
-        # Remote-tracking refs only. A migration or cache-version verdict against
-        # a stale origin/<base> is confidently wrong in the direction that lands.
-        run(["git", "-C", cfg["path"], "fetch", "origin", pr["baseRefName"]])
+    base = refresh_base(cfg["path"], pr["baseRefName"], fetch=not args.no_fetch)
 
-    checks = gather(cfg, pr, off, args.claim_holder)
-    out = payload(cfg, pr, checks)
+    checks = gather(cfg, pr, base, off, args.claim_holder)
+    out = payload(cfg, pr, checks, base)
     if args.as_json:
         print(json.dumps(out, indent=2))
     else:

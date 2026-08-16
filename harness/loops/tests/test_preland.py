@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import preland  # noqa: E402
 
 HEAD = "a" * 40
+BASE = preland.BaseRef("main")
 OTHER = "b" * 40
 
 
@@ -206,9 +207,14 @@ def test_ci_gates_on_green_only(rollup, status):
     assert preland.check_ci(pr(statusCheckRollup=rollup)).status == status
 
 
-def test_a_pr_with_no_checks_warns():
+def test_a_pr_with_no_checks_at_all_holds():
+    """No CI signal is the absence of evidence, not evidence of green. A workflow
+    that failed to trigger and a repo with no CI look identical from here, and
+    only one of them is safe — so the repo that genuinely has none says so in
+    .harness-rules, and the message names that switch."""
     c = preland.check_ci(pr(statusCheckRollup=[]))
-    assert c.status == "passed" and "no checks at all" in c.warnings[0]
+    assert c.status == "failed"
+    assert "no checks at all" in c.reasons[0] and "disabled_checks" in c.reasons[0]
 
 
 # --------------------------------------------------------------------- review
@@ -365,7 +371,7 @@ def test_unreadable_claims_hold(board):
 def test_a_repo_without_the_reconciler_skips_silently(repo):
     """Capability detection: an absent script means the invariant does not exist
     in that repo, which is what lets one gate serve every repo."""
-    c = preland.check_migrations(repo, "main")
+    c = preland.check_migrations(repo, BASE)
     assert c.status == "skipped-absent"
 
 
@@ -383,7 +389,7 @@ def reconciler(repo, monkeypatch):
 def test_a_single_head_passes(reconciler):
     root, answer = reconciler
     answer({"action": "noop", "reason": "already linear"})
-    assert preland.check_migrations(root, "main").status == "passed"
+    assert preland.check_migrations(root, BASE).status == "passed"
 
 
 @pytest.mark.parametrize("action", ["relink", "renumber"])
@@ -392,7 +398,7 @@ def test_a_relink_is_mechanical_work_with_commands(reconciler, action):
     answer({"action": action, "reason": "rebase onto main head",
             "base": "0018abc", "base_path": "migrations/versions/0018_x.py",
             "new_down": ["0017abc"]})
-    c = preland.check_migrations(root, "main")
+    c = preland.check_migrations(root, BASE)
     assert c.status == "reconcile"
     assert "apply --onto origin/main" in c.actions[0].command
     # `base`/`new_down` are revision IDS; only the *_path fields are filenames.
@@ -408,7 +414,7 @@ def test_a_renumber_reports_both_ends_of_every_rename(reconciler):
     answer({"action": "renumber", "reason": "two branches minted 0018",
             "renames": [{"old_path": "migrations/versions/0018_x.py",
                          "new_path": "migrations/versions/0019_x.py"}]})
-    c = preland.check_migrations(root, "main")
+    c = preland.check_migrations(root, BASE)
     assert c.actions[0].files == ["migrations/versions/0018_x.py",
                                   "migrations/versions/0019_x.py"]
 
@@ -416,16 +422,19 @@ def test_a_renumber_reports_both_ends_of_every_rename(reconciler):
 def test_the_merge_fallback_brings_base_into_the_branch(reconciler):
     root, answer = reconciler
     answer({"action": "merge", "reason": "the base is itself a merge node"}, code=3)
-    c = preland.check_migrations(root, "main")
+    c = preland.check_migrations(root, BASE)
     assert c.status == "reconcile"
     assert c.actions[0].command == "git merge origin/main"
-    assert "flask db merge heads" in c.actions[1].command
+    # `alembic`, not `flask db` — the prose this replaced named a Flask-Migrate
+    # wrapper that does not exist in an app driving alembic directly, so the
+    # command it prescribed could not run here at all.
+    assert "alembic merge heads" in c.actions[1].command
 
 
 def test_a_stop_holds_because_reconciling_base_is_not_this_prs_job(reconciler):
     root, answer = reconciler
     answer({"action": "stop", "reason": "main itself has two heads"}, code=2)
-    c = preland.check_migrations(root, "main")
+    c = preland.check_migrations(root, BASE)
     assert c.status == "failed" and "main itself has two heads" in c.reasons[0]
 
 
@@ -434,14 +443,14 @@ def test_an_action_this_check_does_not_know_holds(reconciler):
     choice this cannot interpret is a choice it must not overrule."""
     root, answer = reconciler
     answer({"action": "squash", "reason": "something new"})
-    c = preland.check_migrations(root, "main")
+    c = preland.check_migrations(root, BASE)
     assert c.status == "failed" and "does not know" in c.reasons[0]
 
 
 def test_a_reconciler_that_says_nothing_readable_holds(reconciler, monkeypatch):
     root, _ = reconciler
     monkeypatch.setattr(preland, "run", lambda argv, cwd=None: proc(1, "", "boom"))
-    c = preland.check_migrations(root, "main")
+    c = preland.check_migrations(root, BASE)
     assert c.status == "error" and "boom" in c.reasons[0]
 
 
@@ -466,8 +475,88 @@ def test_a_wedged_guardrail_times_out_into_a_verdict(monkeypatch):
 # ----------------------------------------------------------------- sw_version
 
 
+def test_a_branch_that_deleted_the_guardrail_does_not_get_a_skip(repo, monkeypatch):
+    """Capability detection reads the BRANCH's tree, which is the point — and
+    also the hole: a diff that removes `scripts/migration_reconcile.py` would
+    hand itself `skipped-absent`, switching off the check by the very change the
+    check exists to read. An absence only counts when the base lacks it too."""
+    monkeypatch.setattr(preland, "run", lambda argv, cwd=None: proc(0))  # it IS on base
+    c = preland.check_migrations(repo, BASE)
+    assert c.status == "failed" and "cannot switch off the guardrail" in c.reasons[0]
+
+
+def test_a_base_that_could_not_be_refreshed_holds(reconciler):
+    """A verdict against a stale origin/<base> is confidently wrong in the
+    direction that lands, so a fetch that FAILED must not be silently proceeded
+    past — which is what discarding its result used to do."""
+    root, _ = reconciler
+    stale = preland.BaseRef("main", fresh=False, why="could not resolve host")
+    c = preland.check_migrations(root, stale)
+    assert c.status == "error" and "could not be refreshed" in c.reasons[0]
+
+
+def test_no_fetch_is_the_callers_choice_and_does_not_hold(reconciler):
+    root, answer = reconciler
+    answer({"action": "noop", "reason": "linear", "exit_code": 0})
+    chosen = preland.BaseRef("main", fresh=False, chosen=True)
+    assert preland.check_migrations(root, chosen).status == "passed"
+
+
+def test_the_run_says_when_the_base_was_not_refreshed():
+    """One fact about the run, said once — not repeated on each check that
+    depends on it."""
+    out = preland.payload({"github": "o/r", "path": "/x"}, pr(), [check("a", "passed")],
+                          preland.BaseRef("main", fresh=False, chosen=True))
+    assert out["base_fresh"] is False and "--no-fetch" in out["warnings"][0]
+
+
+def test_a_custom_migrations_dir_is_passed_to_the_reconciler(repo, monkeypatch):
+    """The reconciler defaults to `migrations/versions`; a repo whose migrations
+    live elsewhere would otherwise be analysed as having none — which reports
+    NOOP, the cleanest possible answer, about a directory nobody looked in."""
+    (Path(repo) / "scripts" / "migration_reconcile.py").write_text("#\n")
+    seen = []
+    monkeypatch.setattr(preland, "run", lambda argv, cwd=None:
+                        (seen.append(argv), proc(0, json.dumps({"action": "noop",
+                                                                "exit_code": 0})))[1])
+    preland.gather({"github": "o/r", "path": repo, "epic": {"migrations_dir": "db/rev"}},
+                   pr(), BASE, dict.fromkeys(
+                       ("pr_state", "checkout", "ci", "review", "merge_claim",
+                        "sw_version"), "skipped-flag"))
+    assert seen[0][-2:] == ["--versions-path", "db/rev"]
+
+
+def test_a_plan_that_disagrees_with_its_own_exit_code_holds(reconciler):
+    """Two independent statements of one answer, compared against the plan's OWN
+    `exit_code` rather than a second copy of its action-to-code table."""
+    root, answer = reconciler
+    answer({"action": "noop", "exit_code": 0}, code=2)
+    c = preland.check_migrations(root, BASE)
+    assert c.status == "error" and "disagree" in c.reasons[0]
+
+
+def test_a_noop_that_came_back_non_zero_holds(reconciler):
+    """The fallback when the plan states no exit code: reading only the plan is
+    how a failing run carrying a NOOP would have been accepted as clean."""
+    root, answer = reconciler
+    answer({"action": "noop"}, code=2)
+    c = preland.check_migrations(root, BASE)
+    assert c.status == "error" and "does not come back non-zero" in c.reasons[0]
+
+
+def test_a_hostile_branch_name_cannot_escape_an_emitted_command(reconciler):
+    """`actions` are strings a loop is told to run verbatim, and a git refname may
+    legally contain `;`. An unquoted branch name in one of them is an injection
+    into a shell this file does not own."""
+    root, answer = reconciler
+    answer({"action": "merge", "reason": "two heads", "exit_code": 3}, code=3)
+    nasty = preland.BaseRef("main;rm -rf /")
+    c = preland.check_migrations(root, nasty)
+    assert c.actions[0].command == "git merge 'origin/main;rm -rf /'"
+
+
 def test_a_repo_without_the_cache_guard_skips_silently(repo):
-    assert preland.check_sw_version(repo, "main").status == "skipped-absent"
+    assert preland.check_sw_version(repo, BASE).status == "skipped-absent"
 
 
 @pytest.fixture
@@ -482,13 +571,13 @@ def sw_guard(repo, monkeypatch):
 def test_a_monotonic_counter_passes(sw_guard):
     root, answer = sw_guard
     answer(0, "✓ OK: SERVICE_WORKER_VERSION 1.0.154 > base 1.0.153.")
-    assert preland.check_sw_version(root, "main").status == "passed"
+    assert preland.check_sw_version(root, BASE).status == "passed"
 
 
 def test_a_regression_is_mechanical_work(sw_guard):
     root, answer = sw_guard
     answer(1, "✗ REGRESSION: SERVICE_WORKER_VERSION 1.0.9 is BELOW base 1.0.153.")
-    c = preland.check_sw_version(root, "main")
+    c = preland.check_sw_version(root, BASE)
     assert c.status == "reconcile" and "--fix" in c.actions[0].command
 
 
@@ -497,13 +586,13 @@ def test_a_broken_multiline_value_holds(sw_guard):
     hand the caller a command that cannot work."""
     root, answer = sw_guard
     answer(1, "HEAD has no plain SERVICE_WORKER_VERSION literal (broken multiline?)")
-    assert preland.check_sw_version(root, "main").status == "failed"
+    assert preland.check_sw_version(root, BASE).status == "failed"
 
 
 def test_a_case_the_tool_declined_to_fix_holds(sw_guard):
     root, answer = sw_guard
     answer(2, "✗ Cannot --fix: base ref has an unparseable version.")
-    assert preland.check_sw_version(root, "main").status == "failed"
+    assert preland.check_sw_version(root, BASE).status == "failed"
 
 
 # --------------------------------------------------- which checks run, and why
@@ -537,8 +626,8 @@ def test_a_skipped_check_is_still_in_the_payload(monkeypatch, repo):
     guardrail that would have objected is simply not in it."""
     monkeypatch.setattr(preland, "_git", lambda root, *a: HEAD if a[0] == "rev-parse" else "")
     cfg = {"github": "o/r", "path": repo}
-    checks = preland.gather(cfg, pr(), {"review": "skipped-disabled",
-                                        "merge_claim": "skipped-flag"}, "")
+    checks = preland.gather(cfg, pr(), BASE, {"review": "skipped-disabled",
+                                     "merge_claim": "skipped-flag"})
     by_name = {c.name: c for c in checks}
     assert [c.name for c in checks] == list(preland.CHECKS)
     assert by_name["review"].status == "skipped-disabled"
@@ -551,8 +640,8 @@ def test_a_check_that_crashes_holds_and_the_others_still_run(monkeypatch, repo):
     monkeypatch.setattr(preland, "_git", lambda root, *a: HEAD if a[0] == "rev-parse" else "")
     monkeypatch.setattr(preland, "check_ci",
                         lambda p: (_ for _ in ()).throw(KeyError("statusCheckRollup")))
-    checks = preland.gather({"github": "o/r", "path": repo}, pr(),
-                            {"review": "skipped-flag", "merge_claim": "skipped-flag"}, "")
+    checks = preland.gather({"github": "o/r", "path": repo}, pr(), BASE,
+                            {"review": "skipped-flag", "merge_claim": "skipped-flag"})
     by_name = {c.name: c for c in checks}
     assert by_name["ci"].status == "error" and "KeyError" in by_name["ci"].reasons[0]
     assert by_name["pr_state"].status == "passed"
@@ -562,7 +651,7 @@ def test_a_check_that_crashes_holds_and_the_others_still_run(monkeypatch, repo):
 def test_the_payload_gathers_every_reason_across_checks():
     checks = [check("pr_state", "failed", reasons=["closed"]),
               check("review", "failed", reasons=["stale", "confirmed"])]
-    out = preland.payload({"github": "o/r", "path": "/x"}, pr(), checks)
+    out = preland.payload({"github": "o/r", "path": "/x"}, pr(), checks, BASE)
     assert out["verdict"] == preland.HOLD and out["exit_code"] == 2
     assert out["reasons"] == ["closed", "stale", "confirmed"]
 
@@ -627,7 +716,11 @@ def wired(monkeypatch, board, repo):
                                       "default_branch": "main", "_rules_from": "test"})
     monkeypatch.setattr(preland, "read_pr", lambda repo_, n, root: pr(number=n or 7))
     monkeypatch.setattr(preland, "_git", lambda root, *a: HEAD if a[0] == "rev-parse" else "")
-    monkeypatch.setattr(preland, "run", lambda argv, cwd=None: proc())
+    # A fetch succeeds; `cat-file -e origin/main:<script>` does not, because the
+    # tmp repo has no guardrails on either side. Answering 0 to everything would
+    # make every run look like a branch that had DELETED its guardrails.
+    monkeypatch.setattr(preland, "run", lambda argv, cwd=None:
+                        proc(1 if "cat-file" in argv else 0))
     board["claims"] = ({"claims": []}, "")
     return board
 
@@ -664,7 +757,8 @@ def test_the_base_ref_is_refreshed_before_the_repo_guardrails_run(wired, monkeyp
     """A migration verdict against a stale origin/<base> is confidently wrong in
     the direction that lands."""
     ran = []
-    monkeypatch.setattr(preland, "run", lambda argv, cwd=None: (ran.append(argv), proc())[1])
+    monkeypatch.setattr(preland, "run", lambda argv, cwd=None:
+                        (ran.append(argv), proc(1 if "cat-file" in argv else 0))[1])
     wired["reviews"] = ([review_row()], "")
     preland.main(["--pr", "7", "--json"])
     assert ["git", "-C", preland.resolve_repo(None)["path"],
@@ -673,7 +767,8 @@ def test_the_base_ref_is_refreshed_before_the_repo_guardrails_run(wired, monkeyp
 
 def test_no_fetch_leaves_the_refs_alone(wired, monkeypatch):
     ran = []
-    monkeypatch.setattr(preland, "run", lambda argv, cwd=None: (ran.append(argv), proc())[1])
+    monkeypatch.setattr(preland, "run", lambda argv, cwd=None:
+                        (ran.append(argv), proc(1 if "cat-file" in argv else 0))[1])
     wired["reviews"] = ([review_row()], "")
     preland.main(["--pr", "7", "--json", "--no-fetch"])
     assert not any("fetch" in argv for argv in ran)

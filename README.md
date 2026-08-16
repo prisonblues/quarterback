@@ -228,15 +228,15 @@ service knows which it is: ask it with `GET /openapi.json` → `.info.version`, 
 instance you care about. (Anything built off this branch says 2.33.0.) A
 number written here instead would be wrong the next time Portainer redeploys, with no diff to catch
 it.
-Latest release: **v2.33** — the repair of v2.31's claim table: it enforced atomicity at the
+Latest release: **v2.35** — the pre-land gate stops being prose. The checks a merge has to pass
+existed twice and in two forms — fifty lines of English in `/fix-and-land`, nothing at all in
+`/panel-review-pr` — so `preland.py` computes the verdict instead: READY / RECONCILE / HOLD, with an
+exit code, the exact commands a reconcile needs, and a per-check record of what actually ran.
+Harness-side, so the served version is unchanged.
+Before it, **v2.33** — the repair of v2.31's claim table: it enforced atomicity at the
 database for INSERT and nowhere else, authorised release numbers by machine when the whole point is
 that two agents on one box are two branches, and let the generic claim endpoint write rows the
 allocator's invariants are enforced nowhere else. Eight P1s from its own panel round.
-Before it, **v2.32** — the panel has always computed whether CI passed and told no reviewer:
-`review_ci` reached the payload and the human report, never a prompt. Both prompts and the judge now
-carry it in words, no non-passing state can read as a pass, and a green suite is stated as "every
-test we thought to write passed" rather than as evidence the code is correct. Harness-side, so the
-served version is unchanged.
 Previously: **v2.31** — the board allocates release numbers and merge claims atomically, off one
 resource-keyed lease table (schema revision 0019). Announcing a number on the board was falsified as
 a remedy nine times in two days: every agent was correct from what it could see, and an announcement
@@ -359,6 +359,13 @@ the other way):
   text, so the generic claim endpoint could write rows carrying invariants only the allocator
   enforces. The two bugs that mattered most were unreachable sequentially — a race-based feature had
   shipped with a sequential test suite.
+- **v2.35** — the pre-land gate becomes executable. `harness/loops/preland.py --pr <n>` answers
+  READY (exit 0) / RECONCILE (3, with the exact commands and the files they touch) / HOLD (2, with
+  what is unresolved and who has to resolve it). It reads the panel round's own statements off the
+  board rather than re-deriving them, so the day a PR merged over its own unread round — 8 P1s
+  outstanding, by an agent that had written up that exact confusion an hour earlier — comes out HOLD
+  on two independent counts. Absent never reads as clean: no round, no CI, an unreadable board or a
+  branch that deleted its own guardrail all hold, and a check turned off is still reported.
 - **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
   object store; wire `landed` refs to a cherry-pick helper.
 

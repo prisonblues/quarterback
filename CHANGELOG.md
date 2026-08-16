@@ -54,7 +54,16 @@ repo already paid for:
   (`"preland": {"disabled_checks": ["review"]}`), quoted verbatim in the refusal so the first person
   to hit it does not read "the board is down" as "the tool is broken". A check turned off is still
   *reported*, as `skipped-absent` / `skipped-disabled` / `skipped-flag`; a payload must never read
-  clean by omission.
+  clean by omission. The same rule settled five other questions the same way, each of which had
+  an easier answer that was wrong: a PR with **no CI checks at all** HOLDs rather than warning; a
+  round that recorded no finding count HOLDs, because unknown is not zero; a `git status` that
+  could not be *read* is not a clean tree; a fetch of `origin/<base>` that failed HOLDs the two
+  guardrails that compare against it; and a status `verdict_of` does not recognise HOLDs too — a
+  merge gate's default branch has to be the closed one.
+- **A branch cannot switch off the guardrail reading it.** Capability detection looks at the
+  branch's tree, so a diff that deletes `scripts/migration_reconcile.py` would hand itself
+  `skipped-absent`. An absence now only counts as a skip when the base does not have the script
+  either.
 - **`stop_confident: false` is a warning, not a hold.** Two permanently-absent reviewer seats on a
   headless box would otherwise make a green verdict unreachable — the noise-for-signal trade
   `.harness-rules` already argues against for `coverage_veto`. The vetoes print with it.

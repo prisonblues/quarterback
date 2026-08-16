@@ -666,11 +666,13 @@ that had written up that exact confusion an hour earlier.
 |---|---|
 | `pr_state` | Not OPEN, a draft, or `CONFLICTING`. Uncomputed mergeability warns. |
 | `checkout` | This tree is not at the PR's head, or has tracked modifications. Untracked files warn. |
-| `ci` | `gh`'s check rollup is red **or pending** — a push restarts CI, so an earlier green is stale. |
-| `review` | The board's newest round for this PR read another commit, did not `stop`, has `confirmed > 0`, or has a failing Sonar gate. No round at all is a HOLD too. |
+| `ci` | `gh`'s check rollup is red, **pending**, or **empty** — a push restarts CI, so an earlier green is stale, and no checks at all is silence rather than green. |
+| `review` | The board's newest round for this PR read another commit, did not `stop`, has `confirmed > 0`, or has a failing Sonar gate. No round at all is a HOLD too, and so is a round that recorded no finding count — unknown is not zero. |
 | `merge_claim` | Another agent holds `kind=merge` on `<repo>:<branch>`. |
-| `migrations` | `scripts/migration_reconcile.py` says `stop`. `relink`/`renumber`/`merge` are RECONCILE. |
+| `migrations` | `scripts/migration_reconcile.py` says `stop`, or its plan and its exit code disagree. `relink`/`renumber`/`merge` are RECONCILE. |
 | `sw_version` | `scripts/check_sw_version.py` fails in a way `--fix` cannot repair. A repairable one is RECONCILE. |
+
+The last two also HOLD when `origin/<base>` could not be refreshed — they are answers about the gap between this branch and the base, and a base last fetched yesterday produces a confident NOOP about a head that moved this morning. `--no-fetch` makes that the caller's choice instead, noted once on the run.
 
 The `review` clauses are the round's **own statements** — `head_sha`, `stopped`,
 `confirmed`, `sonar_gate` — read back rather than re-derived. #62 spent three rounds
@@ -682,13 +684,21 @@ reviewer seats on a headless box would otherwise make a green verdict unreachabl
 the noise-for-signal trade this file already argues against for `coverage_veto`. The vetoes
 are printed with it.
 
-**Capability detection, and its one exception.** Repo-local guardrails are detected — a
+**Capability detection, and its two exceptions.** Repo-local guardrails are detected — a
 repo without `scripts/migration_reconcile.py` records `skipped-absent` and moves on, which
 is what lets one gate serve quarterback, lexray and an unenrolled repo with no per-repo
-branch in the skill. The board is the exception: an unset `QUARTERBACK_BASE_URL` does not
-mean this repo has no review invariant, it means the invariant exists and cannot be seen,
-so `review` HOLDs. That knowingly narrows the "local path stays first-class" promise for
-`/fix-and-land` (not for `/panel`, which is unaffected), and the off-switch is one line:
+branch in the skill.
+
+The first exception is a hole in that mechanism rather than a policy: detection reads the
+**branch's** tree, so a diff that *deletes* a guardrail would hand itself `skipped-absent`,
+switching off the check by the very change the check exists to read. So an absence only
+counts as a skip when `origin/<base>` does not have the script either; a branch that removed
+one HOLDs.
+
+The second is the board. An unset `QUARTERBACK_BASE_URL` does not mean this repo has no
+review invariant, it means the invariant exists and cannot be seen, so `review` HOLDs. That
+knowingly narrows the "local path stays first-class" promise for `/fix-and-land` (not for
+`/panel`, which is unaffected), and the off-switch is one line:
 
 ```json
 "preland": { "disabled_checks": ["review"] }
