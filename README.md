@@ -225,14 +225,19 @@ half of the panel↔board drift check #65 asks for.
 
 The deployed board version lags the repo until the stack is redeployed, and only the running
 service knows which it is: ask it with `GET /openapi.json` → `.info.version`, for whichever
-instance you care about. (Anything built off this branch says 2.33.0.) A
+instance you care about. (Anything built off this branch says 2.38.0.) A
 number written here instead would be wrong the next time Portainer redeploys, with no diff to catch
 it.
-Latest release: **v2.33** — the repair of v2.31's claim table: it enforced atomicity at the
+Latest release: **v2.38** — the release allocator keyed on the repo string it was handed, and this
+fleet sends two of them for one repo (`qb-hook` takes the remote's basename, `gh` sends
+`nameWithOwner`), so it kept two floors and issued 2.36 twice with `claimed: true` on both. Keys are
+now canonicalised to lowercased `owner/name`; a bare basename is expanded when exactly one owner
+answers to it and refused when none or several do. Schema revision 0020 rewrites the history.
+Before it, **v2.33** — the repair of v2.31's claim table: it enforced atomicity at the
 database for INSERT and nowhere else, authorised release numbers by machine when the whole point is
 that two agents on one box are two branches, and let the generic claim endpoint write rows the
 allocator's invariants are enforced nowhere else. Eight P1s from its own panel round.
-Before it, **v2.32** — the panel has always computed whether CI passed and told no reviewer:
+Before that, **v2.32** — the panel has always computed whether CI passed and told no reviewer:
 `review_ci` reached the payload and the human report, never a prompt. Both prompts and the judge now
 carry it in words, no non-passing state can read as a pass, and a green suite is stated as "every
 test we thought to write passed" rather than as evidence the code is correct. Harness-side, so the
@@ -359,6 +364,19 @@ the other way):
   text, so the generic claim endpoint could write rows carrying invariants only the allocator
   enforces. The two bugs that mattered most were unreachable sequentially — a race-based feature had
   shipped with a sequential test suite.
+- **v2.38** — one repo, one namespace (schema revision 0020). The allocator keyed on the repo string
+  it was handed, and this fleet sends two for one repo — `qb-hook` takes the origin remote's
+  basename, `gh` and every review payload send `nameWithOwner` — so it kept two floors that could
+  not see each other and handed 2.36 to two agents 28 minutes apart, `claimed: true` on both. The
+  tenth release collision and the first the allocator produced, which is worse than the announcement
+  it replaced: an announcement at least leaves the caller uncertain. Keys are canonicalised to
+  lowercased `owner/name` (URL spellings included); a bare basename is a lookup rather than a
+  namespace, expanded when exactly one owner answers to it and refused with the candidates when
+  none or several do. `kind='merge'` and `kind='work'` were affected identically — a claim keyed on
+  an un-normalised repo name is not exclusive — while a generic key naming no repo is passed through
+  untouched. The migration rewrites the history and keeps the collision inside it: two live rows
+  converging on one number cannot both stay live, so the later one is released as part of the
+  rewrite rather than dropped, because a number that leaves the floor is a number handed out twice.
 - **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
   object store; wire `landed` refs to a cherry-pick helper.
 

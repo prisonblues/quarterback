@@ -408,6 +408,11 @@ def claim(ctx: Context, kind: str, key: str, ttl: int = 3600,
     Args:
         kind: What sort of resource. Use "merge" for landing a branch.
         key: The resource, namespaced by you — e.g. "prisonblues/quarterback:main".
+            The repo half is canonicalised to lowercased `owner/name` when the
+            board can identify it, so "quarterback#142" and
+            "prisonblues/quarterback#142" are ONE claim rather than two agents
+            each certain they hold it. A key naming no repo is stored as sent.
+            The response carries `key_as_given` when the two differ.
         ttl: Seconds until the claim lapses without a renew (default 3600).
         session: Your session id, so a peer can reach you.
         note: One line on what you are doing with it. Send this — it is what the
@@ -481,7 +486,12 @@ def claim_release_number(ctx: Context, repo: str, after: str | None = None,
     never re-issued, because your branch may have shipped it.
 
     Args:
-        repo: The repo the number belongs to, e.g. "prisonblues/quarterback".
+        repo: The repo the number belongs to, as `owner/name` — e.g.
+            "prisonblues/quarterback". A remote URL works too. A bare basename
+            ("quarterback") is expanded only when exactly one owner on this board
+            answers to it, and REFUSED otherwise: two spellings of one repo used
+            to be two independent floors, which handed 2.36 to two agents on the
+            same day with a green light on both (#148).
         after: Highest version you can see locally ("2.31" or "2.31.0").
         branch: Your branch, recorded so others can see what is landing soon.
         ttl: Seconds until the claim lapses (default 3600). Renew for long work.
@@ -518,7 +528,9 @@ def reclaim_release_number(ctx: Context, repo: str, claim_id: str,
     full of a number you no longer own with nothing to replace it.
 
     Args:
-        repo: The repo, e.g. "prisonblues/quarterback".
+        repo: The repo, as `owner/name` — e.g. "prisonblues/quarterback". Same
+            rule as `claim_release_number`; the claim being given up may have
+            been taken under the other spelling and is still recognised as yours.
         claim_id: The claim you are giving up (from `claim_release_number`).
         after: Highest version you can now see — usually the number that just
             landed on you and forced the renumber.
@@ -543,6 +555,11 @@ def releases(ctx: Context, repo: str) -> dict:
 
     Also the answer to "what is landing soon", which nothing else here can tell
     you. Reading it is not claiming it — use `claim_release_number` for that.
+
+    `repo` goes through the same canonicaliser the allocator uses, so this list
+    cannot disagree with what allocation would do. That mattered: #148 was found
+    by reading the numbers back under one spelling and not seeing one that was
+    known to be held.
     """
     try:
         return _get_client(ctx).releases(repo)

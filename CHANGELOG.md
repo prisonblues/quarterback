@@ -7,6 +7,63 @@ that number where it was, so the repo can be a version ahead of the service.
 Entries are newest first. Each one says what was broken or missing before it, because that is the
 part that isn't recoverable from the diff.
 
+## v2.38 — the allocator had two namespaces for one repo, and it issued 2.36 twice
+
+v2.31 exists because announcing a release number was falsified nine times in two days: every agent
+was correct from what it could see, and an announcement does not force the next one to look. An
+allocation does — the number comes from asking. On 2026-08-16 the allocator itself produced the
+**tenth** collision, and that is a different and worse thing, because it came back `claimed: true`.
+
+**`POST /release/claim` took `repo` as free text and keyed on it.** The fleet supplies two spellings
+for one repo and both are locally correct: `qb-hook` derives identity from the origin remote and
+takes the **basename** (`quarterback`), for the stated reason that a checkout cloned to a different
+local name is still the same repo to everyone else; `gh` and every review payload use GitHub's
+**`nameWithOwner`** (`prisonblues/quarterback`), which is what `POST /review` documents. The claim
+table inherited whichever the caller happened to use, so it maintained two independent sequences
+over one repo and neither could see the other. `zeus/nimbus-sorrel` was handed 2.36 under one
+spelling and `zeus/hazel-jasper` was handed 2.36 under the other, 28 minutes apart, each with a
+green light on it. The atomicity was never in question — a unique index is simply only unique within
+a spelling.
+
+**The key is canonicalised on the way in, and the canonical form is `owner/name`, lowercased.**
+`nameWithOwner` and not the basename, because the basename is the ambiguous one:
+`prisonblues/quarterback` and `someone-else/quarterback` collapse onto the same key, which is a
+worse bug hiding in the same place. Case is folded because GitHub resolves owners and names
+case-insensitively, so `PrisonBlues/Quarterback` is a third fork waiting to happen. A full remote
+URL — `https://github.com/o/n.git`, `git@github.com:o/n.git` — is a spelling too, and reduces to the
+same key rather than being refused, since refusing it pushes the caller back to the basename.
+
+**A bare basename is a lookup, not a namespace.** It is expanded when exactly one repo this board
+has seen answers to that name, drawn from `review_runs.repo` (which is `nameWithOwner` by documented
+contract) and from claims already written in full. When none or several do, the call is **refused**
+with the form that works and, where there are any, the candidates — because coining a namespace is
+the failure being fixed, and picking an owner is a guess. That refusal is deliberately confined to
+`/release/claim`, `/release/reclaim` and `/releases`, where `repo` is a typed field documented as a
+repo. The generic `POST /claim` takes a caller-namespaced key by design — `kind='deploy',
+key='portainer-stack-189'` names no repo at all — so its head is rewritten only when the board can
+positively identify it and is otherwise passed through untouched.
+
+**The blast radius was never only release numbers.** `kind='merge'` and `kind='work'` use the same
+key, so two agents claiming `#142` under different spellings both succeeded and each was told it
+held it. A claim keyed on an un-normalised repo name is not exclusive, whatever the authorisation
+rule above it says.
+
+**Schema revision 0020 rewrites the history, and preserves the collision inside it.** Without it the
+first post-fix allocation reads a floor missing whatever is stranded under the other spelling, and
+re-issues it. Two live rows can converge on one key — 2.36 did — which the partial unique index
+cannot represent, so the later-acquired one is released *as part of* the rewrite: it keeps its
+canonical key, because history has to record that the number went out twice or the floor forgets it,
+and it stops being live. First-claim-wins, applied to a fact that was already true and merely
+unrepresentable. A basename the migration cannot expand is left exactly as it is, and the read side
+still scans that bucket, so a stranded number keeps raising the floor it belongs to even though
+nothing can be written beside it any more.
+
+**One thing worth carrying past this release.** The loose version of the host rule — "a dotted
+leading segment in front of two others is a hostname" — turned `../etc/passwd` into the repo
+`etc/passwd`, a path traversal laundered into an identity. It was caught by a test written for
+tidiness rather than for security, which is the argument for asserting the negative cases of a
+parser even when the positive ones all pass.
+
 ## v2.33 — v2.31's claim table was right about INSERT and wrong about everything else
 
 v2.31 landed the resource-claim table and its release allocator, and its own panel round found

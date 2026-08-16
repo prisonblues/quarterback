@@ -23,6 +23,16 @@ backstop stays where it was — the pre-land verdict re-checked after base
 movement (#96), and CI on ``main``. If a skill ever calls this "the merge lock",
 the skill is wrong.
 
+**A unique index is only unique within a spelling (v2.38).** The key was built
+from a repo string the caller supplied as free text, and this fleet supplies two
+of them for one repo — the origin remote's basename and GitHub's
+``nameWithOwner`` — so the table kept two independent sequences over one repo and
+handed 2.36 to two agents 28 minutes apart with ``claimed: true`` on both. That
+is the tenth collision and the first this allocator produced, which is worse than
+the announcement it replaced: an announcement leaves the caller uncertain. Every
+repo string now goes through :mod:`app.repokey` first. See there for the
+canonical form and for why a bare basename is a lookup rather than a namespace.
+
 The two kinds ship off one table on purpose. Two independent implementations of
 "who has this right now" is the outcome #99 was filed to avoid.
 """
@@ -35,7 +45,7 @@ from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -43,6 +53,17 @@ from app.auth import identify, reader
 from app.db import get_session
 from app.identity import same_machine
 from app.models.resource_lease import ResourceLease
+from app.models.review import ReviewRun
+from app.repokey import (
+    canonical_repo,
+    like_escape,
+    like_prefix,
+    name_half,
+    repo_basename,
+    resolve_against,
+    split_repo_head,
+    version_tail,
+)
 
 router = APIRouter(tags=["claim"])
 
@@ -180,6 +201,35 @@ def _view(c: ResourceLease) -> dict:
     }
 
 
+def _claimed(c: ResourceLease, as_given: str, *, renewed: bool) -> dict:
+    """A claim response, saying so when the key it landed on is not the one sent.
+
+    Normalising silently would leave a caller holding a string the board does not
+    use, and the next thing it does with that string is usually to look the claim
+    up again. Told, not advised: the rewrite still happens either way.
+    """
+    out = {**_view(c), "claimed": True, "renewed": renewed}
+    if as_given != c.key:
+        out["key_as_given"] = as_given
+    return out
+
+
+def _allocated(c: ResourceLease, version: tuple[int, int], repo: str, as_given: str,
+               *, renewed: bool, unreadable: bool) -> dict:
+    """An allocation response, naming the repo the number was actually taken under.
+
+    ``repo`` is echoed because the caller may not have sent this spelling, and a
+    number is only meaningful with the namespace it came from — that being the
+    whole of #148. ``repo_as_given`` appears only when the two differ, so a caller
+    can notice its own spelling drifting rather than discover it at the collision.
+    """
+    out = {**_view(c), "version": fmt_version(version), "repo": repo,
+           "claimed": True, "renewed": renewed, "after_unreadable": unreadable}
+    if as_given != repo:
+        out["repo_as_given"] = as_given
+    return out
+
+
 async def _sweep_lapsed(session: AsyncSession, kind: str, key: str,
                         now: datetime) -> None:
     """Retire a claim whose TTL ran out, so the unique index will admit the next.
@@ -223,16 +273,108 @@ async def _held(session: AsyncSession, kind: str, key: str,
 
 
 def _repo_prefix(repo: str):
-    """A LIKE clause matching one repo's release keys, with wildcards escaped.
+    """A LIKE clause matching one repo's release keys — canonical AND legacy.
 
-    ``startswith`` compiles to ``LIKE 'prefix%'`` and does NOT escape ``_`` or
-    ``%``, both of which are LIKE wildcards and both of which occur in real repo
-    names. ``acme/my_repo`` matched ``acme/myXrepo`` (round 1's F19) — so one
-    repo's allocation floor could be raised by another's, and `/releases` could
-    list a neighbour's numbers as its own.
+    Two prefixes, not one, and the second is the reason this fix has a floor it
+    can trust. Rows written before v2.38 are keyed on whichever spelling the
+    caller happened to use, and migration 0020 rewrites the ones it can resolve —
+    but a basename it could not expand stays where it is, and a number that has
+    fallen out of the floor is a number this board will hand out twice. So the
+    read side also looks in the bare-basename bucket that the write side can no
+    longer reach.
+
+    **This is deliberately the unsafe-looking direction, because it is the safe
+    one.** ``prisonblues/quarterback`` and ``someone-else/quarterback`` both read
+    the legacy ``quarterback:`` rows, so one repo's history could raise the
+    other's floor — and that costs a skipped number, while the alternative costs
+    a rename across eight files. Nothing new is ever written there, so the bucket
+    only shrinks.
+
+    ``startswith`` is not used: it compiles to ``LIKE 'prefix%'`` and does NOT
+    escape ``_`` or ``%``, both of which are LIKE wildcards and both of which
+    occur in real repo names. ``acme/my_repo`` matched ``acme/myXrepo`` (v2.33's
+    F19) — so one repo's allocation floor could be raised by another's, and
+    `/releases` could list a neighbour's numbers as its own.
     """
-    escaped = repo.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-    return ResourceLease.key.like(f"{escaped}:%", escape="\\")
+    clauses = [ResourceLease.key.like(like_prefix(repo), escape="\\")]
+    legacy = name_half(repo)
+    if legacy != repo:
+        clauses.append(ResourceLease.key.like(like_prefix(legacy), escape="\\"))
+    return or_(*clauses)
+
+
+async def _repos_named(session: AsyncSession, base: str) -> list[str]:
+    """Every canonical repo this board has seen whose name half is ``base``.
+
+    The expansion table for ``qb-hook``'s spelling, drawn from what the board
+    already holds rather than from a list somebody has to maintain: review runs
+    record ``nameWithOwner`` by documented contract, and any claim taken under a
+    full spelling names one too. Case-insensitive on the way in, because the
+    stored form is GitHub's and the lookup key is already folded.
+    """
+    esc = like_escape(base)
+    runs = await session.scalars(
+        select(ReviewRun.repo).where(ReviewRun.repo.ilike(f"%/{esc}", escape="\\")).distinct()
+    )
+    keys = await session.scalars(
+        select(ResourceLease.key)
+        .where(or_(ResourceLease.key.ilike(f"%/{esc}:%", escape="\\"),
+                   ResourceLease.key.ilike(f"%/{esc}#%", escape="\\")))
+        .distinct()
+    )
+    found = {canonical_repo(r) for r in runs}
+    found |= {canonical_repo(split_repo_head(k)[0]) for k in keys}
+    return sorted(r for r in found if r is not None and name_half(r) == base)
+
+
+async def _resolve_repo(session: AsyncSession, given: str) -> tuple[str | None, list[str]]:
+    """``(canonical repo, candidates)``, expanding a bare basename if it is unambiguous."""
+    if canonical_repo(given) is None and (base := repo_basename(given)) is not None:
+        return resolve_against(given, set(await _repos_named(session, base)))
+    return resolve_against(given, set())
+
+
+def _unknown_repo(given: str, candidates: list[str]) -> HTTPException:
+    """400 naming the form that works, and the choices when there were several.
+
+    A refusal rather than a guess, because coining a namespace is the failure
+    being fixed and it fails silently — with ``claimed: true`` on it. The
+    candidates are listed when there are any: an ambiguous basename is a question
+    only the caller can answer, and answering it for them would pick an owner.
+    """
+    return HTTPException(400, detail={
+        "error": f"cannot tell which repo {given!r} means",
+        "repo": given,
+        "expected": "owner/name (GitHub's nameWithOwner), a full remote URL, or a "
+                    "basename this board has already seen under exactly one owner",
+        "candidates": candidates,
+        "hint": ("several owners answer to that name — say which"
+                 if candidates else
+                 "this board has no repo by that name; send owner/name"),
+    })
+
+
+async def _require_repo(session: AsyncSession, given: str) -> str:
+    repo, candidates = await _resolve_repo(session, given)
+    if repo is None:
+        raise _unknown_repo(given, candidates)
+    return repo
+
+
+async def _canonical_key(session: AsyncSession, key: str) -> str:
+    """A generic claim key with its repo head canonicalised, or unchanged.
+
+    **Never refuses, unlike the release path, and the asymmetry is deliberate.**
+    ``ReleaseClaimIn.repo`` is a typed field documented as a repo, so a string
+    that is not one is a caller error worth reporting. A generic ``key`` is the
+    caller's own vocabulary by design — ``kind='deploy', key='portainer-stack-189'``
+    is a perfectly good claim with no repo in it — so a head that does not resolve
+    is left exactly as sent, and only a head this board can positively identify as
+    a repo is rewritten.
+    """
+    head, rest = split_repo_head(key)
+    repo, _ = await _resolve_repo(session, head)
+    return f"{repo}{rest}" if repo is not None else key
 
 
 #: Postgres' unique-violation SQLSTATE. `_take` must distinguish "somebody else
@@ -363,6 +505,11 @@ async def take_claim(
     conflict — the same rule ``POST /lease`` applies, and for the same reason: a
     claim belongs to the box, and an agent that restarts mid-land must be able to
     pick its own claim back up rather than be locked out by its former self.
+
+    **The key's repo head is canonicalised first**, so ``quarterback#142`` and
+    ``prisonblues/quarterback#142`` are one claim rather than two agents each
+    holding "the same" issue (#148). A key with no repo in it is untouched — see
+    :func:`_canonical_key`.
     """
     if body.kind in RESERVED_KINDS:
         raise HTTPException(409, detail={
@@ -372,28 +519,29 @@ async def take_claim(
 
     now = _utcnow()
     sess = _clean(body.session)
-    await _sweep_lapsed(session, body.kind, body.key, now)
+    key = await _canonical_key(session, body.key)
+    await _sweep_lapsed(session, body.kind, key, now)
     await session.commit()
 
-    held = await _held(session, body.kind, body.key, now)
+    held = await _held(session, body.kind, key, now)
     if held is not None:
         if not _may_mutate(held, holder, sess):
-            raise _conflict(body.kind, body.key, held)
+            raise _conflict(body.kind, key, held)
         _renew_onto(held, holder=holder, ttl=body.ttl, sess=sess,
                     note=body.note, now=now)
         await session.commit()
-        return {**_view(held), "claimed": True, "renewed": True}
+        return _claimed(held, body.key, renewed=True)
 
-    claim = await _take(session, kind=body.kind, key=body.key, holder=holder,
+    claim = await _take(session, kind=body.kind, key=key, holder=holder,
                         ttl=body.ttl, sess=sess, note=body.note, now=now)
     if claim is None:
         # Lost the insert race. Re-read rather than reporting a generic failure:
         # the loser of a race is exactly the caller who most needs to know who won.
-        winner = await _held(session, body.kind, body.key, now)
+        winner = await _held(session, body.kind, key, now)
         if winner is None:
             raise HTTPException(409, detail={
                 "error": "claim contended; try again",
-                "kind": body.kind, "key": body.key})
+                "kind": body.kind, "key": key})
         if _may_mutate(winner, holder, sess):
             # A real renew, written and committed — not a `renewed: true` over an
             # untouched row. Same request, same reported outcome, same effect,
@@ -401,9 +549,9 @@ async def take_claim(
             _renew_onto(winner, holder=holder, ttl=body.ttl, sess=sess,
                         note=body.note, now=now)
             await session.commit()
-            return {**_view(winner), "claimed": True, "renewed": True}
-        raise _conflict(body.kind, body.key, winner)
-    return {**_view(claim), "claimed": True, "renewed": False}
+            return _claimed(winner, body.key, renewed=True)
+        raise _conflict(body.kind, key, winner)
+    return _claimed(claim, body.key, renewed=False)
 
 
 @router.post("/claim/renew")
@@ -493,7 +641,9 @@ async def list_claims(
     if kind:
         stmt = stmt.where(ResourceLease.kind == kind)
     if key:
-        stmt = stmt.where(ResourceLease.key == key)
+        # Through the same canonicaliser the write path uses, or a lookup by the
+        # spelling you claimed with would miss the row you just took.
+        stmt = stmt.where(ResourceLease.key == await _canonical_key(session, key))
     if holder_q:
         stmt = stmt.where(ResourceLease.holder == holder_q)
     if not include_released:
@@ -522,13 +672,18 @@ async def _highest_known(session: AsyncSession, repo: str) -> tuple[int, int] | 
     number whose claim lapsed is not free: the branch holding it may well have
     shipped, and re-issuing it would manufacture the exact collision this table
     exists to prevent. History is why released rows are kept rather than deleted.
+
+    ``repo`` must already be canonical — see :func:`_repo_prefix`, which also
+    explains why this scan reaches into the pre-v2.38 bare-basename bucket. The
+    version is read off the END of the key rather than by removing a ``repo:``
+    prefix, because a legacy row is not keyed on the spelling this call was made
+    with, and a mis-sliced key parses as nothing and vanishes from the floor.
     """
-    prefix = f"{repo}:"
     rows = await session.scalars(
         select(ResourceLease.key)
         .where(ResourceLease.kind == "release", _repo_prefix(repo))
     )
-    seen = [v for v in (parse_version(k[len(prefix):]) for k in rows) if v]
+    seen = [v for v in (parse_version(version_tail(k)) for k in rows) if v]
     return max(seen) if seen else None
 
 
@@ -579,8 +734,15 @@ async def allocate_release(
     the number this caller was about to, so the correct answer is the next one,
     not an error. Bounded, because an unbounded retry against a genuinely
     contended key is a spin.
+
+    **``repo`` is canonicalised before anything is read or written** (#148/#150).
+    It used to be the string the caller sent, and this fleet sends two of them
+    for one repo, so the board kept two floors and issued 2.36 twice with
+    ``claimed: true`` on both. An allocator with two namespaces is not an
+    allocator; it is an announcement that sounds authoritative.
     """
     now = _utcnow()
+    repo = await _require_repo(session, body.repo)
     told = parse_version(body.after)
     unreadable = body.after is not None and told is None
 
@@ -594,9 +756,9 @@ async def allocate_release(
     # Scoped to the session AND the machine — see `_my_live_release` for why the
     # session alone was a hole rather than a shortcut.
     sess = _clean(body.session)
-    mine = await _my_live_release(session, body.repo, holder, sess, now)
+    mine = await _my_live_release(session, repo, holder, sess, now)
     if mine is not None:
-        got = parse_version(mine.key[len(body.repo) + 1:])
+        got = parse_version(version_tail(mine.key))
         # ...but only while it still satisfies what the caller asked for. A
         # caller renumbering off a collision re-runs this with a HIGHER `after`,
         # and handing back the very number it is trying to escape reports success
@@ -606,9 +768,8 @@ async def allocate_release(
             _renew_onto(mine, holder=holder, ttl=body.ttl, sess=sess,
                         note=body.note, now=now)
             await session.commit()
-            return {**_view(mine), "version": fmt_version(got),
-                    "claimed": True, "renewed": True,
-                    "after_unreadable": unreadable}
+            return _allocated(mine, got, repo, body.repo,
+                              renewed=True, unreadable=unreadable)
 
     for _attempt in range(8):
         # Re-checked every pass, not once before the loop. Two concurrent
@@ -617,21 +778,20 @@ async def allocate_release(
         # instead of finding its twin — one session holding two numbers, which is
         # exactly what the idempotency was built to prevent (round 1's F06).
         if _attempt:
-            mine = await _my_live_release(session, body.repo, holder, sess, now)
+            mine = await _my_live_release(session, repo, holder, sess, now)
             if mine is not None:
-                got = parse_version(mine.key[len(body.repo) + 1:])
+                got = parse_version(version_tail(mine.key))
                 if got is not None and (told is None or got > told):
-                    return {**_view(mine), "version": fmt_version(got),
-                            "claimed": True, "renewed": True,
-                            "after_unreadable": unreadable}
-        known = await _highest_known(session, body.repo)
+                    return _allocated(mine, got, repo, body.repo,
+                                      renewed=True, unreadable=unreadable)
+        known = await _highest_known(session, repo)
         floor = max([v for v in (told, known) if v is not None], default=(0, 0))
         candidate = _next_version(floor)
         if candidate is None:
             raise HTTPException(409, detail={
-                "error": "release namespace exhausted", "repo": body.repo,
+                "error": "release namespace exhausted", "repo": repo,
                 "floor": fmt_version(floor)})
-        key = release_key(body.repo, candidate)
+        key = release_key(repo, candidate)
 
         await _sweep_lapsed(session, "release", key, now)
         await session.commit()
@@ -662,9 +822,8 @@ async def allocate_release(
                 _renew_onto(held, holder=holder, ttl=body.ttl, sess=sess,
                             note=body.note, now=now)
                 await session.commit()
-                return {**_view(held), "version": fmt_version(candidate),
-                        "claimed": True, "renewed": True,
-                        "after_unreadable": unreadable}
+                return _allocated(held, candidate, repo, body.repo,
+                                  renewed=True, unreadable=unreadable)
             # Held, so it is not free however the arithmetic came out.
             # `_highest_known` will now see it and the next pass moves on.
             continue
@@ -674,17 +833,16 @@ async def allocate_release(
                             ttl=body.ttl, sess=sess, note=note, now=now)
         if claim is None:
             continue
-        return {**_view(claim), "version": fmt_version(candidate),
-                "claimed": True, "renewed": False,
-                # Said rather than swallowed: an `after` this board could not
-                # parse means the allocation rested on board history alone, and a
-                # caller that mistyped its own version wants to know that before
-                # it writes the number into eight files.
-                "after_unreadable": unreadable}
+        # `after_unreadable` is said rather than swallowed: an `after` this
+        # board could not parse means the allocation rested on board history
+        # alone, and a caller that mistyped its own version wants to know that
+        # before it writes the number into eight files.
+        return _allocated(claim, candidate, repo, body.repo,
+                          renewed=False, unreadable=unreadable)
 
     raise HTTPException(409, detail={
         "error": "could not allocate a release number: the namespace is contended",
-        "repo": body.repo,
+        "repo": repo,
         "advice": "retry; several agents are allocating for this repo right now"})
 
 
@@ -732,6 +890,7 @@ async def reclaim_release(
     replace it with. That asymmetry is the whole reason this is not two calls.
     """
     now = now_pre = _utcnow()
+    repo = await _require_repo(session, body.repo)
     old = await session.get(ResourceLease, body.claim_id)
     if old is None:
         raise HTTPException(404, "claim not found")
@@ -754,11 +913,16 @@ async def reclaim_release(
         raise HTTPException(409, detail={
             "error": "not a release claim", "kind": old.kind, "key": old.key})
 
-    prefix = f"{body.repo}:"
-    if not old.key.startswith(prefix):
+    # Compared through the canonicaliser rather than by prefix, because the claim
+    # being given up may predate v2.38 and be keyed on the other spelling of this
+    # very repo — and a renumber refused as "another repo's claim" would strand
+    # exactly the rows #148 is about, at exactly the moment their holder is trying
+    # to get off a collision.
+    old_repo, _ = await _resolve_repo(session, split_repo_head(old.key)[0])
+    if old_repo != repo:
         raise HTTPException(409, detail={
             "error": "that claim belongs to another repo",
-            "key": old.key, "repo": body.repo})
+            "key": old.key, "repo": repo})
 
     told = parse_version(body.after)
     unreadable = body.after is not None and told is None
@@ -770,17 +934,17 @@ async def reclaim_release(
     # Found by the concurrent test below and by nothing else.
     old_id, old_key = old.id, old.key
     old_session, old_note = old.session, old.note
-    gave_up = parse_version(old_key[len(prefix):])
+    gave_up = parse_version(version_tail(old_key))
 
     for _attempt in range(8):
-        known = await _highest_known(session, body.repo)
+        known = await _highest_known(session, repo)
         floor = max([v for v in (told, known) if v is not None], default=(0, 0))
         candidate = _next_version(floor)
         if candidate is None:
             raise HTTPException(409, detail={
-                "error": "release namespace exhausted", "repo": body.repo,
+                "error": "release namespace exhausted", "repo": repo,
                 "still_holding": fmt_version(gave_up) if gave_up else None})
-        key = release_key(body.repo, candidate)
+        key = release_key(repo, candidate)
 
         await _sweep_lapsed(session, "release", key, now)
         await session.commit()
@@ -820,16 +984,15 @@ async def reclaim_release(
                 raise
             continue
         await session.refresh(fresh)
-        return {**_view(fresh), "version": fmt_version(candidate),
-                "claimed": True, "renewed": False,
+        return {**_allocated(fresh, candidate, repo, body.repo,
+                             renewed=False, unreadable=unreadable),
                 # Named back so the caller can check the swap it just made
                 # against the number it has already written into eight files.
-                "gave_up": fmt_version(gave_up) if gave_up else None,
-                "after_unreadable": unreadable}
+                "gave_up": fmt_version(gave_up) if gave_up else None}
 
     raise HTTPException(409, detail={
         "error": "could not reclaim: the namespace is contended",
-        "repo": body.repo,
+        "repo": repo,
         "still_holding": fmt_version(gave_up) if gave_up else None,
         "advice": "you still hold your original number; retry"})
 
@@ -846,9 +1009,14 @@ async def list_releases(
     Also the answer to a question the board could not previously answer at all —
     "what is landing soon" — which #46 names as a side benefit and is arguably
     the more useful half day to day.
+
+    **Through the same canonicaliser the allocator uses** (#148). This is how the
+    bug was found — a caller read the numbers back under one spelling and did not
+    see one it knew was held — so a read that could still disagree with the write
+    would leave the detection half as broken as the allocation half was.
     """
     now = _utcnow()
-    prefix = f"{repo}:"
+    given, repo = repo, await _require_repo(session, repo)
     rows = list(await session.scalars(
         select(ResourceLease)
         .where(ResourceLease.kind == "release", _repo_prefix(repo))
@@ -857,7 +1025,7 @@ async def list_releases(
     ))
     out = []
     for c in rows:
-        v = parse_version(c.key[len(prefix):])
+        v = parse_version(version_tail(c.key))
         out.append({
             # The id every mutating endpoint requires. Without it a client that
             # discovered its claim here had to go to `GET /claims` to act on it
@@ -872,10 +1040,18 @@ async def list_releases(
             "held": c.released_at is None and c.expires_at > now,
             "released": c.released_at.isoformat() if c.released_at else None,
             "lapsed": c.lapsed,
+            # The stored key, spelling included. A row rewritten by 0020 or left
+            # under a basename it could not expand is visible here rather than
+            # inferred from the repo above, which is the only way a reader can
+            # tell a legacy row from a current one.
+            "key": c.key,
         })
     highest = await _highest_known(session, repo)
-    return {"repo": repo, "releases": out,
+    body = {"repo": repo, "releases": out,
             # What the NEXT call would allocate, absent a higher `after` from the
             # caller. Advisory and racy by nature — reading it is not claiming it,
             # which is the distinction this whole module is about.
             "highest_known": fmt_version(highest) if highest else None}
+    if given != repo:
+        body["repo_as_given"] = given
+    return body
