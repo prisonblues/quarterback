@@ -29,14 +29,17 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from harness_rules import (RepoNotFound, cli_failure_gist, describe,  # noqa: E402
-                           resolve_repo)
+from harness_rules import (  # noqa: E402
+    RepoNotFound, agent_failure, agent_gist, cli_failure_gist, describe,
+    resolve_repo, run_agent, tail_gist,
+)
 
 PANEL = Path(__file__).with_name("panel.py")
 # State must live OUTSIDE the script dir for the same reason (the store is read-only).
@@ -413,8 +416,19 @@ def triage(w: IssueWork, model: str) -> tuple[bool | None, str, str]:
         return None, f"untriaged (judge failed: {cli_failure_gist(proc)})", ""
     m = re.search(r"\{.*\}", proc.stdout or "", re.S)
     if not m:
-        return None, ("untriaged (no verdict: "
-                      f"{cli_failure_gist(proc, 'no JSON in reply')})"), ""
+        # Exit 0 with no JSON means the judge ANSWERED and simply did not rule.
+        # Two things have to be true of that line at once, and each was a
+        # separate bug: it must NOT blame stderr (warm-up chatter is the normal
+        # state of these CLIs, and "loaded 3 plugins" is a fabricated cause for a
+        # reply that merely was not JSON), and it must not throw away what the
+        # judge actually said — "I cannot assess this issue: its body is empty"
+        # is the operator's entire account of a sub-issue that --execute then
+        # SKIPS. So: name the shape, and quote the reply from STDOUT only.
+        # Where the run genuinely failed, cli_failure_gist ignores all of this
+        # and reports the failure instead. (#31)
+        said = tail_gist(proc.stdout or "")
+        about = "no JSON in reply" + (f" — said: {said}" if said else "")
+        return None, f"untriaged (no verdict: {cli_failure_gist(proc, about)})", ""
     try:
         v = json.loads(m.group(0))
     except json.JSONDecodeError:
@@ -426,22 +440,94 @@ def triage(w: IssueWork, model: str) -> tuple[bool | None, str, str]:
 
 # --------------------------------------------------------------- per-issue pipeline
 
-def claude(skill_cmd: str, cwd: str, perm_mode: str, model: str = "") -> None:
+def claude(skill_cmd: str, cwd: str, perm_mode: str,
+           model: str = "") -> subprocess.CompletedProcess:
+    """Run a skill headless and hand the caller the whole run to judge.
+
+    Returns rather than raising, and captures rather than streaming into the void:
+    the run is unattended, so an agent that was denied a tool and stopped exits 0
+    with its explanation on stdout and nobody reading it (#31). The caller pairs
+    this with agent_failure() and says what happened on the line it was going to
+    print anyway.
+    """
     # model = the tier the judge routed this sub-issue to; empty pins nothing
     # (the CLI's saved default applies, the pre-routing behaviour).
-    subprocess.run(["claude", "-p", skill_cmd, "--permission-mode", perm_mode]
-                   + (["--model", model] if model else []),
-                   cwd=cwd, stdin=subprocess.DEVNULL, check=True)
+    return run_agent(["claude", "-p", skill_cmd, "--permission-mode", perm_mode]
+                     + (["--model", model] if model else []), cwd=cwd)
 
 
-def run_panel(repo_path: str, pr: int) -> None:
-    # Pass the PATH, not the name: the resolver would otherwise look a bare name
-    # up under ~/source, which silently picks the wrong repo when the directory
-    # name and the GitHub name differ.
-    # sys.executable, not `uv run`: there is no project to resolve from once this
-    # ships to ~/.claude/loops, and panel.py is stdlib-only anyway.
-    subprocess.run([sys.executable, str(PANEL), "--repo", repo_path,
-                    "--pr", str(pr)], check=False)
+def run_panel(repo_path: str, pr: int) -> tuple[bool, int | None]:
+    """Run the panel. Returns (produced_a_report, findings_it_confirmed).
+
+    Pass the PATH, not the name: the resolver would otherwise look a bare name
+    up under ~/source, which silently picks the wrong repo when the directory
+    name and the GitHub name differ. sys.executable, not `uv run`: there is no
+    project to resolve from once this ships to ~/.claude/loops, and panel.py is
+    stdlib-only anyway. The report stays UNCAPTURED — it IS the output and it
+    belongs in the log as it is written.
+
+    **The answer is the panel's own statement that it reviewed, and nothing else.**
+    Three rounds of review on this file each replaced one proxy for "a review
+    happened" with another, and each was defeated the same way:
+
+      r1  panel.py exited 0                 -> it exits 0 on a title-pattern skip
+      r2  the reviewer pushed a commit      -> a run that fixes 1 of 5 findings
+                                               and then crashes also pushes
+      r3  a --json-file payload exists      -> EVERY exit-0 path writes one,
+                                               skip included (panel.py:3561,
+                                               `write_payload` then `finish`)
+
+    They are the same error three times: an observable side effect standing in
+    for the thing itself. So this reads the payload's own account of the run
+    rather than any consequence of it. `reviewed` is False on every path that did
+    not review, `skip_reason` is non-null only on a skip, `reviewers_ran` is empty
+    when nobody ran, and `judged` is False when nothing adjudicated — all four are
+    `_payload_defaults()` keys, present on every payload panel.py emits, so
+    reading them needs no version check and cannot KeyError.
+
+    There is no fourth proxy to get wrong here, which is the point of doing it
+    this way rather than more carefully: a claim can be false, but it is at least
+    a claim ABOUT the review, made by the only component that knows. Same shape as
+    #43's fix — an answer that has to identify itself rather than be inferred from
+    a score.
+
+    The findings COUNT matters just as much, because "the reviewer pushed
+    nothing" means opposite things either side of it. Zero findings and nothing
+    pushed is the panel working: there was nothing to fix, which by the last
+    round is the point. Findings and nothing pushed is the ambiguous case worth
+    withholding a merge for. Without the count the caller cannot tell them apart,
+    and treating both as suspect halts an integration epic on its first clean
+    sub-PR.
+    """
+    with tempfile.TemporaryDirectory(prefix="epic-panel-") as tmp:
+        payload = Path(tmp) / "panel.json"
+        rc = subprocess.run([sys.executable, str(PANEL), "--repo", repo_path,
+                             "--pr", str(pr), "--json-file", str(payload)],
+                            check=False).returncode
+        try:
+            report = json.loads(payload.read_text())
+        except (OSError, json.JSONDecodeError):
+            report = None
+    if report is None:
+        print(f"    (panel exited {rc} and wrote no report — the review that "
+              f"follows has nothing to act on)")
+        return False, None
+    # The payload exists; now ask it whether it is a review. A skipped or no-op
+    # run writes one of these too, and used to clear the gate on the strength of
+    # having written it.
+    if not report.get("reviewed") or report.get("skip_reason"):
+        why = report.get("skip_reason") or "the run reported reviewed=false"
+        print(f"    (panel wrote a report but did NOT review this PR: {why})")
+        return False, None
+    if not (report.get("reviewers_ran") or []):
+        print("    (panel reviewed but no reviewer filed — nothing read this diff)")
+        return False, None
+    found = len(report.get("to_fix") or [])
+    if rc != 0:
+        # A report AND a bad exit: the run got far enough to rule on findings and
+        # then tripped. The findings are real, so they are not thrown away.
+        print(f"    (panel exited {rc} but wrote a report with {found} finding(s))")
+    return True, found
 
 
 def pr_green(gh_repo: str, pr: int) -> tuple[bool, str]:
@@ -470,6 +556,19 @@ def pr_green(gh_repo: str, pr: int) -> tuple[bool, str]:
     if "pending" in buckets:
         return False, "pending"
     return True, "green"
+
+
+def pr_head_sha(gh_repo: str, pr: int) -> str:
+    """Tip of the PR's head branch — the before/after that says whether a review
+    actually changed anything.
+
+    "" means "could not tell", never "nothing changed": a lookup that failed must
+    not be reported as a review that did nothing."""
+    try:
+        out = gh_json(["pr", "view", str(pr), "--json", "headRefOid"], gh_repo)
+    except (subprocess.CalledProcessError, OSError, json.JSONDecodeError):
+        return ""
+    return str(out.get("headRefOid", "")) if isinstance(out, dict) else ""
 
 
 def worktree_has_new_commit(wt: str, base: str) -> bool:
@@ -624,6 +723,15 @@ class WorkResult:
     outcome: str            # done | reviewed | failed | blocked
     pr: int | None = None
     detail: str = ""
+    #: Is this review known to have HAPPENED? `reviewed` is the outcome that lets
+    #: the driver stack a sub-PR into the epic branch, and several routes reach it
+    #: without evidence that anything was reviewed: a panel that died leaves
+    #: `/review-pr` nothing to act on, an agent that was denied its tools exits 0
+    #: saying so, and an unreadable head SHA cannot tell a push from a no-op.
+    #: None of those is a failure — the PR is real and a re-run picks it up — but
+    #: none of them may be auto-merged either, so the gate needs to tell them from
+    #: a review that demonstrably ran.
+    verified: bool = True
 
 
 # ----------------------------------------------------------------- preflight
@@ -770,7 +878,12 @@ def work_issue(cfg: dict, w: IssueWork, execute: bool, base: str | None = None,
                 return WorkResult(w.num, "failed", detail=detail)
             # /fix-issue plans, implements, tests, pushes, opens a PR targeting --base
             # (the epic branch in integration mode). Needs git/gh → bypassPermissions.
-            claude(f"/fix-issue {w.num} --base {base}", wt, perm, w.model)
+            agent = claude(f"/fix-issue {w.num} --base {base}", wt, perm, w.model)
+            if failure := agent_failure(agent):
+                # Not fatal on its own — a run can open its PR and then trip on the
+                # way out — but it is never noise, and if no PR appears this is the
+                # sentence that says why.
+                print(f"  #{w.num}: /fix-issue {failure}")
 
             # P2 — fail loud: /fix-issue must leave a PR to review and stack. If it
             # didn't, this issue FAILS (we never pretend it reached the merge gate) —
@@ -786,6 +899,12 @@ def work_issue(cfg: dict, w: IssueWork, execute: bool, base: str | None = None,
                 detail = (f"committed but /fix-issue opened no PR (pushed {branch}) — "
                           f"open its PR and re-run" if salvaged
                           else "/fix-issue produced no commit and no PR")
+                # The agent's own account of the run, recorded with the failure:
+                # "produced no commit and no PR" says what we observed, never why,
+                # and by the time anyone reads the state file the worktree it
+                # happened in has been torn down.
+                account = failure or f"said: {agent_gist(agent)}"
+                detail += f" — agent {account}"
                 print(f"  #{w.num}: FAILED — {detail}")
                 if state is not None:
                     record(state, w.num, stage="failed", branch=branch,
@@ -804,12 +923,78 @@ def work_issue(cfg: dict, w: IssueWork, execute: bool, base: str | None = None,
                 return WorkResult(w.num, "failed", detail=detail)
 
         print(f"  #{w.num}: reviewing PR #{pr}")
-        run_panel(cfg["path"], pr)
+        panelled, found = run_panel(cfg["path"], pr)
         # /review-pr addresses findings + pushes; merge withheld (human/epic gate).
-        claude(f"/review-pr {pr}", cfg["path"], perm, w.model)
+        before = pr_head_sha(gh_repo, pr)
+        reviewer = claude(f"/review-pr {pr}", cfg["path"], perm, w.model)
+        # The head is read BEFORE the exit code is judged, because a push is the
+        # stronger evidence and the implement stage two blocks up already says so
+        # about the PR it opens: "a run can open its PR and then trip on the way
+        # out. The exit is worth a line; it is not worth discarding the artifact."
+        # A `/review-pr` that read the report, pushed three fix commits and then
+        # died on teardown or an MCP disconnect was being recorded `failed`, which
+        # aborts the whole epic without --keep-going.
+        after = pr_head_sha(gh_repo, pr)
+        # Three-valued, not two. `""` from either lookup means "could not tell",
+        # which pr_head_sha's own docstring insists is never "nothing changed" —
+        # and collapsing it into `pushed` fed the confident branch straight to
+        # auto-merge on the strength of a failed `gh` call.
+        known = bool(before and after)
+        pushed = known and before != after
+        # A crash AFTER pushing keeps the work but does not clear the gate.
+        # Keeping the artifact and calling the review verified are two different
+        # decisions, and this branch used to make both by making neither: it
+        # printed a line and fell through, `why` never got set, and a reviewer
+        # that fixed the first of five findings and then died on teardown
+        # auto-merged with four unaddressed. That is exactly the case the
+        # unverified flag exists for.
+        crashed = ""
+        if failure := agent_failure(reviewer):
+            if pushed:
+                crashed = (f"the reviewer {failure} after pushing — the review "
+                           f"may have stopped partway")
+                print(f"  #{w.num}: /review-pr {failure}, but pushed to PR #{pr} "
+                      f"first — keeping the work; the exit is worth a line, not "
+                      f"the artifact.")
+            else:
+                # A reviewer that never ran must not report as "reviewed": that
+                # outcome is what lets the driver stack the sub-PR into the epic
+                # branch, so calling it reviewed would merge a PR whose findings
+                # nobody addressed. The PR itself survives, and a re-run
+                # classifies the issue back into the review stage.
+                detail = f"/review-pr {failure} — findings unaddressed"
+                print(f"  #{w.num}: FAILED — {detail}")
+                if state is not None:
+                    record(state, w.num, stage="failed", branch=branch, pr=pr,
+                           lastAction=detail)
+                return WorkResult(w.num, "failed", pr=pr, detail=detail)
+        # A review that pushed nothing is the remaining ambiguous case, and it is
+        # NOT treated as a failure: finding nothing to fix is a legitimate — and by
+        # the last round, expected — outcome. But it is the same shape as a review
+        # that was stopped from fixing anything, so it is reported with the agent's
+        # own account rather than passing as an ordinary review — and it is not
+        # auto-merged on that ambiguity. Same for a review with no panel report to
+        # work from, and for a head SHA nobody could read.
+        # "Pushed nothing" is only ambiguous when there was something to push.
+        # With a report saying zero findings, a reviewer that changed nothing did
+        # exactly the right thing — that is the panel working, and by the last
+        # round it is the expected outcome. Reading it as unverified halted an
+        # integration epic on its first CLEAN sub-PR and demanded a human for the
+        # happy path.
+        why = (crashed if crashed else
+               "the panel produced no report" if not panelled else
+               "the head SHA could not be read" if not known else
+               "it pushed nothing against %d finding(s) — nothing it could fix, "
+               "or nothing it would" % found if not pushed and found
+               else "")
+        if why:
+            print(f"  #{w.num}: /review-pr on PR #{pr} is unverified: {why}. "
+                  f"It said: {agent_gist(reviewer)}")
+        action = "reviewed" if not why else f"reviewed (unverified: {why})"
         if state is not None:
-            record(state, w.num, stage="reviewed", branch=branch, pr=pr, lastAction="reviewed")
-        return WorkResult(w.num, "reviewed", pr=pr)
+            record(state, w.num, stage="reviewed", branch=branch, pr=pr,
+                   lastAction=action)
+        return WorkResult(w.num, "reviewed", pr=pr, verified=not why)
     finally:
         # P4 — tear down the worktree AND its containers / isolated DB, not just the dir.
         teardown_worktree(cfg, branch, wt)
@@ -1089,6 +1274,22 @@ def run(repo_name: str, epic: int, execute: bool, max_issues: int | None,
             return 1
         # res.outcome == "reviewed": it has a PR. In integration/auto, merge it into
         # the epic branch when CI is green so the next issue stacks on top.
+        if auto_merge_subs and res.pr and not res.verified:
+            # `reviewed` without evidence that a review happened. Not a failure —
+            # the PR is real and a re-run picks the issue back up in the review
+            # stage — but stacking it into the epic branch would merge a PR whose
+            # findings may never have been generated, let alone addressed. That is
+            # the one thing the auto-merge path must not do on an assumption.
+            print(f"  #{w.num}: PR #{res.pr} reviewed but UNVERIFIED "
+                  f"({res.detail or 'see above'}) — NOT merging into "
+                  f"'{land['epic_branch']}'; left for a human. Stacking may stall.")
+            record(state, w.num, stage="reviewed-unverified", pr=res.pr,
+                   lastAction="not merged: review unverified")
+            if not keep_going:
+                print(f"\n✗ STOP: #{w.num}'s review could not be verified — re-run "
+                      f"it, or merge by hand once you have checked it.")
+                return 1
+            continue
         if auto_merge_subs and res.pr:
             green, status = pr_green(cfg["github"], res.pr)
             if not green:

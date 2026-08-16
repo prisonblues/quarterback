@@ -36,6 +36,16 @@ these to the sub-agent.
 
 ## 2. Launch the fixer sub-agent
 
+Stamp the stage so the statusline says what this session is doing:
+```bash
+qb-stage R1
+```
+One agent here both reviews and fixes, so unlike `/panel-review-pr` there is no
+separate `R1F` to stamp — the honest answer for the whole run is `R1`. Splitting
+it would mean guessing when the sub-agent stopped reading and started writing,
+and a bar that says `R1F` while a reviewer is still reading is worse than one
+that says less. `/drop-worktree` clears it.
+
 Launch **one** `general-purpose` sub-agent (Agent tool). Its brief is the
 complete boil-the-ocean discipline below. It runs autonomously to completion —
 find, fix, verify, amend, push — and returns a summary. Do not babysit it; do

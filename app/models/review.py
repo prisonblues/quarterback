@@ -56,7 +56,75 @@ class ReviewRun(Base):
     pr: Mapped[int] = mapped_column(Integer, nullable=False)
     pr_title: Mapped[str | None] = mapped_column(Text)
     base_branch: Mapped[str | None] = mapped_column(Text)
+    #: The COMMIT this round reviewed (v2.26). Nothing else on a run identifies
+    #: one — ``base_branch`` holds a branch *name*, which moves — so without this
+    #: a round can never be replayed against the repo after the fact, and the fix
+    #: range between two rounds cannot be computed at all. #98 wants the base end
+    #: of that same range; #80 wants this column to reason about what a merge
+    #: actually moved. NULL for every run recorded before the board stored it.
+    head_sha: Mapped[str | None] = mapped_column(Text)
+    #: Paths NO reviewer that ran read in full — the round's own coverage hole,
+    #: banked for the NEXT round's ``missed-unread`` bucket. A file only lands
+    #: here if every seat was truncated out of it: one seat that read it means the
+    #: ROUND saw it.
+    #:
+    #: NULL = the panel did not say (every pre-v2.26 run); [] = it said, and
+    #: nothing was cut. The same distinction ``could_not_assess`` and ``stop_veto``
+    #: are built on, and for the same reason — collapsing them reads a round
+    #: nobody measured as a round that read everything.
+    #:
+    #: JSONB rather than a child table like :class:`ReviewRunFile`: that table
+    #: exists to carry per-path churn and answer a by-path collision query, and
+    #: this list has neither. It is read whole, per run, by whatever computes the
+    #: next round's provenance.
+    #:
+    #: **Deferred**, and that is load-bearing rather than tidy. The list views
+    #: publish only a count, and the first cut of that computed it in Python as
+    #: ``len(r.unread_files)`` — which meant Postgres still shipped every path of
+    #: every row to the app and only the JSON serialisation was saved. The read
+    #: path's stated defence did not hold on the read path it was written for. The
+    #: count is now ``jsonb_array_length`` in the query and this column is not
+    #: fetched at all unless somebody asks for the paths.
+    #:
+    #: Consequence for callers: async SQLAlchemy cannot lazy-load, so reading
+    #: ``run.unread_files`` off a run this session did not undefer raises
+    #: ``MissingGreenlet`` rather than quietly issuing a second query.
+    #: ``GET /review/{id}`` asks with ``undefer()``; nothing else should need to.
+    unread_files: Mapped[list[Any] | None] = mapped_column(JSONB, deferred=True)
+    #: The panel's own tally of :data:`app.api.reviews.PROVENANCE` buckets over
+    #: the findings the cycle still has to clear, verbatim (v2.26).
+    #:
+    #: **Stored, not derived from** :attr:`ReviewFinding.provenance`. The panel
+    #: counts over ``outstanding``; the finding rows also include the dismissed
+    #: ones, so a derivation would quietly disagree with the round's own statement
+    #: about itself. And ``{}`` — "the question does not arise", a round 1 or a
+    #: run outside any cycle — is a fact no count over findings can express; it is
+    #: not the same as all-zero, which says attribution ran and found nothing.
+    #: NULL is the third state: nobody said.
+    provenance_counts: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     changed_lines: Mapped[int | None] = mapped_column(Integer)
+    #: GitHub's own count of the PR's changed files (v2.23), stored beside the
+    #: rows in :class:`ReviewRunFile` rather than derived from them. When the two
+    #: disagree the stored list is partial — GitHub caps a PR's file list at
+    #: 3,000 — and a collision query over it under-reports. NULL for every run
+    #: recorded before the panel sent it, which is NOT the same as zero files.
+    changed_files_total: Mapped[int | None] = mapped_column(Integer)
+    #: The PR's state as of THIS panel — `OPEN` / `MERGED` / `CLOSED`, verbatim
+    #: from `gh pr view --json state`. Recorded because the board otherwise holds
+    #: no PR state at all, and a collision query without it reports every PR
+    #: panelled in the window as a live rival, merged ones included: on a repo
+    #: landing several a week the answer is mostly PRs that no longer exist,
+    #: which is how an advisory endpoint stops being read.
+    #:
+    #: **As of the last panel, never live.** The board is told about panels, not
+    #: about merges, so a PR merged after its final round still reads OPEN here.
+    #: That is the same currency as `changed_files` itself, and why every read
+    #: path hands back the run's `ts` beside it. NULL for every pre-v2.23 run.
+    pr_state: Mapped[str | None] = mapped_column(Text)
+    #: A draft PR is open and not landing yet, which is a different thing to
+    #: collide with. Separate from `pr_state` because GitHub's `state` does not
+    #: encode it — a draft's state is `OPEN`.
+    is_draft: Mapped[bool | None] = mapped_column(Boolean)
     diff_chars: Mapped[int | None] = mapped_column(Integer)
     diff_truncated: Mapped[bool | None] = mapped_column(Boolean)
 
@@ -254,6 +322,41 @@ class ReviewReviewer(Base):
     p3: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     p4: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
 
+    #: #48's axis, at the grain #48 asked for it (v2.26): of the defects THIS
+    #: member found, how many did the previous fix pass introduce and how many had
+    #: been sitting there all along? Those are different competencies and a
+    #: confirmed-finding count cannot see either.
+    #:
+    #: Tallied here at ingest from :attr:`ReviewFinding.provenance`, like every
+    #: sibling counter, so a scorecard cannot contradict the findings it
+    #: summarises — and so the leaderboard is a ``SUM`` rather than a three-table
+    #: join re-deriving per-reviewer attribution on every page load.
+    #:
+    #: **Over CONFIRMED findings only**, the same population as ``p1``..``p4`` and
+    #: ``solo``. A dismissed finding was not a defect, so attributing its cause to
+    #: a fix pass would credit a reviewer for spotting something that was not
+    #: there. This makes them deliberately narrower than the run's own
+    #: :attr:`ReviewRun.provenance_counts`, which the panel computes over
+    #: everything still outstanding.
+    #:
+    #: 0 and "not recorded" are one value here — the price of matching the
+    #: siblings — so ``GET /review/stats`` publishes a ``provenance_runs``
+    #: coverage marker beside the sums, read off the run's ``provenance_counts``.
+    #: Read a bare zero without it and a window of pre-v2.26 runs looks like a
+    #: panel that never caught a regression.
+    prov_introduced: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0")
+    prov_missed: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0")
+    #: The bucket that indicts the HARNESS rather than the panel: the earlier
+    #: round was truncated out of that file, so nobody could have caught it.
+    prov_missed_unread: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0")
+    #: Asked, and unplaceable — an unreadable fix range, a finding with no file.
+    #: A real answer, and NOT the same as the NULL on a finding nobody asked about.
+    prov_unknown: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0")
+
     __table_args__ = (
         UniqueConstraint("run_id", "name", name="uq_review_reviewer_run_name"),
         Index("ix_review_reviewers_name_model", "name", "model"),
@@ -316,6 +419,26 @@ class ReviewFinding(Base):
     #: This observation was not raised by any earlier round of the same PR — the
     #: dry-round counter, per finding. NULL where the panel didn't say.
     new_this_round: Mapped[bool | None] = mapped_column(Boolean)
+    #: Did the previous round's FIX introduce this defect, or did that round MISS
+    #: it (v2.26)? One of :data:`app.api.reviews.PROVENANCE`. The two were one
+    #: number (``new_this_round``) and they want opposite remedies: self-inflicted
+    #: findings say make fix passes smaller, missed ones say the earlier round
+    #: under-read and coverage is worth paying for.
+    #:
+    #: **The field this whole release exists for.** It is per finding, so unlike
+    #: the run-level columns it cannot be reconstructed later from anything else
+    #: the board keeps — every round that ran while it was dropped is gone.
+    #:
+    #: NULL where the question does not arise: outside a cycle, in a round 1, for
+    #: a defect an earlier round already raised, or for any run recorded before
+    #: this column existed. ``"unknown"`` is the opposite state — the question was
+    #: asked and the answer could not be placed — and the two must never collapse.
+    #:
+    #: A SIGNAL, not a verdict. ``introduced`` requires exact membership in the
+    #: fix's added lines, so a defect introduced by a DELETION and an ordinary
+    #: reviewer line-drift both land in ``missed``: read the ``introduced`` count
+    #: as a floor. #41 (review the increment) is what makes it exact.
+    provenance: Mapped[str | None] = mapped_column(Text)
 
     __table_args__ = (
         Index("ix_review_findings_run", "run_id"),
@@ -367,4 +490,56 @@ class ReviewFindingReport(Base):
         UniqueConstraint("finding_id", "reviewer", name="uq_review_report_finding_reviewer"),
         Index("ix_review_finding_reports_finding", "finding_id"),
         Index("ix_review_finding_reports_reviewer", "reviewer"),
+    )
+
+
+class ReviewRunFile(Base):
+    """One path the reviewed PR touched, with that path's share of the churn.
+
+    The board could already say a merge changed 2,032 lines and never which
+    files, so it could not answer the only question integration cost turns on:
+    *which other open PRs does this one disturb?* The paths findings happen to
+    name are a proxy for the diff and not the diff — nine files for a run whose
+    PR touched far more, and only the nine somebody complained about.
+
+    Stored per RUN rather than per PR, like :class:`ReviewFinding`: a PR's file
+    set grows while it is open, and a row that is overwritten cannot say what the
+    round that ran on Tuesday was actually looking at. "The PR's files now" is
+    then the newest run's rows, which is a query.
+
+    It is the PR's file list, not the round's. Under a review-the-increment
+    round the two diverge, and the collision surface is the PR's — narrowing this
+    to the increment would say two PRs no longer collide because one of them
+    stopped re-reading the file it still changes.
+
+    Paths, not hunk ranges: paths answer "will these two collide", ranges answer
+    "and where", and nothing asks the second yet. ``additions``/``deletions`` ride
+    along because the same ``gh pr view`` call already returns them, and they make
+    ``ReviewRun.changed_lines`` attributable to a file instead of a bare total.
+    """
+
+    __tablename__ = "review_run_files"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    run_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("review_runs.id", ondelete="CASCADE"), nullable=False
+    )
+    path: Mapped[str] = mapped_column(Text, nullable=False)
+    additions: Mapped[int | None] = mapped_column(Integer)
+    deletions: Mapped[int | None] = mapped_column(Integer)
+
+    __table_args__ = (
+        # One row per path per run. A payload that repeats a path is a bug in the
+        # sender, and letting it through would double that file's weight in every
+        # collision count built on this table.
+        #
+        # Its underlying B-tree on (run_id, path) also serves every run_id-only
+        # lookup through its leftmost prefix, so there is deliberately NO separate
+        # index on run_id: it would be storage and write cost, on the largest
+        # table this feature creates, for a lookup already covered.
+        UniqueConstraint("run_id", "path", name="uq_review_run_file_run_path"),
+        # The collision index. (path, run_id), not (path): the query this table
+        # exists for reads by PATH and wants run_id back, which the composite
+        # answers from the index alone rather than a heap fetch per matching row.
+        Index("ix_review_run_files_path", "path", "run_id"),
     )
