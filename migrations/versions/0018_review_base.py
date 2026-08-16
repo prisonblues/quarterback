@@ -19,11 +19,13 @@ detector whose only possible output is *fresh*.
 
 So both ends are stored, and they answer different questions:
 
-* `review_runs.merge_base` — the commit the reviewed diff was built FROM.
-  `gh pr diff` is the three-dot diff, so the seats read `merge_base...head` and
-  nothing in the payload named that commit. Free off metadata `panel.py` already
-  fetches. It moves only when the PR merges its base in or is rebased, which is
-  the *branch* acting.
+* `review_runs.merge_base` — the PR's base commit. `gh pr diff` is the three-dot
+  diff, so a whole-PR round reads `merge_base...head` and nothing in the payload
+  named that commit. Free off metadata `panel.py` already fetches. It moves only
+  when the PR merges its base in or is rebased, which is the *branch* acting.
+  Note it is the PR's anchor and not always the round's: under v2.28's increment
+  scope the target is `since_sha...head_sha` and this is where that round's
+  tier-2 context is measured from, so a consumer reads `scope` first.
 * `review_runs.base_sha` — the live tip of the base branch at review time: what
   the PR would be merged INTO. The end that moves on its own, and therefore the
   only one a staleness check can rest on. Costs its own lookup, which is why it

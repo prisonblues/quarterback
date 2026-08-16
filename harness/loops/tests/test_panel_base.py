@@ -18,9 +18,12 @@ stands" in precisely the case it exists to catch.
 The two ends therefore mean different things and are never derived from each
 other:
 
-* `merge_base` — what the reviewed diff was built FROM. `gh pr diff` is the
-  three-dot diff, so the seats read `merge_base...head_sha`. Free off metadata
-  `run()` already fetches. Moves only when the branch acts.
+* `merge_base` — the PR's base commit. `gh pr diff` is the three-dot diff, so a
+  whole-PR round reads `merge_base...head_sha`. Free off metadata `run()`
+  already fetches. Moves only when the branch acts. It is the PR's anchor and
+  not always the round's — under v2.28's increment scope the target is
+  `since_sha...head_sha` — which is why nothing here asserts it IS what the
+  seats read, only that it is recorded and distinct.
 * `base_sha` — the base branch's tip at review time. Costs its own lookup, and
   is the only end a staleness check can rest on.
 

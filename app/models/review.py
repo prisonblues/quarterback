@@ -63,11 +63,16 @@ class ReviewRun(Base):
     #: of that same range; #80 wants this column to reason about what a merge
     #: actually moved. NULL for every run recorded before the board stored it.
     head_sha: Mapped[str | None] = mapped_column(Text)
-    #: The commit the reviewed diff was built FROM (v2.29) — the merge base.
-    #: ``gh pr diff`` is the three-dot diff, so the seats read
-    #: ``merge_base...head_sha`` and until now nothing named the left-hand side.
-    #: It moves when the PR merges its base in or is rebased, which is the branch
-    #: acting; base branch movement cannot touch it.
+    #: The PR's base commit (v2.29) — the merge base. ``gh pr diff`` is the
+    #: three-dot diff, so a whole-PR round reads ``merge_base...head_sha`` and
+    #: until now nothing named the left-hand side. It moves when the PR merges its
+    #: base in or is rebased, which is the branch acting; base branch movement
+    #: cannot touch it.
+    #:
+    #: **The PR's anchor, not necessarily the round's.** Under v2.28's increment
+    #: scope the target is ``since_sha...head_sha`` and this is where the tier-2
+    #: context is measured from instead, so read ``scope`` before treating it as
+    #: the left-hand side of what a given round reviewed.
     merge_base: Mapped[str | None] = mapped_column(Text)
     #: The live tip of ``base_branch`` at review time (v2.29) — what the PR would
     #: be merged INTO, as opposed to what it was diffed from.

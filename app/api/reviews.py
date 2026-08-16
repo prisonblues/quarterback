@@ -151,9 +151,15 @@ answered ``88643c14``. A check written that way reports "the review still
 stands" exactly when the base has run away underneath it.
 
 So ``merge_base`` and ``base_sha`` are separate columns and mean different
-things: the first is what the reviewed diff was built from (``gh pr diff`` is the
-three-dot diff, so the seats read ``merge_base...head_sha``), the second is the
-base branch's tip at review time — the end that moves on its own. Neither is
+things: the first is the PR's own base commit (``gh pr diff`` is the three-dot
+diff, so a whole-PR round reads ``merge_base...head_sha``), the second is the
+base branch's tip at review time — the end that moves on its own.
+
+``merge_base`` is the PR's anchor and not always the ROUND's: under v2.28's
+increment scope a later round's target is ``since_sha...head_sha``, and
+``merge_base`` is where that round's tier-2 context is measured from. A consumer
+assembling "what did this round read" reads ``scope`` first, exactly as one
+comparing ``diff_chars`` across rounds already has to. Neither is
 derived from the other, and a run that could not read one stores null there
 rather than the other one standing in.
 
@@ -909,8 +915,10 @@ class ReviewIn(BaseModel):
     head_sha: str | None = None
     #: The base end of that range, as two fields rather than one, because the
     #: field #98 named for the job reports the merge base and a merge base cannot
-    #: move when the base branch does. ``merge_base`` is what the reviewed diff
-    #: was built from; ``base_sha`` is the base branch's tip at review time, and
+    #: move when the base branch does. ``merge_base`` is the PR's base commit —
+    #: the round's own anchor under increment scope is ``since_sha``, so read
+    #: ``scope`` before assuming the two are the same thing. ``base_sha`` is the
+    #: base branch's tip at review time, and
     #: is the only one of the two a staleness check can rest on. Both coerced or
     #: dropped by :func:`_sha_or_none`, and neither ever derived from the other.
     merge_base: str | None = None

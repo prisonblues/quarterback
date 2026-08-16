@@ -12,8 +12,10 @@ commits landing on the base branch cannot move it. A check built on it alone can
 only ever answer "unmoved". Both ends are therefore stored and they are never
 interchangeable:
 
-* ``merge_base`` — what the reviewed diff was built FROM. Moves when the PR
-  merges its base in or is rebased: the branch acting.
+* ``merge_base`` — the PR's base commit, which a whole-PR round's diff is built
+  from. Moves when the PR merges its base in or is rebased: the branch acting.
+  Under v2.28's increment scope a round's own target anchor is ``since_sha``
+  instead, so this is the PR's anchor and not always the round's.
 * ``base_sha`` — the base branch's tip at review time, the end that moves on its
   own, and the only one a staleness check can rest on.
 

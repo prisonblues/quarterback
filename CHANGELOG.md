@@ -34,10 +34,14 @@ as a success, but a staleness detector whose only possible output is **fresh**.
 
 So both ends are recorded, as two fields that mean different things (schema revision **0018**):
 
-- **`review_runs.merge_base`** — the commit the reviewed diff was built FROM. `gh pr diff` is the
-  three-dot diff, so the seats read `merge_base...head_sha` and nothing in the payload had ever
-  named the left-hand side. Free off metadata `panel.py` already fetches, and it moves only when the
-  PR merges its base in or is rebased.
+- **`review_runs.merge_base`** — the PR's base commit. `gh pr diff` is the three-dot diff, so a
+  whole-PR round reads `merge_base...head_sha` and nothing in the payload had ever named the
+  left-hand side. Free off metadata `panel.py` already fetches, and it moves only when the PR merges
+  its base in or is rebased. It is the PR's anchor and not always the *round's*: v2.28 landed while
+  this was being built, and under its increment scope a later round's target is
+  `since_sha...head_sha` — `merge_base` is then where that round's tier-2 context is measured from.
+  A consumer assembling "what did this round read" reads `scope` first, exactly as one comparing
+  `diff_chars` across rounds already has to.
 - **`review_runs.base_sha`** — the live tip of the base branch at review time: what the PR would be
   merged INTO. The end that moves on its own, and therefore the only one a staleness check can rest
   on. It costs its own lookup (`git/ref/heads/…`, a few hundred bytes, not the commits endpoint's
@@ -58,6 +62,105 @@ cheap and proving freshness is not, so a base that moved without touching the PR
 overlap detected" and never "the review is current". Files are a proxy — a base commit that changes
 a shared contract without touching this PR's files can still invalidate a finding.
 
+## v2.28 — a later round reads the fix commit, not the whole PR again
+
+(There is no v2.22 entry: that number is held by PR #87, which is harness-side and still open.
+v2.23 and v2.24 are below — both landed via #89, which carried the work #88 was closed in favour of.)
+
+A panel/fix cycle exists because nobody reads the fixer's commit (v2.15). Round 2 was then handed
+the entire PR — the fix plus everything rounds before it had already read, ruled on and confirmed —
+and paid for all of it in budget, in wall-clock and in the reviewer's attention, every round.
+
+**The loop was inflating its own input.** PR #34's four rounds went 1,675 lines to 4,140, and its
+diff 140 KB to 292 KB, *because it was being reviewed*: each round found defects in the previous
+round's fix commit at about one per fix, and each fix made the next round's reading longer. By the
+last round both reviewers declared they could not read ~600 lines of one test file. The 22 findings
+that round were overwhelmingly in the last commit, and the reviewers re-read 3,300 lines to reach
+them, losing the tail of the diff on the way.
+
+So a round past the first reviews the **increment** — what changed since the head its baseline
+reviewed — with the PR as it stood at that head behind it as context. Three tiers, and the order is
+the design: the increment, then those same files as they were *before* the increment changed them,
+then the rest of the PR. A budget is spent in that order, so what gets dropped is context and never
+the thing under review. That inverts the degradation: the target stays about the size of one fix
+commit however large the PR grows.
+
+The context is fetched as its own `base...anchor` comparison rather than sliced out of the current
+PR diff, and that is not a detail. The fix commit is *part of* the PR, so a near tier cut from the
+PR's current diff for those files contains it — the reviewer would get the target twice, the second
+copy under a header saying an earlier round had already dealt with that code, which is precisely
+what both briefs tell it not to re-report. The header can only be true of material that predates the
+fix.
+
+`--scope pr` keeps the old behaviour, `review_panel.round_scope` sets it per repo, and round 1 is
+always the whole PR. The anchor comes from the baseline payload's new `head_sha`; `--since` overrides
+it. Every fallback to whole-PR scope is written into `config_notes` — a round that says it reviewed
+the increment and in fact re-read the PR would be wrong about the one measurement this exists to
+produce, and invisible in the numbers, because a large `diff_chars` is what those always were.
+
+**The obvious implementation is wrong, and only measuring it showed that.** A commit range between
+two rounds spans everything the fixer did, *including a merge of the base branch* — which on this
+repo is the normal case rather than a corner, since landing six PRs in a day took eleven integration
+merges (#80). Measured on PR #62, the raw range between two of its own round heads was **92,415 chars
+against a 45,370-char PR**: the "increment" was twice the size of the whole thing, carrying
+`flake.nix`, the worktree scripts and the README that main had gained in between. Left alone it would
+have made rounds more expensive while reporting them as cheaper.
+
+Two things stop that. The range is cut down to the PR's own files, which on #62 takes it from 19
+files to 5 and the target to 17,075 chars — 62% off the PR, which is the saving the whole change is
+for. And a size guard falls back to whole-PR scope whenever the increment is still the larger of the
+two, because a file filter cannot remove main's changes to a file the PR *also* touches. A round must
+never cost more than it did before scope existed.
+
+The range is then checked against GitHub's own account of it, because three things a compare response
+can be are invisible in the diff it returns. A **truncated** one is a 200 with files missing: smaller
+than the PR, so it clears every guard and becomes the target — half a fix commit reviewed as though
+it were all of it, which is the one failure `truncated` was built for and the one place it cannot
+see. That falls back to the whole PR. A **rebased or force-pushed** range is not a delta from the
+anchor at all (`a...b` is measured from the merge base), so anything the fixer reverted between the
+two heads is in neither tier; that is reviewed anyway and reported. So is a **merge commit** in the
+range: files the PR does not touch are dropped from the target, but main's changes to files it does
+touch cannot be, and a reviewer reads them as the fixer's work.
+
+**Be clear about what shrinks.** The review TARGET shrinks, always, and that is what the change is
+for: the reviewer's attention lands on the fix commit and `diff_chars` measures it. The BILL is a
+separate question. A round still sends its target plus its context, and the context is most of the
+PR, so the total material is in the same range as a whole-PR round — it is smaller than it would be
+with the near tier cut from the current diff, which sent the fix twice, but it is not a saving to
+plan around. Where a fix touches the files that carry most of the PR there is barely any of it left
+to leave out, and a note says so with both numbers on any run where that happens. The reviewer's
+attention narrows; the token bill mostly does not. That is where the seam lives — the defect class
+this cycle exists to catch is a fix that is correct on its own terms and wrong where it meets what
+was already there — and paying for the context is how a reviewer can see it.
+
+The saving that is unambiguous is the one on the far end of a *budget*: with a cap set, the target is
+bought first and whole, so the thing a tight `max_diff_chars` drops is context rather than the tail of
+the fix commit. That is what stopped PR #34's later rounds losing 600 lines of the file under review.
+
+The judge sees exactly what the panel saw, briefed to rule rather than to review: an adjudicator adds
+nothing if it rules "not in the diff" while holding a different diff, and it would do so with the
+authority of the final call.
+
+**A scoped round can still raise a defect nobody has raised, wherever it sits.** The obvious rule —
+"the context has already been reviewed, do not report it" — makes a pre-existing defect
+structurally unfindable, and #48's `missed` bucket then reads zero by construction rather than by
+measurement. On PR #75's real round 1 to round 2 that bucket was 12 of 26: twelve defects that sat
+in round 1's diff and round 1 did not see. Suppressing them would not re-attribute them, it would
+make them invisible, and the loop would look converged because it had stopped looking. So what is
+out of scope is a defect an earlier round *already raised* — which is fixed, and whose fix is in
+the target. Earlier rounds read the rest; reading it is not the same as being right about it, and
+both briefs say so.
+
+That is also why context the budget cut is a **veto** and not merely a note: the context is the only
+part of the PR a scoped round can find a pre-existing defect in, so a round that could not see all of
+it must not report the resulting quiet as convergence.
+
+**One more caveat, and it vetoes a confident stop too.** Increment scope makes an
+earlier round's truncation permanent. Under whole-PR scope a region round 1 was cut off from is read
+again by round 2; under increment scope round 2 reads only the fix commit and never returns, so a
+cycle can now converge — nothing new, nothing outstanding — over code that no round in it ever read.
+The baseline carries which rounds were truncated, and a scoped round that inherits one says its quiet
+is not evidence about that region.
 ## v2.27 — one question to the panel, when a whole round was never the question
 
 A fix's premise had no cheap challenger. The only thing that reviewed a fix was a full panel round:
