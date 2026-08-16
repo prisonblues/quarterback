@@ -97,6 +97,39 @@ class QuarterbackClient:
         resp.raise_for_status()
         return resp.json()
 
+    # -- resource claims + release allocation (v2.31) -------------------
+
+    def claim(self, body: dict) -> dict:
+        resp = self._http.post(self._url("/claim"), json=body)
+        resp.raise_for_status()
+        return resp.json()
+
+    def renew_claim(self, claim_id: str) -> dict:
+        resp = self._http.post(self._url("/claim/renew"), json={"claim_id": claim_id})
+        resp.raise_for_status()
+        return resp.json()
+
+    def release_claim(self, claim_id: str) -> dict:
+        resp = self._http.post(self._url("/claim/release"), json={"claim_id": claim_id})
+        resp.raise_for_status()
+        return resp.json()
+
+    def claims(self, params: dict) -> dict:
+        resp = self._http.get(self._url("/claims"),
+                              params={k: v for k, v in params.items() if v is not None})
+        resp.raise_for_status()
+        return resp.json()
+
+    def claim_release(self, body: dict) -> dict:
+        resp = self._http.post(self._url("/release/claim"), json=body)
+        resp.raise_for_status()
+        return resp.json()
+
+    def releases(self, repo: str) -> dict:
+        resp = self._http.get(self._url("/releases"), params={"repo": repo})
+        resp.raise_for_status()
+        return resp.json()
+
     def handoff(self, session: str, blob: str) -> dict:
         resp = self._http.post(self._url("/handoff"), json={"session": session, "blob": blob})
         resp.raise_for_status()

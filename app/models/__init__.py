@@ -3,6 +3,7 @@ from app.models.base import Base
 from app.models.blob import Blob
 from app.models.lease import Lease
 from app.models.post import Post
+from app.models.resource_lease import ResourceLease
 from app.models.review import (
     ReviewFinding,
     ReviewFindingReport,
@@ -20,6 +21,7 @@ __all__ = [
     "Blob",
     "Lease",
     "Post",
+    "ResourceLease",
     "ReviewFinding",
     "ReviewFindingReport",
     "ReviewReviewer",
