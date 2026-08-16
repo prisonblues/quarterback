@@ -1,4 +1,7 @@
-"""Tests for qb-seats, the layout, and qb-seat, the per-seat wrapper.
+"""Tests for qb-seats, the layout.
+
+`qb-seat`, the per-seat wrapper each pane runs, ships and is tested separately;
+the fixture here stubs it, so nothing below depends on the real one.
 
 These drive a REAL tmux server against a stub agent, because the things worth
 testing here are not string manipulation — they are what the panes actually end
@@ -29,7 +32,6 @@ import pytest
 
 BIN = Path(__file__).resolve().parent.parent / "bin"
 QB_SEATS = BIN / "qb-seats"
-QB_SEAT = BIN / "qb-seat"
 
 pytestmark = pytest.mark.skipif(
     shutil.which("tmux") is None, reason="tmux is the thing under test"
@@ -137,7 +139,7 @@ def test_the_default_is_two_seats(screen):
 def test_no_inherited_instance_reaches_a_seat(screen):
     """The failure this guards against looks like nothing at all from the screen.
 
-    Naming a seat is qb-seat's job and is tested below; the LAYOUT's job is to
+    Naming a seat is qb-seat's job and is tested with it; the LAYOUT's job is to
     guarantee that whatever was in the launching environment does not arrive
     here. So the stub seeing no value at all is the pass condition.
     """
@@ -254,65 +256,3 @@ def test_kill_tears_the_screen_down(screen):
     screen("-n", "1")
     assert screen("--kill").returncode == 0
     assert screen.tmux("has-session", "-t", "=t").returncode != 0
-
-
-# ---- qb-seat, on its own ----------------------------------------------------
-
-def _seat(tmp_path, *args, **env):
-    """Run qb-seat with a stub agent that prints its argv and environment."""
-    stub_dir = tmp_path / "agentbin"
-    stub_dir.mkdir(exist_ok=True)
-    agent = stub_dir / "fake-agent"
-    agent.write_text(
-        "#!/bin/sh\n"
-        'printf "instance=%s\\ncwd=%s\\nargc=%s\\n" '
-        '"${QUARTERBACK_INSTANCE:-unset}" "$PWD" "$#"\n'
-        'printf "%s\\n" "$@"\n'
-    )
-    agent.chmod(0o755)
-    return subprocess.run(
-        [str(QB_SEAT), *args],
-        env={**os.environ, "PATH": f"{stub_dir}:{os.environ['PATH']}",
-             "QB_SEAT_AGENT": "fake-agent", **env},
-        capture_output=True, text=True, timeout=30, cwd=tmp_path,
-    )
-
-
-def test_qb_seat_names_the_seat(tmp_path):
-    assert "instance=seat-4" in _seat(tmp_path, "4").stdout
-
-
-def test_qb_seat_passes_one_brief_argument(tmp_path):
-    """The brief is one argument. Word-split, it would arrive as gibberish."""
-    assert "argc=1" in _seat(tmp_path, "1").stdout
-
-
-def test_every_seat_gets_the_same_brief(tmp_path):
-    """Different briefs per seat would be dispatch, which is the thing removed."""
-    briefs = [
-        _seat(tmp_path, str(n)).stdout.split("argc=1\n", 1)[1].replace(
-            f"seat {n} ", "seat N "
-        ).replace(f"seat-{n}", "seat-N")
-        for n in (1, 2, 3)
-    ]
-    assert briefs[0] == briefs[1] == briefs[2]
-
-
-def test_the_brief_can_be_replaced_wholesale(tmp_path):
-    brief = tmp_path / "brief.txt"
-    brief.write_text("do the other thing")
-    out = _seat(tmp_path, "1", QB_SEAT_BRIEF=str(brief)).stdout
-    assert "do the other thing" in out
-    assert "coordination board" not in out
-
-
-def test_qb_seat_rejects_a_missing_or_bad_seat_number(tmp_path):
-    assert _seat(tmp_path).returncode == 2
-    assert _seat(tmp_path, "0").returncode == 2
-    assert _seat(tmp_path, "two").returncode == 2
-
-
-def test_qb_seat_says_so_when_the_agent_is_absent(tmp_path):
-    r = _seat(tmp_path, "1", QB_SEAT_AGENT="definitely-not-installed")
-    assert r.returncode == 1
-    assert "QB_SEAT_AGENT" in r.stderr

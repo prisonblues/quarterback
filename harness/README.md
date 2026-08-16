@@ -210,7 +210,7 @@ out of reach, and that is accepted: the slash commands that drive worktree teard
 (`/wt`, `/drop-worktree`, `/tree-shake`) tell the model to ask first, and an agent
 running raw git was never going to be caught by tooling it did not invoke.
 
-### `qb-seats` and `qb-seat` — the agent screen
+### `qb-seats` — the agent screen
 
 Working a plan in parallel takes N terminals and a human dispatcher: open a terminal, `cd`,
 run the agent, say what to work on, repeat. The dispatching human is the part that does not
@@ -247,11 +247,11 @@ Two things to know before you run it:
   swallow it. `QB_SEATS=1` is exported into every pane precisely so an rc can detect a seat
   and skip that. This is not theoretical — it cost five minutes per seat on the machine
   this was written for, where the greeter was an animation that ran until a keypress.
-- **`QUARTERBACK_INSTANCE` must be per seat, never host-wide.** The board takes it as the
-  agent *key*, so two seats sharing one are not two agents with muddled inboxes — they are
-  **one agent**: one history, one presence, one lease, holding each other's claims
-  legitimately. `qb-seat` sets its own and `qb-seats` strips any inherited value; nothing in
-  your shell profile should set it.
+- **`QUARTERBACK_INSTANCE` must be per seat, never host-wide.** `qb-seat` sets its own —
+  see its section above for why sharing one is worse than it sounds — and the layout's
+  half of that guarantee is to strip any inherited value, from the session as well as the
+  panes, so nothing split off later picks one up. Nothing in your shell profile should set
+  it.
 
 `qb-seats` deliberately does not create worktrees (a self-selecting seat does not know its
 branch until it has claimed), does not assign work, and does not drive the agents past
