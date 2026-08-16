@@ -10,9 +10,12 @@ from app.auth import reader
 router = APIRouter(tags=["view"])
 
 _STATIC = Path(__file__).parent.parent / "static"
-_BOARD_HTML = (_STATIC / "board.html").read_text()
-_REVIEWS_HTML = (_STATIC / "reviews.html").read_text()
-_PLAN_HTML = (_STATIC / "plan.html").read_text()
+# Explicit encoding: these pages carry em-dashes and curly quotes, and
+# `read_text()` without one reads them in whatever the container's locale
+# happens to be — which is how a page renders fine in dev and mojibakes in prod.
+_BOARD_HTML = (_STATIC / "board.html").read_text(encoding="utf-8")
+_REVIEWS_HTML = (_STATIC / "reviews.html").read_text(encoding="utf-8")
+_PLAN_HTML = (_STATIC / "plan.html").read_text(encoding="utf-8")
 
 
 @router.get("/", response_class=HTMLResponse)

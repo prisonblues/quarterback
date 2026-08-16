@@ -12,7 +12,14 @@ from app.models.base import Base
 #: The states an item can be in. ``dropped`` is not ``done``: one says the work
 #: happened, the other says a human decided it should not. Collapsing them would
 #: make the plan's own history unreadable a fortnight later.
+#:
+#: The check constraint below is built from this tuple rather than restating it,
+#: so the declared vocabulary and the enforced one cannot drift. (The API's
+#: ``Literal``s are deliberately narrower: an agent may not spell ``done`` on the
+#: update endpoint, because deciding an item is finished is a different verb.)
 STATES = ("open", "done", "dropped")
+
+_STATE_LIST = ", ".join(f"'{s}'" for s in STATES)
 
 
 class PlanItem(Base):
@@ -46,8 +53,11 @@ class PlanItem(Base):
     #: NULL is fleet scope — the plan spans repos, as does the fleet.
     repo: Mapped[str | None] = mapped_column(Text)
     title: Mapped[str] = mapped_column(Text, nullable=False)
-    #: ``issue`` or ``pr``. Free text for the same reason ``ResourceLease.kind``
-    #: is: a third kind should cost an endpoint, not a migration.
+    #: ``issue`` or ``pr``. The COLUMN is free text for the same reason
+    #: ``ResourceLease.kind`` is — a third kind should not cost a migration — but
+    #: the API pins it to a ``Literal``, so adding one is still a code change:
+    #: every kind needs a URL template to render and a claim key that cannot
+    #: collide with another kind's. Permissive storage, decided intake.
     ref_kind: Mapped[str | None] = mapped_column(Text)
     ref_value: Mapped[str | None] = mapped_column(Text)
     phase: Mapped[str | None] = mapped_column(Text)
@@ -75,7 +85,7 @@ class PlanItem(Base):
     done_by: Mapped[str | None] = mapped_column(Text)
 
     __table_args__ = (
-        CheckConstraint("state IN ('open','done','dropped')", name="ck_plan_items_state"),
+        CheckConstraint(f"state IN ({_STATE_LIST})", name="ck_plan_items_state"),
         CheckConstraint("(ref_kind IS NULL) = (ref_value IS NULL)", name="ck_plan_items_ref_pair"),
         Index("ix_plan_items_repo_rank", "repo", "rank"),
         Index("ix_plan_items_open_ref", text("COALESCE(repo, '')"), "ref_kind", "ref_value",

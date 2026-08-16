@@ -44,6 +44,8 @@
   .chip.block { color:#f0b429; border-color:#5c4a1e; }
   .chip.stale { color:#e5484d; border-color:#5c2626; }
   .chip.phase { color:#c9b6f5; border-color:#3a2f56; }
+  .chip.fleet { color:#8fb4e8; border-color:#31435c; }
+  .refless { color:var(--muted); }
   .acts { display:flex; gap:4px; }
   .acts button { font:inherit; font-size:11px; cursor:pointer; background:#222831;
     color:#9fddc7; border:1px solid #2e3742; border-radius:5px; padding:1px 7px; }
@@ -78,8 +80,14 @@ const errEl = document.getElementById("err");
 const repoSel = document.getElementById("repo");
 const showDone = document.getElementById("showDone");
 
-let items = [];        // as returned, in plan order
+// Everything the last read returned, kept together: the rows in plan order, plus the
+// counts and the `next` the SERVER computed over the whole scope. They travel as one
+// because they have to agree — the header, the list and the next panel used to be
+// worked out separately here, over a subset, and so disagreed on the same page load.
+let plan = {items:[], counts:{}, next:null};
 let repos = new Set(); // every repo scope seen, so the filter can be built from data
+let gen = 0;           // read generation — a reply from a superseded read is discarded
+let busy = false;      // a write is in flight — the 20s tick must not read back over it
 
 // Safe in an ATTRIBUTE as well as in text: textContent→innerHTML escapes & < >
 // and leaves quotes alone, and every value here (repo, ref, title, note) is
@@ -102,22 +110,50 @@ function refUrl(it){ return (it.repo && it.ref && it.ref.kind)
 function refLabel(it){ return it.ref ? (it.ref.kind==="pr"?"PR #":"#")+it.ref.value : null; }
 function say(msg){ errEl.textContent = msg||""; }
 
+// A fleet item names no repo, so there is no GitHub URL to build from its ref — show
+// the ref it does carry, and say why it is not a link, rather than dropping it.
+function refHtml(it){
+  if(!it.ref) return "";
+  const url = refUrl(it), lbl = esc(refLabel(it));
+  const why = "fleet-wide item — it names no repo to link the ref to";
+  return url ? `<a href="${esc(url)}" target="_blank" rel="noopener">${lbl}</a>`
+             : `<span class="refless" title="${why}">${lbl}</span>`;
+}
+
 // The scope being reordered is EXACT — fleet items are their own list, so a
 // reorder of "prisonblues/quarterback" can never renumber them by accident.
-function scope(){ const v = repoSel.value; return v==="(fleet)" ? null : (v==="(all)" ? undefined : v); }
-function inScope(it){ const s = scope(); return s===undefined ? true : it.repo===s; }
+// "" is the value of the select before the first read has built its options — it means
+// (all), not a repo named "", which is what an unguarded read would ask the server for.
+function scope(){ const v = repoSel.value;
+  return v==="(fleet)" ? null : (!v || v==="(all)") ? undefined : v; }
 
-function row(it){
+function row(it, s){
   const el = document.createElement("div");
   const held = it.claim, blocked = (it.blocked_by||[]).length;
   el.className = "item " + it.state + (held?" claimed":"") + (blocked?" blocked":"");
-  const url = refUrl(it);
+  // Only an OPEN row of the exact scope on screen has an order this page can rewrite:
+  // the server orders open items alone, and per exact scope — so a done row, a fleet
+  // row riding along in a repo read, or anything in the mixed (all) list would be
+  // refused. The buttons say that by being dead, instead of accepting the click and
+  // quietly doing nothing with it.
+  const canMove = it.state==="open" && s!==undefined && it.repo===s;
+  const why = canMove ? null
+    : it.state!=="open" ? "only open items carry an order"
+    : s===undefined ? "pick a repo (or the fleet list) to reorder — order is per scope"
+    : "ordered in its own list, not this one";
+  // A done row exists FOR its completion record, so dropping it would destroy the one
+  // thing it is there to hold (the server refuses too). Present-but-dead, because a
+  // missing button reads as a bug rather than as "not applicable here".
+  const dropTo = it.state==="done" ? null : (it.state==="dropped" ? "open" : "dropped");
+  const dropWhy = dropTo==="open" ? "put it back"
+    : dropTo ? "drop it" : "done stays done — its completion record is the point";
   el.innerHTML = `
     <div class="rank">${it.state==="open"?it.rank:"·"}</div>
     <div class="body">
       <div class="row1">
-        ${url?`<a href="${esc(url)}" target="_blank" rel="noopener">${esc(refLabel(it))}</a>`:""}
+        ${refHtml(it)}
         <span class="title">${esc(it.title)}</span>
+        ${it.repo===null&&s!==null?`<span class="chip fleet">fleet</span>`:""}
         ${it.phase?`<span class="chip phase">${esc(it.phase)}</span>`:""}
         ${held?`<span class="chip hold">held by ${who(held.holder)} · expires ${until(held.expires)}</span>`:""}
         ${blocked?`<span class="chip block">waiting on ${it.blocked_by.map(b=>esc(b.ref?("#"+b.ref):b.title)).join(", ")}</span>`:""}
@@ -129,41 +165,74 @@ function row(it){
         held&&held.note?` · “${esc(held.note)}”`:""}</div>
     </div>
     <div class="acts">
-      <button data-move="up" data-id="${it.item_id}" title="move up">▲</button>
-      <button data-move="down" data-id="${it.item_id}" title="move down">▼</button>
-      <button data-state="${it.state==="dropped"?"open":"dropped"}" data-id="${it.item_id}"
-        title="${it.state==="dropped"?"put it back":"drop it"}">${it.state==="dropped"?"↩":"✕"}</button>
+      <button data-move="up" data-id="${esc(it.item_id)}" ${canMove?"":"disabled"}
+        title="${esc(why||"move up")}">▲</button>
+      <button data-move="down" data-id="${esc(it.item_id)}" ${canMove?"":"disabled"}
+        title="${esc(why||"move down")}">▼</button>
+      <button data-id="${esc(it.item_id)}" ${dropTo?`data-state="${dropTo}"`:"disabled"}
+        title="${esc(dropWhy)}">${it.state==="dropped"?"↩":"✕"}</button>
     </div>`;
   return el;
 }
 
+// The one invariant: the counts, the list and the next panel always describe the same
+// set of rows — so all three come from the same read, and none of them is worked out
+// here. Every scope this page offers is a scope the server can be asked for directly:
+// (all) is an unscoped read, a repo is `?repo=` (which brings the fleet band with it,
+// by design), and (fleet) is `?exact=true` with no repo. Narrowing a wider read here
+// instead is what made the header describe one set and the list another — and, once
+// the fleet band sorts last, would have let `limit` cut off the very rows it kept.
 function render(){
+  const s = scope();
+  const shown = plan.items, counts = plan.counts || {}, next = plan.next;
+
   listEl.innerHTML = "";
-  const shown = items.filter(inScope);
-  for(const it of shown) listEl.appendChild(row(it));
-  const n = items.find(it => it.state==="open" && !it.claim && !(it.blocked_by||[]).length && inScope(it));
-  nextEl.innerHTML = n
-    ? `<div class="next"><div class="lbl">next</div><div>${
-        refUrl(n)?`<a href="${esc(refUrl(n))}" target="_blank" rel="noopener">${esc(refLabel(n))}</a> `:""
-      }${esc(n.title)}</div>${n.note?`<div class="note">${esc(n.note)}</div>`:""}</div>`
-    : (shown.length ? `<div class="next" style="border-color:#5c4a1e"><div class="lbl" style="color:#f0b429">next</div>
+  for(const it of shown) listEl.appendChild(row(it, s));
+  countsEl.textContent = `${counts.open||0} open · ${counts.claimed||0} held · ` +
+    `${counts.blocked||0} waiting · ${counts.stale||0} stale`;
+  nextEl.innerHTML = next
+    ? `<div class="next"><div class="lbl">next</div><div>${refHtml(next)} ${
+        esc(next.title)}</div>${next.note?`<div class="note">${esc(next.note)}</div>`:""}</div>`
+    // Keyed off the same counts as the header: "everything open is spoken for" is only
+    // true if something is open at all — a page of history alone gets no panel.
+    : (counts.open ? `<div class="next" style="border-color:#5c4a1e"><div class="lbl" style="color:#f0b429">next</div>
         <div>nothing is free — everything open is claimed or waiting</div></div>` : "");
   emptyEl.style.display = shown.length ? "none" : "block";
 }
 
 async function load(){
-  const s = scope();
+  const s = scope(), my = ++gen;
   const p = new URLSearchParams();
-  if(s) p.set("repo", s);
+  // (fleet) is `?exact=true` with no repo — the fleet list by itself. A repo read
+  // deliberately widens to carry the fleet band along: those items are part of what is
+  // next for anybody, and an agent that never sees them is who fleet scope is for.
+  if(typeof s === "string") p.set("repo", s);
+  if(s === null) p.set("exact", "true");
   if(showDone.checked) p.set("include_done", "true");
-  const r = await fetch("/plan?"+p, {headers:{Accept:"application/json"}});
-  if(!r.ok){ say("plan unavailable ("+r.status+")"); return; }
-  const data = await r.json();
-  items = data.items;
-  for(const it of items) repos.add(it.repo || "(fleet)");
+  let d;
+  try {
+    const r = await fetch("/plan?"+p, {headers:{Accept:"application/json"}});
+    if(!r.ok){ if(my===gen) say("plan unavailable ("+r.status+")"); return; }
+    d = await r.json();
+  } catch(err) {
+    // Without this the last good page stayed on screen, looking live, with nothing to
+    // say it had stopped refreshing.
+    if(my===gen) say("plan unreachable — " + ((err && err.message) || "network error"));
+    return;
+  }
+  // A slower earlier read — the 20s tick, usually — must not repaint over a newer
+  // filter change or over a list that has just been reordered.
+  if(my !== gen) return;
+  plan = {items: d.items || [], counts: d.counts || {}, next: d.next || null};
+  const seen = new Set(plan.items.map(it => it.repo || "(fleet)"));
+  // Only the unscoped (all) read sees every repo, so only it may REPLACE the option
+  // list; a repo read returns that repo plus the fleet band, and the fleet read returns
+  // the fleet alone — rebuilding from either would strand the reader in the scope they
+  // just picked. Rebuilding at all matters because a repo whose items have all gone
+  // should leave the dropdown, not sit in it forever.
+  repos = s === undefined ? seen : new Set([...repos, ...seen]);
+  if(repoSel.value && repoSel.value !== "(all)") repos.add(repoSel.value);
   buildRepoOptions();
-  const c = data.counts;
-  countsEl.textContent = `${c.open} open · ${c.claimed} held · ${c.blocked} waiting · ${c.stale} stale`;
   say("");
   render();
 }
@@ -177,42 +246,64 @@ function buildRepoOptions(){
 }
 
 async function post(path, body){
-  const r = await fetch(path, {method:"POST", headers:{"Content-Type":"application/json"},
-                              body: JSON.stringify(body)});
+  let r;
+  try {
+    r = await fetch(path, {method:"POST", headers:{"Content-Type":"application/json"},
+                           body: JSON.stringify(body)});
+  } catch(err) {
+    say("could not reach the server — " + ((err && err.message) || "network error"));
+    return null;
+  }
   if(!r.ok){
-    const d = await r.json().catch(()=>({}));
-    say(typeof d.detail === "string" ? d.detail : (d.detail?.error || ("failed: "+r.status)));
+    // Plan errors are {detail:{error,hint}}, but a pydantic validation error keeps
+    // detail a bare string or a list — so nothing here may assume the object shape.
+    const payload = await r.json().catch(()=>null), det = payload && payload.detail;
+    say(typeof det === "string" ? det
+      : (det && det.error) ? det.error + (det.hint ? " — " + det.hint : "")
+      : "failed: "+r.status);
     return null;
   }
   say("");
-  return r.json();
+  // Never null on success: the caller reads null as "it failed, keep the message up".
+  return (await r.json().catch(()=>null)) || {};
 }
 
 listEl.addEventListener("click", async (e)=>{
   const move = e.target.closest("button[data-move]");
   const state = e.target.closest("button[data-state]");
+  let path, body;
   if(state){
-    await post("/plan/item/update", {item_id: state.dataset.id, state: state.dataset.state});
-    return load();
-  }
-  if(!move) return;
-  // Reorder is a whole-scope rewrite: an item's rank is only meaningful beside
-  // its neighbours', so the page sends the order it is showing rather than a delta.
-  const s = scope();
-  if(s === undefined){ say("pick a repo (or the fleet list) before reordering — order is per scope"); return; }
-  const ids = items.filter(it => it.repo === s && it.state !== "done").map(it => it.item_id);
-  const i = ids.indexOf(move.dataset.id);
-  const j = move.dataset.move === "up" ? i-1 : i+1;
-  if(i < 0 || j < 0 || j >= ids.length) return;
-  [ids[i], ids[j]] = [ids[j], ids[i]];
-  await post("/plan/reorder", {repo: s, order: ids});
-  load();
+    // Belt and braces beside the disabled button in row(): dropping a done item would
+    // throw away the completion record the row exists to hold (the server 409s too).
+    const it = plan.items.find(x => x.item_id === state.dataset.id);
+    if(it && it.state === "done") return;
+    path = "/plan/item/update";
+    body = {item_id: state.dataset.id, state: state.dataset.state};
+  } else if(move){
+    // Reorder is a whole-scope rewrite: an item's rank is only meaningful beside its
+    // neighbours', so the page sends the order it is showing rather than a delta. Only
+    // OPEN items of the exact scope may be in it — anything else is a 422.
+    const s = scope();
+    if(s === undefined){ say("pick a repo (or the fleet list) before reordering — order is per scope"); return; }
+    const ids = plan.items.filter(it => it.repo === s && it.state === "open").map(it => it.item_id);
+    const i = ids.indexOf(move.dataset.id);
+    const j = move.dataset.move === "up" ? i-1 : i+1;
+    if(i < 0 || j < 0 || j >= ids.length) return;
+    [ids[i], ids[j]] = [ids[j], ids[i]];
+    path = "/plan/reorder";
+    body = {repo: s, order: ids};
+  } else return;
+  // A tick landing between the write and its read-back would paint the pre-write order.
+  busy = true;
+  let ok;
+  try { ok = await post(path, body); } finally { busy = false; }
+  if(ok) load();  // a failed write keeps its message up — load() would wipe it
 });
 
 repoSel.onchange = load;
 showDone.onchange = load;
 load();
-setInterval(load, 20000);
+setInterval(()=>{ if(!busy) load(); }, 20000);
 </script>
 </body>
 </html>

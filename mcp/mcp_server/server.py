@@ -562,7 +562,7 @@ def releases(ctx: Context, repo: str) -> dict:
 
 @mcp.tool()
 def plan_read(ctx: Context, repo: str | None = None, phase: str | None = None,
-              include_done: bool = False) -> dict:
+              include_done: bool = False, limit: int | None = None) -> dict:
     """What is next, in order, and who has it. Read this when you start cold.
 
     The board's other tools answer who is here and what they touched; this is the
@@ -579,10 +579,14 @@ def plan_read(ctx: Context, repo: str | None = None, phase: str | None = None,
         repo: this repo's items plus the fleet-wide ones. Omit for everything.
         phase: only one phase ("stage 1").
         include_done: include finished and dropped items (history, not work).
+        limit: most items to return, from the TOP of the order (the board caps it
+            at 200 by default). `next` and `counts` always describe the whole
+            plan, never the page, and `truncated` says whether you got one.
     """
     try:
         return _get_client(ctx).plan(
-            {"repo": repo, "phase": phase, "include_done": include_done})
+            {"repo": repo, "phase": phase, "include_done": include_done,
+             "limit": limit})
     except httpx.HTTPStatusError as e:
         _raise(e, "plan_read")
 
@@ -622,7 +626,7 @@ def plan_add(ctx: Context, title: str, repo: str | None = None,
 
 
 @mcp.tool()
-def plan_claim(ctx: Context, item_id: str, ttl: int = 3600,
+def plan_claim(ctx: Context, item_id: str, ttl: int | None = None,
                note: str | None = None, force: bool = False) -> dict:
     """Take a plan item before you start. This is the post that prevents duplicated work.
 
@@ -638,14 +642,18 @@ def plan_claim(ctx: Context, item_id: str, ttl: int = 3600,
 
     Args:
         item_id: from `plan_read`.
-        ttl: seconds before the claim lapses without a renew (default 3600).
-            Renew with `renew_claim` using the returned claim_id.
+        ttl: seconds before the claim lapses without a renew. Omit to take the
+            board's default (an hour today) — the number lives in one place on
+            the server, and a client that restates it disagrees the moment it
+            changes. Renew with `renew_claim` using the returned claim_id.
         note: what you are doing with it — shown to whoever is refused.
         force: take it even though something it waits on is unfinished.
     """
     try:
-        return _get_client(ctx).plan_item(
-            "claim", {"item_id": item_id, "ttl": ttl, "note": note, "force": force})
+        body = {"item_id": item_id, "note": note, "force": force}
+        if ttl is not None:
+            body["ttl"] = ttl
+        return _get_client(ctx).plan_item("claim", body)
     except httpx.HTTPStatusError as e:
         _raise(e, "plan_claim")
 

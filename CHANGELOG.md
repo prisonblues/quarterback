@@ -7,6 +7,13 @@ that number where it was, so the repo can be a version ahead of the service.
 Entries are newest first. Each one says what was broken or missing before it, because that is the
 part that isn't recoverable from the diff.
 
+**The sequence can gap, and a gap is not a missing entry.** A number is *allocated* to a branch
+when its work starts (`POST /release/claim`, v2.31) rather than when it merges, so branches in
+flight hold numbers this file has no entry for yet — v2.34, v2.36, v2.37 and v2.38 were all
+claimed by other branches while v2.39 was being written, and each lands with its own entry when
+it does. Reading a gap as a lost release is the mistake; the numbers are handed out by asking,
+which is the whole point of allocating them.
+
 ## v2.39 — the board knew who was here and not what was next
 
 Presence, publishes, panel findings: the board could answer every question about *now*. The one
@@ -59,6 +66,45 @@ want an atomic claim and the first not to build one.
 
 `/plan/view` is the human board's plan, and the only place the human-only endpoints can be reached
 from a browser. Schema revision **0020**.
+
+**What the panel round changed, and the premises behind it.** Three of the findings were the same
+mistake in three places — *a rule written for one kind of claim, applied to a different kind*:
+
+- **A header is not an authentication method.** `human()` accepted any `Remote-User`, with the
+  enforcement ("the edge must strip it") living in deployment config this repo does not ship — and
+  a forward-auth bypass for bearer traffic, which is precisely the shape agent traffic has, quietly
+  reopens it. The edge now proves it is the edge: `HUMAN_EDGE_SECRET`, injected as `X-Edge-Auth`
+  beside the identity. **Unset means nobody is a human** — a board nobody configured is one nobody
+  can reorder, rather than one every agent can. `BROWSER_DEV_USER` went back to being what its
+  docstring always said it was, a *read* bypass; the human-only writes have their own opt-in
+  (`BROWSER_DEV_HUMAN`), off by default. See DEPLOY.md §0.
+- **A worker is not a box.** A plan claim is owned by the *session*: a machine runs several agents
+  at once and they all authenticate as that one token, so the claims table's "your own machine
+  renews" rule — right for a land, where an agent that restarts must reclaim its own — answered the
+  second agent on a box with `renewed: true` and let both of them work the same item. That is the
+  three-agents-one-CI-job failure the feature exists to prevent, moved indoors. Opt-in per request
+  (`ClaimRequest.session_owned`), so nothing else changed.
+- **`next` is about the plan, not about the page.** `limit` was applied before `next` and `counts`
+  were worked out, so a page whose first rows were all claimed or blocked answered "nothing is
+  free" while free work sat one rank below the cut, and the board header under-counted every scope
+  larger than the cap. The open set is now read whole (it is bounded by design; history is what
+  grows) and `limit` truncates the page alone, which `truncated` says out loud.
+
+And the ordering rule that had no answer: fleet-wide and per-repo items are ranked in independent
+sequences, and merging them by rank alone interleaved two lists nobody had ever compared. **Your
+repo's list comes first, then the fleet's** — the fleet list is what you pick up when your own has
+nothing free, and `next` falls through into it rather than being preempted by it. `?exact=true`
+reads one scope without the widening, which is how the page's fleet view asks for the fleet.
+
+Smaller repairs from the same round: a live claim no longer renders on the finished history row it
+shares an issue key with; dropping an item releases whoever was holding it, and a *done* item can
+no longer be dropped out of its own completion record; a completion note is added to the human's
+reasoning rather than over it; a release that released nothing no longer resets the staleness
+clock it exists to expose; ranks are serialised per scope, so two adds cannot land on one rank and
+two reorders cannot interleave or deadlock; the cycle check reads open items instead of every row
+ever written, under the lock it holds; a forced claim records that it was forced; a dependency on a
+dropped item is refused by *both* spellings; and repo names are case-folded, because
+`Acme/Repo#60` and `acme/repo#60` were two open items and two claim keys for one issue.
 
 ## v2.33 — v2.31's claim table was right about INSERT and wrong about everything else
 

@@ -28,15 +28,31 @@ coordination primitive rather than a to-do list in a table:
 from __future__ import annotations
 
 import asyncio
+import sys
 import uuid
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
-from app.api.plan import STALE_DAYS, _item_view
+import httpx
+import pytest
+from fastapi import HTTPException
+from sqlalchemy import select, update
+
+from app.api.claims import ClaimRequest, acquire
+from app.api.plan import CLAIM_KIND, STALE_DAYS, _item_view
+from app.config import settings
+from app.db import async_session
 from app.models.plan_item import PlanItem
+from app.models.resource_lease import ResourceLease
 
-from .conftest import DESKTOP, LAPTOP, SERVER
+from .conftest import DESKTOP, LAPTOP, PINNED_SETTINGS, SERVER
 
-HUMAN = {"Remote-User": "rich"}
+#: A person, as the edge proves it: the identity header AND the secret only the
+#: proxy knows. `Remote-User` alone is what any caller can send, which is why it
+#: is no longer enough on its own — see `app.auth.human`.
+HUMAN = {"Remote-User": "rich", "X-Edge-Auth": PINNED_SETTINGS["HUMAN_EDGE_SECRET"]}
+#: What an agent can trivially forge, and must not be believed.
+SPOOFED = {"Remote-User": "rich"}
 
 
 async def add(client, repo: str, title: str, headers=LAPTOP, **over) -> dict:
@@ -69,6 +85,17 @@ async def take(client, item_id: str, headers=LAPTOP, **over) -> dict:
     return r.json()
 
 
+async def _expire(key: str) -> None:
+    """Age a live claim out, instead of waiting for the wall clock to do it."""
+    async with async_session() as s:
+        await s.execute(
+            update(ResourceLease)
+            .where(ResourceLease.kind == CLAIM_KIND, ResourceLease.key == key,
+                   ResourceLease.released_at.is_(None))
+            .values(expires_at=datetime.now(UTC) - timedelta(seconds=1)))
+        await s.commit()
+
+
 # ------------------------------------------- an ordered answer, not a guess
 
 async def test_a_cold_agent_is_told_what_is_next_rather_than_working_it_out(client):
@@ -85,8 +112,12 @@ async def test_a_cold_agent_is_told_what_is_next_rather_than_working_it_out(clie
     # The reasoning behind the order travels with it — that sentence is the half
     # a GitHub issue has no field for, and the reason the plan exists at all.
     assert plan["next"]["note"].startswith("before #53")
-    assert plan["counts"] == {"open": 2, "claimed": 0, "blocked": 0, "stale": 0,
-                              "done": 0, "dropped": 0}
+    # The live counts are this repo's; `done`/`dropped` are deliberately not
+    # asserted here, because a repo read's scope includes the fleet-wide items
+    # and therefore every fleet item any other test has ever finished.
+    assert {k: plan["counts"][k] for k in ("open", "claimed", "blocked", "stale")} == {
+        "open": 2, "claimed": 0, "blocked": 0, "stale": 0}
+    assert plan["truncated"] is False
 
 
 async def test_the_plan_links_to_an_issue_and_never_restates_it(client):
@@ -171,11 +202,16 @@ async def test_a_second_claimant_is_refused_and_told_who_holds_it(client):
 async def test_a_dead_agents_claim_disappears_without_anyone_intervening(client):
     """The acceptance criterion that rules out a GitHub assignee: an agent that
     dies at 3am must not hold an item until somebody notices. Nothing reaps it —
-    the next claimant's own request sweeps the key."""
+    the next claimant's own request sweeps the key.
+
+    The clock is moved rather than waited on: a correctness assertion that
+    depends on the scheduler having run within 100ms is a flake on a loaded box,
+    and every other time-dependent property in this file is asserted the same
+    way."""
     repo = "acme/deadagent"
     item = await issue(client, repo, 9)
-    await take(client, item["item_id"], ttl=1, session="s-dies")
-    await asyncio.sleep(1.1)
+    await take(client, item["item_id"], session="s-dies")
+    await _expire(f"{repo}#9")
 
     plan = await read(client, repo, headers=DESKTOP)
     assert plan["items"][0]["claim"] is None
@@ -207,12 +243,14 @@ async def test_releasing_puts_it_back_and_is_idempotent(client):
     item = await issue(client, repo, 3)
     await take(client, item["item_id"], session="s-1")
 
-    r = await client.post("/plan/item/release", json={"item_id": item["item_id"]},
+    r = await client.post("/plan/item/release",
+                          json={"item_id": item["item_id"], "session": "s-1"},
                           headers=LAPTOP)
     assert r.status_code == 200 and r.json()["released"] is True
     assert r.json()["claim"] is None
 
-    again = await client.post("/plan/item/release", json={"item_id": item["item_id"]},
+    again = await client.post("/plan/item/release",
+                              json={"item_id": item["item_id"], "session": "s-1"},
                               headers=LAPTOP)
     assert again.status_code == 200 and again.json()["released"] is False
 
@@ -397,7 +435,8 @@ async def test_done_releases_the_claim_and_records_who_and_when(client):
     await take(client, item["item_id"], session="s-1")
 
     r = await client.post("/plan/item/done",
-                          json={"item_id": item["item_id"], "note": "landed in PR #143"},
+                          json={"item_id": item["item_id"], "session": "s-1",
+                                "note": "landed in PR #143"},
                           headers=LAPTOP)
     assert r.status_code == 200, r.text
     body = r.json()
@@ -438,7 +477,11 @@ async def test_done_leaves_another_agents_claim_alone_and_says_so(client):
     r = await client.post("/plan/item/done", json={"item_id": item["item_id"]},
                           headers=DESKTOP)
     assert r.status_code == 200, r.text
-    assert r.json()["claim_left"] is True
+    # The claim itself, because a done item no longer renders one: "server was
+    # still holding this when desktop recorded it finished" has to be readable
+    # somewhere, and this is the only place left.
+    assert r.json()["claim_left"]["holder"] == "server"
+    assert r.json()["claim_left"]["session"] == "s-server"
     assert r.json()["state"] == "done"
 
 
@@ -572,6 +615,10 @@ async def test_a_fleet_item_shows_in_every_repos_plan(client):
     ids = [i["item_id"] for i in (await read(client, "acme/fleetread"))["items"]]
     assert fleet["item_id"] in ids and repo_item["item_id"] in ids
     assert fleet["repo"] is None
+    # Finished for the same reason the other two fleet tests finish theirs: a
+    # fleet item is in EVERY repo's read, so an open one left here is a row in
+    # every later test's scope. It survived only because nothing ran after it.
+    await client.post("/plan/item/done", json={"item_id": fleet["item_id"]}, headers=LAPTOP)
 
 
 def test_staleness_is_reported_rather_than_left_to_the_reader():
@@ -593,3 +640,508 @@ def test_staleness_is_reported_rather_than_left_to_the_reader():
     # A finished item is not stale, it is history — flagging it would make the
     # count meaningless the week after any release.
     assert _item_view(done, None, [], now)["stale"] is False
+
+
+# ------------------------------------------------- the human/agent boundary
+
+async def test_a_remote_user_header_alone_is_not_a_person(client):
+    """The boundary the whole human-only split rests on, enforced rather than
+    documented. Every agent on a box holds the same machine token, so if the one
+    thing dividing "an agent" from "a person" is a header any caller can set,
+    the split is one extra header wide — and the deployment note that says the
+    edge strips it lives in a config file this repo does not ship."""
+    repo = "acme/spoof"
+    first = await issue(client, repo, 500)
+    second = await issue(client, repo, 501)
+    order = {"repo": repo, "order": [second["item_id"], first["item_id"]]}
+
+    forged = await client.post("/plan/reorder", json=order, headers=SPOOFED)
+    assert forged.status_code == 403
+    assert "not asserted by the edge" in forged.json()["detail"]
+
+    wrong = await client.post("/plan/reorder", json=order,
+                              headers={**SPOOFED, "X-Edge-Auth": "not-the-secret"})
+    assert wrong.status_code == 403, "a near-miss secret is a miss"
+
+    ok = await client.post("/plan/reorder", json=order, headers=HUMAN)
+    assert ok.status_code == 200, ok.text
+
+
+async def test_an_agent_token_plus_a_forged_edge_header_is_still_an_agent(client):
+    """The traffic shape that makes this reachable: a bypass rule that skips
+    forward-auth for bearer-authenticated API paths is normal, and it is exactly
+    what agents send."""
+    repo = "acme/spoofbearer"
+    item = await issue(client, repo, 502)
+    r = await client.post("/plan/item/update",
+                          json={"item_id": item["item_id"], "state": "dropped"},
+                          headers={**LAPTOP, **SPOOFED})
+    assert r.status_code == 403
+    assert (await read(client, repo))["items"][0]["state"] == "open"
+
+
+async def test_the_dev_browser_bypass_reads_but_does_not_decide(client, monkeypatch):
+    """`BROWSER_DEV_USER` is `reader`'s bypass, and reading is not deciding. It
+    used to grant the human-only writes to any unauthenticated caller — on a
+    reachable instance, to every agent on the box — because the same flag was
+    doing two different jobs."""
+    repo = "acme/devuser"
+    item = await issue(client, repo, 503)
+    monkeypatch.setattr(settings, "browser_dev_user", "devuser")
+
+    assert (await client.get("/plan", params={"repo": repo})).status_code == 200
+    r = await client.post("/plan/item/update",
+                          json={"item_id": item["item_id"], "state": "dropped"})
+    assert r.status_code == 401, "a read bypass is not an authorisation"
+
+    # ...and the local board that wants the buttons says so, deliberately.
+    monkeypatch.setattr(settings, "browser_dev_human", True)
+    ok = await client.post("/plan/item/update",
+                           json={"item_id": item["item_id"], "state": "dropped"})
+    assert ok.status_code == 200 and ok.json()["edited_by"] == "devuser"
+
+
+# --------------------------------------- `next` is about the plan, not the page
+
+async def test_the_limit_pages_the_list_and_never_the_answer(client):
+    """`limit` truncates the page; it used to truncate the question. With the
+    first `limit` items claimed or blocked, the endpoint answered "nothing is
+    free" while free work sat one rank below the cut — the single failure the
+    whole feature exists to prevent."""
+    repo = "acme/limitnext"
+    held = await issue(client, repo, 600)
+    blocked = await issue(client, repo, 601, depends_on=["#600"])
+    free = await issue(client, repo, 602)
+    await take(client, held["item_id"], session="s-1")
+
+    plan = await read(client, repo, limit=1)
+    assert [i["item_id"] for i in plan["items"]] == [held["item_id"]]
+    assert plan["truncated"] is True
+    assert plan["next"]["item_id"] == free["item_id"], "the answer is not paged"
+    # ...and the counts are the plan's, not the page's: the board header renders
+    # them verbatim, so under-reporting them is a wrong number a human reads.
+    assert plan["counts"]["open"] >= 3
+    assert plan["counts"]["claimed"] >= 1 and plan["counts"]["blocked"] >= 1
+    assert blocked["item_id"] not in [i["item_id"] for i in plan["items"]]
+
+
+async def test_history_counts_are_the_scopes_and_not_the_pages(client):
+    repo = "acme/counthistory"
+    done_one = await issue(client, repo, 610)
+    await issue(client, repo, 611)
+    await client.post("/plan/item/done", json={"item_id": done_one["item_id"]},
+                      headers=LAPTOP)
+
+    plan = await read(client, repo, include_done=True, limit=1)
+    assert len(plan["items"]) == 1 and plan["truncated"] is True
+    assert plan["counts"]["done"] >= 1 and plan["counts"]["open"] >= 1
+
+
+async def test_a_repos_own_list_comes_before_the_fleets(client):
+    """Ranks are allocated per scope, so merging two independent 1..n sequences
+    by rank alone interleaved orders nobody had ever compared. The rule is
+    stated instead: your repo first, and the fleet list is what you pick up when
+    your own has nothing free."""
+    repo = "acme/bands"
+    fleet = await add(client, None, "rebuild everything everywhere")
+    mine = await issue(client, repo, 620)
+
+    plan = await read(client, repo)
+    ids = [i["item_id"] for i in plan["items"]]
+    assert ids.index(mine["item_id"]) < ids.index(fleet["item_id"])
+    assert plan["next"]["item_id"] == mine["item_id"]
+
+    # ...and it falls through into the fleet band rather than starving it.
+    await take(client, mine["item_id"], session="s-1")
+    assert (await read(client, repo))["next"]["item_id"] == fleet["item_id"]
+    await client.post("/plan/item/done", json={"item_id": fleet["item_id"]}, headers=LAPTOP)
+
+
+# ------------------------------------------- one worker is not one machine
+
+async def test_the_fleet_list_can_be_read_by_itself(client):
+    """The board page's fleet view is a read, not a filter. Narrowing a wider
+    read in the browser made the header describe one set and the list another —
+    and, with the fleet band sorting last, `limit` could cut off the very rows
+    the view exists to show."""
+    repo = "acme/exactread"
+    mine = await issue(client, repo, 625)
+    fleet = await add(client, None, "fleet-only read")
+
+    only_fleet = await read(client, exact="true")
+    ids = [i["item_id"] for i in only_fleet["items"]]
+    assert fleet["item_id"] in ids and mine["item_id"] not in ids
+    assert only_fleet["counts"]["open"] == len(only_fleet["items"])
+    assert only_fleet["next"]["item_id"] in ids
+
+    just_mine = await read(client, repo, exact="true")
+    assert [i["item_id"] for i in just_mine["items"]] == [mine["item_id"]]
+    await client.post("/plan/item/done", json={"item_id": fleet["item_id"]}, headers=LAPTOP)
+
+
+async def test_two_agents_on_one_machine_cannot_both_hold_an_item(client):
+    """The failure this feature exists to prevent, moved indoors. A claim
+    belongs to the box for a land — an agent that restarts must reclaim its
+    own — but a machine runs several agents at once and they all authenticate
+    as that one token, so the box rule told the second one `renewed: true`."""
+    repo = "acme/samebox"
+    item = await issue(client, repo, 630)
+    await take(client, item["item_id"], session="s-first", note="on it")
+
+    contended = await claim_item(client, item["item_id"], session="s-second")
+    assert contended.status_code == 409, "a second session is a second worker"
+    assert contended.json()["detail"]["session"] == "s-first"
+
+    mine_again = await take(client, item["item_id"], session="s-first")
+    assert mine_again["renewed"] is True, "my own session still renews"
+
+
+async def test_a_co_tenant_cannot_release_or_finish_your_item(client):
+    repo = "acme/sameboxrelease"
+    item = await issue(client, repo, 631)
+    await take(client, item["item_id"], session="s-mine")
+
+    r = await client.post("/plan/item/release",
+                          json={"item_id": item["item_id"], "session": "s-theirs"},
+                          headers=LAPTOP)
+    assert r.status_code == 403 and r.json()["detail"]["session"] == "s-mine"
+
+    done = await client.post("/plan/item/done",
+                             json={"item_id": item["item_id"], "session": "s-theirs"},
+                             headers=LAPTOP)
+    assert done.status_code == 200, "recording that the issue closed is anyone's"
+    assert done.json()["claim_left"]["session"] == "s-mine", "their claim is theirs"
+
+
+async def test_a_claim_that_named_no_session_still_belongs_to_the_box(client):
+    """Nothing finer was recorded, so the machine is all there is to compare —
+    refusing outright would strand every claim taken by a caller that sent none.
+    """
+    repo = "acme/nosession"
+    item = await issue(client, repo, 632)
+    await take(client, item["item_id"])
+    r = await client.post("/plan/item/release",
+                          json={"item_id": item["item_id"], "session": "s-later"},
+                          headers=LAPTOP)
+    assert r.status_code == 200 and r.json()["released"] is True
+
+
+# ----------------------------------------- terminal states and their claims
+
+async def test_dropping_an_item_frees_whoever_was_holding_it(client):
+    """A human deciding this should not happen has to reach the agent doing it:
+    the item vanishes from every read, so a claim left live on its key is one
+    nobody can see, blocking the issue's next item until the TTL runs out."""
+    repo = "acme/dropclaim"
+    item = await issue(client, repo, 640)
+    await take(client, item["item_id"], headers=SERVER, session="s-server")
+
+    r = await client.post("/plan/item/update",
+                          json={"item_id": item["item_id"], "state": "dropped"},
+                          headers=HUMAN)
+    assert r.status_code == 200, r.text
+    async with async_session() as s:
+        live = await s.scalar(select(ResourceLease).where(
+            ResourceLease.kind == CLAIM_KIND, ResourceLease.key == f"{repo}#640",
+            ResourceLease.released_at.is_(None)))
+    assert live is None, "a cancelled item must not stay held"
+
+
+async def test_a_done_item_cannot_be_dropped_out_of_its_own_history(client):
+    """Dropping clears done_at and done_by, so the drop control on a history row
+    was one click from erasing the record that the issue ever closed."""
+    repo = "acme/donedrop"
+    item = await issue(client, repo, 641)
+    await client.post("/plan/item/done", json={"item_id": item["item_id"]}, headers=LAPTOP)
+
+    r = await client.post("/plan/item/update",
+                          json={"item_id": item["item_id"], "state": "dropped"},
+                          headers=HUMAN)
+    assert r.status_code == 409 and "record" in r.json()["detail"]["error"]
+    history = await read(client, repo, include_done=True)
+    mine = next(i for i in history["items"] if i["item_id"] == item["item_id"])
+    assert mine["state"] == "done" and mine["done_by"] == "laptop"
+
+
+async def test_a_live_claim_is_never_shown_on_finished_history(client):
+    """Claims are keyed by repo#issue, so a re-added item shares its key with the
+    one it replaced — and the history read showed the new item's live claim
+    sitting on the old done row, which reads as work being done twice."""
+    repo = "acme/refreuse"
+    first = await issue(client, repo, 650)
+    await client.post("/plan/item/done", json={"item_id": first["item_id"]}, headers=LAPTOP)
+    second = await issue(client, repo, 650)
+    await take(client, second["item_id"], session="s-again")
+
+    history = await read(client, repo, include_done=True)
+    by_id = {i["item_id"]: i for i in history["items"]}
+    assert by_id[second["item_id"]]["claim"]["session"] == "s-again"
+    assert by_id[first["item_id"]]["claim"] is None
+
+
+async def test_an_item_finished_mid_claim_does_not_stay_claimed(client):
+    """The state check and the claim are two statements and nothing can lock
+    across them — `acquire` commits, which is where its atomicity comes from —
+    so the check is made again afterwards and a claim that lost is handed back.
+    """
+    repo = "acme/racedone"
+    item = await issue(client, repo, 651)
+    claiming = asyncio.create_task(
+        claim_item(client, item["item_id"], session="s-race"))
+    finishing = asyncio.create_task(
+        client.post("/plan/item/done", json={"item_id": item["item_id"]}, headers=DESKTOP))
+    claimed, _ = await asyncio.gather(claiming, finishing)
+
+    if claimed.status_code == 200:
+        return  # it won the race outright; nothing to leave behind
+    assert claimed.status_code == 409
+    async with async_session() as s:
+        live = await s.scalar(select(ResourceLease).where(
+            ResourceLease.kind == CLAIM_KIND, ResourceLease.key == f"{repo}#651",
+            ResourceLease.released_at.is_(None)))
+    assert live is None, "a claim on a finished item is a claim nobody can act on"
+
+
+async def test_releasing_nothing_does_not_reset_the_staleness_clock(client):
+    """`updated_at` is the only input to `stale`, so a poller calling release on
+    an item it never held could keep an abandoned one looking fresh forever —
+    hiding precisely the item the flag exists to surface."""
+    repo = "acme/staleclock"
+    item = await issue(client, repo, 660)
+    before = (await read(client, repo))["items"][0]["updated"]
+
+    r = await client.post("/plan/item/release",
+                          json={"item_id": item["item_id"]}, headers=DESKTOP)
+    assert r.status_code == 200 and r.json()["released"] is False
+    assert (await read(client, repo))["items"][0]["updated"] == before
+
+
+async def test_a_forced_claim_says_so_in_the_record(client):
+    """"The refusal is advice, but it has to be said out loud" — and it was said
+    to nobody: a forced claim and an ordinary one were indistinguishable an hour
+    later."""
+    repo = "acme/forcednote"
+    await issue(client, repo, 670)
+    waiter = await issue(client, repo, 671, depends_on=["#670"])
+    forced = await take(client, waiter["item_id"], force=True, note="doing it anyway",
+                        session="s-force")
+    assert forced["claim"]["note"].startswith("[forced past #670]")
+    assert "doing it anyway" in forced["claim"]["note"]
+    assert forced["forced"] is True
+
+
+async def test_the_completion_note_is_added_to_the_human_note_not_over_it(client):
+    """`note` is why the item sits where it sits — human-only to edit for that
+    very reason — and a completing agent's receipt used to replace it."""
+    repo = "acme/notekeep"
+    item = await issue(client, repo, 680, note="before #53: its schema is what #53 queries")
+    r = await client.post("/plan/item/done",
+                          json={"item_id": item["item_id"], "note": "landed in PR #143"},
+                          headers=LAPTOP)
+    assert r.status_code == 200, r.text
+    assert r.json()["note"].startswith("before #53")
+    assert "landed in PR #143" in r.json()["note"]
+
+
+# --------------------------------------------- order is a total order, still
+
+async def test_two_reorders_of_one_scope_cannot_interleave(client):
+    """Read-rewrite-commit with nothing between them: two board tabs both read
+    the same list and both wrote, so the ranks could end up neither order."""
+    repo = "acme/reorderrace"
+    a = await issue(client, repo, 700)
+    b = await issue(client, repo, 701)
+    c = await issue(client, repo, 702)
+    forward = [a["item_id"], b["item_id"], c["item_id"]]
+    backward = list(reversed(forward))
+
+    both = await asyncio.gather(
+        client.post("/plan/reorder", json={"repo": repo, "order": forward}, headers=HUMAN),
+        client.post("/plan/reorder", json={"repo": repo, "order": backward}, headers=HUMAN),
+    )
+    assert [r.status_code for r in both] == [200, 200], [r.text for r in both]
+    landed = [i["item_id"] for i in (await read(client, repo))["items"]]
+    assert landed in (forward, backward), "one order or the other, never a blend"
+
+
+async def test_two_adds_in_one_scope_do_not_land_on_one_rank(client):
+    """`_next_rank` is a read-then-insert and there is no unique index on
+    (repo, rank) to notice the collision — two items at one position, ordered
+    thereafter by whichever was created first."""
+    repo = "acme/addrace"
+    both = await asyncio.gather(
+        add(client, repo, "first"), add(client, repo, "second", headers=DESKTOP))
+    ranks = sorted(i["rank"] for i in both)
+    assert ranks == [1, 2], f"one rank each, got {ranks}"
+
+
+async def test_a_reorder_will_not_renumber_history(client):
+    """Dropped rows used to be re-ranked by every reorder and named in
+    `appended` while being absent from the `items` the same response returned."""
+    repo = "acme/reorderdropped"
+    live = await issue(client, repo, 710)
+    dropped = await issue(client, repo, 711)
+    await client.post("/plan/item/update",
+                      json={"item_id": dropped["item_id"], "state": "dropped"},
+                      headers=HUMAN)
+
+    r = await client.post("/plan/reorder",
+                          json={"repo": repo, "order": [dropped["item_id"]]},
+                          headers=HUMAN)
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"]["items"] == [dropped["item_id"]]
+
+    ok = await client.post("/plan/reorder",
+                           json={"repo": repo, "order": [live["item_id"]]}, headers=HUMAN)
+    assert ok.status_code == 200 and ok.json()["appended"] == []
+    assert [i["item_id"] for i in ok.json()["items"]] == [live["item_id"]]
+
+
+# --------------------------------------------------- spelling and edge cases
+
+async def test_one_issue_is_one_item_however_the_repo_is_spelled(client):
+    """GitHub repository names are case-insensitive, so `Acme/Repo#60` and
+    `acme/repo#60` are one issue everywhere except a table that never
+    lower-cased them — where they were two open items with two claim keys."""
+    first = await issue(client, "Acme/CaseRepo", 720)
+    assert first["repo"] == "acme/caserepo"
+    dup = await client.post("/plan/item", json={
+        "repo": "acme/caserepo", "title": "same issue, other spelling",
+        "ref_kind": "issue", "ref_value": "720"}, headers=DESKTOP)
+    assert dup.status_code == 409
+    assert (await read(client, "ACME/CaseRepo"))["items"][0]["item_id"] == first["item_id"]
+
+
+async def test_a_title_of_spaces_is_not_a_title(client):
+    r = await client.post("/plan/item", json={"repo": "acme/blank", "title": "   "},
+                          headers=LAPTOP)
+    assert r.status_code == 422
+
+
+async def test_a_dependency_on_a_dropped_item_is_refused_by_either_spelling(client):
+    """`#20` was refused and the same item's uuid was accepted, storing an edge
+    that could never block and never show — a 200 for nothing."""
+    repo = "acme/deadedge"
+    blocker = await issue(client, repo, 730)
+    waiter = await issue(client, repo, 731)
+    await client.post("/plan/item/update",
+                      json={"item_id": blocker["item_id"], "state": "dropped"},
+                      headers=HUMAN)
+
+    for token in ("#730", blocker["item_id"]):
+        r = await client.post("/plan/item/depends",
+                              json={"item_id": waiter["item_id"], "depends_on": [token]},
+                              headers=LAPTOP)
+        assert r.status_code == 422, f"{token}: {r.text}"
+        assert r.json()["detail"]["error"], "every refusal has the same shape"
+
+
+async def test_history_records_no_new_dependencies(client):
+    repo = "acme/depdone"
+    blocker = await issue(client, repo, 740)
+    finished = await issue(client, repo, 741)
+    await client.post("/plan/item/done", json={"item_id": finished["item_id"]},
+                      headers=LAPTOP)
+    r = await client.post("/plan/item/depends",
+                          json={"item_id": finished["item_id"],
+                                "depends_on": [blocker["item_id"]]}, headers=LAPTOP)
+    assert r.status_code == 409
+
+
+# ------------------------------------------------------------- the primitive
+
+async def test_acquire_refuses_a_session_with_work_in_flight():
+    """It commits — that is where the atomicity comes from — so handing it a
+    half-finished unit of work committed the half. Both callers happen to be
+    clean today; the function was extracted precisely so more will exist."""
+    async with async_session() as s:
+        s.add(PlanItem(title="not yet saved", rank=1, depends_on=[], added_by="laptop"))
+        with pytest.raises(RuntimeError, match="commits"):
+            await acquire(s, ClaimRequest(kind="work", key="acme/x#1", holder="laptop"))
+        await s.rollback()
+
+
+async def test_acquire_refuses_a_reserved_kind():
+    """The guard sat in front of one caller of the primitive rather than inside
+    it, so the next caller could write the row v2.33's fix closed off."""
+    async with async_session() as s:
+        with pytest.raises(HTTPException) as e:
+            await acquire(s, ClaimRequest(kind="release", key="acme/x:9.9",
+                                          holder="laptop"))
+    assert e.value.status_code == 409
+    assert "allocated, not taken" in e.value.detail["error"]
+
+
+# ------------------------------------------------------------ the browser page
+
+async def test_the_plan_page_is_served_to_a_reader(client):
+    r = await client.get("/plan/view", headers=LAPTOP)
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/html")
+    assert "plan" in r.text
+    assert (await client.get("/plan/view")).status_code == 401
+
+
+# ---------------------------------------------------------- the MCP surface
+
+def _mcp_client(recorder, **over):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "mcp"))
+    from mcp_server.client import QuarterbackClient
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        recorder.append(request)
+        return httpx.Response(200, json={"ok": True})
+
+    http = httpx.Client(transport=httpx.MockTransport(handle), base_url="http://board")
+    return QuarterbackClient("http://board", "tok", http_client=http, **over)
+
+
+def test_the_mcp_client_stamps_the_session_on_every_plan_verb():
+    """A claim whose holder cannot be reached is half a claim — and with the
+    plan's claims owned by the session rather than the box, an unstamped one is
+    also a claim its own agent cannot release."""
+    seen: list[httpx.Request] = []
+    client = _mcp_client(seen, session="s-42")
+    client.plan_item("claim", {"item_id": "abc"})
+    client.plan_item("release", {"item_id": "abc", "session": "s-mine"})
+
+    assert seen[0].url.path == "/plan/item/claim"
+    assert b'"session":"s-42"' in seen[0].content.replace(b" ", b"")
+    assert b'"session":"s-mine"' in seen[1].content.replace(b" ", b"")
+
+
+def test_the_mcp_client_sends_only_the_plan_filters_it_was_given():
+    seen: list[httpx.Request] = []
+    client = _mcp_client(seen)
+    client.plan({"repo": "acme/x", "phase": None, "include_done": False, "limit": None})
+    assert seen[0].url.params.get("repo") == "acme/x"
+    assert "phase" not in seen[0].url.params and "limit" not in seen[0].url.params
+
+    client.plan_add({"title": "t", "repo": None})
+    assert seen[1].url.path == "/plan/item" and seen[1].method == "POST"
+
+
+def test_every_plan_verb_the_mcp_tools_use_is_a_route_the_board_serves():
+    """The MCP tools live in a package that does not ship with the server, so
+    nothing but a test connects the two: a renamed endpoint would be discovered
+    by an agent, at the moment it needed the plan."""
+    from app.main import app as board
+
+    paths = set(board.openapi()["paths"])
+    for verb in ("claim", "release", "done", "depends"):
+        assert f"/plan/item/{verb}" in paths
+    assert {"/plan", "/plan/item", "/plan/reorder", "/plan/view"} <= paths
+
+
+def test_the_mcp_plan_tools_restate_neither_the_ttl_nor_the_limit():
+    """`mcp[cli]` is the MCP package's own dependency and is not installed here,
+    so the tool module cannot be imported — but the two things that must not
+    drift are readable without importing it: a hardcoded default TTL changes
+    behaviour the day the board's changes, and a `limit` the tool cannot pass is
+    a cap every MCP caller hits without being told."""
+    source = (Path(__file__).resolve().parent.parent
+              / "mcp" / "mcp_server" / "server.py").read_text(encoding="utf-8")
+    claim = source[source.index("def plan_claim("):source.index("def plan_release(")]
+    assert "ttl: int | None = None" in claim and "ttl: int = 3600" not in claim
+    read_tool = source[source.index("def plan_read("):source.index("def plan_add(")]
+    assert "limit" in read_tool
