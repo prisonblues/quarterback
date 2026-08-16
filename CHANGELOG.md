@@ -31,16 +31,26 @@ ref being merged into*, adds one, and writes it into every heading and bold run 
 markdown — so `harness/loops/README.md` is stamped by the same pass rather than being the file
 somebody forgets. `pyproject.toml` and `app/main.py` move with it, but only when the branch changed
 `app/` or `migrations/`, because most releases here are harness-side and correctly leave the served
-version alone; the inference is always reported and `--serve`/`--no-serve` override it. Placeholders
-inside code spans are documentation of the mechanism and are left alone; a placeholder written
-anywhere the stamper would *not* rewrite is a refusal, not a shrug. Two branches that stamp at once
-get the same number and the second re-stamps after the conflict — which is the point, since nothing
+version alone; the inference is always reported and `--serve`/`--no-serve` override it. `--major` is
+the one thing no ref can answer, so it is a flag rather than an inference. Placeholders inside code
+spans are documentation of the mechanism and are left alone; a placeholder written anywhere the
+stamper would *not* rewrite is a refusal, not a shrug.
+
+**Two branches can still stamp the same number, and the tool's job is to make that impossible to
+miss rather than impossible.** Once `apply` has run the placeholder is gone, so there is no
+automatic re-stamp — what there is instead is detection of both shapes the collision takes: a
+release number declared twice in one CHANGELOG (what "keep both sides" leaves behind, and a
+perfectly clean merge otherwise), and a branch carrying a number that already exists at the base
+under a different title. `preflight`, `apply` and `check` all refuse on those, and the message says
+the repair: put your entry back to `## vNEXT` and run `apply` again. Two tokens, because nothing
 else on the branch was ever written in terms of the number.
 
-This is not a second allocator, and #46/#99's `POST /release/claim` is untouched. The tenth
-collision happened an hour after that allocator shipped and worked: both branches simply did not
-call it. **A lock that has to be remembered is a lock that will be forgotten, and a placeholder
-cannot be got wrong** — that is the whole argument for doing it this way round.
+This is not a second allocator, and #46/#99's `POST /release/claim` is untouched — and is now
+described for what it is, an announcement rather than a reservation: the stamper does not read it,
+so a claim on v2.34 does not keep v2.34 free. The tenth collision happened an hour after that
+allocator shipped and worked: both branches simply did not call it. **A lock that has to be
+remembered is a lock that will be forgotten, and a placeholder cannot be got wrong** — that is the
+whole argument for doing it this way round.
 
 **README stops restating the CHANGELOG.** The "Latest release / Before it / Before that" paragraph
 re-wrote the previous four releases in fresh prose every time, which is why merging two branches

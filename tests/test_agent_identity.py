@@ -16,7 +16,18 @@ See test_designated_names.py for the naming, aliasing and allocation that replac
 
 from __future__ import annotations
 
-from app.identity import addressed_to, compose, machine_of, same_machine, split, valid_key
+import re
+from pathlib import Path
+
+from app.identity import (
+    addressed_to,
+    compose,
+    machine_of,
+    same_machine,
+    split,
+    valid_key,
+    valid_name,
+)
 
 from .conftest import LAPTOP, SERVER
 
@@ -33,7 +44,15 @@ SERVER_B = {**SERVER, "X-Agent-Key": "938fca68"}
 # the collision was invisible for as long as the version-numbered filenames happened to sort
 # the file that asserts on the name first. Renaming the files off their release numbers
 # reordered collection and surfaced it — which is the argument for the rename in miniature.
-LAPTOP_A = {**LAPTOP, "X-Agent-Key": "deploykey", "X-Agent-Name": "deploy-a"}
+#
+# So the name is derived rather than chosen, and cannot be picked twice: the module owns
+# exactly one filename, and no other module can spell it. Picking a second literal would only
+# have moved the collision one file along, because nothing about a literal says it is free.
+# The board validates a requested name (`valid_name`: lowercase, hyphen-separated, no
+# underscore, no leading hyphen, at most forty characters), and module names are snake_case,
+# hence the one substitution.
+AGENT_NAME = Path(__file__).stem.replace("_", "-")
+LAPTOP_A = {**LAPTOP, "X-Agent-Key": "deploykey", "X-Agent-Name": AGENT_NAME}
 
 
 async def ident(client, headers) -> str:
@@ -76,6 +95,58 @@ def test_valid_key_rejects_separators_and_empties():
     assert not valid_key("")
     assert not valid_key("-leading")
     assert not valid_key("x" * 41)
+
+
+# ---- the suite asking the board for names, seen from above ------------------
+
+#: A header dict that requests a name outright — a splat of one of conftest's machine
+#: constants, and somewhere in the same braces an X-Agent-Name key with a literal value.
+#: The machine is captured too, because names are claimed per machine and two files may ask
+#: different boxes for the same label without ever meeting. ``[^{}]`` cannot cross a brace, so
+#: a match is confined to one dict literal and the machine is genuinely the one it was written
+#: with. Only lowercase hyphenated literals match: a name built from a variable (``me["name"]``)
+#: is out of scope by construction, and rightly so — that is a name the board handed out, not
+#: one this suite chose. A malformed literal such as ``"Not A Name"`` is out of scope too; it
+#: exists to be rejected, so it never claims anything.
+REQUESTED_NAME = re.compile(
+    r"\{\*\*(?P<machine>[A-Z][A-Z0-9_]*)[^{}]*?\"X-Agent-Name\"\s*:\s*\"(?P<name>[a-z0-9-]+)\""
+)
+
+
+def test_this_module_derives_a_name_the_board_will_accept():
+    """The derivation is only worth anything if the board honours what it produces.
+
+    A requested name that fails validation is a 400 on every request this module makes, so
+    the constraint belongs next to the derivation rather than in whoever renames the file
+    next. Asserted on the derived value, not on a copy of it — a literal here would be the
+    same mistake one level up.
+    """
+    assert valid_name(AGENT_NAME) and "_" not in AGENT_NAME
+
+
+def test_no_two_test_modules_request_the_same_designated_name():
+    """No name literal may appear in two files, which is the collision LAPTOP_A had.
+
+    A designated name is claimed once per machine: the first module to ask gets it, and every
+    later asker is quietly handed something else. So a file that asserts on the name it asked
+    for passes or fails on collection order, and passes for as long as it happens to be
+    collected first. That is why the original clash survived months of green runs — nothing
+    was wrong with either file in isolation, and nothing in either file could have noticed.
+    Only a view across the whole suite can, which is what this is.
+
+    A file using several literals of its own is fine; test_designated_names.py legitimately
+    asks for both ``deploy`` and ``shadowme``, and they do not compete with each other.
+    """
+    claimed: dict[tuple[str, str], set[str]] = {}
+    for path in sorted(Path(__file__).parent.glob("test_*.py")):
+        for match in REQUESTED_NAME.finditer(path.read_text(encoding="utf-8")):
+            claimed.setdefault((match["machine"], match["name"]), set()).add(path.name)
+
+    clashes = {where: sorted(files) for where, files in claimed.items() if len(files) > 1}
+    assert not clashes, (
+        "two modules request the same designated name; whichever is collected second is "
+        f"handed a different one: {clashes}"
+    )
 
 
 # ---- the caller's key becomes an identity -----------------------------------

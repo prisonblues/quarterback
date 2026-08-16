@@ -239,6 +239,8 @@ the end of the list below. Name no number, in either file. Whoever lands first g
 git fetch origin
 scripts/release_stamp.py preflight        # what it would take, read-only
 scripts/release_stamp.py apply            # rewrites the placeholder; commits nothing
+scripts/release_stamp.py apply --major    # …as v3 rather than v2.34
+scripts/release_stamp.py check            # nothing unstamped, no number used twice
 ```
 
 `apply` reads the highest `## vX.Y` heading in the CHANGELOG **at the ref you are merging into**,
@@ -249,15 +251,26 @@ changed `app/` or `migrations/`: most releases here are harness-side and correct
 version where it was, and `--serve` / `--no-serve` override the inference for the release that
 proves it wrong.
 
-Two branches that stamp in the same minute get the same number, and the second one to reach the
-merge conflicts on the CHANGELOG, re-stamps against the moved base, and gets the next. That is the
-design and not a hole in it: the number is cheap to redo precisely because nothing else on the
-branch was ever written in terms of it. PR #90 was renumbered three times without one line of its
-behaviour changing, which is the cost this removes. Ten collisions in two days made the case, and
-the tenth landed an hour after the board's allocator shipped and worked — two agents simply did not
-call it, because a lock that has to be remembered is a lock that will be forgotten. `POST
-/release/claim` (#46, #99) is still there for a caller that wants to announce a number in advance;
-nothing in this flow needs one.
+Whether v2.34 or v3 follows v2.33 is the one thing no ref can answer, so `--major` is a flag and
+never an inference: `apply --major` stamps `v3`, and the plan says which kind of bump it made.
+
+Two branches that stamp in the same minute get the same number, and nothing can prevent that —
+what the tool does instead is make it impossible to miss. Once `apply` has run the placeholder is
+gone, so there is no automatic re-stamp and none is claimed; `preflight`, `apply` and `check` all
+refuse, either on the duplicate heading a "keep both sides" merge leaves behind or on the branch
+carrying a number that now exists at `origin/main` under a different title. The repair is in the
+message: put *your* entry back to `## vNEXT` and its bullet back to `- **vNEXT** — …`, then run
+`apply` again. Two tokens, because nothing else on the branch was ever written in terms of the
+number — which is what "cheap to redo" actually buys. PR #90 was renumbered three times without one
+line of its behaviour changing, which is the cost this removes.
+
+Ten collisions in two days made the case, and the tenth landed an hour after the board's allocator
+shipped and worked — two agents simply did not call it, because a lock that has to be remembered is
+a lock that will be forgotten. `POST /release/claim` (#46, #99) is still there, and it is worth
+being plain about what it is: an **announcement, not a reservation**. This flow neither reads it nor
+honours it, so a claim on v2.34 does not keep v2.34 free — the next `apply` on any branch stamps it
+anyway, because a stamped number is only ever "the next one free at the ref I merged into". Claim
+one if it helps a human coordinate; do not rely on it to hold a number.
 
 For the same reason **test files are named after what they test, not after the release that shipped
 them** — `tests/test_resource_claims.py`, never `tests/test_v231.py`. A version in a filename is a

@@ -145,7 +145,9 @@ which releases happen to be in flight — has stopped being one, and it is worth
 rather than quietly swapping it: quarterback's branches no longer write a release number
 at all (`scripts/release_stamp.py`, #122), so the CHANGELOG conflict that remains is two
 `vNEXT` headings whose answer is always keep-both, and the README narrative that had to be
-*rewritten* by hand is deleted. That removes the case; it does not remove the class. A
+*rewritten* by hand is deleted. (Keep-both on two already-STAMPED entries is the one case where it
+is still wrong, and `release_stamp.py check` refuses on the duplicate number rather than leaving it
+to a replayed resolution.) That removes the case; it does not remove the class. A
 replayed resolution is still last time's answer, and the merge that made this rule worth
 having had three prose conflicts where keep-both was right and a fourth, in `panel.py`,
 where it was not. `rerere.autoUpdate` is therefore pinned to

@@ -73,17 +73,30 @@ This is the hybrid path: the guardrails of a guided integration merge (lexray's 
 
    **4c. Release number** (if `scripts/release_stamp.py` exists):
    ```bash
-   python3 scripts/release_stamp.py apply --onto origin/$BASE
+   python3 scripts/release_stamp.py apply --onto origin/$BASE || {
+     [[ $? -eq 2 ]] && echo "HOLD: read the STOP above" && exit 1
+   }
    ```
+   The `|| { … }` is not decoration. Exit 2 is a refusal carrying the sentence that repairs it, and
+   under a `set -e` wrapper a bare invocation terminates the surrounding script before anything
+   reads the message — so the one output that makes a HOLD actionable is the one output that gets
+   lost. Same 0/2 scheme as `migration_reconcile.py` in 4a, and for the same reason: a caller
+   consuming it reads Python's uncaught-exception 1 as "unknown" rather than as "stop".
+
    A branch that ships a release writes `vNEXT` and names no number, so this is where the number
    is decided — against `$BASE` **as it stands now**, which is the only moment the answer is
    knowable. It is a noop on a branch that ships no release, so run it unconditionally rather than
-   guessing whether this one does. Exit 0 = stamped or nothing to stamp; **exit 2 = HOLD** and read
-   the message: every refusal is a release entry in a shape the tool will not guess about (two
-   unstamped entries, an entry below a released one, a placeholder somewhere nothing rewrites), and
-   guessing is what this whole mechanism exists to stop. `apply` writes and does not commit, so
-   commit what it produced. Re-run it if the branch takes a later merge from `$BASE` — the number
-   is computed from the base and a moved base can move it.
+   guessing whether this one does. Every refusal is a release entry in a shape the tool will not
+   guess about: two unstamped entries, an entry below a released one, a placeholder somewhere
+   nothing rewrites, or a number already taken at `$BASE`. `apply` writes and does not commit, so
+   commit what it produced.
+
+   **If the branch was already stamped and `$BASE` has since taken that number**, `apply` refuses
+   rather than re-stamping — the placeholder is gone, so there is nothing left for it to rewrite.
+   The message names the repair and it is two tokens: put this branch's entry back to
+   `## vNEXT — …` and its README bullet back to `- **vNEXT** — …`, then run 4c again. Nothing else
+   on the branch was ever written in terms of the number, which is what makes that an edit rather
+   than a rewrite.
 
    **4d. Push whatever 4a/4b/4c produced to the PR branch.** Those commits are mechanical (a
    `down_revision` line, a version counter, a release number the tool chose) and need no
