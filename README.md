@@ -100,9 +100,18 @@ GET   /sync              ?repo=&branch=&device=&path=          (registered workt
 
 # reviewer-panel stats (v2.10, accounts v2.11, rounds + coverage v2.15, cost v2.19,
 #                        changed files v2.23, provenance v2.26)
-POST  /review            (panel.py --json payload)              -> {id, recorded, accounts,
-                                                                    changed_files[, dropped]}
-GET   /reviews           ?repo=&pr=&author=&since=&days=&limit=  (runs + scorecards)
+POST  /review            (panel.py --json payload)              -> {id, recorded, findings,
+                                                                    accounts, changed_files
+                                                                    [, changed_files_dropped]
+                                                                    [, unread_files_dropped]
+                                                                    [, head_sha_dropped]
+                                                                    [, provenance_unknown]
+                                                                    [, provenance_counts_unusable]
+                                                                    [, unreadable_fields]}
+                          the bracketed keys appear only when something was dropped, and are the
+                          machine-readable drift signal #65 reads; every one is logged too
+GET   /reviews           ?repo=&pr=&author=&since=&days=&limit=  (runs + scorecards,
+                                                                  unread_files as a count)
 GET   /review/{id}                                              (scorecards + findings + accounts
                                                                  + the PR's changed_files
                                                                  + head_sha/unread_files/provenance)
@@ -201,7 +210,16 @@ so a defect introduced by a *deletion* has no added line to sit on, and ordinary
 line-drift misses the set by a line or two. Both land in `missed`. Null throughout is *not
 recorded* — a run before v2.26, a round 1 with nothing to attribute against, a defect an earlier
 round already raised — and is never the `unknown` bucket, which means the question was asked and
-the answer could not be placed. `provenance_runs` says how much of a window could attribute at all.
+the answer could not be placed. `provenance_runs` says how much of a window could attribute at all,
+and counts only judged runs: the per-member counters are tallied over confirmed findings, so an
+unjudged run can only contribute zeros to the sums it annotates.
+
+**Anything the ingest drops is named back and logged.** An unrecognised bucket, a `head_sha` that
+cannot be a commit id, an unread path over the cap or unreadable, a known bucket carrying an
+unbelievable count, a field whose value is not the shape that field takes: each comes back in the
+`POST /review` response under its own key and goes to the service log, because a response nobody
+stores is not a record and `qb record-review` prints only the run id. That is the machine-readable
+half of the panel↔board drift check #65 asks for.
 
 ## Releases
 

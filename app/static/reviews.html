@@ -261,11 +261,37 @@ function tokenTip(r){
     <br><span class="dim">tokens compare this vendor's tiers, not one vendor with another</span>`;
 }
 
-// The buckets, in the order they are worth reading: what the last fix caused,
-// what the last round missed, what it could not have seen, what could not be
-// placed. Spelled as the panel spells them — one vocabulary from `panel.py`
-// through the payload and the columns to here.
-const PROV = ["introduced", "missed", "missed-unread", "unknown"];
+// How the buckets this page knows about are worded, in the order they are worth
+// reading: what the last fix caused, what the last round missed, what it could
+// not have seen, what could not be placed. Spelled as the panel spells them —
+// one vocabulary from `panel.py` through the payload and the columns to here.
+//
+// A LOOKUP, never the list of what exists. Migration 0017 says this vocabulary
+// grows when #41 makes attribution exact, and a hard-coded array was silently
+// excluding any new bucket from both the tooltip's sum and the tile's
+// denominator — the same drop-without-a-word shape one layer up. Every total on
+// this page is therefore summed over the object the server sent, and a bucket
+// with no wording here is still counted and still named, just in its own words.
+const PROV_WORDS = {
+  introduced: n => `${n} introduced by the last fix`,
+  missed: n => `${n} the last round missed`,
+  "missed-unread": n => `${n} in a file that round could not read`,
+  unknown: n => `${n} unplaceable`,
+};
+const PROV_ORDER = Object.keys(PROV_WORDS);
+
+// Every bucket the server sent, in this page's reading order, with anything it
+// has never heard of after them rather than dropped.
+function provKeys(p){
+  return [...PROV_ORDER.filter(k => k in p),
+          ...Object.keys(p).filter(k => !(k in PROV_WORDS))];
+}
+function provTotal(p){
+  return Object.values(p || {}).reduce((a, v) => a + (v || 0), 0);
+}
+function provWords(k, n){
+  return (PROV_WORDS[k] || (m => `${m} ${k}`))(n);
+}
 
 // #48's second axis for one reviewer. Finding a regression somebody just wrote
 // and finding a defect that has sat there for months are different competencies,
@@ -278,13 +304,13 @@ const PROV = ["introduced", "missed", "missed-unread", "unknown"];
 function provTip(r){
   if (!r.provenance_runs) return "";
   const p = r.provenance || {};
-  const n = PROV.reduce((a, k) => a + (p[k] || 0), 0);
+  const n = provTotal(p);
   const of = `${r.provenance_runs} run${r.provenance_runs === 1 ? "" : "s"} where the cause could be traced`;
   if (!n) return `<br><span class="dim">nothing of its own attributed in ${of}</span>`;
-  const rest = [
-    (p["missed-unread"] || 0) ? `${p["missed-unread"]} in a file that round could not read` : "",
-    (p.unknown || 0) ? `${p.unknown} unplaceable` : "",
-  ].filter(Boolean).join(", ");
+  const rest = provKeys(p)
+    .filter(k => k !== "introduced" && k !== "missed" && (p[k] || 0))
+    .map(k => provWords(k, p[k]))
+    .join(", ");
   return `<br>across ${of}: <b>${p.introduced || 0}</b> introduced by the last fix,
     ${p.missed || 0} the last round missed${rest ? ` (${rest})` : ""}`;
 }
@@ -451,6 +477,12 @@ function accountsBlock(f){
     </div>`).join("")}</div>`;
 }
 
+// On one line deliberately: a template literal keeps the newline and the source
+// indentation, and a `title` attribute renders both — so wrapping this the way
+// the surrounding code wraps put a line break and eight spaces inside the
+// tooltip text. Every other tooltip here is one line or uses `<br>` on purpose.
+const PROV_CHIP_TIP = "did the previous fix pass cause this, or did the previous round miss it? a signal, not a verdict";
+
 function findingBlock(f){
   const n = (f.reported_by || []).length;
   const who = (f.reviewers || []).map(esc).join(", ") || f.verdict;
@@ -459,8 +491,7 @@ function findingBlock(f){
       <span class="loc">${esc(f.file || "")}${f.line ? ":" + f.line : ""}</span>
       <span>${esc(f.title)}</span>
       <span class="by">${who}${f.reviewers && f.reviewers.length > 1 ? " ⋆" : ""}</span>
-      ${f.provenance ? `<span class="chip dim" title="did the previous fix pass cause this,
-        or did the previous round miss it? a signal, not a verdict">${esc(f.provenance)}</span>` : ""}
+      ${f.provenance ? `<span class="chip dim" title="${PROV_CHIP_TIP}">${esc(f.provenance)}</span>` : ""}
       ${n ? `<span class="chip">${n} account${n === 1 ? "" : "s"} ▸</span>` : ""}
     </div>${accountsBlock(f)}`;
 }
@@ -652,8 +683,14 @@ function renderTiles(s){
   // Absent entirely when nothing in the window was attributable — the tile would
   // otherwise read "0%" over runs where the question was never asked, and that is
   // the most flattering possible way to say "not measured".
+  //
+  // Summed over what the server sent minus `not_attributed`, rather than over a
+  // list of bucket names kept here: a bucket added under #41 belongs in the
+  // denominator the day it exists, and a page that omits it reports a percentage
+  // of the wrong total while looking exactly as confident.
   const prov = s.by_provenance || {};
-  const traced = PROV.reduce((a, k) => a + (prov[k] || 0), 0);
+  const traced = Object.entries(prov)
+    .reduce((a, [k, v]) => k === "not_attributed" ? a : a + (v || 0), 0);
   const inflicted = traced ? Math.round(((prov.introduced || 0) / traced) * 100) : null;
   $("tiles").innerHTML = `
     <div class="tile"><div class="n">${s.runs}</div><div class="k">panel runs</div></div>

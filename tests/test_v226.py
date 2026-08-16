@@ -34,6 +34,8 @@ itself) — the second counts a finding two seats agreed on once, the first twic
 
 from __future__ import annotations
 
+import logging
+
 from .conftest import LAPTOP
 
 REPO = "acme/v226repo"
@@ -215,11 +217,125 @@ async def test_an_unrecognised_tally_key_is_dropped_and_named(client):
 
 async def test_an_unbelievable_count_drops_with_its_key_rather_than_becoming_zero(client):
     """Zero is a claim everywhere in this feature. A count that cannot be believed
-    must not be recorded as one that was measured at nothing."""
+    must not be recorded as one that was measured at nothing — and the drop says
+    so, under its own key: an unknown NAME and a known name carrying an
+    unbelievable NUMBER are two different things for a sender to fix."""
     run = await record(client, 9322,
                        provenance_counts={"introduced": -1, "missed": "two",
                                           "unknown": 5})
     assert (await detail(client, run["id"]))["provenance_counts"] == {"unknown": 5}
+    assert run["provenance_counts_unusable"] == ["introduced", "missed"]
+    assert "provenance_unknown" not in run, "the names were known; the counts were not"
+
+
+async def test_a_tally_that_loses_every_key_is_null_and_not_the_empty_object(client):
+    """`{}` is the panel's positive statement that the question does not arise —
+    a round 1, a run outside a cycle. A tally that arrived with keys and lost all
+    of them says nothing of the sort, and storing `{}` for it manufactures a claim
+    the sender never made, out of the exact collapse this release argues against.
+
+    It also costs the run its coverage marker, since `{}` is deliberately excluded
+    from `provenance_runs`. NULL — nobody said anything this board could read — is
+    the honest side to collapse onto, and the names are in the response."""
+    unknown_name = await record(client, 9324, provenance_counts={"regressed": 4})
+    bad_count = await record(client, 9325, provenance_counts={"introduced": -1})
+    assert (await detail(client, unknown_name["id"]))["provenance_counts"] is None
+    assert (await detail(client, bad_count["id"]))["provenance_counts"] is None
+    assert unknown_name["provenance_unknown"] == ["regressed"]
+    assert bad_count["provenance_counts_unusable"] == ["introduced"]
+    # ...and `{}` itself still means what it means.
+    sent_empty = await record(client, 9326, provenance_counts={})
+    assert (await detail(client, sent_empty["id"]))["provenance_counts"] == {}
+
+
+async def test_a_tally_key_that_is_not_a_string_is_named_back(client):
+    """JSON has no non-string keys, but a hand-rolled Python caller posting a dict
+    does, and `_count_files_sent` handles it with `str(k)` — a path nothing
+    exercised."""
+    run = await record(client, 9327, provenance_counts={1: 2, "introduced": 1})
+    assert run["provenance_unknown"] == ["1"]
+    assert (await detail(client, run["id"]))["provenance_counts"] == {"introduced": 1}
+
+
+async def test_one_drift_arrives_under_one_spelling_however_it_was_sent(client):
+    """The two echo paths merge into one set, so they have to normalise the same
+    way. `_bucket_or_none` strips before testing membership, so `"  regressed  "`
+    is rejected as a bucket — and an unstripped echo then reported it as a
+    SECOND, different drift beside the finding's own `regressed`, defeating the
+    dedup the set exists for."""
+    run = await record(client, 9328,
+                       provenance_counts={"  regressed  ": 4},
+                       to_fix=[finding("odd", provenance="regressed")])
+    assert run["provenance_unknown"] == ["regressed"]
+
+
+async def test_a_long_bucket_name_is_cut_and_marked_as_cut(client):
+    """The echo is bounded so a caller cannot use the response as a mirror for
+    arbitrary text. A cut name is marked, so a reader is never handed a prefix as
+    if it were the whole name."""
+    from app.api.reviews import MAX_BUCKET_ECHO
+    long_name = "introduced-" + "z" * MAX_BUCKET_ECHO
+    run = await record(client, 9329, to_fix=[finding("odd", provenance=long_name)])
+    assert run["provenance_unknown"] == [long_name[:MAX_BUCKET_ECHO] + "…"]
+
+
+async def test_the_number_of_named_buckets_is_bounded_too(client):
+    """`MAX_BUCKET_ECHO` bounds each NAME and nothing bounded the count, so a
+    tally of arbitrarily many junk keys was sorted and serialised in full. Past
+    the cap the response says how many there were instead."""
+    from app.api.reviews import MAX_UNKNOWN_BUCKETS
+    n = MAX_UNKNOWN_BUCKETS + 7
+    run = await record(client, 9339,
+                       provenance_counts={f"bucket-{i:03d}": 1 for i in range(n)})
+    assert len(run["provenance_unknown"]) == MAX_UNKNOWN_BUCKETS
+    assert run["provenance_unknown_total"] == n
+
+
+async def test_a_provenance_that_is_not_a_string_is_named_rather_than_vanishing(client):
+    """`provenance: 5` and `provenance: ["missed"]` used to leave nothing at all —
+    normalised to NULL with no entry in `provenance_unknown` — so a type-confused
+    producer read exactly like a finding nobody asked about. A blank string did
+    the same, because the response filter tested truthiness."""
+    run = await record(client, 9342,
+                       to_fix=[finding("typed wrong", provenance=5),
+                               finding("listed", provenance=["missed"],
+                                       file="app/db.py"),
+                               finding("blank", provenance="   ", file="app/x.py")])
+    assert run["provenance_unknown"] == ["", "5", "['missed']"]
+    d = await detail(client, run["id"])
+    assert all(f["provenance"] is None for f in d["findings"])
+
+
+async def test_a_dropped_head_sha_is_named_back_like_every_other_drop(client):
+    """A run sent `"HEAD"` and a run sent nothing both store NULL, and only the
+    response can tell the sender which of the two it just recorded. Every other
+    drop in this release says so; this one said nothing."""
+    run = await record(client, 9343, head_sha="origin/main")
+    assert run["head_sha_dropped"] == "origin/main"
+    silent = await record(client, 9344)
+    assert "head_sha_dropped" not in silent, "nothing was sent, so nothing was dropped"
+
+
+async def test_a_drop_is_logged_and_not_only_returned(client, caplog):
+    """The response is read by whoever made the request and `qb record-review`
+    prints only the run id, so until this line the evidence was gone the moment
+    the response was parsed — and #65's drift check, the reader this signal exists
+    for, would have had nothing left to read."""
+    with caplog.at_level(logging.WARNING, logger="app.review"):
+        run = await record(client, 9345, head_sha="HEAD",
+                           to_fix=[finding("odd", provenance="regressed")])
+    line = "\n".join(r.getMessage() for r in caplog.records)
+    assert f"run={run['id']}" in line
+    assert "regressed" in line and "HEAD" in line
+
+
+async def test_an_ordinary_run_logs_nothing(client, caplog):
+    """A log line per run would be noise, and noise is how a real drop goes
+    unread."""
+    with caplog.at_level(logging.WARNING, logger="app.review"):
+        await record(client, 9346, head_sha=SHA, unread_files=["a.py"],
+                     to_fix=[finding("fine", provenance="missed")])
+    assert not [r for r in caplog.records if r.name == "app.review"]
 
 
 async def test_an_ordinary_run_keeps_the_response_shape_callers_already_parse(client):
@@ -233,8 +349,8 @@ async def test_an_ordinary_run_keeps_the_response_shape_callers_already_parse(cl
 async def test_a_garbled_head_sha_costs_the_sha_and_nothing_else(client):
     """Recording is best-effort. A branch name where a commit id was promised is
     "nobody said", which is a state the column already has."""
-    for bad in ("HEAD", "origin/main", "zzzz", "abc", 12345, None,
-                {"oid": SHA}, SHA + SHA):
+    for bad in ("HEAD", "origin/main", "zzzz", "abc", 12345, "12345678", None,
+                SHA[:7], SHA[:12], {"oid": SHA}, SHA + SHA):
         run = await record(client, 9330, head_sha=bad, to_fix=[finding("still here")])
         d = await detail(client, run["id"])
         assert d["head_sha"] is None, bad
@@ -244,11 +360,17 @@ async def test_a_garbled_head_sha_costs_the_sha_and_nothing_else(client):
 async def test_a_malformed_unread_list_never_costs_the_run_its_findings(client):
     """A shape that is not a declaration lands on NULL, exactly as
     `could_not_assess` does — [] would say the round measured and found nothing
-    cut, which is the opposite of what a garbled value tells us."""
+    cut, which is the opposite of what a garbled value tells us.
+
+    Including a list whose every entry is unusable: `[{"path": "a.py"}, 7, None]`
+    is a garbled declaration, not a measured one, and storing [] for it would put
+    the release's own clean bill of coverage on a value that says the opposite."""
     for bad, want in (
         ("harness/loops/panel.py", ["harness/loops/panel.py"]),  # one path, spelled bare
         ([" a.py ", "a.py", ""], ["a.py"]),                      # trimmed, deduped, blanks gone
-        ([{"path": "a.py"}, 7, None], []),                       # no usable item
+        ([{"path": "a.py"}, 7, None], None),                     # no usable item
+        ([""], None),                                            # nor is a blank one
+        ("   ", None),                                           # nor a blank string
         ({"a.py": True}, None),                                  # not a declaration at all
         (42, None),
     ):
@@ -257,6 +379,58 @@ async def test_a_malformed_unread_list_never_costs_the_run_its_findings(client):
         d = await detail(client, run["id"])
         assert d["unread_files"] == want, bad
         assert len(d["findings"]) == 1, bad
+
+
+async def test_an_all_unusable_unread_list_says_what_it_could_not_read(client):
+    """The other half of the same fix. NULL is the honest storage, and it is the
+    same NULL a run that said nothing carries — so the response has to be what
+    tells the sender its declaration was garbled rather than absent.
+
+    Mirrors `changed_files_dropped.unusable` one field over, down to counting a
+    blank entry as a loss."""
+    run = await record(client, 9336, unread_files=[{"path": "a.py"}, 7, None])
+    assert run["unread_files_dropped"] == {"over_cap": 0, "unusable": 3}
+    assert (await detail(client, run["id"]))["unread_files"] is None
+
+
+async def test_an_overlong_unread_path_is_dropped_rather_than_truncated(client):
+    """Truncating it would store a DIFFERENT path under an ordinary 201, and this
+    list is matched against the next round's diff by exact path — so the
+    `missed-unread` bucket it feeds would never match and nothing would say why."""
+    from app.api.reviews import MAX_PATH_CHARS
+    long_path = "a/" + "x" * MAX_PATH_CHARS
+    run = await record(client, 9337, unread_files=[long_path, "b.py"])
+    assert run["unread_files_dropped"] == {"over_cap": 0, "unusable": 1}
+    assert (await detail(client, run["id"]))["unread_files"] == ["b.py"]
+
+
+def test_the_unread_accounting_closes():
+    """`unread_files_sent` is what the over-cap arithmetic subtracts from, and a
+    bare string is a shape `_unread_paths` explicitly supports — counting it as
+    zero sent recorded a caller that sent one path as one that sent none.
+
+    The invariant the three numbers owe a reader: stored + unusable + over-cap is
+    what arrived."""
+    from app.api.reviews import MAX_PATH_CHARS, ReviewIn
+
+    def parse(unread):
+        return ReviewIn.model_validate({"repo": REPO, "pr": 1, "unread_files": unread})
+
+    one = parse("a.py")
+    assert (one.unread_files, one.unread_files_sent, one.unread_files_unusable) == (
+        ["a.py"], 1, 0)
+    # A blank string is no declaration rather than a lost path — nothing was there
+    # to lose, so neither number counts it.
+    blank = parse("   ")
+    assert (blank.unread_files, blank.unread_files_sent, blank.unread_files_unusable) == (
+        None, 0, 0)
+    # One entry, and it was not a path.
+    long_one = parse("x" * (MAX_PATH_CHARS + 1))
+    assert (long_one.unread_files, long_one.unread_files_sent,
+            long_one.unread_files_unusable) == (None, 1, 1)
+    mixed = parse(["a.py", "", 7, "a.py"])
+    assert (mixed.unread_files, mixed.unread_files_sent, mixed.unread_files_unusable) == (
+        ["a.py"], 4, 2)
 
 
 async def test_a_malformed_tally_never_costs_the_run_its_findings(client):
@@ -268,13 +442,36 @@ async def test_a_malformed_tally_never_costs_the_run_its_findings(client):
         assert len(d["findings"]) == 1, bad
 
 
+async def test_a_field_of_the_wrong_shape_entirely_still_says_so(client):
+    """The last of the silent drops, and the coarsest: the per-entry signals can
+    only speak about a value they could walk, so `unread_files: 42` and
+    `provenance_counts: ["introduced"]` went to NULL with nothing said — a
+    wrong-typed producer reading exactly like one that sent nothing, which is
+    #93's own failure mode."""
+    run = await record(client, 9347, unread_files=42,
+                       provenance_counts=["introduced"])
+    assert run["unreadable_fields"] == ["provenance_counts", "unread_files"]
+    d = await detail(client, run["id"])
+    assert d["unread_files"] is None and d["provenance_counts"] is None
+    # An absent field is not an unreadable one: nobody said, and that is a state.
+    assert "unreadable_fields" not in await record(client, 9348)
+    assert "unreadable_fields" not in await record(
+        client, 9349, unread_files=None, provenance_counts=None)
+
+
 async def test_a_folded_path_is_not_reported_as_a_loss(client):
-    """A blank or repeated path is folded, not lost, so the drop signal must stay
-    quiet — a warning that fires on a payload nothing went missing from teaches a
-    reader to ignore it. Same silence `changed_files` keeps over its own dedup."""
-    run = await record(client, 9334, unread_files=[" a.py ", "a.py", "", "b.py"])
+    """A repeated path is folded, not lost, so the drop signal must stay quiet — a
+    warning that fires on a payload nothing went missing from teaches a reader to
+    ignore it. Same silence `changed_files` keeps over its own dedup.
+
+    A blank entry is a different matter and counts as unusable, which is what
+    `changed_files` does with one too: consistency between two path lists in one
+    module is worth more than one fewer number in a response."""
+    run = await record(client, 9334, unread_files=[" a.py ", "a.py", "b.py"])
     assert "unread_files_dropped" not in run
     assert (await detail(client, run["id"]))["unread_files"] == ["a.py", "b.py"]
+    blank = await record(client, 9338, unread_files=[" a.py ", "a.py", "", "b.py"])
+    assert blank["unread_files_dropped"] == {"over_cap": 0, "unusable": 1}
 
 
 async def test_an_oversized_unread_list_is_truncated_and_reported(client):
@@ -283,7 +480,7 @@ async def test_an_oversized_unread_list_is_truncated_and_reported(client):
     announced — a truncation the sender cannot see reads as a complete list."""
     run = await record(client, 9333,
                        unread_files=[f"f{i}.py" for i in range(5200)])
-    assert run["unread_files_dropped"] == 200
+    assert run["unread_files_dropped"] == {"over_cap": 200, "unusable": 0}
     assert len((await detail(client, run["id"]))["unread_files"]) == 5000
 
 
@@ -304,7 +501,8 @@ async def test_the_reported_truncation_is_what_was_actually_ignored(client):
     worth more than optimising a payload that cannot occur."""
     paired = [p for i in range(3000) for p in (f"g{i}.py", f"g{i}.py")]
     run = await record(client, 9335, unread_files=paired)
-    assert run["unread_files_dropped"] == 1000, "6000 sent, 5000 considered"
+    assert run["unread_files_dropped"] == {"over_cap": 1000, "unusable": 0}, \
+        "6000 sent, 5000 considered"
     # The first 5,000 entries are 2,500 paths seen twice each.
     assert len((await detail(client, run["id"]))["unread_files"]) == 2500
 
@@ -388,11 +586,13 @@ async def test_coverage_is_never_zero_beside_a_non_zero_split(client):
 
     Reachable without a malicious caller: the run tally is a separate field, and
     a payload that attributes its findings while sending no tally — or one whose
-    tally is emptied by the validator for holding unbelievable numbers — used to
-    land exactly there."""
+    tally the validator refuses outright for holding unbelievable numbers — lands
+    exactly there."""
     repo = "acme/v226cover"
     await record(client, 9370, repo=repo, head_sha=SHA,
-                 provenance_counts={"introduced": -1},   # emptied by the validator
+                 # NULL after the validator: the tally arrived and nothing in it
+                 # could be believed, which is not the same as `{}`.
+                 provenance_counts={"introduced": -1},
                  to_fix=[finding("attributed anyway", provenance="introduced",
                                  reviewers=["claude"])])
     s = await stats(client, repo=repo)
@@ -437,3 +637,198 @@ async def test_every_bucket_is_reported_even_when_the_window_is_empty(client):
     s = await stats(client, repo="acme/v226nothing")
     assert s["by_provenance"] == {"introduced": 0, "missed": 0, "missed-unread": 0,
                                   "unknown": 0, "not_attributed": 0}
+
+
+async def test_the_window_split_counts_observations_and_says_so(client):
+    """A defect raised again in a later round is another ROW, carrying NULL
+    provenance because the question does not arise for something an earlier round
+    already raised. So repeats inflate `not_attributed` and leave the four buckets
+    alone — which is why the docstring says this is per observation, and why
+    `not_attributed` must not be read against a count of distinct defects."""
+    repo = "acme/v226repeat"
+    again = finding("the same defect", key="d1", provenance="introduced")
+    await record(client, 9362, repo=repo, round=2, cycle="c9", head_sha=SHA,
+                 to_fix=[again])
+    await record(client, 9362, repo=repo, round=3, cycle="c9", head_sha=SHA,
+                 to_fix=[{**again, "provenance": None}])
+    s = await stats(client, repo=repo)
+    assert s["by_provenance"]["introduced"] == 1
+    assert s["by_provenance"]["not_attributed"] == 1, "one defect, two observations"
+
+
+# ------------------------------------------- what each read path carries, and why
+
+async def test_the_run_list_carries_the_count_and_not_the_file_dump(client):
+    """`unread_files` is bounded only by 5,000 entries of 4,096 characters per
+    run, so a page of runs could serialise millions of path strings — the cost
+    `changed_files` was kept out of this same view for. The count still separates
+    "measured, nothing cut" (0) from "never measured" (null), which is the
+    distinction the storage side exists to protect; the paths are on
+    `GET /review/{id}`."""
+    repo = "acme/v226list"
+    await record(client, 9380, repo=repo, head_sha=SHA,
+                 unread_files=["a.py", "b.py"],
+                 provenance_counts={"introduced": 1})
+    r = await client.get("/reviews", params={"repo": repo, "pr": 9380}, headers=AGENT)
+    assert r.status_code == 200, r.text
+    row = r.json()[0]
+    assert "unread_files" not in row, "the paths belong on the detail endpoint"
+    assert row["unread_files_count"] == 2
+    assert row["head_sha"] == SHA
+    assert row["provenance_counts"] == {"introduced": 1}
+    # ...and the three states survive the count.
+    await record(client, 9381, repo=repo, unread_files=[])
+    await record(client, 9382, repo=repo)
+    rows = {x["pr"]: x for x in (await client.get(
+        "/reviews", params={"repo": repo}, headers=AGENT)).json()}
+    assert rows[9381]["unread_files_count"] == 0
+    assert rows[9382]["unread_files_count"] is None
+
+
+async def test_the_finding_history_carries_the_round_tally_beside_the_buckets(client):
+    """This endpoint is where a defect's chain of observations is read, so a
+    consumer interpreting a `missed-unread` bucket or comparing a finding against
+    its round's own tally had to issue an extra request per run to get either."""
+    await record(client, 9383, head_sha=SHA, unread_files=["far.py"],
+                 provenance_counts={"introduced": 1, "missed": 0},
+                 to_fix=[finding("traced", provenance="introduced")])
+    r = await client.get("/review/findings", params={"repo": REPO, "pr": 9383},
+                         headers=AGENT)
+    assert r.status_code == 200, r.text
+    run = r.json()["runs"][0]
+    assert run["provenance_counts"] == {"introduced": 1, "missed": 0}
+    assert run["unread_files_count"] == 1
+    assert "unread_files" not in run, "a page of runs is not a place for path lists"
+
+
+async def test_a_scorecard_says_nothing_rather_than_four_zeros(client):
+    """`review_stats` publishes `provenance_runs` beside its sums precisely
+    because the columns are NOT NULL and a window of older runs reports four
+    honest zeros that mean nothing. A single card had no equivalent, so a
+    pre-v2.26 run rendered as a member that never once caught a regression."""
+    silent = await record(client, 9384, to_fix=[finding("no provenance anywhere")])
+    assert card(await detail(client, silent["id"]), "claude")["provenance"] is None
+    # A tally with nothing of this member's in it is still a run that attributed.
+    asked = await record(client, 9385, provenance_counts={"introduced": 0},
+                         to_fix=[finding("nothing to attribute")])
+    assert card(await detail(client, asked["id"]), "claude")["provenance"] == {
+        "introduced": 0, "missed": 0, "missed-unread": 0, "unknown": 0}
+    # ...and so is one that attributed a finding while sending no tally at all.
+    counted = await record(client, 9386,
+                           to_fix=[finding("fresh", provenance="introduced")])
+    assert card(await detail(client, counted["id"]),
+                "claude")["provenance"]["introduced"] == 1
+
+
+async def test_an_unjudged_run_is_not_counted_as_coverage(client):
+    """The scorecard counters are tallied under the `confirmed` branch, so an
+    unjudged run can only ever contribute zeros to the sums — while its non-empty
+    tally used to make it count as coverage. A reader following the documented
+    rule then saw a covered window with zero `introduced` and concluded the member
+    catches no regressions, when nothing in that run was adjudicated at all."""
+    repo = "acme/v226unjudged"
+    run = await record(client, 9387, repo=repo, judged=False, head_sha=SHA,
+                       provenance_counts={"introduced": 2},
+                       to_fix=[finding("nobody ruled on this", provenance="introduced",
+                                       reviewers=["claude"])])
+    s = await stats(client, repo=repo, judged_only="false")
+    claude = model_row(s, "claude")
+    assert claude["provenance"]["introduced"] == 0, "unjudged findings are not tallied"
+    assert claude["provenance_runs"] == 0, "so the run is not coverage either"
+    # ...and the same guard one grain down: the card's counters can only be zero
+    # on this run, so its tally must not present four of them as a measurement.
+    assert card(await detail(client, run["id"]), "claude")["provenance"] is None
+    # The finding still records its own bucket. It was asked and answered; what is
+    # missing is a verdict, not an attribution.
+    assert (await detail(client, run["id"]))["findings"][0]["provenance"] == "introduced"
+
+
+async def test_the_window_filters_reach_the_new_aggregates(client):
+    """`judged_only` and the time window are applied to the new provenance query
+    the same way they are to every other one — an axis that quietly ignored the
+    window would publish a number about a different population than the page says
+    it is about."""
+    repo = "acme/v226filter"
+    await record(client, 9388, repo=repo, judged=True, head_sha=SHA,
+                 provenance_counts={"introduced": 1},
+                 to_fix=[finding("judged", provenance="introduced",
+                                 reviewers=["claude"])])
+    await record(client, 9389, repo=repo, judged=False, head_sha=SHA,
+                 provenance_counts={"missed": 1},
+                 to_fix=[finding("unjudged", provenance="missed",
+                                 reviewers=["claude"], file="app/db.py")])
+    judged = await stats(client, repo=repo)
+    assert judged["by_provenance"] == {"introduced": 1, "missed": 0,
+                                       "missed-unread": 0, "unknown": 0,
+                                       "not_attributed": 0}
+    # Dropping `judged_only` widens the RUN window and changes nothing here: this
+    # split is over confirmed findings, and an unjudged run has none by
+    # construction. Worth pinning, because the same relaxation does change
+    # `by_model`, and a reader comparing the two needs the reason.
+    both = await stats(client, repo=repo, judged_only="false")
+    assert both["by_provenance"] == judged["by_provenance"]
+    assert model_row(both, "claude")["runs"] == 2
+    assert model_row(judged, "claude")["runs"] == 1
+    # A window that excludes everything excludes the provenance too.
+    future = await stats(client, repo=repo, since="2099-01-01T00:00:00+00:00")
+    assert future["by_provenance"]["introduced"] == 0
+    assert future["by_model"] == []
+    # ...and so does a window that names another repo.
+    assert (await stats(client, repo="acme/v226elsewhere"))["by_provenance"][
+        "introduced"] == 0
+
+
+# --------------------------------------------------- the vocabulary and the caller
+
+def test_every_bucket_has_a_column_behind_it():
+    """`PROVENANCE_COUNTER` used to derive its column names by string transform,
+    which assumed the column existed — and migration 0017 says in as many words
+    that this vocabulary grows when #41 makes attribution exact. A word added
+    without the migration would then have raised `AttributeError` under a request,
+    on `/review/stats` and on the whole `POST /review` ingest path. It now fails
+    at import with the missing column named; this pins that the mapping and the
+    model actually agree today."""
+    from app.api.reviews import PROVENANCE, PROVENANCE_COUNTER
+    from app.models.review import ReviewReviewer
+    assert set(PROVENANCE_COUNTER) == set(PROVENANCE)
+    for col in PROVENANCE_COUNTER.values():
+        assert hasattr(ReviewReviewer, col), col
+
+
+def test_the_migration_creates_exactly_the_columns_the_api_reads():
+    """The other end of the same agreement: 0017 adds the counters and the API
+    sums them, and a bucket added to one side without the other is the silent miss
+    the mapping exists to prevent."""
+    import importlib
+
+    from app.api.reviews import PROVENANCE_COUNTER
+    mig = importlib.import_module("migrations.versions.0017_review_provenance")
+    assert set(mig.COUNTERS) == set(PROVENANCE_COUNTER.values())
+
+
+def test_a_caller_cannot_write_its_own_account_of_what_it_sent():
+    """`provenance_sent` is evidence about what arrived, and evidence the sender
+    can write is not evidence: it feeds `provenance_unknown`, the drift signal
+    #65 is meant to read."""
+    from app.api.reviews import FindingIn
+    f = FindingIn.model_validate({"provenance": "regressed",
+                                  "provenance_sent": "introduced"})
+    assert f.provenance_sent == "regressed"
+    assert f.provenance is None
+    # The keyword path goes through the same validator.
+    assert FindingIn(provenance_sent="mine").provenance_sent is None
+
+
+def test_only_a_full_commit_id_is_stored():
+    """`[0-9a-f]{7,64}` also matched every 7+ digit decimal string, so a PR
+    number, a timestamp or a run id was stored as a commit — data-looking at
+    exactly the moment the column's purpose (resolving it against the repo)
+    fails. Every real producer sends a full oid: `panel.py` sends
+    `meta["headRefOid"]`, `_head_sha_now` the same, and an abbreviation could not
+    be resolved without the repo that minted it anyway."""
+    from app.api.reviews import _sha_or_none
+    assert _sha_or_none(SHA) == SHA
+    assert _sha_or_none("f" * 64) == "f" * 64, "sha-256 is a commit id too"
+    for bad in ("12345678", "1234567890123", SHA[:12], SHA[:7], "f" * 39, "f" * 41,
+                "f" * 63, "f" * 65):
+        assert _sha_or_none(bad) is None, bad

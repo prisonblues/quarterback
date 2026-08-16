@@ -123,13 +123,29 @@ Two rules the ingest side holds to, both of them the reason this release exists:
 * **A dropped field says so.** An unrecognised bucket normalises to null (the
   ``pr_state`` rule) and is named back in the response as ``provenance_unknown``,
   because shipping a quieter version of #93 as the fix for #93 would be a poor
-  joke. It is the machine-readable half of the drift check #65 asks for.
+  joke. It is the machine-readable half of the drift check #65 asks for. Every
+  other drop on this path is reported the same way — ``head_sha_dropped`` for a
+  commit id that could not be one, ``unread_files_dropped`` for paths over the cap
+  or unreadable, ``provenance_counts_unusable`` for a known bucket carrying a
+  count that cannot be believed, ``unreadable_fields`` for a value that was not
+  the shape its field takes at all — and each of them is also logged, because a
+  response nobody stores is not a record. ``qb record-review`` prints the run id
+  and nothing else.
+
+Where the four fields are READ, and why they are not all in the same places:
+``head_sha`` and ``provenance_counts`` ride every view — one string and at most
+four integers. The unread PATHS are on ``GET /review/{id}`` only, exactly where
+``changed_files`` lives; the list views carry ``unread_files_count`` instead,
+which still separates "measured, nothing cut" (0) from "never measured" (null)
+without letting one page of runs serialise a few million path strings.
 """
 
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -160,6 +176,14 @@ from app.models.review import (
 )
 
 router = APIRouter(tags=["review"])
+
+#: A child of the logger ``app.main`` configures, so a drop recorded here reaches
+#: the same handler as the rest of the service. This is the DURABLE half of "a
+#: dropped field says so": the POST response names the drift to whoever made the
+#: request, and ``qb record-review`` prints only the run id, so without a log line
+#: the evidence was gone the moment the response was discarded — and #65's drift
+#: check, the thing this signal exists to feed, would have had nothing to read.
+_log = logging.getLogger("app.review")
 
 
 async def _authored_as(session: AsyncSession, author: str) -> str:
@@ -279,14 +303,49 @@ PROVENANCE = ("introduced", "missed", "missed-unread", "unknown")
 
 #: How much of an unrecognised bucket name is echoed back to the sender. Long
 #: enough to name the drift, short enough that a caller cannot use the response
-#: as a mirror for arbitrary text.
+#: as a mirror for arbitrary text. A name cut to this length is echoed with a
+#: trailing ``…`` so a reader is never told a truncated name is the whole one.
 MAX_BUCKET_ECHO = 64
 
-#: Bucket -> the :class:`ReviewReviewer` counter it feeds. Derived from
-#: :data:`PROVENANCE` rather than written out, so a bucket cannot be added to the
-#: vocabulary and silently miss the leaderboard — which is the exact shape of the
-#: defect this release repairs.
-PROVENANCE_COUNTER = {b: "prov_" + b.replace("-", "_") for b in PROVENANCE}
+#: How many distinct unrecognised names one response will list. ``MAX_BUCKET_ECHO``
+#: bounds each name and nothing bounded the COUNT, so a tally with ten thousand
+#: junk keys — or a payload whose findings each spell a different one — was sorted
+#: and serialised in full. Drift is a handful of names in practice; past this the
+#: response says how many there were instead of naming them all.
+MAX_UNKNOWN_BUCKETS = 25
+
+#: Bucket -> the :class:`ReviewReviewer` counter it feeds.
+#:
+#: Written out rather than derived by string transform. The derivation
+#: (``"prov_" + b.replace("-", "_")``) read as the safer choice — a bucket could
+#: not be added to :data:`PROVENANCE` and silently miss the leaderboard — but it
+#: bought that by ASSUMING the column exists, and migration 0017 says in as many
+#: words that this vocabulary grows when #41 makes attribution exact. Adding a
+#: word here would then have raised ``AttributeError`` at request time, on
+#: ``GET /review/stats`` and on the whole ``POST /review`` ingest path, because
+#: :func:`_scorecards` splats the tally straight into the ORM object.
+#:
+#: The check below is what actually buys the safety, and it fires at import
+#: rather than under a request, with the missing column named.
+PROVENANCE_COUNTER = {
+    "introduced": "prov_introduced",
+    "missed": "prov_missed",
+    "missed-unread": "prov_missed_unread",
+    "unknown": "prov_unknown",
+}
+
+if set(PROVENANCE_COUNTER) != set(PROVENANCE):  # pragma: no cover - import guard
+    raise RuntimeError(
+        "PROVENANCE_COUNTER does not cover PROVENANCE: "
+        f"{sorted(set(PROVENANCE) ^ set(PROVENANCE_COUNTER))}"
+    )
+_no_column = [c for c in PROVENANCE_COUNTER.values() if not hasattr(ReviewReviewer, c)]
+if _no_column:  # pragma: no cover - import guard
+    raise RuntimeError(
+        f"PROVENANCE_COUNTER names columns review_reviewers does not have: {_no_column}"
+        " — add them in a migration and on the model before adding the bucket."
+    )
+del _no_column
 
 
 def _bucket_or_none(v: object) -> str | None:
@@ -308,10 +367,43 @@ def _bucket_or_none(v: object) -> str | None:
     return s if s in PROVENANCE else None
 
 
-#: A commit id, loosely: hex, and long enough to be an abbreviation somebody
-#: could actually resolve. Bounded above by sha-256's 64, so the column holds a
-#: commit id and never a paragraph.
-_SHA_RE = re.compile(r"[0-9a-f]{7,64}\Z")
+def _echo(v: object) -> str:
+    """What the sender spelled, bounded, for a drop signal to name it back.
+
+    Stripped — the same normalisation :func:`_bucket_or_none` applies before
+    testing membership, so ``"  regressed  "`` is rejected and reported under one
+    spelling rather than two. Both echo paths (a finding's ``provenance`` and a
+    tally's keys) go through here for exactly that reason: they merge into one
+    set in :func:`record_review`, and two spellings of one drift defeat the dedup
+    the set is there for.
+
+    A non-string is echoed as its ``str()``. ``provenance: 5`` and
+    ``provenance: ["missed"]`` used to vanish leaving nothing at all, which reads
+    as a finding nobody asked about rather than as a producer sending the wrong
+    shape — and a type-confused sender is the more likely drift of the two.
+
+    Marked with ``…`` when it was cut, so a truncated name is never handed to a
+    reader as a whole one. Two names agreeing in their first
+    :data:`MAX_BUCKET_ECHO` characters still report once, marked; that is a
+    bounded echo doing its job, not a lost signal.
+    """
+    s = v.strip() if isinstance(v, str) else str(v)
+    return s[:MAX_BUCKET_ECHO] + "…" if len(s) > MAX_BUCKET_ECHO else s
+
+
+#: A commit id: sha-1's 40 hex characters or sha-256's 64, and nothing between.
+#:
+#: Abbreviations are refused deliberately. ``[0-9a-f]{7,64}`` also matched every
+#: 7+ digit DECIMAL string, so a caller that sent a PR number, a timestamp or a
+#: run id had it stored as a commit — looking like data at exactly the moment the
+#: column's purpose (resolving it against the repo) fails. Requiring an ``a-f``
+#: character instead would reject the roughly one in twenty-seven legitimate
+#: 7-character abbreviations that happen to be all digits, which is a worse cure
+#: than the disease. The full lengths cost nothing real:
+#: ``panel.py`` sends ``meta["headRefOid"]`` and ``_head_sha_now`` sends the same,
+#: both full oids, and an abbreviation could not be resolved without the repo
+#: that minted it anyway.
+_SHA_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 
 
 def _sha_or_none(v: object) -> str | None:
@@ -323,6 +415,11 @@ def _sha_or_none(v: object) -> str | None:
     repo, against the next round's baseline, against #98's base end — and a value
     that cannot be a commit id would fail that lookup while looking like data.
     NULL already means "the panel did not say", which is the honest reading.
+
+    The drop is reported: :meth:`ReviewIn._count_files_sent` keeps what arrived
+    and :func:`record_review` names it back as ``head_sha_dropped``. A run that
+    was sent ``"HEAD"`` must not be indistinguishable from one sent nothing —
+    that silence is #93 in miniature.
     """
     if not isinstance(v, str):
         return None
@@ -443,18 +540,37 @@ class FindingIn(BaseModel):
     #: knows. Set by the validator, never by the sender — it exists so
     #: :func:`record_review` can report the drift instead of dropping it in
     #: silence, which is the failure this whole field arrived to fix.
+    #:
+    #: ``None`` means the key was absent — nobody said. ``""`` means a blank or
+    #: all-whitespace string arrived, which IS a statement, just not a usable one:
+    #: the response filter therefore tests ``is not None`` rather than
+    #: truthiness, or a producer sending empty buckets would look like one asking
+    #: nothing.
     provenance_sent: str | None = None
 
     @model_validator(mode="before")
     @classmethod
     def _keep_provenance_sent(cls, v: object) -> object:
         """Set unconditionally, so a caller cannot supply it: it is evidence about
-        what arrived, and evidence the sender can write is not evidence."""
-        if not isinstance(v, dict):
+        what arrived, and evidence the sender can write is not evidence.
+
+        Every mapping is rewritten, so a caller spelling ``provenance_sent``
+        itself has it overwritten rather than merged. The only other input
+        pydantic will accept here is an instance of this model — the class sets no
+        ``from_attributes``, so an arbitrary attribute-carrying object raises
+        rather than passing through — and an instance carries a value this same
+        validator derived. The claim above is therefore unconditional over every
+        construction path: ``model_validate`` of a mapping, ``FindingIn(**kw)``
+        (pydantic routes keyword construction through this validator too), and
+        revalidation of an instance.
+        """
+        if not isinstance(v, Mapping):
             return v
+        # `_echo`, not a bare strip: a non-string `provenance` (`5`,
+        # `["missed"]`) used to leave nothing here at all, so a type-confused
+        # producer read as a finding nobody asked about. See :func:`_echo`.
         raw = v.get("provenance")
-        return {**v, "provenance_sent":
-                raw.strip()[:MAX_BUCKET_ECHO] if isinstance(raw, str) else None}
+        return {**v, "provenance_sent": None if raw is None else _echo(raw)}
 
     @field_validator("provenance", mode="before")
     @classmethod
@@ -580,6 +696,80 @@ MAX_CHANGED_FILES = 5000
 PR_STATES = frozenset({"OPEN", "MERGED", "CLOSED"})
 
 
+def _unread_paths(v: object) -> tuple[list[str] | None, int]:
+    """``unread_files`` as paths, with the count of entries that were not paths.
+
+    One function for both answers because they must agree: the validator stores
+    the list and :meth:`ReviewIn._count_files_sent` reports the loss, and two
+    implementations of "was this entry usable" would eventually disagree about a
+    payload nobody looked at twice.
+
+    The three results, and the reason each is a different state:
+
+    * ``(None, n)`` — not a declaration. A shape that is not a list or a string
+      at all, and also a **non-empty input from which no path could be read**:
+      ``[{"path": "a.py"}, 7, None]`` is a garbled declaration, and returning
+      ``[]`` for it would store the round's positive statement "coverage was
+      measured and nothing was cut" on the strength of a value that says the
+      opposite. That collapse is the exact one this release exists to prevent,
+      and it was in the release's own ingest path.
+    * ``([], 0)`` — the caller sent ``[]``: measured, nothing cut.
+    * ``([...], n)`` — paths, stripped, deduped in first-mention order.
+
+    The count is what ``unread_files_dropped.unusable`` reports, and it is kept in
+    step with ``unread_files_sent`` so the arithmetic closes: what was stored, plus
+    what was unusable, plus what the cap cut, is what arrived.
+
+    An entry counts as unusable when something was there and no path could be read
+    from it: a non-string, a blank, or a path over :data:`MAX_PATH_CHARS`. The
+    first two are exactly what ``changed_files`` counts under
+    ``changed_files_dropped.unusable``, deliberately — two path lists one function
+    apart must not disagree about what counts as a loss.
+
+    An over-long path is DROPPED rather than truncated, which is where this parts
+    company with ``changed_files``' own path bound. This list is matched against
+    the next round's diff by exact path, so a truncated entry is not a shortened
+    path, it is a different file: the ``missed-unread`` bucket it feeds would
+    silently never match, and the response would have said nothing was lost. "A
+    path longer than this is not a path", as :data:`MAX_PATH_CHARS` already says.
+
+    A REPEATED entry is folded and not counted. Nothing went missing, so firing a
+    drop signal over it teaches its reader to ignore the signal — the same silence
+    ``changed_files`` keeps over its own dedup.
+
+    The cap is applied to the RAW list, before coercion, exactly as
+    ``changed_files`` applies its own — and that ordering is load-bearing rather
+    than incidental. ``record_review`` reports the truncation as ``sent - cap``,
+    so capping after the dedup would make that arithmetic lie: 5,100 entries
+    holding 200 duplicates fit under the cap with nothing lost, and the response
+    would still have announced 100 missing paths.
+    """
+    if v is None or not isinstance(v, (str, list)):
+        return None, 0
+    # A bare string is one path: `panel.py::_str_list` tolerates that shape on the
+    # way in and this module mirrors it. A blank one is no declaration rather than
+    # a lost path — there is no entry there to have lost — which keeps the
+    # accounting closed: what was stored, plus `unusable`, plus what the cap cut,
+    # is what `unread_files_sent` says arrived.
+    if isinstance(v, str) and not v.strip():
+        return None, 0
+    raw = [v] if isinstance(v, str) else v[:MAX_CHANGED_FILES]
+    paths: list[str] = []
+    unusable = 0
+    for item in raw:
+        if not isinstance(item, str):
+            unusable += 1
+            continue
+        p = item.strip()
+        if not p or len(p) > MAX_PATH_CHARS:
+            unusable += 1
+            continue
+        paths.append(p)
+    if raw and not paths:
+        return None, unusable
+    return list(dict.fromkeys(paths)), unusable
+
+
 class ChangedFileIn(BaseModel):
     """One path the PR touched, with that path's own share of ``changed_lines``.
 
@@ -674,19 +864,47 @@ class ReviewIn(BaseModel):
     #: commit id or dropped — see :func:`_sha_or_none`.
     head_sha: str | None = None
     #: Paths no reviewer that ran read in full. NULL (the field absent) is "the
-    #: panel did not say"; ``[]`` is "it said, and nothing was cut". Bounded and
-    #: coerced like every other list here, never a 422.
+    #: panel did not say"; ``[]`` is "it said, and nothing was cut"; a non-empty
+    #: value nothing usable could be read from is NULL too, and says so in the
+    #: response. Bounded and coerced like every other list here, never a 422 —
+    #: see :func:`_unread_paths`.
     unread_files: list[str] | None = None
     #: The panel's own tally of :data:`PROVENANCE` buckets for this round, stored
     #: verbatim. Absent = nobody said; ``{}`` = the question does not arise (a
     #: round 1, or a run outside any cycle); all-zero = attribution ran and had
     #: nothing to attribute. Three states, and the release exists because
     #: collapsing states like these is how a measurement stops meaning anything.
+    #:
+    #: A tally that arrived non-empty and lost every pair to coercion lands on
+    #: NULL, not ``{}`` — see :meth:`_prov_counts`.
     provenance_counts: dict[str, int] | None = None
-    #: Set by the validators, never by the caller: what was trimmed, and which
-    #: bucket names this board did not recognise. Reported in the response.
+    #: Set by the validators, never by the caller: what was trimmed, what could
+    #: not be read, and which bucket names this board did not recognise. All of it
+    #: reported in the response, none of it storable by the sender.
     unread_files_sent: int = 0
+    #: Entries of ``unread_files`` that were there and were not paths — a
+    #: non-string, or one over :data:`MAX_PATH_CHARS`. Distinct from the over-cap
+    #: count: one says "we did not look", this says "we looked and it was not a
+    #: path". Mirrors ``changed_files_dropped.unusable``.
+    unread_files_unusable: int = 0
+    #: The raw ``head_sha``, when one arrived and :func:`_sha_or_none` refused it.
+    #: A run sent ``"HEAD"`` and a run sent nothing both store NULL, and only this
+    #: tells the sender which of the two it just recorded.
+    head_sha_dropped: str | None = None
+    #: Tally keys that are not a bucket this board knows.
     provenance_counts_unknown: list[str] = Field(default_factory=list)
+    #: Tally keys that ARE a known bucket and whose count could not be believed —
+    #: ``{"introduced": -1}``, ``{"missed": "two"}``. A second drop path, and it
+    #: was the silent one: the release's rule is that a dropped field says so, and
+    #: it was being applied to unknown NAMES only.
+    provenance_counts_unusable: list[str] = Field(default_factory=list)
+    #: Fields whose VALUE was not a shape this board can read at all —
+    #: ``unread_files: 42``, ``provenance_counts: ["introduced"]``. The coarsest
+    #: drop of the lot and the last one still silent: the per-entry signals above
+    #: can only speak about a value they could iterate, so a wrong-typed field
+    #: produced no entries, no keys and no word. Named, not counted: there is
+    #: exactly one value and the fact worth reporting is which field it was.
+    unreadable_fields: list[str] = Field(default_factory=list)
     changed_lines: int | None = None
     #: The PR's touched paths — the PR's, never the round's. Under #41 a later
     #: round reviews only the increment; narrowing this to it would report two
@@ -719,29 +937,73 @@ class ReviewIn(BaseModel):
     def _count_files_sent(cls, v: object) -> object:
         """Record what the sender sent, before the bounds below trim it.
 
-        Two path lists and one bucket tally, all counted here for one reason: a
-        cap or a filter that trims an answer has to be able to say so, and the
-        field validators cannot reach the response.
+        Two path lists, one commit id and one bucket tally, all examined here for
+        one reason: a cap or a filter that trims an answer has to be able to say
+        so, and the field validators cannot reach the response.
 
-        All three are set unconditionally rather than only when the matching
-        field is present. They are the record of what ARRIVED, so a caller that
-        spells one of them itself must not be able to write its own account of
-        how much of its payload was kept.
+        Every one of them is set unconditionally rather than only when the
+        matching field is present. They are the record of what ARRIVED, so a
+        caller that spells one of them itself must not be able to write its own
+        account of how much of its payload was kept.
+
+        **This runs after the whole body is parsed, which is where the storage
+        caps bite and not where the cost does.** ``MAX_CHANGED_FILES`` bounds what
+        is STORED; a sender can still make FastAPI parse an arbitrarily large list
+        before either bound is reached, and ``changed_files`` has had that
+        property since v2.23. Bounding it belongs in front of the app — a request
+        body limit in the proxy — because by the time any pydantic validator runs
+        the allocation has already happened. Noted rather than papered over: the
+        cap here is a bound on what one request can INSERT, and it is not a
+        defence against a large body.
         """
-        if not isinstance(v, dict):
+        if not isinstance(v, Mapping):
             return v
         files, unread = v.get("changed_files"), v.get("unread_files")
         counts = v.get("provenance_counts")
+        _, unusable = _unread_paths(unread)
+        head = v.get("head_sha")
         return {**v,
                 "changed_files_sent": len(files) if isinstance(files, list) else 0,
-                "unread_files_sent": len(unread) if isinstance(unread, list) else 0,
+                # A bare string is one path — a shape `_unread_paths` explicitly
+                # supports, and one this counted as zero sent, so a caller that
+                # sent a single path read as a caller that sent nothing.
+                "unread_files_sent": (len(unread) if isinstance(unread, list)
+                                      else 1 if isinstance(unread, str) and unread.strip()
+                                      else 0),
+                "unread_files_unusable": unusable,
+                "head_sha_dropped": (_echo(head) if head is not None
+                                     and _sha_or_none(head) is None else None),
                 # Keys this board has no column for. Named rather than dropped: a
                 # bucket the panel has started sending and the board silently
                 # ignores is #93 happening again, one release later.
+                #
+                # Echoed through `_echo`, the same normalisation
+                # `FindingIn._keep_provenance_sent` uses, because `record_review`
+                # merges the two into one set: `_bucket_or_none` strips before
+                # testing membership, so an unstripped echo reported
+                # `"  regressed  "` and `"regressed"` as two separate drifts.
                 "provenance_counts_unknown": sorted(
-                    {str(k)[:MAX_BUCKET_ECHO] for k in counts
-                     if _bucket_or_none(k) is None}
-                ) if isinstance(counts, dict) else []}
+                    {_echo(k) for k in counts if _bucket_or_none(k) is None}
+                ) if isinstance(counts, Mapping) else [],
+                # ...and the OTHER drop path, which said nothing at all: a key
+                # this board does know, carrying a count it cannot believe.
+                # `{"introduced": -1, "missed": "two", "unknown": 5}` stored one
+                # pair of three and reported no loss.
+                "provenance_counts_unusable": sorted(
+                    {_echo(k) for k, n in counts.items()
+                     if _bucket_or_none(k) is not None and _count_or_none(n) is None}
+                ) if isinstance(counts, Mapping) else [],
+                # ...and the coarsest drop of all: a value that is not the SHAPE
+                # the field takes. The two signals above can only speak about a
+                # value they could iterate, so `unread_files: 42` and
+                # `provenance_counts: ["introduced"]` went to NULL with nothing
+                # said — a wrong-typed producer reading exactly like one that sent
+                # nothing, which is #93's own failure mode.
+                "unreadable_fields": sorted(
+                    name for name, val, ok in (
+                        ("unread_files", unread, isinstance(unread, (str, list))),
+                        ("provenance_counts", counts, isinstance(counts, Mapping)),
+                    ) if val is not None and not ok)}
 
     @field_validator("head_sha", mode="before")
     @classmethod
@@ -751,34 +1013,11 @@ class ReviewIn(BaseModel):
     @field_validator("unread_files", mode="before")
     @classmethod
     def _unread(cls, v: object) -> list[str] | None:
-        """Coerced to paths, deduped, bounded — or None.
-
-        None for a shape that is not a declaration at all, exactly as
-        :meth:`ReviewerIn._gaps` does: ``[]`` would say the round measured its
-        coverage and found nothing cut, which is the opposite of what a
-        malformed value tells us. A bare string is one path, because
-        ``panel.py::_str_list`` tolerates that shape on the way in and this
-        module mirrors it.
-
-        Bounded by :data:`MAX_CHANGED_FILES`, the same ceiling as the changed-file
-        list: both are path lists from the same authenticated-but-not-bounded
-        sender, and one request should not be able to push a million strings into
-        a single JSONB value.
-
-        The cap is applied to the RAW list, before coercion, exactly as
-        ``changed_files`` applies its own — and that ordering is load-bearing
-        rather than incidental. ``record_review`` reports the truncation as
-        ``sent - cap``, so capping after the dedup would make that arithmetic lie:
-        5,100 entries holding 200 duplicates fit under the cap with nothing lost,
-        and the response would still have announced 100 missing paths. A drop
-        signal that fires on a payload nothing went missing from teaches its
-        reader to ignore it.
-        """
-        if v is None or not isinstance(v, (str, list)):
-            return None
-        if isinstance(v, list):
-            v = v[:MAX_CHANGED_FILES]
-        return list(dict.fromkeys(p[:MAX_PATH_CHARS] for p in _phrases(v)))
+        """Coerced to paths, deduped, bounded — or None. See :func:`_unread_paths`
+        for the rule and for why an unreadable declaration is NULL rather than the
+        empty list. What it could not read is counted in ``unread_files_unusable``
+        and named back by :func:`record_review`."""
+        return _unread_paths(v)[0]
 
     @field_validator("provenance_counts", mode="before")
     @classmethod
@@ -789,11 +1028,22 @@ class ReviewIn(BaseModel):
         consumer can interpret — and named in the response by
         :meth:`_count_files_sent` so the drop is visible. A count that cannot be
         believed drops with its key rather than becoming 0: this whole feature is
-        built on zero being a claim.
+        built on zero being a claim. That drop is reported too, under
+        ``provenance_counts_unusable``.
 
-        ``{}`` survives as ``{}``. It is the panel's way of saying the question
-        does not arise, and turning it into None here would make a round 1
-        indistinguishable from a run recorded before any of this existed.
+        ``{}`` survives as ``{}`` **when the caller sent** ``{}``. It is the
+        panel's way of saying the question does not arise, and turning it into
+        None here would make a round 1 indistinguishable from a run recorded
+        before any of this existed.
+
+        A tally that arrived non-empty and lost every pair lands on None, NOT on
+        ``{}``. Returning the emptied dict manufactured the round-1 statement out
+        of a payload that had attempted attribution and had every answer refused
+        — the same collapse in the other direction, and worse, because it also
+        cost the run its ``provenance_runs`` coverage marker (``{}`` is
+        deliberately excluded from that filter). NULL is where an unreadable value
+        belongs: nobody said anything this board could read. The names are in the
+        response either way.
 
         Two keys that normalise to one bucket (``Introduced`` beside
         ``introduced``) leave the last one, which is what a dict comprehension
@@ -801,7 +1051,7 @@ class ReviewIn(BaseModel):
         real sends that shape and inventing a merge rule for it would be picking
         a number nobody stated.
         """
-        if not isinstance(v, dict):
+        if not isinstance(v, Mapping):
             return None
         out = {}
         for k, raw in v.items():
@@ -809,7 +1059,7 @@ class ReviewIn(BaseModel):
             n = _count_or_none(raw)
             if bucket is not None and n is not None:
                 out[bucket] = n
-        return out
+        return out if out or not v else None
 
     @field_validator("changed_files", mode="before")
     @classmethod
@@ -1345,34 +1595,83 @@ async def record_review(
     await session.commit()
     recorded = {"id": run.id, "recorded": True, "findings": len(findings),
                 "accounts": accounts, "changed_files": len(seen)}
+    #: Everything this request sent and this run did not store, keyed as the
+    #: response keys it: merged into the response below AND logged, because the
+    #: response is read once by whoever posted it and `qb record-review` prints
+    #: only the run id.
+    dropped: dict = {}
     # Only when something WAS dropped, so an ordinary response stays the shape
     # every existing caller already parses.
     if over_cap or unusable:
-        recorded["changed_files_dropped"] = {"over_cap": over_cap, "unusable": unusable}
-    # Entries beyond the cap, and only those — deliberately NOT the difference
-    # between what was sent and what was stored. A blank or repeated path is
-    # folded rather than lost (the same silence `changed_files` keeps over its own
-    # dedup), and counting a fold as a drop would fire this signal on a payload
-    # nothing went missing from. Over the cap, something did.
-    unread_dropped = max(0, body.unread_files_sent - MAX_CHANGED_FILES)
-    if unread_dropped:
-        recorded["unread_files_dropped"] = unread_dropped
+        dropped["changed_files_dropped"] = {"over_cap": over_cap, "unusable": unusable}
+    # Two ways an unread path can be lost, reported as two numbers under one key
+    # exactly as `changed_files_dropped` does. `over_cap` is entries beyond the
+    # cap and only those — deliberately NOT the difference between what was sent
+    # and what was stored, because a blank or repeated path is folded rather than
+    # lost (the same silence `changed_files` keeps over its own dedup) and a
+    # signal that fires on a payload nothing went missing from teaches its reader
+    # to ignore it. `unusable` is an entry that was there and was not a path.
+    unread_over_cap = max(0, body.unread_files_sent - MAX_CHANGED_FILES)
+    if unread_over_cap or body.unread_files_unusable:
+        dropped["unread_files_dropped"] = {
+            "over_cap": unread_over_cap, "unusable": body.unread_files_unusable}
+    # A commit id that was sent and could not be one. Without this, a run whose
+    # producer sent `"HEAD"` is indistinguishable on read from a run whose
+    # producer sent nothing — the drop this release was filed over, one field
+    # across.
+    if body.head_sha_dropped is not None:
+        dropped["head_sha_dropped"] = body.head_sha_dropped
     # Every provenance bucket this board did not recognise, from the findings and
     # from the run's own tally, named rather than swallowed.
     #
     # This issue IS the cost of an ingest that drops what it does not understand
     # without a word, so the repair must not ship its own quieter version of the
-    # same thing. It is a machine-readable signal and honest about its reach:
-    # `qb record-review` prints only the run id today, so nobody SEES this until
-    # #65's drift check reads it — which is precisely the check this gives
-    # something to read.
+    # same thing.
+    #
+    # A finding whose `provenance_sent` is `""` counts: an empty or all-whitespace
+    # bucket name is a producer sending a malformed value, not one asking nothing,
+    # and the two must not read the same. Hence `is not None`.
     unknown = sorted({
         p.f.provenance_sent for p in findings
-        if p.f.provenance is None and p.f.provenance_sent
+        if p.f.provenance is None and p.f.provenance_sent is not None
     } | set(body.provenance_counts_unknown))
+    # Each NAME is bounded by `MAX_BUCKET_ECHO` and the COUNT was bounded by
+    # nothing, so a tally of ten thousand junk keys was sorted and serialised in
+    # full. Past the cap the response says how many there were rather than listing
+    # them: drift is a handful of names, and a longer list is a sender fault the
+    # count describes better than the names would. Both the list and the total are
+    # over distinct ECHOES — two names agreeing in their first `MAX_BUCKET_ECHO`
+    # characters are one marked entry and one unit of the count, which is the
+    # bounded echo doing its job rather than the count being wrong.
     if unknown:
-        recorded["provenance_unknown"] = unknown
-    return recorded
+        dropped["provenance_unknown"] = unknown[:MAX_UNKNOWN_BUCKETS]
+        if len(unknown) > MAX_UNKNOWN_BUCKETS:
+            dropped["provenance_unknown_total"] = len(unknown)
+    # Bounded for the same reason, and it is not only the pathological case: a
+    # known bucket is echoed as the sender SPELLED it, and one word has as many
+    # spellings as it has letters to re-case.
+    if body.provenance_counts_unusable:
+        dropped["provenance_counts_unusable"] = (
+            body.provenance_counts_unusable[:MAX_UNKNOWN_BUCKETS])
+        if len(body.provenance_counts_unusable) > MAX_UNKNOWN_BUCKETS:
+            dropped["provenance_counts_unusable_total"] = len(
+                body.provenance_counts_unusable)
+    # A field whose value was not a shape this board reads at all. Last of the
+    # silent drops, and the coarsest: nothing about the value could be reported
+    # per entry, because nothing about it could be walked.
+    if body.unreadable_fields:
+        dropped["unreadable_fields"] = body.unreadable_fields
+
+    # The durable half. The response names the drift to whoever made the request,
+    # and `qb record-review` prints only the run id — so without this line the
+    # evidence was gone as soon as the response was parsed, and #65's drift check,
+    # the reader this signal exists for, would have had nothing left to read. One
+    # line per run, and only when something was actually dropped: a line per
+    # ordinary run is noise, and noise is how a real drop goes unread.
+    if dropped:
+        _log.warning("review ingest dropped fields: run=%s repo=%s pr=%s author=%s %s",
+                     run.id, body.repo, body.pr, author, dropped)
+    return {**recorded, **dropped}
 
 
 # ------------------------------------------------------------------ read paths
@@ -1389,16 +1688,26 @@ def _run_view(r: ReviewRun) -> dict:
         "base": r.base_branch,
         # The commit this round read, which `base` (a branch name) cannot say.
         "head_sha": r.head_sha,
-        # Unmasked, like `stop_veto` further down: NULL means the panel never said
-        # and [] means it said nothing was cut, and a read path that folded one
-        # into the other would hand every consumer exactly the collapse the
-        # storage side is built to prevent.
+        # The COUNT, not the paths — the same trade `changed_files_total` makes
+        # two lines down, and for the same reason. The list is a run column rather
+        # than a child table, so including it costs no extra query, but query
+        # count is not the cost `changed_files` was kept out of this view for:
+        # response size is. `unread_files` is bounded only by MAX_CHANGED_FILES
+        # entries of MAX_PATH_CHARS each, so `GET /reviews?limit=500` could
+        # serialise millions of path strings. "Bounded by what one round could not
+        # read" is a fact about a real panel and not a bound this ingest enforces
+        # on an authenticated-but-unbounded sender, which is precisely why the cap
+        # exists. `GET /review/{id}` carries the list.
         #
-        # It rides in the run LIST, unlike `changed_files`, because it is a column
-        # on the run and not a child table — no extra query per row — and because
-        # it is bounded by what one round could not read rather than by the PR's
-        # whole file set.
-        "unread_files": r.unread_files,
+        # Unmasked in the sense that matters, like `stop_veto` further down: NULL
+        # here means the panel never said and 0 means it said nothing was cut, so
+        # the three states survive into the list view rather than being folded
+        # into one by the read path — which is the collapse the storage side is
+        # built to prevent.
+        "unread_files_count": None if r.unread_files is None else len(r.unread_files),
+        # Four integer keys at most, so this one rides everywhere: it is the
+        # round's own statement about its attribution and the thing a reader needs
+        # beside every per-finding bucket.
         "provenance_counts": r.provenance_counts,
         "changed_lines": r.changed_lines,
         # The count only — the paths themselves are per-run children and would
@@ -1437,7 +1746,31 @@ def _run_view(r: ReviewRun) -> dict:
     }
 
 
-def _card_view(c: ReviewReviewer) -> dict:
+def _prov_measured(c: ReviewReviewer, run: ReviewRun) -> bool:
+    """Did this run attribute anything at all, for this member's scorecard?
+
+    The same question ``review_stats.provenance_runs`` answers for a window, at
+    the grain a single card is read on, and by the same rule, down to the judged
+    guard: a JUDGED run sent a non-empty tally, OR this member's own counters are
+    not all zero.
+
+    The second half is not belt-and-braces — a payload that attributes its
+    findings while sending no run tally has a real split and no tally to prove it.
+    The judged guard is not decoration either: these counters are tallied over
+    confirmed findings, so an unjudged run's card can only hold zeros, and its
+    tally would otherwise present four of them as a measurement.
+
+    A member that did NOT run still reads as measured on a run that attributed,
+    and that is the same answer ``provenance_runs`` gives for the same row: the
+    round asked the question, this seat contributed nothing to it, and its zero is
+    as honest as the ``raised: 0`` beside it. "Measured" is a fact about the run;
+    ``ran`` is the field that says whether this seat was in it.
+    """
+    return (run.judged and bool(run.provenance_counts)) or any(
+        getattr(c, col) for col in PROVENANCE_COUNTER.values())
+
+
+def _card_view(c: ReviewReviewer, run: ReviewRun) -> dict:
     return {
         "name": c.name,
         "model": c.model,
@@ -1471,7 +1804,17 @@ def _card_view(c: ReviewReviewer) -> dict:
         # one vocabulary crosses the whole contract — payload, storage, API,
         # page. Over this member's CONFIRMED findings only, which is a narrower
         # population than the run's `provenance_counts` beside it.
-        "provenance": {b: getattr(c, col) for b, col in PROVENANCE_COUNTER.items()},
+        #
+        # **null when this run attributed nothing**, which is the same care
+        # `review_stats` takes with `provenance_runs` and for the same reason: the
+        # columns behind these four are NOT NULL, so a pre-v2.26 run — or any run
+        # whose panel sent no provenance — would otherwise render as a scorecard
+        # stating four honest zeros that mean nothing. A zero is a claim
+        # everywhere else in this feature, so it must not be manufactured here.
+        # The run's own `provenance_counts` is in the same payload; this says
+        # which of the two readings applies to this card.
+        "provenance": ({b: getattr(c, col) for b, col in PROVENANCE_COUNTER.items()}
+                       if _prov_measured(c, run) else None),
     }
 
 
@@ -1575,9 +1918,10 @@ async def list_reviews(
             select(ReviewReviewer).where(ReviewReviewer.run_id.in_([r.id for r in runs]))
         )).all()
     )
+    run_by_id = {r.id: r for r in runs}
     by_run: dict[int, list[dict]] = {}
     for c in cards:
-        by_run.setdefault(c.run_id, []).append(_card_view(c))
+        by_run.setdefault(c.run_id, []).append(_card_view(c, run_by_id[c.run_id]))
     return [{**_run_view(r), "reviewers": sorted(by_run.get(r.id, []), key=lambda c: c["name"])}
             for r in runs]
 
@@ -1613,6 +1957,25 @@ async def review_stats(
     ``not_attributed`` for every finding the question never reached. That is the
     number to read at the cap: how much of what this loop found did it inflict on
     itself.
+
+    "Counted once each" is **within a run**, not within a cycle: this counts
+    OBSERVATIONS, like every other number on this page. A defect raised in rounds
+    2, 3 and 4 of one cycle is three rows — once as ``introduced`` in round 2 and
+    twice as ``not_attributed`` in the rounds after, where the question does not
+    arise for a defect an earlier round already raised. So repeats inflate
+    ``not_attributed`` and leave the four buckets alone, and the ratio the
+    ``/panel`` tile computes (``introduced / traced``) is unaffected — but
+    ``not_attributed`` is not a count of distinct defects and should not be read
+    against one. ``GET /review/findings`` is where a chain collapses to a defect.
+
+    Every figure here comes from four separate statements against one connection,
+    so under PostgreSQL's default READ COMMITTED each sees its own snapshot: a run
+    recorded between them can appear in one aggregate and not another, leaving the
+    sums, ``provenance_runs`` and the page's percentages fractionally out of step
+    within a single response. That has been true of this endpoint since it had
+    three statements; it is a stats page over a window measured in days, and
+    paying for a repeatable-read transaction to make a sub-second boundary exact
+    is a worse trade than saying so here.
     """
     filters = []
     if repo is not None:
@@ -1746,13 +2109,25 @@ async def review_stats(
                 # not belt-and-braces: without it the marker could read 0 beside
                 # sums that do not, because it was measuring a DIFFERENT field
                 # from the one it annotates. A caller that attributes its findings
-                # and sends no run tally — or whose tally is emptied by the
-                # validator for holding unbelievable numbers — would have its real
-                # split hidden by a marker saying nothing was measured. The
-                # invariant a reader needs is that a non-zero sum always comes
-                # with non-zero coverage, and only counting the counters gives it.
+                # and sends no run tally would have its real split hidden by a
+                # marker saying nothing was measured. The invariant a reader needs
+                # is that a non-zero sum always comes with non-zero coverage, and
+                # only counting the counters gives it.
+                #
+                # The tally half is restricted to JUDGED runs, and that is not a
+                # tightening for its own sake. The counters are tallied under the
+                # `confirmed` branch of `_scorecards`, so an unjudged run can only
+                # ever contribute zeros to the sums — while its non-empty tally
+                # made it count as coverage. A reader following the documented
+                # rule ("read the sums against `provenance_runs`") then saw a
+                # covered window with zero `introduced` and concluded the member
+                # catches no regressions, when nothing in that run was adjudicated
+                # at all. `judged_only=true` hid it and is not the default. The
+                # counter half needs no such guard: a counter can only be non-zero
+                # on a judged run.
                 func.count(ReviewReviewer.id).filter(sa_or(
-                    sa_and(func.jsonb_typeof(ReviewRun.provenance_counts) == "object",
+                    sa_and(ReviewRun.judged.is_(True),
+                           func.jsonb_typeof(ReviewRun.provenance_counts) == "object",
                            ReviewRun.provenance_counts != func.jsonb_build_object()),
                     *(getattr(ReviewReviewer, col) > 0
                       for col in PROVENANCE_COUNTER.values()),
@@ -1978,6 +2353,10 @@ async def review_stats(
         # never reached. Read `introduced` as a FLOOR: it needs exact membership
         # in the fix's added lines, so a defect introduced by a deletion and an
         # ordinary reviewer line-drift both land in `missed`.
+        #
+        # Per OBSERVATION, not per defect: a finding raised again in a later round
+        # of the same cycle is another row, carrying NULL provenance, so repeats
+        # land in `not_attributed`. See the docstring.
         "by_provenance": by_provenance,
     }
 
@@ -2235,8 +2614,21 @@ async def pr_finding_history(
             # `head_sha` rides along because this endpoint is where a defect is
             # traced to the fix that caused it, and a round is only replayable
             # against the repo if something says which commit it read.
+            #
+            # `provenance_counts` for the same reason one field over: this is
+            # where the per-finding buckets are READ, and a reader interpreting
+            # them without the round's own tally beside them had to issue a
+            # request per run to get it. It is at most four integers.
+            #
+            # The unread PATHS are not here — up to `limit` runs of them would be
+            # the file dump `_run_view` keeps out of `GET /reviews`. The count says
+            # whether a `missed-unread` bucket had coverage behind it, and
+            # `GET /review/{id}` has the list.
             {"id": r.id, "ts": r.ts.isoformat(), "author": r.author, "judged": r.judged,
              "head_sha": r.head_sha,
+             "provenance_counts": r.provenance_counts,
+             "unread_files_count": (None if r.unread_files is None
+                                    else len(r.unread_files)),
              "confirmed": r.n_confirmed, "dismissed": r.n_dismissed,
              "unjudged": r.n_unjudged, "sonar": r.n_sonar,
              "round": r.round, "cycle": r.cycle, "new_findings": r.new_findings,
@@ -2289,6 +2681,16 @@ async def get_review(
     )
     return {
         **_run_view(run),
+        # The paths themselves, here and not in the run LIST — exactly where
+        # `changed_files` lives and for the same reason: one run's worth of paths
+        # is a fair payload, a page of them is a file dump. `_run_view` carries
+        # `unread_files_count` so a list reader still knows a list exists and can
+        # still tell "measured nothing" (0) from "never measured" (null).
+        #
+        # Unmasked: NULL means the panel never said and [] means it said nothing
+        # was cut, and folding one into the other on read would hand every
+        # consumer the collapse the storage side is built to prevent.
+        "unread_files": run.unread_files,
         # Read `changed_files_total` against `len(changed_files)` before building
         # anything on this list: they are allowed to disagree, and when they do
         # the list is a PREFIX of what the PR touches.
@@ -2296,6 +2698,6 @@ async def get_review(
             {"path": f.path, "additions": f.additions, "deletions": f.deletions}
             for f in files
         ],
-        "reviewers": [_card_view(c) for c in cards],
+        "reviewers": [_card_view(c, run) for c in cards],
         "findings": [_finding_view(f, reports.get(f.id, [])) for f in findings],
     }
