@@ -106,7 +106,7 @@ def test_the_judge_and_ITS_retry_run_in_a_sandbox(monkeypatch):
     is asserted for the same reason as the reviewer's."""
     seen = []
     _record_cwds(monkeypatch, seen)
-    monkeypatch.setattr(panel, "extract_json_value", lambda *a, **k: None)
+    monkeypatch.setattr(panel_core, "extract_json_value", lambda *a, **k: None)
     f = panel.Finding("claude", "P1", "a.py", 1, "title", "detail")
     panel.adjudicate([[f]], "diff", "sonnet", 34)
     assert len(seen) == 2, f"expected judge + reparse retry, got {len(seen)}"

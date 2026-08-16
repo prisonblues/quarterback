@@ -30,6 +30,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import harness_rules  # noqa: E402
 import panel  # noqa: E402
+import panel_ask  # noqa: E402  — the ask path moved here in #129
 import panel_seats  # noqa: E402  — run_cli lives here since #129
 
 ANSWER = '{"verdict": "fails", "reason": "the skip branch returns finish(failed)"}'
@@ -462,7 +463,7 @@ def test_a_text_file_carrying_nuls_is_a_problem_too(repo):
 def test_a_file_past_the_read_ceiling_is_refused_rather_than_read(repo, monkeypatch):
     """Bounds what is materialised in memory, which is a different cost from the
     char budget's: that one bounds what the seats are sent and paid for."""
-    monkeypatch.setattr(panel, "ASK_CONTEXT_FILE_MAX_BYTES", 64)
+    monkeypatch.setattr(panel_ask, "ASK_CONTEXT_FILE_MAX_BYTES", 64)
     (repo / "huge.py").write_text("x" * 500)
     problems = []
     assert panel.read_context(repo, ["huge.py"], problems) == []
@@ -904,17 +905,17 @@ def cfg(monkeypatch, repo):
     exercise `ask()` and not `git remote get-url`."""
     conf = copy.deepcopy(harness_rules.DEFAULTS)
     conf |= {"name": "demo", "github": "me/demo", "path": str(repo)}
-    monkeypatch.setattr(panel, "load_repo_cfg", lambda name: conf)
+    monkeypatch.setattr(panel_ask, "load_repo_cfg", lambda name: conf)
     return conf
 
 
 @pytest.fixture()
 def asked(monkeypatch, cfg):
     """`ask()` over a repo of stub seats, returning (exit code, payload)."""
-    monkeypatch.setattr(panel, "record_ask", lambda payload: None)
+    monkeypatch.setattr(panel_ask, "record_ask", lambda payload: None)
 
     def run(verdicts, out, **kw):
-        monkeypatch.setattr(panel, "ask_llm", lambda name, model, prompt, effort="":
+        monkeypatch.setattr(panel_ask, "ask_llm", lambda name, model, prompt, effort="":
                             verdicts[name])
         code = panel.ask(cfg["path"], "the premise", ["sub/a.py:1-3"],
                          reviewers=",".join(verdicts), json_file=str(out), **kw)
@@ -967,8 +968,8 @@ def test_an_unreadable_seat_is_shown_as_one(asked, tmp_path, capsys):
 def test_sonarqube_is_not_a_correspondent(monkeypatch, cfg, tmp_path):
     """Selectable for a review and meaningless here — said out loud, because
     `--reviewers claude,sonarqube` otherwise looks like a two-seat ask."""
-    monkeypatch.setattr(panel, "record_ask", lambda payload: None)
-    monkeypatch.setattr(panel, "ask_llm", lambda *a, **k: panel.SeatAnswer("holds", "r"))
+    monkeypatch.setattr(panel_ask, "record_ask", lambda payload: None)
+    monkeypatch.setattr(panel_ask, "ask_llm", lambda *a, **k: panel.SeatAnswer("holds", "r"))
     out = tmp_path / "ask.json"
     panel.ask(cfg["path"], "p", [], reviewers="claude,sonarqube", json_file=str(out))
     payload = json.loads(out.read_text())
@@ -977,8 +978,8 @@ def test_sonarqube_is_not_a_correspondent(monkeypatch, cfg, tmp_path):
 
 
 def test_json_mode_puts_the_payload_on_stdout_and_nothing_else(monkeypatch, cfg, capsys):
-    monkeypatch.setattr(panel, "record_ask", lambda payload: None)
-    monkeypatch.setattr(panel, "ask_llm", lambda *a, **k: panel.SeatAnswer("holds", "r"))
+    monkeypatch.setattr(panel_ask, "record_ask", lambda payload: None)
+    monkeypatch.setattr(panel_ask, "ask_llm", lambda *a, **k: panel.SeatAnswer("holds", "r"))
     panel.ask(cfg["path"], "p", [], reviewers="claude", json_out=True)
     assert json.loads(capsys.readouterr().out)["verdict"] == "unchallenged"
 
@@ -986,8 +987,8 @@ def test_json_mode_puts_the_payload_on_stdout_and_nothing_else(monkeypatch, cfg,
 def test_an_unwritable_payload_fails_the_run(monkeypatch, cfg):
     """Same rule as a round's: the artefact IS the record, and a caller told it
     would get one must not be handed a 0 instead."""
-    monkeypatch.setattr(panel, "record_ask", lambda payload: None)
-    monkeypatch.setattr(panel, "ask_llm", lambda *a, **k: panel.SeatAnswer("holds", "r"))
+    monkeypatch.setattr(panel_ask, "record_ask", lambda payload: None)
+    monkeypatch.setattr(panel_ask, "ask_llm", lambda *a, **k: panel.SeatAnswer("holds", "r"))
     code = panel.ask(cfg["path"], "p", [], reviewers="claude",
                      json_file=cfg["path"] + "/no/such/dir/x.json")
     assert code == panel.UNWRITTEN_PAYLOAD_EXIT
@@ -997,8 +998,8 @@ def test_a_run_whose_payload_could_not_be_written_is_not_recorded(monkeypatch, c
     """The run is about to exit non-zero. A board row for it would be two records
     disagreeing about whether this ask happened."""
     recorded = []
-    monkeypatch.setattr(panel, "record_ask", recorded.append)
-    monkeypatch.setattr(panel, "ask_llm", lambda *a, **k: panel.SeatAnswer("holds", "r"))
+    monkeypatch.setattr(panel_ask, "record_ask", recorded.append)
+    monkeypatch.setattr(panel_ask, "ask_llm", lambda *a, **k: panel.SeatAnswer("holds", "r"))
     code = panel.ask(cfg["path"], "p", [], reviewers="claude",
                      json_file=cfg["path"] + "/no/such/dir/x.json")
     assert code == panel.UNWRITTEN_PAYLOAD_EXIT and recorded == []
@@ -1010,14 +1011,14 @@ def test_a_seat_that_raises_does_not_take_the_ask_down(monkeypatch, cfg, tmp_pat
     Re-raised out of the futures it discarded every other seat's finished answer,
     the tally, the payload and the --json-file, and handed the caller a traceback
     where the documented exit-0 report should be."""
-    monkeypatch.setattr(panel, "record_ask", lambda payload: None)
+    monkeypatch.setattr(panel_ask, "record_ask", lambda payload: None)
 
     def flaky(name, *a, **k):
         if name == "codex":
             raise OSError("No space left on device")
         return panel.SeatAnswer("fails", "the branch returns 0")
 
-    monkeypatch.setattr(panel, "ask_llm", flaky)
+    monkeypatch.setattr(panel_ask, "ask_llm", flaky)
     out = tmp_path / "ask.json"
     code = panel.ask(cfg["path"], "p", [], reviewers="claude,codex",
                      json_file=str(out), asker="")
@@ -1032,8 +1033,8 @@ def test_context_problems_are_not_config_problems(asked, monkeypatch, cfg, tmp_p
     """A reader told that a missing file is a "config" problem goes looking for a
     key that does not exist, and #77's reader of `config_notes` could not tell
     "the repo is misconfigured" from "the asker's context never got read"."""
-    monkeypatch.setattr(panel, "record_ask", lambda payload: None)
-    monkeypatch.setattr(panel, "ask_llm", lambda *a, **k: panel.SeatAnswer("holds", "r"))
+    monkeypatch.setattr(panel_ask, "record_ask", lambda payload: None)
+    monkeypatch.setattr(panel_ask, "ask_llm", lambda *a, **k: panel.SeatAnswer("holds", "r"))
     out = tmp_path / "ask.json"
     panel.ask(cfg["path"], "p", ["sub/nope.py", "sub/a.py:40"], reviewers="claude,codex",
               json_file=str(out), asker="")
@@ -1049,8 +1050,8 @@ def test_a_rule_no_seat_count_can_satisfy_is_the_one_that_is_warned_about(
     and the warning that used to fire on it named an invariant that is not one.
     What can never be met is a rule above the number of seats: the ask runs and
     is paid for, then reports `unchallenged` however emphatic the seats were."""
-    monkeypatch.setattr(panel, "record_ask", lambda payload: None)
-    monkeypatch.setattr(panel, "ask_llm", lambda *a, **k: panel.SeatAnswer("holds", "r"))
+    monkeypatch.setattr(panel_ask, "record_ask", lambda payload: None)
+    monkeypatch.setattr(panel_ask, "ask_llm", lambda *a, **k: panel.SeatAnswer("holds", "r"))
     out = tmp_path / "ask.json"
     panel.ask(cfg["path"], "p", [], reviewers="claude", json_file=str(out), asker="")
     payload = json.loads(out.read_text())
@@ -1063,8 +1064,8 @@ def test_a_threshold_above_the_quorum_is_not_warned_about(monkeypatch, cfg, tmp_
     this configuration works and a warning about it trains readers to ignore
     warnings."""
     cfg["review_panel"] |= {"ask_quorum": 2, "ask_threshold": 3}
-    monkeypatch.setattr(panel, "record_ask", lambda payload: None)
-    monkeypatch.setattr(panel, "ask_llm", lambda *a, **k: panel.SeatAnswer("holds", "r"))
+    monkeypatch.setattr(panel_ask, "record_ask", lambda payload: None)
+    monkeypatch.setattr(panel_ask, "ask_llm", lambda *a, **k: panel.SeatAnswer("holds", "r"))
     out = tmp_path / "ask.json"
     panel.ask(cfg["path"], "p", [], reviewers="claude,codex,pi",
               json_file=str(out), asker="")
@@ -1078,8 +1079,8 @@ def test_sonarqube_enabled_for_reviews_does_not_warn_on_every_ask(monkeypatch, c
     On the resolved set it was a permanent warning about a seat nobody tried."""
     cfg["reviewers"]["sonarqube"] = dict(cfg["reviewers"].get("sonarqube", {}), enabled=True)
     cfg["reviewers"]["claude"] = dict(cfg["reviewers"].get("claude", {}), enabled=True)
-    monkeypatch.setattr(panel, "record_ask", lambda payload: None)
-    monkeypatch.setattr(panel, "ask_llm", lambda *a, **k: panel.SeatAnswer("holds", "r"))
+    monkeypatch.setattr(panel_ask, "record_ask", lambda payload: None)
+    monkeypatch.setattr(panel_ask, "ask_llm", lambda *a, **k: panel.SeatAnswer("holds", "r"))
     out = tmp_path / "ask.json"
     panel.ask(cfg["path"], "p", [], json_file=str(out), asker="")
     payload = json.loads(out.read_text())
@@ -1091,8 +1092,8 @@ def test_an_agent_no_env_marker_names_is_told_the_guard_is_off(monkeypatch, cfg,
     codex- or pi-driven agent got `asker=""` and the headline safety rule
     silently did not fire — with nothing in the report or the payload saying
     detection had found nothing."""
-    monkeypatch.setattr(panel, "record_ask", lambda payload: None)
-    monkeypatch.setattr(panel, "ask_llm", lambda *a, **k: panel.SeatAnswer("holds", "r"))
+    monkeypatch.setattr(panel_ask, "record_ask", lambda payload: None)
+    monkeypatch.setattr(panel_ask, "ask_llm", lambda *a, **k: panel.SeatAnswer("holds", "r"))
     out = tmp_path / "ask.json"
     panel.ask(cfg["path"], "p", [], reviewers="claude,codex", json_file=str(out))
     payload = json.loads(out.read_text())
@@ -1106,8 +1107,8 @@ def test_turning_the_guard_off_by_hand_while_an_agent_is_running_is_said(
     terminal must be able to turn off a rule that does not apply to them. It is
     no longer usable QUIETLY by an agent."""
     monkeypatch.setenv("CLAUDECODE", "1")
-    monkeypatch.setattr(panel, "record_ask", lambda payload: None)
-    monkeypatch.setattr(panel, "ask_llm", lambda *a, **k: panel.SeatAnswer("holds", "r"))
+    monkeypatch.setattr(panel_ask, "record_ask", lambda payload: None)
+    monkeypatch.setattr(panel_ask, "ask_llm", lambda *a, **k: panel.SeatAnswer("holds", "r"))
     out = tmp_path / "ask.json"
     panel.ask(cfg["path"], "p", [], reviewers="claude,codex", json_file=str(out), asker="")
     payload = json.loads(out.read_text())
@@ -1120,8 +1121,8 @@ def test_a_caller_that_is_not_the_command_line_still_gets_the_guard(monkeypatch,
     """`ask`'s asker used to default to "" — no asker, guard off — so every
     caller but `main()` silently lost the one rule this feature is built on."""
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "abc")
-    monkeypatch.setattr(panel, "record_ask", lambda payload: None)
-    monkeypatch.setattr(panel, "ask_llm", lambda *a, **k: panel.SeatAnswer("holds", "sure"))
+    monkeypatch.setattr(panel_ask, "record_ask", lambda payload: None)
+    monkeypatch.setattr(panel_ask, "ask_llm", lambda *a, **k: panel.SeatAnswer("holds", "sure"))
     out = tmp_path / "ask.json"
     panel.ask(cfg["path"], "p", [], reviewers="claude", json_file=str(out))
     payload = json.loads(out.read_text())
@@ -1136,8 +1137,8 @@ def test_however_a_caller_spells_the_asker_the_guard_still_fires(monkeypatch, cf
     lower-cased seat key against a string it could never equal — and a premise an
     agent put to itself came back `holds` with a panel's authority. Normalised at
     the single point an asker enters `ask()`, so no spelling can lose it."""
-    monkeypatch.setattr(panel, "record_ask", lambda payload: None)
-    monkeypatch.setattr(panel, "ask_llm", lambda *a, **k: panel.SeatAnswer("holds", "sure"))
+    monkeypatch.setattr(panel_ask, "record_ask", lambda payload: None)
+    monkeypatch.setattr(panel_ask, "ask_llm", lambda *a, **k: panel.SeatAnswer("holds", "sure"))
     out = tmp_path / "ask.json"
     panel.ask(cfg["path"], "p", [], reviewers="claude", json_file=str(out), asker=spelled)
     payload = json.loads(out.read_text())
@@ -1148,8 +1149,8 @@ def test_an_asker_no_seat_answers_to_is_refused_and_said(monkeypatch, cfg, tmp_p
     """`"claude-code"` is not a seat, so it can never match a vote — a guard that
     cannot fire. Carrying it silently is what made the hole invisible; it is
     recorded as no asker and the run says so."""
-    monkeypatch.setattr(panel, "record_ask", lambda payload: None)
-    monkeypatch.setattr(panel, "ask_llm", lambda *a, **k: panel.SeatAnswer("holds", "sure"))
+    monkeypatch.setattr(panel_ask, "record_ask", lambda payload: None)
+    monkeypatch.setattr(panel_ask, "ask_llm", lambda *a, **k: panel.SeatAnswer("holds", "sure"))
     out = tmp_path / "ask.json"
     panel.ask(cfg["path"], "p", [], reviewers="claude", json_file=str(out),
               asker="claude-code")
@@ -1162,8 +1163,8 @@ def test_an_asker_no_seat_answers_to_is_refused_and_said(monkeypatch, cfg, tmp_p
 def test_the_asker_that_is_not_a_seat_claims_no_vote(monkeypatch, cfg, capsys):
     """`--reviewers codex --asker claude` asserted "its own answer is one vote
     and cannot be the only one" of a seat with no vote at all on this ask."""
-    monkeypatch.setattr(panel, "record_ask", lambda payload: None)
-    monkeypatch.setattr(panel, "ask_llm", lambda *a, **k: panel.SeatAnswer("holds", "r"))
+    monkeypatch.setattr(panel_ask, "record_ask", lambda payload: None)
+    monkeypatch.setattr(panel_ask, "ask_llm", lambda *a, **k: panel.SeatAnswer("holds", "r"))
     panel.ask(cfg["path"], "p", [], reviewers="codex", asker="claude")
     out = capsys.readouterr().out
     assert "**Asked by:** claude — not a seat on this ask" in out
@@ -1171,8 +1172,8 @@ def test_the_asker_that_is_not_a_seat_claims_no_vote(monkeypatch, cfg, capsys):
 
 def test_the_heading_separates_the_repo_from_the_pr(monkeypatch, cfg, capsys):
     """"Premise challenge — demo#62" reads as one token."""
-    monkeypatch.setattr(panel, "record_ask", lambda payload: None)
-    monkeypatch.setattr(panel, "ask_llm", lambda *a, **k: panel.SeatAnswer("holds", "r"))
+    monkeypatch.setattr(panel_ask, "record_ask", lambda payload: None)
+    monkeypatch.setattr(panel_ask, "ask_llm", lambda *a, **k: panel.SeatAnswer("holds", "r"))
     panel.ask(cfg["path"], "p", [], reviewers="claude", pr_number=62, asker="")
     assert "## Premise challenge — demo, PR #62" in capsys.readouterr().out
 
@@ -1180,8 +1181,8 @@ def test_the_heading_separates_the_repo_from_the_pr(monkeypatch, cfg, capsys):
 def test_telemetry_can_never_overwrite_what_a_seat_answered(monkeypatch, cfg, tmp_path):
     """A usage key colliding with a primary field silently replaced the seat's
     actual answer, because usage was unpacked last."""
-    monkeypatch.setattr(panel, "record_ask", lambda payload: None)
-    monkeypatch.setattr(panel, "ask_llm", lambda *a, **k: panel.SeatAnswer(
+    monkeypatch.setattr(panel_ask, "record_ask", lambda payload: None)
+    monkeypatch.setattr(panel_ask, "ask_llm", lambda *a, **k: panel.SeatAnswer(
         "fails", "the branch returns 0",
         usage={"model": "some-telemetry-model", "verdict": "holds", "input_tokens": 12}))
     out = tmp_path / "ask.json"
@@ -1192,8 +1193,8 @@ def test_telemetry_can_never_overwrite_what_a_seat_answered(monkeypatch, cfg, tm
 
 
 def test_an_unreadable_reply_keeps_its_quote_out_of_the_reason(monkeypatch, cfg, tmp_path):
-    monkeypatch.setattr(panel, "record_ask", lambda payload: None)
-    monkeypatch.setattr(panel, "ask_llm", lambda *a, **k: panel.SeatAnswer(
+    monkeypatch.setattr(panel_ask, "record_ask", lambda payload: None)
+    monkeypatch.setattr(panel_ask, "ask_llm", lambda *a, **k: panel.SeatAnswer(
         unreadable=True, gist="I think it is probably fine"))
     out = tmp_path / "ask.json"
     panel.ask(cfg["path"], "p", [], reviewers="claude", json_file=str(out), asker="")
@@ -1209,14 +1210,14 @@ def test_the_seat_whose_prompt_travels_in_argv_is_clamped_and_said(monkeypatch, 
     with an opaque error."""
     (repo / "big.py").write_text("z" * 4_000)
     monkeypatch.setattr(panel_seats, "ARGV_PROMPT_MAX_BYTES", 2_000)
-    monkeypatch.setattr(panel, "record_ask", lambda payload: None)
+    monkeypatch.setattr(panel_ask, "record_ask", lambda payload: None)
     prompts = {}
 
     def seat(name, model, prompt, effort=""):
         prompts[name] = prompt
         return panel.SeatAnswer("holds", "r")
 
-    monkeypatch.setattr(panel, "ask_llm", seat)
+    monkeypatch.setattr(panel_ask, "ask_llm", seat)
     out = tmp_path / "ask.json"
     panel.ask(cfg["path"], "p", ["big.py"], reviewers="antigravity,claude",
               json_file=str(out), asker="")
@@ -1236,15 +1237,15 @@ def test_a_prompt_that_cannot_fit_argv_at_all_skips_the_seat_rather_than_execve(
     left to cut. `fit_argv_budget` returning 0 is not the same claim as "it
     fits", and the oversized argv used to go to execve and die there with an
     opaque error and no note at all."""
-    monkeypatch.setattr(panel, "ARGV_PROMPT_MAX_BYTES", 200)
-    monkeypatch.setattr(panel, "record_ask", lambda payload: None)
+    monkeypatch.setattr(panel_ask, "ARGV_PROMPT_MAX_BYTES", 200)
+    monkeypatch.setattr(panel_ask, "record_ask", lambda payload: None)
     ran = []
 
     def seat(name, model, prompt, effort=""):
         ran.append(name)
         return panel.SeatAnswer("holds", "r")
 
-    monkeypatch.setattr(panel, "ask_llm", seat)
+    monkeypatch.setattr(panel_ask, "ask_llm", seat)
     out = tmp_path / "ask.json"
     panel.ask(cfg["path"], "q" * 500, [], reviewers="antigravity,claude",
               json_file=str(out), asker="")
@@ -1257,9 +1258,9 @@ def test_a_prompt_that_cannot_fit_argv_at_all_skips_the_seat_rather_than_execve(
 def test_the_seat_that_could_not_be_run_is_shown_as_one(monkeypatch, cfg, capsys):
     """A skip is the panel's idiom for a seat that did not run, and the report
     shows it beside the seats that did rather than quietly dropping the column."""
-    monkeypatch.setattr(panel, "ARGV_PROMPT_MAX_BYTES", 200)
-    monkeypatch.setattr(panel, "record_ask", lambda payload: None)
-    monkeypatch.setattr(panel, "ask_llm", lambda *a, **k: panel.SeatAnswer("holds", "r"))
+    monkeypatch.setattr(panel_ask, "ARGV_PROMPT_MAX_BYTES", 200)
+    monkeypatch.setattr(panel_ask, "record_ask", lambda payload: None)
+    monkeypatch.setattr(panel_ask, "ask_llm", lambda *a, **k: panel.SeatAnswer("holds", "r"))
     panel.ask(cfg["path"], "q" * 500, [], reviewers="antigravity", asker="")
     out = capsys.readouterr().out
     assert "did not answer" in out and "argv ceiling" in out
@@ -1326,10 +1327,10 @@ def test_the_asker_reaches_the_tally(monkeypatch, cfg):
     """The environment says which seat is running this, and that has to survive
     the whole way to the rule it exists for."""
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "abc")
-    monkeypatch.setattr(panel, "record_ask", lambda payload: None)
-    monkeypatch.setattr(panel, "ask_llm", lambda *a, **k: panel.SeatAnswer("holds", "r"))
+    monkeypatch.setattr(panel_ask, "record_ask", lambda payload: None)
+    monkeypatch.setattr(panel_ask, "ask_llm", lambda *a, **k: panel.SeatAnswer("holds", "r"))
     seen = {}
-    monkeypatch.setattr(panel, "ask_tally",
+    monkeypatch.setattr(panel_ask, "ask_tally",
                         lambda answers, quorum, threshold, asker="": (
                             seen.update(asker=asker),
                             panel.AskTally("unchallenged", "r", dict.fromkeys(

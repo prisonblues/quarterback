@@ -1361,6 +1361,64 @@ def _same_file(a: str, b: str) -> bool:
         return True
     return a.endswith("/" + b) or b.endswith("/" + a)
 
+# Shared by both entry points (#129): `run()` writes a review payload and `ask()`
+# writes an ask payload, and both exit through `finish`. Leaving them beside run()
+# would have made panel_ask import panel, which imports panel_ask.
+
+def write_payload(json_file: str, payload: dict) -> str:
+    """Write a run payload where ``--json-file`` asked for it.
+
+    Returns "" on success (or when nothing was asked for), else a description of
+    the failure for :func:`finish` to fail the run with. Shared by every non-error
+    exit, because the file is the NEXT round's baseline and a caller told "the
+    round did not happen unless the panel wrote that file" must get that answer
+    from the skip-pattern exit too.
+
+    Opened ``O_NOFOLLOW``, so a pre-planted symlink at the requested path
+    (``/tmp/panel-34-r1.json`` -> ``~/.ssh/authorized_keys``) fails the write
+    instead of following it — the hazard ``panel-review-pr.md`` §3 warns about,
+    enforced here rather than left to an instruction the caller may never read."""
+    if not json_file:
+        return ""
+    try:
+        fd = os.open(json_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(json.dumps(payload, indent=2))
+    except OSError as e:
+        failed = f"{json_file} ({e.__class__.__name__})"
+        print(f"panel: could not write {failed}", file=sys.stderr)
+        return failed
+    return ""
+
+def finish(write_failed: str, code: int = 0) -> int:
+    """The exit code, failing the run when the requested ``--json-file`` was not
+    written.
+
+    Without that file round r+1 classifies every repeated finding as new, prints
+    "N of N raised by no earlier round" and drives a fix pass over work already
+    done. Warning and exiting 0 let the caller advance the cycle on a baseline
+    that does not exist.
+
+    Reported at the END of a run rather than at the write: the report, the board
+    record and the PR comment are a review that has already been paid for, and
+    throwing them away would push the caller towards re-running the panel — which
+    the workflow forbids, because each run is an observation and re-rolling one
+    corrupts the record."""
+    if write_failed:
+        print(f"\npanel: FAILED — the requested --json-file was not written: "
+              f"{write_failed}. The review above is complete, but the next round "
+              "has no baseline: fix the path and re-run the CYCLE from round 1 "
+              "rather than treating this round as done.", file=sys.stderr)
+        return UNWRITTEN_PAYLOAD_EXIT
+    return code
+
+
+#: Exit code for "the review ran, but the requested --json-file was not written".
+#: Deliberately not 2: argparse exits 2 on its own usage errors, and the caller is
+#: told a non-zero exit means the round did not happen for cycle purposes — which
+#: it cannot tell from a mistyped flag if the two share a code.
+UNWRITTEN_PAYLOAD_EXIT = 3
+
 
 #: Everything this module offers, INCLUDING the underscore names — the suites
 #: reach for several of them through `panel`, and a plain star import would drop
@@ -1393,5 +1451,6 @@ __all__ = [
     "_ruling", "ASK_VERDICTS", "_ASK_ALIASES", "ASK_REASON_CHARS",
     "_REVIEW_SHAPED", "_cut", "_ask_reason", "Answer",
     "_ask_verdict", "_one_verdict", "parse_answer", "SeatAnswer",
-    "AskTally", "ask_tally", "_same_file",
+    "AskTally", "ask_tally", "_same_file", "write_payload",
+    "finish", "UNWRITTEN_PAYLOAD_EXIT",
 ]
