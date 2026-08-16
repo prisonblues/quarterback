@@ -20,81 +20,73 @@ This is the hybrid path: the guardrails of a guided integration merge (lexray's 
    (a slow reviewer outlives the 10-minute foreground Bash cap, which would kill the panel) — and run
    `/review-pr <pr>` to address findings. Repeat review→fix until the panel's **To fix** list is
    empty and CI is green.
-4. **Pre-land gate (mechanical).** Work in the PR branch's checkout, clean tree, `git fetch origin`.
-   Each guardrail is **capability-detected** — run it only if that script exists in the repo; a repo
-   without it skips that guardrail silently. These fix what CI can only *detect*.
-
-   **4a. Migration graph → exactly one head** (if `scripts/migration_reconcile.py` exists):
+4. **Pre-land gate (mechanical).** Work in the PR branch's checkout and ask for the verdict.
+   Do not re-derive it:
    ```bash
-   uv run python scripts/migration_reconcile.py preflight --onto origin/$BASE --branch HEAD
+   python3 ~/.claude/loops/preland.py --pr <pr> --json
    ```
-   Act on the reported `action` — **never override the tool's choice**, it picks relink vs merge on
-   guards you are not re-deciding:
-   - **NOOP** — nothing to reconcile.
-   - **RELINK** — rewrite the base migration's `down_revision` onto `$BASE`'s head. `apply` writes
-     the file and does **not** commit, so commit that one line yourself:
-     ```bash
-     uv run python scripts/migration_reconcile.py apply --onto origin/$BASE --branch HEAD
-     git add migrations/versions/<base>.py
-     git commit -m "fix(migrations): rebase <base> onto $BASE head <HEAD_REV>"
-     ```
-   - **MERGE** — relink is unsafe (multiple bases, a forked branch head, or a base that is itself a
-     merge node). Bring `$BASE` **into the branch**. The direction is the opposite of a guided
-     integration merge: there you merge branch→base locally, but here the PR does that, so the two
-     heads have to meet on the branch.
-     ```bash
-     git merge origin/$BASE          # resolve conflicts — see the cache-version rule in 4b
-     uv run flask db merge heads -m "merge <branch> and $BASE heads"
-     # rename to the repo's convention if it has one, e.g. mNNNa_merge_<desc>_heads.py
-     git add -A && git commit
-     ```
-     HOLD if a conflict is not mechanically obvious. Resolving product code by guess is exactly the
-     judgement this loop must not make on its own.
-   - **STOP** — `$BASE` itself has more than one head, independent of this branch. **HOLD.**
-     Reconciling the integration branch is not this issue's job.
+   It exits **0 = READY**, **3 = RECONCILE**, **2 = HOLD**, and the payload says why: `reasons`
+   (what is unresolved and who has to resolve it), `actions` (the exact commands a RECONCILE needs
+   and the files they touch), `warnings`, and `checks` — per guardrail, whether it ran, was skipped
+   for want of the script it needs, or was turned off.
 
-   Then **re-verify**, and HOLD if it is not exactly one head:
-   ```bash
-   uv run python scripts/migration_reconcile.py preflight --onto origin/$BASE --branch HEAD
-   ```
+   **The verdict is the decision.** Act on it; never substitute your own reading of the same facts
+   for it. That substitution is exactly what this replaced: on 2026-08-16 a PR was merged on
+   `mergeable` + CI-green over its own panel round, which had 8 P1s outstanding, by an agent who had
+   written up that precise confusion an hour earlier and had itself recorded the PR as blocked.
 
-   **4b. Service-worker cache-bust monotonicity** (if `scripts/check_sw_version.py` exists):
-   ```bash
-   uv run python scripts/check_sw_version.py --base origin/$BASE
-   ```
-   `SERVICE_WORKER_VERSION` is one hand-maintained global counter that every branch edits, so
-   parallel branches collide on merge and a careless resolution lands a value **≤ what is already
-   deployed** — which silently breaks cache invalidation rather than failing. On REGRESSION or STALE
-   BUMP let the tool fix it (`--fix` rewrites to `max(base, head) + 1` and re-stages), then commit.
-   A broken multiline value (`SERVICE_WORKER_VERSION = (`) → **HOLD**; that needs a human to restore
-   a single-line literal. The same rule governs a merge conflict on that line in 4a:
-   `max(both) + 1`, keeping the branch's descriptive comment — **never take the branch's number
-   blindly**.
+   - **HOLD** → stop. Post `reasons` as a PR comment and leave it for a human. Do **not** clear a
+     HOLD by re-running with that check turned off; `--skip` and `.harness-rules` exist for repos
+     that genuinely lack the guardrail, not for a verdict you dislike.
+   - **RECONCILE** → run every command in `actions`, in order, verbatim. Commit what they produce
+     (they deliberately do not commit for you), push, and **run preland again**. Those commits are
+     mechanical — a `down_revision` line, a version counter, a generated merge migration — and need
+     no re-review. **Never override the reconciler's choice of action**: relink vs merge turns on
+     guards you are not re-deciding. If a `git merge` in `actions` conflicts anywhere that is not
+     mechanically obvious, that is a HOLD — resolving product code by guess is the judgement this
+     loop must not make on its own.
+   - **READY** → step 5.
 
-   **4c. Push whatever 4a/4b produced to the PR branch.** Those commits are mechanical (a
-   `down_revision` line, a version counter, a generated merge migration) and need no re-review; a
-   MERGE-path merge commit brings in `$BASE` changes already reviewed on their own PRs.
-5. **Confidence gate — MERGE only if ALL hold:**
-   - `gh pr checks <pr>` is **green** (never merge on red/pending CI) — **re-checked after the
-     step-4 push**, since that push restarts CI and any earlier green is stale,
-   - the pre-land gate came out clean (single head re-verified, cache-version guard passing),
-   - the panel's **To fix** is empty (no master-confirmed defects) and SonarCloud is not failing,
+   Re-running after the push is not optional. The push restarts CI, so the `ci` check's earlier
+   green is a statement about a commit that is no longer the head — and preland is what re-reads it,
+   along with everything else the push may have staled.
+
+5. **Confidence gate — MERGE only if BOTH hold:**
+   - preland's **last** run, after the final push, came out **READY**, and
    - the change is low-risk and you are **genuinely confident** it is correct and complete.
 
-   If all hold → `gh pr merge <pr> --squash --delete-branch`.
-   If not → **STOP**, post a concise PR comment explaining what's unresolved, and leave it for a human.
-6. **Report** the outcome: implemented / reviewed / pre-land actions taken / merged-or-held, and the
-   confidence reasoning.
+   The first is mechanical and preland owns it whole: the PR is open and not conflicting, CI is
+   green *now*, the panel's newest round read *this* head and stopped with nothing confirmed and no
+   failing Sonar gate, the migration graph lands on one head, and nobody else holds the merge claim
+   on the branch. Do not re-check those by hand and do not weigh them against each other. A READY
+   you talk yourself past and a HOLD you talk yourself through are the same failure in two
+   directions.
+
+   The second is yours, and it is stated separately because it is not mechanical and never will be:
+   preland can tell you nothing objects. It cannot tell you the change is a good idea.
+
+   If both hold → `gh pr merge <pr> --squash --delete-branch`.
+   If not → **STOP**, post a concise PR comment quoting preland's `reasons`, and leave it for a human.
+
+6. **Report** the outcome: implemented / reviewed / pre-land verdict and any actions taken /
+   merged-or-held, and the confidence reasoning. Quote the verdict; do not paraphrase it.
 
 Rules:
 - **Be honest about confidence.** When unsure, do NOT merge — holding for a human is the correct,
   safe outcome, not a failure.
 - **Never** merge with red/pending CI, unresolved P1/P2 findings, or a failing SonarCloud gate.
+  Every one of those is a preland HOLD, so this rule now survives as the *reason* the gate exists
+  rather than as a second checklist to run by hand — and a second checklist is how the two drifted
+  apart in the first place.
 - Higher-risk changes (auth, migrations, data, security-sensitive paths) should bias strongly toward
   holding even if gates pass.
 - **`gh pr merge` is a server-side merge, so a repo's `pre-push` hook never fires on this path.**
   Whatever invariant that hook backstops is unprotected here — CI plus step 4 are what replace it.
-  That is why 4a is not optional where the script exists.
+  That is why step 4 is not optional, and why it is a script rather than a paragraph: a paragraph
+  cannot be re-run after the push that staled it, and cannot be asked afterwards whether it ran.
+- **preland is advisory and says so.** It is a script this loop chooses to run; it cannot stop a
+  human merging in the UI, or a loop that skips the step. What would actually block a merge is a
+  required status check on a protected branch, which does not exist for this repo yet.
 - **Landing on `$BASE` may deploy.** For lexray, `test` is a semi-production environment; the
   absence of a sign-off step is the whole point of this skill, and the price is that step 4 gets run
   in full rather than assumed.

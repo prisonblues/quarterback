@@ -7,6 +7,74 @@ that number where it was, so the repo can be a version ahead of the service.
 Entries are newest first. Each one says what was broken or missing before it, because that is the
 part that isn't recoverable from the diff.
 
+## v2.35 — the pre-land gate was prose in one skill and absent from the other
+
+Harness only; the board is unchanged and still serves 2.33.0.
+
+The mechanical checks a merge has to pass existed twice, in two forms, and neither was executable.
+`/fix-and-land` §4 was about fifty lines of English describing a pre-land gate — reconcile the
+migration graph, act on the reported action, re-verify a single head, run the cache-version guard,
+push what that produced, re-check CI because the push staled it. `/panel-review-pr` §7 was one line,
+`gh pr merge --merge --delete-branch`, with nothing in front of it at all. The same job, one skill
+doing it thoroughly in English and the other not doing it.
+
+Prose in two files drifts. It has no exit code, no test, and no way to answer *did the gate actually
+run* after the fact — and a model reading it is invited to re-derive a decision it should be
+executing. On 2026-08-16 PR #131 was merged on `mergeable` + CI-green over its own panel round, which
+had 8 P1s and 12 P2s outstanding, three of them auth-shaped; `main` shipped them for about three
+hours. The agent that merged it had written up that exact confusion an hour earlier — *"three PRs
+were MERGEABLE and CI-green today and only one was actually ready"* — and had recorded #131 as
+blocked in its own morning survey. That is not a discipline gap, and it is not answerable with "be
+more careful".
+
+`harness/loops/preland.py --pr <n>` is the verdict, on the same terms as `round_stop`: mechanical,
+and the caller does not substitute its own judgement for it. **READY** (exit 0), **RECONCILE**
+(exit 3, with the exact commands and the files they touch), or **HOLD** (exit 2, with what is
+unresolved and who has to resolve it), plus `--json` and a per-check audit trail. The codes are
+`migration_reconcile.py`'s, so the two tools never mean different things by the same number.
+
+**No new data was needed** — the verdict is a query. Every clause reads a field the panel already
+wrote about its own round (`head_sha`, `stopped`, `confirmed`, `sonar_gate`, `stop_confident`) and
+`GET /reviews?repo=&pr=` already returned all of it. #131 was HOLD on two independent counts and
+neither required judgement. The `head_sha` clause is v2.29's stamp finding its first real consumer:
+without it, a review of an earlier commit reads as a review of this one.
+
+Three properties are the reason this is a script and not tidier prose, and each is a lesson this
+repo already paid for:
+
+- **Never gate on a proxy.** Not "a payload exists", not "the job exited 0". #62 spent three rounds
+  replacing one proxy for "the review happened" with another — the exit code, then the push, then
+  the payload artefact — and this is built to have no fourth.
+- **Absent never reads as clean.** A PR the panel never saw is a HOLD, not a pass for want of an
+  objection. Repo-local guardrails *are* capability-detected — a repo without
+  `scripts/migration_reconcile.py` skips that check silently, which is what lets one gate serve
+  several repos with no per-repo branch in the skill — but an unreadable *board* is the opposite
+  case: the invariant exists and cannot be seen. That knowingly narrows #59's "the local path stays
+  first-class" for `/fix-and-land`, and the off-switch is one line of `.harness-rules`
+  (`"preland": {"disabled_checks": ["review"]}`), quoted verbatim in the refusal so the first person
+  to hit it does not read "the board is down" as "the tool is broken". A check turned off is still
+  *reported*, as `skipped-absent` / `skipped-disabled` / `skipped-flag`; a payload must never read
+  clean by omission.
+- **`stop_confident: false` is a warning, not a hold.** Two permanently-absent reviewer seats on a
+  headless box would otherwise make a green verdict unreachable — the noise-for-signal trade
+  `.harness-rules` already argues against for `coverage_veto`. The vetoes print with it.
+
+It also reads `kind=merge` claims and holds when another agent has the branch. v2.31 shipped that
+primitive and nothing had ever read it — on the same day two agents merged at once. It **reads**
+the claim and does not take one: a verdict that mutates cannot run as a CI check, cannot be re-run
+to verify itself, and cannot be asked twice by a loop that wants to know whether its own fix worked.
+Taking it across a land belongs to whatever does the merging.
+
+Both skills now call it and act on the verdict. `lander.py`'s CI-rollup reader moved to
+`harness_rules.py` so the two callers share one answer to "is CI green" rather than growing a second
+that disagrees — which is the failure this release is about, one level down.
+
+**What it is not.** Advisory. A script an agent chooses to run cannot stop a human merging in the UI
+or a loop that skips the step; what would actually block a merge is a required status check on a
+protected branch, and `main` has no protection at all today. A CI job doing that must pass
+`--skip ci`, because such a job is itself one of the checks `ci` reads and would otherwise gate on
+its own pending status.
+
 ## v2.33 — v2.31's claim table was right about INSERT and wrong about everything else
 
 v2.31 landed the resource-claim table and its release allocator, and its own panel round found
