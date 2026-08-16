@@ -28,6 +28,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
+import panel_scope  # noqa: E402  — scope/range readers moved here in #129
 import panel_core  # noqa: E402  — `sh` is defined here since #129
 import panel_seats  # noqa: E402  — these seats moved here in #129
 
@@ -384,8 +385,8 @@ def decide(monkeypatch, want="increment", round_no=2, anchor="1111111", head="22
         return (prior, "") if a == base else (increment, problem)
     said = dict(FACTS, files=len([f for f in panel._diff_by_file(increment) if f]))
     said.update(facts or {})
-    monkeypatch.setattr(panel_seats, "fetch_increment", fetch)
-    monkeypatch.setattr(panel_seats, "compare_facts", lambda *a: said)
+    monkeypatch.setattr(panel_scope, "fetch_increment", fetch)
+    monkeypatch.setattr(panel_scope, "compare_facts", lambda *a: said)
     return panel.ReviewScope.decide(want, round_no, PR, (anchor, head), "acme/board",
                                     base, since_round)
 
@@ -470,8 +471,8 @@ def test_a_failed_context_fetch_falls_back_rather_than_mislabelling_the_context(
     suppresses findings."""
     def fetch(repo, a, b):
         return ("", "gh api failed") if a == "main" else (INCREMENT, "")
-    monkeypatch.setattr(panel_seats, "fetch_increment", fetch)
-    monkeypatch.setattr(panel_seats, "compare_facts", lambda *a: dict(FACTS, files=1))
+    monkeypatch.setattr(panel_scope, "fetch_increment", fetch)
+    monkeypatch.setattr(panel_scope, "compare_facts", lambda *a: dict(FACTS, files=1))
     got, notes = panel.ReviewScope.decide("increment", 2, PR, ("1111111", "2222222"),
                                           "acme/board", "main", 1)
     assert got.scope == "pr"
@@ -534,9 +535,9 @@ def test_a_truncated_compare_is_refused_rather_than_reviewed(monkeypatch):
 
 def test_an_unreadable_compare_response_says_the_checks_did_not_run(monkeypatch):
     """No caveat would otherwise read as "checked, nothing wrong"."""
-    monkeypatch.setattr(panel_seats, "fetch_increment",
+    monkeypatch.setattr(panel_scope, "fetch_increment",
                         lambda repo, a, b: ((PRIOR, "") if a == "main" else (INCREMENT, "")))
-    monkeypatch.setattr(panel_seats, "compare_facts", lambda *a: {})
+    monkeypatch.setattr(panel_scope, "compare_facts", lambda *a: {})
     got, notes = panel.ReviewScope.decide("increment", 2, PR, ("1111111", "2222222"),
                                           "acme/board", "main", 1)
     assert got.scope == "increment"
@@ -994,12 +995,12 @@ def _stub_run(monkeypatch, seen, *, cfg=None, findings=(), increment=INCREMENT,
         return PR
 
     monkeypatch.setattr(panel_core, "sh", fake_sh)
-    monkeypatch.setattr(panel_seats, "fetch_increment",
+    monkeypatch.setattr(panel_scope, "fetch_increment",
                         lambda repo, a, b: (PRIOR, "") if a == "main"
                         else (increment, problem))
     said = dict(FACTS, files=len([f for f in panel._diff_by_file(increment) if f]))
     said.update(facts or {})
-    monkeypatch.setattr(panel_seats, "compare_facts", lambda *a: said)
+    monkeypatch.setattr(panel_scope, "compare_facts", lambda *a: said)
     def reviewer(name, model, prompt, effort=""):
         seen.setdefault("prompts", {})[name] = prompt
         return panel.ReviewerRun(list(findings), None, 10, [])

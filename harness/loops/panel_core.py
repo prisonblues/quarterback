@@ -1419,6 +1419,163 @@ def finish(write_failed: str, code: int = 0) -> int:
 #: it cannot tell from a mistyped flag if the two share a code.
 UNWRITTEN_PAYLOAD_EXIT = 3
 
+# Range/auth primitives used by BOTH panel_seats and panel_scope (#129), so they
+# sit in the foundation rather than in either caller.
+
+def resolve_token(sonar: dict, repo_path: str = "") -> str:
+    """SONAR token, in order:
+
+        1. the process env var named by `token_env`
+        2. the repo's `.env`            <- the work-machine source
+        3. the 0600 cache in ~/.cache/loops
+        4. `op read` of `token_op_ref`  (write-through to the cache)
+
+    So a work machine, which has no 1Password/sops and no login-time export,
+    just carries the value in the repo's own gitignored `.env`; `op signin` is
+    needed once on a personal machine and later runs read the cache.
+
+    `.env` sits BELOW the real env var rather than above it, which is the one
+    place this departs from "look in .env first". An exported SONARQUBE_TOKEN is
+    an explicit, deliberate override (zeus sets one at login), and a stale `.env`
+    left in a checkout silently shadowing it would surface as an unexplained 401
+    from SonarCloud. Nothing is lost on a work machine, where no such export
+    exists and resolution falls straight through to `.env`. This also matches
+    python-dotenv's default (`override=False`).
+
+    Never logged. Delete the cache file to refresh after a token rotation."""
+    env = os.environ.get(sonar.get("token_env", ""), "")
+    if env:
+        return env
+
+    name = sonar.get("token_env", "")
+    if repo_path and name:
+        if harness_rules.dotenv_is_tracked(repo_path):
+            print(f"  ! {repo_path}/.env is COMMITTED to git — a credential is in "
+                  f"the repo's history. Add it to .gitignore and rotate the token.",
+                  file=sys.stderr)
+        dotenv = harness_rules.read_dotenv(repo_path)
+        if dotenv.get(name):
+            return dotenv[name]
+
+    key = sonar.get("project_key", "") or "default"
+    cache = Path.home() / ".cache" / "loops" / f"sonar-{key}.token"
+    if cache.is_file():
+        tok = cache.read_text().strip()
+        if tok:
+            return tok
+
+    ref = sonar.get("token_op_ref")
+    if not ref:
+        return ""
+    try:
+        # DEVNULL + timeout for the same reasons run_cli has them, and they bite
+        # harder here: a locked 1Password session makes `op read` PROMPT, and with
+        # the parent's stdin inherited that blocks the entire panel indefinitely on
+        # the one step nobody is watching. EOF turns a locked session into a fast
+        # failure and a skipped Sonar gate, which is a reported degradation rather
+        # than a hang.
+        tok = subprocess.run(["op", "read", ref], capture_output=True, text=True,
+                             check=True, stdin=subprocess.DEVNULL,
+                             timeout=30).stdout.strip()
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        return ""
+    if tok:
+        try:
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            cache.write_text(tok)
+            cache.chmod(0o600)
+        except OSError:
+            pass  # caching is best-effort; token still usable this run
+    return tok
+
+def _ssl_context() -> ssl.SSLContext:
+    """TLS context with a CA bundle that actually exists. Python's baked-in
+    default openssl path (e.g. /etc/ssl/cert.pem) is absent on NixOS, so
+    urllib verification fails out of the box; prefer SSL_CERT_FILE, then
+    certifi, then the common system bundles."""
+    env = os.environ.get("SSL_CERT_FILE")
+    if env and os.path.isfile(env):
+        return ssl.create_default_context(cafile=env)
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        pass
+    for p in ("/etc/ssl/certs/ca-certificates.crt",
+              "/etc/ssl/certs/ca-bundle.crt",
+              "/etc/pki/tls/certs/ca-bundle.crt"):
+        if os.path.isfile(p):
+            return ssl.create_default_context(cafile=p)
+    return ssl.create_default_context()  # last resort: platform default
+
+def _diff_file_path(line: str) -> str | None:
+    """The repo-relative new-side path a diff header line names, or None where it
+    names none — a `+++ /dev/null` deletion, a header nothing can parse.
+
+    ONE parser for `diff --git a/… b/…` and for `+++ b/…`, shared by
+    :func:`_diff_added_lines` and :func:`_diff_files_cut` because
+    :func:`_provenance` compares one's keys against the other's members through
+    :func:`_same_file`: two spellings of "what a path is" would misattribute in
+    silence rather than fail. `+++` is the reliable anchor, carrying ONE path so
+    nothing has to be guessed about where it ends; the `diff --git` header is
+    parsed as well only so a file has a name before its `+++` line arrives, which
+    matters when a budget cuts between the two.
+    """
+    if line.startswith("+++ "):
+        tok = _unquote_path(line[4:].strip())
+        return tok[2:] if tok.startswith("b/") else None
+    if not line.startswith("diff --git "):
+        return None
+    rest = line[len("diff --git "):].strip()
+    # `a/P b/P`, where both sides are the SAME path. Git does not quote a plain
+    # space, so `diff --git a/x b/y.py b/x b/y.py` splits at the wrong ` b/`
+    # whichever end you start from — but the two halves are equal in length, so
+    # the split point is arithmetic rather than a guess.
+    if len(rest) > 5 and (len(rest) - 5) % 2 == 0:
+        half = (len(rest) - 5) // 2
+        a_side, b_side = rest[:2 + half], rest[2 + half:]
+        if a_side.startswith("a/") and b_side == " b/" + a_side[2:]:
+            return a_side[2:]
+    # A rename (`a/old b/new`), or a quoted path. Quoted, both sides are quoted
+    # and the separator between them is unambiguous. Unquoted, the first ` b/` is
+    # the best guess left, and a path containing one is misread until the `+++`
+    # line corrects it.
+    if rest.startswith('"') and rest.endswith('"') and '" "' in rest:
+        tok = _unquote_path('"' + rest.rsplit('" "', 1)[1])
+        return tok[2:] if tok.startswith("b/") else None
+    _, sep, tail = rest.partition(" b/")
+    return tail.strip() if sep else None
+
+#: How long provenance waits on the compare API, and how much of a range it will
+#: hold. Nothing gates on provenance, so a slow or enormous range degrades to
+#: "unknown" rather than making a round wait on it or keeping it all in memory.
+FIX_RANGE_TIMEOUT_S = 60
+
+FIX_RANGE_MAX_CHARS = 2_000_000
+
+#: Only what attribution reads: the ancestry verdict and the per-file patches.
+#: The compare response also carries every commit in the range and a dozen URLs
+#: per file, and none of that is ever looked at.
+_FIX_RANGE_JQ = "{status: .status, files: [(.files // [])[] | {filename, patch}]}"
+
+
+def _unquote_path(tok: str) -> str:
+    r"""Git's C-quoted path form (`"a/w\303\251ird.py"`) back to the real path.
+
+    Git quotes a path — in the `diff --git` header and on the `---`/`+++` lines
+    alike — whenever it holds a non-ASCII byte, a quote, a backslash or a control
+    character, escaping the bytes in octal. Left quoted, such a file is spelled
+    one way here and another way by every reviewer that reports a finding in it,
+    and :func:`_same_file` then matches neither spelling against the other.
+    """
+    if len(tok) < 2 or not (tok.startswith('"') and tok.endswith('"')):
+        return tok
+    try:
+        return (tok[1:-1].encode("utf-8").decode("unicode_escape")
+                .encode("latin-1").decode("utf-8"))
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        return tok[1:-1]  # not the escaping git uses; the quotes still come off
+
 
 #: Everything this module offers, INCLUDING the underscore names — the suites
 #: reach for several of them through `panel`, and a plain star import would drop
@@ -1452,5 +1609,7 @@ __all__ = [
     "_REVIEW_SHAPED", "_cut", "_ask_reason", "Answer",
     "_ask_verdict", "_one_verdict", "parse_answer", "SeatAnswer",
     "AskTally", "ask_tally", "_same_file", "write_payload",
-    "finish", "UNWRITTEN_PAYLOAD_EXIT",
+    "finish", "UNWRITTEN_PAYLOAD_EXIT", "resolve_token", "_ssl_context",
+    "_diff_file_path", "FIX_RANGE_TIMEOUT_S", "FIX_RANGE_MAX_CHARS", "_FIX_RANGE_JQ",
+    "_unquote_path",
 ]

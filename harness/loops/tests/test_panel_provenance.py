@@ -32,6 +32,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
+import panel_scope  # noqa: E402  — scope/range readers moved here in #129
 import panel_seats  # noqa: E402
 import panel_core  # noqa: E402  — `sh` is defined here since #129
 from conftest import gh_stub  # noqa: E402
@@ -335,7 +336,7 @@ def test_a_range_too_large_to_hold_is_not_held(monkeypatch):
     multi-commit range big enough to matter is not worth the memory: past the cap
     it degrades to unknown, which costs a signal, rather than to a resident copy
     of somebody's vendored tree."""
-    monkeypatch.setattr(panel_seats, "FIX_RANGE_MAX_CHARS", 40)
+    monkeypatch.setattr(panel_scope, "FIX_RANGE_MAX_CHARS", 40)
     monkeypatch.setattr(panel_core, "sh", _sh_returning(_compare()))
     diff, why = panel._fix_range_diff("acme/board", "aaaa1111", "bbbb2222")
     assert diff is None and "larger than" in why

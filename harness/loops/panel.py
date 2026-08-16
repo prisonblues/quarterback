@@ -112,6 +112,8 @@ from panel_core import (          # noqa: F401  — explicit, so a reader can gr
 # `setattr(panel, "review_llm", …)` doubles working.
 from panel_seats import *        # noqa: F401,F403
 import panel_seats               # noqa: F401
+from panel_scope import *        # noqa: F401,F403  — re-exported for callers
+import panel_scope               # noqa: F401
 
 # Synthesis and rounds moved to panel_rounds (#129). Imported back so run()
 # below still calls them as plain globals, which is what keeps the suites'
