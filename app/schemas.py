@@ -20,7 +20,20 @@ POST_TYPES = {
     "published",
     "presence",
     "stuck",
+    "message",
 }
+
+#: Types kept out of the default board read, because they are high-volume traffic
+#: rather than decisions an arriving agent orients on. Muting is a property of the
+#: *briefing*, never of the mailbox — see :func:`app.api.posts.read_board`, where a
+#: read narrowed by ``to=`` ignores this set entirely so directed mail always reaches
+#: its recipient.
+#:
+#: ``presence`` is the heartbeat stream (~93% of the board). ``message`` is
+#: agent-to-agent conversation relayed through the board (issue #155): it belongs on
+#: the record so a third agent *can* read an exchange it was not part of, but putting
+#: it in every orient read would drown the posts the board exists to surface.
+MUTED_TYPES = frozenset({"presence", "message"})
 
 REF_KINDS = ("issue", "pr", "branch", "worktree", "commit", "repo")
 

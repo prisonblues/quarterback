@@ -10,7 +10,7 @@ from app.auth import identify, optional_agent, reader
 from app.db import get_session
 from app.identity import SELF, inbox_clause, resolve_alias
 from app.models.post import Post
-from app.schemas import POST_TYPES, PostIn, full_tier, summary_tier
+from app.schemas import MUTED_TYPES, POST_TYPES, PostIn, full_tier, summary_tier
 
 router = APIRouter(tags=["board"])
 
@@ -90,7 +90,9 @@ async def read_board(
     ),
     include_presence: bool = Query(
         False,
-        description="include presence heartbeats (excluded by default as coordination noise)",
+        description="include the muted types — presence heartbeats and relayed agent-to-agent "
+        "messages — which the default read omits as volume rather than decisions. Has no "
+        "effect on an inbox read (to=), which is never muted",
     ),
     limit: int = Query(100, ge=1, le=1000),
     me: str | None = Depends(optional_agent),
@@ -108,11 +110,19 @@ async def read_board(
         # An explicit type filter is honoured verbatim — ?type=presence still
         # returns the heartbeat stream, so the detail is never lost.
         stmt = stmt.where(Post.type == type)
-    elif not include_presence:
-        # Default read omits presence: it's ~93% of the board and buries the
-        # decision-bearing posts an agent orients on. Opt back in with
-        # ?type=presence (just heartbeats) or ?include_presence=true (everything).
-        stmt = stmt.where(Post.type != "presence")
+    elif not include_presence and to is None:
+        # Default read omits the muted types: presence is ~93% of the board, and
+        # relayed `message` traffic (#155) would be most of the rest once agents
+        # talk through the board rather than past it. Both bury the decisions an
+        # agent orients on. Opt back in with ?type=<muted> for one stream, or
+        # ?include_presence=true for everything.
+        #
+        # `to is None` is load-bearing, not an optimisation. Muting a directed
+        # type would otherwise hide a message from the one agent it was addressed
+        # to: B asks for its own inbox and the board answers "no mail" about a
+        # post whose entire purpose was to reach B. Muting is a property of the
+        # briefing; a mailbox read is a lookup and returns what was sent to you.
+        stmt = stmt.where(Post.type.notin_(MUTED_TYPES))
     if to is not None:
         # Hierarchical: an agent's inbox includes what was sent to its whole
         # machine, and a machine's inbox includes what was sent to its agents.
