@@ -393,13 +393,22 @@ class BoardApp(App):
         return text
 
     def _fill_fleet(self, active: dict) -> None:
+        """Who is live where — with an agent's fan-out visibly its fan-out.
+
+        ``/active`` also takes ``mine=``/``peers_only=``, which tag or drop the
+        caller's *own* sub-agents. Neither is passed, and that is not an
+        oversight: this client is a person at a terminal, not a session, so it
+        has no `mine` to send and every row is somebody else's by construction.
+        The ``kind`` column does the job those flags do for an agent — a
+        session's five Explore workers read as five sub-agents of the holder
+        above them rather than as five peers.
+        """
         table = self.query_one("#fleet", DataTable)
         table.clear()
         for row in fleet_rows(active):
-            mark = " (yours)" if row["own"] else ""
             table.add_row(
                 row["kind"], row["holder"], row["device"], row["repo"], row["branch"],
-                row["ttl"], row["since"], (row["title"] + mark)[:60],
+                row["ttl"], row["since"], row["title"][:60],
             )
 
     def _fill_sessions(self, sessions: list[dict]) -> None:
