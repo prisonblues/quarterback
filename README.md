@@ -116,11 +116,17 @@ GET   /review/{id}                                              (scorecards + fi
                                                                  + the PR's changed_files
                                                                  + head_sha/unread_files/provenance)
 POST  /review/outcomes   {repo, pr, outcomes:[{key, outcome, note?,               -> {recorded, changed,
-                          deferred_to?, superseded_by?, attested_by?}]}              unchanged, rejected,
+                          deferred_to?, superseded_by?, attested_by?}]}              amended, unchanged,
+                                                                                     rejected,
                                                                                      unattested_refutations}
                           what HAPPENED to a defect once somebody acted on it:
                           fixed | refuted | deferred | superseded, one per (repo, pr, key).
-                          `refuted` needs its reasoning; rejections are per item and named
+                          `refuted` needs its reasoning and `superseded` needs the key that
+                          replaced it; rejections are per item and named, never a 422 for the
+                          batch; a repeat FILLS a field and an overwrite is an `amended`
+                          revision; 201 created / 200 updated / 422 nothing accepted.
+                          `attested_by` is a CLAIM the caller makes, not a signature — the
+                          board authenticates `set_by` and cannot authenticate a human
 GET   /review/stats      ?repo=&author=&days=&judged_only=       -> {by_model, by_agent,
                                                                      by_provenance, by_outcome,
                                                                      by_outcome_attested}

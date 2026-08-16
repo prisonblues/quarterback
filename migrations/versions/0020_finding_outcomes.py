@@ -58,6 +58,19 @@ The vocabulary is a CHECK as well as an ingest validation, because this table
 feeds a published precision figure: an unknown value would drop out of the
 numerator while still counting as coverage, which reads as "recorded, and it was
 neither fixed nor refuted" — the most flattering possible way to say nothing.
+The same argument puts the evidence rule at the boundary, so a backfill or an
+admin script cannot insert a bare contradiction of the judge either. Both halves
+of it are needed: `btrim(note) <> ''` refuses a whitespace note, and the
+`note IS NOT NULL` beside it is not redundant — **a CHECK passes when its
+expression evaluates to NULL**, so the trim test alone would let a null note
+straight through, which is the row the rule exists to refuse.
+
+**The vocabulary is spelled out here rather than imported from
+`app.api.reviews.OUTCOMES`, deliberately.** A migration is a snapshot of what the
+schema became on a particular day; one that imported a live constant would replay
+differently after the constant moved, which is the single thing a migration may
+not do. The two definitions that *can* drift within one deployment — the constant
+and the model's CHECK — are compared at import instead, and the mismatch is named.
 
 The unique constraint is the read path too. `(repo, pr, finding_key)` is what the
 stats join matches on and its leftmost prefix serves the by-PR chain lookup, so
@@ -108,6 +121,10 @@ def upgrade() -> None:
         sa.CheckConstraint(
             "outcome IN ('fixed', 'refuted', 'deferred', 'superseded')",
             name="ck_review_finding_outcomes_vocabulary",
+        ),
+        sa.CheckConstraint(
+            "outcome <> 'refuted' OR (note IS NOT NULL AND btrim(note) <> '')",
+            name="ck_review_finding_outcomes_refuted_note",
         ),
         sa.CheckConstraint("revisions >= 0", name="ck_review_finding_outcomes_revisions"),
     )

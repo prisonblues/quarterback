@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
 from sqlalchemy.exc import IntegrityError
 
 from app.api import reviews
@@ -69,13 +70,28 @@ async def record(client, case: str, **over) -> dict:
     return r.json()
 
 
-async def outcomes(client, case: str, items: list[dict], **over) -> dict:
-    r = await client.post(
+async def post_outcomes(client, case: str, items: list[dict], **over):
+    return await client.post(
         "/review/outcomes",
         json={"repo": repo_of(case), "pr": 1, "outcomes": items, **over},
         headers=AGENT,
     )
-    assert r.status_code == 201, r.text
+
+
+async def outcomes(client, case: str, items: list[dict], expect: int | None = None,
+                   **over) -> dict:
+    """POST a batch and return the body.
+
+    The status code is part of the contract — 201 created, 200 updated, 422 when
+    nothing was accepted — so it is asserted rather than ignored: `expect` pins
+    one, and the default accepts either success code, because most tests here are
+    about the body and would otherwise re-encode the code in every call.
+    """
+    r = await post_outcomes(client, case, items, **over)
+    if expect is not None:
+        assert r.status_code == expect, r.text
+    else:
+        assert r.status_code in (200, 201), r.text
     return r.json()
 
 
@@ -202,24 +218,64 @@ async def test_changing_the_answer_is_visible_and_drops_the_old_reasoning(client
 
 
 async def test_rejections_are_itemised_and_named(client):
-    """Four ways to be wrong in one payload, each named, and the one good item
-    still lands: a fix pass reporting a round's findings must not lose eleven of
-    them to one typo."""
-    await record(client, "reject", to_fix=[finding("x1"), finding("x2")])
+    """Four ways to be wrong in one payload, each named, and the good item still
+    lands: a fix pass reporting a round's findings must not lose eleven of them to
+    one typo."""
+    await record(client, "reject", to_fix=[finding("x1"), finding("x2"), finding("x3")])
     res = await outcomes(client, "reject", [
         {"key": "x1", "outcome": "regressed"},
         {"key": "ghost", "outcome": "fixed"},
         {"key": "x1", "outcome": "fixed"},
-        {"key": "x1", "outcome": "fixed"},
         {"key": "x2", "outcome": "fixed", "deferred_to": "acme/repo#1"},
-    ])
-    assert res["recorded"] == ["x1"]
+        {"key": "x3", "outcome": "fixed"},
+    ], expect=201)
+    assert res["recorded"] == ["x3"]
     reasons = [r["reason"] for r in res["rejected"]]
     assert len(reasons) == 4
     assert any("unknown outcome" in r for r in reasons)
     assert any("no finding with this key" in r for r in reasons)
-    assert any("repeated in this payload" in r for r in reasons)
+    assert any("once per request" in r for r in reasons)
     assert any("only meaningful on a deferred outcome" in r for r in reasons)
+
+
+async def test_a_key_may_be_reported_once_per_request(client):
+    """A payload that says two things about one defect is a caller contradicting
+    itself, and picking either is a guess — so the later entry is refused whether
+    or not the first was accepted. It used to be refused only when the first had
+    been ACCEPTED, so a key whose first entry was rejected had its duplicates told
+    "the first entry was kept" when nothing had been kept for it at all."""
+    await record(client, "dupe", to_fix=[finding("d1")])
+    res = await outcomes(client, "dupe", [
+        {"key": "d1", "outcome": "regressed"},
+        {"key": "d1", "outcome": "fixed"},
+    ], expect=422)
+    assert res["recorded"] == []
+    assert "unknown outcome" in res["rejected"][0]["reason"]
+    assert "once per request" in res["rejected"][1]["reason"]
+
+
+async def test_the_status_code_agrees_with_the_body(client):
+    """A shell pipeline built around `qb` — a curl wrapper — checks the status and
+    nothing else, so "201 Created" over a body of twelve rejections is the
+    response lying about what it did."""
+    await record(client, "codes", to_fix=[finding("c1")])
+    created = await post_outcomes(client, "codes", [{"key": "c1", "outcome": "fixed"}])
+    assert created.status_code == 201
+    updated = await post_outcomes(client, "codes", [{"key": "c1", "outcome": "fixed"}])
+    assert updated.status_code == 200
+    nothing = await post_outcomes(client, "codes", [{"key": "ghost", "outcome": "fixed"}])
+    assert nothing.status_code == 422
+    assert nothing.json()["rejected"][0]["reason"] == "no finding with this key on this PR"
+
+
+async def test_superseded_needs_the_key_that_replaced_it(client):
+    """The replacing key is the entire content of a `superseded` outcome, so it is
+    required the way a note is required for `refuted` — a bare `superseded`
+    records "replaced by something"."""
+    await record(client, "supersede-bare", to_fix=[finding("b1"), finding("b2")])
+    res = await outcomes(client, "supersede-bare", [
+        {"key": "b1", "outcome": "superseded"}], expect=422)
+    assert "superseded needs superseded_by" in res["rejected"][0]["reason"]
 
 
 async def test_superseded_by_must_name_another_finding_on_this_pr(client):
@@ -227,7 +283,7 @@ async def test_superseded_by_must_name_another_finding_on_this_pr(client):
     res = await outcomes(client, "supersede", [
         {"key": "s1", "outcome": "superseded", "superseded_by": "s1"},
         {"key": "s2", "outcome": "superseded", "superseded_by": "elsewhere"},
-    ])
+    ], expect=422)
     assert res["recorded"] == []
     assert any("itself" in r["reason"] for r in res["rejected"])
     assert any("names no finding on this PR" in r["reason"] for r in res["rejected"])
@@ -392,7 +448,7 @@ async def test_dismissed_findings_are_outside_the_measure(client):
 
 async def test_a_key_that_names_no_finding_is_refused_and_an_empty_batch_is_a_422(client):
     await record(client, "empty", to_fix=[finding("e1")])
-    res = await outcomes(client, "empty", [{"key": "ghost", "outcome": "fixed"}])
+    res = await outcomes(client, "empty", [{"key": "ghost", "outcome": "fixed"}], expect=422)
     assert res["recorded"] == []
     assert res["rejected"][0]["reason"] == "no finding with this key on this PR"
 
@@ -418,12 +474,22 @@ async def test_two_writers_recording_one_defect_at_once_leave_one_row(client):
                           "outcomes": [{"key": "w1", "outcome": "fixed"}]},
                     headers=AGENT),
     )
-    assert [r.status_code for r in both] == [201, 201], [r.text for r in both]
+    # 201 for whichever inserted, 200 for whichever found the row already there —
+    # in either order, since that is what "concurrent" means.
+    assert sorted(r.status_code for r in both) == [200, 201], [r.text for r in both]
     # One defect, one outcome — whichever way the two interleaved.
     c = await chains(client, "race")
     assert c["w1"]["outcome"]["outcome"] == "fixed"
     assert c["w1"]["outcome"]["revisions"] == 0
     assert row(await stats(client, "race"))["outcome"]["fixed"] == 1
+
+
+def unique_violation() -> IntegrityError:
+    """What asyncpg raises when two writers insert the same key — SQLSTATE and
+    all, because the SQLSTATE is what the handler now discriminates on."""
+    orig = Exception("duplicate key value violates unique constraint")
+    orig.sqlstate = "23505"
+    return IntegrityError("insert", {}, orig)
 
 
 async def test_a_lost_insert_race_is_retried_once_and_then_reported(client, monkeypatch):
@@ -437,7 +503,7 @@ async def test_a_lost_insert_race_is_retried_once_and_then_reported(client, monk
     async def flaky(session, body, author):
         calls["n"] += 1
         if calls["n"] == 1:
-            raise IntegrityError("insert", {}, Exception("duplicate key"))
+            raise unique_violation()
         return await real(session, body, author)
 
     await record(client, "retry", to_fix=[finding("t1")])
@@ -446,7 +512,7 @@ async def test_a_lost_insert_race_is_retried_once_and_then_reported(client, monk
     assert res["recorded"] == ["t1"] and calls["n"] == 2
 
     async def always(session, body, author):
-        raise IntegrityError("insert", {}, Exception("duplicate key"))
+        raise unique_violation()
 
     monkeypatch.setattr(reviews, "_apply_outcomes", always)
     r = await client.post("/review/outcomes",
@@ -455,6 +521,234 @@ async def test_a_lost_insert_race_is_retried_once_and_then_reported(client, monk
                           headers=AGENT)
     assert r.status_code == 409
     assert "in flight" in r.json()["detail"]
+
+
+async def test_only_a_unique_violation_is_treated_as_contention(client, monkeypatch):
+    """A CHECK or NOT NULL violation is deterministic: retrying builds the same
+    invalid row, and reporting it as "another writer got there first; retry" sends
+    the caller round a loop over a bug in this service while hiding it from the
+    logs. Only 23505 is somebody else."""
+    calls = {"n": 0}
+
+    async def check_violation(session, body, author):
+        calls["n"] += 1
+        orig = Exception('violates check constraint "ck_review_finding_outcomes_vocabulary"')
+        orig.sqlstate = "23514"
+        raise IntegrityError("insert", {}, orig)
+
+    await record(client, "sqlstate", to_fix=[finding("v1")])
+    monkeypatch.setattr(reviews, "_apply_outcomes", check_violation)
+    with pytest.raises(IntegrityError):
+        await client.post("/review/outcomes",
+                          json={"repo": repo_of("sqlstate"), "pr": 1,
+                                "outcomes": [{"key": "v1", "outcome": "fixed"}]},
+                          headers=AGENT)
+    assert calls["n"] == 1, "a deterministic integrity error must not be retried"
+
+
+async def test_a_rewritten_note_is_a_revision_and_is_named(client):
+    """The hole under "a repeat only enriches": it also let a repeat REPLACE the
+    stored note — the evidence for a refutation — while reporting `unchanged` and
+    leaving `revisions` at zero, so the row afterwards was indistinguishable from
+    one recorded that way. Filling an empty field is enrichment; overwriting a
+    stored one is a change, and changes are visible here by construction."""
+    await record(client, "amend", to_fix=[finding("a1")])
+    await outcomes(client, "amend", [
+        {"key": "a1", "outcome": "refuted", "note": "the condition it assumed is false"}])
+    res = await outcomes(client, "amend", [
+        {"key": "a1", "outcome": "refuted", "note": "actually: the glob covers it"}])
+    assert res["unchanged"] == []
+    assert res["amended"] == [{"key": "a1", "fields": ["note"], "outcome": "refuted"}]
+    c = await chains(client, "amend")
+    assert c["a1"]["outcome"]["note"] == "actually: the glob covers it"
+    assert c["a1"]["outcome"]["revisions"] == 1
+    # The answer did not move, so `prior_outcome` — which is about the ANSWER —
+    # stays empty. `revisions` is what says the record was edited.
+    assert c["a1"]["outcome"]["prior_outcome"] is None
+
+
+async def test_an_attestation_can_be_retracted_and_cannot_be_added_silently(client):
+    """Two halves of one rule. An explicit null CLEARS (a mistaken attestation is
+    retractable without flipping the outcome twice to do it, which would fabricate
+    two revisions); and adding an attestation to somebody else's unattended
+    refutation is an amendment, named, not a quiet edit."""
+    await record(client, "retract", to_fix=[finding("k1")])
+    await outcomes(client, "retract", [
+        {"key": "k1", "outcome": "refuted", "note": "not a defect"}])
+    added = await outcomes(client, "retract", [
+        {"key": "k1", "outcome": "refuted", "attested_by": "rich"}])
+    assert added["amended"] == []          # it FILLED an empty field
+    assert added["unchanged"] == ["k1"]
+    assert added["unattested_refutations"] == []
+
+    dropped = await outcomes(client, "retract", [
+        {"key": "k1", "outcome": "refuted", "attested_by": None}])
+    assert dropped["amended"] == [{"key": "k1", "fields": ["attested_by"],
+                                   "outcome": "refuted"}]
+    assert dropped["unattested_refutations"] == ["k1"]
+    c = await chains(client, "retract")
+    assert c["k1"]["outcome"]["attested_by"] is None
+    assert c["k1"]["outcome"]["note"] == "not a defect"
+
+
+async def test_refuted_cannot_have_its_note_cleared_out_from_under_it(client):
+    """The clearing rule must not become a hole in the evidence rule: an explicit
+    null note on a `refuted` row would otherwise pass the check on the strength of
+    the note it is in the act of deleting."""
+    await record(client, "clearnote", to_fix=[finding("n2")])
+    await outcomes(client, "clearnote", [
+        {"key": "n2", "outcome": "refuted", "note": "the transcript carries it"}])
+    res = await outcomes(client, "clearnote", [
+        {"key": "n2", "outcome": "refuted", "note": None}], expect=422)
+    assert "refuted needs a note" in res["rejected"][0]["reason"]
+    c = await chains(client, "clearnote")
+    assert c["n2"]["outcome"]["note"] == "the transcript carries it"
+
+
+async def test_a_no_op_repeat_steals_no_authorship_but_a_fill_records_its_author(client):
+    """`set_by` names who is responsible for the row's CURRENT content. Two ways
+    to get that wrong, and this pins both ends:
+
+    * it used to be overwritten on every repeat, so the author of a refutation
+      became whoever last re-reported it — and `session`, which is how a peer
+      reaches that agent, was nulled by any repeat that omitted it;
+    * but a repeat that FILLS an empty field is adding content, and leaving the
+      author alone then filed a signoff claim under the name of the agent that did
+      not make it — in the one field that exists to say who is claiming.
+    """
+    sid = "1111aaaa-2222-3333-4444-555555555555"
+    await record(client, "author", to_fix=[finding("s1")])
+    await outcomes(client, "author", [{"key": "s1", "outcome": "refuted", "note": "not real"}],
+                   session=sid)
+    before = (await chains(client, "author"))["s1"]["outcome"]
+    assert before["session"] == sid
+
+    # A genuine no-op: nothing moves, including the provenance pair.
+    await outcomes(client, "author", [{"key": "s1", "outcome": "refuted"}])
+    after = (await chains(client, "author"))["s1"]["outcome"]
+    assert after["set_by"] == before["set_by"]
+    assert after["session"] == sid
+
+    # A fill IS a change, so it records who made it — and the session travels
+    # with the identity rather than being updated on its own.
+    await outcomes(client, "author", [{"key": "s1", "outcome": "refuted",
+                                       "attested_by": "rich"}], session="2222bbbb")
+    filled = (await chains(client, "author"))["s1"]["outcome"]
+    assert filled["attested_by"] == "rich"
+    assert filled["session"] == "2222bbbb"
+
+
+async def test_an_over_long_value_is_refused_not_quietly_trimmed(client):
+    """Silently slicing a note to the cap loses whichever sentence was last, which
+    on a refutation is usually the conclusion — and tells the caller it recorded
+    fine. This endpoint refuses and says which field."""
+    await record(client, "bounds", to_fix=[finding("b1"), finding("b2")])
+    res = await outcomes(client, "bounds", [
+        {"key": "b1", "outcome": "refuted", "note": "x" * 4001},
+        {"key": "b2", "outcome": "fixed"},
+    ], expect=201)
+    assert res["recorded"] == ["b2"]
+    assert "note over 4000 characters" in res["rejected"][0]["reason"]
+    c = await chains(client, "bounds")
+    assert c["b1"]["outcome"] is None
+
+
+async def test_a_misspelled_field_is_rejected_rather_than_dropped(client):
+    """`extra="forbid"`, unlike the panel ingest: a dropped `attestedBy` silently
+    downgrades a signed-off refutation to unattended in a published figure, and a
+    rejection here costs one item rather than the batch."""
+    await record(client, "typo", to_fix=[finding("t1"), finding("t2")])
+    res = await outcomes(client, "typo", [
+        {"key": "t1", "outcome": "refuted", "note": "n", "attestedBy": "rich"},
+        {"key": "t2", "outcome": "fixed"},
+    ], expect=201)
+    assert res["recorded"] == ["t2"]
+    assert "attestedBy" in res["rejected"][0]["reason"]
+
+
+async def test_one_malformed_item_does_not_cost_the_batch(client):
+    """The reason `outcomes` is a list of raw objects: FastAPI validates a typed
+    list whole, so an item with no `key` would 422 the request and lose every
+    valid sibling — the opposite of what this endpoint promises."""
+    await record(client, "malformed", to_fix=[finding("m1")])
+    res = await outcomes(client, "malformed", [
+        {"outcome": "fixed"},
+        "not an object",
+        {"key": "   ", "outcome": "fixed"},
+        {"key": "m1", "outcome": "fixed"},
+    ], expect=201)
+    assert res["recorded"] == ["m1"]
+    reasons = [r["reason"] for r in res["rejected"]]
+    assert len(reasons) == 3
+    assert any("key" in r for r in reasons)
+    assert any("not an object" in r for r in reasons)
+    # A blank key says it was blank, rather than "no finding with this key",
+    # which points the caller at keys that were never the problem.
+    assert any("blank" in r.lower() for r in reasons)
+
+
+async def test_the_cap_is_named_rather_than_422ing_the_batch(client):
+    """A caller batching a long fix loop past the cap keeps the first
+    MAX_OUTCOMES rows and is told what was dropped, rather than losing all 501."""
+    await record(client, "cap", to_fix=[finding(f"c{i}") for i in range(3)])
+    over = reviews.MAX_OUTCOMES + 1
+    items = [{"key": "c0", "outcome": "fixed"}]
+    items += [{"key": f"filler{i}", "outcome": "fixed"} for i in range(over - 1)]
+    res = await outcomes(client, "cap", items, expect=201)
+    assert res["recorded"] == ["c0"]
+    assert any("over the" in r["reason"] and "cap" in r["reason"] for r in res["rejected"])
+
+
+async def test_the_repo_is_taken_by_either_name_and_trimmed(client):
+    """`github` is what the panel calls the slug, so it is accepted here as it is
+    on the ingest path — and an untrimmed repo matched nothing, which came back as
+    "no finding with this key", pointing the caller at keys that were fine."""
+    await record(client, "alias", to_fix=[finding("a1")])
+    r = await client.post("/review/outcomes",
+                          json={"github": f"  {repo_of('alias')}  ", "pr": 1,
+                                "outcomes": [{"key": "a1", "outcome": "fixed"}]},
+                          headers=AGENT)
+    assert r.status_code == 201, r.text
+    assert r.json()["recorded"] == ["a1"]
+
+
+async def test_an_outcome_does_not_leak_across_prs_of_one_repo(client):
+    """`finding_key` identifies a defect WITHIN a PR, which is why the row is
+    keyed on all three columns — the same key on PR 2 is a different defect."""
+    await record(client, "prscope", to_fix=[finding("same")])
+    r = await client.post("/review", json={
+        "repo": repo_of("prscope"), "pr": 2, "judged": True, "judge_model": "opus",
+        "reviewers_selected": ["claude"], "reviewers": {"claude": {"model": "opus", "ran": True}},
+        "to_fix": [finding("same")], "dismissed": [], "sonar_findings": [],
+    }, headers=AGENT)
+    assert r.status_code == 201, r.text
+    await outcomes(client, "prscope", [{"key": "same", "outcome": "fixed"}])
+
+    pr2 = await client.get(f"/review/findings?repo={repo_of('prscope')}&pr=2", headers=AGENT)
+    assert pr2.status_code == 200
+    assert pr2.json()["findings"][0]["outcome"] is None
+
+
+async def test_the_database_refuses_a_bare_refutation_too(client):
+    """The evidence rule at the boundary, for writers that are not this API — a
+    backfill, an admin script, the next write path. Both halves of the CHECK
+    matter: a CHECK passes when its expression is NULL, so the trim test alone
+    would let a null note through, which is the row it exists to refuse."""
+    from sqlalchemy import text
+
+    from app.db import engine
+
+    # One transaction per attempt: a failed statement aborts its transaction, so
+    # a loop inside one `begin()` fails the second case on the FIRST case's
+    # rollback state rather than on the constraint.
+    for note in ("NULL", "''", "'   '"):
+        with pytest.raises(IntegrityError) as caught:
+            async with engine.begin() as conn:
+                await conn.execute(text(
+                    "INSERT INTO review_finding_outcomes "
+                    "(repo, pr, finding_key, outcome, note, set_by) VALUES "
+                    f"('acme/direct', 1, 'k', 'refuted', {note}, 'laptop/hand')"))
+        assert "ck_review_finding_outcomes_refuted_note" in str(caught.value)
 
 
 async def test_recording_requires_a_writer_token(client):

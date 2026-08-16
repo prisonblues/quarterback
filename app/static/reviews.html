@@ -196,11 +196,19 @@ function precColor(x){ return x==null ? "var(--muted)"
 const THIN = 10;
 function ruled(r){ return r.confirmed + r.dismissed; }
 function thin(r){ return r.precision != null && ruled(r) < THIN; }
-// The same rule for the after-the-fact ratio, over its own population: scored
-// defects, not adjudicated observations. It will mark nearly every row for a
-// while, and that is the honest state — an outcome is recorded by hand, so the
-// early numbers really are two or three defects wide.
-function thinAfter(r){ return r.precision_after != null && (r.outcomes_recorded || 0) < THIN; }
+// The same rule for the after-the-fact ratio, over its OWN population:
+// `outcomes_scored` (fixed + refuted), which is what `precision_after` divides,
+// and never `outcomes_recorded`, which also counts deferred and superseded. A
+// member with 1 fixed and 11 deferred has 12 recorded outcomes and one scored
+// defect — keying the marker on the recorded count rendered an unasterisked,
+// confident 100% off that single finding. A marker has to be computed over the
+// population of the number it annotates; this page has now learned that twice
+// (see `billable_runs` above).
+//
+// It will mark nearly every row for a while, and that is the honest state — an
+// outcome is recorded by hand, so the early numbers really are two or three
+// defects wide.
+function thinAfter(r){ return r.precision_after != null && (r.outcomes_scored || 0) < THIN; }
 
 let tipEl = $("tip");
 function bindTip(el, html){
@@ -355,19 +363,26 @@ function outcomeTip(r){
       : "";
   }
   const att = r.outcome_attested || {};
+  // `esc(k)` on the fallback: every other dynamic value on this page is escaped,
+  // and this branch exists precisely for a bucket the page has never seen — i.e.
+  // for the day the vocabulary widens, which is exactly when an unescaped one
+  // would first matter.
   const said = Object.entries(o).filter(([, n]) => n)
-    .map(([k, n]) => (OUTCOME_WORDS[k] || (m => `${m} ${k}`))(n)).join(", ");
-  // Refutations nobody signed off. Named, because #77's rule is that an agent
-  // must not grade its own findings unattended and the API records rather than
-  // enforces it — so the page is where a reader sees which it is looking at.
+    .map(([k, n]) => (OUTCOME_WORDS[k] || (m => `${m} ${esc(k)}`))(n)).join(", ");
+  // Refutations nobody CLAIMS a human signed off. Named, because #77's rule is
+  // that an agent must not grade its own findings unattended and the API records
+  // rather than enforces it — so the page is where a reader sees which it is
+  // looking at.
   const unattested = (o.refuted || 0) - (att.refuted || 0);
+  const n = r.confirmed_defects;
   return `<br>—<br>after the fact: ${said}
-    <span class="dim">(${r.outcomes_recorded} of ${r.confirmed_defects} defects scored)</span>
+    <span class="dim">(${r.outcomes_recorded} of ${n} defect${n === 1 ? "" : "s"} ruled on,
+      ${r.outcomes_scored} of them fixed-or-refuted)</span>
     ${r.precision_after == null ? ""
       : `<br><b>${pct(r.precision_after)}</b> of its scored findings held up,
          against ${pct(r.precision)} the judge confirmed`}
     ${unattested > 0 ? `<br><span style="color:var(--warn)">${unattested} refutation${
-        unattested === 1 ? "" : "s"} nobody signed off</span>` : ""}`;
+        unattested === 1 ? "" : "s"} with no human signoff claimed</span>` : ""}`;
 }
 
 function renderLeaderboard(rows, judgedOnly){
@@ -414,8 +429,9 @@ function renderLeaderboard(rows, judgedOnly){
       <td><span class="pct" style="color:${
         r.precision_after == null ? "var(--muted)" : precColor(r.precision_after)};opacity:${
         thinAfter(r) ? .45 : 1}" title="${r.precision_after == null
-          ? `nothing recorded about what happened to its ${r.confirmed_defects || 0} defect(s)`
-          : `${r.outcomes_recorded} of ${r.confirmed_defects} defects scored`}">${
+          ? `nothing scored yet of its ${r.confirmed_defects || 0} confirmed defect(s)`
+          : `${r.outcomes_scored} of ${r.confirmed_defects} defects scored fixed-or-refuted`
+            + ` (${r.outcomes_recorded} have any outcome at all)`}">${
         r.precision_after == null ? "—" : pct(r.precision_after) + (thinAfter(r) ? "*" : "")}</span></td>
       <td>${r.solo}</td><td class="dim">${pct(r.consensus_rate)}</td>
       <td>${r.p1}</td><td>${r.raised}</td><td>${r.dismissed}</td>
@@ -555,14 +571,23 @@ const PROV_CHIP_TIP = "did the previous fix pass cause this, or did the previous
 // to sit next to the row rather than restyle it.
 function outcomeChip(o){
   if (!o) return "";
-  const who = o.attested_by ? `signed off by ${o.attested_by}` : "unattended";
+  // "claims" and not "signed off by": `attested_by` is free text from the same
+  // request that carried the outcome, so it says the RECORDER asserts a human
+  // agreed. Rendering it as a signature would make the one number meant to be
+  // trustworthy the one with no provenance — so the claim always travels with
+  // its claimant.
+  const who = o.attested_by
+    ? `${o.set_by} claims signoff by ${o.attested_by}`
+    : `unattended (recorded by ${o.set_by})`;
   const extra = o.deferred_to ? ` → ${o.deferred_to}`
               : o.superseded_by ? ` → ${o.superseded_by}` : "";
-  const was = o.prior_outcome ? ` (was ${o.prior_outcome}, changed ${o.revisions}×)` : "";
-  const tip = `${o.outcome}${extra} · ${who} · set by ${o.set_by}${was}${
-    o.note ? "\n" + o.note : ""}`;
+  const was = o.prior_outcome ? ` (was ${o.prior_outcome})` : "";
+  const rev = o.revisions ? ` · amended ${o.revisions}×` : "";
+  const tip = `${o.outcome}${extra}${was} · ${who}${rev}${o.note ? "\n" + o.note : ""}`;
   return `<span class="oc ${esc(o.outcome)}" title="${esc(tip)}">${esc(o.outcome)}${
-    esc(extra)}${o.attested_by ? "" : ' <span class="un">·unattested</span>'}</span>`;
+    esc(extra)}${o.attested_by
+      ? ` <span class="un">·signoff claimed</span>`
+      : ' <span class="un">·unattested</span>'}</span>`;
 }
 
 function findingBlock(f){
@@ -785,6 +810,15 @@ function renderTiles(s){
   const out = s.by_outcome || {};
   const scored = (out.fixed || 0) + (out.refuted || 0);
   const held = scored ? Math.round(((out.fixed || 0) / scored) * 100) : null;
+  // How much of the headline is self-signed. The refutations are what move this
+  // percentage, `attested_by` is a CLAIM the recorder makes and not a signature
+  // the board can check, and the first thing a reader sees should not be a number
+  // whose provenance lives two tooltips away.
+  const attested = (s.by_outcome_attested || {}).refuted || 0;
+  const selfSigned = (out.refuted || 0) - attested;
+  const signedOff = out.refuted
+    ? ` <span style="color:${selfSigned ? "var(--warn)" : "var(--muted)"}">(${
+        attested} signoff${attested === 1 ? "" : "s"} claimed)</span>` : "";
   $("tiles").innerHTML = `
     <div class="tile"><div class="n">${s.runs}</div><div class="k">panel runs</div></div>
     <div class="tile"><div class="n">${s.prs}</div><div class="k">PRs reviewed</div></div>
@@ -798,7 +832,8 @@ function renderTiles(s){
         <span class="dim">${prov.introduced || 0} of ${traced} traced · a floor</span></div></div>`}
     ${held == null ? "" : `<div class="tile"><div class="n" style="color:${precColor(held / 100)}">${held}%</div>
       <div class="k">held up after the fix<br>
-        <span class="dim">${out.fixed || 0} fixed · ${out.refuted || 0} refuted
+        <span class="dim">${out.fixed || 0} fixed · ${out.refuted || 0} refuted${
+          signedOff}<br>${out.deferred || 0} deferred · ${out.superseded || 0} superseded
           · ${out.not_recorded || 0} unruled</span></div></div>`}`;
 }
 

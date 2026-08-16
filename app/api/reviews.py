@@ -208,14 +208,23 @@ Three properties hold the thing up:
   issue was filed for — so ``GET /review/findings`` shows ``status`` (what the
   reviews support) beside ``outcome`` (what somebody found out), and neither is
   folded into the other.
-* **The self-grading guard is published, not pretended.** #77 says an agent must
-  not mark its own findings ``refuted`` unattended, and this API cannot tell a
-  fixer from a reviewer: the reviewer is a model name, the caller is a board
-  identity. So it stores ``set_by`` from the token and ``attested_by`` for the
-  human who signed off, names unattested refutations back in the response, and
-  publishes the attested split beside the raw counts. An unattended refutation on
-  the record beats one in a PR comment nothing counts; what it must not be is
-  counted silently.
+* **The self-grading guard is published, not pretended, and ``attested_by`` is a
+  CLAIM.** #77 says an agent must not mark its own findings ``refuted``
+  unattended, and this API cannot tell a fixer from a reviewer: the reviewer is a
+  model name, the caller is a board identity. ``set_by`` comes from the token and
+  is proof; ``attested_by`` is free text from the same request that carried the
+  refutation, so it records that the caller says a human agreed — the board
+  cannot authenticate a person. Every publication says so: the response splits
+  ``unattested_refutations`` out, the stats carry ``outcome_attested`` beside the
+  raw counts, and ``/panel`` renders the claim with its claimant. An unattended
+  refutation on the record beats one in a PR comment nothing counts; what neither
+  must be is counted silently.
+* **Every edit to a recorded outcome is visible.** A different outcome bumps
+  ``revisions`` and keeps ``prior_outcome``; a repeat FILLS an empty field and
+  never silently rewrites a stored one — overwriting the note that is the evidence
+  for a refutation is itself a revision, and comes back in ``amended`` naming the
+  fields. An explicitly-null field clears, which is how a mistaken attestation is
+  retracted without flipping the outcome twice to do it.
 
 ``GET /review/stats`` grows ``precision_after`` per (reviewer, model, effort) —
 ``fixed / (fixed + refuted)``, the same ratio as ``precision`` but scored against
@@ -236,18 +245,20 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import (
     AliasChoices,
     BaseModel,
     ConfigDict,
     Field,
+    ValidationError,
     field_validator,
     model_validator,
 )
 from sqlalchemy import and_ as sa_and
-from sqlalchemy import case, func, select
+from sqlalchemy import case, func, select, tuple_
 from sqlalchemy import or_ as sa_or
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -474,11 +485,39 @@ MAX_NOTE_CHARS = 4000
 #: defect key. Generous for all three and far short of a text dump.
 MAX_REF_CHARS = 200
 
+#: The vocabulary is stated twice — here, and as a SQL CHECK on the table, which
+#: cannot import this tuple. (Three times counting migration 0020, and that one
+#: is a frozen snapshot on purpose: a migration that imported a live constant
+#: would replay differently after the constant moved, which is the one thing a
+#: migration may not do.) So the two that CAN be compared are, at import, with the
+#: mismatch named — the same guard :data:`PROVENANCE_COUNTER` gets, and for the
+#: same reason: adding a fifth outcome here and not there fails at the database
+#: on the first insert, which is a long way from where the edit was made.
+_VOCAB_CONSTRAINT = "ck_review_finding_outcomes_vocabulary"
+_declared = {
+    c for con in ReviewFindingOutcome.__table__.constraints
+    if getattr(con, "name", None) == _VOCAB_CONSTRAINT
+    for c in re.findall(r"'([a-z][a-z-]*)'", str(con.sqltext))
+}
+if _declared != set(OUTCOMES):  # pragma: no cover - import guard
+    raise RuntimeError(
+        f"OUTCOMES and the {_VOCAB_CONSTRAINT} CHECK disagree: "
+        f"{sorted(_declared ^ set(OUTCOMES))} — a value in one and not the other is "
+        "either rejected at ingest or refused by the database on insert."
+    )
+del _declared
+
 #: How many outcomes one request may carry. A fix pass clears a round's findings
 #: in one call — a round is tens of findings, not thousands — and this is the same
 #: "one request should not insert a million rows in one transaction" bound
 #: ``MAX_CHANGED_FILES`` sets on the ingest path.
 MAX_OUTCOMES = 500
+
+#: Postgres' SQLSTATE for a unique-constraint violation. The ONE integrity error
+#: on the outcome path that means "somebody else got there first" — every other
+#: one (a CHECK, a NOT NULL) is deterministic, and retrying it builds the same
+#: invalid row again while reporting a bug in this service as contention.
+_PG_UNIQUE_VIOLATION = "23505"
 
 
 def _bucket_or_none(v: object) -> str | None:
@@ -1887,45 +1926,84 @@ def _trimmed_or_none(v: object) -> str | None:
     return v.strip() or None
 
 
-class OutcomeIn(BaseModel):
-    """One defect's terminal outcome, as the fixer (or a human) reports it."""
+#: The single-line fields a caller may set on an outcome, and the bound each
+#: takes. Named once because three separate rules (bounds, "was it sent",
+#: fill-versus-rewrite) all iterate the same set, and a field added to one list
+#: and not the others is the silent half-wiring this endpoint keeps finding.
+OUTCOME_FIELDS = {
+    "note": MAX_NOTE_CHARS,
+    "deferred_to": MAX_REF_CHARS,
+    "superseded_by": MAX_REF_CHARS,
+    "attested_by": MAX_REF_CHARS,
+}
 
-    model_config = ConfigDict(populate_by_name=True)
+
+class OutcomeIn(BaseModel):
+    """One defect's terminal outcome, as the fixer (or a human) reports it.
+
+    ``extra="forbid"``, unlike every model on the ingest path: a misspelled
+    ``attestedBy`` there costs a field on a review that still records, and here it
+    silently downgrades a signed-off refutation to unattended in a published
+    figure. This model can afford it because a rejection is per ITEM — see
+    :func:`record_outcomes` — so a typo costs its own row and not the batch.
+
+    Over-long values are refused rather than trimmed, for the same reason: a
+    refutation cut at :data:`MAX_NOTE_CHARS` loses whichever sentence was last,
+    which on a refutation is usually the conclusion, and the caller is told it
+    recorded fine.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
     #: The defect's ``finding_key`` — the identity of the defect, which is what
     #: makes an outcome joinable to every round that raised it. ``finding_key`` is
     #: accepted as an alias because that is what the read paths call it back.
-    key: str = Field(min_length=1, validation_alias=AliasChoices("key", "finding_key"))
-    outcome: str = Field(min_length=1)
+    key: str = Field(min_length=1, max_length=MAX_REF_CHARS,
+                     validation_alias=AliasChoices("key", "finding_key"))
+    outcome: str = Field(min_length=1, max_length=MAX_REF_CHARS)
     #: Why. Required for ``refuted`` — see :func:`record_outcomes`.
     note: str | None = None
     deferred_to: str | None = None
     superseded_by: str | None = None
-    #: The human who signed this off. Absent means unattended, which is recorded
-    #: rather than refused.
+    #: Who the CALLER SAYS signed this off. Recorded as a claim, never as proof:
+    #: the board cannot authenticate a human, and this field is free text from the
+    #: same request that carries the refutation. See :func:`record_outcomes`.
     attested_by: str | None = None
 
     @field_validator("key", "outcome")
     @classmethod
     def _trim(cls, v: str) -> str:
-        return v.strip()
+        # `min_length=1` is checked before this runs, so `"   "` passes it and
+        # trims to empty — and an empty key was then rejected downstream with
+        # "no finding with this key on this PR", which points the caller at its
+        # keys when the fault was a blank one. Say what actually happened.
+        s = v.strip()
+        if not s:
+            raise ValueError("blank")
+        return s
 
     @field_validator("outcome")
     @classmethod
     def _fold(cls, v: str) -> str:
         return v.lower()
 
-    @field_validator("note")
+    @field_validator("note", "deferred_to", "superseded_by", "attested_by")
     @classmethod
-    def _note(cls, v: str | None) -> str | None:
-        s = _trimmed_or_none(v)
-        return s[:MAX_NOTE_CHARS] if s else None
+    def _text(cls, v: str | None) -> str | None:
+        # None survives as None and means CLEAR when the key was sent explicitly
+        # — `model_fields_set` is what tells that apart from an absent key, so a
+        # mistaken attestation can be retracted without inventing two revisions
+        # by flipping the outcome and back.
+        return _trimmed_or_none(v)
 
-    @field_validator("deferred_to", "superseded_by", "attested_by")
-    @classmethod
-    def _ref(cls, v: str | None) -> str | None:
-        s = _trimmed_or_none(v)
-        return s[:MAX_REF_CHARS] if s else None
+    @model_validator(mode="after")
+    def _bounds(self) -> OutcomeIn:
+        long = [f for f, cap in OUTCOME_FIELDS.items()
+                if (getattr(self, f) or "") and len(getattr(self, f)) > cap]
+        if long:
+            caps = ", ".join(f"{f} over {OUTCOME_FIELDS[f]} characters" for f in long)
+            raise ValueError(f"too long: {caps}")
+        return self
 
 
 class OutcomesIn(BaseModel):
@@ -1935,17 +2013,48 @@ class OutcomesIn(BaseModel):
     findings together, and one call per finding turns "record what happened" into
     a loop the fixer can abandon half-way — which is how the outcomes end up
     partially recorded and the coverage marker lies about the rest.
+
+    ``outcomes`` is a list of raw objects rather than of :class:`OutcomeIn`, and
+    that is the whole point: FastAPI validates a typed list before the handler
+    runs, so one item with a missing ``key`` would 422 the request and lose the
+    eleven good rows this endpoint promises to keep. Each item is validated
+    individually in :func:`record_outcomes` and a failure becomes that item's
+    rejection.
     """
 
     model_config = ConfigDict(populate_by_name=True)
 
-    repo: str = Field(min_length=1, validation_alias=AliasChoices("github", "repo"),
+    repo: str = Field(min_length=1, max_length=MAX_REF_CHARS,
+                      validation_alias=AliasChoices("github", "repo"),
                       description="github nameWithOwner")
     pr: int = Field(ge=1)
     #: The recorder's session, stored beside its identity exactly as a run stores
     #: it: ``set_by`` says who, and this is what lets a peer reach them about it.
     session: str | None = None
-    outcomes: list[OutcomeIn] = Field(min_length=1, max_length=MAX_OUTCOMES)
+    #: ``list[Any]``, and every word of that is load-bearing. Unbounded, so an
+    #: over-cap batch has its overflow NAMED rather than 422'ing 501 rows down to
+    #: nothing; and untyped, because even ``list[dict]`` is validated by FastAPI
+    #: before the handler runs — one entry that is a bare string then costs the
+    #: whole request, which is precisely the guarantee this endpoint makes.
+    outcomes: list[Any] = Field(min_length=1)
+
+    @field_validator("repo")
+    @classmethod
+    def _repo(cls, v: str) -> str:
+        # Trimmed because it is matched with `==` against what `POST /review`
+        # stored: a trailing space makes `known` empty and every item in the
+        # batch is then rejected with "no finding with this key on this PR",
+        # which points the caller at its keys, which were fine.
+        s = v.strip()
+        if not s:
+            raise ValueError("repo is blank")
+        return s
+
+    @field_validator("session")
+    @classmethod
+    def _session(cls, v: str | None) -> str | None:
+        s = _trimmed_or_none(v)
+        return s[:MAX_REF_CHARS] if s else None
 
 
 def _outcome_reason(item: OutcomeIn, known: set[str], stored: ReviewFindingOutcome | None,
@@ -1966,7 +2075,12 @@ def _outcome_reason(item: OutcomeIn, known: set[str], stored: ReviewFindingOutco
     if item.outcome not in OUTCOMES:
         return f"unknown outcome {_echo(item.outcome)!r}; one of {'|'.join(OUTCOMES)}"
     if item.key in seen:
-        return "key repeated in this payload; the first entry was kept"
+        # `seen` holds every key this payload has already spoken about, accepted
+        # or not: it used to hold only the accepted ones, so a key whose FIRST
+        # entry was rejected had its later duplicates told "the first entry was
+        # kept" when nothing had been kept for it at all.
+        return ("this key already appears earlier in this payload; "
+                "a key may be reported once per request")
     if item.key not in known:
         return "no finding with this key on this PR"
     # The refutation IS the evidence. Without it this records a bare contradiction
@@ -1975,9 +2089,24 @@ def _outcome_reason(item: OutcomeIn, known: set[str], stored: ReviewFindingOutco
     # published precision figure. An existing note on an unchanged `refuted` row
     # counts: the evidence is already on the record, and re-reporting a refutation
     # should not require re-typing it.
-    if item.outcome == "refuted" and not item.note and not (
-            stored is not None and stored.outcome == "refuted" and stored.note):
+    held = stored if stored is not None and stored.outcome == item.outcome else None
+
+    def inherits(attr: str) -> bool:
+        """Would the stored value survive this item? Not if it is being CLEARED —
+        an explicit null retracts, and a rule that read only "was a value sent"
+        would let ``{"outcome": "refuted", "note": null}`` pass on the strength of
+        the note it is in the act of deleting."""
+        if attr in item.model_fields_set and getattr(item, attr) is None:
+            return False
+        return held is not None and getattr(held, attr) is not None
+
+    if item.outcome == "refuted" and not item.note and not inherits("note"):
         return "refuted needs a note: the refutation is the evidence for it"
+    # ...and the same rule for `superseded`, which was asymmetric: the key of the
+    # finding that replaced this one is the entire content of that outcome, and
+    # it was optional, so `superseded` alone recorded "replaced by something".
+    if item.outcome == "superseded" and not item.superseded_by and not inherits("superseded_by"):
+        return "superseded needs superseded_by: the key of the finding that replaced it"
     if item.deferred_to and item.outcome != "deferred":
         return f"deferred_to is only meaningful on a deferred outcome, not {item.outcome}"
     if item.superseded_by:
@@ -1991,9 +2120,31 @@ def _outcome_reason(item: OutcomeIn, known: set[str], stored: ReviewFindingOutco
     return None
 
 
+def _outcome_item(raw: object) -> tuple[OutcomeIn | None, str | None]:
+    """One payload entry as a validated item, or the reason it is not one.
+
+    Validated here rather than by FastAPI, which is the point of ``outcomes``
+    being a list of raw objects: a typed list is validated whole, so one entry
+    with a missing ``key`` or a misspelled field would 422 the request and lose
+    every valid sibling — the opposite of what this endpoint promises.
+    """
+    if not isinstance(raw, dict):
+        return None, f"not an object: {_echo(type(raw).__name__)}"
+    try:
+        return OutcomeIn.model_validate(raw), None
+    except ValidationError as e:
+        # One line, naming each field and what was wrong with it. Pydantic's own
+        # rendering is multi-line with a docs URL per error, which is not what a
+        # per-item `reason` string is for.
+        parts = [f"{'.'.join(str(p) for p in err['loc']) or 'item'}: {err['msg']}"
+                 for err in e.errors()]
+        return None, "; ".join(_echo(p) for p in parts[:4])
+
+
 @router.post("/review/outcomes", status_code=status.HTTP_201_CREATED)
 async def record_outcomes(
     body: OutcomesIn,
+    response: Response,
     author: str = Depends(identify),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
@@ -2012,24 +2163,39 @@ async def record_outcomes(
     multiply one refutation by the number of rounds — largest exactly where the
     measurement matters most.
 
-    **Who may set what.** #77 is explicit that an agent must not mark its own
-    findings ``refuted`` unattended: that is a self-grading loop, and #40's
-    constraint applies for the same reason. This API cannot tell a fixer from a
-    reviewer — the reviewer is a model name, the caller is a board identity — so
-    it does not pretend to enforce it. It records ``set_by`` (from the token, not
-    from the payload) and ``attested_by`` (the human who signed it off, absent =
-    unattended), names unattested refutations back in the response, and
-    ``GET /review/stats`` publishes the attested split beside the raw one. An
-    unattended refutation is worth more on the record than in a PR comment where
-    nothing can count it; what it is not worth is being counted silently.
+    **Who may set what, and what ``attested_by`` is NOT.** #77 is explicit that an
+    agent must not mark its own findings ``refuted`` unattended: that is a
+    self-grading loop, and #40's constraint applies for the same reason. This API
+    cannot tell a fixer from a reviewer — the reviewer is a model name, the caller
+    is a board identity — so it does not pretend to enforce it.
 
-    **Re-reporting.** An outcome may move — a deferred finding is later fixed —
-    so a repeat updates rather than 409s. A change bumps ``revisions`` and keeps
-    ``prior_outcome``, because a terminal state that flips quietly is how an
-    after-the-fact precision figure gets improved without anybody deciding to. A
-    field the caller does not resend is left alone on a repeat of the SAME
-    outcome (so re-reporting need not re-type the note) and cleared when the
-    outcome CHANGES (the old note explained the old answer).
+    ``set_by`` comes from the token and is proof. ``attested_by`` is **free text
+    from the same request that carries the refutation**, so it is a CLAIM that a
+    named human signed off, recorded beside who claimed it — the board cannot
+    authenticate a person, and an agent that wants to write ``attested_by:
+    "rich"`` can. Every place it is published says so: the response splits
+    ``unattested_refutations`` out, ``GET /review/stats`` publishes the attested
+    counts beside the raw ones, and ``/panel`` renders the claim with its claimant
+    rather than as a signature. Read together they say "this agent says a human
+    agreed", which is worth having on the record and is not the same thing as a
+    human having agreed. An unattended refutation is still worth more here than in
+    a PR comment nothing counts; what neither is worth is being counted silently.
+
+    **Re-reporting.** An outcome may move — a deferred finding is later fixed — so
+    a repeat updates rather than 409s, and every kind of change is visible:
+
+    * a different ``outcome`` bumps ``revisions``, keeps ``prior_outcome``, and
+      clears the fields the caller did not resend (the old note explained the old
+      answer);
+    * a repeat of the SAME outcome FILLS empty fields and never silently rewrites
+      a stored one. Overwriting a stored value — replacing the note that IS the
+      evidence for a refutation, or adding an attestation to somebody else's
+      unattended one — is a real change, so it bumps ``revisions`` too and comes
+      back in ``amended`` naming the fields. A terminal state that flips quietly
+      is how an after-the-fact precision figure improves without anybody deciding
+      to, and so is a note rewritten under an unchanged verdict;
+    * an explicitly-null field CLEARS, which is how a mistaken attestation is
+      retracted. Absent and null are different: absent is "nothing to add".
     """
     # Retried once, and the retry is not defensive tidiness: the commonest way two
     # writers race for one (repo, pr, key) is not two agents, it is ONE agent
@@ -2043,8 +2209,15 @@ async def record_outcomes(
         try:
             result = await _apply_outcomes(session, body, author)
             break
-        except IntegrityError:
+        except IntegrityError as e:
             await session.rollback()
+            # ONLY the unique constraint is contention. A CHECK violation or a
+            # NOT NULL is deterministic: retrying builds the identical invalid
+            # row, and reporting it as "another writer got there first; retry"
+            # sends the caller round a loop over a bug in this service while
+            # hiding it from the logs.
+            if getattr(e.orig, "sqlstate", None) != _PG_UNIQUE_VIOLATION:
+                raise
             if attempt == 2:
                 raise HTTPException(
                     status.HTTP_409_CONFLICT,
@@ -2060,6 +2233,18 @@ async def record_outcomes(
         _log.warning("review outcomes rejected: %s", json.dumps(
             {"repo": body.repo, "pr": body.pr, "author": author,
              "rejected": result["rejected"]}, default=str))
+
+    # The status code has to agree with the body, because a shell pipeline built
+    # around `qb` (a curl wrapper) checks the code and nothing else. 201 only when
+    # something was created; 200 when the batch changed or confirmed existing
+    # rows; 422 when nothing was accepted at all and something was refused —
+    # "created" over a body of twelve rejections is the response lying.
+    if result["recorded"]:
+        response.status_code = status.HTTP_201_CREATED
+    elif result["changed"] or result["amended"] or result["unchanged"]:
+        response.status_code = status.HTTP_200_OK
+    else:
+        response.status_code = status.HTTP_422_UNPROCESSABLE_ENTITY
     return result
 
 
@@ -2076,43 +2261,62 @@ async def _apply_outcomes(session: AsyncSession, body: OutcomesIn, author: str) 
         .where(ReviewRun.repo == body.repo, ReviewRun.pr == body.pr)
         .distinct()
     )).all())
-    sent = [i.key for i in body.outcomes]
+
+    # Validate every entry BEFORE the row read, so `sent` names only keys that
+    # could be written and one malformed entry costs its own row.
+    items: list[tuple[int, OutcomeIn | None, str | None]] = []
+    for i, raw in enumerate(body.outcomes):
+        if i >= MAX_OUTCOMES:
+            # Named rather than 422'd: a caller batching a long fix loop would
+            # otherwise lose all 501 rows, when the first 500 were fine.
+            items.append((i, None, f"over the {MAX_OUTCOMES}-outcome cap for one request"))
+            continue
+        item, why = _outcome_item(raw)
+        items.append((i, item, why))
+    sent = [it.key for _, it, why in items if it is not None and why is None]
+
+    # `with_for_update`, and it is the difference between two writers and a lost
+    # one. The insert race is caught by the unique constraint and retried; two
+    # writers UPDATING one existing row raise nothing at all — both read, both
+    # mutate in Python, and the second commit silently discards the first's note,
+    # attestation or revision. Locking the rows this batch will touch makes the
+    # second writer wait and then re-read, which is the only way its "fill an
+    # empty field" decision is made against what is actually stored.
     stored = {o.finding_key: o for o in (await session.scalars(
         select(ReviewFindingOutcome).where(
             ReviewFindingOutcome.repo == body.repo,
             ReviewFindingOutcome.pr == body.pr,
             ReviewFindingOutcome.finding_key.in_(sent),
-        )
-    )).all()}
+        ).with_for_update()
+    )).all()} if sent else {}
 
     now = datetime.now(UTC)
     recorded: list[str] = []
     changed: list[dict] = []
+    amended: list[dict] = []
     unchanged: list[str] = []
     rejected: list[dict] = []
     unattested: list[str] = []
     seen: set[str] = set()
 
-    for item in body.outcomes:
+    for i, item, why in items:
+        if item is None:
+            raw = body.outcomes[i]
+            key = raw.get("key") if isinstance(raw, dict) else None
+            rejected.append({"key": _echo(key) if key else f"item {i}", "reason": why})
+            continue
         row = stored.get(item.key)
         reason = _outcome_reason(item, known, row, seen)
+        # Every key this payload has spoken about, accepted or refused — so a
+        # later duplicate is never told "the first entry was kept" when the first
+        # entry was itself rejected.
+        seen.add(item.key)
         if reason is not None:
             rejected.append({"key": _echo(item.key), "reason": reason})
             continue
-        seen.add(item.key)
-        # The EFFECTIVE attestation, not the one this request happened to carry.
-        # A repeat of an unchanged outcome keeps what is stored, so reading only
-        # the payload reported a refutation a human had already signed off as
-        # unattested — the response contradicting the row it just wrote, and in
-        # the direction that cries wolf. A change of outcome clears the old
-        # attestation (it signed off the old answer), so there is nothing to
-        # inherit on that path and the payload is the whole of it.
-        attested = item.attested_by or (
-            row.attested_by if row is not None and row.outcome == item.outcome else None)
-        if item.outcome == "refuted" and not attested:
-            unattested.append(item.key)
-
         if row is None:
+            if item.outcome == "refuted" and not item.attested_by:
+                unattested.append(item.key)
             session.add(ReviewFindingOutcome(
                 repo=body.repo, pr=body.pr, finding_key=item.key,
                 outcome=item.outcome, note=item.note,
@@ -2122,30 +2326,68 @@ async def _apply_outcomes(session: AsyncSession, body: OutcomesIn, author: str) 
             recorded.append(item.key)
             continue
 
-        moved = row.outcome != item.outcome
-        if moved:
+        if row.outcome != item.outcome:
             row.revisions += 1
             row.prior_outcome = row.outcome
             row.outcome = item.outcome
             # The old answer's explanation does not survive the answer. Anything
             # the caller did not resend is cleared, so a note reading "not a
             # defect: install globs" cannot end up filed under `fixed`.
-            row.note, row.deferred_to = item.note, item.deferred_to
-            row.superseded_by, row.attested_by = item.superseded_by, item.attested_by
+            for attr in OUTCOME_FIELDS:
+                setattr(row, attr, getattr(item, attr))
             changed.append({"key": item.key, "from": row.prior_outcome, "to": row.outcome})
+            # Whoever moved the answer owns it. On an unchanged repeat the row
+            # keeps its original author (below), so `set_by` names the agent that
+            # made the current statement rather than the last one to touch it.
+            row.set_by, row.session = author, body.session
         else:
-            # A repeat of the same answer only ever enriches: an omitted field is
-            # "nothing to add", never "clear what is there". Otherwise a second
-            # report of a refutation, sent by a loop that has the key and not the
-            # prose, would erase the evidence for it.
-            for attr, value in (("note", item.note), ("deferred_to", item.deferred_to),
-                                ("superseded_by", item.superseded_by),
-                                ("attested_by", item.attested_by)):
-                if value is not None:
-                    setattr(row, attr, value)
-            unchanged.append(item.key)
-        row.set_by, row.session = author, body.session
+            # A repeat of the same answer FILLS an empty field and never silently
+            # rewrites a stored one. Rewriting is a real change — replacing the
+            # note that IS the evidence for a refutation, or adding an
+            # attestation to somebody else's unattended one — so it is counted as
+            # a revision and named back. An absent field is "nothing to add"; an
+            # explicit null CLEARS, which is how a mistaken attestation is
+            # retracted without flipping the outcome twice to do it.
+            edits, filled = [], False
+            for attr in OUTCOME_FIELDS:
+                if attr not in item.model_fields_set:
+                    continue
+                value, was = getattr(item, attr), getattr(row, attr)
+                if value == was:
+                    continue
+                if was is not None:
+                    edits.append(attr)
+                else:
+                    filled = True
+                setattr(row, attr, value)
+            if edits:
+                row.revisions += 1
+                amended.append({"key": item.key, "fields": sorted(edits),
+                                "outcome": row.outcome})
+            else:
+                unchanged.append(item.key)
+            # `set_by` names the agent responsible for the row's CURRENT content,
+            # which is whoever last changed any of it — a fill counts. An agent
+            # that adds an attestation to somebody else's refutation is making
+            # that claim, and leaving `set_by` on the original recorder filed the
+            # claim under the wrong name, in the one field that exists to say who
+            # is claiming. A genuine no-op changes nothing and therefore steals
+            # no authorship — which is the case an idempotent retry hits, and the
+            # reason this is not simply "the last toucher wins".
+            #
+            # `session` travels WITH it, always: they are one provenance pair, and
+            # updating the session without the identity leaves a row whose contact
+            # details belong to a different agent from its author.
+            if edits or filled:
+                row.set_by, row.session = author, body.session
         row.updated_at = now
+        # Read off the ROW, after it has been written, not off the payload: a
+        # repeat that inherits a stored attestation is attested, and one that
+        # explicitly clears it is not. Reading the payload alone reported the
+        # first as unattested — the response contradicting the row it had just
+        # written, in the direction that cries wolf.
+        if row.outcome == "refuted" and not row.attested_by:
+            unattested.append(item.key)
 
     await session.commit()
 
@@ -2154,12 +2396,18 @@ async def _apply_outcomes(session: AsyncSession, body: OutcomesIn, author: str) 
         "pr": body.pr,
         "recorded": recorded,
         "changed": changed,
+        # A repeat that REWROTE a stored field under an unchanged outcome. Its own
+        # bucket rather than folded into `changed` (which is about the answer
+        # moving) or `unchanged` (which it is not): the fields are named because
+        # the one that matters is `note` on a refutation, and a rewritten
+        # refutation is a rewritten piece of evidence.
+        "amended": amended,
         "unchanged": unchanged,
         "rejected": rejected,
-        # Refutations nobody signed off. Not an error and not a refusal — an
-        # unattended refutation on the record beats a refutation in prose — but
-        # the caller is told which of its rows the stats will report as
-        # unattested, rather than finding out from the leaderboard.
+        # Refutations nobody CLAIMS a human signed off. Not an error and not a
+        # refusal — an unattended refutation on the record beats a refutation in
+        # prose — but the caller is told which of its rows the stats will report
+        # as unattested, rather than finding out from the leaderboard.
         "unattested_refutations": unattested,
     }
 
@@ -2369,9 +2617,16 @@ def _outcome_view(o: ReviewFindingOutcome) -> dict:
         "deferred_to": o.deferred_to,
         "superseded_by": o.superseded_by,
         "set_by": o.set_by,
-        # Absent = unattended. Published rather than hidden because #77's rule is
-        # that an agent must not grade its own findings unattended, and this is
-        # the field a reader checks that against.
+        # The recorder's session, beside its identity — the same pairing a run
+        # publishes, and what lets a reader reach whoever wrote this about a
+        # refutation they disagree with. Stored since v2.37 and, until this was
+        # noticed, never handed back by any read path.
+        "session": o.session,
+        # Who the recorder SAYS signed this off; absent = unattended. A claim
+        # carried beside `set_by`, which is proof — the board cannot authenticate
+        # a human. Published rather than hidden because #77's rule is that an
+        # agent must not grade its own findings unattended, and this pair is what
+        # a reader checks that against.
         "attested_by": o.attested_by,
         "ts": o.ts.isoformat(),
         "updated_at": o.updated_at.isoformat() if o.updated_at else None,
@@ -2768,7 +3023,14 @@ async def review_stats(
     # tallies `confirmed` over, rather than the per-reporter rows: a caller that
     # sent no `reported_by` has no rows there, and its members would silently
     # score no outcomes at all while still showing a confirmed count.
-    defect = func.concat(ReviewRun.repo, "#", ReviewRun.pr, "#", ReviewFinding.finding_key)
+    # A row constructor, not a `concat` with a separator. `repo` and
+    # `finding_key` are both free text — the panel supplies its own keys and this
+    # release's own docs are full of refs containing `#` — so any separator can
+    # occur inside a value, and two different (repo, pr, key) triples that
+    # concatenate to one string collapse into a single counted defect. Always in
+    # the undercounting direction, and undetectably. `COUNT(DISTINCT (a,b,c))`
+    # compares the fields, so no spelling of a value can forge another triple.
+    defect = tuple_(ReviewRun.repo, ReviewRun.pr, ReviewFinding.finding_key)
     outcome_join = sa_and(
         ReviewFindingOutcome.repo == ReviewRun.repo,
         ReviewFindingOutcome.pr == ReviewRun.pr,
@@ -2868,6 +3130,13 @@ async def review_stats(
         # got to it" read as "it was real". None where nobody has scored one of
         # this member's findings yet — the same rule as `precision`, where "the
         # judge never ruled" must not render as "everything it raised was wrong".
+        #
+        # Published as `outcomes_scored`, because it is the population
+        # `precision_after` is actually over and `outcomes_recorded` is NOT: a
+        # member with 1 fixed and 11 deferred has 12 recorded outcomes and one
+        # scored defect, so a client marking thin ratios on the recorded count
+        # renders a confident 100% off a single finding — the exact over-reading
+        # a thinness marker exists to prevent, in the flattering direction.
         scored = sum(outcome_counts.get(b, 0) for b in OUTCOMES_SCORED)
 
         by_model.append({
@@ -2977,6 +3246,10 @@ async def review_stats(
             # has them here; one who takes the raw number knows what it includes.
             "outcome_attested": outcome_attested,
             "outcomes_recorded": outcomes_recorded,
+            # The population `precision_after` is over — fixed + refuted, never
+            # the whole of `outcomes_recorded`. A ratio and the marker that
+            # qualifies it have to be computed over one population; they were not.
+            "outcomes_scored": scored,
             # The denominator `outcomes_recorded` is out of: distinct confirmed
             # defects this member raised in the window. Named because it is NOT
             # `confirmed` two lines up — that one counts observations.

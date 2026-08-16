@@ -7,6 +7,13 @@ that number where it was, so the repo can be a version ahead of the service.
 Entries are newest first. Each one says what was broken or missing before it, because that is the
 part that isn't recoverable from the diff.
 
+> **v2.34–v2.36 are missing from this file on purpose.** Each was allocated to a branch by the
+> board's release allocator (`POST /release/claim`, v2.31) and lands in its own PR; the numbers are
+> never re-issued, so a gap here means "claimed elsewhere", not "an entry was lost". v2.37's own
+> number was reclaimed off a collision — see #150, where the allocator handed two branches 2.36
+> because it namespaces by the repo string it is given and `quarterback` and `prisonblues/quarterback`
+> are two spellings of one repo.
+
 ## v2.37 — a finding's life ended at the judge, so the board scored confidence and called it correctness
 
 `review_findings.verdict` is set once, at review time, by a master model with no more access to the
@@ -53,19 +60,39 @@ the measurement. `GET /review/findings` shows `status` (what the record of the r
 beside `outcome` (what somebody found out by acting on it), and a chain that reads `gone` — raised
 earlier, not raised again — carrying `refuted` is exactly the case this release was filed for.
 
-**The self-grading guard is published, not pretended.** #77 is explicit that an agent must not mark
-its own findings `refuted` unattended, and this API cannot tell a fixer from a reviewer: the reviewer
-is a model name, the caller is a board identity. So it records `set_by` from the token, takes
-`attested_by` for the human who signed off, names unattested refutations back in the response, and
-publishes the attested split beside the raw counts. Refusing an unattended refutation would have left
-it where it is today — in a PR comment nothing reads. What it must not be is counted silently.
+**The self-grading guard is published, not pretended — and `attested_by` is a CLAIM.** #77 is
+explicit that an agent must not mark its own findings `refuted` unattended, and this API cannot tell
+a fixer from a reviewer: the reviewer is a model name, the caller is a board identity. `set_by` comes
+from the token and is proof. `attested_by` does not: it is free text in the same request that carries
+the refutation, so the same agent that self-grades can type a human's name. It is therefore recorded
+as a claim beside its claimant and published as one — the response splits `unattested_refutations`
+out, the stats carry `outcome_attested` beside the raw counts, and `/panel` renders "X claims signoff
+by Y" rather than a signature. Refusing an unattended refutation would have left it where it is today,
+in a PR comment nothing reads. What neither must be is counted silently.
 
-Also: an outcome may move (a deferred finding is later fixed), so a repeat updates rather than 409s —
-a change keeps `prior_outcome` and bumps `revisions`, because a terminal state that flips quietly is
-how an after-the-fact precision figure improves without anybody deciding to. A repeat of the *same*
-answer only enriches, so a loop with the key and not the prose cannot erase the evidence for it.
+**Every edit to a recorded outcome is visible.** An outcome may move (a deferred finding is later
+fixed), so a repeat updates rather than 409s: a changed answer keeps `prior_outcome` and bumps
+`revisions`. A repeat of the *same* answer FILLS an empty field and never silently rewrites a stored
+one — replacing the note that IS the evidence for a refutation is itself a revision and comes back in
+`amended`, naming the fields, because a quietly rewritten refutation improves an after-the-fact
+precision figure exactly as a quietly flipped verdict does. An explicitly-null field clears, which is
+how a mistaken attestation is retracted without flipping the outcome twice to fake it.
+
 Rejections are per item and named, never a 422 for the batch: a fix pass reporting twelve findings
-must not lose eleven good ones to one typo.
+must not lose eleven good ones to one typo. That is also why `outcomes` is an untyped list — a typed
+one is validated by FastAPI before the handler runs, so a single malformed entry would have cost the
+whole request the guarantee. Over-long values are refused rather than trimmed (a truncated refutation
+loses its conclusion and reports success), an unknown field is refused rather than dropped (a
+misspelled `attestedBy` silently downgrades a signed-off refutation), and the status code agrees with
+the body: 201 created, 200 updated, 422 when nothing was accepted — a shell pipeline that checks only
+the code must not read twelve rejections as success.
+
+**Concurrency.** The unique constraint catches two writers inserting one defect and the request is
+retried once — the commonest second writer is the same client retrying after a timeout — but only on
+SQLSTATE 23505: a CHECK or NOT NULL violation is deterministic, and retrying it reports a bug in this
+service as contention. Two writers *updating* one row raise nothing at all, so the batch's rows are
+selected `FOR UPDATE`; without that the second commit silently discarded the first's note or
+attestation, which is the same lost-write class v2.33 fixed in the claim table.
 
 ## v2.33 — v2.31's claim table was right about INSERT and wrong about everything else
 

@@ -548,13 +548,16 @@ class ReviewFindingOutcome(Base):
     finding rows immutable: what a round said is a fact about that round, and
     later knowledge is a different fact with a different author.
 
-    ``set_by`` is the board identity that recorded it and ``attested_by`` is the
-    human who signed it off, NULL where nobody did. #77 is explicit that an agent
-    must not mark its own findings ``refuted`` unattended — that is a
-    self-grading loop, #40's constraint for the same reason — and the API cannot
-    tell a fixer from a reviewer, so the record carries who said it and
-    ``GET /review/stats`` publishes the attested split beside the raw one rather
-    than pretending the guard was enforced.
+    ``set_by`` is the board identity that recorded it, taken from the token, and
+    is proof. ``attested_by`` is **not**: it is free text from the same request
+    that carried the outcome, so it records that the caller CLAIMS a named human
+    signed off. The board cannot authenticate a person, and an agent that wants
+    to write ``attested_by: "rich"`` can. #77 is explicit that an agent must not
+    mark its own findings ``refuted`` unattended — a self-grading loop, #40's
+    constraint for the same reason — and since this API cannot tell a fixer from a
+    reviewer, the claim is stored beside its claimant and published as a claim:
+    ``GET /review/stats`` splits the attested counts out and ``/panel`` renders
+    "X claims signoff by Y", never a signature.
     """
 
     __tablename__ = "review_finding_outcomes"
@@ -589,9 +592,10 @@ class ReviewFindingOutcome(Base):
     #: The board identity that recorded this — an agent or a human at a terminal.
     set_by: Mapped[str] = mapped_column(Text, nullable=False)
     session: Mapped[str | None] = mapped_column(Text)
-    #: The human who signed it off. NULL = unattended, which is a fact reported
-    #: rather than a request refused: refusing it would leave the refutation
-    #: exactly where it is today, in prose nothing counts.
+    #: Who the recorder SAYS signed it off — a claim, not a signature; see the
+    #: class docstring. NULL = unattended, which is a fact reported rather than a
+    #: request refused: refusing it would leave the refutation exactly where it is
+    #: today, in prose nothing counts.
     attested_by: Mapped[str | None] = mapped_column(Text)
 
     #: How many times this outcome has been REPLACED. A terminal state that moves
@@ -620,6 +624,23 @@ class ReviewFindingOutcome(Base):
         CheckConstraint(
             "outcome IN ('fixed', 'refuted', 'deferred', 'superseded')",
             name="ck_review_finding_outcomes_vocabulary",
+        ),
+        # The evidence rule, at the boundary rather than only in the API. A bare
+        # `refuted` is a confident contradiction of the judge with nothing behind
+        # it, and it lands in a published precision figure — so an admin script,
+        # a backfill or a future write path must not be able to insert one either.
+        # NOT NULL rather than non-empty: the API already collapses whitespace to
+        # NULL, so the two agree, and a CHECK that has to reason about trimming
+        # would be a second opinion about what counts as a note.
+        CheckConstraint(
+            # `btrim(...) <> ''` as well as NOT NULL, and the NOT NULL is not
+            # redundant: a CHECK passes when its expression is NULL, so
+            # `btrim(note) <> ''` ALONE would let a null note through — the exact
+            # row it exists to refuse. The API already collapses whitespace to
+            # NULL, so this only ever bites a writer that is not the API, which is
+            # the writer it is here for.
+            "outcome <> 'refuted' OR (note IS NOT NULL AND btrim(note) <> '')",
+            name="ck_review_finding_outcomes_refuted_note",
         ),
         CheckConstraint("revisions >= 0", name="ck_review_finding_outcomes_revisions"),
     )
