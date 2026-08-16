@@ -126,7 +126,7 @@ Detected from the checkout, **not settable** here: `path`, `github`, `default_br
 the diff each model is given. Override per reviewer with
 `reviewers.<name>.max_diff_chars` and for the master with
 `review_panel.judge_max_diff_chars`; both inherit the panel value when unset. Since
-v2.25 that budget buys the review target first and the PR context with whatever is left
+v2.28 that budget buys the review target first and the PR context with whatever is left
 (see rounds, below), so on a scoped round it is no longer the target that a tight budget
 cuts. On a scoped round the budget also covers the brief and the section headers around
 the diff — a little over a kilobyte — because the ceiling that matters is the model's
@@ -134,7 +134,7 @@ context window, and the prompt is what lands in it. Under `pr` scope it means ch
 diff, exactly as it always has.
 
 `review_panel.round_scope` (default: **`increment`**) — whether a round past the first
-reads the fix commit or the whole PR again. `pr` restores the pre-v2.25 behaviour for a
+reads the fix commit or the whole PR again. `pr` restores the pre-v2.28 behaviour for a
 repo whose PRs are small enough that re-reading them costs nothing. Anything else is a
 typo, and lands in `config_notes` saying so rather than quietly turning scoping off.
 
@@ -311,7 +311,7 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   reviewer is truncated again next round — they only stop a broken round being reported
   as clean. A round past the first with no `--baseline` is itself a veto: it has nothing
   to compare against, so its "all new" count means nothing and its stop is unearned.
-- **A round past the first reviews the INCREMENT, not the whole PR** (v2.25). The target is
+- **A round past the first reviews the INCREMENT, not the whole PR** (v2.28). The target is
   what changed since the head its baseline reviewed (`head_sha` in the payload; `--since`
   overrides it), and behind it comes the PR **as it stood at that head**, in two tiers: the
   files the increment touched as they were before it touched them, then the rest of the PR.
@@ -450,7 +450,7 @@ Run-level fields it depends on:
 
 | field | what it is |
 |---|---|
-| `head_sha` | **v2.24.** The commit this round reviewed. Recorded because nothing else identified one — `base` holds a branch *name* — and the next round needs it twice over: as one end of the fix range, and (**v2.25**) as the anchor its increment is taken from. Re-read straight after the diff is fetched, which narrows the mid-round-push window without closing it: a push can land either side of the fetch and nothing can tell which, so a move is reported as a move (`config_notes`) rather than as a claim about which commit produced the diff, and the later commit is recorded because it is where the next round's fix range starts. Present on the **skipped** payload too: a skipped round is still the round the next one baselines against |
+| `head_sha` | **v2.24.** The commit this round reviewed. Recorded because nothing else identified one — `base` holds a branch *name* — and the next round needs it twice over: as one end of the fix range, and (**v2.28**) as the anchor its increment is taken from. Re-read straight after the diff is fetched, which narrows the mid-round-push window without closing it: a push can land either side of the fetch and nothing can tell which, so a move is reported as a move (`config_notes`) rather than as a claim about which commit produced the diff, and the later commit is recorded because it is where the next round's fix range starts. Present on the **skipped** payload too: a skipped round is still the round the next one baselines against |
 | `unread_files` | **v2.24.** Files no reviewer that ran read in full, for the next round's `missed-unread`. A file counts as unread only if *every* running reviewer was cut on it, and a file straddling the cut counts as unread — half a file's hunks is not a read file. Empty on a payload whose `reviewed` is `false` means *no coverage at all* (a skipped round never fetched a diff to name files from), not "read everything" — the consumer tells the two apart by `reviewed` |
 | `provenance_counts` | **v2.24.** The per-round tally over the findings the cycle has to clear, so a consumer gets the shape of a round without walking every finding. `{}` where the question does not arise — outside a cycle, or in a cycle's round 1, which has no earlier round to attribute against. All-zero is the other statement: a round that could have attributed and had nothing to, which is what a **skipped** in-cycle round sends |
 

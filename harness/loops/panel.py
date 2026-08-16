@@ -155,7 +155,7 @@ DEFAULT_MAX_ROUNDS = 2
 # What a round past the first REVIEWS. "increment" makes the review target the
 # diff between the previous round's head and this one's — the fix commit, which
 # is the only thing round 2 exists to read (#24) — with the rest of the PR
-# supplied as context rather than as target. "pr" is the pre-v2.25 behaviour:
+# supplied as context rather than as target. "pr" is the pre-v2.28 behaviour:
 # re-read the whole growing PR every round.
 #
 # The default is `increment` because the alternative degrades as it works. Over
@@ -2947,7 +2947,7 @@ class ReviewScope:
             notes.append(
                 f"round {round_no} reviewed the whole PR, not the increment: no baseline "
                 "said which commit it reviewed (`head_sha`). Pass --since <sha>, or a "
-                "baseline written by v2.25 or later")
+                "baseline written by v2.28 or later")
             return whole, notes
         if _same_commit(anchor, head):
             # A fact about the cycle rather than a failure, and a loud one: the
@@ -3044,7 +3044,7 @@ class ReviewScope:
         # header saying an earlier round dealt with it already.
         #
         # Falls back to the whole PR rather than to a near tier we would have to
-        # mislabel. Reviewing the whole PR is what this round did before v2.25 and
+        # mislabel. Reviewing the whole PR is what this round did before v2.28 and
         # is never wrong, only dearer; a context section whose header is false is
         # wrong in the direction that suppresses findings.
         prior_diff, problem = fetch_increment(gh_repo, base, anchor) if base else (
@@ -3104,7 +3104,7 @@ class ReviewScope:
             # header: `max_diff_chars` has always meant "this many chars of diff"
             # under whole-PR scope, and a "pr" round's prompt is byte-identical to
             # what it has always been. The overhead below is a fact about the
-            # scoped prompt, which did not exist before v2.25.
+            # scoped prompt, which did not exist before v2.28.
             body = _fit_parts([self.diff], budget)[0]
             return f"{PR_SCOPE_HEADER}\n{body}", len(body), 0
 
@@ -6026,7 +6026,7 @@ def main() -> int:
                          "commits since the last round's head, with the rest of the "
                          "PR as context — cheaper as the PR grows, and it is the fix "
                          "commit the cycle exists to read. pr: re-read the whole diff, "
-                         "as every release before v2.25 did. auto (default): the repo's "
+                         "as every release before v2.28 did. auto (default): the repo's "
                          f"review_panel.round_scope, itself defaulting to "
                          f"{DEFAULT_ROUND_SCOPE}. Round 1 is always the whole PR")
     ap.add_argument("--since", default="", metavar="SHA",

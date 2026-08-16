@@ -190,7 +190,7 @@ The deployed board version lags the repo until the stack is redeployed, and only
 service knows which it is: ask it with `GET /openapi.json` → `.info.version`, for whichever
 instance you care about. (Anything built off this branch says 2.23.0 — v2.24 is harness-side.) A number written here
 instead would be wrong the next time Portainer redeploys, with no diff to catch it.
-Latest release: **v2.25**, harness-side — a panel round past the first reviews the fix commit rather
+Latest release: **v2.28**, harness-side — a panel round past the first reviews the fix commit rather
 than re-reading the whole PR, with the PR as the last round saw it behind that as context. (**v2.22**
 is claimed by PR #87, still open, which is why the numbering skips it.) Before it, **v2.24** had a new
 finding say whether the last fix pass caused it or the last round missed it — one number before, and
@@ -238,7 +238,7 @@ the other way):
 - **v2.24** — a new finding records whether the last fix pass introduced it or the last round missed
   it: two facts with opposite remedies that `new_this_round` collapsed into one, plus the commit each
   round reviewed and the files it was truncated out of. A signal, not a verdict — nothing gates on it.
-- **v2.25** — a panel round past the first reviews the increment since the last round's head, not
+- **v2.28** — a panel round past the first reviews the increment since the last round's head, not
   the whole growing PR: the fix commit first, then the files it touched as they stood before it,
   then the rest of the PR, with a budget spent in that order so context is what gets dropped. Falls
   back to the whole PR — and says why — when there is no anchor, when nothing was pushed, when a

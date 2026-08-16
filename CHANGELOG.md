@@ -7,7 +7,7 @@ that number where it was, so the repo can be a version ahead of the service.
 Entries are newest first. Each one says what was broken or missing before it, because that is the
 part that isn't recoverable from the diff.
 
-## v2.25 — a later round reads the fix commit, not the whole PR again
+## v2.28 — a later round reads the fix commit, not the whole PR again
 
 (There is no v2.22 entry: that number is held by PR #87, which is harness-side and still open.
 v2.23 and v2.24 are below — both landed via #89, which carried the work #88 was closed in favour of.)

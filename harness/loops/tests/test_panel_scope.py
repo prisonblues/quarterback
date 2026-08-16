@@ -1,7 +1,7 @@
 """What a round past the first actually reviews (#41).
 
 Round 2 exists to read the fix commit — nobody else does (#24) — and until
-v2.25 it was handed the whole PR instead: the fix plus everything the earlier
+v2.28 it was handed the whole PR instead: the fix plus everything the earlier
 rounds had already read and confirmed, paid for again in budget, wall-clock and
 attention. PR #34's four rounds grew 140 KB -> 292 KB *because* it was being
 reviewed, until both reviewers declared they could not read ~600 lines of one
