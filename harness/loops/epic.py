@@ -37,8 +37,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from harness_rules import (  # noqa: E402
-    RepoNotFound, agent_failure, agent_gist, cli_failure_gist, describe,
-    resolve_repo, run_agent, tail_gist,
+    DEFAULTS, RepoNotFound, agent_failure, agent_gist, cli_failure_gist,
+    describe, resolve_repo, run_agent, tail_gist,
 )
 
 PANEL = Path(__file__).with_name("panel.py")
@@ -87,6 +87,40 @@ Issue #{n}: {title}
 # Ascending capability tiers a sub-issue may be implemented on. haiku is deliberately
 # excluded — the floor for epic implementation work is sonnet.
 MODEL_TIERS = ["sonnet", "opus", "fable"]
+
+
+def resolve_ceiling(cfg: dict, model: str | None) -> str:
+    """The capability tier this epic may spend on a sub-issue: `--model` if one was
+    given, else the repo's `epic.model_ceiling`.
+
+    This used to fall back to `review_panel.judge_model`, and the two agreed only
+    by accident. That key answers "which brain adjudicates the panel", and since
+    it became deliberately UNLIKE a seat's model (#81, implementing the first line
+    of #78) it no longer answers "how capable a model may this epic spend on an
+    issue" — a ceiling of `fable` would quietly route every sub-issue's
+    implementation at the top tier. Two questions, two keys.
+
+    A function rather than an expression inside `run()` because the wiring is the
+    whole point of the change and an expression buried in a 200-line driver can
+    only be tested by running the driver. Asserting relationships between
+    `DEFAULTS` literals — which is all the first version of this could do — cannot
+    catch a typo'd key or a restored fallback.
+
+    Absent → the default; explicitly `""` → off; explicitly `null` → off. `epic`
+    is one of `harness_rules._DEEP_BLOCKS`, so a repo declaring an `epic` block
+    without `model_ceiling` still gets the default merged in and the key is always
+    present: the `.get` default states the intent rather than serving a live path.
+    The live path is a rules file setting the key to `""` (a repo asking for no
+    routing, which must survive as `""`) or to `null` (the same request, arriving
+    as `None`, which the tier lookups would otherwise carry into `w.model` and the
+    state file as a non-string). Writing this as `x or DEFAULT` collapses absent
+    and empty together and turns a repo that asked for no routing back on at the
+    top tier — which is why it is not written that way."""
+    if model:
+        return model
+    ceiling = cfg.get("epic", {}).get("model_ceiling",
+                                      DEFAULTS["epic"]["model_ceiling"])
+    return "" if ceiling is None else ceiling
 
 
 def allowed_models(ceiling: str) -> list[str]:
@@ -1146,13 +1180,7 @@ def run(repo_name: str, epic: int, execute: bool, max_issues: int | None,
     # falls back to `epic.model_ceiling`) and routes each sub-issue to an
     # equal-or-lesser tier for implementation.
     #
-    # This used to fall back to `review_panel.judge_model`, and the two agreed
-    # only by accident. That key answers "which brain adjudicates the panel",
-    # and since it became deliberately UNLIKE a seat's model (#78) it no longer
-    # answers "how capable a model may this epic spend on an issue" — a ceiling
-    # of `fable` would quietly route every sub-issue's implementation at the top
-    # tier. Two questions, two keys.
-    ceiling = model or cfg.get("epic", {}).get("model_ceiling", "")
+    ceiling = resolve_ceiling(cfg, model)
     impl = [w for w in work if w.stage == "implement"]
     if impl:
         with ThreadPoolExecutor(max_workers=4) as ex:

@@ -472,7 +472,39 @@ What was missing was the datum. Closes #82.
 ## v2.22 — the judge was one of the parties, and every worktree re-resolved the same conflict
 
 Two defaults, both cheap, both fixing something a day of dogfooding actually ran into. Harness-side
-only: the served version stays at 2.19.0.
+only: the served version is unchanged by this release.
+
+**Round 1 of the panel found the cheap half of both defaults wrong, and one of the two documented
+guarantees was simply not true.** `rerere.autoUpdate` was left *absent* rather than set, and absent
+is not off: a user carrying `autoUpdate=true` in their global config got exactly the silent staging
+this entry promises cannot happen, with nothing having looked. It is now written to `false` beside
+`rerere.enabled`, for a repo that had decided neither. The probe reads `--type=bool`, because
+`git config --get` exits 0 for *any* value — so a repo with `rerere.enabled=banana` was treated as
+having decided, and git then refuses every merge in every worktree with "bad boolean config value".
+And the write is guarded: it ran unguarded under `set -euo pipefail`, so a held `config.lock` — which
+parallel loops contend for on a shared common git dir — aborted worktree creation after the banner
+and before any worktree existed. Verified against the pre-fix block rather than argued: exit 255 on
+a held lock, `banana` left in place, effective `autoUpdate` reading `true`.
+
+**The guarantee that survives is narrower than it was written.** "A replayed resolution is left
+unstaged, so you have to look at it" holds for a human at a terminal. `epic.py` and `lander.py` both
+run a blanket `git add -A` in their worktrees, which stages a replayed resolution whatever
+`autoUpdate` says — so on the unattended path an answer given once by hand in one branch can be
+committed unread in another. Documented here and in `harness/README.md`, and filed rather than
+guessed at: the fix is explicit staging in those two loops, or rerere scoped away from loop-driven
+worktrees, and neither belongs in a release about defaults.
+
+**The ceiling's wiring is now called by a test rather than inferred from one.** The first version
+asserted relationships between `DEFAULTS` literals, which cannot catch a typo'd key or a restored
+fallback — the two ways this change actually breaks. `resolve_ceiling()` is lifted out of `run()`
+and covered directly, including the case review got wrong: the obvious `x or DEFAULT` form collapses
+"absent" and "explicitly empty" together, turning a repo that asked for *no* model routing back on at
+the top tier. Absent → default, `""` → off, `null` → off.
+
+**And repos that had tuned `judge_model` were tuning two things.** One of them was undocumented, so a
+repo that set `judge_model: sonnet` to keep unattended implementation cheap kept its custom judge and
+silently picked up the new `opus` ceiling. "Epic behaviour is unchanged" is true for repos on the
+default and only for them; `harness/loops/README.md` now says so where the key is described.
 
 **`review_panel.judge_model` was `opus`, and so is `reviewers.claude.model`.** The panel's
 adjudicator was therefore the same brain as one of the seats it rules on, by default, in every repo.

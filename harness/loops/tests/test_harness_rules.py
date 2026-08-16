@@ -553,24 +553,46 @@ def test_dotenv_is_tracked(repo):
     assert hr.dotenv_is_tracked(repo) is True        # committed — a real leak
 
 
+def test_the_documented_judge_default_is_the_one_that_ships():
+    """A literal pin, kept deliberately. The relationship test below cannot catch
+    a default-vs-loader drift — if both move together it stays green — and after
+    the de-hardcoding above nothing else in the suite asserts that the model the
+    READMEs name is the model that loads."""
+    assert hr.DEFAULTS["review_panel"]["judge_model"] == "fable"
+
+
 def test_the_judge_is_not_the_same_model_as_a_seat():
     """#78's independence rule, as far as a default can carry it: the model that
     adjudicates must not be the model that raised the finding. Asserted against
-    the enabled seats rather than against the literal string `opus`, because the
-    invariant is the relationship — swapping a seat's model must fail this too,
-    not quietly restore the thing it is here to prevent."""
+    the relationship rather than against a literal, because swapping a seat's
+    model must fail this too, not quietly restore the thing it is here to prevent.
+
+    **Every seat, not just the enabled ones.** A reviewer that ships disabled with
+    the judge's model passes an enabled-only check and then collides the moment a
+    repo turns it on — which is precisely the condition the rule exists to reject,
+    arriving by the one route the test did not look down. This is a defaults-level
+    check with no runtime config in play, so the broader assertion costs nothing."""
     judge = hr.DEFAULTS["review_panel"]["judge_model"]
     seats = {name: r.get("model") for name, r in hr.DEFAULTS["reviewers"].items()
-             if r.get("enabled") and r.get("model")}
+             if r.get("model")}
     assert judge, "an empty judge_model resolves to the claude CLI's default, which may be a seat"
+    assert seats, ("no seat declares a model, so the assertion below is vacuous — "
+                   "a DEFAULTS edit dropping the model keys would pass this silently")
     assert judge not in seats.values(), f"judge {judge!r} is also a seat's model: {seats}"
 
 
-def test_the_epic_ceiling_does_not_inherit_the_judge():
+def test_the_epic_ceiling_is_pinned_to_what_the_old_fallback_resolved_to():
     """The epic's spending ceiling and the panel's adjudicator were one key, and
     they agreed only by accident. Since the judge became deliberately unlike a
     seat, that fallback would have routed every sub-issue's implementation at
-    whatever tier the judge happens to sit at."""
+    whatever tier the judge happens to sit at.
+
+    `opus` is pinned as a literal **on purpose**: it is what the old fallback
+    resolved to, so changing it is a behaviour change for every repo on the
+    defaults, not a refactor. What is deliberately NOT asserted is that the
+    ceiling differs from the judge — that is today's coincidence, not the rule,
+    and encoding it would make a future editor move the ceiling to keep a test
+    green when the judge legitimately moves. The rule itself is that these are
+    independent keys, and it is asserted where it lives: `resolve_ceiling` in
+    `harness/loops/tests/test_epic_model_ceiling.py`, which calls the wiring."""
     assert hr.DEFAULTS["epic"]["model_ceiling"] == "opus"
-    assert (hr.DEFAULTS["epic"]["model_ceiling"]
-            != hr.DEFAULTS["review_panel"]["judge_model"])

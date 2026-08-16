@@ -731,7 +731,6 @@ fi
 # ============================================
 # STEP: Create git worktree
 # ============================================
-step "Creating git worktree and branch..."
 cd "$MAIN_REPO"
 
 # Remember how a conflict was resolved, and replay it the next time the same one
@@ -742,18 +741,46 @@ cd "$MAIN_REPO"
 # further configuration. Resolve once, replay in the other nine.
 #
 # Repo-local, never --global: it is this repo's shape that justifies it. Only set
-# when unset, so a repo that turned it off stays off. And `rerere.autoUpdate` is
-# deliberately NOT set — a replayed resolution is left unstaged, so it has to be
-# looked at before it is committed. That matters: rerere matches on conflict text
-# and cannot know the right answer changed since last time, which is the live
-# hazard for the file this helps most with (a CHANGELOG's version narrative,
-# where the correct resolution depends on which releases are in flight).
-if ! git config --get rerere.enabled >/dev/null 2>&1; then
-    git config rerere.enabled true
-    echo -e "  ${GREEN}rerere enabled${NC} for this repo — conflict resolutions are now"
-    echo -e "  remembered and replayed across its worktrees. Read a replayed one before"
-    echo -e "  committing it: it is git's last answer, not necessarily this one's."
+# when unset, so a repo that turned it off stays off. `rerere.autoUpdate` is
+# pinned to false in the same breath — a replayed resolution must be left
+# unstaged, so it has to be looked at before it is committed. That matters:
+# rerere matches on conflict text and cannot know the right answer changed since
+# last time, which is the live hazard for the file this helps most with (a
+# CHANGELOG's version narrative, where the correct resolution depends on which
+# releases are in flight).
+#
+# Pinned rather than left absent, because "absent" is not the same as "off": a
+# user with `rerere.autoUpdate=true` in their global or system config gets
+# exactly the staging this block's docs promise cannot happen, and nothing here
+# would have looked. Written only alongside `rerere.enabled`, so a repo that
+# decided either key for itself is still left alone.
+#
+# NOT closed by that pin, and worth knowing before you trust the "you will see
+# it" half: `epic.py:593` and `lander.py:197` both run a blanket `git add -A` in
+# a worktree, which stages a replayed resolution whether or not autoUpdate is
+# off. rerere is a hazard for unattended merge loops in a way it is not for a
+# human at a terminal, and only the human half is closed here.
+#
+# `--type=bool` on the probe, so a set-but-invalid value counts as undecided
+# rather than as a decision: `git config --get` exits 0 for any value at all,
+# including ones git then refuses at merge time with "bad boolean config value".
+if ! git config --get --type=bool rerere.enabled >/dev/null 2>&1; then
+    if git config rerere.enabled true && git config rerere.autoUpdate false; then
+        echo -e "  ${GREEN}rerere enabled${NC} for this repo — conflict resolutions are now"
+        echo -e "  remembered and replayed across its worktrees. Read a replayed one before"
+        echo -e "  committing it: it is git's last answer, not necessarily this one's."
+    else
+        # Never fail worktree creation over a convenience default — the same
+        # choice the remote refresh below makes explicitly, and for the same
+        # reason. A held `config.lock` (parallel loops share this common git
+        # dir), a read-only `.git/config` or a HOME-less environment all reach
+        # here, and none of them is a reason to have no worktree.
+        echo -e "  ${YELLOW}could not enable rerere${NC} for this repo (config not writable?)" >&2
+        echo -e "  — carrying on; conflicts will just be resolved by hand as before." >&2
+    fi
 fi
+
+step "Creating git worktree and branch..."
 
 # Refresh remote-tracking refs so an existing/remote branch checks out at its
 # latest pushed state, not whatever was cached at the last fetch. Best-effort:

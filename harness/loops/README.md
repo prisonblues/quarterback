@@ -98,7 +98,7 @@ Detected from the checkout, **not settable** here: `path`, `github`, `default_br
 | `dependabot_author` | Author filter for the lander (`app/dependabot`). |
 | `reviewers` | Which reviewers run — see below. |
 | `review_panel.skip_title_patterns` | Regexes for PRs not worth LLM review (merge/promote/release/format-the-world). These drove a cost blow-up in #117 — one release-merge ≈ $750. |
-| `review_panel.judge_model` | Claude model for the master judge (`""` = default). Defaults to `fable` — **not** `reviewers.claude.model`, on purpose; see below. |
+| `review_panel.judge_model` | Claude model for the master judge (`""` = the harness default, `fable`) — deliberately **not** `reviewers.claude.model`; see below. |
 | `review_panel.ask_quorum` / `ask_threshold` | `--ask`'s tally rules: how many seats must have **answered** for the vote to mean anything, and how many must have said the same thing for it to be that answer. Both **2** — one seat agreeing with the agent that wrote the premise is not a challenge. A rule above the number of seats on the ask is warned about: it can never be met. |
 | `review_panel.ask_max_context_chars` | Total `--context` material one ask may hand its seats, across every spec. **60,000** (~15k tokens). Over budget is clamped and SAID, per spec — an ask's whole claim is that it is the cheap check, and unbounded context is the #117 cost shape on the path advertised as costing a minute. |
 | `loops` | `dependabot_lander` / `stacked_driver` / `issue_executor` — which loops may run. |
@@ -137,6 +137,16 @@ This is only the default. **Pinning both keys to the same model still works and 
 nothing** — the enforcement half (`judge_independent`: refuse to run when the judge's
 model matches an enabled seat's) is [#78](https://github.com/prisonblues/quarterback/issues/78)
 and is not implemented.
+
+**Two costs of that default, neither of them free.** `fable` is not universally
+available: it needs a recent Claude Code, is not on every plan, can be disabled for an
+organization, and may want credits — and the panel does no availability preflight, so an
+installation without access loses its judge on every run rather than falling back. And it
+is now the most expensive model in the panel by default, on a run that happens for every
+reviewed PR, in a harness whose `skip_title_patterns` exist because one release-merge came
+to about $750. Independence was purchasable at `sonnet` too and was decided on a
+capability tie-break rather than a measurement. **If either bites, pin `judge_model`** —
+that is what the key is for, and doing so costs you only the independence default.
 
 `review_panel.max_diff_chars` (default: **none — the whole diff**) — how much of
 the diff each model is given. Override per reviewer with
@@ -215,10 +225,21 @@ on no branch and a PR cannot introduce one.
 - `executor_worktree_args` — extra flags for `create-worktree` (e.g. `["--no-docker"]`).
 - `min_free_mb` — preflight warns below this `MemAvailable`.
 - `model_ceiling` — highest tier a sub-issue may be implemented at when `--model` is
-  not passed (`sonnet` < `opus` < `fable`; default `opus`). The triage judge runs here
-  and routes each issue to this tier or lower. Anything outside those three turns model
-  routing off. It used to fall back to `review_panel.judge_model`, which is a different
-  question and now deliberately has a different answer — see below.
+  not passed (`sonnet` < `opus` < `fable`; default `opus` — the ordering and the
+  off-switch are pinned against `epic.MODEL_TIERS` in
+  `harness/loops/tests/test_epic_model_ceiling.py`, so this sentence cannot go stale
+  quietly). The triage judge runs here and routes each issue to this tier or lower.
+  Anything outside those three turns model routing off, as does an explicit `""` or
+  `null`. It used to fall back to `review_panel.judge_model`, which is a different
+  question and now deliberately has a different answer — see `review_panel.judge_model`
+  earlier in this file.
+  > **If you previously set `review_panel.judge_model` to control what an epic spends,
+  > set `epic.model_ceiling` too.** That key was load-bearing for two things and only
+  > one of them was documented. A repo that set `judge_model: sonnet` to keep unattended
+  > implementation cheap kept its custom judge across this change and picked up the new
+  > `opus` ceiling — an unannounced rise in what an unattended sub-issue may spend. Repos
+  > on the default are unaffected, which is what the CHANGELOG's "epic behaviour is
+  > unchanged" means and all it means.
 - `migrations_dir` — where alembic revisions live, for the linear-heads guard.
   **Leave it alone in a repo without alembic.** The default doesn't exist there, so the
   guard returns `None` and no-ops. Setting it to `""` breaks that: `Path(repo)/""` *is*
