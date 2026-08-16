@@ -68,8 +68,9 @@ like a real one — on PR #64, three of six confirmed P2s were wrong and are sti
 confirmed. After the fixer pushes, each finding gets a terminal outcome (`qb record-outcome`):
 `fixed`, `refuted` **with the reasoning**, `deferred` with where it went, or `superseded`. The
 refutation is the one that pays, and it is already being written into the PR comment — this is
-where it stops being prose nothing can count. Do not mark your own findings refuted unattended;
-the board records who set it and whether a human signed off, and `/panel` shows the split.
+where it stops being prose nothing can count. Do not mark your own findings refuted unattended:
+the board records who set it (from your token) and who you SAY signed it off — `attested_by` is a
+claim you are making, not a signature the board checked — and `/panel` shows the split.
 
 The same rule shapes how a run's **cost** is measured. Each member is timed, and each one that
 can be is also asked what it spent in tokens — but never by switching its CLI to a JSON output

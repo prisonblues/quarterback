@@ -40,17 +40,20 @@ a round's record changes after the fact, which is the property that makes
   release exists to measure, arriving one level up.
 * `deferred_to` and `superseded_by` are separate columns rather than one `ref`.
   Two readings of one field is how a consumer ends up guessing which it has.
-* `set_by` / `attested_by` — who recorded it, and the human who signed it off.
-  #77 is explicit that an agent must not mark its own findings `refuted`
-  unattended; the API cannot tell a fixer from a reviewer, so the record carries
-  who said it and the stats publish the attested split rather than pretending a
-  guard was enforced. NULL `attested_by` is *unattended*, reported and not
-  refused: refusing it would leave the refutation exactly where it is today, in
-  prose that nothing counts.
+* `set_by` / `attested_by` — who recorded it, and who they SAY signed it off.
+  `set_by` comes from the token and is proof; `attested_by` is free text in the
+  same request that carries the outcome, so it is a claim and never a signature —
+  the board cannot authenticate a person. #77 is explicit that an agent must not
+  mark its own findings `refuted` unattended; the API cannot tell a fixer from a
+  reviewer, so the record carries the claim beside its claimant and the stats
+  publish the attested split rather than pretending a guard was enforced. NULL
+  `attested_by` is *unattended*, reported and not refused: refusing it would leave
+  the refutation exactly where it is today, in prose that nothing counts.
 * `revisions` / `prior_outcome` — a terminal state that moves is legitimate (a
-  deferred finding is later fixed) and a silent flip is not. Together they say an
-  answer changed and what it was, so a window whose after-the-fact precision
-  improved can be told from one whose refutations were quietly rewritten.
+  deferred finding is later fixed) and a silent flip is not. `revisions` counts
+  every change to the record, a note rewritten under an unchanged outcome
+  included, because that route improves an after-the-fact precision figure just
+  as effectively; `prior_outcome` names the answer it used to give.
 
 ## Constraints
 
@@ -59,11 +62,15 @@ feeds a published precision figure: an unknown value would drop out of the
 numerator while still counting as coverage, which reads as "recorded, and it was
 neither fixed nor refuted" — the most flattering possible way to say nothing.
 The same argument puts the evidence rule at the boundary, so a backfill or an
-admin script cannot insert a bare contradiction of the judge either. Both halves
-of it are needed: `btrim(note) <> ''` refuses a whitespace note, and the
-`note IS NOT NULL` beside it is not redundant — **a CHECK passes when its
-expression evaluates to NULL**, so the trim test alone would let a null note
-straight through, which is the row the rule exists to refuse.
+admin script cannot insert a bare contradiction of the judge either — and the
+same rule for `superseded`, whose replacing key is the whole content of that
+outcome. Every clause of those two constraints earns its place:
+
+* the `IS NOT NULL` is not redundant beside the trim test. **A CHECK passes when
+  its expression evaluates to NULL**, so the trim alone would let a null straight
+  through, which is the row the rule exists to refuse.
+* `btrim` is given an explicit character set, because single-argument `btrim`
+  strips ORDINARY SPACES ONLY — a note consisting of one tab satisfied it.
 
 **The vocabulary is spelled out here rather than imported from
 `app.api.reviews.OUTCOMES`, deliberately.** A migration is a snapshot of what the
@@ -123,8 +130,14 @@ def upgrade() -> None:
             name="ck_review_finding_outcomes_vocabulary",
         ),
         sa.CheckConstraint(
-            "outcome <> 'refuted' OR (note IS NOT NULL AND btrim(note) <> '')",
+            r"outcome <> 'refuted' OR (note IS NOT NULL "
+            r"AND btrim(note, E' \t\n\r\f\v') <> '')",
             name="ck_review_finding_outcomes_refuted_note",
+        ),
+        sa.CheckConstraint(
+            "outcome <> 'superseded' OR (superseded_by IS NOT NULL "
+            r"AND btrim(superseded_by, E' \t\n\r\f\v') <> '')",
+            name="ck_review_finding_outcomes_superseded_by",
         ),
         sa.CheckConstraint("revisions >= 0", name="ck_review_finding_outcomes_revisions"),
     )

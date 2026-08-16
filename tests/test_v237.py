@@ -32,6 +32,7 @@ measuring anything.
 from __future__ import annotations
 
 import asyncio
+from urllib.parse import quote
 
 import pytest
 from sqlalchemy.exc import IntegrityError
@@ -558,7 +559,8 @@ async def test_a_rewritten_note_is_a_revision_and_is_named(client):
     res = await outcomes(client, "amend", [
         {"key": "a1", "outcome": "refuted", "note": "actually: the glob covers it"}])
     assert res["unchanged"] == []
-    assert res["amended"] == [{"key": "a1", "fields": ["note"], "outcome": "refuted"}]
+    assert res["amended"] == [{"key": "a1", "outcome": "refuted",
+                               "filled": [], "rewrote": ["note"]}]
     c = await chains(client, "amend")
     assert c["a1"]["outcome"]["note"] == "actually: the glob covers it"
     assert c["a1"]["outcome"]["revisions"] == 1
@@ -577,14 +579,19 @@ async def test_an_attestation_can_be_retracted_and_cannot_be_added_silently(clie
         {"key": "k1", "outcome": "refuted", "note": "not a defect"}])
     added = await outcomes(client, "retract", [
         {"key": "k1", "outcome": "refuted", "attested_by": "rich"}])
-    assert added["amended"] == []          # it FILLED an empty field
-    assert added["unchanged"] == ["k1"]
+    # A FILL, and it is reported as one rather than as `unchanged`: it moves
+    # `set_by`, so an agent adding a signoff claim to somebody else's refutation
+    # reassigns the authorship of that claim, and an invisible edit to the field
+    # #77's guard is read against is the one edit that must not be silent.
+    assert added["unchanged"] == []
+    assert added["amended"] == [{"key": "k1", "outcome": "refuted",
+                                 "filled": ["attested_by"], "rewrote": []}]
     assert added["unattested_refutations"] == []
 
     dropped = await outcomes(client, "retract", [
         {"key": "k1", "outcome": "refuted", "attested_by": None}])
-    assert dropped["amended"] == [{"key": "k1", "fields": ["attested_by"],
-                                   "outcome": "refuted"}]
+    assert dropped["amended"] == [{"key": "k1", "outcome": "refuted",
+                                   "filled": [], "rewrote": ["attested_by"]}]
     assert dropped["unattested_refutations"] == ["k1"]
     c = await chains(client, "retract")
     assert c["k1"]["outcome"]["attested_by"] is None
@@ -749,6 +756,114 @@ async def test_the_database_refuses_a_bare_refutation_too(client):
                     "(repo, pr, finding_key, outcome, note, set_by) VALUES "
                     f"('acme/direct', 1, 'k', 'refuted', {note}, 'laptop/hand')"))
         assert "ck_review_finding_outcomes_refuted_note" in str(caught.value)
+
+
+async def test_two_writers_updating_one_row_do_not_lose_an_edit(client):
+    """The insert race is caught by the unique constraint; two writers UPDATING an
+    existing row raise nothing at all — both read, both mutate, and the second
+    commit silently discards the first. That is what `FOR UPDATE` is for, and the
+    insert-race test above would pass with it removed."""
+    await record(client, "update-race", to_fix=[finding("u1")])
+    await outcomes(client, "update-race", [
+        {"key": "u1", "outcome": "refuted", "note": "first"}])
+    both = await asyncio.gather(
+        post_outcomes(client, "update-race",
+                      [{"key": "u1", "outcome": "refuted", "note": "second"}]),
+        post_outcomes(client, "update-race",
+                      [{"key": "u1", "outcome": "refuted", "attested_by": "rich"}]),
+    )
+    assert [r.status_code for r in both] == [200, 200], [r.text for r in both]
+    o = (await chains(client, "update-race"))["u1"]["outcome"]
+    # Both edits survive: serialised, they are a rewrite and a fill, and each is
+    # counted. Without the row lock one of them is gone and nothing says so.
+    assert o["note"] == "second"
+    assert o["attested_by"] == "rich"
+    assert o["revisions"] == 2
+
+
+async def test_the_defect_identity_survives_a_hash_in_a_repo_or_key(client):
+    """The distinct-defect key is a row constructor, not a `#`-joined string.
+    `repo` and `finding_key` are both free text, so any separator can occur inside
+    a value and two different triples could concatenate to one — always
+    undercounting, and undetectably."""
+    repo = "acme/v237-hash#1"
+    for key in ("a#b", "a", "b"):
+        r = await client.post("/review", json={
+            "repo": repo, "pr": 2, "judged": True, "judge_model": "opus",
+            "reviewers_selected": ["claude"],
+            "reviewers": {"claude": {"model": "opus", "ran": True}},
+            "to_fix": [finding(key)], "dismissed": [], "sonar_findings": [],
+        }, headers=AGENT)
+        assert r.status_code == 201, r.text
+    # Quoted: the repo carries a `#`, which a bare query string would read as the
+    # start of a fragment — the client-side echo of the very ambiguity this test
+    # is about.
+    s = await client.get(f"/review/stats?repo={quote(repo, safe='')}", headers=AGENT)
+    assert s.status_code == 200, s.text
+    body = s.json()
+    # Three distinct defects, one of which carries the separator in its key.
+    assert next(m for m in body["by_model"])["confirmed_defects"] == 3
+    assert body["by_outcome"]["not_recorded"] == 3
+
+
+async def test_outcomes_scored_is_published_beside_the_ratio(client):
+    """`precision_after` divides fixed+refuted; `outcomes_recorded` counts every
+    outcome. A client marking thin ratios needs the former, so it is published
+    rather than left to be re-derived (and mis-derived) per client."""
+    await record(client, "scored", to_fix=[finding(k) for k in ("s1", "s2", "s3")])
+    await outcomes(client, "scored", [
+        {"key": "s1", "outcome": "fixed"},
+        {"key": "s2", "outcome": "deferred"},
+        {"key": "s3", "outcome": "superseded", "superseded_by": "s1"},
+    ])
+    m = row(await stats(client, "scored"))
+    assert m["outcomes_recorded"] == 3
+    assert m["outcomes_scored"] == 1
+    assert m["precision_after"] == 1.0
+
+
+async def test_the_finding_key_alias_is_accepted(client):
+    """The read paths call it `finding_key`, so a caller copying it back is not
+    made to rename the field."""
+    await record(client, "aliaskey", to_fix=[finding("f1")])
+    res = await outcomes(client, "aliaskey", [{"finding_key": "f1", "outcome": "fixed"}])
+    assert res["recorded"] == ["f1"]
+
+
+async def test_a_malformed_first_entry_still_reserves_its_key(client):
+    """A key whose first entry failed to PARSE used to reserve nothing, so a later
+    well-formed entry for the same key slipped past the once-per-request rule on
+    the strength of an entry that never validated."""
+    await record(client, "reserve", to_fix=[finding("r1")])
+    res = await outcomes(client, "reserve", [
+        {"key": "r1", "outcome": "fixed", "nonsense": 1},
+        {"key": "r1", "outcome": "fixed"},
+    ], expect=422)
+    assert res["recorded"] == []
+    assert "nonsense" in res["rejected"][0]["reason"]
+    assert "once per request" in res["rejected"][1]["reason"]
+    # ...and the rejection names the key rather than "item 0", including when the
+    # caller used the alias.
+    aliased = await outcomes(client, "reserve", [
+        {"finding_key": "r1", "outcome": "fixed", "nonsense": 1}], expect=422)
+    assert aliased["rejected"][0]["key"] == "r1"
+
+
+async def test_the_database_refuses_a_bare_supersession_too(client):
+    """The same boundary rule as the refuted note, for the outcome whose whole
+    content is the key that replaced it."""
+    from sqlalchemy import text
+
+    from app.db import engine
+
+    for value in ("NULL", "''", "'\t'"):
+        with pytest.raises(IntegrityError) as caught:
+            async with engine.begin() as conn:
+                await conn.execute(text(
+                    "INSERT INTO review_finding_outcomes "
+                    "(repo, pr, finding_key, outcome, superseded_by, set_by) VALUES "
+                    f"('acme/direct2', 1, 'k', 'superseded', {value}, 'laptop/hand')"))
+        assert "ck_review_finding_outcomes_superseded_by" in str(caught.value)
 
 
 async def test_recording_requires_a_writer_token(client):

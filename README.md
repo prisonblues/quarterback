@@ -131,7 +131,9 @@ GET   /review/stats      ?repo=&author=&days=&judged_only=       -> {by_model, b
                                                                      by_provenance, by_outcome,
                                                                      by_outcome_attested}
                           by_model rows carry precision (the judge's) beside precision_after
-                          (what survived the fix) — the GAP is the measurement
+                          (what survived the fix) — the GAP is the measurement. Read it
+                          against outcomes_scored (fixed+refuted, the ratio's own
+                          population) and confirmed_defects, never outcomes_recorded
 GET   /review/findings   ?repo=&pr=&limit=                       (one PR's findings as
                                                                   chains of observations,
                                                                   per round: what was new,

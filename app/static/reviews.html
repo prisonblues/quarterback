@@ -367,17 +367,18 @@ function outcomeTip(r){
   // and this branch exists precisely for a bucket the page has never seen — i.e.
   // for the day the vocabulary widens, which is exactly when an unescaped one
   // would first matter.
-  const said = Object.entries(o).filter(([, n]) => n)
-    .map(([k, n]) => (OUTCOME_WORDS[k] || (m => `${m} ${esc(k)}`))(n)).join(", ");
+  const said = Object.entries(o).filter(([, count]) => count)
+    .map(([k, count]) => (OUTCOME_WORDS[k] || (m => `${m} ${esc(k)}`))(count)).join(", ");
   // Refutations nobody CLAIMS a human signed off. Named, because #77's rule is
   // that an agent must not grade its own findings unattended and the API records
   // rather than enforces it — so the page is where a reader sees which it is
   // looking at.
   const unattested = (o.refuted || 0) - (att.refuted || 0);
-  const n = r.confirmed_defects;
+  const defects = r.confirmed_defects || 0;
   return `<br>—<br>after the fact: ${said}
-    <span class="dim">(${r.outcomes_recorded} of ${n} defect${n === 1 ? "" : "s"} ruled on,
-      ${r.outcomes_scored} of them fixed-or-refuted)</span>
+    <span class="dim">(${r.outcomes_recorded || 0} of ${defects}
+      defect${defects === 1 ? "" : "s"} ruled on,
+      ${r.outcomes_scored || 0} of them fixed-or-refuted)</span>
     ${r.precision_after == null ? ""
       : `<br><b>${pct(r.precision_after)}</b> of its scored findings held up,
          against ${pct(r.precision)} the judge confirmed`}
@@ -430,8 +431,8 @@ function renderLeaderboard(rows, judgedOnly){
         r.precision_after == null ? "var(--muted)" : precColor(r.precision_after)};opacity:${
         thinAfter(r) ? .45 : 1}" title="${r.precision_after == null
           ? `nothing scored yet of its ${r.confirmed_defects || 0} confirmed defect(s)`
-          : `${r.outcomes_scored} of ${r.confirmed_defects} defects scored fixed-or-refuted`
-            + ` (${r.outcomes_recorded} have any outcome at all)`}">${
+          : `${r.outcomes_scored || 0} of ${r.confirmed_defects || 0} defects scored`
+            + ` fixed-or-refuted (${r.outcomes_recorded || 0} have any outcome at all)`}">${
         r.precision_after == null ? "—" : pct(r.precision_after) + (thinAfter(r) ? "*" : "")}</span></td>
       <td>${r.solo}</td><td class="dim">${pct(r.consensus_rate)}</td>
       <td>${r.p1}</td><td>${r.raised}</td><td>${r.dismissed}</td>
@@ -576,17 +577,24 @@ function outcomeChip(o){
   // agreed. Rendering it as a signature would make the one number meant to be
   // trustworthy the one with no provenance — so the claim always travels with
   // its claimant.
-  const who = o.attested_by
-    ? `${o.set_by} claims signoff by ${o.attested_by}`
+  // Attestation is only meaningful on a refutation — that is the outcome #77's
+  // self-grading rule is about. Printing "unattended" under a `fixed` invited a
+  // reader to look for a signoff that nothing ever wanted.
+  const refuted = o.outcome === "refuted";
+  const who = !refuted ? `recorded by ${o.set_by}`
+    : o.attested_by ? `${o.set_by} claims signoff by ${o.attested_by}`
     : `unattended (recorded by ${o.set_by})`;
   const extra = o.deferred_to ? ` → ${o.deferred_to}`
               : o.superseded_by ? ` → ${o.superseded_by}` : "";
   const was = o.prior_outcome ? ` (was ${o.prior_outcome})` : "";
-  const rev = o.revisions ? ` · amended ${o.revisions}×` : "";
+  // "changed", not "amended": `revisions` counts an outcome MOVE as well as a
+  // field rewritten under an unchanged one, so naming it after the second
+  // asserted an edit to the evidence that a plain renumbering never made.
+  const rev = o.revisions ? ` · changed ${o.revisions}×` : "";
   const tip = `${o.outcome}${extra}${was} · ${who}${rev}${o.note ? "\n" + o.note : ""}`;
   return `<span class="oc ${esc(o.outcome)}" title="${esc(tip)}">${esc(o.outcome)}${
-    esc(extra)}${o.attested_by
-      ? ` <span class="un">·signoff claimed</span>`
+    esc(extra)}${!refuted ? ""
+      : o.attested_by ? ' <span class="un">·signoff claimed</span>'
       : ' <span class="un">·unattested</span>'}</span>`;
 }
 

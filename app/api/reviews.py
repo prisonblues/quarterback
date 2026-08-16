@@ -228,8 +228,12 @@ Three properties hold the thing up:
 
 ``GET /review/stats`` grows ``precision_after`` per (reviewer, model, effort) —
 ``fixed / (fixed + refuted)``, the same ratio as ``precision`` but scored against
-the code — plus ``outcome``, ``outcome_attested``, ``outcomes_recorded`` and
-``confirmed_defects``, and ``by_outcome`` for the window. **The gap between
+the code — plus ``outcome``, ``outcome_attested``, ``outcomes_recorded``,
+``outcomes_scored`` (the population the ratio is actually over, which is NOT
+``outcomes_recorded``) and ``confirmed_defects``, with ``by_outcome`` and
+``by_outcome_attested`` for the window. The read paths carry the outcome's own
+``set_by``/``session`` pair beside it, so a reader can reach whoever recorded a
+refutation they disagree with. **The gap between
 ``precision`` and ``precision_after`` is the number the panel exists to produce
 and could not.** These are the only counts on that page measured per defect
 rather than per observation, which is why both denominators are published.
@@ -497,7 +501,12 @@ _VOCAB_CONSTRAINT = "ck_review_finding_outcomes_vocabulary"
 _declared = {
     c for con in ReviewFindingOutcome.__table__.constraints
     if getattr(con, "name", None) == _VOCAB_CONSTRAINT
-    for c in re.findall(r"'([a-z][a-z-]*)'", str(con.sqltext))
+    # Deliberately wider than today's vocabulary: a future `not_applicable` or
+    # `wont-fix` added correctly to BOTH sides would make a narrower pattern match
+    # nothing, and a guard that matches nothing reports a mismatch against the
+    # empty set — failing at import on a correct change, which is how a guard gets
+    # deleted rather than fixed.
+    for c in re.findall(r"'([a-z][a-z0-9_-]*)'", str(con.sqltext))
 }
 if _declared != set(OUTCOMES):  # pragma: no cover - import guard
     raise RuntimeError(
@@ -510,8 +519,27 @@ del _declared
 #: How many outcomes one request may carry. A fix pass clears a round's findings
 #: in one call — a round is tens of findings, not thousands — and this is the same
 #: "one request should not insert a million rows in one transaction" bound
-#: ``MAX_CHANGED_FILES`` sets on the ingest path.
+#: ``MAX_CHANGED_FILES`` sets on the ingest path. Entries past it are NAMED rather
+#: than 422'ing the batch, so a caller that batched a long loop keeps the first
+#: 500 rows.
 MAX_OUTCOMES = 500
+
+#: ...and a hard ceiling above it, where the request is refused outright.
+#: "Name the overflow" is right for a caller that sent slightly too many and
+#: wrong for one that sent 100,000: pydantic materialises the whole array either
+#: way, and the naming itself then costs a rejection dict per entry and one
+#: enormous log line. Ten times the cap is comfortably past any real fix pass and
+#: far short of a body that hurts.
+MAX_OUTCOMES_ACCEPTED = MAX_OUTCOMES * 10
+
+#: How many of one item's validation errors the rejection reason quotes before it
+#: says how many more there were.
+_MAX_ITEM_ERRORS = 4
+
+#: How many rejections one log line carries. The response names every one — that
+#: is the contract — but the LOG is a shared resource, and a 5,000-item batch of
+#: junk would otherwise write a megabyte of JSON into it.
+MAX_REJECTIONS_LOGGED = 50
 
 #: Postgres' SQLSTATE for a unique-constraint violation. The ONE integrity error
 #: on the outcome path that means "somebody else got there first" — every other
@@ -2031,12 +2059,23 @@ class OutcomesIn(BaseModel):
     #: The recorder's session, stored beside its identity exactly as a run stores
     #: it: ``set_by`` says who, and this is what lets a peer reach them about it.
     session: str | None = None
-    #: ``list[Any]``, and every word of that is load-bearing. Unbounded, so an
-    #: over-cap batch has its overflow NAMED rather than 422'ing 501 rows down to
-    #: nothing; and untyped, because even ``list[dict]`` is validated by FastAPI
-    #: before the handler runs — one entry that is a bare string then costs the
-    #: whole request, which is precisely the guarantee this endpoint makes.
-    outcomes: list[Any] = Field(min_length=1)
+    #: ``list[Any]``, and every word of that is load-bearing. Untyped, because
+    #: even ``list[dict]`` is validated by FastAPI before the handler runs — one
+    #: entry that is a bare string then costs the whole request, which is
+    #: precisely the guarantee this endpoint makes. Bounded at
+    #: :data:`MAX_OUTCOMES_ACCEPTED` rather than at :data:`MAX_OUTCOMES`, so an
+    #: over-cap batch has its overflow NAMED (a caller that batched a long fix
+    #: loop keeps its first 500 rows) while a body ten times that is refused at
+    #: parse time: naming 99,500 rejections costs a dict each and one enormous
+    #: log line, which is a worse answer than one cheap 422.
+    #: The item schema is attached by hand, because `list[Any]` erases it: a
+    #: generated client would otherwise be told the request body is an array of
+    #: anything, with none of `key`/`outcome`/`note` named. The type is what buys
+    #: per-item rejection; the schema is what a caller reads.
+    outcomes: list[Any] = Field(
+        min_length=1, max_length=MAX_OUTCOMES_ACCEPTED,
+        json_schema_extra=lambda f: f.update(items=OutcomeIn.model_json_schema()),
+    )
 
     @field_validator("repo")
     @classmethod
@@ -2053,8 +2092,14 @@ class OutcomesIn(BaseModel):
     @field_validator("session")
     @classmethod
     def _session(cls, v: str | None) -> str | None:
+        # Refused, not sliced — the same rule `OutcomeIn._bounds` enforces for
+        # every other bounded field, and for a sharper reason here: a truncated
+        # session is a contact address that resolves to nothing, handed back as
+        # if it were the real one.
         s = _trimmed_or_none(v)
-        return s[:MAX_REF_CHARS] if s else None
+        if s and len(s) > MAX_REF_CHARS:
+            raise ValueError(f"session over {MAX_REF_CHARS} characters")
+        return s
 
 
 def _outcome_reason(item: OutcomeIn, known: set[str], stored: ReviewFindingOutcome | None,
@@ -2138,10 +2183,31 @@ def _outcome_item(raw: object) -> tuple[OutcomeIn | None, str | None]:
         # per-item `reason` string is for.
         parts = [f"{'.'.join(str(p) for p in err['loc']) or 'item'}: {err['msg']}"
                  for err in e.errors()]
-        return None, "; ".join(_echo(p) for p in parts[:4])
+        shown = "; ".join(_echo(p) for p in parts[:_MAX_ITEM_ERRORS])
+        # ...and say how many were not shown. Dropping the rest silently is the
+        # same "a caller told nothing assumes it was told everything" failure the
+        # whole endpoint is organised against, one layer down.
+        rest = len(parts) - _MAX_ITEM_ERRORS
+        return None, f"{shown} (+{rest} more)" if rest > 0 else shown
 
 
-@router.post("/review/outcomes", status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/review/outcomes",
+    status_code=status.HTTP_201_CREATED,
+    # Declared, because the handler sets the code from what it did and a generated
+    # client built off the schema would otherwise be told 201 is the only answer.
+    # The 422 is doubly worth naming: FastAPI already uses it for request-shape
+    # failures with a `detail` body, and this one is a well-formed request whose
+    # every item was refused, carrying the endpoint's own `rejected` list. A
+    # client tells them apart by which key is present, never by the code.
+    responses={
+        200: {"description": "existing outcomes updated, amended or confirmed unchanged"},
+        201: {"description": "at least one outcome recorded for the first time"},
+        409: {"description": "another writer recorded one of these while this was in flight"},
+        422: {"description": "either the request shape was wrong (`detail`) or every item "
+                             "in a well-formed request was refused (`rejected`)"},
+    },
+)
 async def record_outcomes(
     body: OutcomesIn,
     response: Response,
@@ -2216,7 +2282,11 @@ async def record_outcomes(
             # row, and reporting it as "another writer got there first; retry"
             # sends the caller round a loop over a bug in this service while
             # hiding it from the logs.
-            if getattr(e.orig, "sqlstate", None) != _PG_UNIQUE_VIOLATION:
+            # `sqlstate` is asyncpg's spelling and `pgcode` is psycopg's. Reading
+            # only one fails CLOSED in the wrong direction under the other: every
+            # genuine insert race would stop being retried and become a 500.
+            code = getattr(e.orig, "sqlstate", None) or getattr(e.orig, "pgcode", None)
+            if code != _PG_UNIQUE_VIOLATION:
                 raise
             if attempt == 2:
                 raise HTTPException(
@@ -2230,9 +2300,13 @@ async def record_outcomes(
         # drops: a caller that is told nothing assumes everything landed, and
         # these are the rows a coverage marker will otherwise report as never
         # recorded.
+        # The RESPONSE names every rejection; the log takes a bounded prefix and
+        # says how many there were. A shared log is not the place to render a
+        # 5,000-item batch of junk in full.
+        listed = result["rejected"][:MAX_REJECTIONS_LOGGED]
         _log.warning("review outcomes rejected: %s", json.dumps(
             {"repo": body.repo, "pr": body.pr, "author": author,
-             "rejected": result["rejected"]}, default=str))
+             "rejected_total": len(result["rejected"]), "rejected": listed}, default=str))
 
     # The status code has to agree with the body, because a shell pipeline built
     # around `qb` (a curl wrapper) checks the code and nothing else. 201 only when
@@ -2287,7 +2361,12 @@ async def _apply_outcomes(session: AsyncSession, body: OutcomesIn, author: str) 
             ReviewFindingOutcome.repo == body.repo,
             ReviewFindingOutcome.pr == body.pr,
             ReviewFindingOutcome.finding_key.in_(sent),
-        ).with_for_update()
+        # ORDER BY under FOR UPDATE: two overlapping batches take their row locks
+        # in whatever order the planner returns them, and a plan change between
+        # the two (index scan one side, bitmap heap the other) is enough to
+        # reverse it and deadlock. One agreed order removes the possibility
+        # rather than making it rare.
+        ).order_by(ReviewFindingOutcome.finding_key).with_for_update()
     )).all()} if sent else {}
 
     now = datetime.now(UTC)
@@ -2301,9 +2380,21 @@ async def _apply_outcomes(session: AsyncSession, body: OutcomesIn, author: str) 
 
     for i, item, why in items:
         if item is None:
+            # The key an unparseable item MEANT, under either spelling the model
+            # accepts. Two reasons it is dug out of the raw object rather than
+            # left as "item N": a caller using the `finding_key` alias had its
+            # rejection reported anonymously, and — the real one — a key that
+            # reserves nothing lets a LATER well-formed entry for the same key
+            # slip past the once-per-request rule, on the strength of an earlier
+            # entry that failed to parse.
             raw = body.outcomes[i]
-            key = raw.get("key") if isinstance(raw, dict) else None
-            rejected.append({"key": _echo(key) if key else f"item {i}", "reason": why})
+            key = None
+            if isinstance(raw, dict):
+                key = raw.get("key") if raw.get("key") is not None else raw.get("finding_key")
+            if isinstance(key, str) and key.strip():
+                seen.add(key.strip())
+            rejected.append({"key": _echo(key) if key is not None else f"item {i}",
+                             "reason": why})
             continue
         row = stored.get(item.key)
         reason = _outcome_reason(item, known, row, seen)
@@ -2340,6 +2431,7 @@ async def _apply_outcomes(session: AsyncSession, body: OutcomesIn, author: str) 
             # keeps its original author (below), so `set_by` names the agent that
             # made the current statement rather than the last one to touch it.
             row.set_by, row.session = author, body.session
+            row.updated_at = now
         else:
             # A repeat of the same answer FILLS an empty field and never silently
             # rewrites a stored one. Rewriting is a real change — replacing the
@@ -2348,22 +2440,26 @@ async def _apply_outcomes(session: AsyncSession, body: OutcomesIn, author: str) 
             # a revision and named back. An absent field is "nothing to add"; an
             # explicit null CLEARS, which is how a mistaken attestation is
             # retracted without flipping the outcome twice to do it.
-            edits, filled = [], False
+            rewrote, filled = [], []
             for attr in OUTCOME_FIELDS:
                 if attr not in item.model_fields_set:
                     continue
                 value, was = getattr(item, attr), getattr(row, attr)
                 if value == was:
                     continue
-                if was is not None:
-                    edits.append(attr)
-                else:
-                    filled = True
+                (rewrote if was is not None else filled).append(attr)
                 setattr(row, attr, value)
-            if edits:
+            if rewrote or filled:
+                # Reported whichever it was, because BOTH move `set_by` and a
+                # fill used to move it invisibly: an agent adding an attestation
+                # to somebody else's unattended refutation reassigned the
+                # authorship of the claim, landed in `unchanged`, and left no
+                # trace anywhere in the response. `set_by` is the field #77's
+                # self-grading guard is read against, so an edit to it that
+                # nothing reports is the one edit that must not be silent.
                 row.revisions += 1
-                amended.append({"key": item.key, "fields": sorted(edits),
-                                "outcome": row.outcome})
+                amended.append({"key": item.key, "outcome": row.outcome,
+                                "filled": sorted(filled), "rewrote": sorted(rewrote)})
             else:
                 unchanged.append(item.key)
             # `set_by` names the agent responsible for the row's CURRENT content,
@@ -2378,9 +2474,14 @@ async def _apply_outcomes(session: AsyncSession, body: OutcomesIn, author: str) 
             # `session` travels WITH it, always: they are one provenance pair, and
             # updating the session without the identity leaves a row whose contact
             # details belong to a different agent from its author.
-            if edits or filled:
+            if rewrote or filled:
                 row.set_by, row.session = author, body.session
-        row.updated_at = now
+                # ...and only then. A no-op repeat — the shape an idempotent
+                # retry storm has — must not move the row's published timestamp
+                # while `set_by` and `revisions` correctly report that nothing
+                # happened, or "when was this last decided" answers "just now"
+                # for a decision taken last week.
+                row.updated_at = now
         # Read off the ROW, after it has been written, not off the payload: a
         # repeat that inherits a stored attestation is attested, and one that
         # explicitly clears it is not. Reading the payload alone reported the

@@ -598,11 +598,14 @@ class ReviewFindingOutcome(Base):
     #: today, in prose nothing counts.
     attested_by: Mapped[str | None] = mapped_column(Text)
 
-    #: How many times this outcome has been REPLACED. A terminal state that moves
-    #: is legitimate (a deferred finding is later fixed) and a silent flip is not:
-    #: with ``prior_outcome`` this says an answer changed and what it was, so a
-    #: window whose precision improved after the fact can be told from one whose
-    #: refutations were quietly rewritten.
+    #: How many times this record has CHANGED since it was first written — an
+    #: outcome replaced, or a stored field rewritten under an unchanged outcome.
+    #: Both, deliberately: a terminal state that moves is legitimate (a deferred
+    #: finding is later fixed) and a silent flip is not, and a refutation whose
+    #: NOTE is quietly rewritten improves an after-the-fact precision figure by
+    #: exactly the same route. ``prior_outcome`` covers only the first kind — the
+    #: answer this row used to give — so a non-zero ``revisions`` with an empty
+    #: ``prior_outcome`` is a record that was edited without the answer moving.
     revisions: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     prior_outcome: Mapped[str | None] = mapped_column(Text)
 
@@ -632,15 +635,26 @@ class ReviewFindingOutcome(Base):
         # NOT NULL rather than non-empty: the API already collapses whitespace to
         # NULL, so the two agree, and a CHECK that has to reason about trimming
         # would be a second opinion about what counts as a note.
+        # The two "the value must actually say something" rules, at the boundary
+        # rather than only in the API — for a backfill, an admin script, or the
+        # next write path. Three things each of them gets right:
+        #
+        # * the NOT NULL is not redundant beside the trim test. **A CHECK passes
+        #   when its expression evaluates to NULL**, so the trim alone would let a
+        #   null straight through — the exact row the rule exists to refuse.
+        # * `btrim` with an explicit character set, because single-argument
+        #   `btrim` strips ORDINARY SPACES ONLY: a note of one tab satisfied it.
+        # * they mirror the API's two required-field rules exactly, so a row this
+        #   service would refuse cannot arrive by another door.
         CheckConstraint(
-            # `btrim(...) <> ''` as well as NOT NULL, and the NOT NULL is not
-            # redundant: a CHECK passes when its expression is NULL, so
-            # `btrim(note) <> ''` ALONE would let a null note through — the exact
-            # row it exists to refuse. The API already collapses whitespace to
-            # NULL, so this only ever bites a writer that is not the API, which is
-            # the writer it is here for.
-            "outcome <> 'refuted' OR (note IS NOT NULL AND btrim(note) <> '')",
+            r"outcome <> 'refuted' OR (note IS NOT NULL "
+            r"AND btrim(note, E' \t\n\r\f\v') <> '')",
             name="ck_review_finding_outcomes_refuted_note",
+        ),
+        CheckConstraint(
+            "outcome <> 'superseded' OR (superseded_by IS NOT NULL "
+            r"AND btrim(superseded_by, E' \t\n\r\f\v') <> '')",
+            name="ck_review_finding_outcomes_superseded_by",
         ),
         CheckConstraint("revisions >= 0", name="ck_review_finding_outcomes_revisions"),
     )
