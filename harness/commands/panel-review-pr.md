@@ -333,6 +333,10 @@ own panel round — 8 P1s and 12 P2s outstanding at the moment it landed, on
 python3 ~/.claude/loops/preland.py --pr <pr>
 ```
 
+If that path does not exist, the box's `~/.claude/loops` predates the script — run
+`python3 harness/loops/preland.py --pr <pr> --repo .` from a checkout instead. A
+missing gate is not a passed one.
+
 - **HOLD (exit 2)** — do not merge, whatever was asked for. Show the user
   `reasons` and let them decide with them in front of them; someone asking for a
   merge is asking for the merge they think they are getting.

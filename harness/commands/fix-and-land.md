@@ -25,6 +25,13 @@ This is the hybrid path: the guardrails of a guided integration merge (lexray's 
    ```bash
    python3 ~/.claude/loops/preland.py --pr <pr> --json
    ```
+   **If that path does not exist, run it out of a checkout** — `python3 harness/loops/preland.py
+   --pr <pr> --repo . --json` — and do NOT read the missing file as permission to skip step 4.
+   `~/.claude/loops` is a nix store symlink, so it is exactly as current as the last
+   home-manager rebuild and nothing announces the gap; a box whose flake pin predates this script
+   simply does not have it yet. "The gate would not run, so I merged" is the failure this step was
+   written to remove, arriving through the step itself.
+
    It exits **0 = READY**, **3 = RECONCILE**, **2 = HOLD**, and the payload says why: `reasons`
    (what is unresolved and who has to resolve it), `actions` (the exact commands a RECONCILE needs
    and the files they touch), `warnings`, and `checks` — per guardrail, whether it ran, was skipped
