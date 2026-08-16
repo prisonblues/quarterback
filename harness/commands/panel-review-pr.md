@@ -238,14 +238,25 @@ three scripts does `install -m 0755 bin/*` and globs — and they are still in t
 board as confirmed.
 
 ```bash
-jq -c '{repo: .github, pr: .pr, outcomes: [...]}' r<r>.json   # keys are in the round payload
-printf '%s' "$payload" | qb record-outcome
+# the keys, beside what each finding actually was
+jq -r '.to_fix[] | "\(.key)\t\(.severity)\t\(.synthesis)"' r<r>.json
+
+cat <<'JSON' | qb record-outcome
+{"repo": "prisonblues/quarterback", "pr": 151, "outcomes": [
+  {"key": "<key of a finding the fixer resolved>", "outcome": "fixed"},
+  {"key": "<key of one that was not a defect>", "outcome": "refuted",
+   "note": "installPhase does `install -m 0755 bin/*` — it globs, the script IS installed"},
+  {"key": "<key of one left for later>", "outcome": "deferred",
+   "deferred_to": "prisonblues/quarterback#132"}
+]}
+JSON
 ```
 
-The `key` of each finding is in the round's `--json-file` payload (`.to_fix[].key`),
-which is the same identity the board chains observations by — so an outcome
-recorded now attaches to every round that raised the defect, including the ones
-still to come.
+A key is a 16-character hex digest, and it is the same identity the board chains
+observations by — so an outcome recorded now attaches to every round that raised
+the defect, including the ones still to come. (Substituted rather than shown
+inline because a literal one reads as an API key to every secret scanner,
+`gitleaks` on this repo's pre-commit hook included.)
 
 One of four per finding:
 
