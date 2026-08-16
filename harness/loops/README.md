@@ -179,7 +179,10 @@ on no branch and a PR cannot introduce one.
 - `landing` — `auto` suggests integration vs multi from coupling signals; `integration`
   = one epic branch → one PR; `multi` = a PR per sub-issue.
 - `sub_pr_merge` — integration only. `auto` ff-merges each green sub-PR into the epic
-  branch; `gate` holds each at a human merge.
+  branch; `gate` holds each at a human merge. **Defaults to `gate`.** It is the switch
+  that decides whether the review gate merges anything, and that gate has been wrong on
+  its first attempt three rounds running — so it defaults closed, like every other
+  setting that lets an agent act unattended. Turning it on is one line.
 - `auto_finish` — on a `/fix-issue` that pushed nothing, commit+push salvaged work
   rather than failing the issue.
 - `executor_worktree_args` — extra flags for `create-worktree` (e.g. `["--no-docker"]`).
@@ -418,6 +421,18 @@ has to be updated.
 Per sub-issue: create worktree → `/fix-issue` → CI → panel → `/review-pr` → stop at
 the human merge. Merge is never automatic. Run state in `~/.local/state/loops/`, so a
 killed run resumes instead of re-deriving from GitHub.
+
+Both skill runs are captured (and passed through, so the log stays live). The driver
+already refused to call an issue done without a PR; it now records *why* there wasn't
+one — the agent's own last sentence, which the torn-down worktree took with it before.
+A `/review-pr` that exited non-zero or printed nothing is a **failure**, not a review:
+`reviewed` is the outcome that lets the driver stack the sub-PR into the epic branch,
+so it would otherwise merge a PR whose findings nobody addressed. A re-run sees the
+open PR and retries the review stage. A review that ran and pushed nothing (the PR's
+head SHA is where it was) is *reported* rather than failed — finding nothing to fix is
+legitimate, and by the last round it is the point — but it is reported with the agent's
+own last sentence, because it is the same shape as a review that was stopped from
+fixing anything.
 
 ## Deployment
 

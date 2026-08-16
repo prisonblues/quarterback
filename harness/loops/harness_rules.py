@@ -136,7 +136,27 @@ DEFAULTS: dict = {
     },
     "epic": {
         "landing": "auto",
-        "sub_pr_merge": "auto",
+        # `gate` (hold each sub-PR at a human merge) until a repo opts in, on the
+        # same principle as approved authors (#63/#56): anything that lets an agent
+        # ACT without a human defaults closed. It also makes this module's own
+        # docstring true — DEFAULTS claims to be "the safe end of every switch: no
+        # auto-merge, no unattended loop", and `auto` was the one switch that
+        # contradicted it.
+        #
+        # This is the setting that decides whether the merge gate above it merges
+        # anything, and that gate has now been wrong on its first attempt
+        # three times running — each round replacing one proxy for "the review
+        # happened" with another (exit code, then the push, then the payload's
+        # existence). The current fix reads the panel's own declaration instead
+        # and has no fourth proxy to get wrong, but "we got it right this time" is
+        # what the last three said. Defaulting closed makes a fourth mistake cost
+        # a printed line instead of an unreviewed merge.
+        #
+        # Not a claim that auto-merge is wrong, and not permanent: #78 is where it
+        # becomes a governed setting with `escalate_on`/`quorum` beside it, and a
+        # repo that wants it back says so in one line. Until then this is the safe
+        # end of the switch, which is the end an unexercised gate belongs on.
+        "sub_pr_merge": "gate",
         "auto_finish": False,
         "executor_worktree_args": [],
         "min_free_mb": 2048,
