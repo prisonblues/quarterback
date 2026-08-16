@@ -351,59 +351,97 @@ class ReleaseClaimIn(BaseModel):
     note: str | None = Field(default=None, max_length=500)
 
 
-@router.post("/claim")
-async def take_claim(
-    body: ClaimIn,
-    holder: str = Depends(identify),
-    session: AsyncSession = Depends(get_session),
-) -> dict:
-    """Claim a named resource, or be told who has it.
+async def acquire(session: AsyncSession, *, kind: str, key: str, holder: str,
+                  ttl: int, sess: str | None, note: str | None,
+                  now: datetime) -> tuple[ResourceLease, bool]:
+    """Take or renew a claim on ``(kind, key)``. Raises :func:`_conflict` if held.
+
+    The whole of ``POST /claim``'s body, as a function, so a feature that needs
+    an atomic claim reuses this one rather than growing a second implementation
+    of "who has this right now" — which is the outcome #99 was filed to avoid and
+    the plan (v2.39) is the third feature to want. Returns ``(claim, renewed)``.
 
     Re-claiming something your own machine already holds is a RENEW, not a
     conflict — the same rule ``POST /lease`` applies, and for the same reason: a
     claim belongs to the box, and an agent that restarts mid-land must be able to
     pick its own claim back up rather than be locked out by its former self.
     """
+    await _sweep_lapsed(session, kind, key, now)
+    await session.commit()
+
+    held = await _held(session, kind, key, now)
+    if held is not None:
+        if not _may_mutate(held, holder, sess):
+            raise _conflict(kind, key, held)
+        _renew_onto(held, holder=holder, ttl=ttl, sess=sess, note=note, now=now)
+        await session.commit()
+        return held, True
+
+    claim = await _take(session, kind=kind, key=key, holder=holder,
+                        ttl=ttl, sess=sess, note=note, now=now)
+    if claim is not None:
+        return claim, False
+
+    # Lost the insert race. Re-read rather than reporting a generic failure:
+    # the loser of a race is exactly the caller who most needs to know who won.
+    winner = await _held(session, kind, key, now)
+    if winner is None:
+        raise HTTPException(409, detail={
+            "error": "claim contended; try again", "kind": kind, "key": key})
+    if not _may_mutate(winner, holder, sess):
+        raise _conflict(kind, key, winner)
+    # A real renew, written and committed — not a `renewed: true` over an
+    # untouched row. Same request, same reported outcome, same effect,
+    # whether or not a race happened to occur (F05).
+    _renew_onto(winner, holder=holder, ttl=ttl, sess=sess, note=note, now=now)
+    await session.commit()
+    return winner, True
+
+
+async def live_claim(session: AsyncSession, kind: str, key: str,
+                     now: datetime | None = None) -> ResourceLease | None:
+    """The claim holding ``(kind, key)`` right now, or None. For other routers."""
+    return await _held(session, kind, key, now or _utcnow())
+
+
+def claim_view(claim: ResourceLease) -> dict:
+    """One claim, as every claim endpoint renders it. For other routers."""
+    return _view(claim)
+
+
+def may_mutate(claim: ResourceLease, holder: str, session_id: str | None) -> bool:
+    """May this caller change this claim? The one ownership rule. For other routers."""
+    return _may_mutate(claim, holder, session_id)
+
+
+def is_unique_violation(exc: IntegrityError) -> bool:
+    """Postgres' 23505, told apart from every other integrity failure.
+
+    Public for the same reason as the rest of this section: the alternative is
+    each router re-deriving which ``IntegrityError`` means "somebody else has
+    that row" — and catching them all is round 1's F24, where a genuine schema
+    fault came back as a misleading "contended".
+    """
+    return _is_lost_race(exc)
+
+
+@router.post("/claim")
+async def take_claim(
+    body: ClaimIn,
+    holder: str = Depends(identify),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Claim a named resource, or be told who has it."""
     if body.kind in RESERVED_KINDS:
         raise HTTPException(409, detail={
             "error": f"{body.kind!r} claims are allocated, not taken",
             "kind": body.kind,
             "hint": "use POST /release/claim — see RESERVED_KINDS for why"})
 
-    now = _utcnow()
-    sess = _clean(body.session)
-    await _sweep_lapsed(session, body.kind, body.key, now)
-    await session.commit()
-
-    held = await _held(session, body.kind, body.key, now)
-    if held is not None:
-        if not _may_mutate(held, holder, sess):
-            raise _conflict(body.kind, body.key, held)
-        _renew_onto(held, holder=holder, ttl=body.ttl, sess=sess,
-                    note=body.note, now=now)
-        await session.commit()
-        return {**_view(held), "claimed": True, "renewed": True}
-
-    claim = await _take(session, kind=body.kind, key=body.key, holder=holder,
-                        ttl=body.ttl, sess=sess, note=body.note, now=now)
-    if claim is None:
-        # Lost the insert race. Re-read rather than reporting a generic failure:
-        # the loser of a race is exactly the caller who most needs to know who won.
-        winner = await _held(session, body.kind, body.key, now)
-        if winner is None:
-            raise HTTPException(409, detail={
-                "error": "claim contended; try again",
-                "kind": body.kind, "key": body.key})
-        if _may_mutate(winner, holder, sess):
-            # A real renew, written and committed — not a `renewed: true` over an
-            # untouched row. Same request, same reported outcome, same effect,
-            # whether or not a race happened to occur (F05).
-            _renew_onto(winner, holder=holder, ttl=body.ttl, sess=sess,
-                        note=body.note, now=now)
-            await session.commit()
-            return {**_view(winner), "claimed": True, "renewed": True}
-        raise _conflict(body.kind, body.key, winner)
-    return {**_view(claim), "claimed": True, "renewed": False}
+    claim, renewed = await acquire(
+        session, kind=body.kind, key=body.key, holder=holder, ttl=body.ttl,
+        sess=_clean(body.session), note=body.note, now=_utcnow())
+    return {**_view(claim), "claimed": True, "renewed": renewed}
 
 
 @router.post("/claim/renew")

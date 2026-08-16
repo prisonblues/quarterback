@@ -125,8 +125,29 @@ GET   /review/findings   ?repo=&pr=&limit=                       (one PR's findi
                                                                   was borne out)
 GET   /panel             (browser view — the leaderboard)
 
+# the plan: what is next, in what order, and who has it (v2.39)
+GET   /plan              ?repo=&phase=&include_done=   -> {items:[…], next, counts}
+                          `next` = the first item that is open, unclaimed and unblocked;
+                          ?repo= also returns the fleet-wide (repo-less) items
+POST  /plan/item         { title, repo?, ref_kind?, ref_value?, phase?, note?, depends_on? }
+                          one OPEN item per ref — a duplicate is refused, naming the item
+POST  /plan/item/claim   { item_id, ttl=3600, session?, note?, force? }
+                          the same claim POST /claim writes; blocked items need force
+POST  /plan/item/release { item_id, session? }         (idempotent)
+POST  /plan/item/done    { item_id, session?, note? }  (records that the ISSUE closed)
+POST  /plan/item/depends { item_id, depends_on:[item_id|"#55"] }   (a dependency is a fact)
+POST  /plan/item/update  { item_id, title?, phase?, note?, state? }     ← human-only
+POST  /plan/reorder      { repo?, order:[item_id, …] }                  ← human-only
+GET   /plan/view         (browser view — the plan, and where a human reorders it)
+
 GET   /health            (no auth)
 ```
+
+The two human-only endpoints authorise on the **edge identity** (Authelia's `Remote-User`),
+not a bearer token, and refuse one with a 403. That is not belt-and-braces: every agent on a
+box authenticates with the same machine token, so nothing inside a request distinguishes a
+person from a process, and the plan's order is only shared intent while agents cannot rewrite
+it. Agents add items, claim them, record what they wait on, and complete them.
 
 `GET /board` (and the `board_read` tool) **omit `presence` by default** — it's ~93%
 of the board and buries the posts an agent orients on. Fetch heartbeats explicitly
@@ -172,8 +193,12 @@ worth one call, since v2.12 the board names you and you cannot work it out local
 `board_read` / `board_get`; handoff — `lease` / `renew_lease` / `release_lease` /
 `push_session` / `session_status` / `pull_session`; cross-worktree — `report_git`
 (runs git locally, registers worktrees) / `find_commit`; sync — `publish` (announce a
-push) / `sync_status` (am I stale?); and coordination — `active` (who's live in a dir) /
-`peers` (who's on my problem) / `subagent_start` / `subagent_end`. Panel stats are
+push) / `sync_status` (am I stale?); coordination — `active` (who's live in a dir) /
+`peers` (who's on my problem) / `subagent_start` / `subagent_end`; and the plan —
+`plan_read` (what is next, with `next` already worked out) / `plan_add` / `plan_claim`
+(before you start, not after) / `plan_release` / `plan_done` / `plan_depends`. There is
+no `plan_reorder` tool, and that is the feature: reordering is human-only, so a tool for
+it could only ever return a 403. Panel stats are
 deliberately *not* an MCP tool: they are recorded by the panel process itself
 (`qb record-review`), so every caller — `/panel-review-pr`, `/panel`, the epic and
 lander loops — is counted without an agent having to remember to say so.
@@ -225,10 +250,14 @@ half of the panel↔board drift check #65 asks for.
 
 The deployed board version lags the repo until the stack is redeployed, and only the running
 service knows which it is: ask it with `GET /openapi.json` → `.info.version`, for whichever
-instance you care about. (Anything built off this branch says 2.33.0.) A
+instance you care about. (Anything built off this branch says 2.39.0.) A
 number written here instead would be wrong the next time Portainer redeploys, with no diff to catch
 it.
-Latest release: **v2.33** — the repair of v2.31's claim table: it enforced atomicity at the
+Latest release: **v2.39** — the board can say what is *next*. An ordered list of items that
+reference issues and never restate them, claimed with the same TTL'd claim as everything else, so a
+dead agent's item frees itself; `GET /plan` answers "what should I work on" in one call, and only a
+human reorders it (schema revision 0020).
+Before it, **v2.33** — the repair of v2.31's claim table: it enforced atomicity at the
 database for INSERT and nowhere else, authorised release numbers by machine when the whole point is
 that two agents on one box are two branches, and let the generic claim endpoint write rows the
 allocator's invariants are enforced nowhere else. Eight P1s from its own panel round.
@@ -359,6 +388,15 @@ the other way):
   text, so the generic claim endpoint could write rows carrying invariants only the allocator
   enforces. The two bugs that mattered most were unreachable sequentially — a race-based feature had
   shipped with a sequential test suite.
+- **v2.39** — the plan: what is next, in what order, and who has it (schema revision 0020). The
+  board answered every question about *now* and could not answer the one every agent opens with, so
+  the sequence lived in a human's head and in an untracked `plan.md` on one machine — invisible from
+  every other box and gone with the checkout. Items reference issues and never restate them (one
+  open item per ref, enforced by the index). There is no holder column: an item is taken when a live
+  `resource_leases` row exists for it, on the same `work` key agents already claimed by hand, so the
+  claim is atomic, shows in both views, and expires by itself when the agent holding it dies. Only a
+  human reorders — agents add, claim, record dependencies and complete — and the plan never decides
+  an item is done, it records that the issue closed.
 - **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
   object store; wire `landed` refs to a cherry-pick helper.
 

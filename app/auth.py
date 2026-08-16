@@ -146,3 +146,41 @@ def reader(
         "authentication required",
         headers={"WWW-Authenticate": "Bearer"},
     )
+
+
+def human(
+    authorization: str = Header(default=""),
+    remote_user: str = Header(default="", alias="Remote-User"),
+) -> str:
+    """Authorise a write only a PERSON may make — reordering the plan (v2.39).
+
+    ``reader`` lets an agent's bearer token and an edge-authenticated browser
+    through the same door, because for a read they are the same caller. For the
+    plan's order they are not: if any agent may reorder it, the plan thrashes and
+    stops being the shared intent it exists to be; if only a human may, it stays
+    the human's sequence and agents claim, complete and record against it.
+
+    The authentication *method* is the only axis that can tell the two apart —
+    every agent on a box holds the same machine token, so nothing inside a
+    request from one distinguishes it from a person with the same token. So this
+    accepts the edge identity (Authelia's ``Remote-User``, which the edge must
+    strip from client input) and refuses a bearer token, with a 403 that says
+    what to do instead rather than merely "no". ``browser_dev_user`` is the same
+    local-only bypass ``reader`` has, for running the board without the edge.
+    """
+    if remote_user:
+        return remote_user
+    if settings.browser_dev_user:
+        return settings.browser_dev_user
+    if _match_bearer(authorization) is not None:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "this is a human-only endpoint: agents claim and complete plan items, "
+            "people decide their order. Use the board in a browser (the edge "
+            "supplies your identity), or set BROWSER_DEV_USER for a local board.",
+        )
+    raise HTTPException(
+        status.HTTP_401_UNAUTHORIZED,
+        "authentication required",
+        headers={"WWW-Authenticate": "Bearer"},
+    )

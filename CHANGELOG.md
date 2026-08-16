@@ -7,6 +7,59 @@ that number where it was, so the repo can be a version ahead of the service.
 Entries are newest first. Each one says what was broken or missing before it, because that is the
 part that isn't recoverable from the diff.
 
+## v2.39 — the board knew who was here and not what was next
+
+Presence, publishes, panel findings: the board could answer every question about *now*. The one
+question every agent actually opens with — **what should I work on** — it could not answer at all,
+so every agent guessed. Three of them once fixed the same red CI job in one morning, and the third
+had checked for peers first and been told the coast was clear. Presence said nobody was in that
+file. Nothing said the job was already taken.
+
+That knowledge lived in three places, none of them the board. **26 unordered issues**, which hold
+the what and the why per item and say nothing about sequence, dependency, or which one to start.
+**A human**, repeating the plan to each agent that asked. And an untracked **`plan.md` on `zeus`** —
+which worked, and was invisible from `hermes`, invisible from a container, and gone with the
+checkout. `epic.py`'s `~/.local/state/loops/epic-*.json` and the panel's `/tmp/panel-<pr>-r<n>.json`
+are the same shape and the same flaw: real item state with real resume semantics, visible only to
+the process that wrote it.
+
+**`GET /plan` is the one call an agent makes cold**, and `next` is the answer already worked out:
+the first item that is open, unclaimed and unblocked. The list shows why the ones above it were
+passed over — held by somebody (named, with their session and what they said they were doing) or
+waiting on something unfinished.
+
+**There is no holder column.** An item is taken when a live `resource_leases` row exists for it, so
+the claim is atomic at v2.31's partial unique index and expires passively — a dead agent's claim
+disappears with no reaper and nobody intervening, which is the property a GitHub assignee cannot
+have: an agent that dies at 3am stays assigned forever. For an issue-backed item the key is exactly
+the `work` key agents had already converged on by hand (`kind='work'`,
+`key='prisonblues/quarterback#142'`), so a claim taken through the plain `POST /claim` shows up in
+the plan without the claimant doing anything, and the two views cannot drift.
+
+**Four rules, and they are the design:**
+
+1. *It never restates an issue.* An item is a title, a ref and an order; `ix_plan_items_open_ref`
+   makes "one open item per issue" a database fact rather than a convention.
+2. *It never decides an item is done.* `done` records that the linked issue closed — git ancestry
+   and GitHub remain the authority. `epic.py` had this right first: *"the file is the fast path +
+   audit trail"*.
+3. *Only a human reorders.* If any agent may, the plan thrashes; if only a human may, it stays the
+   shared intent it exists to be. The split runs the whole way through: order and intent are the
+   human's (reorder, retitle, drop — authorised by the *edge* identity, because every agent on a box
+   holds the same token and nothing else can tell a person from a process), while observations are
+   the fleet's — an agent may add an item, claim it, record what it waits on, and complete it.
+4. *It is not a project-management tool.* No estimates, no sprints, no burndown, no assignee — the
+   claim is the assignee and it expires. `stale` is reported on every read, because a plan nobody
+   updates is worse than none: it is believed.
+
+Not #53's review queue, and the difference is the point: a review job is machine-generated and
+self-clearing, a plan item is human intent that outlives many sessions. Separate table, shared claim
+mechanism — `POST /claim`'s body is now `acquire()`, called by both, so this is the third feature to
+want an atomic claim and the first not to build one.
+
+`/plan/view` is the human board's plan, and the only place the human-only endpoints can be reached
+from a browser. Schema revision **0020**.
+
 ## v2.33 — v2.31's claim table was right about INSERT and wrong about everything else
 
 v2.31 landed the resource-claim table and its release allocator, and its own panel round found
