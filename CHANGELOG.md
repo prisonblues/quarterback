@@ -7,6 +7,42 @@ that number where it was, so the repo can be a version ahead of the service.
 Entries are newest first. Each one says what was broken or missing before it, because that is the
 part that isn't recoverable from the diff.
 
+## v2.32 — the panel knew whether CI passed and told no reviewer
+
+`review_ci()` has run on every round since it was written. Its result reached the payload and the
+human report, and neither prompt — so a full suite could pass or fail on the exact commit under
+review while every seat judged the diff unaware of it. This is not "get CI to the reviewers"; the
+process was already holding the answer and discarding it.
+
+The cost was measured before it was fixed. Reviewers spend `could_not_assess` entries on questions a
+green suite settles — *"pytest was blocked in this environment"*, *"automated tests could not be
+executed"* — and each of those becomes a `coverage_veto` line, while `round_stop` computes
+`confident` as `not veto`. **A seat's inability to run the tests was costing the whole round its
+confident stop.** On PR #90 a full four-seat panel reviewed a PR whose `app suite` and `harness
+suites` checks were both green, and no seat was told.
+
+Both prompts now carry the result in words, and the judge gets it too — arguably the bigger half,
+since its job is dismissing false positives and a finding contradicted by a passing suite is the
+easiest dismissal there is.
+
+Three things it deliberately does not do:
+
+* **No non-passing state reads as a pass.** `PENDING`, `none` and `unknown` each say so in words.
+  "CI has not run yet" and "CI passed" are different facts, and a reviewer told the wrong one is
+  worse off than one told nothing.
+* **A pass is not a licence to stop looking.** The prompt says what green *means* — every test the
+  project thought to write passed — and states plainly that this is not evidence the code is
+  correct. The defects a reviewer hunts live where nobody wrote a test, and this repo's standing
+  argument is that a passing signal is the dangerous kind.
+* **It adds no fetch.** A run that could not read CI says so rather than retrying to tidy the prompt.
+
+One ordering change falls out: CI is now read **before** the seats are dispatched rather than
+concurrently with them. That is why its answer could never have been in their prompt before. One
+`gh pr checks` against a round measured in minutes is a couple of seconds for a fact that refutes a
+whole class of finding.
+
+Harness-side: the served board version is unchanged.
+
 ## v2.31 — an announcement is not a claim: the board allocates, atomically
 
 Nine release-number collisions in two days, and the last three killed the cheap remedy. Two agents

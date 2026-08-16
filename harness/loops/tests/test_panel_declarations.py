@@ -67,8 +67,9 @@ def _echoed(prompt: str, **fields) -> str:
     return re.sub(r"<[^<>]+>", "null", block).replace("true|false", "true")
 
 
-REVIEW_ECHO = _echoed(panel.REVIEW_PROMPT, n=1, repo="acme/board", base="main", diff="")
-JUDGE_ECHO = _echoed(panel.JUDGE_PROMPT, findings="", coverage="", diff="")
+REVIEW_ECHO = _echoed(panel.REVIEW_PROMPT, n=1, repo="acme/board", base="main",
+                      ci="", diff="")
+JUDGE_ECHO = _echoed(panel.JUDGE_PROMPT, findings="", coverage="", ci="", diff="")
 
 
 def test_the_schema_the_prompts_ship_is_recognised_as_a_quotation():
@@ -1156,7 +1157,7 @@ PANEL_CFG = {"github": "acme/board", "path": "/tmp/acme-board",
              "review_panel": {}}
 
 
-def _fake_adjudicate(clusters, diff, model, pr, budget=None, coverage=None, cwd=None):
+def _fake_adjudicate(clusters, diff, model, pr, budget=None, coverage=None, cwd=None, ci=""):
     """Every reported finding confirmed, one canonical record each — the judge's
     ruling is not what these tests are about."""
     flat = [f for grp in clusters for f in grp]

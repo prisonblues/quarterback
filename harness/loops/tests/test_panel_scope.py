@@ -958,7 +958,7 @@ def budget_for_partial_context() -> int:
 
 
 def _judge(seen):
-    def fake(clusters, diff, model, pr, budget=None, coverage=None):
+    def fake(clusters, diff, model, pr, budget=None, coverage=None, ci=""):
         seen["diff"], seen["budget"] = diff, budget
         return [], None, ""
     return fake

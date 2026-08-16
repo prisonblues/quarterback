@@ -303,6 +303,7 @@ whether another review will be needed — you cannot observe findings you have n
   RESULT should be read again — the fix can create new interactions the current diff does
   not contain. False for a local edit whose correctness is evident from the fix itself.
 
+{ci}
 PR #{n} ({repo}), base={base}:
 {diff}
 """
@@ -361,6 +362,7 @@ Reports:
 
 Coverage declared by the reviewers:
 {coverage}
+{ci}
 {diff}
 """
 
@@ -4074,6 +4076,57 @@ def review_sonarqube(sonar: dict, pr: dict,
     return "no-pr-analysis", [], soft, note
 
 
+def ci_brief(status: str, failing: list[str], skip: str | None = None) -> str:
+    """The CI result, in words, for both prompts (#91).
+
+    The panel has always computed this on every run and thrown it away before
+    anyone reviewed: `review_ci` reached the payload and the human report and
+    neither prompt. So reviewers judged a diff while a full suite had already
+    passed or failed on that exact commit, and spent `could_not_assess` budget
+    saying they could not run anything — which is not free, because each such
+    declaration becomes a `coverage_veto` line and `round_stop` computes
+    `confident` as `not veto`. A seat's inability to run the tests was costing
+    the round its confident stop, with the answer already in the process.
+
+    Three things this must not do, all of them the same discipline this codebase
+    applies to NULL vs `[]`:
+
+    * **`PENDING`/`unknown`/`none` must never read as `PASS`.** "CI has not run
+      yet" and "CI passed" are different facts, and a reviewer told the wrong one
+      is worse off than one told nothing. Each of the five states says which it is.
+    * **A pass is not a licence to stop looking.** It says every test we thought
+      to write passed — not that the code is correct. A reviewer treating green as
+      evidence of correctness has stopped reviewing, and this repo's whole
+      argument is that a passing signal is the dangerous kind.
+    * **It never adds a fetch.** If `review_ci` was skipped or unreadable the
+      brief says so, rather than retrying to make the prompt tidier.
+    """
+    head = "CI (the repo's own test suite, run on this exact commit):"
+    if status == "PASS":
+        body = ("PASSED. Every test the project has thought to write is green on this commit. "
+                "That REFUTES findings of the form \"this new test never runs\", \"this may not "
+                "even import\", or \"this migration looks syntactically incomplete\" — do not "
+                "spend a finding or a `could_not_assess` entry on them. It is NOT evidence the "
+                "code is correct: it says nothing about a case nobody wrote a test for, which is "
+                "where the defects you are looking for live.")
+    elif status == "FAIL":
+        named = ", ".join(failing) if failing else "check names unavailable"
+        body = (f"FAILED. Non-passing checks: {named}. Something the project already tests is "
+                "broken by this diff. Treat that as a fact you may reason from, not as a finding "
+                "to re-report — it is already visible to everyone.")
+    elif status == "PENDING":
+        body = ("STILL RUNNING, so its result is NOT known. This is not a pass. Anything you "
+                "would have checked against a green suite is still unchecked.")
+    elif status == "none":
+        body = ("no checks are configured for this repository, so there is no suite result "
+                "either way. This is not a pass.")
+    else:
+        body = ("could NOT be read"
+                + (f" ({skip})" if skip else "")
+                + ". Its result is unknown. This is not a pass.")
+    return f"{head} {body}"
+
+
 def review_ci(gh_repo: str, pr_number: int) -> tuple[str, list[str], str | None]:
     """Fetch the PR's CI status via `gh pr checks`. Returns
     (status, failing, skip_reason); status is PASS | FAIL | PENDING | none | unknown
@@ -4558,7 +4611,8 @@ def _parse_verdicts(parsed: list, flat: list[Finding], pr: int) -> list[Canonica
 
 def adjudicate(clusters: list[list[Finding]], diff: str, model: str, pr: int,
                budget: int | None = DEFAULT_DIFF_BUDGET,
-               coverage: dict[str, list[str]] | None = None
+               coverage: dict[str, list[str]] | None = None,
+               ci: str = ""
                ) -> tuple[list[Canonical], str | None, str]:
     """The 'master' rules on every finding, merges the duplicates it finds, AND
     rules on the coverage the reviewers declared about themselves.
@@ -4626,7 +4680,12 @@ def adjudicate(clusters: list[list[Finding]], diff: str, model: str, pr: int,
     # plus a long panel used to cross the argv limit on its own — and a judge
     # that dies takes every finding through UNADJUDICATED, which reads like a
     # triaged review rather than like a failure.
-    prompt = JUDGE_PROMPT.format(findings=listing, coverage=stated, diff=diff_text)
+    # The judge gets the CI result too, and that is arguably the bigger half of
+    # #91: its job is dismissing false positives, and a finding contradicted by a
+    # passing suite is the easiest dismissal there is. Today it could not make it.
+    prompt = JUDGE_PROMPT.format(findings=listing, coverage=stated,
+                                 ci=ci or ci_brief("unknown", [], "not computed for this run"),
+                                 diff=diff_text)
     args = ["claude", "-p"] + (["--model", model] if model else [])
     # The judge gets a sandbox of its own on the same reasoning as the reviewers,
     # and one sharper argument: it is the seat whose loss is worst (a judge that
@@ -5895,9 +5954,20 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                for name in LLM_REVIEWERS if name in selected}
     judge_budget = diff_budget(panel, "judge_max_diff_chars", panel_budget, notes)
 
+    # Read BEFORE the seats are dispatched, because its result now travels in
+    # their prompt (#91). It used to run concurrently with them and be collected
+    # afterwards, which is why the panel could compute CI on every run and still
+    # tell no reviewer about it. One `gh pr checks` against a round that takes
+    # minutes is a couple of seconds of wall-clock for a fact that refutes a whole
+    # class of finding, so the overlap is not worth keeping.
+    ci_status, ci_failing, ci_skip = review_ci(gh_repo, pr_number)
+    if ci_skip:
+        result.skipped.append(ci_skip)
+    ci_text = ci_brief(ci_status, ci_failing, ci_skip)
+
     def prompt_for(budget: int | None) -> str:
         return REVIEW_PROMPT.format(n=pr_number, repo=gh_repo, base=base,
-                                    diff=review.material(budget)[0])
+                                    ci=ci_text, diff=review.material(budget)[0])
 
     # `agy` is the only reviewer whose prompt must travel in argv, so it is the
     # only one the kernel can veto. Clamp it to what execve will carry and say
@@ -6022,7 +6092,6 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 {"number": pr_number, "base": base,
                  "head": meta["headRefName"], "head_sha": meta["headRefOid"]},
                 changed_lines, cfg["path"])
-        ci_future = ex.submit(review_ci, gh_repo, pr_number)
 
         llm_findings: list[Finding] = []
         ran_llm: list[str] = []
@@ -6092,9 +6161,6 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 # anything into the population the judge clusters, and only this
                 # branch can. See `filers`.
                 sonar_filed = bool(soft)
-        ci_status, ci_failing, ci_skip = ci_future.result()
-        if ci_skip:
-            result.skipped.append(ci_skip)
 
     # Pre-cluster as a hint, then let the master MERGE the duplicates and rule on
     # each issue in one step (no consensus gate). Dedup cannot happen upstream of
@@ -6132,7 +6198,8 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             "it was shown less of than the reviewers were")
     notes.extend(judge_gaps)
     findings, judge_skip, coverage_note = adjudicate(
-        clusters, judge_text, panel.get("judge_model", ""), pr_number, None, coverage)
+        clusters, judge_text, panel.get("judge_model", ""), pr_number, None, coverage,
+        ci=ci_text)
     judged = judge_skip is None and bool(findings)
     to_fix = sorted((c for c in findings if c.verdict != "dismissed"),
                     key=lambda c: c.severity)
