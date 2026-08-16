@@ -28,6 +28,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
+import panel_core  # noqa: E402  — `sh` is defined here since #129
+import panel_seats  # noqa: E402  — run_cli lives here since #129
 from conftest import gh_stub  # noqa: E402
 
 
@@ -174,7 +176,7 @@ def _gh(monkeypatch, meta_json: str, reviewers: dict) -> None:
         "github": "o/r", "path": "/tmp/r", "reviewers": reviewers,
         "review_panel": {"skip_title_patterns": ["^Merge "]},
     })
-    monkeypatch.setattr(panel, "sh", gh_stub(meta=json.loads(meta_json), diff="diff"))
+    monkeypatch.setattr(panel_core, "sh", gh_stub(meta=json.loads(meta_json), diff="diff"))
 
 
 META_FILES = [{"path": "app/api/reviews.py", "additions": 120, "deletions": 4},
@@ -196,7 +198,7 @@ def test_a_reviewed_run_sends_the_paths_with_the_line_count(monkeypatch, capsys)
                         lambda *a, **k: panel.ReviewerRun([], None, 5))
     monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
     monkeypatch.setattr(panel.shutil, "which", lambda _: "/usr/bin/claude")
-    monkeypatch.setattr(panel, "run_cli", lambda *a, **k: (reply, None))
+    monkeypatch.setattr(panel_seats, "run_cli", lambda *a, **k: (reply, None))
     monkeypatch.setattr(panel, "record_run", lambda p: None)
     panel.run("r", 1701, post=False, json_out=True)
     payload = json.loads(capsys.readouterr().out)
@@ -232,7 +234,7 @@ def test_a_partial_list_is_said_out_loud_and_not_only_implied(monkeypatch, capsy
                         lambda *a, **k: panel.ReviewerRun([], None, 5))
     monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
     monkeypatch.setattr(panel.shutil, "which", lambda _: "/usr/bin/claude")
-    monkeypatch.setattr(panel, "run_cli", lambda *a, **k: (reply, None))
+    monkeypatch.setattr(panel_seats, "run_cli", lambda *a, **k: (reply, None))
     monkeypatch.setattr(panel, "record_run", lambda p: None)
     panel.run("r", 1703, post=False, json_out=True)
     payload = json.loads(capsys.readouterr().out)
@@ -251,7 +253,7 @@ def test_a_complete_list_says_nothing(monkeypatch, capsys):
                         lambda *a, **k: panel.ReviewerRun([], None, 5))
     monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
     monkeypatch.setattr(panel.shutil, "which", lambda _: "/usr/bin/claude")
-    monkeypatch.setattr(panel, "run_cli", lambda *a, **k: (reply, None))
+    monkeypatch.setattr(panel_seats, "run_cli", lambda *a, **k: (reply, None))
     monkeypatch.setattr(panel, "record_run", lambda p: None)
     panel.run("r", 1704, post=False, json_out=True)
     payload = json.loads(capsys.readouterr().out)
@@ -269,7 +271,7 @@ def test_the_pr_state_travels_with_the_file_list(monkeypatch, capsys):
                         lambda *a, **k: panel.ReviewerRun([], None, 5))
     monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
     monkeypatch.setattr(panel.shutil, "which", lambda _: "/usr/bin/claude")
-    monkeypatch.setattr(panel, "run_cli", lambda *a, **k: (reply, None))
+    monkeypatch.setattr(panel_seats, "run_cli", lambda *a, **k: (reply, None))
     monkeypatch.setattr(panel, "record_run", lambda p: None)
     panel.run("r", 1705, post=False, json_out=True)
     payload = json.loads(capsys.readouterr().out)
@@ -303,7 +305,7 @@ def test_a_dropped_entry_does_not_masquerade_as_a_truncated_list(monkeypatch, ca
                         lambda *a, **k: panel.ReviewerRun([], None, 5))
     monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
     monkeypatch.setattr(panel.shutil, "which", lambda _: "/usr/bin/claude")
-    monkeypatch.setattr(panel, "run_cli", lambda *a, **k: (reply, None))
+    monkeypatch.setattr(panel_seats, "run_cli", lambda *a, **k: (reply, None))
     monkeypatch.setattr(panel, "record_run", lambda p: None)
     panel.run("r", 1707, post=False, json_out=True)
     notes = json.loads(capsys.readouterr().out)["config_notes"]

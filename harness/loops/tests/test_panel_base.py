@@ -38,6 +38,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
+import panel_core  # noqa: E402  — `sh` is defined here since #129
 from conftest import UNSET, gh_stub, pr_meta  # noqa: E402
 
 
@@ -60,7 +61,7 @@ def _sh_raising(exc: BaseException):
 # --------------------------------------------------------------------------
 
 def test_the_base_tip_is_read_from_the_ref(monkeypatch):
-    monkeypatch.setattr(panel, "sh", _sh_returning(REF_BODY))
+    monkeypatch.setattr(panel_core, "sh", _sh_returning(REF_BODY))
     assert panel._base_tip_now("acme/board", "main") == "beef0001"
 
 
@@ -72,7 +73,7 @@ def test_the_ref_endpoint_is_asked_for_by_name(monkeypatch):
     commit including its file list to deliver one sha, and this call runs on the
     critical path of every reviewed round."""
     seen = []
-    monkeypatch.setattr(panel, "sh",
+    monkeypatch.setattr(panel_core, "sh",
                         lambda args, **kw: (seen.append(args), REF_BODY)[1])
     panel._base_tip_now("acme/board", "release/2.x")
     assert seen[0][:2] == ["gh", "api"]
@@ -89,7 +90,7 @@ def test_the_call_is_bounded_by_a_timeout(monkeypatch):
         seen.update(kw)
         return REF_BODY
 
-    monkeypatch.setattr(panel, "sh", fake)
+    monkeypatch.setattr(panel_core, "sh", fake)
     panel._base_tip_now("acme/board", "main")
     assert seen.get("timeout") == panel.FIX_RANGE_TIMEOUT_S
 
@@ -97,7 +98,7 @@ def test_the_call_is_bounded_by_a_timeout(monkeypatch):
 def test_no_base_branch_asks_nothing(monkeypatch):
     """An empty ref would build `…/git/ref/heads/` and ask GitHub for every
     branch there is. There is nothing to look up, and the answer is None."""
-    monkeypatch.setattr(panel, "sh", _sh_raising(AssertionError("must not call gh")))
+    monkeypatch.setattr(panel_core, "sh", _sh_raising(AssertionError("must not call gh")))
     assert panel._base_tip_now("acme/board", "") is None
 
 
@@ -110,12 +111,12 @@ def test_every_way_the_call_can_fail_is_a_None_and_not_a_crash(monkeypatch):
     for exc in (subprocess.CalledProcessError(1, "gh"),
                 FileNotFoundError("gh"),
                 subprocess.TimeoutExpired("gh", 60)):
-        monkeypatch.setattr(panel, "sh", _sh_raising(exc))
+        monkeypatch.setattr(panel_core, "sh", _sh_raising(exc))
         assert panel._base_tip_now("acme/board", "main") is None, exc
 
     for body in ("<html>502</html>", "null", "[]", "{}",
                  json.dumps({"object": {}}), json.dumps({"object": None})):
-        monkeypatch.setattr(panel, "sh", _sh_returning(body))
+        monkeypatch.setattr(panel_core, "sh", _sh_returning(body))
         assert panel._base_tip_now("acme/board", "main") is None, body
 
 
@@ -161,7 +162,7 @@ def _run(monkeypatch, tmp_path, title="feat: a thing", merge_base="0ddba5e0",
         return panel.ReviewerRun([], None, 800, None)
 
     monkeypatch.setattr(panel, "load_repo_cfg", lambda name: cfg or CFG)
-    monkeypatch.setattr(panel, "sh", fake_sh)
+    monkeypatch.setattr(panel_core, "sh", fake_sh)
     monkeypatch.setattr(panel, "review_llm", fake_review)
     monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
     monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], None, ""))
@@ -250,7 +251,7 @@ def test_merge_base_is_re_read_when_the_head_moves(monkeypatch):
         seen.append(args)
         return json.dumps({"baseRefOid": "bbbbbbbb2222"})
 
-    monkeypatch.setattr(panel, "sh", fake)
+    monkeypatch.setattr(panel_core, "sh", fake)
     assert panel._merge_base_now("acme/board", 128) == "bbbbbbbb2222"
     assert any("baseRefOid" in " ".join(a) for a in seen), \
         "asked GitHub for the wrong field"
@@ -265,7 +266,7 @@ def test_the_merge_base_re_read_is_bounded_like_its_siblings(monkeypatch):
         seen.update(kw)
         return json.dumps({"baseRefOid": "b" * 12})
 
-    monkeypatch.setattr(panel, "sh", fake)
+    monkeypatch.setattr(panel_core, "sh", fake)
     panel._merge_base_now("acme/board", 128)
     assert seen.get("timeout") == panel.FIX_RANGE_TIMEOUT_S
 
@@ -279,11 +280,11 @@ def test_every_way_the_merge_base_re_read_can_fail_is_a_None(monkeypatch):
     for exc in (subprocess.CalledProcessError(1, "gh"),
                 FileNotFoundError("gh"),
                 subprocess.TimeoutExpired("gh", 60)):
-        monkeypatch.setattr(panel, "sh", _sh_raising(exc))
+        monkeypatch.setattr(panel_core, "sh", _sh_raising(exc))
         assert panel._merge_base_now("acme/board", 128) is None, exc
-    monkeypatch.setattr(panel, "sh", lambda *a, **k: "not json")
+    monkeypatch.setattr(panel_core, "sh", lambda *a, **k: "not json")
     assert panel._merge_base_now("acme/board", 128) is None
-    monkeypatch.setattr(panel, "sh", lambda *a, **k: json.dumps({}))
+    monkeypatch.setattr(panel_core, "sh", lambda *a, **k: json.dumps({}))
     assert panel._merge_base_now("acme/board", 128) is None
 
 

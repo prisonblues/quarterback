@@ -32,6 +32,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
+import panel_seats  # noqa: E402
+import panel_core  # noqa: E402  — `sh` is defined here since #129
 from conftest import gh_stub  # noqa: E402
 
 
@@ -286,7 +288,7 @@ def _sh_raising(exc):
 def test_a_readable_range_comes_back_as_a_diff(monkeypatch):
     """The happy path, reconstructed from the compare API's per-file patches into
     something `_diff_added_lines` reads — which is the only consumer."""
-    monkeypatch.setattr(panel, "sh", _sh_returning(_compare()))
+    monkeypatch.setattr(panel_core, "sh", _sh_returning(_compare()))
     diff, why = panel._fix_range_diff("acme/board", "aaaa1111", "bbbb2222")
     assert why is None
     assert panel._diff_added_lines(diff) == {"app/sync.py": {11, 12}}
@@ -303,7 +305,7 @@ def test_the_range_is_asked_for_as_json_not_as_a_raw_diff(monkeypatch):
         seen.append(args)
         return _compare()
 
-    monkeypatch.setattr(panel, "sh", fake)
+    monkeypatch.setattr(panel_core, "sh", fake)
     panel._fix_range_diff("acme/board", "aaaa1111", "bbbb2222")
     assert seen and "--jq" in seen[0] and "Accept: application/vnd.github.v3.diff" not in seen[0]
 
@@ -314,7 +316,7 @@ def test_a_branch_REWRITTEN_between_rounds_is_refused(monkeypatch):
     back to somewhere on main, and the "fix range" balloons to every line the PR
     ever added — so every finding on a PR-added line reads `introduced` and the
     fixer is confidently blamed for all of it. GitHub calls it `diverged`."""
-    monkeypatch.setattr(panel, "sh", _sh_returning(_compare(status="diverged")))
+    monkeypatch.setattr(panel_core, "sh", _sh_returning(_compare(status="diverged")))
     diff, why = panel._fix_range_diff("acme/board", "aaaa1111", "bbbb2222")
     assert diff is None and "diverged" in why and "rewritten" in why
 
@@ -323,7 +325,7 @@ def test_an_empty_compare_is_no_range(monkeypatch):
     """A revert that nets to nothing, or an empty commit. Treated as a readable
     range with zero added lines, every new finding comes back `missed` —
     confidently, and with no note to say the range was empty."""
-    monkeypatch.setattr(panel, "sh", _sh_returning(_compare(files=())))
+    monkeypatch.setattr(panel_core, "sh", _sh_returning(_compare(files=())))
     diff, why = panel._fix_range_diff("acme/board", "aaaa1111", "bbbb2222")
     assert diff is None and "changed no line" in why
 
@@ -333,8 +335,8 @@ def test_a_range_too_large_to_hold_is_not_held(monkeypatch):
     multi-commit range big enough to matter is not worth the memory: past the cap
     it degrades to unknown, which costs a signal, rather than to a resident copy
     of somebody's vendored tree."""
-    monkeypatch.setattr(panel, "FIX_RANGE_MAX_CHARS", 40)
-    monkeypatch.setattr(panel, "sh", _sh_returning(_compare()))
+    monkeypatch.setattr(panel_seats, "FIX_RANGE_MAX_CHARS", 40)
+    monkeypatch.setattr(panel_core, "sh", _sh_returning(_compare()))
     diff, why = panel._fix_range_diff("acme/board", "aaaa1111", "bbbb2222")
     assert diff is None and "larger than" in why
 
@@ -348,7 +350,7 @@ def test_the_call_is_bounded_by_a_timeout(monkeypatch):
         seen.update(kw)
         return _compare()
 
-    monkeypatch.setattr(panel, "sh", fake)
+    monkeypatch.setattr(panel_core, "sh", fake)
     panel._fix_range_diff("acme/board", "aaaa1111", "bbbb2222")
     assert seen.get("timeout") == panel.FIX_RANGE_TIMEOUT_S
 
@@ -358,7 +360,7 @@ def test_a_missing_end_of_the_range_is_named_before_any_call_is_made(monkeypatch
     very differently to an operator: a baseline written before `head_sha` existed
     is a one-off that fixes itself next round, an unmoved head means no fix pass
     ran at all."""
-    monkeypatch.setattr(panel, "sh", _sh_raising(AssertionError("must not call gh")))
+    monkeypatch.setattr(panel_core, "sh", _sh_raising(AssertionError("must not call gh")))
     assert panel._fix_range_diff("acme/board", None, "bbbb2222")[1].startswith(
         "the baseline does not record")
     assert "did not record" in panel._fix_range_diff("acme/board", "aaaa1111", None)[1]
@@ -369,7 +371,7 @@ def test_an_unmoved_head_is_not_a_github_failure(monkeypatch):
     API fault that never happened. Nothing landed between the rounds — that is the
     whole of it, and asking GitHub to compare a commit with itself buys an API
     call to be told so."""
-    monkeypatch.setattr(panel, "sh", _sh_raising(AssertionError("must not call gh")))
+    monkeypatch.setattr(panel_core, "sh", _sh_raising(AssertionError("must not call gh")))
     diff, why = panel._fix_range_diff("acme/board", "aaa111", "aaa111")
     assert diff is None and why == "no commit landed between rounds (head unchanged at aaa111)"
 
@@ -379,7 +381,7 @@ def test_a_range_that_github_cannot_serve_is_a_reason_not_a_crash(monkeypatch):
     is not gated on, so it must never take a round down with it — and the earlier
     version of this test reached none of this, because every call it made exited
     through a guard clause before `gh` was ever invoked."""
-    monkeypatch.setattr(panel, "sh", _sh_raising(subprocess.CalledProcessError(1, "gh")))
+    monkeypatch.setattr(panel_core, "sh", _sh_raising(subprocess.CalledProcessError(1, "gh")))
     diff, why = panel._fix_range_diff("acme/board", "aaaa1111", "bbbb2222")
     assert diff is None and "could not read the range aaaa1111..bbbb2222" in why
 
@@ -389,16 +391,16 @@ def test_no_gh_on_path_is_a_reason_too(monkeypatch):
     and not a CalledProcessError. Caught only on the latter, it escapes `run()` and
     kills a whole review round to protect an attribution nothing gates on — the
     exact outcome the docstring promises will not happen."""
-    monkeypatch.setattr(panel, "sh", _sh_raising(FileNotFoundError("gh")))
+    monkeypatch.setattr(panel_core, "sh", _sh_raising(FileNotFoundError("gh")))
     assert panel._fix_range_diff("acme/board", "aaaa1111", "bbbb2222")[0] is None
 
 
 def test_a_hung_call_and_a_mangled_body_are_reasons_too(monkeypatch):
     """The other two ways this can fail once it has started: the timeout firing,
     and a body that is not the JSON the `--jq` projection promises."""
-    monkeypatch.setattr(panel, "sh", _sh_raising(subprocess.TimeoutExpired("gh", 60)))
+    monkeypatch.setattr(panel_core, "sh", _sh_raising(subprocess.TimeoutExpired("gh", 60)))
     assert panel._fix_range_diff("acme/board", "aaaa1111", "bbbb2222")[0] is None
-    monkeypatch.setattr(panel, "sh", _sh_returning("<html>502</html>"))
+    monkeypatch.setattr(panel_core, "sh", _sh_returning("<html>502</html>"))
     assert panel._fix_range_diff("acme/board", "aaaa1111", "bbbb2222")[0] is None
 
 
@@ -626,7 +628,7 @@ def _panel_round(monkeypatch, tmp_path, round_no, findings, head, baseline=(),
                  for i, grp in enumerate(clusters) for f in grp], None, "")
 
     monkeypatch.setattr(panel, "load_repo_cfg", lambda name: cfg or CFG)
-    monkeypatch.setattr(panel, "sh", fake_sh)
+    monkeypatch.setattr(panel_core, "sh", fake_sh)
     monkeypatch.setattr(panel, "review_llm", fake_review)
     monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
     monkeypatch.setattr(panel, "adjudicate", fake_adjudicate)
@@ -801,7 +803,7 @@ def test_the_head_RE_READ_is_bounded_by_a_timeout(monkeypatch):
         seen.update(kw)
         return json.dumps({"headRefOid": "ccc333"})
 
-    monkeypatch.setattr(panel, "sh", fake)
+    monkeypatch.setattr(panel_core, "sh", fake)
     assert panel._head_sha_now("acme/board", 77) == "ccc333"
     assert seen.get("timeout") == panel.FIX_RANGE_TIMEOUT_S
 
@@ -811,7 +813,7 @@ def test_a_compare_body_that_is_valid_json_but_not_an_OBJECT_is_a_reason(monkeyp
     `json.loads` and leaves through the ValueError arm. A body of `null` or `[]`
     parses cleanly and then has no `.get`, which is the case that guard is for."""
     for body in ("null", "[]"):
-        monkeypatch.setattr(panel, "sh", _sh_returning(body))
+        monkeypatch.setattr(panel_core, "sh", _sh_returning(body))
         diff, why = panel._fix_range_diff("acme/board", "aaaa1111", "bbbb2222")
         assert diff is None and "not an object" in why
 

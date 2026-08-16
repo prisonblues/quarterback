@@ -30,6 +30,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import harness_rules  # noqa: E402
 import panel  # noqa: E402
+import panel_seats  # noqa: E402  — run_cli lives here since #129
 
 ANSWER = '{"verdict": "fails", "reason": "the skip branch returns finish(failed)"}'
 
@@ -654,7 +655,7 @@ def _seat(monkeypatch, *replies, err=None):
     """Stub the CLI so `run_seat` returns each reply in turn."""
     monkeypatch.setattr(panel.shutil, "which", lambda _: "/usr/bin/claude")
     seen = list(replies)
-    monkeypatch.setattr(panel, "run_cli",
+    monkeypatch.setattr(panel_seats, "run_cli",
                         lambda *a, **k: (seen.pop(0) if seen else replies[-1], err))
     return seen
 
@@ -690,7 +691,7 @@ def test_an_unreadable_reply_buys_exactly_one_retry(monkeypatch):
         calls.append(1)
         return ("prose" if len(calls) == 1 else ANSWER), None
 
-    monkeypatch.setattr(panel, "run_cli", fake)
+    monkeypatch.setattr(panel_seats, "run_cli", fake)
     got = panel.ask_llm("claude", "opus", "p")
     assert got.verdict == "fails" and len(calls) == 2
 
@@ -765,7 +766,7 @@ def test_a_review_that_produced_nothing_is_a_skip_and_not_a_blank_finding(monkey
 def test_run_seat_without_a_parser_never_retries(monkeypatch):
     calls = []
     monkeypatch.setattr(panel.shutil, "which", lambda _: "/usr/bin/claude")
-    monkeypatch.setattr(panel, "run_cli",
+    monkeypatch.setattr(panel_seats, "run_cli",
                         lambda *a, **k: (calls.append(1), ("prose", None))[1])
     turn = panel.run_seat("claude", "opus", "p")
     assert turn.reply == "prose" and turn.parsed is None and len(calls) == 1
@@ -1207,7 +1208,7 @@ def test_the_seat_whose_prompt_travels_in_argv_is_clamped_and_said(monkeypatch, 
     clamp, which is how a seat could get an unbounded prompt and die at execve
     with an opaque error."""
     (repo / "big.py").write_text("z" * 4_000)
-    monkeypatch.setattr(panel, "ARGV_PROMPT_MAX_BYTES", 2_000)
+    monkeypatch.setattr(panel_seats, "ARGV_PROMPT_MAX_BYTES", 2_000)
     monkeypatch.setattr(panel, "record_ask", lambda payload: None)
     prompts = {}
 

@@ -18,6 +18,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
+import panel_core  # noqa: E402  — `sh` is defined here since #129
+import panel_seats  # noqa: E402  — run_cli lives here since #129
 from conftest import gh_stub  # noqa: E402
 
 
@@ -397,14 +399,14 @@ def test_an_absent_judge_keeps_every_finding_with_its_account(monkeypatch):
 
 def test_an_unparseable_judge_reply_keeps_every_finding(monkeypatch):
     monkeypatch.setattr(panel.shutil, "which", lambda _: "/usr/bin/claude")
-    monkeypatch.setattr(panel, "run_cli", lambda *a, **k: ("I have thoughts.", None))
+    monkeypatch.setattr(panel_seats, "run_cli", lambda *a, **k: ("I have thoughts.", None))
     out, skip, _ = panel.adjudicate(clusters_of(find()), "diff", "", 1)
     assert "unparseable" in skip and [c.verdict for c in out] == ["unjudged"]
 
 
 def test_a_dead_judge_reports_why_and_suppresses_nothing(monkeypatch):
     monkeypatch.setattr(panel.shutil, "which", lambda _: "/usr/bin/claude")
-    monkeypatch.setattr(panel, "run_cli", lambda *a, **k: (None, "judge: timed out after 600s"))
+    monkeypatch.setattr(panel_seats, "run_cli", lambda *a, **k: (None, "judge: timed out after 600s"))
     out, skip, _ = panel.adjudicate(clusters_of(find(), find(reviewer="pi")), "diff", "", 1)
     assert skip == "judge: timed out after 600s" and len(out) == 2
 
@@ -491,14 +493,14 @@ def run_panel(monkeypatch, judge_reply, findings, capsys, json_out=False, sonar=
     })
     meta = {"title": "t", "additions": 1, "deletions": 0,
             "headRefName": "h", "headRefOid": "abc"}
-    monkeypatch.setattr(panel, "sh", gh_stub(meta=meta, diff="diff"))
+    monkeypatch.setattr(panel_core, "sh", gh_stub(meta=meta, diff="diff"))
     per_reviewer = {"codex": findings[:1], "claude": findings[1:]}
     monkeypatch.setattr(panel, "review_llm",
                         lambda name, *a, **k: panel.ReviewerRun(
                             per_reviewer.get(name, []), None, 5))
     monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
     monkeypatch.setattr(panel.shutil, "which", lambda _: "/usr/bin/claude")
-    monkeypatch.setattr(panel, "run_cli", lambda *a, **k: (judge_reply, None))
+    monkeypatch.setattr(panel_seats, "run_cli", lambda *a, **k: (judge_reply, None))
     recorded = {}
     monkeypatch.setattr(panel, "record_run", lambda p: recorded.update(p))
     assert panel.run("r", 1609, post=False, json_out=json_out) == 0
@@ -515,12 +517,12 @@ def test_json_mode_puts_nothing_but_the_payload_on_stdout(monkeypatch, capsys):
     })
     meta = {"title": "t", "additions": 1, "deletions": 0,
             "headRefName": "h", "headRefOid": "abc"}
-    monkeypatch.setattr(panel, "sh", gh_stub(meta=meta, diff="diff"))
+    monkeypatch.setattr(panel_core, "sh", gh_stub(meta=meta, diff="diff"))
     monkeypatch.setattr(panel, "review_llm",
                         lambda *a, **k: panel.ReviewerRun([find()], None, 5))
     monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
     monkeypatch.setattr(panel.shutil, "which", lambda _: "/usr/bin/claude")
-    monkeypatch.setattr(panel, "run_cli", lambda *a, **k: (reply, None))
+    monkeypatch.setattr(panel_seats, "run_cli", lambda *a, **k: (reply, None))
     monkeypatch.setattr(panel, "record_run", lambda p: None)
     panel.run("r", 1609, post=False, json_out=True)
     captured = capsys.readouterr()
@@ -537,7 +539,7 @@ def test_a_skipped_pr_still_answers_json_mode(monkeypatch, capsys):
     })
     meta = {"title": "Merge test into main", "additions": 1, "deletions": 0,
             "headRefName": "h", "headRefOid": "abc"}
-    monkeypatch.setattr(panel, "sh", gh_stub(meta=meta))
+    monkeypatch.setattr(panel_core, "sh", gh_stub(meta=meta))
     assert panel.run("r", 1609, post=False, json_out=True) == 0
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
@@ -600,7 +602,7 @@ def test_a_skipped_pr_answers_with_the_same_payload_SHAPE_as_a_reviewed_one(
     })
     meta = {"title": "Merge test into main", "additions": 1, "deletions": 0,
             "headRefName": "h", "headRefOid": "abc"}
-    monkeypatch.setattr(panel, "sh", gh_stub(meta=meta))
+    monkeypatch.setattr(panel_core, "sh", gh_stub(meta=meta))
     assert panel.run("r", 1609, post=False, json_out=True) == 0
     skipped = json.loads(capsys.readouterr().out)
 

@@ -22,6 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
+import panel_seats  # noqa: E402  — run_cli lives here since #129
 
 FINDINGS = '[{"severity":"P2","file":"a.py","line":1,"title":"t","detail":"d"}]'
 
@@ -244,7 +245,7 @@ def test_codex_findings_come_from_the_file_not_the_event_stream(monkeypatch):
         on_output(out)
         return out, None
 
-    monkeypatch.setattr(panel, "run_cli", fake)
+    monkeypatch.setattr(panel_seats, "run_cli", fake)
     run = panel.review_llm("codex", "gpt-5.6-luna", "p")
     assert run.skip is None and len(run.findings) == 1
     assert run.usage["input_tokens"] == 90 and run.usage["output_tokens"] == 20
@@ -259,7 +260,7 @@ def test_a_reviewer_that_burned_tokens_then_failed_still_reports_them(monkeypatc
         return None, "codex: timed out after 600s"
 
     monkeypatch.setattr(panel.shutil, "which", lambda _: "/usr/bin/codex")
-    monkeypatch.setattr(panel, "run_cli", burned)
+    monkeypatch.setattr(panel_seats, "run_cli", burned)
     run = panel.review_llm("codex", "gpt-5.6-luna", "p")
     assert "timed out" in run.skip
     assert run.usage["input_tokens"] == 5000
@@ -269,8 +270,8 @@ def test_an_unreadable_session_costs_a_number_and_never_the_findings(monkeypatch
     """The trade this whole approach is chosen for. Nothing at all is written
     where claude's transcript would be, and the review still lands."""
     monkeypatch.setattr(panel.shutil, "which", lambda _: "/usr/bin/claude")
-    monkeypatch.setattr(panel, "run_cli", lambda *a, **k: (FINDINGS, None))
-    monkeypatch.setattr(panel, "claude_usage",
+    monkeypatch.setattr(panel_seats, "run_cli", lambda *a, **k: (FINDINGS, None))
+    monkeypatch.setattr(panel_seats, "claude_usage",
                         lambda _sids: (_ for _ in ()).throw(OSError("no transcript")))
     run = panel.review_llm("claude", "opus", "p")
     assert run.skip is None and len(run.findings) == 1
@@ -290,8 +291,8 @@ def capture_argv(monkeypatch, cli, reviewer, model):
         return FINDINGS, None
 
     monkeypatch.setattr(panel.shutil, "which", lambda _: cli)
-    monkeypatch.setattr(panel, "run_cli", run)
-    monkeypatch.setattr(panel, "claude_usage", lambda _sids: None)
+    monkeypatch.setattr(panel_seats, "run_cli", run)
+    monkeypatch.setattr(panel_seats, "claude_usage", lambda _sids: None)
     panel.review_llm(reviewer, model, "p")
     return seen["argv"]
 
@@ -325,8 +326,8 @@ def test_every_attempt_gets_its_own_session(monkeypatch):
         return FINDINGS, None
 
     monkeypatch.setattr(panel.shutil, "which", lambda _: "/usr/bin/claude")
-    monkeypatch.setattr(panel, "run_cli", flaky)
-    monkeypatch.setattr(panel, "claude_usage", lambda sids: {"seen": len(sids)})
+    monkeypatch.setattr(panel_seats, "run_cli", flaky)
+    monkeypatch.setattr(panel_seats, "claude_usage", lambda sids: {"seen": len(sids)})
     run = panel.review_llm("claude", "opus", "p")
     assert len(set(ids)) == 3                    # three attempts, three ids
     assert run.usage == {"seen": 3}              # and all three are read back
@@ -417,7 +418,7 @@ def test_antigravity_reviews_exactly_as_before_and_reports_no_tokens(monkeypatch
     null renders as "not recorded" rather than as a free reviewer."""
     seen = {}
     monkeypatch.setattr(panel.shutil, "which", lambda _: "/usr/bin/agy")
-    monkeypatch.setattr(panel, "run_cli",
+    monkeypatch.setattr(panel_seats, "run_cli",
                         lambda args, *a, **k: (seen.update(args=args), (FINDINGS, None))[1])
     run = panel.review_llm("antigravity", "gemini-3-pro", "p")
     assert run.usage is None and len(run.findings) == 1
@@ -469,7 +470,7 @@ def test_each_codex_attempt_gets_its_own_reply_file(monkeypatch):
         return out, None
 
     monkeypatch.setattr(panel.shutil, "which", lambda _: "/usr/bin/codex")
-    monkeypatch.setattr(panel, "run_cli", fake)
+    monkeypatch.setattr(panel_seats, "run_cli", fake)
     run = panel.review_llm("codex", "gpt-5.6-luna", "p")
     assert len(set(seen)) == len(seen), "a fresh path per attempt, never reused"
     # Four, not two: the last attempt wrote no reply, so the reply is missing
