@@ -104,13 +104,15 @@ class QuarterbackClient:
         resp.raise_for_status()
         return resp.json()
 
-    def renew_claim(self, claim_id: str) -> dict:
-        resp = self._http.post(self._url("/claim/renew"), json={"claim_id": claim_id})
+    def renew_claim(self, claim_id: str, session: str | None = None) -> dict:
+        resp = self._http.post(self._url("/claim/renew"),
+                               json={"claim_id": claim_id, "session": session})
         resp.raise_for_status()
         return resp.json()
 
-    def release_claim(self, claim_id: str) -> dict:
-        resp = self._http.post(self._url("/claim/release"), json={"claim_id": claim_id})
+    def release_claim(self, claim_id: str, session: str | None = None) -> dict:
+        resp = self._http.post(self._url("/claim/release"),
+                               json={"claim_id": claim_id, "session": session})
         resp.raise_for_status()
         return resp.json()
 
