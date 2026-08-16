@@ -23,6 +23,10 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
+from conftest import gh_stub  # noqa: E402
+
+
+
 
 
 def _reports(title, file="a.py", reviewer="codex", line=1, flagged=False):
@@ -63,8 +67,9 @@ def _echoed(prompt: str, **fields) -> str:
     return re.sub(r"<[^<>]+>", "null", block).replace("true|false", "true")
 
 
-REVIEW_ECHO = _echoed(panel.REVIEW_PROMPT, n=1, repo="acme/board", base="main", diff="")
-JUDGE_ECHO = _echoed(panel.JUDGE_PROMPT, findings="", coverage="", diff="")
+REVIEW_ECHO = _echoed(panel.REVIEW_PROMPT, n=1, repo="acme/board", base="main",
+                      ci="", diff="")
+JUDGE_ECHO = _echoed(panel.JUDGE_PROMPT, findings="", coverage="", ci="", diff="")
 
 
 def test_the_schema_the_prompts_ship_is_recognised_as_a_quotation():
@@ -1152,7 +1157,7 @@ PANEL_CFG = {"github": "acme/board", "path": "/tmp/acme-board",
              "review_panel": {}}
 
 
-def _fake_adjudicate(clusters, diff, model, pr, budget=None, coverage=None, cwd=None):
+def _fake_adjudicate(clusters, diff, model, pr, budget=None, coverage=None, cwd=None, ci=""):
     """Every reported finding confirmed, one canonical record each — the judge's
     ruling is not what these tests are about."""
     flat = [f for grp in clusters for f in grp]
@@ -1169,10 +1174,9 @@ def _stub_panel(monkeypatch, findings=None, title="feat: x", cfg=PANEL_CFG):
     if findings is None:
         findings = [panel.Finding("claude", "P3", "a.py", 3, "unused import")]
     monkeypatch.setattr(panel, "load_repo_cfg", lambda name: cfg)
-    monkeypatch.setattr(panel, "sh", lambda args, **kw: (
-        json.dumps({"title": title, "additions": 3, "deletions": 1,
-                    "baseRefName": "main", "headRefName": "feat/x", "headRefOid": "abc"})
-        if args[:3] == ["gh", "pr", "view"] else "diff --git a/a.py b/a.py\n+x\n"))
+    monkeypatch.setattr(panel, "sh", gh_stub(
+        meta={"title": title, "additions": 3, "deletions": 1, "headRefOid": "abc"},
+        diff="diff --git a/a.py b/a.py\n+x\n"))
     monkeypatch.setattr(panel, "review_llm",
                         lambda *a, **k: panel.ReviewerRun(list(findings), None, 10, []))
     monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
@@ -1322,10 +1326,9 @@ SONAR_CFG = {**PANEL_CFG,
 def _sonar_round(monkeypatch, tmp_path, round_no, baseline=(), max_rounds=3):
     """A round whose ONLY outstanding item is a SonarCloud hard-gate issue."""
     monkeypatch.setattr(panel, "load_repo_cfg", lambda name: SONAR_CFG)
-    monkeypatch.setattr(panel, "sh", lambda args, **kw: (
-        json.dumps({"title": "feat: x", "additions": 3, "deletions": 1,
-                    "baseRefName": "main", "headRefName": "feat/x", "headRefOid": "abc"})
-        if args[:3] == ["gh", "pr", "view"] else "diff --git a/a.py b/a.py\n+x\n"))
+    monkeypatch.setattr(panel, "sh", gh_stub(
+        meta={"title": "feat: x", "additions": 3, "deletions": 1, "headRefOid": "abc"},
+        diff="diff --git a/a.py b/a.py\n+x\n"))
     monkeypatch.setattr(panel, "review_llm",
                         lambda *a, **k: panel.ReviewerRun([], None, 10, []))
     monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
@@ -1366,10 +1369,9 @@ def test_a_json_file_that_could_not_be_written_fails_the_run(monkeypatch, capsys
     advance the cycle onto a baseline that does not exist, where every repeated
     finding reads as new."""
     monkeypatch.setattr(panel, "load_repo_cfg", lambda name: PANEL_CFG)
-    monkeypatch.setattr(panel, "sh", lambda args, **kw: (
-        json.dumps({"title": "feat: x", "additions": 3, "deletions": 1,
-                    "baseRefName": "main", "headRefName": "feat/x", "headRefOid": "abc"})
-        if args[:3] == ["gh", "pr", "view"] else "diff --git a/a.py b/a.py\n+x\n"))
+    monkeypatch.setattr(panel, "sh", gh_stub(
+        meta={"title": "feat: x", "additions": 3, "deletions": 1, "headRefOid": "abc"},
+        diff="diff --git a/a.py b/a.py\n+x\n"))
     monkeypatch.setattr(panel, "review_llm",
                         lambda *a, **k: panel.ReviewerRun([], None, 10, []))
     monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))

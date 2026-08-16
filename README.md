@@ -225,13 +225,28 @@ half of the panel↔board drift check #65 asks for.
 
 The deployed board version lags the repo until the stack is redeployed, and only the running
 service knows which it is: ask it with `GET /openapi.json` → `.info.version`, for whichever
-instance you care about. (Anything built off this branch says 2.26.0 — v2.27 and v2.28 are
-harness-side, v2.30 repo tooling.) A number written here instead would be wrong the next time
-Portainer redeploys, with no diff to catch it.
-Latest release: **v2.30** (repo tooling) — `scripts/migration_reconcile.py`, so two branches both
-minting migration `0018` is caught before it lands rather than after: renumbered when the
+instance you care about. (Anything built off this branch says 2.31.0.) A
+number written here instead would be wrong the next time Portainer redeploys, with no diff to catch
+it.
+Latest release: **v2.32** — the panel has always computed whether CI passed and told no reviewer:
+`review_ci` reached the payload and the human report, never a prompt. Both prompts and the judge now
+carry it in words, no non-passing state can read as a pass, and a green suite is stated as "every
+test we thought to write passed" rather than as evidence the code is correct. Harness-side, so the
+served version is unchanged.
+Previously: **v2.31** — the board allocates release numbers and merge claims atomically, off one
+resource-keyed lease table (schema revision 0019). Announcing a number on the board was falsified as
+a remedy nine times in two days: every agent was correct from what it could see, and an announcement
+does not force the next one to look. Asking does. Advisory, never a lock — it cannot stop a merge,
+only tell you who is already landing. Before it, **v2.30** (repo tooling) — `scripts/migration_reconcile.py`, so two branches
+both minting migration `0018` is caught before it lands rather than after: renumbered when the
 branch's migrations are one linear chain, and stopped when they are not.
-Before it, **v2.28**, harness-side — a panel round past the first reviews the fix commit rather
+Before it, **v2.29** — a panel round records both ends of what it was judged against, not just
+the commit it read: the merge base its diff was built from, and the base branch's tip at the time
+(schema revision 0018). The two are separate because GitHub's `baseRefOid` is the merge base, and a
+merge base does not move when the base branch does — so the obvious single-field version of this
+check could only ever answer "unmoved". (**v2.22** is claimed by PR #87, still open, which is why
+the numbering skips it.)
+Before that, **v2.28**, harness-side — a panel round past the first reviews the fix commit rather
 than re-reading the whole PR, with the PR as the last round saw it behind that as context.
 Before that, **v2.27** put one premise to the seats and reported the tally, with no diff, no judge and
 no gate, so a fix's assumption can be challenged in a minute instead of in a twenty-minute round,
@@ -308,16 +323,31 @@ the other way):
   back to the whole PR — and says why — when there is no anchor, when nothing was pushed, when a
   base-branch merge makes the range bigger than the PR itself, or when GitHub's compare response
   came back truncated.
-- **v2.30** — repo tooling: `scripts/migration_reconcile.py` decides, from the migration files at
-  two git refs and never from a live database, whether a branch's migrations land on a single
-  Alembic head. `migrations/versions/` is hand-numbered, so two agents both writing `0018` collide
-  on the revision **id** and not only on the filename — git conflicts on neither, and a graph-only
-  reconciler calls that merge clean. It renumbers the branch's chain instead, tells a collision
-  apart from a rewrite of already-merged history by asking git for the merge base, and reports the
-  prose that still names the old number rather than editing it. Where it cannot renumber — the
-  branch's migrations are not one chain, or an id in the contested chain carries no number — it
-  stops rather than deferring to `alembic merge heads`, which adds a merge revision and renumbers
-  nothing, so it cannot resolve a duplicate id.
+- **v2.29** — a round records what it was judged AGAINST, which was a branch name before: the merge
+  base its diff was built from and the base branch's tip at review time (schema revision 0018). Two
+  fields rather than one because GitHub's `baseRefOid` is the merge base, and adding commits to a
+  base branch cannot move a common ancestor — PR #87 held one value across ten commits of `main` —
+  so a staleness check resting on it alone would report "the review still stands" in exactly the
+  case it exists to catch. Stamped and published; what a moved base MEANS is #96's verdict.
+- **v2.30** — `scripts/migration_reconcile.py`: two branches both minting migration `0018` is caught
+  before it lands rather than after. Git conflicts on neither (the filenames differ) and a graph-only
+  reconciler calls the merge CLEAN, so the wrong answer was the reassuring one. Renumber-and-relink
+  when the branch's migrations are one linear chain; stop when they are not.
+- **v2.31** — release numbers and merge claims become an ALLOCATION rather than an announcement, off
+  one resource-keyed lease table with passive expiry (schema revision 0019). Nine collisions in two
+  days made the case: two agents announced the same number one second apart, both correct from what
+  they could see. Atomicity is a partial unique index, so the loser of a race loses at the database
+  rather than in the gap between looking and writing — which is where every one of those collisions
+  happened. Advisory and it says so in the refusal: the board cannot gate github.com. A lapsed claim
+  frees the KEY (a crashed lander must not wedge everyone's landing) but never the NUMBER, because
+  that branch may have shipped it. Renumbering is one atomic call rather than a release and a claim —
+  both of the collisions that prompted this were renumbers off an earlier one, and doing it in two
+  steps reopens the race in the exact window where the namespace is most contended.
+- **v2.32** — reviewers are told whether CI passed. The panel already computed it on every round and
+  discarded it before anyone reviewed, so seats spent `could_not_assess` entries on questions a green
+  suite settles — and each of those is a `coverage_veto` line, which costs the ROUND its confident
+  stop. CI is now read before the seats are dispatched rather than concurrently with them, which is
+  why its answer could never have reached their prompt before.
 - **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
   object store; wire `landed` refs to a cherry-pick helper.
 

@@ -18,6 +18,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
+from conftest import gh_stub  # noqa: E402
+
+
+
 
 F = panel.Finding
 
@@ -485,9 +489,9 @@ def run_panel(monkeypatch, judge_reply, findings, capsys, json_out=False, sonar=
         "reviewers": reviewers,
         "review_panel": {},
     })
-    meta = ('{"title":"t","additions":1,"deletions":0,"baseRefName":"main",'
-            '"headRefName":"h","headRefOid":"abc"}')
-    monkeypatch.setattr(panel, "sh", lambda args, **k: meta if "view" in args else "diff")
+    meta = {"title": "t", "additions": 1, "deletions": 0,
+            "headRefName": "h", "headRefOid": "abc"}
+    monkeypatch.setattr(panel, "sh", gh_stub(meta=meta, diff="diff"))
     per_reviewer = {"codex": findings[:1], "claude": findings[1:]}
     monkeypatch.setattr(panel, "review_llm",
                         lambda name, *a, **k: panel.ReviewerRun(
@@ -509,9 +513,9 @@ def test_json_mode_puts_nothing_but_the_payload_on_stdout(monkeypatch, capsys):
         "github": "o/r", "path": "/tmp/r",
         "reviewers": {"codex": {"enabled": True}}, "review_panel": {},
     })
-    meta = ('{"title":"t","additions":1,"deletions":0,"baseRefName":"main",'
-            '"headRefName":"h","headRefOid":"abc"}')
-    monkeypatch.setattr(panel, "sh", lambda args, **k: meta if "view" in args else "diff")
+    meta = {"title": "t", "additions": 1, "deletions": 0,
+            "headRefName": "h", "headRefOid": "abc"}
+    monkeypatch.setattr(panel, "sh", gh_stub(meta=meta, diff="diff"))
     monkeypatch.setattr(panel, "review_llm",
                         lambda *a, **k: panel.ReviewerRun([find()], None, 5))
     monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
@@ -531,9 +535,9 @@ def test_a_skipped_pr_still_answers_json_mode(monkeypatch, capsys):
         "github": "o/r", "path": "/tmp/r", "reviewers": {},
         "review_panel": {"skip_title_patterns": ["^Merge "]},
     })
-    meta = ('{"title":"Merge test into main","additions":1,"deletions":0,'
-            '"baseRefName":"main","headRefName":"h","headRefOid":"abc"}')
-    monkeypatch.setattr(panel, "sh", lambda args, **k: meta)
+    meta = {"title": "Merge test into main", "additions": 1, "deletions": 0,
+            "headRefName": "h", "headRefOid": "abc"}
+    monkeypatch.setattr(panel, "sh", gh_stub(meta=meta))
     assert panel.run("r", 1609, post=False, json_out=True) == 0
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
@@ -594,9 +598,9 @@ def test_a_skipped_pr_answers_with_the_same_payload_SHAPE_as_a_reviewed_one(
         "github": "o/r", "path": "/tmp/r", "reviewers": {},
         "review_panel": {"skip_title_patterns": ["^Merge "]},
     })
-    meta = ('{"title":"Merge test into main","additions":1,"deletions":0,'
-            '"baseRefName":"main","headRefName":"h","headRefOid":"abc"}')
-    monkeypatch.setattr(panel, "sh", lambda args, **k: meta)
+    meta = {"title": "Merge test into main", "additions": 1, "deletions": 0,
+            "headRefName": "h", "headRefOid": "abc"}
+    monkeypatch.setattr(panel, "sh", gh_stub(meta=meta))
     assert panel.run("r", 1609, post=False, json_out=True) == 0
     skipped = json.loads(capsys.readouterr().out)
 

@@ -7,6 +7,126 @@ that number where it was, so the repo can be a version ahead of the service.
 Entries are newest first. Each one says what was broken or missing before it, because that is the
 part that isn't recoverable from the diff.
 
+## v2.32 — the panel knew whether CI passed and told no reviewer
+
+`review_ci()` has run on every round since it was written. Its result reached the payload and the
+human report, and neither prompt — so a full suite could pass or fail on the exact commit under
+review while every seat judged the diff unaware of it. This is not "get CI to the reviewers"; the
+process was already holding the answer and discarding it.
+
+The cost was measured before it was fixed. Reviewers spend `could_not_assess` entries on questions a
+green suite settles — *"pytest was blocked in this environment"*, *"automated tests could not be
+executed"* — and each of those becomes a `coverage_veto` line, while `round_stop` computes
+`confident` as `not veto`. **A seat's inability to run the tests was costing the whole round its
+confident stop.** On PR #90 a full four-seat panel reviewed a PR whose `app suite` and `harness
+suites` checks were both green, and no seat was told.
+
+Both prompts now carry the result in words, and the judge gets it too — arguably the bigger half,
+since its job is dismissing false positives and a finding contradicted by a passing suite is the
+easiest dismissal there is.
+
+Three things it deliberately does not do:
+
+* **No non-passing state reads as a pass.** `PENDING`, `none` and `unknown` each say so in words.
+  "CI has not run yet" and "CI passed" are different facts, and a reviewer told the wrong one is
+  worse off than one told nothing.
+* **A pass is not a licence to stop looking.** The prompt says what green *means* — every test the
+  project thought to write passed — and states plainly that this is not evidence the code is
+  correct. The defects a reviewer hunts live where nobody wrote a test, and this repo's standing
+  argument is that a passing signal is the dangerous kind.
+* **It adds no fetch.** A run that could not read CI says so rather than retrying to tidy the prompt.
+
+One ordering change falls out: CI is now read **before** the seats are dispatched rather than
+concurrently with them. That is why its answer could never have been in their prompt before. One
+`gh pr checks` against a round measured in minutes is a couple of seconds for a fact that refutes a
+whole class of finding.
+
+Harness-side: the served board version is unchanged.
+
+## v2.31 — an announcement is not a claim: the board allocates, atomically
+
+Nine release-number collisions in two days, and the last three killed the cheap remedy. Two agents
+announced v2.23 on the board **one second apart** and were both correct from what they could see. On
+2026-08-16 a number claimed on the board at 10:17 was taken at 11:18 by an agent that picked it by
+reading `main` plus the open PRs' CHANGELOGs — a check that structurally cannot see a claim which
+exists only as a board post — and the renumber off *that* collision landed straight on a number
+claimed seven minutes earlier.
+
+**Announcement was falsified twice in one morning, and not because nobody announced.** An
+announcement does not force the next agent to look. An allocation does, because the number comes
+from asking.
+
+The same gap sits under landing. Nothing serialises it: several agents are live in this repo and
+each will at some point decide its gates are green and merge. Two doing that inside the same minute
+is not a rare interleaving — it is the normal case for a worktree-per-issue fleet, and the board is
+the only component that can see both.
+
+Both are one primitive, and #99 was filed largely to stop them being built twice. `resource_leases`
+is keyed on (`kind`, `key`) with the passive expiry the session lease already gets right:
+
+- `kind='merge'`, `key='<repo>:<branch>'` — held across a land.
+- `kind='release'`, `key='<repo>:<version>'` — held while a branch owns a number.
+
+`POST /claim` · `/claim/renew` · `/claim/release` · `GET /claims`, plus `POST /release/claim`,
+`POST /release/reclaim` and `GET /releases` for the allocator, and MCP tools for all of them — the feature is worth nothing if an
+agent cannot reach it from where it works.
+
+**Advisory, not a lock, and it says so in the refusal itself.** The board cannot gate github.com: a
+human merging in the UI, or an agent not enrolled here, lands regardless. What this removes is
+collisions between agents that ask, which is the observed failure mode and the entire claim. The
+correctness backstop stays where it was — the pre-land verdict re-checked after base movement (#96),
+and CI on `main`. A skill describing this as "the merge lock" is wrong.
+
+Four decisions worth more than the endpoints:
+
+- **Atomicity is a partial unique index, not a look-then-write.** `ix_resource_leases_held` is UNIQUE
+  on (`kind`, `key`) over unreleased rows only, so the loser of a race loses at the database. Every
+  collision above happened in the gap between an agent looking and an agent writing, so a design that
+  looks first cannot fix them. The index cannot also test `expires_at > now()` — a partial predicate
+  must be immutable — so the claim path sweeps a lapsed row first. That sweep stays passive: it runs
+  only when somebody asks for that exact key, so there is still no reaper and a quiet key costs
+  nothing.
+- **A refusal names the holder, their session and what they are doing.** An agent told only "held"
+  can do nothing but spin; one told "held by zeus/thorn-spruce, landing #128, expires 12:04" can go
+  and talk to them or pick up something else. The refusal is the coordination.
+- **Lapsing and letting go are different facts, and are stored as different facts.** A crashed holder
+  must not wedge everyone's landing, so a TTL sweep frees the key — but it sets `lapsed`, because for
+  a release number "the holder vanished" and "the holder finished" is the difference between
+  abandoned and shipped. **A lapsed number is never re-issued**: the branch holding it may well have
+  merged. History accumulates for exactly this reason, and released rows are kept rather than deleted.
+- **The same-machine renew rule of `/claim` must NOT apply to the allocator, and a concurrency test is
+  what proved it.** Four callers racing for one repo came back `3.1, 3.2, 3.3, 3.2` — the duplicate
+  being two agents on one box, where the second matched on machine and "renewed" into a number
+  already spoken for. For a merge claim, a box re-taking its own claim is an agent recovering from a
+  restart; for a release number, two agents on one machine are two *branches*, and this fleet runs
+  several agents per box all authenticating as that box. That is the population the allocator exists
+  for, so it would have been the first thing to break it. Idempotency is keyed on the session
+  instead, and asked before allocating rather than as a renew inside the loop — the loop's candidate
+  is always `highest + 1`, so a number the caller already holds is never the candidate.
+
+**The renumber is a first-class operation, because the renumber is where the collisions actually
+happened.** Both of 2026-08-16's were renumbers off an earlier collision, not fresh picks — and the
+proposal on #46 only covers the fresh pick. Choosing a version at the start feels like a decision, so
+it gets announced and re-read; replacing one feels like bookkeeping, so it gets neither. Doing it as
+release-then-claim through the two ordinary endpoints reopens exactly the race this table closes:
+between the two calls the caller holds nothing, and that window is widest precisely when the
+namespace is contended, which is the only time anyone renumbers. So `POST /release/reclaim` is one
+call and one transaction — the old row is released in the same commit that takes the new one, and a
+failed allocation rolls the release back with it. **You keep what you had, or you get the new one;
+never neither.** An agent holding a CHANGELOG full of a number it no longer owns, with nothing to
+replace it, is worse off than one that never tried.
+
+**Allocation takes both the caller's view and the board's, because neither is sufficient.** The board
+cannot read a CHANGELOG, so it knows nothing of the releases that merged before it existed; the
+caller's repo scan cannot see a claim that is not yet in any file, which is precisely how v2.28 was
+taken an hour after it was announced. `POST /release/claim {repo, after}` allocates
+`max(what you can see, what this board has handed out) + 1`. An `after` the board cannot parse falls
+back to board history and says so in `after_unreadable` — it never becomes a zero floor, which would
+allocate v0.1 over the top of a live series.
+
+#46's smaller half (the check that the number agrees with itself across four files) shipped in v2.21;
+this is its larger half. Schema revision **0019**.
+
 ## v2.30 — two branches could both write migration 0018 and the merge looked clean
 
 `migrations/versions/` is a hand-numbered linear chain: `0017_review_provenance.py` declares
@@ -66,6 +186,60 @@ deployed board is at whatever revision the last Portainer deploy left it and no 
 agree, so a resolution valid only from one starting revision is not a resolution.
 
 Repo tooling: the board schema is untouched and the served version stays 2.26.0.
+## v2.29 — a round said which commit it read and never which one it was judged against
+
+v2.26 gave a run its `head_sha` and its own migration named what was still missing: "#98 wants the
+other end of that range". A panel round's most consequential output is an empty **To fix** list, and
+that claim is only true relative to a base. The payload named the base with a branch *name*, which
+moves — so at merge time nothing could ask whether the base had moved since the review, and if it
+had, whether the movement touched anything the review looked at. The PR merges on a review that
+expired, and nobody gets an error. On this repo that is not a hypothetical: it runs ~1.8 integration
+merges per PR landed (#80).
+
+**The field the issue named for the job cannot do it, and finding that out is most of this release.**
+#98 proposed storing GitHub's `baseRefOid` as `base_sha` and having the pre-land check compare it
+against the PR's *current* `baseRefOid` — unmoved meaning the review still stands. But `baseRefOid`
+is the **merge base**, and a merge base is a common ancestor: commits added to one side of it do not
+move it. GitHub recomputes it when the HEAD branch is pushed, never when the base branch advances.
+
+Measured on this repo rather than argued from the docs. PR #87 sat at `baseRefOid = 88643c14` from
+20:34 while `main` took ten commits; REST `.base.sha` agreed; and `git merge-base origin/main
+origin/fix/issue-81`, computed against the moved `main` afterwards, still answered `88643c14`. Ten
+commits of base movement, zero movement in the field the check would have read. Three more PRs
+matched, and the two that did move their `baseRefOid` moved it by merging `main` INTO themselves —
+the branch acting, never the base. So the check as specified would answer *unmoved, the review still
+stands* precisely when `main` had run away underneath a clean panel verdict: not a failure recording
+as a success, but a staleness detector whose only possible output is **fresh**.
+
+So both ends are recorded, as two fields that mean different things (schema revision **0018**):
+
+- **`review_runs.merge_base`** — the PR's base commit. `gh pr diff` is the three-dot diff, so a
+  whole-PR round reads `merge_base...head_sha` and nothing in the payload had ever named the
+  left-hand side. Free off metadata `panel.py` already fetches, and it moves only when the PR merges
+  its base in or is rebased. It is the PR's anchor and not always the *round's*: v2.28 landed while
+  this was being built, and under its increment scope a later round's target is
+  `since_sha...head_sha` — `merge_base` is then where that round's tier-2 context is measured from.
+  A consumer assembling "what did this round read" reads `scope` first, exactly as one comparing
+  `diff_chars` across rounds already has to.
+- **`review_runs.base_sha`** — the live tip of the base branch at review time: what the PR would be
+  merged INTO. The end that moves on its own, and therefore the only one a staleness check can rest
+  on. It costs its own lookup (`git/ref/heads/…`, a few hundred bytes, not the commits endpoint's
+  whole file list), which is why the title-skip path does not pay for one — that path never reaches
+  the board, so a base tip recorded there would have no consumer.
+
+Neither is ever derived from the other, and their disagreement is not a defect: `base_sha !=
+merge_base` is the ordinary state of every PR whose base gained a commit after it forked. Warning on
+it would fire on nearly every run and be trained away, so the panel does not. NULL keeps its v2.26
+meaning throughout — **not recorded**, never "no base" — and a run whose base tip could not be read
+says so in `config_notes` instead of inventing a value. A garbled commit id is refused by the same
+`_sha_or_none` the head end uses and named back in the 201 as `merge_base_dropped` /
+`base_sha_dropped`, because a sender that thinks it stored a base must not be left believing it.
+
+**This release stamps and publishes; it draws no conclusion.** Whether a moved base makes a review
+stale is #96's verdict, and #98 states the asymmetry that verdict has to keep: proving staleness is
+cheap and proving freshness is not, so a base that moved without touching the PR's files is "no
+overlap detected" and never "the review is current". Files are a proxy — a base commit that changes
+a shared contract without touching this PR's files can still invalidate a finding.
 
 ## v2.28 — a later round reads the fix commit, not the whole PR again
 

@@ -935,6 +935,11 @@ CFG = {"github": "acme/board", "path": "/tmp/acme-board", "name": "board",
        "review_panel": {}}
 HEAD = "b" * 40
 ANCHOR = "a" * 40
+#: The PR's base commit and the base branch's live tip (v2.29). Distinct values,
+#: and distinct from `ANCHOR`: under increment scope the round's own left-hand
+#: side is the anchor, and the merge base is neither of the other two.
+MERGE_BASE = "c" * 40
+BASE_TIP = "d" * 40
 #: What `decide` builds for the runs below, so a test can work out a budget that
 #: lands between "the whole target fits" and "all of the context fits".
 SCOPED = panel.ReviewScope(scope="increment", diff=PR, increment=INCREMENT,
@@ -953,7 +958,7 @@ def budget_for_partial_context() -> int:
 
 
 def _judge(seen):
-    def fake(clusters, diff, model, pr, budget=None, coverage=None):
+    def fake(clusters, diff, model, pr, budget=None, coverage=None, ci=""):
         seen["diff"], seen["budget"] = diff, budget
         return [], None, ""
     return fake
@@ -968,8 +973,14 @@ def _stub_run(monkeypatch, seen, *, cfg=None, findings=(), increment=INCREMENT,
     def fake_sh(args, **kw):
         if args[:3] == ["gh", "pr", "view"]:
             return json.dumps({"title": title, "additions": 3, "deletions": 1,
-                               "baseRefName": "main", "headRefName": "feat/x",
-                               "headRefOid": HEAD})
+                               "baseRefName": "main", "baseRefOid": MERGE_BASE,
+                               "headRefName": "feat/x", "headRefOid": HEAD})
+        # The base branch's tip, which v2.29 reads to stamp what this round would
+        # be merged INTO. Answered here for the same reason the compare call
+        # below is: unanswered it degrades to a `config_notes` entry, and these
+        # tests read `config_notes` as a scope note that never happened.
+        if args[:2] == ["gh", "api"] and "/git/ref/heads/" in args[2]:
+            return json.dumps({"object": {"sha": BASE_TIP}})
         # The compare call PROVENANCE makes (v2.24), answered in the shape its
         # `--jq` projects. Scope's own compare calls are stubbed at
         # `fetch_increment`/`compare_facts` below, so this one is the only reader
@@ -1025,6 +1036,27 @@ def test_a_scoped_round_records_what_it_reviewed_and_against_what(monkeypatch, t
     assert got["context_chars"] == len(SCOPED.near) + len(SCOPED.far)
     assert got["config_notes"] == []
     assert "the fix commit" in seen["prompts"]["claude"]
+
+
+def test_a_scoped_round_keeps_the_PRs_base_apart_from_its_OWN_anchor(monkeypatch,
+                                                                     tmp_path):
+    """v2.29 stamps the base end; v2.28 moved what "the base of this round" means,
+    and the two must not be read as one field.
+
+    Under increment scope the round's target is `since_sha...head_sha`, while
+    `merge_base` stays the PR's own base — where tier 2's context is measured
+    from, not where the target starts. Three different commits with three
+    different jobs, and a consumer that assembled a range from the wrong pair
+    would attribute the fix pass against code no round in this cycle read.
+    `base_sha` is a fourth thing again: where the base branch has got to, which
+    is what a later staleness check compares."""
+    got = _round(monkeypatch, tmp_path, {}, baselines=[_baseline(tmp_path)])
+    assert got["scope"] == "increment"
+    assert got["since_sha"] == ANCHOR, "the round's own left-hand side"
+    assert got["merge_base"] == MERGE_BASE, "the PR's base, not the round's"
+    assert got["base_sha"] == BASE_TIP, "where the base branch is now"
+    assert len({got["since_sha"], got["merge_base"],
+                got["base_sha"], got["head_sha"]}) == 4
 
 
 def test_a_scope_note_reaches_config_notes(monkeypatch, tmp_path):
