@@ -329,7 +329,9 @@ the other way):
   rather than in the gap between looking and writing — which is where every one of those collisions
   happened. Advisory and it says so in the refusal: the board cannot gate github.com. A lapsed claim
   frees the KEY (a crashed lander must not wedge everyone's landing) but never the NUMBER, because
-  that branch may have shipped it.
+  that branch may have shipped it. Renumbering is one atomic call rather than a release and a claim —
+  both of the collisions that prompted this were renumbers off an earlier one, and doing it in two
+  steps reopens the race in the exact window where the namespace is most contended.
 - **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
   object store; wire `landed` refs to a cherry-pick helper.
 

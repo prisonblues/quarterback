@@ -346,3 +346,90 @@ async def test_a_retrying_caller_gets_its_OWN_number_back(client):
 
     other = await alloc(client, repo="acme/retry", after="8.0", session="s-other")
     assert other["version"] == "8.2"
+
+
+# ------------------------------------------------- the renumber, as one step
+
+async def test_a_renumber_is_one_atomic_swap(client):
+    """**Both of 2026-08-16's collisions were RENUMBERS, not fresh picks**, and
+    the proposal only covered the fresh pick. Choosing a version at the start
+    feels like a decision, so it gets announced; replacing one feels like
+    bookkeeping, so it gets neither announced nor re-read.
+
+    Release-then-claim through the two ordinary endpoints reopens the race this
+    table closes — between the two calls the caller holds nothing, and that
+    window is widest exactly when the namespace is contended, which is the only
+    time anybody renumbers."""
+    mine = await alloc(client, repo="acme/renum", after="2.27")
+    assert mine["version"] == "2.28"
+    # Somebody else takes the number above; now I must move.
+    await alloc(client, repo="acme/renum", headers=DESKTOP, after="2.28")
+
+    r = await client.post("/release/reclaim",
+                          json={"repo": "acme/renum", "claim_id": mine["claim_id"],
+                                "after": "2.27"},
+                          headers=LAPTOP)
+    assert r.status_code == 200, r.text
+    got = r.json()
+    assert got["version"] == "2.30"
+    assert got["gave_up"] == "2.28"
+
+    # The number given up is released, and never re-issued to anyone.
+    later = await alloc(client, repo="acme/renum", headers=DESKTOP, after="2.0")
+    assert later["version"] == "2.31"
+
+
+async def test_a_renumber_is_all_or_nothing(client):
+    """The asymmetry that makes this one call rather than two: an agent with a
+    CHANGELOG full of a number it no longer owns, and nothing to replace it
+    with, is strictly worse off than one that never tried. So the old row is
+    released in the SAME commit that takes the new one — never both held, never
+    neither."""
+    mine = await alloc(client, repo="acme/renumatomic", after="4.0")
+    r = await client.post("/release/reclaim",
+                          json={"repo": "acme/renumatomic", "claim_id": mine["claim_id"],
+                                "after": "4.0"},
+                          headers=LAPTOP)
+    assert r.status_code == 200, r.text
+    got = r.json()
+    assert got["gave_up"] == mine["version"] and got["version"] != mine["version"]
+
+    live = await client.get("/claims", params={"kind": "release"}, headers=LAPTOP)
+    held = [c["key"] for c in live.json()["claims"]
+            if c["key"].startswith("acme/renumatomic:")]
+    assert held == [f"acme/renumatomic:{got['version']}"], (
+        "exactly one number held afterwards, and it is the new one")
+
+
+async def test_you_cannot_renumber_a_claim_that_is_not_yours_or_not_a_release(client):
+    mine = await alloc(client, repo="acme/renumauth", after="1.0")
+    r = await client.post("/release/reclaim",
+                          json={"repo": "acme/renumauth", "claim_id": mine["claim_id"]},
+                          headers=DESKTOP)
+    assert r.status_code == 403
+
+    merge = await take(client, "merge", "acme/renumauth:main")
+    r = await client.post("/release/reclaim",
+                          json={"repo": "acme/renumauth", "claim_id": merge["claim_id"]},
+                          headers=LAPTOP)
+    assert r.status_code == 409 and "not a release claim" in r.json()["detail"]["error"]
+
+
+async def test_racing_renumbers_never_land_on_one_number(client):
+    """Two agents renumbering off the same collision at the same time — which is
+    literally what happened this morning."""
+    import asyncio
+    repo = "acme/renumrace"
+    a = await alloc(client, repo=repo, after="6.0")
+    b = await alloc(client, repo=repo, headers=DESKTOP, after="6.0")
+
+    r1, r2 = await asyncio.gather(
+        client.post("/release/reclaim",
+                    json={"repo": repo, "claim_id": a["claim_id"], "after": "6.0"},
+                    headers=LAPTOP),
+        client.post("/release/reclaim",
+                    json={"repo": repo, "claim_id": b["claim_id"], "after": "6.0"},
+                    headers=DESKTOP),
+    )
+    assert r1.status_code == 200 and r2.status_code == 200, (r1.text, r2.text)
+    assert r1.json()["version"] != r2.json()["version"]

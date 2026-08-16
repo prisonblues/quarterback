@@ -491,6 +491,43 @@ def claim_release_number(ctx: Context, repo: str, after: str | None = None,
 
 
 @mcp.tool()
+def reclaim_release_number(ctx: Context, repo: str, claim_id: str,
+                           after: str | None = None, ttl: int = 3600,
+                           session: str | None = None, note: str | None = None) -> dict:
+    """Renumber: give up the release number you hold and take the next free one, in ONE step.
+
+    Use this instead of releasing and then claiming again. **The renumber is
+    where this repo's collisions actually happened** — both of them were
+    renumbers off an earlier collision, because picking a number feels like a
+    decision and replacing one feels like bookkeeping, so nobody re-reads. A
+    release followed by a claim leaves you holding nothing in between, and that
+    window is widest exactly when the namespace is contended, which is the only
+    time anyone renumbers.
+
+    If the allocation fails you keep the number you had — better than a CHANGELOG
+    full of a number you no longer own with nothing to replace it.
+
+    Args:
+        repo: The repo, e.g. "prisonblues/quarterback".
+        claim_id: The claim you are giving up (from `claim_release_number`).
+        after: Highest version you can now see — usually the number that just
+            landed on you and forced the renumber.
+        ttl: Seconds until the new claim lapses (default 3600).
+        session: Your session id.
+        note: One line on what the release is.
+
+    Returns the new `version` plus `gave_up`, so you can check the swap against
+    what you have already written into your files.
+    """
+    try:
+        return _get_client(ctx).reclaim_release({
+            "repo": repo, "claim_id": claim_id, "after": after, "ttl": ttl,
+            "session": session, "note": note})
+    except httpx.HTTPStatusError as e:
+        _raise(e, "reclaim_release_number")
+
+
+@mcp.tool()
 def releases(ctx: Context, repo: str) -> dict:
     """Every release number the board has handed out for a repo, and who holds what.
 

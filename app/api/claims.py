@@ -467,6 +467,119 @@ async def allocate_release(
         "advice": "retry; several agents are allocating for this repo right now"})
 
 
+class ReleaseReclaimIn(BaseModel):
+    """Swap one release number for another, atomically."""
+
+    repo: str = Field(min_length=1, max_length=256)
+    #: The claim being given up. Named by id rather than by version so a caller
+    #: cannot accidentally release a number it never held.
+    claim_id: uuid.UUID
+    after: str | None = None
+    ttl: int = Field(default=DEFAULT_TTL, ge=1, le=MAX_TTL)
+    session: str | None = None
+    note: str | None = Field(default=None, max_length=500)
+
+
+@router.post("/release/reclaim")
+async def reclaim_release(
+    body: ReleaseReclaimIn,
+    holder: str = Depends(identify),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Give up a number and take the next free one, as ONE step.
+
+    **The renumber is the dangerous moment, not the first pick, and the evidence
+    is that both of 2026-08-16's collisions were renumbers.** Choosing a version
+    at the start feels like a decision, so it gets announced and re-read;
+    replacing one feels like bookkeeping, so it gets neither. Both branches that
+    collided that morning were renumbering off an earlier collision.
+
+    Doing it as release-then-claim through the two endpoints above reopens
+    exactly the race this table closes: between the release and the claim the
+    caller holds nothing, and the window is widest precisely when the namespace
+    is contended — which is the only time anyone renumbers. So it is one call and
+    one transaction.
+
+    **The old claim is given up only if a new one was taken.** A failed
+    allocation leaves the caller holding what it had, because the alternative is
+    an agent with a CHANGELOG full of a number it no longer owns and nothing to
+    replace it with. That asymmetry is the whole reason this is not two calls.
+    """
+    now = _utcnow()
+    old = await session.get(ResourceLease, body.claim_id)
+    if old is None:
+        raise HTTPException(404, "claim not found")
+    if not same_machine(old.holder, holder):
+        raise HTTPException(403, "not your claim")
+    if old.kind != "release":
+        raise HTTPException(409, detail={
+            "error": "not a release claim", "kind": old.kind, "key": old.key})
+
+    prefix = f"{body.repo}:"
+    if not old.key.startswith(prefix):
+        raise HTTPException(409, detail={
+            "error": "that claim belongs to another repo",
+            "key": old.key, "repo": body.repo})
+
+    told = parse_version(body.after)
+    unreadable = body.after is not None and told is None
+    # Read off the row ONCE, before any commit or rollback. Both expire every
+    # attribute on the session's objects, and an expired attribute read back
+    # under async SQLAlchemy is a lazy load outside the greenlet — a
+    # `MissingGreenlet` at the exact moment this endpoint is doing its job,
+    # since the retry path is reached only when the namespace is contended.
+    # Found by the concurrent test below and by nothing else.
+    old_id, old_key = old.id, old.key
+    old_session, old_note = old.session, old.note
+    gave_up = parse_version(old_key[len(prefix):])
+
+    for _attempt in range(8):
+        known = await _highest_known(session, body.repo)
+        floor = max([v for v in (told, known) if v is not None], default=(0, 0))
+        candidate = (floor[0], floor[1] + 1)
+        key = release_key(body.repo, candidate)
+
+        await _sweep_lapsed(session, "release", key, now)
+        await session.commit()
+        if await _held(session, "release", key) is not None:
+            continue
+
+        # Both writes in one transaction: the old row is released in the same
+        # commit that takes the new one, so there is no instant at which this
+        # caller holds neither. If the INSERT loses its race the rollback takes
+        # the release with it, which is what makes the failure path safe rather
+        # than merely unlikely.
+        #
+        # `old` is re-fetched each pass because the commit above expired it.
+        fresh = ResourceLease(kind="release", key=key, holder=holder,
+                              session=body.session or old_session,
+                              note=body.note or old_note,
+                              ttl_seconds=body.ttl,
+                              expires_at=now + timedelta(seconds=body.ttl))
+        session.add(fresh)
+        giving_up = await session.get(ResourceLease, old_id)
+        if giving_up is not None:
+            giving_up.released_at = now
+        try:
+            await session.commit()
+        except IntegrityError:
+            await session.rollback()
+            continue
+        await session.refresh(fresh)
+        return {**_view(fresh), "version": fmt_version(candidate),
+                "claimed": True, "renewed": False,
+                # Named back so the caller can check the swap it just made
+                # against the number it has already written into eight files.
+                "gave_up": fmt_version(gave_up) if gave_up else None,
+                "after_unreadable": unreadable}
+
+    raise HTTPException(409, detail={
+        "error": "could not reclaim: the namespace is contended",
+        "repo": body.repo,
+        "still_holding": fmt_version(gave_up) if gave_up else None,
+        "advice": "you still hold your original number; retry"})
+
+
 @router.get("/releases")
 async def list_releases(
     repo: str,

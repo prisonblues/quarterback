@@ -31,8 +31,8 @@ is keyed on (`kind`, `key`) with the passive expiry the session lease already ge
 - `kind='merge'`, `key='<repo>:<branch>'` — held across a land.
 - `kind='release'`, `key='<repo>:<version>'` — held while a branch owns a number.
 
-`POST /claim` · `/claim/renew` · `/claim/release` · `GET /claims`, plus `POST /release/claim` and
-`GET /releases` for the allocator, and MCP tools for all of them — the feature is worth nothing if an
+`POST /claim` · `/claim/renew` · `/claim/release` · `GET /claims`, plus `POST /release/claim`,
+`POST /release/reclaim` and `GET /releases` for the allocator, and MCP tools for all of them — the feature is worth nothing if an
 agent cannot reach it from where it works.
 
 **Advisory, not a lock, and it says so in the refusal itself.** The board cannot gate github.com: a
@@ -67,6 +67,18 @@ Four decisions worth more than the endpoints:
   for, so it would have been the first thing to break it. Idempotency is keyed on the session
   instead, and asked before allocating rather than as a renew inside the loop — the loop's candidate
   is always `highest + 1`, so a number the caller already holds is never the candidate.
+
+**The renumber is a first-class operation, because the renumber is where the collisions actually
+happened.** Both of 2026-08-16's were renumbers off an earlier collision, not fresh picks — and the
+proposal on #46 only covers the fresh pick. Choosing a version at the start feels like a decision, so
+it gets announced and re-read; replacing one feels like bookkeeping, so it gets neither. Doing it as
+release-then-claim through the two ordinary endpoints reopens exactly the race this table closes:
+between the two calls the caller holds nothing, and that window is widest precisely when the
+namespace is contended, which is the only time anyone renumbers. So `POST /release/reclaim` is one
+call and one transaction — the old row is released in the same commit that takes the new one, and a
+failed allocation rolls the release back with it. **You keep what you had, or you get the new one;
+never neither.** An agent holding a CHANGELOG full of a number it no longer owns, with nothing to
+replace it, is worse off than one that never tried.
 
 **Allocation takes both the caller's view and the board's, because neither is sufficient.** The board
 cannot read a CHANGELOG, so it knows nothing of the releases that merged before it existed; the

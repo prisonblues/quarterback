@@ -125,6 +125,11 @@ class QuarterbackClient:
         resp.raise_for_status()
         return resp.json()
 
+    def reclaim_release(self, body: dict) -> dict:
+        resp = self._http.post(self._url("/release/reclaim"), json=body)
+        resp.raise_for_status()
+        return resp.json()
+
     def releases(self, repo: str) -> dict:
         resp = self._http.get(self._url("/releases"), params={"repo": repo})
         resp.raise_for_status()
