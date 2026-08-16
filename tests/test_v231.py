@@ -101,12 +101,12 @@ async def test_releasing_frees_it_for_the_next_agent(client):
 async def test_releasing_is_idempotent_and_never_deletes_the_row(client):
     """The row is the history an allocator reads. A release that deleted it would
     make a handed-out number look never-issued."""
-    held = await take(client, "release", "acme/idemrepo:9.1")
+    held = await take(client, "merge", "acme/idemrepo:9.1")
     for _ in range(2):
         r = await client.post("/claim/release", json={"claim_id": held["claim_id"]},
                               headers=LAPTOP)
         assert r.status_code == 200
-    r = await client.get("/claims", params={"kind": "release", "key": "acme/idemrepo:9.1",
+    r = await client.get("/claims", params={"kind": "merge", "key": "acme/idemrepo:9.1",
                                             "include_released": True}, headers=LAPTOP)
     assert len(r.json()["claims"]) == 1
 
@@ -159,7 +159,7 @@ async def test_an_expired_claim_cannot_be_renewed_back_to_life(client):
     r = await client.post("/claim/renew", json={"claim_id": held["claim_id"]},
                           headers=LAPTOP)
     assert r.status_code == 409
-    assert "re-take" in r.json()["detail"]
+    assert "re-take" in r.json()["detail"]["error"]
 
 
 # ------------------------------------------------------------- the allocator
@@ -433,3 +433,171 @@ async def test_racing_renumbers_never_land_on_one_number(client):
     )
     assert r1.status_code == 200 and r2.status_code == 200, (r1.text, r2.text)
     assert r1.json()["version"] != r2.json()["version"]
+
+
+# ---------------------------------------------- round 1's premises, pinned
+
+async def test_the_generic_claim_endpoint_refuses_release_kind(client):
+    """Round 1's F01. `kind` is free text, so `POST /claim {kind:'release'}` could
+    write rows the allocator's invariants are enforced nowhere else: it could
+    take an already-released historical key (re-issuing a number a branch may
+    have shipped), advance the floor forever with `<repo>:9999.1`, or insert
+    `v2.31` beside a held `2.31` — an alternate spelling the unique index cannot
+    see, leaving two agents each certain they hold the same number."""
+    r = await claim(client, "release", "acme/reserved:2.31")
+    assert r.status_code == 409, r.text
+    assert "allocated, not taken" in r.json()["detail"]["error"]
+
+
+async def test_a_co_tenant_cannot_touch_another_agents_release_claim(client):
+    """Round 1's F02, and it was this module's own argument turned against it.
+    Every mutating path authorised by machine — inherited from `Lease`, where it
+    is right — while the allocator's comment argues at length that for a release
+    number two agents on one box are two BRANCHES. So a co-tenant could renew,
+    release or silently RENUMBER a branch that had already written its version
+    into eight files."""
+    mine = await alloc(client, repo="acme/cotenant", after="1.0", session="s-mine")
+    body = {"claim_id": mine["claim_id"], "session": "s-theirs"}
+
+    # Same machine, same token — a co-tenant, not an intruder.
+    r = await client.post("/claim/release", json=body, headers=LAPTOP)
+    assert r.status_code == 403, r.text
+    assert "two agents on one box are two branches" in r.json()["detail"]["hint"]
+
+    assert (await client.post("/claim/renew", json=body, headers=LAPTOP)).status_code == 403
+    r = await client.post("/release/reclaim",
+                          json={"repo": "acme/cotenant", **body}, headers=LAPTOP)
+    assert r.status_code == 403
+
+    # ...and the owning session still can.
+    ok = await client.post("/claim/renew",
+                           json={"claim_id": mine["claim_id"], "session": "s-mine"},
+                           headers=LAPTOP)
+    assert ok.status_code == 200, ok.text
+
+
+async def test_a_session_id_alone_does_not_hand_over_a_claim(client):
+    """Round 1's F03. Session ids are the board's public addressing scheme —
+    peers quote them at each other constantly — so a lookup keyed on the session
+    ALONE handed any agent that knew one back the owner's live claim, holder and
+    note included, as its own."""
+    mine = await alloc(client, repo="acme/sessleak", after="3.0", session="s-shared")
+    other = await alloc(client, repo="acme/sessleak", headers=DESKTOP,
+                        session="s-shared")
+    assert other["version"] != mine["version"], "a different machine gets its own"
+
+
+async def test_a_renumber_refuses_a_claim_that_is_no_longer_held(client):
+    """Round 1's F07. `renew_claim` checked liveness and this did not, so a
+    timed-out retry or a repeated id minted ANOTHER number — the double
+    allocation the session idempotency exists to prevent, on the one path with no
+    equivalent guard."""
+    mine = await alloc(client, repo="acme/dblrenum", after="2.0", session="s-1")
+    first = await client.post("/release/reclaim",
+                              json={"repo": "acme/dblrenum", "claim_id": mine["claim_id"],
+                                    "after": "2.1", "session": "s-1"}, headers=LAPTOP)
+    assert first.status_code == 200, first.text
+
+    replay = await client.post("/release/reclaim",
+                               json={"repo": "acme/dblrenum", "claim_id": mine["claim_id"],
+                                     "after": "2.1", "session": "s-1"}, headers=LAPTOP)
+    assert replay.status_code == 409, replay.text
+    assert "no longer held" in replay.json()["detail"]["error"]
+
+
+async def test_idempotency_does_not_hand_back_the_number_you_are_escaping(client):
+    """Round 1's F20. An agent renumbering off a collision re-runs the allocator
+    with a HIGHER `after`; returning the very number it is trying to leave
+    reports success for the one outcome it asked to avoid."""
+    mine = await alloc(client, repo="acme/escape", after="5.0", session="s-e")
+    assert mine["version"] == "5.1"
+    moved = await alloc(client, repo="acme/escape", after="5.1", session="s-e")
+    assert moved["version"] != "5.1"
+
+
+async def test_a_renewed_claim_really_has_its_ttl_extended(client):
+    """Round 1's F05 + F21: `renewed: true` meant two different things. One path
+    extended the TTL and wrote it; two others returned the row untouched and
+    uncommitted, so a caller retrying a long allocation was told it was renewed
+    and had its claim lapse anyway."""
+    first = await alloc(client, repo="acme/ttl", after="1.0", session="s-t", ttl=60)
+    again = await alloc(client, repo="acme/ttl", after="1.0", session="s-t", ttl=3600)
+    assert again["renewed"] is True
+    assert again["expires"] > first["expires"], "the TTL actually moved"
+
+
+async def test_concurrent_requests_sharing_one_session_get_one_number(client):
+    """Round 1's F06 + F32. The session check ran once, before the retry loop, so
+    two concurrent requests carrying one session both passed it (neither had
+    committed) and the insert loser then allocated the NEXT number instead of
+    finding its twin."""
+    import asyncio
+    repo = "acme/sessrace"
+    results = await asyncio.gather(*[
+        client.post("/release/claim",
+                    json={"repo": repo, "after": "8.0", "session": "s-same"},
+                    headers=LAPTOP)
+        for _ in range(4)
+    ])
+    assert all(r.status_code == 200 for r in results), [r.text for r in results]
+    versions = {r.json()["version"] for r in results}
+    assert len(versions) == 1, f"one session, one number — got {versions}"
+
+
+async def test_concurrent_reclaims_of_one_claim_mint_at_most_one_number(client):
+    """Round 1's F32. The renumber had no test that replayed or raced the same
+    old claim, which is exactly where F07 was hiding."""
+    import asyncio
+    repo = "acme/reclaimrace"
+    mine = await alloc(client, repo=repo, after="9.0", session="s-r")
+    body = {"repo": repo, "claim_id": mine["claim_id"], "after": "9.1", "session": "s-r"}
+    a, b = await asyncio.gather(
+        client.post("/release/reclaim", json=body, headers=LAPTOP),
+        client.post("/release/reclaim", json=body, headers=LAPTOP),
+    )
+    codes = sorted([a.status_code, b.status_code])
+    assert codes == [200, 409], f"one renumber, one refusal — got {codes}"
+
+
+async def test_a_repo_name_with_an_underscore_is_not_a_wildcard(client):
+    """Round 1's F19. `startswith` compiles to LIKE without escaping, and `_` is a
+    LIKE wildcard that occurs in real repo names — so one repo's allocation floor
+    could be raised by an unrelated repo's numbers."""
+    await alloc(client, repo="acme/myXrepo", after="40.0")
+    mine = await alloc(client, repo="acme/my_repo", after="1.0")
+    assert mine["version"] == "1.1", "the neighbour's 40.x must not raise this floor"
+
+
+async def test_an_empty_session_is_not_a_session(client):
+    """Round 1's F27. `session=""` was stored on the first claim and skipped by
+    every idempotency lookup, so each retry spent a fresh number while reporting
+    success."""
+    first = await alloc(client, repo="acme/blanksess", after="1.0", session="")
+    again = await alloc(client, repo="acme/blanksess", after="1.0", session="")
+    assert again["version"] != first["version"], "blank is absent, not an identity"
+    assert first["session"] is None
+
+
+async def test_the_allocator_never_hands_out_a_number_it_cannot_read_back(client):
+    """Round 1's F17. Allocation is `minor + 1` in unbounded Python while the
+    parser caps the minor at five digits, so a repo near the ceiling was handed a
+    version that vanished from `_highest_known` — and every later caller got the
+    same one."""
+    from app.api.claims import MAX_MINOR, parse_version
+    got = await alloc(client, repo="acme/ceiling", after=f"7.{MAX_MINOR}")
+    assert parse_version(got["version"]) is not None, got["version"]
+    assert got["version"] == "8.0", "rolls the major rather than leaving the grammar"
+
+
+async def test_releases_carries_the_id_needed_to_act_on_a_claim(client):
+    """Round 1's F31. Every mutating endpoint wants a claim_id, and this was the
+    natural place to discover your own claim — without one, a client had to go
+    somewhere else to act on what it had just found."""
+    await alloc(client, repo="acme/withid", after="1.0", session="s-i")
+    r = await client.get("/releases", params={"repo": "acme/withid"}, headers=LAPTOP)
+    row = r.json()["releases"][0]
+    assert row["claim_id"]
+    ok = await client.post("/claim/release",
+                           json={"claim_id": row["claim_id"], "session": "s-i"},
+                           headers=LAPTOP)
+    assert ok.status_code == 200, ok.text
