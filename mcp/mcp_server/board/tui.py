@@ -12,14 +12,18 @@ last three actions — pull, cherry-pick, resume — because those need a proces
 
 from __future__ import annotations
 
+import time
+from pathlib import Path
 from typing import ClassVar
 
 import httpx
+from rich.markup import escape
 from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.widgets import ContentSwitcher, DataTable, Footer, Input, Static
+from textual.worker import get_current_worker
 
 from ..client import QuarterbackClient
 from ..gitctx import recent_shas, repo_slug
@@ -28,6 +32,7 @@ from .config import BoardConfig
 from .render import type_colour
 from .state import read_cursor, write_cursor
 from .views import (
+    NOT_RECORDED,
     fleet_rows,
     panel_rows,
     panel_window,
@@ -43,6 +48,17 @@ MAX_ROWS = 2000
 #: Seconds between refreshes of the panes that have no live stream behind them.
 POLL_SECONDS = 20.0
 
+#: ...except the Panel, which is a 30-day aggregate over every judged run in the
+#: fleet — by far the most expensive read here, and the one whose answer moves
+#: slowest. It gets its own cadence, plus a refresh when you actually open the
+#: pane and on `r`, so the number you are looking at is never the stale one.
+PANEL_SECONDS = 300.0
+
+#: How often the cursor file is rewritten. Every post would mean a disk write per
+#: heartbeat on Textual's own thread; losing a few seconds of cursor costs a
+#: replay the pane dedupes away, so time wins over precision here.
+CURSOR_SECONDS = 5.0
+
 #: The orient read the Board pane opens with — `GET /board`'s own defaults, so
 #: this client sees what an arriving agent sees, floor and all.
 ORIENT_MINUTES = 30
@@ -53,6 +69,13 @@ ORIENT_LIMIT = 100
 #: not a day, because an inbox that reaches back to yesterday is how every fresh
 #: session ends up rediscovering the same handful of long-dead asks (issue #17).
 INBOX_MINUTES = 240
+
+#: How many asks, and how many replies per kind, one refresh will look at. Half
+#: the server's cap of 1000: a page that comes back full is a page with more
+#: behind it, and the alert says "at least" rather than paginating a mailbox
+#: nobody is reading through a status line anyway.
+INBOX_LIMIT = 500
+REPLY_LIMIT = 500
 
 
 class ResumeRequest:
@@ -111,8 +134,25 @@ class BoardApp(App):
         self.posts: dict[int, dict] = {}
         self.inbox: list[dict] = []
         self.replies: list[dict] = []
+        # True when a mailbox page came back at its limit, so the ask count below
+        # is a floor rather than a total.
+        self.mail_truncated = False
         self.cursor = read_cursor(cfg.base_url)
+        # Where the *stream* resumes, kept apart from `cursor` on purpose.
+        # `cursor` is "the newest post this pane has drawn" and only ever grows;
+        # this one may deliberately rewind (see `_oriented`) and is advanced in
+        # the tail's own thread, so a drop before the UI catches up cannot make
+        # the reconnect re-request a batch it already received.
+        self._tail_cursor = self.cursor
+        self._cursor_written = self.cursor
         self._pending: str | None = None  # which action the prompt is collecting for
+        # The post an ack/nak is being written for, captured when the prompt
+        # opens rather than read back when it is submitted.
+        self._reply_target: dict | None = None
+        # One local action at a time. Textual can cancel a thread worker's
+        # *result* but not the git it is already running, so overlapping p/c
+        # presses are refused before the worker starts rather than after.
+        self._local_busy = False
         # Mirrors of the three one-line panels, so state can be read without
         # reaching into a widget that may not exist yet (or any more).
         self.status_text = ""
@@ -169,7 +209,19 @@ class BoardApp(App):
         # call rather than showing nothing.
         self.bootstrap()
         self.refresh_panes()
+        self.refresh_panel()
         self.set_interval(POLL_SECONDS, self.refresh_panes)
+        self.set_interval(PANEL_SECONDS, self.refresh_panel)
+        self.set_interval(CURSOR_SECONDS, self._flush_cursor)
+
+    def on_unmount(self) -> None:
+        """The last write of the cursor, on the way out.
+
+        The debounced interval means the newest post id may only be in memory
+        when the app closes, and a resume point that is five seconds behind on
+        every quit is a resume point that replays the same posts on every start.
+        """
+        self._flush_cursor()
 
     # -- small helpers --------------------------------------------------
 
@@ -203,6 +255,13 @@ class BoardApp(App):
     def detail(self, text: str) -> None:
         self.detail_text = text
         self._write("#detail", text)
+
+    def _flush_cursor(self) -> None:
+        """Persist the cursor if it has moved since the last write."""
+        if self.cursor == self._cursor_written:
+            return
+        write_cursor(self.cfg.base_url, self.cursor)
+        self._cursor_written = self.cursor
 
     def current_view(self) -> str:
         return self.query_one("#switcher", ContentSwitcher).current or "board"
@@ -266,14 +325,26 @@ class BoardApp(App):
         self.call_from_thread(self._oriented, recent)
 
     def _oriented(self, recent: list[dict]) -> None:
+        # Read before the loop, not after: `add_post` drags `self.cursor` up to
+        # the newest row of this 100-post page, and resuming the stream from
+        # there would silently drop everything that landed between where this
+        # client stopped and where the page begins.
+        saved = self.cursor
         for post in recent:
             self.add_post(post)
-        # Resume where this client stopped — but never from the very beginning.
-        # A first run here has cursor 0, and streaming from 0 would replay every
-        # post the board has ever held to render the last few hundred of them.
-        oldest = min((int(p["id"]) for p in recent if p.get("id")), default=0)
-        if not self.cursor:
-            self.cursor = max(oldest - 1, 0)
+        ids = [int(p["id"]) for p in recent if p.get("id")]
+        if ids:
+            # One id before the oldest row drawn, so no post can fall into the
+            # gap between the page and the saved cursor — and the older of the
+            # two, because a rewind costs a replay `add_post` dedupes away while
+            # a skip loses those posts for the life of the session.
+            floor = max(min(ids) - 1, 0)
+            self._tail_cursor = min(saved, floor) if saved else floor
+        else:
+            # Nothing to orient on: an empty board (so nothing to replay) or a
+            # failed read (so no id to reason from). The saved cursor is the only
+            # honest answer either way.
+            self._tail_cursor = saved
         self.tail()
 
     @work(thread=True, exclusive=True, group="tail")
@@ -281,50 +352,75 @@ class BoardApp(App):
         """Follow the stream forever, reconnecting from the cursor on a drop."""
         while True:
             try:
-                for post in self.client.stream(since=self.cursor):
+                for post in self.client.stream(since=self._tail_cursor):
+                    # Advanced here rather than in `add_post`, because the UI
+                    # callback below may never run: a drop with work still
+                    # queued would otherwise reconnect from a cursor that has
+                    # not moved and replay the same batch on every retry.
+                    self._tail_cursor = max(self._tail_cursor, int(post.get("id") or 0))
                     self.call_from_thread(self.add_post, post)
             except httpx.HTTPStatusError as e:
-                if e.response.status_code in (401, 403):
-                    self.call_from_thread(self.note, "board rejected this machine's token")
+                code = e.response.status_code
+                if 400 <= code < 500:
+                    # A 4xx is this client asking wrongly — a token the board
+                    # will not take, a route that moved, a schema this build
+                    # does not speak. Retrying re-sends the same wrong request
+                    # forever, so it is reported and the tail stops.
+                    self.call_from_thread(self.note, self._stream_refusal(code))
                     return
-                self.call_from_thread(self.note, f"stream: HTTP {e.response.status_code}")
+                self.call_from_thread(self.note, f"stream: HTTP {code}; retrying")
             except httpx.HTTPError as e:
                 self.call_from_thread(self.note, f"stream dropped ({type(e).__name__}); retrying")
             if not self._sleep(3.0):
                 return
 
+    @staticmethod
+    def _stream_refusal(code: int) -> str:
+        if code in (401, 403):
+            return "board rejected this machine's token"
+        return f"stream: HTTP {code} — this client cannot follow this board; not retrying"
+
     def _sleep(self, seconds: float) -> bool:
         """Sleep unless the app is shutting down. Returns False when it is."""
-        import time
-
         for _ in range(int(seconds * 10)):
             if not self.is_running:
                 return False
             time.sleep(0.1)
         return self.is_running
 
-    @work(thread=True, group="panes")
+    @work(thread=True, exclusive=True, group="panes")
     def refresh_panes(self) -> None:
+        """The fleet, the sessions and the mailbox — everything but the Panel.
+
+        Exclusive because `r` and the interval both land here: two refreshes in
+        flight finish in whatever order the board answers them, and the loser
+        would repaint fresh panes with older data.
+        """
+        worker = get_current_worker()
+        truncated = False
         try:
             active = self.client.active({})
             sessions = self.client.sessions(limit=60)
-            stats = self.client.review_stats({"days": 30})
             inbox = self.client.board(
-                {"to": "@me", "window_min": INBOX_MINUTES, "limit": 100}
+                {"to": "@me", "window_min": INBOX_MINUTES, "limit": INBOX_LIMIT}
             )
+            truncated = len(inbox) >= INBOX_LIMIT
             # The replies, over the SAME window as the inbox. Reading them off
             # the streamed posts instead would compare a 4-hour mailbox against
             # a 30-minute view of the board, so an ask answered three hours ago
             # would still be counted — the alert would only ever grow.
-            replies = [
-                p
-                for kind in ("ack", "nak")
-                for p in self.client.board(
-                    {"type": kind, "window_min": INBOX_MINUTES, "limit": 200}
+            #
+            # Two calls, not one: `/board` takes a single `type`, so ack and nak
+            # cannot be asked for together.
+            replies: list[dict] = []
+            for kind in ("ack", "nak"):
+                page = self.client.board(
+                    {"type": kind, "window_min": INBOX_MINUTES, "limit": REPLY_LIMIT}
                 )
-            ]
+                truncated = truncated or len(page) >= REPLY_LIMIT
+                replies.extend(page)
         except httpx.HTTPError as e:
-            self.call_from_thread(self.note, f"refresh failed: {e}")
+            self.call_from_thread(self.note, f"refresh failed: {_esc(e)}")
             return
         sync = None
         if self.repo:
@@ -338,17 +434,39 @@ class BoardApp(App):
                 )
             except httpx.HTTPError:
                 sync = None
+        if worker.is_cancelled:
+            return
         self.call_from_thread(
-            self._panes_loaded, active, sessions, stats, inbox, replies, sync
+            self._panes_loaded,
+            {
+                "active": active,
+                "sessions": sessions,
+                "inbox": inbox,
+                "replies": replies,
+                "truncated": truncated,
+                "sync": sync,
+            },
         )
 
-    def _panes_loaded(self, active, sessions, stats, inbox, replies, sync) -> None:
-        self.inbox = inbox
-        self.replies = replies
-        self._fill_fleet(active)
-        self._fill_sessions(sessions)
-        self._fill_panel(stats)
-        self._update_alerts(sync)
+    def _panes_loaded(self, data: dict) -> None:
+        self.inbox = data["inbox"]
+        self.replies = data["replies"]
+        self.mail_truncated = data["truncated"]
+        self._fill_fleet(data["active"])
+        self._fill_sessions(data["sessions"])
+        self._update_alerts(data["sync"])
+
+    @work(thread=True, exclusive=True, group="panel")
+    def refresh_panel(self) -> None:
+        """The Panel's 30-day aggregate, on its own much slower cadence."""
+        worker = get_current_worker()
+        try:
+            stats = self.client.review_stats({"days": 30})
+        except httpx.HTTPError as e:
+            self.call_from_thread(self.note, f"panel refresh failed: {_esc(e)}")
+            return
+        if not worker.is_cancelled:
+            self.call_from_thread(self._fill_panel, stats)
 
     # -- pane fills -----------------------------------------------------
 
@@ -358,37 +476,47 @@ class BoardApp(App):
             return
         self.posts[pid] = post
         self.cursor = max(self.cursor, pid)
-        write_cursor(self.cfg.base_url, self.cursor)
-        if post.get("type") == "presence" and not self.show_presence:
-            return
         table = self.query_one("#board", DataTable)
-        self._add_board_row(table, pid, post)
-        while table.row_count > MAX_ROWS:
-            table.remove_row(next(iter(table.rows)))
-        # The dict backs the table's rows (detail, refs, the reply target), so it
-        # is trimmed with them. Trimming only the table would leave a client left
-        # open for a day holding every post the board produced in it.
+        # Heartbeats are cached but not drawn — the toggle redraws from the dict,
+        # so hiding one must not mean discarding it.
+        shown = post.get("type") != "presence" or self.show_presence
+        if shown:
+            self._add_board_row(table, pid, post)
+        # One trim, over the dict, dropping the row that goes with each eviction.
+        # The dict is what a row reads from (detail, refs, the reply target), so
+        # the two cannot be trimmed on separate conditions: a row outliving its
+        # post selects nothing, and a post outliving every row is a client left
+        # open for a day holding every heartbeat the board produced.
         while len(self.posts) > MAX_ROWS:
-            del self.posts[min(self.posts)]
-        if table.cursor_row >= table.row_count - 2:
+            evicted = min(self.posts)
+            del self.posts[evicted]
+            if str(evicted) in table.rows:
+                table.remove_row(str(evicted))
+        if shown and table.cursor_row >= table.row_count - 2:
             table.move_cursor(row=table.row_count - 1)
 
     def _add_board_row(self, table: DataTable, pid: int, post: dict) -> None:
         colour = type_colour(post.get("type", "note"))
+        # Every cell but the client's own colour tag is escaped: DataTable renders
+        # strings as markup, so an unescaped `[` in somebody's summary is at best
+        # a missing word and at worst a render error on the pane that shows it.
         table.add_row(
-            (post.get("ts") or "")[11:19],
+            _esc((post.get("ts") or "")[11:19]),
             str(pid),
-            str(post.get("from") or "?"),
-            f"[{colour}]{post.get('type', 'note')}[/]",
+            _esc(post.get("from") or "?"),
+            f"[{colour}]{_esc(post.get('type', 'note'))}[/]",
             self._summary_cell(post),
             key=str(pid),
         )
 
     def _summary_cell(self, post: dict) -> str:
-        text = " ".join(str(post.get("summary") or "").split())
+        text = _esc(" ".join(str(post.get("summary") or "").split()))
         if post.get("to"):
-            text = f"{text}  [dim]→{post['to']}[/dim]"
-        if post.get("has_detail"):
+            text = f"{text}  [dim]→{_esc(post['to'])}[/dim]"
+        # Both tiers, because both are something Enter will show: `has_detail`
+        # fetches the body, `detail_ref` names where the body was put. A row with
+        # only the ref used to look like a row with nothing behind it.
+        if post.get("has_detail") or post.get("detail_ref"):
             text = f"{text}  [dim]+detail[/dim]"
         return text
 
@@ -407,8 +535,9 @@ class BoardApp(App):
         table.clear()
         for row in fleet_rows(active):
             table.add_row(
-                row["kind"], row["holder"], row["device"], row["repo"], row["branch"],
-                row["ttl"], row["since"], row["title"][:60],
+                _esc(row["kind"]), _esc(row["holder"]), _esc(row["device"]),
+                _esc(row["repo"]), _esc(row["branch"]),
+                _esc(row["ttl"]), _esc(row["since"]), _esc(row["title"][:60]),
             )
 
     def _fill_sessions(self, sessions: list[dict]) -> None:
@@ -417,8 +546,8 @@ class BoardApp(App):
         for row in session_rows(sessions):
             flag = "●" if row["live"] else ("↻" if row["resumable"] else "○")
             table.add_row(
-                flag, row["title"][:40], row["holder"], row["device"],
-                row["age"], row["size"], row["session"][:8],
+                flag, _esc(row["title"][:40]), _esc(row["holder"]), _esc(row["device"]),
+                _esc(row["age"]), _esc(row["size"]), _esc(row["session"][:8]),
                 key=row["session"],
             )
 
@@ -427,9 +556,11 @@ class BoardApp(App):
         table.clear()
         for row in panel_rows(stats):
             table.add_row(
-                row["reviewer"], row["model"], row["effort"], str(row["runs"]),
-                str(row["confirmed"]), row["precision"], row["per_run"],
-                row["tokens"], row["cost"],
+                _esc(row["reviewer"]), _esc(row["model"]), _esc(row["effort"]),
+                str(row["runs"]), str(row["confirmed"]), _esc(row["precision"]),
+                _esc(row["per_run"]),
+                _esc(_covered(row["tokens"], row["token_runs"], row["runs"])),
+                _esc(_covered(row["cost"], row["cost_runs"], row["runs"])),
             )
         # Kept rather than written straight to the detail panel: the panel view
         # may not be the one on screen when the poll lands, and switching to it
@@ -443,13 +574,18 @@ class BoardApp(App):
         pending = unanswered_asks(self.inbox, [*self.replies, *self.posts.values()], self.me)
         if pending:
             newest = pending[-1]
+            # "at least" when a page came back full: replies past the limit were
+            # never fetched, so some of these asks may already be answered. A
+            # count the client cannot back is how an alert stops being read.
+            count = f"≥{len(pending)}" if self.mail_truncated else str(len(pending))
+            summary = " ".join(str(newest.get("summary") or "").split())[:70]
             parts.append(
-                f"[b]📨 {len(pending)} ask(s) for you[/b] — "
-                f"#{newest.get('id')} {newest.get('from')}: "
-                f"{' '.join(str(newest.get('summary') or '').split())[:70]}"
+                f"[b]📨 {count} ask(s) for you[/b] — "
+                f"#{_esc(newest.get('id'))} {_esc(newest.get('from'))}: {_esc(summary)}"
             )
         if sync is not None:
             stale, advice = staleness(sync)
+            advice = _esc(advice)
             parts.append(f"[b]⬇️ {advice}[/b]" if stale else f"[dim]{advice}[/dim]")
         elif self.repo is None:
             parts.append("[dim]not in a git checkout — no staleness to report[/dim]")
@@ -461,6 +597,10 @@ class BoardApp(App):
         self.query_one("#switcher", ContentSwitcher).current = name
         self.query_one("#tabs", Static).update(self._tab_line(name))
         self.detail(self._panel_window if name == "panel" else "")
+        if name == "panel" and self.cfg.authenticated:
+            # Opening the pane is the one moment its five-minute cadence is
+            # certainly too slow, so the aggregate is asked for again here.
+            self.refresh_panel()
 
     def action_toggle_presence(self) -> None:
         """Show or hide heartbeats, and redraw what is already here.
@@ -488,6 +628,8 @@ class BoardApp(App):
 
     def action_refresh(self) -> None:
         self.refresh_panes()
+        if self.cfg.authenticated:
+            self.refresh_panel()
         self.note("refreshing…")
 
     @on(DataTable.RowHighlighted, "#board")
@@ -514,22 +656,29 @@ class BoardApp(App):
         if post.get("has_detail"):
             self.load_detail(int(post["id"]))
         elif post.get("detail_ref"):
-            self.detail(f"{self._summary_detail(post)}\n\ndetail stored at {post['detail_ref']}")
+            self.detail(
+                f"{self._summary_detail(post)}\n\ndetail stored at {_esc(post['detail_ref'])}"
+            )
 
     def _summary_detail(self, post: dict) -> str:
         header = (
-            f"#{post['id']} [b]{post.get('from')}[/b] {post.get('type')} "
-            f"{post.get('ts', '')[:19]}"
+            f"#{_esc(post['id'])} [b]{_esc(post.get('from'))}[/b] {_esc(post.get('type'))} "
+            f"{_esc(post.get('ts', '')[:19])}"
         )
         if post.get("has_detail"):
             header += "  [dim](enter to load detail)[/dim]"
-        return f"{header}\n{post.get('summary', '')}"
+        elif post.get("detail_ref"):
+            header += "  [dim](enter to show where the detail is stored)[/dim]"
+        return f"{header}\n{_esc(post.get('summary', ''))}"
 
     @work(thread=True, group="detail")
     def load_detail(self, post_id: int) -> None:
         try:
             full = self.client.get_post(post_id)
-        except httpx.HTTPError:
+        except httpx.HTTPError as e:
+            # Silence here left the pane reading "enter to load detail" forever,
+            # so a board that answered nothing looked like a key that did nothing.
+            self.call_from_thread(self.note, f"could not load #{post_id}'s detail: {_esc(e)}")
             return
         self.call_from_thread(self._detail_loaded, full)
 
@@ -537,14 +686,25 @@ class BoardApp(App):
         selected = self.selected_post()
         if selected is None or int(selected.get("id", 0)) != int(full.get("id", 0)):
             return  # the cursor moved on while we were fetching
-        header = f"#{full['id']} [b]{full.get('from')}[/b] {full.get('type')}"
-        self.detail(f"{header}\n{full.get('summary', '')}\n\n{full.get('detail') or ''}")
+        header = f"#{_esc(full['id'])} [b]{_esc(full.get('from'))}[/b] {_esc(full.get('type'))}"
+        body = _esc(full.get("detail") or "")
+        self.detail(f"{header}\n{_esc(full.get('summary', ''))}\n\n{body}")
 
     def action_reply(self, kind: str) -> None:
         post = self.selected_post()
         if post is None:
             self.note("select a post on the Board view first")
             return
+        if post.get("type") != "ask":
+            # The board threads replies onto asks; an ack on a status is a post
+            # nothing reads. Refused here rather than left for the server, which
+            # would answer a keypress with a 4xx the status line has to explain.
+            self.note(f"`{kind}` answers an `ask` — that row is a `{_esc(post.get('type'))}`")
+            return
+        # Captured now, not read back on submit: the pane follows the stream, so
+        # a post arriving while the reply is being typed moves the cursor, and
+        # the ack would go to that author, about that thread, instead.
+        self._reply_target = {"id": post.get("id"), "from": post.get("from")}
         self._open_prompt(kind, f"{kind} to {post.get('from')} re #{post.get('id')}: ")
 
     def action_claim(self) -> None:
@@ -561,6 +721,7 @@ class BoardApp(App):
 
     def _close_prompt(self) -> None:
         self._pending = None
+        self._reply_target = None
         self.query_one("#prompt", Vertical).remove_class("open")
         self.query_one("#promptinput", Input).value = ""
         self.query_one(f"#{self.current_view()}", DataTable).focus()
@@ -579,19 +740,19 @@ class BoardApp(App):
     @on(Input.Submitted, "#promptinput")
     def _prompt_submitted(self, event: Input.Submitted) -> None:
         kind, summary = self._pending, event.value.strip()
+        target = self._reply_target
         self._close_prompt()
         if not kind or not summary:
             return
         body: dict = {"type": kind, "summary": summary}
         if kind in ("ack", "nak"):
-            post = self.selected_post()
-            if post is None:
-                self.note("the post being replied to is no longer selected")
+            if target is None:
+                self.note("no longer sure which post this replies to — nothing sent")
                 return
             # Both halves of the addressing, prefilled: a reply that names the
             # thread but not the reader lands in nobody's inbox.
-            body["re"] = post.get("id")
-            body["to"] = post.get("from")
+            body["re"] = target["id"]
+            body["to"] = target["from"]
         self.send(body)
 
     @work(thread=True, group="post")
@@ -599,9 +760,9 @@ class BoardApp(App):
         try:
             result = self.client.post(body)
         except httpx.HTTPError as e:
-            self.call_from_thread(self.note, f"post failed: {e}")
+            self.call_from_thread(self.note, f"post failed: {_esc(e)}")
             return
-        self.call_from_thread(self.note, f"posted {body['type']} as #{result.get('id')}")
+        self.call_from_thread(self.note, f"posted {body['type']} as #{_esc(result.get('id'))}")
 
     def action_pull(self) -> None:
         post = self.selected_post()
@@ -611,7 +772,7 @@ class BoardApp(App):
         if not _ref(post, "repo"):
             self.note("that `published` post names no repo, so there is no checkout to pull")
             return
-        self.run_local("pull", post)
+        self._start_local("pull", post)
 
     def action_pick(self) -> None:
         post = self.selected_post()
@@ -631,10 +792,40 @@ class BoardApp(App):
         if not _ref(post, "repo"):
             self.note("that `landed` post names no repo, so there is nowhere to pick it into")
             return
-        self.run_local("pick", post)
+        self._start_local("pick", post)
 
-    @work(thread=True, group="local")
+    def _start_local(self, action: str, post: dict) -> None:
+        """Refuse a second local action while one is running.
+
+        `exclusive=True` below cancels the earlier worker's *result*, not the
+        `git pull` it is halfway through — and two gits in one checkout is the
+        thing local.py's refusals exist to prevent. So the second press is turned
+        away here, before a thread starts.
+        """
+        if self._local_busy:
+            self.note("a pull or cherry-pick is already running — wait for it to report")
+            return
+        self._local_busy = True
+        self.run_local(action, post)
+
+    @work(thread=True, exclusive=True, group="local")
     def run_local(self, action: str, post: dict) -> None:
+        try:
+            message = self._local_action(action, post)
+        finally:
+            self.call_from_thread(self._local_released)
+        self.call_from_thread(self.note, message)
+
+    def _local_released(self) -> None:
+        self._local_busy = False
+
+    def _local_action(self, action: str, post: dict) -> str:
+        """Find the checkout to act in, act in it, and return the line to show.
+
+        Every outcome is a return rather than a notification, so the whole
+        decision — which checkout, and why not the others — can be checked
+        without a terminal.
+        """
         repo, sha = _ref(post, "repo"), _ref(post, "commit")
         try:
             params = {"device": self.device}
@@ -647,8 +838,7 @@ class BoardApp(App):
                     params["branch"] = branch
             registered = self.client.get_worktrees(params)
         except httpx.HTTPError as e:
-            self.call_from_thread(self.note, f"could not ask the board where to act: {e}")
-            return
+            return f"could not ask the board where to act: {_esc(e)}"
 
         if action == "pick":
             # find_commit's job: the SHA already exists somewhere on this machine,
@@ -659,26 +849,47 @@ class BoardApp(App):
                     self.client.get_worktrees({"device": self.device, "repo": repo}), self.device
                 )
             except httpx.HTTPError as e:
-                self.call_from_thread(self.note, f"could not list this machine's worktrees: {e}")
-                return
+                return f"could not list this machine's worktrees: {_esc(e)}"
+            # Asked before the subtraction: with no checkout of the repo here at
+            # all, "already in nowhere on this machine" was the report — an
+            # answer to a question nobody asked instead of the one fact that
+            # explains it.
+            if not targets:
+                return self._nothing_registered(repo)
             candidates = [w for w in targets if w["path"] not in holders]
             if not candidates:
-                where = ", ".join(sorted(holders)) or "nowhere on this machine"
-                self.call_from_thread(self.note, f"{sha[:12]} is already in {where}")
-                return
+                return f"{sha[:12]} is already in {_esc(', '.join(sorted(holders)))}"
         else:
             candidates = local.local_worktrees(registered, self.device)
+            if not candidates:
+                return self._nothing_registered(repo)
 
-        if not candidates:
-            self.call_from_thread(
-                self.note,
-                f"no registered checkout of {repo} on {self.device} — run report_git there first",
-            )
-            return
-        path = candidates[0]["path"]
+        chosen = self._choose_checkout(candidates)
+        path = chosen["path"]
         outcome = local.pull(path) if action == "pull" else local.cherry_pick(path, sha)
-        prefix = "✓" if outcome.ok else "✗"
-        self.call_from_thread(self.note, f"{prefix} {path}: {outcome.message}")
+        line = f"{'✓' if outcome.ok else '✗'} {_esc(path)}: {_esc(outcome.message)}"
+        if len(candidates) > 1:
+            line += f"  [dim](chosen from {len(candidates)} matching checkouts)[/dim]"
+        return line
+
+    def _nothing_registered(self, repo: str | None) -> str:
+        return (
+            f"no registered checkout of {_esc(repo)} on {_esc(self.device)} — "
+            "run report_git there first"
+        )
+
+    def _choose_checkout(self, candidates: list[dict]) -> dict:
+        """One checkout, chosen the same way twice — and this one if it qualifies.
+
+        The board returns worktrees in whatever order they were registered, so
+        taking the first meant the same keypress could act on a different
+        checkout tomorrow. Sorting settles that; preferring the directory the
+        client was started in settles the more useful question, which is that
+        `--repo` should not be the only thing that knows where the user is.
+        """
+        ordered = sorted(candidates, key=lambda w: str(w.get("path") or ""))
+        here = _resolved(self.repo_path)
+        return next((w for w in ordered if _resolved(w.get("path")) == here), ordered[0])
 
     @on(DataTable.RowSelected, "#sessions")
     def _resume(self, event: DataTable.RowSelected) -> None:
@@ -691,6 +902,36 @@ class BoardApp(App):
         session = str(event.row_key.value) if event.row_key.value else None
         if session:
             self.exit(ResumeRequest(session))
+
+
+def _esc(value: object) -> str:
+    """Board content, made safe to hand a widget that renders markup.
+
+    Every string here came off the wire — summaries, agent names, git output,
+    error bodies — and both DataTable cells and Static take markup, so a `[` in
+    somebody's post is a swallowed word at best and a render error at worst. The
+    client's own tags are written outside this call and keep working.
+    """
+    return escape("" if value is None else str(value))
+
+
+def _resolved(path: str | None) -> str:
+    """A path in one comparable form, without asking the filesystem to exist."""
+    if not path:
+        return ""
+    return str(Path(path).expanduser().resolve())
+
+
+def _covered(value: str, covered: int, runs: int) -> str:
+    """``$1.2345 (7/12 runs)`` — a total, with how much of the window reported it.
+
+    The board hands back the coverage precisely because a sum over a
+    half-instrumented window is not a sum over the window; showing the sum alone
+    is how a partial figure gets read as a complete one.
+    """
+    if value == NOT_RECORDED or not runs or covered >= runs:
+        return value
+    return f"{value} ({covered}/{runs} runs)"
 
 
 def _ref(post: dict, kind: str) -> str | None:

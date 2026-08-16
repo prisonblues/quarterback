@@ -17,8 +17,8 @@
 # mcp_server.board.config, which reads the same per-host contract.
 #
 # A leading literal `board` argument is accepted and dropped by the Python, so
-# nix-fleet's `qb` needs only:  board) shift; exec qb-board "$@" ;;
-set -uo pipefail
+# nix-fleet's `qb` needs only:  board) exec qb-board "$@" ;;
+set -euo pipefail
 
 # Where the script itself lives, resolved one link at a time. NOT `readlink -f`:
 # home-manager installs each file as its own flat /nix/store path, so full
@@ -28,7 +28,7 @@ self_dir() {
   for _ in 1 2 3 4 5 6 7 8; do
     d="$(cd -P "$(dirname "$p")" 2>/dev/null && pwd)" || return 1
     [ -L "$p" ] || { printf '%s\n' "$d"; return 0; }
-    p="$(readlink "$p")"
+    p="$(readlink "$p")" || return 1
     case "$p" in /*) ;; *) p="$d/$p" ;; esac
   done
   return 1
@@ -37,22 +37,35 @@ self_dir() {
 usable() { [ -x "$1" ] && "$1" -c 'import mcp_server.board' >/dev/null 2>&1; }
 
 BIN_DIR="$(self_dir)" || BIN_DIR=""
-CANDIDATES=(
-  "${QB_BOARD_PYTHON:-}"
-  "${QUARTERBACK_REPO:-}/mcp/.venv/bin/python"
-  "${BIN_DIR:-.}/../../mcp/.venv/bin/python"
-  "$HOME/source/quarterback/mcp/.venv/bin/python"
-)
+
+# Built by appending only the candidates that exist, rather than as a fixed list
+# with empty entries skipped afterwards. The fixed list needed a sentinel — it
+# matched the literal "/mcp/.venv/bin/python" that an unset QUARTERBACK_REPO
+# expanded to — and that sentinel is a string which silently stops matching the
+# moment the expression above it is edited, leaving `/mcp` to be probed on every
+# launch. Appending conditionally also keeps `set -u` happy about $HOME, which
+# a cron or systemd environment need not define.
+CANDIDATES=()
+[ -n "${QB_BOARD_PYTHON:-}" ] && CANDIDATES+=("$QB_BOARD_PYTHON")
+[ -n "${QUARTERBACK_REPO:-}" ] && CANDIDATES+=("$QUARTERBACK_REPO/mcp/.venv/bin/python")
+[ -n "$BIN_DIR" ] && CANDIDATES+=("$BIN_DIR/../../mcp/.venv/bin/python")
+[ -n "${HOME:-}" ] && CANDIDATES+=("$HOME/source/quarterback/mcp/.venv/bin/python")
 
 PY=""
-for candidate in "${CANDIDATES[@]}"; do
-  case "$candidate" in ""|"/mcp/.venv/bin/python") continue ;; esac
-  usable "$candidate" && { PY="$candidate"; break; }
+# `${arr[@]+…}`: bash before 4.4 treats an empty array as unset under `set -u`,
+# and every candidate above is conditional, so the array genuinely can be empty.
+for candidate in ${CANDIDATES[@]+"${CANDIDATES[@]}"}; do
+  if usable "$candidate"; then PY="$candidate"; break; fi
 done
 # Last: whatever python3 is on PATH, which is the right answer for anyone who
 # simply `pip install`ed the package rather than running from a checkout.
-[ -n "$PY" ] || { command -v python3 >/dev/null 2>&1 && usable "$(command -v python3)" \
-  && PY="$(command -v python3)"; }
+# Spelled with an explicit `|| true` rather than an `&&` chain: under `set -e` a
+# chain that ends in a failed test is a launcher that exits silently, which is
+# the one outcome the message below exists to prevent.
+if [ -z "$PY" ]; then
+  fallback="$(command -v python3 || true)"
+  if [ -n "$fallback" ] && usable "$fallback"; then PY="$fallback"; fi
+fi
 
 if [ -z "$PY" ]; then
   cat >&2 <<EOF

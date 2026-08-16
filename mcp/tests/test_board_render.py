@@ -67,6 +67,52 @@ def test_missing_fields_degrade_to_placeholders():
     assert "#1" in out and "?" in out and "--:--:--" in out
 
 
+def test_an_explicitly_null_id_renders_as_a_placeholder():
+    """`.get('id', '?')` never fires on `{"id": None}` — `f"#{None:<6}"` raises."""
+    out = format_post({**POST, "id": None}, colour=False)
+    assert "#?" in out
+
+
+def test_escapes_in_a_post_do_not_reach_the_terminal():
+    """Board content is written by anyone holding a token, and a tail runs unattended.
+
+    An OSC in a summary retitles the reader's terminal and a CSI can clear it, so
+    the sequences are stripped rather than passed through with the text.
+    """
+    hostile = {
+        **POST,
+        "from": "zeus/\x1b]0;pwned\x07agent",
+        "summary": "looks fine\x1b[2J\x1b[38;2;255;0;0mred",
+        "to": "zeus/\x07bell",
+        "re": "33\x1b41",
+        "ts": "2026-08-16T\x1b[1m20:35\x1b",
+        "refs": [{"kind": "branch\x1b[0m", "value": "feat/\x1bx"}],
+    }
+    out = format_post(hostile, colour=False)
+    assert "\x1b" not in out and "\x07" not in out
+    assert "]0;pwned" in out  # the ESC is gone; the inert remains are still greppable
+    assert "\n" not in out
+
+
+def test_stripping_escapes_does_not_disturb_our_own_colour():
+    """The scrub runs on the untrusted text, before paint wraps it."""
+    out = format_post({**POST, "summary": "\x1b[2Jclear"}, colour=True)
+    r, g, b = (0x35, 0xC4, 0x8A)  # TYPE_COLOR["ack"]
+    assert f"\x1b[38;2;{r};{g};{b}m" in out
+    assert "\x1b[2J" not in out
+
+
+def test_scrubbing_happens_before_padding_so_the_columns_stay_put():
+    """Escapes occupy no columns, so scrubbing after padding lets a post shift the row."""
+    hostile = format_post({**POST, "from": "\x1b[31mzeus/a", "summary": "MARK"}, colour=False)
+    plain = format_post({**POST, "from": "zeus/a", "summary": "MARK"}, colour=False)
+    assert hostile.index("MARK") == plain.index("MARK")
+
+
+def test_refs_carrying_escapes_are_stripped_too():
+    assert format_refs([{"kind": "issue", "value": "1\x1b[31m10"}]) == "[issue #1[31m10]"
+
+
 def test_short_time_slices_utc_without_reinterpreting_it():
     # Sliced, not parsed: converting to local time here would make the tail and
     # the browser disagree about when one post happened.

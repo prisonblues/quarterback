@@ -99,13 +99,33 @@ def test_null_is_not_zero_in_the_panel_view():
     # Zero cost renders as a price, and is visibly a different claim from silence.
     assert claude["cost"] == "$0.0000"
     assert claude["tokens"] == NOT_RECORDED
-    assert claude["precision"] == "—"  # the judge never ruled, not "always wrong"
+    # The judge never ruled — which is what the words say, and what a dash does not.
+    # The dash is spent elsewhere in this row, on a missing effort, where it means
+    # "none" rather than "unknown".
+    assert claude["precision"] == NOT_RECORDED
+    assert claude["per_run"] == NOT_RECORDED
+    assert claude["effort"] == "—"
 
 
 def test_panel_window_says_what_the_numbers_are_over():
     line = panel_window({"runs": 12, "prs": 5, "repos": 2,
                          "window": {"repo": "prisonblues/quarterback", "judged_only": True}})
     assert "12 run(s)" in line and "prisonblues/quarterback" in line and "judged runs only" in line
+
+
+def test_a_window_that_does_not_say_which_runs_it_counted_is_not_labelled_judged():
+    """An older stats payload has made no claim, and defaulting to True invents one."""
+    line = panel_window({"runs": 12, "prs": 5, "repos": 2, "window": {}})
+    assert NOT_RECORDED in line
+    assert "judged runs only" not in line and "all runs" not in line
+    assert "all runs" in panel_window({"window": {"judged_only": False}})
+
+
+def test_a_timestamp_of_the_wrong_type_is_unparseable_not_an_exception():
+    """`fromisoformat(1755370000)` raises TypeError, which no caller here catches."""
+    assert age(1755370000, NOW) == "?"
+    assert age(True, NOW) == "?"
+    assert ttl(12.5, NOW) == "?"
 
 
 def test_an_ask_i_have_answered_stops_counting():
@@ -143,6 +163,30 @@ def test_answers_for_is_hierarchical_in_one_direction_only():
     assert answers_for("zeus/a", "zeus/a") is True
     assert answers_for("zeus-two/a", "zeus") is False  # not a path boundary
     assert answers_for("anyone", None) is True  # identity unknown: don't over-report
+
+
+def test_an_anonymous_reply_is_not_evidence_that_i_answered():
+    """The two None cases are not symmetric, and collapsing them clears live alerts.
+
+    An unknown *me* means every reply counts (an alert nobody can clear is one
+    nobody reads); an unknown *author* means no reply counts, because a post whose
+    `from` failed to decode is not mine and the ask it answers is still open.
+    """
+    assert answers_for(None, "zeus") is False
+    inbox = [{"id": 10, "type": "ask", "from": "atlas/x"}]
+    seen = [{"id": 12, "type": "ack", "re": 10, "from": None}]
+    assert [p["id"] for p in unanswered_asks(inbox, seen, "zeus")] == [10]
+
+
+def test_an_ask_stays_answered_when_the_two_payloads_spell_the_id_differently():
+    """`re` and `id` arrive from /board and from /stream; only their meaning is shared.
+
+    A string `"10"` never matched an integer `10`, so the ask came back as pending
+    every refresh and could not be cleared by answering it again.
+    """
+    inbox = [{"id": 10, "type": "ask", "from": "zeus/b"}]
+    seen = [{"id": 12, "type": "ack", "re": "10", "from": "zeus/me"}]
+    assert unanswered_asks(inbox, seen, "zeus/me") == []
 
 
 def test_non_ask_mail_is_not_a_pending_ask():

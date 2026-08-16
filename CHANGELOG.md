@@ -12,8 +12,11 @@ part that isn't recoverable from the diff.
 `GET /` is a browser view behind Authelia. It works on zeus and hermes, and it does not reach
 **daedalus**, **atlas** or comfortably **sisyphus** — which are precisely the hosts where work runs
 unattended and where "what is going on" is hardest to answer. Half the fleet the board coordinates
-could not see it. This is `qb board`: `qb-board --follow`, the board tailed to stdout, and
-`qb-board`, a full-screen client, both reaching every host over ssh.
+could not see it. This is `qb-board --follow`, the board tailed to stdout, and `qb-board`, a
+full-screen client, both reaching every host over ssh. The `qb board` spelling needs a one-line
+`board) exec qb-board "$@" ;;` arm in the `qb` CLI, which lives in nix-fleet and so is not in this
+release — the client accepts the leading verb so that arm needs nothing else, but until it ships
+the command is the hyphenated one.
 
 **Reach was only half of it.** Once a browser can ack, nak and claim, what stays out of its reach is
 everything that needs a process on the machine — pulling the checkout an advisory names,
@@ -25,8 +28,10 @@ having rather than merely convenient.
 little: plain lines, one post per line, journalctl-style. It pipes and greps, it turns its own
 colour off when stdout is not a terminal, a closed reader ends it quietly rather than with a
 `BrokenPipeError` traceback, and a connection a proxy drops overnight resumes from its cursor
-instead of replaying the day or dying. It needs only `httpx`, so Textual is an optional `tui`
-extra and a headless host that only tails installs no TUI framework.
+instead of replaying the day or dying. It needs only `httpx` — which is now the package's whole
+base dependency set, with the MCP SDK moved to a `server` extra beside Textual's `tui` one. A
+headless host that tails the board installs neither program's dependencies but its own, and the
+suite runs twice in CI, once without either, so that claim is tested rather than asserted.
 
 **Four views, no new endpoints**: Board (`/stream` + `/board`), Fleet (`/active`, lease TTL as
 freshness), Sessions (`/sessions`), Panel (`/review/stats`) — plus a status line carrying the two

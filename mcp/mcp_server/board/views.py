@@ -21,7 +21,10 @@ def _parse(ts: str | None) -> datetime | None:
         return None
     try:
         parsed = datetime.fromisoformat(ts)
-    except ValueError:
+    except (ValueError, TypeError):
+        # TypeError as well as ValueError: a payload carrying an epoch int or a bool
+        # where a timestamp belongs is malformed, not exceptional, and every caller
+        # here already renders None as "?".
         return None
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
@@ -143,22 +146,29 @@ def _fmt_int(value: int | None) -> str:
 
 
 def _fmt_ratio(value: float | None) -> str:
-    return "—" if value is None else f"{value:.0%}"
+    return NOT_RECORDED if value is None else f"{value:.0%}"
+
+
+def _fmt_per_run(value: float | None) -> str:
+    return NOT_RECORDED if value is None else f"{value:.2f}"
 
 
 def panel_rows(stats: dict) -> list[dict]:
     """``/review/stats`` by_model as rows: what reviews cost and what they found.
 
-    Three columns can be genuinely absent and each is rendered as *not recorded*
-    rather than as a zero — cost, tokens, and precision. A vendor that does not
-    state a price is not a free vendor, and a member the judge never ruled on is
-    not a member that was always wrong.
+    Four columns can be genuinely absent and each is rendered as *not recorded*
+    rather than as a zero — cost, tokens, precision, and confirmed-per-run. A
+    vendor that does not state a price is not a free vendor, and a member the judge
+    never ruled on is not a member that was always wrong.
     """
     rows = []
     for m in stats.get("by_model", []):
         rows.append(
             {
                 "reviewer": m.get("reviewer") or "?",
+                # The em-dash here means "none", not "unknown": a member with no
+                # model or effort pinned genuinely has none, and that is the fact
+                # rather than a gap in the payload — hence a mark, not NOT_RECORDED.
                 "model": m.get("model") or "—",
                 "effort": m.get("effort") or "—",
                 "runs": m.get("runs", 0),
@@ -166,8 +176,7 @@ def panel_rows(stats: dict) -> list[dict]:
                 "confirmed": m.get("confirmed", 0),
                 "dismissed": m.get("dismissed", 0),
                 "precision": _fmt_ratio(m.get("precision")),
-                "per_run": ("—" if m.get("confirmed_per_run") is None
-                            else f"{m['confirmed_per_run']:.2f}"),
+                "per_run": _fmt_per_run(m.get("confirmed_per_run")),
                 "tokens": _fmt_int(m.get("total_tokens")),
                 "cost": _fmt_cost(m.get("cost_usd")),
                 # Coverage markers: a sum over a half-instrumented window is not a
@@ -184,7 +193,14 @@ def panel_window(stats: dict) -> str:
     """One line describing what the Panel numbers are actually over."""
     window = stats.get("window") or {}
     scope = window.get("repo") or "all repos"
-    judged = "judged runs only" if window.get("judged_only", True) else "all runs"
+    # No default of True: "judged runs only" is a claim about which runs the numbers
+    # came from, and an older or partial stats payload that omits the field has not
+    # made it. Saying so beats labelling an unknown window as the narrow one.
+    judged_only = window.get("judged_only")
+    if judged_only is None:
+        judged = f"coverage {NOT_RECORDED}"
+    else:
+        judged = "judged runs only" if judged_only else "all runs"
     return (
         f"{stats.get('runs', 0)} run(s) over {stats.get('prs', 0)} PR(s) "
         f"in {stats.get('repos', 0)} repo(s) · {scope} · {judged}"
@@ -220,8 +236,14 @@ def answers_for(author: str | None, me: str | None) -> bool:
     already answered as still outstanding — which was 20 of them on the first
     real run, and an alert nobody can clear is an alert nobody reads.
     """
-    if me is None or author is None:
+    if me is None:
+        # Identity unknown: every reply counts, because an alert that fires on
+        # everything is worse than one that fires on nothing you can act on.
         return True
+    if author is None:
+        # An anonymous reply is somebody's, but there is no evidence it is mine, and
+        # treating it as mine clears an ask that is still sitting in my inbox.
+        return False
     if author == me:
         return True
     return "/" not in me and author.startswith(f"{me}/")
@@ -237,12 +259,16 @@ def unanswered_asks(inbox: list[dict], seen: list[dict], me: str | None) -> list
     view*", and the client says so rather than claiming a mailbox it cannot see
     all of.
     """
+    # Compared as strings: `re` and `id` reach here from two payloads — a `/board`
+    # page and a `/stream` frame — and JSON only guarantees they mean the same
+    # number, not that both sides spelled it as one. `"123" != 123` would leave an
+    # answered ask on the list for good.
     answered = {
-        p.get("re")
+        str(p.get("re"))
         for p in seen
         if p.get("type") in ("ack", "nak") and p.get("re") and answers_for(p.get("from"), me)
     }
-    return [p for p in inbox if p.get("type") == "ask" and p.get("id") not in answered]
+    return [p for p in inbox if p.get("type") == "ask" and str(p.get("id")) not in answered]
 
 
 def staleness(sync: dict) -> tuple[bool, str]:

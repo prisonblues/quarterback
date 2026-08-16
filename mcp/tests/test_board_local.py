@@ -103,6 +103,25 @@ def test_a_synced_branch_passes(git_repo):
     assert local.check_no_unpushed(str(git_repo)).ok
 
 
+def test_a_count_git_never_printed_is_a_refusal_not_a_crash(git_repo, monkeypatch):
+    """`int("")` in a background worker raises where nobody is listening.
+
+    Only `rev-list --count` is faked, and only its stdout: no real git prints an
+    empty count on exit 0, so the state cannot be built — but a truncated pipe or
+    a wrapper on PATH can produce it, and the worker has no other way to report.
+    """
+    real = local._git
+
+    def blank_the_count(path, *args):
+        if args[:2] == ("rev-list", "--count"):
+            return subprocess.CompletedProcess(args, 0, "", "")
+        return real(path, *args)
+
+    monkeypatch.setattr(local, "_git", blank_the_count)
+    outcome = local.check_no_unpushed(str(git_repo))
+    assert not outcome.ok and "could not read" in outcome.message
+
+
 # -- pull --------------------------------------------------------------
 
 
@@ -127,6 +146,20 @@ def test_pull_refuses_a_dirty_tree(git_repo, holder_stub):
     (git_repo / "README").write_text("mine\n")
     assert not local.pull(str(git_repo)).ok
     assert not (git_repo / "NEW").exists()
+
+
+def test_the_local_checks_answer_before_the_board_is_asked(git_repo, holder_stub):
+    """Ordering, observed through the message: the holder question is asked last.
+
+    It is the slow one — it goes to the board — so it sits immediately before the
+    git write, which is the only thing that shortens the gap between "nobody else
+    is here" and acting on it. Nothing here is a lock and nothing can be; see the
+    module docstring. If check_free ran first this would refuse as "held".
+    """
+    holder_stub(3)
+    (git_repo / "README").write_text("mine\n")
+    outcome = local.pull(str(git_repo))
+    assert not outcome.ok and "dirty" in outcome.message
 
 
 def test_pull_refuses_when_the_checkout_holds_unpushed_commits(git_repo, holder_stub):
@@ -156,6 +189,69 @@ def test_cherry_pick_applies_a_commit_the_checkout_can_reach(git_repo, holder_st
 def test_cherry_pick_refuses_a_short_sha(git_repo, holder_stub):
     holder_stub(0)
     assert not local.cherry_pick(str(git_repo), "abc12").ok
+
+
+def test_cherry_pick_takes_a_sha_and_nothing_else_from_the_board(git_repo, holder_stub):
+    """A `landed` post's `commit` ref is whatever its author typed.
+
+    Git's revision grammar is wide and `cherry-pick` reads flags: a length check
+    alone let `HEAD~10` select a commit nobody named and `--upload-pack=…` change
+    what git does. Each of these must be refused before it reaches git at all.
+    """
+    holder_stub(0)
+    advance_origin(git_repo)
+    before = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=git_repo, capture_output=True, text=True
+    ).stdout.strip()
+    for bad in ("HEAD~10", "--upload-pack=evil", "origin/main", "0" * 41, ":/second", ""):
+        outcome = local.cherry_pick(str(git_repo), bad)
+        assert not outcome.ok, bad
+        assert "hex" in outcome.message, bad
+    after = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=git_repo, capture_output=True, text=True
+    ).stdout.strip()
+    assert after == before  # nothing was applied on the way to any of those refusals
+
+
+def test_cherry_pick_refuses_a_checkout_already_mid_cherry_pick(git_repo, holder_stub):
+    """Somebody else's stopped pick is theirs to finish or abandon, not ours to abort.
+
+    The old code ran `cherry-pick --abort` on any failure of its own, which threw
+    away a pre-existing CHERRY_PICK_HEAD it had never started. Refusing up front is
+    what makes the cleanup below provably ours.
+    """
+    holder_stub(0)
+    advance_origin(git_repo)
+    theirs = subprocess.run(
+        ["git", "rev-parse", "origin/main"], cwd=git_repo, capture_output=True, text=True
+    ).stdout.strip()
+    (git_repo / "NEW").write_text("conflicting content\n")
+    git(git_repo, "add", "NEW")
+    git(git_repo, "commit", "-m", "conflict")
+    subprocess.run(["git", "cherry-pick", theirs], cwd=git_repo, capture_output=True)
+    assert (git_repo / ".git" / "CHERRY_PICK_HEAD").exists()  # the state under test
+
+    outcome = local.cherry_pick(str(git_repo), theirs)
+    assert not outcome.ok and "in progress" in outcome.message
+    assert (git_repo / ".git" / "CHERRY_PICK_HEAD").exists()  # left exactly as found
+
+
+def test_cherry_pick_refuses_a_paused_rebase_even_though_the_tree_is_clean(git_repo, holder_stub):
+    """The case `check_clean` cannot see: mid-operation with nothing modified.
+
+    A rebase stopped between steps leaves a checkout only `--continue` or `--abort`
+    can resolve, and neither is this client's to choose on somebody's behalf.
+    """
+    holder_stub(0)
+    sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=git_repo, capture_output=True, text=True
+    ).stdout.strip()
+    git(git_repo, "commit", "--allow-empty", "-m", "second")
+    subprocess.run(["git", "rebase", "--exec", "false", "HEAD~1"], cwd=git_repo,
+                   capture_output=True)
+    assert local.check_clean(str(git_repo)).ok  # clean, and still not writable
+    outcome = local.cherry_pick(str(git_repo), sha)
+    assert not outcome.ok and "in progress" in outcome.message
 
 
 def test_cherry_pick_reports_an_unreachable_sha_rather_than_guessing(git_repo, holder_stub):

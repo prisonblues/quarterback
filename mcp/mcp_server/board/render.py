@@ -9,6 +9,7 @@ surfaces onto one stream should agree about what a `published` post looks like.
 from __future__ import annotations
 
 import os
+import re
 import sys
 
 #: app/static/board.html's TYPE_COLOR, verbatim. `published` is `landed`'s
@@ -30,6 +31,25 @@ _DEFAULT_COLOR = "#5b6472"
 
 _MUTED = "#8b93a3"
 _ACCENT = "#6ea8fe"
+
+
+#: C0 controls, DEL, and C1. Board content is written by whoever holds a token,
+#: and a summary is free text — so an `ESC ]0;…BEL` in one would retitle the
+#: reader's terminal and an `ESC [2J` would clear it, on a headless box tailing
+#: the board unattended. `--no-color` is no defence: it stops *us* emitting
+#: escapes, not the post from carrying its own.
+_CONTROLS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def _scrub(text: str) -> str:
+    """Board-supplied text with every control character removed.
+
+    Dropped rather than escaped: what is left is inert and still greppable, which
+    is what this output is for. Applied before :func:`paint`, so the module's own
+    colour escapes are unaffected — they are added after the untrusted part is
+    already flat.
+    """
+    return _CONTROLS.sub("", text)
 
 
 def _rgb(hex_colour: str) -> tuple[int, int, int]:
@@ -72,7 +92,7 @@ def short_time(ts: str | None) -> str:
     way (`(p.ts||"").slice(11,19)`); converting to local time here would make two
     views of one post disagree about when it happened.
     """
-    return (ts or "")[11:19] or "--:--:--"
+    return _scrub((ts or "")[11:19]) or "--:--:--"
 
 
 def format_refs(refs: list[dict] | None) -> str:
@@ -81,13 +101,14 @@ def format_refs(refs: list[dict] | None) -> str:
         return ""
     parts = []
     for ref in refs:
-        kind, value = ref.get("kind"), ref.get("value")
+        kind = _scrub(str(ref.get("kind") or ""))
+        value = _scrub(str(ref.get("value") or ""))
         if not kind or not value:
             continue
         if kind in ("issue", "pr"):
             parts.append(f"{kind} #{value}")
         elif kind == "commit":
-            parts.append(f"commit {str(value)[:12]}")
+            parts.append(f"commit {value[:12]}")
         else:
             parts.append(f"{kind} {value}")
     return f"[{', '.join(parts)}]" if parts else ""
@@ -99,24 +120,34 @@ def format_post(post: dict, *, colour: bool = True) -> str:
     Deliberately single-line and column-aligned rather than wrapped. This is the
     output a headless host greps and pipes, and a summary that spilled onto a
     second line would break every `grep -c` over it.
+
+    Every board-supplied field goes through :func:`_scrub` on the way in — see the
+    note there — and is padded after scrubbing, so a post cannot buy itself extra
+    columns with characters that occupy none.
     """
     tc = type_colour(post.get("type", "note"))
     ts = paint(short_time(post.get("ts")), _MUTED, colour=colour)
-    pid = paint(f"#{post.get('id', '?'):<6}", _MUTED, colour=colour)
-    author = paint(f"{post.get('from') or '?'!s:<20.20}", tc, colour=colour)
-    ptype = paint(f"{post.get('type') or 'note'!s:<9.9}", tc, colour=colour)
+    # `.get('id') or '?'`, not `.get('id', '?')`: an explicit `{"id": None}` — which
+    # a partial payload does produce — takes the default past the two-argument get
+    # and `f"#{None:<6}"` raises rather than rendering a placeholder.
+    pid = paint(f"#{_scrub(str(post.get('id') or '?')):<6}", _MUTED, colour=colour)
+    author = paint(f"{_scrub(str(post.get('from') or '?')):<20.20}", tc, colour=colour)
+    ptype = paint(f"{_scrub(str(post.get('type') or 'note')):<9.9}", tc, colour=colour)
 
     tail = []
     if post.get("to"):
-        tail.append(paint(f"→{post['to']}", _ACCENT, colour=colour))
+        tail.append(paint(f"→{_scrub(str(post['to']))}", _ACCENT, colour=colour))
     if post.get("re"):
-        tail.append(paint(f"re:{post['re']}", _MUTED, colour=colour))
+        tail.append(paint(f"re:{_scrub(str(post['re']))}", _MUTED, colour=colour))
     if post.get("has_detail") or post.get("detail_ref"):
         tail.append(paint("+detail", _MUTED, colour=colour))
     refs = format_refs(post.get("refs"))
     if refs:
         tail.append(paint(refs, _ACCENT, colour=colour))
 
-    summary = " ".join(str(post.get("summary") or "").split())
+    # Collapse first, scrub second: `split()` is what turns a legitimate newline or
+    # tab into a space, and scrubbing ahead of it would delete the separator and
+    # weld two words together.
+    summary = _scrub(" ".join(str(post.get("summary") or "").split()))
     line = f"{ts} {pid} {author} {ptype} {summary}"
     return f"{line}  {'  '.join(tail)}" if tail else line

@@ -10,9 +10,19 @@ a local process.
 checkout out from under them is the failure this exists to prevent, so each
 action asks three questions first and a "could not tell" counts as a no:
 
-1. is another live agent holding this worktree? (``worktree-holder``, exit 3)
-2. could we even ask? (exit 4 — a down board must not read as "free")
-3. is the tree dirty, or carrying commits that exist nowhere else?
+1. is the tree dirty, mid-sequencer, or carrying commits that exist nowhere else?
+2. is another live agent holding this worktree? (``worktree-holder``, exit 3)
+3. could we even ask? (exit 4 — a down board must not read as "free")
+
+**These checks narrow a race; they do not close it.** Nothing here reserves the
+checkout, and deliberately so: ``worktree-holder`` says of itself that it is
+ADVISORY, NEVER A LOCK, and a lock taken by this client would wedge whatever
+live session it locked out. An agent can still arrive between the last check and
+the git write. What that buys is the ordering below — the slow, network-bound
+holder question is asked *last*, immediately before git writes, so the window it
+leaves open is as small as a client without a lock can make it. The failure
+being prevented is the *silent* rewrite of somebody else's checkout, which is
+the one this ordering actually catches.
 
 Issue #83 will land the same rebase-on-publish behaviour as a first-class
 operation. When it does, :func:`pull` should call it instead of running the
@@ -22,6 +32,7 @@ refusals survive that swap rather than being re-derived inside it.
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -32,6 +43,24 @@ _GIT_TIMEOUT = 120
 #: worktree-holder's documented exit codes.
 _HELD = 3
 _CANNOT_TELL = 4
+
+#: A git object name and nothing else, applied with `fullmatch` because the point
+#: is to *exclude* the rest of git's revision grammar: `HEAD~10`, `:/subject`,
+#: `main@{yesterday}` and `--upload-pack=…` are all things a board post's `commit`
+#: ref can carry, and all things that would make `cherry-pick` pick something
+#: nobody asked for. 7 is git's own minimum unambiguous prefix, 40 a full SHA-1.
+_SHA = re.compile(r"[0-9a-fA-F]{7,40}")
+
+#: What git leaves in the git dir while an interrupted multi-step operation is
+#: still open. Checked by path because there is no porcelain that reports it, and
+#: this is where git's own `wt_status` looks.
+_SEQUENCER_MARKERS = (
+    "CHERRY_PICK_HEAD",
+    "REVERT_HEAD",
+    "MERGE_HEAD",
+    "rebase-merge",
+    "rebase-apply",
+)
 
 
 @dataclass(frozen=True)
@@ -134,10 +163,47 @@ def check_no_unpushed(path: str) -> Outcome:
     ahead = _git(path, "rev-list", "--count", "@{u}..HEAD")
     if ahead.returncode != 0:
         return Outcome(False, f"could not count unpushed commits ({_first_line(ahead.stderr, '?')})")
-    count = int(ahead.stdout.strip() or 0)
+    try:
+        # Not `int(x or 0)`: a git that exits 0 having printed nothing (or a
+        # locale-mangled number) would raise out of the background worker, and an
+        # exception there is the one outcome the caller cannot turn into a message.
+        count = int(ahead.stdout.strip())
+    except ValueError:
+        got = " ".join(ahead.stdout.split())[:60]
+        return Outcome(False, f"could not read git's unpushed count (got {got!r}) — refusing")
     if count:
         return Outcome(False, f"{count} unpushed commit(s) here — refusing")
     return Outcome(True, "nothing unpushed")
+
+
+def _git_dir(path: str) -> Path | None:
+    """The checkout's git dir, or None if `path` is not one.
+
+    Resolved rather than assumed ``<path>/.git``: in a linked worktree that is a
+    file pointing elsewhere, and the sequencer state lives at the far end of it.
+    """
+    proc = _git(path, "rev-parse", "--absolute-git-dir")
+    if proc.returncode != 0:
+        return None
+    out = proc.stdout.strip()
+    return Path(out) if out else None
+
+
+def check_not_mid_operation(path: str) -> Outcome:
+    """Refuse a checkout that is part-way through a cherry-pick, revert, merge or rebase.
+
+    A tree can be clean and still be mid-sequencer — a rebase paused on `edit` is
+    exactly that — so :func:`check_clean` does not cover this. Writing into one is
+    worse than writing into a dirty tree: whoever left it there has state that only
+    `--continue` or `--abort` can resolve, and neither is ours to choose.
+    """
+    git_dir = _git_dir(path)
+    if git_dir is None:
+        return Outcome(False, "not a git checkout")
+    for marker in _SEQUENCER_MARKERS:
+        if (git_dir / marker).exists():
+            return Outcome(False, f"a {marker} operation is already in progress here — refusing")
+    return Outcome(True, "no operation in progress")
 
 
 def pull(path: str) -> Outcome:
@@ -148,8 +214,14 @@ def pull(path: str) -> Outcome:
     for a merge or a rebase to do that a fast-forward cannot, and `--ff-only`
     fails loudly instead of inventing a merge commit if that stops being true
     between the check and the pull.
+
+    The local checks run first and :func:`check_free` last, immediately before the
+    write: it is the slow one (it asks the board) and the only one whose answer can
+    go stale in a way that matters, so it gets the shortest gap to the git call.
+    That narrows the race, it does not remove it — see the module docstring; there
+    is no reservation here and by design cannot be one.
     """
-    for check in (check_free, check_clean, check_no_unpushed):
+    for check in (check_clean, check_no_unpushed, check_free):
         outcome = check(path)
         if not outcome.ok:
             return outcome
@@ -165,10 +237,20 @@ def cherry_pick(path: str, sha: str) -> Outcome:
     Unpushed commits are not a refusal here, unlike :func:`pull` — adding a
     commit on top of local work is the ordinary case, and the thing being
     protected against is writing into a checkout somebody else is using.
+
+    Check order matches :func:`pull`'s and for the same reason: the local checks
+    are cheap and stable, :func:`check_free` is neither, so it is asked last and
+    the git write follows it immediately. The gap is small, not absent.
     """
-    if len(sha) < 7:
-        return Outcome(False, "need at least 7 characters of the SHA")
-    for check in (check_free, check_clean):
+    if not _SHA.fullmatch(sha or ""):
+        return Outcome(
+            False,
+            f"{sha!r} is not a commit SHA — this takes 7 to 40 hex characters and "
+            "nothing else (no HEAD~n, no branch names, no flags)",
+        )
+    # Mid-operation before dirty: a stopped cherry-pick is *also* a dirty tree, and
+    # "you are part-way through a cherry-pick" is the half of that a person can act on.
+    for check in (check_not_mid_operation, check_clean, check_free):
         outcome = check(path)
         if not outcome.ok:
             return outcome
@@ -177,11 +259,17 @@ def cherry_pick(path: str, sha: str) -> Outcome:
         fetch = _git(path, "fetch", "--all", "--quiet")
         if fetch.returncode != 0 or _git(path, "cat-file", "-e", f"{sha}^{{commit}}").returncode != 0:
             return Outcome(False, f"{sha[:12]} is not in this checkout, even after a fetch")
-    proc = _git(path, "cherry-pick", sha)
+    # `--`, even though `sha` is already known to be hex: the separator is what
+    # makes that a property of the call rather than of the validator staying right.
+    proc = _git(path, "cherry-pick", "--", sha)
     if proc.returncode != 0:
         # Leave no half-applied pick behind: an abandoned CHERRY_PICK_HEAD is a
         # trap for whoever opens this checkout next, and they did not ask for it.
-        _git(path, "cherry-pick", "--abort")
+        # Only ours, though — `check_not_mid_operation` above established there was
+        # no sequencer state here before this call, so anything present now is this
+        # call's, and `--abort` cannot be discarding somebody else's afternoon.
+        if not check_not_mid_operation(path).ok:
+            _git(path, "cherry-pick", "--abort")
         return Outcome(False, f"cherry-pick failed: {_first_line(proc.stderr, 'conflict')}")
     return Outcome(True, f"cherry-picked {sha[:12]}")
 

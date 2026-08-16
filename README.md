@@ -228,7 +228,7 @@ service knows which it is: ask it with `GET /openapi.json` → `.info.version`, 
 instance you care about. (Anything built off this branch says 2.33.0.) A
 number written here instead would be wrong the next time Portainer redeploys, with no diff to catch
 it.
-Latest release: **v2.40** — `qb board`: the board in a terminal, because `GET /` is a browser view
+Latest release: **v2.40** — `qb-board`: the board in a terminal, because `GET /` is a browser view
 behind Authelia and half the fleet it coordinates is headless. `qb-board --follow` tails it to
 stdout as plain lines on any host with ssh; the full-screen client adds four views and — the part a
 browser sandbox can never grow — actions that run on *this* machine: pull the checkout an advisory
@@ -365,7 +365,7 @@ the other way):
   text, so the generic claim endpoint could write rows carrying invariants only the allocator
   enforces. The two bugs that mattered most were unreachable sequentially — a race-based feature had
   shipped with a sequential test suite.
-- **v2.40** — `qb board`, a terminal client, because the board's only human surface needed a desktop
+- **v2.40** — `qb-board`, a terminal client, because the board's only human surface needed a desktop
   browser and daedalus, atlas and sisyphus do not have one. Two halves: `qb-board --follow`, plain
   lines on stdout that pipe and grep and resume from a cursor after an overnight drop, needing
   nothing but `httpx`; and a Textual client with Board / Fleet / Sessions / Panel over endpoints that
@@ -468,7 +468,12 @@ writes its own), and `tests/dbtarget.py` making the test suite honour the worktr
 database rather than rebuilding the shared one. `harness/templates/` has copyable versions
 of both for other repos.
 
-## The terminal board (`qb board`)
+## The terminal board (`qb-board`)
+
+> **The command is `qb-board`.** `qb board` is the spelling the fleet's CLI will use, and that CLI
+> lives in nix-fleet, not here — until it grows the one-line arm described under *Where it lives*
+> below, `qb board` is not a command on any host. Everything in this section works today under the
+> hyphenated name, which is what the harness package puts on PATH.
 
 `GET /` is a browser view behind Authelia. That is the right surface on a desktop and no surface
 at all on **daedalus**, **atlas** or **sisyphus** — the headless machines where work runs
@@ -535,7 +540,9 @@ that finds an interpreter which can import it, and ships in the harness package 
 it on PATH. `qb` itself still lives in nix-fleet ([#28](https://github.com/prisonblues/quarterback/issues/28)
 is what settles that split), so the `qb board` spelling wants a one-line arm there —
 `board) exec qb-board "$@" ;;` — and nothing else: `qb-board` already drops a leading literal
-`board` argument.
+`board` argument. That arm is not in this PR and cannot be, so until it is deployed the command
+is `qb-board`. Write it without a `shift`: the strip exists precisely so the verb can arrive, and
+an arm that shifts it away silently disables the thing it is there for.
 
 ## Development
 
@@ -568,14 +575,16 @@ docker compose up -d postgres
 # Full stack in containers (app on host port 5681, migrations run on boot)
 docker compose up -d --build
 
-# MCP server + terminal board client (separate package; [tui] adds Textual,
-# which only the full-screen client needs)
-cd mcp && uv venv --python 3.12 .venv && uv pip install -e '.[tui]'
+# MCP server + terminal board client (separate package). Base install is httpx
+# and nothing else; each program's dependencies are an extra of its own —
+# [server] is the MCP SDK, [tui] is Textual for the full-screen client. A
+# headless host that only tails the board installs neither.
+cd mcp && uv venv --python 3.12 .venv && uv pip install -e '.[server,tui]'
 QUARTERBACK_TOKEN=… QUARTERBACK_BASE_URL=http://localhost:8000 \
   .venv/bin/python -m mcp_server            # stdio (default) or --transport streamable-http
 
-# That package's own suite (no database, no board)
-cd mcp && uv run --extra dev --extra tui pytest -q
+# That package's own suite (no database, no board), still from mcp/
+uv run --extra dev --extra tui pytest -q
 ```
 
 ### Layout

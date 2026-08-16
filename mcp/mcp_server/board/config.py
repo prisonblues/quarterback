@@ -23,6 +23,7 @@ import socket
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse
 
 #: The pre-config fleet layout, kept so a host that has not been rebuilt still works.
 LEGACY_TOKEN_FILE = Path("/run/op-secrets/quarterback-token")
@@ -53,7 +54,12 @@ def config_path(env: dict[str, str] | None = None) -> Path:
     explicit = env.get("QUARTERBACK_CONFIG")
     if explicit:
         return Path(explicit)
-    base = env.get("XDG_CONFIG_HOME") or os.path.join(env.get("HOME", "~"), ".config")
+    # `expanduser`, not a literal "~": Path does not expand tildes, so a HOME-less
+    # env (a systemd unit, a bare `env -i`) would have produced a relative `./~`
+    # directory under whatever the cwd happened to be and read the config from
+    # nowhere. expanduser falls back to the passwd entry, which is the real answer.
+    home = env.get("HOME") or os.path.expanduser("~")
+    base = env.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
     return Path(base) / "quarterback" / "config"
 
 
@@ -94,19 +100,25 @@ def _read_config_file(path: Path, env: dict[str, str]) -> dict[str, str]:
 
 
 def _run_token_cmd(cmd: str, env: dict[str, str]) -> str | None:
-    """First line of ``QUARTERBACK_TOKEN_CMD``'s output, or None if it produced nothing.
+    """First line of ``QUARTERBACK_TOKEN_CMD``'s output, or None unless it succeeded.
 
     Kept cheap by contract — it runs on every call — so the timeout is short and a
     failure is silent: an unresolvable token is reported once, by the caller, as
     "no token", not as a stack trace per attempt.
     """
     try:
-        out = subprocess.run(
+        proc = subprocess.run(
             cmd, shell=True, capture_output=True, text=True, timeout=15, env=env
-        ).stdout
+        )
     except (OSError, subprocess.SubprocessError):
         return None
-    token = out.split("\n", 1)[0].strip()
+    # Exit status, not just output. `op read …` and friends print partial or stale
+    # material and *then* fail, and a client that took the first line anyway would
+    # authenticate with a credential the provider had just disowned — arriving as a
+    # 401 loop against the board rather than as the "no token" this reports.
+    if proc.returncode != 0:
+        return None
+    token = proc.stdout.split("\n", 1)[0].strip()
     return token or None
 
 
@@ -118,7 +130,8 @@ def _hostname() -> str:
 def resolve(env: dict[str, str] | None = None) -> BoardConfig:
     """Resolve the board URL, this machine's token, and its name.
 
-    Raises :class:`NoBoardConfigured` when no base URL is set anywhere.
+    Raises :class:`NoBoardConfigured` when no base URL is set anywhere, or when
+    what is set is not one.
     """
     env = dict(os.environ if env is None else env)
     path = config_path(env)
@@ -132,6 +145,20 @@ def resolve(env: dict[str, str] | None = None) -> BoardConfig:
             "  There is deliberately no fallback: guessing would point this client at\n"
             f"  another island's board. Set it in {path} (rendered per-host by\n"
             "  home-manager), or pass QUARTERBACK_BASE_URL for this invocation."
+        )
+
+    # Checked here rather than left to the first request, because the tail's
+    # reconnect loop cannot tell a typo from an outage: `board.example` with no
+    # scheme raises the same transport error as a board that is down, so the client
+    # would retry a misconfiguration forever and never say what was wrong with it.
+    parsed = urlparse(base_url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise NoBoardConfigured(
+            f"QUARTERBACK_BASE_URL is set to {base_url!r}, which is not a board URL.\n\n"
+            "  It needs an http:// or https:// scheme and a host — the client speaks\n"
+            "  HTTP to the board, and anything else fails as a transport error that\n"
+            "  the reconnecting tail reads as an outage and retries forever.\n"
+            f"  Fix it in {path}, or pass QUARTERBACK_BASE_URL for this invocation."
         )
 
     token = env.get("QUARTERBACK_TOKEN") or from_file.get("QUARTERBACK_TOKEN")

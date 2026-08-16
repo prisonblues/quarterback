@@ -3,21 +3,39 @@ name = "quarterback-mcp"
 version = "0.2.0"
 description = "MCP wrapper and terminal client for the quarterback coordination board"
 requires-python = ">=3.12"
+# httpx and nothing else. This package is two programs sharing one HTTP client —
+# the MCP server and the terminal board client — and the headless half of the
+# fleet installs only the second. Every dependency below is therefore an extra,
+# named for the program that needs it, so `qb-board --follow` on a box with ssh
+# and no display pulls neither the MCP SDK nor a TUI framework to print lines.
 dependencies = [
-    "mcp[cli]>=1.27.0",
     "httpx>=0.28.0",
 ]
 
 [project.optional-dependencies]
-# The full-screen client only. `qb board --follow` — the half that has to run on
+# The MCP server (`python -m mcp_server`). An extra rather than a base
+# dependency because nothing on the board-client path imports the SDK, and a
+# release of it that breaks would otherwise break a tail that never used it.
+#
+# Upper-bounded, which the pin was not: the SDK moved `FastMCP` out of
+# `mcp.server.fastmcp` at 2.0, so `>=1.27.0` alone resolves to a version
+# `server.py` cannot import. Nothing noticed, because nothing imported the
+# server — `tests/test_package_contract.py` now does, and that is how this
+# surfaced. Raise the ceiling when server.py is ported, not before.
+server = ["mcp[cli]>=1.27.0,<2"]
+# The full-screen client only. `qb-board --follow` — the half that has to run on
 # every headless host — needs nothing beyond httpx, so Textual is an extra rather
 # than a dependency: a box that only ever tails the board should not have to
 # install a TUI framework to do it.
 tui = ["textual>=1.0"]
+# Deliberately WITHOUT textual. It was in here, and that made
+# `pytest.importorskip("textual")` in test_board_tui.py decoration — the suite
+# could never run without the framework, so nothing ever proved the tail half
+# does. CI now runs the suite twice, `--extra dev` alone and then with every
+# extra, and the first run is what turns that importorskip back into a claim.
 dev = [
     "pytest",
     "pytest-asyncio",
-    "textual>=1.0",
 ]
 
 [project.scripts]

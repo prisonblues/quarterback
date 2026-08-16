@@ -106,6 +106,36 @@ def test_a_failing_token_cmd_leaves_the_client_unauthenticated(tmp_path):
     assert not cfg.authenticated  # the tokenless health path, not a crash
 
 
+def test_a_token_cmd_that_prints_then_fails_yields_no_token(tmp_path):
+    """Exit status decides, not the first line that happened to arrive.
+
+    Secret providers do print partial or stale material before failing, and taking
+    it anyway means querying the board with a credential the provider disowned —
+    which arrives as a 401 loop rather than as the "not authenticated" it is.
+    """
+    path = write_config(
+        tmp_path,
+        "QUARTERBACK_BASE_URL=https://board.example\n"
+        "QUARTERBACK_TOKEN_CMD='echo stale-token; exit 1'\n",
+    )
+    cfg = resolve(env_for(tmp_path, QUARTERBACK_CONFIG=str(path)))
+    assert cfg.token is None and not cfg.authenticated
+
+
+def test_a_base_url_that_is_not_a_url_fails_loudly_like_an_unset_one(tmp_path):
+    """A typo must not read as an outage.
+
+    Without a scheme or a host the first request raises a transport error, and the
+    tail's reconnect loop cannot tell that from a board that is down — so it would
+    retry the typo forever and never say what was wrong with it.
+    """
+    for bad in ("board.example", "not a url at all", "ftp://board.example", "https://"):
+        with pytest.raises(NoBoardConfigured) as e:
+            resolve(env_for(tmp_path, QUARTERBACK_CONFIG=str(tmp_path / "none"),
+                            QUARTERBACK_BASE_URL=bad))
+        assert "http" in str(e.value) and bad in str(e.value)
+
+
 def test_config_file_may_use_shell_expansion(tmp_path):
     """Sourced, not parsed — sites do write `cat $HOME/.tok` in this file.
 
@@ -134,6 +164,17 @@ def test_config_path_honours_xdg_then_home(tmp_path):
     ).Path("/xdg/quarterback/config")
     assert config_path({"HOME": "/h"}).as_posix() == "/h/.config/quarterback/config"
     assert config_path({"QUARTERBACK_CONFIG": "/tmp/x"}).as_posix() == "/tmp/x"
+
+
+def test_config_path_without_home_resolves_rather_than_writing_a_literal_tilde():
+    """Path does not expand `~`, so the old fallback made a `./~` beside the cwd.
+
+    An env with no HOME is a real case — a systemd unit, `env -i` — and a config
+    read from a relative directory named `~` is read from nowhere.
+    """
+    path = config_path({})
+    assert path.is_absolute()
+    assert "~" not in path.as_posix()
 
 
 def test_missing_config_file_is_not_an_error_when_the_env_has_the_url(tmp_path):

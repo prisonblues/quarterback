@@ -87,9 +87,20 @@
         # server. A check rather than only a GitHub job for the same reason the
         # two above are: `harness/bin/qb-board` ships in the package, so a
         # consumer pinning a revision whose client is broken should find out at
-        # build time. `mcp[cli]` is deliberately absent — nothing under test
-        # imports the MCP SDK, and pulling it in would make this check fail on
-        # the day that package does, for a reason unrelated to the client.
+        # build time.
+        #
+        # `mcp[cli]` is deliberately absent — nothing under test imports the MCP
+        # SDK, and pulling it in would make this check fail on the day that
+        # package does, for a reason unrelated to the client. That holds because
+        # `mcp/mcp_server/__init__.py` is one docstring and imports nothing, so
+        # `import mcp_server.board` executes no SDK code on the way. It is an
+        # assumption about a file NOT in this expression, which is why
+        # `tests/test_package_contract.py` asserts it: add a re-export to that
+        # `__init__.py` and the suite says so here, rather than this check going
+        # red for a consumer while the GitHub job — which installs more — stays
+        # green. The same file pins `python3` against `requires-python` and
+        # `textual` against the `tui` extra's `>=1.0`, neither of which anything
+        # else compares the (floating) nixpkgs versions below to.
         mcp-tests = pkgs.runCommand "quarterback-mcp-tests"
           {
             nativeBuildInputs = [
@@ -109,10 +120,15 @@
           } ''
           # The two directories by name, not the whole of mcp/: that directory
           # also holds a developer's .venv, which is a large symlinked tree and
-          # has no business in the store.
+          # has no business in the store. pyproject.toml comes too, because the
+          # constraints this check floats against — `requires-python` and the
+          # `tui` extra's `textual>=1.0` — are written there and read by
+          # tests/test_package_contract.py; without it those assertions can only
+          # be made where nixpkgs is not what supplies the packages.
           mkdir mcp
           cp -r ${./mcp/mcp_server} mcp/mcp_server
           cp -r ${./mcp/tests} mcp/tests
+          cp ${./mcp/pyproject.toml} mcp/pyproject.toml
           chmod -R u+w mcp
           cd mcp
           export HOME=$TMPDIR

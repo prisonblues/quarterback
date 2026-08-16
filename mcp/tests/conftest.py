@@ -19,9 +19,20 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
-class FakeResponse:
-    def __init__(self, status_code: int) -> None:
-        self.status_code = status_code
+@pytest.fixture(autouse=True)
+def _isolate_xdg_dirs(tmp_path, monkeypatch):
+    """Point the cursor file and the config file at this test's own directory.
+
+    Both are resolved from the environment (``state.py`` keys the cursor by board
+    URL under ``XDG_STATE_HOME``; ``config.py`` reads ``XDG_CONFIG_HOME``), and
+    every test here uses the same fake board URL — so a test that forgets to pass
+    an explicit ``env`` reads, and *overwrites*, the position the developer's own
+    client left behind. That is a suite editing the machine it runs on, and the
+    kind of thing that is only noticed long after it starts happening, so the
+    guarantee belongs here rather than in each test that remembers to want it.
+    """
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
 
 
 class FakeClient:

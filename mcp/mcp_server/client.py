@@ -10,12 +10,26 @@ process that names the same agent, across repos that don't ship together.
 
 from __future__ import annotations
 
-import contextlib
 import hashlib
 import json
 from collections.abc import Iterable, Iterator
 
 import httpx
+
+
+def _decode_frame(data: list[str]) -> dict | None:
+    """The frame's payload, or None if it is not something a consumer can read.
+
+    Every caller reaches straight for ``.get`` on what this yields, so a frame
+    that parses to null, a list or a scalar is as unusable as one that does not
+    parse at all — and is dropped by the same rule rather than crashing a tail
+    several hours in.
+    """
+    try:
+        event = json.loads("\n".join(data))
+    except json.JSONDecodeError:
+        return None
+    return event if isinstance(event, dict) else None
 
 
 def sse_events(lines: Iterable[str]) -> Iterator[dict]:
@@ -32,8 +46,9 @@ def sse_events(lines: Iterable[str]) -> Iterator[dict]:
         line = raw.rstrip("\r")
         if not line:
             if data:
-                with contextlib.suppress(json.JSONDecodeError):
-                    yield json.loads("\n".join(data))
+                event = _decode_frame(data)
+                if event is not None:
+                    yield event
                 data = []
             continue
         if line.startswith(":"):
@@ -41,6 +56,14 @@ def sse_events(lines: Iterable[str]) -> Iterator[dict]:
         field, _, value = line.partition(":")
         if field == "data":
             data.append(value[1:] if value.startswith(" ") else value)
+    if data:
+        # A connection dropped after the payload but before its blank line still
+        # left a whole post behind; discarding it cost the cursor that post and
+        # the reader the line. A genuinely truncated payload does not parse, so
+        # it is dropped here anyway.
+        event = _decode_frame(data)
+        if event is not None:
+            yield event
 
 
 class QuarterbackClient:
@@ -68,7 +91,12 @@ class QuarterbackClient:
             headers["X-Agent-Key"] = key
         if requested_name:
             headers["X-Agent-Name"] = requested_name
-        self._http = http_client or httpx.Client(headers=headers, timeout=30)
+        # An injected client is given the same headers rather than replacing
+        # them: it is supplied for its transport (a test's, a proxy's), and a
+        # client that quietly stopped authenticating when one was passed would be
+        # a trap for whoever passes the first real one.
+        self._http = http_client or httpx.Client(timeout=30)
+        self._http.headers.update(headers)
 
     def close(self) -> None:
         self._http.close()
