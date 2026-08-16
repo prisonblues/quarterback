@@ -7,6 +7,55 @@ that number where it was, so the repo can be a version ahead of the service.
 Entries are newest first. Each one says what was broken or missing before it, because that is the
 part that isn't recoverable from the diff.
 
+## v2.33 — v2.31's claim table was right about INSERT and wrong about everything else
+
+v2.31 landed the resource-claim table and its release allocator, and its own panel round found
+**eight P1s in it**. The PR merged before that fix pass was pushed, so this is the repair, and the
+findings are worth more than the diff: clustered by the failure they produce rather than by file,
+they are three premises, and one of them is v2.31's own thesis turned against it.
+
+**"Atomicity is enforced at the database, not by looking first."** That was the release's argument,
+and it was true of exactly one path. The INSERT was made atomic by the partial unique index; every
+UPDATE still read the row, checked it, and wrote — the shape the whole feature exists to remove. A
+concurrent TTL sweep could release a claim between the read and the write, so a lapsed claim another
+agent already held could still be "renewed" and reported `claimed: true`. `renew` is now a
+conditional `UPDATE … RETURNING`; `_held` tests `expires_at` and not only `released_at`; the renumber
+checks liveness the way `renew` always did; and the old row is re-fetched *before* the new one is
+added, so autoflush cannot emit the pending INSERT outside its own `try/except`.
+
+**"A resource claim's owner is its machine."** Inherited from `Lease`, where it is right — a session
+lease belongs to the box, so an agent recovering from a restart must be able to reclaim it. v2.31's
+allocator argued at length that for a release number *"two agents on one machine are two BRANCHES"*
+— and then authorised every renew, release and renumber by machine anyway. A co-tenant could
+silently renumber a branch that had already written its version into eight files. Worse, the
+idempotency lookup keyed on the **session alone**, and session ids are the board's public addressing
+scheme: any agent that knew one was handed back the owner's live claim, holder and note included.
+Ownership is now one predicate used by every mutating path — machine throughout, plus the owning
+session for a release claim that named one.
+
+**"`renewed: true` means one thing."** Three paths reported it; one wrote and committed, two returned
+the row untouched. A caller retrying a long allocation was told it was renewed and had its claim
+lapse anyway.
+
+And one the generic endpoint gave away: `kind` is free text, so `POST /claim {kind:'release'}` could
+take an already-released historical key — re-issuing a number a branch may have shipped — advance the
+allocation floor forever with `<repo>:9999.1`, or insert `v2.31` beside a held `2.31`, an alternate
+spelling the unique index cannot see. `release` is now reserved to the allocator, where its
+invariants actually live.
+
+Also fixed: `startswith` compiles to LIKE without escaping, and `_` is a wildcard that occurs in real
+repo names, so `acme/my_repo` matched `acme/myXrepo` and one repo's floor could be raised by
+another's. Allocation is `minor + 1` in unbounded Python while the parser caps the minor at five
+digits, so a repo near the ceiling was handed a version its own parser rejects — invisible to
+`_highest_known`, and therefore re-issued to everyone thereafter. Every `IntegrityError` read as a
+lost race, hiding real faults behind a "contended" 409. `session=""` was stored and then skipped by
+every lookup, so each retry spent a number. Idempotency returned the number a caller was renumbering
+*away* from. `branch` was missing from reclaim, and `claim_id` from `GET /releases`.
+
+**The two bugs that mattered most were unreachable sequentially**, and the tests that now cover them
+are the reusable part: concurrent allocations sharing one session, and concurrent reclaims of one
+claim. v2.31 shipped with a race-based feature and a sequential test suite.
+
 ## v2.32 — the panel knew whether CI passed and told no reviewer
 
 `review_ci()` has run on every round since it was written. Its result reached the payload and the

@@ -423,21 +423,30 @@ def claim(ctx: Context, kind: str, key: str, ttl: int = 3600,
 
 
 @mcp.tool()
-def renew_claim(ctx: Context, claim_id: str) -> dict:
+def renew_claim(ctx: Context, claim_id: str, session: str | None = None) -> dict:
     """Extend a claim you hold. Re-take via `claim` if it already lapsed — an expired
-    claim is never revived, because somebody else may already hold the key."""
+    claim is never revived, because somebody else may already hold the key.
+
+    Pass the same `session` you claimed with. A RELEASE claim is owned by the
+    session that took it, not by the machine: several agents share one box here,
+    and for a version number they are different branches.
+    """
     try:
-        return _get_client(ctx).renew_claim(claim_id)
+        return _get_client(ctx).renew_claim(claim_id, session)
     except httpx.HTTPStatusError as e:
         _raise(e, "renew_claim")
 
 
 @mcp.tool()
-def release_claim(ctx: Context, claim_id: str) -> dict:
+def release_claim(ctx: Context, claim_id: str, session: str | None = None) -> dict:
     """Let go of a claim (idempotent). Do this the moment you land, or the next agent
-    waits out your whole TTL for nothing."""
+    waits out your whole TTL for nothing.
+
+    Pass the same `session` you claimed with, for a release claim — it is owned by
+    the session rather than by the machine.
+    """
     try:
-        return _get_client(ctx).release_claim(claim_id)
+        return _get_client(ctx).release_claim(claim_id, session)
     except httpx.HTTPStatusError as e:
         _raise(e, "release_claim")
 
@@ -492,8 +501,9 @@ def claim_release_number(ctx: Context, repo: str, after: str | None = None,
 
 @mcp.tool()
 def reclaim_release_number(ctx: Context, repo: str, claim_id: str,
-                           after: str | None = None, ttl: int = 3600,
-                           session: str | None = None, note: str | None = None) -> dict:
+                           after: str | None = None, branch: str | None = None,
+                           ttl: int = 3600, session: str | None = None,
+                           note: str | None = None) -> dict:
     """Renumber: give up the release number you hold and take the next free one, in ONE step.
 
     Use this instead of releasing and then claiming again. **The renumber is
@@ -521,8 +531,8 @@ def reclaim_release_number(ctx: Context, repo: str, claim_id: str,
     """
     try:
         return _get_client(ctx).reclaim_release({
-            "repo": repo, "claim_id": claim_id, "after": after, "ttl": ttl,
-            "session": session, "note": note})
+            "repo": repo, "claim_id": claim_id, "after": after, "branch": branch,
+            "ttl": ttl, "session": session, "note": note})
     except httpx.HTTPStatusError as e:
         _raise(e, "reclaim_release_number")
 

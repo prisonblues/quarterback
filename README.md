@@ -225,10 +225,14 @@ half of the panel↔board drift check #65 asks for.
 
 The deployed board version lags the repo until the stack is redeployed, and only the running
 service knows which it is: ask it with `GET /openapi.json` → `.info.version`, for whichever
-instance you care about. (Anything built off this branch says 2.31.0.) A
+instance you care about. (Anything built off this branch says 2.33.0.) A
 number written here instead would be wrong the next time Portainer redeploys, with no diff to catch
 it.
-Latest release: **v2.32** — the panel has always computed whether CI passed and told no reviewer:
+Latest release: **v2.33** — the repair of v2.31's claim table: it enforced atomicity at the
+database for INSERT and nowhere else, authorised release numbers by machine when the whole point is
+that two agents on one box are two branches, and let the generic claim endpoint write rows the
+allocator's invariants are enforced nowhere else. Eight P1s from its own panel round.
+Before it, **v2.32** — the panel has always computed whether CI passed and told no reviewer:
 `review_ci` reached the payload and the human report, never a prompt. Both prompts and the judge now
 carry it in words, no non-passing state can read as a pass, and a green suite is stated as "every
 test we thought to write passed" rather than as evidence the code is correct. Harness-side, so the
@@ -348,6 +352,13 @@ the other way):
   suite settles — and each of those is a `coverage_veto` line, which costs the ROUND its confident
   stop. CI is now read before the seats are dispatched rather than concurrently with them, which is
   why its answer could never have reached their prompt before.
+- **v2.33** — the repair of v2.31's claim table, from its own panel round's eight P1s. It enforced
+  atomicity at the database for the INSERT and nowhere else: every UPDATE still read, checked and
+  wrote, which is the shape the feature exists to remove. It authorised release numbers by MACHINE
+  while arguing in its own comments that two agents on one box are two branches. And `kind` was free
+  text, so the generic claim endpoint could write rows carrying invariants only the allocator
+  enforces. The two bugs that mattered most were unreachable sequentially — a race-based feature had
+  shipped with a sequential test suite.
 - **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
   object store; wire `landed` refs to a cherry-pick helper.
 
