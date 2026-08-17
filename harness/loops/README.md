@@ -103,6 +103,7 @@ Detected from the checkout, **not settable** here: `path`, `github`, `default_br
 | `review_panel.ask_max_context_chars` | Total `--context` material one ask may hand its seats, across every spec. **60,000** (~15k tokens). Over budget is clamped and SAID, per spec — an ask's whole claim is that it is the cheap check, and unbounded context is the #117 cost shape on the path advertised as costing a minute. |
 | `loops` | `dependabot_lander` / `stacked_driver` / `issue_executor` — which loops may run. |
 | `epic` | Epic-driver settings — see below. |
+| `preland.disabled_checks` | Checks `preland.py` must not run, by name. Empty by default — every guardrail it can detect, it runs. A name nothing answers to is a **hard error**, not a warning; see below. |
 
 `auto_merge`:
 - `none` — never auto-merge; always stop for a human.
@@ -629,6 +630,102 @@ legitimate, and by the last round it is the point — but it is reported with th
 own last sentence, because it is the same shape as a review that was stopped from
 fixing anything.
 
+## Pre-land verdict (`preland.py`)
+
+```bash
+python3 ~/.claude/loops/preland.py --pr 131            # the report
+python3 ~/.claude/loops/preland.py --pr 131 --json     # the payload a loop reads
+```
+
+**May this PR be merged, and if not, what is outstanding.** One answer, three values,
+exit codes deliberately shared with `scripts/migration_reconcile.py` so the two tools
+never mean different things by the same number:
+
+| Verdict | Exit | Means |
+|---|---|---|
+| `READY` | 0 | Every check that ran is satisfied. |
+| `RECONCILE` | 3 | Mechanical work is outstanding; `actions` holds the exact commands and the files they touch. Do them, then run this again. |
+| `HOLD` | 2 | Something is unresolved that the loop must not resolve itself. `reasons` says what, and who has to. |
+
+HOLD dominates RECONCILE — relinking a migration graph on a PR nobody reviewed is work
+spent to reach a wall. Note that 2 is also argparse's usage exit; the JSON payload is what
+tells them apart, and since both mean *do not merge*, a caller that conflates them fails
+safe.
+
+**Why it exists.** The checks a merge must pass used to be prose in two places:
+`/fix-and-land` §4 described them in about fifty lines of English, and `/panel-review-pr`
+§7 was a bare `gh pr merge` with nothing in front of it. Prose in two files drifts, has no
+exit code, and cannot be asked afterwards whether it ran — and a model reading it is
+invited to re-derive a decision it should be executing. On 2026-08-16 a PR was merged on
+`mergeable` + CI-green over its own panel round (8 P1s and 12 P2s outstanding) by an agent
+that had written up that exact confusion an hour earlier.
+
+**What it checks**, all of it mechanical, none of it a proxy:
+
+| Check | Holds when |
+|---|---|
+| `pr_state` | Not OPEN, a draft, or `CONFLICTING`. Uncomputed mergeability warns. |
+| `checkout` | This tree is not at the PR's head, or has tracked modifications. Untracked files warn. |
+| `ci` | `gh`'s check rollup is red, **pending**, or **empty** — a push restarts CI, so an earlier green is stale, and no checks at all is silence rather than green. |
+| `review` | The board's newest round for this PR read another commit, did not `stop`, has `confirmed > 0`, or has a failing Sonar gate. No round at all is a HOLD too, and so is a round that recorded no finding count — unknown is not zero. |
+| `merge_claim` | Another agent holds `kind=merge` on `<repo>:<branch>`. |
+| `migrations` | `scripts/migration_reconcile.py` says `stop`, or its plan and its exit code disagree. `relink`/`renumber`/`merge` are RECONCILE. |
+| `sw_version` | `scripts/check_sw_version.py` fails in a way `--fix` cannot repair. A repairable one is RECONCILE. |
+
+The last two also HOLD when `origin/<base>` could not be refreshed — they are answers about the gap between this branch and the base, and a base last fetched yesterday produces a confident NOOP about a head that moved this morning. `--no-fetch` makes that the caller's choice instead, noted once on the run.
+
+The `review` clauses are the round's **own statements** — `head_sha`, `stopped`,
+`confirmed`, `sonar_gate` — read back rather than re-derived. #62 spent three rounds
+discovering that merge gates trust proxies (the exit code, then the push, then the
+existence of a payload file), and this must not become the fourth.
+
+`stop_confident: false` is a **warning, not a hold**, deliberately: two permanently-absent
+reviewer seats on a headless box would otherwise make a green verdict unreachable, which is
+the noise-for-signal trade this file already argues against for `coverage_veto`. The vetoes
+are printed with it.
+
+**Capability detection, and its two exceptions.** Repo-local guardrails are detected — a
+repo without `scripts/migration_reconcile.py` records `skipped-absent` and moves on, which
+is what lets one gate serve quarterback, lexray and an unenrolled repo with no per-repo
+branch in the skill.
+
+The first exception is a hole in that mechanism rather than a policy: detection reads the
+**branch's** tree, so a diff that *deletes* a guardrail would hand itself `skipped-absent`,
+switching off the check by the very change the check exists to read. So an absence only
+counts as a skip when `origin/<base>` does not have the script either; a branch that removed
+one HOLDs.
+
+The second is the board. An unset `QUARTERBACK_BASE_URL` does not mean this repo has no
+review invariant, it means the invariant exists and cannot be seen, so `review` HOLDs. That
+knowingly narrows the "local path stays first-class" promise for `/fix-and-land` (not for
+`/panel`, which is unaffected), and the off-switch is one line:
+
+```json
+"preland": { "disabled_checks": ["review"] }
+```
+
+A name in that list that no check answers to is a **hard exit**, unlike every other
+unknown key in a rules file, which is warned about and dropped. The asymmetry is the point:
+a misspelled key elsewhere leaves a setting at its default and the default is the safe end,
+where a misspelled name here would leave a merge gate's check running while reading as
+deliberately off.
+
+**A check that did not run is still reported** — `skipped-absent`, `skipped-disabled`, or
+`skipped-flag` for `--skip` — because a payload must never read clean by omission.
+
+**It is read-only and takes no claim.** It reports commands and never runs them; it reads
+`kind=merge` claims and never takes one. That belongs to whatever does the merging
+([#100](https://github.com/prisonblues/quarterback/issues/100)) — a verdict that mutates
+cannot run as a CI check, cannot be re-run to verify itself, and cannot be asked twice by a
+loop that wants to know whether its own fix worked. The single write is `git fetch` of the
+base branch's remote-tracking ref (`--no-fetch` suppresses it), because a migration verdict
+computed against a stale `origin/main` is confidently wrong in the direction that lands.
+
+**Its limit.** It is advisory: a script an agent chooses to run cannot stop a human merging
+in the UI or a loop that skips the step. What would actually block a merge is a required
+status check on a protected branch. A CI job doing that must pass `--skip ci` — such a job
+is itself one of the checks `ci` reads, and would otherwise gate on its own pending status.
+
 ## Deployment
 
 - **The flake's home-manager module** (`harness/hm-module.nix`) — ships this directory to
@@ -656,3 +753,7 @@ fixing anything.
 - **Soft gates** (advisory): Claude + Codex reviewers. Never a lone-LLM hard block.
 - Auto-merge only within the `auto_merge` policy; everything else → human at the
   merge button.
+- **`preland.py` is where those gates are read**, so that a loop about to merge consults
+  one verdict rather than each skill's own paragraph about them. It does not add a gate;
+  it makes the existing ones executable, and its `READY` is a claim about what was
+  checked, not about whether the change is a good idea.
