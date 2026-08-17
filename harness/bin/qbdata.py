@@ -10,6 +10,7 @@ import json
 import os
 import shlex
 import socket
+import ssl
 import subprocess
 import urllib.request
 from datetime import datetime, timezone
@@ -141,6 +142,27 @@ def resolve_config() -> BoardConfig:
     return BoardConfig(url, token, socket.gethostname().split(".", 1)[0])
 
 
+def _ssl_context():
+    """A context that trusts something, on interpreters that trust nothing.
+
+    A uv-installed standalone Python has no CA bundle of its own and no NixOS
+    ssl paths, so `urllib` there fails every HTTPS request with
+    CERTIFICATE_VERIFY_FAILED — while the same code works on the interpreter the
+    harness packages. That asymmetry is invisible until someone runs the
+    dashboard from a checkout's venv and sees "board unreachable" on a board that
+    is up, which is how this was found: in a pane, next to a working copy in the
+    shell beside it.
+
+    certifi is not a dependency; it is used when the interpreter already has it,
+    which is exactly the case where the default store is empty.
+    """
+    try:
+        import certifi
+    except ImportError:
+        return None                                 # the default store, which is fine
+    return ssl.create_default_context(cafile=certifi.where())
+
+
 class BoardClient:
     """The two GETs this dashboard makes. stdlib only, on purpose."""
 
@@ -151,7 +173,7 @@ class BoardClient:
         req = urllib.request.Request(f"{self.cfg.base_url}{path}")
         if self.cfg.token:
             req.add_header("Authorization", f"Bearer {self.cfg.token}")
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=30, context=_ssl_context()) as resp:
             return json.loads(resp.read().decode())
 
     def active(self) -> dict:
