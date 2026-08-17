@@ -41,6 +41,12 @@
     }
   },
 
+  "preland": {
+    "disabled_checks": [],
+    "_": "Every check preland.py can detect, it runs here. Stated explicitly rather than omitted, for the same reason as sonarqube and epic.sub_pr_merge below: the default is an empty list too, and a reader should not have to guess whether the absence was a decision. It was.",
+    "_the_one_worth_naming": "`review` is the check a repo would be tempted to disable, because it HOLDs when the board cannot be read at all — an unset QUARTERBACK_BASE_URL is not evidence the PR is clean, it is the absence of evidence either way. This repo IS the board, is enrolled on it, and records every panel run there, so turning it off would be turning off the only check that reads what the panel actually said. If a future box cannot reach the board, the answer is to fix the box or disable it for THAT checkout, not to commit the switch here."
+  },
+
   "epic": {
     "sub_pr_merge": "gate",
     "_": "Whether the epic driver merges a reviewed sub-PR into the epic branch by itself, or holds each at a human merge. Stated explicitly for the same reason as sonarqube above — the default is `gate` too, and a reader should not have to guess whether that was a decision. It was.",
