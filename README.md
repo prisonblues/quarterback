@@ -405,7 +405,7 @@ full — including what was broken before it, which is the part no diff recovers
   named a session belongs to that session. No opt-out list — every kind in that table is
   exclusive work, and session leases (the one case where the machine IS the right owner) are a
   different table with their own checks.
-- **vNEXT** — a finding's outcome, which the judge cannot know. `verdict` is set once, at review
+- **v2.37** — a finding's outcome, which the judge cannot know. `verdict` is set once, at review
   time, by a model with no more access to the answer than the reviewer it rules on, and the
   leaderboard was built on that alone — so a confident wrong finding scored like a real one. Three of
   six judge-confirmed P2s on PR #64 were plainly wrong and are still in the board as confirmed.

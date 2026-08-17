@@ -11,7 +11,7 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
-## vNEXT — a finding's life ended at the judge, so the board scored confidence and called it correctness
+## v2.37 — a finding's life ended at the judge, so the board scored confidence and called it correctness
 
 `review_findings.verdict` is set once, at review time, by a master model with no more access to the
 answer than the reviewer it is ruling on. `GET /review/stats` then ranked reviewers on it. That was
