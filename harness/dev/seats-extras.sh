@@ -21,6 +21,7 @@ SEATBIN=/tmp/seatbin
 # lands it is this repo's own mcp/.venv. Override for another checkout.
 W110=${QB_MCP_CHECKOUT:-/home/rich/source/quarterback-feat-issue-110}
 SRC="$(cd -P "$(dirname "$0")" && pwd)"
+LAYOUT=${QB_LAYOUT_CHECKOUT:-/home/rich/source/quarterback-seats}
 export TMUX_TMPDIR=${TMUX_TMPDIR:-/tmp/seatrun}
 
 # Resolve tmux ONCE. `nix shell ... -c tmux` per call would be a fresh nix
@@ -42,23 +43,27 @@ tmux() { "$TMUX_BIN" "$@"; }
 # that fact out of the pane's command line, and out of the environment that
 # qb-seats would have to forward.
 mkdir -p "$SEATBIN"
-cp "$SRC/qbdata.py" "$SEATBIN/qbdata.py"
-cp "$SRC/qb-dash" "$SEATBIN/qb-dash.py"
-cp "$SRC/qb-dash-tui" "$SEATBIN/qb-dash-tui.py"
-for name in qb-dash qb-dash-tui; do
-  cat > "$SEATBIN/$name" <<EOF
-#!/bin/sh
-exec $W110/mcp/.venv/bin/python $SEATBIN/$name.py "\$@"
-EOF
-  chmod +x "$SEATBIN/$name"
-done
+# Prefer the INSTALLED dashboard. It carries its own interpreter, which is the
+# whole point of packaging it — and forcing a checkout venv here was actively
+# wrong: a uv-standalone python has no CA bundle, so the pane showed "board
+# unreachable" against a board that was up, beside a shell where it worked.
+# Only fall back to the checkout when nothing is installed.
+if command -v qb-dash-tui >/dev/null 2>&1; then
+  DASH_TUI=$(command -v qb-dash-tui); DASH_PLAIN=$(command -v qb-dash)
+else
+  for f in qbdata.py qb-dash.py qb-dash-tui.py qb-dash qb-dash-tui; do
+    cp "$LAYOUT/harness/bin/$f" "$SEATBIN/$f"
+  done
+  chmod +x "$SEATBIN/qb-dash" "$SEATBIN/qb-dash-tui"
+  DASH_TUI="$SEATBIN/qb-dash-tui"; DASH_PLAIN="$SEATBIN/qb-dash"
+fi
 
 # The clickable one by default; QB_DASH=rich for the plain redrawing renderer,
 # which is the one to fall back to if a terminal turns out not to forward mouse
 # events (ssh through something old, say).
 case "${QB_DASH:-tui}" in
-  rich) DASH_CMD="$SEATBIN/qb-dash" ;;
-  *)    DASH_CMD="$SEATBIN/qb-dash-tui" ;;
+  rich) DASH_CMD="$DASH_PLAIN" ;;
+  *)    DASH_CMD="$DASH_TUI" ;;
 esac
 
 tmux has-session -t "=$SESSION" 2>/dev/null || {
