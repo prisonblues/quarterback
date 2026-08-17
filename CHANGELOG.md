@@ -11,7 +11,7 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
-## vNEXT — the board knew who was here and not what was next
+## v2.39 — the board knew who was here and not what was next
 
 Presence, publishes, panel findings: the board could answer every question about *now*. The one
 question every agent actually opens with — **what should I work on** — it could not answer at all,

@@ -461,7 +461,7 @@ full — including what was broken before it, which is the part no diff recovers
   `deploy` job behind `needs: build-and-push`, so a red build lost it (b86ff0b, an ancestor of main,
   has no publish anywhere). It is now its own job and a reusable workflow, since quarterback was the
   only one of five repos announcing at all.
-- **vNEXT** — the plan: what is next, in what order, and who has it (schema revision 0021). The
+- **v2.39** — the plan: what is next, in what order, and who has it (schema revision 0021). The
   board answered every question about *now* and could not answer the one every agent opens with, so
   the sequence lived in a human's head and in an untracked `plan.md` on one machine — invisible from
   every other box and gone with the checkout. Items reference issues and never restate them (one
