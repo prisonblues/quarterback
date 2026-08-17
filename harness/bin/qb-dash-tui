@@ -21,6 +21,7 @@ behaviour (selecting text) instead of the app's.
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -31,10 +32,48 @@ from textual.app import App, ComposeResult
 from textual.containers import Vertical
 from textual.coordinate import Coordinate
 from textual.events import Click
+from textual.screen import ModalScreen
 from textual.widgets import DataTable, Footer, Static
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import qbdata as qd                                             # noqa: E402
+
+
+class Confirm(ModalScreen[bool]):
+    """Yes/no before something expensive and outward-facing.
+
+    A panel review costs real money, comments on a public PR and pushes a fix
+    commit, so a stray click on a 78-column pane should not be able to start
+    one. It shows the exact command, because the answer to "what will this do"
+    should not require trusting a sentence about it. QB_DASH_CONFIRM=0 turns it
+    off for anyone who wants the single click and means it.
+    """
+
+    BINDINGS = [("escape", "no", "cancel"), ("n", "no", "cancel"),
+                ("y", "yes", "run"), ("enter", "yes", "run")]
+
+    CSS = """
+    Confirm { align: center middle; }
+    #box { width: 90%; max-width: 70; height: auto; padding: 1 2;
+           background: $panel; border: thick $accent; }
+    #cmd { color: $text-muted; padding: 1 0; }
+    """
+
+    def __init__(self, prompt: str, command: str, cwd: str) -> None:
+        super().__init__()
+        self.prompt, self.command, self.cwd = prompt, command, cwd
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="box"):
+            yield Static(Text(self.prompt, style="bold"))
+            yield Static(Text(f"$ {self.command}\n  in {self.cwd}", style="dim"), id="cmd")
+            yield Static(Text("enter/y — run     esc/n — cancel", style="bold $accent"))
+
+    def action_yes(self) -> None:
+        self.dismiss(True)
+
+    def action_no(self) -> None:
+        self.dismiss(False)
 
 
 class ClickTable(DataTable):
@@ -49,11 +88,22 @@ class ClickTable(DataTable):
     def on_click(self, event: Click) -> None:
         if not self.row_count:
             return
-        row = self.hover_coordinate.row
+        # The cell comes off the CLICK, not off hover_coordinate. Hover is set by
+        # a separate mouse-move message, so reading it here is a race: a click
+        # arriving without a preceding move — the first click into a pane, or any
+        # click a test synthesises — reads whatever the last move left behind and
+        # acts on the wrong cell. This is the same source DataTable itself uses.
+        meta = event.style.meta
+        if "row" not in meta or "column" not in meta:
+            return
+        row, column = meta["row"], meta["column"]
         if not 0 <= row < self.row_count:
             return                                  # the header, or past the last row
         key = self.coordinate_to_cell_key(Coordinate(row, 0)).row_key
-        self.app.dispatch_row(str(key.value))
+        # The COLUMN goes with it: an action icon in its own column is how one
+        # row offers more than one verb — click the ⚖ to review, the rest of the
+        # row to open.
+        self.app.dispatch_row(str(key.value), column)
 
 
 class Dash(App):
@@ -78,8 +128,14 @@ class Dash(App):
     BINDINGS = [
         ("q", "quit", "quit"),
         ("r", "refresh_now", "refresh"),
-        ("o", "open_pr", "open PR"),
+        ("o", "open_pr", "open"),
+        ("p", "panel_pr", "panel"),
+        ("question_mark", "help", "keys"),
     ]
+
+    # The ⚖ lives in its own column so that clicking it means something
+    # different from clicking the row. Column 1 of the PR table.
+    PANEL_COLUMN = 1
 
     def __init__(self, interval: float = 4.0, pr_interval: float = 90.0) -> None:
         super().__init__()
@@ -91,6 +147,10 @@ class Dash(App):
         self.prs: list[dict] = []
         self.detail_text = ""
         self.last_dispatch: tuple[str, float] | None = None
+        # Where launched work runs, what it runs, and whether it asks first.
+        self.repo = os.environ.get("QB_DASH_REPO") or os.getcwd()
+        self.agent_bin = os.environ.get("QB_SEAT_AGENT", "claude")
+        self.confirm = os.environ.get("QB_DASH_CONFIRM", "1") != "0"
         self.pr_err: str | None = None
 
     # ---- layout ---------------------------------------------------------
@@ -104,13 +164,14 @@ class Dash(App):
             yield ClickTable(id="claims", cursor_type="row")
             yield Static("OPEN PRs", classes="title", id="t_prs")
             yield ClickTable(id="prs", cursor_type="row")
-        yield Static("click a row · seats jump the pane, PRs open GitHub", id="detail")
+        yield Static("click: seat→pane, PR→GitHub, ⚖→panel review   ? for keys",
+                     id="detail")
         yield Footer()
 
     def on_mount(self) -> None:
         self.query_one("#fleet", DataTable).add_columns("who", "repo", "what", "ttl")
         self.query_one("#claims", DataTable).add_columns("who", "key", "left")
-        self.query_one("#prs", DataTable).add_columns("", "pr", "title", "age")
+        self.query_one("#prs", DataTable).add_columns("", "⚖", "pr", "title", "age")
         try:
             self.client, self.cfg = qd.board_client()
         except Exception as exc:                  # noqa: BLE001
@@ -195,6 +256,7 @@ class Dash(App):
             self.rows[key] = pr
             table.add_row(
                 Text(glyph, style=colour),
+                Text("⚖", style="bold cyan"),          # click to panel-review
                 Text(f"#{pr.get('number')}", style="bold grey70"),
                 Text(qd.clip(pr.get("title"), 44),
                      style="grey50" if pr.get("isDraft") else "white"),
@@ -223,7 +285,7 @@ class Dash(App):
             return
         self.dispatch_row(key)
 
-    def dispatch_row(self, key: str) -> None:
+    def dispatch_row(self, key: str, column: int | None = None) -> None:
         record = self.rows.get(key)
         if record is None:
             return
@@ -234,7 +296,58 @@ class Dash(App):
         elif kind == "claim":
             self.say(qd.clip(record.get("note") or "(no note on this claim)", 400))
         elif kind == "pr":
-            self.open_pr(record)
+            if column == self.PANEL_COLUMN:
+                self.panel_pr(record)
+            else:
+                self.open_pr(record)
+
+    # ---- launching work ---------------------------------------------------
+
+    def panel_pr(self, pr: dict) -> None:
+        """Kick off /panel-review-pr for a PR, in a tmux window of its own.
+
+        A new WINDOW, not a pane: the seat row is a layout with widths that mean
+        something, and a review is not a seat. It runs the agent the same way
+        qb-seat does — the brief positionally, after `--`.
+        """
+        number = pr.get("number")
+        command = f"{shlex.quote(self.agent_bin)} -- {shlex.quote(f'/panel-review-pr {number}')}"
+        if self.confirm:
+            self.push_screen(
+                Confirm(f"panel-review PR #{number}?", command, self.repo),
+                lambda go: self.run_in_window(f"panel-{number}", command) if go else
+                self.say("cancelled"),
+            )
+        else:
+            self.run_in_window(f"panel-{number}", command)
+
+    def run_in_window(self, name: str, command: str) -> None:
+        """A detached tmux window running `command`, dropping to a shell after.
+
+        Detached (-d) so a review starting does not yank the screen away from
+        whatever you were reading; `exec $SHELL` after it so the window survives
+        the command and its output can still be read.
+        """
+        # Checked HERE, not before the confirmation: outside tmux there is still
+        # a useful answer — the exact command — and a dialog that never appears
+        # is also a dialog that cannot be tested.
+        if not os.environ.get("TMUX"):
+            self.say(f"not inside tmux — run it yourself: {command}")
+            return
+        shell = os.environ.get("SHELL", "/bin/bash")
+        full = f"{command}; exec {shlex.quote(shell)} -i"
+        try:
+            done = subprocess.run(
+                ["tmux", "new-window", "-d", "-n", name, "-c", self.repo, full],
+                capture_output=True, text=True, timeout=10,
+            )
+        except Exception as exc:                       # noqa: BLE001
+            self.say(f"could not start {name}: {type(exc).__name__}")
+            return
+        if done.returncode:
+            self.say(f"tmux refused: {qd.clip(done.stderr, 60)}")
+        else:
+            self.say(f"started window '{name}' — Ctrl-b n to watch it")
 
     def click_agent(self, agent: dict) -> None:
         seat = qd.seat_number(agent.get("holder"))
@@ -281,13 +394,26 @@ class Dash(App):
         self.refresh_prs()
         self.say("refreshing…")
 
-    def action_open_pr(self) -> None:
+    def action_panel_pr(self) -> None:
+        record = self.selected_pr()
+        if record:
+            self.panel_pr(record)
+
+    def action_help(self) -> None:
+        self.say("o open on GitHub · p panel-review · r refresh · q quit · "
+                 "click ⚖ to review, a seat to jump to its pane")
+
+    def selected_pr(self) -> dict | None:
         table = self.query_one("#prs", DataTable)
-        if table.row_count:
-            row = table.coordinate_to_cell_key(table.cursor_coordinate).row_key
-            record = self.rows.get(str(row.value))
-            if record:
-                self.open_pr(record)
+        if not table.row_count:
+            return None
+        row = table.coordinate_to_cell_key(table.cursor_coordinate).row_key
+        return self.rows.get(str(row.value))
+
+    def action_open_pr(self) -> None:
+        record = self.selected_pr()
+        if record:
+            self.open_pr(record)
 
 
 if __name__ == "__main__":

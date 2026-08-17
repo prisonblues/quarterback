@@ -436,6 +436,22 @@ a seat jumps the tmux cursor to that seat's pane, a claim shows its note, a PR o
 GitHub. `qb-dash` is the same three views rendered without interaction, for a terminal that
 will not forward mouse events.
 
+**Clicking starts work, not just navigation.** Each PR row carries a `⚖`; clicking it opens
+a confirmation showing the exact command, and confirming runs `/panel-review-pr <n>` in a
+detached tmux window of its own — the same way `qb-seat` starts an agent, so the review is
+a real session you can attach to, read and interrupt. Clicking anywhere else on the row
+still opens the PR on GitHub. The keys are `o` open, `p` panel-review, `r` refresh, `?` the
+list, `q` quit.
+
+The confirmation is deliberate: a panel review costs money, comments on a public PR and
+pushes a fix commit, so a stray click in a 78-column pane should not be able to start one.
+`QB_DASH_CONFIRM=0` for anyone who wants the single click and means it. `QB_DASH_REPO` says
+where launched work runs, defaulting to the dashboard's own cwd.
+
+Adding another verb is three things: an entry in `BINDINGS`, an `action_*` method, and — if
+it wants an icon — a column, since a click carries the column it landed in and that is how
+one row offers more than one verb.
+
 Not wired into `qb-seats` yet, and not packaged: both scripts import `mcp_server`, `rich`
 and `textual`, which today means the environment belonging to `qb-board` (#110). Bring one
 up beside a running screen with `harness/dev/seats-extras.sh <session> <width>`, which also

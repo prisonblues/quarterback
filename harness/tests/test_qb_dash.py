@@ -62,6 +62,15 @@ def test_a_single_click_acts_on_the_row_under_the_pointer():
     assert asyncio.run(_drive()) == []
 
 
+def test_the_scales_icon_reviews_and_the_rest_of_the_row_opens():
+    """One row, two verbs, told apart by which column was clicked.
+
+    Also covers the confirmation: a panel review costs money and comments on a
+    public PR, so the click must not start one on its own.
+    """
+    assert asyncio.run(_drive_panel()) == []
+
+
 async def _drive() -> list[str]:
     app_module = _load_app()
     app = app_module.Dash(interval=3600, pr_interval=3600)   # no refresh mid-test
@@ -86,7 +95,9 @@ async def _drive() -> list[str]:
             return ["no PR rows arrived — cannot test a click on them"]
 
         # ONE click, on a row that is not the cursor's, is the whole point.
-        await pilot.click(prs, offset=(4, 1))
+        # x=30 is the title column: the first columns are the CI glyph and the
+        # ⚖, which mean something else and are covered by the test below.
+        await pilot.click(prs, offset=(30, 1))
         await pilot.pause(0.2)
         if not opened:
             failures.append("a click on a PR row did not open it")
@@ -106,5 +117,69 @@ async def _drive() -> list[str]:
         await pilot.pause(0.2)
         if not opened:
             failures.append("'o' did not open the selected PR")
+
+    return failures
+
+
+async def _drive_panel() -> list[str]:
+    app_module = _load_app()
+    app = app_module.Dash(interval=3600, pr_interval=3600)
+
+    started: list[tuple[str, str]] = []
+    opened: list[int] = []
+    app.run_in_window = lambda name, command: started.append((name, command))
+    app.open_pr = lambda pr: opened.append(pr.get("number"))
+
+    failures: list[str] = []
+    async with app.run_test(size=(90, 44)) as pilot:
+        for _ in range(40):
+            await pilot.pause(0.25)
+            if app.query_one("#prs").row_count:
+                break
+        prs = app.query_one("#prs")
+        if not prs.row_count:
+            return ["no PR rows arrived"]
+
+        # The ⚖ column asks first and starts nothing by itself.
+        await pilot.click(prs, offset=(app_module.Dash.PANEL_COLUMN + 2, 1))
+        await pilot.pause(0.3)
+        if started:
+            failures.append("the icon started a review with no confirmation")
+        if not isinstance(app.screen, app_module.Confirm):
+            failures.append("the icon did not raise the confirmation")
+        else:
+            await pilot.press("enter")               # …and confirming starts it
+            await pilot.pause(0.3)
+            if not started:
+                failures.append("confirming did not start the review")
+            elif "/panel-review-pr" not in started[0][1]:
+                failures.append(f"wrong command launched: {started[0][1]}")
+
+        # Cancelling starts nothing.
+        started.clear()
+        await pilot.click(prs, offset=(app_module.Dash.PANEL_COLUMN + 2, 2))
+        await pilot.pause(0.3)
+        await pilot.press("escape")
+        await pilot.pause(0.3)
+        if started:
+            failures.append("cancelling still started a review")
+
+        # A click anywhere else on the row still means "open on GitHub".
+        await pilot.click(prs, offset=(30, 1))
+        await pilot.pause(0.3)
+        if not opened:
+            failures.append("clicking the title did not open the PR")
+        if started:
+            failures.append("clicking the title started a review")
+
+        # And the keyboard route to the same verb.
+        prs.focus()
+        await pilot.press("p")
+        await pilot.pause(0.3)
+        if not isinstance(app.screen, app_module.Confirm):
+            failures.append("'p' did not raise the confirmation")
+        else:
+            await pilot.press("escape")
+            await pilot.pause(0.2)
 
     return failures
