@@ -111,6 +111,16 @@ def _backlog(
     doesn't carry it at all, since the ids in between belong to the posts that
     were filtered out. So this says ``None`` when it cannot know, and the caller
     anchors properly rather than defaulting to the beginning of the board.
+
+    **There is a known race here and it is not fixed, deliberately — see #173.**
+    When this returns ``None`` the caller reads the board's head in a second
+    request, and a post landing between the two is in neither: not in the backlog
+    (it did not exist yet) and not in the stream (the cursor is already past it).
+    The obvious repair — anchor on this response's own newest id — is wrong, and
+    the suite catches it: on a narrowed or empty response that id is ancient or
+    zero, so the stream replays the whole board. Both failure modes are real and
+    the fix is a design choice rather than a patch, which is why it is an issue
+    and not a fourth attempt in this file.
     """
     if tail <= 0:
         return [], None
@@ -314,14 +324,27 @@ def _tail(
             persist(cursor, force=True)
 
 
+#: The 4xx codes that mean "ask again", not "you asked wrong". Named rather than
+#: inlined so the stream loop and the backlog fetch cannot disagree about them.
+_RETRYABLE = frozenset({408, 429})
+
+
 def _is_client_error(e: httpx.HTTPStatusError) -> bool:
     """Is this our mistake rather than the board's trouble?
 
-    Anything 4xx — a bad filter, a wrong path, an unparseable argument — comes
+    Most of 4xx — a bad filter, a wrong path, an unparseable argument — comes
     back identically however many times it is asked, so retrying it produces an
     endless loop where the user wanted a message they could act on.
+
+    **408 and 429 are the exceptions, and excluding them is round 2's P2.** Round
+    1 fixed the endless loop by making every 4xx fatal, which swept in the two
+    that are explicitly transient: 408 is "take your time and ask again" and 429
+    is "ask again more slowly". They are precisely what a long-running tail
+    meets — it is the client that holds a connection open for hours and the one
+    most likely to be rate-limited — so treating them as "this process asked for
+    the wrong thing" kills the tail for the one reason it should have survived.
     """
-    return 400 <= e.response.status_code < 500
+    return 400 <= e.response.status_code < 500 and e.response.status_code not in _RETRYABLE
 
 
 def _no_anchor(err, why: str) -> None:

@@ -455,3 +455,31 @@ def test_quieting_a_broken_pipe_leaks_no_descriptor():
         "sys.exit(len(os.listdir('/proc/self/fd')) - len(before))"
     )
     assert subprocess.run([sys.executable, "-c", program], check=False).returncode == 0
+
+
+# ------------------------------------- 408/429 are "ask again", not "you asked wrong"
+
+@pytest.mark.parametrize("code", [408, 429])
+def test_a_transient_4xx_does_not_kill_the_tail(tmp_path, code):
+    """Round 1 stopped an endless retry loop by making every 4xx fatal, and swept
+    in the two that explicitly mean "try again": 408 is a request timeout, 429 is
+    rate limiting. A `--follow` left running for hours is the client most likely
+    to meet both — it holds a connection open and it is the one that gets
+    throttled — so treating them as "this process asked for the wrong thing"
+    killed the tail for the one reason it should have survived."""
+    client = FlakyBoard(status(code), board=[post(7)], batches=[[]])
+    code_out, _out, err = run_follow(client, max_reconnects=0, home=str(tmp_path))
+    assert code_out == 0, "a retryable status must not be a fatal exit"
+    assert client.stream_calls == [7], "the tail should have carried on and anchored"
+    assert "unavailable" in err or err == "" or "qb board" in err
+
+
+@pytest.mark.parametrize("code", [400, 401, 403, 404, 422])
+def test_a_real_client_error_is_still_fatal(tmp_path, code):
+    """The endless loop round 1 fixed has to stay fixed: these come back the same
+    however many times they are asked, and retrying one is a spin where the user
+    wanted a message."""
+    client = FlakyBoard(status(code), board=[post(7)], batches=[[]])
+    code_out, _out, _err = run_follow(client, max_reconnects=0, home=str(tmp_path))
+    assert code_out != 0, f"HTTP {code} should be fatal"
+    assert client.stream_calls == []

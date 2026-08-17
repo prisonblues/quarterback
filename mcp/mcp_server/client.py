@@ -76,7 +76,7 @@ class QuarterbackClient:
         key: str | None = None,
         requested_name: str | None = None,
         session: str | None = None,
-        http_client: httpx.Client | None = None,
+        transport: httpx.BaseTransport | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._session = session
@@ -91,12 +91,20 @@ class QuarterbackClient:
             headers["X-Agent-Key"] = key
         if requested_name:
             headers["X-Agent-Name"] = requested_name
-        # An injected client is given the same headers rather than replacing
-        # them: it is supplied for its transport (a test's, a proxy's), and a
-        # client that quietly stopped authenticating when one was passed would be
-        # a trap for whoever passes the first real one.
-        self._http = http_client or httpx.Client(timeout=30)
-        self._http.headers.update(headers)
+        # A TRANSPORT is injected, never a client, and this is round 2's third
+        # P2. The parameter used to take an httpx.Client and call
+        # `.headers.update()` on it — which mutates an object the caller owns, so
+        # constructing a second QuarterbackClient over one shared client
+        # overwrote the first one's bearer. Round 1 was right that an injected
+        # client must still authenticate and wrong about where to put the
+        # headers.
+        #
+        # Taking the transport removes the question rather than answering it: a
+        # client is only ever passed for its transport anyway (a test's
+        # MockTransport, a proxy's), the httpx.Client is then always ours to
+        # configure, and two QuarterbackClients over one transport hold their own
+        # credentials — which is the property that was actually wanted.
+        self._http = httpx.Client(timeout=30, headers=headers, transport=transport)
 
     def close(self) -> None:
         self._http.close()

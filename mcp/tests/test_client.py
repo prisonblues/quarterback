@@ -35,7 +35,7 @@ class Recorder:
 
 def make_client(handler: Recorder, token: str = "tok", **kw) -> QuarterbackClient:
     return QuarterbackClient(
-        f"{BASE}/", token, http_client=httpx.Client(transport=httpx.MockTransport(handler)), **kw
+        f"{BASE}/", token, transport=httpx.MockTransport(handler), **kw
     )
 
 
@@ -186,3 +186,32 @@ def test_a_reader_that_stops_early_still_closes_the_connection():
     assert next(events) == {"id": 1}
     events.close()
     assert body.closed
+
+
+def test_two_clients_over_one_transport_keep_their_own_credentials():
+    """A transport is injected, never a client, and this is why.
+
+    The parameter used to take an httpx.Client and call `.headers.update()` on
+    it — mutating an object the caller owns. Two QuarterbackClients built over
+    one shared client therefore ended up with ONE Authorization header, the
+    second overwriting the first, and the first went on making requests it
+    believed were authenticated as itself. Silent, and wrong in the direction
+    that matters: it authenticates as somebody else rather than failing.
+    """
+    seen: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get("authorization"))
+        return httpx.Response(200, json={"agent": "x"})
+
+    shared = httpx.MockTransport(handler)
+    first = QuarterbackClient(f"{BASE}/", "token-one", transport=shared)
+    second = QuarterbackClient(f"{BASE}/", "token-two", transport=shared)
+
+    first.whoami()
+    second.whoami()
+    first.whoami()
+
+    assert seen == ["Bearer token-one", "Bearer token-two", "Bearer token-one"], (
+        "constructing the second client changed what the first one sends"
+    )
