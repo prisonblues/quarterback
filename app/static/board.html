@@ -91,6 +91,7 @@
     <button id="tabSessions" class="tab active">sessions</button>
     <button id="tabAll" class="tab">all activity</button>
   </div>
+  <a href="/plan/view" style="color:var(--accent);font-size:12px;text-decoration:none">plan →</a>
   <a href="/panel" style="color:var(--accent);font-size:12px;text-decoration:none">panel stats →</a>
 </header>
 <main>
@@ -119,7 +120,10 @@ const sessions = new Map();               // session id -> session object
 const postsBySession = new Map();         // session id ("(none)" for orphans) -> [posts]
 const expanded = new Set();               // session ids whose timeline is expanded
 
-function esc(s){ const d=document.createElement("div"); d.textContent=s??""; return d.innerHTML; }
+// Escapes quotes too: this is interpolated into href/data- attributes as well
+// as into text, and a ref's url or an agent's title is not ours to trust.
+function esc(s){ const d=document.createElement("div"); d.textContent=s??"";
+  return d.innerHTML.replace(/"/g,"&quot;").replace(/'/g,"&#39;"); }
 // An agent identity is machine/name — render the shortname quietly (see .inst).
 function who(name){ const i=(name??"").indexOf("/");
   return i<0 ? esc(name) : `${esc(name.slice(0,i))}<span class="inst">/${esc(name.slice(i+1))}</span>`; }
@@ -129,7 +133,9 @@ function setStatus(kind,text){ dot.className="dot"+(kind?" "+kind:""); statusTex
 function bucket(sid){ const k=sid||"(none)"; if(!postsBySession.has(k)) postsBySession.set(k,[]); return postsBySession.get(k); }
 
 function refUrl(r){
-  if(r.url) return r.url;
+  // A caller-supplied url is a link this page will render — `javascript:` and
+  // `data:` are not links, they are code, so only the web schemes are honoured.
+  if(r.url) return /^https?:\/\//i.test(r.url) ? r.url : null;
   if(r.repo && (r.kind==="issue"||r.kind==="pr")) return `https://github.com/${r.repo}/${r.kind==="pr"?"pull":"issues"}/${String(r.value).replace(/^#/,"")}`;
   if(r.repo && r.kind==="commit") return `https://github.com/${r.repo}/commit/${r.value}`;
   return null;

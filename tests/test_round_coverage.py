@@ -28,8 +28,11 @@ from app.db import engine
 from .conftest import LAPTOP
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "harness" / "loops"))
+# `panel_core` is deliberately NOT imported here: `sh` has lived there since #129, and the
+# one test that patches it goes through `panel.panel_core` so the object it patches is the
+# object `panel.run()` calls. A second import binds the same module under a second name and
+# reads as if there were a choice about which to patch, which is the mistake #129 fixed.
 import panel
-import panel_core  # noqa: E402  — `sh` is defined here since #129
 
 REPO = "acme/v215repo"
 AGENT = {**LAPTOP, "X-Agent-Instance": "d14d14"}

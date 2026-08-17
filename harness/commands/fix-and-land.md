@@ -20,81 +20,117 @@ This is the hybrid path: the guardrails of a guided integration merge (lexray's 
    (a slow reviewer outlives the 10-minute foreground Bash cap, which would kill the panel) — and run
    `/review-pr <pr>` to address findings. Repeat review→fix until the panel's **To fix** list is
    empty and CI is green.
-4. **Pre-land gate (mechanical).** Work in the PR branch's checkout, clean tree, `git fetch origin`.
-   Each guardrail is **capability-detected** — run it only if that script exists in the repo; a repo
-   without it skips that guardrail silently. These fix what CI can only *detect*.
-
-   **4a. Migration graph → exactly one head** (if `scripts/migration_reconcile.py` exists):
+4. **Pre-land gate (mechanical).** Work in the PR branch's checkout and ask for the verdict.
+   Do not re-derive it:
    ```bash
-   uv run python scripts/migration_reconcile.py preflight --onto origin/$BASE --branch HEAD
+   python3 ~/.claude/loops/preland.py --pr <pr> --json
    ```
-   Act on the reported `action` — **never override the tool's choice**, it picks relink vs merge on
-   guards you are not re-deciding:
-   - **NOOP** — nothing to reconcile.
-   - **RELINK** — rewrite the base migration's `down_revision` onto `$BASE`'s head. `apply` writes
-     the file and does **not** commit, so commit that one line yourself:
-     ```bash
-     uv run python scripts/migration_reconcile.py apply --onto origin/$BASE --branch HEAD
-     git add migrations/versions/<base>.py
-     git commit -m "fix(migrations): rebase <base> onto $BASE head <HEAD_REV>"
-     ```
-   - **MERGE** — relink is unsafe (multiple bases, a forked branch head, or a base that is itself a
-     merge node). Bring `$BASE` **into the branch**. The direction is the opposite of a guided
-     integration merge: there you merge branch→base locally, but here the PR does that, so the two
-     heads have to meet on the branch.
-     ```bash
-     git merge origin/$BASE          # resolve conflicts — see the cache-version rule in 4b
-     uv run flask db merge heads -m "merge <branch> and $BASE heads"
-     # rename to the repo's convention if it has one, e.g. mNNNa_merge_<desc>_heads.py
-     git add -A && git commit
-     ```
-     HOLD if a conflict is not mechanically obvious. Resolving product code by guess is exactly the
-     judgement this loop must not make on its own.
-   - **STOP** — `$BASE` itself has more than one head, independent of this branch. **HOLD.**
-     Reconciling the integration branch is not this issue's job.
+   **If that path does not exist, run it out of a checkout** — `python3 harness/loops/preland.py
+   --pr <pr> --repo . --json` — and do NOT read the missing file as permission to skip step 4.
+   `~/.claude/loops` is a nix store symlink, so it is exactly as current as the last
+   home-manager rebuild and nothing announces the gap; a box whose flake pin predates this script
+   simply does not have it yet. "The gate would not run, so I merged" is the failure this step was
+   written to remove, arriving through the step itself.
 
-   Then **re-verify**, and HOLD if it is not exactly one head:
+   It exits **0 = READY**, **3 = RECONCILE**, **2 = HOLD**, and the payload says why: `reasons`
+   (what is unresolved and who has to resolve it), `actions` (the exact commands a RECONCILE needs
+   and the files they touch), `warnings`, and `checks` — per guardrail, whether it ran, was skipped
+   for want of the script it needs, or was turned off.
+
+   **The verdict is the decision.** Act on it; never substitute your own reading of the same facts
+   for it. That substitution is exactly what this replaced: on 2026-08-16 a PR was merged on
+   `mergeable` + CI-green over its own panel round, which had 8 P1s outstanding, by an agent who had
+   written up that precise confusion an hour earlier and had itself recorded the PR as blocked.
+
+   - **HOLD** → stop. Post `reasons` as a PR comment and leave it for a human. Do **not** clear a
+     HOLD by re-running with that check turned off; `--skip` and `.harness-rules` exist for repos
+     that genuinely lack the guardrail, not for a verdict you dislike.
+   - **RECONCILE** → run every command in `actions`, in order, verbatim. Commit what they produce
+     (they deliberately do not commit for you), push, and **run preland again**. Those commits are
+     mechanical — a `down_revision` line, a version counter, a generated merge migration — and need
+     no re-review. **Never override the reconciler's choice of action**: relink vs merge turns on
+     guards you are not re-deciding. If a `git merge` in `actions` conflicts anywhere that is not
+     mechanically obvious, that is a HOLD — resolving product code by guess is the judgement this
+     loop must not make on its own.
+   - **READY** → step 5.
+
+   **Once READY, before you push: the release number.** A branch that ships a release writes
+   `vNEXT` and names no number, so this is where the number is decided — against `$BASE` **as it
+   stands now**, which is the only moment the answer is knowable.
+
    ```bash
-   uv run python scripts/migration_reconcile.py preflight --onto origin/$BASE --branch HEAD
+   rc=0
+   python3 scripts/release_stamp.py apply --onto origin/$BASE || rc=$?
+   [[ $rc -eq 2 ]] && echo "HOLD: read the STOP above"
+   [[ $rc -eq 0 ]] || exit "$rc"
    ```
 
-   **4b. Service-worker cache-bust monotonicity** (if `scripts/check_sw_version.py` exists):
-   ```bash
-   uv run python scripts/check_sw_version.py --base origin/$BASE
-   ```
-   `SERVICE_WORKER_VERSION` is one hand-maintained global counter that every branch edits, so
-   parallel branches collide on merge and a careless resolution lands a value **≤ what is already
-   deployed** — which silently breaks cache invalidation rather than failing. On REGRESSION or STALE
-   BUMP let the tool fix it (`--fix` rewrites to `max(base, head) + 1` and re-stages), then commit.
-   A broken multiline value (`SERVICE_WORKER_VERSION = (`) → **HOLD**; that needs a human to restore
-   a single-line literal. The same rule governs a merge conflict on that line in 4a:
-   `max(both) + 1`, keeping the branch's descriptive comment — **never take the branch's number
-   blindly**.
+   The `|| rc=$?` is not decoration. Exit 2 is a refusal carrying the sentence that repairs it, and
+   under a `set -e` wrapper a bare invocation terminates the surrounding script before anything
+   reads the message — so the one output that makes a HOLD actionable is the one output that gets
+   lost. Capture the status once, because `$?` is gone the moment anything else runs, and exit with
+   it rather than a flat 1: same 0/2 scheme as `migration_reconcile.py`, and for the same reason —
+   a caller consuming it reads Python's uncaught-exception 1 as "unknown" rather than as "stop".
 
-   **4c. Push whatever 4a/4b produced to the PR branch.** Those commits are mechanical (a
-   `down_revision` line, a version counter, a generated merge migration) and need no re-review; a
-   MERGE-path merge commit brings in `$BASE` changes already reviewed on their own PRs.
-5. **Confidence gate — MERGE only if ALL hold:**
-   - `gh pr checks <pr>` is **green** (never merge on red/pending CI) — **re-checked after the
-     step-4 push**, since that push restarts CI and any earlier green is stale,
-   - the pre-land gate came out clean (single head re-verified, cache-version guard passing),
-   - the panel's **To fix** is empty (no master-confirmed defects) and SonarCloud is not failing,
+   It is a noop on a branch that ships no release, so run it unconditionally rather than guessing
+   whether this one does. Every refusal names its own repair, so read the message rather than
+   matching it against a list of causes. Most are a release entry in a shape the tool will not
+   guess about — two unstamped entries, an entry below a released one, a placeholder somewhere
+   nothing rewrites, a number written by hand that `$BASE` has not reached, or one already taken
+   there — but it also refuses on things that are not the entry at all: an unclosed code fence or
+   non-UTF-8 in the markdown it scans, a missing or symlinked `pyproject.toml` or `app/main.py`, an
+   `--onto` it cannot resolve or that carries no CHANGELOG.md.
+
+   **If the branch was already stamped and `$BASE` has since taken that number**, `apply` refuses
+   rather than re-stamping — the placeholder is gone, so there is nothing left for it to rewrite.
+   The message names the repair and it is two tokens: put this branch's entry back to
+   `## vNEXT — …` and its README bullet back to `- **vNEXT** — …`, then run this step again.
+   Nothing else on the branch was ever written in terms of the number, which is what makes that an
+   edit rather than a rewrite.
+
+   `apply` writes and does not commit, so commit what it produced and push it. That commit is
+   mechanical — a release number the tool chose — and needs no re-review.
+
+   Re-running after the push is not optional. The push restarts CI, so the `ci` check's earlier
+   green is a statement about a commit that is no longer the head — and preland is what re-reads it,
+   along with everything else the push may have staled.
+
+5. **Confidence gate — MERGE only if BOTH hold:**
+   - preland's **last** run, after the final push, came out **READY**, and
    - the change is low-risk and you are **genuinely confident** it is correct and complete.
 
-   If all hold → `gh pr merge <pr> --squash --delete-branch`.
-   If not → **STOP**, post a concise PR comment explaining what's unresolved, and leave it for a human.
-6. **Report** the outcome: implemented / reviewed / pre-land actions taken / merged-or-held, and the
-   confidence reasoning.
+   The first is mechanical and preland owns it whole: the PR is open and not conflicting, CI is
+   green *now*, the panel's newest round read *this* head and stopped with nothing confirmed and no
+   failing Sonar gate, the migration graph lands on one head, and nobody else holds the merge claim
+   on the branch. Do not re-check those by hand and do not weigh them against each other. A READY
+   you talk yourself past and a HOLD you talk yourself through are the same failure in two
+   directions.
+
+   The second is yours, and it is stated separately because it is not mechanical and never will be:
+   preland can tell you nothing objects. It cannot tell you the change is a good idea.
+
+   If both hold → `gh pr merge <pr> --squash --delete-branch`.
+   If not → **STOP**, post a concise PR comment quoting preland's `reasons`, and leave it for a human.
+
+6. **Report** the outcome: implemented / reviewed / pre-land verdict and any actions taken /
+   merged-or-held, and the confidence reasoning. Quote the verdict; do not paraphrase it.
 
 Rules:
 - **Be honest about confidence.** When unsure, do NOT merge — holding for a human is the correct,
   safe outcome, not a failure.
 - **Never** merge with red/pending CI, unresolved P1/P2 findings, or a failing SonarCloud gate.
+  Every one of those is a preland HOLD, so this rule now survives as the *reason* the gate exists
+  rather than as a second checklist to run by hand — and a second checklist is how the two drifted
+  apart in the first place.
 - Higher-risk changes (auth, migrations, data, security-sensitive paths) should bias strongly toward
   holding even if gates pass.
 - **`gh pr merge` is a server-side merge, so a repo's `pre-push` hook never fires on this path.**
   Whatever invariant that hook backstops is unprotected here — CI plus step 4 are what replace it.
-  That is why 4a is not optional where the script exists.
+  That is why step 4 is not optional, and why it is a script rather than a paragraph: a paragraph
+  cannot be re-run after the push that staled it, and cannot be asked afterwards whether it ran.
+- **preland is advisory and says so.** It is a script this loop chooses to run; it cannot stop a
+  human merging in the UI, or a loop that skips the step. What would actually block a merge is a
+  required status check on a protected branch, which does not exist for this repo yet.
 - **Landing on `$BASE` may deploy.** For lexray, `test` is a semi-production environment; the
   absence of a sign-off step is the whole point of this skill, and the price is that step 4 gets run
   in full rather than assumed.

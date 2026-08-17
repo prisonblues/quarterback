@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import re
 import uuid
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -40,7 +41,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import identify, reader
-from app.db import get_session
+from app.db import async_session, get_session
 from app.identity import same_machine
 from app.models.resource_lease import ResourceLease
 
@@ -52,6 +53,11 @@ router = APIRouter(tags=["claim"])
 #: holder frees it within one coffee.
 DEFAULT_TTL = 3600
 MAX_TTL = 86_400
+
+#: The longest session identifier that means anything. A session id is a uuid or
+#: a short handle; unbounded free text on an identifier is a column of somebody
+#: else's paste, and every free-text field on this table is bounded but this one.
+MAX_SESSION = 200
 
 #: ``2.31`` or ``v2.31`` or ``2.31.0``. The CHANGELOG's grain is two components
 #: (``## v2.31 — …``) and the packaged version's is three (``2.31.0``), so both
@@ -85,7 +91,7 @@ def _utcnow() -> datetime:
     return datetime.now(UTC)
 
 
-def _clean(s: str | None) -> str | None:
+def clean_session(s: str | None) -> str | None:
     """A caller-supplied identifier, or None — never the empty string.
 
     ``session=""`` used to be stored on the first claim and then skipped by every
@@ -113,7 +119,7 @@ def _next_version(floor: tuple[int, int]) -> tuple[int, int] | None:
     return (major + 1, 0) if major + 1 <= MAX_MAJOR else None
 
 
-def _may_mutate(claim: ResourceLease, holder: str, session_id: str | None) -> bool:
+def may_mutate(claim: ResourceLease, holder: str, session_id: str | None) -> bool:
     """May this caller change this claim?
 
     **The premise round 1 broke, and it was this module's own.** Every mutating
@@ -125,16 +131,35 @@ def _may_mutate(claim: ResourceLease, holder: str, session_id: str | None) -> bo
     authorised by machine anyway. A co-tenant could silently renumber a branch
     that had already written its version into eight files.
 
-    So the rule now follows the kind rather than the table. The machine is
-    necessary throughout; for a release claim that named a session, that session
-    is necessary too. A release claim with no session falls back to the machine,
-    because there is nothing finer to check and refusing outright would strand
-    claims taken by callers that sent none.
+    **That fix named one kind, and the premise was never about kinds (#142).**
+    The rule above read ``claim.kind == "release" and claim.session``, so every
+    other kind kept the machine-only authorisation it had just been argued out
+    of. On a one-box fleet — which is what this fleet is — a co-tenant claiming
+    a key another agent holds got ``renewed: true`` rather than a 409: a
+    collision with a green light on it, which is worse than no claim at all
+    because it reads as authoritative. Measured on 2026-08-16: three agents
+    claimed overlapping work inside 56 seconds and a human resolved it by
+    reading timestamps off the board.
+
+    **Every kind in THIS table is exclusive work**, which is what makes the
+    general rule safe rather than merely tidier. ``same_machine`` is right for a
+    session lease — an agent recovering from a restart must reclaim its own —
+    and session leases are a different table with their own checks in
+    ``app/api/leases.py``; nothing here governs them. So there is no kind left
+    for which the machine is the right owner, and no opt-out list is needed.
+    (#142 proposed one. Reading the code said it was unnecessary, which is the
+    cheaper answer: an opt-out set is a second place to forget something.)
+
+    What survives from the release-only version, because it was right and is not
+    specific to releases: the machine is necessary throughout, and a claim that
+    named **no** session falls back to the machine — there is nothing finer to
+    check, and refusing outright would strand claims taken by callers that sent
+    none.
     """
     if not same_machine(claim.holder, holder):
         return False
-    if claim.kind == "release" and claim.session:
-        return _clean(session_id) == claim.session
+    if claim.session:
+        return clean_session(session_id) == claim.session
     return True
 
 
@@ -143,8 +168,9 @@ def _not_yours(claim: ResourceLease) -> HTTPException:
         "error": "not your claim",
         "kind": claim.kind, "key": claim.key,
         "held_by": claim.holder, "session": claim.session,
-        "hint": ("a release claim is owned by the session that took it, not by the "
-                 "machine: two agents on one box are two branches"),
+        "hint": ("a claim is owned by the session that took it, not by the machine: "
+                 "two agents on one box are two agents. Take a different key, or "
+                 "wait for this one to lapse — its holder and expiry are above"),
     })
 
 
@@ -167,7 +193,7 @@ def fmt_version(v: tuple[int, int]) -> str:
     return f"{v[0]}.{v[1]}"
 
 
-def _view(c: ResourceLease) -> dict:
+def claim_view(c: ResourceLease) -> dict:
     return {
         "claim_id": str(c.id),
         "kind": c.kind,
@@ -198,9 +224,9 @@ async def _sweep_lapsed(session: AsyncSession, kind: str, key: str,
     )
 
 
-async def _held(session: AsyncSession, kind: str, key: str,
-                now: datetime) -> ResourceLease | None:
-    """The claim actually holding a key right now, or None.
+async def live_claim(session: AsyncSession, kind: str, key: str,
+                     now: datetime | None = None) -> ResourceLease | None:
+    """The claim actually holding a key right now, or None. Also for other routers.
 
     Tests ``expires_at`` as well as ``released_at``. Callers sweep first, but the
     sweep uses a timestamp captured once at request start, so a claim can expire
@@ -217,7 +243,7 @@ async def _held(session: AsyncSession, kind: str, key: str,
         select(ResourceLease)
         .where(ResourceLease.kind == kind, ResourceLease.key == key,
                ResourceLease.released_at.is_(None),
-               ResourceLease.expires_at > now)
+               ResourceLease.expires_at > (now or _utcnow()))
         .limit(1)
     )
 
@@ -242,7 +268,7 @@ def _repo_prefix(repo: str):
 _UNIQUE_VIOLATION = "23505"
 
 
-def _is_lost_race(exc: IntegrityError) -> bool:
+def is_unique_violation(exc: IntegrityError) -> bool:
     orig = getattr(exc, "orig", None)
     code = getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
     return code == _UNIQUE_VIOLATION
@@ -271,7 +297,7 @@ async def _take(session: AsyncSession, *, kind: str, key: str, holder: str,
         # ...but ONLY for the unique violation this races on. Any other
         # integrity failure is a real fault, and swallowing it as "contended"
         # would retry it eight times and then report a queue that is not there.
-        if not _is_lost_race(e):
+        if not is_unique_violation(e):
             raise
         return None
     await session.refresh(claim)
@@ -321,7 +347,7 @@ class ClaimIn(BaseModel):
     kind: str = Field(min_length=1, max_length=64)
     key: str = Field(min_length=1, max_length=512)
     ttl: int = Field(default=DEFAULT_TTL, ge=1, le=MAX_TTL)
-    session: str | None = None
+    session: str | None = Field(default=None, max_length=MAX_SESSION)
     #: What you are doing with it. Optional, and worth sending: it is what the
     #: next agent is shown instead of a bare refusal.
     note: str | None = Field(default=None, max_length=500)
@@ -329,10 +355,12 @@ class ClaimIn(BaseModel):
 
 class ClaimRefIn(BaseModel):
     claim_id: uuid.UUID
-    #: Required in practice for a release claim that named one — see
-    #: :func:`_may_mutate`. Ownership of a release number is the session's, not
-    #: the box's, because on this fleet two agents per box are two branches.
-    session: str | None = None
+    #: Required in practice for ANY claim that named one — see
+    #: :func:`may_mutate`. Ownership is the session's, not the box's, because on
+    #: this fleet two agents per box are two agents; the release-only reading of
+    #: this line was the #142 bug, and a comment that outlives its rule is how it
+    #: got there.
+    session: str | None = Field(default=None, max_length=MAX_SESSION)
 
 
 class ReleaseClaimIn(BaseModel):
@@ -347,8 +375,143 @@ class ReleaseClaimIn(BaseModel):
     #: which is every release before this one.
     after: str | None = None
     ttl: int = Field(default=DEFAULT_TTL, ge=1, le=MAX_TTL)
-    session: str | None = None
+    session: str | None = Field(default=None, max_length=MAX_SESSION)
     note: str | None = Field(default=None, max_length=500)
+
+
+@dataclass(frozen=True, slots=True)
+class ClaimRequest:
+    """One claim, as asked for — :func:`acquire`'s argument.
+
+    An options object rather than eight keyword parameters, so a caller reads as
+    one intent and a new field (``session_owned``) costs no call site anything.
+    ``sess`` is normalised on the way in, because "" and None are the same
+    absence and only one of them is storable (see :func:`clean_session`).
+    """
+
+    kind: str
+    key: str
+    holder: str
+    ttl: int = DEFAULT_TTL
+    sess: str | None = None
+    note: str | None = None
+    now: datetime = field(default_factory=_utcnow)
+    #: Is this claim owned by the SESSION rather than by the box? Off by default
+    #: — a land claim belongs to the machine, so an agent that restarts can pick
+    #: its own back up. The plan (v2.39) turns it on: a machine runs several
+    #: agents at once, all authenticating as that one token, and "two agents on
+    #: one box both hold item #60" is the exact duplicated work it exists to
+    #: prevent. Opt-in and per-request, so it changes nothing else.
+    session_owned: bool = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "sess", clean_session(self.sess))
+
+
+def _may_renew(claim: ResourceLease, req: ClaimRequest) -> bool:
+    """May this request renew the claim it found, instead of being refused?
+
+    :func:`may_mutate` is the table-wide rule and stays exactly as it is — a
+    separate branch is changing it for release claims and this must not collide
+    with that. What is added here is the caller's own answer to "what is a
+    worker": with ``session_owned`` a claim taken by session A is not session B's
+    to renew even on the same machine, and a claim that recorded no session at
+    all still falls back to the box, because there is nothing finer to compare.
+    """
+    if not may_mutate(claim, req.holder, req.sess):
+        return False
+    if req.session_owned and claim.session:
+        return req.sess == claim.session
+    return True
+
+
+async def _sweep_apart(kind: str, key: str, now: datetime) -> None:
+    """Retire this key's lapsed claims in a session of the caller's own.
+
+    :func:`acquire` used to sweep on the caller's session and commit — which
+    committed whatever else that unit of work had pending, before doing anything
+    the caller asked for. Nothing broke, because both callers happened to be
+    clean at that line; the function is extracted precisely so a fourth and fifth
+    caller will exist, and "it commits your half-finished mutation first" is not
+    a precondition a signature can carry. So the housekeeping runs on its own
+    connection and commits only itself.
+    """
+    async with async_session() as own:
+        await _sweep_lapsed(own, kind, key, now)
+        await own.commit()
+
+
+def _refuse_pending_work(session: AsyncSession) -> None:
+    """:func:`acquire` commits, so it must not be handed uncommitted work."""
+    pending = bool(session.new or session.deleted) or any(
+        session.is_modified(o, include_collections=False) for o in session.dirty)
+    if pending:
+        raise RuntimeError(
+            "acquire() commits: flush and commit your own writes before calling it, "
+            "or they land as part of the claim — and roll back with it.")
+
+
+async def acquire(session: AsyncSession, req: ClaimRequest) -> tuple[ResourceLease, bool]:
+    """Take or renew a claim on ``(kind, key)``. Raises :func:`_conflict` if held.
+
+    The whole of ``POST /claim``'s body, as a function, so a feature that needs
+    an atomic claim reuses this one rather than growing a second implementation
+    of "who has this right now" — which is the outcome #99 was filed to avoid and
+    the plan (v2.39) is the third feature to want. Returns ``(claim, renewed)``.
+
+    Re-claiming something your own machine already holds is a RENEW, not a
+    conflict — the same rule ``POST /lease`` applies, and for the same reason: a
+    claim belongs to the box, and an agent that restarts mid-land must be able to
+    pick its own claim back up rather than be locked out by its former self.
+    Callers for whom the *session* is the worker say so with
+    ``session_owned=True`` (see :func:`_may_renew`).
+
+    **It commits.** It has to: atomicity here is a committed INSERT against a
+    unique index, not a lock. So it is not composable inside a larger unit of
+    work, and rather than leave that as a docstring nobody reads at the call
+    site, a session with pending work is refused outright.
+    """
+    if req.kind in RESERVED_KINDS:
+        # Inside the primitive, not in front of one caller of it. `release`
+        # carries invariants only `allocate_release` enforces, and the whole
+        # point of extracting `acquire` is that callers three and four will
+        # arrive — each of them able to write the row v2.33 closed off.
+        raise HTTPException(409, detail={
+            "error": f"{req.kind!r} claims are allocated, not taken",
+            "kind": req.kind, "key": req.key,
+            "hint": "use POST /release/claim — see RESERVED_KINDS for why"})
+    _refuse_pending_work(session)
+    await _sweep_apart(req.kind, req.key, req.now)
+
+    held = await live_claim(session, req.kind, req.key, req.now)
+    if held is not None:
+        if not _may_renew(held, req):
+            raise _conflict(req.kind, req.key, held)
+        _renew_onto(held, holder=req.holder, ttl=req.ttl, sess=req.sess,
+                    note=req.note, now=req.now)
+        await session.commit()
+        return held, True
+
+    claim = await _take(session, kind=req.kind, key=req.key, holder=req.holder,
+                        ttl=req.ttl, sess=req.sess, note=req.note, now=req.now)
+    if claim is not None:
+        return claim, False
+
+    # Lost the insert race. Re-read rather than reporting a generic failure:
+    # the loser of a race is exactly the caller who most needs to know who won.
+    winner = await live_claim(session, req.kind, req.key, req.now)
+    if winner is None:
+        raise HTTPException(409, detail={
+            "error": "claim contended; try again", "kind": req.kind, "key": req.key})
+    if not _may_renew(winner, req):
+        raise _conflict(req.kind, req.key, winner)
+    # A real renew, written and committed — not a `renewed: true` over an
+    # untouched row. Same request, same reported outcome, same effect,
+    # whether or not a race happened to occur (F05).
+    _renew_onto(winner, holder=req.holder, ttl=req.ttl, sess=req.sess,
+                note=req.note, now=req.now)
+    await session.commit()
+    return winner, True
 
 
 @router.post("/claim")
@@ -357,53 +520,19 @@ async def take_claim(
     holder: str = Depends(identify),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
-    """Claim a named resource, or be told who has it.
-
-    Re-claiming something your own machine already holds is a RENEW, not a
-    conflict — the same rule ``POST /lease`` applies, and for the same reason: a
-    claim belongs to the box, and an agent that restarts mid-land must be able to
-    pick its own claim back up rather than be locked out by its former self.
-    """
+    """Claim a named resource, or be told who has it."""
     if body.kind in RESERVED_KINDS:
+        # `acquire` refuses this too, and must. Kept here for the friendlier
+        # message: this is the endpoint people actually call by hand.
         raise HTTPException(409, detail={
             "error": f"{body.kind!r} claims are allocated, not taken",
             "kind": body.kind,
             "hint": "use POST /release/claim — see RESERVED_KINDS for why"})
 
-    now = _utcnow()
-    sess = _clean(body.session)
-    await _sweep_lapsed(session, body.kind, body.key, now)
-    await session.commit()
-
-    held = await _held(session, body.kind, body.key, now)
-    if held is not None:
-        if not _may_mutate(held, holder, sess):
-            raise _conflict(body.kind, body.key, held)
-        _renew_onto(held, holder=holder, ttl=body.ttl, sess=sess,
-                    note=body.note, now=now)
-        await session.commit()
-        return {**_view(held), "claimed": True, "renewed": True}
-
-    claim = await _take(session, kind=body.kind, key=body.key, holder=holder,
-                        ttl=body.ttl, sess=sess, note=body.note, now=now)
-    if claim is None:
-        # Lost the insert race. Re-read rather than reporting a generic failure:
-        # the loser of a race is exactly the caller who most needs to know who won.
-        winner = await _held(session, body.kind, body.key, now)
-        if winner is None:
-            raise HTTPException(409, detail={
-                "error": "claim contended; try again",
-                "kind": body.kind, "key": body.key})
-        if _may_mutate(winner, holder, sess):
-            # A real renew, written and committed — not a `renewed: true` over an
-            # untouched row. Same request, same reported outcome, same effect,
-            # whether or not a race happened to occur (F05).
-            _renew_onto(winner, holder=holder, ttl=body.ttl, sess=sess,
-                        note=body.note, now=now)
-            await session.commit()
-            return {**_view(winner), "claimed": True, "renewed": True}
-        raise _conflict(body.kind, body.key, winner)
-    return {**_view(claim), "claimed": True, "renewed": False}
+    claim, renewed = await acquire(session, ClaimRequest(
+        kind=body.kind, key=body.key, holder=holder, ttl=body.ttl,
+        sess=body.session, note=body.note, now=_utcnow()))
+    return {**claim_view(claim), "claimed": True, "renewed": renewed}
 
 
 @router.post("/claim/renew")
@@ -415,7 +544,7 @@ async def renew_claim(
     claim = await session.get(ResourceLease, body.claim_id)
     if claim is None:
         raise HTTPException(404, "claim not found")
-    if not _may_mutate(claim, holder, body.session):
+    if not may_mutate(claim, holder, body.session):
         raise _not_yours(claim)
     now = _utcnow()
     kind, key = claim.kind, claim.key
@@ -423,7 +552,7 @@ async def renew_claim(
     # against a row that a concurrent sweep could release between the read and
     # the write, so a lapsed claim another agent had already taken could still be
     # "renewed" and reported `claimed: true` (round 1's F04). The predicate is
-    # the same one `_held` uses, evaluated by the database at write time.
+    # the same one `live_claim` uses, evaluated by the database at write time.
     #
     # This is the PR's own thesis applied to the paths it had not been applied
     # to: the INSERT was made atomic by the unique index while every UPDATE still
@@ -446,7 +575,7 @@ async def renew_claim(
             "kind": kind, "key": key})
     await session.commit()
     fresh = await session.get(ResourceLease, body.claim_id)
-    return _view(fresh)
+    return claim_view(fresh)
 
 
 @router.post("/claim/release")
@@ -461,7 +590,7 @@ async def release_claim(
     claim = await session.get(ResourceLease, body.claim_id)
     if claim is None:
         raise HTTPException(404, "claim not found")
-    if not _may_mutate(claim, holder, body.session):
+    if not may_mutate(claim, holder, body.session):
         raise _not_yours(claim)
     if claim.released_at is None:
         claim.released_at = _utcnow()
@@ -502,7 +631,7 @@ async def list_claims(
     stmt = stmt.order_by(ResourceLease.acquired_at.desc()).limit(limit)
     rows = list(await session.scalars(stmt))
     return {"claims": [
-        {**_view(c),
+        {**claim_view(c),
          "released": c.released_at.isoformat() if c.released_at else None,
          "lapsed": c.lapsed}
         for c in rows]}
@@ -593,7 +722,7 @@ async def allocate_release(
     #
     # Scoped to the session AND the machine — see `_my_live_release` for why the
     # session alone was a hole rather than a shortcut.
-    sess = _clean(body.session)
+    sess = clean_session(body.session)
     mine = await _my_live_release(session, body.repo, holder, sess, now)
     if mine is not None:
         got = parse_version(mine.key[len(body.repo) + 1:])
@@ -606,7 +735,7 @@ async def allocate_release(
             _renew_onto(mine, holder=holder, ttl=body.ttl, sess=sess,
                         note=body.note, now=now)
             await session.commit()
-            return {**_view(mine), "version": fmt_version(got),
+            return {**claim_view(mine), "version": fmt_version(got),
                     "claimed": True, "renewed": True,
                     "after_unreadable": unreadable}
 
@@ -621,7 +750,7 @@ async def allocate_release(
             if mine is not None:
                 got = parse_version(mine.key[len(body.repo) + 1:])
                 if got is not None and (told is None or got > told):
-                    return {**_view(mine), "version": fmt_version(got),
+                    return {**claim_view(mine), "version": fmt_version(got),
                             "claimed": True, "renewed": True,
                             "after_unreadable": unreadable}
         known = await _highest_known(session, body.repo)
@@ -635,7 +764,7 @@ async def allocate_release(
 
         await _sweep_lapsed(session, "release", key, now)
         await session.commit()
-        held = await _held(session, "release", key, now)
+        held = await live_claim(session, "release", key, now)
         if held is not None:
             # **The same-machine renew rule of `POST /claim` must NOT apply here,
             # and a concurrent test is what proved it.** Four callers racing for
@@ -662,7 +791,7 @@ async def allocate_release(
                 _renew_onto(held, holder=holder, ttl=body.ttl, sess=sess,
                             note=body.note, now=now)
                 await session.commit()
-                return {**_view(held), "version": fmt_version(candidate),
+                return {**claim_view(held), "version": fmt_version(candidate),
                         "claimed": True, "renewed": True,
                         "after_unreadable": unreadable}
             # Held, so it is not free however the arithmetic came out.
@@ -674,7 +803,7 @@ async def allocate_release(
                             ttl=body.ttl, sess=sess, note=note, now=now)
         if claim is None:
             continue
-        return {**_view(claim), "version": fmt_version(candidate),
+        return {**claim_view(claim), "version": fmt_version(candidate),
                 "claimed": True, "renewed": False,
                 # Said rather than swallowed: an `after` this board could not
                 # parse means the allocation rested on board history alone, and a
@@ -702,7 +831,7 @@ class ReleaseReclaimIn(BaseModel):
     branch: str | None = None
     after: str | None = None
     ttl: int = Field(default=DEFAULT_TTL, ge=1, le=MAX_TTL)
-    session: str | None = None
+    session: str | None = Field(default=None, max_length=MAX_SESSION)
     note: str | None = Field(default=None, max_length=500)
 
 
@@ -735,7 +864,7 @@ async def reclaim_release(
     old = await session.get(ResourceLease, body.claim_id)
     if old is None:
         raise HTTPException(404, "claim not found")
-    if not _may_mutate(old, holder, body.session):
+    if not may_mutate(old, holder, body.session):
         raise _not_yours(old)
     # Liveness, which `renew_claim` checked and this did not (round 1's F07).
     # Without it a timed-out retry, a concurrent reclaim of the same id, or
@@ -784,7 +913,7 @@ async def reclaim_release(
 
         await _sweep_lapsed(session, "release", key, now)
         await session.commit()
-        if await _held(session, "release", key, now) is not None:
+        if await live_claim(session, "release", key, now) is not None:
             continue
 
         # Both writes in one transaction: the old row is released in the same
@@ -806,7 +935,7 @@ async def reclaim_release(
                 "key": old_key})
         note = body.note or (f"held for {body.branch}" if body.branch else old_note)
         fresh = ResourceLease(kind="release", key=key, holder=holder,
-                              session=_clean(body.session) or old_session,
+                              session=clean_session(body.session) or old_session,
                               note=note,
                               ttl_seconds=body.ttl,
                               expires_at=now + timedelta(seconds=body.ttl))
@@ -816,11 +945,11 @@ async def reclaim_release(
             await session.commit()
         except IntegrityError as e:
             await session.rollback()
-            if not _is_lost_race(e):
+            if not is_unique_violation(e):
                 raise
             continue
         await session.refresh(fresh)
-        return {**_view(fresh), "version": fmt_version(candidate),
+        return {**claim_view(fresh), "version": fmt_version(candidate),
                 "claimed": True, "renewed": False,
                 # Named back so the caller can check the swap it just made
                 # against the number it has already written into eight files.

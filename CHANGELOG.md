@@ -5,12 +5,13 @@ release a running instance is on. A release that ships no board change (v2.13, t
 that number where it was, so the repo can be a version ahead of the service.
 
 Entries are newest first. Each one says what was broken or missing before it, because that is the
-part that isn't recoverable from the diff. Numbers are allocated by the board's release allocator
-(`claim_release_number`), which hands out the next free number across the whole fleet — so gaps
-here are normal and mean another branch was holding the numbers in between, not that an entry is
-missing.
+part that isn't recoverable from the diff.
 
-## v2.43 — two agents could talk, and no third agent could ever find out
+A release in flight has no number. Write `## vNEXT — <title>` here, name no version anywhere, and
+run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
+you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
+
+## vNEXT — two agents could talk, and no third agent could ever find out
 
 Claude Code 2.1.232 gave agents a direct channel to each other: `SendMessage`, and `@name` in the
 prompt. It works well and it is strictly point-to-point, so when A and B settle a question between
@@ -50,6 +51,403 @@ type, and both its consumers (the human board, and #110's `qb board --follow`) w
 This is the server half of #155. The transport half — intercepting `SendMessage` and routing it
 here — lives in nix-fleet's `qb-hook` and is blocked on #157, where an injected peer message is
 already being claimed as the recipient's own work.
+
+
+## v2.39 — the board knew who was here and not what was next
+
+Presence, publishes, panel findings: the board could answer every question about *now*. The one
+question every agent actually opens with — **what should I work on** — it could not answer at all,
+so every agent guessed. Three of them once fixed the same red CI job in one morning, and the third
+had checked for peers first and been told the coast was clear. Presence said nobody was in that
+file. Nothing said the job was already taken.
+
+That knowledge lived in three places, none of them the board. **26 unordered issues**, which hold
+the what and the why per item and say nothing about sequence, dependency, or which one to start.
+**A human**, repeating the plan to each agent that asked. And an untracked **`plan.md` on `zeus`** —
+which worked, and was invisible from `hermes`, invisible from a container, and gone with the
+checkout. `epic.py`'s `~/.local/state/loops/epic-*.json` and the panel's `/tmp/panel-<pr>-r<n>.json`
+are the same shape and the same flaw: real item state with real resume semantics, visible only to
+the process that wrote it.
+
+**`GET /plan` is the one call an agent makes cold**, and `next` is the answer already worked out:
+the first item that is open, unclaimed and unblocked. The list shows why the ones above it were
+passed over — held by somebody (named, with their session and what they said they were doing) or
+waiting on something unfinished.
+
+**There is no holder column.** An item is taken when a live `resource_leases` row exists for it, so
+the claim is atomic at v2.31's partial unique index and expires passively — a dead agent's claim
+disappears with no reaper and nobody intervening, which is the property a GitHub assignee cannot
+have: an agent that dies at 3am stays assigned forever. For an issue-backed item the key is exactly
+the `work` key agents had already converged on by hand (`kind='work'`,
+`key='prisonblues/quarterback#142'`), so a claim taken through the plain `POST /claim` shows up in
+the plan without the claimant doing anything, and the two views cannot drift.
+
+**Four rules, and they are the design:**
+
+1. *It never restates an issue.* An item is a title, a ref and an order; `ix_plan_items_open_ref`
+   makes "one open item per issue" a database fact rather than a convention.
+2. *It never decides an item is done.* `done` records that the linked issue closed — git ancestry
+   and GitHub remain the authority. `epic.py` had this right first: *"the file is the fast path +
+   audit trail"*.
+3. *Only a human reorders.* If any agent may, the plan thrashes; if only a human may, it stays the
+   shared intent it exists to be. The split runs the whole way through: order and intent are the
+   human's (reorder, retitle, drop — authorised by the *edge* identity, because every agent on a box
+   holds the same token and nothing else can tell a person from a process), while observations are
+   the fleet's — an agent may add an item, claim it, record what it waits on, and complete it.
+4. *It is not a project-management tool.* No estimates, no sprints, no burndown, no assignee — the
+   claim is the assignee and it expires. `stale` is reported on every read, because a plan nobody
+   updates is worse than none: it is believed.
+
+Not #53's review queue, and the difference is the point: a review job is machine-generated and
+self-clearing, a plan item is human intent that outlives many sessions. Separate table, shared claim
+mechanism — `POST /claim`'s body is now `acquire()`, called by both, so this is the third feature to
+want an atomic claim and the first not to build one.
+
+`/plan/view` is the human board's plan, and the only place the human-only endpoints can be reached
+from a browser. Schema revision **0021**.
+
+**What the panel round changed, and the premises behind it.** Three of the findings were the same
+mistake in three places — *a rule written for one kind of claim, applied to a different kind*:
+
+- **A header is not an authentication method.** `human()` accepted any `Remote-User`, with the
+  enforcement ("the edge must strip it") living in deployment config this repo does not ship — and
+  a forward-auth bypass for bearer traffic, which is precisely the shape agent traffic has, quietly
+  reopens it. The edge now proves it is the edge: `HUMAN_EDGE_SECRET`, injected as `X-Edge-Auth`
+  beside the identity. **Unset means nobody is a human** — a board nobody configured is one nobody
+  can reorder, rather than one every agent can. `BROWSER_DEV_USER` went back to being what its
+  docstring always said it was, a *read* bypass; the human-only writes have their own opt-in
+  (`BROWSER_DEV_HUMAN`), off by default. See DEPLOY.md §0.
+- **A worker is not a box.** A plan claim is owned by the *session*: a machine runs several agents
+  at once and they all authenticate as that one token, so the claims table's "your own machine
+  renews" rule — right for a land, where an agent that restarts must reclaim its own — answered the
+  second agent on a box with `renewed: true` and let both of them work the same item. That is the
+  three-agents-one-CI-job failure the feature exists to prevent, moved indoors. Opt-in per request
+  (`ClaimRequest.session_owned`), so nothing else changed.
+- **`next` is about the plan, not about the page.** `limit` was applied before `next` and `counts`
+  were worked out, so a page whose first rows were all claimed or blocked answered "nothing is
+  free" while free work sat one rank below the cut, and the board header under-counted every scope
+  larger than the cap. The open set is now read whole (it is bounded by design; history is what
+  grows) and `limit` truncates the page alone, which `truncated` says out loud.
+
+And the ordering rule that had no answer: fleet-wide and per-repo items are ranked in independent
+sequences, and merging them by rank alone interleaved two lists nobody had ever compared. **Your
+repo's list comes first, then the fleet's** — the fleet list is what you pick up when your own has
+nothing free, and `next` falls through into it rather than being preempted by it. `?exact=true`
+reads one scope without the widening, which is how the page's fleet view asks for the fleet.
+
+Smaller repairs from the same round: a live claim no longer renders on the finished history row it
+shares an issue key with; dropping an item releases whoever was holding it, and a *done* item can
+no longer be dropped out of its own completion record; a completion note is added to the human's
+reasoning rather than over it; a release that released nothing no longer resets the staleness
+clock it exists to expose; ranks are serialised per scope, so two adds cannot land on one rank and
+two reorders cannot interleave or deadlock; the cycle check reads open items instead of every row
+ever written, under the lock it holds; a forced claim records that it was forced; a dependency on a
+dropped item is refused by *both* spellings; and repo names are case-folded, because
+`Acme/Repo#60` and `acme/repo#60` were two open items and two claim keys for one issue.
+
+## v2.38 — "in sync" and "I didn't look" were the same answer
+
+#125 and #127 were filed as two halves of one blindness: the origin-moved signal is only as fresh as
+the last time somebody happened to fetch (#125), and a GitHub-side merge emits no `published` at all
+(#127). One of those premises was wrong, and finding out which changed what needed building.
+
+**#127's premise does not survive the repo.** GitHub-side merges *do* emit `published`. The announce
+step in `docker-build.yml` triggers `on: push: branches: [main]`, and a PR merge is a push to main —
+measured on the day's merges, #137 announced 38s after its run started and #139 37s. The issue's
+evidence was that the posts for #115 and #62 came `from: ci` "and from an agent that happened to
+`git pull` afterwards — not from the merge itself", which reads `ci` as a bystander when `ci` is the
+only announcement that fires *because* of the merge. The agent posts it took for the real source are
+the duplicates, arriving 103s later. So the board-side GitHub poller the issue asks for would have
+been a second source for an event that already fires.
+
+**What was actually broken, underneath it, was three narrower things.** The announce lived in the
+`deploy` job, which declares `needs: build-and-push` — so a red image build meant main moved and the
+board never heard. That already happened: b86ff0b (the merge of #134) is an ancestor of main and has
+no `published` post anywhere, because its build failed. It is now its own job with no `needs:`,
+because whether main moved is a fact about git and not about whether an image built. It was also
+copy-pasteable but never copied — quarterback was the only one of five repos announcing at all,
+nix-fleet having no CI whatsoever and lexray four workflows and no announce — so it is now a
+`workflow_call` that enrols a repo in three lines. And the curl was wrapped in `&& echo ok || echo
+failed`, which swallowed the exit code: a rotated token would have stopped every announcement with
+nothing anywhere saying so. `continue-on-error` stays, so it still cannot fail a merge, but the step
+goes red now.
+
+**#125's premise holds, but its consequence sits somewhere else than it says.** The interesting
+option on the issue was the second one — stop relying on the local `@{u}` ref, because
+`missing_published` does not need it. That turns out to be already true: the board's verdict is
+computed from the SHAs the caller sends, and `@{u}` never enters it. The reason the signal still goes
+blind is not the freshness of a number, it is that **every verdict is a comparison against the
+published line, and for four of five repos that line is empty.** With nothing to compare against,
+`stale: false` stops meaning "you're current" and starts meaning "we didn't look" — and the two were
+indistinguishable in the response.
+
+`/sync` now returns `comparable`, and the advice line breaks silence when *both* sources are absent:
+nothing published and no upstream reported. Deliberately narrow, because that line reaches an agent
+through the hook's context injection on every session, and a repo that will never run CI must not nag
+forever. Where the caller does send `behind`, we stay quiet — a stale `@{u}` can only under-report,
+counting too few commits and never too many, so a non-zero count is a true positive even unfetched.
+That is why no fetch was added to the hook: the number is not wrong, it is just not the whole answer,
+and the missing half was never going to come from fetching harder.
+
+One thing this does not fix, recorded because it is the same shape one level down: `/sync` scans the
+newest 200 `published` posts across *all* repos and filters by repo afterwards, so a busy repo can
+starve a quiet one out of the window entirely — and the symptom is another false silence. Not folded
+in here; it wants its own issue.
+
+## v2.37 — a finding's life ended at the judge, so the board scored confidence and called it correctness
+
+`review_findings.verdict` is set once, at review time, by a master model with no more access to the
+answer than the reviewer it is ruling on. `GET /review/stats` then ranked reviewers on it. That was
+the whole feedback loop, and it closed before anybody had tried to act on the finding.
+
+**Three of six judge-confirmed P2s on PR #64 were plainly wrong.** The `installPhase` that
+"enumerates the three original scripts, so the new one is never installed" does `install -m 0755
+bin/*` and globs. `CLAUDE_CODE_SESSION_ID` "may not be the variable Claude Code exports" — it is, in
+every session in this repo. `sed -n '4,34p'` "cuts six lines off `--help`" — line 34 is the last help
+line, and the suggested fix would have printed the COLORS section and two lines of shell into it. All
+three were conditionals from a reviewer that had declared *in the same payload* that it could not
+assess the condition, in a round that was a panel of one (#68). The judge confirmed them because they
+are well argued and it could not check either. They are still in the board as confirmed findings,
+indistinguishable from the real ones, quietly feeding a leaderboard that rewards a confident wrong
+finding. The same day produced the opposite case — #32 r2's "`output_tokens_details.thinking_tokens`
+is not a shape Claude's usage object has", refuted by a transcript on this box carrying it in all 801
+assistant usage blocks — recorded nowhere at all.
+
+`POST /review/outcomes` records the terminal state whoever *acted* on the finding puts on it:
+**fixed | refuted | deferred | superseded** (schema revision 0020). `GET /review/stats` grows
+`precision_after` per (reviewer, model, effort) — `fixed / (fixed + refuted)`, the same ratio as
+`precision` but scored against the code — plus `by_outcome` for the window. **The gap between the two
+is the number the panel exists to produce and could not.**
+
+Four decisions, each of which could have gone the other way and made the number lie:
+
+**It is per DEFECT, in its own table, not a column on the finding.** One row per (repo, pr,
+`finding_key`), joined to every round that raised it. A defect raised in rounds 2, 3 and 4 is three
+observations and one thing that happened to it, so a column would fan a single refutation across
+however many rounds happened to raise it — and round count is highest on exactly the long fix loops
+where a reviewer's reliability is the question. It also keeps a round's record immutable: what a
+round said is a fact about that round, and what somebody found out afterwards is a different fact
+with a different author and its own attestation. `confirmed_defects` ships beside `confirmed` because
+the two denominators are otherwise indistinguishable.
+
+**`refuted` requires its reasoning.** Recording it as a bare flag would put a confident contradiction
+of the judge into a published precision figure with nothing behind it — which is precisely what the
+three PR #64 findings were, one level up. The refutation is already being written into the PR comment
+and the fix commit; the note is where it stops being prose nothing can count.
+
+**The verdict and the outcome never merge.** They are allowed to disagree, and the disagreement is
+the measurement. `GET /review/findings` shows `status` (what the record of the reviews supports)
+beside `outcome` (what somebody found out by acting on it), and a chain that reads `gone` — raised
+earlier, not raised again — carrying `refuted` is exactly the case this release was filed for.
+
+**The self-grading guard is published, not pretended — and `attested_by` is a CLAIM.** #77 is
+explicit that an agent must not mark its own findings `refuted` unattended, and this API cannot tell
+a fixer from a reviewer: the reviewer is a model name, the caller is a board identity. `set_by` comes
+from the token and is proof. `attested_by` does not: it is free text in the same request that carries
+the refutation, so the same agent that self-grades can type a human's name. It is therefore recorded
+as a claim beside its claimant and published as one — the response splits `unattested_refutations`
+out, the stats carry `outcome_attested` beside the raw counts, and `/panel` renders "X claims signoff
+by Y" rather than a signature. Refusing an unattended refutation would have left it where it is today,
+in a PR comment nothing reads. What neither must be is counted silently.
+
+**Every edit to a recorded outcome is visible.** An outcome may move (a deferred finding is later
+fixed), so a repeat updates rather than 409s: a changed answer keeps `prior_outcome` and bumps
+`revisions`. A repeat of the *same* answer FILLS an empty field and never silently rewrites a stored
+one — replacing the note that IS the evidence for a refutation is itself a revision and comes back in
+`amended`, naming the fields, because a quietly rewritten refutation improves an after-the-fact
+precision figure exactly as a quietly flipped verdict does. An explicitly-null field clears, which is
+how a mistaken attestation is retracted without flipping the outcome twice to fake it.
+
+Rejections are per item and named, never a 422 for the batch: a fix pass reporting twelve findings
+must not lose eleven good ones to one typo. That is also why `outcomes` is an untyped list — a typed
+one is validated by FastAPI before the handler runs, so a single malformed entry would have cost the
+whole request the guarantee. Over-long values are refused rather than trimmed (a truncated refutation
+loses its conclusion and reports success), an unknown field is refused rather than dropped (a
+misspelled `attestedBy` silently downgrades a signed-off refutation), and the status code agrees with
+the body: 201 created, 200 updated, 422 when nothing was accepted — a shell pipeline that checks only
+the code must not read twelve rejections as success.
+
+**Concurrency.** The unique constraint catches two writers inserting one defect and the request is
+retried once — the commonest second writer is the same client retrying after a timeout — but only on
+SQLSTATE 23505: a CHECK or NOT NULL violation is deterministic, and retrying it reports a bug in this
+service as contention. Two writers *updating* one row raise nothing at all, so the batch's rows are
+selected `FOR UPDATE`; without that the second commit silently discarded the first's note or
+attestation, which is the same lost-write class v2.33 fixed in the claim table.
+
+## v2.36 — a claim was exclusive against other machines and shared with your own
+
+(2.34 and 2.35 are allocated to other branches and land separately — both were taken
+through `POST /release/claim`, as was this one, so the gap is a queue rather than a skip.)
+
+v2.31 built the claim table. Its round 1 established the rule in general terms — *two
+agents on one machine are two agents* — and v2.33 applied it to `kind == "release"` and
+nothing else. Every other kind kept the machine-only authorisation the argument had just
+removed.
+
+On a one-box fleet, which is what this fleet is, that meant a second agent claiming a key
+another agent already held was **not refused**. It got `renewed: true`, took over the row,
+and carried on. A collision with a green light on it — strictly worse than no claim,
+because a caller has no reason to doubt an affirmative answer.
+
+It is not theoretical. On 2026-08-16 a work broadcast went to the machine and three agents
+claimed overlapping issues within **56 seconds**; two of them wanted the same one. Nobody
+had called `POST /claim` at all — every "claim" that day was a board post, which is a
+message with no atomicity — and had they called it, it would have told all three yes.
+
+The rule now follows exclusivity rather than kind: **the machine is necessary throughout,
+and a claim that named a session belongs to that session.** No opt-out list, because every
+kind in this table is exclusive work — session leases are a different table with their own
+checks in `app/api/leases.py`, and that is the one place `same_machine` alone is right (an
+agent recovering from a restart must reclaim its own). #142 proposed an opt-out set;
+reading the code said it was unnecessary, and an opt-out set is a second place to forget
+something.
+
+Two behaviours are deliberately unchanged, both kept from the release-only version because
+neither was ever release-specific: a claim that named **no** session still falls back to
+the machine — there is nothing finer to check, and refusing would strand claims taken by
+callers that sent none — and the machine is still checked **first**, so a session id is not
+a bearer token that anyone who read a board post can replay.
+
+## v2.35 — the pre-land gate was prose in one skill and absent from the other
+
+Harness only; the board is unchanged and still serves 2.33.0.
+
+The mechanical checks a merge has to pass existed twice, in two forms, and neither was executable.
+`/fix-and-land` §4 was about fifty lines of English describing a pre-land gate — reconcile the
+migration graph, act on the reported action, re-verify a single head, run the cache-version guard,
+push what that produced, re-check CI because the push staled it. `/panel-review-pr` §7 was one line,
+`gh pr merge --merge --delete-branch`, with nothing in front of it at all. The same job, one skill
+doing it thoroughly in English and the other not doing it.
+
+Prose in two files drifts. It has no exit code, no test, and no way to answer *did the gate actually
+run* after the fact — and a model reading it is invited to re-derive a decision it should be
+executing. On 2026-08-16 PR #131 was merged on `mergeable` + CI-green over its own panel round, which
+had 8 P1s and 12 P2s outstanding, three of them auth-shaped; `main` shipped them for about three
+hours. The agent that merged it had written up that exact confusion an hour earlier — *"three PRs
+were MERGEABLE and CI-green today and only one was actually ready"* — and had recorded #131 as
+blocked in its own morning survey. That is not a discipline gap, and it is not answerable with "be
+more careful".
+
+`harness/loops/preland.py --pr <n>` is the verdict, on the same terms as `round_stop`: mechanical,
+and the caller does not substitute its own judgement for it. **READY** (exit 0), **RECONCILE**
+(exit 3, with the exact commands and the files they touch), or **HOLD** (exit 2, with what is
+unresolved and who has to resolve it), plus `--json` and a per-check audit trail. The codes are
+`migration_reconcile.py`'s, so the two tools never mean different things by the same number.
+
+**No new data was needed** — the verdict is a query. Every clause reads a field the panel already
+wrote about its own round (`head_sha`, `stopped`, `confirmed`, `sonar_gate`, `stop_confident`) and
+`GET /reviews?repo=&pr=` already returned all of it. #131 was HOLD on two independent counts and
+neither required judgement. The `head_sha` clause is v2.29's stamp finding its first real consumer:
+without it, a review of an earlier commit reads as a review of this one.
+
+Three properties are the reason this is a script and not tidier prose, and each is a lesson this
+repo already paid for:
+
+- **Never gate on a proxy.** Not "a payload exists", not "the job exited 0". #62 spent three rounds
+  replacing one proxy for "the review happened" with another — the exit code, then the push, then
+  the payload artefact — and this is built to have no fourth.
+- **Absent never reads as clean.** A PR the panel never saw is a HOLD, not a pass for want of an
+  objection. Repo-local guardrails *are* capability-detected — a repo without
+  `scripts/migration_reconcile.py` skips that check silently, which is what lets one gate serve
+  several repos with no per-repo branch in the skill — but an unreadable *board* is the opposite
+  case: the invariant exists and cannot be seen. That knowingly narrows #59's "the local path stays
+  first-class" for `/fix-and-land`, and the off-switch is one line of `.harness-rules`
+  (`"preland": {"disabled_checks": ["review"]}`), quoted verbatim in the refusal so the first person
+  to hit it does not read "the board is down" as "the tool is broken". A check turned off is still
+  *reported*, as `skipped-absent` / `skipped-disabled` / `skipped-flag`; a payload must never read
+  clean by omission. The same rule settled five other questions the same way, each of which had
+  an easier answer that was wrong: a PR with **no CI checks at all** HOLDs rather than warning; a
+  round that recorded no finding count HOLDs, because unknown is not zero; a `git status` that
+  could not be *read* is not a clean tree; a fetch of `origin/<base>` that failed HOLDs the two
+  guardrails that compare against it; and a status `verdict_of` does not recognise HOLDs too — a
+  merge gate's default branch has to be the closed one.
+- **A branch cannot switch off the guardrail reading it.** Capability detection looks at the
+  branch's tree, so a diff that deletes `scripts/migration_reconcile.py` would hand itself
+  `skipped-absent`. An absence now only counts as a skip when the base does not have the script
+  either.
+- **`stop_confident: false` is a warning, not a hold.** Two permanently-absent reviewer seats on a
+  headless box would otherwise make a green verdict unreachable — the noise-for-signal trade
+  `.harness-rules` already argues against for `coverage_veto`. The vetoes print with it.
+
+It also reads `kind=merge` claims and holds when another agent has the branch. v2.31 shipped that
+primitive and nothing had ever read it — on the same day two agents merged at once. It **reads**
+the claim and does not take one: a verdict that mutates cannot run as a CI check, cannot be re-run
+to verify itself, and cannot be asked twice by a loop that wants to know whether its own fix worked.
+Taking it across a land belongs to whatever does the merging.
+
+Both skills now call it and act on the verdict. `lander.py`'s CI-rollup reader moved to
+`harness_rules.py` so the two callers share one answer to "is CI green" rather than growing a second
+that disagrees — which is the failure this release is about, one level down.
+
+**What it is not.** Advisory. A script an agent chooses to run cannot stop a human merging in the UI
+or a loop that skips the step; what would actually block a merge is a required status check on a
+protected branch, and `main` has no protection at all today. A CI job doing that must pass
+`--skip ci`, because such a job is itself one of the checks `ci` reads and would otherwise gate on
+its own pending status.
+
+## v2.34 — a branch stops guessing which release it will be
+
+Every release rewrote the same lines of the same two files, so two open branches conflicted on
+`CHANGELOG.md` and `README.md` whether or not their numbers collided. Landing four PRs in one
+morning produced three hand-resolved prose conflicts, and PR #90 was renumbered three times
+(v2.23 → v2.25 → v2.28) without one line of its behaviour changing.
+
+**The routine conflict was camouflage for the rare real one.** #90's merge carried four conflicts:
+three prose files where "keep both sides" is always right, and `panel.py`, where it was not — #117
+had made `--round` a sentinel while #90 still passed `args.round_no` straight through, so the
+reflex the other three trained would have passed `None` into a signature that says `int`. It merged
+clean either way; only reading it caught it. A conflict resolved by reflex three times a day trains
+the reflex, and the volume of routine is what makes the camouflage work.
+
+**The number is now stamped at land, not chosen at write.** A branch writes `## vNEXT` and
+`- **vNEXT** — …`; `scripts/release_stamp.py` reads the highest heading in the CHANGELOG *at the
+ref being merged into*, adds one, and writes it into every heading and bold run across all tracked
+markdown — so `harness/loops/README.md` is stamped by the same pass rather than being the file
+somebody forgets. `pyproject.toml` and `app/main.py` move with it, but only when the branch changed
+`app/` or `migrations/`, because most releases here are harness-side and correctly leave the served
+version alone; the inference is always reported and `--serve`/`--no-serve` override it. `--major` is
+the one thing no ref can answer, so it is a flag rather than an inference. Placeholders inside code
+spans are documentation of the mechanism and are left alone; a placeholder written anywhere the
+stamper would *not* rewrite is a refusal, not a shrug.
+
+**Two branches can still stamp the same number, and the tool's job is to make that impossible to
+miss rather than impossible.** Once `apply` has run the placeholder is gone, so there is no
+automatic re-stamp — what there is instead is detection of both shapes the collision takes: a
+release number declared twice (what "keep both sides" leaves behind, and a perfectly clean merge
+otherwise), and a branch carrying a number it ADDED which already exists at the base. `preflight`
+and `apply` refuse on both. `check` refuses on the first only, over CHANGELOG headings and README
+bullets alike, because it deliberately takes no base ref — the guard runs on an integration branch
+that may have no upstream configured, and one that errored on a missing ref would report the same
+exit code as the defect it looks for. The message says the repair: put your entry back to
+`## vNEXT` and run `apply` again. Two tokens, because nothing else on the branch was ever written
+in terms of the number.
+
+Whether a number was *added* by the branch is asked of the fork point rather than of the heading
+text. Text equality is wrong in both directions: two branches that both wrote a boilerplate title
+share a number and read as no collision, while fixing a typo in an entry that shipped last month
+reads as one.
+
+This is not a second allocator, and #46/#99's `POST /release/claim` is untouched — and is now
+described for what it is, an announcement rather than a reservation: the stamper does not read it,
+so a claim on v2.34 does not keep v2.34 free. The tenth collision happened an hour after that
+allocator shipped and worked: both branches simply did not call it. **A lock that has to be
+remembered is a lock that will be forgotten, and a placeholder cannot be got wrong** — that is the
+whole argument for doing it this way round.
+
+**README stops restating the CHANGELOG.** The "Latest release / Before it / Before that" paragraph
+re-wrote the previous four releases in fresh prose every time, which is why merging two branches
+meant *writing* a paragraph rather than keeping both sides of one. It is deleted; the oldest-first
+list, which appends one bullet, stays. The parenthetical naming this branch's served version goes
+with it — a fourth copy of a number the README's own argument says should be read from
+`GET /openapi.json`.
+
+**Test files are named after what they test.** Sixteen `tests/test_vNNN.py` became
+`test_resource_claims.py`, `test_finding_provenance.py`, `test_round_baseline.py` and so on. This
+was the site that failed hardest and was in none of the reports: two branches taking the same number
+both add `tests/test_v234.py`, which is the same PATH with different contents — not a text conflict
+git can resolve by keeping both sides, but a choice between two unrelated suites that happen to
+share a name. `harness/tests/test_release_numbers.py` now enforces the naming rule, tolerates the
+placeholder, and has dropped the two assertions about README prose that no longer exists.
 
 ## v2.33 — v2.31's claim table was right about INSERT and wrong about everything else
 
