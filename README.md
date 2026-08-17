@@ -731,7 +731,8 @@ harness/      step 2 of the install — the workflow the board coordinates
   commands/        Claude Code slash commands (/panel, /fix-issue, /wt, …)
   bin/             create-worktree, remove-worktree, prune-worktrees,
                    worktree-holder (who is live in a worktree — asked before
-                   anything destroys one)
+                   anything destroys one), qb-stage, qb-seat (one pane of a
+                   multiplexer, started as a seat with its own board identity)
   tests/           the worktree-tooling suite (pytest driving the bash)
   templates/       copyable .worktree.json starting points + dbtarget.py (the DB guard)
   package.nix      the derivation; hm-module.nix wires it into ~/.claude
