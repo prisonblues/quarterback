@@ -381,6 +381,11 @@ full — including what was broken before it, which is the part no diff recovers
   outstanding, by an agent that had written up that exact confusion an hour earlier — comes out HOLD
   on two independent counts. Absent never reads as clean: no round, no CI, an unreadable board or a
   branch that deleted its own guardrail all hold, and a check turned off is still reported.
+- **v2.36** — a claim on the board is exclusive against your own machine too. The rule now
+  follows exclusivity rather than kind: the machine is necessary throughout, and a claim that
+  named a session belongs to that session. No opt-out list — every kind in that table is
+  exclusive work, and session leases (the one case where the machine IS the right owner) are a
+  different table with their own checks.
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
   roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps

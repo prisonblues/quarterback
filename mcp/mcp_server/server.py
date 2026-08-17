@@ -403,13 +403,17 @@ def claim(ctx: Context, kind: str, key: str, ttl: int = 3600,
 
     Fails with a conflict naming the current holder, their session and what they
     said they were doing — so a refusal is somebody to talk to, not a wall.
-    Re-claiming something your own machine holds is a renew.
+    Re-claiming something YOUR OWN SESSION holds is a renew; re-claiming what a
+    co-tenant on your machine holds is a 409, because two agents on one box are
+    two agents. A claim that named no session falls back to the machine.
 
     Args:
         kind: What sort of resource. Use "merge" for landing a branch.
         key: The resource, namespaced by you — e.g. "prisonblues/quarterback:main".
         ttl: Seconds until the claim lapses without a renew (default 3600).
-        session: Your session id, so a peer can reach you.
+        session: Your session id. Not just so a peer can reach you — it is what
+            makes the claim exclusive against your own machine, so send it, and
+            send the SAME one to renew or release.
         note: One line on what you are doing with it. Send this — it is what the
             next agent is shown instead of a bare refusal.
 
@@ -427,9 +431,10 @@ def renew_claim(ctx: Context, claim_id: str, session: str | None = None) -> dict
     """Extend a claim you hold. Re-take via `claim` if it already lapsed — an expired
     claim is never revived, because somebody else may already hold the key.
 
-    Pass the same `session` you claimed with. A RELEASE claim is owned by the
-    session that took it, not by the machine: several agents share one box here,
-    and for a version number they are different branches.
+    Pass the same `session` you claimed with. ANY claim that named a session is
+    owned by that session, not by the machine: several agents share one box here,
+    and they are different agents doing different work. Renewing without the
+    session you claimed with is a 409 against your own claim.
     """
     try:
         return _get_client(ctx).renew_claim(claim_id, session)
@@ -442,8 +447,9 @@ def release_claim(ctx: Context, claim_id: str, session: str | None = None) -> di
     """Let go of a claim (idempotent). Do this the moment you land, or the next agent
     waits out your whole TTL for nothing.
 
-    Pass the same `session` you claimed with, for a release claim — it is owned by
-    the session rather than by the machine.
+    Pass the same `session` you claimed with. Any claim that named a session is
+    owned by that session rather than by the machine, so releasing without it
+    fails the same way renewing does.
     """
     try:
         return _get_client(ctx).release_claim(claim_id, session)
