@@ -413,6 +413,14 @@ full — including what was broken before it, which is the part no diff recovers
   row per defect, with the reasoning required for a refutation and the human who signed it off kept
   beside it. `precision_after` then sits next to `precision`, and the gap between them is how often
   a reviewer's confidence survives contact with the code.
+- **v2.38** — the origin-moved signal (#125, #127). Every staleness verdict is a comparison against
+  the `published` line, so a repo with nothing on that line got `stale: false` — "we didn't look"
+  wearing the same face as "you're current". `/sync` now returns `comparable`, and breaks silence
+  when both signals are absent. The companion issue blamed GitHub-side merges for emitting nothing;
+  they emit within ~38s via CI's push trigger, and the real hole was that the announce sat in the
+  `deploy` job behind `needs: build-and-push`, so a red build lost it (b86ff0b, an ancestor of main,
+  has no publish anywhere). It is now its own job and a reusable workflow, since quarterback was the
+  only one of five repos announcing at all.
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
   roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps
