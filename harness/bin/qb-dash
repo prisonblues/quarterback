@@ -5,15 +5,16 @@
 #   qb-dash --tui        the clickable one (what `qb` and `qb-dash-tui` run)
 #   qb-dash --once       one frame and exit
 #
-# A LAUNCHER, NOT THE DASHBOARD. The dashboard is Python and needs three things
-# the harness cannot assume: rich, textual, and mcp_server — the same board
-# client the MCP server uses, which lives in this repo's mcp/ and is not on a
-# plain python3. So a shebang is exactly the wrong mechanism: patchShebangs
-# rewrites it to a store python3 that has none of them, and the whole thing dies
-# on `import textual` the first time somebody types `qb` after a rebuild.
+# A LAUNCHER, NOT THE DASHBOARD. The dashboard is Python and needs rich (and
+# textual, for the clickable one), which a plain python3 does not have — so a
+# shebang is the wrong mechanism: patchShebangs rewrites it to a store python3
+# with neither, and the whole thing dies on `import rich` the first time somebody
+# types `qb` after a rebuild.
 #
-# Instead: find an interpreter that can actually import what this needs, the way
-# qb-board does. QB_DASH_PYTHON short-circuits the search.
+# The nix build sets QB_DASH_PYTHON to an interpreter carrying exactly those two,
+# so an installed harness needs nothing from the host. Run from a checkout it
+# searches instead, and any python3 with rich will do — the board client is
+# stdlib now, deliberately, so that this list stays short.
 set -uo pipefail
 
 PROG=${0##*/}
@@ -44,13 +45,13 @@ case "$PROG" in *-tui) MODE=tui ;; esac
 [ "$MODE" = tui ] && TARGET="$BIN_DIR/qb-dash-tui.py" || TARGET="$BIN_DIR/qb-dash.py"
 
 # `textual` only matters for the clickable one, so the plain renderer still runs
-# on an interpreter that has rich and the client but no textual.
+# on an interpreter that has rich but no textual.
 usable() {
   [ -x "$1" ] || return 1
   if [ "$MODE" = tui ]; then
-    "$1" -c 'import rich, textual, mcp_server.board.config' >/dev/null 2>&1
+    "$1" -c 'import rich, textual' >/dev/null 2>&1
   else
-    "$1" -c 'import rich, mcp_server.board.config' >/dev/null 2>&1
+    "$1" -c 'import rich' >/dev/null 2>&1
   fi
 }
 
@@ -71,13 +72,12 @@ done
 if [ -z "$PY" ]; then
   cat >&2 <<EOF
 $PROG: no Python here can import what the dashboard needs
-        (rich$([ "$MODE" = tui ] && printf ', textual'), and mcp_server for the board client).
+        (rich$([ "$MODE" = tui ] && printf ', textual')).
 
-        Point QB_DASH_PYTHON at one, or QUARTERBACK_REPO at a quarterback
-        checkout whose mcp/.venv is built:
+        An installed harness carries its own; from a checkout, point
+        QB_DASH_PYTHON at any interpreter that has them:
 
           QB_DASH_PYTHON=/path/to/venv/bin/python $PROG
-          QUARTERBACK_REPO=~/source/quarterback $PROG
 EOF
   exit 1
 fi

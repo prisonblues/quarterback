@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import importlib.machinery
 import importlib.util
+import sys
 from pathlib import Path
 
 import pytest
@@ -41,16 +42,20 @@ def _load_app():
 
 
 def _why_skip() -> str | None:
+    """Runnable wherever the dashboard is: rich, textual, and a board to read.
+
+    It no longer wants mcp_server — the board client is stdlib now — so this
+    passes under the interpreter the nix build carries, not only under a
+    developer's venv.
+    """
     try:
-        import textual  # noqa: F401
+        import rich, textual  # noqa: F401
     except ImportError:
-        return "textual is not importable (it lives in mcp/'s environment)"
+        return "textual/rich are not importable"
+    sys.path.insert(0, str(BIN))
     try:
-        from mcp_server.board.config import resolve
-    except ImportError:
-        return "mcp_server is not importable"
-    try:
-        resolve()
+        import qbdata
+        qbdata.resolve_config()
     except Exception as exc:                       # noqa: BLE001
         return f"no board configured here ({type(exc).__name__})"
     return None

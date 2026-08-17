@@ -7,7 +7,11 @@ One source of truth for "what is the board saying", so the snapshot renderer
 from __future__ import annotations
 
 import json
+import os
+import shlex
+import socket
 import subprocess
+import urllib.request
 from datetime import datetime, timezone
 
 REPO = "prisonblues/quarterback"
@@ -79,23 +83,98 @@ def seat_number(holder: str | None) -> int | None:
     return int(tail) if tail.isdigit() else None
 
 
-def board_client():
-    from mcp_server.board.config import resolve
-    from mcp_server.client import QuarterbackClient
+class BoardConfig:
+    """Where the board is and how to authenticate to it."""
 
-    cfg = resolve()
-    return QuarterbackClient(cfg.base_url, cfg.token or ""), cfg
+    def __init__(self, base_url: str, token: str, agent: str) -> None:
+        self.base_url, self.token, self.agent = base_url.rstrip("/"), token, agent
+
+
+def resolve_config() -> BoardConfig:
+    """Environment first, then the per-host config file.
+
+    The same contract qb-seat implements in bash, and read the same way: the
+    config is an unrestricted shell script, so it is SOURCED IN A SUBSHELL with
+    three values read back out. Sourcing it into this process would let it
+    replace anything it liked; parsing it with a regex would get the quoting
+    wrong on the day someone puts a `$(…)` in their token command.
+
+    Deliberately no mcp_server import. Depending on it made the dashboard need a
+    built checkout of this repo's mcp/ — which is a thing an INSTALLED harness
+    has no reason to have, and it is why `qb` failed on a freshly rebuilt host
+    while every test passed on the machine that wrote it.
+    """
+    url = os.environ.get("QUARTERBACK_BASE_URL", "")
+    token = os.environ.get("QUARTERBACK_TOKEN", "")
+    token_cmd = os.environ.get("QUARTERBACK_TOKEN_CMD", "")
+
+    if not url or not (token or token_cmd):
+        config = (os.environ.get("QUARTERBACK_CONFIG")
+                  or os.path.join(os.environ.get("XDG_CONFIG_HOME")
+                                  or os.path.expanduser("~/.config"),
+                                  "quarterback", "config"))
+        if os.path.isfile(config):
+            script = (f'. {shlex.quote(config)} >&2 || exit 1\n'
+                      'printf "url=%s\\n" "${QUARTERBACK_BASE_URL:-}"\n'
+                      'printf "token=%s\\n" "${QUARTERBACK_TOKEN:-}"\n'
+                      'printf "token_cmd=%s\\n" "${QUARTERBACK_TOKEN_CMD:-}"\n')
+            got = subprocess.run(["bash", "-c", script], capture_output=True,
+                                 text=True, timeout=15)
+            if got.returncode == 0:
+                for line in got.stdout.splitlines():
+                    name, _, value = line.partition("=")
+                    if name == "url" and not url:
+                        url = value
+                    elif name == "token" and not token:
+                        token = value
+                    elif name == "token_cmd" and not token_cmd:
+                        token_cmd = value
+
+    if not token and token_cmd:
+        got = subprocess.run(["bash", "-c", token_cmd], capture_output=True,
+                             text=True, timeout=30)
+        token = got.stdout.strip() if got.returncode == 0 else ""
+
+    if not url:
+        raise RuntimeError("no board configured (QUARTERBACK_BASE_URL is unset "
+                           "and the site config did not supply one)")
+    return BoardConfig(url, token, socket.gethostname().split(".", 1)[0])
+
+
+class BoardClient:
+    """The two GETs this dashboard makes. stdlib only, on purpose."""
+
+    def __init__(self, cfg: BoardConfig) -> None:
+        self.cfg = cfg
+
+    def get(self, path: str) -> dict:
+        req = urllib.request.Request(f"{self.cfg.base_url}{path}")
+        if self.cfg.token:
+            req.add_header("Authorization", f"Bearer {self.cfg.token}")
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode())
+
+    def active(self) -> dict:
+        return self.get("/active")
+
+    def claims(self) -> dict:
+        return self.get("/claims")
+
+
+def board_client():
+    cfg = resolve_config()
+    return BoardClient(cfg), cfg
 
 
 def fetch_board(client) -> dict:
     """Everything the board can tell us. Never raises — a dead board is a state."""
     out: dict = {"agents": [], "subagents": [], "claims": [], "error": None}
     try:
-        active = client.active({})
+        active = client.active()
         out["agents"] = active.get("agents", [])
         out["subagents"] = active.get("subagents", [])
         out["claims"] = [
-            c for c in client.claims({}).get("claims", [])
+            c for c in client.claims().get("claims", [])
             if not c.get("released") and not c.get("lapsed")
         ]
     except Exception as exc:                      # noqa: BLE001 — display it, don't die
