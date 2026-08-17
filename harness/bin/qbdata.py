@@ -12,6 +12,7 @@ import shlex
 import socket
 import ssl
 import subprocess
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
@@ -182,6 +183,10 @@ class BoardClient:
     def claims(self) -> dict:
         return self.get("/claims")
 
+    def plan(self, repo: str | None = None) -> dict:
+        query = f"?repo={urllib.parse.quote(repo)}" if repo else ""
+        return self.get(f"/plan{query}")
+
 
 def board_client():
     cfg = resolve_config()
@@ -204,11 +209,53 @@ def fetch_board(client) -> dict:
     return out
 
 
-def fetch_prs() -> tuple[list[dict], str | None]:
+def fetch_plan(client, repo: str | None = REPO) -> dict:
+    """The ordered plan. Never raises — a dead board is a state, as above.
+
+    `next` comes from the board rather than being recomputed here: it is the one
+    field the endpoint exists to answer, and a second implementation of "first
+    open, unclaimed, unblocked" is a second thing to get wrong.
+    """
+    out: dict = {"items": [], "next": None, "counts": {}, "error": None}
+    try:
+        out.update(client.plan(repo))
+    except Exception as exc:                      # noqa: BLE001 — display it, don't die
+        out["error"] = f"{type(exc).__name__}: {exc}"
+    return out
+
+
+def fetch_blocked(repo: str = REPO) -> tuple[dict[int, list[int]], str | None]:
+    """Issue number → the OPEN issues blocking it.
+
+    Filtering on state matters and is the whole reason this is a function rather
+    than a field read. GitHub keeps a `blocked-by` edge after the blocker closes,
+    which is right — the dependency was real — but it means a bare read reports
+    an issue as blocked by work that finished weeks ago. Two do so today.
+    """
+    try:
+        raw = subprocess.run(
+            ["gh", "issue", "list", "--repo", repo, "--state", "open",
+             "--limit", "200", "--json", "number,blockedBy"],
+            capture_output=True, text=True, timeout=45,
+        )
+        if raw.returncode != 0:
+            return {}, clip(raw.stderr, 60) or f"gh exit {raw.returncode}"
+        blocked = {}
+        for issue in json.loads(raw.stdout):
+            open_blockers = [b["number"] for b in (issue.get("blockedBy") or {}).get("nodes", [])
+                             if b.get("state") == "OPEN"]
+            if open_blockers:
+                blocked[issue["number"]] = sorted(open_blockers)
+        return blocked, None
+    except Exception as exc:                      # noqa: BLE001
+        return {}, f"{type(exc).__name__}"
+
+
+def fetch_prs(repo: str = REPO) -> tuple[list[dict], str | None]:
     fields = "number,title,isDraft,updatedAt,statusCheckRollup,headRefName"
     try:
         raw = subprocess.run(
-            ["gh", "pr", "list", "--repo", REPO, "--state", "open",
+            ["gh", "pr", "list", "--repo", repo, "--state", "open",
              "--limit", "30", "--json", fields],
             capture_output=True, text=True, timeout=45,
         )

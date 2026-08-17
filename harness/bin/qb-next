@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""qb-next — what can I pick up right now, and why.
+
+The third question the fleet asks. `qb-board --follow` answers "what just
+happened"; `qb-dash` answers "who is alive and what do they hold"; this answers
+"what should I do", which used to cost about ten tool calls and a careful read of
+an untracked file (#135).
+
+  qb-next              PRs, then the plan, then what is held and what is blocked
+  qb-next --json       the same data, for a hook or another tool
+  qb-next --repo R     a different repo's plan
+
+STDLIB ONLY, AND NO LAUNCHER — unlike qb-dash, which needs `rich` and therefore a
+bash script to find an interpreter that has it. A one-shot answer printed to a
+pipe does not need a renderer, so this keeps a plain shebang that patchShebangs
+can rewrite, and runs on any python3 the host happens to have. Do not add a
+dependency here without also adding the launcher, because the failure mode is
+`qb next` dying on an import the day after a rebuild, which is exactly what the
+comment at the top of qb-dash exists to describe.
+
+Every line answers WHY, not just WHAT. "#44 free" is the thing you could already
+get by reading the plan; "#44 free — rank 2, nothing blocking it, nobody on it"
+is the thing that saves the ten calls.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from qbdata import (  # noqa: E402
+    REPO, board_client, ci_state, clip, fetch_blocked, fetch_board, fetch_plan,
+    fetch_prs, minutes_left,
+)
+
+# A PR is worth surfacing for a reason, and the reason is the point of the line.
+CI_REASON = {
+    "✓": ("ready", "checks green"),
+    "✗": ("broken", "a check is failing"),
+    "◐": ("running", "checks still going"),
+    "·": ("unchecked", "no checks reported"),
+    "?": ("unclear", "checks in a state this does not model"),
+}
+
+
+def _issue_of(item: dict) -> int | None:
+    """The issue number a plan item points at, if it points at one."""
+    ref = item.get("ref") or {}
+    if ref.get("kind") != "issue":
+        return None
+    try:
+        return int(str(ref.get("value", "")).lstrip("#"))
+    except ValueError:
+        return None
+
+
+def collect(repo: str) -> dict:
+    """Everything the three sources know, joined. Never raises."""
+    client, _cfg = board_client()
+    board = fetch_board(client)
+    plan = fetch_plan(client, repo)
+    prs, pr_error = fetch_prs(repo)
+    blocked, blocked_error = fetch_blocked(repo)
+
+    # Claim keys are `<owner>/<repo>#<number>`. Matched on the WHOLE repo rather
+    # than the trailing number: #163 exists in every repo the fleet touches, and
+    # a claim on somebody else's must not mark this one held.
+    held: dict[int, dict] = {}
+    for claim in board.get("claims", []):
+        claim_repo, _, number = claim.get("key", "").rpartition("#")
+        if claim_repo == repo and number.isdigit():
+            held.setdefault(int(number), claim)
+
+    items = []
+    for item in plan.get("items", []):
+        if item.get("state") != "open":
+            continue
+        issue = _issue_of(item)
+        # The plan's own claim is authoritative; a bare /claims row is the
+        # fallback, because a claim taken with `claim` rather than `plan_claim`
+        # does not surface on the item (see #172).
+        claim = item.get("claim") or (held.get(issue) if issue else None)
+        items.append({
+            "rank": item.get("rank"),
+            "title": item.get("title", ""),
+            "issue": issue,
+            "phase": item.get("phase"),
+            "claim": claim,
+            # The board decides blocked-ness for plan dependencies; GitHub's
+            # graph covers the issues the plan does not model. Either is enough.
+            "blocked_by_plan": [b.get("ref") for b in item.get("blocked_by", [])],
+            "blocked_by_github": blocked.get(issue, []) if issue else [],
+        })
+
+    return {
+        "repo": repo,
+        "next": plan.get("next"),
+        "items": items,
+        "prs": prs,
+        "counts": plan.get("counts", {}),
+        "errors": {k: v for k, v in {
+            "board": board.get("error"), "plan": plan.get("error"),
+            "prs": pr_error, "github": blocked_error,
+        }.items() if v},
+    }
+
+
+def _pr_lines(prs: list[dict]) -> list[str]:
+    out = []
+    for pr in sorted(prs, key=lambda p: p["number"]):
+        glyph, _colour = ci_state(pr)
+        state, why = CI_REASON.get(glyph, ("unclear", "unknown check state"))
+        if pr.get("isDraft"):
+            state, why = "draft", "marked draft, so not asking to land"
+        out.append(f"  {glyph} #{pr['number']:<5} {clip(pr.get('title'), 58):<58}  {state} — {why}")
+    return out
+
+
+def _free_lines(items: list[dict], limit: int) -> list[str]:
+    out = []
+    for item in items:
+        if item["claim"] or item["blocked_by_plan"] or item["blocked_by_github"]:
+            continue
+        ref = f"#{item['issue']}" if item["issue"] else "—"
+        out.append(f"  → {ref:<6} {clip(item['title'], 58):<58}  rank {item['rank']}, free, unblocked")
+        if len(out) >= limit:
+            break
+    return out
+
+
+def render(data: dict, limit: int) -> str:
+    lines = [f"NEXT — {data['repo']}", ""]
+
+    prs = _pr_lines(data["prs"])
+    lines += [f"OPEN PRS ({len(data['prs'])})"] + (prs or ["  none"]) + [""]
+
+    held = [i for i in data["items"] if i["claim"]]
+    waiting = [i for i in data["items"] if not i["claim"]
+               and (i["blocked_by_plan"] or i["blocked_by_github"])]
+
+    free = _free_lines(data["items"], limit)
+    # Counted from the joined view, NOT from the plan's own `counts`. The board
+    # can only count the dependencies it holds, so its `blocked` is smaller than
+    # what is printed below the moment GitHub's graph contributes an edge — and a
+    # header disagreeing with the section under it is worse than no header.
+    header = (f"PLAN — {len(data['items'])} open, "
+              f"{len(held)} held, {len(waiting)} blocked")
+    lines += [header] + (free or ["  nothing free — everything open is held or blocked"]) + [""]
+
+    if held:
+        lines.append(f"HELD ({len(held)})")
+        for item in held:
+            claim = item["claim"]
+            left = minutes_left(claim.get("expires"))
+            expiry = f"{left}m left" if left is not None else "no expiry"
+            ref = f"#{item['issue']}" if item["issue"] else "—"
+            lines.append(f"  {ref:<6} {claim.get('holder', '?'):<24} {expiry}")
+        lines.append("")
+
+    if waiting:
+        lines.append(f"BLOCKED ({len(waiting)})")
+        for item in waiting:
+            on = [f"#{b}" for b in item["blocked_by_github"]]
+            on += [f"#{b}" for b in item["blocked_by_plan"] if f"#{b}" not in on]
+            ref = f"#{item['issue']}" if item["issue"] else "—"
+            lines.append(f"  {ref:<6} waits on {', '.join(on)}")
+        lines.append("")
+
+    for source, error in data["errors"].items():
+        # Loud, because a section that is empty because a source died looks
+        # exactly like a section that is empty because there is no work.
+        lines.append(f"! {source} unavailable: {error}")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="qb-next", description=__doc__.splitlines()[0])
+    parser.add_argument("--repo", default=REPO, help=f"which repo's plan (default {REPO})")
+    parser.add_argument("--json", action="store_true", help="emit the joined data instead")
+    parser.add_argument("--limit", type=int, default=5, help="free items to show (default 5)")
+    args = parser.parse_args()
+
+    try:
+        data = collect(args.repo)
+    except Exception as exc:                      # noqa: BLE001 — a config error is a message
+        print(f"qb-next: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        json.dump(data, sys.stdout, indent=2, default=str)
+        sys.stdout.write("\n")
+    else:
+        sys.stdout.write(render(data, args.limit))
+    # A dead source is worth a non-zero exit for a script, but never an empty
+    # answer for a person — the text above has already said what is missing.
+    return 2 if data["errors"] else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
