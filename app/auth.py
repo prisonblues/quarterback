@@ -29,6 +29,11 @@ LEGACY_KEY_HEADER = "X-Agent-Instance"
 #: free on the machine, quietly disambiguated when not — a request, not a claim.
 NAME_HEADER = "X-Agent-Name"
 
+#: The proof that a ``Remote-User`` came from the edge and not from a caller.
+#: The auth proxy injects it with the value of ``HUMAN_EDGE_SECRET``; nothing
+#: else can, because nothing else knows it. See :func:`human`.
+EDGE_SECRET_HEADER = "X-Edge-Auth"
+
 
 def _match_bearer(authorization: str) -> str | None:
     """Return the machine name for a valid bearer token, else None. Constant-time."""
@@ -133,6 +138,12 @@ def reader(
     ``Remote-User`` header (the app must only be reachable *through* Authelia, so
     the edge must strip any client-supplied Remote-User). ``browser_dev_user``
     is a local-only bypass for running the board without the edge.
+
+    This deliberately stays looser than :func:`human`, and the difference is the
+    difference between the two questions. A spoofed ``Remote-User`` here buys a
+    caller a *read* of a board every enrolled agent can already read; there, it
+    buys the authority to rewrite the fleet's shared intent. Authentication may
+    be ambient; authorisation may not.
     """
     name = _match_bearer(authorization)
     if name is not None:
@@ -141,6 +152,80 @@ def reader(
         return remote_user
     if settings.browser_dev_user:
         return settings.browser_dev_user
+    raise HTTPException(
+        status.HTTP_401_UNAUTHORIZED,
+        "authentication required",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+def _edge_asserted(edge_auth: str) -> bool:
+    """Did the EDGE assert this identity, or did the caller just claim it?
+
+    ``Remote-User`` is an ordinary request header. The app cannot see whether it
+    was injected by the auth proxy or typed by whoever sent the request, so the
+    proxy also injects a secret only it knows. Constant-time, and closed when no
+    secret is configured: an unconfigured deployment must refuse every human
+    write, never accept every one.
+    """
+    secret = settings.human_edge_secret
+    if not secret:
+        return False
+    return bool(edge_auth) and hmac.compare_digest(edge_auth, secret)
+
+
+def human(
+    authorization: str = Header(default=""),
+    remote_user: str = Header(default="", alias="Remote-User"),
+    edge_auth: str = Header(default="", alias=EDGE_SECRET_HEADER),
+) -> str:
+    """Authorise a write only a PERSON may make — reordering the plan (v2.39).
+
+    ``reader`` lets an agent's bearer token and an edge-authenticated browser
+    through the same door, because for a read they are the same caller. For the
+    plan's order they are not: if any agent may reorder it, the plan thrashes and
+    stops being the shared intent it exists to be; if only a human may, it stays
+    the human's sequence and agents claim, complete and record against it.
+
+    The authentication *method* is the only axis that can tell the two apart —
+    every agent on a box holds the same machine token, so nothing inside a
+    request from one distinguishes it from a person with the same token.
+
+    **And a header alone is not a method.** ``Remote-User`` is client-settable;
+    the deployment note that says the edge must strip it is a promise made in a
+    config file this repo does not ship, and Authelia bypass rules routinely skip
+    API paths for bearer traffic — which is exactly the traffic shape agents use.
+    So the boundary is enforced here instead: the edge injects
+    ``HUMAN_EDGE_SECRET`` as ``X-Edge-Auth`` alongside ``Remote-User``, and a
+    request without it is not a person no matter what it calls itself. With no
+    secret configured, nobody is a human — the failure is a 403 telling an
+    operator what to set, not a plan any agent on the box may rewrite.
+
+    ``BROWSER_DEV_USER`` deliberately does **not** open this door. It is
+    ``reader``'s read bypass, and reading is not deciding; a local board that
+    wants the reorder buttons opts in with ``BROWSER_DEV_HUMAN=true``, which is
+    off by default and documented as local-only in DEPLOY.md.
+    """
+    if settings.browser_dev_human:
+        # Local dev: no edge, no secret. The setting is the acknowledgement.
+        return remote_user or settings.browser_dev_user or "dev"
+    if remote_user:
+        if _edge_asserted(edge_auth):
+            return remote_user
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "that Remote-User was not asserted by the edge: the human-only "
+            "endpoints need the proxy's " + EDGE_SECRET_HEADER + " secret "
+            "(HUMAN_EDGE_SECRET) alongside it, because a header anyone can send "
+            "cannot be the boundary between a person and an agent. See DEPLOY.md.",
+        )
+    if _match_bearer(authorization) is not None:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "this is a human-only endpoint: agents claim and complete plan items, "
+            "people decide their order. Use the board in a browser (the edge "
+            "supplies your identity), or set BROWSER_DEV_HUMAN for a local board.",
+        )
     raise HTTPException(
         status.HTTP_401_UNAUTHORIZED,
         "authentication required",

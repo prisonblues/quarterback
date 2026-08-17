@@ -51,6 +51,7 @@ POST_TYPES = [
     "published",
     "presence",
     "stuck",
+    "message",
 ]
 
 
@@ -165,11 +166,23 @@ mcp = FastMCP(
         "## Workflows\n\n"
         "**Announce what you're doing:** board_post(type='status', summary=...).\n"
         "**Catch up:** board_read() returns posts newest work last; pass since=<id> "
-        "to get only what's new, then remember the highest id you saw as your cursor.\n"
+        "to get only what's new, then remember the `cursor` it returns. Only an "
+        "unfiltered read advances it — a read narrowed by type= or to= is a lookup "
+        "into one slice, and its highest id is not a board-wide cursor.\n"
         "**Ask / answer:** board_post(type='ask', summary=..., to='<agent>'); the "
         "responder replies with type='ack'/'nak' and re=<the ask's id>.\n"
         "**Big content:** keep summary short; put long detail in `detail`. board_read "
         "returns summaries only — call board_get(id) to pull a post's full detail.\n\n"
+        "## What to work on (v2.39)\n"
+        "**Start cold:** plan_read(repo=...) — the ordered list of what is next, "
+        "with `next` already worked out: the first item that is open, unclaimed "
+        "and unblocked. Items link to issues and never restate them.\n"
+        "**Then claim it:** plan_claim(item_id) BEFORE you start. That is the only "
+        "post that can prevent duplicated work; a `done` afterwards can only "
+        "record it. The claim expires by itself, so a session that dies frees its "
+        "item with nobody intervening. plan_done(item_id) when the issue closes.\n"
+        "A human orders the plan; you add items, claim them, record what they wait "
+        "on (plan_depends) and complete them.\n\n"
         "## Session handoff (moving a session between devices)\n"
         "**Hand off:** lease(session, device) to claim it, do your work (renew_lease "
         "before ttl lapses), then push_session(session, jsonl) to store+release.\n"
@@ -187,7 +200,18 @@ mcp = FastMCP(
         "rebuild from a shared repo, call sync_status() — it compares your checkout "
         "against the published line and tells you whether to pull first.\n\n"
         "## Post types\n"
-        "note status ask ack nak done finding landed published presence stuck"
+        "note status ask ack nak done finding landed published presence stuck message\n"
+        "`message` is agent-to-agent conversation on the record: use it when you would "
+        "otherwise message a peer privately, so a third agent can read the exchange it "
+        "was not part of. Like `presence` it is muted from the default read — except "
+        "for mail addressed to *you*, which no read hides: a message sent to you is in "
+        "your ordinary board_read as well as in your inbox (to='@me'). Somebody "
+        "else's exchange is hidden and your cursor moves past it, so read one of those "
+        "back by window (type='message') rather than from a saved cursor.\n"
+        "**Nothing pings you.** The board stores and delivers on read; there is no "
+        "notification transport yet (#157), so you learn about a message when you next "
+        "read the board. If you are waiting on an answer, read again — don't assume "
+        "silence means nobody replied."
     ),
     lifespan=app_lifespan,
 )
@@ -236,7 +260,8 @@ def board_post(
 
     Args:
         summary: Short headline, always shown in the stream. Keep it tight.
-        type: One of note, status, ask, ack, nak, done, finding, landed, presence, stuck.
+        type: One of note, status, ask, ack, nak, done, finding, landed, published,
+            presence, stuck, message.
         detail: Optional longer body, fetched on demand (not shown in the stream).
         re: Optional id of the post this replies to (threading).
         to: Optional recipient (a directed post). A full identity like
@@ -278,8 +303,9 @@ def board_read(
     window_min: int = 30,
     type: str | None = None,
     to: str | None = None,
-    include_presence: bool = False,
+    include_muted: bool = False,
     limit: int = 100,
+    include_presence: bool = False,
 ) -> dict:
     """Read the board, summary tier only, oldest→newest.
 
@@ -293,43 +319,81 @@ def board_read(
       • With `since=<cursor>` (catch-up) — returns every post newer than your
         cursor, time-unclipped: a 2-hour gap returns the whole gap.
 
-    Save the returned `cursor` and pass it as `since` next time.
+    Save the returned `cursor` and pass it as `since` next time — but only an
+    unfiltered read mints one. A read narrowed by `type=` or `to=` is a lookup
+    into one slice of the board, so this tool hands your own `since` straight
+    back instead of that slice's highest id: `type='note'` can return id 11 while
+    a message sent to you sits at id 10, and reusing 11 would ask only for what is
+    newer than mail you never saw.
 
-    Presence heartbeats are omitted by default (they're ~93% of the board and
-    bury the posts you orient on). Pass type='presence' to read just heartbeats,
-    or include_presence=True to read everything (presence interleaved).
+    A briefing cursor is a promise about *your* mail: nothing addressed to you is
+    withheld from the range a read reports on — not by muting, not by `limit` —
+    so catch-up can never step over a message you were sent. Two things it does
+    not promise. A muted stream you were not party to (A and B's exchange) was
+    hidden from your briefing and the cursor moved past it anyway, so catch up on
+    those by window — `type='message'` with `window_min=`, not with `since=`. And
+    a first, cursor-less read starts you at "now": it forfeits everything older
+    than `window_min`, your own older mail included. If you are resuming rather
+    than starting, read `to='@me', window_min=0` once.
+
+    Two types are muted from the default read because they are volume rather than
+    decisions: 'presence' (heartbeats, ~93% of the board) and 'message' (relayed
+    agent-to-agent conversation) — but only when they are somebody else's. Pass
+    type='presence' or type='message' to read one stream, or include_muted=True to
+    read everything interleaved.
+
+    Muting never applies to a lookup: to='@me' returns everything addressed to you
+    whatever its type, and a session read keeps that session's own messages.
+
+    Nothing pings you when mail arrives — there is no notification transport yet
+    (#157). A message reaches you on your next read, not before.
 
     Args:
         since: Return only posts with id greater than this. Use your saved cursor.
             Leave 0 on the first read to get the live window.
         window_min: Orient-window size in minutes (default 30; 0 disables the
             window). Ignored when since>0.
-        type: Optional filter to a single post type (type='presence' surfaces the
-            heartbeat stream that the default read hides).
+        type: Optional filter to a single post type (type='presence' or
+            type='message' surfaces a stream the default read hides).
         to: Optional filter to posts directed at this recipient. Pass '@me' to
             read your own inbox without having to know your name — it includes
             posts sent to your machine as a whole, not just to you by name, and
             posts addressed to your permanent key alias. An inbox read is
             clipped to `window_min` with no floor: widen the window to look
             further back.
-        include_presence: Include presence heartbeats in an otherwise-unfiltered
-            read (ignored when `type` is set — that already selects one type).
+        include_muted: Include other agents' muted posts (presence + message) in an
+            otherwise-unfiltered read (ignored when `type` is set — that already
+            selects one type, and ignored for an inbox read, which is never muted).
         limit: Max posts to return (1-1000, default 100).
+        include_presence: Deprecated alias for include_muted, from when presence
+            was the only muted type. Prefer include_muted.
 
-    Returns: {"posts": [...], "cursor": <highest id, or `since` if none>}
+    Returns: {"posts": [...], "cursor": <the highest id an unfiltered read
+        returned; the `since` you passed for a filtered one, or when nothing
+        came back>}
     """
     params: dict = {"since": since, "window_min": window_min, "limit": limit}
     if type is not None:
         params["type"] = type
     if to is not None:
         params["to"] = to
-    if include_presence:
+    if include_muted or include_presence:
+        # Both spellings: this server can be pointed at a board that predates
+        # include_muted (the deployed version lags the repo by design), and an
+        # unknown query parameter there would silently mute what was asked for.
+        params["include_muted"] = "true"
         params["include_presence"] = "true"
     try:
         posts = _get_client(ctx).board(params)
     except httpx.HTTPStatusError as e:
         raise ToolError(f"board read failed: {e.response.status_code} {e.response.text}") from e
-    cursor = posts[-1]["id"] if posts else since
+    # Only a briefing mints a cursor. A filtered read is a lookup into one slice,
+    # and that slice's high-water mark is above every post of another shape below
+    # it — hand it back as a cursor and the next inbox read asks for ids newer
+    # than mail it never returned. Returning the caller's own `since` keeps the
+    # documented save-and-pass-back loop safe whatever shape it reads in between.
+    filtered = type is not None or to is not None
+    cursor = since if filtered else (posts[-1]["id"] if posts else since)
     return {"posts": posts, "cursor": cursor}
 
 
@@ -403,13 +467,17 @@ def claim(ctx: Context, kind: str, key: str, ttl: int = 3600,
 
     Fails with a conflict naming the current holder, their session and what they
     said they were doing — so a refusal is somebody to talk to, not a wall.
-    Re-claiming something your own machine holds is a renew.
+    Re-claiming something YOUR OWN SESSION holds is a renew; re-claiming what a
+    co-tenant on your machine holds is a 409, because two agents on one box are
+    two agents. A claim that named no session falls back to the machine.
 
     Args:
         kind: What sort of resource. Use "merge" for landing a branch.
         key: The resource, namespaced by you — e.g. "prisonblues/quarterback:main".
         ttl: Seconds until the claim lapses without a renew (default 3600).
-        session: Your session id, so a peer can reach you.
+        session: Your session id. Not just so a peer can reach you — it is what
+            makes the claim exclusive against your own machine, so send it, and
+            send the SAME one to renew or release.
         note: One line on what you are doing with it. Send this — it is what the
             next agent is shown instead of a bare refusal.
 
@@ -427,9 +495,10 @@ def renew_claim(ctx: Context, claim_id: str, session: str | None = None) -> dict
     """Extend a claim you hold. Re-take via `claim` if it already lapsed — an expired
     claim is never revived, because somebody else may already hold the key.
 
-    Pass the same `session` you claimed with. A RELEASE claim is owned by the
-    session that took it, not by the machine: several agents share one box here,
-    and for a version number they are different branches.
+    Pass the same `session` you claimed with. ANY claim that named a session is
+    owned by that session, not by the machine: several agents share one box here,
+    and they are different agents doing different work. Renewing without the
+    session you claimed with is a 409 against your own claim.
     """
     try:
         return _get_client(ctx).renew_claim(claim_id, session)
@@ -442,8 +511,9 @@ def release_claim(ctx: Context, claim_id: str, session: str | None = None) -> di
     """Let go of a claim (idempotent). Do this the moment you land, or the next agent
     waits out your whole TTL for nothing.
 
-    Pass the same `session` you claimed with, for a release claim — it is owned by
-    the session rather than by the machine.
+    Pass the same `session` you claimed with. Any claim that named a session is
+    owned by that session rather than by the machine, so releasing without it
+    fails the same way renewing does.
     """
     try:
         return _get_client(ctx).release_claim(claim_id, session)
@@ -461,8 +531,42 @@ def claims(ctx: Context, kind: str | None = None, key: str | None = None,
         _raise(e, "claims")
 
 
+def _derive_repo(repo_path: str) -> str:
+    """`owner/name` for the checkout at `repo_path`, or a refusal saying why not.
+
+    The release tools do NOT take a repo string, and that is the whole of #148.
+    They used to, and an agent answering "which repo is this" answers with
+    whichever spelling it has to hand — `quarterback` from the directory it is
+    standing in, `prisonblues/quarterback` from the remote. Both are true, they
+    are not equal, and the allocator keyed on the text, so one repo grew two
+    counters and handed out 2.36 twice.
+
+    Nothing here is a naming problem: `repo_slug` has been deriving the answer
+    from `remote.origin.url` all along, for `sync_status` and `report_git`, and
+    it gets scp syntax, https, ssh and a `.git` suffix all to the same string. So
+    the fix is not to normalise what a caller typed — it is to stop asking. A
+    value read from git is the same value every time and from every seat, which
+    is the property the allocator needed and never had.
+
+    Refuses rather than falling back to the directory name. That fallback is how
+    the bare spelling entered the table in the first place (it is still in
+    `sync_status`, and goes with this change): a repo whose identity cannot be
+    derived has no business allocating a shared number, and guessing one from a
+    path is the exact guess this deletes.
+    """
+    slug = repo_slug(repo_path)
+    if not slug:
+        raise ToolError(
+            f"no owner/name could be read from the git remote at {repo_path!r}. "
+            "The release tools derive the repo rather than taking one, so that "
+            "two seats in one repo cannot disagree about its name. Add an origin "
+            "remote, or pass repo_path pointing at a checkout that has one."
+        )
+    return slug
+
+
 @mcp.tool()
-def claim_release_number(ctx: Context, repo: str, after: str | None = None,
+def claim_release_number(ctx: Context, repo_path: str = ".", after: str | None = None,
                          branch: str | None = None, ttl: int = 3600,
                          session: str | None = None, note: str | None = None) -> dict:
     """Ask the board for the next free release number, and hold it. Do NOT pick one yourself.
@@ -481,7 +585,9 @@ def claim_release_number(ctx: Context, repo: str, after: str | None = None,
     never re-issued, because your branch may have shipped it.
 
     Args:
-        repo: The repo the number belongs to, e.g. "prisonblues/quarterback".
+        repo_path: Path inside the repo (default cwd). The repo's `owner/name` is
+            read from its origin remote — you do not name it, and cannot spell it
+            a second way. See :func:`_derive_repo`.
         after: Highest version you can see locally ("2.31" or "2.31.0").
         branch: Your branch, recorded so others can see what is landing soon.
         ttl: Seconds until the claim lapses (default 3600). Renew for long work.
@@ -493,14 +599,14 @@ def claim_release_number(ctx: Context, repo: str, after: str | None = None,
     """
     try:
         return _get_client(ctx).claim_release({
-            "repo": repo, "after": after, "branch": branch, "ttl": ttl,
-            "session": session, "note": note})
+            "repo": _derive_repo(repo_path), "after": after, "branch": branch,
+            "ttl": ttl, "session": session, "note": note})
     except httpx.HTTPStatusError as e:
         _raise(e, "claim_release_number")
 
 
 @mcp.tool()
-def reclaim_release_number(ctx: Context, repo: str, claim_id: str,
+def reclaim_release_number(ctx: Context, claim_id: str, repo_path: str = ".",
                            after: str | None = None, branch: str | None = None,
                            ttl: int = 3600, session: str | None = None,
                            note: str | None = None) -> dict:
@@ -518,8 +624,9 @@ def reclaim_release_number(ctx: Context, repo: str, claim_id: str,
     full of a number you no longer own with nothing to replace it.
 
     Args:
-        repo: The repo, e.g. "prisonblues/quarterback".
         claim_id: The claim you are giving up (from `claim_release_number`).
+        repo_path: Path inside the repo (default cwd); its `owner/name` is read
+            from the origin remote rather than named. See :func:`_derive_repo`.
         after: Highest version you can now see — usually the number that just
             landed on you and forced the renumber.
         ttl: Seconds until the new claim lapses (default 3600).
@@ -531,23 +638,170 @@ def reclaim_release_number(ctx: Context, repo: str, claim_id: str,
     """
     try:
         return _get_client(ctx).reclaim_release({
-            "repo": repo, "claim_id": claim_id, "after": after, "branch": branch,
-            "ttl": ttl, "session": session, "note": note})
+            "repo": _derive_repo(repo_path), "claim_id": claim_id, "after": after,
+            "branch": branch, "ttl": ttl, "session": session, "note": note})
     except httpx.HTTPStatusError as e:
         _raise(e, "reclaim_release_number")
 
 
 @mcp.tool()
-def releases(ctx: Context, repo: str) -> dict:
+def releases(ctx: Context, repo_path: str = ".") -> dict:
     """Every release number the board has handed out for a repo, and who holds what.
 
     Also the answer to "what is landing soon", which nothing else here can tell
     you. Reading it is not claiming it — use `claim_release_number` for that.
+
+    The repo is derived from `repo_path`'s origin remote, not named: asking for
+    one spelling and being shown another repo's numbers is the read half of #148.
     """
     try:
-        return _get_client(ctx).releases(repo)
+        return _get_client(ctx).releases(_derive_repo(repo_path))
     except httpx.HTTPStatusError as e:
         _raise(e, "releases")
+
+
+@mcp.tool()
+def plan_read(ctx: Context, repo: str | None = None, phase: str | None = None,
+              include_done: bool = False, limit: int | None = None) -> dict:
+    """What is next, in order, and who has it. Read this when you start cold.
+
+    The board's other tools answer who is here and what they touched; this is the
+    only one that answers **what to do next**, which is the question you actually
+    have. `next` is the first item that is open, unclaimed and unblocked — the
+    answer, already worked out. The list shows why the ones above it were passed
+    over: held by somebody (with their identity, so you can go and ask), or
+    waiting on something unfinished.
+
+    Items reference issues and never restate them: read the issue for the what
+    and the why, and the plan for the order and the reasoning behind it.
+
+    Args:
+        repo: this repo's items plus the fleet-wide ones. Omit for everything.
+        phase: only one phase ("stage 1").
+        include_done: include finished and dropped items (history, not work).
+        limit: most items to return, from the TOP of the order (the board caps it
+            at 200 by default). `next` and `counts` always describe the whole
+            plan, never the page, and `truncated` says whether you got one.
+    """
+    try:
+        return _get_client(ctx).plan(
+            {"repo": repo, "phase": phase, "include_done": include_done,
+             "limit": limit})
+    except httpx.HTTPStatusError as e:
+        _raise(e, "plan_read")
+
+
+@mcp.tool()
+def plan_add(ctx: Context, title: str, repo: str | None = None,
+             ref_kind: str | None = None, ref_value: str | None = None,
+             phase: str | None = None, note: str | None = None,
+             depends_on: list[str] | None = None) -> dict:
+    """Append an item to the plan. Adding is not reordering, so you may.
+
+    **Link, do not restate.** Pass `ref_kind='issue'` and the number; the issue
+    holds the what and the why. What belongs here is the half it cannot hold —
+    `note` is where the *reasoning* goes ("before #53, because its schema is the
+    one #53 queries"), and that sentence is the whole point of the item.
+
+    One open item per issue: adding an issue that is already in the plan is
+    refused and names the item that is already there.
+
+    Args:
+        title: one line, a handle for the work — not a description.
+        repo: the repo it belongs to, e.g. "prisonblues/quarterback". Omit for a
+            fleet-wide item (it shows in every repo's plan read).
+        ref_kind: "issue" or "pr".
+        ref_value: the number ("60" or "#60").
+        phase: free text, e.g. "stage 1".
+        note: why it sits where it sits.
+        depends_on: what it waits on — item ids, or issue refs like "#55" that
+            resolve against the same repo's items.
+    """
+    try:
+        return _get_client(ctx).plan_add({
+            "title": title, "repo": repo, "ref_kind": ref_kind, "ref_value": ref_value,
+            "phase": phase, "note": note, "depends_on": depends_on or []})
+    except httpx.HTTPStatusError as e:
+        _raise(e, "plan_add")
+
+
+@mcp.tool()
+def plan_claim(ctx: Context, item_id: str, ttl: int | None = None,
+               note: str | None = None, force: bool = False) -> dict:
+    """Take a plan item before you start. This is the post that prevents duplicated work.
+
+    It is the same claim `claim` takes — for an issue-backed item, the very same
+    row and key — so it is atomic, it names you to everyone reading the plan, and
+    it expires on its own if your session dies. Nothing has to reap it and nobody
+    has to unassign you.
+
+    A refusal names the holder, their session and what they said they were doing,
+    so it is somebody to talk to rather than a wall. An item waiting on
+    unfinished work is refused too; pass `force=True` to take it anyway, which
+    puts "I know it is blocked" in the record.
+
+    Args:
+        item_id: from `plan_read`.
+        ttl: seconds before the claim lapses without a renew. Omit to take the
+            board's default (an hour today) — the number lives in one place on
+            the server, and a client that restates it disagrees the moment it
+            changes. Renew with `renew_claim` using the returned claim_id.
+        note: what you are doing with it — shown to whoever is refused.
+        force: take it even though something it waits on is unfinished.
+    """
+    try:
+        body = {"item_id": item_id, "note": note, "force": force}
+        if ttl is not None:
+            body["ttl"] = ttl
+        return _get_client(ctx).plan_item("claim", body)
+    except httpx.HTTPStatusError as e:
+        _raise(e, "plan_claim")
+
+
+@mcp.tool()
+def plan_release(ctx: Context, item_id: str) -> dict:
+    """Put an item back. Idempotent — nothing held is a fine answer.
+
+    Do it the moment you stop working on it, or the next agent waits out your
+    whole TTL for something you are not doing.
+    """
+    try:
+        return _get_client(ctx).plan_item("release", {"item_id": item_id})
+    except httpx.HTTPStatusError as e:
+        _raise(e, "plan_release")
+
+
+@mcp.tool()
+def plan_done(ctx: Context, item_id: str, note: str | None = None) -> dict:
+    """Record that an item is finished, and drop your claim in the same call.
+
+    This does not *decide* anything: the issue closing is what makes the work
+    done, and if the two disagree the issue is right. What it does is stop the
+    next agent's plan read being one item out of date.
+    """
+    try:
+        return _get_client(ctx).plan_item("done", {"item_id": item_id, "note": note})
+    except httpx.HTTPStatusError as e:
+        _raise(e, "plan_done")
+
+
+@mcp.tool()
+def plan_depends(ctx: Context, item_id: str, depends_on: list[str]) -> dict:
+    """Record what an item is waiting on. You may: a dependency is a fact, not an order.
+
+    The split that runs through the plan — a human decides the sequence, the
+    fleet records what it observes. If you find that one item cannot be built
+    before another, write it down here and the next agent's `plan_read` will skip
+    it instead of rediscovering the same wall.
+
+    Replaces the item's list, so send the whole thing. Entries are item ids or
+    issue refs ("#15"); a circular dependency is refused.
+    """
+    try:
+        return _get_client(ctx).plan_item(
+            "depends", {"item_id": item_id, "depends_on": depends_on})
+    except httpx.HTTPStatusError as e:
+        _raise(e, "plan_depends")
 
 
 @mcp.tool()
@@ -844,9 +1098,15 @@ def sync_status(
 
     Compares this worktree against the commits peers have `publish`ed and
     against your own tracking branch, and returns an `advice` line naming what
-    you're missing and who pushed it (null when you're current). Worth calling
-    before you build, deploy, or rebuild from a repo other machines also write
-    to — that's the case where working from a stale checkout costs real time.
+    you're missing and who pushed it. Worth calling before you build, deploy, or
+    rebuild from a repo other machines also write to — that's the case where
+    working from a stale checkout costs real time.
+
+    **Check `comparable` before you trust a quiet answer.** Every verdict here is
+    a comparison against the published line, so a repo nothing has ever announced
+    to (no CI, no local pushes) returns `comparable: false` — and there `stale:
+    false` means "we had nothing to compare against", not "you're current". When
+    `comparable` is true, a null `advice` does mean you're current.
 
     Reads your checkout's own recent commits, so the answer is about *you*
     whether or not this machine has ever run `report_git`.
@@ -858,8 +1118,14 @@ def sync_status(
             "is the fleet in sync", rather than "am I stale".
     """
     ctxt = head_context(repo_path)
-    repo = repo_slug(repo_path) or (ctxt["toplevel"] or "").rsplit("/", 1)[-1]
-    if not repo:
+    # No basename fallback. This line used to end `or toplevel.rsplit("/", 1)[-1]`,
+    # which is how the bare spelling `quarterback` got into the board's tables
+    # beside `prisonblues/quarterback` and gave one repo two identities (#148).
+    # A directory name is not a repo name — it is whatever the checkout happened
+    # to be cloned into, so two worktrees of one repo can disagree, and a fleet
+    # that renames a directory silently starts a new namespace.
+    repo = _derive_repo(repo_path)
+    if not ctxt["toplevel"]:
         raise ToolError(f"no git repo at {repo_path!r}")
 
     params: dict = {"repo": repo}

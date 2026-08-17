@@ -168,6 +168,75 @@ them. Whether a moved base makes a review stale is #96's verdict, and #98 states
 the asymmetry it has to keep: proving staleness is cheap, proving freshness is
 not, so a base that moved without touching the PR's files is "no overlap
 detected" and never "the review is current".
+
+**v2.37 — what happened to the finding, which the judge cannot know.** A
+finding's life ended at the judge. ``verdict`` is ``confirmed | dismissed |
+unjudged | sonar``, set once, at review time, by a master model with no more
+access to the answer than the reviewer it is ruling on — and ``GET
+/review/stats`` then ranked reviewers on it. The whole feedback loop closed
+before anybody had tried to act on the finding, so the leaderboard was fed
+confidence and called it correctness.
+
+Measured, not supposed: on PR #64 **three of six judge-confirmed P2s were plainly
+wrong** — ``install -m 0755 bin/*`` globs, ``CLAUDE_CODE_SESSION_ID`` is exported
+by every session in this repo, and ``sed -n '4,34p'`` already ends on the last
+help line, so the suggested "fix" would have printed the COLORS section into
+``--help``. All three were conditionals from a reviewer that had declared it
+could not assess the condition, in a round that was a panel of one (#68). They
+are still in the board as confirmed. The same day produced the opposite case —
+#32 r2's "``output_tokens_details.thinking_tokens`` is not a shape Claude's usage
+object has", refuted by a transcript carrying it in all 801 assistant usage
+blocks — and that refutation is recorded nowhere.
+
+``POST /review/outcomes`` records the terminal state whoever ACTED on the finding
+puts on it: ``fixed | refuted | deferred | superseded``. ``refuted`` is what pays
+for the release and is the cheapest to capture, because the refutation is already
+being written in the PR comment and the fix commit's message, in prose that
+nothing can count. ``deferred`` gives the parked backlogs a state instead of a
+markdown list; ``superseded`` is what a later round marks a finding as when it
+re-derives it.
+
+Three properties hold the thing up:
+
+* **Per DEFECT, in its own table.** One row per (repo, pr, ``finding_key``),
+  joined to every round that raised it. A column on ``review_findings`` would fan
+  one refutation across however many rounds happened to raise the defect, and
+  round count correlates with exactly the long fix loops this measures. It also
+  keeps a round's record immutable: what a round said is a fact about that round.
+* **The judge's verdict and the outcome never merge.** They are allowed to
+  disagree — a ``confirmed`` finding with a ``refuted`` outcome is the case the
+  issue was filed for — so ``GET /review/findings`` shows ``status`` (what the
+  reviews support) beside ``outcome`` (what somebody found out), and neither is
+  folded into the other.
+* **The self-grading guard is published, not pretended, and ``attested_by`` is a
+  CLAIM.** #77 says an agent must not mark its own findings ``refuted``
+  unattended, and this API cannot tell a fixer from a reviewer: the reviewer is a
+  model name, the caller is a board identity. ``set_by`` comes from the token and
+  is proof; ``attested_by`` is free text from the same request that carried the
+  refutation, so it records that the caller says a human agreed — the board
+  cannot authenticate a person. Every publication says so: the response splits
+  ``unattested_refutations`` out, the stats carry ``outcome_attested`` beside the
+  raw counts, and ``/panel`` renders the claim with its claimant. An unattended
+  refutation on the record beats one in a PR comment nothing counts; what neither
+  must be is counted silently.
+* **Every edit to a recorded outcome is visible.** A different outcome bumps
+  ``revisions`` and keeps ``prior_outcome``; a repeat FILLS an empty field and
+  never silently rewrites a stored one — overwriting the note that is the evidence
+  for a refutation is itself a revision, and comes back in ``amended`` naming the
+  fields. An explicitly-null field clears, which is how a mistaken attestation is
+  retracted without flipping the outcome twice to do it.
+
+``GET /review/stats`` grows ``precision_after`` per (reviewer, model, effort) —
+``fixed / (fixed + refuted)``, the same ratio as ``precision`` but scored against
+the code — plus ``outcome``, ``outcome_attested``, ``outcomes_recorded``,
+``outcomes_scored`` (the population the ratio is actually over, which is NOT
+``outcomes_recorded``) and ``confirmed_defects``, with ``by_outcome`` and
+``by_outcome_attested`` for the window. The read paths carry the outcome's own
+``set_by``/``session`` pair beside it, so a reader can reach whoever recorded a
+refutation they disagree with. **The gap between
+``precision`` and ``precision_after`` is the number the panel exists to produce
+and could not.** These are the only counts on that page measured per defect
+rather than per observation, which is why both denominators are published.
 """
 
 from __future__ import annotations
@@ -180,19 +249,22 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import (
     AliasChoices,
     BaseModel,
     ConfigDict,
     Field,
+    ValidationError,
     field_validator,
     model_validator,
 )
 from sqlalchemy import and_ as sa_and
-from sqlalchemy import case, func, select
+from sqlalchemy import case, func, select, tuple_
 from sqlalchemy import or_ as sa_or
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import undefer
 
@@ -201,6 +273,7 @@ from app.db import get_session
 from app.identity import agent_row, compose, machine_of
 from app.models.review import (
     ReviewFinding,
+    ReviewFindingOutcome,
     ReviewFindingReport,
     ReviewReviewer,
     ReviewRun,
@@ -384,6 +457,95 @@ if _no_column:  # pragma: no cover - import guard
         " — add them in a migration and on the model before adding the bucket."
     )
 del _no_column
+
+
+#: What happened to a defect after the judge ruled on it (v2.37). Set by whoever
+#: ACTED on the finding — the fixer, or a human — and never by the judge, which
+#: has already had its say and had no more access to the answer than the reviewer
+#: it was ruling on.
+#:
+#: ``refuted`` is the one that pays for the feature: it is the only value here
+#: that contradicts the judge, and it is the cheapest to capture, because the
+#: refutation is already being written in the PR comment and the fix commit.
+#: ``deferred`` gives the parked backlogs (#66, #69, #72, #74 and the ones after
+#: them) a state instead of a markdown list. ``superseded`` is what a later round
+#: marks a finding as when it re-derives it.
+OUTCOMES = ("fixed", "refuted", "deferred", "superseded")
+
+#: The two outcomes that are a judgement about whether the finding was RIGHT, and
+#: therefore the only two in the precision-after-the-fact ratio. ``deferred`` and
+#: ``superseded`` are decisions about what to do next and say nothing about
+#: correctness — counting either as a success would make "we did not get to it"
+#: read as "it was real", which is the direction that flatters.
+OUTCOMES_SCORED = ("fixed", "refuted")
+
+#: The longest note this endpoint stores. Long enough for the refutation itself —
+#: which is the point, since a bare ``refuted`` flag is exactly the confident
+#: assertion with nothing behind it that this feature exists to measure — and
+#: bounded because an authenticated sender is not a bounded one.
+MAX_NOTE_CHARS = 4000
+
+#: Bounds on the single-line fields beside it: a board identity, an issue ref, a
+#: defect key. Generous for all three and far short of a text dump.
+MAX_REF_CHARS = 200
+
+#: The vocabulary is stated twice — here, and as a SQL CHECK on the table, which
+#: cannot import this tuple. (Three times counting migration 0020, and that one
+#: is a frozen snapshot on purpose: a migration that imported a live constant
+#: would replay differently after the constant moved, which is the one thing a
+#: migration may not do.) So the two that CAN be compared are, at import, with the
+#: mismatch named — the same guard :data:`PROVENANCE_COUNTER` gets, and for the
+#: same reason: adding a fifth outcome here and not there fails at the database
+#: on the first insert, which is a long way from where the edit was made.
+_VOCAB_CONSTRAINT = "ck_review_finding_outcomes_vocabulary"
+_declared = {
+    c for con in ReviewFindingOutcome.__table__.constraints
+    if getattr(con, "name", None) == _VOCAB_CONSTRAINT
+    # Deliberately wider than today's vocabulary: a future `not_applicable` or
+    # `wont-fix` added correctly to BOTH sides would make a narrower pattern match
+    # nothing, and a guard that matches nothing reports a mismatch against the
+    # empty set — failing at import on a correct change, which is how a guard gets
+    # deleted rather than fixed.
+    for c in re.findall(r"'([a-z][a-z0-9_-]*)'", str(con.sqltext))
+}
+if _declared != set(OUTCOMES):  # pragma: no cover - import guard
+    raise RuntimeError(
+        f"OUTCOMES and the {_VOCAB_CONSTRAINT} CHECK disagree: "
+        f"{sorted(_declared ^ set(OUTCOMES))} — a value in one and not the other is "
+        "either rejected at ingest or refused by the database on insert."
+    )
+del _declared
+
+#: How many outcomes one request may carry. A fix pass clears a round's findings
+#: in one call — a round is tens of findings, not thousands — and this is the same
+#: "one request should not insert a million rows in one transaction" bound
+#: ``MAX_CHANGED_FILES`` sets on the ingest path. Entries past it are NAMED rather
+#: than 422'ing the batch, so a caller that batched a long loop keeps the first
+#: 500 rows.
+MAX_OUTCOMES = 500
+
+#: ...and a hard ceiling above it, where the request is refused outright.
+#: "Name the overflow" is right for a caller that sent slightly too many and
+#: wrong for one that sent 100,000: pydantic materialises the whole array either
+#: way, and the naming itself then costs a rejection dict per entry and one
+#: enormous log line. Ten times the cap is comfortably past any real fix pass and
+#: far short of a body that hurts.
+MAX_OUTCOMES_ACCEPTED = MAX_OUTCOMES * 10
+
+#: How many of one item's validation errors the rejection reason quotes before it
+#: says how many more there were.
+_MAX_ITEM_ERRORS = 4
+
+#: How many rejections one log line carries. The response names every one — that
+#: is the contract — but the LOG is a shared resource, and a 5,000-item batch of
+#: junk would otherwise write a megabyte of JSON into it.
+MAX_REJECTIONS_LOGGED = 50
+
+#: Postgres' SQLSTATE for a unique-constraint violation. The ONE integrity error
+#: on the outcome path that means "somebody else got there first" — every other
+#: one (a CHECK, a NOT NULL) is deterministic, and retrying it builds the same
+#: invalid row again while reporting a bug in this service as contention.
+_PG_UNIQUE_VIOLATION = "23505"
 
 
 def _bucket_or_none(v: object) -> str | None:
@@ -1777,6 +1939,580 @@ async def record_review(
     return {**recorded, **dropped}
 
 
+# --------------------------------------------------------------- outcome ingest
+
+def _trimmed_or_none(v: object) -> str | None:
+    """A caller's single-line value, trimmed, or nothing at all.
+
+    Empty and whitespace collapse to None deliberately: ``attested_by: "  "`` is
+    not an attestation, and storing it would make an unattended refutation
+    indistinguishable from a signed-off one in every query that tests the column
+    for NULL.
+    """
+    if not isinstance(v, str):
+        return None
+    return v.strip() or None
+
+
+#: The single-line fields a caller may set on an outcome, and the bound each
+#: takes. Named once because three separate rules (bounds, "was it sent",
+#: fill-versus-rewrite) all iterate the same set, and a field added to one list
+#: and not the others is the silent half-wiring this endpoint keeps finding.
+OUTCOME_FIELDS = {
+    "note": MAX_NOTE_CHARS,
+    "deferred_to": MAX_REF_CHARS,
+    "superseded_by": MAX_REF_CHARS,
+    "attested_by": MAX_REF_CHARS,
+}
+
+
+class OutcomeIn(BaseModel):
+    """One defect's terminal outcome, as the fixer (or a human) reports it.
+
+    ``extra="forbid"``, unlike every model on the ingest path: a misspelled
+    ``attestedBy`` there costs a field on a review that still records, and here it
+    silently downgrades a signed-off refutation to unattended in a published
+    figure. This model can afford it because a rejection is per ITEM — see
+    :func:`record_outcomes` — so a typo costs its own row and not the batch.
+
+    Over-long values are refused rather than trimmed, for the same reason: a
+    refutation cut at :data:`MAX_NOTE_CHARS` loses whichever sentence was last,
+    which on a refutation is usually the conclusion, and the caller is told it
+    recorded fine.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    #: The defect's ``finding_key`` — the identity of the defect, which is what
+    #: makes an outcome joinable to every round that raised it. ``finding_key`` is
+    #: accepted as an alias because that is what the read paths call it back.
+    key: str = Field(min_length=1, max_length=MAX_REF_CHARS,
+                     validation_alias=AliasChoices("key", "finding_key"))
+    outcome: str = Field(min_length=1, max_length=MAX_REF_CHARS)
+    #: Why. Required for ``refuted`` — see :func:`record_outcomes`.
+    note: str | None = None
+    deferred_to: str | None = None
+    superseded_by: str | None = None
+    #: Who the CALLER SAYS signed this off. Recorded as a claim, never as proof:
+    #: the board cannot authenticate a human, and this field is free text from the
+    #: same request that carries the refutation. See :func:`record_outcomes`.
+    attested_by: str | None = None
+
+    @field_validator("key", "outcome")
+    @classmethod
+    def _trim(cls, v: str) -> str:
+        # `min_length=1` is checked before this runs, so `"   "` passes it and
+        # trims to empty — and an empty key was then rejected downstream with
+        # "no finding with this key on this PR", which points the caller at its
+        # keys when the fault was a blank one. Say what actually happened.
+        s = v.strip()
+        if not s:
+            raise ValueError("blank")
+        return s
+
+    @field_validator("outcome")
+    @classmethod
+    def _fold(cls, v: str) -> str:
+        return v.lower()
+
+    @field_validator("note", "deferred_to", "superseded_by", "attested_by")
+    @classmethod
+    def _text(cls, v: str | None) -> str | None:
+        # None survives as None and means CLEAR when the key was sent explicitly
+        # — `model_fields_set` is what tells that apart from an absent key, so a
+        # mistaken attestation can be retracted without inventing two revisions
+        # by flipping the outcome and back.
+        return _trimmed_or_none(v)
+
+    @model_validator(mode="after")
+    def _bounds(self) -> OutcomeIn:
+        long = [f for f, cap in OUTCOME_FIELDS.items()
+                if (getattr(self, f) or "") and len(getattr(self, f)) > cap]
+        if long:
+            caps = ", ".join(f"{f} over {OUTCOME_FIELDS[f]} characters" for f in long)
+            raise ValueError(f"too long: {caps}")
+        return self
+
+
+class OutcomesIn(BaseModel):
+    """A batch of outcomes for one PR.
+
+    Batched because that is the shape the work has: a fix pass clears a round's
+    findings together, and one call per finding turns "record what happened" into
+    a loop the fixer can abandon half-way — which is how the outcomes end up
+    partially recorded and the coverage marker lies about the rest.
+
+    ``outcomes`` is a list of raw objects rather than of :class:`OutcomeIn`, and
+    that is the whole point: FastAPI validates a typed list before the handler
+    runs, so one item with a missing ``key`` would 422 the request and lose the
+    eleven good rows this endpoint promises to keep. Each item is validated
+    individually in :func:`record_outcomes` and a failure becomes that item's
+    rejection.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    repo: str = Field(min_length=1, max_length=MAX_REF_CHARS,
+                      validation_alias=AliasChoices("github", "repo"),
+                      description="github nameWithOwner")
+    pr: int = Field(ge=1)
+    #: The recorder's session, stored beside its identity exactly as a run stores
+    #: it: ``set_by`` says who, and this is what lets a peer reach them about it.
+    session: str | None = None
+    #: ``list[Any]``, and every word of that is load-bearing. Untyped, because
+    #: even ``list[dict]`` is validated by FastAPI before the handler runs — one
+    #: entry that is a bare string then costs the whole request, which is
+    #: precisely the guarantee this endpoint makes. Bounded at
+    #: :data:`MAX_OUTCOMES_ACCEPTED` rather than at :data:`MAX_OUTCOMES`, so an
+    #: over-cap batch has its overflow NAMED (a caller that batched a long fix
+    #: loop keeps its first 500 rows) while a body ten times that is refused at
+    #: parse time: naming 99,500 rejections costs a dict each and one enormous
+    #: log line, which is a worse answer than one cheap 422.
+    #: The item schema is attached by hand, because `list[Any]` erases it: a
+    #: generated client would otherwise be told the request body is an array of
+    #: anything, with none of `key`/`outcome`/`note` named. The type is what buys
+    #: per-item rejection; the schema is what a caller reads.
+    outcomes: list[Any] = Field(
+        min_length=1, max_length=MAX_OUTCOMES_ACCEPTED,
+        json_schema_extra=lambda f: f.update(items=OutcomeIn.model_json_schema()),
+    )
+
+    @field_validator("repo")
+    @classmethod
+    def _repo(cls, v: str) -> str:
+        # Trimmed because it is matched with `==` against what `POST /review`
+        # stored: a trailing space makes `known` empty and every item in the
+        # batch is then rejected with "no finding with this key on this PR",
+        # which points the caller at its keys, which were fine.
+        s = v.strip()
+        if not s:
+            raise ValueError("repo is blank")
+        return s
+
+    @field_validator("session")
+    @classmethod
+    def _session(cls, v: str | None) -> str | None:
+        # Refused, not sliced — the same rule `OutcomeIn._bounds` enforces for
+        # every other bounded field, and for a sharper reason here: a truncated
+        # session is a contact address that resolves to nothing, handed back as
+        # if it were the real one.
+        s = _trimmed_or_none(v)
+        if s and len(s) > MAX_REF_CHARS:
+            raise ValueError(f"session over {MAX_REF_CHARS} characters")
+        return s
+
+
+def _outcome_reason(item: OutcomeIn, known: set[str], stored: ReviewFindingOutcome | None,
+                    seen: set[str]) -> str | None:
+    """Why this item cannot be recorded, or None if it can.
+
+    Rejections are itemised and named rather than the request being refused
+    wholesale: a fix pass reporting twelve findings must not lose the eleven good
+    ones to one typo. They are also never silent — this is the same rule the
+    review ingest holds to, and it exists because a caller told nothing assumes it
+    was told everything.
+
+    Unlike ``POST /review``, an unusable value here is refused rather than coerced
+    away. The panel must never fail a review because the board was fussy, so that
+    path takes what it can read; a fixer recording an outcome has no such
+    constraint and can simply be told.
+    """
+    if item.outcome not in OUTCOMES:
+        return f"unknown outcome {_echo(item.outcome)!r}; one of {'|'.join(OUTCOMES)}"
+    if item.key in seen:
+        # `seen` holds every key this payload has already spoken about, accepted
+        # or not: it used to hold only the accepted ones, so a key whose FIRST
+        # entry was rejected had its later duplicates told "the first entry was
+        # kept" when nothing had been kept for it at all.
+        return ("this key already appears earlier in this payload; "
+                "a key may be reported once per request")
+    if item.key not in known:
+        return "no finding with this key on this PR"
+    # The refutation IS the evidence. Without it this records a bare contradiction
+    # of the judge, which is the same confident-assertion-with-nothing-behind-it
+    # that the confirmed findings on PR #64 were — and it would land in a
+    # published precision figure. An existing note on an unchanged `refuted` row
+    # counts: the evidence is already on the record, and re-reporting a refutation
+    # should not require re-typing it.
+    held = stored if stored is not None and stored.outcome == item.outcome else None
+
+    def inherits(attr: str) -> bool:
+        """Would the stored value survive this item? Not if it is being CLEARED —
+        an explicit null retracts, and a rule that read only "was a value sent"
+        would let ``{"outcome": "refuted", "note": null}`` pass on the strength of
+        the note it is in the act of deleting."""
+        if attr in item.model_fields_set and getattr(item, attr) is None:
+            return False
+        return held is not None and getattr(held, attr) is not None
+
+    if item.outcome == "refuted" and not item.note and not inherits("note"):
+        return "refuted needs a note: the refutation is the evidence for it"
+    # ...and the same rule for `superseded`, which was asymmetric: the key of the
+    # finding that replaced this one is the entire content of that outcome, and
+    # it was optional, so `superseded` alone recorded "replaced by something".
+    if item.outcome == "superseded" and not item.superseded_by and not inherits("superseded_by"):
+        return "superseded needs superseded_by: the key of the finding that replaced it"
+    if item.deferred_to and item.outcome != "deferred":
+        return f"deferred_to is only meaningful on a deferred outcome, not {item.outcome}"
+    if item.superseded_by:
+        if item.outcome != "superseded":
+            return ("superseded_by is only meaningful on a superseded outcome, "
+                    f"not {item.outcome}")
+        if item.superseded_by == item.key:
+            return "superseded_by names this finding itself"
+        if item.superseded_by not in known:
+            return "superseded_by names no finding on this PR"
+    return None
+
+
+def _outcome_item(raw: object) -> tuple[OutcomeIn | None, str | None]:
+    """One payload entry as a validated item, or the reason it is not one.
+
+    Validated here rather than by FastAPI, which is the point of ``outcomes``
+    being a list of raw objects: a typed list is validated whole, so one entry
+    with a missing ``key`` or a misspelled field would 422 the request and lose
+    every valid sibling — the opposite of what this endpoint promises.
+    """
+    if not isinstance(raw, dict):
+        return None, f"not an object: {_echo(type(raw).__name__)}"
+    try:
+        return OutcomeIn.model_validate(raw), None
+    except ValidationError as e:
+        # One line, naming each field and what was wrong with it. Pydantic's own
+        # rendering is multi-line with a docs URL per error, which is not what a
+        # per-item `reason` string is for.
+        parts = [f"{'.'.join(str(p) for p in err['loc']) or 'item'}: {err['msg']}"
+                 for err in e.errors()]
+        shown = "; ".join(_echo(p) for p in parts[:_MAX_ITEM_ERRORS])
+        # ...and say how many were not shown. Dropping the rest silently is the
+        # same "a caller told nothing assumes it was told everything" failure the
+        # whole endpoint is organised against, one layer down.
+        rest = len(parts) - _MAX_ITEM_ERRORS
+        return None, f"{shown} (+{rest} more)" if rest > 0 else shown
+
+
+@router.post(
+    "/review/outcomes",
+    status_code=status.HTTP_201_CREATED,
+    # Declared, because the handler sets the code from what it did and a generated
+    # client built off the schema would otherwise be told 201 is the only answer.
+    # The 422 is doubly worth naming: FastAPI already uses it for request-shape
+    # failures with a `detail` body, and this one is a well-formed request whose
+    # every item was refused, carrying the endpoint's own `rejected` list. A
+    # client tells them apart by which key is present, never by the code.
+    responses={
+        200: {"description": "existing outcomes updated, amended or confirmed unchanged"},
+        201: {"description": "at least one outcome recorded for the first time"},
+        409: {"description": "another writer recorded one of these while this was in flight"},
+        422: {"description": "either the request shape was wrong (`detail`) or every item "
+                             "in a well-formed request was refused (`rejected`)"},
+    },
+)
+async def record_outcomes(
+    body: OutcomesIn,
+    response: Response,
+    author: str = Depends(identify),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """What actually happened to these findings — the half the judge cannot know.
+
+    A finding's life ended at the judge: ``verdict`` is set once, at review time,
+    by a model with no more access to the answer than the reviewer that raised
+    the finding, and ``GET /review/stats`` then ranked reviewers on it. So a
+    confident wrong finding scored exactly like a real one — three of six
+    judge-confirmed P2s on PR #64 were plainly wrong and are still in the board
+    as confirmed, and #32 r2's refuted finding is recorded nowhere at all.
+
+    This is the terminal state, per DEFECT rather than per observation: one row
+    for each (repo, pr, ``key``), joined to every round that raised it. Rounds are
+    what a long fix loop produces, so attaching it to the observation would
+    multiply one refutation by the number of rounds — largest exactly where the
+    measurement matters most.
+
+    **Who may set what, and what ``attested_by`` is NOT.** #77 is explicit that an
+    agent must not mark its own findings ``refuted`` unattended: that is a
+    self-grading loop, and #40's constraint applies for the same reason. This API
+    cannot tell a fixer from a reviewer — the reviewer is a model name, the caller
+    is a board identity — so it does not pretend to enforce it.
+
+    ``set_by`` comes from the token and is proof. ``attested_by`` is **free text
+    from the same request that carries the refutation**, so it is a CLAIM that a
+    named human signed off, recorded beside who claimed it — the board cannot
+    authenticate a person, and an agent that wants to write ``attested_by:
+    "rich"`` can. Every place it is published says so: the response splits
+    ``unattested_refutations`` out, ``GET /review/stats`` publishes the attested
+    counts beside the raw ones, and ``/panel`` renders the claim with its claimant
+    rather than as a signature. Read together they say "this agent says a human
+    agreed", which is worth having on the record and is not the same thing as a
+    human having agreed. An unattended refutation is still worth more here than in
+    a PR comment nothing counts; what neither is worth is being counted silently.
+
+    **Re-reporting.** An outcome may move — a deferred finding is later fixed — so
+    a repeat updates rather than 409s, and every kind of change is visible:
+
+    * a different ``outcome`` bumps ``revisions``, keeps ``prior_outcome``, and
+      clears the fields the caller did not resend (the old note explained the old
+      answer);
+    * a repeat of the SAME outcome FILLS empty fields and never silently rewrites
+      a stored one. Overwriting a stored value — replacing the note that IS the
+      evidence for a refutation, or adding an attestation to somebody else's
+      unattended one — is a real change, so it bumps ``revisions`` too and comes
+      back in ``amended`` naming the fields. A terminal state that flips quietly
+      is how an after-the-fact precision figure improves without anybody deciding
+      to, and so is a note rewritten under an unchanged verdict;
+    * an explicitly-null field CLEARS, which is how a mistaken attestation is
+      retracted. Absent and null are different: absent is "nothing to add".
+    """
+    # Retried once, and the retry is not defensive tidiness: the commonest way two
+    # writers race for one (repo, pr, key) is not two agents, it is ONE agent
+    # whose request the board accepted and whose client timed out waiting for the
+    # response — `qb` gives curl 15 seconds — so the retry arrives with the row
+    # already inserted. Both attempts read the stored rows first, so the second
+    # one takes the update path and the outcome is the same as if the two had
+    # been sequential. Two attempts, never a loop: a third failure is not
+    # contention, and a request that keeps retrying itself hides whatever it is.
+    for attempt in (1, 2):
+        try:
+            result = await _apply_outcomes(session, body, author)
+            break
+        except IntegrityError as e:
+            await session.rollback()
+            # ONLY the unique constraint is contention. A CHECK violation or a
+            # NOT NULL is deterministic: retrying builds the identical invalid
+            # row, and reporting it as "another writer got there first; retry"
+            # sends the caller round a loop over a bug in this service while
+            # hiding it from the logs.
+            # `sqlstate` is asyncpg's spelling and `pgcode` is psycopg's. Reading
+            # only one fails CLOSED in the wrong direction under the other: every
+            # genuine insert race would stop being retried and become a 500.
+            code = getattr(e.orig, "sqlstate", None) or getattr(e.orig, "pgcode", None)
+            if code != _PG_UNIQUE_VIOLATION:
+                raise
+            if attempt == 2:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "another writer recorded an outcome for one of these findings "
+                    "while this request was in flight; retry",
+                ) from None
+
+    if result["rejected"]:
+        # Named back, and logged, for the same reason the ingest path names its
+        # drops: a caller that is told nothing assumes everything landed, and
+        # these are the rows a coverage marker will otherwise report as never
+        # recorded.
+        # The RESPONSE names every rejection; the log takes a bounded prefix and
+        # says how many there were. A shared log is not the place to render a
+        # 5,000-item batch of junk in full.
+        listed = result["rejected"][:MAX_REJECTIONS_LOGGED]
+        _log.warning("review outcomes rejected: %s", json.dumps(
+            {"repo": body.repo, "pr": body.pr, "author": author,
+             "rejected_total": len(result["rejected"]), "rejected": listed}, default=str))
+
+    # The status code has to agree with the body, because a shell pipeline built
+    # around `qb` (a curl wrapper) checks the code and nothing else. 201 only when
+    # something was created; 200 when the batch changed or confirmed existing
+    # rows; 422 when nothing was accepted at all and something was refused —
+    # "created" over a body of twelve rejections is the response lying.
+    if result["recorded"]:
+        response.status_code = status.HTTP_201_CREATED
+    elif result["changed"] or result["amended"] or result["unchanged"]:
+        response.status_code = status.HTTP_200_OK
+    else:
+        response.status_code = status.HTTP_422_UNPROCESSABLE_ENTITY
+    return result
+
+
+async def _apply_outcomes(session: AsyncSession, body: OutcomesIn, author: str) -> dict:
+    """One attempt at recording a batch — see :func:`record_outcomes`.
+
+    Separate so the retry re-reads: the stored rows are what decide insert from
+    update, so replaying a failed attempt against the map fetched before it would
+    take the same doomed path again.
+    """
+    known = set((await session.scalars(
+        select(ReviewFinding.finding_key)
+        .join(ReviewRun, ReviewRun.id == ReviewFinding.run_id)
+        .where(ReviewRun.repo == body.repo, ReviewRun.pr == body.pr)
+        .distinct()
+    )).all())
+
+    # Validate every entry BEFORE the row read, so `sent` names only keys that
+    # could be written and one malformed entry costs its own row.
+    items: list[tuple[int, OutcomeIn | None, str | None]] = []
+    for i, raw in enumerate(body.outcomes):
+        if i >= MAX_OUTCOMES:
+            # Named rather than 422'd: a caller batching a long fix loop would
+            # otherwise lose all 501 rows, when the first 500 were fine.
+            items.append((i, None, f"over the {MAX_OUTCOMES}-outcome cap for one request"))
+            continue
+        item, why = _outcome_item(raw)
+        items.append((i, item, why))
+    sent = [it.key for _, it, why in items if it is not None and why is None]
+
+    # `with_for_update`, and it is the difference between two writers and a lost
+    # one. The insert race is caught by the unique constraint and retried; two
+    # writers UPDATING one existing row raise nothing at all — both read, both
+    # mutate in Python, and the second commit silently discards the first's note,
+    # attestation or revision. Locking the rows this batch will touch makes the
+    # second writer wait and then re-read, which is the only way its "fill an
+    # empty field" decision is made against what is actually stored.
+    stored = {o.finding_key: o for o in (await session.scalars(
+        select(ReviewFindingOutcome).where(
+            ReviewFindingOutcome.repo == body.repo,
+            ReviewFindingOutcome.pr == body.pr,
+            ReviewFindingOutcome.finding_key.in_(sent),
+        # ORDER BY under FOR UPDATE: two overlapping batches take their row locks
+        # in whatever order the planner returns them, and a plan change between
+        # the two (index scan one side, bitmap heap the other) is enough to
+        # reverse it and deadlock. One agreed order removes the possibility
+        # rather than making it rare.
+        ).order_by(ReviewFindingOutcome.finding_key).with_for_update()
+    )).all()} if sent else {}
+
+    now = datetime.now(UTC)
+    recorded: list[str] = []
+    changed: list[dict] = []
+    amended: list[dict] = []
+    unchanged: list[str] = []
+    rejected: list[dict] = []
+    unattested: list[str] = []
+    seen: set[str] = set()
+
+    for i, item, why in items:
+        if item is None:
+            # The key an unparseable item MEANT, under either spelling the model
+            # accepts. Two reasons it is dug out of the raw object rather than
+            # left as "item N": a caller using the `finding_key` alias had its
+            # rejection reported anonymously, and — the real one — a key that
+            # reserves nothing lets a LATER well-formed entry for the same key
+            # slip past the once-per-request rule, on the strength of an earlier
+            # entry that failed to parse.
+            raw = body.outcomes[i]
+            key = None
+            if isinstance(raw, dict):
+                key = raw.get("key") if raw.get("key") is not None else raw.get("finding_key")
+            if isinstance(key, str) and key.strip():
+                seen.add(key.strip())
+            rejected.append({"key": _echo(key) if key is not None else f"item {i}",
+                             "reason": why})
+            continue
+        row = stored.get(item.key)
+        reason = _outcome_reason(item, known, row, seen)
+        # Every key this payload has spoken about, accepted or refused — so a
+        # later duplicate is never told "the first entry was kept" when the first
+        # entry was itself rejected.
+        seen.add(item.key)
+        if reason is not None:
+            rejected.append({"key": _echo(item.key), "reason": reason})
+            continue
+        if row is None:
+            if item.outcome == "refuted" and not item.attested_by:
+                unattested.append(item.key)
+            session.add(ReviewFindingOutcome(
+                repo=body.repo, pr=body.pr, finding_key=item.key,
+                outcome=item.outcome, note=item.note,
+                deferred_to=item.deferred_to, superseded_by=item.superseded_by,
+                set_by=author, session=body.session, attested_by=item.attested_by,
+            ))
+            recorded.append(item.key)
+            continue
+
+        if row.outcome != item.outcome:
+            row.revisions += 1
+            row.prior_outcome = row.outcome
+            row.outcome = item.outcome
+            # The old answer's explanation does not survive the answer. Anything
+            # the caller did not resend is cleared, so a note reading "not a
+            # defect: install globs" cannot end up filed under `fixed`.
+            for attr in OUTCOME_FIELDS:
+                setattr(row, attr, getattr(item, attr))
+            changed.append({"key": item.key, "from": row.prior_outcome, "to": row.outcome})
+            # Whoever moved the answer owns it. On an unchanged repeat the row
+            # keeps its original author (below), so `set_by` names the agent that
+            # made the current statement rather than the last one to touch it.
+            row.set_by, row.session = author, body.session
+            row.updated_at = now
+        else:
+            # A repeat of the same answer FILLS an empty field and never silently
+            # rewrites a stored one. Rewriting is a real change — replacing the
+            # note that IS the evidence for a refutation, or adding an
+            # attestation to somebody else's unattended one — so it is counted as
+            # a revision and named back. An absent field is "nothing to add"; an
+            # explicit null CLEARS, which is how a mistaken attestation is
+            # retracted without flipping the outcome twice to do it.
+            rewrote, filled = [], []
+            for attr in OUTCOME_FIELDS:
+                if attr not in item.model_fields_set:
+                    continue
+                value, was = getattr(item, attr), getattr(row, attr)
+                if value == was:
+                    continue
+                (rewrote if was is not None else filled).append(attr)
+                setattr(row, attr, value)
+            if rewrote or filled:
+                # Reported whichever it was, because BOTH move `set_by` and a
+                # fill used to move it invisibly: an agent adding an attestation
+                # to somebody else's unattended refutation reassigned the
+                # authorship of the claim, landed in `unchanged`, and left no
+                # trace anywhere in the response. `set_by` is the field #77's
+                # self-grading guard is read against, so an edit to it that
+                # nothing reports is the one edit that must not be silent.
+                row.revisions += 1
+                amended.append({"key": item.key, "outcome": row.outcome,
+                                "filled": sorted(filled), "rewrote": sorted(rewrote)})
+            else:
+                unchanged.append(item.key)
+            # `set_by` names the agent responsible for the row's CURRENT content,
+            # which is whoever last changed any of it — a fill counts. An agent
+            # that adds an attestation to somebody else's refutation is making
+            # that claim, and leaving `set_by` on the original recorder filed the
+            # claim under the wrong name, in the one field that exists to say who
+            # is claiming. A genuine no-op changes nothing and therefore steals
+            # no authorship — which is the case an idempotent retry hits, and the
+            # reason this is not simply "the last toucher wins".
+            #
+            # `session` travels WITH it, always: they are one provenance pair, and
+            # updating the session without the identity leaves a row whose contact
+            # details belong to a different agent from its author.
+            if rewrote or filled:
+                row.set_by, row.session = author, body.session
+                # ...and only then. A no-op repeat — the shape an idempotent
+                # retry storm has — must not move the row's published timestamp
+                # while `set_by` and `revisions` correctly report that nothing
+                # happened, or "when was this last decided" answers "just now"
+                # for a decision taken last week.
+                row.updated_at = now
+        # Read off the ROW, after it has been written, not off the payload: a
+        # repeat that inherits a stored attestation is attested, and one that
+        # explicitly clears it is not. Reading the payload alone reported the
+        # first as unattested — the response contradicting the row it had just
+        # written, in the direction that cries wolf.
+        if row.outcome == "refuted" and not row.attested_by:
+            unattested.append(item.key)
+
+    await session.commit()
+
+    return {
+        "repo": body.repo,
+        "pr": body.pr,
+        "recorded": recorded,
+        "changed": changed,
+        # A repeat that REWROTE a stored field under an unchanged outcome. Its own
+        # bucket rather than folded into `changed` (which is about the answer
+        # moving) or `unchanged` (which it is not): the fields are named because
+        # the one that matters is `note` on a refutation, and a rewritten
+        # refutation is a rewritten piece of evidence.
+        "amended": amended,
+        "unchanged": unchanged,
+        "rejected": rejected,
+        # Refutations nobody CLAIMS a human signed off. Not an error and not a
+        # refusal — an unattended refutation on the record beats a refutation in
+        # prose — but the caller is told which of its rows the stats will report
+        # as unattested, rather than finding out from the leaderboard.
+        "unattested_refutations": unattested,
+    }
+
+
 # ------------------------------------------------------------------ read paths
 
 #: How many paths a run's ``unread_files`` holds, computed in SQL so the column
@@ -1967,7 +2703,59 @@ def _report_view(r: ReviewFindingReport) -> dict:
     }
 
 
-def _finding_view(f: ReviewFinding, reports: list[ReviewFindingReport]) -> dict:
+def _outcome_view(o: ReviewFindingOutcome) -> dict:
+    """What happened to this defect afterwards — never merged into the verdict.
+
+    ``verdict`` is the judge's ruling at review time and this is what somebody
+    found out by acting on it, and the whole value of the pair is that they can
+    disagree: a ``confirmed`` finding with a ``refuted`` outcome is precisely the
+    case #77 was filed for. Folding one into the other on read would hand every
+    consumer back the collapse this feature exists to undo.
+    """
+    return {
+        "outcome": o.outcome,
+        "note": o.note,
+        "deferred_to": o.deferred_to,
+        "superseded_by": o.superseded_by,
+        "set_by": o.set_by,
+        # The recorder's session, beside its identity — the same pairing a run
+        # publishes, and what lets a reader reach whoever wrote this about a
+        # refutation they disagree with. Stored since v2.37 and, until this was
+        # noticed, never handed back by any read path.
+        "session": o.session,
+        # Who the recorder SAYS signed this off; absent = unattended. A claim
+        # carried beside `set_by`, which is proof — the board cannot authenticate
+        # a human. Published rather than hidden because #77's rule is that an
+        # agent must not grade its own findings unattended, and this pair is what
+        # a reader checks that against.
+        "attested_by": o.attested_by,
+        "ts": o.ts.isoformat(),
+        "updated_at": o.updated_at.isoformat() if o.updated_at else None,
+        # A terminal state that moved, and what it moved from. Silence here is a
+        # first answer; a count is an answer that changed.
+        "revisions": o.revisions,
+        "prior_outcome": o.prior_outcome,
+    }
+
+
+async def _outcomes_for(
+    session: AsyncSession, repo: str, pr: int, keys: list[str]
+) -> dict[str, ReviewFindingOutcome]:
+    """Terminal outcomes for these defects, by key, in one query rather than N."""
+    if not keys:
+        return {}
+    rows = (await session.scalars(
+        select(ReviewFindingOutcome).where(
+            ReviewFindingOutcome.repo == repo,
+            ReviewFindingOutcome.pr == pr,
+            ReviewFindingOutcome.finding_key.in_(keys),
+        )
+    )).all()
+    return {o.finding_key: o for o in rows}
+
+
+def _finding_view(f: ReviewFinding, reports: list[ReviewFindingReport],
+                  outcome: ReviewFindingOutcome | None = None) -> dict:
     return {
         "key": f.finding_key,
         "verdict": f.verdict,
@@ -1986,6 +2774,12 @@ def _finding_view(f: ReviewFinding, reports: list[ReviewFindingReport]) -> dict:
         # caused it. null = the question does not arise (round 1, outside a cycle,
         # or a repeat) and is NOT the `"unknown"` bucket.
         "provenance": f.provenance,
+        # What happened to the DEFECT afterwards (v2.37), null where nobody has
+        # said yet. It is deliberately the same object on every observation of one
+        # defect: the outcome is a fact about the defect, not about the round that
+        # happened to raise it, and a per-round outcome is the multiplication the
+        # storage side refuses.
+        "outcome": _outcome_view(outcome) if outcome is not None else None,
         "reported_by": [_report_view(r) for r in reports],
     }
 
@@ -2112,7 +2906,25 @@ async def review_stats(
     ``not_attributed`` is not a count of distinct defects and should not be read
     against one. ``GET /review/findings`` is where a chain collapses to a defect.
 
-    Every figure here comes from four separate statements against one connection,
+    ``precision_after`` (v2.37) is ``precision``'s honest twin: the same ratio
+    scored against what happened to the finding rather than against the judge's
+    opinion of it, over ``fixed`` and ``refuted`` only. The GAP between the two is
+    the measurement #77 asks for — how often a confident, judge-confirmed finding
+    survives contact with the code. ``outcome`` / ``outcome_attested`` /
+    ``outcomes_recorded`` sit beside it, and ``by_outcome`` is the same split
+    across the window.
+
+    **These are the one set of counts here measured per DEFECT rather than per
+    observation**, and ``confirmed_defects`` is published so the two denominators
+    cannot be confused. An outcome is one fact about one defect; a defect raised
+    in rounds 2, 3 and 4 of a cycle is three observations, so counting outcomes
+    per observation would weight a single refutation by how many rounds the fix
+    loop took — heaviest on exactly the PRs where a reviewer's reliability is the
+    question. Nobody is obliged to record an outcome, so read the counts against
+    ``outcomes_recorded``: zeros mean unrecorded far more often than they mean
+    nothing happened.
+
+    Every figure here comes from six separate statements against one connection,
     so under PostgreSQL's default READ COMMITTED each sees its own snapshot: a run
     recorded between them can appear in one aggregate and not another, leaving the
     sums, ``provenance_runs`` and the page's percentages fractionally out of step
@@ -2294,6 +3106,90 @@ async def review_stats(
         )
     ).all()
 
+    # --- precision after the fact (v2.37). What happened to the defects each
+    # member found, once somebody acted on them: the judge's verdict is a
+    # judgement made at review time by a model with no more access to the answer
+    # than the reviewer, so `precision` above rewards a confident finding and
+    # `precision_after` is the same ratio scored against the code.
+    #
+    # Per DEFECT and not per observation, which makes it the one aggregate on this
+    # page with a different grain, deliberately: an outcome is one fact about one
+    # defect, and a defect raised in rounds 2, 3 and 4 is three observations. A
+    # per-observation count would weight one refutation by how many rounds the fix
+    # loop took — largest exactly on the PRs a reviewer's reliability matters most
+    # for. `confirmed_defects` is published beside it so the two denominators are
+    # never mistaken for each other.
+    #
+    # Attribution is `ReviewFinding.reviewers`, the same population `_scorecards`
+    # tallies `confirmed` over, rather than the per-reporter rows: a caller that
+    # sent no `reported_by` has no rows there, and its members would silently
+    # score no outcomes at all while still showing a confirmed count.
+    # A row constructor, not a `concat` with a separator. `repo` and
+    # `finding_key` are both free text — the panel supplies its own keys and this
+    # release's own docs are full of refs containing `#` — so any separator can
+    # occur inside a value, and two different (repo, pr, key) triples that
+    # concatenate to one string collapse into a single counted defect. Always in
+    # the undercounting direction, and undetectably. `COUNT(DISTINCT (a,b,c))`
+    # compares the fields, so no spelling of a value can forge another triple.
+    defect = tuple_(ReviewRun.repo, ReviewRun.pr, ReviewFinding.finding_key)
+    outcome_join = sa_and(
+        ReviewFindingOutcome.repo == ReviewRun.repo,
+        ReviewFindingOutcome.pr == ReviewRun.pr,
+        ReviewFindingOutcome.finding_key == ReviewFinding.finding_key,
+    )
+    # LEFT, so a defect nobody has ruled on lands in the NULL bucket and is
+    # counted as coverage-missing rather than dropped: a ratio over only the
+    # defects somebody bothered to record is the most flattering possible reading.
+    outcome_rows = (
+        await session.execute(
+            select(
+                ReviewReviewer.name.label("name"),
+                ReviewReviewer.model.label("model"),
+                ReviewReviewer.effort.label("effort"),
+                ReviewFindingOutcome.outcome.label("outcome"),
+                func.count(func.distinct(defect)).label("defects"),
+                func.count(func.distinct(defect))
+                    .filter(ReviewFindingOutcome.attested_by.isnot(None)).label("attested"),
+            )
+            .select_from(ReviewFinding)
+            .join(ReviewRun, ReviewRun.id == ReviewFinding.run_id)
+            .join(ReviewReviewer, sa_and(
+                ReviewReviewer.run_id == ReviewFinding.run_id,
+                # The member is credited on the finding. `@>` against an array
+                # built server-side from the column: a Python list bound as a
+                # JSONB parameter is the trap `declared_runs` documents, one
+                # operator over.
+                ReviewFinding.reviewers.op("@>")(
+                    func.jsonb_build_array(ReviewReviewer.name)),
+            ))
+            .outerjoin(ReviewFindingOutcome, outcome_join)
+            .where(*filters, ReviewFinding.verdict == "confirmed")
+            .group_by(ReviewReviewer.name, ReviewReviewer.model, ReviewReviewer.effort,
+                      ReviewFindingOutcome.outcome)
+        )
+    ).all()
+
+    # One defect has exactly one outcome row, so a group's buckets partition its
+    # distinct defects and summing them is not a double count — the property the
+    # unique constraint on (repo, pr, finding_key) exists to give.
+    outcomes_by_group: dict[tuple[str, str | None, str | None], dict] = {}
+    for r in outcome_rows:
+        g = outcomes_by_group.setdefault(
+            (r.name, r.model, r.effort),
+            {"counts": dict.fromkeys(OUTCOMES, 0), "attested": dict.fromkeys(OUTCOMES, 0),
+             "recorded": 0, "defects": 0},
+        )
+        n, att = int(r.defects or 0), int(r.attested or 0)
+        g["defects"] += n
+        if r.outcome is None:
+            continue
+        # A value outside the vocabulary cannot come from this API — the column
+        # has a CHECK — so it is surfaced under its own name rather than folded
+        # into a bucket it is not, the rule `by_provenance` follows.
+        g["counts"][r.outcome] = g["counts"].get(r.outcome, 0) + n
+        g["attested"][r.outcome] = g["attested"].get(r.outcome, 0) + att
+        g["recorded"] += n
+
     by_model = []
     for r in model_rows:
         confirmed, dismissed = int(r.confirmed or 0), int(r.dismissed or 0)
@@ -2322,6 +3218,27 @@ async def review_stats(
         total_tokens = sum(billable) if billable else None
         token_runs, cost_runs, billable_runs = r.token_runs, r.cost_runs, r.billable_runs
         cost = float(r.cost_usd) if r.cost_usd is not None else None
+
+        # What became of the defects this member found. Absent from the map only
+        # when it was credited on no confirmed finding in the window at all, which
+        # is a real zero rather than missing coverage.
+        og = outcomes_by_group.get((r.name, r.model, r.effort))
+        outcome_counts = og["counts"] if og else dict.fromkeys(OUTCOMES, 0)
+        outcome_attested = og["attested"] if og else dict.fromkeys(OUTCOMES, 0)
+        outcomes_recorded, confirmed_defects = (og["recorded"], og["defects"]) if og else (0, 0)
+        # Fixed against refuted, and nothing else: `deferred` and `superseded` are
+        # decisions about what to do next, so counting either would let "we never
+        # got to it" read as "it was real". None where nobody has scored one of
+        # this member's findings yet — the same rule as `precision`, where "the
+        # judge never ruled" must not render as "everything it raised was wrong".
+        #
+        # Published as `outcomes_scored`, because it is the population
+        # `precision_after` is actually over and `outcomes_recorded` is NOT: a
+        # member with 1 fixed and 11 deferred has 12 recorded outcomes and one
+        # scored defect, so a client marking thin ratios on the recorded count
+        # renders a confident 100% off a single finding — the exact over-reading
+        # a thinness marker exists to prevent, in the flattering direction.
+        scored = sum(outcome_counts.get(b, 0) for b in OUTCOMES_SCORED)
 
         by_model.append({
             "reviewer": r.name,
@@ -2413,6 +3330,37 @@ async def review_stats(
             "provenance": {b: int(getattr(r, col) or 0)
                            for b, col in PROVENANCE_COUNTER.items()},
             "provenance_runs": r.provenance_runs,
+
+            # --- what happened afterwards (v2.37). Read these against
+            # `outcomes_recorded` / `confirmed_defects` for the same reason
+            # provenance is read against `provenance_runs`: nobody has to record
+            # an outcome, so a group with none reports four honest zeros.
+            #
+            # PER DEFECT — every other count in this row is per observation. A
+            # defect this member raised in three rounds is three `confirmed` and
+            # one outcome.
+            "outcome": outcome_counts,
+            # The subset a human signed off. #77's rule is that an agent must not
+            # mark its own findings refuted unattended, and this API cannot tell a
+            # fixer from a reviewer — so the split is published rather than the
+            # guard pretended. A reader who wants only human-confirmed refutations
+            # has them here; one who takes the raw number knows what it includes.
+            "outcome_attested": outcome_attested,
+            "outcomes_recorded": outcomes_recorded,
+            # The population `precision_after` is over — fixed + refuted, never
+            # the whole of `outcomes_recorded`. A ratio and the marker that
+            # qualifies it have to be computed over one population; they were not.
+            "outcomes_scored": scored,
+            # The denominator `outcomes_recorded` is out of: distinct confirmed
+            # defects this member raised in the window. Named because it is NOT
+            # `confirmed` two lines up — that one counts observations.
+            "confirmed_defects": confirmed_defects,
+            # The number this release exists to publish: how often a confident,
+            # judge-confirmed finding survived contact with the code. Sits beside
+            # `precision`, never replacing it — the gap between the two is the
+            # measurement.
+            "precision_after": (round(outcome_counts["fixed"] / scored, 3)
+                                if scored else None),
         })
     by_model.sort(key=lambda m: (-m["confirmed"], m["reviewer"]))
 
@@ -2475,6 +3423,38 @@ async def review_stats(
         key = "not_attributed" if bucket is None else str(bucket)
         by_provenance[key] = by_provenance.get(key, 0) + int(n or 0)
 
+    # The same after-the-fact split at the window's grain: how much of what this
+    # loop confirmed turned out to be real. Counted per DEFECT, once, rather than
+    # once per member that raised it — a sum across `by_model` double-counts every
+    # finding two seats agreed on, exactly as it does for provenance.
+    outcome_window = (
+        await session.execute(
+            select(
+                ReviewFindingOutcome.outcome,
+                func.count(func.distinct(defect)),
+                func.count(func.distinct(defect))
+                    .filter(ReviewFindingOutcome.attested_by.isnot(None)),
+            )
+            .select_from(ReviewFinding)
+            .join(ReviewRun, ReviewRun.id == ReviewFinding.run_id)
+            .outerjoin(ReviewFindingOutcome, outcome_join)
+            .where(*filters, ReviewFinding.verdict == "confirmed")
+            .group_by(ReviewFindingOutcome.outcome)
+        )
+    ).all()
+    by_outcome = dict.fromkeys(OUTCOMES, 0)
+    by_outcome_attested = dict.fromkeys(OUTCOMES, 0)
+    # Confirmed defects nobody has ruled on yet. Under its own name, and reported
+    # rather than omitted, because the four buckets are a small part of the window
+    # until the fix passes start recording — and a page that showed only them
+    # would present today's handful as the whole picture.
+    by_outcome["not_recorded"] = 0
+    for bucket, n, attested in outcome_window:
+        key = "not_recorded" if bucket is None else str(bucket)
+        by_outcome[key] = by_outcome.get(key, 0) + int(n or 0)
+        if bucket is not None:
+            by_outcome_attested[key] = by_outcome_attested.get(key, 0) + int(attested or 0)
+
     runs_total, prs_total, repos_total, first_ts, last_ts = totals
     return {
         "window": {
@@ -2502,6 +3482,17 @@ async def review_stats(
         # of the same cycle is another row, carrying NULL provenance, so repeats
         # land in `not_attributed`. See the docstring.
         "by_provenance": by_provenance,
+        # What became of this window's confirmed findings once somebody acted on
+        # them, per DEFECT — `fixed` and `refuted` are the judgement about whether
+        # the finding was right, `deferred` and `superseded` are decisions about
+        # what to do next, and `not_recorded` is every confirmed defect nobody has
+        # ruled on. The gap between `fixed / (fixed + refuted)` here and the
+        # `precision` figures above is what a reviewer's confidence is actually
+        # worth.
+        "by_outcome": by_outcome,
+        # The subset a human signed off, so an unattended agent's refutations
+        # cannot be read as adjudicated without the reader choosing to.
+        "by_outcome_attested": by_outcome_attested,
     }
 
 
@@ -2527,6 +3518,15 @@ async def pr_finding_history(
       Usually the fix landed; it can also mean the reviewer that raised it did
       not run again, which the observation list shows.
     * ``open`` — still raised in the most recent run.
+
+    ``outcome`` is the other thing entirely (v2.37): what somebody found out by
+    acting on the finding — ``fixed`` / ``refuted`` / ``deferred`` /
+    ``superseded`` — recorded by the fixer or a human through
+    ``POST /review/outcomes``. It sits beside ``status`` and is never folded into
+    it, because they answer different questions and are allowed to disagree: a
+    chain reading ``gone`` (the reviewer that raised it did not run again) with an
+    outcome of ``refuted`` is the exact case #77 was filed for. Null means nobody
+    has said, which is neither.
 
     Scoped to one PR because ``key`` identifies a defect within a PR: the same
     "unused import" in two repos is not one chain.
@@ -2591,6 +3591,8 @@ async def pr_finding_history(
         )).all()
     )
     reports = await _reports_by_finding(session, [f.id for f in findings])
+    outcomes = await _outcomes_for(session, repo, pr,
+                                   sorted({f.finding_key for f in findings}))
 
     chains: dict[str, list[ReviewFinding]] = {}
     for f in sorted(findings, key=lambda f: order[f.run_id]):
@@ -2719,6 +3721,14 @@ async def pr_finding_history(
             "severity": last.severity,
             "status": ("dismissed" if verdicts == {"dismissed"}
                        else "open" if last.run_id == latest_id else "gone"),
+            # What somebody found out by ACTING on it — beside `status`, never
+            # folded into it. `status` is what the record of the reviews supports
+            # ("raised earlier, not raised in the latest run"); this is a claim
+            # about the code, made by whoever did the work, and the two are
+            # allowed to disagree loudly: a chain that reads `gone` because the
+            # reviewer never ran again, with an outcome of `refuted`, is exactly
+            # the case this feature exists to make visible. Null = nobody has said.
+            "outcome": (_outcome_view(outcomes[key]) if key in outcomes else None),
             "runs_seen": len(obs),
             "first_run": obs[0].run_id,
             "last_run": last.run_id,
@@ -2835,6 +3845,11 @@ async def get_review(
         )).all()
     )
     reports = await _reports_by_finding(session, [f.id for f in findings])
+    # What became of each defect this run raised. Keyed by (repo, pr, key) rather
+    # than by run: the outcome outlives the round, and this run is one of the
+    # rounds that saw it.
+    outcomes = await _outcomes_for(session, run.repo, run.pr,
+                                   [f.finding_key for f in findings])
     files = list(
         (await session.scalars(
             select(ReviewRunFile)
@@ -2865,5 +3880,6 @@ async def get_review(
             for f in files
         ],
         "reviewers": [_card_view(c, run) for c in cards],
-        "findings": [_finding_view(f, reports.get(f.id, [])) for f in findings],
+        "findings": [_finding_view(f, reports.get(f.id, []), outcomes.get(f.finding_key))
+                     for f in findings],
     }

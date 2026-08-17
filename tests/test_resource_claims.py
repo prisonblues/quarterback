@@ -462,7 +462,8 @@ async def test_a_co_tenant_cannot_touch_another_agents_release_claim(client):
     # Same machine, same token — a co-tenant, not an intruder.
     r = await client.post("/claim/release", json=body, headers=LAPTOP)
     assert r.status_code == 403, r.text
-    assert "two agents on one box are two branches" in r.json()["detail"]["hint"]
+    # Wording generalised in #142 — the rule stopped being release-specific.
+    assert "two agents on one box are two agents" in r.json()["detail"]["hint"]
 
     assert (await client.post("/claim/renew", json=body, headers=LAPTOP)).status_code == 403
     r = await client.post("/release/reclaim",
@@ -601,3 +602,92 @@ async def test_releases_carries_the_id_needed_to_act_on_a_claim(client):
                            json={"claim_id": row["claim_id"], "session": "s-i"},
                            headers=LAPTOP)
     assert ok.status_code == 200, ok.text
+
+
+# --------------------------------------------------------------------------
+# #142 — the co-tenant rule is about EXCLUSIVITY, not about releases
+#
+# v2.31's round 1 established that two agents on one box are two agents, and
+# v2.33 applied it to `kind == "release"` alone. Every other kind kept the
+# machine-only authorisation the argument had just removed — so on this fleet,
+# where every agent authenticates as one machine, a second agent claiming a key
+# another already held got `renewed: true` instead of a 409. A collision with a
+# green light on it, which is worse than no claim because it reads as
+# authoritative: measured 2026-08-16, three agents claimed overlapping work
+# inside 56 seconds and a human resolved it by reading timestamps.
+#
+# These pin the general rule on a NON-release kind, because that is the half the
+# release tests cannot cover.
+# --------------------------------------------------------------------------
+
+async def test_a_co_tenant_cannot_take_a_work_claim_another_agent_holds(client):
+    """The whole point. A second agent on the same box asking for a key that is
+    already held must be REFUSED and told who has it — not quietly handed a
+    renew, which is what made a stampede look like three successful claims."""
+    key = "acme/repo#142"
+    mine = await client.post("/claim", headers=LAPTOP, json={
+        "kind": "work", "key": key, "ttl": 600, "session": "s-mine"})
+    assert mine.status_code == 200, mine.text
+    assert mine.json()["renewed"] is False
+
+    theirs = await client.post("/claim", headers=LAPTOP, json={
+        "kind": "work", "key": key, "ttl": 600, "session": "s-theirs"})
+    assert theirs.status_code == 409, theirs.text
+    detail = theirs.json()["detail"]
+    # The loser of a race is the caller who most needs to know who won.
+    assert detail["held_by"] == mine.json()["holder"]
+    assert detail["key"] == key
+
+
+async def test_the_same_session_still_renews_its_own_work_claim(client):
+    """The other side of it, and the one a too-broad fix would break: an agent
+    re-claiming its OWN key is a renew, not a conflict. That is how a long task
+    keeps its claim alive past the TTL."""
+    key = "acme/repo#renew"
+    first = await client.post("/claim", headers=LAPTOP, json={
+        "kind": "work", "key": key, "ttl": 600, "session": "s-mine"})
+    again = await client.post("/claim", headers=LAPTOP, json={
+        "kind": "work", "key": key, "ttl": 600, "session": "s-mine"})
+    assert again.status_code == 200, again.text
+    assert again.json()["renewed"] is True
+    assert again.json()["claim_id"] == first.json()["claim_id"]
+
+
+async def test_a_work_claim_that_named_no_session_still_falls_back_to_the_machine(client):
+    """Kept deliberately from the release-only version, because it was right and
+    was never release-specific: a claim with no session has nothing finer to
+    check, and refusing outright would strand claims taken by callers that sent
+    none."""
+    key = "acme/repo#nosession"
+    mine = await client.post("/claim", headers=LAPTOP, json={
+        "kind": "work", "key": key, "ttl": 600})
+    assert mine.status_code == 200, mine.text
+    again = await client.post("/claim", headers=LAPTOP, json={
+        "kind": "work", "key": key, "ttl": 600, "session": "s-anything"})
+    assert again.status_code == 200, again.text
+    assert again.json()["renewed"] is True
+
+
+async def test_a_co_tenant_cannot_release_or_renew_another_agents_work_claim(client):
+    """Refusing the TAKE is not enough on its own — release and renew are the
+    paths by which a co-tenant could drop a claim out from under the agent doing
+    the work, and they authorise through the same predicate."""
+    key = "acme/repo#mutate"
+    mine = await client.post("/claim", headers=LAPTOP, json={
+        "kind": "work", "key": key, "ttl": 600, "session": "s-mine"})
+    body = {"claim_id": mine.json()["claim_id"], "session": "s-theirs"}
+    assert (await client.post("/claim/release", json=body, headers=LAPTOP)).status_code == 403
+    assert (await client.post("/claim/renew", json=body, headers=LAPTOP)).status_code == 403
+
+
+async def test_a_different_MACHINE_is_still_refused_before_any_session_check(client):
+    """The machine remains necessary throughout. A session id is not a bearer
+    token: presenting the right one from the wrong machine must not pass, or the
+    session becomes a credential anybody who saw a board post can replay."""
+    key = "acme/repo#machine"
+    mine = await client.post("/claim", headers=LAPTOP, json={
+        "kind": "work", "key": key, "ttl": 600, "session": "s-mine"})
+    assert mine.status_code == 200
+    r = await client.post("/claim", headers=DESKTOP, json={
+        "kind": "work", "key": key, "ttl": 600, "session": "s-mine"})
+    assert r.status_code == 409, r.text

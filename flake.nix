@@ -65,6 +65,12 @@
               pkgs.git
               pkgs.curl
               pkgs.jq
+              # tmux is not incidental either: the qb-seats suite drives a real
+              # server and asserts on the panes it ends up with. Without it here
+              # those tests would SKIP rather than fail, and a skipped test that
+              # nobody notices is worse than an absent one — the CI summary reads
+              # green either way.
+              pkgs.tmux
             ];
           } ''
           mkdir harness
