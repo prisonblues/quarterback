@@ -99,7 +99,7 @@ GET   /sync              ?repo=&branch=&device=&path=          (registered workt
                          -> {published:[…], worktrees:[…], caller, stale, registered, advice}
 
 # reviewer-panel stats (v2.10, accounts v2.11, rounds + coverage v2.15, cost v2.19,
-#                        changed files v2.23, provenance v2.26)
+#                        changed files v2.23, provenance v2.26, outcomes v2.37)
 POST  /review            (panel.py --json payload)              -> {id, recorded, findings,
                                                                     accounts, changed_files
                                                                     [, changed_files_dropped]
@@ -115,14 +115,33 @@ GET   /reviews           ?repo=&pr=&author=&since=&days=&limit=  (runs + scoreca
 GET   /review/{id}                                              (scorecards + findings + accounts
                                                                  + the PR's changed_files
                                                                  + head_sha/unread_files/provenance)
+POST  /review/outcomes   {repo, pr, outcomes:[{key, outcome, note?,               -> {recorded, changed,
+                          deferred_to?, superseded_by?, attested_by?}]}              amended, unchanged,
+                                                                                     rejected,
+                                                                                     unattested_refutations}
+                          what HAPPENED to a defect once somebody acted on it:
+                          fixed | refuted | deferred | superseded, one per (repo, pr, key).
+                          `refuted` needs its reasoning and `superseded` needs the key that
+                          replaced it; rejections are per item and named, never a 422 for the
+                          batch; a repeat FILLS a field and an overwrite is an `amended`
+                          revision; 201 created / 200 updated / 422 nothing accepted.
+                          `attested_by` is a CLAIM the caller makes, not a signature — the
+                          board authenticates `set_by` and cannot authenticate a human
 GET   /review/stats      ?repo=&author=&days=&judged_only=       -> {by_model, by_agent,
-                                                                     by_provenance}
+                                                                     by_provenance, by_outcome,
+                                                                     by_outcome_attested}
+                          by_model rows carry precision (the judge's) beside precision_after
+                          (what survived the fix) — the GAP is the measurement. Read it
+                          against outcomes_scored (fixed+refuted, the ratio's own
+                          population) and confirmed_defects, never outcomes_recorded
 GET   /review/findings   ?repo=&pr=&limit=                       (one PR's findings as
                                                                   chains of observations,
                                                                   per round: what was new,
                                                                   what stopped the loop,
                                                                   whether a re-review flag
-                                                                  was borne out)
+                                                                  was borne out, and each
+                                                                  defect's outcome beside
+                                                                  its status)
 GET   /panel             (browser view — the leaderboard)
 
 GET   /health            (no auth)
@@ -386,6 +405,14 @@ full — including what was broken before it, which is the part no diff recovers
   named a session belongs to that session. No opt-out list — every kind in that table is
   exclusive work, and session leases (the one case where the machine IS the right owner) are a
   different table with their own checks.
+- **v2.37** — a finding's outcome, which the judge cannot know. `verdict` is set once, at review
+  time, by a model with no more access to the answer than the reviewer it rules on, and the
+  leaderboard was built on that alone — so a confident wrong finding scored like a real one. Three of
+  six judge-confirmed P2s on PR #64 were plainly wrong and are still in the board as confirmed.
+  `POST /review/outcomes` records what happened next — fixed | refuted | deferred | superseded — one
+  row per defect, with the reasoning required for a refutation and the human who signed it off kept
+  beside it. `precision_after` then sits next to `precision`, and the gap between them is how often
+  a reviewer's confidence survives contact with the code.
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
   roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps

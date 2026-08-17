@@ -11,6 +11,86 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
+## v2.37 — a finding's life ended at the judge, so the board scored confidence and called it correctness
+
+`review_findings.verdict` is set once, at review time, by a master model with no more access to the
+answer than the reviewer it is ruling on. `GET /review/stats` then ranked reviewers on it. That was
+the whole feedback loop, and it closed before anybody had tried to act on the finding.
+
+**Three of six judge-confirmed P2s on PR #64 were plainly wrong.** The `installPhase` that
+"enumerates the three original scripts, so the new one is never installed" does `install -m 0755
+bin/*` and globs. `CLAUDE_CODE_SESSION_ID` "may not be the variable Claude Code exports" — it is, in
+every session in this repo. `sed -n '4,34p'` "cuts six lines off `--help`" — line 34 is the last help
+line, and the suggested fix would have printed the COLORS section and two lines of shell into it. All
+three were conditionals from a reviewer that had declared *in the same payload* that it could not
+assess the condition, in a round that was a panel of one (#68). The judge confirmed them because they
+are well argued and it could not check either. They are still in the board as confirmed findings,
+indistinguishable from the real ones, quietly feeding a leaderboard that rewards a confident wrong
+finding. The same day produced the opposite case — #32 r2's "`output_tokens_details.thinking_tokens`
+is not a shape Claude's usage object has", refuted by a transcript on this box carrying it in all 801
+assistant usage blocks — recorded nowhere at all.
+
+`POST /review/outcomes` records the terminal state whoever *acted* on the finding puts on it:
+**fixed | refuted | deferred | superseded** (schema revision 0020). `GET /review/stats` grows
+`precision_after` per (reviewer, model, effort) — `fixed / (fixed + refuted)`, the same ratio as
+`precision` but scored against the code — plus `by_outcome` for the window. **The gap between the two
+is the number the panel exists to produce and could not.**
+
+Four decisions, each of which could have gone the other way and made the number lie:
+
+**It is per DEFECT, in its own table, not a column on the finding.** One row per (repo, pr,
+`finding_key`), joined to every round that raised it. A defect raised in rounds 2, 3 and 4 is three
+observations and one thing that happened to it, so a column would fan a single refutation across
+however many rounds happened to raise it — and round count is highest on exactly the long fix loops
+where a reviewer's reliability is the question. It also keeps a round's record immutable: what a
+round said is a fact about that round, and what somebody found out afterwards is a different fact
+with a different author and its own attestation. `confirmed_defects` ships beside `confirmed` because
+the two denominators are otherwise indistinguishable.
+
+**`refuted` requires its reasoning.** Recording it as a bare flag would put a confident contradiction
+of the judge into a published precision figure with nothing behind it — which is precisely what the
+three PR #64 findings were, one level up. The refutation is already being written into the PR comment
+and the fix commit; the note is where it stops being prose nothing can count.
+
+**The verdict and the outcome never merge.** They are allowed to disagree, and the disagreement is
+the measurement. `GET /review/findings` shows `status` (what the record of the reviews supports)
+beside `outcome` (what somebody found out by acting on it), and a chain that reads `gone` — raised
+earlier, not raised again — carrying `refuted` is exactly the case this release was filed for.
+
+**The self-grading guard is published, not pretended — and `attested_by` is a CLAIM.** #77 is
+explicit that an agent must not mark its own findings `refuted` unattended, and this API cannot tell
+a fixer from a reviewer: the reviewer is a model name, the caller is a board identity. `set_by` comes
+from the token and is proof. `attested_by` does not: it is free text in the same request that carries
+the refutation, so the same agent that self-grades can type a human's name. It is therefore recorded
+as a claim beside its claimant and published as one — the response splits `unattested_refutations`
+out, the stats carry `outcome_attested` beside the raw counts, and `/panel` renders "X claims signoff
+by Y" rather than a signature. Refusing an unattended refutation would have left it where it is today,
+in a PR comment nothing reads. What neither must be is counted silently.
+
+**Every edit to a recorded outcome is visible.** An outcome may move (a deferred finding is later
+fixed), so a repeat updates rather than 409s: a changed answer keeps `prior_outcome` and bumps
+`revisions`. A repeat of the *same* answer FILLS an empty field and never silently rewrites a stored
+one — replacing the note that IS the evidence for a refutation is itself a revision and comes back in
+`amended`, naming the fields, because a quietly rewritten refutation improves an after-the-fact
+precision figure exactly as a quietly flipped verdict does. An explicitly-null field clears, which is
+how a mistaken attestation is retracted without flipping the outcome twice to fake it.
+
+Rejections are per item and named, never a 422 for the batch: a fix pass reporting twelve findings
+must not lose eleven good ones to one typo. That is also why `outcomes` is an untyped list — a typed
+one is validated by FastAPI before the handler runs, so a single malformed entry would have cost the
+whole request the guarantee. Over-long values are refused rather than trimmed (a truncated refutation
+loses its conclusion and reports success), an unknown field is refused rather than dropped (a
+misspelled `attestedBy` silently downgrades a signed-off refutation), and the status code agrees with
+the body: 201 created, 200 updated, 422 when nothing was accepted — a shell pipeline that checks only
+the code must not read twelve rejections as success.
+
+**Concurrency.** The unique constraint catches two writers inserting one defect and the request is
+retried once — the commonest second writer is the same client retrying after a timeout — but only on
+SQLSTATE 23505: a CHECK or NOT NULL violation is deterministic, and retrying it reports a bug in this
+service as contention. Two writers *updating* one row raise nothing at all, so the batch's rows are
+selected `FOR UPDATE`; without that the second commit silently discarded the first's note or
+attestation, which is the same lost-write class v2.33 fixed in the claim table.
+
 ## v2.36 — a claim was exclusive against other machines and shared with your own
 
 (2.34 and 2.35 are allocated to other branches and land separately — both were taken
