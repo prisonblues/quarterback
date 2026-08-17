@@ -427,6 +427,46 @@ Two things to know before you run it:
 branch until it has claimed), does not assign work, and does not drive the agents past
 starting them.
 
+#### The dash — WORK IN PROGRESS
+
+`qb-dash-tui` is a fourth pane for the right-hand side: fleet state, where the board pane
+along the bottom (the **tape**) is the event stream. Who is alive and on what, who holds
+which claim and for how long, and every open PR with its CI verdict. Rows are clickable —
+a seat jumps the tmux cursor to that seat's pane, a claim shows its note, a PR opens on
+GitHub. `qb-dash` is the same three views rendered without interaction, for a terminal that
+will not forward mouse events.
+
+**Clicking starts work, not just navigation.** Each PR row carries a `⚖`; clicking it opens
+a confirmation showing the exact command, and confirming runs `/panel-review-pr <n>` in a
+detached tmux window of its own — the same way `qb-seat` starts an agent, so the review is
+a real session you can attach to, read and interrupt. Clicking anywhere else on the row
+still opens the PR on GitHub. The keys are `o` open, `p` panel-review, `r` refresh, `?` the
+list, `q` quit.
+
+The confirmation is deliberate: a panel review costs money, comments on a public PR and
+pushes a fix commit, so a stray click in a 78-column pane should not be able to start one.
+`QB_DASH_CONFIRM=0` for anyone who wants the single click and means it. `QB_DASH_REPO` says
+where launched work runs, defaulting to the dashboard's own cwd.
+
+Adding another verb is three things: an entry in `BINDINGS`, an `action_*` method, and — if
+it wants an icon — a column, since a click carries the column it landed in and that is how
+one row offers more than one verb.
+
+Not wired into `qb-seats` yet. `qb-dash` is a **launcher**, not the dashboard: the dashboard
+is Python needing `rich`, `textual` and `mcp_server`, none of which a plain `python3` has, so
+a shebang would be rewritten by `patchShebangs` to an interpreter that dies on the first
+import. It hunts for one that can, the way `qb-board` does — `QB_DASH_PYTHON` names one
+outright, `QUARTERBACK_REPO` points at a checkout whose `mcp/.venv` is built. Until
+`mcp_server` is packaged, that venv is the only thing that satisfies it. Bring one
+up beside a running screen with `harness/dev/seats-extras.sh <session> <width>`, which also
+relabels the board pane — that script hardcodes local checkout paths behind
+`QB_MCP_CHECKOUT` and is developer scaffolding, not something to ship.
+
+Adding the dash also needs a wider `pane-border-format` than `qb-seats` sets: its own
+prints `board` for any pane with no seat number, so a second unlabelled pane claims that
+name. The dev script widens it to fall through to a `@qb_label` option; that belongs in
+`qb-seats` proper once this settles.
+
 ## How it works
 
 - **Layout.** A worktree is a *sibling* of the main checkout: `../<project>-<branch>`, with

@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# qb-b — the seat screen, spelled short.
+#
+#   qb-b            2 seats plus the tape, in the current repo
+#   qb-b -n 4       four seats
+#   qb-b --add      one more seat on a running screen
+#   qb-b --kill     tear it down
+#
+# Every argument goes straight to `qb-seats`; this is a SPELLING, not a second
+# implementation, and there is deliberately no behaviour here to drift out of
+# step with the thing it calls. It exists because bringing the screen up is the
+# command you run most often and by far the most often mistyped.
+#
+# Finding its sibling: NOT `readlink -f`. home-manager installs each file as its
+# own flat /nix/store/…-hm_qb-b path, so full resolution walks straight past the
+# bin/ directory. Walk the symlink chain one link at a time and take the first
+# directory that actually holds a qb-seats, exactly as qb-board does — then fall
+# back to PATH, which is the right answer for a pip- or hand-installed layout.
+set -euo pipefail
+
+self_dir() {
+  local p="$1" d
+  for _ in 1 2 3 4 5 6 7 8; do
+    d="$(cd -P "$(dirname "$p")" 2>/dev/null && pwd)" || return 1
+    [ -x "$d/qb-seats" ] && { printf '%s\n' "$d"; return 0; }
+    [ -L "$p" ] || return 1
+    p="$(readlink "$p")"
+    case "$p" in /*) ;; *) p="$d/$p" ;; esac
+  done
+  return 1
+}
+
+if dir="$(self_dir "$0")"; then
+  exec "$dir/qb-seats" "$@"
+fi
+command -v qb-seats >/dev/null 2>&1 \
+  || { echo "qb-b: qb-seats is not next to this script or on PATH" >&2; exit 1; }
+exec qb-seats "$@"

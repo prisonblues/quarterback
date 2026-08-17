@@ -62,9 +62,21 @@ def screen(tmp_path):
     )
     stub.chmod(0o755)
 
+    # A HOME of its own, so the developer's ~/.config/tmux/tmux.conf cannot
+    # decide whether these pass. It is not hypothetical: a config setting
+    # `pane-base-index 1` turned eight of these red at once, because the script
+    # targeted `seats.0` and pane numbering no longer started at zero. The bug
+    # was real and is fixed — but which config the machine happens to carry is
+    # not something a test suite should depend on, so the conf is now an input.
+    home = tmp_path / "home"
+    (home / ".config" / "tmux").mkdir(parents=True)
+    tmux_conf = home / ".config" / "tmux" / "tmux.conf"
+
     socket = str(tmp_path / "tmux.sock")
     env = {
         **os.environ,
+        "HOME": str(home),
+        "XDG_CONFIG_HOME": str(home / ".config"),
         "PATH": f"{stub_dir}:{os.environ['PATH']}",
         # -L would be cleaner than an env var, but the script builds its own tmux
         # command lines; TMUX_TMPDIR isolates the server without touching them.
@@ -91,6 +103,8 @@ def screen(tmp_path):
         )
 
     _run.tmux = _tmux
+    _run.tmux_conf = tmux_conf     # write to this BEFORE the first call: tmux
+                                   # reads its config when the server starts
     _run.repo = repo
     _run.log = tmp_path / "seats.log"
     _run.env = env
@@ -128,6 +142,19 @@ def test_the_screen_is_n_seats_plus_one_board(screen):
     got = panes(screen)
     assert sorted(n for _, n in got if n) == ["1", "2", "3"]
     assert [n for _, n in got].count(None) == 1, "exactly one board pane"
+
+
+def test_a_pane_base_index_of_one_still_builds_the_screen(screen):
+    """Pane numbering is the user's to set, and `pane-base-index 1` is common.
+
+    Every `-t session:window.0` target fails outright under it ("can't find
+    pane: 0"), which is why the script addresses panes by ID instead.
+    """
+    screen.tmux_conf.write_text("set -g base-index 1\nsetw -g pane-base-index 1\n")
+    screen("-n", "2")
+    got = panes(screen)
+    assert sorted(n for _, n in got if n) == ["1", "2"]
+    assert [n for _, n in got].count(None) == 1, "the board pane too"
 
 
 def test_the_default_is_two_seats(screen):
@@ -256,3 +283,21 @@ def test_kill_tears_the_screen_down(screen):
     screen("-n", "1")
     assert screen("--kill").returncode == 0
     assert screen.tmux("has-session", "-t", "=t").returncode != 0
+
+
+def test_qb_b_is_a_spelling_of_qb_seats(tmp_path):
+    """The short name must reach the real script, including through the flat
+    symlinks home-manager installs — which is the layout `readlink -f` breaks on.
+    """
+    r = subprocess.run([str(BIN / "qb-b"), "--help"], capture_output=True, text=True,
+                       timeout=30)
+    assert r.returncode == 0, r.stderr
+    assert "--staged" in r.stdout and "--kill" in r.stdout
+
+    # …and via a home-manager-shaped symlink: one flat link per file, so the
+    # link's own directory holds nothing else.
+    flat = tmp_path / "hm_qb-b"
+    flat.symlink_to(BIN / "qb-b")
+    r = subprocess.run([str(flat), "--help"], capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stderr
+    assert "--staged" in r.stdout

@@ -1,4 +1,4 @@
-{ lib, stdenvNoCC, python3, bash }:
+{ lib, stdenvNoCC, python3, bash, makeWrapper }:
 
 # The harness is plain bash and stdlib Python — no build step, no third-party
 # imports. So this derivation copies rather than compiles, and its only real job
@@ -17,6 +17,14 @@
 # nixpkgs into the wrapper would point the scripts at a different machine's idea
 # of the world than the one they are provisioning. Requirements are documented in
 # harness/README.md and checked at runtime by the scripts themselves.
+let
+  # The dashboard's interpreter, and the ONLY third-party imports in the harness.
+  # Carried by the package rather than hunted for on the host: `qb` is the first
+  # thing typed after a rebuild, and "no Python here can import rich" is a poor
+  # welcome. The board client it uses is stdlib on purpose, so this list is two
+  # entries rather than a requirements file.
+  dashPython = python3.withPackages (ps: [ ps.rich ps.textual ]);
+in
 stdenvNoCC.mkDerivation {
   pname = "quarterback-harness";
   version = "0.1.0";
@@ -48,12 +56,19 @@ stdenvNoCC.mkDerivation {
     runHook postInstall
   '';
 
+  # qb-dash-tui execs qb-dash, so wrapping the one covers both. --set-default,
+  # not --set: a developer running against a venv of their own still wins.
+  postInstall = ''
+    wrapProgram $out/bin/qb-dash --set-default QB_DASH_PYTHON ${dashPython}/bin/python
+  '';
+
   # Rewrites `#!/usr/bin/env bash|python3` to store paths, so an installed
   # harness does not depend on what happens to be on the user's PATH.
   postFixup = ''
     patchShebangs $out/bin $out/share/quarterback-harness/loops
   '';
 
+  nativeBuildInputs = [ makeWrapper ];
   buildInputs = [ bash python3 ];
 
   meta = with lib; {

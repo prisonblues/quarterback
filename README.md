@@ -555,6 +555,13 @@ full — including what was broken before it, which is the part no diff recovers
   spelling got in. The rejected alternative — accept every spelling and reconcile
   them on read — is closed as PR #152: an open input domain cannot be enumerated,
   and three rounds found three more holes in the attempt.
+- **v2.43** — the seat screen learns to answer questions about itself. `qb-dash-tui` puts the
+  fleet beside the seats — who is alive, what they hold, which PRs are open and what CI says —
+  and rows are clickable: a seat jumps the tmux cursor to its pane, a PR opens on GitHub, the ⚖
+  starts `/panel-review-pr` in a window of its own. `qb-b` is `qb-seats`, spelled short. It also
+  fixes a layout defect nobody could see: `qb-seats` addressed panes as `session:window.0`, so a
+  `pane-base-index 1` config broke the screen entirely, and the suite inherited the developer's
+  own tmux.conf — green where nobody had that setting, red where somebody did.
 - **v2.42** — `qb-board`, a terminal client, because the board's only human surface needed a desktop
   browser and daedalus, atlas and sisyphus do not have one. Two halves: `qb-board --follow`, plain
   lines on stdout that pipe and grep and resume from a cursor after an overnight drop, needing

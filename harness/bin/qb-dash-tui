@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# qb-dash-tui — the clickable dashboard. A name, not an implementation.
+#
+# `qb-dash --tui` is the same thing; this exists because the name is what `qb`
+# and a multiplexer layout reach for, and because "the TUI one" deserves to be
+# findable by tab-completion rather than by remembering a flag.
+set -uo pipefail
+dir="$(cd -P "$(dirname "$0")" 2>/dev/null && pwd)"
+[ -x "$dir/qb-dash" ] || { echo "qb-dash-tui: qb-dash is not beside me" >&2; exit 1; }
+exec "$dir/qb-dash" --tui "$@"

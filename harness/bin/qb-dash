@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# qb-dash — the fleet dashboard: who is alive, what they hold, what is open.
+#
+#   qb-dash              the plain renderer, redrawing in place
+#   qb-dash --tui        the clickable one (what `qb` and `qb-dash-tui` run)
+#   qb-dash --once       one frame and exit
+#
+# A LAUNCHER, NOT THE DASHBOARD. The dashboard is Python and needs rich (and
+# textual, for the clickable one), which a plain python3 does not have — so a
+# shebang is the wrong mechanism: patchShebangs rewrites it to a store python3
+# with neither, and the whole thing dies on `import rich` the first time somebody
+# types `qb` after a rebuild.
+#
+# The nix build sets QB_DASH_PYTHON to an interpreter carrying exactly those two,
+# so an installed harness needs nothing from the host. Run from a checkout it
+# searches instead, and any python3 with rich will do — the board client is
+# stdlib now, deliberately, so that this list stays short.
+set -uo pipefail
+
+PROG=${0##*/}
+
+# Where this script really lives. NOT `readlink -f`: home-manager installs each
+# file as its own flat /nix/store/…-hm_qb-dash path, so full resolution walks
+# straight past the bin/ directory holding the .py beside it.
+self_dir() {
+  local p="$1" d
+  for _ in 1 2 3 4 5 6 7 8; do
+    d="$(cd -P "$(dirname "$p")" 2>/dev/null && pwd)" || return 1
+    [ -r "$d/qbdata.py" ] && { printf '%s\n' "$d"; return 0; }
+    [ -L "$p" ] || return 1
+    p="$(readlink "$p")"
+    case "$p" in /*) ;; *) p="$d/$p" ;; esac
+  done
+  return 1
+}
+
+BIN_DIR="$(self_dir "$0")" || {
+  echo "$PROG: cannot find qbdata.py beside this script — broken install" >&2
+  exit 1
+}
+
+MODE=plain
+case "${1:-}" in --tui) MODE=tui; shift ;; esac
+case "$PROG" in *-tui) MODE=tui ;; esac
+[ "$MODE" = tui ] && TARGET="$BIN_DIR/qb-dash-tui.py" || TARGET="$BIN_DIR/qb-dash.py"
+
+# `textual` only matters for the clickable one, so the plain renderer still runs
+# on an interpreter that has rich but no textual.
+usable() {
+  [ -x "$1" ] || return 1
+  if [ "$MODE" = tui ]; then
+    "$1" -c 'import rich, textual' >/dev/null 2>&1
+  else
+    "$1" -c 'import rich' >/dev/null 2>&1
+  fi
+}
+
+CANDIDATES=(
+  "${QB_DASH_PYTHON:-}"
+  "${QUARTERBACK_REPO:-}/mcp/.venv/bin/python"
+  "$BIN_DIR/../../mcp/.venv/bin/python"
+  "$HOME/source/quarterback/mcp/.venv/bin/python"
+)
+PY=""
+for candidate in "${CANDIDATES[@]}"; do
+  case "$candidate" in ""|"/mcp/.venv/bin/python") continue ;; esac
+  usable "$candidate" && { PY="$candidate"; break; }
+done
+[ -n "$PY" ] || { command -v python3 >/dev/null 2>&1 && usable "$(command -v python3)" \
+  && PY="$(command -v python3)"; }
+
+if [ -z "$PY" ]; then
+  cat >&2 <<EOF
+$PROG: no Python here can import what the dashboard needs
+        (rich$([ "$MODE" = tui ] && printf ', textual')).
+
+        An installed harness carries its own; from a checkout, point
+        QB_DASH_PYTHON at any interpreter that has them:
+
+          QB_DASH_PYTHON=/path/to/venv/bin/python $PROG
+EOF
+  exit 1
+fi
+
+exec "$PY" "$TARGET" "$@"

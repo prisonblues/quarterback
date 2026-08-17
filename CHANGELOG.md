@@ -11,6 +11,37 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
+## v2.43 — the fleet at a glance, and one click to act on it
+
+The seat screen could show you N agents working and tell you nothing about them.
+The tape along the bottom answers "what just happened"; nothing answered "who is
+alive, what have they claimed, and what is waiting to land". Finding out meant
+leaving the screen — `gh pr list` in one terminal, the board in a browser in
+another — which is the context switch the screen exists to remove.
+
+`qb-dash-tui` is that view, and it is clickable: a seat row jumps the tmux cursor
+to that seat's pane, a claim shows its note, a PR opens on GitHub, and the ⚖ in a
+PR row starts `/panel-review-pr` in a tmux window of its own after showing the
+exact command it will run. `qb-dash` renders the same three views without
+interaction. `qb-b` is a short spelling of `qb-seats`.
+
+**A defect in the layout came with it.** `qb-seats` addressed panes as
+`session:window.0`, which assumes pane numbering starts at zero. Under a
+`pane-base-index 1` config — common enough to be in half the dotfiles on the
+internet — every such target fails with "can't find pane: 0" and the screen does
+not build at all. It was invisible because the test suite inherited the
+developer's `~/.config/tmux/tmux.conf`: green on a machine with no config, red on
+a machine with one, and nobody had one until today. Panes are addressed by ID
+now, the fixture has a HOME of its own, and a regression test writes that exact
+setting and asserts the screen still builds.
+
+**Two things only packaging could find.** `#!/usr/bin/env python3` does not
+survive `patchShebangs`: it is rewritten to a store interpreter with neither
+`rich` nor `textual`, so the first `qb` after a rebuild died on import. And the
+board client imported `mcp_server`, which made an installed harness depend on a
+built checkout of this repo's `mcp/` — something no installed harness has any
+reason to have. The client is now the config contract `qb-seat` already
+implements plus `urllib`, and the derivation carries its own interpreter.
 ## v2.42 — the board had no human surface on the machines that most needed one
 
 `GET /` is a browser view behind Authelia. It works on zeus and hermes, and it does not reach
