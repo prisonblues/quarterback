@@ -57,10 +57,10 @@ the authority, exactly as `epic.py` already had it right — *"the file is the
 fast path + audit trail"*.
 
 The revision number and the release number are unrelated counters: this is
-schema revision **0020** and it ships in product version **v2.39**.
+schema revision **0021** and it ships in the release stamped at land.
 
-Revision ID: 0020
-Revises: 0019
+Revision ID: 0021
+Revises: 0020
 Create Date: 2026-08-16
 
 """
@@ -73,8 +73,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision: str = "0020"
-down_revision: str | None = "0019"
+revision: str = "0021"
+down_revision: str | None = "0020"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

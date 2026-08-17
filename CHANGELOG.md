@@ -62,7 +62,7 @@ mechanism — `POST /claim`'s body is now `acquire()`, called by both, so this i
 want an atomic claim and the first not to build one.
 
 `/plan/view` is the human board's plan, and the only place the human-only endpoints can be reached
-from a browser. Schema revision **0020**.
+from a browser. Schema revision **0021**.
 
 **What the panel round changed, and the premises behind it.** Three of the findings were the same
 mistake in three places — *a rule written for one kind of claim, applied to a different kind*:
