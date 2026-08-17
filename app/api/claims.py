@@ -33,9 +33,10 @@ import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import AfterValidator, BaseModel, Field
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -65,6 +66,67 @@ MAX_SESSION = 200
 #: dropped rather than tracked: nothing in this repo has ever allocated one, and
 #: a namespace nobody claims in does not need an allocator.
 _VERSION_RE = re.compile(r"\Av?(\d{1,4})\.(\d{1,5})(?:\.\d{1,5})?\Z")
+
+#: ``owner/name``, and nothing else. This is the whole of #148's fix, and it is a
+#: refusal rather than a parser on purpose.
+#:
+#: The allocator handed out 2.36 twice because its key was caller-supplied text:
+#: one agent called itself ``quarterback`` and another ``prisonblues/quarterback``,
+#: so one repo grew two counters. The obvious repair is to canonicalise — accept
+#: every spelling and map them onto one — and it is the wrong one. That input
+#: domain is open (URLs, scp syntax, ``.git`` suffixes, bare names, paths), and an
+#: open domain cannot be enumerated: three review rounds on that parser produced
+#: three more holes, each the previous fix overshooting. See PR #152, closed.
+#:
+#: Closing the domain makes the whole class impossible. Callers do not spell the
+#: repo at all now — the MCP tools read it from ``remote.origin.url`` — so this
+#: is the boundary check for anything reaching the endpoint another way, and the
+#: right answer to a spelling it does not recognise is 422, not a guess. A bare
+#: name is refused precisely because it is the ambiguous one.
+#: A trailing ``.git`` is refused rather than stripped. GitHub does not allow a
+#: repository name to end in ``.git`` either, so the only thing that spelling can
+#: be is a clone URL's suffix — and stripping it would be the first step back
+#: onto the parser this replaces.
+_REPO_RE = re.compile(
+    r"\A[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9][A-Za-z0-9._-]{0,99}\Z(?<!\.git)"
+)
+
+#: The message a refusal carries. Named once so the endpoint, the query parameter
+#: and the migration all say the same thing to whoever hits it.
+REPO_SHAPE = (
+    "repo must be `owner/name` (e.g. `prisonblues/quarterback`). A bare name, a "
+    "URL or an scp remote is refused rather than guessed at: two spellings of one "
+    "repo is how the allocator issued the same number twice. The MCP tools read "
+    "this from your origin remote — you should not be typing it."
+)
+
+
+def _canonical_repo(value: str) -> str:
+    """The repo key, lowercased, or a 422.
+
+    **Case is folded, and that is the one normalisation here.** It looks like the
+    read-time reconciliation this release deletes, and it is not the same
+    operation: ``lower()`` is total and its domain is closed, so unlike an alias
+    enumeration it cannot be incomplete — there is no next case to discover. The
+    parser it replaces failed because "the spellings a repo can sit under" is an
+    open set; "the case a string is in" is not.
+
+    It has to happen because GitHub treats owner and repo names
+    case-insensitively while preserving what you typed, so ``Acme/Widget`` and
+    ``acme/widget`` are one repository with two remotes possible — which is #148
+    exactly, in a spelling the shape rule alone would let through. Refusing the
+    capitalised form instead was the alternative and is worse: a repo genuinely
+    named ``acme/MyProject`` would be unable to allocate at all.
+    """
+    if not _REPO_RE.match(value):
+        raise ValueError(REPO_SHAPE)
+    return value.lower()
+
+
+#: Every repo field on this router. One place, so the claim path, the reclaim path
+#: and the read path cannot drift into disagreeing about what a repo is — which is
+#: the shape of the original bug one level up.
+RepoKey = Annotated[str, AfterValidator(_canonical_repo)]
 
 
 #: Kinds the generic ``POST /claim`` refuses. ``release`` carries invariants no
@@ -364,7 +426,7 @@ class ClaimRefIn(BaseModel):
 
 
 class ReleaseClaimIn(BaseModel):
-    repo: str = Field(min_length=1, max_length=256)
+    repo: RepoKey = Field(max_length=256)
     branch: str | None = None
     #: The highest release the CALLER can see, from the repo it has checked out.
     #: The board cannot read a CHANGELOG, so allocation is the maximum of what
@@ -820,7 +882,7 @@ async def allocate_release(
 class ReleaseReclaimIn(BaseModel):
     """Swap one release number for another, atomically."""
 
-    repo: str = Field(min_length=1, max_length=256)
+    repo: RepoKey = Field(max_length=256)
     #: The claim being given up. Named by id rather than by version so a caller
     #: cannot accidentally release a number it never held.
     claim_id: uuid.UUID
@@ -965,7 +1027,7 @@ async def reclaim_release(
 
 @router.get("/releases")
 async def list_releases(
-    repo: str,
+    repo: RepoKey,
     limit: int = Query(default=200, ge=1, le=1000),
     _: str = Depends(reader),
     session: AsyncSession = Depends(get_session),

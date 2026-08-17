@@ -11,6 +11,52 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
+## v2.41 — one repo, two names, and an allocator that believed both
+
+`claim_release_number` took a `repo` string. An agent asked which repo it is in
+answers with whichever spelling it has to hand: `quarterback` from the directory
+it is standing in, `prisonblues/quarterback` from the remote. Both true, not
+equal, and the allocator keyed on the text — so one repository grew two counters
+and handed out 2.36 to two branches (#148, #150). Nine collisions preceded it and
+the tenth was issued by the thing built to stop them.
+
+**The input was never noisy. One parameter made it noisy.** `repo_slug()` has
+been in the MCP server all along, deriving `owner/name` from
+`remote.origin.url`, and `sync_status` and `report_git` already used it. Six
+lines and one regex, and it gets scp syntax, `https://`, `ssh://` and a `.git`
+suffix all to the same string. Two tools in one file: one read the answer from
+git, the other asked a model.
+
+So the release tools no longer take a repo. They take `repo_path` and derive it,
+the endpoints accept `owner/name` and refuse anything else with a 422, and
+`sync_status` stops falling back to the directory basename when the slug cannot
+be read — that fallback is how the bare spelling entered the table, one call site
+deriving the tight name and quietly degrading to the loose one. A directory name
+is not a repo name: two worktrees of one repo can disagree about it.
+
+**What this replaces is more interesting than what it does.** PR #152 took the
+other road — accept every spelling and reconcile them at read time — and is
+closed unmerged at 2195 lines. That input domain is open, an open domain cannot
+be enumerated, and three review rounds found three more holes, each one the
+previous fix overshooting: `../etc/passwd`, then `/etc/passwd` and `file://`,
+then `https:///etc/passwd` still laundering through an unvalidated empty
+authority. Closing the domain makes the whole class impossible instead of making
+the next patch smaller. Credit to the round-2 analysis that refused to run a
+third fix pass and said the premise was the problem.
+
+Case is folded, and it is the one normalisation here. GitHub treats owner and
+repo names case-insensitively while preserving what you typed, so `Acme/Widget`
+and `acme/widget` are one repository — #148 again in a spelling the shape rule
+alone lets through. `lower()` is safe where a parser was not, for the reason the
+parser failed: it is total, so there is no next case to miss.
+
+Schema revision 0022 resolves the rows written before this, once, and **refuses
+to complete** if any is unresolvable rather than aliasing it forever. A bare name
+resolves only when exactly one repo on the board owns that name half; zero or
+several and a human names the owner. On this board there are two such rows and
+one candidate, so nothing is asked of anyone.
+
+
 ## v2.40 — two agents could talk, and no third agent could ever find out
 
 Claude Code 2.1.232 gave agents a direct channel to each other: `SendMessage`, and `@name` in the

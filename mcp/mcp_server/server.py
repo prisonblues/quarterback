@@ -531,8 +531,42 @@ def claims(ctx: Context, kind: str | None = None, key: str | None = None,
         _raise(e, "claims")
 
 
+def _derive_repo(repo_path: str) -> str:
+    """`owner/name` for the checkout at `repo_path`, or a refusal saying why not.
+
+    The release tools do NOT take a repo string, and that is the whole of #148.
+    They used to, and an agent answering "which repo is this" answers with
+    whichever spelling it has to hand — `quarterback` from the directory it is
+    standing in, `prisonblues/quarterback` from the remote. Both are true, they
+    are not equal, and the allocator keyed on the text, so one repo grew two
+    counters and handed out 2.36 twice.
+
+    Nothing here is a naming problem: `repo_slug` has been deriving the answer
+    from `remote.origin.url` all along, for `sync_status` and `report_git`, and
+    it gets scp syntax, https, ssh and a `.git` suffix all to the same string. So
+    the fix is not to normalise what a caller typed — it is to stop asking. A
+    value read from git is the same value every time and from every seat, which
+    is the property the allocator needed and never had.
+
+    Refuses rather than falling back to the directory name. That fallback is how
+    the bare spelling entered the table in the first place (it is still in
+    `sync_status`, and goes with this change): a repo whose identity cannot be
+    derived has no business allocating a shared number, and guessing one from a
+    path is the exact guess this deletes.
+    """
+    slug = repo_slug(repo_path)
+    if not slug:
+        raise ToolError(
+            f"no owner/name could be read from the git remote at {repo_path!r}. "
+            "The release tools derive the repo rather than taking one, so that "
+            "two seats in one repo cannot disagree about its name. Add an origin "
+            "remote, or pass repo_path pointing at a checkout that has one."
+        )
+    return slug
+
+
 @mcp.tool()
-def claim_release_number(ctx: Context, repo: str, after: str | None = None,
+def claim_release_number(ctx: Context, repo_path: str = ".", after: str | None = None,
                          branch: str | None = None, ttl: int = 3600,
                          session: str | None = None, note: str | None = None) -> dict:
     """Ask the board for the next free release number, and hold it. Do NOT pick one yourself.
@@ -551,7 +585,9 @@ def claim_release_number(ctx: Context, repo: str, after: str | None = None,
     never re-issued, because your branch may have shipped it.
 
     Args:
-        repo: The repo the number belongs to, e.g. "prisonblues/quarterback".
+        repo_path: Path inside the repo (default cwd). The repo's `owner/name` is
+            read from its origin remote — you do not name it, and cannot spell it
+            a second way. See :func:`_derive_repo`.
         after: Highest version you can see locally ("2.31" or "2.31.0").
         branch: Your branch, recorded so others can see what is landing soon.
         ttl: Seconds until the claim lapses (default 3600). Renew for long work.
@@ -563,14 +599,14 @@ def claim_release_number(ctx: Context, repo: str, after: str | None = None,
     """
     try:
         return _get_client(ctx).claim_release({
-            "repo": repo, "after": after, "branch": branch, "ttl": ttl,
-            "session": session, "note": note})
+            "repo": _derive_repo(repo_path), "after": after, "branch": branch,
+            "ttl": ttl, "session": session, "note": note})
     except httpx.HTTPStatusError as e:
         _raise(e, "claim_release_number")
 
 
 @mcp.tool()
-def reclaim_release_number(ctx: Context, repo: str, claim_id: str,
+def reclaim_release_number(ctx: Context, claim_id: str, repo_path: str = ".",
                            after: str | None = None, branch: str | None = None,
                            ttl: int = 3600, session: str | None = None,
                            note: str | None = None) -> dict:
@@ -588,8 +624,9 @@ def reclaim_release_number(ctx: Context, repo: str, claim_id: str,
     full of a number you no longer own with nothing to replace it.
 
     Args:
-        repo: The repo, e.g. "prisonblues/quarterback".
         claim_id: The claim you are giving up (from `claim_release_number`).
+        repo_path: Path inside the repo (default cwd); its `owner/name` is read
+            from the origin remote rather than named. See :func:`_derive_repo`.
         after: Highest version you can now see — usually the number that just
             landed on you and forced the renumber.
         ttl: Seconds until the new claim lapses (default 3600).
@@ -601,21 +638,24 @@ def reclaim_release_number(ctx: Context, repo: str, claim_id: str,
     """
     try:
         return _get_client(ctx).reclaim_release({
-            "repo": repo, "claim_id": claim_id, "after": after, "branch": branch,
-            "ttl": ttl, "session": session, "note": note})
+            "repo": _derive_repo(repo_path), "claim_id": claim_id, "after": after,
+            "branch": branch, "ttl": ttl, "session": session, "note": note})
     except httpx.HTTPStatusError as e:
         _raise(e, "reclaim_release_number")
 
 
 @mcp.tool()
-def releases(ctx: Context, repo: str) -> dict:
+def releases(ctx: Context, repo_path: str = ".") -> dict:
     """Every release number the board has handed out for a repo, and who holds what.
 
     Also the answer to "what is landing soon", which nothing else here can tell
     you. Reading it is not claiming it — use `claim_release_number` for that.
+
+    The repo is derived from `repo_path`'s origin remote, not named: asking for
+    one spelling and being shown another repo's numbers is the read half of #148.
     """
     try:
-        return _get_client(ctx).releases(repo)
+        return _get_client(ctx).releases(_derive_repo(repo_path))
     except httpx.HTTPStatusError as e:
         _raise(e, "releases")
 
@@ -1078,8 +1118,14 @@ def sync_status(
             "is the fleet in sync", rather than "am I stale".
     """
     ctxt = head_context(repo_path)
-    repo = repo_slug(repo_path) or (ctxt["toplevel"] or "").rsplit("/", 1)[-1]
-    if not repo:
+    # No basename fallback. This line used to end `or toplevel.rsplit("/", 1)[-1]`,
+    # which is how the bare spelling `quarterback` got into the board's tables
+    # beside `prisonblues/quarterback` and gave one repo two identities (#148).
+    # A directory name is not a repo name — it is whatever the checkout happened
+    # to be cloned into, so two worktrees of one repo can disagree, and a fleet
+    # that renames a directory silently starts a new namespace.
+    repo = _derive_repo(repo_path)
+    if not ctxt["toplevel"]:
         raise ToolError(f"no git repo at {repo_path!r}")
 
     params: dict = {"repo": repo}

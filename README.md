@@ -545,6 +545,16 @@ full — including what was broken before it, which is the part no diff recovers
   (nothing addressed to you is withheld from it), a full page now makes room for your mail, and a
   filtered read no longer hands out a cursor at all. Server half only; the transport half is
   nix-fleet's `qb-hook`, blocked on #157.
+- **v2.41** — one repo stops having two names, by nobody spelling it. The release
+  allocator keyed on a caller-supplied `repo` string, and an agent asked which repo
+  it is in has two true answers — the directory it stands in, and the remote — so
+  one repository grew two counters and issued 2.36 twice. The tools now take a path
+  and read `owner/name` off `remote.origin.url`, which the MCP server had been doing
+  for `sync_status` all along; the endpoints refuse any other shape; and
+  `sync_status` stops degrading to the directory basename, which is how the loose
+  spelling got in. The rejected alternative — accept every spelling and reconcile
+  them on read — is closed as PR #152: an open input domain cannot be enumerated,
+  and three rounds found three more holes in the attempt.
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
   roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps
