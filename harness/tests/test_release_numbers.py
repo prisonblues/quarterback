@@ -796,3 +796,88 @@ def test_only_a_copy_counts_as_supplying_a_file():
              "          cp   ${./CHANGELOG.md}  repo/CHANGELOG.md\n"
              "          cp -r ${./app} repo/app\n")
     assert set(_FLAKE_COPY.findall(block)) == {"CHANGELOG.md", "app"}
+
+
+def _repo_root_uses_the_reader_cannot_follow(source: str) -> list[int]:
+    """The lines where `source` uses `REPO_ROOT` in a shape `_repo_root_paths_in` cannot see.
+
+    That reader refuses most of the ways of building a repo-root path it cannot resolve — the
+    `.joinpath` and `Path(REPO_ROOT, …)` spellings, and any segment that is not a string
+    literal — and names the line when it does. One shape gets past it: binding a second name to
+    `REPO_ROOT` and joining onto that. `R = REPO_ROOT` then `R / "DEPLOY.md"` reads a repo-root
+    file, and the reader sees a join onto `R`, which is not a name it is looking for. It reports
+    nothing, the flake enumeration goes stale, and the sandbox errors on a file nobody copied
+    in — #163 again, by the same mechanism.
+
+    So this closes the reader's blind spot from the other side. Rather than resolving the alias
+    — which is chasing the general case, and a parser that tried would fail silently at the
+    first idiom it missed — it walks every load of `REPO_ROOT` itself and reports the ones that
+    are not a literal join the reader would follow. The coupling asserted is not "the reader
+    sees every read", which is unachievable, but "every read is written in a shape the reader
+    sees", which is checkable.
+
+    `str(REPO_ROOT)` is the exception: it is the directory handed to `git ls-files`, not a file
+    read. Takes source text rather than reading the file itself for the same reason
+    `_repo_root_paths_in` does — a guard that fails loudly is only worth having if something
+    checks that it does."""
+    tree = ast.parse(source)
+    parents = {id(child): node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+    unreadable: list[int] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Name) or node.id != "REPO_ROOT":
+            continue
+        if not isinstance(node.ctx, ast.Load):
+            continue  # the assignment that defines it
+        parent = parents.get(id(node))
+        if isinstance(parent, ast.Call) and isinstance(parent.func, ast.Name) and \
+                parent.func.id == "str":
+            continue
+        cur: ast.AST = node
+        joined = False
+        while isinstance(parent, ast.BinOp) and isinstance(parent.op, ast.Div) \
+                and parent.left is cur:
+            if not isinstance(parent.right, ast.Constant) or \
+                    not isinstance(parent.right.value, str):
+                joined = False
+                break
+            joined = True
+            cur, parent = parent, parents.get(id(parent))
+        if not joined:
+            unreadable.append(node.lineno)
+    return unreadable
+
+
+def test_every_use_of_repo_root_in_this_file_is_one_the_reader_can_follow():
+    """The guard this file relies on to keep `flake.nix` honest can only report the reads it can
+    see, and an alias bound to `REPO_ROOT` is one it cannot. Nothing stops somebody writing one:
+    it is a perfectly ordinary thing to do, it reads a real file, and it leaves both guards with
+    nothing to say until the nix build errors on the missing copy."""
+    unreadable = _repo_root_uses_the_reader_cannot_follow(
+        Path(__file__).read_text(encoding="utf-8"))
+    assert not unreadable, (
+        "REPO_ROOT is used at line(s) " + ", ".join(str(n) for n in unreadable) + " in a shape "
+        "`_repo_root_paths_in` cannot follow, so the file being read there will not reach "
+        "the list checked against flake.nix. Write it as `REPO_ROOT / \"literal\"`, or teach "
+        "the reader the new shape and add the file to the release-metadata-tests check")
+
+
+def test_the_alias_the_reader_cannot_resolve_is_reported_by_line():
+    """The gap this guard exists for, planted rather than argued about.
+
+    `_repo_root_paths_in` returns an empty set for this source and raises nothing — it is the
+    one bypass that survives its refusals — so if this guard were also silent the pair would
+    pass a file that errors in the sandbox."""
+    source = ('R = REPO_ROOT\n'
+              'text = (R / "DEPLOY.md").read_text(encoding="utf-8")\n')
+    assert _repo_root_paths_in(source, "a snippet") == set()
+    assert _repo_root_uses_the_reader_cannot_follow(source) == [1]
+
+
+def test_the_guard_accepts_the_shapes_this_file_already_uses():
+    """Narrow on purpose, and for the same reason as the reader's own refusals: a guard that
+    tripped on `str(REPO_ROOT)` or on the assignment that defines it would fail this suite on
+    its own unmodified source, and the fix somebody reaches for then is to delete the guard."""
+    source = ('REPO_ROOT = Path(__file__).resolve().parent.parent.parent\n'
+              'proc = subprocess.run(["git", "-C", str(REPO_ROOT), "ls-files", "-z"])\n'
+              'text = (REPO_ROOT / "app" / "main.py").read_text(encoding="utf-8")\n')
+    assert _repo_root_uses_the_reader_cannot_follow(source) == []
