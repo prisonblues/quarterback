@@ -16,6 +16,7 @@ Run: pytest harness/tests
 
 import json
 import os
+import re
 import shlex
 import subprocess
 import time
@@ -913,3 +914,45 @@ def test_the_registration_is_skipped_for_a_dry_run(run, board):
         env={"QUARTERBACK_BASE_URL": "https://board.example", "QUARTERBACK_TOKEN": "t"},
     )
     assert _sent(calls) == ""
+
+
+def test_forwarded_knobs_are_all_read():
+    """Every QB_SEAT_* qb-seats forwards into a pane must be one qb-seat reads.
+
+    The two halves of this feature shipped with almost disjoint vocabularies:
+    qb-seats forwarded QB_SEAT_AGENT, QB_SEAT_AGENT_ARGS and QB_SEAT_BRIEF, while
+    qb-seat read QB_SEAT_CLAUDE, QB_SEAT_REPO, QB_SEAT_FORCE and QB_SEAT_BRIEF.
+    Only BRIEF was common, so `QB_SEAT_AGENT=cat qb-seats` — the exact trick for a
+    smoke test — arrived in the pane, was read by nothing, and started real agents
+    (board finding 3632).
+
+    Nothing fails when this drifts. The variable is set, the pane receives it, the
+    seat ignores it and reports success, so the only symptom is that the knob does
+    not work — which you discover by having run the thing you were trying not to
+    run. Hence a test rather than a comment: it is asked of both files, so a knob
+    renamed on one side has to be renamed on the other or this goes red.
+
+    One-directional on purpose. qb-seat may read a knob qb-seats does not forward
+    (QB_SEAT_REPO is one: the layout sets each pane's cwd instead, so forwarding a
+    repo would fight it). The reverse is the defect.
+    """
+    seats = (QB_SEAT.parent / "qb-seats").read_text()
+    seat = QB_SEAT.read_text()
+
+    forwarded = set()
+    for line in seats.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("for v in QB_SEAT"):
+            forwarded = set(stripped[len("for v in "):].split(";")[0].split())
+            break
+    assert forwarded, "could not find qb-seats' forwarding loop — has it been rewritten?"
+
+    read = set(re.findall(r"\$\{(QB_SEAT_[A-Z_]+)", seat))
+    assert read, "could not find any QB_SEAT_* reads in qb-seat"
+
+    unread = forwarded - read
+    assert not unread, (
+        "qb-seats forwards knobs qb-seat never reads, so setting them does nothing "
+        f"and says nothing: {sorted(unread)}. qb-seat reads {sorted(read)}."
+    )
+

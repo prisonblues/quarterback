@@ -31,6 +31,24 @@ in
       '';
     };
 
+    seats.enable = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Install the multiplexer `qb-seats` needs. The scripts themselves are in
+        the package already — this only adds tmux, which is the one runtime
+        dependency the harness cannot assume is present.
+
+        Off by default, and that is deliberate rather than timid. A consumer
+        typically enables this whole module once, for every host they own; a
+        seat screen is something they want on ONE of them. Defaulting to on would
+        push a package onto machines that will never run a seat — including work
+        machines somebody else owns the disk of — as a side effect of enabling
+        the loops and the worktree tooling, which is not a trade a default gets
+        to make on their behalf.
+      '';
+    };
+
     installScripts = lib.mkOption {
       type = lib.types.bool;
       default = true;
@@ -44,7 +62,14 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    home.packages = lib.mkIf cfg.installScripts [ cfg.package ];
+    home.packages =
+      lib.optionals cfg.installScripts [ cfg.package ]
+      # NOT wrapped into the package's PATH, unlike a build dependency would be.
+      # The user attaches to tmux by hand, reattaches over ssh, and has their own
+      # config for it — so it has to be the tmux they can see and configure, not
+      # one hidden inside a wrapper where `tmux attach` from their own shell
+      # would find a different binary.
+      ++ lib.optionals cfg.seats.enable [ pkgs.tmux ];
 
     home.file = lib.mkMerge (
       # ~/.claude/loops is a store symlink, i.e. READ-ONLY. epic.py already
