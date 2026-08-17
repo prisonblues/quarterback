@@ -72,7 +72,8 @@ tooling talks to the board through were the two things in this repo nothing test
 runs its suite, and `nix flake check` runs it too, so a consumer pinning a revision whose client is
 broken finds out at build time.
 
-Served version unchanged — no board change ships here.
+The board moves with it: `GET /board` now reports its newest id in an `X-Board-Head`
+header, which is what lets a filtered read anchor a tail without a second request (#173).
 
 ## v2.41 — one repo, two names, and an allocator that believed both
 

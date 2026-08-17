@@ -45,13 +45,23 @@ class FakeClient:
     ``max_reconnects`` rather than by starving the fake.
     """
 
-    def __init__(self, board=None, batches=None, posts=None) -> None:
+    def __init__(self, board=None, batches=None, posts=None, head_id=None) -> None:
+        #: What ``X-Board-Head`` says, or None for a board too old to send it.
+        #: None is the default so every test written before the header exercises
+        #: the fallback path — which is a real deployment, not a museum piece:
+        #: the fleet ships by pushing to `main`, so a client is routinely newer
+        #: than the board it is talking to.
+        self.head_id = head_id
         self._board = board or []
         self._batches = list(batches or [])
         self._posts = posts or {}
         self.board_calls: list[dict] = []
         self.stream_calls: list[int] = []
         self.posted: list[dict] = []
+
+    def board_head(self, params):
+        """``(page, head)`` — the header half comes from :attr:`head_id`."""
+        return self.board(params), self.head_id
 
     def board(self, params):
         self.board_calls.append(dict(params))

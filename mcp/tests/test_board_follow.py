@@ -131,6 +131,9 @@ class BoardWithHead(FakeClient):
     def __init__(self, head: int, **kw) -> None:
         super().__init__(**kw)
         self.head = head
+        # This board is new enough to report where it ends, which is what lets a
+        # narrowed backlog anchor without a second request (#173).
+        self.head_id = head
 
     def board(self, params):
         self.board_calls.append(dict(params))
@@ -483,3 +486,41 @@ def test_a_real_client_error_is_still_fatal(tmp_path, code):
     code_out, _out, _err = run_follow(client, max_reconnects=0, home=str(tmp_path))
     assert code_out != 0, f"HTTP {code} should be fatal"
     assert client.stream_calls == []
+
+
+# --------------------------------- one request answers both halves (#173)
+
+def test_a_narrowed_backlog_anchors_without_a_second_request(tmp_path):
+    """The race in #173 was a race between two reads, so the fix is that there is
+    one. A filtered body cannot say where the board ends — the ids in between
+    belong to posts the filter dropped — and `X-Board-Head` says it anyway, on
+    the response already being fetched.
+
+    Asserting the CALL COUNT rather than the cursor is the point: the old code
+    reached the same cursor, one request later, with a window in between where a
+    post could land in neither the backlog nor the stream and be lost silently.
+    """
+    client = BoardWithHead(900, board=[post(3, type="finding")], batches=[[]])
+    run_follow(client, types=["finding"], max_reconnects=0, home=str(tmp_path))
+    assert client.stream_calls == [900]
+    assert len(client.board_calls) == 1, (
+        f"anchored in {len(client.board_calls)} requests; the second one is the race"
+    )
+
+
+def test_an_old_board_without_the_header_still_works_the_old_way(tmp_path):
+    """The fleet deploys by pushing to `main`, so a client talking to a board that
+    predates the header is ordinary rather than exotic. Falling back to the two
+    reads keeps the tail working — it does not close the race, which no client can
+    do alone, and pretending otherwise would be worse than the race."""
+    client = FakeClient(board=[post(3, type="finding")], batches=[[]])  # head_id None
+    run_follow(client, types=["finding"], max_reconnects=0, home=str(tmp_path))
+    assert len(client.board_calls) == 2, "an old board still needs the head request"
+
+
+def test_the_header_is_preferred_over_the_body_even_for_the_head_request(tmp_path):
+    """`_head` asks for one row and the newest row can be muted, so a body-derived
+    answer can sit behind the board's real end. The header cannot."""
+    client = BoardWithHead(900, board=[], batches=[[]])
+    run_follow(client, tail=0, max_reconnects=0, home=str(tmp_path))
+    assert client.stream_calls == [900]

@@ -67,11 +67,19 @@ def _newest_id(posts: list[dict]) -> int:
 def _head(client: QuarterbackClient) -> int:
     """The id of the newest post on the board, in one deliberately tiny request.
 
+    Only the fallback path reaches this now: a board too old to send
+    ``X-Board-Head``, or a backlog request that failed outright. When the header
+    is there, :func:`_backlog` already answered this in the request it was making
+    anyway, and #173's race is that this used to be a second read.
+
     ``include_presence`` because heartbeats are most of the board and carry its
     highest ids, and ``window_min=0`` because a board that has been quiet longer
-    than the default window still has an end.
+    than the default window still has an end. The header is preferred over the
+    body even here: on a board whose newest post is muted, a one-row body can
+    disagree with the board's real end, and the header cannot.
     """
-    return _newest_id(client.board({"limit": 1, "window_min": 0, "include_presence": True}))
+    posts, head = client.board_head({"limit": 1, "window_min": 0, "include_presence": True})
+    return head if head is not None else _newest_id(posts)
 
 
 def _backlog_params(tail: int, types: set[str] | None, to: str | None, presence: bool) -> dict:
@@ -106,29 +114,43 @@ def _backlog(
     low cursor: only ``/board`` can bound the count, and `--follow -n 20` on a
     board with 3000 posts must not stream all 3000 to throw away 2980.
 
-    The cursor is the half that is easy to get wrong. It has to be the newest id
-    the *server* returned, never the newest id printed — and a narrowed request
-    doesn't carry it at all, since the ids in between belong to the posts that
-    were filtered out. So this says ``None`` when it cannot know, and the caller
-    anchors properly rather than defaulting to the beginning of the board.
+    The cursor comes from the ``X-Board-Head`` header on this same response, and
+    that is the fix for #173.
 
-    **There is a known race here and it is not fixed, deliberately — see #173.**
-    When this returns ``None`` the caller reads the board's head in a second
-    request, and a post landing between the two is in neither: not in the backlog
-    (it did not exist yet) and not in the stream (the cursor is already past it).
-    The obvious repair — anchor on this response's own newest id — is wrong, and
-    the suite catches it: on a narrowed or empty response that id is ancient or
-    zero, so the stream replays the whole board. Both failure modes are real and
-    the fix is a design choice rather than a patch, which is why it is an issue
-    and not a fourth attempt in this file.
+    It used to come from the body, which cannot supply it: the newest id in a
+    *narrowed* response belongs to a matching post, and the ids in between belong
+    to posts the filter dropped, so anchoring there replays everything after it —
+    "the flood", and two tests in this suite exist to catch it. The old code
+    therefore returned ``None`` for a narrowed request and the caller asked the
+    board for its head in a SECOND request. Two reads are not atomic: a post
+    landing between them is in neither the backlog (it did not exist yet) nor the
+    stream (the cursor is already past it), and it is lost with nothing printed
+    and no error.
+
+    A header carries the whole board's newest id regardless of what the query
+    filtered to, so one request now answers both halves and there is no second
+    read to race against. Neither failure mode is traded for the other; the
+    choice between them is what has gone.
+
+    ``None`` still comes back when the board is older than this client and sends
+    no header — the fleet deploys by pushing to `main`, so that is ordinary — and
+    the caller keeps its old two-read fallback for exactly that case.
     """
     if tail <= 0:
         return [], None
     params = _backlog_params(tail, types, to, presence)
-    posts = list(client.board(params))
-    narrowed = "type" in params or "to" in params or not params.get("include_presence")
+    posts, head = client.board_head(params)
+    if head is None:
+        # No header: the board predates it, so fall back to exactly what this did
+        # before. An UNNARROWED response's newest id *is* the board's newest, so
+        # it anchors correctly and needs no second read; a narrowed one does not,
+        # and returning None is what sends the caller to `_head`. That leaves the
+        # race in place on an old board, which is the honest outcome — the fix is
+        # a thing the server has to say, and a client cannot infer it.
+        narrowed = "type" in params or "to" in params or not params.get("include_presence")
+        head = None if narrowed else _newest_id(posts)
     matched = [p for p in posts if wants(p, types, to, presence)]
-    return matched[-tail:], None if narrowed else _newest_id(posts)
+    return matched[-tail:], head
 
 
 def quiet_broken_pipe() -> None:

@@ -504,3 +504,40 @@ async def test_catch_up_on_an_inbox_still_delivers_messages(client):
     msg = await post(client, headers=LAPTOP, type="message", to=desktop, summary="for you")
 
     assert msg in ids(await board(client, headers=DESKTOP, to="@me", since=start))
+
+
+async def test_the_board_reports_where_it_ends_regardless_of_the_filter(client):
+    """`X-Board-Head` is the whole board's newest id, not this page's.
+
+    A filtered body cannot answer "where does the board end" — the ids in between
+    belong to posts the filter dropped — so a tail asking for one type had to make
+    a second request for the head, and a post landing between the two was in
+    neither. It is a header rather than a field because the body is a bare JSON
+    array with a browser and six client call sites reading it, and this is not a
+    fact about the posts returned. See #173.
+    """
+    await client.post("/post", json={"type": "note", "summary": "one"}, headers=LAPTOP)
+    await client.post("/post", json={"type": "note", "summary": "two"}, headers=LAPTOP)
+    r = await client.post("/post", json={"type": "presence", "summary": "beat"},
+                          headers=LAPTOP)
+    newest = r.json()["id"]
+
+    # A narrowed read: presence is muted, so the newest post is NOT in this body.
+    narrowed = await client.get("/board", params={"type": "note", "window_min": 0},
+                                headers=LAPTOP)
+    assert narrowed.status_code == 200
+    assert newest not in [p["id"] for p in narrowed.json()], "fixture is not narrowing"
+    assert narrowed.headers["X-Board-Head"] == str(newest), (
+        "the header reported the page's end rather than the board's"
+    )
+
+
+async def test_the_head_header_is_present_on_an_empty_page(client):
+    """An empty body is the case that used to anchor at zero and replay the whole
+    board. The header still says where the board is."""
+    r = await client.post("/post", json={"type": "note", "summary": "x"}, headers=LAPTOP)
+    newest = r.json()["id"]
+    empty = await client.get("/board", params={"to": "nobody/at-all", "window_min": 0},
+                             headers=LAPTOP)
+    assert empty.json() == []
+    assert empty.headers["X-Board-Head"] == str(newest)

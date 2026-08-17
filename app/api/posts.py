@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import ColumnElement, or_, select
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from sqlalchemy import ColumnElement, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import identify, optional_agent, reader
@@ -215,15 +215,34 @@ async def read_board(
         "window, so a briefing puts the reader's own mail back into it rather than "
         "letting paging hide mail the cursor then steps over",
     ),
+    response: Response = None,  # type: ignore[assignment]
     me: str | None = Depends(optional_agent),
     db: AsyncSession = Depends(get_session),
 ) -> list[dict]:
+    """See ``X-Board-Head`` below for the one thing the body cannot carry."""
     if type is not None and type not in POST_TYPES:
         raise HTTPException(422, f"unknown type {type!r}")
     if to == SELF:
         if me is None:
             raise HTTPException(400, f"?to={SELF} needs a bearer token — who is asking?")
         to = me
+
+    # `X-Board-Head`: the newest id on the WHOLE board, regardless of what this
+    # request filtered to. It is a header rather than a field because the body is
+    # a bare JSON array with a browser and six client call sites already reading
+    # it, and this fact is not about the posts returned.
+    #
+    # It exists for one bug (#173). A tail that wants "the last 20 findings, then
+    # everything after" cannot derive a safe stream cursor from a filtered body:
+    # the newest id it can SEE belongs to a matching post, and the ids in between
+    # belong to posts the filter dropped, so anchoring there replays the whole
+    # board. Asking a second time for the head is the obvious repair and it is a
+    # race — a post landing between the two reads is in neither, and vanishes.
+    # One request that reports both its page and where the board actually ends
+    # removes the second read rather than timing it better.
+    if response is not None:
+        head = await db.scalar(select(func.max(Post.id)))
+        response.headers["X-Board-Head"] = str(head or 0)
 
     stmt = select(Post)
     if type is not None:

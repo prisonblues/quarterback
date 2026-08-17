@@ -132,6 +132,29 @@ class QuarterbackClient:
         resp.raise_for_status()
         return resp.json()
 
+    def board_head(self, params: dict) -> tuple[list[dict], int | None]:
+        """A page of the board, and where the board actually ends.
+
+        The second half comes from the ``X-Board-Head`` response header, so it is
+        the newest id on the WHOLE board even when this request was filtered down
+        to one type or one recipient — which is the thing a filtered body cannot
+        tell you, and the thing a tail needs to pick a stream cursor without
+        asking twice (#173).
+
+        ``None`` when the header is absent or unreadable, which is a board older
+        than this client rather than an error: the fleet is deployed by pushing to
+        `main`, so a client can very ordinarily be newer than the board it talks
+        to. Callers fall back to the behaviour they had before the header existed.
+        """
+        resp = self._http.get(self._url("/board"), params=params)
+        resp.raise_for_status()
+        raw = resp.headers.get("X-Board-Head")
+        try:
+            head = int(raw) if raw is not None else None
+        except ValueError:
+            head = None
+        return resp.json(), head
+
     def get_post(self, post_id: int) -> dict:
         resp = self._http.get(self._url(f"/post/{post_id}"))
         resp.raise_for_status()
