@@ -324,4 +324,29 @@ Then the part that is new, and is the point of running more than one round:
 
 ## 7. Merging (only if the user asks)
 
-`gh pr merge --merge --delete-branch` — preserve commits; never squash.
+Run the gate first. This step used to be one line with nothing in front of it,
+and the PR that exposed that (#131) was merged on `mergeable` + CI-green over its
+own panel round — 8 P1s and 12 P2s outstanding at the moment it landed, on
+`main`, for three hours, two of them auth-shaped.
+
+```bash
+python3 ~/.claude/loops/preland.py --pr <pr>
+```
+
+If that path does not exist, the box's `~/.claude/loops` predates the script — run
+`python3 harness/loops/preland.py --pr <pr> --repo .` from a checkout instead. A
+missing gate is not a passed one.
+
+- **HOLD (exit 2)** — do not merge, whatever was asked for. Show the user
+  `reasons` and let them decide with them in front of them; someone asking for a
+  merge is asking for the merge they think they are getting.
+- **RECONCILE (exit 3)** — mechanical work is outstanding and this skill does not
+  do it. `/fix-and-land` §4 does, or a human does.
+- **READY (exit 0)** — `gh pr merge --merge --delete-branch`; preserve commits,
+  never squash.
+
+**The rounds you just ran are an input to that verdict, not a substitute for it.**
+preland reads the round the panel *recorded on the board*, so a round that never
+got there — no `qb` on this host, a board outage, `--no-record` — reads as never
+reviewed and HOLDs. That is deliberate: a review nobody can point to afterwards
+is not evidence the review happened.

@@ -374,6 +374,13 @@ full — including what was broken before it, which is the part no diff recovers
   CHANGELOG and made every release rewrite the same lines of the same two files, so two branches
   conflicted whether or not their numbers collided. Test files are named after their subject
   rather than their release, which was the one site git could not resolve by keeping both sides.
+- **v2.35** — the pre-land gate becomes executable. `harness/loops/preland.py --pr <n>` answers
+  READY (exit 0) / RECONCILE (3, with the exact commands and the files they touch) / HOLD (2, with
+  what is unresolved and who has to resolve it). It reads the panel round's own statements off the
+  board rather than re-deriving them, so the day a PR merged over its own unread round — 8 P1s
+  outstanding, by an agent that had written up that exact confusion an hour earlier — comes out HOLD
+  on two independent counts. Absent never reads as clean: no round, no CI, an unreadable board or a
+  branch that deleted its own guardrail all hold, and a check turned off is still reported.
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
   roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps

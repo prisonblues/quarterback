@@ -90,6 +90,30 @@ the slash commands or on a timer (`loops/systemd/`).
 Because `~/.claude/loops` is a read-only store symlink when installed via nix, these write
 their run state to `~/.local/state/loops` rather than beside themselves.
 
+### `preland.py` — the pre-land verdict
+
+`loops/preland.py --pr <n>` answers one question mechanically: **may this PR be merged,
+and if not, what is outstanding.** `READY` (exit 0), `RECONCILE` (exit 3, with the exact
+commands and the files they touch), or `HOLD` (exit 2, with what is unresolved and who has
+to resolve it). `--json` for a loop, plain text for a person.
+
+It is not a new gate. It is the gates the harness already had — CI green *now*, the panel's
+newest round read *this* commit and stopped with nothing confirmed, one migration head,
+no failing Sonar gate, nobody else landing the same branch — read in one place instead of
+described in two. `/fix-and-land` used to hold about fifty lines of prose about them and
+`/panel-review-pr` held none, which is how they came to disagree; both now call this and
+act on the verdict.
+
+Guardrails are capability-detected, so a repo without `scripts/migration_reconcile.py`
+skips that check and says it skipped it. The board is the one exception — an unreadable
+review state is a HOLD, not a skip, because "nobody reviewed it" and "nobody could tell"
+are the same thing to a merge. `.harness-rules` is where a repo turns that off deliberately.
+
+It reads; it does not act. It reports commands rather than running them and reads merge
+claims rather than taking them, which is what lets it be re-run to check its own advice —
+and what would let a CI job call it. See [loops/README.md](loops/README.md) for the check
+list and the exit-code contract.
+
 ### `/fix-issue <number>` — the driver
 
 End-to-end resolution of a GitHub issue in a dedicated worktree. Reads the issue, plans,
