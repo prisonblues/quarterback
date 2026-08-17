@@ -77,6 +77,15 @@
           cp -r ${./harness/bin} harness/bin
           cp -r ${./harness/tests} harness/tests
           chmod -R u+w harness
+          # test_release_numbers.py is not a harness test and cannot run in this
+          # sandbox: it reads CHANGELOG.md, README.md, pyproject.toml and
+          # app/main.py at the repo root, which this check does not contain. It
+          # has its own check below, with a source that does. Removed rather
+          # than --ignore'd so that renaming the file fails HERE, loudly, in the
+          # build that would otherwise carry on collecting it — a `rm` of a path
+          # that is gone is an error, and the person renaming it has to look at
+          # both checks.
+          rm harness/tests/test_release_numbers.py
           # Same treatment the package gets: there is no /usr/bin/env in the
           # sandbox, so an unpatched `#!/usr/bin/env bash` fails to exec at all
           # — and every test then fails for a reason that has nothing to do with
@@ -86,6 +95,64 @@
           export HOME=$TMPDIR
           git config --global init.defaultBranch main
           pytest -q -p no:cacheprovider tests
+          touch $out
+        '';
+
+        # The release-metadata suite, which is not a harness suite at all: it
+        # asserts that the release number written in CHANGELOG.md, README.md,
+        # pyproject.toml and app/main.py agrees with itself. It lives under
+        # `harness/tests/` for the reason its own docstring gives — the top-level
+        # `tests/conftest.py` resolves DATABASE_URL and imports the app, which
+        # made the cheapest check in the repo the hardest to run — and that is
+        # what put it in a sandbox holding only `harness/`, where all eight of
+        # its assertions errored on missing files instead of being evaluated
+        # (#163). So it gets a sandbox with the four files it actually reads.
+        #
+        # This is the check that would have caught the v2.34 collision two
+        # branches created on 2026-08-17, and it has never once run here.
+        #
+        # The four `cp`s are enumerated rather than the repo root being copied
+        # wholesale: `./.` would drag a developer's `mcp/.venv` and every
+        # `__pycache__` into the store. Enumeration is the thing that can go
+        # stale, so it does not rely on someone remembering —
+        # `test_the_flake_check_supplies_every_repo_root_file_this_suite_reads`
+        # in the suite itself compares this list against the paths the suite
+        # reads, and that is why flake.nix is copied in below alongside them.
+        release-metadata-tests = pkgs.runCommand "quarterback-release-metadata-tests"
+          {
+            # git is deliberately ABSENT. One test asks git for the repo's
+            # tracked files to check that no test file is named after a release;
+            # a store sandbox is not a checkout, so with git present that test
+            # skips on "not a git checkout" and without it skips on "git is not
+            # on PATH". Identical outcome, one less dependency. It is not going
+            # unchecked: CI runs this suite in a real checkout on every push,
+            # and that is where the question "what does this repo track" can be
+            # answered at all.
+            nativeBuildInputs = [ (pkgs.python3.withPackages (ps: [ ps.pytest ])) ];
+          } ''
+          # The layout matters, not just the file set: the suite computes its
+          # repo root as the test file's parent.parent.parent, so the test has
+          # to sit two directories below the files it reads.
+          mkdir -p repo/harness/tests repo/app
+          cp ${./harness/tests/test_release_numbers.py} repo/harness/tests/test_release_numbers.py
+          cp ${./CHANGELOG.md}    repo/CHANGELOG.md
+          cp ${./README.md}       repo/README.md
+          cp ${./pyproject.toml}  repo/pyproject.toml
+          cp ${./app/main.py}     repo/app/main.py
+          cp ${./flake.nix}       repo/flake.nix
+          chmod -R u+w repo
+          cd repo/harness
+          # -rs: print the reason for every skip. This check exists because eight
+          # assertions were inert and said so only in ERROR lines nobody read;
+          # a silent skip is the same failure wearing a green badge. Two are
+          # expected here — the git-tracked-filenames test, and the unstamped
+          # entry test on a branch not writing a release.
+          #
+          # The path is passed explicitly and must stay that way: pyproject.toml
+          # is copied in above, so it is the rootdir, and its
+          # `testpaths = ["tests"]` would otherwise resolve against the REPO root
+          # rather than this directory and collect nothing at all.
+          pytest -q -rs -p no:cacheprovider tests
           touch $out
         '';
 

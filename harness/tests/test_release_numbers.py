@@ -60,6 +60,7 @@ exists.
 
 from __future__ import annotations
 
+import ast
 import re
 import subprocess
 import tomllib
@@ -523,3 +524,86 @@ def test_an_unclosed_fence_says_which_line_opened_it():
     """The marker alone does not locate anything in a file with forty fences in it."""
     with pytest.raises(AssertionError, match="line 3"):
         _without_fenced_blocks("intro\n\n```md\n## vNEXT — a sample entry\n")
+
+
+#: A `cp ${./some/path}` inside the flake's release-metadata check.
+_FLAKE_COPY = re.compile(r"\$\{\./([^}]+)\}")
+
+
+def _paths_this_suite_reads() -> set[str]:
+    """Every repo-root path this file joins onto `REPO_ROOT`, read out of its own syntax tree.
+
+    Parsed rather than grepped, and the first version of this was grepped. A pattern over the
+    raw source cannot tell an expression from a sentence, and it read the path out of the
+    comment that documented it — so the guard failed on a repo where nothing was wrong, which
+    is the one failure this whole suite argues gets a check switched off. The tree has only
+    the expressions.
+
+    A bare `REPO_ROOT` with nothing joined onto it is not a file read: it is the directory
+    handed to `git ls-files`, and it yields no chain here."""
+    tree = ast.parse(Path(__file__).read_text())
+    # `ast.walk` yields every node, so a two-component join offers itself twice: once whole,
+    # and once as its own left operand. Taking both would register the DIRECTORY `app` as a
+    # file to copy alongside `app/main.py`. Only maximal chains are reads.
+    inner = {id(n.left) for n in ast.walk(tree)
+             if isinstance(n, ast.BinOp) and isinstance(n.op, ast.Div)}
+    paths: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.BinOp) or not isinstance(node.op, ast.Div):
+            continue
+        if id(node) in inner:
+            continue
+        parts: list[str] = []
+        cur: ast.expr = node
+        while isinstance(cur, ast.BinOp) and isinstance(cur.op, ast.Div):
+            if not isinstance(cur.right, ast.Constant) or not isinstance(cur.right.value, str):
+                break
+            parts.append(cur.right.value)
+            cur = cur.left
+        else:
+            if isinstance(cur, ast.Name) and cur.id == "REPO_ROOT":
+                paths.add("/".join(reversed(parts)))
+    return paths
+
+
+def test_the_flake_check_supplies_every_repo_root_file_this_suite_reads():
+    """The enumeration in `flake.nix` is the thing that goes stale, so nothing relies on
+    somebody remembering it.
+
+    This suite reads files at the repo ROOT while living two directories below it, and
+    `nix build .#checks.<system>.release-metadata-tests` runs it in a sandbox containing
+    only the files that check names one by one. Add a fifth file to the four below and the
+    sandbox does not have it: the new assertion does not fail there, it ERRORS on a missing
+    file — and an ERROR line in a check somebody has to go and read is exactly how #163 sat
+    unnoticed for a day with all eight of these assertions inert.
+
+    So the coupling is asserted here, where it fails in the ordinary `pytest harness/tests`
+    a developer runs before pushing, rather than in a nix build they may not run at all.
+
+    Skipped rather than failed when `flake.nix` is absent: this file is also collected from
+    a sandbox, and a check that cannot see the expression cannot judge it."""
+    flake = REPO_ROOT / "flake.nix"
+    if not flake.is_file():
+        pytest.skip("no flake.nix beside this checkout, so there is no check to compare against")
+    text = flake.read_text()
+    start = text.find("release-metadata-tests =")
+    assert start != -1, (
+        "flake.nix has no `release-metadata-tests` check. If it was renamed, rename it here "
+        "too — this assertion is the only thing tying the suite to the sandbox that feeds it")
+    end = text.find("'';", start)
+    assert end != -1, "the release-metadata-tests check is not terminated — the parser is wrong"
+    copied = set(_FLAKE_COPY.findall(text[start:end]))
+
+    missing = sorted(_paths_this_suite_reads() - copied)
+    assert not missing, (
+        "this suite reads repo-root files that flake.nix's release-metadata-tests check does "
+        "not copy into its sandbox, so they will error there as FileNotFoundError rather than "
+        "be asserted: " + ", ".join(missing) + ". Add a `cp ${./<path>}` for each")
+
+
+def test_the_reader_finds_the_paths_it_is_meant_to_find():
+    """The guard above is only worth having if its parser works, and a parser that silently
+    finds NOTHING would make it pass on any flake at all."""
+    found = _paths_this_suite_reads()
+    assert {"CHANGELOG.md", "README.md", "pyproject.toml", "app/main.py"} <= found
+    assert not any(p.startswith("REPO_ROOT") or p == "" for p in found)
