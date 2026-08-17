@@ -283,3 +283,21 @@ def test_kill_tears_the_screen_down(screen):
     screen("-n", "1")
     assert screen("--kill").returncode == 0
     assert screen.tmux("has-session", "-t", "=t").returncode != 0
+
+
+def test_qb_b_is_a_spelling_of_qb_seats(tmp_path):
+    """The short name must reach the real script, including through the flat
+    symlinks home-manager installs — which is the layout `readlink -f` breaks on.
+    """
+    r = subprocess.run([str(BIN / "qb-b"), "--help"], capture_output=True, text=True,
+                       timeout=30)
+    assert r.returncode == 0, r.stderr
+    assert "--staged" in r.stdout and "--kill" in r.stdout
+
+    # …and via a home-manager-shaped symlink: one flat link per file, so the
+    # link's own directory holds nothing else.
+    flat = tmp_path / "hm_qb-b"
+    flat.symlink_to(BIN / "qb-b")
+    r = subprocess.run([str(flat), "--help"], capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stderr
+    assert "--staged" in r.stdout
