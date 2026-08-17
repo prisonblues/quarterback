@@ -368,7 +368,7 @@ full — including what was broken before it, which is the part no diff recovers
   text, so the generic claim endpoint could write rows carrying invariants only the allocator
   enforces. The two bugs that mattered most were unreachable sequentially — a race-based feature had
   shipped with a sequential test suite.
-- **vNEXT** — a branch stops naming its own release number: it writes `vNEXT`, and
+- **v2.34** — a branch stops naming its own release number: it writes `vNEXT`, and
   `scripts/release_stamp.py` resolves it against the ref being merged into. The narrative
   paragraph that restated the last four releases in fresh prose is gone — it duplicated the
   CHANGELOG and made every release rewrite the same lines of the same two files, so two branches

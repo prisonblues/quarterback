@@ -11,7 +11,7 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
-## vNEXT — a branch stops guessing which release it will be
+## v2.34 — a branch stops guessing which release it will be
 
 Every release rewrote the same lines of the same two files, so two open branches conflicted on
 `CHANGELOG.md` and `README.md` whether or not their numbers collided. Landing four PRs in one
