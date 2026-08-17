@@ -349,9 +349,11 @@ class ClaimIn(BaseModel):
 
 class ClaimRefIn(BaseModel):
     claim_id: uuid.UUID
-    #: Required in practice for a release claim that named one — see
-    #: :func:`_may_mutate`. Ownership of a release number is the session's, not
-    #: the box's, because on this fleet two agents per box are two branches.
+    #: Required in practice for ANY claim that named one — see
+    #: :func:`_may_mutate`. Ownership is the session's, not the box's, because on
+    #: this fleet two agents per box are two agents; the release-only reading of
+    #: this line was the #142 bug, and a comment that outlives its rule is how it
+    #: got there.
     session: str | None = None
 
 
