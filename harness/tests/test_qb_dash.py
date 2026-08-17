@@ -64,6 +64,21 @@ def _why_skip() -> str | None:
 pytestmark = pytest.mark.skipif(_why_skip() is not None, reason=_why_skip() or "")
 
 
+def _need_rows(table, what: str, err: str | None) -> None:
+    """A click test needs something to click, and live data is not guaranteed.
+
+    An empty table is two different things and they deserve different answers: a
+    repo with no open PRs today is nothing to report, while `gh` refusing is a
+    failure that must not go green — so the skip carries the error when there
+    was one.
+    """
+    if table.row_count:
+        return
+    if err:
+        raise AssertionError(f"gh could not list {what}: {err}")
+    pytest.skip(f"no open {what} on the repo — nothing to click")
+
+
 def test_a_single_click_acts_on_the_row_under_the_pointer():
     assert asyncio.run(_drive()) == []
 
@@ -77,9 +92,20 @@ def test_the_scales_icon_reviews_and_the_rest_of_the_row_opens():
     assert asyncio.run(_drive_panel()) == []
 
 
+def test_the_hammer_starts_a_fix_and_the_rest_of_the_issue_row_opens():
+    """The issue panel's two verbs, told apart the same way the PR panel's are.
+
+    The panel exists so a free issue can be picked up in one click, so what it
+    launches has to be `/fix-issue <n>` for the issue actually under the pointer
+    — a review of the wrong PR wastes money, and a fix on the wrong issue writes
+    code nobody asked for.
+    """
+    assert asyncio.run(_drive_issues()) == []
+
+
 async def _drive() -> list[str]:
     app_module = _load_app()
-    app = app_module.Dash(interval=3600, pr_interval=3600)   # no refresh mid-test
+    app = app_module.Dash(interval=3600, gh_interval=3600)   # no refresh mid-test
 
     opened: list[int] = []
     jumped: list[int] = []
@@ -97,8 +123,7 @@ async def _drive() -> list[str]:
         prs = app.query_one("#prs")
         fleet = app.query_one("#fleet")
         claims = app.query_one("#claims")
-        if not prs.row_count:
-            return ["no PR rows arrived — cannot test a click on them"]
+        _need_rows(prs, "PRs", app.pr_err)
 
         # ONE click, on a row that is not the cursor's, is the whole point.
         # x=30 is the title column: the first columns are the CI glyph and the
@@ -127,9 +152,69 @@ async def _drive() -> list[str]:
     return failures
 
 
+async def _drive_issues() -> list[str]:
+    app_module = _load_app()
+    app = app_module.Dash(interval=3600, gh_interval=3600)
+
+    started: list[tuple[str, str]] = []
+    opened: list[int] = []
+    app.run_in_window = lambda name, command: started.append((name, command))
+    app.open_issue = lambda issue: opened.append(issue.get("number"))
+
+    failures: list[str] = []
+    async with app.run_test(size=(90, 50)) as pilot:
+        for _ in range(40):
+            await pilot.pause(0.25)
+            if app.query_one("#issues").row_count:
+                break
+        issues = app.query_one("#issues")
+        _need_rows(issues, "issues", app.issue_err)
+        # Read the number off the RENDERED first row rather than re-deriving the
+        # order here: what the click has to match is the row a human sees.
+        top = int(str(issues.get_row_at(0)[2]).lstrip("#"))
+
+        # The ⚒ column asks first, the same as the ⚖ does.
+        await pilot.click(issues, offset=(app_module.Dash.FIX_COLUMN + 2, 1))
+        await pilot.pause(0.3)
+        if started:
+            failures.append("the icon started a fix with no confirmation")
+        if not isinstance(app.screen, app_module.Confirm):
+            failures.append("the icon did not raise the confirmation")
+        else:
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            if not started:
+                failures.append("confirming did not start the fix")
+            elif f"/fix-issue {top}" not in started[0][1]:
+                failures.append(f"wrong command launched: {started[0][1]}")
+            elif started[0][0] != f"fix-{top}":
+                failures.append(f"wrong window name: {started[0][0]}")
+
+        # A click anywhere else on the row still means "open it on GitHub".
+        started.clear()
+        await pilot.click(issues, offset=(30, 1))
+        await pilot.pause(0.3)
+        if opened != [top]:
+            failures.append(f"clicking the title opened {opened}, expected [{top}]")
+        if started:
+            failures.append("clicking the title started a fix")
+
+        # And the keyboard route to the same verb.
+        issues.focus()
+        await pilot.press("f")
+        await pilot.pause(0.3)
+        if not isinstance(app.screen, app_module.Confirm):
+            failures.append("'f' did not raise the confirmation")
+        else:
+            await pilot.press("escape")
+            await pilot.pause(0.2)
+
+    return failures
+
+
 async def _drive_panel() -> list[str]:
     app_module = _load_app()
-    app = app_module.Dash(interval=3600, pr_interval=3600)
+    app = app_module.Dash(interval=3600, gh_interval=3600)
 
     started: list[tuple[str, str]] = []
     opened: list[int] = []
@@ -143,8 +228,7 @@ async def _drive_panel() -> list[str]:
             if app.query_one("#prs").row_count:
                 break
         prs = app.query_one("#prs")
-        if not prs.row_count:
-            return ["no PR rows arrived"]
+        _need_rows(prs, "PRs", app.pr_err)
 
         # The ⚖ column asks first and starts nothing by itself.
         await pilot.click(prs, offset=(app_module.Dash.PANEL_COLUMN + 2, 1))

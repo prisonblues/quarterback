@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """qb-dash-tui — the fleet dashboard, clickable.
 
-Same three views as qb-dash (fleet / claims / PRs), but as a Textual app, so
-rows respond to the mouse. What a click does depends on what you clicked:
+Same four views as qb-dash (fleet / claims / PRs / issues), but as a Textual
+app, so rows respond to the mouse. What a click does depends on what you
+clicked:
 
   a seat        jump the tmux cursor to that seat's pane — the dashboard is a
                 switcher, which is the whole reason to have it beside the seats
   an agent      its cwd, branch, model and session id, in the detail line
   a claim       the claim note, which is where an agent says what it is doing
   a PR          open it on GitHub
+  an issue      open it on GitHub — or its ⚒, to start /fix-issue on it
 
 Keys: r refresh now, o open the selected PR, q quit.
 
@@ -37,6 +39,11 @@ from textual.widgets import DataTable, Footer, Static
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import qbdata as qd                                             # noqa: E402
+
+
+def holders(held: dict[int, dict]) -> dict[int, str]:
+    """{issue → who holds it}, which is all of a claim this dashboard shows."""
+    return {n: (c.get("holder") or "?") for n, c in held.items()}
 
 
 class Confirm(ModalScreen[bool]):
@@ -117,12 +124,13 @@ class Dash(App):
     .title { height: 1; padding: 0 1; background: $boost; color: $accent; }
 
     /* A share of the pane each, and each scrolls inside its share. With
-       `height: auto` the three tables simply stack past the bottom of a 42-row
+       `height: auto` the four tables simply stack past the bottom of a 42-row
        pane: the PRs then cannot be clicked, because they are not on screen —
        which is how the click test caught it. */
     #fleet  { height: 2fr; }
     #claims { height: 1fr; }
     #prs    { height: 2fr; }
+    #issues { height: 2fr; }
     """
 
     BINDINGS = [
@@ -130,21 +138,27 @@ class Dash(App):
         ("r", "refresh_now", "refresh"),
         ("o", "open_pr", "open"),
         ("p", "panel_pr", "panel"),
+        ("f", "fix_issue", "fix"),
         ("question_mark", "help", "keys"),
     ]
 
     # The ⚖ lives in its own column so that clicking it means something
     # different from clicking the row. Column 1 of the PR table.
     PANEL_COLUMN = 1
+    # The same trick on the issue table: column 1 is the ⚒ that takes the issue.
+    FIX_COLUMN = 1
 
-    def __init__(self, interval: float = 4.0, pr_interval: float = 90.0) -> None:
+    def __init__(self, interval: float = 4.0, gh_interval: float = 90.0) -> None:
         super().__init__()
         self.interval = interval
-        self.pr_interval = pr_interval
+        self.gh_interval = gh_interval
         self.client = None
         self.cfg = None
         self.rows: dict[str, dict] = {}       # row key → the record behind it
         self.prs: list[dict] = []
+        self.issues: list[dict] = []
+        self.issue_err: str | None = None
+        self.held: dict[int, dict] = {}       # issue number → the claim on it
         self.detail_text = ""
         self.last_dispatch: tuple[str, float] | None = None
         # Where launched work runs, what it runs, and whether it asks first.
@@ -164,14 +178,17 @@ class Dash(App):
             yield ClickTable(id="claims", cursor_type="row")
             yield Static("OPEN PRs", classes="title", id="t_prs")
             yield ClickTable(id="prs", cursor_type="row")
-        yield Static("click: seat→pane, PR→GitHub, ⚖→panel review   ? for keys",
-                     id="detail")
+            yield Static("ISSUES", classes="title", id="t_issues")
+            yield ClickTable(id="issues", cursor_type="row")
+        yield Static("click: seat→pane, PR→GitHub, ⚖→panel review, ⚒→fix issue   "
+                     "? for keys", id="detail")
         yield Footer()
 
     def on_mount(self) -> None:
         self.query_one("#fleet", DataTable).add_columns("who", "repo", "what", "ttl")
         self.query_one("#claims", DataTable).add_columns("who", "key", "left")
         self.query_one("#prs", DataTable).add_columns("", "⚖", "pr", "title", "age")
+        self.query_one("#issues", DataTable).add_columns("", "⚒", "issue", "title", "who")
         try:
             self.client, self.cfg = qd.board_client()
         except Exception as exc:                  # noqa: BLE001
@@ -180,8 +197,10 @@ class Dash(App):
             return
         self.refresh_board()
         self.refresh_prs()
+        self.refresh_issues()
         self.set_interval(self.interval, self.refresh_board)
-        self.set_interval(self.pr_interval, self.refresh_prs)
+        self.set_interval(self.gh_interval, self.refresh_prs)
+        self.set_interval(self.gh_interval, self.refresh_issues)
 
     # ---- data (threads, so a slow board never freezes the ui) -----------
 
@@ -194,6 +213,11 @@ class Dash(App):
     def refresh_prs(self) -> None:
         prs, err = qd.fetch_prs()
         self.call_from_thread(self.render_prs, prs, err)
+
+    @work(thread=True, exclusive=True, group="issues")
+    def refresh_issues(self) -> None:
+        issues, err = qd.fetch_issues()
+        self.call_from_thread(self.render_issues, issues, err)
 
     # ---- rendering -------------------------------------------------------
 
@@ -244,6 +268,15 @@ class Dash(App):
             )
         self.query_one("#t_claims", Static).update(f"CLAIMED · {len(claims)}")
 
+        # Who holds which issue comes off the same claims, and only the holder
+        # is displayed — so compare on that, not on the whole claim. A claim
+        # renewing changes its expiry every time, and rebuilding the issue table
+        # for that would move the cursor out from under a click.
+        held = qd.issue_claims(claims)
+        if holders(held) != holders(self.held):
+            self.held = held
+            self.render_issues(self.issues, self.issue_err)
+
     def render_prs(self, prs: list[dict], err: str | None) -> None:
         self.prs, self.pr_err = prs, err
         table = self.query_one("#prs", DataTable)
@@ -267,6 +300,39 @@ class Dash(App):
         if err:
             title += f" · gh: {qd.clip(err, 24)}"
         self.query_one("#t_prs", Static).update(title)
+
+    def render_issues(self, issues: list[dict], err: str | None) -> None:
+        """Open issues, free ones first, the held ones greyed and named.
+
+        A free issue is the one a seat should take next, so it is what this
+        panel is for: the ⚒ on its row starts /fix-issue on it.
+        """
+        self.issues, self.issue_err = issues, err
+        table = self.query_one("#issues", DataTable)
+        table.clear()
+        free = 0
+        for issue in qd.sort_issues(issues, self.held):
+            number = issue.get("number")
+            claim = self.held.get(number)
+            holder = (claim.get("holder") or "?") if claim else None
+            free += holder is None
+            key = f"issue:{number}"
+            self.rows[key] = issue
+            table.add_row(
+                Text("·" if holder else "○", style="grey50" if holder else "green"),
+                Text("⚒", style="grey50" if holder else "bold cyan"),
+                Text(f"#{number}", style="bold grey70"),
+                Text(qd.clip(issue.get("title"), 44),
+                     style="grey50" if holder else "white"),
+                Text(qd.clip(holder.split("/", 1)[-1], 13) if holder
+                     else qd.ago(issue.get("updatedAt")),
+                     style="yellow" if holder else "grey50"),
+                key=key,
+            )
+        title = f"ISSUES · {len(issues)}" + (f" · {free} free" if issues else "")
+        if err:
+            title += f" · gh: {qd.clip(err, 24)}"
+        self.query_one("#t_issues", Static).update(title)
 
     def say(self, text: str) -> None:
         # Kept on the app as well as in the widget: a Static does not hand back
@@ -300,6 +366,11 @@ class Dash(App):
                 self.panel_pr(record)
             else:
                 self.open_pr(record)
+        elif kind == "issue":
+            if column == self.FIX_COLUMN:
+                self.fix_issue(record)
+            else:
+                self.open_issue(record)
 
     # ---- launching work ---------------------------------------------------
 
@@ -320,6 +391,29 @@ class Dash(App):
             )
         else:
             self.run_in_window(f"panel-{number}", command)
+
+    def fix_issue(self, issue: dict) -> None:
+        """Kick off /fix-issue for an issue, the same way ⚖ starts a review.
+
+        The prompt names the holder when the board already has a claim on it:
+        taking a held issue is somebody else's work redone, and that is worth a
+        sentence before the click, not a rule against it — a lapsed session
+        leaves a claim standing that somebody should pick up.
+        """
+        number = issue.get("number")
+        command = f"{shlex.quote(self.agent_bin)} -- {shlex.quote(f'/fix-issue {number}')}"
+        holder = holders(self.held).get(number)
+        prompt = f"start /fix-issue on #{number}?"
+        if holder:
+            prompt += f"  (held by {holder})"
+        if self.confirm:
+            self.push_screen(
+                Confirm(prompt, command, self.repo),
+                lambda go: self.run_in_window(f"fix-{number}", command) if go else
+                self.say("cancelled"),
+            )
+        else:
+            self.run_in_window(f"fix-{number}", command)
 
     def run_in_window(self, name: str, command: str) -> None:
         """A detached tmux window running `command`, dropping to a shell after.
@@ -379,7 +473,12 @@ class Dash(App):
         return False
 
     def open_pr(self, pr: dict) -> None:
-        url = f"{qd.REPO_URL}/pull/{pr.get('number')}"
+        self.open_url(f"{qd.REPO_URL}/pull/{pr.get('number')}")
+
+    def open_issue(self, issue: dict) -> None:
+        self.open_url(f"{qd.REPO_URL}/issues/{issue.get('number')}")
+
+    def open_url(self, url: str) -> None:
         try:
             subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL)
@@ -392,6 +491,7 @@ class Dash(App):
     def action_refresh_now(self) -> None:
         self.refresh_board()
         self.refresh_prs()
+        self.refresh_issues()
         self.say("refreshing…")
 
     def action_panel_pr(self) -> None:
@@ -399,18 +499,33 @@ class Dash(App):
         if record:
             self.panel_pr(record)
 
-    def action_help(self) -> None:
-        self.say("o open on GitHub · p panel-review · r refresh · q quit · "
-                 "click ⚖ to review, a seat to jump to its pane")
+    def action_fix_issue(self) -> None:
+        record = self.selected_row("#issues")
+        if record:
+            self.fix_issue(record)
 
-    def selected_pr(self) -> dict | None:
-        table = self.query_one("#prs", DataTable)
+    def action_help(self) -> None:
+        self.say("o open on GitHub · p panel-review · f fix the selected issue · "
+                 "r refresh · q quit · click ⚖ to review, ⚒ to fix, "
+                 "a seat to jump to its pane")
+
+    def selected_row(self, table_id: str) -> dict | None:
+        table = self.query_one(table_id, DataTable)
         if not table.row_count:
             return None
         row = table.coordinate_to_cell_key(table.cursor_coordinate).row_key
         return self.rows.get(str(row.value))
 
+    def selected_pr(self) -> dict | None:
+        return self.selected_row("#prs")
+
     def action_open_pr(self) -> None:
+        """`o` opens whatever is selected in the table you are in."""
+        if getattr(self.focused, "id", None) == "issues":
+            record = self.selected_row("#issues")
+            if record:
+                self.open_issue(record)
+            return
         record = self.selected_pr()
         if record:
             self.open_pr(record)
