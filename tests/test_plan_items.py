@@ -1092,8 +1092,8 @@ def _mcp_client(recorder, **over):
         recorder.append(request)
         return httpx.Response(200, json={"ok": True})
 
-    http = httpx.Client(transport=httpx.MockTransport(handle), base_url="http://board")
-    return QuarterbackClient("http://board", "tok", http_client=http, **over)
+    return QuarterbackClient("http://board", "tok",
+                              transport=httpx.MockTransport(handle), **over)
 
 
 def test_the_mcp_client_stamps_the_session_on_every_plan_verb():
