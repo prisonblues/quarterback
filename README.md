@@ -374,7 +374,7 @@ full — including what was broken before it, which is the part no diff recovers
   CHANGELOG and made every release rewrite the same lines of the same two files, so two branches
   conflicted whether or not their numbers collided. Test files are named after their subject
   rather than their release, which was the one site git could not resolve by keeping both sides.
-- **vNEXT** — the pre-land gate becomes executable. `harness/loops/preland.py --pr <n>` answers
+- **v2.35** — the pre-land gate becomes executable. `harness/loops/preland.py --pr <n>` answers
   READY (exit 0) / RECONCILE (3, with the exact commands and the files they touch) / HOLD (2, with
   what is unresolved and who has to resolve it). It reads the panel round's own statements off the
   board rather than re-deriving them, so the day a PR merged over its own unread round — 8 P1s

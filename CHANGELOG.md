@@ -11,7 +11,7 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
-## vNEXT — the pre-land gate was prose in one skill and absent from the other
+## v2.35 — the pre-land gate was prose in one skill and absent from the other
 
 Harness only; the board is unchanged and still serves 2.33.0.
 
