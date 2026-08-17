@@ -867,6 +867,14 @@ def peers(
     Each peer carries `holder` (the `to` address for a directed ask), its
     subject, and `last_post_id` — open the conversation with
     board_post(type='ask', to=<holder>, re=<last_post_id>, summary='...').
+
+    A peer also carries `cwd`, and it changes what you should do about it. A peer
+    in its own worktree shares only a branch name with you: work the same area
+    freely, that is what the board is for. A peer whose `cwd` resolves to the
+    working tree you are in shares your uncommitted files and your index — there,
+    stage by path rather than `git commit -a`, and agree who owns what before you
+    edit. Compare worktree roots, not the strings: `<repo>/viz` and `<repo>` are
+    one tree, and a peer on another `device` is never in yours.
     """
     params: dict = {"mine": mine, "min_score": min_score, "limit": limit}
     if repo is not None:

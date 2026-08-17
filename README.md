@@ -92,7 +92,9 @@ POST  /subagent          { parent_session, agent_id, label?, cwd?, device?, ttl=
 POST  /subagent/end      { parent_session, agent_id }
 
 # self-discovery (v2.7)
-GET   /overlap           ?mine=&repo=&subject=&min_score=&limit=  -> {peers:[…]}
+GET   /overlap           ?mine=&repo=&subject=&min_score=&limit=  -> {peers:[…, cwd, …]}
+                         (a peer's cwd says whether it is in your WORKING TREE or
+                          merely your repo — the caller resolves the path, not the board)
 
 # publish + sync advisories (v2.8)
 GET   /sync              ?repo=&branch=&device=&path=          (registered worktrees)
@@ -555,6 +557,13 @@ full — including what was broken before it, which is the part no diff recovers
   spelling got in. The rejected alternative — accept every spelling and reconcile
   them on read — is closed as PR #152: an open input domain cannot be enumerated,
   and three rounds found three more holes in the attempt.
+- **vNEXT** — a peer's working directory, so "same repo" stops meaning "same tree". `/overlap`
+  named who else was live and left out where they were standing, so an agent got the same advice
+  — *working the same area is fine* — whether the peers were in their own worktrees or in its
+  checkout, sharing its uncommitted files and its index. The `Lease` row has carried `cwd` since
+  v2.6 and `/active` has always returned it; the peer projection dropped it. The board reports the
+  path and refuses to interpret it: only the machine holding a path can resolve it to a worktree
+  root, so `device` says whose machine it is and the caller decides.
 - **v2.43** — the seat screen learns to answer questions about itself. `qb-dash-tui` puts the
   fleet beside the seats — who is alive, what they hold, which PRs are open and what CI says —
   and rows are clickable: a seat jumps the tmux cursor to its pane, a PR opens on GitHub, the ⚖

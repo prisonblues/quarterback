@@ -14,8 +14,13 @@ from .conftest import DESKTOP, LAPTOP, SERVER
 REPO = "v27repo"
 
 
-def _lease_body(session: str, title: str, recap: str = "", repo: str = REPO) -> dict:
-    return {"session": session, "device": "d", "repo": repo, "title": title, "recap": recap}
+def _lease_body(
+    session: str, title: str, recap: str = "", repo: str = REPO, cwd: str | None = None
+) -> dict:
+    body = {"session": session, "device": "d", "repo": repo, "title": title, "recap": recap}
+    if cwd is not None:
+        body["cwd"] = cwd
+    return body
 
 
 # ---- overlap scorer (pure) --------------------------------------------------
@@ -134,6 +139,64 @@ async def test_overlap_finds_same_problem_peer_and_threads_last_post(client):
     assert peers["o-server"]["score"] > 0
     assert peers["o-server"]["last_post_id"] == pid
     assert peers["o-server"]["holder"] == "server"  # the `to` address for a directed ask
+
+
+async def test_overlap_reports_each_peer_cwd(client):
+    # Same repo, two different checkouts, and the advice differs: a peer in its
+    # own worktree shares a branch name, a peer in YOUR tree shares your index.
+    # The caller can only tell them apart if the path comes back.
+    tree = "/src/shared"
+    await client.post(
+        "/lease",
+        json=_lease_body("c-laptop", "annex geometry", repo="cwdrepo", cwd=tree),
+        headers=LAPTOP,
+    )
+    await client.post(
+        "/lease",
+        json=_lease_body("c-server", "annex geometry clashes", repo="cwdrepo", cwd=tree),
+        headers=SERVER,
+    )
+    await client.post(
+        "/lease",
+        json=_lease_body(
+            "c-desktop", "annex geometry review", repo="cwdrepo", cwd="/src/shared-wt-2"
+        ),
+        headers=DESKTOP,
+    )
+
+    res = (
+        await client.get(
+            "/overlap",
+            params={"mine": "c-laptop", "repo": "cwdrepo", "subject": "annex geometry"},
+            headers=LAPTOP,
+        )
+    ).json()
+    peers = {p["session"]: p for p in res["peers"]}
+    assert peers["c-server"]["cwd"] == tree  # my tree: uncommitted files shared
+    assert peers["c-desktop"]["cwd"] == "/src/shared-wt-2"  # own worktree: free to work
+
+
+async def test_overlap_peer_cwd_is_null_when_the_lease_never_sent_one(client):
+    # A lease may carry no cwd at all (a scripted or non-git session). The field
+    # must still be present and null rather than absent, so a caller can tell
+    # "not in your tree" from "the server does not report this".
+    await client.post(
+        "/lease", json=_lease_body("n-laptop", "cwdless probe", repo="nocwdrepo"), headers=LAPTOP
+    )
+    await client.post(
+        "/lease", json=_lease_body("n-server", "cwdless probe", repo="nocwdrepo"), headers=SERVER
+    )
+
+    res = (
+        await client.get(
+            "/overlap",
+            params={"mine": "n-laptop", "repo": "nocwdrepo", "subject": "cwdless probe"},
+            headers=LAPTOP,
+        )
+    ).json()
+    peer = next(p for p in res["peers"] if p["session"] == "n-server")
+    assert "cwd" in peer
+    assert peer["cwd"] is None
 
 
 async def test_directed_ask_inbox_by_to_and_type(client):

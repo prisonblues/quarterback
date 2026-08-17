@@ -271,6 +271,19 @@ async def find_overlap(
     ``subject`` present ⇒ rank by overlap and drop peers below ``min_score``.
     ``subject`` absent ⇒ every same-repo peer is returned (repo alone is the
     signal), score null.
+
+    **Same repo is not the same working tree, and the difference is the advice.**
+    A peer in its own worktree shares nothing with you but a branch name; a peer
+    in *your* checkout shares your uncommitted files and your index, where one
+    ``git commit -a`` sweeps up their half-finished work. So each peer carries its
+    ``cwd`` — the same field ``/active`` has always returned — and the caller
+    decides.
+
+    The decision is deliberately not made here. Resolving a path to a worktree
+    root needs the filesystem that path is on, and this process does not have it:
+    ``/home/rich/source/65lowther/viz`` and ``/home/rich/source/65lowther`` are
+    one tree, and only the machine holding them can say so. The server reports the
+    path; a caller on that machine (``device`` says which) resolves it.
     """
     now = _utcnow()
     lstmt = select(Lease).where(
@@ -309,6 +322,7 @@ async def find_overlap(
             "session": lease.session,
             "holder": lease.holder,
             "device": lease.device,
+            "cwd": lease.cwd,
             "repo": lease.repo,
             "branch": lease.branch,
             "title": lease.title,

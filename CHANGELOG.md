@@ -11,6 +11,26 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
+## vNEXT — a peer's working directory, so "same repo" stops meaning "same tree"
+
+`/overlap` told an agent who else was live in its repo and left out where they
+were standing. Every peer therefore read the same, and so did the advice built on
+it: *working the same area is fine — that is what the board is for.* That is
+right for three agents in three worktrees and wrong for three agents in one
+checkout, where the same area means the same uncommitted files and the same
+index, and one `git commit -a` sweeps up everyone's half-finished work.
+
+It was not a missing capability. `/active` has returned `cwd` since v2.6 and the
+`Lease` row has always carried it — `/overlap`'s projection simply dropped it on
+the floor, so the endpoint an agent consults *about a specific task* knew less
+than the one it consults about a directory.
+
+Peers now carry `cwd`. The board deliberately does not decide from it: resolving
+a path to a worktree root needs the filesystem that path is on, and the board
+does not have it — `…/65lowther/viz` and `…/65lowther` are one tree, and only the
+machine holding them can say so. The board reports the path, `device` says whose
+machine it is on, and the caller resolves it there.
+
 ## v2.43 — the fleet at a glance, and one click to act on it
 
 The seat screen could show you N agents working and tell you nothing about them.
