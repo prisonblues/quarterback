@@ -892,9 +892,9 @@ def test_the_reader_is_not_silently_finding_nothing():
     assert _paths_this_suite_reads()
 
 
-#: The shapes the shape guard exists to refuse, one snippet each. The five named in
-#: `_repo_root_uses_the_reader_cannot_follow`'s docstring were measured rather than supposed:
-#: each reads a repo-root file while leaving `_paths_this_suite_reads` with nothing to report.
+#: The shapes the shape guard exists to refuse, one snippet each. Measured rather than
+#: supposed: every one of them reads a repo-root file while leaving `_paths_this_suite_reads`
+#: with nothing to report, so the flake enumeration never hears about the file.
 _SHAPES_THE_READER_CANNOT_FOLLOW = {
     "joinpath": 'REPO_ROOT.joinpath("CHANGELOG.md").read_text()',
     "Path(REPO_ROOT, ...)": 'Path(REPO_ROOT, "CHANGELOG.md").read_text()',
@@ -993,6 +993,7 @@ def test_the_region_reader_takes_the_whole_check_and_stops_at_its_end():
 
 
 def test_the_region_reader_says_so_when_the_check_is_not_there():
+    """A renamed check, which is the whole reason the name is a constant here."""
     with pytest.raises(AssertionError, match="0 lines defining"):
         _flake_check_region("        loops-tests = pkgs.runCommand \"a\" { } ''\n        '';\n")
 
