@@ -81,7 +81,14 @@ def screen(tmp_path):
     # It did exactly that on this machine, taking a live seat screen with it.
     socket_dir = tempfile.mkdtemp(prefix="qbt-", dir="/tmp")
     env = {
-        **os.environ,
+        **{k: v for k, v in os.environ.items() if k not in ("TMUX", "TMUX_PANE")},
+        # $TMUX BEATS $TMUX_TMPDIR, and that is the whole bug. Inside a tmux pane
+        # $TMUX names the server the client is attached to, so every tmux call
+        # below reaches THAT server no matter where TMUX_TMPDIR points — the
+        # suite creates its sessions on it and then tears it down. Measured: a
+        # seat ran `pytest harness/tests` inside the screen it was sitting in and
+        # killed the server hosting it, with TMUX_TMPDIR correctly set the whole
+        # time. Unset both, so a run from inside tmux is a run outside it.
         "HOME": str(home),
         "XDG_CONFIG_HOME": str(home / ".config"),
         "PATH": f"{stub_dir}:{os.environ['PATH']}",
@@ -108,6 +115,7 @@ def screen(tmp_path):
         # server — and pass while doing it. Fail here instead, before the
         # teardown touches anything.
         if done.returncode == 0:
+            assert "TMUX" not in env, "a test that inherits $TMUX drives the caller's server"
             assert (Path(socket_dir) / f"tmux-{os.getuid()}").exists(), (
                 f"tmux did not use TMUX_TMPDIR={socket_dir}; it is on the default "
                 "socket and this suite is now driving somebody else's server"
