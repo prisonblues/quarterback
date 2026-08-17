@@ -227,6 +227,75 @@ with these overrides:
   Re-briefing it with round 1's list has it re-examine work already done and
   buries the new finding — which is the one the round existed to catch.
 
+## 4b. Record what actually happened to each finding
+
+Once the fixer has pushed, say what became of every finding it was given. This is
+the half the judge cannot know: it ruled at review time with no more access to
+the answer than the reviewer it was ruling on, so without this the board scores a
+confident wrong finding exactly like a real one. On PR #64 three of six
+judge-confirmed P2s were plainly wrong — the `installPhase` it said enumerated
+three scripts does `install -m 0755 bin/*` and globs — and they are still in the
+board as confirmed.
+
+**`qb record-outcome` ships in nix-fleet and is not in force until a
+home-manager rebuild** (it is nix-fleet PR #19). Until then the verb exits 2 with
+a usage line; record the outcomes once it lands rather than dropping them, and
+say in the relay that they are outstanding — an outcome nobody records is the
+gap this whole feature exists to close.
+
+```bash
+# the keys, beside what each finding actually was
+jq -r '.to_fix[] | "\(.key)\t\(.severity)\t\(.synthesis)"' r<r>.json
+
+cat <<'JSON' | qb record-outcome
+{"repo": "<owner/name>", "pr": <pr>, "outcomes": [
+  {"key": "<key of a finding the fixer resolved>", "outcome": "fixed"},
+  {"key": "<key of one that was not a defect>", "outcome": "refuted",
+   "note": "installPhase does `install -m 0755 bin/*` — it globs, the script IS installed"},
+  {"key": "<key of one left for later>", "outcome": "deferred",
+   "deferred_to": "prisonblues/quarterback#132"}
+]}
+JSON
+```
+
+A key is a 16-character hex digest, and it is the same identity the board chains
+observations by — so an outcome recorded now attaches to every round that raised
+the defect, including the ones still to come. (Substituted rather than shown
+inline because a literal one reads as an API key to every secret scanner,
+`gitleaks` on this repo's pre-commit hook included.)
+
+One of four per finding:
+
+- **`fixed`** — the fixer changed the code and the finding is answered.
+- **`refuted`** — it was not a defect. **Requires a `note`, and the note is the
+  point**: you are already writing the refutation into the PR comment and the fix
+  commit, in prose nothing can count. A bare `refuted` is the same
+  confident-assertion-with-nothing-behind-it the release exists to measure.
+- **`deferred`** — real, not now. Put where it went in `deferred_to`.
+- **`superseded`** — a later finding replaced it; name that finding's key in
+  `superseded_by`, which is **required** for the same reason a note is required
+  for a refutation: without it the row records "replaced by something".
+
+**Do not mark your own findings `refuted` unattended.** That is a self-grading
+loop and #40's constraint applies for the same reason. The board cannot tell a
+fixer from a reviewer, so it does not refuse — it records `set_by` from your
+token, marks the row unattested, names it back in the response, and `/panel`
+shows the split. When a human has confirmed the refutation, send `attested_by`;
+when one has not, record it anyway (an unattested refutation on the board beats
+one in a comment nothing reads) and say so in the relay.
+
+**`attested_by` is a claim you are making, not a signature the board checked** —
+it is free text in your own request, stored beside your identity and rendered as
+"you claim signoff by X". Sending it for a human who did not actually confirm is
+the one way to corrupt the number this whole feature exists to produce.
+
+Re-reporting is safe and every edit is visible: a repeat FILLS an empty field,
+rewriting a stored one counts as a revision and comes back in `amended`, an
+explicit `null` clears a field (how you retract a mistaken attestation), and a
+changed answer keeps what it changed from. The status code says which happened —
+201 created, 200 updated, 422 when nothing was accepted — so `qb`'s exit status
+is worth reading rather than assuming.
+
 ## 5. Re-review the fix commit — the round that used to be skipped
 
 Once the fixer has **pushed**, run the panel again over the new commit:
@@ -324,4 +393,29 @@ Then the part that is new, and is the point of running more than one round:
 
 ## 7. Merging (only if the user asks)
 
-`gh pr merge --merge --delete-branch` — preserve commits; never squash.
+Run the gate first. This step used to be one line with nothing in front of it,
+and the PR that exposed that (#131) was merged on `mergeable` + CI-green over its
+own panel round — 8 P1s and 12 P2s outstanding at the moment it landed, on
+`main`, for three hours, two of them auth-shaped.
+
+```bash
+python3 ~/.claude/loops/preland.py --pr <pr>
+```
+
+If that path does not exist, the box's `~/.claude/loops` predates the script — run
+`python3 harness/loops/preland.py --pr <pr> --repo .` from a checkout instead. A
+missing gate is not a passed one.
+
+- **HOLD (exit 2)** — do not merge, whatever was asked for. Show the user
+  `reasons` and let them decide with them in front of them; someone asking for a
+  merge is asking for the merge they think they are getting.
+- **RECONCILE (exit 3)** — mechanical work is outstanding and this skill does not
+  do it. `/fix-and-land` §4 does, or a human does.
+- **READY (exit 0)** — `gh pr merge --merge --delete-branch`; preserve commits,
+  never squash.
+
+**The rounds you just ran are an input to that verdict, not a substitute for it.**
+preland reads the round the panel *recorded on the board*, so a round that never
+got there — no `qb` on this host, a board outage, `--no-record` — reads as never
+reviewed and HOLDs. That is deliberate: a review nobody can point to afterwards
+is not evidence the review happened.

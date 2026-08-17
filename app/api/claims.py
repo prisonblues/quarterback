@@ -131,15 +131,34 @@ def may_mutate(claim: ResourceLease, holder: str, session_id: str | None) -> boo
     authorised by machine anyway. A co-tenant could silently renumber a branch
     that had already written its version into eight files.
 
-    So the rule now follows the kind rather than the table. The machine is
-    necessary throughout; for a release claim that named a session, that session
-    is necessary too. A release claim with no session falls back to the machine,
-    because there is nothing finer to check and refusing outright would strand
-    claims taken by callers that sent none.
+    **That fix named one kind, and the premise was never about kinds (#142).**
+    The rule above read ``claim.kind == "release" and claim.session``, so every
+    other kind kept the machine-only authorisation it had just been argued out
+    of. On a one-box fleet — which is what this fleet is — a co-tenant claiming
+    a key another agent holds got ``renewed: true`` rather than a 409: a
+    collision with a green light on it, which is worse than no claim at all
+    because it reads as authoritative. Measured on 2026-08-16: three agents
+    claimed overlapping work inside 56 seconds and a human resolved it by
+    reading timestamps off the board.
+
+    **Every kind in THIS table is exclusive work**, which is what makes the
+    general rule safe rather than merely tidier. ``same_machine`` is right for a
+    session lease — an agent recovering from a restart must reclaim its own —
+    and session leases are a different table with their own checks in
+    ``app/api/leases.py``; nothing here governs them. So there is no kind left
+    for which the machine is the right owner, and no opt-out list is needed.
+    (#142 proposed one. Reading the code said it was unnecessary, which is the
+    cheaper answer: an opt-out set is a second place to forget something.)
+
+    What survives from the release-only version, because it was right and is not
+    specific to releases: the machine is necessary throughout, and a claim that
+    named **no** session falls back to the machine — there is nothing finer to
+    check, and refusing outright would strand claims taken by callers that sent
+    none.
     """
     if not same_machine(claim.holder, holder):
         return False
-    if claim.kind == "release" and claim.session:
+    if claim.session:
         return clean_session(session_id) == claim.session
     return True
 
@@ -149,8 +168,9 @@ def _not_yours(claim: ResourceLease) -> HTTPException:
         "error": "not your claim",
         "kind": claim.kind, "key": claim.key,
         "held_by": claim.holder, "session": claim.session,
-        "hint": ("a release claim is owned by the session that took it, not by the "
-                 "machine: two agents on one box are two branches"),
+        "hint": ("a claim is owned by the session that took it, not by the machine: "
+                 "two agents on one box are two agents. Take a different key, or "
+                 "wait for this one to lapse — its holder and expiry are above"),
     })
 
 
@@ -335,9 +355,11 @@ class ClaimIn(BaseModel):
 
 class ClaimRefIn(BaseModel):
     claim_id: uuid.UUID
-    #: Required in practice for a release claim that named one — see
-    #: :func:`may_mutate`. Ownership of a release number is the session's, not
-    #: the box's, because on this fleet two agents per box are two branches.
+    #: Required in practice for ANY claim that named one — see
+    #: :func:`may_mutate`. Ownership is the session's, not the box's, because on
+    #: this fleet two agents per box are two agents; the release-only reading of
+    #: this line was the #142 bug, and a comment that outlives its rule is how it
+    #: got there.
     session: str | None = Field(default=None, max_length=MAX_SESSION)
 
 

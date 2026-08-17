@@ -160,6 +160,12 @@ async def sync_status(
 
     # The caller asked about itself: answer about itself, not about the fleet.
     subject = [caller] if caller else states
+    on_branch = _on_branch(all_published, branch)
+    # Can we answer at all? Every verdict below is a comparison against the
+    # published line; with nothing on it there is nothing to compare against, and
+    # `stale: false` stops meaning "you're current" and starts meaning "we didn't
+    # look". Callers need those two apart — see the advice fallback below.
+    comparable = bool(on_branch)
     line = advice(repo, subject)
     if caller is None and not states and (device is not None or path is not None):
         # Scoped to a specific checkout that the board has never seen. Silence
@@ -169,14 +175,29 @@ async def sync_status(
             f"{repo}: this worktree isn't registered with the board, so staleness "
             f"can't be checked — run report_git, or pass `have`."
         )
+    elif line is None and not comparable and caller is not None and behind is None:
+        # Nothing published for this repo *and* the caller has no upstream to fall
+        # back on (detached, or a branch that has never been pushed). Both sources
+        # are absent, so the honest answer is "unknown", not silence.
+        #
+        # Deliberately narrow: with `behind` present we still hold the weak local
+        # signal and stay quiet, because this line reaches an agent through the
+        # hook's context injection on every session. A repo that will never run
+        # CI must not nag once a session forever — the case worth breaking
+        # silence for is the one where we hold no signal at all.
+        line = (
+            f"{repo}: nothing has been published to the board for this repo, and "
+            f"this checkout reports no upstream — staleness is unknown, not clear."
+        )
 
     return {
         "repo": repo,
         "branch": branch,
-        "published": _on_branch(all_published, branch),
+        "published": on_branch,
         "worktrees": states,
         "caller": caller,
         "registered": bool(states),
+        "comparable": comparable,
         "stale": any(s["stale"] for s in subject),
         "advice": line,
     }

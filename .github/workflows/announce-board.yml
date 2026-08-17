@@ -1,0 +1,78 @@
+name: Announce on the coordination board
+
+# Announce a pushed commit on the quarterback board so peers learn their checkout
+# went stale. The lifecycle hook covers a local `git push`; a PR merged on GitHub
+# is nobody's push, so without this the branch peers care about is the one never
+# announced.
+#
+# Lives in its own reusable workflow for two reasons, both of them bugs it fixes:
+#
+#  1. It used to be a step in the `deploy` job, which declares `needs:
+#     build-and-push`. A red build meant main moved and the board never heard —
+#     verified on b86ff0b (merge of #134), which is an ancestor of main and has no
+#     `published` post anywhere on the board because its image build failed.
+#     Announcing that main moved is not contingent on shipping an image.
+#
+#  2. It was copy-pasteable but never copied. quarterback was the only one of the
+#     fleet's repos that announced at all: nix-fleet has no CI whatsoever, lexray
+#     has four workflows and none of them announce. Every non-quarterback
+#     `published` on the board came from an agent that happened to push locally.
+#     A `workflow_call` turns enrolment into three lines in the caller.
+#
+# Called from another repo, the `github` context here is the *caller's*, so no
+# inputs are needed — just `secrets: inherit`.
+
+on:
+  workflow_call:
+    secrets:
+      QUARTERBACK_TOKEN:
+        required: false
+      QUARTERBACK_BASE_URL:
+        required: false
+
+jobs:
+  announce:
+    runs-on: ubuntu-latest
+    steps:
+      # continue-on-error so a board outage never fails someone's merge — but the
+      # step still goes RED and visible when the post doesn't land. The previous
+      # version wrapped the curl in `&& echo ok || echo failed`, which swallowed
+      # the exit code and left the step green whether or not anything was posted;
+      # a rotated token would have silently stopped every announcement with
+      # nothing anywhere saying so.
+      - name: Post the published commit
+        continue-on-error: true
+        env:
+          QUARTERBACK_TOKEN: ${{ secrets.QUARTERBACK_TOKEN }}
+          # Also a secret: the agent host is a private deployment, not a public API.
+          QUARTERBACK_BASE_URL: ${{ secrets.QUARTERBACK_BASE_URL }}
+          # Via env, never inlined into the script: a commit message is attacker-
+          # controlled text and `${{ }}` interpolation would make it executable.
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+          COMMIT_SHA: ${{ github.sha }}
+          BRANCH: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # The "skip when unconfigured" guard is inside the script, not a
+          # step-level `if:`: the `secrets` context is not available there, and
+          # referencing it fails the WHOLE workflow at validation time — no jobs,
+          # no build, no deploy, and a 0s "workflow file issue" run that says
+          # nothing about which line.
+          if [ -z "${QUARTERBACK_TOKEN:-}" ] || [ -z "${QUARTERBACK_BASE_URL:-}" ]; then
+            echo "board not configured; skipping"
+            exit 0
+          fi
+          # head_commit is absent on non-push events; fall back rather than post
+          # an empty summary.
+          summary=$(printf '%s' "${COMMIT_MESSAGE:-}" | head -1 | cut -c1-120)
+          [ -n "$summary" ] || summary="pushed ${COMMIT_SHA:0:7}"
+          body=$(jq -nc --arg s "$summary" --arg c "$COMMIT_SHA" --arg b "$BRANCH" --arg r "$REPO" \
+            '{type:"published", summary:$s,
+              refs:[{kind:"commit", value:$c, repo:$r},
+                    {kind:"repo", value:($r|split("/")|last)},
+                    {kind:"branch", value:$b}]}')
+          curl -sf --max-time 10 -X POST "${QUARTERBACK_BASE_URL%/}/post" \
+            -H "Authorization: Bearer $QUARTERBACK_TOKEN" \
+            -H "Content-Type: application/json" -d "$body"
+          echo "Announced ${COMMIT_SHA:0:7} on the board"

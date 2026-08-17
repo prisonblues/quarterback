@@ -7,6 +7,7 @@ from app.models.post import Post
 from app.models.resource_lease import ResourceLease
 from app.models.review import (
     ReviewFinding,
+    ReviewFindingOutcome,
     ReviewFindingReport,
     ReviewReviewer,
     ReviewRun,
@@ -25,6 +26,7 @@ __all__ = [
     "Post",
     "ResourceLease",
     "ReviewFinding",
+    "ReviewFindingOutcome",
     "ReviewFindingReport",
     "ReviewReviewer",
     "ReviewRun",
