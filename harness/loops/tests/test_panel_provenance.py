@@ -551,7 +551,7 @@ def test_a_skipped_payload_answers_the_provenance_keys(tmp_path):
 # whether `head_sha` reaches the payload, whether the fix range is taken between
 # the RIGHT two commits, whether a repeat is left unasked rather than attributed,
 # and — the one that actually shipped broken — whether the per-reviewer budgets
-# are looked up under a key that exists. `tests/test_v215.py` drives a full cycle
+# are looked up under a key that exists. `tests/test_round_coverage.py` drives a full cycle
 # already, but its double returns one `headRefOid` for every round, so the head
 # never moves, the range is empty by the guard, and every finding there is
 # `unknown`. That is correct behaviour and no cover at all for the path that does
@@ -740,7 +740,7 @@ def test_a_repeat_is_not_asked_rather_than_answered_unknown(monkeypatch, tmp_pat
 
 def test_an_unmoved_head_attributes_nothing(monkeypatch, tmp_path):
     """No fix pass ran between the rounds, so there is no range and nothing to
-    blame it for. This is the case `tests/test_v215.py`'s double happens to
+    blame it for. This is the case `tests/test_round_coverage.py`'s double happens to
     exercise, and it must degrade to `unknown` rather than to `missed` — and say
     that nothing landed, rather than implying GitHub refused something."""
     r1_path, _ = _panel_round(monkeypatch, tmp_path, 1,

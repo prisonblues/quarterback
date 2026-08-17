@@ -7,14 +7,11 @@ that number where it was, so the repo can be a version ahead of the service.
 Entries are newest first. Each one says what was broken or missing before it, because that is the
 part that isn't recoverable from the diff.
 
-> **v2.34–v2.36 are missing from this file on purpose.** Each was allocated to a branch by the
-> board's release allocator (`POST /release/claim`, v2.31) and lands in its own PR; the numbers are
-> never re-issued, so a gap here means "claimed elsewhere", not "an entry was lost". v2.37's own
-> number was reclaimed off a collision — see #150, where the allocator handed two branches 2.36
-> because it namespaces by the repo string it is given and `quarterback` and `prisonblues/quarterback`
-> are two spellings of one repo.
+A release in flight has no number. Write `## vNEXT — <title>` here, name no version anywhere, and
+run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
+you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
-## v2.37 — a finding's life ended at the judge, so the board scored confidence and called it correctness
+## vNEXT — a finding's life ended at the judge, so the board scored confidence and called it correctness
 
 `review_findings.verdict` is set once, at review time, by a master model with no more access to the
 answer than the reviewer it is ruling on. `GET /review/stats` then ranked reviewers on it. That was
@@ -93,6 +90,181 @@ SQLSTATE 23505: a CHECK or NOT NULL violation is deterministic, and retrying it 
 service as contention. Two writers *updating* one row raise nothing at all, so the batch's rows are
 selected `FOR UPDATE`; without that the second commit silently discarded the first's note or
 attestation, which is the same lost-write class v2.33 fixed in the claim table.
+
+## v2.36 — a claim was exclusive against other machines and shared with your own
+
+(2.34 and 2.35 are allocated to other branches and land separately — both were taken
+through `POST /release/claim`, as was this one, so the gap is a queue rather than a skip.)
+
+v2.31 built the claim table. Its round 1 established the rule in general terms — *two
+agents on one machine are two agents* — and v2.33 applied it to `kind == "release"` and
+nothing else. Every other kind kept the machine-only authorisation the argument had just
+removed.
+
+On a one-box fleet, which is what this fleet is, that meant a second agent claiming a key
+another agent already held was **not refused**. It got `renewed: true`, took over the row,
+and carried on. A collision with a green light on it — strictly worse than no claim,
+because a caller has no reason to doubt an affirmative answer.
+
+It is not theoretical. On 2026-08-16 a work broadcast went to the machine and three agents
+claimed overlapping issues within **56 seconds**; two of them wanted the same one. Nobody
+had called `POST /claim` at all — every "claim" that day was a board post, which is a
+message with no atomicity — and had they called it, it would have told all three yes.
+
+The rule now follows exclusivity rather than kind: **the machine is necessary throughout,
+and a claim that named a session belongs to that session.** No opt-out list, because every
+kind in this table is exclusive work — session leases are a different table with their own
+checks in `app/api/leases.py`, and that is the one place `same_machine` alone is right (an
+agent recovering from a restart must reclaim its own). #142 proposed an opt-out set;
+reading the code said it was unnecessary, and an opt-out set is a second place to forget
+something.
+
+Two behaviours are deliberately unchanged, both kept from the release-only version because
+neither was ever release-specific: a claim that named **no** session still falls back to
+the machine — there is nothing finer to check, and refusing would strand claims taken by
+callers that sent none — and the machine is still checked **first**, so a session id is not
+a bearer token that anyone who read a board post can replay.
+
+## v2.35 — the pre-land gate was prose in one skill and absent from the other
+
+Harness only; the board is unchanged and still serves 2.33.0.
+
+The mechanical checks a merge has to pass existed twice, in two forms, and neither was executable.
+`/fix-and-land` §4 was about fifty lines of English describing a pre-land gate — reconcile the
+migration graph, act on the reported action, re-verify a single head, run the cache-version guard,
+push what that produced, re-check CI because the push staled it. `/panel-review-pr` §7 was one line,
+`gh pr merge --merge --delete-branch`, with nothing in front of it at all. The same job, one skill
+doing it thoroughly in English and the other not doing it.
+
+Prose in two files drifts. It has no exit code, no test, and no way to answer *did the gate actually
+run* after the fact — and a model reading it is invited to re-derive a decision it should be
+executing. On 2026-08-16 PR #131 was merged on `mergeable` + CI-green over its own panel round, which
+had 8 P1s and 12 P2s outstanding, three of them auth-shaped; `main` shipped them for about three
+hours. The agent that merged it had written up that exact confusion an hour earlier — *"three PRs
+were MERGEABLE and CI-green today and only one was actually ready"* — and had recorded #131 as
+blocked in its own morning survey. That is not a discipline gap, and it is not answerable with "be
+more careful".
+
+`harness/loops/preland.py --pr <n>` is the verdict, on the same terms as `round_stop`: mechanical,
+and the caller does not substitute its own judgement for it. **READY** (exit 0), **RECONCILE**
+(exit 3, with the exact commands and the files they touch), or **HOLD** (exit 2, with what is
+unresolved and who has to resolve it), plus `--json` and a per-check audit trail. The codes are
+`migration_reconcile.py`'s, so the two tools never mean different things by the same number.
+
+**No new data was needed** — the verdict is a query. Every clause reads a field the panel already
+wrote about its own round (`head_sha`, `stopped`, `confirmed`, `sonar_gate`, `stop_confident`) and
+`GET /reviews?repo=&pr=` already returned all of it. #131 was HOLD on two independent counts and
+neither required judgement. The `head_sha` clause is v2.29's stamp finding its first real consumer:
+without it, a review of an earlier commit reads as a review of this one.
+
+Three properties are the reason this is a script and not tidier prose, and each is a lesson this
+repo already paid for:
+
+- **Never gate on a proxy.** Not "a payload exists", not "the job exited 0". #62 spent three rounds
+  replacing one proxy for "the review happened" with another — the exit code, then the push, then
+  the payload artefact — and this is built to have no fourth.
+- **Absent never reads as clean.** A PR the panel never saw is a HOLD, not a pass for want of an
+  objection. Repo-local guardrails *are* capability-detected — a repo without
+  `scripts/migration_reconcile.py` skips that check silently, which is what lets one gate serve
+  several repos with no per-repo branch in the skill — but an unreadable *board* is the opposite
+  case: the invariant exists and cannot be seen. That knowingly narrows #59's "the local path stays
+  first-class" for `/fix-and-land`, and the off-switch is one line of `.harness-rules`
+  (`"preland": {"disabled_checks": ["review"]}`), quoted verbatim in the refusal so the first person
+  to hit it does not read "the board is down" as "the tool is broken". A check turned off is still
+  *reported*, as `skipped-absent` / `skipped-disabled` / `skipped-flag`; a payload must never read
+  clean by omission. The same rule settled five other questions the same way, each of which had
+  an easier answer that was wrong: a PR with **no CI checks at all** HOLDs rather than warning; a
+  round that recorded no finding count HOLDs, because unknown is not zero; a `git status` that
+  could not be *read* is not a clean tree; a fetch of `origin/<base>` that failed HOLDs the two
+  guardrails that compare against it; and a status `verdict_of` does not recognise HOLDs too — a
+  merge gate's default branch has to be the closed one.
+- **A branch cannot switch off the guardrail reading it.** Capability detection looks at the
+  branch's tree, so a diff that deletes `scripts/migration_reconcile.py` would hand itself
+  `skipped-absent`. An absence now only counts as a skip when the base does not have the script
+  either.
+- **`stop_confident: false` is a warning, not a hold.** Two permanently-absent reviewer seats on a
+  headless box would otherwise make a green verdict unreachable — the noise-for-signal trade
+  `.harness-rules` already argues against for `coverage_veto`. The vetoes print with it.
+
+It also reads `kind=merge` claims and holds when another agent has the branch. v2.31 shipped that
+primitive and nothing had ever read it — on the same day two agents merged at once. It **reads**
+the claim and does not take one: a verdict that mutates cannot run as a CI check, cannot be re-run
+to verify itself, and cannot be asked twice by a loop that wants to know whether its own fix worked.
+Taking it across a land belongs to whatever does the merging.
+
+Both skills now call it and act on the verdict. `lander.py`'s CI-rollup reader moved to
+`harness_rules.py` so the two callers share one answer to "is CI green" rather than growing a second
+that disagrees — which is the failure this release is about, one level down.
+
+**What it is not.** Advisory. A script an agent chooses to run cannot stop a human merging in the UI
+or a loop that skips the step; what would actually block a merge is a required status check on a
+protected branch, and `main` has no protection at all today. A CI job doing that must pass
+`--skip ci`, because such a job is itself one of the checks `ci` reads and would otherwise gate on
+its own pending status.
+
+## v2.34 — a branch stops guessing which release it will be
+
+Every release rewrote the same lines of the same two files, so two open branches conflicted on
+`CHANGELOG.md` and `README.md` whether or not their numbers collided. Landing four PRs in one
+morning produced three hand-resolved prose conflicts, and PR #90 was renumbered three times
+(v2.23 → v2.25 → v2.28) without one line of its behaviour changing.
+
+**The routine conflict was camouflage for the rare real one.** #90's merge carried four conflicts:
+three prose files where "keep both sides" is always right, and `panel.py`, where it was not — #117
+had made `--round` a sentinel while #90 still passed `args.round_no` straight through, so the
+reflex the other three trained would have passed `None` into a signature that says `int`. It merged
+clean either way; only reading it caught it. A conflict resolved by reflex three times a day trains
+the reflex, and the volume of routine is what makes the camouflage work.
+
+**The number is now stamped at land, not chosen at write.** A branch writes `## vNEXT` and
+`- **vNEXT** — …`; `scripts/release_stamp.py` reads the highest heading in the CHANGELOG *at the
+ref being merged into*, adds one, and writes it into every heading and bold run across all tracked
+markdown — so `harness/loops/README.md` is stamped by the same pass rather than being the file
+somebody forgets. `pyproject.toml` and `app/main.py` move with it, but only when the branch changed
+`app/` or `migrations/`, because most releases here are harness-side and correctly leave the served
+version alone; the inference is always reported and `--serve`/`--no-serve` override it. `--major` is
+the one thing no ref can answer, so it is a flag rather than an inference. Placeholders inside code
+spans are documentation of the mechanism and are left alone; a placeholder written anywhere the
+stamper would *not* rewrite is a refusal, not a shrug.
+
+**Two branches can still stamp the same number, and the tool's job is to make that impossible to
+miss rather than impossible.** Once `apply` has run the placeholder is gone, so there is no
+automatic re-stamp — what there is instead is detection of both shapes the collision takes: a
+release number declared twice (what "keep both sides" leaves behind, and a perfectly clean merge
+otherwise), and a branch carrying a number it ADDED which already exists at the base. `preflight`
+and `apply` refuse on both. `check` refuses on the first only, over CHANGELOG headings and README
+bullets alike, because it deliberately takes no base ref — the guard runs on an integration branch
+that may have no upstream configured, and one that errored on a missing ref would report the same
+exit code as the defect it looks for. The message says the repair: put your entry back to
+`## vNEXT` and run `apply` again. Two tokens, because nothing else on the branch was ever written
+in terms of the number.
+
+Whether a number was *added* by the branch is asked of the fork point rather than of the heading
+text. Text equality is wrong in both directions: two branches that both wrote a boilerplate title
+share a number and read as no collision, while fixing a typo in an entry that shipped last month
+reads as one.
+
+This is not a second allocator, and #46/#99's `POST /release/claim` is untouched — and is now
+described for what it is, an announcement rather than a reservation: the stamper does not read it,
+so a claim on v2.34 does not keep v2.34 free. The tenth collision happened an hour after that
+allocator shipped and worked: both branches simply did not call it. **A lock that has to be
+remembered is a lock that will be forgotten, and a placeholder cannot be got wrong** — that is the
+whole argument for doing it this way round.
+
+**README stops restating the CHANGELOG.** The "Latest release / Before it / Before that" paragraph
+re-wrote the previous four releases in fresh prose every time, which is why merging two branches
+meant *writing* a paragraph rather than keeping both sides of one. It is deleted; the oldest-first
+list, which appends one bullet, stays. The parenthetical naming this branch's served version goes
+with it — a fourth copy of a number the README's own argument says should be read from
+`GET /openapi.json`.
+
+**Test files are named after what they test.** Sixteen `tests/test_vNNN.py` became
+`test_resource_claims.py`, `test_finding_provenance.py`, `test_round_baseline.py` and so on. This
+was the site that failed hardest and was in none of the reports: two branches taking the same number
+both add `tests/test_v234.py`, which is the same PATH with different contents — not a text conflict
+git can resolve by keeping both sides, but a choice between two unrelated suites that happen to
+share a name. `harness/tests/test_release_numbers.py` now enforces the naming rule, tolerates the
+placeholder, and has dropped the two assertions about README prose that no longer exists.
 
 ## v2.33 — v2.31's claim table was right about INSERT and wrong about everything else
 

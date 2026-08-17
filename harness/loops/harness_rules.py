@@ -234,11 +234,32 @@ DEFAULTS: dict = {
         # migrations exist and it stops no-opping.
         "migrations_dir": "migrations/versions",
     },
+    "preland": {
+        # The pre-land verdict's only knob: check names preland.py must NOT run.
+        # Empty is the safe end — every guardrail it can detect, it runs.
+        #
+        # One list rather than a switch per check, because the checks are
+        # capability-detected already: a repo without `scripts/migration_reconcile.py`
+        # skips that one on its own, and needing a key to say so would put a
+        # per-repo branch back in the config that detection exists to remove.
+        # What this is for is the case detection CANNOT decide — a repo that is
+        # not enrolled on a board, where `review` would HOLD forever because the
+        # review state is unreadable rather than clean. That is a deliberate
+        # decision with a cost, so it is written down rather than inferred.
+        #
+        # A name here that no check answers to is a HARD ERROR, unlike every
+        # other unknown key in this file, which is warned about and dropped. The
+        # asymmetry is deliberate: a misspelled key elsewhere leaves a setting at
+        # its default, and the default is the safe end. A misspelled name HERE
+        # would leave a merge gate's check running while reading as configured
+        # off — or, worse, look like it turned one off and not have.
+        "disabled_checks": [],
+    },
 }
 
 # Blocks merged one level deep rather than replaced wholesale, so a repo can set
 # `reviewers.sonarqube` without having to restate claude and codex.
-_DEEP_BLOCKS = ("reviewers", "review_panel", "loops", "epic")
+_DEEP_BLOCKS = ("reviewers", "review_panel", "loops", "epic", "preland")
 
 # The documentation convention every rules file in the fleet leans on: a key
 # whose name starts with "_" is prose for whoever reads the file next, not a
@@ -536,6 +557,32 @@ def describe(cfg: dict) -> str:
     return (f"[{cfg['name']}] {cfg['github']} @ {cfg['default_branch']} — "
             f"rules: {cfg['_rules_from']}"
             + ("  (unattended)" if unattended() else ""))
+
+
+def check_status(pr: dict) -> str:
+    """Aggregate a PR's `statusCheckRollup` into green/red/pending/none.
+
+    Shared plumbing rather than lander.py's private helper, because preland.py
+    asks the same question for the same reason — "is CI green right now?" — and
+    two implementations of a merge gate's CI clause is precisely the drift #96
+    was filed about. `pending` is deliberately NOT `green`: a check that has not
+    reported is not a check that passed, and both callers refuse to merge on it.
+    """
+    rollup = pr.get("statusCheckRollup") or []
+    if not rollup:
+        return "none"
+    states = set()
+    for c in rollup:
+        # checks use 'conclusion'+'status'; statuses use 'state'
+        s = c.get("conclusion") or c.get("state") or c.get("status") or ""
+        states.add(s.upper())
+    if states & {"FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED"}:
+        return "red"
+    if states & {"PENDING", "QUEUED", "IN_PROGRESS", "EXPECTED", ""}:
+        return "pending"
+    if states <= {"SUCCESS", "NEUTRAL", "SKIPPED", "COMPLETED"}:
+        return "green"
+    return "pending"
 
 
 # ------------------------------------------------- shared CLI-failure plumbing
