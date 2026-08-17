@@ -214,13 +214,13 @@ jobs:
     # For anyone wiring up branch protection: unlike `stamped` below, this job
     # runs on pull_request as well as push, so it is safe to require.
     #
-    # Generous timeout, deliberately. Unlike the jobs above, most of the wall
-    # clock here is fetching a python, tmux, git, curl and jq closure from
-    # cache.nixos.org before a single test runs, and this repo publishes no
-    # binary cache of its own for the checks themselves. The suites inside are
-    # fast — worktree-tests spends about 31 seconds in pytest — so a run still
-    # going at half an hour is wedged, not slow.
-    timeout-minutes: 30
+    # Same fifteen minutes as the jobs above, and measured rather than guessed:
+    # the first run of this job took 1m04s in total on a cold runner — about 25
+    # seconds to install nix and fetch the closure from cache.nixos.org, and
+    # about 45 seconds to build all four checks, worktree-tests included. That
+    # fourteen times the headroom, so a run still going at fifteen minutes is
+    # wedged rather than slow, which is what a timeout is for.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
