@@ -74,7 +74,7 @@ set -uo pipefail
 # beside it, and the panel's board recording before that.
 
 SEAT_NAME_PREFIX="seat-"
-CLAUDE_BIN="${QB_SEAT_CLAUDE:-claude}"
+AGENT_BIN="${QB_SEAT_AGENT:-claude}"
 
 # The brief. Identical for every seat — that is the design, not an omission: the
 # moment one seat is told something another is not, there is a dispatcher again.
@@ -349,7 +349,7 @@ seat_marker_claim() {
 # file is an unrestricted shell script — everything it sets, it keeps — so
 # sourcing it here would let it replace QUARTERBACK_INSTANCE (leaving a seat
 # whose marker, dry-run output and refusals all still say seat-3 while the board
-# has been told something else), or REPO, or SEAT, or CLAUDE_BIN, or PATH, and
+# has been told something else), or REPO, or SEAT, or AGENT_BIN, or PATH, and
 # anything it EXPORTS is then inherited by the agent we exec. That is not a threat
 # model, it is just what "source a file" means, and it is avoidable for free.
 #
@@ -598,7 +598,7 @@ if [[ -n "$DRY_RUN" ]]; then
     fi
     printf 'cwd:      %s\n' "$REPO"
     printf 'instance: %s\n' "$QUARTERBACK_INSTANCE"
-    printf 'command:  %s' "$CLAUDE_BIN"
+    printf 'command:  %s' "$AGENT_BIN"
     # Guarded, because with nothing to print `printf ' %q' "$@"` still applies
     # the format once with the missing argument as the empty string, and shows a
     # `claude ''` that this would never really pass.
@@ -642,7 +642,7 @@ cd "$REPO" || exit 2
 # about the first thing anybody overrides it with while trying it out; without
 # the terminator that one is an option to the agent and never a brief at all.
 if [[ -n "$BRIEF" ]]; then
-    exec "$CLAUDE_BIN" "$@" -- "$BRIEF"
+    exec "$AGENT_BIN" "$@" -- "$BRIEF"
 else
-    exec "$CLAUDE_BIN" "$@"
+    exec "$AGENT_BIN" "$@"
 fi

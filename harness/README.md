@@ -365,7 +365,7 @@ per-branch database), assign work, or drive the agent past starting it.
 |---|---|---|
 | `QB_SEAT_REPO` | the pane's cwd | Where the seat works; the layout normally sets the cwd instead |
 | `QB_SEAT_BRIEF` | the built-in brief | Replaces it wholesale; empty means no brief at all |
-| `QB_SEAT_CLAUDE` | `claude` | The agent to start |
+| `QB_SEAT_AGENT` | `claude` | The agent to start |
 | `QB_SEAT_FORCE` | unset | Start anyway when this seat number looks already taken. Truthy values only (`1`, `yes`, `true`, `on`) — `QB_SEAT_FORCE=0` leaves the guard on |
 | `QUARTERBACK_BASE_URL`, `QUARTERBACK_TOKEN` / `QUARTERBACK_TOKEN_CMD` | from the config file | The board to register the name with |
 | `QUARTERBACK_CONFIG` | `$XDG_CONFIG_HOME/quarterback/config`, else `~/.config/quarterback/config` | Where those three are read from when the environment does not supply them. Sourced in a subshell, and only those three are read back out of it, so nothing else the file sets can reach the seat or the agent |

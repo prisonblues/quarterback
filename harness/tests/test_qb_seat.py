@@ -104,7 +104,7 @@ def run(repo, fake_bin, tmp_path, runtime_dir):
             "QUARTERBACK_INSTANCE",
             "QB_SEAT_REPO",
             "QB_SEAT_BRIEF",
-            "QB_SEAT_CLAUDE",
+            "QB_SEAT_AGENT",
             "QB_SEAT_LEAKED",
         ):
             environ.pop(leaked, None)
@@ -317,7 +317,7 @@ def test_qb_seat_claude_chooses_the_agent(run, agent, fake_bin, tmp_path):
     `claude`; getting it wrong starts the wrong binary rather than failing."""
     other_record = tmp_path / "other-agent.json"
     fake_bin("other-agent", _fake_agent_body(other_record))
-    assert run("1", env={"QB_SEAT_CLAUDE": "other-agent"}).returncode == 0
+    assert run("1", env={"QB_SEAT_AGENT": "other-agent"}).returncode == 0
     assert not agent.exists()
     assert json.loads(other_record.read_text())["instance"] == "seat-1"
 
