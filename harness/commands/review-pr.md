@@ -222,6 +222,22 @@ Commit: <sha> <subject>
 ```
 ---
 
+## 2b. Record what happened to each finding (when the findings came from a panel)
+
+If the findings you handed the fixer came from a recorded panel round — i.e. the
+board has them, with a `key` each — say what became of them, per the **4b**
+section of `panel-review-pr.md`. The `Resolution` column of the summary table
+above is exactly this information in prose: `fixed`, or `refuted` with the reason
+it was not a defect, or `deferred` with where it went.
+
+The one that matters is `refuted`. A judge-confirmed finding that turns out to be
+wrong is recorded nowhere today, so the leaderboard rewards a reviewer for being
+confident rather than for being right — and the refutation is already written in
+that table. `qb record-outcome` is the two lines that keep it.
+
+Findings you discovered yourself, with no board record behind them, have no key
+and nothing to record: this is for panel findings only.
+
 ## 3. Relay the result
 
 Show the user the sub-agent's summary table verbatim, then state plainly: the

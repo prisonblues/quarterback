@@ -284,8 +284,16 @@ require_qb_seat
 # variable in this process that no seat ever sees, and start the real agent while
 # reporting nothing wrong. Found exactly that way: a smoke test meant to run a
 # harmless stand-in launched two live agent sessions instead.
+#
+# This list is exactly the set qb-seat READS, and test_forwarded_knobs_are_all_read
+# pins it that way. Forwarding a name qb-seat does not read is the same silent
+# failure one layer along: the variable arrives in the pane, nothing consults it,
+# and the seat starts the real agent while reporting nothing wrong. That is how
+# QB_SEAT_AGENT_ARGS got here — qb-seat takes agent arguments positionally, so no
+# such variable was ever read — and how this list said QB_SEAT_AGENT while qb-seat
+# said QB_SEAT_CLAUDE, which is board finding 3632.
 seat_env=()
-for v in QB_SEAT_AGENT QB_SEAT_AGENT_ARGS QB_SEAT_BRIEF; do
+for v in QB_SEAT_AGENT QB_SEAT_BRIEF QB_SEAT_FORCE; do
   [ -n "${!v:-}" ] && seat_env+=(-e "$v=${!v}")
 done
 

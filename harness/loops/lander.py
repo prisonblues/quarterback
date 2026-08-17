@@ -25,8 +25,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from harness_rules import (  # noqa: E402
-    RepoNotFound, agent_failure, agent_gist, describe, resolve_repo, run_agent,
-    stderr_gist,
+    RepoNotFound, agent_failure, agent_gist, check_status, describe, resolve_repo,
+    run_agent, stderr_gist,
 )
 
 SECURITY_RE = re.compile(r"security|cve|rce|xss|vuln|advisory", re.I)
@@ -83,25 +83,6 @@ def classify(title: str, labels: list[str]) -> str:
             return "patch_minor"
         return "unknown"
     return "unknown"
-
-
-def check_status(pr: dict) -> str:
-    """Aggregate statusCheckRollup into green/red/pending/none."""
-    rollup = pr.get("statusCheckRollup") or []
-    if not rollup:
-        return "none"
-    states = set()
-    for c in rollup:
-        # checks use 'conclusion'+'status'; statuses use 'state'
-        s = c.get("conclusion") or c.get("state") or c.get("status") or ""
-        states.add(s.upper())
-    if states & {"FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED"}:
-        return "red"
-    if states & {"PENDING", "QUEUED", "IN_PROGRESS", "EXPECTED", ""}:
-        return "pending"
-    if states <= {"SUCCESS", "NEUTRAL", "SKIPPED", "COMPLETED"}:
-        return "green"
-    return "pending"
 
 
 def decide(klass: str, checks: str, policy: str) -> str:
