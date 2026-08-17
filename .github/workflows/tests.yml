@@ -198,6 +198,68 @@ jobs:
           cd mcp
           uv run --extra dev --extra tui --extra server pytest -q
 
+  flake:
+    name: flake checks
+    runs-on: ubuntu-latest
+    # The four jobs above and this one do NOT run the same thing, and that is the
+    # point rather than duplication (#179). They run `uv run pytest` against a
+    # normal checkout; the flake runs the same suites inside a sandbox that has
+    # only what `flake.nix` puts there. Each is blind where the other sees:
+    # `test_release_numbers.py` passes above and errored on missing files in the
+    # sandbox for a day (#163), and the qb-seats suite SKIPS above because the
+    # runner has no tmux while the sandbox installs it deliberately so it cannot.
+    # Until this job existed the flake's checks ran only when a human typed `nix
+    # build`, which is how a red `main` went a day without anyone noticing.
+    #
+    # For anyone wiring up branch protection: unlike `stamped` below, this job
+    # runs on pull_request as well as push, so it is safe to require.
+    #
+    # Generous timeout, deliberately. Unlike the jobs above, most of the wall
+    # clock here is fetching a python, tmux, git, curl and jq closure from
+    # cache.nixos.org before a single test runs, and this repo publishes no
+    # binary cache of its own for the checks themselves. The suites inside are
+    # fast — worktree-tests spends about 31 seconds in pytest — so a run still
+    # going at half an hour is wedged, not slow.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nix
+        uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      # DISCOVERED and not listed, and it FAILS when it finds nothing — the same
+      # rule as the harness job above, for a sharper reason: `nix flake check` on
+      # a flake whose checks have been removed exits 0. A job that only ran that
+      # would go green the day the checks disappear, which is precisely the
+      # failure this job exists to end. Naming them also puts the set in the log,
+      # so a reviewer can see a new check is actually being run rather than
+      # assume it: #163's `release-metadata-tests` was added because the old
+      # arrangement ran eight assertions that had never once been evaluated.
+      #
+      # The system is derived, not written down. A hardcoded x86_64-linux is
+      # wrong the day this moves to an arm runner, and the same lesson landed
+      # twice in this repo already (#148, #176).
+      - name: Name the checks
+        run: |
+          set -euo pipefail
+          system=$(nix eval --impure --raw --expr 'builtins.currentSystem')
+          names=$(nix eval ".#checks.$system" --apply 'cs: builtins.attrNames cs' --json)
+          count=$(jq 'length' <<<"$names")
+          if [[ "$count" -eq 0 ]]; then
+            echo "::error::flake.nix declares no checks for $system — they were removed, or this job is now a no-op reporting green."
+            exit 1
+          fi
+          printf 'running %d flake check(s) on %s: %s\n' "$count" "$system" "$(jq -r 'join(", ")' <<<"$names")"
+
+      # -L so the pytest output of a failing suite is in this log. Without it a
+      # red check reports `builder for '...drv' failed` and the assertion that
+      # actually broke is behind a `nix log` on a machine nobody has.
+      - name: nix flake check
+        run: nix flake check -L
+
   stamped:
     name: no unstamped release on main
     # `main` only, and that is the whole design rather than an optimisation. An
