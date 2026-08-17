@@ -28,6 +28,7 @@ from app.models.lease import Lease
 from app.models.post import Post
 from app.models.subagent import Subagent
 from app.overlap import overlap_score
+from app.schemas import SESSION_MUTED_TYPES
 
 router = APIRouter(tags=["coordination"])
 
@@ -296,7 +297,11 @@ async def find_overlap(
     for score, lease in scored[:limit]:
         last = await session.scalar(
             select(Post)
-            .where(Post.session == lease.session, Post.type != "presence")
+            # A peer's last *substantive* post — the one a reply threads onto.
+            # Same rule as a session lookup on /board: heartbeats are volume, a
+            # message is something a peer actually said. One definition, so the
+            # two cannot drift apart.
+            .where(Post.session == lease.session, Post.type.notin_(SESSION_MUTED_TYPES))
             .order_by(Post.id.desc())
             .limit(1)
         )

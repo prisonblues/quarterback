@@ -9,6 +9,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from pydantic import TypeAdapter
+
 from app.config import Settings, settings
 
 from . import dbtarget
@@ -29,8 +31,13 @@ def test_every_setting_but_the_database_is_pinned_by_conftest():
 
 
 def test_the_pinned_values_are_what_the_app_actually_reads():
+    # Compared through the field's own type rather than as strings: the
+    # environment only carries text, and a pinned "false" that the app reads as
+    # the boolean False is the pin working, not the pin failing.
     for name, value in PINNED_SETTINGS.items():
-        assert getattr(settings, name.lower()) == value
+        field = Settings.model_fields[name.lower()]
+        expected = TypeAdapter(field.annotation).validate_python(value)
+        assert getattr(settings, name.lower()) == expected
 
 
 def test_the_suites_fallback_the_apps_default_and_env_example_name_one_database():

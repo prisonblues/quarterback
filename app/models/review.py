@@ -520,6 +520,152 @@ class ReviewFindingReport(Base):
     )
 
 
+class ReviewFindingOutcome(Base):
+    """What actually happened to a defect after the judge ruled on it (v2.37).
+
+    A finding's life used to end at the judge. ``verdict`` is set once, at review
+    time, by a judge with no more access to the answer than the reviewer that
+    raised it — and then ``/review/stats`` ranked reviewers on it. On PR #64
+    three of six judge-confirmed P2s were simply wrong (``install -m 0755 bin/*``
+    does glob; ``CLAUDE_CODE_SESSION_ID`` is exported; line 34 *is* the last help
+    line), all three conditionals from a reviewer that had declared it could not
+    assess the condition. They sit in the board indistinguishable from the real
+    ones, so the leaderboard rewards a confident wrong finding — confidence is
+    what the judge can see and correctness is not.
+
+    This is the terminal state, set by whoever ACTED on the finding rather than
+    by whoever ruled on it. ``refuted`` is the one that pays for the feature, and
+    it is also the cheapest to capture: the refutation is already being written,
+    in the PR comment and the fix commit's message, in prose where nothing can
+    count it.
+
+    **Per DEFECT, not per observation** — one row per (repo, pr, finding_key),
+    which is why this is its own table rather than a column on
+    :class:`ReviewFinding`. A defect raised in rounds 2, 3 and 4 is three finding
+    rows and one thing that happened to it; a column would fan one refutation out
+    over however many rounds happened to raise it, and the number of rounds
+    correlates with exactly the PRs this measure is about. It also keeps the
+    finding rows immutable: what a round said is a fact about that round, and
+    later knowledge is a different fact with a different author.
+
+    ``set_by`` is the board identity that recorded it, taken from the token, and
+    is proof. ``attested_by`` is **not**: it is free text from the same request
+    that carried the outcome, so it records that the caller CLAIMS a named human
+    signed off. The board cannot authenticate a person, and an agent that wants
+    to write ``attested_by: "rich"`` can. #77 is explicit that an agent must not
+    mark its own findings ``refuted`` unattended — a self-grading loop, #40's
+    constraint for the same reason — and since this API cannot tell a fixer from a
+    reviewer, the claim is stored beside its claimant and published as a claim:
+    ``GET /review/stats`` splits the attested counts out and ``/panel`` renders
+    "X claims signoff by Y", never a signature.
+    """
+
+    __tablename__ = "review_finding_outcomes"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    #: Scoped the way ``finding_key`` is scoped — by (repo, pr) — because that is
+    #: what makes a key identify a defect at all. Not a foreign key to a run: the
+    #: outcome outlives any one round, and pinning it to the run that happened to
+    #: raise the defect first would delete the outcome with that run.
+    repo: Mapped[str] = mapped_column(Text, nullable=False)
+    pr: Mapped[int] = mapped_column(Integer, nullable=False)
+    finding_key: Mapped[str] = mapped_column(Text, nullable=False)
+
+    #: One of :data:`app.api.reviews.OUTCOMES` — fixed | refuted | deferred |
+    #: superseded. Constrained in the database as well as at ingest: this table
+    #: feeds a published precision figure, and an unknown value would silently
+    #: leave the numerator while still counting as coverage.
+    outcome: Mapped[str] = mapped_column(Text, nullable=False)
+    #: Why — required by the API for ``refuted`` and optional otherwise. A bare
+    #: `refuted` flag is a confident assertion with nothing behind it, which is
+    #: the failure this whole feature exists to measure, arriving one level up.
+    note: Mapped[str | None] = mapped_column(Text)
+    #: Where a ``deferred`` finding went: an issue ref. #66, #69, #72, #74 and the
+    #: backlogs after them park findings in a markdown list with no state at all,
+    #: and this is the state.
+    deferred_to: Mapped[str | None] = mapped_column(Text)
+    #: The ``finding_key`` that replaced this one, for ``superseded``. Kept apart
+    #: from ``deferred_to`` rather than sharing one "ref" column: two readings of
+    #: one field is how a tool ends up guessing which it was looking at.
+    superseded_by: Mapped[str | None] = mapped_column(Text)
+
+    #: The board identity that recorded this — an agent or a human at a terminal.
+    set_by: Mapped[str] = mapped_column(Text, nullable=False)
+    session: Mapped[str | None] = mapped_column(Text)
+    #: Who the recorder SAYS signed it off — a claim, not a signature; see the
+    #: class docstring. NULL = unattended, which is a fact reported rather than a
+    #: request refused: refusing it would leave the refutation exactly where it is
+    #: today, in prose nothing counts.
+    attested_by: Mapped[str | None] = mapped_column(Text)
+
+    #: How many times this record has CHANGED since it was first written — an
+    #: outcome replaced, or a stored field rewritten under an unchanged outcome.
+    #: Both, deliberately: a terminal state that moves is legitimate (a deferred
+    #: finding is later fixed) and a silent flip is not, and a refutation whose
+    #: NOTE is quietly rewritten improves an after-the-fact precision figure by
+    #: exactly the same route. ``prior_outcome`` covers only the first kind — the
+    #: answer this row used to give — so a non-zero ``revisions`` with an empty
+    #: ``prior_outcome`` is a record that was edited without the answer moving.
+    revisions: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    prior_outcome: Mapped[str | None] = mapped_column(Text)
+
+    ts: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        # One terminal outcome per defect. A second row for the same key would
+        # make "what happened to this?" a question with two answers, and every
+        # count over the table a double count.
+        #
+        # Its B-tree on (repo, pr, finding_key) is also the read path: the stats
+        # join matches all three columns and the chain view looks up by (repo,
+        # pr), which the leftmost prefix serves. No separate index — the same
+        # argument `ReviewRunFile` records for its own unique constraint.
+        UniqueConstraint("repo", "pr", "finding_key", name="uq_review_finding_outcome"),
+        CheckConstraint(
+            "outcome IN ('fixed', 'refuted', 'deferred', 'superseded')",
+            name="ck_review_finding_outcomes_vocabulary",
+        ),
+        # The evidence rule, at the boundary rather than only in the API. A bare
+        # `refuted` is a confident contradiction of the judge with nothing behind
+        # it, and it lands in a published precision figure — so an admin script,
+        # a backfill or a future write path must not be able to insert one either.
+        # NOT NULL rather than non-empty: the API already collapses whitespace to
+        # NULL, so the two agree, and a CHECK that has to reason about trimming
+        # would be a second opinion about what counts as a note.
+        # The two "the value must actually say something" rules, at the boundary
+        # rather than only in the API — for a backfill, an admin script, or the
+        # next write path. Three things each of them gets right:
+        #
+        # * the NOT NULL is not redundant beside the trim test. **A CHECK passes
+        #   when its expression evaluates to NULL**, so the trim alone would let a
+        #   null straight through — the exact row the rule exists to refuse.
+        # * `btrim` with an explicit character set, because single-argument
+        #   `btrim` strips ORDINARY SPACES ONLY: a note of one tab satisfied it.
+        # * vertical tab is spelled `\013` and NOT `\v`. Postgres' escape strings
+        #   do not define `\v`, and an undefined escape drops the backslash and
+        #   keeps the character — so `E'\v'` is the LETTER v (ascii 118, measured,
+        #   not read off a doc page). The set would have trimmed v's off both ends
+        #   and refused a note of "v" as empty: a rule about whitespace quietly
+        #   deciding a letter of the alphabet does not count as evidence.
+        # * they mirror the API's two required-field rules exactly, so a row this
+        #   service would refuse cannot arrive by another door.
+        CheckConstraint(
+            r"outcome <> 'refuted' OR (note IS NOT NULL "
+            r"AND btrim(note, E' \t\n\r\f\013') <> '')",
+            name="ck_review_finding_outcomes_refuted_note",
+        ),
+        CheckConstraint(
+            "outcome <> 'superseded' OR (superseded_by IS NOT NULL "
+            r"AND btrim(superseded_by, E' \t\n\r\f\013') <> '')",
+            name="ck_review_finding_outcomes_superseded_by",
+        ),
+        CheckConstraint("revisions >= 0", name="ck_review_finding_outcomes_revisions"),
+    )
+
+
 class ReviewRunFile(Base):
     """One path the reviewed PR touched, with that path's share of the churn.
 
