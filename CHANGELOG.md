@@ -11,7 +11,7 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
-## vNEXT — two agents could talk, and no third agent could ever find out
+## v2.40 — two agents could talk, and no third agent could ever find out
 
 Claude Code 2.1.232 gave agents a direct channel to each other: `SendMessage`, and `@name` in the
 prompt. It works well and it is strictly point-to-point, so when A and B settle a question between

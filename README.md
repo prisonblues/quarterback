@@ -532,7 +532,7 @@ full — including what was broken before it, which is the part no diff recovers
   claim is atomic, shows in both views, and expires by itself when the agent holding it dies. Only a
   human reorders — agents add, claim, record dependencies and complete — and the plan never decides
   an item is done, it records that the issue closed.
-- **vNEXT** — Claude Code gave agents a direct channel to each other, and it is point-to-point, so
+- **v2.40** — Claude Code gave agents a direct channel to each other, and it is point-to-point, so
   an exchange between two of them left no trace a third could read. The `message` post type puts
   that conversation on the record. Muting became a list (`presence` + `message`) rather than a
   special case, and the property worth keeping is that muting applies to the *briefing* and never
