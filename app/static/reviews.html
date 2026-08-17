@@ -676,7 +676,14 @@ async function renderHistory(box, repo, pr){
   // finished.
   const why = (h.stop_veto || []).length
     ? ` <span class="dim" title="${esc(h.stop_veto.join(" | "))}">(${h.stop_veto.length} veto)</span>` : "";
-  const ending = h.stopped === false
+  // More than one cycle in the window and there is no single ending to print —
+  // the API nulls the summary rather than letting the newest loop describe an
+  // older one. Said out loud instead of rendered as blank: an absent ending
+  // otherwise reads as "nothing recorded", which is a different thing from "two
+  // loops ran here and neither speaks for the other".
+  const ending = h.cycles > 1
+    ? ` · <span class="dim">${h.cycles} cycles in this window — no single stop state</span>`
+    : h.stopped === false
     ? ` · <span style="color:var(--warn)">not stopped: ${esc(h.stop_reason || "another round is due")}</span>`
     : h.stop_reason ? ` · stopped: ${esc(h.stop_reason)}${
         h.stop_confident === false

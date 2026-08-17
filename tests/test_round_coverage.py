@@ -387,6 +387,90 @@ async def test_one_cycles_re_review_is_not_credited_to_anothers_declaration(clie
     assert b1["rereview_flagged"] == 1 and b1["rereview_hit"] is None
 
 
+async def test_a_pr_running_one_cycle_still_summarises_its_stop_state(client):
+    """The control for the four below: nothing about #44 costs the ordinary PR its
+    summary, which is what the endpoint is for."""
+    await record(client, 6150, cycle="cycle-A")
+    await record(client, 6150, cycle="cycle-A", round=2, new_findings=0,
+                 round_stop={"stop": True, "reason": "dry — nothing raised that an "
+                             "earlier round had not", "confident": True, "veto": []})
+    h = (await client.get(f"/review/findings?repo={REPO}&pr=6150", headers=AGENT)).json()
+    assert h["cycles"] == 1
+    assert h["stopped"] is True and h["stop_confident"] is True
+    assert h["stop_reason"].startswith("dry") and h["stop_veto"] == []
+
+
+async def test_two_cycles_on_one_pr_do_not_summarise_each_other(client):
+    """#44: `stopped`, `stop_reason`, `stop_confident` and `stop_veto` came from
+    `runs[-1]` whatever cycle it belonged to, so B's last round decided how A read.
+    Here A is explicitly still going and B has stopped, confidently — the old
+    summary reported this PR as a confident convergence, and the reader has no way
+    to tell that the round which said so belongs to somebody else's loop.
+
+    The per-finding join in the same response has refused this inference since
+    cycles became a stored fact. A summary that contradicts the rows underneath it
+    is worse than an absent one."""
+    await record(client, 6151, cycle="cycle-A")   # A is going again: stop False
+    await record(client, 6151, cycle="cycle-B", round=1, new_findings=0, to_fix=[],
+                 round_stop={"stop": True, "reason": "dry — nothing raised that an "
+                             "earlier round had not", "confident": True, "veto": []})
+    h = (await client.get(f"/review/findings?repo={REPO}&pr=6151", headers=AGENT)).json()
+    assert h["cycles"] == 2
+    assert h["stopped"] is None and h["stop_reason"] is None
+    assert h["stop_confident"] is None
+    # NULL, not []: the same distinction `GET /review/{id}` draws. [] would say the
+    # stopping rule ran and vetoed nothing.
+    assert h["stop_veto"] is None
+    # Only the SUMMARY is withheld. The rounds and the chains are per-run facts and
+    # are unaffected — withholding them would answer less than the record supports.
+    assert h["rounds"] == 2 and len(h["runs"]) == 2
+    assert h["runs"][1]["stopped"] is True
+
+
+async def test_a_review_only_run_makes_the_summary_unattributable(client):
+    """The other way two cycles land on one PR, and the reason a null cycle is its
+    own identity here rather than a wildcard: a standalone `/panel` read carries no
+    cycle, so it never ended the cycle running around it. Adjacency said otherwise
+    and the summary took its word for it."""
+    await record(client, 6152, cycle="cycle-A")
+    await record(client, 6152, cycle=None, round=1, new_findings=0, to_fix=[],
+                 round_stop={"stop": True, "reason": "one-shot read", "confident": True,
+                             "veto": []})
+    h = (await client.get(f"/review/findings?repo={REPO}&pr=6152", headers=AGENT)).json()
+    assert h["cycles"] == 2
+    assert h["stopped"] is None and h["stop_veto"] is None
+
+
+async def test_history_recorded_before_cycles_existed_still_summarises(client):
+    """Every run predating the cycle column has a null one, so a window of them is
+    one bucket and reads exactly as it always did. Treating null as "unknown, and
+    therefore ambiguous" would have withheld the summary from all of the archive to
+    describe a case that cannot arise in it."""
+    await record(client, 6153, cycle=None)
+    await record(client, 6153, cycle=None, round=2, new_findings=0,
+                 round_stop={"stop": True, "reason": "dry", "confident": True, "veto": []})
+    h = (await client.get(f"/review/findings?repo={REPO}&pr=6153", headers=AGENT)).json()
+    assert h["cycles"] == 1
+    assert h["stopped"] is True and h["stop_reason"] == "dry"
+
+
+async def test_narrowing_the_window_to_one_cycle_brings_the_summary_back(client):
+    """What a caller does about a null summary, and the reason nulling is not a
+    dead end: `limit` decides the window, so a window of one cycle summarises. The
+    docstring says so, which makes it a promise worth pinning."""
+    await record(client, 6154, cycle="cycle-A")
+    await record(client, 6154, cycle="cycle-B", round=1, new_findings=0, to_fix=[],
+                 round_stop={"stop": True, "reason": "dry", "confident": True, "veto": []})
+    wide = (await client.get(f"/review/findings?repo={REPO}&pr=6154",
+                             headers=AGENT)).json()
+    assert wide["cycles"] == 2 and wide["stopped"] is None
+    narrow = (await client.get(f"/review/findings?repo={REPO}&pr=6154&limit=1",
+                               headers=AGENT)).json()
+    assert narrow["cycles"] == 1 and narrow["stopped"] is True
+    # ...and it says so: the window it summarises is not the PR's whole history.
+    assert narrow["truncated"] is True
+
+
 async def test_a_finding_older_than_the_window_is_not_new_inside_it(client):
     """"New" used to be first appearance within the traced window, so a round that
     fell outside `limit` made a long-standing finding read as fresh — falsely

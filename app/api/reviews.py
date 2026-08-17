@@ -3613,6 +3613,16 @@ async def pr_finding_history(
     with ``stop_reason`` for the words and ``stop_veto`` for the reasons a stop was
     not convergence. It is not the reason string: that states a reason to go again
     just as often, so naming the ending after it called a running cycle finished.
+
+    Those four describe **one** cycle, so they are null whenever the traced runs
+    hold more than one (#44) — two agents looping the same PR, or a review-only
+    run landing between rounds. ``cycles`` says how many the window held, and a
+    caller that wants a summary can narrow ``limit`` until it gets one. The
+    alternative, which this endpoint used to do, is to report ``runs[-1]``
+    regardless and let the newest loop decide how an older one reads; the
+    per-finding join beside it has refused that inference since cycles became a
+    stored fact, and a summary that contradicts the rows underneath it is worse
+    than an absent one.
     """
     # One over the window, so "there is older history" is a fact rather than the
     # guess "we returned exactly as many as we asked for".
@@ -3631,7 +3641,7 @@ async def pr_finding_history(
     fetched = [r for r, _ in fetched_rows]
     unread_counts = {r.id: n for r, n in fetched_rows}
     if not fetched:
-        return {"repo": repo, "pr": pr, "rounds": 0, "stopped": None,
+        return {"repo": repo, "pr": pr, "rounds": 0, "cycles": 0, "stopped": None,
                 "stop_reason": None, "stop_confident": None, "stop_veto": [],
                 "truncated": False, "runs": [], "findings": []}
 
@@ -3804,10 +3814,27 @@ async def pr_finding_history(
         })
     out.sort(key=lambda c: (c["severity"] or "P9", order[c["first_run"]], c["key"]))
 
+    # Whether this PR's stop state is one thing to report. A null cycle is its own
+    # identity here rather than a wildcard: a run outside any cycle — a review-only
+    # `/panel`, or anything recorded before cycles were stored — cannot be said to
+    # have ended a cycle it was never part of, so a window mixing one with a real
+    # cycle is exactly as unattributable as one holding two. A window that is ALL
+    # nulls is one bucket and still summarises, which keeps pre-cycle history
+    # reading as it always did.
+    cycles = {r.cycle for r in runs}
+    one_cycle = len(cycles) == 1
+    last = runs[-1]
+
     return {
         "repo": repo,
         "pr": pr,
         "rounds": len(runs),
+        # How many distinct cycles the traced runs belong to, which is what makes
+        # the four fields below readable. One is the ordinary case. More than one
+        # means two loops overlapped on this PR — two agents reviewing it, or a
+        # review-only `/panel` run landing between rounds — and `rounds` alone
+        # cannot say so.
+        "cycles": len(cycles),
         # What ended the cycle, from the last round that ran — and whether that
         # was convergence or merely a stop. A PR whose panel gave up at the round
         # cap, or stopped while a reviewer was reading half the diff, must not
@@ -3818,13 +3845,30 @@ async def pr_finding_history(
         # reason to go again just as often ("N finding(s) no earlier round
         # raised") — so a cycle that explicitly must continue was labelled
         # finished by the field that names the ending.
-        "stopped": runs[-1].stopped,
-        "stop_reason": runs[-1].stop_reason,
-        "stop_confident": runs[-1].stop_confident,
+        #
+        # NULL when the window holds more than one cycle (#44). These four came
+        # from `runs[-1]` whatever cycle it belonged to, so cycle B's last round
+        # decided how cycle A read — complete, unfinished, or unconfident — in the
+        # same response whose per-finding join refuses that exact inference:
+        # `followed_by` requires matching cycle ids rather than guessing from
+        # adjacency. A summary is a claim about one loop, and with two in the
+        # window there is no one loop to claim it about. `cycles` above says how
+        # many there were, which is the honest answer and lets a caller narrow
+        # `limit` until it gets a summary back.
+        "stopped": last.stopped if one_cycle else None,
+        "stop_reason": last.stop_reason if one_cycle else None,
+        "stop_confident": last.stop_confident if one_cycle else None,
         # WHY the stop was unearned, in the panel's words. "not convergence" with
         # no reasons attached is the question this feature exists to answer left
         # unanswered.
-        "stop_veto": runs[-1].stop_veto or [],
+        #
+        # NULL rather than [] when the cycles are mixed, the same distinction
+        # `GET /review/{id}` already draws: [] is "the stopping rule ran and
+        # vetoed nothing", null is "nobody attributable said". Every consumer
+        # reads it as `stop_veto || []` (reviews.html) or `.get("stop_veto") or
+        # [...]` (preland.py), so null does not break the rendering — it stops
+        # a mixed window rendering as an unvetoed clean stop.
+        "stop_veto": (last.stop_veto or []) if one_cycle else None,
         # More runs exist than the window traced, so `first_run` and a `gone`
         # status describe the window, not the PR's whole history.
         "truncated": truncated,
