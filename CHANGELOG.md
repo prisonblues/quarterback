@@ -11,7 +11,7 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
-## vNEXT — one repo, two names, and an allocator that believed both
+## v2.41 — one repo, two names, and an allocator that believed both
 
 `claim_release_number` took a `repo` string. An agent asked which repo it is in
 answers with whichever spelling it has to hand: `quarterback` from the directory

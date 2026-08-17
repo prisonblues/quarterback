@@ -545,7 +545,7 @@ full — including what was broken before it, which is the part no diff recovers
   (nothing addressed to you is withheld from it), a full page now makes room for your mail, and a
   filtered read no longer hands out a cursor at all. Server half only; the transport half is
   nix-fleet's `qb-hook`, blocked on #157.
-- **vNEXT** — one repo stops having two names, by nobody spelling it. The release
+- **v2.41** — one repo stops having two names, by nobody spelling it. The release
   allocator keyed on a caller-supplied `repo` string, and an agent asked which repo
   it is in has two true answers — the directory it stands in, and the remote — so
   one repository grew two counters and issued 2.36 twice. The tools now take a path
