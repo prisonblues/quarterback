@@ -387,8 +387,9 @@ run the agent, say what to work on, repeat. The dispatching human is the part th
 scale, and it is the part the board exists to remove. `qb-seats` replaces the terminals.
 
 ```
-qb-seats              # 2 seats plus the board, in the current repo
-qb-seats -n 1         # one seat
+qb-b 3                # three seats plus the board, in the current repo (the short name)
+qb-seats              # the same, three by default
+qb-seats 10           # ten: five across, two down
 qb-seats --staged     # built, each seat waiting on Enter
 qb-seats --add        # add a seat to a running screen
 ssh box -t qb-seats   # reattach from anywhere

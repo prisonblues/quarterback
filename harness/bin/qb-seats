@@ -95,7 +95,8 @@ SH=${SHELL:-/bin/bash}          # the shell a seat drops back to when it exits
 # `set-environment -r` further down covers every pane split off afterwards.
 unset QUARTERBACK_INSTANCE
 
-SEATS=2                 # the integration ceiling, not the monitor's width
+SEATS=3                 # what one human can actually follow at once
+MAX_SEATS=10            # five across, two down — see the layout note below
 REPO=""                 # default: the git repo you ran this from
 SESSION=""              # default: seats-<repo basename>
 STAGED=0                # 1 = pane waits on Enter before starting its agent
@@ -104,9 +105,9 @@ ACTION="up"
 
 usage() {
   cat <<EOF
-usage: $PROG [-n N] [-C DIR] [-s NAME] [--staged] [--add] [--kill]
+usage: $PROG [N] [-C DIR] [-s NAME] [--staged] [--add] [--kill]
 
-  -n N        number of seats (default $SEATS)
+  N           number of seats, 1-$MAX_SEATS (default $SEATS); -n N also works
   -C DIR      repo the seats run in (default: the git root of \$PWD)
   -s NAME     tmux session name (default: seats-<repo basename>)
   --staged    build the screen with each seat waiting on Enter, so the layout
@@ -212,12 +213,19 @@ while [ $# -gt 0 ]; do
     --add)  ACTION="add";  shift ;;
     --kill) ACTION="kill"; shift ;;
     -h|--help) usage; exit 0 ;;
+    # A bare number is the seat count. `qb-b 3` is the shape this is reached for
+    # twenty times a day, and -n is two keystrokes of ceremony on the only
+    # argument that varies.
+    [0-9]|[0-9][0-9]) SEATS=$1; shift ;;
     *) usage >&2; exit 2 ;;
   esac
 done
 
 case "$SEATS" in ''|*[!0-9]*) usage >&2; exit 2 ;; esac
 [ "$SEATS" -ge 1 ] || { usage >&2; exit 2; }
+[ "$SEATS" -le "$MAX_SEATS" ] \
+  || die "$SEATS seats: the ceiling is $MAX_SEATS (five across, two down). Past that a
+       pane is too narrow to read an agent in, and a human cannot follow it anyway."
 
 command -v tmux >/dev/null 2>&1 \
   || die "tmux is not installed (home-manager: programs.quarterback-harness.seats.enable)"
@@ -314,15 +322,48 @@ tmux set-option -w -t "$SESSION:seats" pane-border-status top
 tmux set-option -w -t "$SESSION:seats" pane-border-format \
   ' #{?@qb_seat,seat #{@qb_seat},board} #{?pane_active,*,} '
 
+# ROWS ARE BUILT, NOT CHOSEN. `select-layout tiled` picks its own arrangement
+# from the window's aspect ratio — six seats in a 240x60 window come out 2 across
+# and 3 down, which is the wrong axis: a seat pane wants WIDTH, because an agent
+# prints prose and diffs, and it wants only enough height to see the last few
+# turns. So the rows are split explicitly and evened out per row.
+row_of() {                      # how many seats go in the top row
+  [ "$SEATS" -le 5 ] && { printf '%s' "$SEATS"; return; }
+  printf '%s' $(( (SEATS + 1) / 2 ))
+}
+TOP=$(row_of)
+
 first=$(tmux list-panes -t "$SESSION:seats" -F '#{pane_id}')
 tmux set-option -p -t "$first" @qb_seat 1
+
+# Split off the pane just made, not off $first: a split lands to the RIGHT of
+# its target, so splitting $first every time builds 1,5,4,3,2 across the row.
+# Seat numbers are how a human addresses one of these, and reading them out of
+# order is a small tax paid on every glance.
 i=2
-while [ "$i" -le "$SEATS" ]; do
-  pane=$(tmux split-window -h -P -F '#{pane_id}' -t "$first" -c "$REPO")
-  tmux set-option -p -t "$pane" @qb_seat "$i"
+last=$first
+while [ "$i" -le "$TOP" ]; do   # the rest of the top row
+  last=$(tmux split-window -h -P -F '#{pane_id}' -t "$last" -c "$REPO")
+  tmux set-option -p -t "$last" @qb_seat "$i"
   i=$((i + 1))
 done
-tmux select-layout -t "$SESSION:seats" even-horizontal
+tmux select-layout -t "$first" -E 2>/dev/null || true
+
+if [ "$SEATS" -gt "$TOP" ]; then
+  # -f: a full-width split off the top row, which is the second ROW rather than a
+  # third column of the first one.
+  second=$(tmux split-window -v -f -P -F '#{pane_id}' -t "$first" -c "$REPO")
+  tmux set-option -p -t "$second" @qb_seat "$i"
+  i=$((i + 1))
+  last=$second
+  while [ "$i" -le "$SEATS" ]; do
+    last=$(tmux split-window -h -P -F '#{pane_id}' -t "$last" -c "$REPO")
+    tmux set-option -p -t "$last" @qb_seat "$i"
+    i=$((i + 1))
+  done
+  tmux select-layout -t "$second" -E 2>/dev/null || true
+fi
+[ "$SEATS" -le 5 ] && tmux select-layout -t "$SESSION:seats" even-horizontal
 
 # The board, on the same screen as the seats — full width along the bottom, so
 # long summaries are read rather than wrapped. -f makes the split span the whole
