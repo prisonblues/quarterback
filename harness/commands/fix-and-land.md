@@ -71,9 +71,44 @@ This is the hybrid path: the guardrails of a guided integration merge (lexray's 
    `max(both) + 1`, keeping the branch's descriptive comment — **never take the branch's number
    blindly**.
 
-   **4c. Push whatever 4a/4b produced to the PR branch.** Those commits are mechanical (a
-   `down_revision` line, a version counter, a generated merge migration) and need no re-review; a
-   MERGE-path merge commit brings in `$BASE` changes already reviewed on their own PRs.
+   **4c. Release number** (if `scripts/release_stamp.py` exists):
+   ```bash
+   rc=0
+   python3 scripts/release_stamp.py apply --onto origin/$BASE || rc=$?
+   [[ $rc -eq 2 ]] && echo "HOLD: read the STOP above"
+   [[ $rc -eq 0 ]] || exit "$rc"
+   ```
+   The `|| rc=$?` is not decoration. Exit 2 is a refusal carrying the sentence that repairs it, and
+   under a `set -e` wrapper a bare invocation terminates the surrounding script before anything
+   reads the message — so the one output that makes a HOLD actionable is the one output that gets
+   lost. Capture the status once, because `$?` is gone the moment anything else runs, and exit with
+   it rather than a flat 1: same 0/2 scheme as `migration_reconcile.py` in 4a, and for the same
+   reason: a caller consuming it reads Python's uncaught-exception 1 as "unknown" rather than as
+   "stop", which it can only do if you hand the number on unchanged. Anything nonzero stops here —
+   a status you did not test for must never fall through to the push in 4d.
+
+   A branch that ships a release writes `vNEXT` and names no number, so this is where the number
+   is decided — against `$BASE` **as it stands now**, which is the only moment the answer is
+   knowable. It is a noop on a branch that ships no release, so run it unconditionally rather than
+   guessing whether this one does. Every refusal names its own repair, so read the message rather
+   than matching it against a list of causes. Most are a release entry in a shape the tool will not
+   guess about — two unstamped entries, an entry below a released one, a placeholder somewhere
+   nothing rewrites, a number written by hand that `$BASE` has not reached, or one already taken
+   there — but it also refuses on things that are not the entry at all: an unclosed code fence or
+   non-UTF-8 in the markdown it scans, a missing or symlinked `pyproject.toml` or `app/main.py`, an
+   `--onto` it cannot resolve or that carries no CHANGELOG.md. `apply` writes and does not commit,
+   so commit what it produced.
+
+   **If the branch was already stamped and `$BASE` has since taken that number**, `apply` refuses
+   rather than re-stamping — the placeholder is gone, so there is nothing left for it to rewrite.
+   The message names the repair and it is two tokens: put this branch's entry back to
+   `## vNEXT — …` and its README bullet back to `- **vNEXT** — …`, then run 4c again. Nothing else
+   on the branch was ever written in terms of the number, which is what makes that an edit rather
+   than a rewrite.
+
+   **4d. Push whatever 4a/4b/4c produced to the PR branch.** Those commits are mechanical (a
+   `down_revision` line, a version counter, a release number the tool chose) and need no
+   re-review; a MERGE-path merge commit brings in `$BASE` changes already reviewed on their own PRs.
 5. **Confidence gate — MERGE only if ALL hold:**
    - `gh pr checks <pr>` is **green** (never merge on red/pending CI) — **re-checked after the
      step-4 push**, since that push restarts CI and any earlier green is stale,
