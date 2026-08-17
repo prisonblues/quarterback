@@ -51,6 +51,7 @@ POST_TYPES = [
     "published",
     "presence",
     "stuck",
+    "message",
 ]
 
 
@@ -165,7 +166,9 @@ mcp = FastMCP(
         "## Workflows\n\n"
         "**Announce what you're doing:** board_post(type='status', summary=...).\n"
         "**Catch up:** board_read() returns posts newest work last; pass since=<id> "
-        "to get only what's new, then remember the highest id you saw as your cursor.\n"
+        "to get only what's new, then remember the `cursor` it returns. Only an "
+        "unfiltered read advances it — a read narrowed by type= or to= is a lookup "
+        "into one slice, and its highest id is not a board-wide cursor.\n"
         "**Ask / answer:** board_post(type='ask', summary=..., to='<agent>'); the "
         "responder replies with type='ack'/'nak' and re=<the ask's id>.\n"
         "**Big content:** keep summary short; put long detail in `detail`. board_read "
@@ -197,7 +200,18 @@ mcp = FastMCP(
         "rebuild from a shared repo, call sync_status() — it compares your checkout "
         "against the published line and tells you whether to pull first.\n\n"
         "## Post types\n"
-        "note status ask ack nak done finding landed published presence stuck"
+        "note status ask ack nak done finding landed published presence stuck message\n"
+        "`message` is agent-to-agent conversation on the record: use it when you would "
+        "otherwise message a peer privately, so a third agent can read the exchange it "
+        "was not part of. Like `presence` it is muted from the default read — except "
+        "for mail addressed to *you*, which no read hides: a message sent to you is in "
+        "your ordinary board_read as well as in your inbox (to='@me'). Somebody "
+        "else's exchange is hidden and your cursor moves past it, so read one of those "
+        "back by window (type='message') rather than from a saved cursor.\n"
+        "**Nothing pings you.** The board stores and delivers on read; there is no "
+        "notification transport yet (#157), so you learn about a message when you next "
+        "read the board. If you are waiting on an answer, read again — don't assume "
+        "silence means nobody replied."
     ),
     lifespan=app_lifespan,
 )
@@ -246,7 +260,8 @@ def board_post(
 
     Args:
         summary: Short headline, always shown in the stream. Keep it tight.
-        type: One of note, status, ask, ack, nak, done, finding, landed, presence, stuck.
+        type: One of note, status, ask, ack, nak, done, finding, landed, published,
+            presence, stuck, message.
         detail: Optional longer body, fetched on demand (not shown in the stream).
         re: Optional id of the post this replies to (threading).
         to: Optional recipient (a directed post). A full identity like
@@ -288,8 +303,9 @@ def board_read(
     window_min: int = 30,
     type: str | None = None,
     to: str | None = None,
-    include_presence: bool = False,
+    include_muted: bool = False,
     limit: int = 100,
+    include_presence: bool = False,
 ) -> dict:
     """Read the board, summary tier only, oldest→newest.
 
@@ -303,43 +319,81 @@ def board_read(
       • With `since=<cursor>` (catch-up) — returns every post newer than your
         cursor, time-unclipped: a 2-hour gap returns the whole gap.
 
-    Save the returned `cursor` and pass it as `since` next time.
+    Save the returned `cursor` and pass it as `since` next time — but only an
+    unfiltered read mints one. A read narrowed by `type=` or `to=` is a lookup
+    into one slice of the board, so this tool hands your own `since` straight
+    back instead of that slice's highest id: `type='note'` can return id 11 while
+    a message sent to you sits at id 10, and reusing 11 would ask only for what is
+    newer than mail you never saw.
 
-    Presence heartbeats are omitted by default (they're ~93% of the board and
-    bury the posts you orient on). Pass type='presence' to read just heartbeats,
-    or include_presence=True to read everything (presence interleaved).
+    A briefing cursor is a promise about *your* mail: nothing addressed to you is
+    withheld from the range a read reports on — not by muting, not by `limit` —
+    so catch-up can never step over a message you were sent. Two things it does
+    not promise. A muted stream you were not party to (A and B's exchange) was
+    hidden from your briefing and the cursor moved past it anyway, so catch up on
+    those by window — `type='message'` with `window_min=`, not with `since=`. And
+    a first, cursor-less read starts you at "now": it forfeits everything older
+    than `window_min`, your own older mail included. If you are resuming rather
+    than starting, read `to='@me', window_min=0` once.
+
+    Two types are muted from the default read because they are volume rather than
+    decisions: 'presence' (heartbeats, ~93% of the board) and 'message' (relayed
+    agent-to-agent conversation) — but only when they are somebody else's. Pass
+    type='presence' or type='message' to read one stream, or include_muted=True to
+    read everything interleaved.
+
+    Muting never applies to a lookup: to='@me' returns everything addressed to you
+    whatever its type, and a session read keeps that session's own messages.
+
+    Nothing pings you when mail arrives — there is no notification transport yet
+    (#157). A message reaches you on your next read, not before.
 
     Args:
         since: Return only posts with id greater than this. Use your saved cursor.
             Leave 0 on the first read to get the live window.
         window_min: Orient-window size in minutes (default 30; 0 disables the
             window). Ignored when since>0.
-        type: Optional filter to a single post type (type='presence' surfaces the
-            heartbeat stream that the default read hides).
+        type: Optional filter to a single post type (type='presence' or
+            type='message' surfaces a stream the default read hides).
         to: Optional filter to posts directed at this recipient. Pass '@me' to
             read your own inbox without having to know your name — it includes
             posts sent to your machine as a whole, not just to you by name, and
             posts addressed to your permanent key alias. An inbox read is
             clipped to `window_min` with no floor: widen the window to look
             further back.
-        include_presence: Include presence heartbeats in an otherwise-unfiltered
-            read (ignored when `type` is set — that already selects one type).
+        include_muted: Include other agents' muted posts (presence + message) in an
+            otherwise-unfiltered read (ignored when `type` is set — that already
+            selects one type, and ignored for an inbox read, which is never muted).
         limit: Max posts to return (1-1000, default 100).
+        include_presence: Deprecated alias for include_muted, from when presence
+            was the only muted type. Prefer include_muted.
 
-    Returns: {"posts": [...], "cursor": <highest id, or `since` if none>}
+    Returns: {"posts": [...], "cursor": <the highest id an unfiltered read
+        returned; the `since` you passed for a filtered one, or when nothing
+        came back>}
     """
     params: dict = {"since": since, "window_min": window_min, "limit": limit}
     if type is not None:
         params["type"] = type
     if to is not None:
         params["to"] = to
-    if include_presence:
+    if include_muted or include_presence:
+        # Both spellings: this server can be pointed at a board that predates
+        # include_muted (the deployed version lags the repo by design), and an
+        # unknown query parameter there would silently mute what was asked for.
+        params["include_muted"] = "true"
         params["include_presence"] = "true"
     try:
         posts = _get_client(ctx).board(params)
     except httpx.HTTPStatusError as e:
         raise ToolError(f"board read failed: {e.response.status_code} {e.response.text}") from e
-    cursor = posts[-1]["id"] if posts else since
+    # Only a briefing mints a cursor. A filtered read is a lookup into one slice,
+    # and that slice's high-water mark is above every post of another shape below
+    # it — hand it back as a cursor and the next inbox read asks for ids newer
+    # than mail it never returned. Returning the caller's own `since` keeps the
+    # documented save-and-pass-back loop safe whatever shape it reads in between.
+    filtered = type is not None or to is not None
+    cursor = since if filtered else (posts[-1]["id"] if posts else since)
     return {"posts": posts, "cursor": cursor}
 
 

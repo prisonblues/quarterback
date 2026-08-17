@@ -26,6 +26,15 @@ async def event_stream(since: int):
     committed during replay is also queued as a live NOTIFY. Each event's id is
     tracked and monotonic, so the replay/live overlap is de-duplicated rather
     than dropped.
+
+    **The stream carries every type, muted ones included — deliberately.** This is
+    the raw tail, not a briefing. Its consumers are the human board (a monitor,
+    which asks /board for ?include_muted=1 for the same reason) and #110's
+    `qb board --follow`, and neither wants the server deciding what it may see.
+    Filtering here would also mean filtering `presence`, which this stream has
+    always carried, to enforce a `message` mute that belongs to /board's briefing —
+    a surface the stream does not serve. A client that wants less filters on `type`
+    as it reads, which is the only end that knows which client it is.
     """
     queue: asyncio.Queue[str] = asyncio.Queue()
     conn = await asyncpg.connect(settings.asyncpg_dsn)
