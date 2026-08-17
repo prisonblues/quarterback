@@ -77,8 +77,15 @@ make_sandbox(){
 
     # Docker must look installed for the docker/nginx steps to be selected, but
     # nothing here should actually talk to a daemon.
+    #
+    # /bin/sh, not `#!/usr/bin/env bash`: there is no /usr/bin/env inside the nix
+    # build sandbox. A stub that cannot exec still passes `command -v docker`, so
+    # create-worktree gets an empty container list instead of an error and skips
+    # the nginx step in silence — which reads as eighteen assertion failures about
+    # missing blocks rather than as a broken stub. The shipped scripts dodge this
+    # via patchShebangs; a stub written at runtime cannot.
     cat > "$box/bin/docker" <<'STUB'
-#!/usr/bin/env bash
+#!/bin/sh
 case "${1:-}" in
     ps)      printf '%s\n' ${DOCKER_PS_NAMES:-} ;;
     images)  echo "myproj" ;;

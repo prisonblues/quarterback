@@ -39,7 +39,14 @@ def repo(tmp_path):
 
 @pytest.fixture
 def fake_bin(tmp_path):
-    """A PATH entry we own, for standing in the agent and curl."""
+    """A PATH entry we own, for standing in the agent and curl.
+
+    Stubs installed here get `#!/bin/sh`, never `#!/usr/bin/env bash`: there is no
+    /usr/bin/env inside the nix build sandbox, and a stub that cannot exec makes
+    every test here fail for a reason that has nothing to do with the code under
+    test. The shipped scripts dodge this via patchShebangs; a stub written at
+    runtime cannot.
+    """
     d = tmp_path / "bin"
     d.mkdir()
 
@@ -62,7 +69,7 @@ def _fake_agent_body(record):
     marker, still hold a plausible number, and still be wrong.
     """
     return (
-        "#!/usr/bin/env bash\n"
+        "#!/bin/sh\n"
         "export FAKE_AGENT_PID=$$\n"
         'python3 -c "\n'
         "import json, os, sys\n"
@@ -398,7 +405,7 @@ def board(fake_bin, tmp_path):
             body = f'{{"agent":"{agent_identity}","machine":"zeus"}}'
         fake_bin(
             "curl",
-            "#!/usr/bin/env bash\n"
+            "#!/bin/sh\n"
             f'printf "%s\\n" "$@" >> {calls}\n'
             f"cat >> {stdin}\n"
             f"printf '%s' {shlex.quote(body)}\n"
@@ -688,7 +695,7 @@ def test_a_board_that_answers_with_a_bare_name_is_not_warned_about(run, board, a
 
 def test_a_board_that_is_down_does_not_stop_the_seat(run, fake_bin, agent):
     """No network is a normal state for a laptop and must not cost a seat."""
-    fake_bin("curl", "#!/usr/bin/env bash\nexit 7\n")
+    fake_bin("curl", "#!/bin/sh\nexit 7\n")
     result = run(
         "2", env={"QUARTERBACK_BASE_URL": "https://board.example", "QUARTERBACK_TOKEN": "t"}
     )
@@ -839,7 +846,7 @@ def test_panes_started_at_the_same_instant_leave_exactly_one_seat(
     starts = tmp_path / "starts"
     fake_bin(
         "claude",
-        f'#!/usr/bin/env bash\nprintf "%s\\n" "$$" >> {starts}\nsleep 2\n',
+        f'#!/bin/sh\nprintf "%s\\n" "$$" >> {starts}\nsleep 2\n',
     )
     with ThreadPoolExecutor(max_workers=8) as pool:
         results = [f.result() for f in [pool.submit(run, "1") for _ in range(8)]]
