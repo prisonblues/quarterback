@@ -22,6 +22,13 @@ jobs:
   app:
     name: app suite
     runs-on: ubuntu-latest
+    # Every job here carries one. These suites run in seconds locally, so a run
+    # that is still going after fifteen minutes is wedged rather than slow — and
+    # the runner's default is six hours of silence before anyone finds out. The
+    # SSE tests are the specific worry: one of them exists to prove /stream 401s
+    # without auth, and the way that assertion fails is by hanging on a live
+    # stream rather than by reporting.
+    timeout-minutes: 15
     services:
       # The same image and credentials as docker-compose.yml, so a failure here
       # means the code, not a difference between CI's database and the one the
@@ -66,6 +73,7 @@ jobs:
   harness:
     name: harness suites
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -99,6 +107,57 @@ jobs:
             echo "--- $suite"
             uv run --extra dev pytest "$suite" -q
           done
+
+  mcp:
+    name: mcp + board client
+    runs-on: ubuntu-latest
+    # See the app job. This one has the most ways to hang: the TUI tests drive a
+    # Textual pilot with its own event loop, and the local-action tests run real
+    # `git clone`/`fetch`. Neither has an internal deadline.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      # No `python-version`: `uv run` picks an interpreter from the project's
+      # own `requires-python`, which is the constraint that should decide it,
+      # and pinning one here would be a fourth place the version is written.
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      # mcp/ had no CI job at all until the board client landed there (#110), so
+      # the MCP server and the HTTP client every other piece of tooling talks to
+      # the board through were the two things in this repo nothing tested. It is
+      # its own project (mcp/pyproject.toml) with its own dependency set, hence a
+      # third job rather than another path in one of the two above.
+      #
+      # TWICE, with different extras, because the claim being tested is a
+      # dependency claim. The base install is httpx and nothing else — that is
+      # what a headless host tailing the board actually gets — so the first run
+      # is the one that proves the tail half imports no Textual and no MCP SDK.
+      # Run only the second and `pytest.importorskip("textual")` is decoration:
+      # the framework is always there, and nothing ever exercises its absence.
+      - name: Run the mcp suite as a tail-only host has it
+        run: |
+          set -euo pipefail
+          # git identity: the local-action tests build real repositories, because
+          # every refusal they check is a claim about what git actually reports.
+          git config --global user.email "ci@example.invalid"
+          git config --global user.name "CI"
+          git config --global init.defaultBranch main
+          # Run from mcp/ so pytest's rootdir is that project and its own ini
+          # applies — `asyncio_mode = "auto"`, without which every pilot-driven
+          # test is skipped as an un-awaited coroutine and the job reports green.
+          cd mcp
+          uv run --extra dev pytest -q
+
+      # Everything installed: the full-screen client, and the MCP SDK — without
+      # which the guard asserting the board-client path never imports it has
+      # nothing to catch, since an absent package is trivially unimported.
+      - name: Run the mcp suite with every extra
+        run: |
+          set -euo pipefail
+          cd mcp
+          uv run --extra dev --extra tui --extra server pytest -q
 
   stamped:
     name: no unstamped release on main

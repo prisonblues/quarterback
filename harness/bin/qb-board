@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# qb-board — the quarterback board in a terminal (issue #110).
+#
+#   qb-board --follow      tail the board to stdout as plain lines
+#   qb-board               the full-screen client (needs the `tui` extra)
+#
+# A LAUNCHER, NOT THE CLIENT. The client is Python — `mcp_server.board`, a second
+# consumer of the same HTTP client the MCP server uses — and it lives beside that
+# server in mcp/ rather than being reimplemented here. This repo already had two
+# clients for one board (the browser's JavaScript and mcp_server/client.py); a
+# third written in bash would be the mistake, so this file only finds an
+# interpreter that can import the real one.
+#
+# It deliberately does NOT source `qb-env`. That file lives beside the `qb` CLI,
+# which is a separate install, and the harness is meant to work without it — the
+# same call `worktree-holder` makes. Board URL and token are resolved by
+# mcp_server.board.config, which reads the same per-host contract.
+#
+# A leading literal `board` argument is accepted and dropped by the Python, so
+# nix-fleet's `qb` needs only:  board) exec qb-board "$@" ;;
+set -euo pipefail
+
+# Where the script itself lives, resolved one link at a time. NOT `readlink -f`:
+# home-manager installs each file as its own flat /nix/store path, so full
+# resolution walks straight past the bin/ directory.
+self_dir() {
+  local p="$0" d
+  for _ in 1 2 3 4 5 6 7 8; do
+    d="$(cd -P "$(dirname "$p")" 2>/dev/null && pwd)" || return 1
+    [ -L "$p" ] || { printf '%s\n' "$d"; return 0; }
+    p="$(readlink "$p")" || return 1
+    case "$p" in /*) ;; *) p="$d/$p" ;; esac
+  done
+  return 1
+}
+
+usable() { [ -x "$1" ] && "$1" -c 'import mcp_server.board' >/dev/null 2>&1; }
+
+BIN_DIR="$(self_dir)" || BIN_DIR=""
+
+# Built by appending only the candidates that exist, rather than as a fixed list
+# with empty entries skipped afterwards. The fixed list needed a sentinel — it
+# matched the literal "/mcp/.venv/bin/python" that an unset QUARTERBACK_REPO
+# expanded to — and that sentinel is a string which silently stops matching the
+# moment the expression above it is edited, leaving `/mcp` to be probed on every
+# launch. Appending conditionally also keeps `set -u` happy about $HOME, which
+# a cron or systemd environment need not define.
+CANDIDATES=()
+[ -n "${QB_BOARD_PYTHON:-}" ] && CANDIDATES+=("$QB_BOARD_PYTHON")
+[ -n "${QUARTERBACK_REPO:-}" ] && CANDIDATES+=("$QUARTERBACK_REPO/mcp/.venv/bin/python")
+[ -n "$BIN_DIR" ] && CANDIDATES+=("$BIN_DIR/../../mcp/.venv/bin/python")
+[ -n "${HOME:-}" ] && CANDIDATES+=("$HOME/source/quarterback/mcp/.venv/bin/python")
+
+PY=""
+# `${arr[@]+…}`: bash before 4.4 treats an empty array as unset under `set -u`,
+# and every candidate above is conditional, so the array genuinely can be empty.
+for candidate in ${CANDIDATES[@]+"${CANDIDATES[@]}"}; do
+  if usable "$candidate"; then PY="$candidate"; break; fi
+done
+# Last: whatever python3 is on PATH, which is the right answer for anyone who
+# simply `pip install`ed the package rather than running from a checkout.
+# Spelled with an explicit `|| true` rather than an `&&` chain: under `set -e` a
+# chain that ends in a failed test is a launcher that exits silently, which is
+# the one outcome the message below exists to prevent.
+if [ -z "$PY" ]; then
+  fallback="$(command -v python3 || true)"
+  if [ -n "$fallback" ] && usable "$fallback"; then PY="$fallback"; fi
+fi
+
+if [ -z "$PY" ]; then
+  cat >&2 <<EOF
+qb-board: could not find a Python that can import mcp_server.board.
+
+  Point QUARTERBACK_REPO at a quarterback checkout whose mcp/.venv is built:
+      cd \$QUARTERBACK_REPO/mcp && uv venv --python 3.12 .venv \\
+        && uv pip install -e '.[tui]'
+  or set QB_BOARD_PYTHON to an interpreter that already has it.
+EOF
+  exit 1
+fi
+
+exec "$PY" -m mcp_server.board "$@"
