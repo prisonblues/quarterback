@@ -452,8 +452,12 @@ Adding another verb is three things: an entry in `BINDINGS`, an `action_*` metho
 it wants an icon — a column, since a click carries the column it landed in and that is how
 one row offers more than one verb.
 
-Not wired into `qb-seats` yet, and not packaged: both scripts import `mcp_server`, `rich`
-and `textual`, which today means the environment belonging to `qb-board` (#110). Bring one
+Not wired into `qb-seats` yet. `qb-dash` is a **launcher**, not the dashboard: the dashboard
+is Python needing `rich`, `textual` and `mcp_server`, none of which a plain `python3` has, so
+a shebang would be rewritten by `patchShebangs` to an interpreter that dies on the first
+import. It hunts for one that can, the way `qb-board` does — `QB_DASH_PYTHON` names one
+outright, `QUARTERBACK_REPO` points at a checkout whose `mcp/.venv` is built. Until
+`mcp_server` is packaged, that venv is the only thing that satisfies it. Bring one
 up beside a running screen with `harness/dev/seats-extras.sh <session> <width>`, which also
 relabels the board pane — that script hardcodes local checkout paths behind
 `QB_MCP_CHECKOUT` and is developer scaffolding, not something to ship.

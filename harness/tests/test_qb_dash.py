@@ -31,8 +31,9 @@ BIN = Path(__file__).resolve().parent.parent / "bin"
 
 
 def _load_app():
-    """Import harness/bin/qb-dash-tui, which has no .py for spec inference."""
-    loader = importlib.machinery.SourceFileLoader("qb_dash_tui", str(BIN / "qb-dash-tui"))
+    """Import the dashboard module itself, not the launcher that finds a Python
+    for it — harness/bin/qb-dash-tui is now bash."""
+    loader = importlib.machinery.SourceFileLoader("qb_dash_tui", str(BIN / "qb-dash-tui.py"))
     spec = importlib.util.spec_from_loader("qb_dash_tui", loader)
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
