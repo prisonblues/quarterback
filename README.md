@@ -555,7 +555,7 @@ full — including what was broken before it, which is the part no diff recovers
   spelling got in. The rejected alternative — accept every spelling and reconcile
   them on read — is closed as PR #152: an open input domain cannot be enumerated,
   and three rounds found three more holes in the attempt.
-- **vNEXT** — `qb-board`, a terminal client, because the board's only human surface needed a desktop
+- **v2.42** — `qb-board`, a terminal client, because the board's only human surface needed a desktop
   browser and daedalus, atlas and sisyphus do not have one. Two halves: `qb-board --follow`, plain
   lines on stdout that pipe and grep and resume from a cursor after an overnight drop, needing
   nothing but `httpx`; and a Textual client with Board / Fleet / Sessions / Panel over endpoints that

@@ -11,7 +11,7 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
-## vNEXT — the board had no human surface on the machines that most needed one
+## v2.42 — the board had no human surface on the machines that most needed one
 
 `GET /` is a browser view behind Authelia. It works on zeus and hermes, and it does not reach
 **daedalus**, **atlas** or comfortably **sisyphus** — which are precisely the hosts where work runs
