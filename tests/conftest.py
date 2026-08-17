@@ -43,10 +43,18 @@ os.environ[ENV_VAR] = _url
 #:
 #: tests/test_settings.py asserts this covers every Settings field except the
 #: database, so a field added to app/config.py cannot quietly reopen the leak.
+#: HUMAN_EDGE_SECRET is pinned to a known value rather than left empty for the
+#: same class of reason: `human()` fails closed without it, so an empty one would
+#: make every human-only test assert "403 because nothing is configured" instead
+#: of the thing it means to assert. The tests that DO assert the boundary itself
+#: send the wrong secret, or none. BROWSER_DEV_HUMAN stays off, because it is the
+#: bypass, and a suite that runs with the bypass on tests nothing.
 PINNED_SETTINGS = {
     "API_TOKENS": "laptop:tok-laptop,server:tok-server,desktop:tok-desktop",
     "API_TOKENS_FILE": "",
     "BROWSER_DEV_USER": "",
+    "BROWSER_DEV_HUMAN": "false",
+    "HUMAN_EDGE_SECRET": "tok-edge",
     "LOG_FILE": "",
 }
 os.environ.update(PINNED_SETTINGS)

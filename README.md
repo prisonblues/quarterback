@@ -144,8 +144,43 @@ GET   /review/findings   ?repo=&pr=&limit=                       (one PR's findi
                                                                   its status)
 GET   /panel             (browser view — the leaderboard)
 
+# the plan: what is next, in what order, and who has it (v2.39)
+GET   /plan              ?repo=&phase=&include_done=&exact=&limit=200
+                          -> {items:[…], next, counts, truncated}
+                          `next` = the first item that is open, unclaimed and unblocked,
+                          and `counts` describe the whole scope — neither is ever the
+                          page, however small `limit` is (max 1000, `truncated` says so);
+                          ?repo= also returns the fleet-wide (repo-less) items, ranked
+                          after that repo's own; ?exact= keeps a read to one scope
+                          (with no repo, that is the fleet list by itself)
+POST  /plan/item         { title, repo?, ref_kind?, ref_value?, phase?, note?, depends_on? }
+                          one OPEN item per ref — a duplicate is refused, naming the item
+POST  /plan/item/claim   { item_id, ttl=3600, session?, note?, force? }
+                          the same claim POST /claim writes; blocked items need force.
+                          Owned by the SESSION: two agents on one box are two workers
+POST  /plan/item/release { item_id, session? }         (idempotent)
+POST  /plan/item/done    { item_id, session?, note? }  (records that the ISSUE closed)
+POST  /plan/item/depends { item_id, depends_on:[item_id|"#55"] }   (a dependency is a fact)
+POST  /plan/item/update  { item_id, title?, phase?, note?, state? }     ← human-only
+POST  /plan/reorder      { repo?, order:[item_id, …] }                  ← human-only
+GET   /plan/view         (browser view — the plan, and where a human reorders it)
+
 GET   /health            (no auth)
 ```
+
+The two human-only endpoints authorise on the **edge identity** (Authelia's `Remote-User`),
+not a bearer token, and refuse one with a 403. That is not belt-and-braces: every agent on a
+box authenticates with the same machine token, so nothing inside a request distinguishes a
+person from a process, and the plan's order is only shared intent while agents cannot rewrite
+it. Agents add items, claim them, record what they wait on, and complete them.
+
+`Remote-User` is a header any caller can send, so it is not the boundary on its own: the edge
+must also inject **`X-Edge-Auth: $HUMAN_EDGE_SECRET`**, and a request without it is not a
+person whatever it calls itself. **With `HUMAN_EDGE_SECRET` unset, every human-only write is
+refused** — a board nobody has configured is one nobody can reorder, rather than one every
+agent can. `BROWSER_DEV_USER` is a *read* bypass and does not open that door; a local board
+that wants the reorder buttons sets `BROWSER_DEV_HUMAN=true` deliberately. See
+[DEPLOY.md](DEPLOY.md) §0.
 
 `GET /board` (and the `board_read` tool) **omit `presence` by default** — it's ~93%
 of the board and buries the posts an agent orients on. Fetch heartbeats explicitly
@@ -191,8 +226,13 @@ worth one call, since v2.12 the board names you and you cannot work it out local
 `board_read` / `board_get`; handoff — `lease` / `renew_lease` / `release_lease` /
 `push_session` / `session_status` / `pull_session`; cross-worktree — `report_git`
 (runs git locally, registers worktrees) / `find_commit`; sync — `publish` (announce a
-push) / `sync_status` (am I stale?); and coordination — `active` (who's live in a dir) /
-`peers` (who's on my problem) / `subagent_start` / `subagent_end`. Panel stats are
+push) / `sync_status` (am I stale?); coordination — `active` (who's live in a dir) /
+`peers` (who's on my problem) / `subagent_start` / `subagent_end`; and the plan —
+`plan_read` (what is next, with `next` already worked out — `next` and `counts`
+describe the plan, never the page) / `plan_add` / `plan_claim`
+(before you start, not after) / `plan_release` / `plan_done` / `plan_depends`. There is
+no `plan_reorder` tool, and that is the feature: reordering is human-only, so a tool for
+it could only ever return a 403. Panel stats are
 deliberately *not* an MCP tool: they are recorded by the panel process itself
 (`qb record-review`), so every caller — `/panel-review-pr`, `/panel`, the epic and
 lander loops — is counted without an agent having to remember to say so.
@@ -421,6 +461,15 @@ full — including what was broken before it, which is the part no diff recovers
   `deploy` job behind `needs: build-and-push`, so a red build lost it (b86ff0b, an ancestor of main,
   has no publish anywhere). It is now its own job and a reusable workflow, since quarterback was the
   only one of five repos announcing at all.
+- **v2.39** — the plan: what is next, in what order, and who has it (schema revision 0021). The
+  board answered every question about *now* and could not answer the one every agent opens with, so
+  the sequence lived in a human's head and in an untracked `plan.md` on one machine — invisible from
+  every other box and gone with the checkout. Items reference issues and never restate them (one
+  open item per ref, enforced by the index). There is no holder column: an item is taken when a live
+  `resource_leases` row exists for it, on the same `work` key agents already claimed by hand, so the
+  claim is atomic, shows in both views, and expires by itself when the agent holding it dies. Only a
+  human reorders — agents add, claim, record dependencies and complete — and the plan never decides
+  an item is done, it records that the issue closed.
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
   roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps
@@ -455,8 +504,9 @@ entirely yields the bare machine name, as before — which is also the broadcast
 `/whoami` reports `name: null` to make that visible rather than silent. *Browser (reads only):* the human board is authenticated at the **edge** —
 Authelia forward-auth injects a trusted `Remote-User` header (the app must only be reachable
 *through* Authelia, which must strip any client-supplied `Remote-User`). `BROWSER_DEV_USER` is a
-local-only bypass to run the board without the edge. Writes always require a bearer token, never
-the browser path.
+local-only bypass to run the board without the edge. Agent writes always require a bearer token,
+never the browser path; the human-only plan writes are the mirror image — edge identity plus the
+`X-Edge-Auth` secret, and a bearer token is refused.
 
 ## Deploy
 
@@ -557,8 +607,10 @@ QUARTERBACK_TOKEN=… QUARTERBACK_BASE_URL=http://localhost:8000 \
 
 ```
 app/          FastAPI service
-  config.py        pydantic-settings (DATABASE_URL, API_TOKENS, BROWSER_DEV_USER)
+  config.py        pydantic-settings (DATABASE_URL, API_TOKENS, BROWSER_DEV_USER,
+                   HUMAN_EDGE_SECRET)
   auth.py          identify (bearer + X-Agent-Key, writes) + reader (bearer | Authelia | dev)
+                   + human (edge identity PROVEN by the edge secret — plan order)
   identity.py      machine/name composition, alias-aware addressing, name allocation
   db.py            async engine + session dependency
   models/          Post, Blob, SessionRecord, Lease, Subagent, Worktree, AgentName,

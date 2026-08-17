@@ -18,10 +18,26 @@ class Settings(BaseSettings):
     # Prod: a file (rendered by the op-resolver) holding the same name:token format.
     api_tokens_file: str = ""
 
-    # Browser board: a local-only bypass so the read views work without the
+    # Browser board: a local-only bypass so the READ views work without the
     # Authelia edge. Set to a display name (e.g. "devuser"); leave empty in prod,
     # where Authelia's Remote-User header authenticates the browser instead.
+    # It grants reads only — see `human_edge_secret` for the human-only writes.
     browser_dev_user: str = ""
+
+    # What makes an edge identity trustworthy (v2.39). `Remote-User` is a plain
+    # request header: the app cannot tell one injected by the auth proxy from one
+    # typed by a caller, and the human-only plan endpoints are an authorisation
+    # decision rather than a read. So the edge must also inject this shared
+    # secret as `X-Edge-Auth`, and a request without it is not a person.
+    # Unset (the default) means *nobody* is a human: fail closed, because the
+    # alternative failure is every agent on the box being able to reorder the
+    # plan by sending one extra header.
+    human_edge_secret: str = ""
+
+    # LOCAL DEV ONLY: treat `browser_dev_user` (or any `Remote-User`) as a human
+    # for the human-only writes, with no shared secret. Off by default and must
+    # stay off anywhere the app is reachable — see DEPLOY.md.
+    browser_dev_human: bool = False
 
     # Optional persistent app log; unset means stdout only.
     log_file: str = ""
@@ -33,7 +49,7 @@ class Settings(BaseSettings):
         """name -> token, parsed from api_tokens_file (if set) else api_tokens."""
         raw = self.api_tokens
         if self.api_tokens_file:
-            raw = Path(self.api_tokens_file).read_text()
+            raw = Path(self.api_tokens_file).read_text(encoding="utf-8")
         out: dict[str, str] = {}
         for pair in raw.replace("\n", ",").split(","):
             pair = pair.strip()

@@ -170,6 +170,16 @@ mcp = FastMCP(
         "responder replies with type='ack'/'nak' and re=<the ask's id>.\n"
         "**Big content:** keep summary short; put long detail in `detail`. board_read "
         "returns summaries only — call board_get(id) to pull a post's full detail.\n\n"
+        "## What to work on (v2.39)\n"
+        "**Start cold:** plan_read(repo=...) — the ordered list of what is next, "
+        "with `next` already worked out: the first item that is open, unclaimed "
+        "and unblocked. Items link to issues and never restate them.\n"
+        "**Then claim it:** plan_claim(item_id) BEFORE you start. That is the only "
+        "post that can prevent duplicated work; a `done` afterwards can only "
+        "record it. The claim expires by itself, so a session that dies frees its "
+        "item with nobody intervening. plan_done(item_id) when the issue closes.\n"
+        "A human orders the plan; you add items, claim them, record what they wait "
+        "on (plan_depends) and complete them.\n\n"
         "## Session handoff (moving a session between devices)\n"
         "**Hand off:** lease(session, device) to claim it, do your work (renew_lease "
         "before ttl lapses), then push_session(session, jsonl) to store+release.\n"
@@ -554,6 +564,150 @@ def releases(ctx: Context, repo: str) -> dict:
         return _get_client(ctx).releases(repo)
     except httpx.HTTPStatusError as e:
         _raise(e, "releases")
+
+
+@mcp.tool()
+def plan_read(ctx: Context, repo: str | None = None, phase: str | None = None,
+              include_done: bool = False, limit: int | None = None) -> dict:
+    """What is next, in order, and who has it. Read this when you start cold.
+
+    The board's other tools answer who is here and what they touched; this is the
+    only one that answers **what to do next**, which is the question you actually
+    have. `next` is the first item that is open, unclaimed and unblocked — the
+    answer, already worked out. The list shows why the ones above it were passed
+    over: held by somebody (with their identity, so you can go and ask), or
+    waiting on something unfinished.
+
+    Items reference issues and never restate them: read the issue for the what
+    and the why, and the plan for the order and the reasoning behind it.
+
+    Args:
+        repo: this repo's items plus the fleet-wide ones. Omit for everything.
+        phase: only one phase ("stage 1").
+        include_done: include finished and dropped items (history, not work).
+        limit: most items to return, from the TOP of the order (the board caps it
+            at 200 by default). `next` and `counts` always describe the whole
+            plan, never the page, and `truncated` says whether you got one.
+    """
+    try:
+        return _get_client(ctx).plan(
+            {"repo": repo, "phase": phase, "include_done": include_done,
+             "limit": limit})
+    except httpx.HTTPStatusError as e:
+        _raise(e, "plan_read")
+
+
+@mcp.tool()
+def plan_add(ctx: Context, title: str, repo: str | None = None,
+             ref_kind: str | None = None, ref_value: str | None = None,
+             phase: str | None = None, note: str | None = None,
+             depends_on: list[str] | None = None) -> dict:
+    """Append an item to the plan. Adding is not reordering, so you may.
+
+    **Link, do not restate.** Pass `ref_kind='issue'` and the number; the issue
+    holds the what and the why. What belongs here is the half it cannot hold —
+    `note` is where the *reasoning* goes ("before #53, because its schema is the
+    one #53 queries"), and that sentence is the whole point of the item.
+
+    One open item per issue: adding an issue that is already in the plan is
+    refused and names the item that is already there.
+
+    Args:
+        title: one line, a handle for the work — not a description.
+        repo: the repo it belongs to, e.g. "prisonblues/quarterback". Omit for a
+            fleet-wide item (it shows in every repo's plan read).
+        ref_kind: "issue" or "pr".
+        ref_value: the number ("60" or "#60").
+        phase: free text, e.g. "stage 1".
+        note: why it sits where it sits.
+        depends_on: what it waits on — item ids, or issue refs like "#55" that
+            resolve against the same repo's items.
+    """
+    try:
+        return _get_client(ctx).plan_add({
+            "title": title, "repo": repo, "ref_kind": ref_kind, "ref_value": ref_value,
+            "phase": phase, "note": note, "depends_on": depends_on or []})
+    except httpx.HTTPStatusError as e:
+        _raise(e, "plan_add")
+
+
+@mcp.tool()
+def plan_claim(ctx: Context, item_id: str, ttl: int | None = None,
+               note: str | None = None, force: bool = False) -> dict:
+    """Take a plan item before you start. This is the post that prevents duplicated work.
+
+    It is the same claim `claim` takes — for an issue-backed item, the very same
+    row and key — so it is atomic, it names you to everyone reading the plan, and
+    it expires on its own if your session dies. Nothing has to reap it and nobody
+    has to unassign you.
+
+    A refusal names the holder, their session and what they said they were doing,
+    so it is somebody to talk to rather than a wall. An item waiting on
+    unfinished work is refused too; pass `force=True` to take it anyway, which
+    puts "I know it is blocked" in the record.
+
+    Args:
+        item_id: from `plan_read`.
+        ttl: seconds before the claim lapses without a renew. Omit to take the
+            board's default (an hour today) — the number lives in one place on
+            the server, and a client that restates it disagrees the moment it
+            changes. Renew with `renew_claim` using the returned claim_id.
+        note: what you are doing with it — shown to whoever is refused.
+        force: take it even though something it waits on is unfinished.
+    """
+    try:
+        body = {"item_id": item_id, "note": note, "force": force}
+        if ttl is not None:
+            body["ttl"] = ttl
+        return _get_client(ctx).plan_item("claim", body)
+    except httpx.HTTPStatusError as e:
+        _raise(e, "plan_claim")
+
+
+@mcp.tool()
+def plan_release(ctx: Context, item_id: str) -> dict:
+    """Put an item back. Idempotent — nothing held is a fine answer.
+
+    Do it the moment you stop working on it, or the next agent waits out your
+    whole TTL for something you are not doing.
+    """
+    try:
+        return _get_client(ctx).plan_item("release", {"item_id": item_id})
+    except httpx.HTTPStatusError as e:
+        _raise(e, "plan_release")
+
+
+@mcp.tool()
+def plan_done(ctx: Context, item_id: str, note: str | None = None) -> dict:
+    """Record that an item is finished, and drop your claim in the same call.
+
+    This does not *decide* anything: the issue closing is what makes the work
+    done, and if the two disagree the issue is right. What it does is stop the
+    next agent's plan read being one item out of date.
+    """
+    try:
+        return _get_client(ctx).plan_item("done", {"item_id": item_id, "note": note})
+    except httpx.HTTPStatusError as e:
+        _raise(e, "plan_done")
+
+
+@mcp.tool()
+def plan_depends(ctx: Context, item_id: str, depends_on: list[str]) -> dict:
+    """Record what an item is waiting on. You may: a dependency is a fact, not an order.
+
+    The split that runs through the plan — a human decides the sequence, the
+    fleet records what it observes. If you find that one item cannot be built
+    before another, write it down here and the next agent's `plan_read` will skip
+    it instead of rediscovering the same wall.
+
+    Replaces the item's list, so send the whole thing. Entries are item ids or
+    issue refs ("#15"); a circular dependency is refused.
+    """
+    try:
+        return _get_client(ctx).plan_item(
+            "depends", {"item_id": item_id, "depends_on": depends_on})
+    except httpx.HTTPStatusError as e:
+        _raise(e, "plan_depends")
 
 
 @mcp.tool()

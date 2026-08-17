@@ -11,6 +11,98 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
+## v2.39 — the board knew who was here and not what was next
+
+Presence, publishes, panel findings: the board could answer every question about *now*. The one
+question every agent actually opens with — **what should I work on** — it could not answer at all,
+so every agent guessed. Three of them once fixed the same red CI job in one morning, and the third
+had checked for peers first and been told the coast was clear. Presence said nobody was in that
+file. Nothing said the job was already taken.
+
+That knowledge lived in three places, none of them the board. **26 unordered issues**, which hold
+the what and the why per item and say nothing about sequence, dependency, or which one to start.
+**A human**, repeating the plan to each agent that asked. And an untracked **`plan.md` on `zeus`** —
+which worked, and was invisible from `hermes`, invisible from a container, and gone with the
+checkout. `epic.py`'s `~/.local/state/loops/epic-*.json` and the panel's `/tmp/panel-<pr>-r<n>.json`
+are the same shape and the same flaw: real item state with real resume semantics, visible only to
+the process that wrote it.
+
+**`GET /plan` is the one call an agent makes cold**, and `next` is the answer already worked out:
+the first item that is open, unclaimed and unblocked. The list shows why the ones above it were
+passed over — held by somebody (named, with their session and what they said they were doing) or
+waiting on something unfinished.
+
+**There is no holder column.** An item is taken when a live `resource_leases` row exists for it, so
+the claim is atomic at v2.31's partial unique index and expires passively — a dead agent's claim
+disappears with no reaper and nobody intervening, which is the property a GitHub assignee cannot
+have: an agent that dies at 3am stays assigned forever. For an issue-backed item the key is exactly
+the `work` key agents had already converged on by hand (`kind='work'`,
+`key='prisonblues/quarterback#142'`), so a claim taken through the plain `POST /claim` shows up in
+the plan without the claimant doing anything, and the two views cannot drift.
+
+**Four rules, and they are the design:**
+
+1. *It never restates an issue.* An item is a title, a ref and an order; `ix_plan_items_open_ref`
+   makes "one open item per issue" a database fact rather than a convention.
+2. *It never decides an item is done.* `done` records that the linked issue closed — git ancestry
+   and GitHub remain the authority. `epic.py` had this right first: *"the file is the fast path +
+   audit trail"*.
+3. *Only a human reorders.* If any agent may, the plan thrashes; if only a human may, it stays the
+   shared intent it exists to be. The split runs the whole way through: order and intent are the
+   human's (reorder, retitle, drop — authorised by the *edge* identity, because every agent on a box
+   holds the same token and nothing else can tell a person from a process), while observations are
+   the fleet's — an agent may add an item, claim it, record what it waits on, and complete it.
+4. *It is not a project-management tool.* No estimates, no sprints, no burndown, no assignee — the
+   claim is the assignee and it expires. `stale` is reported on every read, because a plan nobody
+   updates is worse than none: it is believed.
+
+Not #53's review queue, and the difference is the point: a review job is machine-generated and
+self-clearing, a plan item is human intent that outlives many sessions. Separate table, shared claim
+mechanism — `POST /claim`'s body is now `acquire()`, called by both, so this is the third feature to
+want an atomic claim and the first not to build one.
+
+`/plan/view` is the human board's plan, and the only place the human-only endpoints can be reached
+from a browser. Schema revision **0021**.
+
+**What the panel round changed, and the premises behind it.** Three of the findings were the same
+mistake in three places — *a rule written for one kind of claim, applied to a different kind*:
+
+- **A header is not an authentication method.** `human()` accepted any `Remote-User`, with the
+  enforcement ("the edge must strip it") living in deployment config this repo does not ship — and
+  a forward-auth bypass for bearer traffic, which is precisely the shape agent traffic has, quietly
+  reopens it. The edge now proves it is the edge: `HUMAN_EDGE_SECRET`, injected as `X-Edge-Auth`
+  beside the identity. **Unset means nobody is a human** — a board nobody configured is one nobody
+  can reorder, rather than one every agent can. `BROWSER_DEV_USER` went back to being what its
+  docstring always said it was, a *read* bypass; the human-only writes have their own opt-in
+  (`BROWSER_DEV_HUMAN`), off by default. See DEPLOY.md §0.
+- **A worker is not a box.** A plan claim is owned by the *session*: a machine runs several agents
+  at once and they all authenticate as that one token, so the claims table's "your own machine
+  renews" rule — right for a land, where an agent that restarts must reclaim its own — answered the
+  second agent on a box with `renewed: true` and let both of them work the same item. That is the
+  three-agents-one-CI-job failure the feature exists to prevent, moved indoors. Opt-in per request
+  (`ClaimRequest.session_owned`), so nothing else changed.
+- **`next` is about the plan, not about the page.** `limit` was applied before `next` and `counts`
+  were worked out, so a page whose first rows were all claimed or blocked answered "nothing is
+  free" while free work sat one rank below the cut, and the board header under-counted every scope
+  larger than the cap. The open set is now read whole (it is bounded by design; history is what
+  grows) and `limit` truncates the page alone, which `truncated` says out loud.
+
+And the ordering rule that had no answer: fleet-wide and per-repo items are ranked in independent
+sequences, and merging them by rank alone interleaved two lists nobody had ever compared. **Your
+repo's list comes first, then the fleet's** — the fleet list is what you pick up when your own has
+nothing free, and `next` falls through into it rather than being preempted by it. `?exact=true`
+reads one scope without the widening, which is how the page's fleet view asks for the fleet.
+
+Smaller repairs from the same round: a live claim no longer renders on the finished history row it
+shares an issue key with; dropping an item releases whoever was holding it, and a *done* item can
+no longer be dropped out of its own completion record; a completion note is added to the human's
+reasoning rather than over it; a release that released nothing no longer resets the staleness
+clock it exists to expose; ranks are serialised per scope, so two adds cannot land on one rank and
+two reorders cannot interleave or deadlock; the cycle check reads open items instead of every row
+ever written, under the lock it holds; a forced claim records that it was forced; a dependency on a
+dropped item is refused by *both* spellings; and repo names are case-folded, because
+`Acme/Repo#60` and `acme/repo#60` were two open items and two claim keys for one issue.
+
 ## v2.38 — "in sync" and "I didn't look" were the same answer
 
 #125 and #127 were filed as two halves of one blindness: the origin-moved signal is only as fresh as

@@ -137,6 +137,33 @@ class QuarterbackClient:
         resp.raise_for_status()
         return resp.json()
 
+    # -- the plan (v2.39) ----------------------------------------------
+
+    def plan(self, params: dict) -> dict:
+        resp = self._http.get(self._url("/plan"),
+                              params={k: v for k, v in params.items() if v is not None})
+        resp.raise_for_status()
+        return resp.json()
+
+    def plan_add(self, body: dict) -> dict:
+        resp = self._http.post(self._url("/plan/item"), json=body)
+        resp.raise_for_status()
+        return resp.json()
+
+    def plan_item(self, path: str, body: dict) -> dict:
+        """One of the per-item verbs (claim / release / done / depends).
+
+        The session is stamped here rather than at each call site, for the same
+        reason ``post`` does it: a claim whose holder cannot be reached is half a
+        claim, and an agent that forgot to pass its own id should not be the
+        reason the next agent has nobody to ask.
+        """
+        if self._session and not body.get("session"):
+            body = {**body, "session": self._session}
+        resp = self._http.post(self._url(f"/plan/item/{path}"), json=body)
+        resp.raise_for_status()
+        return resp.json()
+
     def handoff(self, session: str, blob: str) -> dict:
         resp = self._http.post(self._url("/handoff"), json={"session": session, "blob": blob})
         resp.raise_for_status()
