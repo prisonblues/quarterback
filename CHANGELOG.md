@@ -11,7 +11,7 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
-## vNEXT — a claim was exclusive against other machines and shared with your own
+## v2.36 — a claim was exclusive against other machines and shared with your own
 
 (2.34 and 2.35 are allocated to other branches and land separately — both were taken
 through `POST /release/claim`, as was this one, so the gap is a queue rather than a skip.)
