@@ -413,7 +413,7 @@ full — including what was broken before it, which is the part no diff recovers
   row per defect, with the reasoning required for a refutation and the human who signed it off kept
   beside it. `precision_after` then sits next to `precision`, and the gap between them is how often
   a reviewer's confidence survives contact with the code.
-- **vNEXT** — the origin-moved signal (#125, #127). Every staleness verdict is a comparison against
+- **v2.38** — the origin-moved signal (#125, #127). Every staleness verdict is a comparison against
   the `published` line, so a repo with nothing on that line got `stale: false` — "we didn't look"
   wearing the same face as "you're current". `/sync` now returns `comparable`, and breaks silence
   when both signals are absent. The companion issue blamed GitHub-side merges for emitting nothing;

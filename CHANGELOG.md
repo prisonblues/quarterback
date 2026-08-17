@@ -11,7 +11,7 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
-## vNEXT — "in sync" and "I didn't look" were the same answer
+## v2.38 — "in sync" and "I didn't look" were the same answer
 
 #125 and #127 were filed as two halves of one blindness: the origin-moved signal is only as fresh as
 the last time somebody happened to fetch (#125), and a GitHub-side merge emits no `published` at all
