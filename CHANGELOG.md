@@ -173,6 +173,65 @@ decision and the missing hint among them, fed a literal 404 string precisely so 
 behaviour rather than the existence of a new function. The rest cover new symbols and are
 `red/green: N-A (new code path)`: reaching for a new name fails the old code with an
 `AttributeError`, which proves only that the name is new.
+## v2.49 — the guard that could not fire
+
+`create-worktree`'s isolated-database step reads the main database name out of the
+worktree's `.env`, and there is a `die` under that read whose whole job is to explain
+the case where it finds nothing. That `die` was unreachable by the one input it
+existed for.
+
+The script runs under `set -euo pipefail`. `MAIN_DB_NAME` was only ever assigned
+*inside* the branches above the guard, so when `database.url_env` was declared but
+absent from `.env`, nothing assigned it and the first reader was the guard's own
+`[[ -z "$MAIN_DB_NAME" ]]` — an unset dereference. The run died on
+`MAIN_DB_NAME: unbound variable` at precisely the instruction written to say
+"Could not determine main database name from .env". One line (`MAIN_DB_NAME=""`
+before the branches) makes the message reachable.
+
+Measured on this repo, twice, because the first time looked like a fluke:
+quarterback's `.env` carries `POSTGRES_PASSWORD` and nothing else.
+
+**The two config keys now cascade instead of excluding each other.**
+`database.url_env` and `database.name_env` name two places the same fact can live,
+and the old `if/else` meant declaring the first *disabled* the second. A repo that
+assembles its URL at runtime, or keeps the database name in `docker-compose.yml`
+while only the password reaches `.env`, could therefore never use an isolated
+database — and got an unbound-variable crash rather than a reason. URL still wins
+where both are set: it is what the application actually connects with.
+
+**And the failure no longer leaves an unusable worktree without saying so.** The
+database step is 3 of 10, so dying there left a directory that is a real checkout on
+a real branch with none of what follows: no `.venv` symlink, no assigned port, no
+`CLAUDE.local.md`, no `.gitignore` entry. It looks provisioned enough to `cd` into
+and then fails later in ways that have nothing to do with the database. `die_half_built`
+says the worktree is incomplete and gives the two commands out. It does not clean up
+automatically — by then the directory is a checkout the caller may be looking at,
+`remove-worktree` also drops the branch, and an error path that deletes things is a
+bad thing to have on a hair trigger; the rest of this script degrades the same way,
+by leaving the state and naming it.
+
+The hint passes `$BRANCH_NAME`, not the directory. `remove-worktree` takes a branch
+and derives the path itself, so pasting the basename the sentence above it names —
+the first thing anyone reaches for — fails with a confusing "no such worktree". The
+first version of the warning got exactly that wrong, and a test now pins it.
+
+**Every pasteable hint is now shell-quoted, including three that predate this
+change.** Git's refname rules forbid far less than a shell's parser does — `$`,
+backtick, `;`, `>`, `&`, `|`, `(` and `'` are all legal in a branch name, and nothing
+validates them — so `remove-worktree feat$(id)` was a hint that ran `id` on the
+reader's machine when pasted, and `feat>out` truncated a file. Nothing was executed
+by the script itself; a variable's value is never re-parsed inside double quotes. The
+hazard was entirely in what we printed for a human to copy. `printf %q` leaves an
+ordinary `feat/thing` untouched so the common case stays readable, and escapes the
+rest. Applied at all four sites, one of which writes into `CLAUDE.local.md` and so
+outlives the run that printed it. Found by a second model reviewing the diff.
+
+Tests extract the block from the shipping script by sentinel marker rather than
+copying it, the way `test_create_worktree_rerere.py` does, so a refactor that moves
+the code fails there instead of leaving the suite green about code nobody runs.
+Reverting the block to its previous shape reproduces `MAIN_DB_NAME: unbound variable`
+and fails three of them; neutering `sh_quote` fails the paste-safety one.
+
 ## v2.48 — a lease says what its holder is doing, not just where
 
 A lease has always answered *who* is on a session and *where* — holder, cwd,
