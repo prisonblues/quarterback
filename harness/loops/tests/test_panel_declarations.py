@@ -1839,3 +1839,30 @@ def test_a_seat_that_can_read_the_code_puts_its_gaps_back_in_the_veto(
     assert any("could not assess: migrations/versions/" in v for v in stop["veto"])
     # The reader-facing note belongs to the blind case and must not appear here.
     assert "did not cost the round its confidence" not in report
+
+
+def test_sonarqube_cannot_switch_off_the_argv_floor():
+    """The floor counts LLM seats only, and the second model that read this diff was
+    right that counting everything was too permissive.
+
+    `sonarqube` shares `reviewer_meta` and carries no `truncated` key, so an `all()`
+    over every entry was False the moment sonar ran — switching the floor off. A
+    round could then stop confidently with `--reviewers antigravity` and sonar
+    enabled and no LLM having read the diff whole. Sonar is the hard gate alongside
+    the panel, not a reviewer reading the change, so it cannot stand in for one.
+
+    Note the floor above this one asks a different question — "did ANYTHING run?" —
+    and counts sonar deliberately. That is why they are separate tests as well as
+    separate branches."""
+    capped = {"antigravity": {"ran": True, "truncated": True, "argv_capped": True,
+                              "max_diff_chars": 116_771, "code_blind": True},
+              "sonarqube": {"ran": True, "skip": None}}
+    veto = panel.coverage_veto(capped, None, 0, 175_547)
+    assert any("nothing read this diff whole" in v for v in veto), (
+        "a running sonarqube suppressed the floor")
+    assert panel.round_stop(1, 2, [], [], veto)["confident"] is False
+
+    # An LLM seat that saw the whole diff still lifts it — that seat's reading is
+    # what the round rests on.
+    with_reader = dict(capped, claude={"ran": True, "code_blind": True})
+    assert panel.coverage_veto(with_reader, None, 0, 175_547) == []

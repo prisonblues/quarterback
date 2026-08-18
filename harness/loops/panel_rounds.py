@@ -925,6 +925,21 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
         # Truncation by a BUDGET still carries, which is the whole point of telling
         # them apart: raise the number and the next round genuinely does read what
         # this one could not.
+        # TWO questions, and one variable used to answer both — which is how the
+        # argv exemption turned into a fail-open bug the first time it was written.
+        #
+        # `truncated_any` — did any seat read a PREFIX of its target? That is the
+        # question `reread` below needs, and the argv cap must NOT be exempted from
+        # it: a round where the kernel-capped seat saw two thirds of the diff did
+        # not read the whole PR, so it cannot be the round that closes every
+        # earlier round's gap. Exempting the cap says "this gap will never close,
+        # stop vetoing on it" — it must not also say "this round closed everyone
+        # else's".
+        #
+        # `cut` — does this round leave an inherited veto for a scoped round after
+        # it? Here the cap IS exempt, because no later round on this box could have
+        # closed it either (see coverage_veto).
+        truncated_any = any(m.get("truncated") for m in recorded)
         cut = any(m.get("truncated") and not m.get("argv_capped") for m in recorded)
         if cut:
             b.truncated_rounds.add(was)
@@ -947,7 +962,10 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
         ran = payload.get("reviewers_ran")
         if isinstance(ran, list) and not ran:
             b.unread_rounds.add(was)
-        elif recorded and not cut and str(payload.get("scope") or "pr") == "pr":
+        elif (recorded and not truncated_any
+                and str(payload.get("scope") or "pr") == "pr"):
+            # `truncated_any`, not `cut`: clearing an earlier gap is a claim that
+            # this round READ the region, and a kernel-capped seat did not.
             reread.add(was)
         for bucket in ("to_fix", "dismissed", "sonar_findings"):
             for f in payload.get(bucket) or []:
@@ -1127,7 +1145,16 @@ def coverage_veto(reviewer_meta: dict[str, dict], judge_skip: str | None,
     # a narrow case and exactly the kind that reaches an unattended loop and is
     # believed. A budget-truncated panel does not need this: those seats already
     # filed their own lines above.
-    ran = [m for m in reviewer_meta.values() if m.get("ran")]
+    # Over the LLM seats only, not every entry. `sonarqube` shares this mapping and
+    # carries no `truncated` key, so counting it made one running static analyser
+    # silently switch this floor off — a round could then stop confidently with
+    # `--reviewers antigravity` and sonar enabled, no LLM having read the diff
+    # whole. Sonar is the hard gate alongside the panel, not a substitute for a
+    # reviewer reading the change, so it cannot stand in for one here. The floor
+    # above it asks a different question ("did ANYTHING run?") and counts sonar
+    # deliberately, which is why the two are separate.
+    ran = [m for n, m in reviewer_meta.items()
+           if m.get("ran") and n in LLM_REVIEWERS]
     if ran and all(m.get("truncated") and m.get("argv_capped") for m in ran):
         out.append("every reviewer that ran was cut by the argv ceiling — "
                    "nothing read this diff whole")

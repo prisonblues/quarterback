@@ -1246,3 +1246,36 @@ def test_a_round_one_run_reviews_the_whole_pr_and_says_nothing_about_it(monkeypa
     assert got["scope"] == "pr" and got["diff_chars"] == len(PR)
     assert got["context_chars"] == 0 and got["config_notes"] == []
     assert seen["prompts"]["claude"].count(panel.PR_SCOPE_HEADER) == 1
+
+
+def test_an_argv_capped_round_does_not_clear_an_earlier_rounds_gap(tmp_path):
+    """The fail-open half of the argv exemption, found by a second model.
+
+    `cut` answers two different questions, and the exemption is only correct for
+    one of them. It decides whether this round leaves an inherited veto (the cap IS
+    exempt — no later round on this box could close a kernel gap either), and it
+    used to also decide `reread`, which ERASES every earlier round's recorded gap.
+
+    Under the exemption an argv-capped round has `cut == False`, so it qualified as
+    "a whole-PR round with nothing truncated" and wiped truncations that were
+    genuinely still open. Exempting the cap says "this gap will never close, stop
+    vetoing on it"; it must not also say "this round closed everyone else's"."""
+    r1 = payload(1, head_sha="1111111111",
+                 reviewers={"claude": {"ran": True, "truncated": True}})
+    # Round 2 read the whole PR, but its kernel-capped seat saw a prefix of it.
+    r2 = payload(2, head_sha="2222222222", scope="pr",
+                 reviewers={"antigravity": {"ran": True, "truncated": True,
+                                            "argv_capped": True},
+                            "claude": {"ran": True, "truncated": False}})
+    base = load([write(tmp_path, "r1.json", r1), write(tmp_path, "r2.json", r2)])
+
+    assert base.truncated_rounds == {1}, (
+        "round 2 was treated as having re-read the PR and cleared round 1's "
+        "truncation, but its argv-capped seat never saw the whole thing")
+
+    # ...and a round with genuinely nothing truncated still clears it, which is the
+    # behaviour this must not break.
+    clean2 = payload(2, head_sha="2222222222", scope="pr",
+                     reviewers={"claude": {"ran": True, "truncated": False}})
+    base = load([write(tmp_path, "r1.json", r1), write(tmp_path, "c2.json", clean2)])
+    assert base.truncated_rounds == set()

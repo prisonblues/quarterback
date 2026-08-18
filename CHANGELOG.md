@@ -58,6 +58,18 @@ would have made round 1 look fixed while the loop went right back to never stopp
 confidently. Found by a second model reviewing this branch, which is the argument
 for having one.
 
+**The exemption is narrower than "ignore truncation", in two places a second model
+had to point out.** An argv-capped round still counts as truncated when the question
+is *did this round read the whole PR* — because `reread` erases every earlier round's
+recorded gap, and a round whose kernel-capped seat saw two thirds of the diff cannot
+be the round that closed everyone else's. Exempting the cap says "this gap will never
+close, stop vetoing on it"; it must not also say "this round closed the others". And
+the floor counts LLM seats only: `sonarqube` shares the same mapping and carries no
+`truncated` key, so counting every entry let one running static analyser switch the
+floor off — a confident stop with `--reviewers antigravity` and no LLM having read
+the diff whole. Sonar is the hard gate beside the panel, not a reviewer reading the
+change.
+
 **And each has a floor**, because exempting seats one at a time is how a veto
 list ends up empty on a round nothing read. A panel whose every running seat was
 cut by the argv ceiling vetoes — reachable with `--reviewers antigravity`, and it
