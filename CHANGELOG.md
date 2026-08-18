@@ -20,16 +20,38 @@ right for three agents in three worktrees and wrong for three agents in one
 checkout, where the same area means the same uncommitted files and the same
 index, and one `git commit -a` sweeps up everyone's half-finished work.
 
-It was not a missing capability. `/active` has returned `cwd` since v2.6 and the
-`Lease` row has always carried it — `/overlap`'s projection simply dropped it on
-the floor, so the endpoint an agent consults *about a specific task* knew less
-than the one it consults about a directory.
+It was not a missing capability. The `Lease` row has carried `cwd` since v2.2
+(migration 0004, for one-click revive) and `/active` has returned it since that
+endpoint arrived in v2.6 — `/overlap`'s projection simply dropped it on the
+floor, so the endpoint an agent consults *about a specific task* knew less than
+the one it consults about a directory.
 
 Peers now carry `cwd`. The board deliberately does not decide from it: resolving
 a path to a worktree root needs the filesystem that path is on, and the board
 does not have it — `…/65lowther/viz` and `…/65lowther` are one tree, and only the
-machine holding them can say so. The board reports the path, `device` says whose
-machine it is on, and the caller resolves it there.
+machine holding them can say so. The board reports the path and the caller
+resolves it there.
+
+Which machine "there" is comes from `holder`, not from `device`. A holder is
+`machine/name` and the machine half is proved by the token that authenticated the
+lease; `device` is a free string in the lease body that nothing checks, so three
+agents on three machines can all call themselves `d` — the suite's own fixtures
+do. Only a peer whose `holder` machine matches yours can be standing in your
+tree, and a `cwd` that matches while the machine does not is a coincidence
+between two filesystems.
+
+Three limits worth stating rather than discovering. `cwd: null` means the lease
+never reported a path — *unknown*, not "somewhere else"; a scripted session
+inside your very checkout looks exactly like that, so a caller seeing null should
+stay conservative rather than reach for `git commit -a`. And the path now reaches
+every authenticated peer that can name the repo, not only peers on the same
+machine, which is a wider audience than `/active`'s: a working directory usually
+carries a home directory and a username, and that is the posture this ships with.
+It is also a string another agent wrote. The board bounds its length at `PATH_MAX`
+and normalises nothing else, because absoluteness and worktree membership are
+questions only that machine can answer — so a caller resolving it, `git -C <cwd>
+rev-parse --show-toplevel`, must quote it and must not let a leading `-` be read
+as a flag.
 
 ## v2.43 — the fleet at a glance, and one click to act on it
 

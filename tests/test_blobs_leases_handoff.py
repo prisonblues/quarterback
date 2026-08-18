@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 
+from app.schemas import CWD_MAX
+
 from .conftest import DESKTOP, LAPTOP, SERVER
 
 
@@ -160,3 +162,25 @@ async def test_handoff_requires_held_lease_and_known_blob(client):
 
 async def test_unknown_session_is_404(client):
     assert (await client.get("/session/never-seen", headers=LAPTOP)).status_code == 404
+
+
+async def test_a_lease_cwd_is_bounded_at_path_max(client):
+    # /overlap broadcasts this string to every authenticated peer that can name the
+    # repo, so the one thing the board can honestly enforce about it — a length no
+    # filesystem could ever produce — it enforces. Everything a real path can be is
+    # still accepted: absoluteness and worktree membership are questions only the
+    # machine holding the path can answer, which is why the caller resolves it there.
+    at_the_limit = "/" + "d" * (CWD_MAX - 1)
+    ok = await client.post(
+        "/lease",
+        json={"session": "sess-cwd-max", "device": "lap", "cwd": at_the_limit},
+        headers=LAPTOP,
+    )
+    assert ok.status_code == 200
+
+    over = await client.post(
+        "/lease",
+        json={"session": "sess-cwd-over", "device": "lap", "cwd": at_the_limit + "d"},
+        headers=LAPTOP,
+    )
+    assert over.status_code == 422

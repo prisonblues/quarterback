@@ -23,6 +23,15 @@ def _lease_body(
     return body
 
 
+def _own_cwd(active: dict, session: str) -> str | None:
+    """The caller's own cwd as the board holds it, off ``/active``.
+
+    A cwd test that compares a peer's path against the literal it posted is
+    comparing a constant with itself; comparing against what the board says the
+    *caller* is standing in is the relationship the endpoint is for."""
+    return next(a for a in active["agents"] if a["session"] == session)["cwd"]
+
+
 # ---- overlap scorer (pure) --------------------------------------------------
 
 def test_tokenize_drops_stopwords_and_noise():
@@ -164,6 +173,14 @@ async def test_overlap_reports_each_peer_cwd(client):
         headers=DESKTOP,
     )
 
+    # My own cwd read back off the board rather than reused from the literal
+    # above: the relationship these assertions describe is "the same path as
+    # mine" and "a different one", so they have to be written against my path.
+    # Against the literal, swapping the two expected values leaves this green.
+    live = (await client.get("/active", params={"repo": "cwdrepo"}, headers=LAPTOP)).json()
+    mine = _own_cwd(live, "c-laptop")
+    assert mine == tree
+
     res = (
         await client.get(
             "/overlap",
@@ -172,14 +189,61 @@ async def test_overlap_reports_each_peer_cwd(client):
         )
     ).json()
     peers = {p["session"]: p for p in res["peers"]}
-    assert peers["c-server"]["cwd"] == tree  # my tree: uncommitted files shared
-    assert peers["c-desktop"]["cwd"] == "/src/shared-wt-2"  # own worktree: free to work
+    assert peers["c-server"]["cwd"] == mine  # my tree: uncommitted files shared
+    assert peers["c-desktop"]["cwd"] != mine  # its own worktree: free to work
+    assert peers["c-desktop"]["cwd"] == "/src/shared-wt-2"
+
+
+async def test_overlap_without_a_subject_also_reports_each_peer_cwd(client):
+    # `subject` absent is a second branch of find_overlap — every same-repo peer
+    # comes back, score null — and it is the branch an agent takes when the
+    # question is "who else is standing in this checkout?" rather than "who is on
+    # my problem?". That is the question cwd exists to answer, so the unscored
+    # path has to carry it too, not just the ranked one.
+    tree = "/src/nosubject"
+    await client.post(
+        "/lease", json=_lease_body("s-laptop", "any", repo="subjrepo", cwd=tree), headers=LAPTOP
+    )
+    await client.post(
+        "/lease",
+        json=_lease_body("s-server", "unrelated entirely", repo="subjrepo", cwd=tree),
+        headers=SERVER,
+    )
+    await client.post(
+        "/lease",
+        json=_lease_body(
+            "s-desktop", "also unrelated", repo="subjrepo", cwd="/src/nosubject-wt-2"
+        ),
+        headers=DESKTOP,
+    )
+    # A fourth lease on this machine that never reported a path at all.
+    await client.post(
+        "/lease", json=_lease_body("s-quiet", "scripted run", repo="subjrepo"), headers=LAPTOP
+    )
+
+    live = (await client.get("/active", params={"repo": "subjrepo"}, headers=LAPTOP)).json()
+    mine = _own_cwd(live, "s-laptop")
+    res = (
+        await client.get(
+            "/overlap", params={"mine": "s-laptop", "repo": "subjrepo"}, headers=LAPTOP
+        )
+    ).json()
+    peers = {p["session"]: p for p in res["peers"]}
+    # No subject was sent, so this is the unscored branch and not the ranked one —
+    # the titles above deliberately share nothing, and all three still come back.
+    assert set(peers) == {"s-server", "s-desktop", "s-quiet"}
+    assert all(p["score"] is None for p in peers.values())
+    assert peers["s-server"]["cwd"] == mine  # my tree
+    assert peers["s-desktop"]["cwd"] != mine  # its own worktree
+    assert peers["s-desktop"]["cwd"] == "/src/nosubject-wt-2"
+    assert peers["s-quiet"]["cwd"] is None  # unknown, which is not "elsewhere"
 
 
 async def test_overlap_peer_cwd_is_null_when_the_lease_never_sent_one(client):
     # A lease may carry no cwd at all (a scripted or non-git session). The field
     # must still be present and null rather than absent, so a caller can tell
-    # "not in your tree" from "the server does not report this".
+    # "the board does not know where this peer is" from "the board does not
+    # report this at all". Null is UNKNOWN either way — never "not in your tree".
     await client.post(
         "/lease", json=_lease_body("n-laptop", "cwdless probe", repo="nocwdrepo"), headers=LAPTOP
     )

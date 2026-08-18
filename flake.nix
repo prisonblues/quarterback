@@ -104,14 +104,16 @@
         # `harness/tests/` for the reason its own docstring gives — the top-level
         # `tests/conftest.py` resolves DATABASE_URL and imports the app, which
         # made the cheapest check in the repo the hardest to run — and that is
-        # what put it in a sandbox holding only `harness/`, where all eight of
+        # what put it in a sandbox holding only `harness/`, where every one of
         # its assertions errored on missing files instead of being evaluated
-        # (#163). So it gets a sandbox with the four files it actually reads.
+        # (#163). So it gets a sandbox holding exactly the files it reads —
+        # counting them here would only go stale the next time the suite reads
+        # one more.
         #
         # This is the check that would have caught the v2.34 collision two
         # branches created on 2026-08-17, and it has never once run here.
         #
-        # The four `cp`s are enumerated rather than the repo root being copied
+        # The `cp`s are enumerated rather than the repo root being copied
         # wholesale: `./.` would drag a developer's `mcp/.venv` and every
         # `__pycache__` into the store. Enumeration is the thing that can go
         # stale, so it does not rely on someone remembering —
@@ -142,17 +144,70 @@
           cp ${./flake.nix}       repo/flake.nix
           chmod -R u+w repo
           cd repo/harness
-          # -rs: print the reason for every skip. This check exists because eight
-          # assertions were inert and said so only in ERROR lines nobody read;
-          # a silent skip is the same failure wearing a green badge. Two are
-          # expected here — the git-tracked-filenames test, and the unstamped
-          # entry test on a branch not writing a release.
+          # -c /dev/null: pyproject.toml is copied in above, which makes it this
+          # run's ini file and hands the sandbox every `[tool.pytest.ini_options]`
+          # the project ever grows. Today that is three pytest-asyncio settings
+          # which merely warn, because the plugin is deliberately not installed
+          # here; tomorrow it is `--strict-config`, an `addopts` naming a plugin
+          # nixpkgs is not supplying to this check, or a coverage flag — and then
+          # this build dies in collection rather than making the one assertion it
+          # exists to make, for a reason that has nothing to do with release
+          # numbers. An empty ini severs that entirely. The copy itself has to
+          # stay: the suite READS pyproject.toml to find the version it compares,
+          # so the file is present as data and ignored as configuration.
           #
-          # The path is passed explicitly and must stay that way: pyproject.toml
-          # is copied in above, so it is the rootdir, and its
-          # `testpaths = ["tests"]` would otherwise resolve against the REPO root
-          # rather than this directory and collect nothing at all.
-          pytest -q -rs -p no:cacheprovider tests
+          # The `tests` argument is load-bearing rather than tidy: with an empty
+          # ini there is no `testpaths` to fall back on at all, so nothing else
+          # tells pytest which directory to collect.
+          #
+          # -rs prints the reason for every skip, and the two guards below turn
+          # those reasons into assertions. Printing alone would not: this check
+          # exists because a whole suite of assertions was inert and said so only
+          # in ERROR lines nobody read, and an unread ERROR line traded for an
+          # unread build log is the same failure wearing the same green badge.
+          # pytest exits 0 whether one test skipped or every last one did, so the
+          # exit status by itself cannot tell "the release numbers agree" from
+          # "nothing looked".
+          set -o pipefail
+          if ! pytest -q -rs -c /dev/null -p no:cacheprovider tests 2>&1 | tee pytest.log; then
+            echo "release-metadata: the suite failed — the assertions are printed above."
+            exit 1
+          fi
+
+          # Guard 1: something actually ran and passed. A run that collected
+          # nothing, or that skipped its way from end to end, prints no "N passed"
+          # and is precisely the inert-but-green outcome this check was added to
+          # make impossible. Deliberately a floor and not a count, so adding a
+          # test to the suite does not also mean editing this line.
+          if ! grep -qE '[1-9][0-9]* passed' pytest.log; then
+            echo "release-metadata: not one test in this suite passed."
+            echo "pytest still exited 0, which means every assertion either skipped or"
+            echo "was never collected — a renamed path, a dropped precondition or a"
+            echo "collection-level skip will all do this, and none of them are a green"
+            echo "build. The pytest summary above says which."
+            exit 1
+          fi
+
+          # Guard 2: every skip is one of the two reasons this sandbox is allowed
+          # to produce. The git-tracked-filenames test skips because git is
+          # deliberately off PATH — see the comment on nativeBuildInputs — and the
+          # unstamped-entry test skips on a stamped main, where there is no
+          # `## vNEXT` heading left for it to look at. On a branch that is writing
+          # a release the second one runs instead, so how MANY tests skip here is
+          # a property of the branch and is deliberately not asserted. WHICH
+          # reasons are permitted is, because a third reason means a precondition
+          # stopped holding and nobody was told.
+          unexpected=$(grep '^SKIPPED' pytest.log \
+            | grep -v -e 'git is not on PATH' -e 'nothing unstamped' || true)
+          if [[ -n "$unexpected" ]]; then
+            echo "release-metadata: a test skipped for a reason this sandbox does not permit:"
+            echo "$unexpected"
+            echo "Either the sandbox stopped supplying something the suite needs, in which"
+            echo "case fix the file set copied in above, or the new skip is legitimate on a"
+            echo "clean checkout too — in which case add its reason to the grep here and"
+            echo "write down why it is allowed to be inert."
+            exit 1
+          fi
           touch $out
         '';
 
