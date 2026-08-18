@@ -41,17 +41,27 @@ def _load_app():
     return module
 
 
-def _why_skip() -> str | None:
-    """Runnable wherever the dashboard is: rich, textual, and a board to read.
-
-    It no longer wants mcp_server — the board client is stdlib now — so this
-    passes under the interpreter the nix build carries, not only under a
-    developer's venv.
-    """
+# TWO conditions, and keeping them apart is what lets any of this run in CI.
+#
+# Every test here needs rich and textual, because every one of them drives the
+# real widgets. Only SOME need a board and a `gh` that can see the repo: those
+# read whatever is open today and click a row of it. When the two were one
+# check, a machine without a board skipped the lot — including the tests whose
+# data is a literal in this file — so the stubbed half never ran anywhere but a
+# developer's laptop, which is the same as not having been written.
+#
+# It no longer wants mcp_server — the board client is stdlib now — so this
+# passes under the interpreter the nix build carries, not only under a
+# developer's venv.
+def _why_no_tui() -> str | None:
     try:
         import rich, textual  # noqa: F401
     except ImportError:
         return "textual/rich are not importable"
+    return None
+
+
+def _why_no_board() -> str | None:
     sys.path.insert(0, str(BIN))
     try:
         import qbdata
@@ -61,7 +71,15 @@ def _why_skip() -> str | None:
     return None
 
 
-pytestmark = pytest.mark.skipif(_why_skip() is not None, reason=_why_skip() or "")
+_NO_TUI = _why_no_tui()
+_NO_BOARD = _why_no_board() if _NO_TUI is None else "textual/rich are not importable"
+
+pytestmark = pytest.mark.skipif(_NO_TUI is not None, reason=_NO_TUI or "")
+
+#: For the tests that click whatever the repo and the board actually have open
+#: today. They are still the ones that found the defects worth finding, so they
+#: are not weakened — they are just no longer the reason the rest cannot run.
+needs_live_data = pytest.mark.skipif(_NO_BOARD is not None, reason=_NO_BOARD or "")
 
 
 def _numbered_cell(row) -> str:
@@ -88,10 +106,12 @@ def _need_rows(table, what: str, err: str | None) -> None:
     pytest.skip(f"no open {what} on the repo — nothing to click")
 
 
+@needs_live_data
 def test_a_single_click_acts_on_the_row_under_the_pointer():
     assert asyncio.run(_drive()) == []
 
 
+@needs_live_data
 def test_the_scales_icon_reviews_and_the_rest_of_the_row_opens():
     """One row, two verbs, told apart by which column was clicked.
 
@@ -101,6 +121,7 @@ def test_the_scales_icon_reviews_and_the_rest_of_the_row_opens():
     assert asyncio.run(_drive_panel()) == []
 
 
+@needs_live_data
 def test_a_plan_row_explains_itself_and_its_hammer_takes_the_issue():
     """The plan panel's two verbs.
 
@@ -112,6 +133,7 @@ def test_a_plan_row_explains_itself_and_its_hammer_takes_the_issue():
     assert asyncio.run(_drive_plan()) == []
 
 
+@needs_live_data
 def test_the_hammer_starts_a_fix_and_the_rest_of_the_issue_row_opens():
     """The issue panel's two verbs, told apart the same way the PR panel's are.
 
