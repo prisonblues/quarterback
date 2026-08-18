@@ -874,6 +874,13 @@ def test_the_judge_gets_the_tree_and_is_told_and_pinned(monkeypatch, tmp_path):
         seen["had_tree"] = (Path(cwd) / "app/main.py").exists()
         return '[{"id":"F1","members":[0],"real":true,"reason":"checked the file"}]', None
 
+    # `which` too, not just `run_cli`: `adjudicate` short-circuits to
+    # `unruled("judge: claude CLI absent")` before it ever builds an argv, so on a
+    # box without the CLI the stub below is never reached and the assertions fail
+    # with a bare KeyError. That is a machine-dependent test — green on a
+    # workstation, red in CI — which is exactly what CI running the harness suites
+    # exists to catch (#70), and it caught this.
+    monkeypatch.setattr(panel.shutil, "which", lambda name: "/usr/bin/" + name)
     monkeypatch.setattr(panel_seats, "run_cli", fake_run_cli)
     f = panel.Finding("claude", "P1", "app/main.py", 1, "title", "detail")
     panel.adjudicate([[f]], "diff", "sonnet", 34, code_tree=tree, budget_usd=8)
@@ -895,6 +902,7 @@ def test_a_judge_with_no_tree_is_unchanged(monkeypatch, tmp_path):
         seen["args"], seen["prompt"] = args, stdin_text
         return '[{"id":"F1","members":[0],"real":true,"reason":"r"}]', None
 
+    monkeypatch.setattr(panel.shutil, "which", lambda name: "/usr/bin/" + name)
     monkeypatch.setattr(panel_seats, "run_cli", fake_run_cli)
     f = panel.Finding("claude", "P1", "a.py", 1, "title", "detail")
     panel.adjudicate([[f]], "diff", "sonnet", 34)
