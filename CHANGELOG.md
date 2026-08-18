@@ -11,7 +11,7 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
-## vNEXT — a peer's working directory, so "same repo" stops meaning "same tree"
+## v2.45 — a peer's working directory, so "same repo" stops meaning "same tree"
 `/overlap` told an agent who else was live in its repo and left out where they
 were standing. Every peer therefore read the same, and so did the advice built on
 it: *working the same area is fine — that is what the board is for.* That is

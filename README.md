@@ -563,7 +563,7 @@ full — including what was broken before it, which is the part no diff recovers
   issues with the board's claims joined onto them — free ones first, held ones greyed and named —
   and each row carries a `⚒` that shows its command and then runs `/fix-issue <n>` in a tmux
   window of its own, the `⚖` of a PR row for the other end of the pipeline.
-- **vNEXT** — a peer's working directory, so "same repo" stops meaning "same tree". `/overlap`
+- **v2.45** — a peer's working directory, so "same repo" stops meaning "same tree". `/overlap`
   named who else was live and left out where they were standing, so an agent got the same advice
   — *working the same area is fine* — whether the peers were in their own worktrees or in its
   checkout, sharing its uncommitted files and its index. The `Lease` row has carried `cwd` since
