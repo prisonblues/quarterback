@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime, timedelta
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -95,6 +96,16 @@ class LeaseIn(BaseModel):
     title: str | None = None    # CC ai-title
     recap: str | None = None    # compact-summary head / last prompt
     model: str | None = None    # model id from last assistant msg
+    #: working | waiting | input — what the holder is doing, for a human reading
+    #: a wall of panes. Constrained rather than free text because it is rendered
+    #: as a word in a footer and a colour in a dashboard: an unknown value would
+    #: reach a human as a blank or a crash, and there is no reader that can do
+    #: anything useful with a fourth spelling.
+    #:
+    #: `stalled` is not accepted. Nobody reports being stalled — that is the
+    #: reader's conclusion from `state_at` — and accepting it would let a holder
+    #: assert a state it cannot know it is in.
+    state: Literal["working", "waiting", "input"] | None = None
 
 
 class RenewIn(BaseModel):
@@ -173,6 +184,9 @@ async def acquire_lease(
             active.recap = body.recap
         if body.model:
             active.model = body.model
+        if body.state:
+            active.state = body.state
+            active.state_at = now
         await session.commit()
         return {**_lease_view(active), "renewed": True}
 
@@ -188,6 +202,8 @@ async def acquire_lease(
         title=body.title,
         recap=body.recap,
         model=body.model,
+        state=body.state,
+        state_at=now if body.state else None,
     )
     session.add(lease)
     await session.commit()
