@@ -593,3 +593,16 @@ def test_a_range_that_means_nothing_here_changes_nothing(screen):
         done = click(screen, junk, "t")
         assert done.returncode in (0, 1), f"{junk!r} → {done.returncode} {done.stderr}"
     assert panes(screen) == before, "an unknown range moved the furniture"
+
+
+def test_an_empty_brief_reaches_the_panes(screen):
+    """The one value QB_SEAT_BRIEF exists to express, and a `-n` forwarding test
+    silently dropped it: nothing arrived in the pane, qb-seat saw unset, and the
+    seat started on the full built-in brief — a screen asked for waiting seats
+    that went and claimed work instead, reporting nothing wrong.
+    """
+    screen.env["QB_SEAT_BRIEF"] = ""
+    screen("-n", "1")
+    env = screen.tmux("show-environment", "-t", "t").stdout
+    assert "QB_SEAT_BRIEF=" in env, "set-and-empty must be forwarded, not dropped"
+    assert "-QB_SEAT_BRIEF" not in env, "must not be marked for removal"

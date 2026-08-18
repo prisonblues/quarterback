@@ -445,11 +445,25 @@ require_qb_seat
 # test. Neither flag given leaves the variable alone entirely — an unset variable
 # is how qb-seat is told "not answered", and answering it here with a default of
 # our own would be a second place for the default to live and drift.
+#
+# THE PREDICATE MIRRORS HOW qb-seat READS EACH NAME, which is not the same test for
+# all of them. qb-seat takes QB_SEAT_BRIEF with `${QB_SEAT_BRIEF+set}` so that
+# set-and-empty means "no brief at all" and unset means "use the built-in one" —
+# those are different answers, and only the first can ask for a waiting seat. A
+# `-n` test here cannot express it: it drops the empty value, nothing arrives in
+# the pane, qb-seat sees unset, and the seat starts on the full brief while
+# reporting nothing wrong. That is the same silent failure this block already
+# warns about twice, arriving through the forwarder instead of past it.
+#
+# The other three are read with `${VAR:-}`, where empty and unset are the same
+# answer, so `-n` is the honest test for them and forwarding an empty value would
+# only add a variable that says nothing.
 seat_env=()
 [ -n "$YOLO" ] && QB_SEAT_YOLO="$YOLO"
-for v in QB_SEAT_AGENT QB_SEAT_BRIEF QB_SEAT_FORCE QB_SEAT_YOLO; do
+for v in QB_SEAT_AGENT QB_SEAT_FORCE QB_SEAT_YOLO; do
   [ -n "${!v:-}" ] && seat_env+=(-e "$v=${!v}")
 done
+[ -n "${QB_SEAT_BRIEF+set}" ] && seat_env+=(-e "QB_SEAT_BRIEF=$QB_SEAT_BRIEF")
 
 tmux new-session -d -s "$SESSION" -n seats -c "$REPO" -x 240 -y 60 \
   -e QB_SEATS=1 -e FLEET_NO_MOTD=1 ${seat_env[@]+"${seat_env[@]}"}
