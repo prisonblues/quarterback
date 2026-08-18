@@ -366,12 +366,36 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   In the payload the seat keeps its `diff_budgets` key with a `null` value rather
   than vanishing, so a consumer reading `diff_budgets[name]` for a configured seat
   does not begin raising `KeyError` on exactly the boxes this is for.
-  `load_baseline` banks a round as truncated on `truncated and not absent` — the
-  same exemption, keyed on the same field — because baselines written before this
-  release still carry the old pairing. Not `ran and truncated`: `ran` is false for
-  *every* way of not running, so that would also drop the truncation of a seat that
-  was installed, read a real prefix and then crashed, which is a genuine coverage
-  gap and the fail-open direction.
+  `load_baseline` banks a round as truncated on `truncated and not argv_capped and
+  not absent` — both exemptions, each keyed on its own recorded field — because
+  baselines written before either release still carry the old pairings. The two do
+  not subsume each other: `argv_capped` covers only what the kernel bounded, so an
+  absent `pi` or `codex` with a configured budget smaller than the target would
+  still bank a phantom round under the argv exemption alone. And not
+  `ran and truncated`: `ran` is false for *every* way of not running, so that would
+  also drop the truncation of a seat that was installed, read a real prefix and then
+  crashed — a genuine coverage gap, and the fail-open direction.
+- **A constant never vetoes, and three of them used to** (#113). The rule
+  generalises the absent-CLI exemption above: an observation that is true of every
+  round cannot tell a quiet round from a broken one, and because `confident` is
+  `not veto`, leaving it in makes a confident stop unreachable rather than rare.
+  The three are an absent CLI (above), a seat that **cannot read the code**
+  (`ReviewerRun.code_blind` — see the coverage bullet below), and the **argv
+  ceiling** on antigravity: its prompt travels in argv, the kernel caps one element
+  at 120,000 bytes, and on a large diff it structurally cannot be handed all of it
+  (measured on PR #160: 116,771 of 175,547 chars, 66.5%). Each is exempted off
+  recorded state, never off the wording of a message; each is still reported; and
+  each has a floor so that exempting seats one at a time cannot empty the veto list
+  on a round where nothing was read whole. Truncation by a **budget** still vetoes —
+  someone typed that number and can raise it, so it is a fact about the round.
+  The argv exemption is applied in **two** places, and the second is easy to miss: the
+  baseline loader carries an earlier round's truncation forward (increment scope never
+  returns to what round 1 was cut off from), and a kernel-capped seat was not going to
+  be closed by a later round either — so carrying it reintroduces the constant one
+  round later and leaves it standing for the rest of the cycle, with round 1's veto
+  list looking fixed. `/panel-review-pr` drives several rounds, so exempting only
+  `coverage_veto` would have undone the change exactly where it matters. A budget
+  truncation still carries: raise the number and the next round really does read it.
 - **A reviewer that produces nothing is SKIPPED, never counted as an empty review.**
   A zero exit with empty stdout is a failure for panel members and the master alike,
   and the skip line quotes the CLI's own stderr, which usually names both the cause
@@ -392,13 +416,28 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   confidence. Truncation is measured, not asked for, since a truncated reviewer is the
   one party that cannot notice it. A bare findings array (any older reviewer) still
   parses and simply declares nothing.
+  **A blind seat's declarations are reported and do not veto** (#113). Every
+  seat reviews from the diff alone — an empty sandbox, no file tools — so "I could not
+  read a function this diff does not change" is true of every round it sits, and a
+  constant is exactly what the veto must not contain. Measured on PR #160's round 1:
+  19 veto lines, 16 of them declarations, and **nine of those asked about a file in
+  this repo**, all nine answered with `grep` in about four minutes. Worse than the lost
+  confidence, blindness manufactures wrong findings — PR #64's proposed fix *was* the
+  bug, PR #90's round-2 P1 inferred a missing `--json` field from its absence in the
+  diff when it was already there. The declarations stay on the PR comment, under a line
+  saying they cost the round nothing and are worth a `grep`; that is the work this
+  used to outsource to whoever read the output, and only when someone happened to.
+  Recorded per seat as `code_blind`, so #113's second half — code access as a per-repo
+  setting — flips it and the declarations start counting again, which is right: a seat
+  that *could* have read the tree and still could not answer is describing the round.
 - **Rounds are mechanical.** `--round`/`--baseline` make each run say which findings no
   earlier round raised; `round_stop` in the payload then says go-again (something new,
   a P1/P2 still outstanding, or a finding an earlier round raised that is still outstanding
   — SonarCloud's hard-gate issues included) or stop (dry / round cap), and whether
   stopping was *convergence*. The declarations never extend the loop — a truncated
-  reviewer is truncated again next round — they only stop a broken round being reported
-  as clean. A round past the first with no `--baseline` is itself a veto: it has nothing
+  reviewer is truncated again next round — and the ones a blind seat makes no longer
+  cost the stop its confidence either; what is left only stops a broken round being
+  reported as clean. A round past the first with no `--baseline` is itself a veto: it has nothing
   to compare against, so its "all new" count means nothing and its stop is unearned.
 - **A round past the first reviews the INCREMENT, not the whole PR** (v2.28). The target is
   what changed since the head its baseline reviewed (`head_sha` in the payload; `--since`

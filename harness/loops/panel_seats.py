@@ -152,6 +152,21 @@ def member_sandbox(where: Path) -> str:
     defence — not "a repo the panel trusts", which is a judgement no reviewer
     should be making about its own input.
 
+    **What it costs is now written down rather than merely paid** (#113).
+    A seat that cannot read the code declares `could_not_assess` about anything the
+    diff does not show it, and on PR #160's round 1 nine of those declarations
+    asked about a file in this repo — 47% of every veto line that round, all nine
+    answered with `grep` in about four minutes. The blindness is structural, so
+    those declarations used to make a confident stop unreachable on any PR that
+    merely references a file it does not change. They are now recorded as
+    :attr:`ReviewerRun.code_blind`, reported, and kept out of `coverage_veto`;
+    the read side of this trade is #113's remaining half, which makes code access
+    a per-repo setting and turns the flag off for the repos that select it.
+
+    Note what that does NOT concede. The two measurements above are why the empty
+    sandbox stays the OFF setting rather than being deleted, and the reasoning
+    above them is the argument to read before proposing that it should be.
+
     A `git init` that fails is reported and then degraded past, never raised. **Every
     way it can fail, not just a non-zero exit** — `git` absent from PATH raises
     `FileNotFoundError`, a bad temp root raises `PermissionError`, a stalled mount or
@@ -549,6 +564,60 @@ def fit_argv_budget(render, budget: int) -> int:
             return budget
         budget = max(0, budget - over)
     return budget
+
+
+def argv_clamp(render, sendable: int, asked: int | None) -> tuple[int, bool]:
+    """The budget the kernel will actually carry for the argv-bound seat, and
+    whether the KERNEL is what cut it.
+
+    Returns ``(fitted, kernel_cut)``. `fitted` is what to hand the seat.
+    `kernel_cut` is half of what :func:`coverage_veto` needs — this function can say
+    who did the cutting, and deliberately does not try to say whether the cut cost
+    the seat any of the review TARGET. See below.
+
+    Two conditions on `kernel_cut`, both load-bearing:
+
+    * ``fitted < want`` — the clamp actually cut what was asked for, so the kernel
+      is the binding constraint. A repo that pins antigravity a smaller
+      ``max_diff_chars`` than this box could carry is truncated by a number
+      somebody typed; that is fixable, so it is evidence about the round and still
+      vetoes. A dropped zero (60_000 -> 6_000) is the exact slip
+      :func:`diff_budget` declines to guard against, on the grounds that the
+      CONSEQUENCE gets surfaced instead — so the consequence has to keep arriving.
+    * ``0 < fitted`` — the seat was partly served rather than not served at all.
+      Not hypothetical: :func:`fit_argv_budget` subtracts a BYTE overflow from a
+      CHARACTER budget, over-shrinking on purpose to converge in one pass, and on
+      three-byte characters it over-shrinks to **zero** — a 200,000 em-dash diff
+      hands this seat an empty prompt. A seat given no diff has not "structurally
+      seen part of it"; it reviewed nothing, which is a stronger reason to withhold
+      confidence rather than a weaker one, so it falls through to the ordinary
+      truncation veto exactly as it did before this exemption existed.
+
+    **Whether the target was actually cut is the caller's half, and it must be
+    measured by COMPOSING the material rather than by comparing this budget against
+    the target's length.** They are different numbers under increment scope: the
+    budget also pays for the brief and the section headers, which are over a
+    kilobyte, so a budget a little OVER the target's size still cuts it. `run`
+    already computes that properly for every seat (`truncated_for`), and the
+    exemption is the intersection — a seat that is truncated by measurement AND was
+    cut by the kernel. Comparing against a raw `target_len` here instead classified
+    exactly that overhead case as a budget truncation, quietly keeping the standing
+    veto this change exists to remove on precisely the rounds that run scoped.
+
+    Note also what this does NOT do: compute a config-independent "ceiling" from
+    `sendable` and compare budgets against it. That reads better and is wrong,
+    because `fit_argv_budget` is not composable — its overshoot depends on the
+    budget it starts from, so ``min(asked, fit(sendable))`` is not ``fit(asked)``.
+    On multibyte material the ceiling collapses to 0 and every budget, however
+    small and deliverable, would be clamped to nothing.
+
+    Extracted from ``run`` so the rule has a name and a test. Inline it was
+    conditions buried in a thousand-line function, reachable only by standing up a
+    whole panel — which is how a classification that decides whether a round can
+    stop confidently ends up with no test at all."""
+    want = sendable if asked is None else asked
+    fitted = fit_argv_budget(render, want)
+    return fitted, 0 < fitted < want
 
 
 def reviewer_label(name: str, model: str, effort: str = "") -> str:
@@ -1053,6 +1122,18 @@ class SeatTurn(NamedTuple):
     duration_ms: int = 0
     usage: dict | None = None
     absent: bool = False
+    #: This seat ran with no way to read the code under review. True from the
+    #: point :func:`member_sandbox` hands it an empty repo — which is every seat
+    #: that gets as far as starting a CLI today. False on the paths that return
+    #: BEFORE a sandbox exists (an absent CLI, a typo'd effort): nothing ran, so
+    #: there is no coverage to characterise, and `absent` already carries the one
+    #: of those two that `coverage_veto` exempts.
+    #:
+    #: Recorded here rather than assumed downstream because the sandbox is what
+    #: causes the blindness, and #113's second half makes it a per-repo choice.
+    #: When a seat is handed the PR's tree, this is the line that turns False and
+    #: its declarations start counting again.
+    code_blind: bool = False
 
 
 def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
@@ -1125,6 +1206,15 @@ def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
         # rather than tmpdir itself: the seats' own telemetry (pi's session,
         # codex's reply files) has no business inside a repo the CLI can see.
         sandbox = member_sandbox(tmpdir / "cwd")
+        #: What that sandbox COSTS the seat, recorded at the line that causes it.
+        #: An empty repo and no file tools means the diff in the prompt is the
+        #: seat's entire evidence, so anything it declares about code outside the
+        #: diff is a fact about this design and not about the round — see
+        #: `ReviewerRun.code_blind`, which is where that gets spent. Every return
+        #: below carries it; `test_every_shape_of_turn_records_the_seat_as_blind`
+        #: is what stops a fifth exit path being added without it, since the
+        #: default is False and forgetting it silently restores a standing veto.
+        blind = True
         #: One reply path per codex ATTEMPT, in the order they were made; empty
         #: for every other seat. A single shared path let an attempt that wrote
         #: no `--output-last-message` serve the PREVIOUS attempt's text as its
@@ -1240,7 +1330,8 @@ def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
             err += cli_hint(cmd_name, err, model)
             # A member that burned tokens and then failed still spent them, so
             # the usage is reported on this path too.
-            return SeatTurn(skip=err, duration_ms=elapsed(), usage=usage_of())
+            return SeatTurn(skip=err, duration_ms=elapsed(), usage=usage_of(),
+                            code_blind=blind)
 
         text = reply_of(out)
         parsed = parse(text) if parse else None
@@ -1259,10 +1350,12 @@ def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
                 retried = parse(retry_text)
                 if retried is not None:
                     return SeatTurn(retry_text, retried, duration_ms=elapsed(),
-                                    usage=usage_of())
+                                    usage=usage_of(), code_blind=blind)
                 text = retry_text
-            return SeatTurn(text, None, duration_ms=elapsed(), usage=usage_of())
-        return SeatTurn(text, parsed, duration_ms=elapsed(), usage=usage_of())
+            return SeatTurn(text, None, duration_ms=elapsed(), usage=usage_of(),
+                            code_blind=blind)
+        return SeatTurn(text, parsed, duration_ms=elapsed(), usage=usage_of(),
+                        code_blind=blind)
 
 
 def review_llm(cmd_name: str, model: str, prompt: str,
@@ -1277,10 +1370,12 @@ def review_llm(cmd_name: str, model: str, prompt: str,
                     parse=lambda text: parse_reply(cmd_name, text))
     if turn.skip:
         return ReviewerRun(skip=turn.skip, duration_ms=turn.duration_ms,
-                           usage=turn.usage, absent=turn.absent)
+                           usage=turn.usage, absent=turn.absent,
+                           code_blind=turn.code_blind)
     if turn.parsed is not None:
         findings, declared = turn.parsed
-        return ReviewerRun(findings, None, turn.duration_ms, declared, usage=turn.usage)
+        return ReviewerRun(findings, None, turn.duration_ms, declared, usage=turn.usage,
+                           code_blind=turn.code_blind)
     # Neither attempt's reply could be read. Rather than drop the reviewer's
     # work, keep the raw text as a single markdown finding for the judge.
     raw = (turn.reply or "").strip()
@@ -1297,9 +1392,11 @@ def review_llm(cmd_name: str, model: str, prompt: str,
     if not raw:
         return ReviewerRun(skip=f"{reviewer_label(cmd_name, model, effort)}: "
                                 "produced no output",
-                           duration_ms=turn.duration_ms, usage=turn.usage)
+                           duration_ms=turn.duration_ms, usage=turn.usage,
+                           code_blind=turn.code_blind)
     return ReviewerRun([_raw_finding(cmd_name, raw)], None, turn.duration_ms,
-                       unstructured=True, usage=turn.usage)
+                       unstructured=True, usage=turn.usage,
+                       code_blind=turn.code_blind)
 
 
 def ask_llm(cmd_name: str, model: str, prompt: str, effort: str = "") -> SeatAnswer:
@@ -1452,7 +1549,8 @@ __all__ = [
     "EFFORTS", "cli_hint", "is_rejection", "is_permission_denied",
     "is_deterministic_failure", "member_sandbox", "run_cli", "record_run",
     "QB_NO_SUBCOMMAND", "record_ask", "diff_budget", "resolve_round_scope",
-    "fit_argv_budget", "reviewer_label", "codex_args", "antigravity_args",
+    "fit_argv_budget", "argv_clamp", "reviewer_label", "codex_args",
+    "antigravity_args",
     "pi_args", "select_reviewers", "_int", "_jsonl",
     "_usage", "claude_usage", "pi_usage", "codex_usage",
     "SeatParsed", "SeatTurn", "run_seat", "review_llm",

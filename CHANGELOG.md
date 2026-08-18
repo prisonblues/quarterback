@@ -83,6 +83,137 @@ a whole module whose subject is absence. That pin is on `panel` only and
 deliberately not on `panel_seats` — forcing `run_seat` to believe an absent binary
 exists makes it exec `agy` and retry with backoff, which hangs the suite rather
 than failing it.
+## v2.50 — the coverage veto stops reporting a constant
+
+`round_stop` computes `confident` as `not veto`, so anything `coverage_veto`
+files permanently costs the panel its confident stop. Three of the things it
+filed were true of **every** round, which makes them worth nothing as evidence
+and expensive as noise: the signal that decides whether to spend another round
+was never positive, and a signal that is never positive trains its reader to
+skip it.
+
+**A reviewer that cannot read the code declares gaps it will declare every
+round.** Every seat reviews from the diff alone — an empty `member_sandbox` cwd
+and no file tools — so `could_not_assess` fills up with questions about code the
+diff does not show. That is a fact about how the panel is BUILT, not about the PR
+in front of it, and it fired on any PR that so much as referenced a file it did
+not change. Measured on PR #160's round 1: 19 veto lines, 16 of them
+declarations, and **nine of those asked about a file in this very repo** — whether
+`mcp_server/__init__.py` imports the MCP SDK, `QuarterbackClient`'s default
+timeout, `worktree-holder`'s exit codes 3 and 4. The orchestrator answered all
+nine with `grep` in about four minutes. Recorded now as `ReviewerRun.code_blind`,
+reported on the PR comment under a line saying so, and kept out of the veto.
+
+**antigravity cannot be handed a large diff, and the kernel is not negotiable.**
+`agy` is the only seat whose prompt travels in argv, and the kernel caps one
+element at 120,000 bytes — on PR #160 it saw 116,771 of 175,547 chars, 66.5%. A
+budget is a different fact: someone typed it and can raise it, so truncation by
+`max_diff_chars` still vetoes. `argv_clamp` tells them apart and requires the
+kernel to be the **binding** constraint, so a dropped zero in a config cannot
+hide behind it.
+
+**Both are exempted off recorded state, never off the wording of a message.** The
+declarations are free-form model prose and the skip lines are free text, so a
+regex over either would exempt a genuine round-specific gap whose phrasing
+happened to match while still counting the structural one that did not — and
+would silently change which rounds can stop confidently the first time a vendor
+reworded something. This is the argument `ReviewerRun.absent` already made; the
+exemption now generalises to the whole class.
+
+**The argv exemption is applied twice, and the second place is the one that
+matters.** The baseline loader carries an earlier round's truncation forward,
+because increment scope never returns to what round 1 was cut off from. A seat cut
+by the kernel was not going to be closed by a later round either, so carrying it
+put the constant back one round later and left it standing for the whole cycle —
+and `/panel-review-pr` drives several rounds, so exempting only `coverage_veto`
+would have made round 1 look fixed while the loop went right back to never stopping
+confidently. Found by a second model reviewing this branch, which is the argument
+for having one.
+
+**The exemption is narrower than "ignore truncation", in two places a second model
+had to point out.** An argv-capped round still counts as truncated when the question
+is *did this round read the whole PR* — because `reread` erases every earlier round's
+recorded gap, and a round whose kernel-capped seat saw two thirds of the diff cannot
+be the round that closed everyone else's. Exempting the cap says "this gap will never
+close, stop vetoing on it"; it must not also say "this round closed the others". And
+the floor counts LLM seats only: `sonarqube` shares the same mapping and carries no
+`truncated` key, so counting every entry let one running static analyser switch the
+floor off — a confident stop with `--reviewers antigravity` and no LLM having read
+the diff whole. Sonar is the hard gate beside the panel, not a reviewer reading the
+change.
+
+**And each has a floor**, because exempting seats one at a time is how a veto
+list ends up empty on a round nothing read. A panel whose every running seat was
+cut by the argv ceiling vetoes — reachable with `--reviewers antigravity`, and it
+lands on the unattended loops where a confident stop is believed. That is the
+same floor the absent-CLI exemption needed for the same reason.
+
+This is the first half of #113. The second — code access as a per-repo setting,
+defaulting ON, with the empty sandbox as what untrusted-contributor repos turn
+off to — is deliberately separate: landing them together would make turning
+access on **look** like it fixed the confidence signal, when the two changes are
+independent, and on a repo that leaves it off the signal would stay dead. The
+state is a flag rather than a deletion precisely so that half can flip it: a seat
+that could have read the tree and still could not answer is describing the round,
+and has to cost it.
+## v2.49 — the guard that could not fire
+
+`create-worktree`'s isolated-database step reads the main database name out of the
+worktree's `.env`, and there is a `die` under that read whose whole job is to explain
+the case where it finds nothing. That `die` was unreachable by the one input it
+existed for.
+
+The script runs under `set -euo pipefail`. `MAIN_DB_NAME` was only ever assigned
+*inside* the branches above the guard, so when `database.url_env` was declared but
+absent from `.env`, nothing assigned it and the first reader was the guard's own
+`[[ -z "$MAIN_DB_NAME" ]]` — an unset dereference. The run died on
+`MAIN_DB_NAME: unbound variable` at precisely the instruction written to say
+"Could not determine main database name from .env". One line (`MAIN_DB_NAME=""`
+before the branches) makes the message reachable.
+
+Measured on this repo, twice, because the first time looked like a fluke:
+quarterback's `.env` carries `POSTGRES_PASSWORD` and nothing else.
+
+**The two config keys now cascade instead of excluding each other.**
+`database.url_env` and `database.name_env` name two places the same fact can live,
+and the old `if/else` meant declaring the first *disabled* the second. A repo that
+assembles its URL at runtime, or keeps the database name in `docker-compose.yml`
+while only the password reaches `.env`, could therefore never use an isolated
+database — and got an unbound-variable crash rather than a reason. URL still wins
+where both are set: it is what the application actually connects with.
+
+**And the failure no longer leaves an unusable worktree without saying so.** The
+database step is 3 of 10, so dying there left a directory that is a real checkout on
+a real branch with none of what follows: no `.venv` symlink, no assigned port, no
+`CLAUDE.local.md`, no `.gitignore` entry. It looks provisioned enough to `cd` into
+and then fails later in ways that have nothing to do with the database. `die_half_built`
+says the worktree is incomplete and gives the two commands out. It does not clean up
+automatically — by then the directory is a checkout the caller may be looking at,
+`remove-worktree` also drops the branch, and an error path that deletes things is a
+bad thing to have on a hair trigger; the rest of this script degrades the same way,
+by leaving the state and naming it.
+
+The hint passes `$BRANCH_NAME`, not the directory. `remove-worktree` takes a branch
+and derives the path itself, so pasting the basename the sentence above it names —
+the first thing anyone reaches for — fails with a confusing "no such worktree". The
+first version of the warning got exactly that wrong, and a test now pins it.
+
+**Every pasteable hint is now shell-quoted, including three that predate this
+change.** Git's refname rules forbid far less than a shell's parser does — `$`,
+backtick, `;`, `>`, `&`, `|`, `(` and `'` are all legal in a branch name, and nothing
+validates them — so `remove-worktree feat$(id)` was a hint that ran `id` on the
+reader's machine when pasted, and `feat>out` truncated a file. Nothing was executed
+by the script itself; a variable's value is never re-parsed inside double quotes. The
+hazard was entirely in what we printed for a human to copy. `printf %q` leaves an
+ordinary `feat/thing` untouched so the common case stays readable, and escapes the
+rest. Applied at all four sites, one of which writes into `CLAUDE.local.md` and so
+outlives the run that printed it. Found by a second model reviewing the diff.
+
+Tests extract the block from the shipping script by sentinel marker rather than
+copying it, the way `test_create_worktree_rerere.py` does, so a refactor that moves
+the code fails there instead of leaving the suite green about code nobody runs.
+Reverting the block to its previous shape reproduces `MAIN_DB_NAME: unbound variable`
+and fails three of them; neutering `sh_quote` fails the paste-safety one.
 
 ## v2.48 — a lease says what its holder is doing, not just where
 

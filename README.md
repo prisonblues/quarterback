@@ -581,6 +581,25 @@ full — including what was broken before it, which is the part no diff recovers
   a repo name, and treat the string itself as untrusted input on the way back in: the board bounds
   its length at `PATH_MAX` and normalises nothing else, so quote it, and do not hand a value
   beginning with `-` to `git` as anything but an operand.
+- **v2.50** — the coverage veto stops reporting a constant. `confident` is `not veto`, so a
+  veto line that fires every round makes a confident stop unreachable rather than rare. Two
+  did: a seat that cannot read the code (every seat — an empty sandbox and no tools) declaring
+  gaps about code outside the diff, and antigravity's argv ceiling, which the kernel sets at
+  120,000 bytes. On PR #160's round 1 that was 16 of 19 veto lines, nine of them asking about
+  a file in this repo that `grep` answered in four minutes. Both are now recorded state
+  (`ReviewerRun.code_blind`, `argv_clamp`) rather than matched on message wording, both are
+  still reported, and both have a floor so exempting seats one at a time cannot empty the veto
+  on a round nothing read. Truncation by a `max_diff_chars` somebody typed still vetoes. First
+  half of #113; code access as a per-repo setting is the second and lands separately.
+- **v2.49** — the guard that could not fire. `create-worktree`'s isolated-DB step had a
+  `die` whose whole job was to explain a missing database name, and `set -u` killed the
+  script at that guard's own dereference instead — `MAIN_DB_NAME: unbound variable`, at the
+  exact line written to say what was wrong. One initialisation makes the message reachable.
+  `database.url_env` and `database.name_env` now cascade rather than excluding each other,
+  so a repo that assembles its URL at runtime (or keeps the name in docker-compose) can use
+  an isolated database. And because the step is 3 of 10, a failure there left a checkout
+  with no `.venv`, port or context file: it now says the worktree is incomplete and gives
+  the two commands out, naming the branch rather than the directory.
 - **v2.48** — a lease says what its holder is doing, not just where. `POST /lease` takes
   `state` (`working | waiting | input`) and `/active` and `/overlap` return it with `state_at`,
   because a state is only as good as its age: `working` last reported twenty minutes ago

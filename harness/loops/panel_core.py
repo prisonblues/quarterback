@@ -410,6 +410,27 @@ class ReviewerRun:
     #: coverage veto, and silently restores the veto the moment the absent
     #: branch's wording gains a suffix.
     absent: bool = False
+    #: This seat had no way to READ the code under review — an empty
+    #: `member_sandbox` cwd and no file tools, so the diff in its prompt was the
+    #: whole of its evidence. Every LLM seat is blind today; the flag exists
+    #: because that is a property of how the panel is BUILT, not of the round it
+    #: just ran, and `coverage_veto` has to be able to tell the difference.
+    #:
+    #: What it buys: a blind seat's `could_not_assess` entries are reported and do
+    #: not veto. "I could not read a function this diff does not change" is true
+    #: of every round a blind seat sits, so it separates no quiet round from a
+    #: broken one — and `round_stop` computes `confident` as `not veto`, so a
+    #: constant there made a confident stop unreachable on any PR that so much as
+    #: mentions a file it does not touch. Measured on PR #160's round 1: 16 of 19
+    #: veto lines were declarations, and nine of those asked about a file in this
+    #: repo, answered with `grep` in four minutes.
+    #:
+    #: Set from the sandbox the seat actually ran in (see :func:`run_seat`),
+    #: never assumed here: #113's second half makes code access a per-repo
+    #: setting, and on a repo that turns it ON the same entry stops being
+    #: structural and must veto again — it is then a fact about the round. A
+    #: hard-coded exemption would keep silently discarding it.
+    code_blind: bool = False
 
 
 @dataclass
