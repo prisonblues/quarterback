@@ -357,6 +357,15 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
     tarball that will not unpack or has an unexpected shape, a copy that runs out of
     disk: the seat is blind, recorded as blind, and the round says why in
     `config_notes`. A review that would have happened always happens.
+  - **A transient fetch failure is retried, a settled one is not.** Measured: five
+    hand-run fetches of one sha during development returned two 502s and a 503 —
+    GitHub packs a repository on demand for this endpoint and it is markedly flakier
+    than the JSON API the rest of the panel uses. That matters more than the rate
+    suggests, because the degrade is silent in *effect*: one note among several, and
+    an ordinary-looking report. A feature that quietly stops applying a third of the
+    time is worse than one that is off, because the config still says it is on. A 404
+    is not retried — it is a settled answer about that sha (a fork PR, most likely),
+    and `run_cli` already draws that line for reviewer CLIs.
   - **The judge is not given the tree.** Out of scope here and worth its own change:
     #90's wrong P1 was a reviewer finding the judge *confirmed*, so a reading judge is
     the natural next step rather than a detail of this one.

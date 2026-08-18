@@ -70,6 +70,13 @@ your own agents, and precisely why `false` is right where they are strangers. Wh
 removed is named per round, so a PR that shipped an `AGENTS.md` is distinguishable from
 one that did not.
 
+**The tarball endpoint is flaky and is retried.** Five hand-run fetches of one sha
+while building this returned two 502s and a 503; GitHub packs a repository on demand
+here and it is much less reliable than the JSON API the rest of the panel uses. A
+transient 5xx gets three attempts, a 404 gets one — it is a settled answer about that
+sha. Without the retry the feature would have stopped applying a noticeable fraction
+of the time while its config said it was on, which is the worst of the three states.
+
 **Every failure degrades to the OFF posture, loudly.** A fetch that 502s, a tarball
 that will not unpack or arrives in an unexpected shape, a copy that runs out of disk:
 the seat is blind, recorded as blind, and the round says why. Three of those paths were

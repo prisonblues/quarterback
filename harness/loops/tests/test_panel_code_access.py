@@ -651,3 +651,64 @@ def test_a_missing_block_defaults_on():
     """An unconfigured repo gets the default, which is what makes `/panel` work in any
     repo at all — `load_repo_cfg`'s whole premise."""
     assert panel.code_access_wanted({}, False, []) is True
+
+
+# ------------------------------------------------- the endpoint is flaky
+
+def test_a_transient_tarball_failure_is_retried(monkeypatch, tmp_path):
+    """GitHub packs a repo on demand for this endpoint and it is flaky: five hand-run
+    fetches of one sha during development returned two 502s and a 503.
+
+    Worth retrying rather than degrading, because the degrade is silent in effect — a
+    round that falls back to the diff files one note among several and produces an
+    ordinary report. A feature that stops applying a third of the time while its
+    config says it is on is worse than one that is off."""
+    calls = []
+
+    def flaky(*a, **k):
+        calls.append(1)
+        if len(calls) < 3:
+            raise subprocess.CalledProcessError(1, "gh", stderr=b"gh: HTTP 502")
+        return pr_tarball(files={"app/main.py": "x = 1"})
+
+    monkeypatch.setattr(panel_core, "sh_bytes", flaky)
+    tree, problem = panel.fetch_pr_tree("acme/board", "deadbee", tmp_path)
+
+    assert problem == "" and tree is not None
+    assert len(calls) == 3, "it gave up before the endpoint recovered"
+    assert (tree / "app/main.py").exists()
+
+
+def test_a_settled_failure_is_not_retried(monkeypatch, tmp_path):
+    """A 404 is an answer about this sha, not a hiccup — most likely a fork PR, whose
+    head is not guaranteed to be a tarball on the base repo. Asking twice more only
+    spends the round's time before filing the same note, which is `run_cli`'s rule
+    (`is_deterministic_failure`) one layer out."""
+    calls = []
+
+    def gone(*a, **k):
+        calls.append(1)
+        raise subprocess.CalledProcessError(1, "gh", stderr=b"gh: Not Found (HTTP 404)")
+
+    monkeypatch.setattr(panel_core, "sh_bytes", gone)
+    tree, problem = panel.fetch_pr_tree("acme/board", "deadbee", tmp_path)
+
+    assert tree is None and "Not Found" in problem
+    assert len(calls) == 1, "a settled answer was asked for three times"
+
+
+def test_a_transient_failure_that_never_clears_still_degrades(monkeypatch, tmp_path):
+    """The retry must not become a way to hang or to raise. Three 502s is a round that
+    reviews from the diff, with a note — never an exception out of a function whose
+    contract is that it never raises."""
+    calls = []
+
+    def always502(*a, **k):
+        calls.append(1)
+        raise subprocess.CalledProcessError(1, "gh", stderr=b"gh: HTTP 503")
+
+    monkeypatch.setattr(panel_core, "sh_bytes", always502)
+    tree, problem = panel.fetch_pr_tree("acme/board", "deadbee", tmp_path)
+
+    assert tree is None and "503" in problem
+    assert len(calls) == 3

@@ -251,6 +251,49 @@ def strip_convention_files(root: Path) -> list[str]:
     return removed
 
 
+#: HTTP statuses worth asking again about: the endpoint was reachable and briefly
+#: could not answer. A 404 is deliberately absent — that is a settled answer about
+#: this sha, and asking twice more only delays the round before the same note.
+TREE_RETRY_STATUSES = ("HTTP 500", "HTTP 502", "HTTP 503", "HTTP 504")
+
+
+def _fetch_tarball(gh_repo: str, head_sha: str, attempts: int = 3) -> bytes:
+    """The tarball bytes, retrying a TRANSIENT failure. Through `sh_bytes`, which is
+    the same seam `sh` is: `gh api` writes the gzip to stdout, and `sh` runs
+    `text=True` and would corrupt it.
+
+    Measured rather than anticipated: while this feature was being built, five
+    hand-run fetches of one sha returned two 502s and a 503. GitHub packs a
+    repository on demand for this endpoint and it is markedly flakier than the JSON
+    API the rest of the panel uses.
+
+    That matters more than the raw rate suggests, because the fallback is silent in
+    EFFECT — the round degrades to reviewing from the diff, files a note among the
+    other config notes, and produces an ordinary-looking report. A feature that
+    quietly stops applying a third of the time is worse than one that is off, because
+    the config still says it is on and the reader has no reason to check.
+
+    The same shape as `run_cli`'s retry and the same rule: retry what can differ next
+    time and never what cannot. A 404 is settled for this sha — a fork PR, most
+    likely; see the caller — so it is raised at once.
+
+    Raises on the final attempt rather than returning a sentinel, so the caller's
+    single `except` still owns every failure and this needs no second error
+    contract."""
+    for attempt in range(attempts):
+        try:
+            return panel_core.sh_bytes(
+                ["gh", "api", f"repos/{gh_repo}/tarball/{head_sha}"],
+                timeout=TREE_FETCH_TIMEOUT)
+        except subprocess.CalledProcessError as e:
+            raw = e.stderr if isinstance(e.stderr, bytes) else (e.stderr or "").encode()
+            tail = raw.decode("utf-8", "replace")
+            if attempt == attempts - 1 or not any(x in tail
+                                                 for x in TREE_RETRY_STATUSES):
+                raise
+    raise AssertionError("unreachable: the loop above always returns or raises")
+
+
 def fetch_pr_tree(gh_repo: str, head_sha: str, into: Path) -> tuple[Path | None, str]:
     """The PR's own tree at `head_sha`, extracted under `into`, as
     ``(tree, problem)`` with `problem` empty on success.
@@ -287,11 +330,7 @@ def fetch_pr_tree(gh_repo: str, head_sha: str, into: Path) -> tuple[Path | None,
     tar_path = into / "tree.tar.gz"
     what = f"the tree at {head_sha[:8]}"
     try:
-        # Through `sh_bytes`, which is the same seam `sh` is: `gh api` writes the
-        # gzip to stdout, and `sh` runs text=True and would corrupt it.
-        raw = panel_core.sh_bytes(
-            ["gh", "api", f"repos/{gh_repo}/tarball/{head_sha}"],
-            timeout=TREE_FETCH_TIMEOUT)
+        raw = _fetch_tarball(gh_repo, head_sha)
         if len(raw) > TREE_MAX_BYTES:
             # Checked before it reaches the disk. The compressed body is already in
             # memory by the time we can measure it — `sh_bytes` captures stdout
@@ -1942,7 +1981,7 @@ __all__ = [
     "is_deterministic_failure", "member_sandbox", "run_cli", "record_run",
     "SEAT_READS_CODE", "CONVENTION_FILES", "CONVENTION_DIRS",
     "strip_convention_files", "fetch_pr_tree", "seat_checkout",
-    "code_access_wanted",
+    "code_access_wanted", "_fetch_tarball", "TREE_RETRY_STATUSES",
     "READ_ONLY_TOOLS", "claude_args",
     "QB_NO_SUBCOMMAND", "record_ask", "diff_budget", "resolve_round_scope",
     "fit_argv_budget", "argv_clamp", "reviewer_label", "codex_args",
