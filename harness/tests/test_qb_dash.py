@@ -148,6 +148,11 @@ def test_the_hammer_starts_a_fix_and_the_rest_of_the_issue_row_opens():
 async def _drive() -> list[str]:
     app_module = _load_app()
     app = app_module.Dash(interval=3600, gh_interval=3600)   # no refresh mid-test
+    # The usage line is a live call to Anthropic and it appears as a ROW when
+    # its first answer lands — which reflows everything under it, mid-click if
+    # the click is already in flight. Off for every test here: none of them is
+    # about the caps, and a test that reached the network would be its own bug.
+    app.refresh_limits = lambda: None
 
     opened: list[int] = []
     jumped: list[int] = []
@@ -197,6 +202,7 @@ async def _drive() -> list[str]:
 async def _drive_issues() -> list[str]:
     app_module = _load_app()
     app = app_module.Dash(interval=3600, gh_interval=3600)
+    app.refresh_limits = lambda: None
 
     started: list[tuple[str, str]] = []
     opened: list[int] = []
@@ -260,6 +266,7 @@ async def _drive_issues() -> list[str]:
 async def _drive_plan() -> list[str]:
     app_module = _load_app()
     app = app_module.Dash(interval=3600, gh_interval=3600, plan_interval=3600)
+    app.refresh_limits = lambda: None
 
     started: list[tuple[str, str]] = []
     app.run_in_window = lambda name, command: started.append((name, command))
@@ -321,6 +328,7 @@ async def _drive_plan() -> list[str]:
 async def _drive_panel() -> list[str]:
     app_module = _load_app()
     app = app_module.Dash(interval=3600, gh_interval=3600)
+    app.refresh_limits = lambda: None
 
     started: list[tuple[str, str]] = []
     windowed: list[tuple[str, str]] = []
@@ -397,6 +405,7 @@ async def _drive_seats() -> list[str]:
     """
     app_module = _load_app()
     app = app_module.Dash(interval=3600, gh_interval=3600)
+    app.refresh_limits = lambda: None
 
     fake = [
         {"pane": "%7", "seat": "1", "session": "seats-demo", "window": "0",
@@ -489,6 +498,7 @@ async def _drive_review_pane(seats: list[dict]) -> tuple[list[list[str]], list[s
     """
     app_module = _load_app()
     app = app_module.Dash(interval=3600, gh_interval=3600)
+    app.refresh_limits = lambda: None
     app.refresh_seats = lambda: None
 
     calls: list[list[str]] = []

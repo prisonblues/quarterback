@@ -125,6 +125,10 @@ class Dash(App):
 
     CSS = """
     Screen { background: $surface; }
+    /* Hidden until the first fetch says there is something to show: an install
+       with no subscription token gets no blank row. */
+    #limits { height: 1; padding: 0 1; background: $panel; color: $text;
+              display: none; }
     #head { height: 1; padding: 0 1; background: $panel; color: $text; }
     #detail { height: auto; min-height: 1; padding: 0 1; background: $panel;
               color: $text-muted; }
@@ -174,6 +178,11 @@ class Dash(App):
         # or an agent claims an item — neither of which happens every four
         # seconds.
         self.plan_interval = plan_interval
+        # Slower again: a five-hour window does not move in four seconds, and
+        # this one is a call to Anthropic rather than to the board.
+        self.limits_interval = qd.LIMITS_EVERY
+        self.limits: list[dict] = []
+        self.limits_err: str | None = None
         self.client = None
         self.cfg = None
         self.rows: dict[str, dict] = {}       # row key → the record behind it
@@ -201,6 +210,10 @@ class Dash(App):
     # ---- layout ---------------------------------------------------------
 
     def compose(self) -> ComposeResult:
+        # Above the board line, because it governs every pane below it: the seats
+        # spend one subscription between them, and the window they are working
+        # towards is the one number none of the tables can show.
+        yield Static("", id="limits")
         yield Static("quarterback — connecting…", id="head")
         with Vertical():
             yield Static("SEATS", classes="title", id="t_seats")
@@ -235,10 +248,12 @@ class Dash(App):
                 Text(f"no board configured: {type(exc).__name__}", style="bold red"))
             return
         self.refresh_seats()
+        self.refresh_limits()
         self.refresh_board()
         self.refresh_plan()
         self.refresh_prs()
         self.refresh_issues()
+        self.set_interval(self.limits_interval, self.refresh_limits)
         self.set_interval(self.interval, self.refresh_seats)
         self.set_interval(self.interval, self.refresh_board)
         self.set_interval(self.plan_interval, self.refresh_plan)
@@ -251,6 +266,11 @@ class Dash(App):
     def refresh_seats(self) -> None:
         seats = qd.tmux_seats()
         self.call_from_thread(self.render_seats, seats)
+
+    @work(thread=True, exclusive=True, group="limits")
+    def refresh_limits(self) -> None:
+        limits, err = qd.fetch_limits()
+        self.call_from_thread(self.render_limits, limits, err)
 
     @work(thread=True, exclusive=True, group="board")
     def refresh_board(self) -> None:
@@ -319,6 +339,45 @@ class Dash(App):
                       key="seat:add")
         title = f"SEATS · {len(seats)}" if seats else "SEATS · none on this screen"
         self.query_one("#t_seats", Static).update(title)
+
+    def render_limits(self, limits: list[dict], err: str | None) -> None:
+        """Claude Code's own caps, as bars — `5h ████░░ 64% 3h57m  7d ██░ 41% 5d8h`.
+
+        A failed call keeps the last figures rather than blanking the line: they
+        are minutes old and still roughly true, and a line that vanished on every
+        hiccup would read as "no limits", which is the opposite of what it means.
+        An install with no subscription token has nothing here to show, and the
+        row is hidden outright rather than left blank.
+        """
+        if limits:
+            self.limits = limits
+        self.limits_err = err
+        try:
+            bar = self.query_one("#limits", Static)
+        except Exception:                         # noqa: BLE001 — a resize before mount
+            return
+        cells = qd.limit_cells(self.limits, max(20, self.size.width - 2))
+        bar.display = bool(cells)
+        if not cells:
+            return
+        text = Text()
+        for i, (label, glyphs, pct, reset, colour) in enumerate(cells):
+            if i:
+                text.append("  ")
+            text.append(label, style="bold grey70")
+            if glyphs:
+                text.append(f" {glyphs}", style=colour)
+            text.append(f" {pct}", style=f"bold {colour}")
+            if reset:
+                text.append(f" {reset}", style="grey50")
+        if err:
+            text.append(" ?", style="grey50")
+        bar.update(text)
+
+    def on_resize(self) -> None:
+        """Re-lay the bars to the new width — they are sized to the pane, and the
+        dash pane is resized every time the screen is."""
+        self.render_limits(self.limits, self.limits_err)
 
     def render_board(self, data: dict) -> None:
         head = self.query_one("#head", Static)

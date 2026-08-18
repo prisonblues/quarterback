@@ -558,6 +558,26 @@ the tmux cursor to that seat's pane, a claim shows its note, a plan item explain
 where it is, a PR or an issue opens on GitHub. `qb-dash` is the same five views rendered
 without interaction, for a terminal that will not forward mouse events.
 
+**The top line is the ceiling every pane below it works towards.** The seats spend one
+Claude subscription between them, so the five-hour and weekly caps are a fleet-wide number
+that none of the tables can show — and six seats working a plan in parallel is exactly the
+way to spend a five-hour window in forty minutes. It reads `5h ██████░░░░ 64% 3h57m  7d
+███░░░░░░ 41% 5d8h`: the share spent, and when it comes back. Green to yellow at 70% and
+red at 90%, or sooner if the endpoint's own severity says so. A weekly cap scoped to one
+model appears under that model's name once it has been spent against; at zero it would be
+noise, so it is left out.
+
+The figures come from the same endpoint `/usage` reads, so a seat and the dash cannot
+disagree, and an install authenticating with an API key has no subscription caps to report —
+that is a missing line, not an error. **The endpoint rate-limits harder than a dashboard's
+instincts suggest**: five calls inside ten minutes earned a 429 while this was being built.
+So the interval is 3 minutes and it is enforced in `~/.cache/quarterback/limits.json` rather
+than in each process's timer — three seat screens are three dash processes, and a per-process
+clock cannot hold a machine-wide budget. A failed call keeps showing the last figures, which
+are minutes old and still roughly true; past ten minutes the line appends a dim `?` rather
+than pretending. A 429 backs off for ten minutes, because the failing call is itself the
+thing being rate limited.
+
 **Clicking starts work, not just navigation.** Each PR row carries a `⚖` and each issue row
 a `⚒`; clicking one opens a confirmation showing the exact command, and confirming runs
 `/panel-review-pr <n>` or `/fix-issue <n>` in a detached tmux window of its own — the same

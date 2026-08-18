@@ -11,9 +11,14 @@ Run: pytest harness/tests/test_qbdata.py
 
 from __future__ import annotations
 
+import io
+import json
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+import pytest
 
 BIN = Path(__file__).resolve().parent.parent / "bin"
 sys.path.insert(0, str(BIN))
@@ -242,3 +247,179 @@ def test_a_state_with_no_timestamp_is_not_promoted_to_stalled():
     evidence of being stuck."""
     assert qd.agent_state({"state": "working", "state_at": None})[0] == "working"
     assert qd.agent_state({"state": "working", "state_at": "not a date"})[0] == "working"
+
+
+# ---- the subscription's own limits -------------------------------------------
+
+USAGE = {
+    "limits": [
+        {"kind": "session", "group": "session", "percent": 62, "severity": "normal",
+         "resets_at": "2026-08-19T02:10:00+00:00", "scope": None, "is_active": True},
+        {"kind": "weekly_all", "group": "weekly", "percent": 41, "severity": "normal",
+         "resets_at": "2026-08-24T07:00:00+00:00", "scope": None, "is_active": False},
+        {"kind": "weekly_scoped", "group": "weekly", "percent": 0, "severity": "normal",
+         "resets_at": None, "scope": {"model": {"display_name": "Fable"}}, "is_active": False},
+    ],
+}
+
+
+def test_the_two_headline_caps_are_named_by_their_window():
+    got = qd.parse_limits(USAGE)
+    assert [l["label"] for l in got] == ["5h", "7d"]
+    assert [l["percent"] for l in got] == [62, 41]
+
+
+def test_an_untouched_scoped_cap_is_not_worth_a_column():
+    """Every model on the plan has one; listing them all buries the two being spent."""
+    assert all(l["label"] != "Fable" for l in qd.parse_limits(USAGE))
+
+
+def test_a_scoped_cap_being_spent_shows_up_under_its_model_name():
+    usage = {"limits": [dict(USAGE["limits"][2], percent=18)]}
+    got = qd.parse_limits(usage)
+    assert [(l["label"], l["percent"]) for l in got] == [("Fable", 18)]
+
+
+def test_a_headline_cap_at_zero_still_shows():
+    """The start of a window is information; a blank line there is not."""
+    usage = {"limits": [dict(USAGE["limits"][0], percent=0)]}
+    assert [l["percent"] for l in qd.parse_limits(usage)] == [0]
+
+
+def test_an_answer_with_no_limits_in_it_is_empty_rather_than_an_exception():
+    assert qd.parse_limits({}) == []
+    assert qd.parse_limits({"limits": [{"kind": "session", "percent": None}]}) == []
+
+
+@pytest.fixture
+def alone(monkeypatch, tmp_path):
+    """A cache of this test's own.
+
+    The cache is a FILE, shared by every dash pane on the machine, so a test that
+    used the real one would read the developer's live figures and pass on them.
+    """
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    return tmp_path
+
+
+def test_no_token_is_nothing_to_show_and_not_a_failure(alone, monkeypatch, tmp_path):
+    """An API-key install has no subscription caps. That is a missing line, not an error."""
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    assert qd.fetch_limits() == ([], None)
+
+
+def test_a_failed_call_says_so_rather_than_reporting_zero_usage(alone, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-whatever")
+
+    def boom(*a, **k):
+        raise OSError("no network")
+
+    monkeypatch.setattr(qd.urllib.request, "urlopen", boom)
+    limits, err = qd.fetch_limits()
+    assert limits == [] and err
+
+
+def test_a_failure_keeps_the_last_good_figures_rather_than_emptying_the_line(alone, monkeypatch):
+    """Minutes-old caps are still worth acting on. A line that vanished on a
+    hiccup would read as 'no limits', which is the opposite of what it means."""
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-whatever")
+    calls = _serve(monkeypatch, USAGE)
+    assert [l["percent"] for l in qd.fetch_limits()[0]] == [62, 41]
+
+    monkeypatch.setattr(qd, "LIMITS_EVERY", 0.0)       # the next call is allowed
+    monkeypatch.setattr(qd.urllib.request, "urlopen",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("gone")))
+    limits, err = qd.fetch_limits()
+    assert [l["percent"] for l in limits] == [62, 41], "the last good answer was dropped"
+    assert err is None, "figures this fresh are not worth flagging"
+    assert len(calls) == 1
+
+
+def test_a_second_pane_asking_a_moment_later_reuses_the_answer(alone, monkeypatch):
+    """Three seat screens are three dash processes. The endpoint rate-limits —
+    it answered 429 while this was being built — so the interval is enforced in
+    a file all three can see, not in each one's timer."""
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-whatever")
+    calls = _serve(monkeypatch, USAGE)
+    first, _ = qd.fetch_limits()
+    second, err = qd.fetch_limits()
+    assert [l["percent"] for l in second] == [l["percent"] for l in first]
+    assert err is None
+    assert len(calls) == 1, "the cached answer was not used"
+
+
+def test_a_rate_limited_dash_backs_further_off_than_a_merely_failed_one(alone, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-whatever")
+
+    def limited(*a, **k):
+        raise qd.urllib.error.HTTPError(qd.USAGE_URL, 429, "slow down", {}, None)
+
+    monkeypatch.setattr(qd.urllib.request, "urlopen", limited)
+    before = time.time()
+    qd.fetch_limits()
+    assert qd._read_cache()["next"] - before > qd.LIMITS_EVERY * 2
+
+
+def test_the_bar_fills_in_proportion_and_never_reads_empty_when_spending_has_started():
+    assert qd.limit_bar(0, 10) == "░" * 10
+    assert qd.limit_bar(50, 10) == "█" * 5 + "░" * 5
+    assert qd.limit_bar(100, 10) == "█" * 10
+    assert qd.limit_bar(3, 10).startswith("█"), "3% must not look like 0%"
+
+
+def test_the_colour_escalates_on_the_number_and_on_the_endpoints_own_severity():
+    assert qd.limit_colour(20) == "green"
+    assert qd.limit_colour(75) == "yellow"
+    assert qd.limit_colour(95) == "red"
+    assert qd.limit_colour(20, "warning") == "yellow"
+    assert qd.limit_colour(20, "critical") == "red"
+
+
+def test_a_weekly_reset_is_days_rather_than_a_three_digit_hour_count():
+    from datetime import datetime, timedelta, timezone
+
+    def ahead(**kw):
+        return (datetime.now(timezone.utc) + timedelta(**kw)).isoformat()
+
+    assert qd.limit_reset(ahead(days=5, hours=8, minutes=1)) == "5d8h"
+    assert qd.limit_reset(ahead(hours=3, minutes=57, seconds=30)) == "3h57m"
+    assert qd.limit_reset(ahead(minutes=44, seconds=30)) == "44m"
+    assert qd.limit_reset("2026-01-01T00:00:00+00:00") == "now"     # long past
+    assert qd.limit_reset(None) == ""
+
+
+def test_the_line_gives_up_its_bars_before_it_overflows_a_narrow_pane():
+    limits = qd.parse_limits(USAGE)
+    wide = qd.limit_cells(limits, 78)
+    narrow = qd.limit_cells(limits, 32)
+    assert all(bar for _, bar, _, _, _ in wide)
+    assert not any(bar for _, bar, _, _, _ in narrow)
+    for cells, width in ((wide, 78), (narrow, 32)):
+        line = "  ".join(" ".join(x for x in cell[:4] if x) for cell in cells)
+        assert len(line) <= width, line
+
+
+def test_a_pane_too_narrow_for_even_the_numbers_gets_no_line_at_all():
+    assert qd.limit_cells(qd.parse_limits(USAGE), 12) == []
+    assert qd.limit_cells([], 78) == []
+
+
+def _serve(monkeypatch, payload: dict) -> list:
+    """Answer the usage endpoint with `payload`, recording how often it is asked."""
+    calls: list = []
+
+    class Response(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def urlopen(*a, **k):
+        calls.append(1)
+        return Response(json.dumps(payload).encode())
+
+    monkeypatch.setattr(qd.urllib.request, "urlopen", urlopen)
+    return calls

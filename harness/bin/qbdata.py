@@ -13,6 +13,8 @@ import shlex
 import socket
 import ssl
 import subprocess
+import time
+import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 
@@ -647,3 +649,242 @@ def tmux_seats() -> list[dict]:
     # By seat NUMBER, not by pane order: --add splits off the leftmost pane, so
     # pane order runs 1, 3, 2 on a screen that has had a seat added to it.
     return sorted(seats, key=lambda s: int(s["seat"]) if s["seat"].isdigit() else 0)
+
+
+# ---- claude code's own limits ------------------------------------------------
+#
+# The seats all bill to ONE subscription, so the ceiling every one of them is
+# working towards is a single fleet-wide number — and it is the one fact this
+# dashboard could not previously show. Six seats making a plan happen in
+# parallel is exactly the way to spend a five-hour window in forty minutes, and
+# the human at the screen finds out by watching an agent stop.
+#
+# The figures come from the same endpoint `/usage` reads, so what this shows and
+# what a seat says about itself cannot disagree. It is the subscription's usage,
+# not this session's: there is no per-session budget to report.
+#
+# NO TOKEN, NO LINE. An API-key install has no subscription limits to report and
+# a missing credentials file is that case, not a failure — it returns nothing to
+# show and no error, and the header simply has one line fewer.
+
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+# THREE MINUTES, AND THAT IS ALREADY GENEROUS. The endpoint rate-limits harder
+# than a dashboard's instincts suggest — five calls inside ten minutes was enough
+# to get a 429 while this was being written. A five-hour window moves about a
+# percent in three minutes, so nothing legible is being given up.
+LIMITS_EVERY = 180.0    # seconds between calls, across every pane on the machine
+BACKOFF = 600.0         # …and this long once the endpoint has said slow down
+STALE_AFTER = 600.0     # past this the line admits its figures are old
+
+
+def _oauth_token() -> str | None:
+    """Claude Code's own OAuth access token, or None if this install has none.
+
+    Read fresh every time rather than cached: Claude Code refreshes the token in
+    place, and a dashboard that cached one at startup would start 401ing after
+    an hour with nothing to say about why.
+    """
+    env = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+    if env:
+        return env
+    home = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+    try:
+        with open(os.path.join(home, ".credentials.json"), encoding="utf-8") as fh:
+            return (json.load(fh).get("claudeAiOauth") or {}).get("accessToken") or None
+    except Exception:                             # noqa: BLE001 — absent, or not ours to read
+        return None
+
+
+def _limit_label(row: dict) -> str:
+    """What to call a limit in two or three columns.
+
+    The kinds are the endpoint's, and the scoped one names its own model: a
+    weekly cap that applies to Opus alone reads 'Opus', because 'weekly_scoped'
+    is not a thing anybody is watching for.
+    """
+    kind = row.get("kind") or ""
+    if kind == "session":
+        return "5h"
+    if kind == "weekly_all":
+        return "7d"
+    if kind == "weekly_scoped":
+        scope = (row.get("scope") or {}).get("model") or {}
+        return scope.get("display_name") or "7d*"
+    return kind[:6] or "?"
+
+
+# THE CACHE IS ON DISK BECAUSE THE POLLERS ARE SEPARATE PROCESSES. A developer
+# running three seat screens has three dash panes, each its own process, each
+# with its own timer — and the endpoint rate-limits, which is not a guess: it
+# answered 429 while this was being built. A per-process interval cannot fix
+# that, so the interval is enforced where they can all see it. One file, last
+# answer plus the time the next call is allowed.
+
+def _cache_path() -> str:
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    return os.path.join(base, "quarterback", "limits.json")
+
+
+def _read_cache() -> dict:
+    try:
+        with open(_cache_path(), encoding="utf-8") as fh:
+            got = json.load(fh)
+        return got if isinstance(got, dict) else {}
+    except Exception:                             # noqa: BLE001 — no cache is a cold start
+        return {}
+
+
+def _write_cache(cache: dict) -> None:
+    """Atomically, because the other dash panes are reading it as this one writes."""
+    path = _cache_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.{os.getpid()}"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(cache, fh)
+        os.replace(tmp, path)
+    except Exception:                             # noqa: BLE001 — a cache is an optimisation
+        pass
+
+
+def _get_usage(token: str) -> tuple[list[dict], str | None]:
+    req = urllib.request.Request(USAGE_URL, headers={
+        "Authorization": f"Bearer {token}",
+        "anthropic-beta": "oauth-2025-04-20",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=15, context=_ssl_context()) as resp:
+            return parse_limits(json.loads(resp.read().decode())), None
+    except urllib.error.HTTPError as exc:
+        return [], f"HTTP {exc.code}"             # the code, or 429 is invisible
+    except Exception as exc:                      # noqa: BLE001
+        return [], type(exc).__name__
+
+
+def _cached(cache: dict, now: float, err: str | None = None) -> tuple[list[dict], str | None]:
+    limits = cache.get("limits") or []
+    if now - float(cache.get("at") or 0) > STALE_AFTER:
+        return limits, err or "stale"
+    return limits, (None if limits else err)
+
+
+def fetch_limits() -> tuple[list[dict], str | None]:
+    """[{label, percent, resets, severity}, …] — the caps the whole fleet shares.
+
+    Never raises, and never blanks a good answer. Returns ([], None) when there
+    is nothing to report at all (no token, so no subscription caps), and the
+    LAST figures with an error beside them when a call fails — they are minutes
+    old and still roughly true, which is more use than an empty line.
+    """
+    token = _oauth_token()
+    if not token:
+        return [], None
+    cache = _read_cache()
+    now = time.time()
+    if now < float(cache.get("next") or 0):
+        return _cached(cache, now)                # somebody else asked recently enough
+    limits, err = _get_usage(token)
+    if err is None:
+        _write_cache({"at": now, "limits": limits, "next": now + LIMITS_EVERY})
+        return limits, None
+    # A 429 means back further off, not try again in a minute: the failing call
+    # is itself the thing being rate limited, and three panes retrying on the
+    # short clock is how a warning becomes a wall.
+    cache["next"] = now + (BACKOFF if err == "HTTP 429" else LIMITS_EVERY)
+    _write_cache(cache)
+    return _cached(cache, now, err)
+
+
+def parse_limits(data: dict) -> list[dict]:
+    """The endpoint's answer, reduced to what fits on one line.
+
+    Split out from the fetch so the shaping is testable without a network, and
+    because the endpoint carries a dozen fields per cap of which this shows
+    three.
+    """
+    out = []
+    for row in data.get("limits") or []:
+        percent = row.get("percent")
+        if percent is None:
+            continue
+        percent = int(round(percent))
+        # A scoped cap nobody has touched is noise; the two headline caps stay
+        # even at zero, because "0%" at the start of a window is information.
+        if percent <= 0 and row.get("kind") not in ("session", "weekly_all"):
+            continue
+        out.append({
+            "label": _limit_label(row),
+            "percent": percent,
+            "resets": row.get("resets_at"),
+            "severity": row.get("severity") or "normal",
+        })
+    return out
+
+
+def limit_reset(stamp: str | None) -> str:
+    """'44m', '3h58m', '5d' — when a cap comes back, in five columns.
+
+    until() is right for a lease measured in minutes and wrong here: a weekly
+    window reads '128h48m', which is both too wide for the line and not how
+    anybody thinks about next Monday.
+    """
+    if not stamp:
+        return ""
+    try:
+        then = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    secs = int((then - datetime.now(timezone.utc)).total_seconds())
+    if secs <= 0:
+        return "now"
+    if secs < 3600:
+        return f"{secs // 60}m"
+    if secs < 48 * 3600:
+        return f"{secs // 3600}h{(secs % 3600) // 60:02d}m"
+    return f"{secs // 86400}d{(secs % 86400) // 3600}h"
+
+
+def limit_colour(percent: int, severity: str = "normal") -> str:
+    """Green, yellow, red — and the endpoint's own severity can only escalate it.
+
+    Thresholds here rather than trusting severity alone: severity says 'normal'
+    at 62% of a window that six seats will finish inside the hour, and the point
+    of the line is to see that coming.
+    """
+    if severity in ("critical", "exceeded", "blocked") or percent >= 90:
+        return "red"
+    if severity == "warning" or percent >= 70:
+        return "yellow"
+    return "green"
+
+
+def limit_bar(percent: int, width: int) -> str:
+    """A bar `width` cells wide. Full blocks for what is spent, light for the rest."""
+    width = max(1, width)
+    filled = max(0, min(width, int(round(percent / 100 * width))))
+    # Anything spent shows at least one cell: a bar that reads empty at 3% and
+    # empty at 0% has thrown away the only distinction that matters early on.
+    if percent > 0 and filled == 0:
+        filled = 1
+    return "█" * filled + "░" * (width - filled)
+
+
+def limit_cells(limits: list[dict], width: int) -> list[tuple[str, str, str, str, str]]:
+    """[(label, bar, '62%', '3h50m', colour), …], sized to fit `width` columns.
+
+    The layout lives here so the two dashboards cannot drift on it, and the
+    styling does not, so each stays in charge of how it draws a colour.
+    """
+    if not limits or width < 20:
+        return []
+    gap = 2                                       # between segments
+    # label + space + … + space + '100%' + space + reset, per segment.
+    fixed = sum(len(l["label"]) for l in limits) + len(limits) * (1 + 1 + 4 + 1 + 5) + \
+        gap * (len(limits) - 1)
+    bar = (width - fixed) // len(limits)
+    if bar < 4:                                   # too narrow for bars: drop them
+        bar = 0
+    bar = min(bar, 16)
+    return [(l["label"], limit_bar(l["percent"], bar) if bar else "",
+             f"{l['percent']}%", limit_reset(l["resets"]),
+             limit_colour(l["percent"], l["severity"])) for l in limits]
