@@ -1304,7 +1304,7 @@ PANEL_CFG = {"github": "acme/board", "path": "/tmp/acme-board",
              "review_panel": {}}
 
 
-def _fake_adjudicate(clusters, diff, model, pr, budget=None, coverage=None, cwd=None, ci=""):
+def _fake_adjudicate(clusters, diff, model, pr, budget=None, coverage=None, cwd=None, ci="", **_kw):  # **_kw: code_tree/budget_usd since #113
     """Every reported finding confirmed, one canonical record each — the judge's
     ruling is not what these tests are about."""
     flat = [f for grp in clusters for f in grp]

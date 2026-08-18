@@ -621,7 +621,7 @@ def _panel_round(monkeypatch, tmp_path, round_no, findings, head, baseline=(),
             [panel.Finding("claude", "P2", f, ln, t, "detail")
              for f, ln, t in findings] if name == "claude" else [], None, 800, None)
 
-    def fake_adjudicate(clusters, diff, model, pr, budget=None, coverage=None, ci=""):
+    def fake_adjudicate(clusters, diff, model, pr, budget=None, coverage=None, ci="", **_kw):  # **_kw: code_tree/budget_usd since #113
         return ([panel.Canonical(id=panel._finding_id(pr, i + 1), severity="P2",
                                  file=f.file, line=f.line, synthesis=f.title,
                                  verdict="confirmed", detail="detail",

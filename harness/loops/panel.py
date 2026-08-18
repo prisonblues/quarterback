@@ -996,8 +996,6 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     #: pointing at nothing, so a later reader of it would be asking a question the
     #: variable can no longer answer honestly.
     code_tree_used = code_tree is not None
-    if code_dir is not None:
-        shutil.rmtree(code_dir, ignore_errors=True)
 
     # Pre-cluster as a hint, then let the master MERGE the duplicates and rule on
     # each issue in one step (no consensus gate). Dedup cannot happen upstream of
@@ -1034,9 +1032,25 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             f"offered (its budget is {judge_budget:,}) — it ruled on findings about code "
             "it was shown less of than the reviewers were")
     notes.extend(judge_gaps)
+    # The judge is a claude seat, so it takes code access on the same terms the
+    # reviewer seats do — and it is the party best placed to use it, because the
+    # wrong findings #113 was filed over were CONFIRMED, not merely raised.
+    #
+    # The tree has to still exist at this line, which is what decides where the
+    # cleanup below it goes. Removing it when the reviewer executor joined — the
+    # obvious place, and where it was first written — left the judge holding a path
+    # to a deleted directory: `seat_checkout` would fail its copy, fall back to an
+    # empty sandbox, and the judge would silently review blind with the setting on
+    # and nothing reporting it. Degrading correctly is exactly what made it silent.
     findings, judge_skip, coverage_note = adjudicate(
         clusters, judge_text, panel.get("judge_model", ""), pr_number, None, coverage,
-        ci=ci_text)
+        ci=ci_text, code_tree=code_tree, budget_usd=budget_usd)
+    # Now nothing reads the tree again: the reviewers copied out of it inside the
+    # executor and the judge has just finished with it. Removed here rather than at
+    # the end of `run` because a PR's checkout is the largest thing this process
+    # holds and the report and board write-up still have to run.
+    if code_dir is not None:
+        shutil.rmtree(code_dir, ignore_errors=True)
     judged = judge_skip is None and bool(findings)
     to_fix = sorted((c for c in findings if c.verdict != "dismissed"),
                     key=lambda c: c.severity)

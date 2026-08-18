@@ -17,6 +17,16 @@ Two halves of #113, and the order matters: the veto split first, because it chan
 no security posture and because landing them together would make turning code access
 on *look* like it fixed the confidence signal when the two are independent.
 
+> **If the two halves land as separate releases, split this heading.** They are under
+> one `vNEXT` because they are stacked: #218 merges into #214's branch, then #214
+> merges to the default branch once — one merge, one release, one number. If instead
+> #214 goes to the default branch on its own, it stamps this heading, and the second
+> half then needs its own: promote *The veto split* below to `## v<the stamped
+> number>` with the prose above it, and leave *Reviewers can read the code* as
+> `## vNEXT` so `release_stamp.py` gives it the next one. Two token edits, and
+> `preflight` will refuse until exactly one `vNEXT` heading remains — which is the
+> tool telling you this note applies, not a problem with the branch.
+
 ### Reviewers can read the code, per repo, on by default
 
 The panel reviewed from a diff and nothing else. Every seat ran in an empty `git init`
@@ -117,11 +127,40 @@ that actually got it, and the files stripped. Read back from what each seat reco
 rather than from the intent, because a fetch that failed leaves the setting on and the
 seat blind, and only the second is true of the round.
 
+**The judge reads too, and it is the party that most needed to.** It is a `claude`
+seat, so it takes the same stripped checkout, the same read-only pin and the same
+spend cap. This is the half the reviewer change alone does not fix: the wrong findings
+#113 was filed over were **confirmed**, not merely raised. On #90 a reviewer inferred
+a missing `--json` field from its absence in the diff, and a judge with the same
+blindness had no way to check; on #64 three of six confirmed P2s were conditionals
+from a reviewer that had *declared* it could not assess the condition. Dismissing
+false positives is the judge's stated job and it cannot do it from the diff that
+produced them. One ordering trap, now pinned: the tree's cleanup has to run after
+`adjudicate`, or the judge is handed a path to a deleted directory and degrades to an
+empty sandbox — reviewing blind while the payload still says access was on. The
+degrade path working correctly is exactly what made that silent.
+
+**And the board stores all of it, instead of dropping it at ingest.** Migration `0023`
+adds `absent`, `code_blind` and `argv_capped` to `review_reviewers`, and `code_access`
+and `convention_files_removed` to `review_runs`; the read path returns them too,
+because a column nothing exposes cannot measure anything. `absent` had been sent since
+v2.32 and silently discarded — `ReviewerIn` declares `populate_by_name=True` with no
+`extra=`, so pydantic's `extra="ignore"` applied, which is precisely the drop v2.26
+records for `head_sha`, `unread_files`, `provenance_counts` and per-finding
+`provenance` (#93). #113 was about to add two more to the same hole.
+
+`code_blind` is the column that matters most: a seat that can open the caller and one
+that cannot are not comparable on findings, on precision, or on `could_not_assess`, so
+`/review/stats` would be averaging two different jobs. #113's own rule was "either
+every seat gets it, or the payload records which did" — this makes the second half
+true of the database and not only of a JSON file on somebody's disk. Every column is
+nullable with no backfill: NULL means "the panel did not say", the honest value for
+every round already recorded, and a manufactured `false` would assert coverage those
+rounds may never have had.
+
 Second half of #113. `--no-code-access` overrides the config for one run; there is
 deliberately no flag the other way, because turning access on for a repo that switched
-it off is a decision about trusting that repo's contributors. The judge is not given
-the tree — #90's wrong P1 was a reviewer finding the judge *confirmed*, so a reading
-judge is the natural next change rather than a detail of this one.
+it off is a decision about trusting that repo's contributors.
 
 ### The coverage veto stops reporting a constant
 

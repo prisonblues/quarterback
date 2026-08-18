@@ -388,9 +388,30 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
     concurrent panels, so this seat is also the critical path. `claude` documents
     `--max-budget-usd`, which works with `--print`; bounding the hunting with it is
     the obvious follow-up and is deliberately not in this change.
-  - **The judge is not given the tree.** Out of scope here and worth its own change:
-    #90's wrong P1 was a reviewer finding the judge *confirmed*, so a reading judge is
-    the natural next step rather than a detail of this one.
+  - **The judge gets the tree too, on the same terms.** It is a `claude` seat, so it
+    takes the same stripped checkout, the same `Read Grep Glob` pin and the same spend
+    cap — and it is the party best placed to use them, because the wrong findings #113
+    was filed over were **confirmed**, not merely raised. On #90 a reviewer inferred a
+    missing `--json` field from its absence in the diff and a judge with the same
+    blindness had no way to check; on #64 three of six confirmed P2s were conditionals
+    from a reviewer that had *declared* it could not assess the condition. Dismissing
+    false positives is the judge's stated job and it cannot do it from the same diff
+    that produced them. One ordering trap, pinned by a test: the tree's cleanup must
+    run **after** `adjudicate`, or the judge gets a path to a deleted directory,
+    degrades to an empty sandbox, and reviews blind with the setting still reading
+    true — the silent failure that the degrade path's own correctness makes possible.
+  - **The board stores it, rather than dropping it at ingest.** `absent`,
+    `code_blind` and `argv_capped` per reviewer, plus `code_access` and
+    `convention_files_removed` per run (migration `0023`), read back out of
+    `GET /review/{id}` as well as written. `absent` had been sent since v2.32 and
+    silently discarded, because `ReviewerIn` inherits pydantic's `extra="ignore"` —
+    the same drop v2.26 records for `head_sha` and `unread_files` (#93). `code_blind`
+    is the one that matters most for anything ranking reviewers: a seat that could
+    open the caller and one that could not are not comparable on findings or on
+    `could_not_assess`, and a leaderboard averaging them measures two different jobs.
+    All columns nullable with no backfill — NULL is "the panel did not say", which is
+    the honest value for every round recorded before this, and inventing `false` would
+    assert coverage those rounds may not have had.
 - **A short panel says so.** The report states seats filled against seats configured
   on every run, and calls the panel degraded above the findings when they differ — a
   weaker review, not a cleaner one. A CLI the host does not carry is exempt (it is a

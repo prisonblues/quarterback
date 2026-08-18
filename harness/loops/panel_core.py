@@ -271,6 +271,14 @@ PR #{n} ({repo}), base={base}:
 {diff}
 """
 
+#: The judge prompt's placeholder for the code-access brief. A literal token
+#: replaced at call time rather than a `{}` format field, because `JUDGE_PROMPT`
+#: is rendered by `.format()` in one place and its findings listing is built from
+#: model-authored text — adding a format field means every caller must pass it and
+#: every stray brace in a finding title becomes a KeyError. A token that nothing
+#: else in the prompt can produce is inert until it is deliberately swapped.
+JUDGE_CODE_SLOT = "<<<CODE_ACCESS_BRIEF>>>"
+
 #: What a seat that was handed the PR's tree is told about it. Empty for every seat
 #: that was not — see SEAT_READS_CODE — so those seats' prompts are unchanged.
 #:
@@ -361,6 +369,7 @@ Reports:
 Coverage declared by the reviewers:
 {coverage}
 {ci}
+<<<CODE_ACCESS_BRIEF>>>
 {diff}
 """
 
@@ -1701,7 +1710,7 @@ __all__ = [
     "DEFAULT_ROUND_SCOPE", "ROUND_SCOPES", "CLI_TIMEOUT", "BLANK_RETRY_MAX_S",
     "CLI_ABSENT", "ARGV_PROMPT_MAX_BYTES", "SEVERITIES", "MAX_LISTING_CHARS",
     "LISTING_ACCOUNT_CHARS", "COMMENT_CHARS", "ROUNDS_HEADING", "LLM_REVIEWERS",
-    "BUDGET_MARKER", "BUDGET_EXHAUSTED",
+    "BUDGET_MARKER", "BUDGET_EXHAUSTED", "JUDGE_CODE_SLOT",
     "ALL_REVIEWERS", "CLI_BIN", "SEAT_MODEL_DEFAULTS", "REVIEW_PROMPT",
     "CODE_ACCESS_BRIEF",
     "JUDGE_PROMPT", "ASK_PROMPT", "Finding", "ReviewerRun",

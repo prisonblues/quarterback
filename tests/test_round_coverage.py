@@ -750,18 +750,24 @@ def _panel_round(monkeypatch, tmp_path, round_no, title, baseline=()):
     """One panel run with every process it would spawn replaced — the reviewers,
     the judge, the CI check — so what is under test is the payload the panel
     builds, not the CLIs."""
-    def fake_review(name, model, prompt, effort=""):
+    def fake_review(name, model, prompt, effort="", code_tree=None, budget_usd=None):
         if name == "codex":
+            # Blind and kernel-capped: codex cannot be given read tools at all
+            # (its only read path is its shell), and it stands in here for the
+            # seat whose truncation is the box's rather than a budget's — so this
+            # row exercises every one of #113's new reviewer columns at once.
             return panel.ReviewerRun(
                 [panel.Finding("codex", "P2", "app/sync.py", 12, title,
                                "detail", needs_rereview=True)],
-                None, 900, ["the migration, which the diff omits"])
+                None, 900, ["the migration, which the diff omits"],
+                code_blind=True)
         # claude answered in the old bare-array shape: it declared NOTHING, which
         # is None all the way to the column — not [], which would say it was asked
-        # and had no gap.
-        return panel.ReviewerRun([], None, 800, None)
+        # and had no gap. It DID read the code, which is what makes its declaring
+        # nothing a fact about the round.
+        return panel.ReviewerRun([], None, 800, None, code_blind=False)
 
-    def fake_adjudicate(clusters, diff, model, pr, budget=None, coverage=None, ci=""):
+    def fake_adjudicate(clusters, diff, model, pr, budget=None, coverage=None, ci="", **_kw):  # **_kw: code_tree/budget_usd since #113
         """The judge confirms what it was shown, keeping every reporter's own
         report on the record — which is where the per-reviewer declarations the
         board scores live."""
@@ -814,6 +820,20 @@ async def test_a_real_panel_payload_records_and_reads_back(client, monkeypatch, 
     assert card(run, "claude")["could_not_assess"] is None
     assert card(run, "codex")["rereview_flagged"] == 1
     assert run["findings"][0]["new_this_round"] is True
+
+    # #113's columns, asserted on the way BACK OUT of the database — which is the
+    # half that was missing. The panel has sent `absent` since v2.32 and ingest
+    # dropped it, because `ReviewerIn` inherits pydantic's `extra="ignore"`; that
+    # is the same silent drop this file's v2.26 note records for `head_sha` and
+    # `unread_files` (#93). A test that only checked the payload would have passed
+    # throughout, which is precisely how four fields went missing last time.
+    assert card(run, "codex")["code_blind"] is True
+    assert card(run, "claude")["code_blind"] is False, \
+        "a seat that read the code must not read back as blind"
+    # The round-level setting is kept apart from the per-seat answer on purpose: a
+    # round with the setting ON and every seat blind is a configuration doing
+    # nothing, and only the difference between the two shows it.
+    assert run["code_access"] is True
 
     # Round 2 raises the SAME finding again, against round 1 as its baseline.
     _, r2 = _panel_round(monkeypatch, tmp_path, 2, "half-stale node", baseline=[r1_path])

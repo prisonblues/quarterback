@@ -850,3 +850,99 @@ def test_a_capped_seat_that_is_cut_off_records_a_skip_and_vetoes(monkeypatch):
     veto = panel.coverage_veto(
         {"claude": {"ran": False, "skip": got.skip, "absent": False}}, None, 0, 1_000)
     assert any(panel.BUDGET_EXHAUSTED in v for v in veto)
+
+
+# ------------------------------------------------- the judge reads too
+
+def test_the_judge_gets_the_tree_and_is_told_and_pinned(monkeypatch, tmp_path):
+    """The half the reviewer change alone does not fix.
+
+    The wrong findings #113 was filed over were **confirmed**, not merely raised.
+    PR #90's round-2 P1 said `headRefOid` was read but never added to the
+    `--json` field list; it was already there, so it never appeared in the diff,
+    the reviewer inferred absence from invisibility — and a judge with the same
+    blindness had no way to check. On PR #64 three of six confirmed P2s were
+    conditionals from a reviewer that had declared it could not assess the
+    condition. Dismissing false positives is the judge's stated job, and it cannot
+    do it from the same diff that produced them."""
+    tree = _tree(tmp_path / "src", {"app/main.py": "x = 1"})
+    seen = {}
+
+    def fake_run_cli(args, label, timeout=panel.CLI_TIMEOUT, attempts=3,
+                     stdin_text=None, on_output=None, replied=None, cwd=None):
+        seen["args"], seen["prompt"], seen["cwd"] = args, stdin_text, cwd
+        seen["had_tree"] = (Path(cwd) / "app/main.py").exists()
+        return '[{"id":"F1","members":[0],"real":true,"reason":"checked the file"}]', None
+
+    monkeypatch.setattr(panel_seats, "run_cli", fake_run_cli)
+    f = panel.Finding("claude", "P1", "app/main.py", 1, "title", "detail")
+    panel.adjudicate([[f]], "diff", "sonnet", 34, code_tree=tree, budget_usd=8)
+
+    assert seen["had_tree"] is True, "the judge ran in an empty sandbox"
+    assert "YOU HAVE THE CODE" in seen["prompt"], "it was not told it has the tree"
+    assert "--allowedTools" in seen["args"] and "Bash" not in seen["args"]
+    assert seen["args"][seen["args"].index("--max-budget-usd") + 1] == "8"
+
+
+def test_a_judge_with_no_tree_is_unchanged(monkeypatch, tmp_path):
+    """Access off, or a fetch that failed: the judge keeps the empty sandbox it has
+    always had, with no brief and no tool pin — and crucially no leftover slot
+    token in its prompt, which would otherwise reach the model as literal noise."""
+    seen = {}
+
+    def fake_run_cli(args, label, timeout=panel.CLI_TIMEOUT, attempts=3,
+                     stdin_text=None, on_output=None, replied=None, cwd=None):
+        seen["args"], seen["prompt"] = args, stdin_text
+        return '[{"id":"F1","members":[0],"real":true,"reason":"r"}]', None
+
+    monkeypatch.setattr(panel_seats, "run_cli", fake_run_cli)
+    f = panel.Finding("claude", "P1", "a.py", 1, "title", "detail")
+    panel.adjudicate([[f]], "diff", "sonnet", 34)
+
+    assert "YOU HAVE THE CODE" not in seen["prompt"]
+    assert panel.JUDGE_CODE_SLOT not in seen["prompt"], \
+        "the unreplaced slot token reached the model"
+    assert "--allowedTools" not in seen["args"]
+    assert "--max-budget-usd" not in seen["args"]
+
+
+def test_the_tree_still_exists_when_the_judge_runs(monkeypatch, tmp_path, capsys):
+    """The ordering bug this pins, which degraded silently in exactly the way the
+    degrade path is designed to.
+
+    The tree's cleanup was first written where the reviewer executor joins — the
+    obvious place. But `adjudicate` runs AFTER that, so the judge was handed a path
+    to a deleted directory: `seat_checkout` failed its copy, fell back to an empty
+    sandbox, and the judge reviewed blind with the setting on, `code_access.setting`
+    still true in the payload, and nothing anywhere reporting it. Asserted through
+    `run()` because the ordering is the whole content of the bug — no unit test of
+    either half can see it."""
+    tree = pr_tarball(files={"app/main.py": "def main():\n    return 1\n"})
+    judged = {}
+
+    def fake_adjudicate(clusters, diff, model, pr, budget=None, coverage=None,
+                        ci="", code_tree=None, budget_usd=None):
+        judged["tree"] = str(code_tree) if code_tree else None
+        judged["alive"] = bool(code_tree) and (Path(code_tree) / "app/main.py").exists()
+        return [], None, ""
+
+    cfg = json.loads(json.dumps(CFG))
+    monkeypatch.setattr(panel, "load_repo_cfg", lambda _n: cfg)
+    monkeypatch.setattr(panel_core, "sh", gh_stub(
+        meta={"title": "feat: x", "additions": 3, "deletions": 1,
+              "headRefOid": "abcdef1234"},
+        diff="diff --git a/a.py b/a.py\n+x\n"))
+    monkeypatch.setattr(panel_core, "sh_bytes", lambda *a, **k: tree)
+    monkeypatch.setattr(panel, "review_llm",
+                        lambda *a, **k: panel.ReviewerRun([], None, 10, [],
+                                                          code_blind=False))
+    monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
+    monkeypatch.setattr(panel, "adjudicate", fake_adjudicate)
+    out = tmp_path / "p.json"
+    assert panel.run("board", 34, post=False, json_file=str(out), record=False) == 0
+    capsys.readouterr()
+
+    assert judged["tree"] is not None, "the judge was handed no tree at all"
+    assert judged["alive"] is True, (
+        "the tree was cleaned up before the judge ran — it would have fallen back "
+        "to an empty sandbox and reviewed blind, silently")
