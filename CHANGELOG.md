@@ -11,6 +11,40 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
+## vNEXT — what to pick up, and why it is the one to pick up
+
+`qb-board --follow` answers "what just happened" and `qb-dash` answers "who is
+alive and what do they hold". Nothing answered "what should I do", and the honest
+version of that question is not one lookup: the plan says what is open and in what
+order, the board's claims say what is already taken, and GitHub says which issues
+wait on another and which PRs are asking to land. Assembling it by hand cost about
+ten tool calls, was stale by the time it finished, and still handed back raw state
+with the reading left to do.
+
+`qb-next` (#135) is that join, printed once. Open PRs with what CI says and
+therefore what each is asking for; the free items in plan order, with the board's
+own pick for what is next marked as such; what is held, by whom, and how long the
+claim has left; what is blocked and on what. Every line carries its reason —
+`#44 free` is what the plan already told you, `#44 — rank 2, free, unblocked` is
+the line that saves the ten calls. `--repo` asks about another repo's plan,
+`--limit` trims the free list and says how many it left out, `--json` emits the
+joined data for a hook or another tool.
+
+**A source that died must not read as "no work".** A section left empty because
+the board is unreachable looks exactly like a section left empty because there is
+nothing in it, so a failed source is named under the answer and the exit code
+separates the cases: 3 when part of the answer is missing, 1 for a configuration
+error, 2 from argparse for a usage error. The text prints either way, because
+somebody asking what to pick up is better served by the sections that did answer
+than by a stack trace.
+
+**Stdlib only, and no launcher**, which is v2.43's packaging lesson applied rather
+than an oversight. `qb-dash` needs `rich`, so it needs a bash script to find an
+interpreter that has it; a one-shot answer printed to a pipe needs no renderer, so
+this keeps a plain shebang `patchShebangs` can rewrite and runs on whatever
+`python3` the host happens to have. A dependency added here without a launcher is
+how the command starts dying on an import the day after a rebuild.
+
 ## v2.43 — the fleet at a glance, and one click to act on it
 
 The seat screen could show you N agents working and tell you nothing about them.

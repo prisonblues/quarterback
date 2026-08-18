@@ -555,13 +555,6 @@ full — including what was broken before it, which is the part no diff recovers
   spelling got in. The rejected alternative — accept every spelling and reconcile
   them on read — is closed as PR #152: an open input domain cannot be enumerated,
   and three rounds found three more holes in the attempt.
-- **v2.43** — the seat screen learns to answer questions about itself. `qb-dash-tui` puts the
-  fleet beside the seats — who is alive, what they hold, which PRs are open and what CI says —
-  and rows are clickable: a seat jumps the tmux cursor to its pane, a PR opens on GitHub, the ⚖
-  starts `/panel-review-pr` in a window of its own. `qb-b` is `qb-seats`, spelled short. It also
-  fixes a layout defect nobody could see: `qb-seats` addressed panes as `session:window.0`, so a
-  `pane-base-index 1` config broke the screen entirely, and the suite inherited the developer's
-  own tmux.conf — green where nobody had that setting, red where somebody did.
 - **v2.42** — `qb-board`, a terminal client, because the board's only human surface needed a desktop
   browser and daedalus, atlas and sisyphus do not have one. Two halves: `qb-board --follow`, plain
   lines on stdout that pipe and grep and resume from a cursor after an overnight drop, needing
@@ -570,14 +563,28 @@ full — including what was broken before it, which is the part no diff recovers
   this machine's checkout, cherry-pick a located SHA, resume a session — and the refusals those
   inherit, where "could not tell" counts as a no. Not a third client: it consumes the same
   `mcp/mcp_server/client.py` the MCP server does, which is also how that package finally got CI.
-- **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
-  object store; wire `landed` refs to a cherry-pick helper.
-
-**[CHANGELOG.md](CHANGELOG.md)** has each release in full, including what was broken before it.
+- **v2.43** — the seat screen learns to answer questions about itself. `qb-dash-tui` puts the
+  fleet beside the seats — who is alive, what they hold, which PRs are open and what CI says —
+  and rows are clickable: a seat jumps the tmux cursor to its pane, a PR opens on GitHub, the ⚖
+  starts `/panel-review-pr` in a window of its own. `qb-b` is `qb-seats`, spelled short. It also
+  fixes a layout defect nobody could see: `qb-seats` addressed panes as `session:window.0`, so a
+  `pane-base-index 1` config broke the screen entirely, and the suite inherited the developer's
+  own tmux.conf — green where nobody had that setting, red where somebody did.
+- **vNEXT** — the third fleet question gets a command. `qb-board --follow` says what just happened
+  and `qb-dash` says who is alive; "what can I pick up right now, and why" was assembled by hand
+  from the plan, the board's claims and GitHub — about ten tool calls, stale by the time they
+  finished, and raw state with the reading still to do. `qb-next` (#135) prints the join once:
+  open PRs with what CI says about each, the free items in plan order with the board's own pick
+  marked, what is held and for how long, what is blocked and on what — every line carrying its
+  reason rather than only its fact. `--json` for a hook, `--limit` for the top of the list,
+  `--repo` for another repo's plan. An unreachable source is named under the answer and exits 3,
+  because a section empty because the board is down reads exactly like one empty for want of work.
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
   roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps
   the real one, and nothing in the tool renames a roadmap entry.
+
+**[CHANGELOG.md](CHANGELOG.md)** has each release in full, including what was broken before it.
 
 ## Stack
 
@@ -847,7 +854,9 @@ harness/      step 2 of the install — the workflow the board coordinates
                    worktree-holder (who is live in a worktree — asked before
                    anything destroys one), qb-stage, qb-seat (one pane of a
                    multiplexer, started as a seat with its own board identity),
-                   qb-board (launcher for the terminal client in mcp/mcp_server/board/)
+                   qb-board (launcher for the terminal client in mcp/mcp_server/board/),
+                   qb-next (plan, claims and PRs joined into one answer to what
+                   to pick up)
   tests/           the worktree-tooling suite (pytest driving the bash)
   templates/       copyable .worktree.json starting points + dbtarget.py (the DB guard)
   package.nix      the derivation; hm-module.nix wires it into ~/.claude

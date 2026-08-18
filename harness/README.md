@@ -15,9 +15,10 @@ board reconnects them.**
 - `bin/` — the bash the worktree commands drive (`create-worktree`, `remove-worktree`,
   `prune-worktrees`, `worktree-holder`), plus `qb-stage`, which records the workflow
   stage a session is in for the statusline, `qb-seat`, which turns one pane of a
-  multiplexer into a fleet seat with its own board identity, and `qb-board`, which
+  multiplexer into a fleet seat with its own board identity, `qb-board`, which
   launches the terminal board client (`qb-board --follow` tails the board to stdout
-  on any host with ssh; see the repo README)
+  on any host with ssh; see the repo README), and `qb-next`, which joins the plan,
+  the board's claims and GitHub into one answer to what to pick up
 - `worktree.example.json` — per-repo config, annotated with quarterback's own values
 
 Neither half needs the other. The loops run with no board configured (recording is
@@ -467,6 +468,41 @@ prints `board` for any pane with no seat number, so a second unlabelled pane cla
 name. The dev script widens it to fall through to a `@qb_label` option; that belongs in
 `qb-seats` proper once this settles.
 
+### `qb-next` — what to pick up, and why
+
+The tape answers "what just happened" and the dash answers "who is alive and what do they
+hold". The question an agent actually opens a session with is the third one — "what can I
+pick up right now, and why" — and until now it was assembled by hand: read the plan, read
+the claims, list the open PRs, check each one's CI, ask GitHub which issues wait on
+another. About ten tool calls, stale by the time they finished, and the answer came back
+as state rather than as a reason (#135).
+
+```
+qb-next                     # PRs, then the plan, then what is held and what is blocked
+qb-next --repo owner/name   # another repo's plan
+qb-next --limit 10          # more of the free list (5 by default)
+qb-next --json              # the same join, for a hook or another tool
+```
+
+Four sections: every open PR with what CI says and therefore what it is asking for; the
+free items in plan order, with the board's own pick for what is next marked as such; what
+is held, by whom, and how long the claim has left; what is blocked and on what. **Every
+line carries its reason.** `#44 free` is what the plan already told you; `#44 — rank 2,
+free, unblocked` is the line worth ten tool calls. When `--limit` cuts the free list it
+says how many it left out, so a short list is not read as a short backlog.
+
+**A source that died is named, not hidden.** A section left empty because the board is
+unreachable looks exactly like a section left empty because there is nothing in it, so an
+unreachable source prints as a warning under the answer and the exit code separates the
+cases: `3` when part of the answer is missing, `1` for a configuration error (no board
+URL), `2` from argparse for a usage error. The text prints either way — somebody asking
+what to do is better served by the sections that did answer than by a stack trace.
+
+Stdlib only, and no launcher, unlike the dash: a one-shot answer printed to a pipe needs
+no renderer, so this keeps a plain shebang `patchShebangs` can rewrite and runs on
+whatever `python3` the host has. A dependency added here without also adding a launcher is
+how the command starts dying on an import the day after a rebuild.
+
 ## How it works
 
 - **Layout.** A worktree is a *sibling* of the main checkout: `../<project>-<branch>`, with
@@ -713,7 +749,7 @@ The panel looks for a `qb` CLI to record runs. With none on `PATH`, it no-ops si
 everything else works unchanged. Point `qb` at your board to light up `GET /review/stats`
 and the board's `/panel` page.
 
-`worktree-holder` and `qb-board` read the same per-host site config —
+`worktree-holder`, `qb-board` and `qb-next` read the same per-host site config —
 `QUARTERBACK_BASE_URL` and `QUARTERBACK_TOKEN_CMD` from
 `${XDG_CONFIG_HOME:-~/.config}/quarterback/config`, either overridable from the
 environment — but read it directly rather than through `qb`, so the occupancy check and

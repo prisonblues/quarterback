@@ -19,6 +19,23 @@ from datetime import datetime, timezone
 REPO = "prisonblues/quarterback"
 REPO_URL = f"https://github.com/{REPO}"
 
+# How much of each list is asked for. Every one of these is a CAP, not a page
+# size — `gh` pages internally until it has `--limit` rows, and /claims takes a
+# limit of its own — so the only thing a caller can get wrong is believing a
+# capped list is the whole list. Each fetch below therefore says so out loud when
+# it comes back full, because "showing the first N" and "there are N" differ by
+# exactly the work somebody would otherwise pick up twice.
+CLAIM_LIMIT = 1000                                # the /claims endpoint's maximum
+ISSUE_LIMIT = 600                                 # open issues read for blocked-by edges
+PR_LIMIT = 100                                    # open PRs listed
+
+
+def truncated(rows: list, limit: int, what: str) -> str | None:
+    """The 'this list is not all of it' message, or None when it is all of it."""
+    if len(rows) < limit:
+        return None
+    return f"showing the first {limit} {what} — there are more, so this is a partial answer"
+
 
 def ago(stamp: str | None) -> str:
     """'4m', '2h10m' — how long since an ISO timestamp. '' if unparseable."""
@@ -72,8 +89,29 @@ def short_key(key: str) -> str:
     return key.split("/", 1)[-1] if key.count("/") == 1 else key
 
 
-def clip(s: str | None, n: int) -> str:
-    s = " ".join((s or "").split())
+#: Every C0 control character plus DEL, mapped to nothing — except the three
+#: that are whitespace, which become a space. Dropping a newline outright would
+#: JOIN the words either side of it, so "a\nb" would read as one word "ab".
+_CONTROL = dict.fromkeys([*range(32), 127])
+_CONTROL.update({0x09: " ", 0x0A: " ", 0x0D: " "})
+
+
+def plain(value: object) -> str:
+    """Display text with control characters gone and whitespace collapsed.
+
+    A PR title, a claim holder and a `gh` error all arrive from somewhere else,
+    and a terminal reads an ESC in any of them as an instruction rather than as
+    text — so a crafted title could redraw a section header or hide the line
+    below it. Collapsing whitespace already removed newlines and tabs; this
+    removes the rest, in the one function every caller already goes through
+    instead of at each of the thirty places that interpolate a remote string.
+    """
+    text = value if isinstance(value, str) else ("" if value is None else str(value))
+    return " ".join(text.translate(_CONTROL).split())
+
+
+def clip(s: object, n: int) -> str:
+    s = plain(s)
     return s if len(s) <= n else s[: max(0, n - 1)] + "…"
 
 
@@ -180,11 +218,17 @@ class BoardClient:
     def active(self) -> dict:
         return self.get("/active")
 
-    def claims(self) -> dict:
-        return self.get("/claims")
+    def claims(self, limit: int = CLAIM_LIMIT) -> dict:
+        # The endpoint's own default is 100 and its maximum is 1000. Asked for
+        # explicitly because a truncated claims page is not a shorter list, it is
+        # a claim the caller cannot see — and an unseen claim reads as free work.
+        return self.get(f"/claims?{urllib.parse.urlencode({'limit': limit})}")
 
     def plan(self, repo: str | None = None) -> dict:
-        query = f"?repo={urllib.parse.quote(repo)}" if repo else ""
+        # urlencode rather than a hand-built `?repo=` + quote: quote's default
+        # `safe='/'` leaves the slash in `owner/repo` unescaped, which happens to
+        # be right for this one value and would be wrong for the next one.
+        query = "?" + urllib.parse.urlencode({"repo": repo}) if repo else ""
         return self.get(f"/plan{query}")
 
 
@@ -200,10 +244,10 @@ def fetch_board(client) -> dict:
         active = client.active()
         out["agents"] = active.get("agents", [])
         out["subagents"] = active.get("subagents", [])
-        out["claims"] = [
-            c for c in client.claims().get("claims", [])
-            if not c.get("released") and not c.get("lapsed")
-        ]
+        rows = client.claims().get("claims", []) or []
+        out["claims"] = [c for c in rows
+                         if isinstance(c, dict) and not c.get("released") and not c.get("lapsed")]
+        out["error"] = truncated(rows, CLAIM_LIMIT, "claims")
     except Exception as exc:                      # noqa: BLE001 — display it, don't die
         out["error"] = f"{type(exc).__name__}: {exc}"
     return out
@@ -215,13 +259,49 @@ def fetch_plan(client, repo: str | None = REPO) -> dict:
     `next` comes from the board rather than being recomputed here: it is the one
     field the endpoint exists to answer, and a second implementation of "first
     open, unclaimed, unblocked" is a second thing to get wrong.
+
+    The claims on the items are LIVE ones, and that is the endpoint's contract
+    rather than this function's hope: `/plan` selects on `expires_at > now` and
+    `/claims` filters expired-but-unswept rows on the way past, so a claim whose
+    holder is gone reads as free without a reaper. A caller may still check the
+    expiry it is handed — `qb-next` does — but it is checking a second time.
+
+    `update` and not a field-by-field copy: a response missing a key keeps the
+    default above, and a response carrying `error` overwrites this one's None,
+    which is the shape a board that answered-but-refused sends.
     """
     out: dict = {"items": [], "next": None, "counts": {}, "error": None}
     try:
-        out.update(client.plan(repo))
+        got = client.plan(repo)
+        if not isinstance(got, dict):
+            return {**out, "error": f"/plan returned {type(got).__name__}, not an object"}
+        out.update(got)
     except Exception as exc:                      # noqa: BLE001 — display it, don't die
         out["error"] = f"{type(exc).__name__}: {exc}"
     return out
+
+
+def _blocker_nodes(issue: dict) -> list[dict]:
+    """The `blockedBy` edges on one issue, whichever of the two shapes it is in.
+
+    `gh issue list --json blockedBy` returns the GraphQL connection —
+    `{"nodes": [...], "totalCount": n}` — and that is what this reads. It also
+    accepts a bare list, because a field that is a connection today is a list in
+    half of GitHub's other payloads and the cost of being wrong is not a
+    TypeError: it is the bare `except` below turning one unexpected shape into
+    "no blockers anywhere in this repo", which reads as everything unblocked.
+
+    An explicit `"nodes": null` is why the `or` is on the INNER get as well: the
+    key is present, so a default cannot fire, and `for b in None` raises.
+    """
+    field = issue.get("blockedBy")
+    if isinstance(field, list):
+        nodes = field
+    elif isinstance(field, dict):
+        nodes = field.get("nodes") or []
+    else:
+        nodes = []
+    return [b for b in nodes if isinstance(b, dict)]
 
 
 def fetch_blocked(repo: str = REPO) -> tuple[dict[int, list[int]], str | None]:
@@ -231,39 +311,75 @@ def fetch_blocked(repo: str = REPO) -> tuple[dict[int, list[int]], str | None]:
     than a field read. GitHub keeps a `blocked-by` edge after the blocker closes,
     which is right — the dependency was real — but it means a bare read reports
     an issue as blocked by work that finished weeks ago. Two do so today.
+
+    The state comparison is case-folded on purpose. GitHub sends `OPEN`, and a
+    strict `== "OPEN"` that met anything else would not fail: it would match
+    nothing and report every issue in the repo as unblocked, with no error and
+    nothing on screen to suggest the answer was wrong. Every other failure here
+    is loud; that one would not be, so it is spelled to survive.
+
+    The error is the second half of the contract and never just the exception's
+    class name: "github unavailable: TimeoutExpired" and "github unavailable:
+    FileNotFoundError" both say nothing about which command timed out or which
+    binary is missing. A truncated read is reported the same way, because a
+    partial blocker map is a wrong answer in the dangerous direction — an issue
+    off the end of the list has no edges here and so reads as free.
     """
     try:
         raw = subprocess.run(
             ["gh", "issue", "list", "--repo", repo, "--state", "open",
-             "--limit", "200", "--json", "number,blockedBy"],
+             "--limit", str(ISSUE_LIMIT), "--json", "number,blockedBy"],
             capture_output=True, text=True, timeout=45,
         )
         if raw.returncode != 0:
             return {}, clip(raw.stderr, 60) or f"gh exit {raw.returncode}"
-        blocked = {}
-        for issue in json.loads(raw.stdout):
-            open_blockers = [b["number"] for b in (issue.get("blockedBy") or {}).get("nodes", [])
-                             if b.get("state") == "OPEN"]
-            if open_blockers:
-                blocked[issue["number"]] = sorted(open_blockers)
-        return blocked, None
+        issues = json.loads(raw.stdout)
+        if not isinstance(issues, list):
+            return {}, f"gh returned {type(issues).__name__}, not a list of issues"
+        blocked: dict[int, list[int]] = {}
+        bad = 0
+        for issue in issues:
+            # Per-issue rather than per-fetch: one malformed record used to take
+            # the whole repo's blocker data down with it, and "no blockers at
+            # all" is the answer that gets somebody working on blocked work.
+            try:
+                open_blockers = sorted(b["number"] for b in _blocker_nodes(issue)
+                                       if str(b.get("state", "")).upper() == "OPEN")
+                if open_blockers:
+                    blocked[issue["number"]] = open_blockers
+            except (KeyError, TypeError, ValueError):
+                bad += 1
+        error = truncated(issues, ISSUE_LIMIT, "open issues")
+        if bad:
+            error = f"{bad} issue record(s) in a shape this cannot read" + (
+                f"; {error}" if error else "")
+        return blocked, error
     except Exception as exc:                      # noqa: BLE001
-        return {}, f"{type(exc).__name__}"
+        return {}, f"{type(exc).__name__}: {exc}"
 
 
 def fetch_prs(repo: str = REPO) -> tuple[list[dict], str | None]:
+    """The open PRs, and whether that is all of them.
+
+    A section headed "OPEN PRS (30)" on a repo with forty of them is not a short
+    list, it is a wrong count — so the cap says so rather than being inferred by
+    a reader who would have to know what the cap was.
+    """
     fields = "number,title,isDraft,updatedAt,statusCheckRollup,headRefName"
     try:
         raw = subprocess.run(
             ["gh", "pr", "list", "--repo", repo, "--state", "open",
-             "--limit", "30", "--json", fields],
+             "--limit", str(PR_LIMIT), "--json", fields],
             capture_output=True, text=True, timeout=45,
         )
         if raw.returncode != 0:
             return [], clip(raw.stderr, 60) or f"gh exit {raw.returncode}"
-        return json.loads(raw.stdout), None
+        prs = json.loads(raw.stdout)
+        if not isinstance(prs, list):
+            return [], f"gh returned {type(prs).__name__}, not a list of PRs"
+        return prs, truncated(prs, PR_LIMIT, "open PRs")
     except Exception as exc:                      # noqa: BLE001
-        return [], f"{type(exc).__name__}"
+        return [], f"{type(exc).__name__}: {exc}"
 
 
 def ci_state(pr: dict) -> tuple[str, str]:
