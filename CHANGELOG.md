@@ -11,7 +11,7 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
-## vNEXT — the guard that could not fire
+## v2.49 — the guard that could not fire
 
 `create-worktree`'s isolated-database step reads the main database name out of the
 worktree's `.env`, and there is a `die` under that read whose whole job is to explain

@@ -581,7 +581,7 @@ full — including what was broken before it, which is the part no diff recovers
   a repo name, and treat the string itself as untrusted input on the way back in: the board bounds
   its length at `PATH_MAX` and normalises nothing else, so quote it, and do not hand a value
   beginning with `-` to `git` as anything but an operand.
-- **vNEXT** — the guard that could not fire. `create-worktree`'s isolated-DB step had a
+- **v2.49** — the guard that could not fire. `create-worktree`'s isolated-DB step had a
   `die` whose whole job was to explain a missing database name, and `set -u` killed the
   script at that guard's own dereference instead — `MAIN_DB_NAME: unbound variable`, at the
   exact line written to say what was wrong. One initialisation makes the message reachable.
