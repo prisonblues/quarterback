@@ -28,7 +28,7 @@ from app.models.lease import Lease
 from app.models.post import Post
 from app.models.subagent import Subagent
 from app.overlap import overlap_score
-from app.schemas import SESSION_MUTED_TYPES
+from app.schemas import CWD_MAX, SESSION_MUTED_TYPES
 
 router = APIRouter(tags=["coordination"])
 
@@ -41,7 +41,7 @@ class SubagentIn(BaseModel):
     parent_session: str = Field(min_length=1)
     agent_id: str = Field(min_length=1, description="unique per sub-agent within the parent")
     label: str | None = None  # e.g. "Explore: board frontend"
-    cwd: str | None = None
+    cwd: str | None = Field(default=None, max_length=CWD_MAX)
     device: str | None = None
     ttl: int = Field(default=900, ge=1, le=86400)
 
@@ -271,6 +271,41 @@ async def find_overlap(
     ``subject`` present ⇒ rank by overlap and drop peers below ``min_score``.
     ``subject`` absent ⇒ every same-repo peer is returned (repo alone is the
     signal), score null.
+
+    **Same repo is not the same working tree, and the difference is the advice.**
+    A peer in its own worktree shares nothing with you but a branch name; a peer
+    in *your* checkout shares your uncommitted files and your index, where one
+    ``git commit -a`` sweeps up their half-finished work. So each peer carries its
+    ``cwd`` — the same field ``/active`` has returned since v2.6, off a ``Lease``
+    column that has held it since v2.2 — and the caller decides.
+
+    The decision is deliberately not made here. Resolving a path to a worktree
+    root needs the filesystem that path is on, and this process does not have it:
+    ``…/65lowther/viz`` and ``…/65lowther`` are one tree, and only the machine
+    holding them can say so. The server reports the path; a caller on that machine
+    resolves it.
+
+    Which machine that is comes from ``holder``, not ``device``. ``holder`` is
+    ``machine/name`` and its machine half is whichever token authenticated the
+    lease (see :func:`app.identity.machine_of`); ``device`` is an unverified
+    string off the lease body, so two peers reporting the same ``device`` may be
+    on different boxes and two peers on one box may report different ones. Only a
+    peer whose ``holder`` machine matches yours can be standing in your tree.
+
+    Three caveats a caller has to carry:
+
+    * ``cwd`` is ``None`` when the lease never sent one. That is *unknown*, not
+      "not in your tree" — a scripted session in your own checkout looks the same
+      — so treat it the conservative way.
+    * The path is disclosed to every authenticated peer that can name the repo,
+      not only same-machine peers. It is a working directory and usually carries a
+      home directory and a username; that is the deliberate posture, matching what
+      ``/active`` already returns to any caller.
+    * It is a string another agent wrote. The board bounds its length
+      (:data:`app.schemas.CWD_MAX`) and normalises nothing else, because
+      absoluteness and worktree membership are questions only that machine can
+      answer. A caller resolving it — ``git -C <cwd> rev-parse --show-toplevel``
+      — must quote it, and must not let a leading ``-`` be read as a flag.
     """
     now = _utcnow()
     lstmt = select(Lease).where(
@@ -309,6 +344,7 @@ async def find_overlap(
             "session": lease.session,
             "holder": lease.holder,
             "device": lease.device,
+            "cwd": lease.cwd,
             "repo": lease.repo,
             "branch": lease.branch,
             "title": lease.title,

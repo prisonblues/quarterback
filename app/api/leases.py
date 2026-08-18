@@ -16,6 +16,7 @@ from app.identity import retire, same_machine
 from app.models.blob import Blob
 from app.models.lease import Lease
 from app.models.session import SessionRecord
+from app.schemas import CWD_MAX
 
 router = APIRouter(tags=["lease"])
 
@@ -88,7 +89,7 @@ class LeaseIn(BaseModel):
     session: str = Field(min_length=1)
     device: str = Field(min_length=1)
     ttl: int = Field(default=300, ge=1, le=86400)
-    cwd: str | None = None      # project dir (for `claude --resume` on a peer)
+    cwd: str | None = Field(default=None, max_length=CWD_MAX)  # project dir (peer `--resume`)
     repo: str | None = None     # git repo name (topic-overlap match)
     branch: str | None = None   # git branch (finer overlap signal)
     title: str | None = None    # CC ai-title
@@ -107,7 +108,7 @@ class ReleaseIn(BaseModel):
 class HandoffIn(BaseModel):
     session: str = Field(min_length=1)
     blob: str = Field(min_length=1, description="sha of the JSONL blob already PUT to /blob")
-    cwd: str | None = None
+    cwd: str | None = Field(default=None, max_length=CWD_MAX)
     title: str | None = None
     recap: str | None = None
     model: str | None = None
@@ -119,7 +120,7 @@ class SnapshotIn(BaseModel):
     transcript. Contrast /handoff, which also releases."""
     session: str = Field(min_length=1)
     blob: str = Field(min_length=1, description="sha of the JSONL blob already PUT to /blob")
-    cwd: str | None = None
+    cwd: str | None = Field(default=None, max_length=CWD_MAX)
     title: str | None = None
     recap: str | None = None
     model: str | None = None
