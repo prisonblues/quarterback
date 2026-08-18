@@ -577,7 +577,7 @@ full — including what was broken before it, which is the part no diff recovers
   a repo name, and treat the string itself as untrusted input on the way back in: the board bounds
   its length at `PATH_MAX` and normalises nothing else, so quote it, and do not hand a value
   beginning with `-` to `git` as anything but an operand.
-- **vNEXT** — the dashboard grows hands, and its tests start running. The SEATS panel
+- **v2.47** — the dashboard grows hands, and its tests start running. The SEATS panel
   closes a seat and adds one, and tmux grows a clickable bar of the same widgets above the
   seat row — both through `qb-seat-click`, which `qb-dash-tui` had been calling since the
   panel landed without the script ever being committed. The bar is a status line rather than

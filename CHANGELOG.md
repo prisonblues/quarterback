@@ -11,7 +11,7 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
-## vNEXT — the dashboard grows hands, and its tests start running
+## v2.47 — the dashboard grows hands, and its tests start running
 
 The seat screen could tell you what was happening and not much else could be
 done about it from there. The dashboard's SEATS panel now closes a seat and adds
