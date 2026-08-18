@@ -671,3 +671,57 @@ def test_a_lowered_attempt_gets_the_remaining_budget_not_a_fresh_one(monkeypatch
     assert seen[1] <= panel_seats.FALLBACK_MAX_ELAPSED_S
     assert seen[1] >= panel_seats.FALLBACK_MIN_TIMEOUT_S, (
         "and never so small that it is a kill dressed as a review")
+
+
+# ---------------------------------- the reply event, as codex actually emits it (#219 ask)
+
+#: A REAL `codex exec --json` stream, captured on daedalus 2026-08-18. Verbatim, and
+#: that is the point: the invented fixture above got the reply event's shape wrong,
+#: and an invented fixture is what let the bug below ship. The answer is nested —
+#: `item.completed` → `item` → `text` — not at the event's top level.
+CODEX_REPLY_STREAM = "\n".join([
+    '{"type":"thread.started","thread_id":"01a0"}',
+    '{"type":"turn.started"}',
+    '{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"ok"}}',
+    '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}',
+])
+
+CODEX_REFUSAL = ('{"type":"error","message":"unexpected status 404 Not Found: '
+                 'The API deployment for this resource does not exist."}')
+
+
+def test_a_reply_nested_inside_its_event_is_still_a_reply():
+    """The bug this pair exists to stop, found by asking and settled by measuring.
+
+    `stdout_is_only_errors` reads each event for reply-bearing fields; the first
+    version read only the event's TOP level. codex puts its answer one level down,
+    so a stream that had replied scored as pure lifecycle, the predicate said
+    "nothing but errors", and `run_cli` discarded a completed review.
+
+    The #219 premise ask split two seats on exactly this: codex said the premise
+    held, claude said it could not tell without the reply-event schema and named the
+    nesting as how it would fail. Claude was right. Pinned against the captured
+    stream so it cannot regress to a guess."""
+    assert not panel_seats.stdout_is_only_errors(
+        CODEX_REPLY_STREAM + "\n" + CODEX_REFUSAL), (
+        "a run that produced a review must never be discarded, whatever else it "
+        "printed — this is the expensive direction of the mistake")
+    lifecycle = "\n".join(ln for ln in CODEX_REPLY_STREAM.splitlines()
+                          if "item.completed" not in ln)
+    assert panel_seats.stdout_is_only_errors(lifecycle + "\n" + CODEX_REFUSAL), (
+        "and the same stream WITHOUT the answer is a refusal and nothing else")
+
+
+def test_the_reply_scan_is_depth_bounded():
+    """It walks a structure the CLI produced. An unbounded walk over one is a stack
+    overflow waiting for a deep reply, so it stops — and stopping means a reply
+    buried absurdly deep reads as lifecycle, which is the safe direction only
+    because nothing emits that."""
+    deep = {"type": "item.completed"}
+    node = deep
+    for _ in range(30):
+        node["item"] = {}
+        node = node["item"]
+    node["text"] = "buried"
+    assert panel_seats._carries_text({"item": {"text": "ok"}}), "one level down is the real case"
+    assert not panel_seats._carries_text(deep), "and it does not recurse for ever"

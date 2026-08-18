@@ -249,6 +249,42 @@ _ERROR_FIELDS = ("message", "param", "code")
 _REPLY_FIELDS = ("text", "content", "delta", "output", "message")
 
 
+def _carries_text(value: object, depth: int = 0) -> bool:
+    """Does this event carry the seat's ANSWER anywhere inside it?
+
+    At any depth, which is the whole point. Reading the event's top level only was
+    wrong against the real thing, and measurably so: codex's reply arrives as
+
+        {"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"ok"}}
+
+    — the text one level down. A top-level read finds nothing, scores that as
+    lifecycle, and `stdout_is_only_errors` then calls a stream that REPLIED an
+    error-only one and throws the review away: the very failure the predicate was
+    narrowed to avoid, reintroduced by the narrowing.
+
+    Captured from a live `codex exec --json` run rather than reasoned about. The
+    #219 ask put the premise to two seats; codex said it held, claude said it could
+    not tell without the reply-event schema and named this exact nesting as how it
+    would fail. Claude was right, and the stream settled it — which is the case for
+    asking a question you can then go and measure.
+
+    Depth-bounded: this walks a structure the CLI produced, and an unbounded walk
+    over one is a stack overflow waiting for a deep reply.
+    """
+    if depth > 6:
+        return False
+    if isinstance(value, dict):
+        for key, sub in value.items():
+            if key in _REPLY_FIELDS and str(sub or "").strip():
+                return True
+            if _carries_text(sub, depth + 1):
+                return True
+        return False
+    if isinstance(value, list):
+        return any(_carries_text(v, depth + 1) for v in value)
+    return False
+
+
 def error_text(stdout: str) -> str:
     """:func:`error_events`, flattened to the text `stderr_gist` and the classifiers read.
 
@@ -292,9 +328,13 @@ def stdout_is_only_errors(stdout: str) -> bool:
     and which never emit that event shape at all. Dead in both directions at once.
 
     What it asks now: every JSON value in the text is a typed EVENT, at least one of
-    them is an error, and there is nothing but whitespace between them. A codex
-    stream that refused satisfies that; a codex stream that also replied does not,
-    because a reply is not an event.
+    them is an error, none of them carries reply text AT ANY DEPTH, and there is
+    nothing but whitespace between them. A codex stream that refused satisfies that;
+    one that also replied does not.
+
+    The depth is not a detail and was got wrong first: codex nests its answer as
+    `item.completed` → `item` → `text`, so reading the event's top level scored a
+    stream that had replied as lifecycle and discarded the review.
 
     That shape is also what keeps the false positive cheap, which the review was
     right to weigh: a seat's REPLY is not a typed event stream. A findings array
@@ -315,7 +355,7 @@ def stdout_is_only_errors(stdout: str) -> bool:
             return False
         if value.get("type") == "error":
             found = True
-        elif any(str(value.get(k) or "").strip() for k in _REPLY_FIELDS):
+        elif _carries_text(value):
             # A lifecycle event carries no answer; one carrying TEXT is the seat
             # saying something, and a refusal beside it does not make the run a
             # failure. Keyed on the payload rather than on a list of event names,
