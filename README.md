@@ -581,7 +581,7 @@ full — including what was broken before it, which is the part no diff recovers
   a repo name, and treat the string itself as untrusted input on the way back in: the board bounds
   its length at `PATH_MAX` and normalises nothing else, so quote it, and do not hand a value
   beginning with `-` to `git` as anything but an operand.
-- **vNEXT** — reviewers can read the code, per repo, on by default (#113's second half).
+- **v2.51** — reviewers can read the code, per repo, on by default (#113's second half).
   `review_panel.reviewer_code_access` runs each seat that can take it in a checkout of the
   PR at its head — fetched from GitHub's tarball endpoint, never from the main checkout,
   whose branch is not the PR's. It buys ONE seat: only `claude` can be told "read but do

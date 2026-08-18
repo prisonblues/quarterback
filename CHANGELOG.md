@@ -11,7 +11,7 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
-## vNEXT — reviewers can read the code, per repo, on by default
+## v2.51 — reviewers can read the code, per repo, on by default
 
 The panel reviewed from a diff and nothing else. Every seat ran in an empty `git init`
 repo, so a reviewer that wanted to check the caller, the test, or the migration the
