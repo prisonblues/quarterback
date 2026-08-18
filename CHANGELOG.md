@@ -155,6 +155,50 @@ decision and the missing hint among them, fed a literal 404 string precisely so 
 behaviour rather than the existence of a new function. The rest cover new symbols and are
 `red/green: N-A (new code path)`: reaching for a new name fails the old code with an
 `AttributeError`, which proves only that the name is new.
+## v2.48 — a lease says what its holder is doing, not just where
+
+A lease has always answered *who* is on a session and *where* — holder, cwd,
+repo, branch, and the ai-title of what they are up to. It never answered whether
+they were moving, and for a wall of seats that is the whole question: a pane that
+finished ten minutes ago, a pane stopped at a permission prompt, and a pane
+thinking hard render identically to anyone looking at them. The screen the last
+two releases built shows N agents and cannot say which one wants you.
+
+`POST /lease` now takes `state` — `working | waiting | input` — and `/active` and
+`/overlap` return it. The vocabulary is closed at the edge (a Literal, so an
+unknown value is a 422 rather than a row) because it is rendered as a word in a
+footer and a colour in a dashboard, and there is no reader that can do anything
+with a fourth spelling.
+
+**`state_at` is not `updated_at`, and the field is useless without it.** A state
+is only as good as its age: `working` last reported twenty minutes ago describes
+a pane that looks busy and has not moved, which is the failure this exists to
+catch — the one v2.46 named when it took the permission prompts away ("a prompt
+no one answers is an outage that looks like progress"). Removing the prompt
+removed the version of that a human could see, not the shape. Neither timestamp
+already on the row can stand in: `acquired_at` is fixed at first claim and
+`expires_at` moves on every heartbeat whether or not anything changed. So the
+pair travels together and each reader picks its own staleness threshold.
+
+**`stalled` is not a value anybody can report.** It is a conclusion drawn from a
+state and its age, and a holder cannot know it is in it — that is precisely the
+state where the holder has stopped talking. Two readers draw it today (the
+dashboards here, via `qbdata.agent_state`, and the pane's own footer in
+nix-fleet), and they share a threshold constant rather than a definition, because
+the same seat described differently by the bar and the dashboard is worse than
+either threshold being wrong.
+
+**Nothing infers it.** "The agent finished its turn" is a fact only the lifecycle
+hook is told; guessing it from lease traffic reads a slow turn as a finished one.
+The hook sends it on the events it already leases for, so the field costs no new
+request — and a heartbeat that knows no state leaves the last report, and its age,
+alone.
+
+Also here: both dashboards grow a `state` column, and a seat cell on the tmux bar
+takes its colour from `@qb_state` on the pane — set by the hook, unset on a fleet
+whose hook predates this, which falls through to the colour the bar always had.
+Only `waiting` and `input` get a colour of their own; `working` is most panes most
+of the time and colouring it would make the row uniformly loud again.
 
 ## v2.47 — the dashboard grows hands, and its tests start running
 

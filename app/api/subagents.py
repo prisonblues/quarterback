@@ -230,6 +230,12 @@ async def list_active(
             "branch": lease.branch,
             "title": lease.title,
             "model": lease.model,
+            # The pair, never the state alone: a caller deciding whether a pane
+            # is stuck needs to know how old the answer is, and no other field
+            # here carries that — `since` is first-claim and `expires` moves on
+            # every heartbeat.
+            "state": lease.state,
+            "state_at": lease.state_at.isoformat() if lease.state_at else None,
             "since": lease.acquired_at.isoformat(),
             "expires": lease.expires_at.isoformat(),
             "own": mine is not None and lease.session == mine,
@@ -349,6 +355,8 @@ async def find_overlap(
             "branch": lease.branch,
             "title": lease.title,
             "recap": lease.recap,
+            "state": lease.state,
+            "state_at": lease.state_at.isoformat() if lease.state_at else None,
             "since": lease.acquired_at.isoformat(),
             "score": round(score, 3) if score is not None else None,
             "last_post_id": last.id if last else None,

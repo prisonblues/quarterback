@@ -430,7 +430,21 @@ qb-seats --staged     # built, each seat waiting on Enter
 qb-seats --no-yolo    # seats that stop and ask, as agents normally do
 qb-seats --add        # add a seat to a running screen
 ssh box -t qb-seats   # reattach from anywhere
+qb-b list             # the screens that are up, numbered
+qb-b resume 2         # reattach to the second of them, from any directory
 ```
+
+`qb-seats` on its own reattaches to the screen for **the repo you are standing in**, which
+is the one thing the shell after a dropped ssh link cannot be relied on to be. `list` and
+`resume` are for that shell: neither needs a repo or a `-C`, because a screen already knows
+the directory it was built in. `resume` takes the number from the list or the screen's name,
+and with exactly one screen up it takes no argument at all.
+
+A screen is recognised by a pane carrying `@qb_seat`, never by its name — `-s` takes
+anything, the fleet's own screen is `qbseats` rather than `seats-nix-fleet`, and tmux
+silently renames what it will not take verbatim. So the list is read back from tmux and can
+only print names that really exist, which also makes it the way to reattach to a screen tmux
+renamed under you.
 
 One tmux session: N panes each running `qb-seat <n>`, and one full-width pane along the
 bottom running `qb-board --follow`. Every seat gets the **same** brief — read the board,

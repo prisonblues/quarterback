@@ -12,6 +12,7 @@ Run: pytest harness/tests/test_qbdata.py
 from __future__ import annotations
 
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 BIN = Path(__file__).resolve().parent.parent / "bin"
@@ -192,3 +193,52 @@ def test_a_tmux_that_fails_is_an_empty_screen_not_a_crash(monkeypatch):
 
     monkeypatch.setattr(qd.subprocess, "run", boom)
     assert qd.tmux_seats() == []
+
+
+# --- what an agent is doing, and when that answer goes off ---------------------
+# The board stores what a holder reported; `stalled` is concluded here, from how
+# old the report is. That conclusion is drawn in two places — this helper and the
+# footer in nix-fleet — and the failure that matters is them disagreeing about
+# one seat, so the threshold is a named constant on both sides and these cases
+# pin the behaviour it drives.
+
+def agent(state: str | None, age_s: int | None = 0) -> dict:
+    a: dict = {"holder": "zeus/seat-1", "state": state}
+    if age_s is not None and state is not None:
+        when = datetime.now(timezone.utc) - timedelta(seconds=age_s)
+        a["state_at"] = when.isoformat()
+    return a
+
+
+def test_a_lease_that_never_reported_says_nothing():
+    word, _ = qd.agent_state(agent(None))
+    assert word == ""
+
+
+def test_a_fresh_working_is_working():
+    assert qd.agent_state(agent("working", 30))[0] == "working"
+
+
+def test_a_working_nobody_has_refreshed_is_stalled():
+    """The whole point: a pane that said `working` and then went quiet looks
+    exactly like a busy one from the outside."""
+    word, style = qd.agent_state(agent("working", qd.STALL_AFTER + 60))
+    assert word == "stalled"
+    assert "red" in style
+
+
+def test_waiting_never_goes_stale():
+    """A pane that has been waiting on a human since lunch is still waiting on
+    that human. Ageing it into `stalled` would hide the state being scanned for."""
+    assert qd.agent_state(agent("waiting", 6 * 3600))[0] == "waiting"
+
+
+def test_input_never_goes_stale_either():
+    assert qd.agent_state(agent("input", 6 * 3600))[0] == "input"
+
+
+def test_a_state_with_no_timestamp_is_not_promoted_to_stalled():
+    """Unparseable or missing `state_at` is unknown age, and unknown is not
+    evidence of being stuck."""
+    assert qd.agent_state({"state": "working", "state_at": None})[0] == "working"
+    assert qd.agent_state({"state": "working", "state_at": "not a date"})[0] == "working"
