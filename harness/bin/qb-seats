@@ -7,14 +7,18 @@
 #                                             normally do
 #        qb-seats --add                       add one seat to a running screen
 #        qb-seats --kill                      tear the screen down
+#        qb-seats list                        the screens that are up, numbered
+#        qb-seats resume [ID|NAME]            reattach to one of them, from
+#                                             anywhere — no repo, no -C
 #        qb-seats --dash-fit -s NAME          put the dash back to the width the
 #                                             screen asked for — what its own
 #                                             resize hooks call
 #        qb-seats -h|--help                   this text
 #
 # Exit codes:
-#   0  screen is up, or was reattached, added to, or killed
-#   1  cannot proceed (no tmux, no qb-seat, no repo, no such session)
+#   0  screen is up, or was reattached, added to, or killed; or the list printed
+#   1  cannot proceed (no tmux, no qb-seat, no repo, no such session, or a
+#      `resume` that names no screen or does not say which)
 #   2  malformed arguments — a caller bug, and says so
 #
 # WHAT THIS IS FOR. Working a plan in parallel took five terminals and a human
@@ -114,10 +118,14 @@ DASH_SHARE=3            # ...and never more than 1/3 of the window — see dash_
 WINDOW_COLS=240         # the window a DETACHED session is built in, and a fiction
 WINDOW_ROWS=60          # until a client attaches — see the -x/-y note further down
 ACTION="up"
+TARGET=""               # which screen `resume` was asked for: a number, a name,
+                        # or empty for "the only one that is up"
 
 usage() {
   cat <<EOF
 usage: $PROG [N] [-C DIR] [-s NAME] [--staged] [--no-yolo] [--add] [--kill]
+       $PROG list
+       $PROG resume [ID|NAME]
 
   N           number of seats, 1-$MAX_SEATS (default $SEATS); -n N also works
   -C DIR      repo the seats run in (default: the git root of \$PWD)
@@ -132,6 +140,14 @@ usage: $PROG [N] [-C DIR] [-s NAME] [--staged] [--no-yolo] [--add] [--kill]
               QB_SEAT_YOLO=0 you have exported
   --add       add one seat to an already-running screen and reflow
   --kill      kill the screen
+  list        the screens that are up — number, name, seats, repo — newest
+              information first-hand from tmux, so a screen whose name it had to
+              mangle is listed under the name it actually has
+  resume      reattach to the screen with that number, or that name. It needs no
+              repo and no -C: a screen already knows the directory it was built
+              in, so this is the command for the ssh link that dropped and the
+              shell that came back up somewhere else. With exactly one screen up
+              the argument is optional
   --dash-fit  put the dash back to the width the screen was built asking for,
               clamped to a third of the window. The window's own resize hooks
               call this; by hand it is only useful after a resize tmux did not
@@ -563,6 +579,112 @@ attach() {
   fi
 }
 
+# ---- the screens that are up ------------------------------------------------
+# WHAT MAKES A TMUX SESSION ONE OF OURS IS A PANE CARRYING @qb_seat, not what the
+# session is called. Three separate reasons the name cannot be the test:
+#
+#   * -s takes anything. The fleet's own screen is `qbseats`, not
+#     `seats-nix-fleet`, and it is no less a screen for it.
+#   * tmux renames what it will not take verbatim — see the note by new-session.
+#     The name you asked for is then not the name that is up, which is precisely
+#     the case a user needs a list to get out of.
+#   * `seats-` is a prefix anyone may have used for something else.
+#
+# The option is set on every seat this script creates and on nothing else, so the
+# panes that have one both identify the screen and count its seats.
+#
+# One `list-panes -s` per session rather than a single `-a` sweep, because a
+# session name is whatever the user gave it and may contain the separator any
+# one-pass format string would have to split on. For the same reason the NAME IS
+# THE LAST FIELD of each record: everything before it is a fixed count of fields,
+# so a reader can take the rest of the line as the name and be right.
+screens() {
+  local s n att path all
+  # READ THE SESSION LIST FIRST, and tolerate it failing. A server with no
+  # sessions at all — which is `list` and `resume` on a box where nothing is up,
+  # the commonest reason to run either — makes `tmux list-sessions` exit 1, and
+  # under `pipefail` that status is the whole pipeline's however the `while`
+  # ends. `set -e` then took the script down before it could say so: measured as
+  # `qb-seats list` printing "no screens are up" and exiting 1 anyway.
+  all=$(tmux list-sessions -F '#{session_name}' 2>/dev/null) || return 0
+  [ -n "$all" ] || return 0
+  printf '%s\n' "$all" | sort | while IFS= read -r s; do
+    n=$(tmux list-panes -s -t "=$s" -F '#{@qb_seat}' 2>/dev/null \
+          | awk 'NF { n++ } END { print n + 0 }')
+    [ "$n" -gt 0 ] || continue
+    # `=$s:` WITH THE COLON, exactly as the set-option calls further down use it
+    # and for the same reason: display-message takes a target-PANE, and a bare
+    # session name is not one. It does not fail loudly either — it prints an
+    # empty line, which is how the first cut of this listed every screen with no
+    # path and every one of them "(attached)".
+    att=$(tmux display-message -p -t "=$s:" '#{session_attached}' 2>/dev/null) || att=
+    path=$(tmux display-message -p -t "=$s:" '#{session_path}' 2>/dev/null) || path=
+    # NO FIELD MAY BE EMPTY. A tab is IFS whitespace, so a reader splitting on one
+    # collapses a run of them: `3\t\t\tname` reads back as two fields, not four,
+    # and the name lands in the second variable. The defaults are therefore not
+    # cosmetic — they are what keeps a session that vanished between the list and
+    # the lookup from silently shifting every column right.
+    printf '%s\t%s\t%s\t%s\n' "$n" "${att:-0}" "${path:-?}" "$s"
+  done
+  return 0
+}
+
+# Just the names, in the order `list` numbers them. Field 4 TO THE END, since the
+# name is the last field and may contain a tab of its own.
+screen_names() { screens | cut -f4-; }
+
+# The numbered list a human reads and `resume` counts against. Both call this, so
+# the number beside a screen cannot come to mean two different things.
+list_screens() {
+  local seats att path name i=0 home=${HOME:-}
+  screens | while IFS=$'\t' read -r seats att path name; do
+    i=$((i + 1))
+    # ~ for $HOME, because the repo path is the column a human scans to tell two
+    # screens apart and the prefix is the same on every row.
+    case "$home" in
+      ?*) case "$path" in "$home"/*) path="~${path#"$home"}" ;; esac ;;
+    esac
+    printf '  %-3s %-24s %2s seat%s  %s%s\n' \
+      "$i" "$name" "$seats" "$([ "$seats" = 1 ] || printf s)" "$path" \
+      "$([ "$att" = 0 ] || printf '  (attached)')"
+  done
+  return 0
+}
+
+# Which screen `resume` means. Empty output and status 1 for "cannot tell".
+#
+# A NAME BEATS A NUMBER, both passes over the same list. Both spellings are
+# offered because `list` prints both, and a screen that happens to be called `3`
+# while sitting at row 1 has to resume when you type its name — the name is the
+# thing the user can see is unambiguous.
+resolve_screen() {
+  local want=$1 list name i=0
+  list=$(screen_names)
+  [ -n "$list" ] || return 1
+
+  if [ -z "$want" ]; then
+    # A list of one is not a choice to make. `qb-seats resume` on a box with a
+    # single screen up is the whole of what most people mean by it.
+    [ "$(printf '%s\n' "$list" | wc -l)" -eq 1 ] || return 1
+    printf '%s\n' "$list"
+    return 0
+  fi
+
+  while IFS= read -r name; do
+    if [ -n "$name" ] && [ "$name" = "$want" ]; then printf '%s\n' "$name"; return 0; fi
+  done <<EOF
+$list
+EOF
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    i=$((i + 1))
+    if [ "$i" = "$want" ]; then printf '%s\n' "$name"; return 0; fi
+  done <<EOF
+$list
+EOF
+  return 1
+}
+
 # Seats are identified by a pane option, not by index or title: the index shifts
 # when a pane is added, and the agent in the pane rewrites the title.
 seat_panes() {
@@ -719,6 +841,18 @@ while [ $# -gt 0 ]; do
     --no-yolo) YOLO=0; shift ;;
     --add)  ACTION="add";  shift ;;
     --kill) ACTION="kill"; shift ;;
+    # Bare words, and the `--` spellings too, because a user who has just learnt
+    # --add and --kill will type --list and must not be told it is a caller bug.
+    list|--list) ACTION="list"; shift ;;
+    resume|--resume)
+      ACTION="resume"; shift
+      # Its target is positional and has to be taken RIGHT HERE, because a bare
+      # number means the seat count everywhere else on this command line:
+      # `qb-seats resume 2` would otherwise be read as "resume, three seats" and
+      # the 2 would vanish into $SEATS. Anything starting with `-` is left for
+      # the loop, so `resume --help` still prints the help.
+      case "${1:-}" in ''|-*) ;; *) TARGET=$1; shift ;; esac
+      ;;
     --dash-fit) ACTION="fit"; shift ;;
     -h|--help) usage; exit 0 ;;
     # A bare number is the seat count. `qb-b 3` is the shape this is reached for
@@ -747,6 +881,38 @@ if [ "$ACTION" = fit ]; then
   [ -n "$SESSION" ] || die "--dash-fit needs -s SESSION"
   have_session || exit 0
   dash_resize
+  exit 0
+fi
+
+# `list` and `resume` are about screens that ALREADY EXIST, so neither may need
+# what building one needs — and in particular neither derives a repo. That is not
+# a shortcut, it is the feature: the whole point of `resume` is that you do not
+# have to be standing in the right directory. The screen already knows the one it
+# was built in and every pane in it is already there, so a dropped ssh link is
+# recovered from whatever shell came back up, in whatever cwd. They run before
+# default_repo for that reason, exactly as --dash-fit does.
+if [ "$ACTION" = list ]; then
+  # An empty list on stdout and a word on stderr: a human running this by hand is
+  # not left staring at silence, and a caller parsing stdout is not handed prose.
+  [ -n "$(screen_names)" ] || warn "no screens are up"
+  list_screens
+  exit 0
+fi
+
+if [ "$ACTION" = resume ]; then
+  if ! SESSION=$(resolve_screen "$TARGET"); then
+    if [ -z "$(screen_names)" ]; then
+      die "no screens are up — start one with \`$PROG\` in the repo you want it in"
+    fi
+    if [ -n "$TARGET" ]; then
+      warn "no screen numbered or named '$TARGET'. These are up:"
+    else
+      warn "more than one screen is up, so say which:"
+    fi
+    list_screens >&2
+    exit 1
+  fi
+  attach
   exit 0
 fi
 
@@ -849,9 +1015,35 @@ esac
 # The knobs the seats need come from seat_env_fill — read the note there before
 # changing the list or the tests that pin it.
 seat_env_fill
-tmux new-session -d -s "$SESSION" -n seats -c "$REPO" \
+# -P -F, because THE NAME TMUX MAKES IS NOT ALWAYS THE NAME IT WAS ASKED FOR, and
+# every `-t` below addresses the session exactly (`=$SESSION`) — so a rename tmux
+# does quietly turns the very next command into a fatal "no such session", with the
+# session, its window and one pane already created and nothing else done. Measured
+# on tmux 3.6a and 3.4, which do not even mangle the same characters:
+#
+#   qb-seats -s my.screen   → session `my_screen`, both versions. `.` and `:` are
+#                             a target's own separators, so tmux replaces them.
+#   qb-seats -s 'a\b'       → session `a\\b`, both versions: session_check_name
+#                             runs the name through strvis, which escapes what it
+#                             cannot print — and a backslash.
+#   qb-seats -s 'a$Bb'      → kept by 3.6a, escaped to `a\\$Bb` by 3.4. THIS is what
+#                             CI caught: green here, red there, on the same commit.
+#
+# So the created name is read back and used from here on, and tmux is the only
+# authority on what it is — reimplementing its rules would be one more thing to
+# keep in step with a moving target, and 3.4 versus 3.6a is exactly how that fails.
+# The one thing this does NOT buy is reattaching to a renamed screen: a later
+# `qb-seats -s my.screen` still looks for the name it was given, does not find it,
+# and refuses on tmux's own "duplicate session: my_screen" — which at least names
+# the screen it is talking about. The warning below is where a user learns it.
+SESSION_ASKED=$SESSION
+SESSION=$(tmux new-session -d -P -F '#{session_name}' -s "$SESSION" -n seats -c "$REPO" \
   -x "$WINDOW_COLS" -y "$WINDOW_ROWS" \
-  -e QB_SEATS=1 -e FLEET_NO_MOTD=1 ${seat_env[@]+"${seat_env[@]}"}
+  -e QB_SEATS=1 -e FLEET_NO_MOTD=1 ${seat_env[@]+"${seat_env[@]}"})
+[ "$SESSION" = "$SESSION_ASKED" ] \
+  || warn "tmux would not take '$SESSION_ASKED' as a session name and called this
+       screen '$SESSION' instead — that is the name to reattach to, and the name
+       to pass to --add and --kill."
 
 # Never a shared instance: strip any inherited value from the session
 # environment, so nothing a seat spawns can pick one up. qb-seat sets its own.

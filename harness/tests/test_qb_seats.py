@@ -96,7 +96,20 @@ def screen(tmp_path):
     # It did exactly that on this machine, taking a live seat screen with it.
     socket_dir = tempfile.mkdtemp(prefix="qbt-", dir="/tmp")
     env = {
-        **{k: v for k, v in os.environ.items() if k not in ("TMUX", "TMUX_PANE")},
+        # EVERY QB_SEAT* KNOB IS STRIPPED, not merely overridden below. These tests
+        # assert what a seat was told, so a value in the developer's own environment
+        # decides their result: `QB_SEAT_BRIEF=` exported fleet-wide — which is the
+        # documented way to ask for waiting seats — is forwarded correctly by the
+        # code under test and makes `test_an_empty_brief_reaches_a_seat_added_later`
+        # fail on its FIRST assertion, the one that wants a plain screen to leave the
+        # knob unset. Green on CI, red on the box that configured it, and the diff
+        # under test innocent in both.
+        #
+        # Same rule the tmux.conf above is an input for, and the same rule that put
+        # QB_SEATS_DASH and QB_SEATS_BOARD below: what the machine happens to carry
+        # is not something a test may consult. A test that wants a knob sets it.
+        **{k: v for k, v in os.environ.items()
+           if k not in ("TMUX", "TMUX_PANE") and not k.startswith("QB_SEAT")},
         # $TMUX BEATS $TMUX_TMPDIR, and that is the whole bug. Inside a tmux pane
         # $TMUX names the server the client is attached to, so every tmux call
         # below reaches THAT server no matter where TMUX_TMPDIR points — the
@@ -1125,13 +1138,17 @@ def resize_hook(run, name="t"):
 def hook_binary(run, name="t"):
     """The qb-seats the resize hook will actually run.
 
-    The hook is `run-shell -b "'<path>' --dash-fit -s '<session>'"`, so the path is
-    its first shell-quoted word. No test here puts a quote in a DIRECTORY name, so
-    reading it back this plainly is enough; the escaping itself is pinned end to end
-    by test_the_resize_hook_survives_a_session_name_that_needs_quoting.
+    TWO LAYERS COME OFF, and both are the point of the escaping this pins. The hook is
+    stored as a tmux command string, so what show-hooks prints is still tmux-escaped:
+    a qb-seats under a directory called `a$Bdir` reads `a\$Bdir` there and only
+    becomes itself when tmux parses the string to fire the hook. Inside that, the path
+    is the first shell-quoted word. No test here puts a quote in a DIRECTORY name, so
+    taking the word this plainly is enough.
     """
     m = re.search(r"run-shell -b \"'([^']+)'", resize_hook(run, name))
-    return m.group(1) if m else ""
+    if not m:
+        return ""
+    return re.sub(r"\\(.)", r"\1", m.group(1).replace("##", "#"))
 
 
 def stale_qb_seats(tmp_path):
@@ -1244,26 +1261,108 @@ def test_no_resize_hook_when_no_copy_understands_the_flag(screen, tmp_path):
 
 
 def test_the_resize_hook_survives_a_session_name_that_needs_quoting(screen):
-    """The session name crosses two quoting layers and a format expander on its way
-    into the hook, and interpolating it raw broke all three. Measured on tmux 3.6a:
+    r"""The session name crosses two quoting layers on its way into the hook, and
+    interpolating it raw broke both. Measured on tmux 3.6a: an apostrophe left the
+    shell an unterminated quote, and a `"` escaped out of tmux's own double quotes
+    and truncated the command mid-word. Both are a hook that does nothing, for ever,
+    in silence — `run-shell -b` discards both streams — so this asserts the end that
+    matters, the dash putting itself back, rather than the string tmux stored.
 
-      * `-s 'a$Bb'` arrived as `--dash-fit -s 'a'`, because tmux expands `$NAME`
-        from its own environment inside its own double quotes. The hook then refit a
-        different screen, or none.
-      * an apostrophe left the shell an unterminated quote, and a `"` truncated the
-        command mid-word.
+    WHICH CHARACTERS A SESSION NAME MAY HAVE IS TMUX'S BUSINESS, NOT OURS, and the
+    two questions have to be kept apart. Measured on 3.6a and on 3.4 (what
+    ubuntu-24.04, and therefore CI, ships), asking for a session called X and then
+    looking it up as `=X`:
 
-    Every one of those is a hook that does nothing, for ever, in silence: run-shell
-    -b discards both streams. So this asserts the end that matters — the dash still
-    puts itself back — rather than the string tmux stored.
+      * `'`, `"`, a space, `;`, `#`, `!`, `%`, `&`, `*` — kept verbatim by both. Safe
+        to ask a test for, which is what this name is made of.
+      * `.` and `:` — replaced with `_` by both, because they are a target's own
+        separators.
+      * `\` — escaped to `\\` by both; `$` — kept by 3.6a and escaped to `\\$` by 3.4,
+        since session_check_name runs the name through strvis and the two versions
+        do not agree on what needs it.
+
+    The last two groups are names whose lookup no longer matches what was asked for.
+    An earlier version of this test put a `$` in the name; it passed here and failed
+    on CI for that reason alone, which is a fact about tmux and not about the quoting
+    this test is for. `$` is covered by
+    test_the_resize_hook_survives_a_dollar_in_the_path_to_itself instead, where the
+    character is in something we own, and what tmux does with a name it will not take
+    is covered by test_a_session_name_tmux_will_not_take_is_still_a_working_screen.
     """
-    name = "it's a $B \"screen\""
+    name = "it's a \"screen\""
     screen.env["QB_SEATS_DASH"] = DASH_STUB
     screen.env["QB_SEATS_DASH_SIZE"] = "60"
     assert screen("-n", "2", name=name).returncode == 0
     assert labels(screen, name)["dash"][0] == 60
     with attached_client(screen, 200, 50, name=name):
         assert wait_for_dash_width(screen, 60, name=name) == 60
+
+
+def test_the_resize_hook_survives_a_dollar_in_the_path_to_itself(screen, tmp_path):
+    """`$` is the character tmux expands inside its OWN double quotes, and the hook is
+    stored as a tmux command string. Unescaped, a `qb-seats` living under a directory
+    called `a$Bdir` went into the hook as `'…/a/qb-seats'` — tmux substituted its
+    idea of `$Bdir`, which is nothing — so the hook pointed at a path that does not
+    exist and failed on every resize into a `run-shell -b` that discards both streams.
+
+    The `$` is in the path to the script rather than in the session name on purpose:
+    a name is the obvious place to put one and cannot be asserted portably, because
+    tmux 3.4 escapes `$` in a session name and 3.6a does not (see the test above). A
+    directory is ours, reaches the hook through exactly the same tmux double quotes,
+    and behaves identically on both versions.
+    """
+    dollar = tmp_path / "a$Bdir"
+    dollar.mkdir()
+    # qb-seat-click too: with BIN off PATH, beside_me falls back to the script's own
+    # directory for the seat bar as well, and a missing one there would fail the run
+    # for an unrelated reason.
+    for name in ("qb-seats", "qb-seat-click"):
+        copy = dollar / name
+        copy.write_text((BIN / name).read_text())
+        copy.chmod(0o755)
+    # BIN has to come OFF this PATH, or beside_me finds the ordinary copy there —
+    # PATH first, deliberately — and the hook never sees the awkward directory.
+    screen.env["PATH"] = path_with_no_dash_on_it(tmp_path, screen)
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen.env["QB_SEATS_DASH_SIZE"] = "60"
+    assert screen("-n", "2", exe=[str(dollar / "qb-seats")]).returncode == 0
+    assert hook_binary(screen) == str(dollar / "qb-seats"), resize_hook(screen)
+    with attached_client(screen, 200, 50):
+        assert wait_for_dash_width(screen, 60) == 60
+
+
+def test_a_session_name_tmux_will_not_take_is_still_a_working_screen(screen):
+    """tmux renames a session whose name it will not take verbatim, and every `-t` in
+    this script addresses the session EXACTLY (`=$SESSION`) — so the rename turned the
+    next command into a fatal "no such session", with the session, its window and one
+    pane already created: a half-built screen with no seat numbers, no dash, no bar,
+    no hook and no agent started, reported as a bare tmux error naming neither the
+    cause nor the fix. Measured on 3.6a against `qb-seats -s my.screen`, which tmux
+    calls `my_screen`.
+
+    `.` and `:` are a target's own separators and every tmux version replaces them, so
+    this was reachable on this host all along. It was found while diagnosing the
+    tmux-3.4-only `$` escaping that CI caught — the same class, one step along — which
+    is why it is tested here.
+
+    The fix is to ask tmux what it called the session (`new-session -P -F`) rather
+    than to reimplement its naming rules, which 3.4 and 3.6a do not even share.
+    """
+    real = "my_screen"
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen.env["QB_SEATS_DASH_SIZE"] = "60"
+    done = screen("-n", "2", name="my.screen")
+    assert done.returncode == 0, done
+    assert real in done.stderr, f"it must say what the screen is really called: {done.stderr}"
+    # A whole screen, not the first pane of one.
+    assert sorted(n for _, n in panes(screen, real) if n) == ["1", "2"]
+    assert labels(screen, real)["dash"][0] == 60
+    # And the hook names the session that EXISTS. Built from the name that was asked
+    # for, it would look up a session that is not there and quietly do nothing.
+    assert f"'{real}'" in resize_hook(screen, real), resize_hook(screen, real)
+    # The warning promises this name works for --kill; hold it to that. It is also how
+    # this test tidies up, since the fixture only knows the name it asked for.
+    assert screen("--kill", name=real).returncode == 0
 
 
 def test_dash_fit_tolerates_a_screen_that_has_moved_on(screen):
@@ -1330,3 +1429,187 @@ def test_an_empty_brief_reaches_a_seat_added_later(screen):
     lines = wait_for_log(screen.log, 2)
     assert len(lines) == 2, lines
     assert lines[1].endswith("brief=set:"), lines
+
+
+# ---- list and resume --------------------------------------------------------
+# The ssh link drops and the shell that comes back up is in the wrong directory,
+# or on the wrong repo, or does not remember what the screen was called. `qb-seats`
+# on its own only reattaches to the screen for the repo you are STANDING IN, which
+# is the one thing a recovering shell cannot be relied on to be.
+
+
+def qb(run, *args, cwd=None):
+    """qb-seats with NO -C and NO -s, from a directory of the caller's choosing.
+
+    The fixture's own runner always supplies both, which is exactly what `list`
+    and `resume` must work without — so these tests go around it.
+    """
+    return subprocess.run(
+        [str(QB_SEATS), *args], cwd=cwd, env=run.env,
+        capture_output=True, text=True, timeout=60,
+    )
+
+
+def listing(run, cwd=None):
+    """[(number, name)] as `list` printed it."""
+    out = qb(run, "list", cwd=cwd)
+    assert out.returncode == 0, out.stderr
+    rows = []
+    for line in out.stdout.splitlines():
+        num, name = line.split()[0], line.split()[1]
+        rows.append((num, name))
+    return rows
+
+
+def test_list_names_every_screen_that_is_up(screen):
+    screen("-n", "2", name="t")
+    screen("-n", "1", name="t2")
+    rows = listing(screen)
+    assert [n for _, n in rows] == ["t", "t2"], rows
+    assert [i for i, _ in rows] == ["1", "2"], "the rows are numbered for `resume`"
+
+
+def test_list_says_the_seats_and_the_repo(screen):
+    """The two columns that tell two screens apart when the names do not."""
+    screen("-n", "2")
+    line = qb(screen, "list").stdout
+    assert "2 seats" in line, line
+    assert str(screen.repo) in line or f"~{str(screen.repo)}" in line, line
+
+
+def test_list_finds_a_screen_whatever_it_is_called(screen):
+    """A screen is identified by a pane carrying @qb_seat, never by its name.
+
+    `-s` takes anything and the fleet's own screen is `qbseats`, not
+    `seats-nix-fleet`; a listing keyed on a `seats-` prefix would simply not show
+    it, which is worse than not having the command.
+    """
+    screen("-n", "1", name="nothing-like-the-default")
+    assert [n for _, n in listing(screen)] == ["nothing-like-the-default"]
+
+
+def test_list_ignores_a_tmux_session_that_is_not_a_screen(screen):
+    """The user's editor session on the same server is none of this command's
+    business, and offering it under a number that `resume` would attach to is the
+    failure that matters."""
+    screen("-n", "1")
+    screen.tmux("new-session", "-d", "-s", "not-ours")
+    try:
+        assert [n for _, n in listing(screen)] == ["t"]
+    finally:
+        screen.tmux("kill-session", "-t", "=not-ours")
+
+
+def test_list_with_nothing_up_prints_nothing_and_says_so(screen):
+    """Empty stdout for a caller parsing it, a word on stderr for the human who
+    would otherwise be staring at silence."""
+    screen.tmux("start-server")
+    out = qb(screen, "list")
+    assert out.returncode == 0, out.stderr
+    assert out.stdout == "", out.stdout
+    assert "no screens" in out.stderr, out.stderr
+
+
+def test_resume_takes_the_number_from_the_list(screen):
+    screen("-n", "1", name="t")
+    screen("-n", "1", name="t2")
+    want = dict((i, n) for i, n in listing(screen))["2"]
+    out = qb(screen, "resume", "2")
+    assert out.returncode == 0, out.stderr
+    # No tty here, so attach() reports rather than attaching — which is the
+    # assertion: it named the screen the list numbered 2.
+    assert want in out.stdout, out.stdout
+
+
+def test_resume_takes_the_name(screen):
+    screen("-n", "1", name="t")
+    screen("-n", "1", name="t2")
+    out = qb(screen, "resume", "t2")
+    assert out.returncode == 0, out.stderr
+    assert "t2" in out.stdout, out.stdout
+
+
+def test_a_number_after_resume_is_not_the_seat_count(screen):
+    """The parser trap this subcommand had to be written around: a bare number is
+    the seat count everywhere else on this command line, so `resume 2` read by the
+    ordinary rules is "resume, and by the way three seats" with the 2 swallowed —
+    silently resuming the wrong screen, or the only one.
+    """
+    screen("-n", "1", name="t")
+    screen("-n", "1", name="t2")
+    before = {n for _, n in listing(screen)}
+    assert qb(screen, "resume", "2").returncode == 0
+    assert {n for _, n in listing(screen)} == before, "resume must build nothing"
+    assert sorted(n for _, n in panes(screen, "t2") if n) == ["1"], "and add no seat"
+
+
+def test_resume_needs_no_repo_and_no_C(screen, tmp_path):
+    """The whole point. A screen already knows the directory it was built in, so
+    recovery must not depend on the shell that came back up being anywhere near
+    it — which is the one thing `qb-seats` on its own does depend on.
+    """
+    screen("-n", "1")
+    elsewhere = tmp_path / "not-a-repo"
+    elsewhere.mkdir()
+    out = qb(screen, "resume", "t", cwd=elsewhere)
+    assert out.returncode == 0, out.stderr
+    assert "t" in out.stdout, out.stdout
+
+
+def test_resume_with_no_argument_takes_the_only_screen(screen):
+    """A list of one is not a choice to make."""
+    screen("-n", "1")
+    out = qb(screen, "resume")
+    assert out.returncode == 0, out.stderr
+    assert "t is up" in out.stdout, out.stdout
+
+
+def test_resume_with_no_argument_will_not_guess_between_two(screen):
+    screen("-n", "1", name="t")
+    screen("-n", "1", name="t2")
+    out = qb(screen, "resume")
+    assert out.returncode == 1
+    assert "say which" in out.stderr, out.stderr
+    # ...and the list is right there, so the next command is one word away.
+    assert "t2" in out.stderr, out.stderr
+
+
+def test_resume_of_a_screen_that_is_not_there_shows_what_is(screen):
+    screen("-n", "1")
+    out = qb(screen, "resume", "no-such-screen")
+    assert out.returncode == 1
+    assert "no-such-screen" in out.stderr, out.stderr
+    assert "  1   t " in out.stderr or "\n  1 " in out.stderr, out.stderr
+
+
+def test_resume_with_nothing_up_says_how_to_start_one(screen):
+    screen.tmux("start-server")
+    out = qb(screen, "resume", "1")
+    assert out.returncode == 1
+    assert "no screens are up" in out.stderr, out.stderr
+
+
+def test_a_name_beats_a_number(screen):
+    """Both spellings are offered, so a screen that happens to be CALLED `1` while
+    sitting at some other row has to resume when you type its name — the name is
+    the half the user can see is unambiguous."""
+    screen("-n", "1", name="t")
+    screen("-n", "1", name="1")      # sorts first, so row 1 is the screen named `1`
+    rows = dict((n, i) for i, n in listing(screen))
+    assert rows["1"] == "1" and rows["t"] == "2", rows
+    assert "1 is up" in qb(screen, "resume", "1").stdout
+
+
+def test_list_and_resume_reach_a_screen_tmux_renamed(screen):
+    """`-s my.screen` becomes `my_screen`, and every `-t` in this script addresses
+    the session exactly — so the name you asked for is not a name that reattaches,
+    and the warning at build time is the only place it was ever said. A list read
+    from tmux is the durable answer: it can only print names that exist.
+    """
+    assert screen("-n", "1", name="my.screen").returncode == 0
+    try:
+        assert [n for _, n in listing(screen)] == ["my_screen"]
+        assert "my_screen is up" in qb(screen, "resume", "my_screen").stdout
+        assert "my_screen is up" in qb(screen, "resume", "1").stdout
+    finally:
+        screen("--kill", name="my_screen")
