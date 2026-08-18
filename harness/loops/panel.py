@@ -706,16 +706,25 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # length. Starting from the PR's would tell antigravity it had been cut on a
     # round whose material fits whole.
     sendable = len(review.target) + len(review.near) + len(review.far)
+    #: Seats whose budget the KERNEL cut, rather than a number somebody typed.
+    #: Half of the coverage exemption; the other half is whether the cut actually
+    #: cost the seat any of the target, which only `truncated_for` below can
+    #: measure — see `argv_clamp` for why a comparison against the target's length
+    #: is not the same question under increment scope.
+    kernel_cut: set[str] = set()
     if "antigravity" in budgets:
         asked = budgets["antigravity"]
-        fitted = fit_argv_budget(prompt_for, sendable if asked is None else asked)
-        if fitted < (sendable if asked is None else asked):
+        want = sendable if asked is None else asked
+        fitted, cut_by_kernel = argv_clamp(prompt_for, sendable, asked)
+        if fitted < want:
             notes.append(
                 f"antigravity gets {fitted:,} of {sendable:,} diff chars — its prompt "
                 f"travels in argv and the kernel caps one element at "
                 f"{ARGV_PROMPT_MAX_BYTES:,} bytes. It is the only reviewer with no way "
                 "to read a prompt off stdin.")
             budgets["antigravity"] = fitted
+        if cut_by_kernel:
+            kernel_cut.add("antigravity")
 
     # Truncation is measured against the review TARGET, not against everything
     # sent. Under increment scope losing context is the design — that is what the
@@ -736,6 +745,12 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     truncated_for = {n: b for n, b in budgets.items()
                      if sent[n][0] < len(review.target)}
     truncated = bool(truncated_for)
+    # The coverage exemption, assembled from both halves: truncated by MEASUREMENT
+    # (composed above, so the brief and headers are accounted for) and cut by the
+    # kernel rather than by a config budget. A subset of `truncated_for` by
+    # construction, which is what keeps the report footnote and the veto agreeing
+    # about the same seats.
+    argv_capped = {n for n in truncated_for if n in kernel_cut}
     # A budget below the scoped frame's OWN size cannot be honoured. The brief and
     # the section headers are over a kilobyte and they are what makes the target
     # legible as the target; cutting them to fit would hand the reviewer an
@@ -839,6 +854,10 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 # checked against the budget rather than asked for, because the
                 # one thing a truncated reviewer cannot notice is the truncation.
                 "truncated": name in truncated_for,
+                # WHY it was truncated, where the answer is the kernel rather than
+                # a number in a config file. Same shape of fact as `absent` and
+                # treated the same way by coverage_veto.
+                "argv_capped": name in argv_capped,
                 "duration_ms": got.duration_ms,
                 "could_not_assess": got.could_not_assess,
                 "unstructured": got.unstructured,
@@ -846,6 +865,11 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 # coverage_veto, which is the one consumer that treats it
                 # differently from every other way of not running.
                 "absent": got.absent,
+                # A fact about the panel's DESIGN rather than about the round: an
+                # empty sandbox and no file tools, so this seat's declarations
+                # about code outside the diff are constants. coverage_veto is
+                # again the consumer that cares.
+                "code_blind": got.code_blind,
                 # Spread, not nested: a member whose usage could not be read
                 # contributes no keys at all, so the board stores nulls and
                 # renders "not recorded" — rather than a zero it would average in
@@ -1414,7 +1438,13 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # Named per reviewer, since the budgets can now differ: "truncated" alone
         # would hide that one model saw the whole diff and another saw a third of
         # it, which is exactly what you need to know when they disagree.
-        cut = ", ".join(f"{n} ({b:,})" for n, b in sorted(truncated_for.items()))
+        # The kernel-capped seat is marked, because the footnote is now the only
+        # place its truncation appears at all: it no longer files a veto line, and
+        # a reader comparing "truncated for antigravity" against a confident stop
+        # needs to see, right there, that the cap was the machine's and not a
+        # budget somebody could raise.
+        cut = ", ".join(f"{n} ({b:,}{', argv ceiling' if n in argv_capped else ''})"
+                        for n, b in sorted(truncated_for.items()))
         what = "increment" if review.scope == "increment" else "diff"
         lines.append(f"\n_{what} is {len(review.target):,} chars — truncated for {cut}_")
 
@@ -1469,6 +1499,18 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         lines.append("\n### Coverage declared by the reviewers")
         for name, gaps in declared.items():
             lines.append(f"- **{name}** could not assess: " + "; ".join(gaps))
+        # Said once, under the declarations themselves, because the report has to
+        # answer the question a reader asks HERE: five declared gaps and a
+        # confident stop used to be a contradiction, and now it is the design.
+        # Without this the change reads as the panel having quietly stopped caring
+        # what its reviewers could not see.
+        if declared and all(reviewer_meta.get(n, {}).get("code_blind")
+                            for n in declared):
+            lines.append(
+                "- _these did not cost the round its confidence: every seat above "
+                "reviews from the diff alone, so a gap outside the diff is a fact "
+                "about the panel and not about this PR. Whoever reads this can "
+                "close one with `grep`, and it is worth doing._")
         if coverage_note:
             lines.append(f"- _master:_ {coverage_note}")
 
