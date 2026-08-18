@@ -76,6 +76,45 @@ set -uo pipefail
 SEAT_NAME_PREFIX="seat-"
 AGENT_BIN="${QB_SEAT_AGENT:-claude}"
 
+# QB_SEAT_YOLO — permission prompts. ON unless this says otherwise, which is the
+# unusual direction for a knob like this and is the whole point, so:
+#
+# WHY THE DEFAULT IS TO SKIP THEM. A seat is a pane nobody is watching. The first
+# tool call wanting a permission the agent does not already hold stops it dead,
+# and it stops in the one way this design cannot recover from: the pane looks
+# busy, the board shows a live agent holding a claim, and the work is not moving.
+# There is no operator to answer the question — that is the definition of a seat.
+# So a seat that stops to ask is not being careful, it is being stuck, and a
+# default that produced N stuck panes would be a default nobody could use without
+# first learning the flag that makes the tool work at all.
+#
+# THIS IS A REAL TRADE AND IT IS MADE DELIBERATELY. It hands a full shell to N
+# agents at once in a repo whose tests, hooks and scripts all run as the operator.
+# What makes it the right way round HERE and not in general is the blast radius
+# either way: a seat that cannot act is useless to everyone, while a seat that can
+# act is dangerous in a repo you already trusted enough to point a fleet at. A
+# consumer who does not want it says so once — `qb-seats --no-yolo`, or
+# QB_SEAT_YOLO=0 in the environment — and gets prompts back everywhere.
+#
+# FALSY VALUES ONLY TURN IT OFF, which is the mirror of QB_SEAT_FORCE's rule and
+# is here for the same reason: the value a caller passes must mean what it says.
+# Unset and empty both mean "not answered", and the answer to an unanswered
+# question is the default, so only an explicit 0/no/false/off disables it.
+#
+# THE SPELLING IS CLAUDE'S. `--dangerously-skip-permissions` is not a universal
+# flag, and QB_SEAT_AGENT can name anything — so a seat running some other agent
+# gets an argument that agent will reject, loudly, at startup. That is the right
+# failure: it is visible in the pane in the first second, where a per-agent table
+# of flags maintained in a script that deliberately knows nothing about the agent
+# would be a second implementation of the agent's own CLI. Point QB_SEAT_AGENT at
+# a wrapper, or turn this off for that seat.
+seat_yolo_requested() {
+    case "${QB_SEAT_YOLO:-}" in
+        0|n|N|no|NO|No|false|FALSE|False|off|OFF|Off) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
 # The brief. Identical for every seat — that is the design, not an omission: the
 # moment one seat is told something another is not, there is a dispatcher again.
 # Overridable wholesale with QB_SEAT_BRIEF so the layout that owns the fleet can
@@ -581,6 +620,12 @@ if [[ -n "${QB_SEAT_BRIEF+set}" ]]; then
     BRIEF="$QB_SEAT_BRIEF"
 else
     BRIEF="$(default_brief)"
+fi
+
+# Prepended, not appended: an explicit argument a caller passed for this seat
+# comes after it and so wins any argument the agent resolves last-one-wins.
+if seat_yolo_requested; then
+    set -- --dangerously-skip-permissions "$@"
 fi
 
 # A dry run is checked against the marker for the same reason it prints anything

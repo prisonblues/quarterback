@@ -577,6 +577,15 @@ full — including what was broken before it, which is the part no diff recovers
   a repo name, and treat the string itself as untrusted input on the way back in: the board bounds
   its length at `PATH_MAX` and normalises nothing else, so quote it, and do not hand a value
   beginning with `-` to `git` as anything but an operand.
+- **v2.46** — a screen you ask for by number, and seats that do not stop to ask. `qb-b 3`
+  is the seat count, the default is 3 and the ceiling is 10; past five, seats are five across
+  and two down, built rather than left to `select-layout tiled`, which picks the wrong axis
+  for a pane that wants width. Seat numbers read left to right. And a seat starts with
+  permission prompts off, because a pane nobody is watching cannot answer one: the agent
+  stops mid-item still holding its board claim, and a prompt no one answers is an outage
+  that looks like progress. `qb-seats --no-yolo` or `QB_SEAT_YOLO=0` gives them back; the
+  default lives in `qb-seat`, which is what execs the agent, so a seat started by hand and a
+  seat the screen builds cannot disagree.
 - **v2.43** — the seat screen learns to answer questions about itself. `qb-dash-tui` puts the
   fleet beside the seats — who is alive, what they hold, which PRs are open and what CI says —
   and rows are clickable: a seat jumps the tmux cursor to its pane, a PR opens on GitHub, the ⚖

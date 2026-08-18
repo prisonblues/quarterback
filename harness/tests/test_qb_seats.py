@@ -185,12 +185,6 @@ def test_a_pane_base_index_of_one_still_builds_the_screen(screen):
     assert [n for _, n in got].count(None) == 1, "the board pane too"
 
 
-def test_the_default_is_two_seats(screen):
-    """Integration cost is quadratic in open PRs; the ceiling is not the monitor."""
-    screen()
-    assert sorted(n for _, n in panes(screen) if n) == ["1", "2"]
-
-
 def test_no_inherited_instance_reaches_a_seat(screen):
     """The failure this guards against looks like nothing at all from the screen.
 
@@ -215,6 +209,21 @@ def test_qb_seat_knobs_reach_the_panes(screen):
     screen("-n", "1")
     env = screen.tmux("show-environment", "-t", "t").stdout
     assert "QB_SEAT_AGENT=some-stand-in" in env
+
+
+def test_no_yolo_reaches_the_panes(screen):
+    """The flag is the env knob with the value supplied by the layout, so there
+    is one mechanism to test and nothing that can drift between the two."""
+    screen("--no-yolo", "-n", "1")
+    assert "QB_SEAT_YOLO=0" in screen.tmux("show-environment", "-t", "t").stdout
+
+
+def test_a_plain_screen_leaves_the_knob_unset(screen):
+    """Not "sets it to on" — an unset variable is how qb-seat is told the question
+    was not answered, and answering it here would be a second place for the
+    default to live and to drift from."""
+    screen("-n", "1")
+    assert "QB_SEAT_YOLO" not in screen.tmux("show-environment", "-t", "t").stdout
 
 
 def test_the_inherited_instance_is_stripped_from_the_session(screen):
@@ -329,3 +338,79 @@ def test_qb_b_is_a_spelling_of_qb_seats(tmp_path):
     r = subprocess.run([str(flat), "--help"], capture_output=True, text=True, timeout=30)
     assert r.returncode == 0, r.stderr
     assert "--staged" in r.stdout
+
+
+def test_the_default_is_three_seats(screen):
+    """Replaces the two-seat default.
+
+    Two was chosen because integration cost grows quadratically in open PRs. That
+    is still true and is still the reason for a ceiling — it is just not a reason
+    for the ceiling to be below what one human can follow, which is three.
+    """
+    screen()
+    assert sorted(n for _, n in panes(screen) if n) == ["1", "2", "3"]
+
+
+def test_a_bare_number_is_the_seat_count(screen):
+    """`qb-b 4` is the shape this is reached for, not `qb-b -n 4`."""
+    screen("4")
+    assert sorted(n for _, n in panes(screen) if n) == ["1", "2", "3", "4"]
+
+
+def test_more_than_ten_seats_is_refused_with_the_reason(screen):
+    r = screen("11")
+    assert r.returncode != 0
+    assert "ceiling is 10" in r.stderr, r.stderr
+
+
+def seat_grid(run, name="t"):
+    """{pane_top: [seat numbers, left to right]} — the screen as a human sees it."""
+    out = run.tmux("list-panes", "-t", f"{name}:seats", "-F",
+                   "#{pane_top}\t#{pane_left}\t#{@qb_seat}").stdout
+    rows: dict[int, list] = {}
+    for line in out.splitlines():
+        top, left, seat = line.split("\t")
+        if seat:
+            rows.setdefault(int(top), []).append((int(left), seat))
+    return {top: [s for _, s in sorted(cells)] for top, cells in rows.items()}
+
+
+def test_ten_seats_are_five_across_and_two_down(screen):
+    """`tiled` would pick its own arrangement — 2 across and 3 down for six, from
+    the window's aspect ratio. That is the wrong axis: a seat needs WIDTH, for
+    prose and diffs, and only enough height for the last few turns. So the rows
+    are built rather than chosen, and this is the assertion that says so."""
+    screen("10")
+    grid = seat_grid(screen)
+    assert len(grid) == 2, f"expected two rows of seats, got {grid}"
+    top, bottom = (grid[k] for k in sorted(grid))
+    assert len(top) == 5 and len(bottom) == 5, grid
+
+
+def test_seat_numbers_read_left_to_right(screen):
+    """A split lands to the RIGHT of its target, so splitting the first pane every
+    time builds 1,5,4,3,2 across the row. Seat numbers are how a human addresses
+    one of these."""
+    screen("5")
+    grid = seat_grid(screen)
+    assert list(grid.values())[0] == ["1", "2", "3", "4", "5"], grid
+
+
+def test_an_odd_count_puts_the_extra_seat_on_the_top_row(screen):
+    screen("7")
+    grid = seat_grid(screen)
+    top, bottom = (grid[k] for k in sorted(grid))
+    assert (len(top), len(bottom)) == (4, 3), grid
+    assert top + bottom == [str(n) for n in range(1, 8)], grid
+
+
+def test_the_board_still_spans_the_full_width_under_a_grid(screen):
+    """`tiled` on a window that already holds the board folds the board into the
+    grid. The rows are built before the board is split for that reason."""
+    screen("6")
+    out = screen.tmux("list-panes", "-t", "t:seats", "-F",
+                      "#{@qb_seat}\t#{pane_width}").stdout
+    rows = [line.split("\t") for line in out.splitlines() if line]
+    seats = [int(w) for seat, w in rows if seat]
+    board = [int(w) for seat, w in rows if not seat]
+    assert max(seats) < board[0], "the board pane stopped being full width"

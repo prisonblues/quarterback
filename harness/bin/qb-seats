@@ -3,6 +3,8 @@
 #
 # Usage: qb-seats [-n N] [-C DIR] [-s NAME]   bring up (or reattach to) a screen
 #        qb-seats --staged                    build it with each seat awaiting Enter
+#        qb-seats --no-yolo                   seats that stop and ask, as agents
+#                                             normally do
 #        qb-seats --add                       add one seat to a running screen
 #        qb-seats --kill                      tear the screen down
 #        qb-seats -h|--help                   this text
@@ -95,27 +97,37 @@ SH=${SHELL:-/bin/bash}          # the shell a seat drops back to when it exits
 # `set-environment -r` further down covers every pane split off afterwards.
 unset QUARTERBACK_INSTANCE
 
-SEATS=2                 # the integration ceiling, not the monitor's width
+SEATS=3                 # what one human can actually follow at once
+MAX_SEATS=10            # five across, two down — see the layout note below
 REPO=""                 # default: the git repo you ran this from
 SESSION=""              # default: seats-<repo basename>
 STAGED=0                # 1 = pane waits on Enter before starting its agent
+YOLO=""                 # "" = as it comes (on), 1 = force on, 0 = prompts back
 BOARD_SIZE="25%"        # board pane height, bottom of the window, full width
 ACTION="up"
 
 usage() {
   cat <<EOF
-usage: $PROG [-n N] [-C DIR] [-s NAME] [--staged] [--add] [--kill]
+usage: $PROG [N] [-C DIR] [-s NAME] [--staged] [--no-yolo] [--add] [--kill]
 
-  -n N        number of seats (default $SEATS)
+  N           number of seats, 1-$MAX_SEATS (default $SEATS); -n N also works
   -C DIR      repo the seats run in (default: the git root of \$PWD)
   -s NAME     tmux session name (default: seats-<repo basename>)
   --staged    build the screen with each seat waiting on Enter, so the layout
               can be eyeballed before N agents start claiming
+  --no-yolo   give the seats their permission prompts back. They start without
+              them, because a pane nobody is watching cannot answer one and a
+              seat waiting to be asked a question is a seat that has stopped.
+              QB_SEAT_YOLO=0 in your environment is the same thing said once
+  --yolo      the default, said out loud — useful only to override a
+              QB_SEAT_YOLO=0 you have exported
   --add       add one seat to an already-running screen and reflow
   --kill      kill the screen
 
 Environment:
   QB_SEATS_BOARD   command for the board pane, overriding the default
+  QB_SEAT_YOLO     0 to give the seats their permission prompts back (--no-yolo)
+  QB_SEAT_AGENT    the agent binary a seat runs, instead of \`claude\`
 EOF
 }
 
@@ -209,15 +221,24 @@ while [ $# -gt 0 ]; do
     -C) REPO=${2:-}; shift 2 ;;
     -s) SESSION=${2:-}; shift 2 ;;
     --staged) STAGED=1; shift ;;
+    --yolo) YOLO=1; shift ;;
+    --no-yolo) YOLO=0; shift ;;
     --add)  ACTION="add";  shift ;;
     --kill) ACTION="kill"; shift ;;
     -h|--help) usage; exit 0 ;;
+    # A bare number is the seat count. `qb-b 3` is the shape this is reached for
+    # twenty times a day, and -n is two keystrokes of ceremony on the only
+    # argument that varies.
+    [0-9]|[0-9][0-9]) SEATS=$1; shift ;;
     *) usage >&2; exit 2 ;;
   esac
 done
 
 case "$SEATS" in ''|*[!0-9]*) usage >&2; exit 2 ;; esac
 [ "$SEATS" -ge 1 ] || { usage >&2; exit 2; }
+[ "$SEATS" -le "$MAX_SEATS" ] \
+  || die "$SEATS seats: the ceiling is $MAX_SEATS (five across, two down). Past that a
+       pane is too narrow to read an agent in, and a human cannot follow it anyway."
 
 command -v tmux >/dev/null 2>&1 \
   || die "tmux is not installed (home-manager: programs.quarterback-harness.seats.enable)"
@@ -247,7 +268,14 @@ if [ "$ACTION" = add ]; then
   # pane-base-index says, and a config setting it to 1 — a common one — leaves
   # every `.0` target failing with "can't find pane: 0".
   first_seat=$(seat_panes | awk 'NR == 1 { print $1 }')
-  pane=$(tmux split-window -h -P -F '#{pane_id}' -t "$first_seat" -c "$REPO")
+  # A pane inherits the SESSION environment as it is created, so a seat added to
+  # a screen built with --no-yolo already has that and this adds nothing. Passing
+  # either flag to --add is the other case: -e scopes it to the pane being added
+  # rather than rewriting the session under the seats already working in it.
+  add_env=()
+  [ -n "$YOLO" ] && add_env=(-e "QB_SEAT_YOLO=$YOLO")
+  pane=$(tmux split-window -h -P -F '#{pane_id}' -t "$first_seat" -c "$REPO" \
+    ${add_env[@]+"${add_env[@]}"})
   tmux set-option -p -t "$pane" @qb_seat "$next"
   tmux select-layout -t "$pane" -E 2>/dev/null || true
   start_seat "$pane" "$next"
@@ -296,8 +324,16 @@ require_qb_seat
 # QB_SEAT_AGENT_ARGS got here — qb-seat takes agent arguments positionally, so no
 # such variable was ever read — and how this list said QB_SEAT_AGENT while qb-seat
 # said QB_SEAT_CLAUDE, which is board finding 3632.
+#
+# --yolo/--no-yolo are not a fourth mechanism, they are this one with the value
+# supplied here: the flags set the variable qb-seat already reads, so a flag and
+# an exported QB_SEAT_YOLO cannot diverge in behaviour and there is one thing to
+# test. Neither flag given leaves the variable alone entirely — an unset variable
+# is how qb-seat is told "not answered", and answering it here with a default of
+# our own would be a second place for the default to live and drift.
 seat_env=()
-for v in QB_SEAT_AGENT QB_SEAT_BRIEF QB_SEAT_FORCE; do
+[ -n "$YOLO" ] && QB_SEAT_YOLO="$YOLO"
+for v in QB_SEAT_AGENT QB_SEAT_BRIEF QB_SEAT_FORCE QB_SEAT_YOLO; do
   [ -n "${!v:-}" ] && seat_env+=(-e "$v=${!v}")
 done
 
@@ -314,15 +350,48 @@ tmux set-option -w -t "$SESSION:seats" pane-border-status top
 tmux set-option -w -t "$SESSION:seats" pane-border-format \
   ' #{?@qb_seat,seat #{@qb_seat},board} #{?pane_active,*,} '
 
+# ROWS ARE BUILT, NOT CHOSEN. `select-layout tiled` picks its own arrangement
+# from the window's aspect ratio — six seats in a 240x60 window come out 2 across
+# and 3 down, which is the wrong axis: a seat pane wants WIDTH, because an agent
+# prints prose and diffs, and it wants only enough height to see the last few
+# turns. So the rows are split explicitly and evened out per row.
+row_of() {                      # how many seats go in the top row
+  [ "$SEATS" -le 5 ] && { printf '%s' "$SEATS"; return; }
+  printf '%s' $(( (SEATS + 1) / 2 ))
+}
+TOP=$(row_of)
+
 first=$(tmux list-panes -t "$SESSION:seats" -F '#{pane_id}')
 tmux set-option -p -t "$first" @qb_seat 1
+
+# Split off the pane just made, not off $first: a split lands to the RIGHT of
+# its target, so splitting $first every time builds 1,5,4,3,2 across the row.
+# Seat numbers are how a human addresses one of these, and reading them out of
+# order is a small tax paid on every glance.
 i=2
-while [ "$i" -le "$SEATS" ]; do
-  pane=$(tmux split-window -h -P -F '#{pane_id}' -t "$first" -c "$REPO")
-  tmux set-option -p -t "$pane" @qb_seat "$i"
+last=$first
+while [ "$i" -le "$TOP" ]; do   # the rest of the top row
+  last=$(tmux split-window -h -P -F '#{pane_id}' -t "$last" -c "$REPO")
+  tmux set-option -p -t "$last" @qb_seat "$i"
   i=$((i + 1))
 done
-tmux select-layout -t "$SESSION:seats" even-horizontal
+tmux select-layout -t "$first" -E 2>/dev/null || true
+
+if [ "$SEATS" -gt "$TOP" ]; then
+  # -f: a full-width split off the top row, which is the second ROW rather than a
+  # third column of the first one.
+  second=$(tmux split-window -v -f -P -F '#{pane_id}' -t "$first" -c "$REPO")
+  tmux set-option -p -t "$second" @qb_seat "$i"
+  i=$((i + 1))
+  last=$second
+  while [ "$i" -le "$SEATS" ]; do
+    last=$(tmux split-window -h -P -F '#{pane_id}' -t "$last" -c "$REPO")
+    tmux set-option -p -t "$last" @qb_seat "$i"
+    i=$((i + 1))
+  done
+  tmux select-layout -t "$second" -E 2>/dev/null || true
+fi
+[ "$SEATS" -le 5 ] && tmux select-layout -t "$SESSION:seats" even-horizontal
 
 # The board, on the same screen as the seats — full width along the bottom, so
 # long summaries are read rather than wrapped. -f makes the split span the whole

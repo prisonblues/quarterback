@@ -106,6 +106,7 @@ def run(repo, fake_bin, tmp_path, runtime_dir):
             "QB_SEAT_REPO",
             "QB_SEAT_BRIEF",
             "QB_SEAT_AGENT",
+            "QB_SEAT_YOLO",
             "QB_SEAT_LEAKED",
         ):
             environ.pop(leaked, None)
@@ -114,6 +115,11 @@ def run(repo, fake_bin, tmp_path, runtime_dir):
         environ["QUARTERBACK_CONFIG"] = str(tmp_path / "no-such-config")
         environ["XDG_RUNTIME_DIR"] = str(runtime_dir)
         environ.pop("QB_SEAT_FORCE", None)
+        # Pinned OFF for the fixture, not popped: seats are yolo by default, so a
+        # test about briefs or pass-through would otherwise be asserting the
+        # default's argv as a side effect and would go red the day it changes.
+        # The tests that are ABOUT the default set it themselves.
+        environ["QB_SEAT_YOLO"] = "0"
         environ.update(env or {})
         for gone in unset:
             environ.pop(gone, None)
@@ -321,6 +327,58 @@ def test_qb_seat_claude_chooses_the_agent(run, agent, fake_bin, tmp_path):
     assert run("1", env={"QB_SEAT_AGENT": "other-agent"}).returncode == 0
     assert not agent.exists()
     assert json.loads(other_record.read_text())["instance"] == "seat-1"
+
+
+# ---- yolo -------------------------------------------------------------------
+
+
+def test_a_seat_starts_without_permission_prompts_by_default(run, agent):
+    """The failure this removes does not look like a failure: a pane nobody is
+    watching stops on the first permission it does not hold, and the board still
+    shows a live agent holding a claim while nothing moves. A seat that stops to
+    ask is not being careful, it is stuck — there is no operator to ask."""
+    run("1", unset=("QB_SEAT_YOLO",))
+    assert json.loads(agent.read_text())["args"][0] == "--dangerously-skip-permissions"
+
+
+def test_an_empty_value_is_not_an_answer(run, agent):
+    """Unset and empty both mean "not answered", and the answer to an unanswered
+    question is the default."""
+    run("1", env={"QB_SEAT_YOLO": ""})
+    assert json.loads(agent.read_text())["args"][0] == "--dangerously-skip-permissions"
+
+
+def test_prompts_come_back_when_they_are_asked_for(run, agent):
+    """The opt-out, which is the whole basis on which the default is defensible."""
+    run("1", env={"QB_SEAT_YOLO": "0"})
+    assert "--dangerously-skip-permissions" not in json.loads(agent.read_text())["args"]
+
+
+def test_only_a_falsy_value_turns_it_off(run, agent):
+    """The mirror of QB_SEAT_FORCE's rule: a value a caller passes must mean what
+    it says, so a stray one does not quietly disable the thing it names."""
+    for value in ("no", "false", "OFF"):
+        run("1", env={"QB_SEAT_YOLO": value})
+        assert "--dangerously-skip-permissions" not in json.loads(agent.read_text())["args"]
+    for value in ("1", "yes", "anything-else"):
+        run("1", env={"QB_SEAT_YOLO": value})
+        assert json.loads(agent.read_text())["args"][0] == "--dangerously-skip-permissions"
+
+
+def test_yolo_comes_before_the_caller_s_own_arguments(run, agent):
+    """Prepended, so an argument passed for this seat is the later one and wins
+    anything the agent resolves last-one-wins."""
+    run("1", "--model", "opus", unset=("QB_SEAT_YOLO",))
+    args = json.loads(agent.read_text())["args"]
+    assert args[:3] == ["--dangerously-skip-permissions", "--model", "opus"]
+
+
+def test_a_dry_run_shows_the_yolo_flag_it_would_pass(run):
+    """A dry run is what you use to check what n panes are about to do; showing
+    an argv that is missing the one argument that changes the risk is worse than
+    showing nothing."""
+    out = run("1", "--dry-run", unset=("QB_SEAT_YOLO",)).stdout
+    assert "claude --dangerously-skip-permissions" in out
 
 
 # ---- --dry-run --------------------------------------------------------------
