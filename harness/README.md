@@ -432,22 +432,32 @@ starting them.
 
 `qb-dash-tui` is a fourth pane for the right-hand side: fleet state, where the board pane
 along the bottom (the **tape**) is the event stream. Who is alive and on what, who holds
-which claim and for how long, and every open PR with its CI verdict. Rows are clickable —
-a seat jumps the tmux cursor to that seat's pane, a claim shows its note, a PR opens on
-GitHub. `qb-dash` is the same three views rendered without interaction, for a terminal that
-will not forward mouse events.
+which claim and for how long, every open PR with its CI verdict, and every open issue with
+whoever has claimed it. Rows are clickable — a seat jumps the tmux cursor to that seat's
+pane, a claim shows its note, a PR or an issue opens on GitHub. `qb-dash` is the same four
+views rendered without interaction, for a terminal that will not forward mouse events.
 
-**Clicking starts work, not just navigation.** Each PR row carries a `⚖`; clicking it opens
-a confirmation showing the exact command, and confirming runs `/panel-review-pr <n>` in a
-detached tmux window of its own — the same way `qb-seat` starts an agent, so the review is
-a real session you can attach to, read and interrupt. Clicking anywhere else on the row
-still opens the PR on GitHub. The keys are `o` open, `p` panel-review, `r` refresh, `?` the
-list, `q` quit.
+**Clicking starts work, not just navigation.** Each PR row carries a `⚖` and each issue row
+a `⚒`; clicking one opens a confirmation showing the exact command, and confirming runs
+`/panel-review-pr <n>` or `/fix-issue <n>` in a detached tmux window of its own — the same
+way `qb-seat` starts an agent, so what it starts is a real session you can attach to, read
+and interrupt. Clicking anywhere else on the row still opens the thing on GitHub. The keys
+are `o` open, `p` panel-review, `f` fix the selected issue, `r` refresh, `?` the list,
+`q` quit.
+
+**The issues panel is the one that feeds the fleet.** A seat picks unclaimed work off the
+board, so what matters is which issues nobody holds: the free ones sort to the top, and a
+held one is greyed and carries its holder's name. That marking is the board's own claims,
+joined on the claim key — an issue claim is namespaced `owner/repo#n`, which is the number
+`gh issue list` reports. The `⚒` on a held issue still works and the confirmation names the
+holder: a session that died leaves its claim standing, and picking that work up is a thing
+to warn about, not to forbid.
 
 The confirmation is deliberate: a panel review costs money, comments on a public PR and
-pushes a fix commit, so a stray click in a 78-column pane should not be able to start one.
-`QB_DASH_CONFIRM=0` for anyone who wants the single click and means it. `QB_DASH_REPO` says
-where launched work runs, defaulting to the dashboard's own cwd.
+pushes a fix commit, and `/fix-issue` writes a branch and opens a PR — so a stray click in a
+78-column pane should not be able to start either. `QB_DASH_CONFIRM=0` for anyone who wants
+the single click and means it. `QB_DASH_REPO` says where launched work runs, defaulting to
+the dashboard's own cwd.
 
 Adding another verb is three things: an entry in `BINDINGS`, an `action_*` method, and — if
 it wants an icon — a column, since a click carries the column it landed in and that is how

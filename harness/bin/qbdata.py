@@ -522,6 +522,54 @@ def fetch_prs(repo: str = REPO) -> tuple[list[dict], str | None]:
         return [], f"{type(exc).__name__}: {exc}"
 
 
+def fetch_issues() -> tuple[list[dict], str | None]:
+    fields = "number,title,updatedAt,labels,assignees"
+    try:
+        raw = subprocess.run(
+            ["gh", "issue", "list", "--repo", REPO, "--state", "open",
+             "--limit", "30", "--json", fields],
+            capture_output=True, text=True, timeout=45,
+        )
+        if raw.returncode != 0:
+            return [], clip(raw.stderr, 60) or f"gh exit {raw.returncode}"
+        return json.loads(raw.stdout), None
+    except Exception as exc:                      # noqa: BLE001
+        return [], f"{type(exc).__name__}"
+
+
+def issue_claims(claims: list[dict], repo: str = REPO) -> dict[int, dict]:
+    """{issue number → the claim on it}, for `repo`'s issues.
+
+    The board namespaces an issue claim as `owner/repo#n` and that `n` is the
+    number `gh issue list` reports, so the join wants no lookup table. Another
+    repo's key is skipped rather than joined on the number alone — two repos
+    both have a #12, and marking ours held because theirs is would send the
+    next seat past the one issue it should have taken.
+
+    The repo is an argument, not a constant read inside: which repo a dashboard
+    is showing is on its way to being derived from the checkout rather than
+    hardcoded here (#176), and a caller that has worked it out should not have
+    to reach past this function to use it.
+    """
+    held: dict[int, dict] = {}
+    for c in claims:
+        prefix, _, number = (c.get("key") or "").strip().rpartition("#")
+        if prefix == repo and number.isdigit():
+            held.setdefault(int(number), c)
+    return held
+
+
+def sort_issues(issues: list[dict], held: dict[int, dict]) -> list[dict]:
+    """Free issues first, newest first inside each group.
+
+    The free ones are what the panel is for — a seat reads it to find work
+    nobody has taken — and on a pane that fits a dozen rows, a run of held
+    issues along the top is the list failing at its one job.
+    """
+    return sorted(issues,
+                  key=lambda i: (i.get("number") in held, -(i.get("number") or 0)))
+
+
 def ci_state(pr: dict) -> tuple[str, str]:
     """(glyph, colour) for a PR's check rollup."""
     checks = pr.get("statusCheckRollup") or []

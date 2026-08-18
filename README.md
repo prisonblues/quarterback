@@ -580,6 +580,10 @@ full — including what was broken before it, which is the part no diff recovers
   `--repo` for another repo's plan. An unreachable source is named under the answer and the
   command exits 3, because a section empty because the board is down reads exactly
   like one empty for want of work.
+  Alongside it, the dash learns about work that has not started. An ISSUES panel lists the open
+  issues with the board's claims joined onto them — free ones first, held ones greyed and named —
+  and each row carries a `⚒` that shows its command and then runs `/fix-issue <n>` in a tmux
+  window of its own, the `⚖` of a PR row for the other end of the pipeline.
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
   roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps
