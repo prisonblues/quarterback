@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+# qb-seat-click — what a click on the seat bar does.
+#
+# Usage: qb-seat-click [RANGE [SESSION]]   both default to what the click stashed
+#
+# Exit codes:
+#   0  the click was handled, or was for something this does not act on
+#   1  not inside tmux, or the seat named by the click no longer has a pane
+#   2  malformed arguments — a caller bug, and says so
+#
+# WHY A SCRIPT AND NOT A KEY BINDING. tmux hands every status-line click to one
+# binding, `MouseDown1Status`, and the only thing distinguishing an ✕ from a ＋
+# is `#{mouse_status_range}` — a string. Branching on a string is a shell's job;
+# doing it in nested `if-shell` would put three levels of tmux quoting into
+# qb-seats for logic that is four cases long. It is also the only part of the
+# seat bar that can be tested without a terminal: pass it a range, then look at
+# what happened to the panes.
+#
+# WHY IT READS OPTIONS AND NOT ONLY ARGUMENTS. The kill path goes through
+# `confirm-before`, and the command confirm-before runs afterwards has lost the
+# mouse event — `#{mouse_status_range}` expands to nothing inside it. So the
+# binding stashes the range in the server option @qb_click while the event is
+# still live, and this reads it back. The argument form is for tests and for
+# anyone driving it by hand.
+#
+# THE SESSION IS STASHED FOR A SEPARATE REASON, and it is the one that cost the
+# most to find: `run-shell` from a MOUSE BINDING gets no $TMUX_PANE. From the
+# command line it does, which is what makes this so quiet — the script works by
+# hand, works when driven by a test, and does nothing at all when clicked, with
+# no error anywhere, because run-shell -b throws its output away. So the binding
+# records #{session_name} too, and nothing here infers a target from "wherever
+# the cursor happens to be".
+#
+# WHY THE BAR AND NOT THE PANE BORDER. The border is the obvious place to want
+# an ✕, and it cannot work. Measured on tmux 3.6a, not read off the manual:
+#
+#   * `#[range=...]` is documented for status-format and is honoured nowhere
+#     else. In pane-border-format it renders away cleanly and registers nothing.
+#   * A click on an inner border does fire `MouseDown1Border` — but #{mouse_x}
+#     and #{mouse_y} come back EMPTY, so there is no way to tell which glyph on
+#     the border was hit.
+#   * That event also reports the pane above the border rather than the pane
+#     whose title is drawn on it.
+#   * A click on the TOPMOST border row — which is exactly where this screen
+#     draws seat 1's title — fires nothing at all.
+#
+# The status line is the only surface in tmux that can carry a clickable widget.
+set -euo pipefail
+
+PROG=${0##*/}
+
+# On the screen as well as on stderr, because stderr is nowhere. The bar reaches
+# this through `run-shell -b`, which discards both streams — so every failure
+# below used to present as the button doing nothing at all, which is the worst
+# way for a button to fail and exactly how the ＋ was reported broken.
+die() {
+  printf '%s: %s\n' "$PROG" "$*" >&2
+  if [ -n "${TMUX:-}" ]; then tmux display-message "$PROG: $*" 2>/dev/null || true; fi
+  exit 1
+}
+
+[ $# -le 2 ] || { printf 'usage: %s [RANGE [SESSION]]\n' "$PROG" >&2; exit 2; }
+[ -n "${TMUX:-}" ] || die "not inside tmux"
+
+# Both stashes are SERVER options rather than session ones, because the binding
+# that writes them is server-wide too and one click is in flight at a time —
+# confirm-before holds the client's input while its prompt is up, so a second
+# click cannot arrive and move the target out from under the first.
+range=${1:-$(tmux show-options -s -v @qb_click 2>/dev/null || true)}
+[ -n "$range" ] || exit 0
+session=${2:-$(tmux show-options -s -v @qb_click_session 2>/dev/null || true)}
+[ -n "$session" ] || die "no session recorded for the click"
+
+# Seats are found by pane option, never by index: the index shifts the moment a
+# pane is added or closed, which is precisely what this script does.
+#
+# `$2 != ""` is not tidiness. The BOARD pane has no @qb_seat, so its line is one
+# field and awk's $2 is the empty string — which compares equal to the seat
+# number extracted from a malformed range like a bare `kill`. Without it,
+# `qb-seat-click kill` closes the board pane. The test suite found that, not a
+# careful reading.
+seat_pane() {
+  tmux list-panes -s -t "=$session" -F '#{pane_id} #{@qb_seat}' \
+    | awk -v want="$1" '$2 != "" && $2 == want { print $1; exit }'
+}
+
+# A range this script owns names a seat by number, and nothing else. Anything
+# else is a widget belonging to somebody's status line, not to us — the binding
+# is server-wide and will hand us those.
+seat_number() {
+  case "$1" in
+    ''|*[!0-9]*) return 1 ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+# A seat row that has just lost a pane leaves a gap. -E spreads the closed
+# pane's neighbours into it — the same call --add uses, and for the same reason:
+# the board was split off full-width, so even-horizontal on the whole window
+# would fold it back into the row.
+reflow() {
+  local survivor
+  survivor=$(tmux list-panes -s -t "=$session" -F '#{pane_id} #{@qb_seat}' \
+    | awk '$2 != "" { print $1; exit }')
+  [ -n "$survivor" ] || return 0
+  tmux select-layout -t "$survivor" -E 2>/dev/null || true
+}
+
+case "$range" in
+  seat*)
+    n=$(seat_number "${range#seat}") || exit 0
+    pane=$(seat_pane "$n")
+    [ -n "$pane" ] || die "seat $n has no pane"
+    # The window too: the bar stays on screen when another window is current, so
+    # the cell you clicked may name a seat that is not being displayed.
+    tmux select-window -t "$pane"
+    tmux select-pane -t "$pane"
+    ;;
+  kill*)
+    # The confirmation already happened, in the binding — see the header.
+    n=$(seat_number "${range#kill}") || exit 0
+    pane=$(seat_pane "$n")
+    [ -n "$pane" ] || die "seat $n has no pane"
+    tmux kill-pane -t "$pane"
+    reflow
+    ;;
+  add)
+    # --add works out the next seat number itself, and deliberately does not
+    # reuse the number of a seat that was closed: the board would read the new
+    # agent as the old one coming back.
+    #
+    # The path is read off the session because a tmux server usually predates
+    # the screen running in it, and its PATH is whatever started it — which is
+    # the same class of bug as the seat_env forwarding in qb-seats.
+    seats=$(tmux show-options -v -t "=$session:" @qb_seats_bin 2>/dev/null || true)
+    [ -n "$seats" ] || seats=$(command -v qb-seats 2>/dev/null || true)
+    [ -n "$seats" ] || die "qb-seats is not on PATH and the session did not record it"
+    repo=$(tmux show-options -v -t "=$session:" @qb_repo 2>/dev/null || true)
+    [ -n "$repo" ] || repo=$(tmux display-message -p -t "=$session:" '#{pane_current_path}')
+    # Its stderr is captured and re-reported rather than left to fall into the
+    # same hole this script's own does: run-shell -b discards it, so a --add
+    # that refused for a good reason looked identical to a button that is not
+    # wired up.
+    if ! why=$("$seats" --add -s "$session" -C "$repo" 2>&1 >/dev/null); then
+      die "${why:-qb-seats --add failed}"
+    fi
+    ;;
+  *) exit 0 ;;
+esac

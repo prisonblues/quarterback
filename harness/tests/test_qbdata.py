@@ -147,3 +147,48 @@ def test_an_unresolvable_plan_key_keeps_the_key():
 
 def test_an_ordinary_claim_key_is_still_shortened():
     assert qd.claim_label(f"{qd.REPO}#142", []) == "quarterback#142"
+
+
+# ---- the tmux screen ---------------------------------------------------------
+
+def test_no_tmux_means_no_seats_rather_than_an_exception(monkeypatch):
+    """The dashboard runs in a bare terminal as often as in the screen.
+
+    An empty SEATS panel is the honest answer there, and it must not cost a
+    traceback on every refresh — this is called on a four-second timer.
+    """
+    monkeypatch.delenv("TMUX", raising=False)
+    assert qd.tmux_seats() == []
+
+
+def test_seats_come_back_in_seat_order_not_pane_order(monkeypatch):
+    """--add splits off the LEFTMOST pane, so a grown screen runs 1, 3, 2.
+
+    Sorting on the seat number is what keeps the panel's ✕ next to the seat a
+    human is reading, rather than next to whichever pane tmux listed third.
+    """
+    monkeypatch.setenv("TMUX", "/tmp/whatever,1,0")
+    rows = ["%0\t1\ts\t0\tclaude\t/repo",
+            "%2\t3\ts\t0\tclaude\t/repo",
+            "%1\t2\ts\t0\tbash\t/repo",
+            "%3\t\ts\t0\tqb-board\t/repo"]        # the board pane: no @qb_seat
+
+    class Done:
+        returncode = 0
+        stdout = "\n".join(rows) + "\n"
+
+    monkeypatch.setattr(qd.subprocess, "run", lambda *a, **k: Done())
+    got = qd.tmux_seats()
+    assert [s["seat"] for s in got] == ["1", "2", "3"]
+    assert [s["pane"] for s in got] == ["%0", "%1", "%2"]
+    assert all(s["command"] for s in got), "the board pane leaked into the seats"
+
+
+def test_a_tmux_that_fails_is_an_empty_screen_not_a_crash(monkeypatch):
+    monkeypatch.setenv("TMUX", "/tmp/whatever,1,0")
+
+    def boom(*a, **k):
+        raise OSError("no tmux here")
+
+    monkeypatch.setattr(qd.subprocess, "run", boom)
+    assert qd.tmux_seats() == []

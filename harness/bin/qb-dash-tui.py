@@ -6,13 +6,17 @@ Textual app, so rows respond to the mouse. What a click does depends on what
 you clicked:
 
   a seat        jump the tmux cursor to that seat's pane — the dashboard is a
-                switcher, which is the whole reason to have it beside the seats
+                switcher, which is the whole reason to have it beside the seats.
+                Its ✕ closes the pane; the ＋ row under the last seat adds one.
+                Both go through qb-seat-click, so they mean exactly what the
+                same widgets on the tmux seat bar mean
   an agent      its cwd, branch, model and session id, in the detail line
   a claim       the claim note, which is where an agent says what it is doing
   a plan item   its phase, its note and what it waits on — the reasoning behind
                 its place in the order, which lives on the board and nowhere
                 else — or its ⚒, to start /fix-issue on the issue behind it
-  a PR          open it on GitHub
+  a PR          open it on GitHub — or its ⚖, to start /panel-review-pr on it
+                in a new pane of the seat row, beside the work it is about
   an issue      open it on GitHub — or its ⚒, to start /fix-issue on it
 
 Keys: r refresh now, o open the selected PR, q quit.
@@ -612,7 +616,7 @@ class Dash(App):
         conclusion was still wrong: a review in a window is a review you go and
         find later, and the reason to click a PR here rather than open it on
         GitHub is to watch the thing happen. run_in_pane keeps it out of the
-        seat machinery — see @qb_review there. It runs the agent the same way
+        seat machinery — see @qb_label there. It runs the agent the same way
         qb-seat does: the brief positionally, after `--`.
         """
         number = pr.get("number")
@@ -715,10 +719,12 @@ class Dash(App):
         `select-layout -E` spreads the row evenly again, so the cost is shared
         rather than taken out of whichever seat happened to be split.
 
-        The pane gets @qb_review and NOT @qb_seat, which is what keeps it out of
+        The pane gets @qb_label and NOT @qb_seat, which is what keeps it out of
         the way of everything else: qb-seats' --add, qb-seat-click's reflow and
         the seat bar all select on @qb_seat, so none of them counts a review as
-        a seat or offers to start an agent in it.
+        a seat or offers to start an agent in it. @qb_label rather than a name
+        of its own because dev/seats-extras.sh already labels the dash and the
+        tape that way, and the pane border should read one option, not two.
 
         With no seat row to join — the dashboard run from a bare terminal, or a
         screen whose seats have all been closed — it falls back to a window
@@ -746,7 +752,7 @@ class Dash(App):
             self.say(f"tmux refused: {qd.clip(done.stderr, 60)}")
             return
         pane = done.stdout.strip()
-        subprocess.run(["tmux", "set-option", "-p", "-t", pane, "@qb_review", name],
+        subprocess.run(["tmux", "set-option", "-p", "-t", pane, "@qb_label", name],
                        capture_output=True, timeout=5)
         subprocess.run(["tmux", "select-layout", "-t", pane, "-E"],
                        capture_output=True, timeout=5)

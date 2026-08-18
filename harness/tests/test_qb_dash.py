@@ -301,8 +301,13 @@ async def _drive_panel() -> list[str]:
     app = app_module.Dash(interval=3600, gh_interval=3600)
 
     started: list[tuple[str, str]] = []
+    windowed: list[tuple[str, str]] = []
     opened: list[int] = []
-    app.run_in_window = lambda name, command: started.append((name, command))
+    # run_in_PANE, not run_in_window: a review now lands in the seat row, beside
+    # the work it is about. Both are stubbed so that a review quietly reverting
+    # to a window shows up here as a failure rather than as a passing test.
+    app.run_in_pane = lambda name, command: started.append((name, command))
+    app.run_in_window = lambda name, command: windowed.append((name, command))
     app.open_pr = lambda pr: opened.append(pr.get("number"))
 
     failures: list[str] = []
@@ -328,6 +333,8 @@ async def _drive_panel() -> list[str]:
                 failures.append("confirming did not start the review")
             elif "/panel-review-pr" not in started[0][1]:
                 failures.append(f"wrong command launched: {started[0][1]}")
+            if windowed:
+                failures.append("the review opened a window, not a seat-row pane")
 
         # Cancelling starts nothing.
         started.clear()
@@ -357,3 +364,166 @@ async def _drive_panel() -> list[str]:
             await pilot.pause(0.2)
 
     return failures
+
+
+async def _drive_seats() -> list[str]:
+    """The SEATS panel: jump, ✕, ＋ — with tmux replaced by a recorder.
+
+    The seats come from a stub rather than from the real server for the obvious
+    reason: a test that closed a pane would close one of the developer's own
+    seats, and the agent working in it would go with it.
+    """
+    app_module = _load_app()
+    app = app_module.Dash(interval=3600, gh_interval=3600)
+
+    fake = [
+        {"pane": "%7", "seat": "1", "session": "seats-demo", "window": "0",
+         "command": "claude", "path": "/tmp/demo"},
+        {"pane": "%8", "seat": "2", "session": "seats-demo", "window": "0",
+         "command": "bash", "path": "/tmp/demo"},
+    ]
+    clicked: list[tuple[str, str]] = []
+    jumped: list[str] = []
+    app.run_seat_click = lambda tag, session: clicked.append((tag, session))
+    app.jump_pane = lambda seat: jumped.append(seat["pane"])
+    # The real reader is switched off, not just overwritten afterwards: it runs
+    # on mount AND on a timer, so a fixture that only re-rendered would race it
+    # and the panel under the pointer would be the developer's own seats.
+    app.refresh_seats = lambda: None
+
+    failures: list[str] = []
+    async with app.run_test(size=(90, 50)) as pilot:
+        app.render_seats(fake)
+        await pilot.pause(0.2)
+        seats = app.query_one("#seats")
+
+        # Two seats plus the ＋ row. The ＋ has to be a row, not a key, or the
+        # panel cannot be driven by the mouse alone.
+        if seats.row_count != len(fake) + 1:
+            failures.append(f"expected {len(fake) + 1} rows, got {seats.row_count}")
+
+        # The ✕ column asks first and closes nothing by itself.
+        await pilot.click(seats, offset=(app_module.Dash.KILL_COLUMN + 2, 1))
+        await pilot.pause(0.3)
+        if clicked:
+            failures.append("the ✕ closed a seat with no confirmation")
+        if not isinstance(app.screen, app_module.Confirm):
+            failures.append("the ✕ did not raise the confirmation")
+        else:
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            if clicked != [("kill1", "seats-demo")]:
+                failures.append(f"wrong close dispatched: {clicked}")
+
+        # Cancelling closes nothing.
+        clicked.clear()
+        await pilot.click(seats, offset=(app_module.Dash.KILL_COLUMN + 2, 2))
+        await pilot.pause(0.3)
+        await pilot.press("escape")
+        await pilot.pause(0.3)
+        if clicked:
+            failures.append("cancelling still closed a seat")
+
+        # The ＋ row adds one, to the session the SEATS came from.
+        await pilot.click(seats, offset=(4, len(fake) + 1))
+        await pilot.pause(0.3)
+        if not isinstance(app.screen, app_module.Confirm):
+            failures.append("the ＋ did not raise the confirmation")
+        else:
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            if clicked != [("add", "seats-demo")]:
+                failures.append(f"the ＋ dispatched {clicked}")
+
+        # Anywhere else on a seat row is still "take me to that pane".
+        clicked.clear()
+        await pilot.click(seats, offset=(20, 1))
+        await pilot.pause(0.3)
+        if jumped != ["%7"]:
+            failures.append(f"clicking a seat row jumped to {jumped}")
+        if clicked:
+            failures.append("clicking a seat row closed something")
+
+    return failures
+
+
+def test_the_seats_panel_jumps_closes_and_adds():
+    """The three verbs the tmux seat bar has, in the panel, meaning the same.
+
+    Closing is the one that matters: it kills a pane with a working agent in it,
+    so a stray click on a 78-column panel must not be able to do it, and the
+    thing it dispatches has to name the seat actually under the pointer.
+    """
+    assert asyncio.run(_drive_seats()) == []
+
+
+async def _drive_review_pane(seats: list[dict]) -> tuple[list[list[str]], list[str]]:
+    """run_in_pane against a recorder, so the tmux argv itself is the assertion.
+
+    Checked against a real screen by hand as well; what this pins is the shape,
+    because every part of it is load-bearing and none of it is obvious from
+    reading the call: the split is anchored on a SEAT pane, the new pane is
+    marked @qb_label and not @qb_seat, and the row is reflowed with -E.
+    """
+    app_module = _load_app()
+    app = app_module.Dash(interval=3600, gh_interval=3600)
+    app.refresh_seats = lambda: None
+
+    calls: list[list[str]] = []
+    windowed: list[str] = []
+
+    class Done:
+        returncode = 0
+        stdout = "%9\n"
+        stderr = ""
+
+    app.run_in_window = lambda name, command: windowed.append(name)
+    # qd is the SHARED qbdata module and subprocess is the real one, so both are
+    # put back: a recorder left installed would silently disarm every later test
+    # that expects a real call, and the suite would go green on nothing.
+    real_seats, real_run = app_module.qd.tmux_seats, app_module.subprocess.run
+    async with app.run_test(size=(90, 44)):
+        app_module.qd.tmux_seats = lambda: seats
+        app_module.subprocess.run = lambda argv, **kw: (calls.append(argv), Done())[1]
+        app_module.os.environ["TMUX"] = "/tmp/whatever,1,0"
+        try:
+            app.run_in_pane("panel-42", "claude -- '/panel-review-pr 42'")
+        finally:
+            app_module.os.environ.pop("TMUX", None)
+            app_module.qd.tmux_seats = real_seats
+            app_module.subprocess.run = real_run
+    return calls, windowed
+
+
+def test_a_review_lands_in_the_seat_row_and_is_not_mistaken_for_a_seat():
+    """The pane has to be reachable AND invisible to the seat machinery.
+
+    Invisible matters as much as reachable: qb-seats --add, qb-seat-click's
+    reflow and the tmux seat bar all select on @qb_seat, so a review wearing one
+    would be offered an agent, counted as a seat, and given a ✕ that closes the
+    wrong thing.
+    """
+    seats = [{"pane": "%7", "seat": "1", "session": "s", "window": "0",
+              "command": "claude", "path": "/tmp/demo"}]
+    calls, windowed = asyncio.run(_drive_review_pane(seats))
+    assert not windowed, "it opened a window instead of joining the row"
+
+    split = next(c for c in calls if c[:2] == ["tmux", "split-window"])
+    assert "-t" in split and split[split.index("-t") + 1] == "%7", (
+        f"the split is not anchored on a seat pane: {split}")
+    assert "/panel-review-pr 42" in " ".join(split), split
+
+    marked = next(c for c in calls if "set-option" in c)
+    assert "@qb_label" in marked and "panel-42" in marked, marked
+    assert "@qb_seat" not in " ".join(marked), (
+        "the review pane was marked as a seat")
+
+    layout = next(c for c in calls if "select-layout" in c)
+    assert "-E" in layout, f"the row was not reflowed: {layout}"
+
+
+def test_with_no_seat_row_to_join_a_review_still_gets_somewhere():
+    """The dashboard runs outside the screen too — a window beats nothing."""
+    calls, windowed = asyncio.run(_drive_review_pane([]))
+    assert windowed == ["panel-42"]
+    assert not any("split-window" in c for c in calls), calls
