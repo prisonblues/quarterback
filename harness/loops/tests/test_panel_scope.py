@@ -801,6 +801,43 @@ def test_an_earlier_rounds_truncation_is_carried_forward(tmp_path):
     assert load([write(tmp_path, "clean.json", clean)]).truncated_rounds == set()
 
 
+def test_a_kernel_capped_truncation_is_not_carried_forward(tmp_path):
+    """The exemption has to hold HERE too, and missing it undid the whole change
+    for the cycles that matter.
+
+    An earlier round's truncation is carried because increment scope makes it
+    permanent — a later round reads only the fix commit and never returns to what
+    round 1 was cut off from. But a seat cut by the KERNEL was never going to be
+    closed by a later round either, on this box at this diff size, so carrying it
+    forward is not "a gap the cheap round failed to re-read": it is the same
+    constant arriving one round later and then standing for the rest of the cycle.
+    `/panel-review-pr` drives several rounds, so the loop would have gone straight
+    back to never stopping confidently while round 1's veto list looked fixed —
+    the change would have measured as working and not worked.
+
+    Truncation by a BUDGET still carries, which is what telling them apart buys:
+    raise the number and the next round really does read what this one could not."""
+    kernel = payload(1, head_sha="1111111111",
+                     reviewers={"antigravity": {"ran": True, "truncated": True,
+                                                "argv_capped": True},
+                                "claude": {"ran": True, "truncated": False}})
+    assert load([write(tmp_path, "kernel.json", kernel)]).truncated_rounds == set()
+
+    budget = payload(1, head_sha="1111111111",
+                     reviewers={"antigravity": {"ran": True, "truncated": True,
+                                                "argv_capped": False},
+                                "claude": {"ran": True, "truncated": False}})
+    assert load([write(tmp_path, "budget.json", budget)]).truncated_rounds == {1}
+
+    # An older payload that records no `argv_capped` at all still carries, which is
+    # the conservative direction this loader takes everywhere: "nobody said" is not
+    # "nothing happened", and an inherited veto left standing costs a round its
+    # confidence where clearing one wrongly claims coverage nothing had.
+    silent = payload(1, head_sha="1111111111",
+                     reviewers={"antigravity": {"ran": True, "truncated": True}})
+    assert load([write(tmp_path, "silent.json", silent)]).truncated_rounds == {1}
+
+
 def test_a_later_whole_pr_round_closes_an_earlier_rounds_gap(tmp_path):
     """The set was accumulate-only, so a round 3 still vetoed on round 1's
     truncation even when round 2 had re-read the whole PR untruncated in between —

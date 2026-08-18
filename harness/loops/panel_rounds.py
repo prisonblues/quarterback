@@ -911,7 +911,21 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
         #: `members` because `reread` below needs POSITIVE evidence, and an empty
         #: list of records is the shape both "nobody said" cases arrive in.
         recorded = [m for m in members if isinstance(m, dict)]
-        cut = any(m.get("truncated") for m in recorded)
+        # `argv_capped` is exempted HERE as well as in `coverage_veto`, and missing
+        # it here would have undone the exemption entirely for the cycles that
+        # matter. An earlier round's truncation is carried because increment scope
+        # makes it permanent — but a seat cut by the KERNEL was never going to be
+        # closed by a later round either, on this box, at this diff size. So the
+        # inherited veto it buys is not "a gap this cheaper round failed to
+        # re-read", it is the same constant arriving one round later and standing
+        # for the whole rest of the cycle: `/panel-review-pr` drives multiple
+        # rounds, so the loop would have gone right back to never stopping
+        # confidently while the round-1 veto list looked fixed.
+        #
+        # Truncation by a BUDGET still carries, which is the whole point of telling
+        # them apart: raise the number and the next round genuinely does read what
+        # this one could not.
+        cut = any(m.get("truncated") and not m.get("argv_capped") for m in recorded)
         if cut:
             b.truncated_rounds.add(was)
         # Two facts about coverage that only matter once a later round stops
@@ -1025,8 +1039,25 @@ def coverage_veto(reviewer_meta: dict[str, dict], judge_skip: str | None,
     at the same budget, so treating that as a reason to go again is a loop with no
     exit. It is a reason to stop CLAIMING the PR is clean.
 
-    The one absence that is not an observation about the round is a reviewer
-    whose CLI this box does not carry — see below."""
+    **What does NOT belong here is a constant.** Three of these observations are
+    true of every round the panel runs, so they distinguish nothing and cost the
+    signal everything: a reviewer whose CLI this box does not carry
+    (:attr:`ReviewerRun.absent`), a seat that cannot read the code it is reviewing
+    (:attr:`ReviewerRun.code_blind`, whose `could_not_assess` entries are
+    therefore reported and not counted), and the one seat the kernel cannot hand a
+    whole diff to (`argv_capped` — `agy`'s prompt travels in argv). All three are
+    facts about the HOST or about the panel's DESIGN. Because `round_stop`
+    computes `confident` as `not veto`, leaving them in made a confident stop
+    unreachable — permanently on a headless box, and on any PR that so much as
+    mentions a file it does not change. A signal that is never positive carries no
+    information and trains its reader to ignore it, which is worse than not
+    emitting it.
+
+    Each is exempted off RECORDED STATE, never off the wording of a message or a
+    declaration, and each has a floor beneath it so that exempting seats one at a
+    time cannot empty the list on a round where nothing was read. Every other way
+    of coming up short — a crash, a timeout, a budget someone typed, a reply that
+    would not parse — is about THIS run and still vetoes."""
     out = []
     for name, meta in sorted(reviewer_meta.items()):
         if not meta.get("ran"):
@@ -1053,13 +1084,33 @@ def coverage_veto(reviewer_meta: dict[str, dict], judge_skip: str | None,
                 continue
             out.append(f"{name} did not run ({skip or 'no reason recorded'})")
             continue
-        if meta.get("truncated"):
+        if meta.get("truncated") and not meta.get("argv_capped"):
             budget = meta.get("max_diff_chars") or 0
             out.append(f"{name} saw {budget:,} of {diff_chars:,} diff chars")
         if meta.get("unstructured"):
             out.append(f"{name} returned no structured reply — its coverage is unknown")
-        for gap in meta.get("could_not_assess") or []:
-            out.append(f"{name} could not assess: {gap}")
+        # A blind seat's declarations are reported and do not vote. See
+        # `ReviewerRun.code_blind`: with an empty sandbox and no file tools the
+        # diff is the seat's whole evidence, so "I could not read a function this
+        # diff does not change" is true of every round it sits. A constant cannot
+        # distinguish a quiet round from a broken one, which is the only thing
+        # this function is for — and `confident` being `not veto` meant one
+        # unreadable neighbour permanently denied a confident stop to any PR that
+        # merely REFERENCES a file it does not touch. That is most of them.
+        #
+        # Kept out on recorded state, never by reading the entries: they are
+        # free-form model prose, and a regex over them would exempt a genuine
+        # round-specific gap whose wording happened to match while missing the
+        # structural one that did not. Same argument, and the same failure in both
+        # directions, as `absent` a few lines up.
+        #
+        # A seat that CAN read the tree (#113's per-repo setting, second half)
+        # comes back with `code_blind` False and its declarations veto again,
+        # which is right: at that point "I could not read it" is a fact about the
+        # round and worth the round's confidence.
+        if not meta.get("code_blind"):
+            for gap in meta.get("could_not_assess") or []:
+                out.append(f"{name} could not assess: {gap}")
     # The floor under the absence exemption above. Exempting absent seats one by
     # one means a box carrying NONE of the reviewer CLIs produces an empty veto
     # list, and `confident` is `not veto` — a confident stop on a diff nobody
@@ -1068,6 +1119,18 @@ def coverage_veto(reviewer_meta: dict[str, dict], judge_skip: str | None,
     # reviewer has to have actually run.
     if not any(m.get("ran") for m in reviewer_meta.values()):
         out.append("no reviewer ran — nothing read this diff")
+    # The same floor, one storey up, and it exists for the same reason: the
+    # `argv_capped` exemption is applied per seat, so a panel whose every running
+    # seat was cut by the kernel produces an empty veto list and a confident stop
+    # on a diff nobody saw whole. Today that means an antigravity-only panel —
+    # `--reviewers antigravity`, or a repo that switched the others off — which is
+    # a narrow case and exactly the kind that reaches an unattended loop and is
+    # believed. A budget-truncated panel does not need this: those seats already
+    # filed their own lines above.
+    ran = [m for m in reviewer_meta.values() if m.get("ran")]
+    if ran and all(m.get("truncated") and m.get("argv_capped") for m in ran):
+        out.append("every reviewer that ran was cut by the argv ceiling — "
+                   "nothing read this diff whole")
     if judge_skip:
         # Phrased for both halves of the judge's job: on a round with no findings
         # it is the coverage split that went unadjudicated, not the findings.
