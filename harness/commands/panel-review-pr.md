@@ -304,9 +304,17 @@ One of four per finding:
 - **`deferred`** — real, not now. Put where it went in `deferred_to`. This is
   also where an **escalated** finding goes (the brief's step 3a): the defect is
   real and the fix is what is in dispute, so `refuted` would be a lie about the
-  finding and `fixed` a lie about the code. `deferred_to` names the issue you
-  opened for the premise, and there is no fifth outcome to invent — the vocabulary
-  is a database constraint, not a convention.
+  finding and `fixed` a lie about the code, and there is no fifth outcome to
+  invent — the vocabulary is a database constraint, not a convention. Recording it
+  does **not** settle the question or take the finding off §5's outstanding list:
+  that list is computed from the round's own payload, never from this table, and the
+  escalation stays open until a human answers it. `deferred_to` names the premise
+  issue — which **you** open, after relaying the escalation (§6), never the fixer,
+  and it is an issue that *asks* the question in the fixer's own five fields
+  (premise, what it explains, what removing it costs, the patch not written, the
+  `--ask` verdict) rather than one that picks an answer. When the human's answer
+  lands, the row moves: `revisions` and `prior_outcome` exist because a `deferred`
+  that later becomes `fixed` is the expected lifecycle, not an anomaly.
 - **`superseded`** — a later finding replaced it; name that finding's key in
   `superseded_by`, which is **required** for the same reason a note is required
   for a refutation: without it the row records "replaced by something".
@@ -403,6 +411,20 @@ next round's findings, arriving through the rule that exists to prevent them.
 
 - **Never re-brief an escalated finding to a fixer.** Not this round, not a later
   one. It goes to the human with the write-up the fixer produced (§6).
+- **Match it by premise, not by key.** The next round is a fresh panel over the
+  same code, so it will very likely report the same premise defect again — with a
+  **new** `finding_key`, at a different line, in different words, and nothing
+  mechanical will connect the two (`superseded_by` records the opposite direction:
+  a finding a *later* one replaced). You are the only reader who has both, because
+  you ran both rounds. So before briefing a round's **To fix** list, read it
+  against every escalation you have already relayed and pull out anything that is
+  the same premise wearing a new key. It does not go in the brief, it does not get
+  a second `deferred` row — one premise is one open question, and a row per round
+  would double-count it in the leaderboard the vocabulary exists to feed — and it
+  is re-stated in this round's relay under `Escalated` as still open, naming the
+  round that first raised it. If you genuinely cannot tell whether it is the same
+  premise, say that in the relay and leave it out of the brief: a premise question
+  asked twice costs a paragraph, and a premise question patched costs the round.
 - **The rest of the cycle carries on.** Findings that WERE fixed still get their
   re-review round, and `round_stop` still decides that — you are not overruling it
   for them, only declining to send one finding back through a pass that has

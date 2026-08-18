@@ -70,6 +70,13 @@ line it names is what produces the next round's findings (step 3a). Everything
 else gets fixed. "Escalated" is a report you write, not a fix you skip: it costs
 you the write-up in step 6 and it costs you nothing else on the list.
 
+Two is the whole list for **you**. §2b of this file records outcomes from a wider
+vocabulary — `fixed | refuted | deferred | superseded` — but those are the board's
+words for what became of a finding, assigned by the orchestrator after you report:
+`refuted` is your false positive, `deferred` is where an escalation lands, and
+`superseded` is bookkeeping for a finding a later one replaced. None of them is a
+third way for you to leave something unfixed. "Not now" is not available to you.
+
 #### 0. Set up the workspace
 
 - **Fix-in-place mode** (current branch): `git branch --show-current`. **Hard
@@ -172,6 +179,20 @@ combined diff still has to be read and the whole suite still has to go green
 under your eye. If a group agent fails or returns short, fix its findings
 yourself — the "everything gets fixed" bar does not move because you delegated.
 
+**A group agent flags a premise; it does not escalate.** Step 3a's judgement needs
+the whole list — "one premise, or say so plainly" is only evaluable by whoever sees
+every group's output — and its product is a question put to a human, which a
+sub-agent of a sub-agent has no way to put. So brief each group agent with this
+rule: if a finding looks like a premise finding, **leave it unfixed, state the
+premise in one sentence, and say so in your summary** — do not patch it and do not
+write the write-up. You then decide, across all groups, whether each flagged
+finding is an escalation (step 3a) or a defect the group should have fixed, and you
+write the one escalation up. This is the single exception to the fallback above: a
+finding a group returned as a premise candidate is **not** yours to patch merely
+because that group "returned short", since writing the patch it declined to write
+is the exact round step 3a exists to prevent. Everything else a group left undone,
+you fix.
+
 #### 3a. When a finding says the APPROACH is wrong, escalate it — don't patch it
 
 One finding in a list is sometimes a different kind of thing from the rest: not a
@@ -221,16 +242,34 @@ one premise, and grouped by file they read as seven unrelated defects.
 minute, and the reason it is here is that this signal cannot be self-reported by
 the agent that wrote the fix:
 
-```
-python3 ~/.claude/loops/panel.py --ask "<the premise, in one sentence>" --pr <n> \
-    --context <the file:first-last the premise lives in>
+```bash
+premise=$(cat <<'PREMISE'
+<the premise, in one sentence>
+PREMISE
+)
+timeout 120 python3 ~/.claude/loops/panel.py --ask "$premise" --pr <n> \
+    --context "<the file:first-last the premise lives in>"
 ```
 
+**Never inline the premise into the command line.** A premise about code carries
+backticks and `$(…)` — the ones in this file do — and inside a double-quoted
+argument bash *executes* them, while a `$VAR` in the text silently expands to
+empty and sends the seats a premise you did not write. The quoted heredoc
+(`<<'PREMISE'`) expands nothing and survives quotes, backticks and `$` in the
+text, which is why the value reaches the flag as typed; `--context` is quoted for
+the same reason, since a path or line range containing a space or a glob character
+would otherwise split into two arguments. The rule generalises: any command you
+build out of a finding's own prose gets the same treatment.
+
 It is not a gate — exit 0 on every verdict, no diff, no judge, no round (see
-`harness/loops/README.md`, *The premise check*). A `fails` is the evidence a human
-should have in front of them. `unresolved` or `unchallenged` is **not** a
-refutation of the escalation and does not turn it back into a patch: say which
-verdict you got. Skip silently if the script isn't there.
+`harness/loops/README.md`, *The premise check (`--ask`)*, for the verdicts and the
+quorum). A `fails` is the evidence a human should have in front of them.
+`unresolved` or `unchallenged` is **not** a refutation of the escalation and does
+not turn it back into a patch: say which verdict you got. `timeout` is there
+because the ask spawns the real reviewer CLIs: a slow seat would otherwise outlive
+the 10-minute foreground Bash cap and take the whole fix pass down with it. A run
+you killed reports as `not run`, exactly like a missing script — and skip silently
+if the script isn't there.
 
 **What escalating means:**
 
@@ -239,6 +278,12 @@ verdict you got. Skip silently if the script isn't there.
 - **Fix everything else in the same pass.** Every finding not downstream of the
   premise still gets fixed, tested, verified, committed and pushed exactly as
   step 3 says. An escalation is a report, not a stop-work.
+- **Open nothing and record nothing for it.** The premise issue and the board row
+  are the orchestrator's, after it has relayed your report (§2b) — you were told to
+  decide nothing and write no patch, and filing the premise yourself is the first
+  move of the redesign you are declining to make. Your durable output is the
+  write-up in step 6 and the same finding named as escalated in the step-5 commit
+  body; those are what get lifted.
 - **Report it in step 6 under `Escalated`** — the premise in one sentence, the
   findings it explains, what removing it would cost, the patch you did not write,
   and the `--ask` verdict if you ran one. An escalation nobody reads is a
@@ -296,14 +341,15 @@ the branch from step 0. Wrong branch → STOP and report; do not commit.
 Return this table as your final message:
 ```
 ## Review Summary — PR #<n> (<repo>)
-Files reviewed: N | Findings: N | Fixed: N | Escalated: N | Not a defect: N
+Files reviewed: N | Findings: N | Fixed: N | Escalated: N | Refuted: N
 
 | # | Severity | Finding | Resolution |
 |---|----------|---------|------------|
 | 1 | P1 | ... | Fixed: ... |
-| 2 | P2 | ... | Escalated: <premise, one line> |
+| 2 | P2 | ... | Escalated — see the block below |
+| 3 | P3 | ... | Refuted: <the evidence it was not a defect> |
 
-Escalated — the approach, not the code   (or "Escalated: none")
+Escalated — the approach, not the code
 - Premise: <one sentence>
   Explains: <the finding numbers above it accounts for>
   Removing it costs: <what would have to change, and where>
@@ -317,10 +363,17 @@ Verification — Tests: pass (N passed, M added) | DB-backed: pass / N-A /
 Commit: <sha> <subject>
 ```
 
-The counts replace the old `All fixed: Yes`, which had no way to say anything but
-yes and so had to be read as covering findings nobody fixed. `Escalated: none` is
-written out rather than omitted: a missing section reads as forgotten, and the one
-run where it matters is the one where a reader has to be sure.
+`Fixed + Escalated + Refuted = Findings`, always. That sum is the one cheap check a
+reader — or `epic.md`'s relay scan — can apply to catch a finding that fell off the
+list, and it is why the counts replaced the old `All fixed: Yes`, which had no way
+to say anything but yes and so had to be read as covering findings nobody fixed.
+`Refuted` is the word §2b records, not a fourth name for the same thing: the
+summary's label and the board's outcome are deliberately the same token.
+
+**Escalated nothing?** Replace the whole block with the single line
+`Escalated: none`. One spelling of the empty case, and it is written out rather
+than omitted: a missing section reads as forgotten, and the one run where it
+matters is the run where a reader has to be sure.
 
 ---
 
@@ -337,14 +390,34 @@ wrong is recorded nowhere today, so the leaderboard rewards a reviewer for being
 confident rather than for being right — and the refutation is already written in
 that table. `qb record-outcome` is the two lines that keep it.
 
-An **escalated** finding (the brief's step 3a) is recorded as `deferred`, with
-`deferred_to` naming the issue you opened for the premise — open one, because a
-`deferred` with nowhere to go is the markdown list this replaced. It is not
+An **escalated** finding (the brief's step 3a) is recorded as `deferred`. It is not
 `refuted`: the defect the finding names is real, and only the *fix* is in dispute.
 It is not `fixed` either, and there is no fifth value to reach for —
 `fixed | refuted | deferred | superseded` is constrained in the database as well
-as at ingest (`app/api/reviews.py`, `app/models/review.py`), so an invented
-`escalated` costs the row and records nothing.
+as at ingest (`app/api/reviews.py`, `app/models/review.py`, the
+`ck_review_finding_outcomes_vocabulary` CHECK), so an invented `escalated` costs
+the row and records nothing.
+
+**`deferred` is not a claim that the question is settled**, and nothing reads it as
+one. The row says what the *fixer* did with the finding; no loop's **To fix** list
+is computed from it — `round_stop` takes its outstanding findings from the round's
+own payload (`harness/loops/panel_rounds.py`) — so recording it neither closes the
+escalation nor removes it from the next round's arithmetic. The relay closes it,
+when a human answers. And a `deferred` row that later moves is designed for:
+`revisions` and `prior_outcome` exist because "a deferred finding is later fixed" is
+an expected lifecycle (`app/models/review.py`), which is exactly what the human's
+answer will make of this row.
+
+**You open the premise issue, not the fixer, and only after you have relayed.**
+`deferred_to` names an issue ref, so the row wants one — a `deferred` with nowhere
+to go is the markdown list this replaced — but the fixer is a sub-agent told to
+decide nothing and write no patch, so the filing is yours (§3 below). Relay the
+escalation first, then open an issue that **asks**: the premise, the findings it
+explains, what removing it would cost, the patch that was not written, and the
+`--ask` verdict — lifted from the fixer's write-up, which already has all five.
+Name that issue in `deferred_to`. An issue that puts the question is not an answer
+to it: what step 3a forbids is *choosing* the redesign, and an issue that proposes
+none has chosen nothing.
 
 Findings you discovered yourself, with no board record behind them, have no key
 and nothing to record: this is for panel findings only.
@@ -361,7 +434,9 @@ anything (its step 3a), lead with it: the premise, what it explains, what removi
 it would cost, and that no patch was written for it. That is a question being put
 to the user, and until they answer it the review is not finished — so do not
 answer it yourself by launching another fixer at the same finding, which is
-precisely the round that produces the next round's findings.
+precisely the round that produces the next round's findings. For panel findings,
+§2b is the follow-through in order: relay, then open the issue that asks the
+premise, then record the finding `deferred` with that issue in `deferred_to`.
 
 ## 4. Merging (only if the user asks)
 

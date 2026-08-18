@@ -104,7 +104,8 @@ fixes on one unexamined premise, and PR #88 had a fixer circle its own previous 
 single commit. So `review-pr.md`'s brief (step 3a) lets a fixer report that a finding says the
 **approach** is wrong rather than the code, and write no patch for it: stated, with the premise
 in one sentence and what removing it would cost, rather than answered with a special case. It is
-narrow on purpose — three tests, all of which must hold — and it never authorises a redesign,
+narrow on purpose — three conditions that must all hold, guarded by
+`harness/tests/test_fixer_escalation.py` — and it never authorises a redesign,
 because the output is "stop and ask" and the evidence behind it is still two PRs (#67). The
 premise can be put to the seats first with `panel.py --ask`, which is exactly the shape of
 question that path exists for, and an escalated finding is recorded as `deferred`. What is NOT
