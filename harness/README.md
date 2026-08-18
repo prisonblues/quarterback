@@ -11,7 +11,8 @@ board reconnects them.**
 - `loops/` — the engine: the reviewer panel (`panel.py`), the epic driver (`epic.py`), the
   Dependabot lander (`lander.py`), and the per-repo config layer (`harness_rules.py`)
 - `commands/` — Claude Code slash commands (`/panel`, `/panel-review-pr`, `/review-pr`,
-  `/fix-issue`, `/epic`, `/lander`, `/wt`, `/drop-worktree`, `/tree-shake`, …)
+  `/fix-issue`, `/fix-and-review`, `/fix-and-land`, `/epic`, `/lander`, `/wt`,
+  `/drop-worktree`, `/tree-shake`, …)
 - `bin/` — the bash the worktree commands drive (`create-worktree`, `remove-worktree`,
   `prune-worktrees`, `worktree-holder`), plus `qb-stage`, which records the workflow
   stage a session is in for the statusline, `qb-seat`, which turns one pane of a
@@ -93,6 +94,27 @@ codex has no session id to pin for a new run, so it uses `--json` for the usage 
 uninstrumented rather than half-converted. A cost in dollars is recorded **only where the vendor
 states one** (pi does) and never derived from a price table, and anything unread stays null —
 which the board renders as "not recorded", never as a reviewer that cost nothing.
+
+### `/fix-and-review` and `/fix-and-land` — an issue, end to end
+
+Both take an issue number and come back with a reviewed PR. They differ in exactly one place, and
+it is the last step: **`/fix-and-review` stops at merge-ready and hands you the merge**, while
+`/fix-and-land` goes on to merge when `preland.py` says READY and the agent states genuine
+confidence. Wanting `/fix-and-review` to merge is the signal to have run `/fix-and-land`, not a
+flag to add.
+
+`/fix-and-review` also spends the review differently: `/panel-review-pr` runs in a **sub-agent that
+did not write the code**. The conversation that implemented the change holds the author's model of
+it — every reason the code is the way it is, and none of a reader's surprise — which is the context
+a review needs not to have, and `/review-pr` says in its own description that fresh eyes are what
+it is for. It is #40's constraint one level up: an agent reviewing its own work is grading itself,
+and the board cannot tell a fixer from a reviewer.
+
+What it deliberately does **not** do as prep is stamp the release number.
+`scripts/release_stamp.py apply` resolves `vNEXT` against the base **as it stands now**, so a
+command that stamps and then leaves the PR for a human has spent a number another branch may take
+in the meantime — after which `apply` refuses, correctly, with a hand-edit as the repair. It runs
+`preflight` instead: the same question, no number spent, and `apply` belongs to whoever merges.
 
 ### `/epic` and `/lander` — the long-running loops
 

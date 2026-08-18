@@ -10,6 +10,11 @@ deliberately — it lands code in a real repo.
 This is the hybrid path: the guardrails of a guided integration merge (lexray's `/merge-to-test`)
 **without** its human sign-off. It does not ask; it either satisfies the gate mechanically or holds.
 
+**If the merge should stay yours, run `/fix-and-review` instead** — same implement-and-review, an
+independent agent for the review, every mechanical prep step run, and it stops at merge-ready. The
+two differ in one step, and picking between them is the whole decision; there is no flag here that
+turns the merge off.
+
 1. **Parse** `$ARGS`: first integer is the issue number; optional repo (default: the cwd's repo).
    Run `python3 ~/.claude/loops/harness_rules.py --json` to see that repo's resolved `github`,
    `executor_pr_base` and `headless_permission_mode`. Loop commands run from anywhere. Let `$BASE` =

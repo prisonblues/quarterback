@@ -14,6 +14,10 @@ always present once the harness is installed.
      opportunistically. The gates are the product.
    - **The pieces:** `lander.py` (dependabot), `panel.py` (multi-reviewer + master judge),
      `epic.py` (epic driver), `run-loop.sh` + systemd timer (unattended sweep).
+   - **Picking between the two end-to-end ones:** `/fix-and-review` reviews with an agent that did
+     not write the code and stops at merge-ready; `/fix-and-land` goes on to merge on a mechanical
+     gate plus stated confidence. Wanting the first one to merge is the signal to have run the
+     second.
    - **Gate model:** SonarCloud = the only HARD gate; Claude + Codex = soft findings; **master
      judgment, no consensus gate** (a real bug from one reviewer still gets fixed); **merge is
      always a human step** (except dependabot patch/minor).
@@ -29,6 +33,7 @@ always present once the harness is installed.
    | `/panel <pr> [repo]` | `python3 ~/.claude/loops/panel.py --pr <pr> [--post]` | review a PR |
    | `/lander [repo]` | `python3 ~/.claude/loops/lander.py [--execute]` | dependabot sweep |
    | `/epic <n> [repo]` | `python3 ~/.claude/loops/epic.py --epic <n> [--execute]` | work an epic |
+   | `/fix-and-review <issue> [repo]` | (skill — orchestrates /fix-issue + an independent /panel-review-pr) | implement → review → merge-**ready**, and stop |
    | `/fix-and-land <issue> [repo]` | (skill — orchestrates /fix-issue + panel + /review-pr) | implement → review → **merge if confident** |
    | — | `~/.claude/loops/run-loop.sh` | unattended dependabot sweep (systemd timer) |
 
