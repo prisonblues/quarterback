@@ -102,6 +102,7 @@ Detected from the checkout, **not settable** here: `path`, `github`, `default_br
 | `review_panel.ask_quorum` / `ask_threshold` | `--ask`'s tally rules: how many seats must have **answered** for the vote to mean anything, and how many must have said the same thing for it to be that answer. Both **2** — one seat agreeing with the agent that wrote the premise is not a challenge. A rule above the number of seats on the ask is warned about: it can never be met. |
 | `review_panel.ask_max_context_chars` | Total `--context` material one ask may hand its seats, across every spec. **60,000** (~15k tokens). Over budget is clamped and SAID, per spec — an ask's whole claim is that it is the cheap check, and unbounded context is the #117 cost shape on the path advertised as costing a minute. |
 | `review_panel.reviewer_code_access` | May a seat READ the code under review? **true**. `false` is the old posture — every seat in an empty repo, the diff its only evidence — and is what a repo taking UNTRUSTED contributions selects. On does not mean every seat gets it: only a CLI that can express "read but do not execute" is handed the tree (today just `claude`), and which seats did is recorded per seat. `--no-code-access` turns it off for one run. See below. |
+| `review_panel.reviewer_code_budget_usd` | Dollars the code-reading seat may spend per invocation (`claude --max-budget-usd`). **`null`** — uncapped — for the reason `max_diff_chars` is: reaching the cap is a LOST seat (a skip, which vetoes), not a cheaper review. Measured for calibration: ~$4 for one seat on a 75,628-char diff against ~$0.70 diff-only. Applies only to a seat that got the tree; the cap is per invocation and a reparse retry can spend it twice. |
 | `loops` | `dependabot_lander` / `stacked_driver` / `issue_executor` — which loops may run. |
 | `epic` | Epic-driver settings — see below. |
 | `preland.disabled_checks` | Checks `preland.py` must not run, by name. Empty by default — every guardrail it can detect, it runs. A name nothing answers to is a **hard error**, not a warning; see below. |
@@ -366,6 +367,15 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
     time is worse than one that is off, because the config still says it is on. A 404
     is not retried — it is a settled answer about that sha (a fork PR, most likely),
     and `run_cli` already draws that line for reviewer CLIs.
+  - **A per-repo spend cap, defaulting to uncapped** —
+    `review_panel.reviewer_code_budget_usd` passes `--max-budget-usd` to the seat that
+    got the tree. Uncapped by default because a number invented here would silently
+    degrade reviews on repos that never asked for one, and because reaching the cap is
+    not a cheaper review: the seat is lost, records a skip, and the skip vetoes the
+    round's confident stop. Reaching it needs a guard nothing about the flag suggests —
+    `claude` exits 1, writes its message to **stdout**, and leaves **stderr empty**, so
+    `run_cli`'s stderr-based reason and stderr-based retry decision would give a bare
+    "exited 1" and then repeat the attempt three times, re-burning a cap already spent.
   - **What it costs, measured** (one seat, sonnet, PR #214's own 75,628-char diff,
     run twice with only this feature differing): wall clock **922s vs 372s** (2.5×),
     input tokens **7,879,643 vs 159,520** (49×, though 97% of the larger figure was

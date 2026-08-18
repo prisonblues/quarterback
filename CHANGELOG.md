@@ -83,6 +83,23 @@ the seat is blind, recorded as blind, and the round says why. Three of those pat
 found by writing the tests — an empty tarball made `iterdir` raise
 `FileNotFoundError` straight out of a function whose contract is that it never raises.
 
+**A per-repo spend cap, defaulting to uncapped.**
+`review_panel.reviewer_code_budget_usd` passes `--max-budget-usd` to the seat that got
+the tree — not to a diff-only seat, which makes one bounded call and would only gain a
+way to be lost. Uncapped by default for the reason `max_diff_chars` gives: a number
+invented here would silently degrade reviews on repos that never asked for one, and
+reaching the cap is a LOST seat rather than a cheap one — it records a skip, and a skip
+vetoes the round's confident stop. The measured figures below live in the key's comment
+so a repo setting a cap is not guessing.
+
+Reaching the cap needed a guard nothing about the flag suggests, and both halves were
+measured on claude 2.1.232: it exits 1, writes its message to **stdout**, and leaves
+**stderr empty**. `run_cli` builds its skip reason from stderr and decides retryability
+from stderr, so without the guard the seat died as a bare "exited 1" with no cause and
+the attempt was then retried three times, re-burning a cap already spent. The test
+asserts the attempt count as well as the message — a fix that named the cause and still
+retried would triple the spend the cap was set to bound.
+
 **Measured, on this repo's own PR.** One seat, sonnet, PR #214's 75,628-char diff, run
 twice with only this feature differing: 922s against 372s of wall clock, 7,879,643
 against 159,520 input tokens (97% of the larger figure cached, so the billed multiple is
