@@ -563,3 +563,111 @@ def test_the_effort_is_lowered_first_when_it_is_what_was_refused(monkeypatch):
         "the model was servable and must survive — only the effort was refused")
     assert "model_reasoning_effort" not in " ".join(seen[1][0])
     assert turn.effort_unsupported == "max" and turn.model_unavailable == ""
+
+
+# ------------------------------------------- exit 0 carrying nothing but a refusal (#219 R2)
+
+#: A codex stream that refused: the benign events it always prints, and the error.
+#: `thread.started`/`turn.started` are why the first version of the predicate could
+#: never fire — it demanded everything outside the ERROR events be blank.
+ERRORS_ONLY_STREAM = "\n".join([
+    '{"type":"thread.started","thread_id":"01a0"}',
+    '{"type":"turn.started"}',
+    '{"type":"error","message":"unexpected status 404 Not Found: The API deployment '
+    'for this resource does not exist."}',
+])
+
+#: The same stream, having also produced a reply. Not an error-only stream.
+STREAM_WITH_REPLY = ERRORS_ONLY_STREAM + '\n{"type":"item.completed","text":"a finding"}'
+
+
+def test_a_stream_of_nothing_but_a_refusal_is_a_failure_not_an_empty_reply():
+    """The branch that turns exit 0 into a failure, in both directions.
+
+    Untested when it shipped, and it is the one addition that can LOSE a seat that
+    would otherwise be reported as a degraded success — so the false-positive side
+    matters as much as the true-positive one."""
+    assert panel_seats.stdout_is_only_errors(ERRORS_ONLY_STREAM), (
+        "a stream whose only outcome is a refusal is a failed run, not a reply "
+        "that failed to parse")
+    assert not panel_seats.stdout_is_only_errors(STREAM_WITH_REPLY), (
+        "it replied — the error alongside must not discard the reply")
+
+
+def test_the_predicate_cannot_mistake_a_reply_for_an_error_stream():
+    """The false-positive side, which is where the cost is asymmetric: a wrong YES
+    throws away a working seat's whole reply, and there is no salvage path behind
+    it. A reply is not a typed event stream, and that is the discriminator."""
+    assert not panel_seats.stdout_is_only_errors(
+        '{"findings":[{"severity":"P2","title":"error handling is wrong"}]}'), (
+        "a findings array has no `type` — it is a reply, whatever words are in it")
+    assert not panel_seats.stdout_is_only_errors(
+        'I could not review this. The CLI printed:\n'
+        '{"type":"error","message":"boom"}\n'
+        'which I could not interpret.'), (
+        "prose around a quoted envelope is a reply that quotes an envelope")
+    assert not panel_seats.stdout_is_only_errors(""), "nothing at all is not a refusal"
+    assert not panel_seats.stdout_is_only_errors(
+        '{"type":"turn.completed","usage":{}}'), "no error in it at all"
+
+
+def test_the_predicate_is_asked_of_every_seat_including_the_one_it_was_written_for():
+    """It was gated to `replied is None` — the seats that never emit this shape —
+    while codex, the seat it exists for, answered a different question one branch up
+    and never reached it. Dead in both directions at once (#219 review).
+
+    Driven through the real `run_cli` rather than asserted against the source, so the
+    wiring is what is pinned and not a grep."""
+    class _Proc:
+        returncode, stdout, stderr = 0, ERRORS_ONLY_STREAM, ""
+
+    for replied in (None, lambda: True):
+        import unittest.mock as _m
+        with _m.patch.object(panel_seats.subprocess, "run", lambda *a, **k: _Proc()):
+            out, err = panel_seats.run_cli(["codex", "exec"], "codex (x)",
+                                           attempts=1, replied=replied)
+        assert err, f"exit 0 with only a refusal must fail the run (replied={replied!r})"
+        assert "reported only errors" in err, err
+        assert "404" in panel_seats.failure_diag(err), (
+            "and the diagnostic must reach the classifiers, or no pin can be lowered")
+
+
+def test_a_brace_inside_prose_is_not_lifted_as_an_event():
+    """Scanning the whole text for `{` bought a false positive for the false negative
+    it fixed: prose quoting an envelope — a stack trace, a reviewer's reply, this
+    file's own fixtures — was handed to the decoder as though the CLI emitted it.
+    These values suppress retries and drop pins, so that is not cosmetic (#219
+    review, codex). The `{` now has to open a line."""
+    embedded = 'the CLI said {"type":"error","message":"404 deployment does not exist"} once'
+    assert panel_seats.error_text(embedded) == "", (
+        "an envelope quoted mid-sentence was never emitted as an event")
+    assert not panel_seats.is_deterministic_failure(panel_seats.error_text(embedded))
+    indented = '  {\n    "type": "error",\n    "message": "404 deployment does not exist"\n  }'
+    assert panel_seats.error_text(indented), (
+        "an indented pretty-printed body still opens its line and must survive — "
+        "that is the false negative the scan was widened for")
+
+
+def test_a_lowered_attempt_gets_the_remaining_budget_not_a_fresh_one(monkeypatch):
+    """The elapsed guard bounds when a lowering may START. Without passing the
+    remainder as the attempt's own timeout, one starting just under the line runs a
+    full CLI_TIMEOUT past it — a whole timeout of overshoot per lowering, on a guard
+    whose stated job is bounding the seat (#219 review, codex)."""
+    seen = []
+    monkeypatch.setattr(panel_seats.shutil, "which", lambda _c: "/usr/bin/codex")
+
+    def fake_run_cli(args, label, **kw):
+        argv = args() if callable(args) else args
+        seen.append(kw.get("timeout"))
+        if len(seen) == 1:
+            return None, f"exited 1 ({GATEWAY_404})"
+        Path(argv[argv.index("--output-last-message") + 1]).write_text("ok")
+        return "{}", None
+
+    monkeypatch.setattr(panel_seats, "run_cli", fake_run_cli)
+    panel_seats.run_seat("codex", "gpt-5.6-luna", "review this", "max")
+    assert seen[0] is None, "the pinned attempt takes run_cli's own default"
+    assert seen[1] is not None, "the lowered attempt must be given a bounded timeout"
+    assert seen[1] <= panel_seats.FALLBACK_MAX_ELAPSED_S
+    assert seen[1] >= panel_seats.FALLBACK_MIN_TIMEOUT_S, (
+        "and never so small that it is a kill dressed as a review")

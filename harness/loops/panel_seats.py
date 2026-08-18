@@ -43,6 +43,12 @@ EFFORTS = {"codex": CODEX_EFFORTS, "pi": PI_EFFORTS, "antigravity": AGY_EFFORTS}
 # the same argument as BLANK_RETRY_MAX_S's, one retry class over.
 FALLBACK_MAX_ELAPSED_S = CLI_TIMEOUT
 
+#: Floor for a lowered attempt's own timeout. The bound above is spent-so-far, so
+#: the remaining budget can be small; handing a reviewer thirty seconds and calling
+#: the result a review would be worse than not trying, and a seat killed mid-thought
+#: costs the tokens anyway.
+FALLBACK_MIN_TIMEOUT_S = 120
+
 
 def cli_hint(cmd_name: str, err: str, model: str) -> str:
     """Point at the actual cause. This used to append '(auth? run `codex login`)'
@@ -116,6 +122,21 @@ def is_permission_denied(stderr: str) -> bool:
 _DECODER = json.JSONDecoder()
 
 
+def _line_start_brace(text: str, frm: int) -> int:
+    """Index of the next `{` that OPENS a line at or after `frm`, else -1.
+
+    Leading whitespace is allowed, so an indented member of a pretty-printed body
+    still qualifies; a brace with anything else before it on its line does not.
+    """
+    at = text.find("{", frm)
+    while at >= 0:
+        nl = text.rfind("\n", 0, at)
+        if not text[nl + 1:at].strip():
+            return at
+        at = text.find("{", at + 1)
+    return -1
+
+
 def _json_values(text: str):
     """Every JSON value in `text`, as `(start, end, value)` — however it is laid out.
 
@@ -133,13 +154,24 @@ def _json_values(text: str):
     out of looking for a `{` and letting the decoder say where the value ends. A
     brace that starts nothing steps forward by one rather than ending the scan: a
     `{` inside prose must not hide a real envelope printed after it.
+
+    **The `{` has to BEGIN a line** (whitespace before it is fine, which is what
+    keeps pretty-printed bodies working). Dropping the old line-oriented parse for a
+    scan of the whole text fixed the false negative it was written for and bought a
+    false POSITIVE in exchange: a brace anywhere at all was handed to the decoder,
+    so prose quoting an envelope — a stack trace, a reviewer's reply, this file's
+    own docstrings — could be lifted as though the CLI had emitted it. That is not
+    cosmetic once these values decide things: `is_deterministic_failure` suppresses
+    a retry on them, and the pin fallback drops a pin on them. Anchoring costs the
+    embedded case, which was never a real event, and keeps the indented one, which
+    is the whole reason the scan exists. (#219 review, codex.)
     """
-    at = text.find("{")
+    at = _line_start_brace(text, 0)
     while at >= 0:
         try:
             value, end = _DECODER.raw_decode(text, at)
         except ValueError:
-            at = text.find("{", at + 1)
+            at = _line_start_brace(text, at + 1)
             continue
         yield at, end, value
         at = text.find("{", max(end, at + 1))
@@ -211,6 +243,11 @@ def error_events(stdout: str) -> list[dict]:
 #: marker rather than an account of anything.
 _ERROR_FIELDS = ("message", "param", "code")
 
+#: Fields that make an event the seat's ANSWER rather than its lifecycle. A stream
+#: carrying any of them said something, so a refusal printed beside it is not a run
+#: that produced nothing — see `stdout_is_only_errors`.
+_REPLY_FIELDS = ("text", "content", "delta", "output", "message")
+
 
 def error_text(stdout: str) -> str:
     """:func:`error_events`, flattened to the text `stderr_gist` and the classifiers read.
@@ -237,32 +274,56 @@ def error_text(stdout: str) -> str:
 
 
 def stdout_is_only_errors(stdout: str) -> bool:
-    """Is this stdout NOTHING BUT error events — no reply anywhere in it?
+    """Is this stdout an event stream carrying NOTHING BUT errors — no reply in it?
 
     The one place these envelopes are used to DECIDE that a run failed rather than
     to explain one that had already failed, so it is the strictest reader of them.
-    `run_cli` asks it about the seats whose stdout IS their reply: such a seat can
-    exit 0, print its provider's refusal and nothing else, and be handed on as a
-    successful run whose reply merely could not be parsed — reported as an
+    A seat can exit 0, print its provider's refusal and nothing else, and be handed
+    on as a successful run whose reply merely could not be parsed — reported as an
     unreadable reply and kept as a raw finding for the judge, which is #215's
     misleading diagnosis one layer up.
 
-    Only the `{"type":"error"}` event shape counts here, and every non-blank
-    character outside those events has to be gone. A reviewer whose reply happens
-    to QUOTE an error envelope (this very diff, reviewed) leaves its prose behind
-    and is a reply; a reply that is a JSON object with an `error` key of its own is
-    not an error stream, and calling either a failure would lose a working seat to
-    a predicate meant to save one.
+    **A stream, not a heap of error objects**, and that is the correction the #219
+    review forced. The first version demanded that every non-blank character outside
+    the `{"type":"error"}` events be gone — which no real stream can satisfy, because
+    codex always prints `thread.started` and `turn.started` alongside anything else.
+    So it could not fire for the seat it was written for even when asked. It was also
+    only asked when `replied is None`, i.e. of the seats whose stdout IS their reply
+    and which never emit that event shape at all. Dead in both directions at once.
+
+    What it asks now: every JSON value in the text is a typed EVENT, at least one of
+    them is an error, and there is nothing but whitespace between them. A codex
+    stream that refused satisfies that; a codex stream that also replied does not,
+    because a reply is not an event.
+
+    That shape is also what keeps the false positive cheap, which the review was
+    right to weigh: a seat's REPLY is not a typed event stream. A findings array
+    (`{"findings": [...]}`) has no `type` and fails immediately; a reply that quotes
+    an envelope leaves prose between the braces and fails; a reply that is one bare
+    `{"type":"error"}` and nothing else is indistinguishable from a refusal by any
+    means available here, and calling it a failure is the same answer a human
+    reading that stdout would give.
     """
     text = stdout or ""
     if '"error"' not in text or not text.strip():
         return False
     rest, cut, found = [], 0, False
     for start, end, value in _json_values(text):
-        if isinstance(value, dict) and value.get("type") == "error":
+        # Every value has to be an event. One that is not — a findings array, a
+        # bare object — means this stdout is a reply, whatever else is in it.
+        if not (isinstance(value, dict) and isinstance(value.get("type"), str)):
+            return False
+        if value.get("type") == "error":
             found = True
-            rest.append(text[cut:start])
-            cut = end
+        elif any(str(value.get(k) or "").strip() for k in _REPLY_FIELDS):
+            # A lifecycle event carries no answer; one carrying TEXT is the seat
+            # saying something, and a refusal beside it does not make the run a
+            # failure. Keyed on the payload rather than on a list of event names,
+            # because the names are the CLI's to change and the question — did it
+            # say anything — is not.
+            return False
+        rest.append(text[cut:start])
+        cut = end
     rest.append(text[cut:])
     return found and not "".join(rest).strip()
 
@@ -666,12 +727,17 @@ def run_cli(args: list[str] | Callable[[], list[str]], label: str, timeout: int 
         # whose reply merely could not be parsed, so the seat's own error text was
         # reported as an unreadable reply and kept as a raw finding for the judge —
         # this issue's misleading diagnosis one layer up, and past the pin fallback
-        # that would have recovered the seat. Only for a seat whose stdout IS its
-        # reply: the seats that reply in a file answer this question through
-        # `replied` above, and `stdout_is_only_errors` is deliberately strict about
-        # a reply that merely quotes an envelope.
+        # that would have recovered the seat.
+        #
+        # Asked of EVERY seat. Gating it on `replied is None` restricted it to the
+        # seats whose stdout is their reply — precisely the ones that never emit this
+        # event shape — while the seat it was written for answered a different
+        # question one branch up and never reached it (#219 review). For a seat that
+        # replies in a file this is belt and braces with `replied`; for the others it
+        # is inert until one of their CLIs starts printing an event stream, and
+        # `stdout_is_only_errors` is strict enough that a reply cannot look like one.
         errors = error_text(proc.stdout or "")
-        if not outcome and replied is None and stdout_is_only_errors(proc.stdout or ""):
+        if not outcome and stdout_is_only_errors(proc.stdout or ""):
             outcome = "exited 0 but reported only errors"
         if not outcome:
             return proc.stdout, None
@@ -1728,7 +1794,17 @@ def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
             label = fallback_label(cmd_name, asked_model[0], asked_effort[0],
                                    dropped_model, dropped_effort)
             print(f"panel: {cmd_name} {note}", file=sys.stderr)
+            # The budget that is LEFT, not a fresh one. Checking elapsed time before
+            # starting an attempt bounds when a lowering may begin and nothing else,
+            # so an attempt starting just under the line could still run a full
+            # CLI_TIMEOUT past it — up to one whole timeout of overshoot per
+            # remaining lowering, on a guard whose stated job is bounding the seat
+            # (#219 review, codex). Floored well above zero: a one-second timeout is
+            # not a review, it is a kill dressed as one, and the elapsed check above
+            # is what stops us getting here with nothing left.
             out, err = run_cli(args, label, attempts=1, stdin_text=stdin_text,
+                               timeout=max(FALLBACK_MIN_TIMEOUT_S,
+                                           FALLBACK_MAX_ELAPSED_S - spent),
                                on_output=collect, replied=wrote_reply, cwd=sandbox)
         if err:
             # `model` and not `asked[0]`: the hint explains the PIN, and after a

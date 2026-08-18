@@ -107,6 +107,37 @@ dataclasses — `SeatAnswer` is constructed positionally, and inserting ahead of
 every ask's verdict to a new field, which surfaced as 19 tests reporting wrong verdicts rather
 than as a type error.
 
+**Round 2 got the seat back and then found five more things, four of them introduced by the
+fix pass.** With both pins lowered, codex ran for the first time on this host — the first
+two-vendor panel here, and it immediately produced findings claude and codex agreed on, which
+was structurally impossible while the panel was one seat. What it found:
+
+- The new "exited 0 but reported only errors" predicate was **dead in both directions**. It was
+  asked only when `replied is None` — the seats whose stdout IS their reply and which never emit
+  that event shape — while codex answered a different question one branch up and never reached
+  it. And it demanded that everything outside the ERROR events be blank, which no real stream can
+  satisfy: codex always prints `thread.started` and `turn.started`. It now asks whether every JSON
+  value is a typed EVENT, at least one is an error, and none carries reply text — keyed on the
+  payload rather than a list of event names, because the names are the CLI's to change and "did it
+  say anything" is not. Asked of every seat.
+- Widening the scan from line-anchored to any `{` fixed a false negative and bought a false
+  POSITIVE: prose quoting an envelope — a stack trace, a reviewer's reply, this file's own
+  fixtures — was decoded as though the CLI had emitted it. These values suppress retries and drop
+  pins, so a `{` now has to open a line. Indented bodies still qualify, which is the whole reason
+  the scan was widened.
+- The elapsed guard bounded when a lowering may START and nothing else, so an attempt beginning
+  just under the line still ran a full `CLI_TIMEOUT` past it. A lowered attempt now gets the
+  budget that is LEFT, floored so a remainder of thirty seconds is not handed to a reviewer and
+  called a review.
+- The branch that can turn a working seat into a lost one had no test at all — the highest-risk
+  addition in the round, and the one whose absence hid the dead wiring above.
+
+One P1 was **refuted**: `class CliFailure(str)` was reported as a `NameError` at import from its
+own `-> CliFailure` annotation, which `from __future__ import annotations` on line 14 makes a
+string that is never evaluated. The judge said plainly that it could not execute the claim and
+kept it under "when unsure, mark it real" — the right policy, and the reason `record-outcome`
+exists to say afterwards which way it fell. Recorded, unattested.
+
 **The panel reviewed this change and its own run demonstrated the bug it found.** Round 1 on
 PR #219 lowered the model correctly, kept `max`, and lost the seat anyway — recording
 `model_unavailable: gpt-5.6-luna`, `effort_unsupported: null`. The reviewer named the cause
