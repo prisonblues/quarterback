@@ -67,7 +67,11 @@ GET   /stream            (SSE; ?since=<id> to replay backlog then go live)
 PUT   /blob/{sha}        (body = bytes; sha256 verified)  -> {sha, size, created}
 GET   /blob/{sha}                                          -> bytes | 404
 POST  /lease             { session, device, ttl=300, cwd?, repo?, branch?, title?, recap?,
-                           model? }                     -> {lease_id, expires, renewed}
+                           model?, state? }             -> {lease_id, expires, renewed}
+                         (state = working|waiting|input — what the holder is DOING.
+                          Returned by /active and /overlap with a `state_at`, and the
+                          two are read together: `stalled` is what a reader concludes
+                          from an old `working`, never something a holder reports.)
 POST  /lease/renew       { lease_id }
 POST  /lease/release     { lease_id }
 POST  /handoff           { session, blob, cwd?, title?, recap?, model? }
@@ -577,7 +581,22 @@ full — including what was broken before it, which is the part no diff recovers
   a repo name, and treat the string itself as untrusted input on the way back in: the board bounds
   its length at `PATH_MAX` and normalises nothing else, so quote it, and do not hand a value
   beginning with `-` to `git` as anything but an operand.
-- **vNEXT** — the panel stops reviewing blind (#113, both halves). *The veto split:* `confident` is `not veto`, so a
+- **vNEXT** — reviewers can read the code, per repo, on by default (#113's second half).
+  `review_panel.reviewer_code_access` runs each seat that can take it in a checkout of the
+  PR at its head — fetched from GitHub's tarball endpoint, never from the main checkout,
+  whose branch is not the PR's. It buys ONE seat: only `claude` can be told "read but do
+  not execute" (`--allowedTools Read Grep Glob`, no `Bash`), while codex's only read path
+  is its shell, pi's `--no-tools` is all-or-nothing and antigravity has no tools at all —
+  so the other three keep the empty sandbox. The judge reads too, and is the party that
+  most needed to: the wrong findings #113 was filed over were *confirmed*, not merely
+  raised. Vendor convention files are stripped at every depth before any CLI starts
+  (symlinks unlinked, never followed), which is a denylist and says so. Every failure
+  degrades to reviewing from the diff, recorded per seat — and the board now stores that
+  rather than dropping it at ingest (migration `0023`). Measured at roughly 6x the cost in
+  money for one seat, so `reviewer_code_budget_usd` can cap it; uncapped by default,
+  because reaching a cap is a lost seat rather than a cheap one. `--no-code-access` opts
+  out for one run; `false` is what a repo taking untrusted contributions sets.
+- **v2.50** — the coverage veto stops reporting a constant. `confident` is `not veto`, so a
   veto line that fires every round makes a confident stop unreachable rather than rare. Two
   did: a seat that cannot read the code (every seat — an empty sandbox and no tools) declaring
   gaps about code outside the diff, and antigravity's argv ceiling, which the kernel sets at
@@ -587,16 +606,26 @@ full — including what was broken before it, which is the part no diff recovers
   still reported, and both have a floor so exempting seats one at a time cannot empty the veto
   on a round nothing read. Truncation by a `max_diff_chars` somebody typed still vetoes. First
   half of #113; code access as a per-repo setting is the second and lands separately.
-  *Code access:* `review_panel.reviewer_code_access`, on by default, runs each seat that
-  can take it in a checkout of the PR at its head — fetched from GitHub's tarball
-  endpoint, never from the main checkout, whose branch is not the PR's. It buys ONE seat:
-  only `claude` can be told "read but do not execute" (`--allowedTools Read Grep Glob`,
-  no `Bash`), while codex's only read path is its shell, pi's `--no-tools` is
-  all-or-nothing and antigravity has no tools at all — so the other three keep the empty
-  sandbox. Vendor convention files are stripped at every depth before any CLI starts
-  (symlinks unlinked, never followed), which is a denylist and says so. Every failure
-  degrades to reviewing from the diff, recorded per seat. `--no-code-access` opts out for
-  one run; `false` is what a repo taking untrusted contributions sets.
+- **v2.49** — the guard that could not fire. `create-worktree`'s isolated-DB step had a
+  `die` whose whole job was to explain a missing database name, and `set -u` killed the
+  script at that guard's own dereference instead — `MAIN_DB_NAME: unbound variable`, at the
+  exact line written to say what was wrong. One initialisation makes the message reachable.
+  `database.url_env` and `database.name_env` now cascade rather than excluding each other,
+  so a repo that assembles its URL at runtime (or keeps the name in docker-compose) can use
+  an isolated database. And because the step is 3 of 10, a failure there left a checkout
+  with no `.venv`, port or context file: it now says the worktree is incomplete and gives
+  the two commands out, naming the branch rather than the directory.
+- **v2.48** — a lease says what its holder is doing, not just where. `POST /lease` takes
+  `state` (`working | waiting | input`) and `/active` and `/overlap` return it with `state_at`,
+  because a state is only as good as its age: `working` last reported twenty minutes ago
+  describes a pane that looks busy and has not moved — the failure v2.46 named when it took the
+  permission prompts away. Neither timestamp already on the row can date it (`acquired_at` is
+  fixed at first claim, `expires_at` moves on every heartbeat), so the pair travels together and
+  each reader picks its own threshold. `stalled` is deliberately unreportable: it is a conclusion
+  drawn from a state and its age, and a holder cannot know it is in the state where it has
+  stopped talking. Both dashboards grow a `state` column and a seat cell on the tmux bar takes
+  its colour from `@qb_state`, set by the lifecycle hook — which is also the only thing that
+  knows a turn ended, so nothing here infers it.
 - **v2.47** — the dashboard grows hands, and its tests start running. The SEATS panel
   closes a seat and adds one, and tmux grows a clickable bar of the same widgets above the
   seat row — both through `qb-seat-click`, which `qb-dash-tui` had been calling since the
