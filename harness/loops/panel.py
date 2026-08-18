@@ -307,6 +307,10 @@ def _payload_defaults() -> dict:
         "diff_chars": 0,
         "diff_budgets": {},
         "config_notes": [],
+        # Present on every payload, empty by default: a consumer that reads it —
+        # the next round, through --baseline — must not have to tell "no
+        # escalations" from "a payload that predates the field".
+        "escalated": {},
         "sonar_gate": "skipped",
         "ci_status": "unknown",
         "ci_failing": [],
@@ -434,7 +438,8 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         round_no: int = 1, baseline: list[str] | None = None,
         max_rounds: int | None = None, scope: str = "auto",
         since: str = "", force: bool = False,
-        no_code_access: bool = False) -> int:
+        no_code_access: bool = False,
+        escalated: list[str] | None = None) -> int:
     # A cycle is something the CALLER drives, and only /panel-review-pr does:
     # naming a cap (or a round, or a baseline) is what says this run is part of
     # one. A review-only /panel run left to the default is a single pass, and
@@ -581,6 +586,13 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 # read is a fact about the cycle, not about the review it skipped,
                 # so it travels rather than being dropped on the floor.
                 "config_notes": notes + skip_prior.problems,
+                # A skipped round still carries the cycle's open escalations
+                # forward. It reviewed nothing, so it can neither answer one nor
+                # add one — but it is the baseline the NEXT round inherits, and a
+                # register that empties whenever a title matches /^Merge / would
+                # lose the question on the quietest round of the cycle.
+                "escalated": {**{str(k): round_no for k in (escalated or []) if k},
+                              **skip_prior.escalated},
                 "round": round_no,
                 "cycle": skip_prior.cycle,
                 "prior_rounds": len(skip_prior.rounds),
@@ -1484,8 +1496,26 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                      if pre.verdict == "manifest" else [])
     veto = (coverage_veto(reviewer_meta, judge_skip, flagged, len(review.target))
             + manifest_veto + judge_gaps + inherited + prior.problems)
+    # Declared this round, plus every key an earlier round declared. The earliest
+    # round that said so owns the answer, so `prior` wins a collision — a caller
+    # re-passing a key it inherited must not re-date the claim to now.
+    held = {**{str(k): round_no for k in (escalated or []) if k}, **prior.escalated}
+    # A key naming no finding this cycle has ever seen is almost always a typo,
+    # and a typo here is silent by construction: the loop would simply carry on
+    # counting a finding the caller believes it excluded. Said out loud rather
+    # than corrected, because the other reading — a key from a cycle whose payload
+    # was lost — is legitimate and this cannot tell them apart.
+    seen = {c.key for c in (*to_fix, *sonar, *dismissed)} | prior.keys
+    for key in sorted(k for k in held if k not in seen):
+        notes.append(f"--escalated {key} names no finding this round raised and no "
+                     "earlier round's payload carries — check the key, or the "
+                     "baseline it should have come in on")
+    # The repeat KEYS, not a count of them: `round_stop` subtracts the escalated
+    # ones itself, so the rule lives in one place instead of depending on every
+    # caller to filter first.
     stop = round_stop(round_no, cap, new_keys, outstanding, veto, not prior.problems,
-                      repeated=len({c.key for c in outstanding if not is_new(c)}))
+                      repeated={c.key for c in outstanding if not is_new(c)},
+                      escalated=held)
     # Whether a CYCLE exists at all, and the one predicate that decides it — for
     # the report's Rounds block and for the payload alike. They used to disagree:
     # the report suppressed the block for a review-only run while the payload sent
@@ -1729,8 +1759,16 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # are facts about this run's comparison against a baseline rather than
         # properties of the defect, and a Canonical that carried either would have
         # to be told about a baseline to know its own shape.
+        # key -> the round it was first declared escalated in. The next round
+        # inherits it through `--baseline`, so a cycle cannot lose an open premise
+        # question by forgetting to re-pass a flag.
+        "escalated": held,
         "to_fix": [{**c.as_dict(), "new_this_round": is_new(c),
-                    "provenance": provenance_of(c)} for c in to_fix],
+                    "provenance": provenance_of(c),
+                    # On the finding, not only in the register beside it: this is
+                    # what a fixer's brief is built from, and §5's rule is that an
+                    # escalated finding is never handed to another fixer.
+                    "escalated": c.key in held} for c in to_fix],
         "sonar_findings": [{**c.as_dict(), "new_this_round": is_new(c),
                             "provenance": provenance_of(c)} for c in sonar],
         "dismissed": [{**c.as_dict(), "new_this_round": is_new(c),
@@ -2016,8 +2054,13 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             fresh = " 🆕" if prior_rounds and is_new(c) else ""
             again = (" ↻ _fix needs re-reading (" + ", ".join(c.rereview_by) + ")_"
                      if c.needs_rereview else "")
+            # Marked in the list a fixer reads, not only in the Rounds block a
+            # reader reads. This finding is still outstanding and still shown —
+            # hiding it would lose the question — but it is not this round's work.
+            escalation = (f" ⛔ _escalated in round {held[c.key]} — awaiting a human, "
+                          "not a fix pass_" if c.key in held else "")
             lines.append(f"- **{c.severity}**{fresh} `{loc(c)}` [{c.id}] — {c.synthesis}"
-                         f"{conf(c)}{unruled}{tail}{rel}{again}")
+                         f"{conf(c)}{unruled}{tail}{rel}{again}{escalation}")
             lines += accounts(c)
     else:
         lines.append("- none")
@@ -2188,6 +2231,14 @@ def main() -> int:
     ap.add_argument("--baseline", action="append", default=[], metavar="PATH",
                     help="a previous round's --json-file payload, so this run can say "
                          "which findings no earlier round raised. Repeatable")
+    ap.add_argument("--escalated", action="append", default=[], metavar="KEY",
+                    help="a finding key whose fixer reported that the APPROACH is "
+                         "wrong rather than the code, and wrote no patch "
+                         "(review-pr.md step 3a). It stays outstanding and stays in "
+                         "the report, but no longer counts as work a fix round can "
+                         "clear — otherwise the cycle runs to its cap on a finding "
+                         "only a human can close. Repeatable, and inherited by later "
+                         "rounds through --baseline")
     ap.add_argument("--scope", choices=ROUND_SCOPES, default="auto",
                     help="what a round past the first REVIEWS. increment: the "
                          "commits since the last round's head, with the rest of the "
@@ -2227,6 +2278,7 @@ def main() -> int:
                                    ("--round", args.round_no is not None),
                                    ("--baseline", bool(args.baseline)),
                                    ("--force", args.force),
+                                   ("--escalated", bool(args.escalated)),
                                    ("--max-rounds", args.max_rounds is not None)) if used]
         if wrong:
             raise SystemExit(f"--ask does not take {', '.join(wrong)}: an ask is one "
@@ -2276,7 +2328,7 @@ def main() -> int:
     return run(args.repo, args.pr, args.post, args.json_out, args.reviewers,
                args.json_file, args.record, round_no, args.baseline,
                args.max_rounds, args.scope, args.since, args.force,
-               args.no_code_access)
+               args.no_code_access, args.escalated)
 
 
 if __name__ == "__main__":

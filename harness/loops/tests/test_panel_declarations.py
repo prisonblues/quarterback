@@ -692,6 +692,45 @@ def test_a_baseline_counts_what_was_raised_not_what_was_confirmed(tmp_path):
     assert b.raised_before(_canonical("a.py", "real bug"))
 
 
+def test_an_escalation_is_inherited_by_every_later_round(tmp_path):
+    """An escalation is answered by a human on their own clock, so nothing about
+    a later round makes it stop being open. A cycle that had to re-pass the flag
+    every round would go back to counting it as work the loop can do the first
+    time a caller forgot — the jam returning one round later."""
+    path = _payload(tmp_path, "r1.json", 1, ["real bug"],
+                    escalated={"deadbeefdeadbeef": 1})
+    b = panel.load_baseline([path], THIS_RUN)
+    assert b.problems == [] and b.escalated == {"deadbeefdeadbeef": 1}
+
+
+def test_the_round_an_escalation_was_first_declared_in_survives_a_merge(tmp_path):
+    """Earliest wins, like the cycle id: a later round re-stating a key it
+    inherited must not re-date the claim to now. The round is the only part of
+    this an auditor can check the caller's word against."""
+    first = _payload(tmp_path, "r1.json", 1, ["a"], escalated={"aabbccddeeff0011": 1})
+    later = _payload(tmp_path, "r2.json", 2, ["b"], escalated={"aabbccddeeff0011": 2})
+    assert panel.load_baseline([first, later], {**THIS_RUN, "round": 3}).escalated \
+        == panel.load_baseline([later, first], {**THIS_RUN, "round": 3}).escalated \
+        == {"aabbccddeeff0011": 1}
+
+
+def test_a_bare_list_of_escalated_keys_is_read_as_that_round_s(tmp_path):
+    """A payload written before the field carried a round, or one written by
+    hand. Attributing it to the round that wrote it is the only answer available
+    and is never later than the truth."""
+    path = _payload(tmp_path, "r1.json", 1, ["a"], escalated=["00ff00ff00ff00ff"])
+    assert panel.load_baseline([path], THIS_RUN).escalated == {"00ff00ff00ff00ff": 1}
+
+
+def test_a_junk_escalated_field_costs_nothing(tmp_path):
+    """Same rule as every other field here: a bad payload costs a `problems`
+    entry at worst, never a review that every reviewer CLI has been paid for."""
+    for junk in ("a string", 7, {"": 1}, {"k": "not a round"}, None):
+        path = _payload(tmp_path, "r.json", 1, ["a"], escalated=junk)
+        b = panel.load_baseline([path], THIS_RUN)
+        assert b.escalated in ({}, {"k": 1}), junk
+
+
 def test_a_baseline_reads_the_key_the_payload_carries(tmp_path):
     """The panel sends a key with every finding, and it is the same identity the
     board chains runs on. Re-deriving one here — from the judge's freshly-worded
@@ -986,6 +1025,128 @@ def test_the_cap_is_what_ends_an_argument_about_a_repeated_p4():
 def test_a_baseline_that_could_not_be_read_also_costs_the_verdict_its_confidence():
     d = panel.round_stop(2, 3, [], [], [], baseline_ok=False)
     assert d["stop"] is True and d["confident"] is False
+
+
+# ---- the finding no round can close (#221) ---------------------------------
+#
+# A fixer may report that a finding says the APPROACH is wrong rather than the
+# code and write no patch (`review-pr.md` step 3a), and `panel-review-pr.md` §5
+# forbids ever handing it to another fixer. Both rules are right and together
+# they jammed the loop: the finding is outstanding, nothing may fix it, so rules
+# 1-3 said "go again" every round until the cap — the mechanism built to stop a
+# cycle circling a premise guaranteed it ran to the cap instead.
+
+
+def _c(sev, file="a.py", title="t"):
+    """A judged finding whose `.key` the test then reads.
+
+    The key is a read-only property derived from the file and the reporters'
+    words (:func:`_defect_key`), so a test cannot hand one in — two findings get
+    two keys by differing in what they are ABOUT, which is also the only way they
+    differ in production."""
+    return _canonical(file, title, severity=sev)
+
+
+def test_an_escalated_finding_alone_does_not_earn_another_round():
+    """The jam itself. Without the register this is `stop: False` at every round
+    until the cap, on a finding no fix pass is allowed to touch."""
+    c = _c("P2")
+    assert panel.round_stop(2, 5, [], [c], [], repeated={c.key})["stop"] is False
+    d = panel.round_stop(2, 5, [], [c], [], repeated={c.key}, escalated=[c.key])
+    assert d["stop"] is True
+    assert "escalated" in d["reason"] and "await a human" in d["reason"]
+
+
+def test_a_stop_holding_an_escalation_is_never_convergence():
+    """It is a stop and it is not clean: the PR carries a question only a human
+    closes. Reported through the existing veto, so `confident` falls out by the
+    rule that was already there and every consumer of it needs no new field."""
+    c = _c("P2")
+    d = panel.round_stop(2, 5, [], [c], [], repeated={c.key}, escalated=[c.key])
+    assert d["confident"] is False
+    assert any("no round can close them" in v for v in d["veto"])
+    assert d["escalated_outstanding"] == [c.key]
+
+
+def test_it_is_never_reported_as_dry():
+    """"Dry" is a claim that nothing was raised. Something was raised, and is
+    unanswered — a reader reconciling "dry" against an open premise question is
+    being told something untrue about why the loop stopped."""
+    c = _c("P4")
+    d = panel.round_stop(2, 5, [], [c], [], escalated=[c.key])
+    assert "dry" not in d["reason"]
+
+
+def test_real_work_beside_an_escalation_still_earns_another_round():
+    """The mixed case, which is the one a "stop on any escalation" rule gets
+    wrong: one escalation beside a live P2 must not end the cycle, or the fixes
+    that WERE made in the same pass go unreviewed."""
+    held, live = _c("P3"), _c("P2", file="b.py", title="a different defect")
+    assert held.key != live.key
+    d = panel.round_stop(2, 5, [], [held, live], [], escalated=[held.key])
+    assert d["stop"] is False and "P1/P2" in d["reason"]
+
+
+def test_the_cycle_stops_as_soon_as_only_escalations_remain():
+    """...and the round after, when the P2 is fixed, it stops — on the work being
+    done rather than on the counter running out. That is the whole point: #67
+    calls the cap arbitrary, and this is the case where the loop can know."""
+    held = _c("P3")
+    d = panel.round_stop(3, 5, [], [held], [], repeated={held.key}, escalated=[held.key])
+    assert d["stop"] is True and d["round"] == 3 and d["max_rounds"] == 5
+
+
+def test_a_finding_escalated_and_raised_again_as_NEW_is_still_held():
+    """A later round can re-derive the same defect under the same key and report
+    it as new. Filtering only `outstanding` would let rule 1 fire on it and buy
+    the round nobody could act on."""
+    held = _c("P3")
+    d = panel.round_stop(2, 5, [held.key], [held], [], escalated=[held.key])
+    assert d["stop"] is True
+
+
+def test_escalating_something_that_is_not_outstanding_costs_nothing():
+    """A key for a finding this round did not raise is not an error — an
+    escalation stays open across rounds whether or not a reviewer mentions it
+    again — but it must not invent a reason to stop or to go on."""
+    fresh = _c("P2")
+    d = panel.round_stop(2, 5, [fresh.key], [fresh], [],
+                         escalated=["a0b1c2d3e4f56789"])
+    assert d["stop"] is False and "1 finding" in d["reason"]
+
+
+def test_a_register_key_this_round_never_raised_does_not_veto_a_dry_round():
+    """Found by the codex seat on this diff's own review. The register is
+    inherited and only grows, so holding the whole of it against every later round
+    meant one stale key — a premise a human has since ANSWERED, a withdrawn
+    finding, a typo — made the cycle permanently unable to report convergence, on
+    rounds that were genuinely dry. A veto that can never be cleared is the loud
+    wrong signal a reader learns to skip past."""
+    d = panel.round_stop(3, 5, [], [], [], escalated=["a0b1c2d3e4f56789"])
+    assert d["stop"] is True and d["confident"] is True
+    assert "dry" in d["reason"] and d["veto"] == []
+    assert d["escalated_outstanding"] == []
+
+
+def test_a_typo_does_not_quietly_end_the_cycle_either():
+    """The same key, with real work outstanding: it must not subtract a finding
+    nobody escalated, and `--escalated` naming nothing is reported in
+    `config_notes` by the caller rather than acted on here."""
+    live = _c("P2")
+    d = panel.round_stop(3, 5, [], [live], [], repeated={live.key},
+                         escalated=["a0b1c2d3e4f56789"])
+    assert d["stop"] is False and "P1/P2" in d["reason"]
+
+
+def test_an_empty_declaration_changes_nothing():
+    """`--escalated ''` and no flag at all are the same run. Guarded because the
+    filter is a membership test, and an empty string in the set would quietly
+    match a finding whose key failed to serialise."""
+    c = _c("P2")
+    plain = panel.round_stop(2, 5, [], [c], [], repeated={c.key})
+    empty = panel.round_stop(2, 5, [], [c], [], repeated={c.key}, escalated=["", None])
+    assert plain["stop"] == empty["stop"] is False
+    assert empty["escalated_outstanding"] == []
 
 
 # ---- what makes a quiet round suspect --------------------------------------

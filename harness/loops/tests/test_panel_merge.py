@@ -479,8 +479,13 @@ def test_a_cluster_of_empty_groups_is_not_a_judge_failure(monkeypatch):
 
 # ------------------------------------------------------------------- the payload shape
 
-def run_panel(monkeypatch, judge_reply, findings, capsys, json_out=False, sonar=()):
-    """Drive `run()` with every subprocess stubbed. Returns (report, payload)."""
+def run_panel(monkeypatch, judge_reply, findings, capsys, json_out=False, sonar=(),
+              **run_kwargs):
+    """Drive `run()` with every subprocess stubbed. Returns (report, payload).
+
+    `run_kwargs` reaches `run()` untouched, for the round arguments a cycle
+    passes (`round_no`, `baseline`, `escalated`) — the default call is still the
+    single-pass review every existing caller here means."""
     reviewers = {"codex": {"enabled": True}, "claude": {"enabled": True}}
     if sonar:
         reviewers["sonarqube"] = {"enabled": True}
@@ -503,7 +508,7 @@ def run_panel(monkeypatch, judge_reply, findings, capsys, json_out=False, sonar=
     monkeypatch.setattr(panel_seats, "run_cli", lambda *a, **k: (judge_reply, None))
     recorded = {}
     monkeypatch.setattr(panel, "record_run", lambda p: recorded.update(p))
-    assert panel.run("r", 1609, post=False, json_out=json_out) == 0
+    assert panel.run("r", 1609, post=False, json_out=json_out, **run_kwargs) == 0
     return capsys.readouterr().out, recorded
 
 
@@ -614,6 +619,36 @@ def test_a_skipped_pr_answers_with_the_same_payload_SHAPE_as_a_reviewed_one(
     assert skipped["judged"] is False and reviewed["judged"] is True
     assert skipped["run_key"] and skipped["skip_reason"]
     assert reviewed["skip_reason"] is None
+
+
+def test_an_escalated_key_reaches_the_payload_the_report_and_the_stop(
+        monkeypatch, capsys):
+    """End to end, because the three consumers are three different code paths and
+    #221 is only closed if all three agree: the register in the payload (which the
+    next round inherits), the ⛔ mark on the finding a fixer's brief is built from,
+    and the stopping rule that no longer runs the cycle to its cap over it."""
+    reply = '[{"id":"F1","members":[0],"real":true,"reason":"real"}]'
+    found = find()
+    key = panel._defect_key(found.file, [found])
+    report, recorded = run_panel(monkeypatch, reply, [found], capsys,
+                                 round_no=2, max_rounds=5, escalated=[key])
+
+    assert recorded["escalated"] == {key: 2}
+    assert [f["escalated"] for f in recorded["to_fix"]] == [True]
+    assert recorded["round_stop"]["stop"] is True
+    assert recorded["round_stop"]["confident"] is False
+    assert recorded["round_stop"]["escalated_outstanding"] == [key]
+    assert "⛔" in report and "escalated in round 2" in report
+
+
+def test_a_run_that_escalates_nothing_says_so_in_the_same_shape(monkeypatch, capsys):
+    """The empty case is written down rather than absent: a later round reading
+    this as a baseline must not have to tell "nothing escalated" from "a payload
+    older than the field"."""
+    reply = '[{"id":"F1","members":[0],"real":true,"reason":"real"}]'
+    _, recorded = run_panel(monkeypatch, reply, [find()], capsys)
+    assert recorded["escalated"] == {}
+    assert [f["escalated"] for f in recorded["to_fix"]] == [False]
 
 
 def test_sonar_gate_issues_become_canonical_records_of_their_own(monkeypatch, capsys):

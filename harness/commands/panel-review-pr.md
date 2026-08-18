@@ -403,16 +403,48 @@ no with complete confidence):
   no baseline to compare against. The `veto` list says which. Report it as a stop,
   never as "clean".
 
-**An escalation ends the fix half of the cycle for that finding, and `round_stop`
-cannot see it.** The rule is mechanical, computed from the rounds' payloads, so a
-finding the fixer escalated instead of patching is simply *outstanding* at the next
-round — correctly, because it is — and `stop: false` sends it back to §4. A fresh
-fixer, briefed with that round's findings and no memory of the escalation, then
-writes the patch the last one declined to write: the round that manufactures the
-next round's findings, arriving through the rule that exists to prevent them.
+**An escalation ends the fix half of the cycle for that finding — tell the loop,
+with `--escalated`.** Pass the finding's key on this round and every later one:
+
+```
+python3 ~/.claude/loops/panel.py --pr <pr> --post --round <r> --max-rounds <N> \
+    --escalated <the key the fixer escalated> \
+    --baseline /tmp/tmp.AbC123/r1.json [--baseline …] \
+    --json-file /tmp/tmp.AbC123/r<r>.json
+```
+
+Without it the cycle jams, and the jam is the mechanism defeating itself: the
+finding is outstanding (correctly), no fixer may touch it (correctly), so
+`round_stop` returned `stop: false` every round until the cap — the thing built to
+stop a loop circling a premise guaranteed it ran to the cap. With it, the key is
+subtracted from the work a fix round can clear: the cycle goes again exactly while
+there is other work, stops as soon as only escalations remain, and **never reports
+that stop as convergence** — it takes a veto line, so `confident` is false and the
+reason says a human is owed an answer. The finding stays in the report, marked ⛔.
+
+You only have to pass it once per key: it rides in the payload as
+`escalated: {key: round}` and every later round inherits it through `--baseline`.
+Passing it again is harmless, and the round it was FIRST declared in is what
+survives — a re-declaration cannot re-date the claim.
+
+**The honest limit, and the reason this is a flag rather than a detector.** The
+loop is taking your word for it, and you read that word out of a fixer's prose —
+so the agent whose fix pass produced the finding is, one step removed, the agent
+ending the cycle over it. That is the signal #67's own evidence says cannot be
+self-reported. The key and its round are recorded so the claim is auditable after
+the fact, and the cap still binds; nothing here detects a premise on its own
+(#67's first piece, still unbuilt). Do not escalate to end a cycle you find
+tedious — that is not a loophole, it is the one way to make this number lie.
+
+**A key that names nothing is reported, not silently ignored.** A typo'd
+`--escalated` lands in `config_notes` saying so, because the failure it would
+otherwise cause is invisible: the loop carries on counting a finding you believe
+you excluded.
 
 - **Never re-brief an escalated finding to a fixer.** Not this round, not a later
-  one. It goes to the human with the write-up the fixer produced (§6).
+  one. It goes to the human with the write-up the fixer produced (§6). The ⛔ mark
+  in the panel's own **To fix** list is there so a brief built from that list
+  cannot include it by accident.
 - **Match it by premise, not by key.** The next round is a fresh panel over the
   same code, so it will very likely report the same premise defect again — with a
   **new** `finding_key`, at a different line, in different words, and nothing

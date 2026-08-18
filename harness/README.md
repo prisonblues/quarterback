@@ -111,9 +111,22 @@ question that path exists for. An escalated finding is recorded as `deferred` by
 orchestrator, which relays it, opens an issue that **asks** the premise, and names that issue in
 `deferred_to`. `harness/tests/test_fixer_escalation.py` guards the wiring rather than the
 judgement: that the permission and its report ship together, that the cross-file references to
-step 3a resolve, and that `deferred` is a value the database accepts. What is NOT
-here is measuring recurrence — asking mechanically whether a round is circling the last round's
-fix — which is #67's other half and needs the provenance work in #48.
+step 3a resolve, and that `deferred` is a value the database accepts.
+
+The loop knows about it, which took a second change (#221). An escalated finding is outstanding
+and no fixer may touch it, so under the original stopping rule it earned another round every time
+until the cap ran out — the mechanism built to stop a cycle circling a premise guaranteed it ran
+to the cap. `panel.py --escalated <key>` subtracts the key from the work a fix round can clear:
+the cycle still goes again for everything else, stops as soon as only escalations remain, and
+records that stop with a veto rather than as convergence, because the PR is carrying a question
+only a human closes. The register rides in the payload as `{key: round}` and later rounds inherit
+it through `--baseline`, so a cycle cannot lose the question by forgetting a flag.
+
+What is NOT here is measuring recurrence — asking mechanically whether a round is circling the
+last round's fix — which is #67's other half and needs the provenance work in #48. Until that
+exists, an escalation is a caller's declaration read out of a fixer's own report: the loop takes
+it on trust, records the round it was first made in so it can be audited afterwards, and keeps
+the cap as the backstop.
 
 The same rule shapes how a run's **cost** is measured. Each member is timed, and each one that
 can be is also asked what it spent in tokens — but never by switching its CLI to a JSON output

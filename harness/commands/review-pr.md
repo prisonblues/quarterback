@@ -363,6 +363,8 @@ Files reviewed: N | Findings: N | Fixed: N | Escalated: N | Refuted: N
 
 Escalated — the approach, not the code
 - Premise: <one sentence>
+  Key: <the finding's key, verbatim — the orchestrator passes this to
+       `panel.py --escalated`, and a premise nobody can key stays in the loop>
   Explains: <the finding numbers above it accounts for>
   Removing it costs: <what would have to change, and where>
   Patch not written: <the special case you declined to add>

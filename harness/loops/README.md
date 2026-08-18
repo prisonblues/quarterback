@@ -835,6 +835,42 @@ Two guards worth knowing, because both are cases that read plausibly when wrong:
   produces exactly the review this feature exists to prevent — but it is a behaviour change
   for a repo that set a small budget on purpose. `refuse_over_cap_multiple: 0` switches the
   refusal off and keeps the manifest.
+### A finding no round can close (`--escalated`)
+
+`--escalated <key>` (repeatable) tells a round that a finding's fixer reported the
+**approach** wrong rather than the code and wrote no patch — `review-pr.md` step
+3a. The key stops counting as work a fix round can clear.
+
+It exists because the two rules around it are individually right and were jointly
+a trap. An escalated finding is outstanding, and `panel-review-pr.md` §5 forbids
+ever handing it to another fixer — so `round_stop` returned `stop: false` every
+round until the cap, and the mechanism meant to stop a cycle circling a premise
+guaranteed it ran to the cap instead (#221).
+
+- **The mixed case is why this is a filter and not "stop on any escalation".** One
+  escalation beside a live P2 still goes again, for the P2; the cycle stops when
+  the fixable work is gone rather than when the counter runs out. Stopping the
+  whole cycle on any escalation would throw away the re-review of fixes made in
+  the same pass — the round that, on PR #212, found 16 defects the previous fix
+  introduced.
+- **The stop is never convergence.** It takes a veto line, so `confident` is
+  false by the rule that was already there, and `reason` says a human is owed an
+  answer instead of saying `dry`. Every existing consumer of `confident` — the
+  report, the board record, `preland.py` — needs no new field to get this right.
+- **Declared once, inherited after.** The payload carries `escalated: {key: round}`
+  and later rounds read it out of `--baseline`, so a cycle cannot lose an open
+  premise question by forgetting a flag. The earliest declaration wins a merge:
+  re-passing a key cannot re-date the claim. A skipped round carries the register
+  forward too — it can neither answer an escalation nor add one.
+- **A key naming nothing is reported** in `config_notes` rather than ignored: the
+  alternative failure is silent, since the loop simply carries on counting a
+  finding the caller believes it excluded.
+- **It takes the caller's word, and that is the design's cost.** The keys come
+  from a fixer's prose report, so the agent whose fix pass produced the finding is
+  one step removed from the agent ending the cycle over it — the signal #67 argues
+  cannot be self-reported. The round each key was first declared in is recorded so
+  the claim is auditable, and the cap still binds. Detecting a premise mechanically
+  is #67's first piece and is not built.
 
 ### The premise check (`--ask`)
 
