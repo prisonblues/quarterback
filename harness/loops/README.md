@@ -366,6 +366,18 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
     time is worse than one that is off, because the config still says it is on. A 404
     is not retried — it is a settled answer about that sha (a fork PR, most likely),
     and `run_cli` already draws that line for reviewer CLIs.
+  - **What it costs, measured** (one seat, sonnet, PR #214's own 75,628-char diff,
+    run twice with only this feature differing): wall clock **922s vs 372s** (2.5×),
+    input tokens **7,879,643 vs 159,520** (49×, though 97% of the larger figure was
+    cached so the billed multiple is well below that), output 71,674 vs 36,364.
+    Against that: `could_not_assess` went **4 → 0**, and the blind run filed a FALSE
+    finding the sighted one did not — it saw a diff line mentioning `argv_capped`,
+    could not tell which function it belonged to, guessed `accounts()`, and concluded
+    the name was undefined. That is #90's failure mode reproduced unprompted.
+    The cost lands per seat per round, and `/panel-review-pr` fans out up to four
+    concurrent panels, so this seat is also the critical path. `claude` documents
+    `--max-budget-usd`, which works with `--print`; bounding the hunting with it is
+    the obvious follow-up and is deliberately not in this change.
   - **The judge is not given the tree.** Out of scope here and worth its own change:
     #90's wrong P1 was a reviewer finding the judge *confirmed*, so a reading judge is
     the natural next step rather than a detail of this one.

@@ -83,6 +83,17 @@ the seat is blind, recorded as blind, and the round says why. Three of those pat
 found by writing the tests — an empty tarball made `iterdir` raise
 `FileNotFoundError` straight out of a function whose contract is that it never raises.
 
+**Measured, on this repo's own PR.** One seat, sonnet, PR #214's 75,628-char diff, run
+twice with only this feature differing: 922s against 372s of wall clock, 7,879,643
+against 159,520 input tokens (97% of the larger figure cached, so the billed multiple is
+far below the raw one), 71,674 against 36,364 output. In exchange, `could_not_assess`
+went from four entries to none — and the blind run filed a **false** finding the sighted
+one did not, having seen a diff line that mentions `argv_capped`, been unable to tell
+which function it belonged to, guessed `accounts()`, and concluded the name was
+undefined. #90's failure mode, reproduced without being asked for. The cost is per seat
+per round and `/panel-review-pr` fans out four concurrent panels, so bounding it with
+`claude`'s `--max-budget-usd` (which works with `--print`) is the obvious follow-up.
+
 **Recorded per seat**, which is the half that makes any of this measurable:
 `reviewers.<name>.code_blind` plus a `code_access` block holding the setting, the seats
 that actually got it, and the files stripped. Read back from what each seat recorded
