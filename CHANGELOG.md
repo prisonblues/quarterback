@@ -107,6 +107,24 @@ dataclasses — `SeatAnswer` is constructed positionally, and inserting ahead of
 every ask's verdict to a new field, which surfaced as 19 tests reporting wrong verdicts rather
 than as a type error.
 
+**What this does NOT ship, and why that is the interesting part.** Round 1 raised a speculative
+finding — what if a seat exits 0 having printed nothing but its provider's refusal — which its own
+judge called "plausible and untested". The fix for it was a predicate, `stdout_is_only_errors`,
+and across rounds 2 and 3 that predicate accumulated roughly seven P1/P2 findings of its own. It
+went through three shapes and each was wrong in a new way: dead in both directions at once, then
+blind to the reply nested one level inside `item.completed`, then unable to recognise the very
+`{"error":{...}}` envelope the gateway actually sends. The round-3 finding that settled it: for a
+seat that replies in a FILE — codex, the seat it existed for — the predicate can only ever take a
+review away, because `replied` has already answered the success question. And the real 404 exits
+1, so `cli_outcome` catches it without any of this.
+
+So it is cut, along with the line-anchoring added beside it, which broke recognition of
+`ERROR: {"type":"error",...}` — the shape this module's own `TOO_OLD` fixture uses — in order to
+defend against prose that quotes an envelope. Both were hardening against cases nobody had seen,
+and both cost more than they bought. Three rounds found 22, 24 and 16 findings, of which 18 and 14
+were introduced by the fix pass before them; almost all of that churn was these two. What remains
+is what #215 asked for and what four consecutive live runs demonstrate works.
+
 **Round 2 got the seat back and then found five more things, four of them introduced by the
 fix pass.** With both pins lowered, codex ran for the first time on this host — the first
 two-vendor panel here, and it immediately produced findings claude and codex agreed on, which

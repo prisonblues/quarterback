@@ -122,21 +122,6 @@ def is_permission_denied(stderr: str) -> bool:
 _DECODER = json.JSONDecoder()
 
 
-def _line_start_brace(text: str, frm: int) -> int:
-    """Index of the next `{` that OPENS a line at or after `frm`, else -1.
-
-    Leading whitespace is allowed, so an indented member of a pretty-printed body
-    still qualifies; a brace with anything else before it on its line does not.
-    """
-    at = text.find("{", frm)
-    while at >= 0:
-        nl = text.rfind("\n", 0, at)
-        if not text[nl + 1:at].strip():
-            return at
-        at = text.find("{", at + 1)
-    return -1
-
-
 def _json_values(text: str):
     """Every JSON value in `text`, as `(start, end, value)` — however it is laid out.
 
@@ -155,23 +140,13 @@ def _json_values(text: str):
     brace that starts nothing steps forward by one rather than ending the scan: a
     `{` inside prose must not hide a real envelope printed after it.
 
-    **The `{` has to BEGIN a line** (whitespace before it is fine, which is what
-    keeps pretty-printed bodies working). Dropping the old line-oriented parse for a
-    scan of the whole text fixed the false negative it was written for and bought a
-    false POSITIVE in exchange: a brace anywhere at all was handed to the decoder,
-    so prose quoting an envelope — a stack trace, a reviewer's reply, this file's
-    own docstrings — could be lifted as though the CLI had emitted it. That is not
-    cosmetic once these values decide things: `is_deterministic_failure` suppresses
-    a retry on them, and the pin fallback drops a pin on them. Anchoring costs the
-    embedded case, which was never a real event, and keeps the indented one, which
-    is the whole reason the scan exists. (#219 review, codex.)
-    """
-    at = _line_start_brace(text, 0)
+"""
+    at = text.find("{")
     while at >= 0:
         try:
             value, end = _DECODER.raw_decode(text, at)
         except ValueError:
-            at = _line_start_brace(text, at + 1)
+            at = text.find("{", at + 1)
             continue
         yield at, end, value
         at = text.find("{", max(end, at + 1))
@@ -225,7 +200,7 @@ def error_events(stdout: str) -> list[dict]:
     parses as a JSON object that is an error envelope by one of `_error_body`'s two
     shapes. Reviewer prose does not, and a findings array does not. The cost of a
     false positive is bounded anyway — this is only ever consulted once a seat has
-    already failed, or (see `stdout_is_only_errors`) about a stdout that is nothing
+    already failed — a stdout that is nothing
     else.
     """
     text = stdout or ""
@@ -242,47 +217,6 @@ def error_events(stdout: str) -> list[dict]:
 #: (see :func:`is_effort_unsupported`); an envelope with none of the three is a
 #: marker rather than an account of anything.
 _ERROR_FIELDS = ("message", "param", "code")
-
-#: Fields that make an event the seat's ANSWER rather than its lifecycle. A stream
-#: carrying any of them said something, so a refusal printed beside it is not a run
-#: that produced nothing — see `stdout_is_only_errors`.
-_REPLY_FIELDS = ("text", "content", "delta", "output", "message")
-
-
-def _carries_text(value: object, depth: int = 0) -> bool:
-    """Does this event carry the seat's ANSWER anywhere inside it?
-
-    At any depth, which is the whole point. Reading the event's top level only was
-    wrong against the real thing, and measurably so: codex's reply arrives as
-
-        {"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"ok"}}
-
-    — the text one level down. A top-level read finds nothing, scores that as
-    lifecycle, and `stdout_is_only_errors` then calls a stream that REPLIED an
-    error-only one and throws the review away: the very failure the predicate was
-    narrowed to avoid, reintroduced by the narrowing.
-
-    Captured from a live `codex exec --json` run rather than reasoned about. The
-    #219 ask put the premise to two seats; codex said it held, claude said it could
-    not tell without the reply-event schema and named this exact nesting as how it
-    would fail. Claude was right, and the stream settled it — which is the case for
-    asking a question you can then go and measure.
-
-    Depth-bounded: this walks a structure the CLI produced, and an unbounded walk
-    over one is a stack overflow waiting for a deep reply.
-    """
-    if depth > 6:
-        return False
-    if isinstance(value, dict):
-        for key, sub in value.items():
-            if key in _REPLY_FIELDS and str(sub or "").strip():
-                return True
-            if _carries_text(sub, depth + 1):
-                return True
-        return False
-    if isinstance(value, list):
-        return any(_carries_text(v, depth + 1) for v in value)
-    return False
 
 
 def error_text(stdout: str) -> str:
@@ -307,65 +241,6 @@ def error_text(stdout: str) -> str:
             continue
         lines.append(json.dumps(ev, ensure_ascii=False, separators=(",", ":")))
     return "\n".join(lines)
-
-
-def stdout_is_only_errors(stdout: str) -> bool:
-    """Is this stdout an event stream carrying NOTHING BUT errors — no reply in it?
-
-    The one place these envelopes are used to DECIDE that a run failed rather than
-    to explain one that had already failed, so it is the strictest reader of them.
-    A seat can exit 0, print its provider's refusal and nothing else, and be handed
-    on as a successful run whose reply merely could not be parsed — reported as an
-    unreadable reply and kept as a raw finding for the judge, which is #215's
-    misleading diagnosis one layer up.
-
-    **A stream, not a heap of error objects**, and that is the correction the #219
-    review forced. The first version demanded that every non-blank character outside
-    the `{"type":"error"}` events be gone — which no real stream can satisfy, because
-    codex always prints `thread.started` and `turn.started` alongside anything else.
-    So it could not fire for the seat it was written for even when asked. It was also
-    only asked when `replied is None`, i.e. of the seats whose stdout IS their reply
-    and which never emit that event shape at all. Dead in both directions at once.
-
-    What it asks now: every JSON value in the text is a typed EVENT, at least one of
-    them is an error, none of them carries reply text AT ANY DEPTH, and there is
-    nothing but whitespace between them. A codex stream that refused satisfies that;
-    one that also replied does not.
-
-    The depth is not a detail and was got wrong first: codex nests its answer as
-    `item.completed` → `item` → `text`, so reading the event's top level scored a
-    stream that had replied as lifecycle and discarded the review.
-
-    That shape is also what keeps the false positive cheap, which the review was
-    right to weigh: a seat's REPLY is not a typed event stream. A findings array
-    (`{"findings": [...]}`) has no `type` and fails immediately; a reply that quotes
-    an envelope leaves prose between the braces and fails; a reply that is one bare
-    `{"type":"error"}` and nothing else is indistinguishable from a refusal by any
-    means available here, and calling it a failure is the same answer a human
-    reading that stdout would give.
-    """
-    text = stdout or ""
-    if '"error"' not in text or not text.strip():
-        return False
-    rest, cut, found = [], 0, False
-    for start, end, value in _json_values(text):
-        # Every value has to be an event. One that is not — a findings array, a
-        # bare object — means this stdout is a reply, whatever else is in it.
-        if not (isinstance(value, dict) and isinstance(value.get("type"), str)):
-            return False
-        if value.get("type") == "error":
-            found = True
-        elif _carries_text(value):
-            # A lifecycle event carries no answer; one carrying TEXT is the seat
-            # saying something, and a refusal beside it does not make the run a
-            # failure. Keyed on the payload rather than on a list of event names,
-            # because the names are the CLI's to change and the question — did it
-            # say anything — is not.
-            return False
-        rest.append(text[cut:start])
-        cut = end
-    rest.append(text[cut:])
-    return found and not "".join(rest).strip()
 
 
 def is_effort_unsupported(diag: str) -> bool:
@@ -766,19 +641,7 @@ def run_cli(args: list[str] | Callable[[], list[str]], label: str, timeout: int 
         # is not empty: exit 0 plus that stream used to return here as a SUCCESS
         # whose reply merely could not be parsed, so the seat's own error text was
         # reported as an unreadable reply and kept as a raw finding for the judge —
-        # this issue's misleading diagnosis one layer up, and past the pin fallback
-        # that would have recovered the seat.
-        #
-        # Asked of EVERY seat. Gating it on `replied is None` restricted it to the
-        # seats whose stdout is their reply — precisely the ones that never emit this
-        # event shape — while the seat it was written for answered a different
-        # question one branch up and never reached it (#219 review). For a seat that
-        # replies in a file this is belt and braces with `replied`; for the others it
-        # is inert until one of their CLIs starts printing an event stream, and
-        # `stdout_is_only_errors` is strict enough that a reply cannot look like one.
         errors = error_text(proc.stdout or "")
-        if not outcome and stdout_is_only_errors(proc.stdout or ""):
-            outcome = "exited 0 but reported only errors"
         if not outcome:
             return proc.stdout, None
         took = time.monotonic() - started
@@ -2094,7 +1957,7 @@ __all__ = [
     "run_cli", "record_run",
     "QB_NO_SUBCOMMAND", "record_ask", "diff_budget", "resolve_round_scope",
     "fit_argv_budget", "reviewer_label", "fallback_label", "seat_label",
-    "error_events", "error_text", "stdout_is_only_errors",
+    "error_events", "error_text",
     "is_model_unavailable", "is_effort_unsupported", "codex_args", "antigravity_args",
     "pi_args", "select_reviewers", "_int", "_jsonl",
     "_usage", "claude_usage", "pi_usage", "codex_usage",
