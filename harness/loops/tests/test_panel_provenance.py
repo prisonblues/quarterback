@@ -593,10 +593,18 @@ def _cfg(**budgets) -> dict:
     """A panel of one seat per named reviewer, each with its own diff budget (None
     for the whole diff). The multi-seat shapes are what pin the intersection rule
     the README makes a load-bearing claim about."""
-    return {**CFG, "reviewers": {
-        name: {"enabled": True, "model": "sonnet",
-               **({} if budget is None else {"max_diff_chars": budget})}
-        for name, budget in budgets.items()}}
+    return {**CFG,
+            # These budgets are truncation devices — `codex=20` cuts a seat out of
+            # both files on purpose — and a budget that far under the diff is also
+            # what #138's pre-flight check refuses a round for. The refusal has its
+            # own suite; here it would replace the coverage arithmetic these tests
+            # pin, so it is switched off for every seat shape this helper builds.
+            "review_panel": {**CFG.get("review_panel", {}),
+                             "refuse_over_cap_multiple": 0},
+            "reviewers": {
+                name: {"enabled": True, "model": "sonnet",
+                       **({} if budget is None else {"max_diff_chars": budget})}
+                for name, budget in budgets.items()}}
 
 
 def _panel_round(monkeypatch, tmp_path, round_no, findings, head, baseline=(),

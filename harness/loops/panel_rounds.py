@@ -670,6 +670,19 @@ class Baseline:
     #: :func:`coverage_veto`, or the cheaper round quietly buys its saving out of
     #: coverage nobody is told it lost.
     truncated_rounds: set[int] = field(default_factory=set)
+    #: Earlier rounds that read a MOVE MANIFEST rather than a diff (#138).
+    #:
+    #: Its own set rather than a reading of the other two, because it is a third
+    #: thing. `unread_rounds` means no seat ran; `truncated_rounds` means a seat
+    #: got a prefix of its target. A manifest round's seats all ran and all got
+    #: their whole target — the target WAS the manifest — so neither is true of it
+    #: and the code it reviewed was still read by nobody.
+    #:
+    #: It matters twice. It must not count as having re-read the PR (see `reread`
+    #: below, whose `scope == "pr"` test a manifest round passes while having read
+    #: no code at all), and under increment scope the next round's anchor steps
+    #: over the code it did not read, exactly as it does past an unread round.
+    manifest_rounds: set[int] = field(default_factory=set)
     #: Files that preceding round could not read in full (:func:`_diff_files_cut`).
     #: A new finding in one of them is a coverage failure, not a reviewer miss.
     unread_files: set[str] = field(default_factory=set)
@@ -930,10 +943,28 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
         # as having re-read the PR if at least one seat recorded that it was
         # there. The conservative direction: an old baseline keeps an inherited
         # veto standing rather than silently clearing it.
+        # A manifest round (#138) reviewed the SHAPE of a move and none of its
+        # code. Read off the payload's own verdict, defensively: a payload written
+        # before `preflight` existed has no such key and is not a manifest round,
+        # which is both true and the conservative direction.
+        pre = payload.get("preflight")
+        was_manifest = (isinstance(pre, dict)
+                        and str(pre.get("verdict") or "") == "manifest")
+        if was_manifest:
+            b.manifest_rounds.add(was)
         ran = payload.get("reviewers_ran")
         if isinstance(ran, list) and not ran:
             b.unread_rounds.add(was)
-        elif recorded and not cut and str(payload.get("scope") or "pr") == "pr":
+        # `not was_manifest` is the load-bearing half. A manifest round records
+        # `scope: "pr"` — the manifest travels as the round's material, so it is a
+        # whole-target round by construction — and nothing was truncated, because
+        # the manifest fitted. It therefore satisfied every term of this test while
+        # having read not one line of the diff, and one entry here erases EVERY
+        # earlier round's truncation and unread record. That is the strongest wrong
+        # signal this function can emit: "the PR has been re-read in full", said of
+        # a round that read a summary of a move.
+        elif (recorded and not cut and not was_manifest
+              and str(payload.get("scope") or "pr") == "pr"):
             reread.add(was)
         for bucket in ("to_fix", "dismissed", "sonar_findings"):
             for f in payload.get(bucket) or []:
@@ -958,6 +989,10 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
         newest = max(reread)
         b.truncated_rounds = {r for r in b.truncated_rounds if r > newest}
         b.unread_rounds = {r for r in b.unread_rounds if r > newest}
+        # A manifest round's gap closes the same way and for the same reason: a
+        # later whole-PR round read the code the manifest only described, so a veto
+        # saying otherwise states something the baselines themselves disprove.
+        b.manifest_rounds = {r for r in b.manifest_rounds if r > newest}
     # The commit and the coverage record come from the END of the set rather than
     # from a merge of all of it: `keys` and `titles` are a union over every earlier
     # round ("has anyone raised this before"), while "which commit did the fix pass

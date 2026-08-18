@@ -629,6 +629,20 @@ class ReviewScope:
     #: supply them separately is letting the three disagree.
     near: str = field(default="", init=False)
     far: str = field(default="", init=False)
+    #: What labels the material under "pr" scope. Defaults to
+    #: :data:`PR_SCOPE_HEADER`, so every round that has ever run is byte-identical
+    #: to before; it is a parameter at all because #138's move manifest travels
+    #: through this class as its `diff` and must not be announced as one.
+    #:
+    #: Substituting the material rather than adding a fifth review mode is what
+    #: keeps the manifest inside the machinery it needs: per-seat budgets, the
+    #: truncation measurement, the judge seeing what the parties saw, the board
+    #: record and the rounds arithmetic all work on `diff` and none of them had to
+    #: learn a new shape. What they then measure is the manifest's own length,
+    #: which is the honest thing to measure — "was this seat handed the whole
+    #: manifest" is the question, and the PR's char count is recorded separately
+    #: in the pre-flight block.
+    header: str = PR_SCOPE_HEADER
 
     def __post_init__(self) -> None:
         if self.scope != "increment":
@@ -850,7 +864,7 @@ class ReviewScope:
             # what it has always been. The overhead below is a fact about the
             # scoped prompt, which did not exist before v2.28.
             body = _fit_parts([self.diff], budget)[0]
-            return f"{PR_SCOPE_HEADER}\n{body}", len(body), 0
+            return f"{self.header}\n{body}", len(body), 0
 
         brief = brief_template.format(
             round_no=self.round_no,

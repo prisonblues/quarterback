@@ -188,6 +188,38 @@ DEFAULTS: dict = {
         # function and its neighbours, and nowhere near a file nobody meant to
         # send. Over budget is CLAMPED and said, per spec, like a round's diff.
         "ask_max_context_chars": 60_000,
+        # The pre-flight verdict (#138): whether a round is worth running at all,
+        # and whether the diff or a manifest of it is what a seat should read.
+        #
+        # These are NOT a diff budget and must not become one. v2.16/#49 refused a
+        # default budget on evidence — truncating when nothing forces it biases
+        # toward false positives — and that stands. A budget says what to SEND;
+        # these decide whether to START, and only ever against a ceiling that
+        # already exists: `max_diff_chars`, or the kernel's argv limit on the one
+        # seat whose prompt travels in argv. With `max_diff_chars` null and no
+        # argv-bound seat enabled there is no ceiling, so none of this fires and
+        # no number invented here reaches anyone's diff. That is why they are ON by
+        # default and still "the safe end of the switch": the default configuration
+        # behaves exactly as it did before them.
+        #
+        # How many times over the tightest seat ceiling a diff may be before the
+        # round is REFUSED rather than truncated. Over the ceiling is ordinary
+        # truncation and has been reported as such since #75; this is for the case
+        # where truncation has stopped being a caveat and become the review. PR
+        # #137 was 6.4x on a 763,375-char diff, and four seats ran at full effort
+        # against it. 0 or null switches the refusal off and keeps the manifest.
+        "refuse_over_cap_multiple": 3,
+        # What fraction of the larger side of a diff must be relocated text — a
+        # line that appears as both a delete and an add — before the change counts
+        # as a move rather than as content. High, because identical boilerplate
+        # matches itself across unrelated files; see DEFAULT_MOVE_SHAPE_RATIO.
+        "move_shape_ratio": 0.9,
+        # Review a move-shaped over-ceiling diff as a MANIFEST (what moved where,
+        # what did not survive, what changed besides moving, which definitions now
+        # exist twice) instead of as content. False falls back to the refusal,
+        # which is strictly less useful: a manifest is a question a reviewer can
+        # answer about a move, and re-reading relocated code is not.
+        "manifest_moves": True,
     },
     "loops": {
         "dependabot_lander": False,

@@ -190,28 +190,17 @@ CLI_BIN = {"antigravity": "agy"}
 # of the dict just built above it.
 SEAT_MODEL_DEFAULTS = {"claude": "sonnet"}
 
-REVIEW_PROMPT = """You are reviewing a pull request diff to the same exhaustive standard as a
-senior reviewer whose bar is "nothing left to improve". The marginal cost of completeness is
-near zero: report EVERYTHING you spot, across every dimension below — do NOT self-censor a
-finding because it seems "minor" or "just style". A later master judge filters false positives;
-your job is breadth, not triage.
-
-Review for:
-- Correctness: logic bugs, off-by-ones, race conditions, boundary conditions, null/None handling
-- Security: injection, auth bypass, secrets in code, path traversal, SSRF, unsafe deserialization
-- Error handling: swallowed errors, missing validation, silent failures, unhelpful messages
-- Concurrency: async pitfalls, missing awaits, shared mutable state, transaction isolation
-- Performance: N+1 queries, unbounded iterations, missing indexes, unnecessary allocations
-- Test coverage: new code paths, bug fixes, or edge cases visible in the diff that lack a test
-- Documentation: behaviour changes that leave CLAUDE.md, docs, README, or docstrings stale
-- Related code: callers, siblings, or parallel implementations that should change to stay consistent
-- Craft: naming, complexity, dead code, redundant conditions, project-convention/style breaks, DRY
-
-Severity: P1 blocks merge (correctness/security) · P2 important (error handling, test gaps,
-logic flaws) · P3 should fix (style, naming, simplifications) · P4 polish (minor consistency).
-Report all of them.
-
-Return ONLY a JSON object (no prose):
+#: The reply contract, shared VERBATIM by every prompt that asks a seat for
+#: findings — the review and the move manifest (#138). Shared rather than copied
+#: because :data:`SCHEMA_ECHOES` identifies a prompt's own example by comparing a
+#: reply against it: two prompts with two hand-kept copies of this block are one
+#: edit away from a manifest run in which the example parses as a finding nobody
+#: made. One string means the echo detection covers both by construction.
+#:
+#: It ends with the material itself, so both prompts take the same `.format` keys
+#: (`ci`, `n`, `repo`, `base`, `diff`) and a caller can swap one for the other
+#: without knowing which it holds.
+_FINDINGS_ENVELOPE = """Return ONLY a JSON object (no prose):
   {{"findings": [{{"severity": "P1|P2|P3|P4", "file": "path", "line": <int|null>,
                   "title": "...", "detail": "...", "needs_rereview": true|false}}],
     "could_not_assess": ["..."]}}
@@ -233,6 +222,70 @@ whether another review will be needed — you cannot observe findings you have n
 PR #{n} ({repo}), base={base}:
 {diff}
 """
+
+REVIEW_PROMPT = """You are reviewing a pull request diff to the same exhaustive standard as a
+senior reviewer whose bar is "nothing left to improve". The marginal cost of completeness is
+near zero: report EVERYTHING you spot, across every dimension below — do NOT self-censor a
+finding because it seems "minor" or "just style". A later master judge filters false positives;
+your job is breadth, not triage.
+
+Review for:
+- Correctness: logic bugs, off-by-ones, race conditions, boundary conditions, null/None handling
+- Security: injection, auth bypass, secrets in code, path traversal, SSRF, unsafe deserialization
+- Error handling: swallowed errors, missing validation, silent failures, unhelpful messages
+- Concurrency: async pitfalls, missing awaits, shared mutable state, transaction isolation
+- Performance: N+1 queries, unbounded iterations, missing indexes, unnecessary allocations
+- Test coverage: new code paths, bug fixes, or edge cases visible in the diff that lack a test
+- Documentation: behaviour changes that leave CLAUDE.md, docs, README, or docstrings stale
+- Related code: callers, siblings, or parallel implementations that should change to stay consistent
+- Craft: naming, complexity, dead code, redundant conditions, project-convention/style breaks, DRY
+
+Severity: P1 blocks merge (correctness/security) · P2 important (error handling, test gaps,
+logic flaws) · P3 should fix (style, naming, simplifications) · P4 polish (minor consistency).
+Report all of them.
+
+""" + _FINDINGS_ENVELOPE
+
+MOVE_MANIFEST_PROMPT = """You are reviewing a MOVE, and you are deliberately NOT being given its
+diff. Read the brief below before the manifest — the question you are being asked is not the one
+a diff review asks, and answering the other one would waste the round.
+
+This change is move-shaped: its added lines are a near-permutation of its deleted ones, measured
+mechanically, so almost every line in the diff appears TWICE — once as a delete and once as an
+add. It is a rename, a file split, a relocation, or several of those. The bulk of that text is
+code nobody changed, and it is code that is already in the base branch and was already reviewed
+when it landed there. A finding about it is a finding about the base branch: it costs the cycle a
+fixer briefed to resolve it against a refactor, and it is worth less than nothing.
+
+So do not review the moved code. Review the MOVE. Four questions, and they are the whole job:
+
+1. **What did not survive.** Lines deleted and not re-added anywhere are listed below. For each,
+   is it a deliberate deletion or a casualty of the move? A dropped guard clause, an `except`
+   arm, a decorator, a default argument or a `del`/cleanup line is the failure this section
+   exists to catch. Say which you cannot tell from the manifest alone.
+2. **What changed besides moving.** Lines added and not deleted anywhere are listed below: this
+   is the ONLY genuinely new code in the change, and it is where a content review belongs. Read
+   it as closely as you would read a small PR. A move that quietly rewrites logic while nobody
+   is reading is the thing a manifest review is most likely to miss.
+3. **Duplicated definitions.** A move that keeps BOTH copies of a definition is a clean merge, a
+   green test run and a silent bug — the later binding wins, the earlier one is dead, and the
+   dead one is the one anybody reading the old file will find. Names added in more than one place
+   are listed; each one is a finding unless there is a reason it is not.
+4. **What the manifest cannot tell you.** Say it. Test counts before and after, whether a module
+   now reaches backward into another, and whether the destination files import what they now
+   need are all facts about a move that the diff cannot answer — they need the branch checked
+   out. Put each one in `could_not_assess` rather than assuming it is fine, and rather than
+   guessing.
+
+Do NOT report: relocated code, its style, its naming, or anything you would only have seen by
+reading the moved text. There is none of it here to read, and inventing findings about it from
+the file names in the manifest is the failure mode this prompt replaces.
+
+Severity: P1 blocks merge (something was lost, or a definition is duplicated) · P2 important (new
+logic smuggled into a move, an unverifiable claim nobody has checked) · P3 should fix · P4 polish.
+Report all of them.
+
+""" + _FINDINGS_ENVELOPE
 
 JUDGE_PROMPT = """You are the lead reviewer ("master") making the FINAL call on review findings for
 a pull request diff, held to the standard "nothing left to improve". The reports below come from
@@ -1594,7 +1647,8 @@ __all__ = [
     "DEFAULT_ROUND_SCOPE", "ROUND_SCOPES", "CLI_TIMEOUT", "BLANK_RETRY_MAX_S",
     "CLI_ABSENT", "ARGV_PROMPT_MAX_BYTES", "SEVERITIES", "MAX_LISTING_CHARS",
     "LISTING_ACCOUNT_CHARS", "COMMENT_CHARS", "ROUNDS_HEADING", "LLM_REVIEWERS",
-    "ALL_REVIEWERS", "CLI_BIN", "SEAT_MODEL_DEFAULTS", "REVIEW_PROMPT",
+    "ALL_REVIEWERS", "CLI_BIN", "SEAT_MODEL_DEFAULTS", "_FINDINGS_ENVELOPE",
+    "REVIEW_PROMPT", "MOVE_MANIFEST_PROMPT",
     "JUDGE_PROMPT", "ASK_PROMPT", "Finding", "ReviewerRun",
     "PanelResult", "sh", "load_repo_cfg", "_spans",
     "ENVELOPE_KEYS", "DECLARATION_KEYS", "_scalar", "_Tok",

@@ -11,6 +11,128 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
+## vNEXT — the panel decides whether the round is worth running
+
+A panel was launched on PR #137 and killed five minutes in by a human asking *"is
+this a crazy token count?"*. It was, and the more important half is that **the
+output would have been worth less than nothing.** Nothing in the harness knew
+that. It dispatched four seats at full effort against a diff it could not usefully
+read, and would have gone on to brief a boil-the-ocean fixer with whatever came
+back.
+
+**The pieces to catch it all existed and none of them was wired to the decision.**
+The truncation report says `N of M configured` and names the cut seats — in
+`config_notes`, after the round, when it is already spent. The ~120,000-byte argv
+ceiling is written down as a permanent property of the harness and gates nothing.
+Increment scope makes *later* rounds cheaper, and round 1 on a 763 KB diff is
+exactly the case it does not help. So the gap was specific: there was no
+pre-flight verdict on whether a round was worth starting at all.
+
+**Size and shape are different quantities and the panel only modelled one.** PR
+#137's diff was 763,375 chars, 6.4× the ceiling, on a change that was a **pure
+move** — `panel.py` split into six modules with nothing retyped. Every relocated
+line appears twice, once as a delete and once as an add, so the bulk of that
+763 KB is code nobody changed, already in `main` and already reviewed when it
+landed there. A finding about it is a finding about the base branch. The token
+cost is the second problem; the first is that a truncated read which *produces
+findings* is worse than no review, because the next step of the cycle briefs a
+fixer to resolve every one of them to a "nothing left to improve" bar. The review
+manufactures work.
+
+**A move is now identified mechanically and reviewed as a manifest.** Its added
+lines are a near-permutation of its deleted ones — a multiset comparison of the
+diff text already in hand, needing no `git diff -M` and no checkout of a PR the
+panel never checks out. A move-shaped diff over a seat's ceiling gets a **manifest**
+instead of content: what moved where, what did NOT survive, what changed *besides*
+moving, and which definitions now exist in more than one place. That last one is
+the duplicate-copy trap — a merge that keeps both copies of a moved function is a
+clean merge, a green test run and a silent bug, because the later binding wins and
+the dead one is what anybody reading the old file finds. The manifest's size tracks
+the change's shape rather than the diff's length: the 428 KB worked example in the
+suite produces 1.3 KB. It travels as the round's review material, so the per-seat
+budgets, the truncation measurement, the judge and the board record all keep
+working unchanged.
+
+**What it cannot measure, it names.** PR #137 was also judged on identical test
+counts before and after and an AST closure check showing no module reaching
+backward into another. Both need the branch checked out and the panel has only the
+diff, so the manifest lists them as unmeasured and the brief tells the reviewer to
+declare them — rather than inventing the two facts a reader would most want to rely
+on.
+
+**A diff far over the ceiling with no smaller honest question is refused, loudly.**
+Printed under "Panel REFUSED — no review happened", stating in its first sentence
+that this is not a clean review, followed by the measurement and the remedies.
+`reviewed: false`, a `skip_reason`, the full `preflight` block in the payload —
+**and recorded on the board**, unlike the title-pattern skip. That difference is
+the design: a title skip says this PR was never worth a panel, a refusal says a
+panel was wanted and this diff defeated it. Under `--post` it goes on the PR too,
+because the terminal copy is read by whoever is watching and under the epic driver
+nobody is. `--force` overrides it and cannot erase it: `preflight.would_have`
+records the verdict, and both the report and the PR comment carry the warning.
+
+**It is not a default diff budget and it must not become one.** v2.16 refused one
+on evidence — truncating when nothing forces it biases toward false positives — and
+that reasoning is untouched. A budget answers *what to send*; this answers *whether
+to start*, and only ever against a ceiling the repo or the kernel already declared.
+On a repo with `max_diff_chars` unset and no argv-bound seat enabled there is no
+ceiling, none of this fires, and no number it invented reaches anyone's diff. Three
+keys govern it: `refuse_over_cap_multiple` (3), `move_shape_ratio` (0.9),
+`manifest_moves` (true).
+
+**Two guards, both for cases that read plausibly when wrong.** A manifest is
+substituted only when it is *smaller* than the diff — its brief is a fixed ~1.3 KB,
+so on a small move over a small ceiling the substitution would hand a seat more text
+than the diff did and then truncate it; that is measured, not assumed, and a
+manifest that does not help falls through to the refusal with a reason saying it was
+tried. And the refusal notice refuses to render a verdict that is not a refusal:
+handed a `run` it would print "**Why:** ." over a measurement table and a list of
+remedies, a document that reads exactly like a refusal and names no reason. That is
+not hypothetical — it is what the first hand-run of it produced.
+
+**And two ways a refusal or a manifest could still have read as a clean round.**
+A refused run is recorded, so it now sends a `reviewers` block marking every
+selected seat as not run: the board builds a scorecard row per name in
+`reviewers_selected` and, with no such block, assumes a member ran unless `skipped`
+names it — so a refusal would have been filed as a clean review *per reviewer*, in
+the table that answers which reviewer finds the real issues. And a manifest's
+material is a whole-target composition, which flipped `scope` from `increment` to
+`pr` and silently skipped three inherited coverage vetoes gated on it — so a
+move-shaped round 2 could stop confidently over gaps earlier rounds left. What a
+round **targeted** and the shape of the material it composed are two different
+facts; only the second one changes.
+
+**A seat whose CLI this box does not carry declares no ceiling.** `agy` is a
+workstation package, so on a headless box this repo's rules enable a seat that
+records "antigravity: CLI absent" and never runs — and its argv ceiling would
+otherwise have refused rounds on behalf of a reviewer that was never going to read
+anything, on exactly the unattended hosts where nobody is watching to pass
+`--force`. The host predicate is resolved in the function body rather than as a
+default argument, which is what makes it replaceable: bound in the signature it made
+`monkeypatch.setattr` a no-op, and ten tests passed on a workstation while reading
+the real PATH. The suite now runs green both with the vendor CLIs present and with
+them hidden.
+
+**A manifest round does not count as having re-read the PR.** It records `scope:
+"pr"` with nothing truncated — the manifest travels as the round's material and it
+fitted — so it satisfied every term of the baseline's re-read test while having read
+no code at all, and one such entry erases *every* earlier round's truncation record.
+It is now tracked as its own thing (`Baseline.manifest_rounds`), it vetoes a
+confident stop on the round itself, and under increment scope a later round carries
+a veto naming it, because the anchor steps over the code the manifest only described.
+A round that genuinely re-reads the whole PR clears it. And the verdict is weighed on
+the **review target** rather than the PR, so a round 2 whose material is a 3 KB fix
+commit is not refused for the size of the 763 KB PR it lands in.
+
+**One behaviour change to know about:** a tightly configured `max_diff_chars` can
+now trigger a refusal. `max_diff_chars: 30` on a 1,559-char diff is 52× over, and a
+seat handed 2% of a PR produces exactly the review this prevents — but a repo that
+chose a small budget deliberately gets a new answer. `refuse_over_cap_multiple: 0`
+switches the refusal off and keeps the manifest.
+
+The irony worth keeping: the PR that makes every module fit the seat that has to
+read it produced a diff that same seat could not read.
+
 ## v2.47 — the dashboard grows hands, and its tests start running
 
 The seat screen could tell you what was happening and not much else could be

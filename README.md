@@ -610,6 +610,21 @@ full — including what was broken before it, which is the part no diff recovers
   this machine's checkout, cherry-pick a located SHA, resume a session — and the refusals those
   inherit, where "could not tell" counts as a no. Not a third client: it consumes the same
   `mcp/mcp_server/client.py` the MCP server does, which is also how that package finally got CI.
+- **vNEXT** — the panel decides whether the round is worth running. It used to dispatch every
+  configured seat at full effort whatever the diff: on PR #137 that was four seats against
+  763,375 chars, 6.4× the argv ceiling of the one seat whose prompt travels in argv, on a change
+  that was a *pure move* — `panel.py` split into six modules with nothing retyped. Every
+  relocated line appears twice in a diff, so the bulk of it was code already in `main` and
+  already reviewed, and a finding about it is a finding about the base branch. The token cost was
+  the second problem; the first is that a truncated read which produces findings is worse than no
+  review, because the next step briefs a fixer to resolve every one of them. The panel now
+  measures **shape** as well as size — a move's added lines are a near-permutation of its deleted
+  ones — and either reads the diff, reads a **manifest** of a move (what moved where, what did not
+  survive, what changed besides moving, which definitions now exist twice), or **refuses** the
+  round loudly: printed, `reviewed: false`, recorded on the board and posted to the PR, because
+  "no review" must never read as "clean". `--force` overrides it and is recorded doing so. None of
+  it fires where no ceiling was declared: this decides *whether to start*, never *what to send*,
+  and v2.16's refusal of a default diff budget stands.
 - **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
   object store; wire `landed` refs to a cherry-pick helper.
 

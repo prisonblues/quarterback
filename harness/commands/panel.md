@@ -38,11 +38,26 @@ panel just adds independent reviewers + hard CI/Sonar gates on top of that bar.
    its reviewer CLIs concurrently, so a dozen at once only makes every one of them slower. Each
    sub-agent must get `--repo <abs repo path>` explicitly — its cwd is not guaranteed to be your
    checkout, and `--repo` defaulting to cwd would silently panel the wrong repo — and returns just
-   the step-5 summary for its PR, so no PR's diff or reviewer output lands in your context. A
+   the step-5/6 summary for its PR, so no PR's diff or reviewer output lands in your context. A
    `--reviewers` list applies to every PR in the run. **One PR failing does not stop the others:**
    an unreadable PR or a dead reviewer CLI is that agent's report to make, and the rest run to
    completion.
-5. Show the user the output: **To fix** (master-confirmed, any reviewer count), **Dismissed by
+5. **A refused or manifest round is not a clean round — report it as what it is.** Before
+   dispatching a seat the panel rules on whether the round is worth running (see
+   `loops/README.md`, "the pre-flight verdict"). Read `preflight.verdict` from the payload, or
+   the warning the report prints above the findings:
+   - `refuse` — **nobody reviewed anything.** The payload is `reviewed: false` with a
+     `skip_reason`. Never summarise this as a clean PR or as "no findings": say the panel
+     declined, quote its reason, and give the user the remedies it named (split the PR, raise
+     the cap, or re-run with `--force`). Do not pass `--force` yourself unless the user asks
+     for it — the refusal is the tool's decision, and overriding it silently is the bug the
+     check exists to prevent.
+   - `manifest` — the change is move-shaped and the seats were asked what *moved*, not whether
+     the code is correct. **The moved code was not read by anybody.** Report the findings as
+     answers about the move (what did not survive, what changed besides moving, duplicated
+     definitions) and say explicitly that its correctness is carried over from when it landed
+     on the base branch, not established here.
+6. Show the user the output: **To fix** (master-confirmed, any reviewer count), **Dismissed by
    master**, **SonarCloud issues**, any skipped reviewers, and the **Coverage declared** block —
    what each reviewer said it could not assess, and any reviewer the panel truncated. A clean
    panel whose reviewers each read half the diff is not a clean PR, and the finding list alone
@@ -63,6 +78,10 @@ Notes:
 - `antigravity` is off unless a repo's `.harness-rules` enables it — its CLI (`agy`) is workstation-only (personal
   Google account, so it never reaches the work box). `--reviewers` still runs it on demand anywhere
   the CLI exists.
+- `--force` overrides a pre-flight refusal (and the manifest substitution) and reviews the diff
+  as content. Pass it only when the user asked for it. What it overrode is recorded in
+  `preflight.would_have`, printed above the findings and posted to the PR — an override is a
+  decision, not a way of avoiding one.
 - The master judge is always `claude`, whoever the reviewers are. `--reviewers antigravity` on a machine
   without the claude CLI therefore returns findings **unjudged** rather than adjudicated — the report
   says so, and every finding is kept.

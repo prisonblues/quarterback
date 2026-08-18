@@ -933,6 +933,16 @@ def test_rounds_are_named_in_the_plural_when_there_are_several():
 
 # --------------------------------------------------------------- the whole round
 
+#: Every test below that forces truncation does it with a budget far under the
+#: diff, which is also what #138's pre-flight check refuses a round for — a
+#: 30-char cap on a 1,559-char diff is 52x over, and the panel now declines to
+#: dispatch rather than review 2% of a PR. That refusal is deliberate and has its
+#: own suite; here it would replace the truncation these tests exist to pin, so it
+#: is switched off explicitly rather than worked around with a bigger diff. `0`
+#: means "never refuse on size", and it leaves every other part of the round
+#: (including the truncation report) exactly as it was.
+NO_REFUSAL = {"refuse_over_cap_multiple": 0}
+
 CFG = {"github": "acme/board", "path": "/tmp/acme-board", "name": "board",
        "reviewers": {"claude": {"enabled": True, "model": "sonnet"}},
        "review_panel": {}}
@@ -1116,7 +1126,7 @@ def test_a_budget_under_the_target_is_truncation(monkeypatch, tmp_path):
     """The one thing that must never pass silently: a reviewer handed a prefix of
     the thing it is reviewing cannot see what it was not given."""
     seen = {}
-    cfg = dict(CFG, review_panel={"max_diff_chars": 30})
+    cfg = dict(CFG, review_panel={"max_diff_chars": 30, **NO_REFUSAL})
     got = _round(monkeypatch, tmp_path, seen, cfg=cfg, baselines=[_baseline(tmp_path)])
     assert got["diff_truncated"] is True
     assert got["reviewers"]["claude"]["truncated"] is True
@@ -1135,7 +1145,7 @@ def test_a_budget_that_cannot_pay_for_the_frame_says_the_prompt_ran_over(monkeyp
     window. Silent, the one contract a caller sets this number for ("the budget
     buys the whole prompt") would fail where it matters most."""
     seen = {}
-    cfg = dict(CFG, review_panel={"max_diff_chars": 30})
+    cfg = dict(CFG, review_panel={"max_diff_chars": 30, **NO_REFUSAL})
     got = _round(monkeypatch, tmp_path, seen, cfg=cfg, baselines=[_baseline(tmp_path)])
     assert len(seen["prompts"]["claude"]) > 30
     assert any("does not fit the budget it was given for claude" in n

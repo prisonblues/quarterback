@@ -53,6 +53,26 @@ Each reviewer also declares what it could *not* assess, and the panel records wh
 saw only a prefix of the diff. A finding count reports "clean" and "I could not tell" as the
 same zero; those two columns are what tell them apart, on the PR comment and on the board.
 
+Before any of that, the panel **rules on whether the round is worth running**. It used to
+dispatch every configured seat at full effort whatever the diff, and on PR #137 that meant
+four seats against 763,375 chars — 6.4× the argv ceiling of the one seat whose prompt travels
+in argv — on a change that was a *pure move*, `panel.py` split into six modules with nothing
+retyped. Every relocated line appears twice in a diff, so the bulk of that was code nobody
+changed, and a finding about it is a finding about the base branch. The token cost was the
+second problem; the first is that a truncated read which produces findings is worse than no
+review, because the next step briefs a fixer to resolve every one of them.
+
+So the panel now measures the diff's **shape** as well as its size — a move is mechanically
+identifiable, because its added lines are a near-permutation of its deleted ones — and does
+one of three things. A diff that fits runs as it always did. A move-shaped diff that does not
+fit is reviewed as a **manifest**: what moved where, what did *not* survive, what changed
+besides moving, and which definitions now exist in more than one place. A diff far over every
+seat's ceiling with no smaller honest question to ask is **refused**, loudly — printed,
+recorded on the board and posted to the PR, because "no review" must never read as "clean" —
+and `--force` overrides it on the record. None of it fires on a repo that declared no
+ceiling: this decides *whether to start*, never *what to send*, and the deliberate absence of
+a default diff budget stands. `loops/README.md` has the whole rule.
+
 This is the piece with the tightest board coupling, and the reason the two halves ship
 together. A panel run is a controlled comparison — one diff, several models, one judge —
 and it used to evaporate when the process exited. Each run now records itself
