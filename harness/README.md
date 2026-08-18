@@ -449,18 +449,39 @@ starting them.
 
 `qb-dash-tui` is a fourth pane for the right-hand side: fleet state, where the board pane
 along the bottom (the **tape**) is the event stream. Who is alive and on what, who holds
-which claim and for how long, every open PR with its CI verdict, and every open issue with
-whoever has claimed it. Rows are clickable — a seat jumps the tmux cursor to that seat's
-pane, a claim shows its note, a PR or an issue opens on GitHub. `qb-dash` is the same four
-views rendered without interaction, for a terminal that will not forward mouse events.
+which claim and for how long, what the fleet agreed to do next, every open PR with its CI
+verdict, and every open issue with whoever has claimed it. Rows are clickable — a seat jumps
+the tmux cursor to that seat's pane, a claim shows its note, a plan item explains why it is
+where it is, a PR or an issue opens on GitHub. `qb-dash` is the same five views rendered
+without interaction, for a terminal that will not forward mouse events.
 
 **Clicking starts work, not just navigation.** Each PR row carries a `⚖` and each issue row
 a `⚒`; clicking one opens a confirmation showing the exact command, and confirming runs
 `/panel-review-pr <n>` or `/fix-issue <n>` in a detached tmux window of its own — the same
 way `qb-seat` starts an agent, so what it starts is a real session you can attach to, read
 and interrupt. Clicking anywhere else on the row still opens the thing on GitHub. The keys
-are `o` open, `p` panel-review, `f` fix the selected issue, `r` refresh, `?` the list,
-`q` quit.
+are `o` open, `p` panel-review, `f` fix the selected issue or plan item, `r` refresh, `?`
+the list, `q` quit.
+
+**The plans panel is the one that says what the work is FOR.** FLEET says who is here and
+CLAIMED says what they hold; neither answers why. `PLANS` is the board's plan — every repo's
+ordered list, plus the fleet-wide one — with the items somebody is running at the top, then
+the ones that are free, then the blocked ones, which are the band a reader can do nothing
+about. Inside each band the board's own order is kept, because the order is the point of a
+plan, and the repos this dashboard watches come before the ones it only overhears. A row
+shows `▶` running with its holder, `○` free with how long it has sat, or `⊘` blocked with
+what it waits on. Clicking one puts its phase, its claim note, its blockers and its own note
+on the detail line: that reasoning lives on the board and nowhere else — a plan item never
+restates its issue — and it does not fit in a title cell.
+
+A plan item that points at an issue carries a `⚒` like an issue row, so the shortest path
+from "what is next" to somebody doing it is one click. An item pointing at nothing, or one
+somebody already holds, says so rather than swallowing the click. The `⚒` refuses an issue
+belonging to a repo this dashboard only watches: `/fix-issue` takes a bare number and reads
+the repository off the checkout it runs in, so starting one from the wrong pane would land
+that number on whatever issue wears it there. A plan claim is keyed `plan:<uuid>`, which is
+right for a lock and unreadable on a pane, so CLAIMED resolves it against the plan and shows
+the item's title instead.
 
 **The issues panel is the one that feeds the fleet.** A seat picks unclaimed work off the
 board, so what matters is which issues nobody holds: the free ones sort to the top, and a

@@ -64,6 +64,15 @@ def _why_skip() -> str | None:
 pytestmark = pytest.mark.skipif(_why_skip() is not None, reason=_why_skip() or "")
 
 
+def _numbered_cell(row) -> str:
+    """The '#123' cell of a rendered row, whatever column it currently sits in."""
+    for cell in row:
+        text = str(cell).strip()
+        if text.startswith("#") and text[1:].isdigit():
+            return text[1:]
+    raise AssertionError(f"no #number cell in row: {[str(c) for c in row]}")
+
+
 def _need_rows(table, what: str, err: str | None) -> None:
     """A click test needs something to click, and live data is not guaranteed.
 
@@ -90,6 +99,17 @@ def test_the_scales_icon_reviews_and_the_rest_of_the_row_opens():
     public PR, so the click must not start one on its own.
     """
     assert asyncio.run(_drive_panel()) == []
+
+
+def test_a_plan_row_explains_itself_and_its_hammer_takes_the_issue():
+    """The plan panel's two verbs.
+
+    A plan item's note is the reasoning behind its place in the order — it is on
+    the board and nowhere else, so a click has to be able to reach it. And the ⚒
+    is the shortest path from "what is next" to somebody doing it, which is the
+    whole reason the plan is on this screen at all.
+    """
+    assert asyncio.run(_drive_plan()) == []
 
 
 def test_the_hammer_starts_a_fix_and_the_rest_of_the_issue_row_opens():
@@ -170,8 +190,11 @@ async def _drive_issues() -> list[str]:
         issues = app.query_one("#issues")
         _need_rows(issues, "issues", app.issue_err)
         # Read the number off the RENDERED first row rather than re-deriving the
-        # order here: what the click has to match is the row a human sees.
-        top = int(str(issues.get_row_at(0)[2]).lstrip("#"))
+        # order here: what the click has to match is the row a human sees. Found
+        # by its "#" rather than by column index — the panels grew a repo column
+        # between the issue number and the icons, and a hardcoded index made this
+        # fail with `int('quarterback')` rather than saying what moved.
+        top = int(_numbered_cell(issues.get_row_at(0)))
 
         # The ⚒ column asks first, the same as the ⚖ does.
         await pilot.click(issues, offset=(app_module.Dash.FIX_COLUMN + 2, 1))
@@ -208,6 +231,67 @@ async def _drive_issues() -> list[str]:
         else:
             await pilot.press("escape")
             await pilot.pause(0.2)
+
+    return failures
+
+
+async def _drive_plan() -> list[str]:
+    app_module = _load_app()
+    app = app_module.Dash(interval=3600, gh_interval=3600, plan_interval=3600)
+
+    started: list[tuple[str, str]] = []
+    app.run_in_window = lambda name, command: started.append((name, command))
+
+    failures: list[str] = []
+    async with app.run_test(size=(100, 50)) as pilot:
+        for _ in range(40):
+            await pilot.pause(0.25)
+            if app.query_one("#plan").row_count:
+                break
+        plan = app.query_one("#plan")
+        _need_rows(plan, "plan items", app.plan_err)
+
+        # Anywhere but the ⚒: the detail line, and it must name the row clicked.
+        await pilot.click(plan, offset=(40, 1))
+        await pilot.pause(0.3)
+        title = str(plan.get_row_at(plan.scroll_offset.y)[4]).rstrip("…")
+        if title and title not in app.detail_text:
+            failures.append(f"the detail line does not describe the row clicked: "
+                            f"{app.detail_text[:80]!r}")
+
+        # The ⚒, on a row that actually has an issue behind it. Which row that is
+        # depends on today's plan, so it is found rather than assumed — and what
+        # it should do is read off the row the table actually scrolled to, not
+        # off the index asked for: scrolling near the end of a list stops short.
+        import qbdata as qd
+        ordered = qd.sort_plan(app.plan)
+        wanted = next((n for n, i in enumerate(ordered)
+                       if qd.plan_issue(i) and not i.get("claim")), None)
+        if wanted is None:
+            pytest.skip("no free issue-backed item on the plan today — nothing to take")
+        plan.scroll_to(y=wanted, animate=False)
+        await pilot.pause(0.3)
+        landed = ordered[plan.scroll_offset.y]
+
+        await pilot.click(plan, offset=(app_module.Dash.FIX_COLUMN + 2, 1))
+        await pilot.pause(0.3)
+        issue = qd.plan_issue(landed)
+        if started:
+            failures.append("the icon started a fix with no confirmation")
+        elif issue is None or landed.get("claim"):
+            # A line of plan with no issue, or somebody's current work: the icon
+            # has to SAY so. Doing nothing is indistinguishable from being broken.
+            if not app.detail_text:
+                failures.append("the icon on an unfixable row said nothing")
+        elif not isinstance(app.screen, app_module.Confirm):
+            failures.append("the icon did not raise the confirmation")
+        else:
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            if not started:
+                failures.append("confirming did not start the fix")
+            elif f"/fix-issue {issue['number']}" not in started[0][1]:
+                failures.append(f"wrong command launched: {started[0][1]}")
 
     return failures
 
