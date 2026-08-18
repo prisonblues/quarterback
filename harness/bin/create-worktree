@@ -60,6 +60,42 @@ step() {
 
 die() { echo -e "${RED}Error: $1${NC}" >&2; exit 1; }
 
+# `die` for a failure that happens AFTER the git worktree exists.
+#
+# The DB steps run at 3 of 10, so a plain `die` there left a directory that is a
+# real checkout on a real branch and nothing else: no `.venv` symlink, no assigned
+# port, no CLAUDE.local.md, and no `.gitignore` entry. It looks provisioned enough
+# to `cd` into and then fails later in ways that have nothing to do with the
+# database — `uv run` with no interpreter, a statusline with no port. Measured
+# twice on quarterback, whose .env carries only POSTGRES_PASSWORD, and the second
+# time cost more than the first because the first looked like a fluke.
+#
+# It says so instead of cleaning up. Removing the worktree automatically would be
+# the tidier ending and the wrong one: by the time this fires the directory is a
+# checkout the caller may already be looking at, `remove-worktree` also drops the
+# branch, and an error path that deletes things is a bad thing to have on a hair
+# trigger. So the rule here is the same one the rest of this script follows for a
+# degraded outcome — leave the state, name it, and say what the two ways out are.
+#
+# The commands take `$BRANCH_NAME`, not the directory: `remove-worktree` is given a
+# branch and derives the path itself, so pasting the directory basename — which is
+# what the sentence above it names, and the first thing anyone reaches for — fails
+# with a confusing "no such worktree". This is the same handle the success path
+# prints at the end of a normal run.
+die_half_built() {
+    echo -e "${RED}Error: $1${NC}" >&2
+    if [[ -n "${WORKTREE_DIR:-}" && -d "${WORKTREE_DIR:-}" ]]; then
+        echo -e "${YELLOW}
+The worktree was created before this failed and is INCOMPLETE — it has a checkout
+and a branch, but not the symlinks, port, or context file that come after the
+database step. Do not use it as-is.
+
+  Finish it:  remove-worktree ${BRANCH_NAME:-<branch>} && create-worktree --shared-db ${BRANCH_NAME:-<branch>}
+  Or drop it: remove-worktree ${BRANCH_NAME:-<branch>}${NC}" >&2
+    fi
+    exit 1
+}
+
 # grep where "matched nothing" is an answer, not a failure. Under
 # `set -euo pipefail` a plain `VAR=$(... | grep ... | head -1)` kills the whole
 # run the moment grep finds nothing: grep exits 1, pipefail carries that status
@@ -959,6 +995,23 @@ elif [[ "$SHARED_DB" = false && "$DB_ENGINE" = "postgresql" ]]; then
     PG_USER=$(env_val "$DB_USER_ENV" "$WORKTREE_DIR/.env")
     PG_PASS=$(env_val "$DB_PASS_ENV" "$WORKTREE_DIR/.env")
 
+    # >>> dbname  (extracted by harness/tests/test_create_worktree_db_name.py)
+    # Initialised BEFORE the branches below, and that is the whole point of the
+    # line. Under `set -u` an unset variable is a fatal dereference, and the only
+    # reader is the `die` two lines further down whose entire job is to explain
+    # this case — so when `url_env` was declared but absent from .env, the script
+    # died with `MAIN_DB_NAME: unbound variable` at the exact instruction written
+    # to say "Could not determine main database name from .env". The guard was
+    # unreachable by the one input it existed for.
+    MAIN_DB_NAME=""
+
+    # CASCADE, not either/or. These two config keys name two places the same fact
+    # can live, and a repo that declares `database.url_env` while keeping the name
+    # in `POSTGRES_DB` is not misconfigured — it is the ordinary shape when the URL
+    # is assembled at runtime, or when the name lives in docker-compose and only
+    # the password reaches .env. The old `if/else` made declaring `url_env` disable
+    # the name lookup outright, so such a repo could never use an isolated DB and
+    # got no usable reason why.
     if [[ -n "$DB_URL_ENV" ]]; then
         # Extract DB name and user from DATABASE_URL
         db_url=$(env_val "$DB_URL_ENV" "$WORKTREE_DIR/.env")
@@ -966,11 +1019,26 @@ elif [[ "$SHARED_DB" = false && "$DB_ENGINE" = "postgresql" ]]; then
             MAIN_DB_NAME=$(db_url_dbname "$db_url")
             [[ -z "$PG_USER" ]] && PG_USER=$(db_url_user "$db_url")
         fi
-    else
+    fi
+    if [[ -z "$MAIN_DB_NAME" && -n "$DB_NAME_ENV" ]]; then
         MAIN_DB_NAME=$(env_val "$DB_NAME_ENV" "$WORKTREE_DIR/.env")
     fi
-    [[ -z "$MAIN_DB_NAME" ]] && die "Could not determine main database name from .env"
-    [[ -z "$PG_USER" ]] && die "Could not determine database user from .env"
+    # Named in full, because "from .env" sent someone reading the wrong two files:
+    # the variables are configurable, so the message says which ones were tried and
+    # where. Both `die`s here fire AFTER the worktree exists — see `die_half_built`.
+    if [[ -z "$MAIN_DB_NAME" ]]; then
+        tried="$DB_NAME_ENV"
+        [[ -n "$DB_URL_ENV" ]] && tried="$DB_URL_ENV${tried:+, }$tried"
+        die_half_built "Could not determine the main database name: none of \
+[$tried] is set in $WORKTREE_DIR/.env.
+  Isolated mode has to know which database to copy. Either set one of those in the
+  main checkout's .env, or point .worktree.json's database.name_env / .url_env at a
+  variable that is set — or pass --shared-db if this worktree does not need its own."
+    fi
+    [[ -z "$PG_USER" ]] && die_half_built \
+        "Could not determine the database user: neither $DB_USER_ENV nor a user in \
+$DB_URL_ENV is set in $WORKTREE_DIR/.env."
+    # <<< dbname
 
     # Now that PG_USER is known, pick the container that actually answers as it.
     if [[ "$DB_CONTAINER_AUTO" = true ]]; then
