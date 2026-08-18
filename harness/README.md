@@ -547,6 +547,16 @@ in `harness/tests/test_qb_seats.py`. The dev script only ever produced the right
 because a human ran it by hand *after* attaching; the reassert is a `window-resized` hook
 precisely so that nobody has to.
 
+That hook has to name a `qb-seats` by absolute path, because a `run-shell` in a hook
+inherits the tmux *server's* PATH and the server usually predates anything that put this
+harness on one. Which copy is not obvious, and getting it wrong is silent: PATH's `qb-seats`
+is preferred everywhere else, so mid-rollout the working tree installed a hook pointing at
+an *installed* copy with no `--dash-fit` — which exits 2 into a `run-shell -b` that discards
+both streams, on every resize, saying nothing. So the copy is asked before the hook goes in:
+PATH's if it answers the flag, otherwise the one that is running, and otherwise no hook at
+all plus a line on stderr naming what it tried. A screen that does not re-fit is honest; a
+hook that fails invisibly is not.
+
 ## How it works
 
 - **Layout.** A worktree is a *sibling* of the main checkout: `../<project>-<branch>`, with

@@ -285,9 +285,21 @@ dash_pane() {
 # front of it, and a narrow client costs the dash rather than the seats. A third of
 # 240 is 80, so the 78-column default is untouched on the window a screen is built
 # in. A width passed in by a reflow is not capped; see dash_resize for why.
+#
+# EVERY tmux READ IN HERE IS TOLERATED, and that is a race rather than a taste for
+# defensive code. --dash-fit is reached from the window-resized hook through
+# `run-shell -b`, i.e. asynchronously, so the pane this is about — or the whole
+# session — can be gone between the hook firing and these commands running, which
+# is the ordinary way a screen ends and not an error. Measured with the session
+# killed: tmux prints "no server running" and exits 1, so under `set -euo pipefail`
+# a bare `p=$(dash_pane)` took the script down through pipefail, and a bare
+# `$(( $(tmux display-message …) / DASH_SHARE ))` was worse — an empty substitution
+# makes that `$(( / 3 ))`, an arithmetic SYNTAX error, which is fatal under `set -e`
+# whatever the surrounding code tolerates. Invisible under a hook that discards
+# both streams; a non-zero exit from --add and from --dash-fit by hand.
 dash_resize() {
-  local want=${1:-} clamp=1 p max got
-  p=$(dash_pane)
+  local want=${1:-} clamp=1 p max win got
+  p=$(dash_pane) || return 0
   [ -n "$p" ] || return 0
   # A width passed IN is one the dash had a moment ago, in a window that has not
   # changed size since — it fitted then and it fits now, so it is taken as given.
@@ -300,11 +312,16 @@ dash_resize() {
   else
     want=$(tmux show-options -p -t "$p" -qv @qb_dash_width)
   fi
-  # Not our pane to resize if nothing recorded a width for it, and never an
-  # arithmetic error: an option somebody else set to a non-number is not fatal.
+  # Not our pane to resize if nothing recorded a width for it, and an option
+  # somebody else set to a non-number is not fatal. This guard covers $want only —
+  # the window read below needs its own, and did not have one.
   case "$want" in ''|*[!0-9]*) return 0 ;; esac
   if [ "$clamp" = 1 ]; then
-    max=$(( $(tmux display-message -p -t "$p" '#{window_width}') / DASH_SHARE ))
+    # Read, checked, and only then divided. See the note above the function for
+    # what an unchecked substitution here does to a script under `set -e`.
+    win=$(tmux display-message -p -t "$p" '#{window_width}') || return 0
+    case "$win" in ''|*[!0-9]*) return 0 ;; esac
+    max=$(( win / DASH_SHARE ))
     [ "$max" -ge 1 ] || max=1
     if [ "$want" -gt "$max" ]; then
       warn "dash: $want columns asked for, $max is a third of this window — taking $max"
@@ -317,9 +334,70 @@ dash_resize() {
   # what actually landed is read back, because tmux clamps quietly as well as
   # refusing loudly.
   tmux resize-pane -t "$p" -x "$want" || true
-  got=$(tmux display-message -p -t "$p" '#{pane_width}')
+  # A read-back that cannot be made has nothing to report: the pane is gone, which
+  # the resize above will already have said on stderr.
+  got=$(tmux display-message -p -t "$p" '#{pane_width}') || return 0
   [ "$got" = "$want" ] \
     || warn "dash: asked tmux for $want columns, the pane came out $got"
+}
+
+# ---- getting a shell command through tmux intact ----------------------------
+# TWO QUOTING LAYERS AND A FORMAT EXPANDER sit between this line and the shell that
+# finally runs it, and the session name is whatever the user typed after -s.
+# Interpolating it raw broke all three, measured on tmux 3.6a:
+#
+#   * `-s 'a$Bb'` came out as `--dash-fit -s 'a'`. Inside its own double quotes
+#     tmux expands `$NAME` from its environment, so the hook refit a DIFFERENT
+#     screen, or none.
+#   * a session called `it's` left the shell an unterminated quote, and one
+#     containing `"` truncated the command mid-word.
+#
+# Every one of those is silent: `run-shell -b` discards both streams, so the hook
+# fires on every resize and reports nothing. So each value crosses each layer
+# explicitly, innermost first:
+#
+#   sh_quote    — for the shell that ends up running the line. Single quotes and
+#                 the `'\''` dance, exactly as placeholder_cmd does it.
+#   tmux_quote  — for the command string the hook is STORED as, which tmux parses
+#                 when the hook fires and run-shell then FORMAT-EXPANDS (measured:
+#                 `#{session_name}` in a run-shell argument is substituted before
+#                 the shell sees it). `\`, `"` and `$` are live inside tmux's double
+#                 quotes and `\\`, `\"`, `\$` say them literally; `#` introduces a
+#                 format and `##` is a literal one. The `#` doubling is belt rather
+#                 than braces — tmux expands a format in a session NAME as the
+#                 session is created, so one cannot reach here today — and it costs
+#                 nothing to keep that true from this side too.
+sh_quote() {
+  local q="'\\''"
+  printf "'%s'" "${1//"'"/$q}"
+}
+
+tmux_quote() {
+  local s=$1
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//\$/\\\$}
+  s=${s//\#/\#\#}
+  printf '%s' "$s"
+}
+
+# THIS FILE, absolutely. Not `beside_me qb-seats`, which asks PATH first — see
+# dash_hooks for why a self-referential caller cannot use that answer unchecked.
+myself() { printf '%s/%s' "$(cd -P "$(dirname "$0")" && pwd)" "${0##*/}"; }
+
+# Does the qb-seats at $1 have the flag this hook is about to call? --dash-fit
+# against a session that does not exist is the cheapest question available: a hook
+# left behind by a killed screen is the ordinary way this ends, so a copy that has
+# the flag exits 0 without touching anything, and a copy that predates it falls
+# through its argument parser to `usage; exit 2`.
+#
+# Both streams to /dev/null because the answer is the exit status, and stdin from
+# /dev/null because this runs while a human is looking at a terminal: whatever is
+# on PATH under this name is not necessarily ours, and a probe that inherited the
+# tty could sit there eating the keystrokes meant for the screen being built.
+understands_dash_fit() {
+  [ -x "$1" ] || return 1
+  "$1" --dash-fit -s "qb-seats-flagprobe-$$" </dev/null >/dev/null 2>&1
 }
 
 # The reassert a call in this script cannot be. Everything here runs while the
@@ -341,10 +419,52 @@ dash_resize() {
 # SERVER's PATH, and the server usually predates anything that put this harness on
 # one. That is the same trap the ＋ on the seat bar fell into, where it also failed
 # silently.
+#
+# WHICH COPY OF ITSELF A SELF-REFERENTIAL HOOK MEANS, which is the question
+# beside_me cannot answer on its own. It asks PATH before this script's directory,
+# so an installed copy beats a checkout — right for @qb_seats_bin and the ＋, whose
+# path is recorded on the session and has to keep working for as long as the screen
+# does, long after a worktree has been dropped. For a hook calling a flag this
+# feature ADDS it was silently wrong, and reproduced on the host it was written on,
+# whose installed copy is the v2.47 build:
+#
+#     $ harness/bin/qb-seats --staged -n 2 -s hooktest        # i.e. the new code
+#     $ tmux show-hooks -w -t hooktest:seats | grep resized
+#     window-resized[0] run-shell -b "'/etc/profiles/…/bin/qb-seats' --dash-fit …"
+#     $ /etc/profiles/per-user/rich/bin/qb-seats --dash-fit -s hooktest; echo $?
+#     2
+#
+# During any rollout — the normal state of a box — the working tree installed a
+# hook pointing at an older qb-seats with no such flag, which exits 2 into a
+# `run-shell -b` that throws it away. The dash bug this whole function exists to
+# fix was therefore fixed nowhere the installed copy lagged, and nothing said so.
+#
+# The fix is to ASK rather than to invert the preference: PATH still wins, but only
+# if it answers the flag, and the fallback is this very file — which understands it
+# by construction. Both are absolute paths, so the server's PATH remains irrelevant
+# either way. If neither answers, NO HOOK IS INSTALLED and it says why: a dash that
+# does not put itself back after a resize is an honest screen, and one line on
+# stderr at build time is where a version skew can still be acted on. A hook that
+# fails invisibly on every resize is neither.
 dash_hooks() {
-  local self=$1
-  tmux set-hook -w -t "$SESSION:seats" window-resized \
-    "run-shell -b \"'$self' --dash-fit -s '$SESSION'\""
+  local self me tried cmd
+  me=$(myself)
+  # Usually the same file twice — PATH finds the checkout that is running when the
+  # checkout is what is on PATH — and then there is one candidate, one probe, and a
+  # warning that does not say "neither X nor X".
+  tried=("$1")
+  [ "$1" = "$me" ] || tried+=("$me")
+  for self in "${tried[@]}"; do
+    understands_dash_fit "$self" || continue
+    cmd="$(sh_quote "$self") --dash-fit -s $(sh_quote "$SESSION")"
+    tmux set-hook -w -t "$SESSION:seats" window-resized \
+      "run-shell -b \"$(tmux_quote "$cmd")\""
+    return 0
+  done
+  warn "dash: no resize hook — no qb-seats here understands --dash-fit (tried
+       ${tried[*]}), so nothing will put the dash back after a client attaches or
+       the terminal is resized. Two copies of the harness have drifted somehow;
+       reinstalling it is the fix."
 }
 
 # ---- the seat bar -----------------------------------------------------------

@@ -26,6 +26,7 @@ import contextlib
 import fcntl
 import os
 import pty
+import re
 import shutil
 import struct
 import subprocess
@@ -138,10 +139,19 @@ def screen(tmp_path):
     }
     sessions = []
 
-    def _run(*args, name="t"):
+    def _run(*args, name="t", exe=None):
+        """`exe` starts the script as something else — a command list, in place of
+        the plain path to the script under test.
+
+        Only the resize-hook tests need it, and they need it for a reason no other
+        test has: what qb-seats writes into a hook depends on the PATH IT WAS
+        STARTED AS, since a hook that calls back into this script has to decide
+        which copy of itself it means. A test about that decision cannot be run
+        through one fixed entry point.
+        """
         sessions.append(name)
         done = subprocess.run(
-            [str(QB_SEATS), "-C", str(repo), "-s", name, *args],
+            [*(exe or [str(QB_SEATS)]), "-C", str(repo), "-s", name, *args],
             env=env,
             capture_output=True,
             text=True,
@@ -1104,6 +1114,186 @@ def test_a_narrow_client_costs_the_dash_and_not_the_seats(screen):
         seats = [int(r.split("\t")[1]) for r in rows if r and r.split("\t")[0]]
         assert len(seats) == 2, rows
         assert min(seats) >= 25, f"a seat was starved to fit the dash: {seats}"
+
+
+def resize_hook(run, name="t"):
+    """The window-resized hook as tmux stored it, or "" if there is none."""
+    out = run.tmux("show-hooks", "-w", "-t", f"{name}:seats").stdout
+    return "".join(x for x in out.splitlines() if "window-resized" in x)
+
+
+def hook_binary(run, name="t"):
+    """The qb-seats the resize hook will actually run.
+
+    The hook is `run-shell -b "'<path>' --dash-fit -s '<session>'"`, so the path is
+    its first shell-quoted word. No test here puts a quote in a DIRECTORY name, so
+    reading it back this plainly is enough; the escaping itself is pinned end to end
+    by test_the_resize_hook_survives_a_session_name_that_needs_quoting.
+    """
+    m = re.search(r"run-shell -b \"'([^']+)'", resize_hook(run, name))
+    return m.group(1) if m else ""
+
+
+def stale_qb_seats(tmp_path):
+    """A qb-seats that predates --dash-fit, in a directory of its own.
+
+    It stands in for the installed copy on a box mid-rollout, and it fails the way
+    the real one does: `qb-seats --dash-fit` on the v2.47 build falls through the
+    argument parser to `usage; exit 2`.
+    """
+    d = tmp_path / "stalebin"
+    d.mkdir(exist_ok=True)
+    stale = d / "qb-seats"
+    stale.write_text("#!/bin/sh\necho 'usage: qb-seats [N]' >&2\nexit 2\n")
+    stale.chmod(0o755)
+    return stale
+
+
+def test_a_dash_that_cannot_be_split_off_is_not_fatal(screen):
+    """The tolerated-failure branch, which shipped with no test at all.
+
+    `split-window -l 240` in a 240-column window is refused — "no space for new
+    pane", measured — and that split runs inside a command substitution under
+    `set -e`, by which point the session, the seats and the tape all exist. Dying
+    there leaves a half-built screen with no agent started and a session name that
+    makes the obvious rerun fail too, so it warns instead.
+
+    What this pins is that EVERYTHING conditional on the dash is skipped with it and
+    not half-applied: a regression that left DASH_CMD set would send the dash's
+    command at an empty pane target, label the tape 'tape' with nothing to tell it
+    apart from, and install a resize hook for a pane that does not exist.
+    """
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen.env["QB_SEATS_DASH_SIZE"] = "240"          # the whole window, so no room
+    done = screen("-n", "2")
+    assert done.returncode == 0, done
+    assert "no dash" in done.stderr, done.stderr
+    assert pane_id(screen, "dash") is None, "a dash pane was built after all"
+    # The tape is the only auxiliary pane, and stays unlabelled — there is nothing
+    # to tell it apart from.
+    assert [label for label, _, _ in aux_panes(screen)] == [""], aux_panes(screen)
+    assert resize_hook(screen) == "", "a hook was installed for a pane that is not there"
+    # ...and the seats that were already built still started.
+    assert len(wait_for_log(screen.log, 2)) == 2
+
+
+def test_the_resize_hook_names_a_copy_that_understands_the_flag(screen, tmp_path):
+    """The rollout case, which PATH-first resolution got silently wrong.
+
+    beside_me asks PATH before the script's own directory, so that an installed copy
+    beats a checkout — right for the ＋, whose path is recorded on the session and
+    has to outlive a worktree. For a hook calling a flag this feature ADDS it was
+    wrong: reproduced on the host this was written on, where running the working
+    tree's qb-seats installed a hook pointing at the v2.47 build, which exits 2 into
+    a `run-shell -b` that discards both streams. The hook fired on every resize and
+    said nothing, so the dash bug it exists to fix was fixed on no box whose
+    installed copy lagged the flag.
+
+    The fixture's own PATH is exactly what hid this — it puts the scripts under test
+    first — so this test has to put an older one ahead of them again.
+    """
+    stale = stale_qb_seats(tmp_path)
+    screen.env["PATH"] = f"{stale.parent}:{screen.env['PATH']}"
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen.env["QB_SEATS_DASH_SIZE"] = "60"
+    assert screen("-n", "2").returncode == 0
+    chose = hook_binary(screen)
+    assert chose, f"no resize hook at all: {resize_hook(screen)!r}"
+    assert str(stale) != chose, "the hook calls a qb-seats with no --dash-fit"
+    assert Path(chose).resolve() == QB_SEATS.resolve(), chose
+    # The property, not the path: whatever it chose answers the flag it is called
+    # with. `-s` names a session that does not exist, which is what a hook left
+    # behind by a killed screen looks like and is not an error.
+    probe = subprocess.run([chose, "--dash-fit", "-s", "no-such-screen"],
+                           env=screen.env, capture_output=True, text=True, timeout=30)
+    assert probe.returncode == 0, probe
+    # And end to end, which is the whole point of the hook: the dash still puts
+    # itself back when a client attaches, with the stale copy first on PATH.
+    with attached_client(screen, 200, 50):
+        assert wait_for_dash_width(screen, 60) == 60
+
+
+def test_no_resize_hook_when_no_copy_understands_the_flag(screen, tmp_path):
+    """A screen that does not re-fit is honest; a hook erroring invisibly on every
+    resize is not. So when nothing it can reach answers --dash-fit, qb-seats installs
+    NOTHING and says so on stderr, where a version skew can still be acted on.
+
+    Both candidates have to fail to get here, and the second one is this very file —
+    which understands the flag by construction. The reachable shape of "and yet it
+    does not" is a path that cannot be executed: `bash qb-seats` on a checkout
+    mounted noexec, a stale symlink farm, a copy whose mode was lost in transit. So
+    the script is started as one of those, with the mid-rollout copy on PATH as the
+    other candidate.
+    """
+    stale = stale_qb_seats(tmp_path)
+    screen.env["PATH"] = f"{stale.parent}:{screen.env['PATH']}"
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen.env["QB_SEATS_DASH_SIZE"] = "60"
+    unrunnable = tmp_path / "noexec"
+    unrunnable.mkdir()
+    copy = unrunnable / "qb-seats"
+    copy.write_text(QB_SEATS.read_text())
+    copy.chmod(0o644)
+    done = screen("-n", "1", exe=["bash", str(copy)])
+    assert done.returncode == 0, done
+    assert "no resize hook" in done.stderr, done.stderr
+    assert resize_hook(screen) == "", "an inert hook was installed anyway"
+    # The screen is otherwise entirely built — this costs the re-fit and nothing else.
+    assert pane_id(screen, "dash"), "the dash went missing with its hook"
+    assert labels(screen)["dash"][0] == 60, "the width it was built asking for"
+
+
+def test_the_resize_hook_survives_a_session_name_that_needs_quoting(screen):
+    """The session name crosses two quoting layers and a format expander on its way
+    into the hook, and interpolating it raw broke all three. Measured on tmux 3.6a:
+
+      * `-s 'a$Bb'` arrived as `--dash-fit -s 'a'`, because tmux expands `$NAME`
+        from its own environment inside its own double quotes. The hook then refit a
+        different screen, or none.
+      * an apostrophe left the shell an unterminated quote, and a `"` truncated the
+        command mid-word.
+
+    Every one of those is a hook that does nothing, for ever, in silence: run-shell
+    -b discards both streams. So this asserts the end that matters — the dash still
+    puts itself back — rather than the string tmux stored.
+    """
+    name = "it's a $B \"screen\""
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen.env["QB_SEATS_DASH_SIZE"] = "60"
+    assert screen("-n", "2", name=name).returncode == 0
+    assert labels(screen, name)["dash"][0] == 60
+    with attached_client(screen, 200, 50, name=name):
+        assert wait_for_dash_width(screen, 60, name=name) == 60
+
+
+def test_dash_fit_tolerates_a_screen_that_has_moved_on(screen):
+    """--dash-fit is reached from the resize hook through `run-shell -b`, so it runs
+    a moment AFTER the resize that asked for it — by which time the dash pane, or
+    the whole screen, can be gone. That is the ordinary way a screen ends and not an
+    error, and every tmux read in dash_resize is tolerated for that reason: measured
+    with the session killed, tmux exits 1 with an empty stdout, which took the script
+    down through pipefail on `p=$(dash_pane)` and made the clamp's
+    `$(( $(tmux display-message …) / DASH_SHARE ))` the arithmetic syntax error
+    `$(( / 3 ))` — fatal under `set -e` however tolerant the code around it is.
+
+    What this pins is every shape of that reachable without a race. The one that is
+    NOT is the window-width read failing between the two commands around it, which
+    is why it is guarded rather than tested.
+    """
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen.env["QB_SEATS_DASH_SIZE"] = "50"
+    screen("-n", "2")
+    screen.tmux("kill-pane", "-t", pane_id(screen, "dash"))
+    assert screen("--dash-fit").returncode == 0, "the dash pane closing is not an error"
+    # A window that is no longer called `seats` — renamed by hand, or by an agent in
+    # a pane. `list-panes` then FAILS rather than printing nothing, and that is the
+    # half that took the whole script down: the failure travels out of the pipeline
+    # through `pipefail` into `p=$(dash_pane)`, and `set -e` does the rest.
+    screen.tmux("rename-window", "-t", "t:seats", "elsewhere")
+    assert screen("--dash-fit").returncode == 0, "a renamed window is not an error"
+    # ...and a screen that is not there at all. The server stays up for session `t`,
+    # so this is the hook's own shape and not a dead socket.
+    assert screen("--dash-fit", name="no-such-screen").returncode == 0
 
 
 def test_an_empty_brief_reaches_the_panes(screen):
