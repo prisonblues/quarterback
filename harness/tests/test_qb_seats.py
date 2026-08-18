@@ -593,3 +593,172 @@ def test_a_range_that_means_nothing_here_changes_nothing(screen):
         done = click(screen, junk, "t")
         assert done.returncode in (0, 1), f"{junk!r} → {done.returncode} {done.stderr}"
     assert panes(screen) == before, "an unknown range moved the furniture"
+
+
+# ---- list and resume --------------------------------------------------------
+# The ssh link drops and the shell that comes back up is in the wrong directory,
+# or on the wrong repo, or does not remember what the screen was called. `qb-seats`
+# on its own only reattaches to the screen for the repo you are STANDING IN, which
+# is the one thing a recovering shell cannot be relied on to be.
+
+
+def qb(run, *args, cwd=None):
+    """qb-seats with NO -C and NO -s, from a directory of the caller's choosing.
+
+    The fixture's own runner always supplies both, which is exactly what `list`
+    and `resume` must work without — so these tests go around it.
+    """
+    return subprocess.run(
+        [str(QB_SEATS), *args], cwd=cwd, env=run.env,
+        capture_output=True, text=True, timeout=60,
+    )
+
+
+def listing(run, cwd=None):
+    """[(number, name)] as `list` printed it."""
+    out = qb(run, "list", cwd=cwd)
+    assert out.returncode == 0, out.stderr
+    rows = []
+    for line in out.stdout.splitlines():
+        num, name = line.split()[0], line.split()[1]
+        rows.append((num, name))
+    return rows
+
+
+def test_list_names_every_screen_that_is_up(screen):
+    screen("-n", "2", name="t")
+    screen("-n", "1", name="t2")
+    rows = listing(screen)
+    assert [n for _, n in rows] == ["t", "t2"], rows
+    assert [i for i, _ in rows] == ["1", "2"], "the rows are numbered for `resume`"
+
+
+def test_list_says_the_seats_and_the_repo(screen):
+    """The two columns that tell two screens apart when the names do not."""
+    screen("-n", "2")
+    line = qb(screen, "list").stdout
+    assert "2 seats" in line, line
+    assert str(screen.repo) in line or f"~{str(screen.repo)}" in line, line
+
+
+def test_list_finds_a_screen_whatever_it_is_called(screen):
+    """A screen is identified by a pane carrying @qb_seat, never by its name.
+
+    `-s` takes anything and the fleet's own screen is `qbseats`, not
+    `seats-nix-fleet`; a listing keyed on a `seats-` prefix would simply not show
+    it, which is worse than not having the command.
+    """
+    screen("-n", "1", name="nothing-like-the-default")
+    assert [n for _, n in listing(screen)] == ["nothing-like-the-default"]
+
+
+def test_list_ignores_a_tmux_session_that_is_not_a_screen(screen):
+    """The user's editor session on the same server is none of this command's
+    business, and offering it under a number that `resume` would attach to is the
+    failure that matters."""
+    screen("-n", "1")
+    screen.tmux("new-session", "-d", "-s", "not-ours")
+    try:
+        assert [n for _, n in listing(screen)] == ["t"]
+    finally:
+        screen.tmux("kill-session", "-t", "=not-ours")
+
+
+def test_list_with_nothing_up_prints_nothing_and_says_so(screen):
+    """Empty stdout for a caller parsing it, a word on stderr for the human who
+    would otherwise be staring at silence."""
+    screen.tmux("start-server")
+    out = qb(screen, "list")
+    assert out.returncode == 0, out.stderr
+    assert out.stdout == "", out.stdout
+    assert "no screens" in out.stderr, out.stderr
+
+
+def test_resume_takes_the_number_from_the_list(screen):
+    screen("-n", "1", name="t")
+    screen("-n", "1", name="t2")
+    want = dict((i, n) for i, n in listing(screen))["2"]
+    out = qb(screen, "resume", "2")
+    assert out.returncode == 0, out.stderr
+    # No tty here, so attach() reports rather than attaching — which is the
+    # assertion: it named the screen the list numbered 2.
+    assert want in out.stdout, out.stdout
+
+
+def test_resume_takes_the_name(screen):
+    screen("-n", "1", name="t")
+    screen("-n", "1", name="t2")
+    out = qb(screen, "resume", "t2")
+    assert out.returncode == 0, out.stderr
+    assert "t2" in out.stdout, out.stdout
+
+
+def test_a_number_after_resume_is_not_the_seat_count(screen):
+    """The parser trap this subcommand had to be written around: a bare number is
+    the seat count everywhere else on this command line, so `resume 2` read by the
+    ordinary rules is "resume, and by the way three seats" with the 2 swallowed —
+    silently resuming the wrong screen, or the only one.
+    """
+    screen("-n", "1", name="t")
+    screen("-n", "1", name="t2")
+    before = {n for _, n in listing(screen)}
+    assert qb(screen, "resume", "2").returncode == 0
+    assert {n for _, n in listing(screen)} == before, "resume must build nothing"
+    assert sorted(n for _, n in panes(screen, "t2") if n) == ["1"], "and add no seat"
+
+
+def test_resume_needs_no_repo_and_no_C(screen, tmp_path):
+    """The whole point. A screen already knows the directory it was built in, so
+    recovery must not depend on the shell that came back up being anywhere near
+    it — which is the one thing `qb-seats` on its own does depend on.
+    """
+    screen("-n", "1")
+    elsewhere = tmp_path / "not-a-repo"
+    elsewhere.mkdir()
+    out = qb(screen, "resume", "t", cwd=elsewhere)
+    assert out.returncode == 0, out.stderr
+    assert "t" in out.stdout, out.stdout
+
+
+def test_resume_with_no_argument_takes_the_only_screen(screen):
+    """A list of one is not a choice to make."""
+    screen("-n", "1")
+    out = qb(screen, "resume")
+    assert out.returncode == 0, out.stderr
+    assert "t is up" in out.stdout, out.stdout
+
+
+def test_resume_with_no_argument_will_not_guess_between_two(screen):
+    screen("-n", "1", name="t")
+    screen("-n", "1", name="t2")
+    out = qb(screen, "resume")
+    assert out.returncode == 1
+    assert "say which" in out.stderr, out.stderr
+    # ...and the list is right there, so the next command is one word away.
+    assert "t2" in out.stderr, out.stderr
+
+
+def test_resume_of_a_screen_that_is_not_there_shows_what_is(screen):
+    screen("-n", "1")
+    out = qb(screen, "resume", "no-such-screen")
+    assert out.returncode == 1
+    assert "no-such-screen" in out.stderr, out.stderr
+    assert "  1   t " in out.stderr or "\n  1 " in out.stderr, out.stderr
+
+
+def test_resume_with_nothing_up_says_how_to_start_one(screen):
+    screen.tmux("start-server")
+    out = qb(screen, "resume", "1")
+    assert out.returncode == 1
+    assert "no screens are up" in out.stderr, out.stderr
+
+
+def test_a_name_beats_a_number(screen):
+    """Both spellings are offered, so a screen that happens to be CALLED `1` while
+    sitting at some other row has to resume when you type its name — the name is
+    the half the user can see is unambiguous."""
+    screen("-n", "1", name="t")
+    screen("-n", "1", name="1")      # sorts first, so row 1 is the screen named `1`
+    rows = dict((n, i) for i, n in listing(screen))
+    assert rows["1"] == "1" and rows["t"] == "2", rows
+    assert "1 is up" in qb(screen, "resume", "1").stdout
