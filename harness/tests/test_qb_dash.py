@@ -41,17 +41,27 @@ def _load_app():
     return module
 
 
-def _why_skip() -> str | None:
-    """Runnable wherever the dashboard is: rich, textual, and a board to read.
-
-    It no longer wants mcp_server — the board client is stdlib now — so this
-    passes under the interpreter the nix build carries, not only under a
-    developer's venv.
-    """
+# TWO conditions, and keeping them apart is what lets any of this run in CI.
+#
+# Every test here needs rich and textual, because every one of them drives the
+# real widgets. Only SOME need a board and a `gh` that can see the repo: those
+# read whatever is open today and click a row of it. When the two were one
+# check, a machine without a board skipped the lot — including the tests whose
+# data is a literal in this file — so the stubbed half never ran anywhere but a
+# developer's laptop, which is the same as not having been written.
+#
+# It no longer wants mcp_server — the board client is stdlib now — so this
+# passes under the interpreter the nix build carries, not only under a
+# developer's venv.
+def _why_no_tui() -> str | None:
     try:
         import rich, textual  # noqa: F401
     except ImportError:
         return "textual/rich are not importable"
+    return None
+
+
+def _why_no_board() -> str | None:
     sys.path.insert(0, str(BIN))
     try:
         import qbdata
@@ -61,7 +71,24 @@ def _why_skip() -> str | None:
     return None
 
 
-pytestmark = pytest.mark.skipif(_why_skip() is not None, reason=_why_skip() or "")
+_NO_TUI = _why_no_tui()
+_NO_BOARD = _why_no_board() if _NO_TUI is None else "textual/rich are not importable"
+
+pytestmark = pytest.mark.skipif(_NO_TUI is not None, reason=_NO_TUI or "")
+
+#: For the tests that click whatever the repo and the board actually have open
+#: today. They are still the ones that found the defects worth finding, so they
+#: are not weakened — they are just no longer the reason the rest cannot run.
+needs_live_data = pytest.mark.skipif(_NO_BOARD is not None, reason=_NO_BOARD or "")
+
+
+def _numbered_cell(row) -> str:
+    """The '#123' cell of a rendered row, whatever column it currently sits in."""
+    for cell in row:
+        text = str(cell).strip()
+        if text.startswith("#") and text[1:].isdigit():
+            return text[1:]
+    raise AssertionError(f"no #number cell in row: {[str(c) for c in row]}")
 
 
 def _need_rows(table, what: str, err: str | None) -> None:
@@ -79,10 +106,12 @@ def _need_rows(table, what: str, err: str | None) -> None:
     pytest.skip(f"no open {what} on the repo — nothing to click")
 
 
+@needs_live_data
 def test_a_single_click_acts_on_the_row_under_the_pointer():
     assert asyncio.run(_drive()) == []
 
 
+@needs_live_data
 def test_the_scales_icon_reviews_and_the_rest_of_the_row_opens():
     """One row, two verbs, told apart by which column was clicked.
 
@@ -92,6 +121,19 @@ def test_the_scales_icon_reviews_and_the_rest_of_the_row_opens():
     assert asyncio.run(_drive_panel()) == []
 
 
+@needs_live_data
+def test_a_plan_row_explains_itself_and_its_hammer_takes_the_issue():
+    """The plan panel's two verbs.
+
+    A plan item's note is the reasoning behind its place in the order — it is on
+    the board and nowhere else, so a click has to be able to reach it. And the ⚒
+    is the shortest path from "what is next" to somebody doing it, which is the
+    whole reason the plan is on this screen at all.
+    """
+    assert asyncio.run(_drive_plan()) == []
+
+
+@needs_live_data
 def test_the_hammer_starts_a_fix_and_the_rest_of_the_issue_row_opens():
     """The issue panel's two verbs, told apart the same way the PR panel's are.
 
@@ -170,8 +212,11 @@ async def _drive_issues() -> list[str]:
         issues = app.query_one("#issues")
         _need_rows(issues, "issues", app.issue_err)
         # Read the number off the RENDERED first row rather than re-deriving the
-        # order here: what the click has to match is the row a human sees.
-        top = int(str(issues.get_row_at(0)[2]).lstrip("#"))
+        # order here: what the click has to match is the row a human sees. Found
+        # by its "#" rather than by column index — the panels grew a repo column
+        # between the issue number and the icons, and a hardcoded index made this
+        # fail with `int('quarterback')` rather than saying what moved.
+        top = int(_numbered_cell(issues.get_row_at(0)))
 
         # The ⚒ column asks first, the same as the ⚖ does.
         await pilot.click(issues, offset=(app_module.Dash.FIX_COLUMN + 2, 1))
@@ -212,13 +257,79 @@ async def _drive_issues() -> list[str]:
     return failures
 
 
+async def _drive_plan() -> list[str]:
+    app_module = _load_app()
+    app = app_module.Dash(interval=3600, gh_interval=3600, plan_interval=3600)
+
+    started: list[tuple[str, str]] = []
+    app.run_in_window = lambda name, command: started.append((name, command))
+
+    failures: list[str] = []
+    async with app.run_test(size=(100, 50)) as pilot:
+        for _ in range(40):
+            await pilot.pause(0.25)
+            if app.query_one("#plan").row_count:
+                break
+        plan = app.query_one("#plan")
+        _need_rows(plan, "plan items", app.plan_err)
+
+        # Anywhere but the ⚒: the detail line, and it must name the row clicked.
+        await pilot.click(plan, offset=(40, 1))
+        await pilot.pause(0.3)
+        title = str(plan.get_row_at(plan.scroll_offset.y)[4]).rstrip("…")
+        if title and title not in app.detail_text:
+            failures.append(f"the detail line does not describe the row clicked: "
+                            f"{app.detail_text[:80]!r}")
+
+        # The ⚒, on a row that actually has an issue behind it. Which row that is
+        # depends on today's plan, so it is found rather than assumed — and what
+        # it should do is read off the row the table actually scrolled to, not
+        # off the index asked for: scrolling near the end of a list stops short.
+        import qbdata as qd
+        ordered = qd.sort_plan(app.plan)
+        wanted = next((n for n, i in enumerate(ordered)
+                       if qd.plan_issue(i) and not i.get("claim")), None)
+        if wanted is None:
+            pytest.skip("no free issue-backed item on the plan today — nothing to take")
+        plan.scroll_to(y=wanted, animate=False)
+        await pilot.pause(0.3)
+        landed = ordered[plan.scroll_offset.y]
+
+        await pilot.click(plan, offset=(app_module.Dash.FIX_COLUMN + 2, 1))
+        await pilot.pause(0.3)
+        issue = qd.plan_issue(landed)
+        if started:
+            failures.append("the icon started a fix with no confirmation")
+        elif issue is None or landed.get("claim"):
+            # A line of plan with no issue, or somebody's current work: the icon
+            # has to SAY so. Doing nothing is indistinguishable from being broken.
+            if not app.detail_text:
+                failures.append("the icon on an unfixable row said nothing")
+        elif not isinstance(app.screen, app_module.Confirm):
+            failures.append("the icon did not raise the confirmation")
+        else:
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            if not started:
+                failures.append("confirming did not start the fix")
+            elif f"/fix-issue {issue['number']}" not in started[0][1]:
+                failures.append(f"wrong command launched: {started[0][1]}")
+
+    return failures
+
+
 async def _drive_panel() -> list[str]:
     app_module = _load_app()
     app = app_module.Dash(interval=3600, gh_interval=3600)
 
     started: list[tuple[str, str]] = []
+    windowed: list[tuple[str, str]] = []
     opened: list[int] = []
-    app.run_in_window = lambda name, command: started.append((name, command))
+    # run_in_PANE, not run_in_window: a review now lands in the seat row, beside
+    # the work it is about. Both are stubbed so that a review quietly reverting
+    # to a window shows up here as a failure rather than as a passing test.
+    app.run_in_pane = lambda name, command: started.append((name, command))
+    app.run_in_window = lambda name, command: windowed.append((name, command))
     app.open_pr = lambda pr: opened.append(pr.get("number"))
 
     failures: list[str] = []
@@ -244,6 +355,8 @@ async def _drive_panel() -> list[str]:
                 failures.append("confirming did not start the review")
             elif "/panel-review-pr" not in started[0][1]:
                 failures.append(f"wrong command launched: {started[0][1]}")
+            if windowed:
+                failures.append("the review opened a window, not a seat-row pane")
 
         # Cancelling starts nothing.
         started.clear()
@@ -273,3 +386,166 @@ async def _drive_panel() -> list[str]:
             await pilot.pause(0.2)
 
     return failures
+
+
+async def _drive_seats() -> list[str]:
+    """The SEATS panel: jump, ✕, ＋ — with tmux replaced by a recorder.
+
+    The seats come from a stub rather than from the real server for the obvious
+    reason: a test that closed a pane would close one of the developer's own
+    seats, and the agent working in it would go with it.
+    """
+    app_module = _load_app()
+    app = app_module.Dash(interval=3600, gh_interval=3600)
+
+    fake = [
+        {"pane": "%7", "seat": "1", "session": "seats-demo", "window": "0",
+         "command": "claude", "path": "/tmp/demo"},
+        {"pane": "%8", "seat": "2", "session": "seats-demo", "window": "0",
+         "command": "bash", "path": "/tmp/demo"},
+    ]
+    clicked: list[tuple[str, str]] = []
+    jumped: list[str] = []
+    app.run_seat_click = lambda tag, session: clicked.append((tag, session))
+    app.jump_pane = lambda seat: jumped.append(seat["pane"])
+    # The real reader is switched off, not just overwritten afterwards: it runs
+    # on mount AND on a timer, so a fixture that only re-rendered would race it
+    # and the panel under the pointer would be the developer's own seats.
+    app.refresh_seats = lambda: None
+
+    failures: list[str] = []
+    async with app.run_test(size=(90, 50)) as pilot:
+        app.render_seats(fake)
+        await pilot.pause(0.2)
+        seats = app.query_one("#seats")
+
+        # Two seats plus the ＋ row. The ＋ has to be a row, not a key, or the
+        # panel cannot be driven by the mouse alone.
+        if seats.row_count != len(fake) + 1:
+            failures.append(f"expected {len(fake) + 1} rows, got {seats.row_count}")
+
+        # The ✕ column asks first and closes nothing by itself.
+        await pilot.click(seats, offset=(app_module.Dash.KILL_COLUMN + 2, 1))
+        await pilot.pause(0.3)
+        if clicked:
+            failures.append("the ✕ closed a seat with no confirmation")
+        if not isinstance(app.screen, app_module.Confirm):
+            failures.append("the ✕ did not raise the confirmation")
+        else:
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            if clicked != [("kill1", "seats-demo")]:
+                failures.append(f"wrong close dispatched: {clicked}")
+
+        # Cancelling closes nothing.
+        clicked.clear()
+        await pilot.click(seats, offset=(app_module.Dash.KILL_COLUMN + 2, 2))
+        await pilot.pause(0.3)
+        await pilot.press("escape")
+        await pilot.pause(0.3)
+        if clicked:
+            failures.append("cancelling still closed a seat")
+
+        # The ＋ row adds one, to the session the SEATS came from.
+        await pilot.click(seats, offset=(4, len(fake) + 1))
+        await pilot.pause(0.3)
+        if not isinstance(app.screen, app_module.Confirm):
+            failures.append("the ＋ did not raise the confirmation")
+        else:
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            if clicked != [("add", "seats-demo")]:
+                failures.append(f"the ＋ dispatched {clicked}")
+
+        # Anywhere else on a seat row is still "take me to that pane".
+        clicked.clear()
+        await pilot.click(seats, offset=(20, 1))
+        await pilot.pause(0.3)
+        if jumped != ["%7"]:
+            failures.append(f"clicking a seat row jumped to {jumped}")
+        if clicked:
+            failures.append("clicking a seat row closed something")
+
+    return failures
+
+
+def test_the_seats_panel_jumps_closes_and_adds():
+    """The three verbs the tmux seat bar has, in the panel, meaning the same.
+
+    Closing is the one that matters: it kills a pane with a working agent in it,
+    so a stray click on a 78-column panel must not be able to do it, and the
+    thing it dispatches has to name the seat actually under the pointer.
+    """
+    assert asyncio.run(_drive_seats()) == []
+
+
+async def _drive_review_pane(seats: list[dict]) -> tuple[list[list[str]], list[str]]:
+    """run_in_pane against a recorder, so the tmux argv itself is the assertion.
+
+    Checked against a real screen by hand as well; what this pins is the shape,
+    because every part of it is load-bearing and none of it is obvious from
+    reading the call: the split is anchored on a SEAT pane, the new pane is
+    marked @qb_label and not @qb_seat, and the row is reflowed with -E.
+    """
+    app_module = _load_app()
+    app = app_module.Dash(interval=3600, gh_interval=3600)
+    app.refresh_seats = lambda: None
+
+    calls: list[list[str]] = []
+    windowed: list[str] = []
+
+    class Done:
+        returncode = 0
+        stdout = "%9\n"
+        stderr = ""
+
+    app.run_in_window = lambda name, command: windowed.append(name)
+    # qd is the SHARED qbdata module and subprocess is the real one, so both are
+    # put back: a recorder left installed would silently disarm every later test
+    # that expects a real call, and the suite would go green on nothing.
+    real_seats, real_run = app_module.qd.tmux_seats, app_module.subprocess.run
+    async with app.run_test(size=(90, 44)):
+        app_module.qd.tmux_seats = lambda: seats
+        app_module.subprocess.run = lambda argv, **kw: (calls.append(argv), Done())[1]
+        app_module.os.environ["TMUX"] = "/tmp/whatever,1,0"
+        try:
+            app.run_in_pane("panel-42", "claude -- '/panel-review-pr 42'")
+        finally:
+            app_module.os.environ.pop("TMUX", None)
+            app_module.qd.tmux_seats = real_seats
+            app_module.subprocess.run = real_run
+    return calls, windowed
+
+
+def test_a_review_lands_in_the_seat_row_and_is_not_mistaken_for_a_seat():
+    """The pane has to be reachable AND invisible to the seat machinery.
+
+    Invisible matters as much as reachable: qb-seats --add, qb-seat-click's
+    reflow and the tmux seat bar all select on @qb_seat, so a review wearing one
+    would be offered an agent, counted as a seat, and given a ✕ that closes the
+    wrong thing.
+    """
+    seats = [{"pane": "%7", "seat": "1", "session": "s", "window": "0",
+              "command": "claude", "path": "/tmp/demo"}]
+    calls, windowed = asyncio.run(_drive_review_pane(seats))
+    assert not windowed, "it opened a window instead of joining the row"
+
+    split = next(c for c in calls if c[:2] == ["tmux", "split-window"])
+    assert "-t" in split and split[split.index("-t") + 1] == "%7", (
+        f"the split is not anchored on a seat pane: {split}")
+    assert "/panel-review-pr 42" in " ".join(split), split
+
+    marked = next(c for c in calls if "set-option" in c)
+    assert "@qb_label" in marked and "panel-42" in marked, marked
+    assert "@qb_seat" not in " ".join(marked), (
+        "the review pane was marked as a seat")
+
+    layout = next(c for c in calls if "select-layout" in c)
+    assert "-E" in layout, f"the row was not reflowed: {layout}"
+
+
+def test_with_no_seat_row_to_join_a_review_still_gets_somewhere():
+    """The dashboard runs outside the screen too — a window beats nothing."""
+    calls, windowed = asyncio.run(_drive_review_pane([]))
+    assert windowed == ["panel-42"]
+    assert not any("split-window" in c for c in calls), calls

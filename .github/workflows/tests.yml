@@ -108,6 +108,39 @@ jobs:
             uv run --extra dev pytest "$suite" -q
           done
 
+      # TWICE, with different extras, for the reason the mcp job below runs
+      # twice: the dependency posture is itself a claim. The run above is the
+      # one that proves the harness needs no Textual — `qb-board --follow` and
+      # every non-dashboard script must import neither it nor rich, and the way
+      # that stays true is that the ordinary run does not have them.
+      #
+      # This run is the one where the dashboard tests EXECUTE. test_qb_dash.py
+      # skips its whole module when textual is absent, and the `tui` extra lived
+      # only in mcp/pyproject.toml — so those tests had never once run in CI.
+      # Seven of them, green by never executing, on the file with the most
+      # clicking-the-wrong-row ways to be wrong.
+      - name: Run every harness suite with the dashboard's dependencies
+        run: |
+          set -euo pipefail
+          mapfile -t suites < <(find harness -type d -name tests -not -path '*/node_modules/*' | sort)
+          for suite in "${suites[@]}"; do
+            echo "--- $suite"
+            uv run --extra dev --extra tui pytest "$suite" -q
+          done
+
+          # And loudly if the thing this step exists for skipped anyway. A module
+          # that skips every test exits 0, so a green step is not evidence on its
+          # own — that is exactly how the gap above went unnoticed. The tests that
+          # want a live board and a `gh` still skip here and are meant to; these
+          # are the ones whose data is a literal in the file.
+          echo "--- did the dashboard tests actually run?"
+          out=$(uv run --extra dev --extra tui pytest harness/tests/test_qb_dash.py -q -rs 2>&1)
+          echo "$out"
+          grep -qE '[0-9]+ passed' <<<"$out" || {
+            echo "::error::The dashboard suite executed nothing. It is skipping under CI again — check _why_no_tui in test_qb_dash.py and the tui extra in pyproject.toml."
+            exit 1
+          }
+
   mcp:
     name: mcp + board client
     runs-on: ubuntu-latest

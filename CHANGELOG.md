@@ -11,6 +11,46 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
+## v2.47 — the dashboard grows hands, and its tests start running
+
+The seat screen could tell you what was happening and not much else could be
+done about it from there. The dashboard's SEATS panel now closes a seat and adds
+one, tmux grows a clickable bar of the same three widgets above the seat row,
+and both go through one script so they cannot come to mean different things.
+
+**`qb-seat-click` was being called by code that shipped without it.**
+`qb-dash-tui` has shelled out to it since the SEATS panel landed and the script
+was never committed, so its ✕ and ＋ were dead in every checkout but the one
+they were written in — and dead quietly, because `run-shell -b` discards stderr
+and the failure path writes to a status line nobody reads.
+
+**The bar is not on the pane borders, where you would want it.** tmux honours
+`#[range=...]` in `status-format` and nowhere else: a click on a border arrives
+with `#{mouse_x}` and `#{mouse_y}` empty, so no glyph on it can be told from any
+other, and a click on the topmost border row — where seat 1's title is drawn —
+is not delivered at all. So it is a second status line, one cell per seat, and
+`QB_SEATS_BAR=0` turns it off for anyone who would rather keep the status line,
+the mouse and an unbound `MouseDown1Status`.
+
+**`run-shell` is a different process than the one you think it is, twice over.**
+Invoked from a MOUSE binding it gets no `$TMUX_PANE`, so the script had nothing
+to work out which screen was clicked; and it inherits the tmux SERVER's PATH,
+which is usually a server that was running long before anything put the harness
+on a PATH. The ＋ therefore died in `require_qb_seat` and, because stderr goes
+nowhere, simply did nothing. The screen now records what it is on the session,
+and resolves its siblings by path with PATH still winning when it has one.
+
+**The dashboard's own tests had never run in CI.** `test_qb_dash.py` skips its
+whole module without Textual, and the `tui` extra lived only in
+`mcp/pyproject.toml` — so seven tests over the code with the most
+clicking-the-wrong-row ways to be wrong were green by never executing. A module
+that skips everything exits 0, so the new step asserts the suite actually
+reported passes rather than trusting a green tick. The skip was also one
+condition doing two jobs: it wanted rich, textual AND a configured board, when
+only four of the tests read live data. Those four still skip in CI, which is
+what they were written for; they are no longer the reason the other three
+cannot run anywhere.
+
 ## v2.46 — a screen you ask for by number, and seats that do not stop to ask
 
 Three of the four changes here are about typing `qb-b 3`. The seat count was the

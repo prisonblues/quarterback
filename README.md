@@ -577,6 +577,15 @@ full — including what was broken before it, which is the part no diff recovers
   a repo name, and treat the string itself as untrusted input on the way back in: the board bounds
   its length at `PATH_MAX` and normalises nothing else, so quote it, and do not hand a value
   beginning with `-` to `git` as anything but an operand.
+- **v2.47** — the dashboard grows hands, and its tests start running. The SEATS panel
+  closes a seat and adds one, and tmux grows a clickable bar of the same widgets above the
+  seat row — both through `qb-seat-click`, which `qb-dash-tui` had been calling since the
+  panel landed without the script ever being committed. The bar is a status line rather than
+  pane-border glyphs because tmux honours `#[range=...]` nowhere else, and a click on the top
+  border row is not delivered at all. `QB_SEATS_BAR=0` opts out. It also fixes a `run-shell`
+  trap that made the ＋ do nothing in silence: a mouse binding gets no `$TMUX_PANE` and the
+  tmux server's PATH usually predates the harness. And the dashboard's seven tests, which had
+  skipped every CI run since they were written, now execute.
 - **v2.46** — a screen you ask for by number, and seats that do not stop to ask. `qb-b 3`
   is the seat count, the default is 3 and the ceiling is 10; past five, seats are five across
   and two down, built rather than left to `select-layout tiled`, which picks the wrong axis

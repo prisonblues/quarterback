@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import socket
 import ssl
@@ -15,8 +16,77 @@ import subprocess
 import urllib.request
 from datetime import datetime, timezone
 
-REPO = "prisonblues/quarterback"
+REPO = "prisonblues/quarterback"          # the fallback, not the answer
 REPO_URL = f"https://github.com/{REPO}"
+
+
+def repo_slug(path: str = ".") -> str | None:
+    """'owner/name' from a checkout's origin remote, or None.
+
+    Handles scp syntax, https://, ssh:// and a .git suffix — the same shapes the
+    MCP server's own repo_slug() has always parsed, and the same lesson as #148:
+    a repo spelled by its caller and a repo read from git are two values that
+    disagree silently.
+    """
+    try:
+        got = subprocess.run(["git", "-C", path, "remote", "get-url", "origin"],
+                             capture_output=True, text=True, timeout=10)
+    except Exception:                             # noqa: BLE001
+        return None
+    if got.returncode != 0:
+        return None
+    url = got.stdout.strip().removesuffix(".git")
+    if not url:
+        return None
+    tail = re.sub(r"^(git@|ssh://|https?://)[^/:]+[:/]", "", url)
+    parts = [p for p in tail.split("/") if p]
+    return "/".join(parts[-2:]) if len(parts) >= 2 else None
+
+
+_repos: list[str] | None = None
+
+
+def resolve_repos() -> list[str]:
+    """Which repositories this dashboard reports on, most relevant first.
+
+    QB_DASH_REPOS names them outright, comma separated, which is how one screen
+    watches a fleet that works in three. Otherwise it is the repo of the
+    directory the dashboard was started in — hardcoding one meant a screen
+    pointed at nix-fleet reported quarterback's pull requests and said nothing
+    about having done so.
+
+    Worked out ONCE per process. Neither the environment nor the cwd's origin
+    changes under a running dashboard, and the fallback shells out to git — which
+    a per-row caller (the plan panel asks "is this one of mine?" of every item it
+    draws) would turn into a subprocess per row per redraw.
+    """
+    global _repos
+    if _repos is None:
+        named = os.environ.get("QB_DASH_REPOS", "").strip()
+        _repos = ([r.strip() for r in named.split(",") if r.strip()] if named
+                  else [repo_slug(os.environ.get("QB_DASH_REPO") or os.getcwd()) or REPO])
+    return _repos
+
+
+def short_repo(repo: str) -> str:
+    """'prisonblues/quarterback' → 'quarterback'. The owner never distinguishes."""
+    return repo.split("/", 1)[-1]
+
+
+_REPO_COLOURS = ["cyan", "magenta", "green", "yellow", "blue", "red"]
+_repo_colour: dict[str, str] = {}
+
+
+def repo_colour(name: str) -> str:
+    """A stable colour per repo, shared by every panel and both renderers.
+
+    The colour is the fastest way to see that a PR and the agent working it are
+    in the same place, so it has to mean the same thing in FLEET as in OPEN PRs.
+    """
+    key = short_repo(name or "")
+    if key not in _repo_colour:
+        _repo_colour[key] = _REPO_COLOURS[len(_repo_colour) % len(_REPO_COLOURS)]
+    return _repo_colour[key]
 
 
 def ago(stamp: str | None) -> str:
@@ -204,34 +274,49 @@ def fetch_board(client) -> dict:
     return out
 
 
-def fetch_prs() -> tuple[list[dict], str | None]:
-    fields = "number,title,isDraft,updatedAt,statusCheckRollup,headRefName"
+def _gh_list(kind: str, repo: str, fields: str) -> tuple[list[dict], str | None]:
+    """One `gh <kind> list` against one repo, every row tagged with that repo.
+
+    The tag is what lets the panels say where a row came from, and it is applied
+    here rather than at render time so nothing downstream can hold a row whose
+    origin it cannot name.
+    """
     try:
         raw = subprocess.run(
-            ["gh", "pr", "list", "--repo", REPO, "--state", "open",
+            ["gh", kind, "list", "--repo", repo, "--state", "open",
              "--limit", "30", "--json", fields],
             capture_output=True, text=True, timeout=45,
         )
         if raw.returncode != 0:
-            return [], clip(raw.stderr, 60) or f"gh exit {raw.returncode}"
-        return json.loads(raw.stdout), None
+            return [], f"{short_repo(repo)}: {clip(raw.stderr, 50)}" or f"gh exit {raw.returncode}"
+        rows = json.loads(raw.stdout)
+        for row in rows:
+            row["repo"] = repo
+        return rows, None
     except Exception as exc:                      # noqa: BLE001
-        return [], f"{type(exc).__name__}"
+        return [], f"{short_repo(repo)}: {type(exc).__name__}"
 
 
-def fetch_issues() -> tuple[list[dict], str | None]:
-    fields = "number,title,updatedAt,labels,assignees"
-    try:
-        raw = subprocess.run(
-            ["gh", "issue", "list", "--repo", REPO, "--state", "open",
-             "--limit", "30", "--json", fields],
-            capture_output=True, text=True, timeout=45,
-        )
-        if raw.returncode != 0:
-            return [], clip(raw.stderr, 60) or f"gh exit {raw.returncode}"
-        return json.loads(raw.stdout), None
-    except Exception as exc:                      # noqa: BLE001
-        return [], f"{type(exc).__name__}"
+def _gh_list_many(kind: str, fields: str, repos: list[str] | None = None):
+    """Every repo this dashboard watches. One failing repo is reported, not fatal:
+    a token that cannot see one of three is still worth three panels."""
+    out: list[dict] = []
+    errs: list[str] = []
+    for repo in (repos if repos is not None else resolve_repos()):
+        rows, err = _gh_list(kind, repo, fields)
+        out.extend(rows)
+        if err:
+            errs.append(err)
+    return out, ("; ".join(errs) if errs else None)
+
+
+def fetch_prs(repos: list[str] | None = None) -> tuple[list[dict], str | None]:
+    return _gh_list_many(
+        "pr", "number,title,isDraft,updatedAt,statusCheckRollup,headRefName", repos)
+
+
+def fetch_issues(repos: list[str] | None = None) -> tuple[list[dict], str | None]:
+    return _gh_list_many("issue", "number,title,updatedAt,labels,assignees", repos)
 
 
 def issue_claims(claims: list[dict], repo: str = REPO) -> dict[int, dict]:
@@ -256,15 +341,41 @@ def issue_claims(claims: list[dict], repo: str = REPO) -> dict[int, dict]:
     return held
 
 
-def sort_issues(issues: list[dict], held: dict[int, dict]) -> list[dict]:
+def issue_key(row: dict) -> str:
+    """'prisonblues/quarterback#176' — how the board namespaces a claim.
+
+    The identity of an issue is the repo AND the number. Once the panels show
+    more than one repo, a bare number stops being unique: two repos both have a
+    #12, and marking ours held because theirs is would send the next seat past
+    the one issue it should have taken.
+    """
+    return f"{row.get('repo') or REPO}#{row.get('number')}"
+
+
+def claims_by_issue(claims: list[dict]) -> dict[str, dict]:
+    """{'owner/repo#n' → the claim on it}, across every repo on the board."""
+    held: dict[str, dict] = {}
+    for c in claims:
+        key = (c.get("key") or "").strip()
+        prefix, sep, number = key.rpartition("#")
+        if sep and prefix.count("/") == 1 and number.isdigit():
+            held.setdefault(key, c)
+    return held
+
+
+def sort_issues(issues: list[dict], held: dict) -> list[dict]:
     """Free issues first, newest first inside each group.
 
     The free ones are what the panel is for — a seat reads it to find work
     nobody has taken — and on a pane that fits a dozen rows, a run of held
     issues along the top is the list failing at its one job.
     """
-    return sorted(issues,
-                  key=lambda i: (i.get("number") in held, -(i.get("number") or 0)))
+    def taken(issue: dict) -> bool:
+        # Accepts either index: keyed by 'owner/repo#n' (what the panels use now
+        # that they show several repos) or by bare number (the older shape).
+        return issue_key(issue) in held or issue.get("number") in held
+
+    return sorted(issues, key=lambda i: (taken(i), -(i.get("number") or 0)))
 
 
 def ci_state(pr: dict) -> tuple[str, str]:
@@ -280,3 +391,220 @@ def ci_state(pr: dict) -> tuple[str, str]:
     if all(c in ("SUCCESS", "SKIPPED", "NEUTRAL") for c in concs):
         return "✓", "green"
     return "?", "grey50"
+
+
+# ---- the plan ----------------------------------------------------------------
+#
+# The board's plan is what the fleet agreed to do next, in order, one list per
+# repo plus a fleet-wide one. It is the half a dashboard could not show before:
+# FLEET says who is here, CLAIMED says what they hold, and neither answers "and
+# what is that work FOR" — the plan does, and it names the item that is next
+# when nobody is on it.
+
+PLAN_LIMIT = 200        # a plan is tens of rows by design; this is a backstop
+
+
+def fetch_plan(client) -> tuple[list[dict], str | None]:
+    """Every open plan item on the board, in the board's own order.
+
+    No repo filter, deliberately: a repo read widens to the fleet-wide items but
+    still hides the other repos' lists, and this panel is called PLANS because
+    the fleet runs more than one. Which list a row belongs to is the repo column.
+
+    Never raises — a dead board is a state the panel renders, the same way
+    :func:`fetch_board` treats it.
+    """
+    try:
+        data = client.get(f"/plan?limit={PLAN_LIMIT}")
+    except Exception as exc:                      # noqa: BLE001 — display it, don't die
+        return [], f"{type(exc).__name__}: {exc}"
+    return data.get("items") or [], None
+
+
+def plan_state(item: dict) -> tuple[str, str]:
+    """(glyph, colour) for a plan row: running, blocked, or free to take."""
+    if item.get("claim"):
+        return "▶", "green"
+    if item.get("blocked_by"):
+        return "⊘", "grey50"
+    return "○", "cyan"
+
+
+def plan_ref(item: dict) -> str:
+    """'#78' for an item that points at an issue or PR, '' for one that does not.
+
+    Most plan items are a line of plan and nothing else; the ref is the link to
+    where the *what* and the *why* live.
+    """
+    value = (item.get("ref") or {}).get("value")
+    return f"#{value}" if value else ""
+
+
+def plan_repo(item: dict, repos: list[str] | None = None) -> str | None:
+    """The GitHub slug behind a plan item's repo, or None if it names no repo.
+
+    A plan item's repo is free text — the fleet has lists under both
+    'prisonblues/quarterback' and a bare '65lowther' — so a bare name is matched
+    against the repos this dashboard watches rather than guessed at. Guessing
+    would put an owner on a name that never had one, and the ⚒ would then start
+    work on somebody else's issue of the same number.
+    """
+    repo = item.get("repo")
+    if not repo:
+        return None                               # fleet scope: no repo to name
+    if "/" in repo:
+        return repo
+    for watched in (repos if repos is not None else resolve_repos()):
+        if short_repo(watched) == repo:
+            return watched
+    return None
+
+
+def plan_issue(item: dict, repos: list[str] | None = None) -> dict | None:
+    """The issue behind a plan item, shaped like a `gh issue list` row — or None.
+
+    What the ⚒ needs and all it needs: a number, and the repo it belongs to. An
+    item with no ref, a `pr` ref, or a repo that cannot be resolved to a slug has
+    no issue to fix and the icon stays dim.
+    """
+    ref = item.get("ref") or {}
+    value = str(ref.get("value") or "")
+    repo = plan_repo(item, repos)
+    if ref.get("kind") != "issue" or not value.isdigit() or not repo:
+        return None
+    return {"number": int(value), "repo": repo, "title": item.get("title")}
+
+
+def sort_plan(items: list[dict], repos: list[str] | None = None) -> list[dict]:
+    """Running first, then what is free to take, then what is blocked.
+
+    Inside each band the board's own order is kept — the plan is an ordered list
+    and the order is the point — with the repos this dashboard watches ahead of
+    the ones it only overhears. Blocked items sink because they are the one band
+    a reader can do nothing about.
+    """
+    watched = {short_repo(r) for r in (repos if repos is not None else resolve_repos())}
+
+    def band(item: dict) -> int:
+        if item.get("claim"):
+            return 0
+        return 2 if item.get("blocked_by") else 1
+
+    def near(item: dict) -> int:
+        repo = item.get("repo")
+        return 0 if not repo or short_repo(repo) in watched else 1
+
+    return sorted(items, key=lambda i: (band(i), near(i)))
+
+
+def plan_counts(items: list[dict]) -> tuple[int, int]:
+    """(running, blocked) — the two numbers both panel titles report."""
+    running = sum(1 for i in items if i.get("claim"))
+    blocked = sum(1 for i in items if not i.get("claim") and i.get("blocked_by"))
+    return running, blocked
+
+
+def plan_who(item: dict) -> tuple[str, str]:
+    """(text, colour) for the right-hand column: who has it, or what it waits on.
+
+    Three different facts share one column because only one of them is ever true
+    of a row: a claimed item has a holder, a blocked one has something to wait
+    for, and a free one has only how long it has been sitting there.
+    """
+    claim = item.get("claim")
+    if claim:
+        return (claim.get("holder") or "?").split("/", 1)[-1], "yellow"
+    blockers = item.get("blocked_by") or []
+    if blockers:
+        first = blockers[0].get("ref")
+        return (f"waits #{first}" if first else f"waits ×{len(blockers)}"), "grey50"
+    return ago(item.get("updated")), "grey50"
+
+
+def claim_label(key: str, plan: list[dict] | None = None) -> str:
+    """What a claim is ON, in words a human can read off a pane.
+
+    A claim on a plan item is keyed ``plan:<uuid>``: right for a lock, useless on
+    a screen — 36 hex characters that say only "something on the plan". Given the
+    plan, the item's title goes in instead. Without it the raw key stays, because
+    a key nobody can resolve still beats a blank.
+    """
+    key = key or "?"
+    wanted = key.split(":", 1)[1] if key.startswith("plan:") else None
+    for item in (plan or []):
+        if wanted and item.get("item_id") == wanted:
+            head = " ".join(x for x in ("plan", plan_ref(item)) if x)
+            return f"{head} {item.get('title') or '?'}"
+    return short_key(key)
+
+
+def plan_detail(item: dict) -> str:
+    """The whole of a plan row, for the detail line under the tables.
+
+    The note is why this is worth a click: it is the reasoning behind the item's
+    place in the order, it exists nowhere else — not in the issue, not on the
+    board tape — and it does not fit in a 44-column title cell.
+    """
+    bits = [f"{short_repo(item.get('repo') or 'fleet')} {plan_ref(item)}".strip(),
+            item.get("title") or "(untitled)"]
+    if item.get("phase"):
+        bits.append(f"[{item['phase']}]")
+    claim = item.get("claim")
+    if claim:
+        held = f"held by {claim.get('holder') or '?'}"
+        if claim.get("note"):
+            held += f" — {claim['note']}"
+        bits.append(held)
+    blockers = item.get("blocked_by") or []
+    if blockers:
+        bits.append("waits on " + ", ".join(
+            f"{b.get('ref') and '#' + str(b['ref']) or ''} {b.get('title') or ''}".strip()
+            for b in blockers))
+    if item.get("note"):
+        bits.append(item["note"])
+    return clip(" · ".join(bits), 400)
+
+
+# ---- the tmux screen ---------------------------------------------------------
+# The dashboard reads the seats off tmux rather than off the board, because they
+# are different questions. The board knows which AGENTS are live anywhere on the
+# fleet; this knows which PANES are on the screen in front of you, including the
+# ones whose agent has exited and left a shell behind. Only the second can be
+# closed with a click.
+
+SEAT_FIELDS = ("pane", "seat", "session", "window", "command", "path")
+
+
+def tmux_seats() -> list[dict]:
+    """Every seat pane on this tmux server, lowest seat number first.
+
+    A seat is a pane carrying the @qb_seat option, which is how qb-seats marks
+    them and the only handle that survives a pane being added or closed — the
+    index shifts and the agent rewrites the title.
+
+    Returns [] rather than raising when there is no tmux, no server, or no
+    screen: the dashboard runs inside the screen most of the time and in a bare
+    terminal the rest, and an empty SEATS panel is the honest answer to the
+    second case.
+    """
+    if not os.environ.get("TMUX"):
+        return []
+    fmt = "\t".join("#{%s}" % f for f in
+                    ("pane_id", "@qb_seat", "session_name", "window_index",
+                     "pane_current_command", "pane_current_path"))
+    try:
+        got = subprocess.run(["tmux", "list-panes", "-a", "-F", fmt],
+                             capture_output=True, text=True, timeout=5)
+    except Exception:                             # noqa: BLE001
+        return []
+    if got.returncode != 0:
+        return []
+    seats = []
+    for line in got.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) != len(SEAT_FIELDS) or not parts[1]:
+            continue
+        seats.append(dict(zip(SEAT_FIELDS, parts)))
+    # By seat NUMBER, not by pane order: --add splits off the leftmost pane, so
+    # pane order runs 1, 3, 2 on a screen that has had a seat added to it.
+    return sorted(seats, key=lambda s: int(s["seat"]) if s["seat"].isdigit() else 0)

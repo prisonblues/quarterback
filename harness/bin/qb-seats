@@ -126,8 +126,15 @@ usage: $PROG [N] [-C DIR] [-s NAME] [--staged] [--no-yolo] [--add] [--kill]
 
 Environment:
   QB_SEATS_BOARD   command for the board pane, overriding the default
+  QB_SEATS_BAR     0 to leave the status line and the mouse alone (see below)
   QB_SEAT_YOLO     0 to give the seats their permission prompts back (--no-yolo)
   QB_SEAT_AGENT    the agent binary a seat runs, instead of \`claude\`
+
+The seat bar is a second status line above the seats, one clickable cell per
+seat: the name jumps to that pane, the ✕ closes it after a y/n, and ＋ adds one.
+Turning it on sets \`mouse on\`, \`status 2\` and \`status-position top\` for this
+session, and binds MouseDown1Status for the whole server — QB_SEATS_BAR=0 if
+that is not a trade you want.
 EOF
 }
 
@@ -150,6 +157,81 @@ board_cmd() {
       "board pane: qb-board is not on PATH, so there is nothing to follow here yet.
 Set QB_SEATS_BOARD to run something else in this pane."
   fi
+}
+
+# ---- the seat bar -----------------------------------------------------------
+# A second status line above the seat row, one cell per seat, drawn by tmux from
+# the panes themselves: `#{P:...}` loops over the panes of the window, and the
+# `#{?@qb_seat,...}` skips the board. Nothing regenerates it. A seat added by
+# --add or closed by its ✕ changes the bar on the next redraw, which is the only
+# reason this is a format and not a string this script prints.
+#
+# THE ✕ CANNOT GO ON THE PANE BORDER, which is where you would want it. tmux
+# honours `#[range=...]` in status-format and nowhere else; a click on a border
+# arrives with #{mouse_x} and #{mouse_y} EMPTY, so no glyph on it is
+# distinguishable from any other; and a click on the topmost border row — where
+# seat 1's title is drawn — is not delivered at all. Measured on tmux 3.6a; the
+# same note is in qb-seat-click, which is where anyone chasing this will look.
+seat_bar() {
+  printf '%s' \
+'#[align=left]'\
+'#{P:#{?@qb_seat,'\
+'#[range=user|seat#{@qb_seat}]#{?pane_active,#[fg=black]#[bg=colour109],#[fg=colour109]}'\
+' seat #{@qb_seat} #[default]#[norange]'\
+'#[range=user|kill#{@qb_seat}]#[fg=colour167] ✕ #[default]#[norange] '\
+',}}'\
+'#[range=user|add]#[fg=colour108] ＋ seat #[default]#[norange]'
+}
+
+# One binding for every widget on the bar, because tmux delivers every
+# status-line click to MouseDown1Status and the widget is only distinguishable
+# by #{mouse_status_range}. Three things are load-bearing here:
+#
+#   * A key table is SERVER-wide, so this fires in the user's other sessions
+#     too. @qb_bar is set only on ours, so everywhere else the first condition
+#     is false and the click falls through to `switch-client -t =` — which is
+#     verbatim what tmux binds by default. Nothing else on the box changes.
+#   * The range is stashed in @qb_click while the mouse event is still live.
+#     confirm-before runs its command afterwards, by which point
+#     #{mouse_status_range} expands to nothing — the stash is what survives.
+#   * Only the ✕ is confirmed. Closing a seat kills the agent working in it, and
+#     the ✕ is three columns from the cell that merely jumps to the pane.
+install_bar() {
+  local click=$1 run stash confirm inner
+  # `-t "=$SESSION:"`, with the colon, throughout. set-option rejects the bare
+  # `=name` exact-match form that every other command here takes — it reports
+  # "no such session" for a session that plainly exists. The colon makes it a
+  # window target of that session, which resolves, and keeps `=` doing its job:
+  # dropping it would let a session named `seats-quarterback-old` be matched by
+  # a prefix and configured instead of this one.
+  tmux set-option -t "=$SESSION:" mouse on
+  tmux set-option -t "=$SESSION:" status 2
+  tmux set-option -t "=$SESSION:" status-position top
+  tmux set-option -t "=$SESSION:" 'status-format[1]' "$(seat_bar)"
+  tmux set-option -t "=$SESSION:" @qb_bar 1
+
+  # Assembled in pieces and passed as ONE LINE. A newline inside a tmux command
+  # string ends the command, so the readable indented version of this — nested
+  # if-shell with its two branches on their own lines — binds a first line that
+  # is missing its arguments and reports nothing when clicked. It looked right
+  # in `list-keys`, which shows the newlines escaped as \n.
+  run="run-shell -b '$click'"
+  # The SESSION is stashed as well as the range, and it is not belt-and-braces:
+  # `run-shell` invoked from a MOUSE binding gets no $TMUX_PANE, so the script
+  # on the other end has nothing to work out which screen was clicked. From a
+  # command line it does get one, which is what made this so quiet — the script
+  # worked by hand and did nothing when clicked, silently, because run-shell -b
+  # discards its output.
+  stash="set-option -s -F @qb_click \"#{mouse_status_range}\""
+  stash="$stash ; set-option -s -F @qb_click_session \"#{session_name}\""
+  confirm="confirm-before -p 'close seat #{s/kill//:@qb_click} —"
+  confirm="$confirm the agent in it goes too (y/n) ' \\\"$run\\\""
+  inner="if-shell -F \"#{m:kill*,#{mouse_status_range}}\" \"$confirm\" \"$run\""
+
+  tmux bind-key -n MouseDown1Status \
+    if-shell -F '#{&&:#{!=:#{@qb_bar},},#{==:#{mouse_status_line},#{@qb_bar}}}' \
+      "$stash ; $inner" \
+      'switch-client -t ='
 }
 
 # ---- where the seats work ---------------------------------------------------
@@ -205,13 +287,45 @@ seat_panes() {
 # command is typed but not entered, so it can be read, edited, or abandoned.
 start_seat() {
   local pane=$1 n=$2
-  tmux send-keys -t "$pane" "qb-seat $n"
+  # The bare name when the pane's shell will find it, which is the ordinary case
+  # and keeps the command line in the pane readable. Otherwise the absolute path
+  # resolved by require_qb_seat — see there for who is short of a PATH.
+  tmux send-keys -t "$pane" "$SEAT_CMD $n"
   [ "$STAGED" -eq 1 ] || tmux send-keys -t "$pane" C-m
 }
 
+SEAT_CMD="qb-seat"      # what start_seat types; require_qb_seat may absolutise it
+
+# PATH is the wrong and only question this used to ask, and --add is where that
+# broke. The ＋ on the seat bar reaches this through `run-shell`, whose PATH is
+# the TMUX SERVER's — and the server is usually one that was already running for
+# something else, long before anything put the harness on a PATH. So the ＋ died
+# here with "qb-seat is not on PATH", and `run-shell -b` throws stderr away, so
+# the button simply did nothing. Measured, not guessed.
+#
+# qb-seat, qb-seats and qb-seat-click install into one directory together, so a
+# sibling of $0 is a better answer than PATH and is always available. PATH still
+# wins when it has one, so an installed copy beats a checkout.
 require_qb_seat() {
-  command -v qb-seat >/dev/null 2>&1 \
-    || die "qb-seat is not on PATH — it installs alongside this script (harness/bin)"
+  SEAT_CMD=$(beside_me qb-seat)
+  [ -x "$SEAT_CMD" ] || die \
+    "qb-seat is neither on PATH nor beside this script (looked at $SEAT_CMD)"
+  # Typed into a pane, the bare name is nicer to read and equivalent whenever
+  # the pane's own shell can resolve it.
+  command -v qb-seat >/dev/null 2>&1 && SEAT_CMD="qb-seat"
+  return 0
+}
+
+# Absolute paths for the two scripts the bar shells out to, resolved HERE rather
+# than left to PATH. A tmux server usually predates the screen running in it, so
+# a `run-shell` inherits whatever PATH started the server — the same trap the
+# seat_env forwarding below exists for, one layer along. PATH first so an
+# installed copy wins over a checkout; this script's own directory as the
+# fallback, because the three install together.
+beside_me() {
+  local name=$1 found
+  found=$(command -v "$name" 2>/dev/null) && { printf '%s' "$found"; return; }
+  printf '%s/%s' "$(cd -P "$(dirname "$0")" && pwd)" "$name"
 }
 
 # ---- args -------------------------------------------------------------------
@@ -347,8 +461,26 @@ tmux set-environment -t "=$SESSION" -r QUARTERBACK_INSTANCE
 # Label the panes. Two seats are indistinguishable once both are printing, and
 # being able to address ONE of them is the whole point.
 tmux set-option -w -t "$SESSION:seats" pane-border-status top
+# @qb_label is how a pane that is NOT a seat says what it is: the option
+# dev/seats-extras.sh already labels the dash and the tape with, and the one the
+# dashboard marks a review pane with when it splits one into this row. Without
+# the middle case every such pane is labelled "board", which is the one thing on
+# this screen they are definitely not.
 tmux set-option -w -t "$SESSION:seats" pane-border-format \
-  ' #{?@qb_seat,seat #{@qb_seat},board} #{?pane_active,*,} '
+  ' #{?@qb_seat,seat #{@qb_seat},#{?@qb_label,#{@qb_label},board}} #{?pane_active,*,} '
+
+# What the screen is, recorded on the screen. The bar's ＋ has to run this same
+# script against this same repo, and it cannot work either out from a pane: PATH
+# in a run-shell is the tmux server's, and the seat panes' cwd is only the repo
+# until somebody cds.
+tmux set-option -t "=$SESSION:" @qb_repo "$REPO"
+tmux set-option -t "=$SESSION:" @qb_seats_bin "$(beside_me qb-seats)"
+
+# The bar is opt-out because turning it on is not free: it takes over the status
+# line, turns the mouse on (which costs shift-less text selection), and binds a
+# key for the whole server. Everything it does is scoped to this session bar the
+# binding, and the binding no-ops everywhere else — see install_bar.
+[ "${QB_SEATS_BAR:-1}" = 0 ] || install_bar "$(beside_me qb-seat-click)"
 
 # ROWS ARE BUILT, NOT CHOSEN. `select-layout tiled` picks its own arrangement
 # from the window's aspect ratio — six seats in a 240x60 window come out 2 across

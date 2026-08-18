@@ -20,6 +20,15 @@ dev = [
     "httpx",
     "ruff",
 ]
+# The dashboard's own dependencies, kept OUT of `dev` on purpose. `qb-board
+# --follow` and the tail half must import neither, and the way that claim stays
+# true is that the ordinary test run does not have them installed — the same
+# reasoning mcp/pyproject.toml already uses for its own `tui`. The harness job
+# runs the suite both ways.
+tui = [
+    "textual",
+    "rich",
+]
 
 [build-system]
 requires = ["hatchling"]
