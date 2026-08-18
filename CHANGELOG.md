@@ -11,6 +11,31 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
+## vNEXT — the dashboard shows the work nobody has taken yet
+
+The dash listed open PRs, which is what you look at when work is finishing. It said
+nothing about work that has not started — and a seat's whole job is to pick an unclaimed
+issue off the board and take it, so the panel was missing the half that feeds the fleet.
+
+There is an ISSUES panel now, with the board's claims joined onto it: an issue somebody
+holds is greyed and carries their name, and the free ones sort to the top, because a free
+issue is the one the next seat should take. The join is the claim key — the board
+namespaces an issue claim `owner/repo#n`, which is exactly the number `gh issue list`
+reports — and the owner/repo half is compared rather than dropped, since two repos both
+have a #12 and marking ours held because theirs is would send a seat past the one issue it
+should have taken.
+
+Clicking is the point of it. Each issue row carries a `⚒`; clicking that shows the exact
+command and, on confirmation, runs `/fix-issue <n>` in a detached tmux window of its own —
+the same shape as the `⚖` that starts a panel review on a PR row. A click anywhere else on
+the row opens the issue on GitHub, `f` does the same job from the keyboard, and the
+confirmation names the holder when the issue is already claimed: taking one back is a real
+thing to want after a session dies with its claim standing, and that is worth a sentence
+rather than a rule against it.
+
+`qb-dash`, the printed one, grew the same panel capped at twelve rows with a count of the
+rest. It cannot scroll, and thirty issues there would push the fleet off the top of a pane.
+
 ## vNEXT — a peer's working directory, so "same repo" stops meaning "same tree"
 
 `/overlap` told an agent who else was live in its repo and left out where they

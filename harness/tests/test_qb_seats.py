@@ -25,6 +25,7 @@ Run: pytest harness/tests
 import os
 import shutil
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -72,15 +73,28 @@ def screen(tmp_path):
     (home / ".config" / "tmux").mkdir(parents=True)
     tmux_conf = home / ".config" / "tmux" / "tmux.conf"
 
-    socket = str(tmp_path / "tmux.sock")
+    # A SHORT socket directory, not tmp_path. A unix socket path is capped at
+    # ~104 characters and pytest's tmp_path spends most of that on the test name,
+    # so tmux cannot bind there and silently uses the default socket instead —
+    # /tmp/tmux-$UID. That is not a test smell, it is a hazard: this fixture used
+    # to end with `tmux kill-server`, which then killed the DEVELOPER'S OWN tmux.
+    # It did exactly that on this machine, taking a live seat screen with it.
+    socket_dir = tempfile.mkdtemp(prefix="qbt-", dir="/tmp")
     env = {
-        **os.environ,
+        **{k: v for k, v in os.environ.items() if k not in ("TMUX", "TMUX_PANE")},
+        # $TMUX BEATS $TMUX_TMPDIR, and that is the whole bug. Inside a tmux pane
+        # $TMUX names the server the client is attached to, so every tmux call
+        # below reaches THAT server no matter where TMUX_TMPDIR points — the
+        # suite creates its sessions on it and then tears it down. Measured: a
+        # seat ran `pytest harness/tests` inside the screen it was sitting in and
+        # killed the server hosting it, with TMUX_TMPDIR correctly set the whole
+        # time. Unset both, so a run from inside tmux is a run outside it.
         "HOME": str(home),
         "XDG_CONFIG_HOME": str(home / ".config"),
         "PATH": f"{stub_dir}:{os.environ['PATH']}",
         # -L would be cleaner than an env var, but the script builds its own tmux
         # command lines; TMUX_TMPDIR isolates the server without touching them.
-        "TMUX_TMPDIR": str(tmp_path),
+        "TMUX_TMPDIR": socket_dir,
         # A stray value in the launching environment is exactly the leak the
         # script has to defend against, so the fixture always supplies one.
         "QUARTERBACK_INSTANCE": "leaked-host-wide",
@@ -89,13 +103,24 @@ def screen(tmp_path):
 
     def _run(*args, name="t"):
         sessions.append(name)
-        return subprocess.run(
+        done = subprocess.run(
             [str(QB_SEATS), "-C", str(repo), "-s", name, *args],
             env=env,
             capture_output=True,
             text=True,
             timeout=60,
         )
+        # Isolation is asserted, not assumed. If tmux ever ignores TMUX_TMPDIR
+        # again, these tests would quietly start driving the developer's own
+        # server — and pass while doing it. Fail here instead, before the
+        # teardown touches anything.
+        if done.returncode == 0:
+            assert "TMUX" not in env, "a test that inherits $TMUX drives the caller's server"
+            assert (Path(socket_dir) / f"tmux-{os.getuid()}").exists(), (
+                f"tmux did not use TMUX_TMPDIR={socket_dir}; it is on the default "
+                "socket and this suite is now driving somebody else's server"
+            )
+        return done
 
     def _tmux(*args):
         return subprocess.run(
@@ -110,11 +135,14 @@ def screen(tmp_path):
     _run.env = env
     yield _run
 
+    # Only the sessions this fixture made, addressed exactly (`=name`), and NEVER
+    # `tmux kill-server`: a server that loses its last session exits on its own,
+    # so the blunt instrument bought nothing and could reach a server that is not
+    # ours. Whatever else is running on this machine is none of a test's business.
     for name in sessions:
         subprocess.run(["tmux", "kill-session", "-t", f"={name}"], env=env,
                        capture_output=True)
-    subprocess.run(["tmux", "kill-server"], env=env, capture_output=True)
-    assert not Path(socket).exists() or True  # server teardown is best-effort
+    shutil.rmtree(socket_dir, ignore_errors=True)
 
 
 def panes(run, name="t"):
