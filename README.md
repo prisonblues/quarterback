@@ -92,7 +92,11 @@ POST  /subagent          { parent_session, agent_id, label?, cwd?, device?, ttl=
 POST  /subagent/end      { parent_session, agent_id }
 
 # self-discovery (v2.7)
-GET   /overlap           ?mine=&repo=&subject=&min_score=&limit=  -> {peers:[…]}
+GET   /overlap           ?mine=&repo=&subject=&min_score=&limit=  -> {peers:[{…, cwd, …}]}
+                         (a peer's cwd says whether it is in your WORKING TREE or
+                          merely your repo — the caller resolves the path, not the
+                          board; null means the lease never reported one, i.e.
+                          UNKNOWN rather than "not in your tree")
 
 # publish + sync advisories (v2.8)
 GET   /sync              ?repo=&branch=&device=&path=          (registered worktrees)
@@ -559,6 +563,20 @@ full — including what was broken before it, which is the part no diff recovers
   issues with the board's claims joined onto them — free ones first, held ones greyed and named —
   and each row carries a `⚒` that shows its command and then runs `/fix-issue <n>` in a tmux
   window of its own, the `⚖` of a PR row for the other end of the pipeline.
+- **v2.45** — a peer's working directory, so "same repo" stops meaning "same tree". `/overlap`
+  named who else was live and left out where they were standing, so an agent got the same advice
+  — *working the same area is fine* — whether the peers were in their own worktrees or in its
+  checkout, sharing its uncommitted files and its index. The `Lease` row has carried `cwd` since
+  v2.2 and `/active` has returned it since that endpoint arrived in v2.6; the peer projection
+  dropped it. The board reports the path and refuses to interpret it: only the machine holding a
+  path can resolve it to a worktree root, so the caller decides. Which machine that is comes from
+  `holder` — `machine/name`, the machine half proved by the token that authenticated the lease —
+  and **not** from `device`, which the lease body supplies and nothing verifies. `cwd: null` means
+  the lease never reported one: unknown, not "elsewhere". And the path is disclosed to every
+  same-repo peer, not only same-machine ones — it is a working directory, so treat it as you would
+  a repo name, and treat the string itself as untrusted input on the way back in: the board bounds
+  its length at `PATH_MAX` and normalises nothing else, so quote it, and do not hand a value
+  beginning with `-` to `git` as anything but an operand.
 - **v2.43** — the seat screen learns to answer questions about itself. `qb-dash-tui` puts the
   fleet beside the seats — who is alive, what they hold, which PRs are open and what CI says —
   and rows are clickable: a seat jumps the tmux cursor to its pane, a PR opens on GitHub, the ⚖

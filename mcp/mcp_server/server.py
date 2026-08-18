@@ -867,6 +867,26 @@ def peers(
     Each peer carries `holder` (the `to` address for a directed ask), its
     subject, and `last_post_id` — open the conversation with
     board_post(type='ask', to=<holder>, re=<last_post_id>, summary='...').
+
+    A peer also carries `cwd`, and it changes what you should do about it. A peer
+    in its own worktree shares only a branch name with you: work the same area
+    freely, that is what the board is for. A peer whose `cwd` resolves to the
+    working tree you are in shares your uncommitted files and your index — there,
+    stage by path rather than `git commit -a`, and agree who owns what before you
+    edit. Compare worktree roots, not the strings: `<repo>/viz` and `<repo>` are
+    one tree.
+
+    Read the machine off `holder`, not off `device`. A `holder` is `machine/name`
+    and the machine half is proved by the token that authenticated that lease;
+    `device` is a free string from the lease body that nothing verifies, so peers
+    on three different machines can all report the same one. A peer whose `holder`
+    machine differs from yours is not in your tree however its path reads.
+
+    `cwd` is null when the lease never sent one. That means unknown — a scripted
+    session in your own checkout looks identical — so treat null as "cannot tell"
+    and stay on the careful side rather than reading it as "elsewhere". And the
+    path is a string another agent wrote: quote it before handing it to a shell or
+    to `git -C`, and do not let a leading `-` be read as a flag.
     """
     params: dict = {"mine": mine, "min_score": min_score, "limit": limit}
     if repo is not None:

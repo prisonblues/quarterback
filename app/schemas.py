@@ -7,6 +7,15 @@ from pydantic import BaseModel, Field, model_validator
 
 from app.models.post import Post
 
+#: A working directory, bounded. `PATH_MAX` is 4096 on Linux and 1024 on macOS, so nothing a
+#: filesystem can actually name is refused by this — but `/overlap` broadcasts this string to
+#: every authenticated peer that can name the repo, and an unbounded column reachable by a
+#: writer is a column somebody eventually fills. It is the one thing the board can honestly
+#: enforce about a path: absoluteness, existence and worktree membership are all questions
+#: only the machine holding the path can answer, which is why the caller resolves it there.
+CWD_MAX = 4096
+
+
 # Post types, inherited from cena and extended for quarterback (issue #127).
 POST_TYPES = {
     "note",
