@@ -250,6 +250,12 @@ with these overrides:
 - **A later round gets its own fixer, briefed with that round's findings only.**
   Re-briefing it with round 1's list has it re-examine work already done and
   buries the new finding — which is the one the round existed to catch.
+- **The brief's step 3a (escalate, don't patch) applies to panel findings too**,
+  and this is where it earns its keep: a panel finding can be a premise finding
+  rather than a defect — #132's P1 was one — and the fixer is the only reader
+  positioned to notice, because it is the one being asked to write the special
+  case. An escalation from this fixer is **not** a finding left outstanding for
+  the next round to pick up; §5 says what happens to it.
 
 ## 4b. Record what actually happened to each finding
 
@@ -295,7 +301,12 @@ One of four per finding:
   point**: you are already writing the refutation into the PR comment and the fix
   commit, in prose nothing can count. A bare `refuted` is the same
   confident-assertion-with-nothing-behind-it the release exists to measure.
-- **`deferred`** — real, not now. Put where it went in `deferred_to`.
+- **`deferred`** — real, not now. Put where it went in `deferred_to`. This is
+  also where an **escalated** finding goes (the brief's step 3a): the defect is
+  real and the fix is what is in dispute, so `refuted` would be a lie about the
+  finding and `fixed` a lie about the code. `deferred_to` names the issue you
+  opened for the premise, and there is no fifth outcome to invent — the vocabulary
+  is a database constraint, not a convention.
 - **`superseded`** — a later finding replaced it; name that finding's key in
   `superseded_by`, which is **required** for the same reason a note is required
   for a refutation: without it the row records "replaced by something".
@@ -382,6 +393,28 @@ no with complete confidence):
   no baseline to compare against. The `veto` list says which. Report it as a stop,
   never as "clean".
 
+**An escalation ends the fix half of the cycle for that finding, and `round_stop`
+cannot see it.** The rule is mechanical, computed from the rounds' payloads, so a
+finding the fixer escalated instead of patching is simply *outstanding* at the next
+round — correctly, because it is — and `stop: false` sends it back to §4. A fresh
+fixer, briefed with that round's findings and no memory of the escalation, then
+writes the patch the last one declined to write: the round that manufactures the
+next round's findings, arriving through the rule that exists to prevent them.
+
+- **Never re-brief an escalated finding to a fixer.** Not this round, not a later
+  one. It goes to the human with the write-up the fixer produced (§6).
+- **The rest of the cycle carries on.** Findings that WERE fixed still get their
+  re-review round, and `round_stop` still decides that — you are not overruling it
+  for them, only declining to send one finding back through a pass that has
+  already been tried on it.
+- **If the escalated premise is what most of the round hangs off, stop the cycle**
+  and say so. Another round would review code whose shape is the open question,
+  and #67's whole observation is that this is where the loop spends the most for
+  the least.
+- **`--ask` is evidence, not the decision.** A premise that survives a challenge
+  may still be the wrong premise, and the seats were never asked whether the
+  redesign is worth its cost. `holds` is not permission to go back and patch.
+
 Two things this must NOT do:
 - **Never let a fix ride out unreviewed silently.** At the cap, if the last fix
   pass changed anything, say so in the relay: "the round-N fix commit was not
@@ -418,6 +451,11 @@ Then the part that is new, and is the point of running more than one round:
   than either verdict on its own.
 - **Flagged for re-review:** findings whose reporter said the FIX needs re-reading,
   and whether the following round did find something there.
+- **Escalated:** any finding a fixer reported as the approach being wrong rather
+  than the code, with its premise, what it explains, what removing it would cost,
+  and its `--ask` verdict if one was run. Say it even when the answer is none. This
+  is the one item in the relay that is a question rather than a report: it is
+  outstanding until a human answers it, and no round will close it.
 
 ## 7. Merging (only if the user asks)
 

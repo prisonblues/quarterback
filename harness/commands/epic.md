@@ -109,6 +109,13 @@ trunk stays a human step regardless.
   makes `claude` silently drop `permissions.allow`, stalling git/gh) and that
   `headless_permission_mode` actually permits git/gh; it warns on low memory / leaked
   `feat-issue-*` containers. Blockers abort with a clear message.
+- **An escalation is invisible to the driver.** `/review-pr` may report that a finding says the
+  approach is wrong rather than the code, and write no patch for it (its step 3a). That report exists
+  only in the agent's text: nothing here parses it, so an issue carrying one still counts as a real
+  artifact and, in integration mode, its sub-PR still ff-merges onto the epic branch. So read each
+  `/review-pr` relay for an `Escalated` block before opening the `epic→base` PR — the merge to the
+  real base is the human step this is for. Making it mechanical is #67's first piece, which is not
+  built.
 - **Resource discipline.** Each issue's worktree **and its containers / isolated DB** are torn down
   in a `finally` (via `remove-worktree`), not just the directory. Set
   `epic.executor_worktree_args` in config (e.g. `["--frontend-only"]`) to run a lighter worktree

@@ -263,6 +263,17 @@ valid skip is a genuine false positive where re-examination
 confirms the code is correct. "Not worth the churn" is not valid.
 "Can do later" is not valid.
 
+One finding can be neither: it says the *approach* you chose is
+wrong rather than the code, and fixing it where it points means
+adding a special case to keep that approach standing (`/review-pr`'s
+step 3a has the test and why it matters — #67). Here you are the
+author and no PR exists yet, which makes it the cheapest moment in
+the whole cycle to act on: change the approach, and say in the PR
+body which finding made you. If you judge the redesign too big for
+this issue, say so in the PR body in one sentence with the premise
+named — a stated tension a reviewer can rule on, never a patch that
+buries it.
+
 After fixing, re-run the quality pipeline. Iterate until clean.
 
 ## 9. Commit and push
