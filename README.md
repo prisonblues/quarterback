@@ -581,7 +581,7 @@ full — including what was broken before it, which is the part no diff recovers
   a repo name, and treat the string itself as untrusted input on the way back in: the board bounds
   its length at `PATH_MAX` and normalises nothing else, so quote it, and do not hand a value
   beginning with `-` to `git` as anything but an operand.
-- **vNEXT** — the coverage veto stops reporting a constant. `confident` is `not veto`, so a
+- **v2.50** — the coverage veto stops reporting a constant. `confident` is `not veto`, so a
   veto line that fires every round makes a confident stop unreachable rather than rare. Two
   did: a seat that cannot read the code (every seat — an empty sandbox and no tools) declaring
   gaps about code outside the diff, and antigravity's argv ceiling, which the kernel sets at
