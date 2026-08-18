@@ -178,12 +178,21 @@ Set QB_SEATS_BOARD to run something else in this pane."
 # shell where the same URL works. That cost real debugging time while this was
 # scaffolding in dev/seats-extras.sh (since removed); it arrives here with the lesson.
 #
-# qb-dash-tui is the default because its rows are clickable and the bar already
-# turns the mouse on. QB_SEATS_DASH=qb-dash gets the plain redrawing renderer,
-# which is what to reach for when a terminal turns out not to forward mouse events.
+# THE PLAIN RENDERER IS THE DEFAULT, AND NOT BECAUSE IT IS BETTER. qb-dash-tui is
+# the nicer of the two — clickable rows, and the seat bar has already turned the
+# mouse on for them — and it should take this slot the moment #209 is fixed.
+# Today it cannot: it keys its seat rows by seat name, two screens both number
+# their seats from 1, so the second screen anywhere on the box turns this pane into
+# a Textual traceback (DuplicateKey). A pane that is meant to be what you look at
+# when something is wrong must not be the thing that breaks first, and a default
+# has to work on the second screen as well as the first. QB_SEATS_DASH=qb-dash-tui
+# opts in meanwhile.
+#
+# The underlying collision is #208: seat identities are machine-wide while the
+# numbering is per-screen.
 dash_cmd() {
   if [ -n "${QB_SEATS_DASH+set}" ]; then printf '%s' "$QB_SEATS_DASH"; return; fi
-  for c in qb-dash-tui qb-dash; do
+  for c in qb-dash qb-dash-tui; do
     command -v "$c" >/dev/null 2>&1 && { printf '%s' "$c"; return; }
   done
   printf 'printf %%s\\n %q' \

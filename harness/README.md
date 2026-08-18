@@ -503,9 +503,11 @@ one row offers more than one verb.
 
 `qb-seats` builds it. A screen is seats across the top, the dash down the right, and the
 tape full width along the bottom — the dash reports what is true now, the tape what just
-happened, and a screen wants both. `QB_SEATS_DASH` names the command (default
-`qb-dash-tui`, or `qb-dash` for the plain renderer if a terminal will not forward mouse
-events); **set it to the empty string for a screen with no dash**. `QB_SEATS_DASH_SIZE` is
+happened, and a screen wants both. `QB_SEATS_DASH` names the command; **set it to the
+empty string for a screen with no dash**. The default is the plain `qb-dash` rather than
+the nicer clickable `qb-dash-tui`, because the TUI crashes with `DuplicateKey` once a
+second screen exists (#209, underlying cause #208) — `QB_SEATS_DASH=qb-dash-tui` opts in,
+and it should become the default once that is fixed. `QB_SEATS_DASH_SIZE` is
 its width in columns, default 78.
 
 `qb-dash` is a **launcher**, not the dashboard: the dashboard is Python needing `rich`,
