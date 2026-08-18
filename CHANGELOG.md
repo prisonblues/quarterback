@@ -11,7 +11,7 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
-## vNEXT — the dashboard shows the work nobody has taken yet
+## v2.44 — the dashboard shows the work nobody has taken yet
 
 The dash listed open PRs, which is what you look at when work is finishing. It said
 nothing about work that has not started — and a seat's whole job is to pick an unclaimed

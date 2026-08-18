@@ -555,7 +555,7 @@ full — including what was broken before it, which is the part no diff recovers
   spelling got in. The rejected alternative — accept every spelling and reconcile
   them on read — is closed as PR #152: an open input domain cannot be enumerated,
   and three rounds found three more holes in the attempt.
-- **vNEXT** — the dash learns about work that has not started. An ISSUES panel lists the open
+- **v2.44** — the dash learns about work that has not started. An ISSUES panel lists the open
   issues with the board's claims joined onto them — free ones first, held ones greyed and named —
   and each row carries a `⚒` that shows its command and then runs `/fix-issue <n>` in a tmux
   window of its own, the `⚖` of a PR row for the other end of the pipeline.
