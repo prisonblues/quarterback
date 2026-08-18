@@ -11,12 +11,13 @@ things stay true at once. This suite asserts those three, because each of them b
    whose summary has nowhere to say so, has been handed note-and-move-on with a nicer name. The
    permission lives in step 3a, the durable record is the step-5 commit body and the relay is
    step 6's table; nothing but this connects them.
-2. **The cross-file anchor resolves.** Four commands and the harness README point at the
-   escalation by the step number it has in `review-pr.md`'s brief — `panel-review-pr.md` lifts
-   that brief verbatim into a sub-agent that cannot see the file, so a renumbered heading leaves
-   every one of them pointing at nothing, and pointing at nothing reads exactly like pointing at
-   something. The other half of the same anchor is outward: step 3a tells the fixer to run
-   `panel.py --ask`, and the flags and the README section it cites have to exist too.
+2. **The cross-file anchor resolves.** Every command in `FIX_LOOPS`, and the harness README,
+   point at the escalation by the step number it has in `review-pr.md`'s brief — and
+   `panel-review-pr.md` lifts that brief verbatim into a sub-agent that cannot see the file, so a
+   renumbered heading leaves every one of them pointing at nothing, and pointing at nothing reads
+   exactly like pointing at something. The same anchor has two further directions: outward,
+   because step 3a tells the fixer to run `panel.py --ask` at a path whose flags have to exist;
+   and inward, because the brief cannot cite a section of the file it was lifted out of.
 3. **The recorded outcome is a value the database will accept.** An escalation is recorded as
    `deferred`; the vocabulary is a SQL CHECK as well as a Python tuple, so a doc that invents
    `"outcome": "escalated"` costs the row and records nothing. The tuple-vs-constraint agreement
@@ -45,9 +46,18 @@ from typing import NamedTuple
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-#: Every read is repo-root-relative, so the paths in a failure message are the paths a reader
-#: types — and one accessor covers the commands, the harness README and the app.
-COMMAND_DIR = "harness/commands"
+#: Every read is repo-root-relative — the keys of `FIX_LOOPS` and `ANCHOR_DOCS` included, since
+#: those are what a failure message names — so one accessor covers the commands, the harness
+#: README and the app, and every path printed on the way out is a path a reader can type.
+REVIEW_PR = "harness/commands/review-pr.md"
+
+#: The script step 3a tells the fixer to run, and the repo file this suite reads its flags out
+#: of. One file at two spellings: `~/.claude/loops` is the installed copy — here a nix store
+#: symlink, so it can be a generation behind the checkout and is not byte-identical to it. What
+#: a text guard can prove is that the two paths have not drifted apart, which is the one part of
+#: the snippet the flag check does not read.
+PANEL_PY = "harness/loops/panel.py"
+PANEL_PY_INSTALLED = "~/.claude/loops/panel.py"
 
 #: The step number the escalation has in `review-pr.md`'s SUB-AGENT BRIEF, and therefore the
 #: token every other file refers to it by. It is a string, not an int: `3a` is a step *between*
@@ -83,14 +93,14 @@ class Loop(NamedTuple):
 #: pattern loose enough to find them all also finds `/panel` (which reviews and never fixes).
 #: A rename fails this suite loudly, which is the intent.
 FIX_LOOPS = {
-    "review-pr.md": Loop(
+    REVIEW_PR: Loop(
         why="defines the escalation; the canonical brief every other path lifts",
         behaviour=("Write no patch for it", "Never redesign on your own authority"),
         behaviour_is="the permission itself — no patch, and no redesign on a fixer's authority",
         defines=True,
         records_outcomes=True,
     ),
-    "panel-review-pr.md": Loop(
+    "harness/commands/panel-review-pr.md": Loop(
         why="cycles panel → fix → panel, and its §4 is what would re-brief it",
         behaviour=("Never re-brief an escalated finding to a fixer",
                    "Match it by premise, not by key"),
@@ -98,19 +108,19 @@ FIX_LOOPS = {
                      "later round re-reports the same premise under a new finding key",
         records_outcomes=True,
     ),
-    "fix-and-land.md": Loop(
+    "harness/commands/fix-and-land.md": Loop(
         why="repeats review→fix until the To fix list is empty, then MERGES",
         behaviour=("do **not** merge", "stop for a human"),
         behaviour_is="that the loop stops and does not merge, since an escalated finding never "
                      "leaves the To fix list and 'repeat until empty' would spin or re-brief it",
     ),
-    "epic.md": Loop(
+    "harness/commands/epic.md": Loop(
         why="drives /review-pr headlessly per sub-issue and ff-merges the sub-PRs",
         behaviour=("before opening the `epic→base` PR", "into the `epic→base` PR body"),
         behaviour_is="that the driver reads each relay before the epic→base PR and carries the "
                      "escalation into that PR's body, the merge already having happened",
     ),
-    "fix-issue.md": Loop(
+    "harness/commands/fix-issue.md": Loop(
         why="runs its own fix pass over review findings, as the code's AUTHOR",
         behaviour=("change the approach", "the patch you did not write"),
         behaviour_is="that the author may take the redesign — the one path where that is its "
@@ -147,15 +157,26 @@ _VOCAB_CONSTRAINT = "ck_review_finding_outcomes_vocabulary"
 #: practice however carefully the constant is written.
 _DOC_OUTCOME = re.compile(r'"outcome":\s*"([^"]*)"')
 
-#: A reference to a step *of the brief*, in any of the phrasings the family actually uses:
-#: "the brief's step 3a", "(its step 3a)", "`/review-pr`'s step 3a", "`review-pr.md`'s brief
-#: (step 3a)". Owner-qualified on purpose — `fix-issue.md` and `fix-and-land.md` have their own
-#: numbered steps, and matching a bare "step 4" would check those against the wrong file's
-#: headings. Case-insensitive because a sentence or a heading can start with the reference, and
-#: applied to whitespace-normalised text because prose wraps between the owner and the step.
+#: A reference to a step *of the brief*, in the phrasings the family actually uses: "the brief's
+#: step 3a", "`/review-pr`'s step 3a", "`review-pr.md`'s brief (step 3a)". Owner-qualified on
+#: purpose — `fix-issue.md` and `fix-and-land.md` have their own numbered steps, and matching a
+#: bare "step 4" would check those against the wrong file's headings. Two things the owner half
+#: has to get right, and neither is free:
+#:
+#: * **the left lookbehind.** `findall` anchors nothing, so `review-pr.md` matches inside
+#:   `panel-review-pr.md` — reading "`panel-review-pr.md`'s step 5" as a reference to the brief
+#:   and checking it against the wrong file's headings. That is a false failure, or a false pass
+#:   when the number happens to exist in both, which is the misattribution this pattern exists to
+#:   avoid arriving through the pattern itself.
+#: * **no bare `its`.** It matched "(its step 3a)" in files whose owner was a sentence away and
+#:   would equally have matched "run `/panel` (its step 2)". The owner is spelled out in every
+#:   guarded file instead, which is cheaper than teaching a regex what a sentence is.
+#:
+#: Case-insensitive because a sentence or a heading can start with the reference, and applied to
+#: whitespace-normalised text because prose wraps between the owner and the step.
 _STEP_REFERENCE = re.compile(
-    r"(?:the\s+brief|its|`?/?review-pr(?:\.md)?`?)['’]?s?\s+(?:brief\s+)?\(?step\s+"
-    r"(\d+[a-z]?)",
+    r"(?<![-\w])(?:the\s+brief|`?/?review-pr(?:\.md)?`?)['’]?s?\s+(?:brief\s+)?"
+    r"\(?step\s+(\d+[a-z]?)",
     re.IGNORECASE,
 )
 
@@ -170,18 +191,13 @@ def doc(relpath: str) -> str:
     # image both commonly run without a UTF-8 locale, and the failure there is a
     # UnicodeDecodeError at collection rather than anything about briefs.
     #
-    # Cached because the parametrised tests read the same handful of files several times each,
-    # and the module-scoped fixtures below would otherwise be the only place caching happened —
-    # one story about reads, not two.
+    # Cached because the parametrised tests read the same handful of files several times each.
+    # A plain speed-up: the module-scoped fixtures below still exist, for the slices they name.
     return (REPO_ROOT / relpath).read_text(encoding="utf-8")
 
 
-def command(name: str) -> str:
-    return doc(f"{COMMAND_DIR}/{name}")
-
-
 def _located(haystack: str, marker: str, what: str, start: int = 0,
-             where: str = "review-pr.md") -> int:
+             where: str = REVIEW_PR) -> int:
     """`str.index` with a message. A bare `.index()` miss aborts the whole module with
     `ValueError: substring not found`, naming neither the marker nor the file it was looked for
     in — in a suite whose every other failure says what moved."""
@@ -194,7 +210,7 @@ def _located(haystack: str, marker: str, what: str, start: int = 0,
 
 @pytest.fixture(scope="module")
 def review_pr() -> str:
-    return command("review-pr.md")
+    return doc(REVIEW_PR)
 
 
 @pytest.fixture(scope="module")
@@ -306,12 +322,19 @@ def test_the_summary_counts_use_the_recorded_vocabulary_and_state_their_invarian
     the summary and the board disagree about what happened to a finding), and no stated sum (so
     a dropped finding leaves the numbers merely unremarkable)."""
     flat = normalised(summary)
-    assert "Refuted: N" in flat, (
-        "the counts line no longer says `Refuted: N` — the summary's label for 'not a defect' is "
-        "deliberately the same token §2b records on the board")
-    assert "Not a defect" not in flat, (
-        "'Not a defect' is a third name for what this file already calls a false positive and "
-        "records as `refuted`; one outcome, one word")
+    # Scoped to the counts line, and case-insensitively. The retired phrase is what the counts
+    # line must not say; three lines above it the table legitimately reads "the evidence it was
+    # not a defect", so a case-sensitive check over the whole section was passing on the capital
+    # N alone — and would have failed on a rewording that merely started a sentence with it.
+    counts = next((line for line in summary.splitlines()
+                   if "Findings:" in line and "Fixed:" in line), None)
+    assert counts, "step 6's summary has no counts line naming both Findings and Fixed"
+    assert "Refuted: N" in counts, (
+        f"the counts line ({counts.strip()!r}) no longer says `Refuted: N` — the summary's label "
+        "for 'not a defect' is deliberately the same token the board records")
+    assert not re.search(r"\bnot a defect\b", counts, re.IGNORECASE), (
+        f"the counts line ({counts.strip()!r}) says 'not a defect', a third name for what this "
+        "file already calls a false positive and records as `refuted`; one outcome, one word")
     assert "Fixed + Escalated + Refuted = Findings" in flat, (
         "the counts state no invariant, so nothing tells a reader that the three must sum to "
         "Findings — the one cheap check that catches a finding that fell off the table")
@@ -329,7 +352,7 @@ def test_every_fix_loop_says_what_it_does_with_an_escalation(name: str):
     asserted is the deciding: naming `step 3a` proves nothing, since a file can name it in one
     paragraph and still say "repeat until the To fix list is empty, then merge" in the next."""
     loop = FIX_LOOPS[name]
-    text = normalised(command(name))
+    text = normalised(doc(name))
     assert f"step {ESCALATION_STEP}" in text, (
         f"{name} ({loop.why}) no longer mentions step {ESCALATION_STEP} — "
         + (f"the definition moved or was renumbered without {ESCALATION_STEP!r} following it"
@@ -356,7 +379,7 @@ def test_nothing_points_at_a_step_the_brief_does_not_have(brief: str):
     headings = set(re.findall(r"^#### (\d+[a-z]?)\.", brief, re.MULTILINE))
     assert ESCALATION_STEP in headings, (
         f"the brief has no step {ESCALATION_STEP} heading; the references below cannot resolve")
-    sources = {name: command(name) for name in FIX_LOOPS} | {p: doc(p) for p in ANCHOR_DOCS}
+    sources = {name: doc(name) for name in (*FIX_LOOPS, *ANCHOR_DOCS)}
     found: dict[str, set[str]] = {}
     for name, text in sources.items():
         found[name] = set(_STEP_REFERENCE.findall(normalised(text)))
@@ -378,6 +401,19 @@ def test_nothing_points_at_a_step_the_brief_does_not_have(brief: str):
         f"no guarded file references step {ESCALATION_STEP} in a form this test reads")
 
 
+def test_the_brief_cites_no_section_of_the_file_it_was_lifted_out_of(brief: str):
+    """The same anchor, inward. `panel-review-pr.md` pastes this slice into a sub-agent that
+    cannot open `review-pr.md`, so a `§2b` inside it resolves to nothing for the one reader it
+    was written for — an instruction that reads as complete and names nothing, which is what the
+    test above guards in the other direction. Step numbers are fine: the brief carries its own
+    headings. Section marks are not, because the sections they name are the orchestrator's, and
+    the fixture's own boundary at `## 2b.` is what proves the reader cannot see them."""
+    cited = sorted(set(re.findall(r"§\s*\S+", brief)))
+    assert not cited, (
+        f"the brief cites {cited} — sections of {REVIEW_PR} that the sub-agent it is handed to "
+        "cannot see. Say what the orchestrator does with the finding, not where that is written")
+
+
 def test_the_premise_check_invocation_resolves(escalation: str):
     """The anchor pointing outwards. Step 3a tells the fixer to put the premise to the seats with
     `panel.py --ask`, and adds "skip silently if the script isn't there" — which turns a wrong
@@ -387,12 +423,27 @@ def test_the_premise_check_invocation_resolves(escalation: str):
     fence = re.search(r"```bash\n(.*?)```", escalation, re.DOTALL)
     assert fence, f"step {ESCALATION_STEP} no longer shows the `--ask` invocation as a bash block"
     snippet = fence.group(1)
-    panel_py = doc("harness/loops/panel.py")
+    # The path first, because it is what a fixer pastes and the flag check below cannot see it:
+    # a wrong path is the same silent no-op as a wrong flag name, by the paragraph's own "skip
+    # silently if the script isn't there". Two assertions, because two things can drift — the
+    # snippet away from the installed path, and the installed path away from the repo file this
+    # test actually reads.
+    assert PANEL_PY_INSTALLED.endswith(PANEL_PY.removeprefix("harness/")), (
+        f"{PANEL_PY_INSTALLED} and {PANEL_PY} no longer name the same file under the harness "
+        "root, so reading the second proves nothing about the first")
+    invoked = re.search(r"python3\s+(\S*panel\.py)", snippet)
+    assert invoked, (
+        f"step {ESCALATION_STEP}'s bash block no longer runs a `panel.py`, so the flags below are "
+        "checked against a script it does not call")
+    assert invoked.group(1) == PANEL_PY_INSTALLED, (
+        f"step {ESCALATION_STEP} runs {invoked.group(1)!r}, not {PANEL_PY_INSTALLED!r} — the path "
+        f"whose repo copy ({PANEL_PY}) is where the flags below are read from")
+    panel_py = doc(PANEL_PY)
     flags = sorted(set(re.findall(r"--[a-z][a-z-]+", snippet)))
     assert "--ask" in flags, f"step {ESCALATION_STEP}'s bash block does not run `--ask`"
     for flag in flags:
         assert f'"{flag}"' in panel_py, (
-            f"step {ESCALATION_STEP} passes {flag}, which harness/loops/panel.py does not "
+            f"step {ESCALATION_STEP} passes {flag}, which {PANEL_PY} does not "
             "declare — and the paragraph's own 'skip silently' makes that a no-op, not an error")
     loops_readme = doc("harness/loops/README.md")
     assert _PREMISE_CHECK_SECTION in normalised(escalation), (
@@ -416,9 +467,16 @@ def test_the_premise_is_not_interpolated_into_a_shell_string(escalation: str):
     assert re.search(r"<<\s*'[A-Z]+'", snippet), (
         "the invocation no longer builds the premise in a QUOTED heredoc, so whatever it "
         "substitutes is expanded by the shell first")
-    assert not re.search(r'--ask\s+"[^$"]', snippet), (
-        "the premise is inlined into a double-quoted `--ask` argument; backticks and `$(…)` in "
-        "it execute, and a `$VAR` in it silently empties")
+    # Asserted positively. Excluding one leading character (`--ask "[^$"]`) rejected the least
+    # of the bad forms and passed the worst: `--ask $premise`, unquoted, word-splits the premise
+    # into a dozen arguments, and `--ask "$(cat premise.txt)"` runs a command substitution. The
+    # property is "the premise is not on the command line", and only one shape has it.
+    ask = re.search(r"--ask\s+(\S+)", snippet)
+    assert ask, f"step {ESCALATION_STEP}'s bash block passes `--ask` no value at all"
+    assert re.fullmatch(r'"\$[A-Za-z_]\w*"', ask.group(1)), (
+        f"`--ask` is given {ask.group(1)!r} rather than a quoted variable holding the heredoc's "
+        "value. Anything else puts the premise on the command line: backticks and `$(…)` in it "
+        "execute, an unquoted `$var` word-splits it, and an unset `$VAR` in the prose empties it")
     assert re.search(r'--context\s+"', snippet), (
         "`--context` is unquoted, so a path or line range with a space or a glob breaks argument "
         "splitting")
@@ -459,16 +517,26 @@ def test_the_constraint_the_docs_name_exists(outcomes: set[str]):
     to catch, one directory over. `app/api/reviews.py` already fails at import if its tuple and
     the CHECK disagree; what is unguarded is the NAME the prose points at."""
     models = doc("app/models/review.py")
-    assert _VOCAB_CONSTRAINT in models, (
-        f"app/models/review.py no longer declares {_VOCAB_CONSTRAINT}, which review-pr.md §2b "
-        "and this suite both name as the reason there is no fifth outcome")
-    assert _VOCAB_CONSTRAINT in doc("app/api/reviews.py")
+    assert _VOCAB_CONSTRAINT in doc("app/api/reviews.py"), (
+        f"app/api/reviews.py no longer names {_VOCAB_CONSTRAINT}, so its import-time guard is no "
+        "longer comparing OUTCOMES against the CHECK the prose sends a reader to")
+    # Scoped to that CHECK's own call rather than searched for over the module. `'fixed'` occurs
+    # in this file in prose, in a sibling constraint and in a docstring, so a whole-file substring
+    # search is satisfied by a vocabulary CHECK that has lost a value — which is the drift.
+    named = _located(models, f'name="{_VOCAB_CONSTRAINT}"', "the vocabulary CHECK",
+                     where="app/models/review.py")
+    opened = models.rfind("CheckConstraint(", 0, named)
+    assert opened != -1, (
+        f"{_VOCAB_CONSTRAINT} in app/models/review.py is not inside a `CheckConstraint(` call, so "
+        "there is no expression to read the four values out of")
+    check = models[opened:named]
     for value in sorted(outcomes):
-        assert f"'{value}'" in models, (
-            f"the CHECK in app/models/review.py does not list {value!r}, which app/api/reviews.py "
-            "declares — the two spellings of the vocabulary have drifted")
-    assert _VOCAB_CONSTRAINT in command("review-pr.md"), (
-        "review-pr.md §2b no longer names the constraint that makes 'there is no fifth outcome' "
+        assert f"'{value}'" in check, (
+            f"the {_VOCAB_CONSTRAINT} CHECK in app/models/review.py does not list {value!r}, "
+            "which app/api/reviews.py declares — the two spellings of the vocabulary have "
+            f"drifted. It reads: {' '.join(check.split())!r}")
+    assert _VOCAB_CONSTRAINT in doc(REVIEW_PR), (
+        f"{REVIEW_PR} §2b no longer names the constraint that makes 'there is no fifth outcome' "
         "a fact rather than a convention")
 
 
@@ -477,7 +545,7 @@ def test_no_command_instructs_an_outcome_the_table_would_reject(name: str, outco
     """The vocabulary is a SQL CHECK as well as a Python tuple, and the docs are the third place
     it is written — the one an agent copies the JSON out of. An invented `escalated` fails at
     ingest, which is a long way from the paragraph that suggested it."""
-    for value in _DOC_OUTCOME.findall(command(name)):
+    for value in _DOC_OUTCOME.findall(doc(name)):
         # How these payloads show a field to substitute: `<key of …>`, a `{{template}}`, a
         # `$VAR`, or the vocabulary itself as an alternation. Only bare literals are checked,
         # because only a bare literal is what an agent would send unaltered.
@@ -508,7 +576,7 @@ def test_an_escalation_is_recorded_as_deferred(name: str, outcomes: set[str]):
     escalation-recording sentence had been deleted."""
     blocks = [
         chunk
-        for paragraph in command(name).split("\n\n")
+        for paragraph in doc(name).split("\n\n")
         for chunk in ([paragraph] if "\n- " not in paragraph else paragraph.split("\n- "))
     ]
     relevant = [

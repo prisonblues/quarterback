@@ -309,8 +309,10 @@ One of four per finding:
   does **not** settle the question or take the finding off §5's outstanding list:
   that list is computed from the round's own payload, never from this table, and the
   escalation stays open until a human answers it. `deferred_to` names the premise
-  issue — which **you** open, after relaying the escalation (§6), never the fixer,
-  and it is an issue that *asks* the question in the fixer's own five fields
+  issue, and that issue does not exist yet at this point in the run — so **the
+  escalated row is the one you record last**: relay (§6), open the issue there,
+  then come back and record this row naming it. You open it, never the fixer, and
+  it is an issue that *asks* the question in the fixer's own five fields
   (premise, what it explains, what removing it costs, the patch not written, the
   `--ask` verdict) rather than one that picks an answer. When the human's answer
   lands, the row moves: `revisions` and `prior_outcome` exist because a `deferred`
@@ -418,13 +420,17 @@ next round's findings, arriving through the rule that exists to prevent them.
   a finding a *later* one replaced). You are the only reader who has both, because
   you ran both rounds. So before briefing a round's **To fix** list, read it
   against every escalation you have already relayed and pull out anything that is
-  the same premise wearing a new key. It does not go in the brief, it does not get
-  a second `deferred` row — one premise is one open question, and a row per round
-  would double-count it in the leaderboard the vocabulary exists to feed — and it
-  is re-stated in this round's relay under `Escalated` as still open, naming the
-  round that first raised it. If you genuinely cannot tell whether it is the same
-  premise, say that in the relay and leave it out of the brief: a premise question
-  asked twice costs a paragraph, and a premise question patched costs the round.
+  the same premise wearing a new key. It does not go in the brief. It **does** get
+  its own `deferred` row, naming the same premise issue in `deferred_to` — it is a
+  real finding nobody fixed, and a key recorded nowhere is the gap §4b exists to
+  close. Two rows do not double-count one premise: only `fixed` and `refuted` are
+  in the precision ratio (`OUTCOMES_SCORED`, `app/api/reviews.py`), so `deferred`
+  says what happened without scoring anyone. One premise is still one open
+  question — it lives in the issue and in the relay, re-stated under `Escalated`
+  as still open, naming the round that first raised it and the key this round gave
+  it. If you genuinely cannot tell whether it is the same premise, say that in the
+  relay and leave it out of the brief: a premise question asked twice costs a
+  paragraph, and a premise question patched costs the round.
 - **The rest of the cycle carries on.** Findings that WERE fixed still get their
   re-review round, and `round_stop` still decides that — you are not overruling it
   for them, only declining to send one finding back through a pass that has
@@ -477,7 +483,10 @@ Then the part that is new, and is the point of running more than one round:
   than the code, with its premise, what it explains, what removing it would cost,
   and its `--ask` verdict if one was run. Say it even when the answer is none. This
   is the one item in the relay that is a question rather than a report: it is
-  outstanding until a human answers it, and no round will close it.
+  outstanding until a human answers it, and no round will close it. Having relayed
+  it, open the issue that **asks** it — the fixer's five fields, no answer picked —
+  and then record the finding `deferred` with that issue in `deferred_to` (§4b),
+  which is the step §4b deferred to here.
 
 ## 7. Merging (only if the user asks)
 

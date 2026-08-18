@@ -70,12 +70,14 @@ line it names is what produces the next round's findings (step 3a). Everything
 else gets fixed. "Escalated" is a report you write, not a fix you skip: it costs
 you the write-up in step 6 and it costs you nothing else on the list.
 
-Two is the whole list for **you**. §2b of this file records outcomes from a wider
-vocabulary — `fixed | refuted | deferred | superseded` — but those are the board's
-words for what became of a finding, assigned by the orchestrator after you report:
-`refuted` is your false positive, `deferred` is where an escalation lands, and
-`superseded` is bookkeeping for a finding a later one replaced. None of them is a
-third way for you to leave something unfixed. "Not now" is not available to you.
+Two is the whole list for **you**. The orchestrator records what became of every
+finding afterwards, from a wider vocabulary — `fixed | refuted | deferred |
+superseded`. Three of the four are its to assign, not yours: `fixed` is its reading
+of your work, `deferred` is where an escalation lands, and `superseded` is
+bookkeeping for a finding a later one replaced. `refuted` is the one you write
+too — it is your false positive, it goes in step 6's table, and it is deliberately
+the same word the board records. None of the four is a third way to leave something
+unfixed. "Not now" is not available to you.
 
 #### 0. Set up the workspace
 
@@ -257,9 +259,10 @@ argument bash *executes* them, while a `$VAR` in the text silently expands to
 empty and sends the seats a premise you did not write. The quoted heredoc
 (`<<'PREMISE'`) expands nothing and survives quotes, backticks and `$` in the
 text, which is why the value reaches the flag as typed; `--context` is quoted for
-the same reason, since a path or line range containing a space or a glob character
-would otherwise split into two arguments. The rule generalises: any command you
-build out of a finding's own prose gets the same treatment.
+the same reason: unquoted, a space in it word-splits, a glob character is expanded
+against the filesystem into zero, one or many arguments, and the `<` and `>` of
+the placeholder shown are redirections rather than text. The rule generalises:
+any command you build out of a finding's own prose gets the same treatment.
 
 It is not a gate — exit 0 on every verdict, no diff, no judge, no round (see
 `harness/loops/README.md`, *The premise check (`--ask`)*, for the verdicts and the
@@ -279,7 +282,7 @@ if the script isn't there.
   premise still gets fixed, tested, verified, committed and pushed exactly as
   step 3 says. An escalation is a report, not a stop-work.
 - **Open nothing and record nothing for it.** The premise issue and the board row
-  are the orchestrator's, after it has relayed your report (§2b) — you were told to
+  are the orchestrator's, after it has relayed your report — you were told to
   decide nothing and write no patch, and filing the premise yourself is the first
   move of the redesign you are declining to make. Your durable output is the
   write-up in step 6 and the same finding named as escalated in the step-5 commit
@@ -367,7 +370,7 @@ Commit: <sha> <subject>
 reader — or `epic.md`'s relay scan — can apply to catch a finding that fell off the
 list, and it is why the counts replaced the old `All fixed: Yes`, which had no way
 to say anything but yes and so had to be read as covering findings nobody fixed.
-`Refuted` is the word §2b records, not a fourth name for the same thing: the
+`Refuted` is the word the board records, not a fourth name for the same thing: the
 summary's label and the board's outcome are deliberately the same token.
 
 **Escalated nothing?** Replace the whole block with the single line
@@ -430,13 +433,14 @@ branch it pushed to, whether all checks passed, and anything it flagged as
 and why — don't paper over it.
 
 **An escalation is the headline, not a footnote.** If the sub-agent escalated
-anything (its step 3a), lead with it: the premise, what it explains, what removing
-it would cost, and that no patch was written for it. That is a question being put
-to the user, and until they answer it the review is not finished — so do not
-answer it yourself by launching another fixer at the same finding, which is
-precisely the round that produces the next round's findings. For panel findings,
-§2b is the follow-through in order: relay, then open the issue that asks the
-premise, then record the finding `deferred` with that issue in `deferred_to`.
+anything (the brief's step 3a), lead with it: the premise, what it explains,
+what removing it would cost, and that no patch was written for it. That is a
+question being put to the user, and until they answer it the review is not
+finished — so do not answer it yourself by launching another fixer at the same
+finding, which is precisely the round that produces the next round's findings.
+For panel findings, §2b is the follow-through in order: relay, then open the
+issue that asks the premise, then record the finding `deferred` with that
+issue in `deferred_to`.
 
 ## 4. Merging (only if the user asks)
 

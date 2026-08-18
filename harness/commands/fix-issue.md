@@ -286,6 +286,10 @@ given them:
 - the patch you did not write (the special case you declined to add);
 - the `--ask` verdict, if you put the premise to the seats
   (`fails` / `holds` / `unresolved` / `unchallenged` / `not run`).
+  Drop step 3a's `--pr` when you run it here: that flag only links
+  the ask to a PR for the board to render, and an `--ask` with no
+  `--pr` is accepted — which is the only form available before one
+  exists.
 
 After fixing, re-run the quality pipeline. Iterate until clean.
 
