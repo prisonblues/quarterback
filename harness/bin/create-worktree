@@ -60,6 +60,22 @@ step() {
 
 die() { echo -e "${RED}Error: $1${NC}" >&2; exit 1; }
 
+# A branch name as it can safely be PASTED into a shell.
+#
+# Every hint this script prints is a command line meant to be copied, and git's
+# refname rules forbid far less than a shell's parser does: `$`, backtick, `;`,
+# `>`, `&`, `|`, `(` and `'` are all legal in a branch name, and nothing here
+# validates them. So `remove-worktree feat$(id)` is a hint that runs `id` on the
+# reader's machine, and `feat>out` truncates a file — not because this script
+# evaluates anything (a variable's value is never re-parsed inside double quotes)
+# but because the person it was printed for hands it to their own shell.
+#
+# `printf %q` is exactly this: an ordinary `feat/thing` passes through untouched so
+# the common case stays readable, and anything that would not survive a paste is
+# escaped. Used by every hint here, including the one written into CLAUDE.local.md,
+# which outlives the run that printed it.
+sh_quote() { printf '%q' "$1"; }
+
 # `die` for a failure that happens AFTER the git worktree exists.
 #
 # The DB steps run at 3 of 10, so a plain `die` there left a directory that is a
@@ -84,14 +100,15 @@ die() { echo -e "${RED}Error: $1${NC}" >&2; exit 1; }
 # prints at the end of a normal run.
 die_half_built() {
     echo -e "${RED}Error: $1${NC}" >&2
+    local b; b=$(sh_quote "${BRANCH_NAME:-<branch>}")
     if [[ -n "${WORKTREE_DIR:-}" && -d "${WORKTREE_DIR:-}" ]]; then
         echo -e "${YELLOW}
 The worktree was created before this failed and is INCOMPLETE — it has a checkout
 and a branch, but not the symlinks, port, or context file that come after the
 database step. Do not use it as-is.
 
-  Finish it:  remove-worktree ${BRANCH_NAME:-<branch>} && create-worktree --shared-db ${BRANCH_NAME:-<branch>}
-  Or drop it: remove-worktree ${BRANCH_NAME:-<branch>}${NC}" >&2
+  Finish it:  remove-worktree $b && create-worktree --shared-db $b
+  Or drop it: remove-worktree $b${NC}" >&2
     fi
     exit 1
 }
@@ -1321,7 +1338,7 @@ step "Writing worktree context (CLAUDE.local.md)..."
     if [[ "$SKIP_NGINX" = false && -n "$NGINX_CONFIG" ]]; then
         echo "- **Via nginx:** \`/$BRANCH_NAME/\`"
     fi
-    echo "- **Remove this worktree:** \`remove-worktree $BRANCH_NAME\`"
+    echo "- **Remove this worktree:** \`remove-worktree $(sh_quote "$BRANCH_NAME")\`"
 } > "$WORKTREE_DIR/CLAUDE.local.md"
 
 # Ensure it is never committed. A project's .worktree.json may override the
@@ -1516,7 +1533,7 @@ sys.exit(0)
         echo -e "${RED}Failed to start containers after retries${NC}"
         echo -e "${YELLOW}The worktree exists but its containers are not running.${NC}"
         echo -e "${YELLOW}  Retry:  cd $WORKTREE_DIR && docker compose up -d${NC}"
-        echo -e "${YELLOW}  Remove: remove-worktree $BRANCH_NAME${NC}"
+        echo -e "${YELLOW}  Remove: remove-worktree $(sh_quote "$BRANCH_NAME")${NC}"
         exit 1
     fi
 fi
@@ -1791,7 +1808,7 @@ if [[ "$SKIP_DOCKER" = false ]]; then
 fi
 
 echo ""
-echo -e "  ${YELLOW}To remove:${NC} remove-worktree $BRANCH_NAME"
+echo -e "  ${YELLOW}To remove:${NC} remove-worktree $(sh_quote "$BRANCH_NAME")"
 echo ""
 
 # Open editor if configured

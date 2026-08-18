@@ -53,11 +53,22 @@ and derives the path itself, so pasting the basename the sentence above it names
 the first thing anyone reaches for — fails with a confusing "no such worktree". The
 first version of the warning got exactly that wrong, and a test now pins it.
 
+**Every pasteable hint is now shell-quoted, including three that predate this
+change.** Git's refname rules forbid far less than a shell's parser does — `$`,
+backtick, `;`, `>`, `&`, `|`, `(` and `'` are all legal in a branch name, and nothing
+validates them — so `remove-worktree feat$(id)` was a hint that ran `id` on the
+reader's machine when pasted, and `feat>out` truncated a file. Nothing was executed
+by the script itself; a variable's value is never re-parsed inside double quotes. The
+hazard was entirely in what we printed for a human to copy. `printf %q` leaves an
+ordinary `feat/thing` untouched so the common case stays readable, and escapes the
+rest. Applied at all four sites, one of which writes into `CLAUDE.local.md` and so
+outlives the run that printed it. Found by a second model reviewing the diff.
+
 Tests extract the block from the shipping script by sentinel marker rather than
 copying it, the way `test_create_worktree_rerere.py` does, so a refactor that moves
 the code fails there instead of leaving the suite green about code nobody runs.
 Reverting the block to its previous shape reproduces `MAIN_DB_NAME: unbound variable`
-and fails three of them.
+and fails three of them; neutering `sh_quote` fails the paste-safety one.
 
 ## v2.48 — a lease says what its holder is doing, not just where
 

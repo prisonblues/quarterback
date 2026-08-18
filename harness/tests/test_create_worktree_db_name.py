@@ -26,6 +26,7 @@ nobody runs any more — the same rule `test_create_worktree_rerere.py` follows.
 Run: pytest harness/tests
 """
 
+import shlex
 import shutil
 import subprocess
 
@@ -53,7 +54,8 @@ def dbname_block() -> str:
 
 
 def run_block(env_text: str, *, url_env="DATABASE_URL", name_env="POSTGRES_DB",
-              user_env="POSTGRES_USER") -> subprocess.CompletedProcess:
+              user_env="POSTGRES_USER",
+              branch="feat/probe") -> subprocess.CompletedProcess:
     """Run the stanza against a `.env` of the caller's choosing.
 
     `set -euo pipefail` is on, exactly as in the script: the whole point of the bug
@@ -76,7 +78,10 @@ def run_block(env_text: str, *, url_env="DATABASE_URL", name_env="POSTGRES_DB",
         "set -euo pipefail",
         "RED=''; YELLOW=''; NC=''",
         f"WORKTREE_DIR={_tmp}",
-        "BRANCH_NAME='feat/probe'",
+        "BRANCH_NAME=" + shlex.quote(branch),
+        # The real helper, not a stub: what it does to a hostile branch name is
+        # precisely what one of these tests is about.
+        "sh_quote() { printf '%q' \"$1\"; }",
         f"DB_URL_ENV='{url_env}'",
         f"DB_NAME_ENV='{name_env}'",
         f"DB_USER_ENV='{user_env}'",
@@ -96,6 +101,31 @@ def run_block(env_text: str, *, url_env="DATABASE_URL", name_env="POSTGRES_DB",
     ])
     script = preamble + dbname_block() + (
         '\necho "RESOLVED=$MAIN_DB_NAME"\necho "USER=$PG_USER"\n')
+    return subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+
+
+def run_half_built(branch: str, workdir: Path) -> subprocess.CompletedProcess:
+    """Run the REAL `die_half_built` and `sh_quote`, lifted out of the script.
+
+    `run_block` above stubs `die_half_built` on purpose — it is testing the
+    resolution, and wants the message without the worktree prose. These two
+    functions are what the hint's safety actually lives in, so they are extracted
+    and run rather than stubbed, or the test would be asserting about a copy.
+    """
+    src = SCRIPT.read_text()
+    fns = []
+    for name in ("sh_quote", "die_half_built"):
+        marker = f"{name}() {{"
+        assert marker in src, f"{name} is gone from create-worktree"
+        fns.append(marker + src.split(marker, 1)[1].split("\n}", 1)[0] + "\n}")
+    script = "\n".join([
+        "set -uo pipefail",          # not -e: die_half_built exits 1 by design
+        "RED=''; YELLOW=''; NC=''",
+        f"WORKTREE_DIR={shlex.quote(str(workdir))}",
+        "BRANCH_NAME=" + shlex.quote(branch),
+        *fns,
+        'die_half_built "the probe message"',
+    ])
     return subprocess.run(["bash", "-c", script], capture_output=True, text=True)
 
 
@@ -174,6 +204,42 @@ def test_a_missing_user_is_also_reported_as_half_built(tmp_path):
     assert r.returncode != 0
     assert "HALFBUILT:" in r.stderr
     assert "POSTGRES_USER" in r.stderr
+
+
+def test_a_hostile_branch_name_cannot_produce_a_dangerous_paste(tmp_path):
+    """Every hint this script prints is a command line meant to be COPIED, and git
+    permits characters a shell parses: `$`, backtick, `;`, `>`, `&`, `|`, `(`, `'`
+    are all legal in a refname and nothing in the script validates them.
+
+    Nothing is executed by the script itself — a variable's value is never re-parsed
+    inside double quotes — so this is not an injection in `create-worktree`. It is a
+    hint that misbehaves in the reader's shell: `remove-worktree feat$(id)` runs
+    `id` on their machine, `feat>out` truncates a file. `printf %q` is the fix, and
+    it leaves an ordinary name alone so the common case stays readable.
+
+    Found by a second model reviewing the diff, and the same shape was already at
+    three older sites — including the one written into CLAUDE.local.md, which
+    outlives the run that printed it. All four now go through `sh_quote`."""
+    payload = "feat/x$(touch " + str(tmp_path / "PWNED") + ")"
+    r = run_half_built(payload, tmp_path)
+
+    assert "INCOMPLETE" in r.stderr, r.stderr
+    assert not (tmp_path / "PWNED").exists(), \
+        "the script itself executed the branch name"
+    # The hint must not contain a live `$(`: that is what a paste would run.
+    hint = r.stderr.split("Finish it:", 1)[1]
+    assert "$(touch" not in hint, f"an unescaped substitution reached the hint: {hint!r}"
+    assert "\\$\\(touch" in hint or "\\$(touch" in hint, \
+        f"the substitution was neither escaped nor removed: {hint!r}"
+
+
+def test_an_ordinary_branch_name_is_printed_unquoted(tmp_path):
+    """The other half: `printf %q` must not make the normal case ugly. A hint nobody
+    can read is a hint nobody pastes, and `remove-worktree feat/probe` is the whole
+    point of printing it."""
+    r = run_half_built("feat/probe", tmp_path)
+
+    assert "remove-worktree feat/probe" in r.stderr, r.stderr
 
 
 def test_the_half_built_warning_names_the_branch_not_the_directory():
