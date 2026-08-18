@@ -277,6 +277,12 @@ def _fetch_tarball(gh_repo: str, head_sha: str, attempts: int = 3) -> bytes:
     time and never what cannot. A 404 is settled for this sha — a fork PR, most
     likely; see the caller — so it is raised at once.
 
+    A TIMEOUT is deliberately not retried, and only `CalledProcessError` is caught
+    here. `TREE_FETCH_TIMEOUT` is a small bound set on the reasoning that a tarball
+    this slow is a network problem whose answer is to review from the diff — so
+    spending two more of them chasing the same slow pack contradicts the bound rather
+    than defending it, and adds minutes to a round before filing the same note.
+
     Raises on the final attempt rather than returning a sentinel, so the caller's
     single `except` still owns every failure and this needs no second error
     contract."""

@@ -712,3 +712,21 @@ def test_a_transient_failure_that_never_clears_still_degrades(monkeypatch, tmp_p
 
     assert tree is None and "503" in problem
     assert len(calls) == 3
+
+
+def test_a_slow_fetch_is_not_retried(monkeypatch, tmp_path):
+    """`TREE_FETCH_TIMEOUT` is a small bound set on the reasoning that a tarball this
+    slow is a network problem whose answer is reviewing from the diff. Spending two
+    more of them chasing the same slow pack contradicts the bound rather than
+    defending it, and adds minutes to a round before filing the same note."""
+    calls = []
+
+    def slow(*a, **k):
+        calls.append(1)
+        raise subprocess.TimeoutExpired("gh", panel.TREE_FETCH_TIMEOUT)
+
+    monkeypatch.setattr(panel_core, "sh_bytes", slow)
+    tree, problem = panel.fetch_pr_tree("acme/board", "deadbee", tmp_path)
+
+    assert tree is None and "TimeoutExpired" in problem
+    assert len(calls) == 1, "a deliberately small bound was spent three times"
