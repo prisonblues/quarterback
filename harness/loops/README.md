@@ -200,10 +200,17 @@ used to do, reporting "LLM reviewers ran: none" as a clean review.
 
 `review_panel.refuse_over_cap_multiple` (default: **3**) — how many times over the
 **tightest seat ceiling** a diff may be before the round is *refused* instead of
-truncated. `review_panel.move_shape_ratio` (default: **0.9**) — what fraction of the
-larger side of a diff must be relocated text before the change counts as a *move*.
+truncated; `0` switches the refusal off and keeps the manifest, and `0` is the only
+spelling of off (`null` and an absent key mean "use the default", here as everywhere
+else in this file). `review_panel.move_shape_ratio` (default: **0.9**) — what fraction
+of the larger side of a diff must be relocated text before the change counts as a
+*move*; a fraction, so values above `1.0` are rejected with a `config_notes` line
+rather than silently making the threshold unsatisfiable.
 `review_panel.manifest_moves` (default: **true**) — review a move-shaped over-ceiling
-diff as a manifest rather than as content. All three are the pre-flight verdict, below.
+diff as a manifest rather than as content. All three are validated: a value that cannot
+be what the key means falls back to the default and *says so* in `config_notes`, which
+covers `"false"` on the boolean (honoured) and `false` on either number (rejected, with
+the note naming `0`). All three are the pre-flight verdict, below.
 
 ### The SonarQube token
 
@@ -460,8 +467,30 @@ rather than the caller's.
 | verdict | when | what happens |
 |---|---|---|
 | `run` | the diff fits every seat's ceiling; or no seat declares one; or it is over but under the refusal multiple | exactly what every release before this one did, truncation report included |
-| `manifest` | over a ceiling **and** move-shaped **and** a manifest of it is smaller than the diff | the seats are handed a *manifest* instead of the diff |
-| `refuse` | over a ceiling by `refuse_over_cap_multiple` with no smaller honest question to ask | nobody is dispatched; the refusal is printed, recorded and posted |
+| `manifest` | over a ceiling **and** move-shaped **and** a manifest of it is smaller than *both* the diff and the ceiling | the seats are handed a *manifest* instead of the diff |
+| `refuse` | over a ceiling by `refuse_over_cap_multiple` with no smaller honest question to ask — not move-shaped, or move-shaped with no manifest to substitute | nobody is dispatched; the refusal is printed, recorded, and posted under `--post` |
+
+A move-shaped diff over a ceiling therefore has three outcomes, not one. It gets the manifest
+whenever there IS one to substitute; when there is not — `manifest_moves` is off, or the
+manifest came out no smaller than the diff, or smaller than the diff and still over the
+ceiling — the refusal multiple decides as it does for content, and *below* the multiple the
+round runs as an ordinary truncated content review. That last case is the one that must not be
+silent, and it is not: the `run` verdict then carries a `reason` naming the manifest path, what
+it measured, and why the substitution did not happen. An empty `reason` on a `run` means
+"nothing objected", and only that.
+
+**Sizes are compared in the ceiling's own unit.** A configured `max_diff_chars` is characters;
+the kernel's argv limit is *bytes*, and the two differ by the diff's non-ASCII density — this
+repo's own diffs are full of em-dashes and arrows. `preflight.shape` carries `chars` and
+`bytes` both, so which reading a verdict used is checkable rather than assumed.
+
+**The judge's `judge_max_diff_chars` is deliberately not one of the ceilings.** This verdict
+decides whether to dispatch the *seats* and what to hand them; that key says what adjudication
+is worth, not whether a round is readable, and counting it would let it refuse a round every
+reviewer could read whole. The judge is not left out in the cold: a manifest substitution
+replaces the round's *material*, so the judge composes the manifest too, and a judge cut by its
+own budget is reported as truncation exactly as a seat is. (`diff_budgets` in the payload does
+include `judge` — that is the budget record, not the ceiling list.)
 
 **A seat whose CLI this box does not carry declares no ceiling here.** That is the same
 host-versus-round distinction the coverage veto makes for an absent seat, and it matters most
@@ -497,12 +526,23 @@ evidence that bears.** The manifest is:
   clause, `except` arm or decorator is invisible in a content review of the destination
 - **what changed besides moving** — lines added and not deleted anywhere. This is the only
   genuinely new code in the change, and the one place a content review belongs
-- **definitions added in more than one place** — the duplicate-copy trap: a merge that keeps
-  both copies of a moved function is a clean merge, a green test run and a silent bug,
-  because the later binding wins and the dead one is what anybody reading the old file finds
-- **what is not here** — test counts before and after, and whether a module now reaches
-  backward into another, both need the branch checked out. They are *named as unmeasured*
-  rather than claimed, and the brief tells the reviewer to declare them
+- **definitions the change adds in more than one place**, with the files each copy landed in —
+  half of the duplicate-copy trap: a merge that keeps both copies of a moved function is a
+  clean merge, a green test run and a silent bug, because the later binding wins and the dead
+  one is what anybody reading the old file finds. Only *half*, and the manifest says which
+  half. What is detectable from a diff is a definition **added** in two or more places. The
+  more common accident — the original left exactly where it was, in a file the merge never
+  touched, while a copy arrives somewhere new — puts no `+` and no `-` line in the diff for
+  that original: it is not in the diff, it is in the base branch, and nothing recovers it from
+  `gh pr diff`. Detecting it needs the PR checked out, which the panel never has, so the claim
+  was narrowed to what is checked rather than the check widened to a promise it cannot keep.
+  The spellings covered are Python `def`/`class` and the JS/TS `function`, brace-class,
+  `const`/`let`/`var`-bound-arrow and `interface`/`type`/`enum` forms; class and object
+  *methods*, wrapped signatures and every other language are named as not covered
+- **what is not here** — test counts before and after, whether a module now reaches backward
+  into another, and the unseeable half of the duplicate trap above. All three need the branch
+  checked out. They are *named as unmeasured* rather than claimed, and the brief tells the
+  reviewer to declare them
 
 Its size is a function of the change's **shape**, not of the diff's length: the 428 KB
 worked example in the test suite produces a 1.3 KB manifest. It travels as the round's
@@ -566,6 +606,17 @@ A refusal:
   names it — deliberately, so a quiet reviewer is not filed as broken. Sending the selection
   and nothing else would file a refusal as a clean review *per reviewer*, in the table that
   answers "which reviewer finds the real issues"
+- **reads the CI gate anyway, and says so under the notice.** CI is size-independent, costs one
+  `gh pr checks`, and consumes no seat's budget — it is the one part of a round a 763 KB diff
+  cannot make useless, and a refusal that lost it left `/panel-review-pr` told to stop the cycle
+  with nothing said about a red build. `ci_status`/`ci_failing` are recorded. **Sonar is not
+  read**: it is a panel *member*, with a `ran: false` row like every other seat, and dispatching
+  one while telling the board none ran would be the inconsistency this path exists to avoid — so
+  the notice states that gate was **not evaluated**, rather than letting its default read as a
+  pass
+- **records what it was going to review** — `scope` and `since_sha`, the same way the ordinary
+  payload does. A refusal under `--scope increment --since <sha>` otherwise publishes the field
+  defaults, and nothing then distinguishes it from a refused whole-PR round
 - is posted to the PR under `--post`. The terminal copy is read by whoever is watching, and
   under the epic driver nobody is
 
@@ -577,11 +628,17 @@ run.
 
 Two guards worth knowing, because both are cases that read plausibly when wrong:
 
-- **A manifest is only substituted when it is smaller than the diff.** Its body scales with
-  the change's shape but its brief and section headers are a fixed ~1.3 KB, so on a small
-  move over a small ceiling the substitution would hand a seat *more* text than the diff did
-  and then have it truncated. Measured, not assumed; when it does not fit, the round falls
-  through to the refusal and the reason says the manifest was tried and why it did not help.
+- **A manifest is only substituted when it is smaller than the diff *and* under the ceiling.**
+  Its body scales with the change's shape but its brief and section headers are a fixed
+  ~1.3 KB, so on a small move over a small ceiling the substitution would hand a seat *more*
+  text than the diff did and then have it truncated. Testing it against the diff alone was not
+  enough: 200 table rows plus 240 quoted residue lines is ~35 KB of manifest, which is smaller
+  than a 763 KB diff and still over a low-thousands `max_diff_chars` — a seat reading a
+  *prefix of a manifest*, reported as a clean `manifest` verdict beside
+  `diff_truncated: true`. Both are measured, not assumed; when the manifest does not fit,
+  the round falls through to the refusal above the multiple and to an ordinary truncated
+  content review below it, and either way the `reason` says the manifest was tried and why it
+  did not help.
 - **A tightly configured `max_diff_chars` can now trigger a refusal.** `max_diff_chars: 30`
   on a 1,559-char diff is 52× over. That is the intended reading — a seat handed 2% of a PR
   produces exactly the review this feature exists to prevent — but it is a behaviour change
@@ -720,7 +777,7 @@ Run-level fields worth knowing about because their meaning is conditional:
 | `scope` | `pr` \| `increment` — what this round actually reviewed. Recorded rather than inferred from the round number, because scope falls back to `pr` whenever the anchor is missing or the range is unusable, so "round 2" does not imply "increment" |
 | `since_sha` | the anchor the increment was taken from; null under `pr` scope |
 | `diff_chars` | the size of the **review target** — the whole PR under `pr` scope, the increment under `increment`. Read `scope` beside it: plotting this across a cycle's rounds without doing so shows a cliff at round 2 and reads as a shrinking PR |
-| `preflight` | the verdict the round was weighed against before it ran, on every exit that reached it: `verdict` (`run`/`manifest`/`refuse`), `reason`, `cap`/`cap_seat`/`over_cap`, `forced`/`would_have`, the `thresholds` in force, and `shape` (`chars`, `added`, `removed`, `moved`, `move_ratio`, `files`). **`null` means the run never reached the verdict** — the title-pattern skip returns before it — which is a different statement from a `run` verdict, and the difference is what answers "was this PR ever weighed?" |
+| `preflight` | the verdict the round was weighed against before it ran, on every exit that reached it: `verdict` (`run`/`manifest`/`refuse`), `reason`, `cap`/`cap_seat`/`over_cap`, `forced`/`would_have`, the `thresholds` in force, and `shape` (`chars`, `bytes`, `added`, `removed`, `moved`, `move_ratio`, `files`, plus `files_added_only`/`files_removed_only` — the one-sided file lists, capped at 40 paths each with a `_elided` count beside them, because this block rides in every board record and a 700-file refactor wrote 700 paths into each one). `over_cap` is null when and only when no ceiling was declared: a measured ratio is emitted even where it rounds to 0.0, so "small against a real ceiling" and "no ceiling" stay different answers. **`null` means the run never reached the verdict** — the title-pattern skip returns before it — which is a different statement from a `run` verdict, and the difference is what answers "was this PR ever weighed?" |
 | `preflight.shape` | measured on the **review target**, so it is scope-dependent exactly as `diff_chars` is: the whole PR under `pr` scope, the increment under `increment`. Read `scope` beside it. Under a `manifest` verdict it is also the only place the target's *pre-substitution* size appears, because `diff_chars` then measures the manifest — which is what was reviewed |
 | `context_chars` | everything prepared *alongside* the target; 0 under `pr` scope. With `diff_chars` this is what an uncapped reviewer was given. Neither is a per-reviewer number — budgets are, so a seat that got less says so in `reviewers.<name>.max_diff_chars` and `.truncated`, and a seat that got the whole target and only part of the context is named in `config_notes` |
 

@@ -207,18 +207,33 @@ DEFAULTS: dict = {
         # truncation and has been reported as such since #75; this is for the case
         # where truncation has stopped being a caveat and become the review. PR
         # #137 was 6.4x on a 763,375-char diff, and four seats ran at full effort
-        # against it. 0 or null switches the refusal off and keeps the manifest.
+        # against it. **`0` switches the refusal off and keeps the manifest** — and
+        # only `0`. This said "0 or null", which was wrong about the half an
+        # operator reaches for: `null` and an absent key mean "use the default"
+        # here as they do for every other setting in this file, so writing `null`
+        # to opt out left the refusal on at 3 with nothing in `config_notes` to
+        # explain the refusals that followed. `false` is rejected as a non-number
+        # and says so, naming `0` — it is not read as 0, because the same rule
+        # covers `move_shape_ratio`, where a threshold of 0 makes every diff with
+        # one relocated line a move.
         "refuse_over_cap_multiple": 3,
         # What fraction of the larger side of a diff must be relocated text — a
         # line that appears as both a delete and an add — before the change counts
         # as a move rather than as content. High, because identical boilerplate
-        # matches itself across unrelated files; see DEFAULT_MOVE_SHAPE_RATIO.
+        # matches itself across unrelated files; see DEFAULT_MOVE_SHAPE_RATIO. A
+        # FRACTION, so 1.0 is the ceiling and `90` (meant as 90%) is rejected: it
+        # would make the threshold unsatisfiable and turn every over-ceiling round
+        # into a refusal reading "under the 90 move ratio".
         "move_shape_ratio": 0.9,
         # Review a move-shaped over-ceiling diff as a MANIFEST (what moved where,
-        # what did not survive, what changed besides moving, which definitions now
-        # exist twice) instead of as content. False falls back to the refusal,
-        # which is strictly less useful: a manifest is a question a reviewer can
-        # answer about a move, and re-reading relocated code is not.
+        # what did not survive, what changed besides moving, which definitions the
+        # change ADDS in more than one place) instead of as content. False falls
+        # back to the refusal where the round is past `refuse_over_cap_multiple`,
+        # and to an ordinary truncated content review below it — which is strictly
+        # less useful either way: a manifest is a question a reviewer can answer
+        # about a move, and re-reading relocated code is not. Validated as a
+        # boolean, `"false"` and `"off"` included, and anything that is not one is
+        # reported rather than read as truthy.
         "manifest_moves": True,
     },
     "loops": {

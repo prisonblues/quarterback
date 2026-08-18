@@ -31,6 +31,7 @@ import panel  # noqa: E402
 import panel_scope  # noqa: E402  — scope/range readers moved here in #129
 import panel_core  # noqa: E402  — `sh` is defined here since #129
 import panel_seats  # noqa: E402  — these seats moved here in #129
+import panel_preflight as pf  # noqa: E402  — the pre-flight verdict (#138)
 
 
 def chunk(path: str, body: str) -> str:
@@ -328,6 +329,29 @@ def test_an_empty_tier_gets_neither_a_header_nor_a_cut_note():
     assert got.far == ""
     text = got.material(None)[0]
     assert "[cut:" not in text and "the rest of the PR" not in text
+
+
+def test_a_custom_header_is_REFUSED_under_increment_scope_rather_than_ignored():
+    """`_compose` interpolates `self.header` only in the whole-target branch; the
+    increment branch renders a brief and three labelled tiers and has nowhere to put a
+    single header that would be true of all of them.
+
+    Today's only caller that sets one — #138's move manifest — also sets `scope="pr"`,
+    because a manifest IS a whole target by construction, so nothing was wrong. But a
+    future caller passing both got no error and no header, which is the class of quiet
+    mismatch every other field on this class is written to prevent: a scoped prompt
+    silently missing a header it was told to carry reads as fine until somebody
+    compares two rounds."""
+    with pytest.raises(ValueError, match="only meaningful for a whole-target"):
+        panel.ReviewScope(scope="increment", diff=PR, increment=INCREMENT,
+                          prior_diff=PRIOR, since=ANCHOR, round_no=2,
+                          header="--- MOVE MANIFEST (NOT A DIFF) ---")
+    # The default header with increment scope is the ordinary case and must stay silent.
+    assert panel.ReviewScope(scope="increment", diff=PR, increment=INCREMENT,
+                             prior_diff=PRIOR, since=ANCHOR, round_no=2).near
+    # And a custom header under "pr" scope is what the manifest does, and it lands.
+    whole = panel.ReviewScope(diff=PR, header="--- NOT A DIFF ---")
+    assert whole.material(None)[0].startswith("--- NOT A DIFF ---\n")
 
 
 def test_the_brief_names_the_round_that_supplied_the_anchor():
@@ -941,7 +965,34 @@ def test_rounds_are_named_in_the_plural_when_there_are_several():
 #: is switched off explicitly rather than worked around with a bigger diff. `0`
 #: means "never refuse on size", and it leaves every other part of the round
 #: (including the truncation report) exactly as it was.
-NO_REFUSAL = {"refuse_over_cap_multiple": 0}
+#:
+#: **`manifest_moves` goes with it, and leaving it out was the sharper hole.** The
+#: refusal is not the only thing #138 does to a tiny-budget round: a diff that is
+#: move-shaped at 0.9 has its material REPLACED by a manifest, which is the very
+#: truncation these tests exist to pin. None of the fixtures here is move-shaped
+#: today, so nothing was wrong — but that made the suite a fixture edit away from a
+#: false green, in a file whose whole subject is what a budget does to a prompt.
+@pytest.fixture(autouse=True)
+def every_seat_is_on_this_box(monkeypatch):
+    """Pin the HOST out of every round in this file.
+
+    #138's `smallest_cap` skips a seat whose CLI is not on PATH — an uninstalled
+    `agy` must not hold a ceiling on a round it cannot read — so a test that leaves
+    the real predicate in place is asserting on which vendor CLIs the machine
+    running the suite happens to carry. Locally that passes quietly; on a CI runner,
+    which has none of them, every ceiling here collapses to `cap is None` and the
+    pre-flight verdict stops engaging at all. That is the same host-dependence
+    `test_panel_preflight.ALL_HERE` documents at length, and it applies to any file
+    that runs a whole round with a budget in it — which this one does throughout.
+
+    Autouse rather than per-test, because the property wanted is "no round in this
+    file depends on the host", and a fixture a new test has to remember to ask for
+    is one a new test will not ask for.
+    """
+    monkeypatch.setattr(pf, "seat_installed", lambda name: True)
+
+
+NO_REFUSAL = {"refuse_over_cap_multiple": 0, "manifest_moves": False}
 
 CFG = {"github": "acme/board", "path": "/tmp/acme-board", "name": "board",
        "reviewers": {"claude": {"enabled": True, "model": "sonnet"}},
@@ -1134,6 +1185,30 @@ def test_a_budget_under_the_target_is_truncation(monkeypatch, tmp_path):
     # off from the increment, which is what it was asked to read.
     assert any(f"of {len(INCREMENT):,} diff chars" in v
                for v in got["round_stop"]["veto"])
+
+
+def test_a_MOVE_SHAPED_increment_on_a_tiny_budget_is_still_truncation_here(monkeypatch,
+                                                                           tmp_path):
+    """`NO_REFUSAL` had to grow `manifest_moves: False`, and this is why.
+
+    Switching the refusal off is not enough to keep a tiny-budget round in this file
+    being about truncation: #138 also REPLACES the material of a move-shaped
+    over-ceiling round with a manifest, which fits, so `diff_truncated` goes false and
+    the very thing these tests pin disappears. None of the fixtures here is move-shaped
+    by accident today; this one is move-shaped on purpose, so the guard is pinned
+    rather than depending on every future fixture staying content-shaped."""
+    seen = {}
+    moved = "\n".join(f"-line {i}" for i in range(40))
+    arrived = "\n".join(f"+line {i}" for i in range(40))
+    increment = chunk("from.py", moved) + chunk("to.py", arrived)
+    assert pf.diff_shape(increment).is_move(), "fixture is not move-shaped"
+    cfg = dict(CFG, review_panel={"max_diff_chars": 30, **NO_REFUSAL})
+    got = _round(monkeypatch, tmp_path, seen, cfg=cfg, increment=increment,
+                 baselines=[_baseline(tmp_path)])
+    assert got["preflight"]["verdict"] == "run", "not substituted"
+    assert got["diff_truncated"] is True
+    assert got["reviewers"]["claude"]["truncated"] is True
+    assert "WHAT MOVED WHERE" not in seen["prompts"]["claude"]
 
 
 def test_a_budget_that_cannot_pay_for_the_frame_says_the_prompt_ran_over(monkeypatch,

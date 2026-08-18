@@ -200,18 +200,28 @@ SEAT_MODEL_DEFAULTS = {"claude": "sonnet"}
 #: It ends with the material itself, so both prompts take the same `.format` keys
 #: (`ci`, `n`, `repo`, `base`, `diff`) and a caller can swap one for the other
 #: without knowing which it holds.
+#:
+#: For that to hold the wording has to be neutral about WHAT the material is, and
+#: it was not: "only if the diff is genuinely flawless" and "a file the diff does
+#: not include" arrived verbatim under a prompt whose first sentence is "you are
+#: deliberately NOT being given its diff", contradicting it on the one point a
+#: manifest round hinges on. Forking the block would have been the wrong fix —
+#: `SCHEMA_ECHOES` recognises a prompt's own example by comparing a reply against
+#: it, and two hand-kept copies are one edit away from a manifest run in which the
+#: example parses as a finding nobody made — so it says "the material below"
+#: instead, which is true of a diff and of a manifest alike.
 _FINDINGS_ENVELOPE = """Return ONLY a JSON object (no prose):
   {{"findings": [{{"severity": "P1|P2|P3|P4", "file": "path", "line": <int|null>,
                   "title": "...", "detail": "...", "needs_rereview": true|false}}],
     "could_not_assess": ["..."]}}
-An empty `findings` array only if the diff is genuinely flawless.
+An empty `findings` array only if the material below is genuinely flawless.
 
 The last two keys are OBSERVATIONS about your own pass, not predictions. Do NOT forecast
 whether another review will be needed — you cannot observe findings you have not made.
 
 - `could_not_assess`: things in scope you could not judge from what you were given — a file
-  the diff does not include, a runtime behaviour, a schema you cannot see, a caller you
-  cannot check. One short phrase each; `[]` if you could genuinely assess everything.
+  the material below does not include, a runtime behaviour, a schema you cannot see, a caller
+  you cannot check. One short phrase each; `[]` if you could genuinely assess everything.
   "I found nothing" and "I could not tell" are different answers and only you know which
   this was.
 - `needs_rereview` (per finding): true when fixing it takes a STRUCTURAL change whose
@@ -269,8 +279,13 @@ So do not review the moved code. Review the MOVE. Four questions, and they are t
    is reading is the thing a manifest review is most likely to miss.
 3. **Duplicated definitions.** A move that keeps BOTH copies of a definition is a clean merge, a
    green test run and a silent bug — the later binding wins, the earlier one is dead, and the
-   dead one is the one anybody reading the old file will find. Names added in more than one place
-   are listed; each one is a finding unless there is a reason it is not.
+   dead one is the one anybody reading the old file will find. Names this change ADDS in more
+   than one place are listed, with the files each copy landed in; each one is a finding unless
+   there is a reason it is not. That is only HALF of the trap, and the other half **cannot be
+   seen from a diff at all**: an original left exactly where it was, in a file this change never
+   touches, appears as neither an added nor a deleted line, so nothing below can list it. If a
+   name that moved looks like it may still exist at its old address, that belongs in
+   `could_not_assess` — checking it needs the branch checked out, and nobody here has it.
 4. **What the manifest cannot tell you.** Say it. Test counts before and after, whether a module
    now reaches backward into another, and whether the destination files import what they now
    need are all facts about a move that the diff cannot answer — they need the branch checked

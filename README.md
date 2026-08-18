@@ -620,11 +620,12 @@ full — including what was broken before it, which is the part no diff recovers
   review, because the next step briefs a fixer to resolve every one of them. The panel now
   measures **shape** as well as size — a move's added lines are a near-permutation of its deleted
   ones — and either reads the diff, reads a **manifest** of a move (what moved where, what did not
-  survive, what changed besides moving, which definitions now exist twice), or **refuses** the
-  round loudly: printed, `reviewed: false`, recorded on the board and posted to the PR, because
-  "no review" must never read as "clean". `--force` overrides it and is recorded doing so. None of
-  it fires where no ceiling was declared: this decides *whether to start*, never *what to send*,
-  and v2.16's refusal of a default diff budget stands.
+  survive, what changed besides moving, which definitions the change adds in more than one
+  place), or **refuses** the round loudly: printed, `reviewed: false`, recorded on the board, and
+  posted to the PR under `--post`, because "no review" must never read as "clean". A refusal still
+  reads the CI gate, which no diff size can defeat. `--force` overrides it and is recorded doing
+  so. None of it fires where no ceiling was declared: this decides *whether to start*, never *what
+  to send*, and v2.16's refusal of a default diff budget stands.
 - **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
   object store; wire `landed` refs to a cherry-pick helper.
 

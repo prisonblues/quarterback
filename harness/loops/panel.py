@@ -721,6 +721,12 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # under a claude-only panel is a lie.
     budgets = {name: diff_budget(rev.get(name, {}), "max_diff_chars", panel_budget, notes)
                for name in LLM_REVIEWERS if name in selected}
+    # The judge's budget is NOT in `budgets` and so is not weighed by the pre-flight
+    # verdict below. That is a boundary, not an oversight, and `smallest_cap` states
+    # the argument: the verdict decides whether to dispatch the SEATS and what to
+    # hand them, and `judge_max_diff_chars` is a statement about what adjudication
+    # is worth rather than about whether a round can be read. Counted here, that
+    # knob could refuse a round every reviewer could read whole.
     judge_budget = diff_budget(panel, "judge_max_diff_chars", panel_budget, notes)
 
     # ---- the pre-flight verdict (#138): is this round worth running, and read as
@@ -741,15 +747,59 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # It also means `preflight.shape.chars` is scope-dependent exactly as
     # `diff_chars` is — read `scope` beside it.
     #
+    # **The CONTEXT tiers are deliberately not weighed with it, and this is where to
+    # say why.** Under increment scope a seat's prompt also carries `review.near` and
+    # `review.far`, so a round with a small increment and large context tiers is
+    # handed more than the target measured here. Neither question this asks is about
+    # that total. "Is IT a move" is plainly about the target. "Would a seat read a
+    # useless fraction of it" is too, because the target is the tier that is never
+    # cut while anything else is present (`ReviewScope.material`'s priority order):
+    # losing context under a tight budget is the DESIGN of increment scope, is
+    # labelled in the prompt, is reported in `config_notes`, and already vetoes a
+    # confident stop through the `short_context` sentence below. Refusing a round
+    # because the optional tiers behind its target are large would refuse the case
+    # scoping exists to make cheap. The one place the total genuinely binds — argv,
+    # which cannot carry an oversized prompt at all — is clamped separately against
+    # `sendable` a few dozen lines down, and says so per seat.
+    #
     # `notes` is passed so a junk threshold in `.harness-rules` is reported the way
     # every other bad config value is. The VERDICT itself is deliberately not a
     # config note: it rides in `payload["preflight"]`, which reaches the board,
     # where `config_notes` does not — and it gets its own warning above the
     # findings, which is a better place for it than a "⚠️ config:" line. Written
     # into both, one report carried the same three sentences twice.
+    #
+    # What this round set out to review, captured BEFORE the manifest can replace
+    # the material: a manifest travels as a whole-target ("pr") scope by
+    # construction — there are no tiers to compose — so substituting it flips
+    # `review.scope`, and the inherited coverage vetoes are gated on that flag. A
+    # move-shaped round 2 would therefore have skipped them and been free to stop
+    # `confident: True` over gaps earlier rounds left, because its material stopped
+    # looking scoped. The round's SCOPE and the shape of its material are two
+    # different facts, and only the second one changed. Captured here rather than
+    # after the refusal branch so that branch can record it too.
+    target_scope = review.scope
     pre = preflight(review.target, budgets, panel, notes, forced=force)
     if pre.refused:
-        report = refusal_report(repo_name, pr_number, title, base, pre)
+        # The CI gate, read on a round that dispatches nobody. It is one API call,
+        # is not defeated by diff size, and costs no seat's budget — and a refusal
+        # that lost it told `/panel-review-pr` to stop the cycle with nothing said
+        # about a red build. "A refusal must cost nothing" is about the seats and
+        # the judge, which is where the minutes and the tokens are. Sonar is NOT
+        # read: it is a selected panel MEMBER with a `ran: false` row below, and
+        # dispatching a member while telling the board none ran is the exact
+        # inconsistency this path is built to avoid. `refusal_report` states that
+        # gate was not evaluated so its absence cannot read as a pass.
+        ci_status, ci_failing, ci_skip = review_ci(gh_repo, pr_number)
+        if ci_skip:
+            # `config_notes` and not `skipped`, unlike the ordinary path's
+            # `result.skipped`: there is no `PanelResult` here, and `skipped` is
+            # parsed board-side as "<reviewer>: <reason>" — a `ci: TimeoutExpired`
+            # entry there would be filed as a reviewer named "ci" that failed to
+            # run, in the table that answers which reviewer finds the real issues.
+            notes.append(ci_skip)
+        report = refusal_report(repo_name, pr_number, title, base, pre,
+                                ci_status, tuple(ci_failing), ci_skip or "")
         # One short sentence per seat: the per-seat answer to "why is this row
         # empty". The whole reason is in `skip_reason` and `preflight.reason`.
         refused_by = (f"not dispatched — the panel refused this round "
@@ -763,6 +813,21 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             # refused round still moved the head, and round r+1 has to be able to
             # anchor its increment and its fix range somewhere.
             "head_sha": head_sha, "merge_base": merge_base, "base_sha": base_sha,
+            # What the round was GOING to review, recorded for the same reason
+            # `preflight.shape` records what it measured: a refusal under
+            # `--scope increment --since <sha>` otherwise publishes the field
+            # defaults, so nothing distinguishes it from a refused whole-PR round.
+            # `load_baseline` reads `payload.get("scope") or "pr"`, which is
+            # harmless here only because `reviewers_ran == []` routes a refused
+            # round to `unread_rounds` before scope matters — a coupling nothing
+            # states and nothing enforces.
+            "scope": target_scope,
+            "since_sha": review.since or None,
+            # The one HARD gate a refusal can still report. `sonar_gate` stays at
+            # its default: Sonar is a member and no member ran, which the notice
+            # says out loud rather than leaving the default to be read as a pass.
+            "ci_status": ci_status,
+            "ci_failing": ci_failing,
             "changed_lines": changed,
             "changed_files": changed_files,
             "changed_files_total": changed_files_total,
@@ -818,15 +883,6 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         elif post:
             post_summary(gh_repo, pr_number, report)
         return finish(failed)
-    # What this round set out to review, captured BEFORE the manifest can replace
-    # the material. A manifest travels as a whole-target ("pr") scope by
-    # construction — there are no tiers to compose — so substituting it flips
-    # `review.scope`, and three inherited coverage vetoes are gated on that flag. A
-    # move-shaped round 2 would therefore have skipped every one of them and been
-    # free to stop `confident: True` over gaps earlier rounds left, because its
-    # material stopped looking scoped. The round's SCOPE and the shape of its
-    # material are two different facts, and only the second one changed.
-    target_scope = review.scope
     if pre.verdict == "manifest":
         # The manifest REPLACES the material rather than adding a review mode:
         # everything downstream works on `review`, so the budgets, the truncation
@@ -1154,6 +1210,20 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # words — so the context is not decoration, it is the only part of the PR this
     # round can find a pre-existing defect in. Cut it and that becomes
     # unreachable, and the round would report the resulting quiet as convergence.
+    #
+    # `review.scope`, and NOT `target_scope` like the three below it — the one
+    # exception in this block, so it is worth saying why rather than leaving it to
+    # look like the conversion that was missed. This veto is about `short_context`,
+    # which measures what the seats were sent AGAINST the context tiers of the
+    # material they were sent it from. A manifest substitution replaces that
+    # material with a whole-target composition whose `near` and `far` are both ""
+    # (they are `init=False` on `ReviewScope` and only filled under increment
+    # scope), so `short_context` on a manifest round is `sent < 0` for every seat —
+    # empty by construction, whichever flag guards it. Converting the guard would
+    # change nothing and would imply this veto can fire on a manifest round, which
+    # it cannot: the gap a manifest round leaves is not "part of the context did
+    # not fit", it is "nobody read the moved code", and `manifest_veto` below is
+    # the sentence for that.
     if review.scope == "increment" and short_context:
         inherited.append(
             f"{', '.join(short_context)} saw only part of the PR behind the increment — a "

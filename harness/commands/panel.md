@@ -38,10 +38,10 @@ panel just adds independent reviewers + hard CI/Sonar gates on top of that bar.
    its reviewer CLIs concurrently, so a dozen at once only makes every one of them slower. Each
    sub-agent must get `--repo <abs repo path>` explicitly — its cwd is not guaranteed to be your
    checkout, and `--repo` defaulting to cwd would silently panel the wrong repo — and returns just
-   the step-5/6 summary for its PR, so no PR's diff or reviewer output lands in your context. A
-   `--reviewers` list applies to every PR in the run. **One PR failing does not stop the others:**
-   an unreadable PR or a dead reviewer CLI is that agent's report to make, and the rest run to
-   completion.
+   its step-6 summary for its PR, written under step 5's reporting rules, so no PR's diff or
+   reviewer output lands in your context. A `--reviewers` list applies to every PR in the run.
+   **One PR failing does not stop the others:** an unreadable PR or a dead reviewer CLI is that
+   agent's report to make, and the rest run to completion.
 5. **A refused or manifest round is not a clean round — report it as what it is.** Before
    dispatching a seat the panel rules on whether the round is worth running (see
    `loops/README.md`, "the pre-flight verdict"). Read `preflight.verdict` from the payload, or

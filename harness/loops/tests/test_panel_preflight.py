@@ -34,6 +34,7 @@ diff at all.
 
 import json
 import sys
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -195,6 +196,37 @@ def test_the_one_sided_files_name_a_split_source_and_its_destinations():
     assert s.files == 3
     assert s.files_removed_only == ("big.py",)
     assert set(s.files_added_only) == {"part_a.py", "part_b.py"}
+
+
+def test_the_one_sided_file_lists_are_CAPPED_in_the_payload():
+    """`preflight.shape` rides in `--json`, in `--json-file` and in the payload piped
+    to `qb record-review` on EVERY run, and these two lists were the only part of it
+    that grew with the PR: a 700-file refactor wrote 700 paths into each board row.
+    The manifest's own file table has been capped since it was written; this is the
+    same rule one layer out, with the elided count emitted even when it is 0 so a
+    consumer can tell "all of them" from "the first forty"."""
+    lines = ["    a_line_of_content()"]
+    diff = "".join(_file(f"gained_{i}.py", added=lines)
+                   for i in range(pf.PAYLOAD_FILE_ROWS + 7))
+    d = pf.diff_shape(diff).as_dict()
+    assert len(d["files_added_only"]) == pf.PAYLOAD_FILE_ROWS
+    assert d["files_added_only_elided"] == 7
+    assert d["files_removed_only"] == [] and d["files_removed_only_elided"] == 0
+
+
+def test_the_diff_is_parsed_ONCE_on_a_manifest_verdict(monkeypatch):
+    """`diff_shape` parsed it and then `move_manifest` parsed it again to rebuild the
+    same three structures — a second full pass and a second pair of Counters over
+    ~10,000 lines on the 763 KB case, for data that was in hand. It is also two
+    answers where there should be one: the manifest has to describe the diff the
+    verdict weighed."""
+    calls = []
+    real = pf._hunk_bodies
+    monkeypatch.setattr(pf, "_hunk_bodies",
+                        lambda diff: calls.append(len(diff)) or real(diff))
+    got = _pre(SPLIT, {"claude": len(SPLIT) // 4}, {}, [])
+    assert got.verdict == "manifest", "the path that used to parse twice"
+    assert len(calls) == 1, calls
 
 
 def test_an_unparseable_header_keeps_its_lines_rather_than_dropping_them():
@@ -403,12 +435,170 @@ def test_turning_the_manifest_off_falls_back_to_the_refusal():
     assert got.refused
 
 
+def test_a_manifest_disabled_move_is_not_reported_as_NOT_move_shaped():
+    """The refusal's reason contradicted the measurement it was made from.
+    `tried_manifest` was only ever set inside the `manifest_on` branch, so switching
+    the manifest off sent the reason down the "it is not move-shaped … under the N
+    move ratio" path on a diff whose ratio is 1.0."""
+    got = _pre(SPLIT, {"claude": len(SPLIT) // 10},
+                       {"manifest_moves": False}, [])
+    assert got.refused
+    assert got.shape.is_move()
+    assert "it IS move-shaped" in got.reason
+    assert "`manifest_moves` is off" in got.reason
+    assert "not move-shaped" not in got.reason
+
+
+def test_a_move_with_no_manifest_UNDER_the_multiple_runs_and_SAYS_why():
+    """The case that fell through to `verdict("run", "")` with an empty reason. A
+    move-shaped diff over the ceiling, the manifest unavailable, and the refusal
+    threshold not crossed: reviewing it as truncated content is the only answer left,
+    and it is the one case where a reader of `preflight.reason` most needs to know
+    the manifest path was reached and did not help."""
+    cap = int(len(SPLIT) / 1.5)          # over the ceiling, well under 3x
+    got = _pre(SPLIT, {"claude": cap}, {"manifest_moves": False}, [])
+    assert got.verdict == "run"
+    assert 1 < got.over < 3
+    assert "it IS move-shaped" in got.reason
+    assert "`manifest_moves` is off" in got.reason
+    assert "Under the 3x refusal threshold" in got.reason
+    assert got.as_dict()["reason"]        # and it reaches the payload
+
+
+def test_a_move_whose_manifest_does_not_help_says_so_with_the_refusal_SWITCHED_OFF():
+    """`refuse_over_cap_multiple: 0` is the documented way to keep the manifest and
+    drop the refusal. It must not become the way to lose the explanation as well."""
+    got = _pre(SPLIT, {"claude": len(SPLIT) // 10},
+                       {"manifest_moves": False, "refuse_over_cap_multiple": 0}, [])
+    assert got.verdict == "run"
+    assert "With the refusal switched off" in got.reason
+
+
+def test_a_manifest_SMALLER_than_the_diff_but_over_the_CEILING_is_not_substituted():
+    """`len(text) < shape.chars` only rejected a manifest bigger than the diff it
+    replaces. A manifest smaller than a 763 KB diff and still over a tight ceiling was
+    substituted and then truncated by the ordinary budget path — a seat reading a
+    PREFIX of a manifest, reported as a clean `manifest` verdict beside
+    `diff_truncated: true`, which is the confusing pair the substitution exists to
+    avoid."""
+    size = len(pf.move_manifest(SPLIT))
+    cap = size - 100                      # smaller than the diff, over the ceiling
+    assert size < len(SPLIT), "fixture drifted: the manifest is not smaller"
+    got = _pre(SPLIT, {"claude": cap}, {}, [])
+    assert got.verdict != "manifest"
+    assert got.manifest == ""
+    assert "smaller than the diff, but still over" in got.reason
+    assert "prefix of a manifest" in got.reason
+    # And with the refusal off it runs rather than silently substituting.
+    ran = _pre(SPLIT, {"claude": cap}, {"refuse_over_cap_multiple": 0}, [])
+    assert (ran.verdict, ran.manifest) == ("run", "")
+
+
+def test_a_manifest_that_fits_BOTH_the_diff_and_the_ceiling_is_still_substituted():
+    """The other side of the guard above, so it cannot become a switch that turns the
+    feature off: a ceiling the manifest comfortably fits under still gets one."""
+    got = _pre(SPLIT, {"claude": len(SPLIT) // 4}, {}, [])
+    assert got.verdict == "manifest"
+    assert len(got.manifest) < len(SPLIT) // 4
+
+
+def test_a_forced_manifest_does_not_claim_the_round_read_a_manifest():
+    """--force does not re-run the verdict: it turns `manifest` into `run`, and
+    `panel.run` then reviews the full diff as content because `pre.verdict ==
+    "manifest"` is what triggers the substitution and is no longer true. The reason
+    was carried through verbatim, so the payload recorded "Reviewed as a MANIFEST
+    instead — what moved where …" on a round that reviewed the diff. `preflight.reason`
+    is what a reader has six weeks later instead of the round."""
+    got = _pre(SPLIT, {"claude": len(SPLIT) // 4}, {}, [], forced=True)
+    assert (got.verdict, got.would_have, got.forced) == ("run", "manifest", True)
+    assert got.reason.startswith("--force: ")
+    assert "Reviewed as a MANIFEST instead" not in got.reason
+    assert "was overruled" in got.reason
+    assert "reviewed as content" in got.reason
+    # The diagnosis survives: an override that erases the measurement leaves nothing
+    # to argue with.
+    assert "move-shaped" in got.reason
+
+
+def test_a_forced_refusal_does_not_still_advise_passing_force():
+    """The refusal's remedies end "or pass --force". Prefixed rather than replaced,
+    a forced round's audit reason told the reader to do the thing they had just
+    done."""
+    got = _pre(FRESH, {"claude": len(FRESH) // 10}, {}, [], forced=True)
+    assert got.would_have == "refuse"
+    assert "or pass --force" not in got.reason
+    assert "The refusal was overruled" in got.reason
+
+
+def test_the_argv_ceiling_is_measured_in_BYTES_not_characters():
+    """`ARGV_PROMPT_MAX_BYTES` is the kernel's `MAX_ARG_STRLEN`, in bytes;
+    `DiffShape.chars` is `len(diff)`, in characters. Compared against each other, a
+    diff full of em-dashes and arrows — which every diff in this repo is — is
+    understated by exactly its non-ASCII density, in the direction that lets an
+    over-cap round through."""
+    # Three bytes per character over most of the line, so the two readings differ by
+    # more than 2x — and a pure move, so the verdict has a reason to state the unit in.
+    wide = [f"    # 全角の行 {i} — 相当な長さの説明がここにあります" for i in range(900)]
+    diff = (_file("wide.py", removed=wide)
+            + _file("part_a.py", added=wide[:450])
+            + _file("part_b.py", added=wide[450:]))
+    shape = pf.diff_shape(diff)
+    assert shape.nbytes > shape.chars * 2, "fixture drifted: not enough non-ASCII"
+    # A diff whose CHARACTER count fits the kernel ceiling and whose BYTE count does
+    # not. Read in characters this round is not over the cap at all.
+    cap = panel_core.ARGV_PROMPT_MAX_BYTES
+    assert shape.chars < cap < shape.nbytes, f"fixture drifted: {shape}"
+    got = _pre(diff, {"antigravity": None}, {}, [])
+    assert got.over > 1, "the byte reading is what the argv ceiling is in"
+    assert got.over == pytest.approx(shape.nbytes / cap)
+    assert got.verdict == "manifest"
+    assert "bytes of diff" in got.reason
+    assert f"{cap:,}-byte ceiling" in got.reason
+    # And a CONFIGURED ceiling is still characters, on the same diff.
+    chars = _pre(diff, {"claude": shape.chars // 2}, {}, [])
+    assert chars.over == pytest.approx(shape.chars / (shape.chars // 2))
+    assert "chars of diff" in chars.reason
+    assert f"{shape.chars // 2:,}-char ceiling" in chars.reason
+
+
+def test_both_readings_of_the_size_are_serialised():
+    """So which one a verdict used is checkable rather than taken on trust."""
+    d = pf.diff_shape("diff --git a/x b/x\n@@ -1 +1 @@\n+é\n").as_dict()
+    assert d["chars"] == 34 and d["bytes"] == 35
+
+
+def test_the_judge_budget_does_not_hold_the_CEILING(monkeypatch, tmp_path):
+    """A deliberate boundary, pinned because the refusal payload records
+    `diff_budgets` WITH a `judge` entry and so invites the opposite reading. This
+    verdict decides whether to dispatch the SEATS; `judge_max_diff_chars` says what
+    adjudication is worth, and counting it here would let that knob refuse a round
+    every reviewer could read whole."""
+    _, got, seen = _run(monkeypatch, tmp_path, FRESH,
+                        _panel(judge_max_diff_chars=len(FRESH) // 50))
+    assert got["preflight"]["verdict"] == "run"
+    assert got["preflight"]["cap"] is None
+    assert seen["prompts"]["claude"], "the seats were dispatched"
+    # The budget is still RECORDED, which is the half that invites the misreading.
+    assert got["diff_budgets"]["judge"] == len(FRESH) // 50
+
+
 def test_the_move_ratio_threshold_is_configurable():
-    moved = [f"line {i}" for i in range(100)]
-    new = [f"brand new {i}" for i in range(50)]
-    diff = _file("from.py", removed=moved) + _file("to.py", added=moved + new)
-    budgets = {"claude": len(diff) // 10}
-    assert _pre(diff, budgets, {}, []).refused            # 0.67 < 0.9
+    """The same diff, read as content at 0.9 and as a move at 0.5.
+
+    The ceiling has to be one the MANIFEST fits under as well as one the diff is
+    far past, and the fixture asserts both rather than assuming them: the
+    substitution is measured against the ceiling now, not only against the diff, so
+    a cap chosen only to be "far over" can no longer reach a manifest verdict at
+    all and the test would be pinning the refusal twice.
+    """
+    new = [f"    fresh_{i} = brand_new({i}, retries=3)" for i in range(50)]
+    diff = _file("from.py", removed=BODY) + _file("to.py", added=BODY + new)
+    ratio = pf.diff_shape(diff).move_ratio
+    assert 0.5 <= ratio < 0.9, f"fixture drifted: {ratio}"
+    cap = len(diff) // 4
+    assert len(pf.move_manifest(diff)) < cap, "fixture drifted: manifest over the cap"
+    budgets = {"claude": cap}
+    assert _pre(diff, budgets, {}, []).refused            # under the 0.9 default
     assert _pre(diff, budgets,
                         {"move_shape_ratio": 0.5}, []).verdict == "manifest"
 
@@ -489,13 +679,119 @@ def test_a_negative_threshold_falls_back_rather_than_inverting_the_test():
     assert any("cannot be negative" in n for n in notes)
 
 
+@pytest.mark.parametrize("junk", [float("nan"), float("inf"), float("-inf"),
+                                  "nan", "inf"])
+def test_a_NON_FINITE_threshold_falls_back_and_says_so(junk):
+    """`nan` compares false against everything and `inf` is never exceeded, so both
+    switch a check off while reading like a number: `move_shape_ratio: nan` silently
+    means "nothing is ever a move", `refuse_over_cap_multiple: inf` silently means
+    "never refuse". The negative check already established that a value which cannot
+    be the thing at all is reported rather than honoured; these are the same class."""
+    notes = []
+    got = _pre(FRESH, {"claude": len(FRESH) // 10},
+                       {"refuse_over_cap_multiple": junk}, notes)
+    assert got.refused, "it fell back to the default, which refuses"
+    assert any("not a finite number" in n for n in notes), notes
+
+
+def test_a_move_ratio_ABOVE_ONE_falls_back_rather_than_becoming_unsatisfiable():
+    """The ratio is relocated lines as a fraction of the LARGER side, so 1.0 is a
+    move with no residue at all and there is nothing above it to express.
+    `move_shape_ratio: 90` — meant as 90% — otherwise passes validation, makes
+    `is_move` unsatisfiable, and turns every over-cap round into a refusal whose
+    reason reads "under the 90 move ratio": a plausible sentence about a threshold
+    that cannot be met."""
+    notes = []
+    got = _pre(SPLIT, {"claude": len(SPLIT) // 4}, {"move_shape_ratio": 90}, notes)
+    assert got.verdict == "manifest", "the default 0.9 applied instead"
+    assert any("cannot be above 1" in n for n in notes), notes
+    # 1.0 itself is legitimate and stays silent — "a move with no residue".
+    quiet = []
+    _pre(SPLIT, {"claude": len(SPLIT) // 4}, {"move_shape_ratio": 1.0}, quiet)
+    assert quiet == []
+
+
+def test_FALSE_on_a_numeric_threshold_is_refused_and_told_which_number_to_write():
+    """`false` is the other way an operator writes "off", and it must not be read as
+    the number 0: the same rule covers `move_shape_ratio`, where a threshold of 0
+    makes every diff with one relocated line a move — the switch flipped to "off"
+    turning the feature all the way on. So it falls back and the note names `0`."""
+    notes = []
+    got = _pre(FRESH, {"claude": len(FRESH) // 10},
+                       {"refuse_over_cap_multiple": False}, notes)
+    assert got.refused
+    assert any("write `0` to switch it off" in n for n in notes), notes
+
+
+def test_NULL_on_the_refusal_multiple_means_the_DEFAULT_and_not_off():
+    """Two docstrings said null switched the refusal off while `_rule` read it as
+    "use the default", so an operator who wrote `refuse_over_cap_multiple: null` to
+    opt out got refusals with nothing in `config_notes` to explain them. The docs
+    were the wrong half — null cannot mean "off" while it also means "inherit", and
+    every other setting in this harness reads it as "inherit" — so this pins the
+    behaviour the docs now describe."""
+    notes = []
+    got = _pre(FRESH, {"claude": len(FRESH) // 10},
+                       {"refuse_over_cap_multiple": None}, notes)
+    assert got.refused, "null is inherit, and the inherited default refuses"
+    assert notes == [], "and inherit is the silent case"
+    # `0` is the one spelling of off.
+    assert _pre(FRESH, {"claude": len(FRESH) // 10},
+                        {"refuse_over_cap_multiple": 0}, []).verdict == "run"
+
+
+@pytest.mark.parametrize("raw,off", [(False, True), ("false", True), ("off", True),
+                                     ("no", True), ("0", True), (True, False),
+                                     ("true", False), ("YES", False), ("", False),
+                                     (None, False)])
+def test_manifest_moves_is_VALIDATED_as_a_boolean(raw, off):
+    """It was `panel.get("manifest_moves", True)` — raw truthiness — while both
+    numeric settings introduced beside it went through `_rule` on purpose, so that a
+    junk threshold is reported the way every other bad config value is. The gap
+    mattered in the one direction nobody notices: `manifest_moves: "false"` is a
+    non-empty string, so the feature an operator had just written "false" against
+    stayed ON, and `thresholds` then reported `bool(raw)` as though the value had
+    been checked."""
+    notes = []
+    got = _pre(SPLIT, {"claude": len(SPLIT) // 4}, {"manifest_moves": raw}, notes)
+    assert got.thresholds["manifest_moves"] is not off
+    assert got.verdict == ("refuse" if off else "manifest")
+    assert notes == []
+
+
+def test_a_manifest_moves_value_that_is_NOT_a_boolean_falls_back_and_says_so():
+    notes = []
+    got = _pre(SPLIT, {"claude": len(SPLIT) // 4},
+                       {"manifest_moves": "maybe"}, notes)
+    assert got.thresholds["manifest_moves"] is True
+    assert got.verdict == "manifest"
+    assert any("is not true or false" in n for n in notes), notes
+
+
+def test_a_measured_ratio_of_zero_is_not_serialised_as_NO_CEILING():
+    """`round(self.over, 2) or None` emitted null both for "no cap" and for a real
+    cap the diff is tiny against (200 chars against 120,000 rounds to 0.0). The
+    `preflight` block's own docs make exactly that null-vs-measured distinction
+    load-bearing one level up, so reusing null inside it undercuts the same
+    argument."""
+    small = _file("x.py", added=["one line"])
+    got = _pre(small, {"antigravity": None}, {}, [])
+    assert got.verdict == "run"
+    assert got.cap == panel_core.ARGV_PROMPT_MAX_BYTES
+    assert round(got.over, 2) == 0.0
+    assert got.as_dict()["over_cap"] == 0.0, "measured, and small"
+    # And no cap at all still serialises as null, which is the other statement.
+    assert _pre(small, UNCAPPED, {}, []).as_dict()["over_cap"] is None
+
+
 def test_the_verdict_serialises_the_measurement_it_was_made_from():
     """A verdict a consumer cannot check is a verdict nobody argues with, and the
     board is the consumer that has to hold it for six weeks."""
-    got = _pre(SPLIT, {"antigravity": 100}, {}, [])
+    cap = len(SPLIT) // 4
+    got = _pre(SPLIT, {"antigravity": cap}, {}, [])
     d = got.as_dict()
     assert d["verdict"] == "manifest"
-    assert d["cap"] == 100 and d["cap_seat"] == "antigravity"
+    assert d["cap"] == cap and d["cap_seat"] == "antigravity"
     assert d["shape"]["moved"] == len(BODY)
     assert d["shape"]["move_ratio"] == 1.0
     assert d["thresholds"]["move_shape_ratio"] == pf.DEFAULT_MOVE_SHAPE_RATIO
@@ -510,7 +806,7 @@ def test_the_refusal_notice_will_not_render_a_verdict_that_is_not_a_refusal():
     bug, and the bug has to surface here rather than on somebody's PR."""
     ran = _pre(FRESH, UNCAPPED, {}, [])
     assert ran.verdict == "run"
-    with pytest.raises(AssertionError, match="only a refusal has a reason"):
+    with pytest.raises(ValueError, match="only a refusal has a reason"):
         pf.refusal_report("board", 137, "a title", "main", ran)
 
 
@@ -526,6 +822,91 @@ def test_the_refusal_notice_names_the_measurement_and_the_remedies():
     # not, or a reader gets a run of spaces mid-sentence.
     for line in text.splitlines():
         assert "  " not in line.strip(), line
+
+
+def test_the_refusal_notice_MARKS_a_truncated_title():
+    """`title[:60]` cut mid-word with no marker, while `_quote` in the same module
+    appends " …" for exactly this reason and `fit_comment` marks its own cut. A reader
+    of a posted refusal could not tell a 60-character title from a truncated one."""
+    got = _pre(FRESH, {"claude": len(FRESH) // 10}, {}, [])
+    long = "refactor: " + "the world and everything that is in it " * 3
+    assert len(long) > 60
+    text = pf.refusal_report("board", 137, long, "main", got)
+    assert f"{long[:60]} …" in text
+    # A title that fits is quoted whole, with no marker to make a reader doubt it.
+    short = "fix: one thing"
+    assert f"{short}\n" in pf.refusal_report("board", 137, short, "main", got)
+
+
+def test_the_refusal_notice_reports_the_CI_gate_and_names_the_one_it_did_NOT_read():
+    """CI is size-independent, costs one API call and consumes no seat's budget — it is
+    the one part of a round a 763 KB diff cannot make useless, and a refusal that lost
+    it left `/panel-review-pr` told to stop the cycle with nothing said about a red
+    build. Sonar is a panel MEMBER with a `ran: false` row, so it is not read; the
+    notice says that gate was not evaluated rather than letting its default read as a
+    pass."""
+    got = _pre(FRESH, {"claude": len(FRESH) // 10}, {}, [])
+    text = pf.refusal_report("board", 137, "a title", "main", got,
+                             "FAIL", ("build", "lint"))
+    assert "CI: FAILED" in text
+    assert "build, lint" in text
+    assert "SonarCloud: NOT evaluated" in text
+    assert "never as a pass" in text
+    for line in text.splitlines():
+        assert "  " not in line.strip(), line
+
+
+@pytest.mark.parametrize("status,says", [
+    ("PASS", "PASSED on this commit"),
+    ("PENDING", "STILL RUNNING"),
+    ("none", "no checks are configured"),
+    ("unknown", "could NOT be read"),
+    ("", "NOT read for this refusal"),
+])
+def test_no_CI_state_is_allowed_to_read_as_a_PASS(status, says):
+    """The same discipline `ci_brief` applies for a reviewer, applied for a human: a
+    refusal notice that lets a missing gate read as a green one is the same failure as
+    a refusal that reads as a clean review."""
+    line = pf._ci_line(status)
+    assert says in line
+    if status != "PASS":
+        assert "not a pass" in line
+
+
+def test_the_refusal_guard_survives_python_dash_O():
+    """It was a bare `assert`, and `python -O` strips assertions — so the one thing
+    standing between a caller with the wrong verdict and a reasonless "**Why:** ."
+    notice on somebody's PR was removed by a flag on the interpreter. The docstring
+    says that failure is not hypothetical, which is the argument for an explicit
+    raise."""
+    import subprocess
+    loops = str(Path(__file__).resolve().parent.parent)
+    code = (
+        "import sys; sys.path.insert(0, %r)\n"
+        "import panel_preflight as pf\n"
+        "ok = pf.Preflight('run', '', pf.diff_shape(''))\n"
+        "try:\n"
+        "    pf.refusal_report('board', 1, 't', 'main', ok)\n"
+        "except ValueError as e:\n"
+        "    print('RAISED' if 'only a refusal' in str(e) else 'WRONG')\n"
+        "else:\n"
+        "    print('SLIPPED THROUGH')\n" % loops)
+    for flags in ([], ["-O"], ["-OO"]):
+        out = subprocess.run([sys.executable, *flags, "-c", code],
+                             capture_output=True, text=True, timeout=60)
+        assert out.stdout.strip() == "RAISED", (flags, out.stdout, out.stderr)
+
+
+def test_the_private_helpers_are_not_re_exported_under_a_star_import():
+    """`panel.py` does `from panel_preflight import *` LAST of five sibling modules, so
+    anything in `__all__` wins a name collision against `panel_core`, `panel_seats`,
+    `panel_scope` and `panel_rounds` — silently, with no error, and with no test able
+    to notice, because the tests reach each module's helpers through the module object.
+    `_rule`, `_listing` and `_quote` are generic enough names that a sibling could grow
+    one any day."""
+    assert not [n for n in pf.__all__ if n.startswith("_")]
+    # Still reachable where they are actually used, which is here.
+    assert callable(pf._rule) and callable(pf._listing) and callable(pf._quote)
 
 
 # ----------------------------------------------------------------------------- manifest
@@ -596,15 +977,95 @@ def test_no_duplicate_says_which_languages_it_actually_looked_at():
     ("class Bare:", "Bare"),
     ("export function render(node) {", "render"),
     ("async function poll() {", "poll"),
+    # The JS/TS spellings the check claimed and did not have. `function name(` is
+    # the one form modern JS/TS uses least, and while only it was matched a
+    # TypeScript move written in any of these got a false all-clear inside a
+    # language the manifest said it had checked.
+    ("class Foo {", "Foo"),
+    ("class Foo extends Bar {", "Foo"),
+    ("export class Foo implements Baz {", "Foo"),
+    ("export default class Foo {", "Foo"),
+    ("export default function render(n) {", "render"),
+    ("function* walk(node) {", "walk"),
+    ("const handle = (req, res) => {", "handle"),
+    ("  let fetchAll = async () => {", "fetchAll"),
+    ("export const send: Sender = payload => post(payload)", "send"),
+    ("var legacy = function (a, b) {", "legacy"),
+    ("export interface Widget {", "Widget"),
+    ("interface Widget extends Base {", "Widget"),
+    ("export enum Colour {", "Colour"),
+    ("export type Handler<T> = (x: T) => void", "Handler"),
 ])
 def test_the_definition_shapes_it_recognises(line, name):
-    from collections import Counter
-    assert list(pf.duplicate_definitions(Counter({line: 2}))) == [name]
+    assert pf._def_name(line) == name
+
+
+@pytest.mark.parametrize("line", [
+    # A method is spelled identically to a call, an `if`, a `for` and a `catch`, so
+    # a pattern loose enough to catch one flags all of them — and a section that
+    # fires on `if (ok) {` appearing twice is worse than one that misses a method,
+    # because the reader stops believing it. Named in the manifest's disclaimer
+    # instead, where a reader can act on it.
+    "    render(props) {",
+    "if (ok) {",
+    "for (const x of xs) {",
+    "} catch (e) {",
+    # Not a definition either way: the right-hand side has to BE a function, or
+    # `const total = (a + b);` is filed as one.
+    "    const total = (a + b);",
+    "    const label = words.map(w => w).join(' ');",
+    "    return compute(x)",
+])
+def test_the_shapes_it_deliberately_does_not_recognise(line):
+    assert pf._def_name(line) == ""
 
 
 def test_a_definition_added_once_is_not_flagged():
-    from collections import Counter
-    assert pf.duplicate_definitions(Counter({"def only_here(x):": 1})) == {}
+    assert pf.duplicate_definitions({"only_here": Counter({"a.py": 1})}) == {}
+    # Twice in ONE file is still twice, and still a duplicate.
+    assert pf.duplicate_definitions({"twice": Counter({"a.py": 2})}) == {
+        "twice": Counter({"a.py": 2})}
+
+
+def test_a_duplicate_names_the_files_each_copy_LANDED_in():
+    """The values were `[]` for every key under a `dict[str, list[str]]` annotation
+    promising locations, and the only caller iterated the keys and ignored them.
+    Where a copy went is the one thing a reader can act on without the checkout the
+    panel does not have."""
+    diff = (_file("from.py", removed=["def review_llm(name):"])
+            + _file("a.py", added=["def review_llm(name):"])
+            + _file("b.py", added=["def review_llm(name):",
+                                   "def review_llm(name):"]))
+    dupes = pf.duplicate_definitions(pf._hunk_bodies(diff).def_sites)
+    # Data, not rendered strings: a list of "b.py x2" would be the same misleading
+    # annotation one step along — values a reader would take for paths.
+    assert dupes == {"review_llm": Counter({"a.py": 1, "b.py": 2})}
+    assert "! review_llm — added in a.py, b.py x2" in pf.move_manifest(diff)
+
+
+def test_the_manifest_says_the_OTHER_half_of_the_trap_is_unseeable():
+    """The canonical duplicate-copy accident leaves the original exactly where it
+    was, in a file the merge never touched — so it appears in the diff as neither an
+    added nor a deleted line, and no amount of parsing recovers it from `gh pr diff`.
+    The section used to render "(none found …)" over that case, which reads as
+    checked-and-clean for precisely the failure it is named after. It now says which
+    half it can see, and the unseeable half is listed with the two other facts that
+    need the branch."""
+    text = pf.move_manifest(SPLIT)
+    assert "DEFINITIONS THIS CHANGE ADDS IN MORE THAN ONE PLACE" in text
+    assert "half of the duplicate-copy trap" in text
+    assert "in a file this change never touches" in text
+    assert "checking it needs the branch" in text
+
+
+def test_the_duplicate_disclaimer_names_the_spellings_it_did_NOT_look_at():
+    """"A pattern that matches nothing is worse than an absent section" is this
+    module's own rule, and it applies one level finer than a language name: a reader
+    told "JavaScript/TypeScript" cannot know that a class method was not looked
+    at."""
+    text = pf.move_manifest(SPLIT)
+    assert "Class and object METHODS" in text
+    assert "wraps onto a second line" in text
 
 
 def test_the_manifest_states_the_two_facts_it_cannot_measure():
@@ -634,6 +1095,37 @@ def test_a_long_residue_line_is_quoted_not_reproduced():
     text = pf.move_manifest(diff)
     assert long not in text
     assert long[:pf.MANIFEST_LINE_CHARS] in text
+
+
+def test_a_repeated_residue_line_does_not_consume_the_whole_listing():
+    """`sorted(bodies.elements(), …)` expanded the Counter, so one long boilerplate
+    line added five hundred times was quoted up to `MANIFEST_RESIDUE_LINES` times —
+    and since the sort is longest-first it crowded out every unique line behind it,
+    with the elision count then reporting "… and N more, not listed" for exactly the
+    lines a reviewer needed to see. The repetition is information and is kept as a
+    multiplier; what it must not be is the whole budget."""
+    boiler = "        raise NotImplementedError('this subclass owes an implementation')"
+    unique = [f"        if guard_{i} is None: return None   # dropped on the way across"
+              for i in range(5)]
+    diff = (_file("from.py", removed=BODY + [boiler] * 500 + unique)
+            + _file("to.py", added=BODY))
+    text = pf.move_manifest(diff)
+    assert f"{boiler.strip()}   (x500)" in text
+    for line in unique:
+        assert line.strip() in text, "a unique residue line was crowded out"
+    assert "not listed" not in text.split("WHAT DID NOT SURVIVE")[1].split("WHAT CHANGED")[0]
+
+
+def test_a_file_with_no_counted_lines_is_not_labelled_BOTH():
+    """A mode change, a binary, a rename git recorded without content: `a == r == 0`,
+    which `diff_shape` reasons about explicitly as being NEITHER one-sided nor the
+    other. The row rendered `path: +0 / -0  [both]`, asserting the file had gained and
+    lost text when it did neither."""
+    diff = (_file("moved_from.py", removed=BODY) + _file("moved_to.py", added=BODY)
+            + "diff --git a/chmod.sh b/chmod.sh\nold mode 100644\nnew mode 100755\n")
+    text = pf.move_manifest(diff)
+    assert "chmod.sh: +0 / -0  [no counted lines]" in text
+    assert "[both]" not in text
 
 
 def test_the_manifest_is_the_same_text_twice():
@@ -752,6 +1244,121 @@ def test_a_refused_round_still_records_the_commit_it_did_not_review(monkeypatch,
                      _panel(max_diff_chars=len(FRESH) // 10))
     assert got["head_sha"]
     assert got["merge_base"]
+
+
+def test_a_refused_round_records_the_CI_gate_and_not_the_SONAR_one(monkeypatch,
+                                                                   tmp_path,
+                                                                   capsys):
+    """CI is size-independent, costs one API read and consumes no seat's budget — the
+    one part of a round a 763 KB diff cannot make useless. A refusal that discarded it
+    left `/panel-review-pr` told to stop the cycle with nothing said about a red build.
+    Sonar is a panel MEMBER with a `ran: false` row below, so it is not dispatched, and
+    the notice says that gate was not evaluated rather than leaving its default to read
+    as a pass."""
+    cfg = {**_panel(max_diff_chars=len(FRESH) // 10),
+           "reviewers": {"claude": {"enabled": True, "model": "sonnet"}}}
+    monkeypatch.setattr(panel, "load_repo_cfg", lambda name: cfg)
+    monkeypatch.setattr(pf, "seat_installed", ALL_HERE)
+    monkeypatch.setattr(panel_core, "sh", gh_stub(diff=FRESH))
+    monkeypatch.setattr(panel, "review_llm",
+                        lambda *a, **k: pytest.fail("a seat was dispatched"))
+    monkeypatch.setattr(panel, "review_ci", lambda *a: ("FAIL", ["build"], None))
+    out = tmp_path / "refused.json"
+    assert panel.run("e2e", 137, post=False, json_file=str(out), record=False) == 0
+    got = json.loads(out.read_text())
+    assert got["preflight"]["verdict"] == "refuse"
+    assert got["ci_status"] == "FAIL"
+    assert got["ci_failing"] == ["build"]
+    assert got["sonar_gate"] == "skipped", "not read, and not claimed either way"
+    printed = capsys.readouterr().out
+    assert "CI: FAILED" in printed
+    assert "SonarCloud: NOT evaluated" in printed
+
+
+def test_a_refused_SCOPED_round_records_what_it_was_going_to_review(monkeypatch,
+                                                                   tmp_path):
+    """The refuse payload is careful to carry `head_sha`/`merge_base`/`base_sha` so
+    round r+1 can anchor, and recorded no `scope` and no `since_sha` — so a refusal
+    under `--scope increment --since <sha>` published the field defaults and nothing
+    told it apart from a refused whole-PR round. `load_baseline` reads
+    `payload.get("scope") or "pr"`, which is harmless today only because
+    `reviewers_ran == []` routes the round to `unread_rounds` before scope matters: a
+    coupling nothing states and nothing enforces."""
+    increment = _file("fix.py", added=BODY)
+    cfg = {"github": "acme/board", "path": "/tmp/b", "name": "board",
+           "reviewers": {"claude": {"enabled": True, "model": "sonnet"}},
+           # Tight enough that the INCREMENT itself is far over — the verdict is
+           # weighed on the target, so refusing takes a target that does not fit.
+           "review_panel": {"max_diff_chars": len(increment) // 10}}
+    monkeypatch.setattr(panel, "load_repo_cfg", lambda name: cfg)
+    monkeypatch.setattr(pf, "seat_installed", ALL_HERE)
+    monkeypatch.setattr(panel_core, "sh", gh_stub(diff=FRESH + increment))
+    monkeypatch.setattr(panel_scope, "fetch_increment",
+                        lambda repo, a, b: (increment, ""))
+    monkeypatch.setattr(panel_scope, "compare_facts",
+                        lambda *a: {"commits": 1, "files": 1, "additions": 200,
+                                    "deletions": 0})
+    monkeypatch.setattr(panel, "review_llm",
+                        lambda *a, **k: pytest.fail("a seat was dispatched"))
+    monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
+    out = tmp_path / "r2.json"
+    assert panel.run("e2e", 137, post=False, json_file=str(out), record=False,
+                     round_no=2, baseline=[_payload(tmp_path, "r1.json")],
+                     max_rounds=3) == 0
+    got = json.loads(out.read_text())
+    assert got["preflight"]["verdict"] == "refuse"
+    assert got["scope"] == "increment", "what the round was going to review"
+    assert got["since_sha"] == "a" * 40, "and the commit it was measured from"
+
+
+def test_a_scoped_round_is_NOT_refused_for_the_size_of_its_CONTEXT(monkeypatch,
+                                                                  tmp_path):
+    """The verdict weighs the review TARGET and deliberately not the context tiers
+    that travel with it, and this pins the contract rather than leaving it to the
+    comment. The target is the tier never cut while anything else is present, so
+    "would a seat read a useless fraction of it" is a question about the target;
+    losing context under a tight budget is the DESIGN of increment scope, is labelled
+    in the prompt, and already vetoes a confident stop on its own. Refusing here would
+    refuse the case scoping exists to make cheap."""
+    increment = _file("fix.py", added=["    the_fix()"])
+    pr = FRESH * 4 + increment
+    cfg = {"github": "acme/board", "path": "/tmp/b", "name": "board",
+           "reviewers": {"claude": {"enabled": True, "model": "sonnet"}},
+           # Enough to pay for the increment AND the scoped frame — which is over a
+           # kilobyte and cannot be cut — so the target is not truncated and the
+           # squeeze lands on the context, which is the regime this pins. Far under
+           # the context itself: weighed on target + near + far this round would be
+           # ~20x over and refused.
+           "review_panel": {"max_diff_chars": 4_000}}
+    monkeypatch.setattr(panel, "load_repo_cfg", lambda name: cfg)
+    monkeypatch.setattr(pf, "seat_installed", ALL_HERE)
+    monkeypatch.setattr(panel_core, "sh", gh_stub(diff=pr))
+    monkeypatch.setattr(panel_scope, "fetch_increment",
+                        lambda repo, a, b: (increment, ""))
+    monkeypatch.setattr(panel_scope, "compare_facts",
+                        lambda *a: {"commits": 1, "files": 1, "additions": 1,
+                                    "deletions": 0})
+    monkeypatch.setattr(panel, "review_llm",
+                        lambda n, m, prompt, effort="":
+                        panel.ReviewerRun([], None, 10, None))
+    monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
+    monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], None, ""))
+    out = tmp_path / "r2.json"
+    assert panel.run("e2e", 137, post=False, json_file=str(out), record=False,
+                     round_no=2, baseline=[_payload(tmp_path, "r1.json")],
+                     max_rounds=3) == 0
+    got = json.loads(out.read_text())
+    assert got["reviewed"] is True
+    assert got["preflight"]["verdict"] == "run"
+    assert got["preflight"]["shape"]["chars"] == len(increment)
+    # The context the budget could not pay for is NOT silent: it is a veto in its own
+    # right, which is the half that makes the exemption above honest.
+    assert got["context_chars"] > got["preflight"]["shape"]["chars"] * 100
+    assert (got["context_chars"] + got["diff_chars"]) / 4_000 > 3, \
+        "the whole prompt IS past the refusal multiple — the target is not"
+    assert got["reviewers"]["claude"]["truncated"] is False, "the target fitted whole"
+    assert any("saw only part of the PR behind the increment" in v
+               for v in got["round_stop"]["veto"])
 
 
 def test_a_manifest_round_hands_the_seats_a_manifest_and_no_diff(monkeypatch,
@@ -910,8 +1517,41 @@ def test_an_uncapped_repo_behaves_exactly_as_it_did_before(monkeypatch, tmp_path
 def test_a_title_skip_never_reaches_the_verdict(monkeypatch, tmp_path):
     """`preflight: None` and a `run` verdict are different statements, and the
     difference is what answers "was this PR ever weighed?". The skip path returns
-    before the diff is even fetched."""
-    assert panel._payload_defaults()["preflight"] is None
+    before the diff is even fetched.
+
+    Driven rather than asserted on the default dict. This test used to be one
+    assertion on `_payload_defaults()`, which pins the DEFAULT and not the path: if
+    the skip branch were moved below the `preflight` call, or began stamping a
+    verdict of its own, that assertion would have gone on passing unchanged.
+    """
+    assert panel._payload_defaults()["preflight"] is None, "the default it relies on"
+    calls: list = []
+    seen: dict = {"prompts": {}}
+    cfg = {"github": "acme/board", "path": "/tmp/acme-board", "name": "board",
+           "reviewers": {"claude": {"enabled": True, "model": "sonnet"}},
+           # A ceiling the fixture diff is far past, so a round that DID reach the
+           # verdict would refuse and stamp one — the skip has to beat it there.
+           "review_panel": {"max_diff_chars": 10,
+                            "skip_title_patterns": ["^chore: promote"]}}
+    monkeypatch.setattr(panel, "load_repo_cfg", lambda name: cfg)
+    monkeypatch.setattr(pf, "seat_installed", ALL_HERE)
+    monkeypatch.setattr(panel_core, "sh",
+                        gh_stub(meta={"title": "chore: promote main to prod"},
+                                diff=FRESH, calls=calls))
+    monkeypatch.setattr(panel, "review_llm",
+                        lambda n, m, prompt, effort="":
+                        seen["prompts"].setdefault(n, prompt)
+                        or panel.ReviewerRun([], None, 10, None))
+    monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
+    out = tmp_path / "skipped.json"
+    assert panel.run("e2e", 137, post=False, json_file=str(out), record=False) == 0
+    got = json.loads(out.read_text())
+    assert got["preflight"] is None, "never weighed, which is not the same as `run`"
+    assert got["skip_reason"] == "title matches skip pattern /^chore: promote/"
+    assert seen["prompts"] == {}, "and no seat was prompted"
+    # It returns before the diff is even fetched, which is what makes it the cheap
+    # path — and the reason a verdict there would have nothing to weigh.
+    assert not any("diff" in c for c in calls), calls
 
 
 # ------------------------------------------------- what the verdict is measured ON
@@ -1135,6 +1775,44 @@ def test_a_manifest_round_does_not_lose_the_INHERITED_vetoes_it_should_carry(
     assert got["scope"] == "increment"
     assert any("had a truncated reviewer" in v for v in got["round_stop"]["veto"])
     assert got["round_stop"]["confident"] is False
+    # The round's OWN manifest gap is a separate sentence, because "no reviewer read
+    # it" is false of a manifest round: every seat ran.
+    assert any("read a MANIFEST of a move" in v for v in got["round_stop"]["veto"])
+    # And the ONE veto in that block still gated on `review.scope` rather than on the
+    # captured target scope cannot fire here, whichever flag guards it. It keys off
+    # `short_context`, which compares what each seat was sent against the CONTEXT
+    # TIERS of the material it was sent — and a manifest's material is a whole-target
+    # composition whose `near` and `far` are both "", so the comparison is `sent < 0`
+    # for every seat. Converting its guard would change nothing and would imply this
+    # veto can fire on a manifest round, which it cannot.
+    assert not any("saw only part of the PR behind the increment" in v
+                   for v in got["round_stop"]["veto"])
+
+
+def test_the_shared_reply_contract_does_not_tell_a_manifest_reviewer_to_judge_a_diff():
+    """`_FINDINGS_ENVELOPE` is appended VERBATIM to both prompts, which is what lets
+    `SCHEMA_ECHOES` recognise either one's own example rather than filing it as a
+    finding — so forking it would be the wrong fix. But it said "only if the diff is
+    genuinely flawless" and "a file the diff does not include" under a prompt whose
+    first sentence is "you are deliberately NOT being given its diff", contradicting it
+    on the one point a manifest round hinges on."""
+    assert "the material below is genuinely flawless" in panel_core.MOVE_MANIFEST_PROMPT
+    assert "a file\n  the material below does not include" in panel_core.REVIEW_PROMPT
+    for prompt in (panel_core.REVIEW_PROMPT, panel_core.MOVE_MANIFEST_PROMPT):
+        assert "if the diff is genuinely flawless" not in prompt
+    # Still one string, shared: two hand-kept copies are one edit away from a manifest
+    # run in which the example parses as a finding nobody made.
+    assert panel_core._FINDINGS_ENVELOPE in panel_core.REVIEW_PROMPT
+    assert panel_core._FINDINGS_ENVELOPE in panel_core.MOVE_MANIFEST_PROMPT
+
+
+def test_the_manifest_prompt_asks_only_for_the_HALF_of_the_trap_it_can_see():
+    """The prompt told the seat that "a move that keeps BOTH copies" is what section 3
+    lists, and the section cannot see that case at all: the surviving original is in a
+    file the diff never touches. A brief that promises evidence the manifest does not
+    carry spends the round's most valuable instruction on a false premise."""
+    assert "Names this change ADDS in more" in panel_core.MOVE_MANIFEST_PROMPT
+    assert "seen from a diff at all" in panel_core.MOVE_MANIFEST_PROMPT
 
 
 # ----------------------------------------------------------------------------- the CLI

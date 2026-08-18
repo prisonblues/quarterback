@@ -66,10 +66,12 @@ So the panel now measures the diff's **shape** as well as its size — a move is
 identifiable, because its added lines are a near-permutation of its deleted ones — and does
 one of three things. A diff that fits runs as it always did. A move-shaped diff that does not
 fit is reviewed as a **manifest**: what moved where, what did *not* survive, what changed
-besides moving, and which definitions now exist in more than one place. A diff far over every
-seat's ceiling with no smaller honest question to ask is **refused**, loudly — printed,
-recorded on the board and posted to the PR, because "no review" must never read as "clean" —
-and `--force` overrides it on the record. None of it fires on a repo that declared no
+besides moving, and which definitions the change *adds* in more than one place. A diff far over
+every seat's ceiling with no smaller honest question to ask is **refused**, loudly — printed,
+recorded on the board, and posted to the PR under `--post`, because "no review" must never read
+as "clean". A refused round still reads the CI gate, which is size-independent and costs one API
+call, and says that the Sonar gate was not evaluated rather than leaving its default to read as a
+pass. `--force` overrides it on the record. None of it fires on a repo that declared no
 ceiling: this decides *whether to start*, never *what to send*, and the deliberate absence of
 a default diff budget stands. `loops/README.md` has the whole rule.
 

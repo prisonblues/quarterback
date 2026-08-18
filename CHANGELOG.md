@@ -44,14 +44,18 @@ lines are a near-permutation of its deleted ones — a multiset comparison of th
 diff text already in hand, needing no `git diff -M` and no checkout of a PR the
 panel never checks out. A move-shaped diff over a seat's ceiling gets a **manifest**
 instead of content: what moved where, what did NOT survive, what changed *besides*
-moving, and which definitions now exist in more than one place. That last one is
-the duplicate-copy trap — a merge that keeps both copies of a moved function is a
-clean merge, a green test run and a silent bug, because the later binding wins and
-the dead one is what anybody reading the old file finds. The manifest's size tracks
-the change's shape rather than the diff's length: the 428 KB worked example in the
-suite produces 1.3 KB. It travels as the round's review material, so the per-seat
-budgets, the truncation measurement, the judge and the board record all keep
-working unchanged.
+moving, and which definitions the change **adds** in more than one place, with the
+files each copy landed in. That last one is half of the duplicate-copy trap — a merge
+that keeps both copies of a moved function is a clean merge, a green test run and a
+silent bug, because the later binding wins and the dead one is what anybody reading
+the old file finds. Only half, and the manifest says which half: the *other* original
+sits in a file the merge never touched, so it appears in the diff as neither an added
+nor a deleted line and no amount of parsing recovers it from `gh pr diff`. Finding it
+needs the branch, so it is listed as unmeasured beside the two facts below rather than
+claimed. The manifest's size tracks the change's shape rather than the diff's length:
+the 428 KB worked example in the suite produces 1.3 KB. It travels as the round's
+review material, so the per-seat budgets, the truncation measurement, the judge and
+the board record all keep working unchanged.
 
 **What it cannot measure, it names.** PR #137 was also judged on identical test
 counts before and after and an AST closure check showing no module reaching
@@ -63,13 +67,17 @@ on.
 **A diff far over the ceiling with no smaller honest question is refused, loudly.**
 Printed under "Panel REFUSED — no review happened", stating in its first sentence
 that this is not a clean review, followed by the measurement and the remedies.
-`reviewed: false`, a `skip_reason`, the full `preflight` block in the payload —
-**and recorded on the board**, unlike the title-pattern skip. That difference is
-the design: a title skip says this PR was never worth a panel, a refusal says a
-panel was wanted and this diff defeated it. Under `--post` it goes on the PR too,
-because the terminal copy is read by whoever is watching and under the epic driver
-nobody is. `--force` overrides it and cannot erase it: `preflight.would_have`
-records the verdict, and both the report and the PR comment carry the warning.
+`reviewed: false`, a `skip_reason`, the full `preflight` block in the payload, the
+`scope` and `since_sha` the round was going to review — **and recorded on the board**,
+unlike the title-pattern skip. It still reads the **CI gate**, which no diff size can
+defeat and which costs one API call, and states that the Sonar gate was **not
+evaluated** rather than letting its default read as a pass: Sonar is a panel member,
+and no member was dispatched. That difference is the design: a title skip says this
+PR was never worth a panel, a refusal says a panel was wanted and this diff defeated
+it. Under `--post` it goes on the PR too, because the terminal copy is read by whoever
+is watching and under the epic driver nobody is. `--force` overrides it and cannot
+erase it: `preflight.would_have` records the verdict, and both the report and the PR
+comment carry the warning.
 
 **It is not a default diff budget and it must not become one.** v2.16 refused one
 on evidence — truncating when nothing forces it biases toward false positives — and
@@ -81,14 +89,17 @@ keys govern it: `refuse_over_cap_multiple` (3), `move_shape_ratio` (0.9),
 `manifest_moves` (true).
 
 **Two guards, both for cases that read plausibly when wrong.** A manifest is
-substituted only when it is *smaller* than the diff — its brief is a fixed ~1.3 KB,
-so on a small move over a small ceiling the substitution would hand a seat more text
-than the diff did and then truncate it; that is measured, not assumed, and a
-manifest that does not help falls through to the refusal with a reason saying it was
-tried. And the refusal notice refuses to render a verdict that is not a refusal:
-handed a `run` it would print "**Why:** ." over a measurement table and a list of
-remedies, a document that reads exactly like a refusal and names no reason. That is
-not hypothetical — it is what the first hand-run of it produced.
+substituted only when it is *smaller* than the diff **and** under the ceiling — its
+brief is a fixed ~1.3 KB, so on a small move over a small ceiling the substitution
+would hand a seat more text than the diff did, and ~35 KB of manifest is smaller than
+a 763 KB diff while still being a prefix-read against a low-thousands ceiling. Both
+are measured, not assumed, and a manifest that does not help falls through to the
+refusal above the multiple and to an ordinary truncated content review below it —
+never silently, because the `run` verdict then carries a reason naming the manifest
+path and what it measured. And the refusal notice refuses to render a verdict that is
+not a refusal: handed a `run` it would print "**Why:** ." over a measurement table and
+a list of remedies, a document that reads exactly like a refusal and names no reason.
+That is not hypothetical — it is what the first hand-run of it produced.
 
 **And two ways a refusal or a manifest could still have read as a clean round.**
 A refused run is recorded, so it now sends a `reviewers` block marking every
@@ -97,7 +108,7 @@ selected seat as not run: the board builds a scorecard row per name in
 names it — so a refusal would have been filed as a clean review *per reviewer*, in
 the table that answers which reviewer finds the real issues. And a manifest's
 material is a whole-target composition, which flipped `scope` from `increment` to
-`pr` and silently skipped three inherited coverage vetoes gated on it — so a
+`pr` and silently skipped the inherited coverage vetoes gated on it — so a
 move-shaped round 2 could stop confidently over gaps earlier rounds left. What a
 round **targeted** and the shape of the material it composed are two different
 facts; only the second one changes.
