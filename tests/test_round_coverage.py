@@ -773,6 +773,17 @@ def _panel_round(monkeypatch, tmp_path, round_no, title, baseline=()):
                 None, "codex is right that the migration is unread")
 
     monkeypatch.setattr(panel, "load_repo_cfg", lambda name: PANEL_CFG)
+    # This box has every seat (#222). `budgets` is built from the seats the HOST
+    # can actually run, so without this the whole round depends on which vendor
+    # CLIs the machine happens to carry: on a CI runner, which carries none,
+    # `claude` and `codex` get no budget at all, and the assertion below that
+    # codex's 40-char budget CUT the diff fails with `assert False is True` —
+    # while `fake_review` has them running perfectly happily. That pairing (a seat
+    # that ran with no budget) is a doubles artefact and not a state production
+    # can reach: `run_cli` refuses an absent seat before it can run. The doubles
+    # replace `review_llm` wholesale and so never reach that refusal, which is
+    # exactly why the host has to be stated here rather than inherited.
+    monkeypatch.setattr(panel, "seat_installed", lambda name: True)
     # Patched through `panel` rather than on a separately-imported panel_core:
     # `run()` calls `panel_core.sh(...)`, and this guarantees the object being
     # patched is the one it resolves. A second import of the same module name is
