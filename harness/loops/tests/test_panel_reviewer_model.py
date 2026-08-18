@@ -13,6 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
 import panel_seats  # noqa: E402  — run_cli lives here since #129
+import panel_core  # noqa: E402  — ReviewerRun/SeatAnswer live here
 
 TOO_OLD = (
     'ERROR: {"type":"error","status":400,"error":{"type":"invalid_request_error",'
@@ -30,6 +31,11 @@ NO_TOOLS = ["codex", "exec", "-s", "read-only",
             "-c", 'web_search="disabled"',
             "-c", "features.shell_tool=false",
             "-c", "features.apps=false", "-c", "features.plugins=false"]
+
+
+def _f():
+    """A finding, so a ReviewerRun reads as one that produced something."""
+    return panel_core.Finding("codex", "P3", "a.py", 1, "t", "d")
 
 
 def test_unpinned_codex_passes_no_model_flag():
@@ -158,6 +164,27 @@ GATEWAY_404 = (
     "this resource does not exist., url: https://example.invalid/openai/responses)"
 )
 
+#: The gateway's refusal of the EFFORT pin, which is a separate sentence from the
+#: model 404 and arrives even once the model is servable. `param` is the only field
+#: that says which pin was refused — the message names the MODEL — so this fixture
+#: is fed through `error_text` wherever it stands in for what a classifier sees.
+GATEWAY_EFFORT = ('{"error":{"param":"reasoning.effort","code":"unsupported_value",'
+                  '"message":"Unsupported value: \'max\' is not supported with this model."}}')
+
+#: And the same refusal as it ACTUALLY arrives on stdout: pretty-printed, which is
+#: what the line-oriented first version of `error_events` silently skipped. The
+#: fragment `stderr_gist` then quoted, `"type": "invalid_request_error",`, is the
+#: sentence the panel really printed about a refused effort (219-F12).
+GATEWAY_EFFORT_PRETTY = """{
+  "error": {
+    "message": "Unsupported value: 'max' is not supported with this model.",
+    "type": "invalid_request_error",
+    "param": "reasoning.effort",
+    "code": "unsupported_value"
+  }
+}
+"""
+
 
 def test_the_error_events_come_off_stdout_because_stderr_never_had_them():
     """The regression, stated as the two streams actually were.
@@ -168,7 +195,7 @@ def test_the_error_events_come_off_stdout_because_stderr_never_had_them():
     reported `exited 1 (Reading prompt from stdin...)` for a 404. Two people
     debugged stdin plumbing off that sentence."""
     assert panel_seats.stderr_gist(GATEWAY_STDERR) == "Reading prompt from stdin..."
-    lifted = panel_seats.error_events(GATEWAY_STDOUT)
+    lifted = panel_seats.error_text(GATEWAY_STDOUT)
     assert lifted.count("\n") == 1, "both error envelopes, and only those"
     diag = f"{GATEWAY_STDERR}\n{lifted}"
     gist = panel_seats.stderr_gist(diag)
@@ -179,13 +206,50 @@ def test_the_error_events_come_off_stdout_because_stderr_never_had_them():
 def test_error_events_ignores_everything_that_is_not_an_error_envelope():
     """Safe to run over any seat's stdout, including the seats whose stdout IS
     their reply — so it has to be strict about what counts."""
-    assert panel_seats.error_events("") == ""
-    assert panel_seats.error_events("Here are my findings:\n- a bug\n") == ""
-    assert panel_seats.error_events('{"type":"turn.completed","usage":{}}') == ""
-    assert panel_seats.error_events('{"type":"error"}') == "", "no message, nothing to say"
-    assert panel_seats.error_events('not json but has "error" in it') == ""
-    assert panel_seats.error_events('{"type":"error","message":"  "}') == "", "blank message"
-    assert panel_seats.error_events('{"type":"error","message":"boom"}') == "boom"
+    assert panel_seats.error_events("") == []
+    assert panel_seats.error_events("Here are my findings:\n- a bug\n") == []
+    assert panel_seats.error_events('{"type":"turn.completed","usage":{}}') == []
+    assert panel_seats.error_events('not json but has "error" in it') == []
+    assert panel_seats.error_events('{"type":"error","message":"boom"}') == [
+        {"type": "error", "message": "boom"}]
+    # Kept as an envelope (it IS one) and dropped from the TEXT, which is the layer
+    # that has to decide whether a line says anything: a bare marker in a diagnosis
+    # only pushes a line that names something out of `stderr_gist`'s pick.
+    assert panel_seats.error_events('{"type":"error"}') == [{"type": "error"}]
+    assert panel_seats.error_text('{"type":"error"}') == "", "no message, nothing to say"
+    assert panel_seats.error_text('{"type":"error","message":"  "}') == "", "blank message"
+    assert panel_seats.error_text('{"type":"error","message":"boom"}') == (
+        '{"type":"error","message":"boom"}')
+
+
+def test_the_envelope_keeps_the_field_that_says_WHICH_pin_was_refused():
+    """F07/F11: the message names the model and `param` names the effort, so a
+    reader that keeps only `ev["message"]` cannot tell the two refusals apart.
+
+    That is not a hypothetical loss. It is what happened: the model pin was dropped
+    correctly, the effort pin was never even considered, and the seat was lost with
+    `model_unavailable: "gpt-5.6-luna"` / `effort_unsupported: null` recorded — half
+    a diagnosis, on the run that motivated the second half of this fix."""
+    text = panel_seats.error_text(GATEWAY_EFFORT)
+    assert text, "the envelope must survive extraction at all"
+    assert "reasoning.effort" in text and "unsupported_value" in text
+    assert panel_seats.is_effort_unsupported(text)
+    assert not panel_seats.is_model_unavailable(text)
+
+
+def test_a_pretty_printed_envelope_is_lifted_and_flattened_to_one_line():
+    """F12: the line-oriented parse assumed strict JSONL, and the gateway's refusal
+    is not JSONL — it is an indented body across seven lines. Nothing recognised it,
+    so `stderr_gist` ranked those lines as prose and quoted the one that carries no
+    information at all: `"type": "invalid_request_error",`. That fragment is exactly
+    what the panel printed, and it names neither the parameter nor the value."""
+    assert panel_seats.error_events(GATEWAY_EFFORT_PRETTY), "indented is still JSON"
+    text = panel_seats.error_text(GATEWAY_EFFORT_PRETTY)
+    assert "\n" not in text, "one line per envelope, or stderr_gist cannot rank it"
+    assert panel_seats.stderr_gist(text) == (
+        "Unsupported value: 'max' is not supported with this model.")
+    assert panel_seats.is_effort_unsupported(text)
+    assert not panel_seats.is_model_unavailable(text)
 
 
 def test_a_provider_404_is_recognised_as_the_pin_being_unservable():
@@ -230,12 +294,6 @@ def test_the_too_old_pin_still_gets_the_upgrade_advice():
     which is a genuinely different remedy for a genuinely different failure."""
     hint = panel_seats.cli_hint("codex", f"exited 1 ({TOO_OLD})", "gpt-5.6-luna")
     assert "upgrade" in hint.lower() and "codex --version" in hint
-
-
-#: The gateway's refusal of the EFFORT pin, which is a separate sentence from the
-#: model 404 and arrives even once the model is servable.
-GATEWAY_EFFORT = ('{"error":{"param":"reasoning.effort","code":"unsupported_value",'
-                  '"message":"Unsupported value: \'max\' is not supported with this model."}}')
 
 
 def test_the_effort_pin_is_refused_independently_of_the_model():
@@ -345,13 +403,45 @@ def test_the_lowering_is_bounded_at_one_per_pin(monkeypatch):
     assert turn.skip
 
 
+#: A refusal that is settled but is NOT about either pin — so there is nothing left
+#: to lower and no reason to try again. `is_rejection` matches the explicit status.
+SETTLED_OTHER = '{"status":400,"error":{"type":"invalid_request_error"}}'
+
+
 def test_a_failed_fallback_still_reports_the_pin_that_could_not_be_served(monkeypatch):
-    """When the default fails too the seat is lost anyway — but WHY has to survive,
-    or the next reader sees only the second failure."""
+    """When the lowered seat is refused too the seat is lost anyway — but WHY has to
+    survive, or the next reader sees only the second failure and re-diagnoses the
+    pin from scratch."""
     turn, seen = _seat_with(monkeypatch, [
-        (None, f"exited 1 ({GATEWAY_404})"), (None, "exited 1 (boom)")])
-    assert len(seen) == 2
+        (None, f"exited 1 ({GATEWAY_404})"), (None, f"exited 1 ({SETTLED_OTHER})")])
+    assert len(seen) == 2, "a settled non-pin refusal is not a flake — no extra go"
     assert turn.skip and turn.model_unavailable == "gpt-5.6-luna"
+
+
+def test_a_flake_after_lowering_buys_one_more_go_and_only_one(monkeypatch):
+    """The recovered seat was getting zero flake tolerance, which loses the vendor by
+    the other road.
+
+    The PINNED attempt gets `run_cli`'s three tries; the lowered one is called with
+    `attempts=1`, so a single 500 threw away the seat this whole path exists to keep.
+    One more go — once per SEAT, not once per lowering, or a two-pin host turns one
+    flake into an unbounded walk."""
+    turn, seen = _seat_with(monkeypatch, [
+        (None, f"exited 1 ({GATEWAY_404})"),   # pin refused -> lower the model
+        (None, "exited 1 (boom)"),             # not a refusal -> one more go
+        ("findings here", None),               # and it works
+    ])
+    assert len(seen) == 3
+    assert turn.reply == "findings here"
+    assert turn.model_unavailable == "gpt-5.6-luna"
+
+    turn, seen = _seat_with(monkeypatch, [
+        (None, f"exited 1 ({GATEWAY_404})"),
+        (None, "exited 1 (boom)"),
+        (None, "exited 1 (boom again)"),
+    ])
+    assert len(seen) == 3, "the flake allowance is once per seat, not per failure"
+    assert turn.skip
 
 
 def test_an_unrelated_failure_does_not_fall_back(monkeypatch):
@@ -386,3 +476,90 @@ def test_only_codex_falls_back_because_only_its_argv_can_ask_for_a_default(monke
     assert len(seen) == 1, "claude must not be sent through the codex fallback"
     assert turn.model_unavailable == ""
     assert "--model" in seen[0][0] and "opus" in seen[0][0]
+
+
+# ------------------------------------------- the seams the review said nothing covered
+
+def test_run_cli_composes_the_diagnostic_so_the_banner_cannot_win(monkeypatch):
+    """End to end through the REAL composition, which nothing exercised before.
+
+    `run_cli` joins stderr and the lifted envelopes and hands that to `stderr_gist`.
+    The ordering puts the progress banner FIRST, which is only safe because
+    `stderr_gist` takes the last of the best rank — so the two are correct together
+    or not at all, and a test that builds `diag` by hand (as every other test here
+    does) cannot tell. The #219 review flagged exactly this gap, and the comment on
+    the composition claimed an end-to-end assertion that did not exist.
+    """
+    class _Proc:
+        returncode, stdout, stderr = 1, GATEWAY_STDOUT, GATEWAY_STDERR
+
+    monkeypatch.setattr(panel_seats.subprocess, "run", lambda *a, **k: _Proc())
+    out, err = panel_seats.run_cli(["codex", "exec"], "codex (gpt-5.6-luna, max)",
+                                   attempts=1, stdin_text="x")
+    assert out is None and err
+    # The sentence a human reads names the cause, not the banner.
+    assert "stdin" not in err, f"the progress banner won the summary: {err}"
+    assert "404" in err or "deployment" in err.lower(), err
+    # And the full diagnostic travels with it, which is what the fallback classifies on.
+    diag = panel_seats.failure_diag(err)
+    assert "Reading prompt from stdin" in diag, "stderr must still be carried"
+    assert panel_seats.is_model_unavailable(diag), (
+        "the composed diagnostic must classify, or the pin lowering never fires")
+
+
+def test_seat_label_names_the_configuration_when_the_seat_produced_nothing():
+    """The rendering logic both reports share, and the case the duplicated inline
+    copy got wrong (#219 F15).
+
+    A seat that lowered its pin and then failed anyway must NOT be named by its
+    substitute: `codex (CLI default; pinned … unavailable)` reads as though the CLI
+    default reviewed, when nothing did. Truthful about the pin, misleading about the
+    brain — and the Seats line exists to say which brain settled the question.
+    """
+    ran = panel_core.ReviewerRun(model_unavailable="gpt-5.6-luna")
+    ran_ok = panel_core.ReviewerRun([_f()], model_unavailable="gpt-5.6-luna")
+    skipped = panel_core.ReviewerRun(skip="codex: exited 1", model_unavailable="gpt-5.6-luna")
+
+    assert panel_seats.seat_label("codex", "gpt-5.6-luna", "max", None) == (
+        panel_seats.reviewer_label("codex", "gpt-5.6-luna", "max")), (
+        "no result yet — name it by what it was configured with")
+    assert "CLI default" in panel_seats.seat_label("codex", "gpt-5.6-luna", "max", ran_ok), (
+        "it reviewed on the substitute, so the substitute is what to name")
+    assert "CLI default" not in panel_seats.seat_label("codex", "gpt-5.6-luna", "max", skipped), (
+        "it produced nothing — naming the substitute claims a review that never happened")
+    assert "gpt-5.6-luna" in panel_seats.seat_label("codex", "gpt-5.6-luna", "max", skipped)
+    del ran
+
+
+def test_both_reports_render_seats_through_the_one_helper():
+    """A round and an ask must not disagree about who reviewed.
+
+    Pinned as source, not behaviour, because the failure it guards is a SECOND copy
+    of the expression appearing — which no assertion about one report's output can
+    see. The first duplicate was written wrong."""
+    import panel as panel_mod
+    import panel_ask
+    for mod in (panel_mod, panel_ask):
+        src = Path(mod.__file__).read_text()
+        assert "seat_label(" in src, f"{mod.__name__} does not use the shared helper"
+        assert "fallback_label(" not in src, (
+            f"{mod.__name__} builds a seat label itself — that is the duplication "
+            f"seat_label exists to remove, and the copy is where the bug was")
+
+
+def test_the_effort_is_lowered_first_when_it_is_what_was_refused(monkeypatch):
+    """The tie-break's OTHER branch, which the first test pass left uncovered.
+
+    A servable model whose effort is refused must drop the effort and keep the
+    model — the reverse of the daedalus ordering. This is the branch
+    `is_model_unavailable`'s effort-wins guard exists for, so it is the one worth
+    asserting keeps the model."""
+    turn, seen = _seat_with(monkeypatch, [
+        (None, f"exited 1 ({GATEWAY_EFFORT})"),
+        ("findings here", None),
+    ], model="gpt-5.5")
+    assert len(seen) == 2
+    assert "--model" in seen[1][0] and "gpt-5.5" in seen[1][0], (
+        "the model was servable and must survive — only the effort was refused")
+    assert "model_reasoning_effort" not in " ".join(seen[1][0])
+    assert turn.effort_unsupported == "max" and turn.model_unavailable == ""

@@ -55,16 +55,19 @@ six weeks later — but a pin is one value for the whole fleet and a *deployment
 so a slug that is right everywhere else can be unservable on one box. On daedalus, codex
 routes through an employer Azure gateway deploying `gpt-5.5` while the rules pin
 `gpt-5.6-luna`: the seat 404s ten times and the panel loses a whole vendor, which on PR #207
-left 25 findings all attributed to `claude` — reviewing a PR `claude` had written. There are **two** such pins and this
+left 25 findings all attributed to `claude` — reviewing a PR `claude` had written. There are
+**two** such pins and this
 gateway refuses both independently — `gpt-5.6-luna+max` 404s, `gpt-5.5+max` is an
 `unsupported_value` on `reasoning.effort`, `gpt-5.5+high` works — so dropping only the model
 loses the seat on the next knob, which is how PR #217 got a round where *no* reviewer ran at
 all. Each pin is now lowered on its own, only when the error names it, at most once each, and
 the report says what happened: `codex (CLI default; pinned gpt-5.6-luna unavailable, effort max
 unsupported)`. The substitution is recorded as
-state (`pinned_unavailable`) in the payload as well as the header, because the board is where
+state (`model_unavailable` / `effort_unsupported`) in the payload as well as the header,
+because the board is where
 "is the expensive tier worth it" gets answered from accumulated runs, and a run whose model
-was swapped must not be averaged in as the pinned one. Deliberately narrow: only for a pin that was set,
+was swapped must not be averaged in as the pinned one. Deliberately narrow: only for a pin
+that was set,
 only for those two causes, at most once each — a general "retry with fewer constraints" would
 quietly review on a weaker seat for reasons nobody chose. **codex only**, because lowering a pin
 means rebuilding the argv without it and only its argv can express "use your default":

@@ -56,7 +56,7 @@ that function exists to stop giving.
 
 **There are TWO unsatisfiable pins, not one, and that broke the first version of this fix.**
 `.harness-rules` pins codex twice — a slug and a reasoning effort — and this gateway refuses
-both, separately::
+both, separately:
 
     gpt-5.6-luna + max    ->  404, no deployment for that model
     gpt-5.5      + max    ->  {"param": "reasoning.effort", "code": "unsupported_value"}
@@ -78,7 +78,8 @@ refusal therefore wins the tie.
 **And the seat is recovered rather than lost.** On an unsatisfiable pin a seat lowers it and
 reviews anyway. A degraded seat beats an empty
 one — but only if the record is honest about it, so the substitution is carried as state
-(`ReviewerRun.pinned_unavailable`, alongside `absent` and for the same reason: a message tail is
+(`ReviewerRun.model_unavailable` / `.effort_unsupported`, alongside `absent` and for the same
+reason: a message tail is
 free text) and rendered in the header as `codex (CLI default, max; pinned gpt-5.6-luna
 unavailable)`. It is in the JSON payload too, because the board is where "which reviewer earns
 its cost" is answered from accumulated runs and a run whose model was swapped must not be
@@ -106,12 +107,23 @@ dataclasses — `SeatAnswer` is constructed positionally, and inserting ahead of
 every ask's verdict to a new field, which surfaced as 19 tests reporting wrong verdicts rather
 than as a type error.
 
-Eighteen tests in `test_panel_reviewer_model.py`, against the real captured streams and the real
-refusal envelopes. Two go red on their assertion against the pre-fix code — the retry decision
-and the missing hint, both fed a literal 404 string precisely so they test behaviour rather than
-the existence of a new function. The rest cover new symbols and are `red/green: N-A (new code
-path)`: reaching for a new name fails the old code with an `AttributeError`, which proves only
-that the name is new.
+**The panel reviewed this change and its own run demonstrated the bug it found.** Round 1 on
+PR #219 lowered the model correctly, kept `max`, and lost the seat anyway — recording
+`model_unavailable: gpt-5.6-luna`, `effort_unsupported: null`. The reviewer named the cause
+independently: the fallback was re-classifying `run_cli`'s human-facing summary rather than the
+full diagnostic, and the gist it had (`"type": "invalid_request_error",`, one fragment of a
+pretty-printed envelope) named neither pin. `run_cli` now returns a `CliFailure` — a `str`
+subclass carrying the streams on `.diag`, so every existing reader is untouched and only the
+classifier looks deeper. `error_events` keeps each envelope's `param`, parses pretty-printed
+JSON, and the seat gets one flake allowance and a wall-clock bound so a recovered seat is not
+lost to a single 500 or given three budgets to burn.
+
+Twenty-three new tests in `test_panel_reviewer_model.py`, against the real captured streams and
+the real refusal envelopes. Those that CAN go red against the pre-fix code do — the retry
+decision and the missing hint among them, fed a literal 404 string precisely so they test
+behaviour rather than the existence of a new function. The rest cover new symbols and are
+`red/green: N-A (new code path)`: reaching for a new name fails the old code with an
+`AttributeError`, which proves only that the name is new.
 
 ## v2.47 — the dashboard grows hands, and its tests start running
 

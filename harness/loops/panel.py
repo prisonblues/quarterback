@@ -794,7 +794,12 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     models = {n: rev.get(n, {}).get("model", SEAT_MODEL_DEFAULTS.get(n, ""))
               for n in LLM_REVIEWERS}
     efforts = {n: rev.get(n, {}).get("effort", "") for n in EFFORTS}
-    labels = {n: reviewer_label(n, models[n], efforts.get(n, "")) for n in LLM_REVIEWERS}
+    # No precomputed `labels` map: the label is not a property of the CONFIG any
+    # more. A seat that could not use its pins reviewed on something else (#215),
+    # so the only place the label can be built is where the run that earned it is
+    # in hand — `seat_label(…, got)`, below. The map that used to be here was left
+    # behind by that change with nothing reading it, which is a copy of the report's
+    # header free to drift out of agreement with the header.
 
     tasks = {}
     with ThreadPoolExecutor(max_workers=len(ALL_REVIEWERS) + 1) as ex:
@@ -869,11 +874,8 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 # here would put a model in the record that never ran — the exact
                 # attributability the pins exist to protect, broken in the
                 # direction that looks correct.
-                ran_llm.append(fallback_label(
-                    name,
-                    "" if got.model_unavailable else models[name],
-                    "" if got.effort_unsupported else efforts.get(name, ""),
-                    got.model_unavailable, got.effort_unsupported))
+                ran_llm.append(seat_label(name, models[name],
+                                          efforts.get(name, ""), got))
                 ran_names.append(name)
                 llm_findings.extend(got.findings)
         if sonar_future:

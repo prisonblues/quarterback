@@ -1282,7 +1282,6 @@ class SeatAnswer:
     effort_unsupported: str = ""
 
 
-
 class AskTally(NamedTuple):
     """What the seats' answers add up to, and why."""
 
