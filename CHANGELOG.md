@@ -11,7 +11,7 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
-## vNEXT — a pinned model no host can serve stops costing the whole seat
+## v2.50 — a pinned model no host can serve stops costing the whole seat
 
 A four-seat panel became a one-seat panel, quietly, and said `exited 1 (Reading prompt from
 stdin...)` about it.

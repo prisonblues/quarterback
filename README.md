@@ -601,7 +601,7 @@ full — including what was broken before it, which is the part no diff recovers
   trap that made the ＋ do nothing in silence: a mouse binding gets no `$TMUX_PANE` and the
   tmux server's PATH usually predates the harness. And the dashboard's seven tests, which had
   skipped every CI run since they were written, now execute.
-- **vNEXT** — a pinned reviewer model no host can serve stops costing the whole seat. A model
+- **v2.50** — a pinned reviewer model no host can serve stops costing the whole seat. A model
   pin is one value for the fleet and a *deployment* is per-host: codex on the work box routes
   through an employer gateway deploying `gpt-5.5` while `.harness-rules` pins `gpt-5.6-luna`,
   so the seat 404s and a four-vendor panel silently became one — on PR #207, 25 findings all
