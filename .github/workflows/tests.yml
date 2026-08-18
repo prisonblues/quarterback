@@ -201,32 +201,48 @@ jobs:
   flake:
     name: flake checks
     runs-on: ubuntu-latest
-    # The four jobs above and this one do NOT run the same thing, and that is the
+    # The jobs above and this one do NOT run the same thing, and that is the
     # point rather than duplication (#179). They run `uv run pytest` against a
-    # normal checkout; the flake runs the same suites inside a sandbox that has
+    # normal checkout; the flake runs the same suites inside a sandbox holding
     # only what `flake.nix` puts there. Each is blind where the other sees:
     # `test_release_numbers.py` passes above and errored on missing files in the
-    # sandbox for a day (#163), and the qb-seats suite SKIPS above because the
-    # runner has no tmux while the sandbox installs it deliberately so it cannot.
-    # Until this job existed the flake's checks ran only when a human typed `nix
-    # build`, which is how a red `main` went a day without anyone noticing.
+    # sandbox for a day (#163), and the qb-seats suite skips above because the
+    # runner has no tmux, while the sandbox installs tmux precisely so that those
+    # tests cannot skip. Until this job existed the flake's checks ran only when
+    # a human typed `nix build`, which is how a red `main` went a day without
+    # anyone noticing.
     #
     # For anyone wiring up branch protection: unlike `stamped` below, this job
     # runs on pull_request as well as push, so it is safe to require.
     #
-    # Same fifteen minutes as the jobs above, and measured rather than guessed:
-    # the first run of this job took 1m04s in total on a cold runner — about 25
-    # seconds to install nix and fetch the closure from cache.nixos.org, and
-    # about 45 seconds to build all four checks, worktree-tests included. That
-    # fourteen times the headroom, so a run still going at fifteen minutes is
-    # wedged rather than slow, which is what a timeout is for.
+    # Same fifteen minutes as the jobs above. No measurement is written down
+    # here on purpose. Cold runs have come in around a minute end to end, but the
+    # runner image, the nixpkgs pin and the check set all move independently, so
+    # a number in a comment goes stale in silence and then misleads the next
+    # reader about how much headroom actually remains. Fifteen minutes is an
+    # order of magnitude clear of anything observed, which is what a timeout is
+    # for: it catches a wedged run, not a slow one.
+    #
+    # No nix store cache, deliberately. `magic-nix-cache-action` was sunset,
+    # `cachix-action` wants a token this repo does not have, and `actions/cache`
+    # over /nix/store restores more slowly than cache.nixos.org serves a closure
+    # this size. If the check set ever grows enough to flip that trade, the
+    # timeout above is the thing that says so.
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
+      # Pinned to the commit behind v31.11.1, not the mutable `v31` tag. This is
+      # third-party and runs before any code of ours, so a repointed tag would
+      # execute here holding the job's token. `actions/checkout` above has the
+      # same tag shape but is first-party, which is why the pin starts here.
+      # Bump the SHA and the trailing comment together.
       - name: Install nix
-        uses: cachix/install-nix-action@v31
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
         with:
+          # Asserted by tests/test_flake_workflow.py: without these two features
+          # every `nix` invocation below fails on a runner whose nix.conf has
+          # neither, and the job's failure names the config rather than the flake.
           extra_nix_config: |
             experimental-features = nix-command flakes
 
@@ -239,6 +255,15 @@ jobs:
       # assume it: #163's `release-metadata-tests` was added because the old
       # arrangement ran eight assertions that had never once been evaluated.
       #
+      # Be clear about the floor this guard sets: it is name-level. It catches
+      # the checks being emptied or the whole output being deleted. It cannot
+      # catch a check that keeps its name and loses its body — swap one for
+      # `pkgs.emptyFile` and the count is unchanged and the log still reads
+      # reassuringly. The guard against THAT is not here but in
+      # tests/test_flake_workflow.py, which pins the expected set of names
+      # against flake.nix so that adding, renaming or dropping a check is a
+      # deliberate, reviewer-visible diff rather than a silent one.
+      #
       # The system is derived, not written down. A hardcoded x86_64-linux is
       # wrong the day this moves to an arm runner, and the same lesson landed
       # twice in this repo already (#148, #176).
@@ -246,13 +271,33 @@ jobs:
         run: |
           set -euo pipefail
           system=$(nix eval --impure --raw --expr 'builtins.currentSystem')
-          names=$(nix eval ".#checks.$system" --apply 'cs: builtins.attrNames cs' --json)
+          # Caught rather than left to `set -e`. If `checks` — or `checks.$system`
+          # — has been deleted from flake.nix outright instead of emptied, the
+          # eval itself is what fails, and an uncaught failure would end this job
+          # on a raw nix error before the annotation below could fire. That
+          # annotation is the entire purpose of the step, so this reads the same
+          # to a human whether the checks were emptied or removed.
+          #
+          # stderr to a file rather than folded in with `2>&1`: nix writes to it
+          # on the SUCCESS path too — "warning: Git tree is dirty" is the common
+          # one — and merging that into the capture hands jq a JSON document with
+          # a line of English glued to the front of it.
+          eval_err=$(mktemp)
+          if ! names=$(nix eval ".#checks.$system" --apply 'cs: builtins.attrNames cs' --json 2>"$eval_err"); then
+            echo "::error::flake.nix declares no checks for $system — \`checks.$system\` could not be evaluated at all, so it was removed or renamed rather than emptied. nix said: $(tr '\n' ' ' <"$eval_err")"
+            exit 1
+          fi
           count=$(jq 'length' <<<"$names")
           if [[ "$count" -eq 0 ]]; then
             echo "::error::flake.nix declares no checks for $system — they were removed, or this job is now a no-op reporting green."
             exit 1
           fi
-          printf 'running %d flake check(s) on %s: %s\n' "$count" "$system" "$(jq -r 'join(", ")' <<<"$names")"
+          # Assigned on its own line rather than substituted into the printf. A
+          # jq that fails inside `$(...)` in printf's argument list still leaves
+          # printf exiting 0, so `set -e` never sees it and the job carries on
+          # reporting an empty set of names as though it had found none.
+          joined=$(jq -r 'join(", ")' <<<"$names")
+          printf 'running %d flake check(s) on %s: %s\n' "$count" "$system" "$joined"
 
       # -L so the pytest output of a failing suite is in this log. Without it a
       # red check reports `builder for '...drv' failed` and the assertion that
