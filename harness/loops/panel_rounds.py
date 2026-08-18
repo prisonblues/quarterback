@@ -911,7 +911,19 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
         #: `members` because `reread` below needs POSITIVE evidence, and an empty
         #: list of records is the shape both "nobody said" cases arrive in.
         recorded = [m for m in members if isinstance(m, dict)]
-        cut = any(m.get("truncated") for m in recorded)
+        # `ran AND truncated`, never `truncated` alone (#222). A member that did
+        # not run cannot have been cut, and until this release an absent seat was
+        # recorded `truncated: True` anyway — so this banked a truncated round on
+        # every cycle of every box configuring a seat it cannot carry, and the
+        # inherited veto below then told a later round that code had "been read by
+        # no round of this cycle" when nothing had been cut off from anything.
+        #
+        # The budgets fix upstream stops NEW payloads carrying that pairing. This
+        # is what stops OLD ones re-introducing it: baselines outlive the release
+        # that wrote them, `--baseline` is fed payloads from earlier rounds by
+        # design, and a fix that only cleans the writer leaves every cycle already
+        # in flight banking phantom gaps until it ends.
+        cut = any(m.get("ran") and m.get("truncated") for m in recorded)
         if cut:
             b.truncated_rounds.add(was)
         # Two facts about coverage that only matter once a later round stops

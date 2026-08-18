@@ -341,6 +341,25 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   confident stop: it is absent every round, so it says nothing about the round —
   otherwise a repo listing a workstation-only vendor would buy every unattended
   run on a headless box a standing veto. Every other way of not running does veto.
+- **An absent seat gets no diff budget either, and that is the same rule reaching
+  the other four places it was missing.** The exemption above was applied to the
+  veto and to nothing else, while `budgets` was still built from the *configured*
+  set — so a seat with no CLI on the box acquired a budget, an argv clamp, a
+  `config_notes` line saying it "gets 116,287 of 177,872 diff chars", and a
+  `truncated: true` record. Four statements about a reviewer that was never going
+  to read a byte, and the last one was not cosmetic: `diff_truncated` went true on
+  rounds where nothing that *ran* was cut, `load_baseline` banked the round as
+  truncated, and the next round inherited *"whatever that round was cut off from
+  has now been read by no round of this cycle"* — a `confident` veto, so every
+  multi-round cycle on such a box was non-confident from round 2 onward,
+  permanently. `budgets` is now filtered by `seat_installed` (in `panel_core`,
+  beside `CLI_BIN`, and shared with `run_cli` so the two cannot come to disagree
+  about which seats exist), which closes all four at once. The seat is still
+  **dispatched** and still records itself absent — that record is what the
+  exemption above reads. Its `max_diff_chars` is `null` and its `truncated` is
+  `false`: the two agree about whether it existed, which is the pairing that broke.
+  `load_baseline` reads `ran and truncated` for the same reason, since baselines
+  written before this release still carry the old pairing.
 - **A reviewer that produces nothing is SKIPPED, never counted as an empty review.**
   A zero exit with empty stdout is a failure for panel members and the master alike,
   and the skip line quotes the CLI's own stderr, which usually names both the cause

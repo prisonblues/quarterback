@@ -41,6 +41,51 @@ answers, and a fixture cannot see those. Call it and hand the result to
 
 import json
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _every_seat_installed(monkeypatch):
+    """Pin every seat as present on this box, for every test that does not say
+    otherwise (#222).
+
+    `budgets` is now built from the seats this host can actually RUN, not merely
+    the configured ones — a seat with no CLI cannot be handed a diff, so it must
+    not acquire a budget, an argv clamp, a `config_notes` line, or a truncation
+    record. That makes `seat_installed` a PATH read on the critical path of every
+    round, and therefore a test-outcome dependency on which vendor CLIs the
+    machine running the suite happens to carry.
+
+    Left unpinned, nine tests across `test_panel_scope.py` and
+    `test_panel_provenance.py` fail on a CI runner (which carries none of the
+    four) and pass on a workstation (which carries some) — while testing budgets,
+    scope and truncation, none of which is about host capability. And they fail
+    through a test-double artefact rather than a real state: those suites replace
+    `review_llm` wholesale, so a seat "runs" without ever reaching `run_cli`'s
+    absence check and lands in `ran_names` with no budget. Production cannot
+    produce that pairing, because `run_cli` refuses an absent seat before it runs.
+
+    So the default here is "this box has everything", which is what those suites
+    always implicitly assumed. A test that cares about absence says so itself:
+    `test_panel_absent_seat.py` overrides this per test, and being explicit about
+    it is that module's entire subject.
+
+    **Patched on `panel` only — deliberately NOT on `panel_seats`.** `budgets` is
+    the consumer this restores; `run_cli`'s own check is a real safety mechanism
+    in a test suite, because it is what stops a test reaching
+    `subprocess.run(["agy", ...])` for a binary this box does not have. Forcing it
+    True hangs the run: the exec fails and the seat retries with backoff, on every
+    test that dispatches. Not hypothetical — it is what the first version of this
+    fixture did.
+
+    The two therefore disagree here, and only here. In production they cannot.
+    """
+    # Imported inside the fixture, not at module scope: this file is loaded before
+    # any test module has run its `sys.path.insert`, so `import panel` at the top
+    # is a ModuleNotFoundError at collection time.
+    import panel
+    monkeypatch.setattr(panel, "seat_installed", lambda name: True, raising=False)
+
 #: Sentinel for "the caller said nothing", so a test can ask for a value that is
 #: genuinely ``None`` — a read that FAILED — as distinct from not specifying one.
 UNSET = object()

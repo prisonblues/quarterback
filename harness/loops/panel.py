@@ -670,8 +670,27 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # Only for the reviewers actually running: a budget warning about a model
     # this run never asked for is noise, and a "truncated for antigravity" footnote
     # under a claude-only panel is a lie.
+    #
+    # "Actually running" means SELECTED AND INSTALLED (#222). It used to mean
+    # selected alone, and the footnote this comment calls a lie was being printed
+    # anyway — one box up: a seat whose CLI is not on it cannot be handed a diff,
+    # so a budget for it, an argv clamp on it, a `config_notes` line saying it
+    # "gets 116,287 of 177,872 diff chars", and a `truncated: True` record are all
+    # statements about a reviewer that was never going to read a byte. On this
+    # repo's own rules — which enable a workstation-only vendor — that made
+    # `diff_truncated` true on rounds where nothing that RAN was cut, and
+    # `load_baseline` banked it as a truncated round, which the next round
+    # inherited as "whatever that round was cut off from has been read by no round
+    # of this cycle". False, and a `confident` veto, so every multi-round cycle on
+    # such a box was non-confident from round 2 onward, permanently.
+    #
+    # Filtered HERE rather than at each of the four consumers because they all
+    # read this dict, and a fifth consumer added later would inherit the fix
+    # instead of needing its own. The absent seat is still DISPATCHED and still
+    # reports itself absent — that record is the point, and `run_cli` refuses it
+    # through the same `seat_installed` this uses.
     budgets = {name: diff_budget(rev.get(name, {}), "max_diff_chars", panel_budget, notes)
-               for name in LLM_REVIEWERS if name in selected}
+               for name in LLM_REVIEWERS if name in selected and seat_installed(name)}
     judge_budget = diff_budget(panel, "judge_max_diff_chars", panel_budget, notes)
 
     # Read BEFORE the seats are dispatched, because its result now travels in
@@ -802,8 +821,15 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # the panel, we want each vendor's eyes regardless of diff size.
         for name in LLM_REVIEWERS:
             if name in selected:
+                # `.get`, because `budgets` now holds only the seats this box can
+                # run (#222) while every SELECTED seat is still dispatched — an
+                # absent one has to reach `run_cli` to report itself absent, which
+                # is the record `coverage_veto` and the report both read. It gets
+                # `None`, the same "uncapped" value an unconfigured seat gets, and
+                # never renders it because it never runs.
                 tasks[name] = ex.submit(review_llm, name, models[name],
-                                        prompt_for(budgets[name]), efforts.get(name, ""))
+                                        prompt_for(budgets.get(name)),
+                                        efforts.get(name, ""))
         sonar_future = None
         sonar_filed = False
         if "sonarqube" in selected:
@@ -834,7 +860,13 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 "effort": efforts.get(name) or None,
                 "ran": not got.skip,
                 "skip": got.skip,
-                "max_diff_chars": budgets[name],
+                # None for a seat this box cannot run (#222) — it had no budget,
+                # rather than a budget it failed to spend. `truncated` below is
+                # keyed off `truncated_for`, which is built from the same dict, so
+                # the two agree about whether this seat existed: a null budget can
+                # never sit beside a `truncated: True`, which is the pairing that
+                # made a round look cut when nothing that ran was.
+                "max_diff_chars": budgets.get(name),
                 # The mechanical half of "did this reviewer see the whole thing":
                 # checked against the budget rather than asked for, because the
                 # one thing a truncated reviewer cannot notice is the truncation.

@@ -1108,7 +1108,10 @@ def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
                     else f"{cmd_name} takes no reasoning effort")
         return SeatTurn(skip=f"{label}: unknown reasoning effort {effort!r} — {expected}",
                         duration_ms=elapsed())
-    if not shutil.which(CLI_BIN.get(cmd_name, cmd_name)):
+    # Through the shared predicate (#222), not an inline `shutil.which`: `budgets`
+    # asks the same question now, and two copies of it are two chances to disagree
+    # about which seats this box has.
+    if not seat_installed(cmd_name):
         return SeatTurn(skip=f"{label}: {CLI_ABSENT}", duration_ms=elapsed(),
                         absent=True)
 

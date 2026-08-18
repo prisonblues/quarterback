@@ -181,6 +181,34 @@ ALL_REVIEWERS = LLM_REVIEWERS + ("sonarqube",)
 # command, not the thing having the opinion.
 CLI_BIN = {"antigravity": "agy"}
 
+
+def seat_installed(name: str) -> bool:
+    """Can this seat run on THIS box at all — is its CLI on PATH?
+
+    A fact about the HOST, not about the round, and the distinction is one this
+    file's neighbours already make at length: `coverage_veto` exempts an absent
+    seat from vetoing a confident stop, because a reviewer whose CLI is not
+    installed is absent every round and vetoing on it makes `confident`
+    permanently unreachable on exactly the unattended boxes where the signal has
+    to mean something.
+
+    It lives HERE, beside :data:`CLI_BIN`, because that exemption was applied to
+    the veto and to nothing else — and the seats' budgets were built from the
+    CONFIGURED set, so a seat this box cannot run still acquired a diff budget, an
+    argv clamp, a `config_notes` line about how much diff it "gets", and a
+    `truncated: True` record. On a repo enabling a workstation-only vendor that
+    made `diff_truncated` true on rounds where nothing that ran was cut, and
+    `load_baseline` then banked it as a coverage gap the next round inherited
+    (#222). One predicate, in the module both callers already import, is what
+    stops the panel holding two opinions about which seats exist.
+
+    :func:`panel_seats.run_cli` asks the same question, through this function
+    rather than through its own copy of it: two spellings of "is this seat here"
+    is how they come to disagree, and the disagreement is silent — a seat skipped
+    as absent while its budget says it was handed 116,287 chars.
+    """
+    return bool(shutil.which(CLI_BIN.get(name, name)))
+
 # Reviewer name -> the model used when its config says nothing, where that is not
 # simply "whatever the CLI defaults to". Only claude has one: its CLI's own
 # default is the account's top model, which is the wrong seat to spend by
@@ -1594,7 +1622,8 @@ __all__ = [
     "DEFAULT_ROUND_SCOPE", "ROUND_SCOPES", "CLI_TIMEOUT", "BLANK_RETRY_MAX_S",
     "CLI_ABSENT", "ARGV_PROMPT_MAX_BYTES", "SEVERITIES", "MAX_LISTING_CHARS",
     "LISTING_ACCOUNT_CHARS", "COMMENT_CHARS", "ROUNDS_HEADING", "LLM_REVIEWERS",
-    "ALL_REVIEWERS", "CLI_BIN", "SEAT_MODEL_DEFAULTS", "REVIEW_PROMPT",
+    "ALL_REVIEWERS", "CLI_BIN", "seat_installed", "SEAT_MODEL_DEFAULTS",
+    "REVIEW_PROMPT",
     "JUDGE_PROMPT", "ASK_PROMPT", "Finding", "ReviewerRun",
     "PanelResult", "sh", "load_repo_cfg", "_spans",
     "ENVELOPE_KEYS", "DECLARATION_KEYS", "_scalar", "_Tok",

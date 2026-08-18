@@ -1,0 +1,311 @@
+"""A seat this box cannot run declares nothing about the round.
+
+`coverage_veto` learned in v2.x that an absent CLI is a fact about the HOST, not
+about the round: it is absent every round, so vetoing on it makes `confident`
+permanently unreachable on exactly the unattended boxes where the signal has to
+mean something. That exemption was applied to the veto **and to nothing else**.
+
+`budgets` was still built from the CONFIGURED set, so a seat with no CLI on the
+box acquired a diff budget, an argv clamp, a `config_notes` line saying it "gets
+116,287 of 177,872 diff chars", and a `truncated: True` record — four statements
+about a reviewer that was never going to read a byte. Measured on PR #217, on a
+box without `agy`:
+
+    antigravity:  ran=False  absent=True  truncated=True
+    diff_truncated (run level): True
+    truncated among seats that RAN: []      <- nothing
+
+And it did not stop there. `load_baseline` read `any(m.get("truncated") …)` over
+every member regardless of whether it ran, so that round was banked as truncated
+and the NEXT round inherited it:
+
+    round 1 had a truncated reviewer and this round reviewed only the increment
+    since e1354dde — whatever that round was cut off from has now been read by no
+    round of this cycle
+
+False on that host, and a `confident` veto — so every multi-round cycle on such a
+box was non-confident from round 2 onward, permanently. The exact failure the
+absent-CLI exemption exists to prevent, arriving through the one consumer nobody
+exempted.
+
+These tests pin both halves, because they fail on different days: the writer
+(`budgets`, so new payloads stop carrying the pairing) and the reader
+(`load_baseline`, so payloads already written stop re-introducing it — baselines
+outlive the release that wrote them and `--baseline` is fed them by design).
+
+**Every test here pins the host.** `seat_installed` consults PATH, so a test that
+leaves it alone asserts on which vendor CLIs the machine happens to carry — green
+on a workstation, red on a CI runner that has none of them, and green for the
+wrong reason on a box that has all four. That is the same trap the pre-flight
+suite documents, and it is sharper here because this whole module is *about* the
+predicate.
+"""
+
+import json
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import panel  # noqa: E402
+import panel_core  # noqa: E402
+import panel_rounds  # noqa: E402
+import panel_seats  # noqa: E402
+from conftest import gh_stub  # noqa: E402
+
+#: A diff big enough to be cut by a small budget AND by the kernel's argv ceiling.
+#:
+#: Sized deliberately past :data:`panel.ARGV_PROMPT_MAX_BYTES` rather than "big
+#: enough looking": the first version of this was ~14 KB, so the argv clamp never
+#: fired, and the test asserting the clamp STILL works for an installed
+#: `antigravity` passed vacuously — a fixture that would have reported the
+#: regression it exists to catch as a pass.
+BIG = "".join(
+    f"diff --git a/f{i}.py b/f{i}.py\nindex 1..2 100644\n"
+    f"--- a/f{i}.py\n+++ b/f{i}.py\n@@ -0,0 +1,100 @@\n"
+    + "".join(f"+    value_{i}_{j} = compute({j}, retries=3, timeout=30)\n"
+              for j in range(100))
+    for i in range(40))
+
+CFG = {"github": "acme/board", "path": "/tmp/acme-board", "name": "board",
+       "review_panel": {}}
+
+
+def test_the_fixture_really_is_over_the_kernels_argv_ceiling():
+    """Pinned, because the clamp test below is meaningless otherwise and passes
+    just as green when it is."""
+    assert len(BIG.encode()) > panel.ARGV_PROMPT_MAX_BYTES
+
+
+def _cfg(**seats):
+    return {**CFG, "reviewers": {n: {"enabled": True, "model": "sonnet",
+                                     **({} if b is None else {"max_diff_chars": b})}
+                                 for n, b in seats.items()}}
+
+
+def _host(monkeypatch, present):
+    """Pin which seats this box carries, for BOTH callers of the predicate.
+
+    `panel.py` and `panel_seats.py` each resolve `seat_installed` through their own
+    module globals (both star-import it), so patching one leaves the other reading
+    the real PATH — and the two disagreeing about which seats exist is precisely
+    the bug this module is about.
+    """
+    def installed(name):
+        return name in present
+    monkeypatch.setattr(panel, "seat_installed", installed)
+    monkeypatch.setattr(panel_seats, "seat_installed", installed)
+    monkeypatch.setattr(panel_core, "seat_installed", installed)
+
+
+def _round(monkeypatch, tmp_path, cfg, *, present, diff=BIG, baselines=()):
+    seen = {"prompts": {}}
+    _host(monkeypatch, present)
+
+    def fake_review(name, model, prompt, effort=""):
+        seen["prompts"][name] = prompt
+        # The real `run_cli` refuses an absent seat before it spends anything; this
+        # double stands in for that, so the test exercises `run()`'s bookkeeping
+        # rather than the CLI layer.
+        if not panel.seat_installed(name):
+            return panel.ReviewerRun([], f"{name}: {panel.CLI_ABSENT}", 1, None,
+                                     absent=True)
+        return panel.ReviewerRun([], None, 10, None)
+
+    monkeypatch.setattr(panel, "load_repo_cfg", lambda n: cfg)
+    monkeypatch.setattr(panel_core, "sh", gh_stub(diff=diff))
+    monkeypatch.setattr(panel, "review_llm", fake_review)
+    monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
+    monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], None, ""))
+    out = tmp_path / "r.json"
+    assert panel.run("e2e", 34, post=False, json_file=str(out), record=False,
+                     baseline=list(baselines), max_rounds=2) == 0
+    return json.loads(out.read_text()), seen
+
+
+# ------------------------------------------------------------------ the predicate
+
+def test_seat_installed_asks_about_the_COMMAND_not_the_seat_name(monkeypatch):
+    """The reviewer is `antigravity`; the command is `agy`. Asking PATH for
+    "antigravity" reports the one argv-bound seat absent on every box — the
+    direction that silently switches its ceiling off everywhere."""
+    asked = []
+    monkeypatch.setattr(panel_core.shutil, "which",
+                        lambda c: asked.append(c) or "/x/bin/agy")
+    assert panel_core.seat_installed("antigravity") is True
+    assert asked == ["agy"]
+    assert panel_core.seat_installed("claude") is True
+    assert asked[-1] == "claude"
+
+
+def test_run_cli_and_budgets_ask_the_SAME_predicate(monkeypatch):
+    """One question, one implementation. `run_cli` used its own inline
+    `shutil.which(CLI_BIN.get(...))`; two copies are two chances to disagree, and
+    the disagreement is silent — a seat skipped as absent while its budget record
+    says it was handed 116,287 chars."""
+    src = Path(panel_seats.__file__).read_text()
+    assert "shutil.which(CLI_BIN" not in src, "run_cli grew its own copy again"
+    assert "seat_installed(" in src
+
+
+# ------------------------------------------------------------------ the writer
+
+def test_an_absent_seat_gets_no_budget(monkeypatch, tmp_path):
+    """The root. Everything below is a consequence of this dict."""
+    got, _ = _round(monkeypatch, tmp_path, _cfg(claude=None, antigravity=None),
+                    present={"claude"})
+    assert got["diff_budgets"]["claude"] is None
+    assert "antigravity" not in got["diff_budgets"]
+
+
+def test_an_absent_seat_is_still_DISPATCHED_and_still_reports_itself_absent(
+        monkeypatch, tmp_path):
+    """Filtering the budget must not filter the seat. That record is what
+    `coverage_veto` reads to exempt it, and what the report reads to say
+    "configured, but never a seat here" — drop the dispatch and an absent seat
+    becomes invisible instead of accounted for."""
+    got, _ = _round(monkeypatch, tmp_path, _cfg(claude=None, antigravity=None),
+                    present={"claude"})
+    meta = got["reviewers"]["antigravity"]
+    assert meta["ran"] is False
+    assert meta["absent"] is True
+    assert panel.CLI_ABSENT in meta["skip"]
+    assert any("antigravity" in s for s in got["skipped"])
+
+
+def test_an_absent_seat_records_a_NULL_budget_and_is_not_truncated(monkeypatch,
+                                                                  tmp_path):
+    """The pairing that caused all of this: `max_diff_chars: 116287` beside
+    `truncated: True`, on a seat that never ran. The two fields must agree about
+    whether the seat existed — null budget and not-truncated, or neither."""
+    got, _ = _round(monkeypatch, tmp_path, _cfg(claude=None, antigravity=None),
+                    present={"claude"})
+    meta = got["reviewers"]["antigravity"]
+    assert meta["max_diff_chars"] is None
+    assert meta["truncated"] is False
+
+
+def test_a_round_where_nothing_that_RAN_was_cut_is_not_truncated(monkeypatch,
+                                                                tmp_path):
+    """The headline symptom, end to end. `agy` absent, claude uncapped: no seat
+    read a prefix of anything, so the round is not a truncated round."""
+    got, _ = _round(monkeypatch, tmp_path, _cfg(claude=None, antigravity=None),
+                    present={"claude"})
+    assert got["reviewers_ran"] == ["claude (sonnet)"]
+    assert got["diff_truncated"] is False
+    assert [n for n, m in got["reviewers"].items() if m["ran"] and m["truncated"]] == []
+
+
+def test_no_config_note_claims_an_absent_seat_GETS_a_share_of_the_diff(monkeypatch,
+                                                                      tmp_path):
+    """`antigravity gets 116,287 of 177,872 diff chars` on a box with no `agy`.
+    It gets nothing; there is no `agy` to get it."""
+    got, _ = _round(monkeypatch, tmp_path, _cfg(claude=None, antigravity=None),
+                    present={"claude"})
+    assert not any("antigravity" in n for n in got["config_notes"]), got["config_notes"]
+
+
+def test_the_argv_clamp_still_fires_when_the_seat_IS_installed(monkeypatch,
+                                                              tmp_path):
+    """The other direction, and the one that must not regress: where `agy` really
+    is on the box, its prompt really does travel in argv and the kernel really
+    does cap it. Filtering absent seats must not disarm the clamp for present
+    ones."""
+    got, _ = _round(monkeypatch, tmp_path, _cfg(claude=None, antigravity=None),
+                    present={"claude", "antigravity"})
+    assert got["diff_budgets"]["antigravity"] is not None
+    assert got["diff_budgets"]["antigravity"] <= panel.ARGV_PROMPT_MAX_BYTES
+    assert any("antigravity" in n and "argv" in n for n in got["config_notes"])
+    assert got["reviewers"]["antigravity"]["truncated"] is True
+
+
+def test_a_seat_that_RAN_and_was_cut_is_still_recorded_truncated(monkeypatch,
+                                                                tmp_path):
+    """The signal this whole area exists to carry, unharmed: a real budget on a
+    real seat that really read a prefix."""
+    got, _ = _round(monkeypatch, tmp_path, _cfg(claude=200), present={"claude"})
+    meta = got["reviewers"]["claude"]
+    assert meta["ran"] is True and meta["truncated"] is True
+    assert got["diff_truncated"] is True
+
+
+def test_a_box_carrying_no_seat_at_all_still_produces_a_payload(monkeypatch,
+                                                               tmp_path):
+    """Every budget filtered away is the degenerate case, and it must not raise:
+    no seat ran, so `coverage_veto` says exactly that, which is the existing and
+    correct answer."""
+    got, _ = _round(monkeypatch, tmp_path, _cfg(claude=None, antigravity=None),
+                    present=set())
+    assert got["diff_budgets"] == {"judge": None}
+    assert got["reviewers_ran"] == []
+    assert got["diff_truncated"] is False
+    assert any("no reviewer ran" in v for v in got["round_stop"]["veto"])
+
+
+# ------------------------------------------------------------------ the reader
+
+def _payload(tmp_path, name, reviewers, **kw):
+    body = {"repo": "board", "github": "acme/board", "pr": 34, "round": 1,
+            "cycle": "cyc", "head_sha": "a" * 40, "reviewers_ran": ["claude"],
+            "scope": "pr", "to_fix": [], "dismissed": [], "sonar_findings": [],
+            "reviewers": reviewers, **kw}
+    p = tmp_path / name
+    p.write_text(json.dumps(body))
+    return str(p)
+
+
+def _baseline(paths):
+    return panel_rounds.load_baseline(list(paths), {"repo": "board",
+                                                    "github": "acme/board",
+                                                    "pr": 34, "round": 2})
+
+
+def test_an_absent_seats_truncation_does_not_bank_a_truncated_round(tmp_path):
+    """The reader half, and the reason it is needed even after the writer is
+    fixed: baselines outlive the release that wrote them. Every payload already on
+    disk carries the old pairing, and `--baseline` is fed them by design — so a
+    fix that only cleans the writer leaves every cycle in flight banking phantom
+    gaps until it ends."""
+    old = _payload(tmp_path, "r1.json",
+                   {"claude": {"ran": True, "truncated": False},
+                    "antigravity": {"ran": False, "absent": True, "truncated": True}})
+    assert _baseline([old]).truncated_rounds == set()
+
+
+def test_a_seat_that_RAN_and_was_truncated_still_banks_one(tmp_path):
+    """The signal, unharmed. `ran and truncated` must not become `not truncated`."""
+    real = _payload(tmp_path, "r1.json",
+                    {"claude": {"ran": True, "truncated": True}})
+    assert _baseline([real]).truncated_rounds == {1}
+
+
+@pytest.mark.parametrize("member", [
+    {"truncated": True},                       # pre-v2.15: no `ran` recorded
+    {"ran": None, "truncated": True},
+    {"ran": True, "truncated": None},
+    {},
+])
+def test_a_payload_that_does_not_say_banks_nothing(tmp_path, member):
+    """`ran` absent means an older panel wrote it, not that the seat ran. Reading
+    a missing field as True would restore the phantom for exactly the payloads
+    this cannot verify — and `load_baseline`'s standing rule is that a payload it
+    cannot read costs a `problems` entry, never a wrong inference."""
+    p = _payload(tmp_path, "r1.json", {"claude": member})
+    b = _baseline([p])
+    assert b.truncated_rounds == set()
+
+
+def test_a_phantom_truncation_no_longer_vetoes_a_later_SCOPED_round(monkeypatch,
+                                                                   tmp_path):
+    """End to end, and this is the sentence that was false: a round 2 inheriting
+    "whatever that round was cut off from has now been read by no round of this
+    cycle" from a seat that never ran. It is a `confident` veto, so on a box
+    configuring a seat it cannot carry, no cycle could report convergence."""
+    old = _payload(tmp_path, "r1.json",
+                   {"claude": {"ran": True, "truncated": False},
+                    "antigravity": {"ran": False, "absent": True, "truncated": True}})
+    got, _ = _round(monkeypatch, tmp_path, _cfg(claude=None, antigravity=None),
+                    present={"claude"}, baselines=[old])
+    assert not any("truncated reviewer" in v for v in got["round_stop"]["veto"]), \
+        got["round_stop"]["veto"]

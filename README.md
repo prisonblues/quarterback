@@ -592,6 +592,17 @@ full — including what was broken before it, which is the part no diff recovers
   stopped talking. Both dashboards grow a `state` column and a seat cell on the tmux bar takes
   its colour from `@qb_state`, set by the lifecycle hook — which is also the only thing that
   knows a turn ended, so nothing here infers it.
+- **vNEXT** — a seat this box cannot run stops declaring things about the round. The panel
+  already knew an absent reviewer CLI is a fact about the *host* and must not veto a confident
+  stop, but `budgets` was still built from the *configured* set — so a seat with no CLI
+  acquired a diff budget, an argv clamp, a `config_notes` line saying how much diff it "gets",
+  and a `truncated: true` record. That last one was inherited: `load_baseline` banked the round
+  as truncated and the next round reported code as "read by no round of this cycle" when nothing
+  had been cut, which is a `confident` veto — so every multi-round cycle on such a box was
+  non-confident from round 2 onward, permanently. `seat_installed` now lives in `panel_core`
+  beside `CLI_BIN`, `budgets` is filtered by it, and `run_cli` shares it rather than keeping its
+  own copy. The absent seat is still dispatched and still records itself absent; it just gets no
+  budget, and its null budget sits beside `truncated: false` so the two agree.
 - **v2.47** — the dashboard grows hands, and its tests start running. The SEATS panel
   closes a seat and adds one, and tmux grows a clickable bar of the same widgets above the
   seat row — both through `qb-seat-click`, which `qb-dash-tui` had been calling since the
