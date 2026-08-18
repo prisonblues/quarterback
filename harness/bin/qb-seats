@@ -103,7 +103,8 @@ REPO=""                 # default: the git repo you ran this from
 SESSION=""              # default: seats-<repo basename>
 STAGED=0                # 1 = pane waits on Enter before starting its agent
 YOLO=""                 # "" = as it comes (on), 1 = force on, 0 = prompts back
-BOARD_SIZE="25%"        # board pane height, bottom of the window, full width
+BOARD_SIZE="25%"        # tape pane height, bottom of the window, full width
+DASH_SIZE="${QB_SEATS_DASH_SIZE:-78}"   # dash pane width, right of the window, full height
 ACTION="up"
 
 usage() {
@@ -125,7 +126,9 @@ usage: $PROG [N] [-C DIR] [-s NAME] [--staged] [--no-yolo] [--add] [--kill]
   --kill      kill the screen
 
 Environment:
-  QB_SEATS_BOARD   command for the board pane, overriding the default
+  QB_SEATS_BOARD   command for the tape pane, overriding the default
+  QB_SEATS_DASH    command for the dash pane; empty for a screen with no dash
+  QB_SEATS_DASH_SIZE  dash width in columns (default 78)
   QB_SEATS_BAR     0 to leave the status line and the mouse alone (see below)
   QB_SEAT_YOLO     0 to give the seats their permission prompts back (--no-yolo)
   QB_SEAT_AGENT    the agent binary a seat runs, instead of \`claude\`
@@ -157,6 +160,53 @@ board_cmd() {
       "board pane: qb-board is not on PATH, so there is nothing to follow here yet.
 Set QB_SEATS_BOARD to run something else in this pane."
   fi
+}
+
+# ---- the dash pane ----------------------------------------------------------
+# The tape says what just happened; the dash says what is true now — fleet, claims,
+# PRs, issues. They are different questions and a screen wants both, which is why
+# this is a second pane and not a swap of QB_SEATS_BOARD.
+#
+# Set QB_SEATS_DASH to the empty string for a screen with no dash at all. Same
+# spelling as qb-seat's QB_SEAT_BRIEF, and for the same reason: `${VAR+set}` so
+# that empty means "none" and unset means "pick for me".
+#
+# The INSTALLED dash is preferred over anything in a checkout, and that is not a
+# style preference. The packaged one carries its own interpreter — the whole point
+# of packaging it — whereas a uv-standalone python has no CA bundle, and a dash
+# run under one shows "board unreachable" against a board that is up, beside a
+# shell where the same URL works. That cost real debugging time while this was
+# scaffolding in dev/seats-extras.sh (since removed); it arrives here with the lesson.
+#
+# qb-dash-tui is the default because its rows are clickable and the bar already
+# turns the mouse on. QB_SEATS_DASH=qb-dash gets the plain redrawing renderer,
+# which is what to reach for when a terminal turns out not to forward mouse events.
+dash_cmd() {
+  if [ -n "${QB_SEATS_DASH+set}" ]; then printf '%s' "$QB_SEATS_DASH"; return; fi
+  for c in qb-dash-tui qb-dash; do
+    command -v "$c" >/dev/null 2>&1 && { printf '%s' "$c"; return; }
+  done
+  printf 'printf %%s\\n %q' \
+    "dash pane: neither qb-dash-tui nor qb-dash is on PATH, so there is nothing to
+show here yet. Set QB_SEATS_DASH to run something else in this pane."
+}
+
+# The dash is addressed by its label, never by index: it is created after the
+# seats and before the tape, and every one of those positions shifts when a seat
+# is added or closed.
+dash_pane() {
+  tmux list-panes -t "$SESSION:seats" -F '#{pane_id} #{@qb_label}' \
+    | awk '$2 == "dash" { print $1 }'
+}
+
+# Reassert the width. Anything that spreads a row — `select-layout -E` on --add,
+# or a client attaching and resizing the window — redistributes every pane in it,
+# including one placed at an explicit width. Measured before this moved out of
+# dev/seats-extras.sh: a dash asked for 78 columns was found at 29 after an attach.
+dash_resize() {
+  local p
+  p=$(dash_pane)
+  [ -n "$p" ] && tmux resize-pane -t "$p" -x "$DASH_SIZE" 2>/dev/null || true
 }
 
 # ---- the seat bar -----------------------------------------------------------
@@ -392,6 +442,10 @@ if [ "$ACTION" = add ]; then
     ${add_env[@]+"${add_env[@]}"})
   tmux set-option -p -t "$pane" @qb_seat "$next"
   tmux select-layout -t "$pane" -E 2>/dev/null || true
+  # -E spread the row, and the dash is in it. Without this an --add narrows the
+  # dash every time it is called, which is how a screen ends up with a 29-column
+  # dashboard nobody chose.
+  dash_resize
   start_seat "$pane" "$next"
   printf '%s: added seat %s to %s\n' "$PROG" "$next" "$SESSION"
   exit 0
@@ -475,9 +529,9 @@ tmux set-environment -t "=$SESSION" -r QUARTERBACK_INSTANCE
 # Label the panes. Two seats are indistinguishable once both are printing, and
 # being able to address ONE of them is the whole point.
 tmux set-option -w -t "$SESSION:seats" pane-border-status top
-# @qb_label is how a pane that is NOT a seat says what it is: the option
-# dev/seats-extras.sh already labels the dash and the tape with, and the one the
-# dashboard marks a review pane with when it splits one into this row. Without
+# @qb_label is how a pane that is NOT a seat says what it is: the option this
+# script labels the dash and the tape with, and the one the dashboard marks a
+# review pane with when it splits one into this row. Without
 # the middle case every such pane is labelled "board", which is the one thing on
 # this screen they are definitely not.
 tmux set-option -w -t "$SESSION:seats" pane-border-format \
@@ -539,13 +593,49 @@ if [ "$SEATS" -gt "$TOP" ]; then
 fi
 [ "$SEATS" -le 5 ] && tmux select-layout -t "$SESSION:seats" even-horizontal
 
-# The board, on the same screen as the seats — full width along the bottom, so
+# The dash, down the right. AFTER the select-layout calls above and BEFORE the
+# tape below, and both halves of that matter:
+#
+#   * after the layouts, because `select-layout` re-equalises every pane in what
+#     it spreads — a dash placed first comes back out at whatever width an even
+#     split gives it, which is the bug the dev scaffolding recorded finding twice.
+#   * before the tape, so the tape's -f split takes its strip from the bottom of
+#     the whole window and the dash ends up ABOVE it rather than beside it. The
+#     dash answers "what is true now" for the screen, not for the seat row, so it
+#     spans both rows when there are two.
+#
+# -f for the same reason the tape uses it: full height of the WINDOW, not a split
+# of the pane it was taken from.
+#
+# send-keys rather than the pane's command, exactly as start_seat does it: if the
+# dash exits or you Ctrl-C it you get a prompt in the pane, instead of the pane
+# vanishing and the screen quietly losing a quarter of itself.
+DASH_CMD=$(dash_cmd)
+if [ -n "$DASH_CMD" ]; then
+  dash=$(tmux split-window -h -f -l "$DASH_SIZE" -P -F '#{pane_id}' \
+    -t "$SESSION:seats" -c "$REPO")
+  tmux set-option -p -t "$dash" @qb_label dash
+  tmux send-keys -t "$dash" "$DASH_CMD" C-m
+fi
+
+# The tape, on the same screen as the seats — full width along the bottom, so
 # long summaries are read rather than wrapped. -f makes the split span the whole
 # window rather than only the pane it was taken from. It drops to a shell rather
 # than closing if the follower dies, so a board outage does not silently leave a
 # screen with no board on it.
-tmux split-window -v -f -l "$BOARD_SIZE" -t "$first" -c "$REPO" \
-  "$(printf '%s; exec %q -i' "$(board_cmd)" "$SH")"
+tape=$(tmux split-window -v -f -l "$BOARD_SIZE" -P -F '#{pane_id}' -t "$first" -c "$REPO" \
+  "$(printf '%s; exec %q -i' "$(board_cmd)" "$SH")")
+
+# Only name it 'tape' when there is a dash to tell it apart FROM. On a screen with
+# one auxiliary pane the border has said 'board' since this script existed, and
+# renaming it for everybody to solve a problem only the two-pane screen has would
+# be a gratuitous break — pane-border-format's fallback already prints 'board'.
+[ -n "$DASH_CMD" ] && tmux set-option -p -t "$tape" @qb_label tape
+
+# The window is 240x60 until a client attaches, and attaching redistributes every
+# pane in the row the dash is in. Reassert it once here so the first thing you see
+# is the width you asked for.
+[ -n "$DASH_CMD" ] && dash_resize
 
 # Seats last, once every pane exists and its shell has had the time it took to
 # build the rest of the screen to reach a prompt.

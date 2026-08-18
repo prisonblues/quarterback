@@ -98,6 +98,14 @@ def screen(tmp_path):
         # A stray value in the launching environment is exactly the leak the
         # script has to defend against, so the fixture always supplies one.
         "QUARTERBACK_INSTANCE": "leaked-host-wide",
+        # NO DASH unless a test asks for one. Left alone, dash_cmd() resolves
+        # whatever qb-dash-tui happens to be installed on the machine running the
+        # suite, so a third of these tests would depend on that — and would start
+        # a real dashboard, against a real board, in every screen they build. Same
+        # rule the tmux.conf above is an input for: what the developer's machine
+        # carries is not something a test may consult. Tests that want a dash set
+        # QB_SEATS_DASH themselves, to a stub.
+        "QB_SEATS_DASH": "",
     }
     sessions = []
 
@@ -153,6 +161,20 @@ def panes(run, name="t"):
         (line.split("\t")[0], line.split("\t")[1] or None)
         for line in out.splitlines() if line
     ]
+
+
+def labels(run, name="t"):
+    """{@qb_label: (width, top)} for the panes that are NOT seats."""
+    out = run.tmux("list-panes", "-t", f"{name}:seats", "-F",
+                   "#{@qb_seat}\t#{@qb_label}\t#{pane_width}\t#{pane_top}").stdout
+    got = {}
+    for line in out.splitlines():
+        if not line:
+            continue
+        seat, label, width, top = line.split("\t")
+        if not seat:
+            got[label] = (int(width), int(top))
+    return got
 
 
 def wait_for_log(path, count, timeout=20):
@@ -593,6 +615,91 @@ def test_a_range_that_means_nothing_here_changes_nothing(screen):
         done = click(screen, junk, "t")
         assert done.returncode in (0, 1), f"{junk!r} → {done.returncode} {done.stderr}"
     assert panes(screen) == before, "an unknown range moved the furniture"
+
+
+# ---- the dash pane -----------------------------------------------------------
+#
+# The tape says what just happened, the dash says what is true now. Both belong on
+# the screen, which is why the dash is a second pane rather than a value of
+# QB_SEATS_BOARD. It shipped first as dev/seats-extras.sh — scaffolding that
+# hardcoded two of one developer's worktrees — and these are the assertions that
+# let it move into the script proper (#174).
+
+DASH_STUB = "printf dash-stub; sleep 300"
+
+
+def test_a_dash_pane_is_built_by_default(screen):
+    """Default-ON is a deliberate divergence from #174, which asked for a flag.
+    A screen whose whole job is situational awareness should not need one."""
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen("-n", "2")
+    assert "dash" in labels(screen), "no pane labelled 'dash'"
+
+
+def test_no_dash_command_means_no_dash_pane(screen):
+    """Set-and-empty is the off switch, matching QB_SEAT_BRIEF's spelling."""
+    screen.env["QB_SEATS_DASH"] = ""
+    screen("-n", "2")
+    got = labels(screen)
+    assert "dash" not in got
+    assert len(got) == 1, "the tape should be the only auxiliary pane"
+
+
+def test_the_tape_is_named_tape_only_when_a_dash_shares_the_screen(screen):
+    """pane-border-format falls back to 'board' for an unlabelled pane, which is
+    what the bottom pane has always read. Renaming it for everybody to solve a
+    problem only the two-pane screen has would be a gratuitous break — so the
+    label arrives with the dash and not before."""
+    screen.env["QB_SEATS_DASH"] = ""
+    screen("-n", "1", name="plain")
+    assert labels(screen, "plain") == {"": (240, 45)}, "the lone pane must stay unlabelled"
+
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen("-n", "1", name="withdash")
+    assert set(labels(screen, "withdash")) == {"dash", "tape"}
+
+
+def test_the_dash_is_a_column_above_the_tape_not_beside_it(screen):
+    """Order of construction, asserted as geometry: the dash is split before the
+    tape so the tape's -f takes its strip from the bottom of the whole window.
+    Reverse them and the tape stops being full width."""
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen("-n", "2")
+    got = labels(screen)
+    dash_w, dash_top = got["dash"]
+    tape_w, tape_top = got["tape"]
+    assert dash_top < tape_top, "the dash must sit above the tape"
+    assert tape_w > dash_w, "the tape stopped spanning the full width"
+
+
+def test_the_dash_spans_both_rows_of_a_grid(screen):
+    """It reports on the screen, not on the top row of it."""
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen("7")
+    out = screen.tmux("list-panes", "-t", "t:seats", "-F",
+                      "#{@qb_seat}\t#{@qb_label}\t#{pane_height}").stdout
+    rows = [line.split("\t") for line in out.splitlines() if line]
+    seats = [int(h) for seat, _, h in rows if seat]
+    dash = [int(h) for seat, label, h in rows if not seat and label == "dash"]
+    assert dash[0] > max(seats), "the dash is inside one seat row rather than beside both"
+
+
+def test_the_dash_width_is_configurable(screen):
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen.env["QB_SEATS_DASH_SIZE"] = "40"
+    screen("-n", "2")
+    assert labels(screen)["dash"][0] == 40
+
+
+def test_add_does_not_squeeze_the_dash(screen):
+    """`select-layout -E` spreads the row the new seat lands in, and the dash is
+    in it. Without a reassert, every --add narrows the dashboard a little more."""
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen.env["QB_SEATS_DASH_SIZE"] = "50"
+    screen("-n", "2")
+    assert labels(screen)["dash"][0] == 50
+    screen("--add")
+    assert labels(screen)["dash"][0] == 50, "the dash was resized by --add"
 
 
 def test_an_empty_brief_reaches_the_panes(screen):

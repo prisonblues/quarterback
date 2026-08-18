@@ -723,7 +723,7 @@ class Dash(App):
         the way of everything else: qb-seats' --add, qb-seat-click's reflow and
         the seat bar all select on @qb_seat, so none of them counts a review as
         a seat or offers to start an agent in it. @qb_label rather than a name
-        of its own because dev/seats-extras.sh already labels the dash and the
+        of its own because qb-seats already labels the dash and the
         tape that way, and the pane border should read one option, not two.
 
         With no seat row to join — the dashboard run from a bare terminal, or a

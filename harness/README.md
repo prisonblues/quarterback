@@ -501,20 +501,28 @@ Adding another verb is three things: an entry in `BINDINGS`, an `action_*` metho
 it wants an icon — a column, since a click carries the column it landed in and that is how
 one row offers more than one verb.
 
-Not wired into `qb-seats` yet. `qb-dash` is a **launcher**, not the dashboard: the dashboard
-is Python needing `rich`, `textual` and `mcp_server`, none of which a plain `python3` has, so
-a shebang would be rewritten by `patchShebangs` to an interpreter that dies on the first
-import. It hunts for one that can, the way `qb-board` does — `QB_DASH_PYTHON` names one
-outright, `QUARTERBACK_REPO` points at a checkout whose `mcp/.venv` is built. Until
-`mcp_server` is packaged, that venv is the only thing that satisfies it. Bring one
-up beside a running screen with `harness/dev/seats-extras.sh <session> <width>`, which also
-relabels the board pane — that script hardcodes local checkout paths behind
-`QB_MCP_CHECKOUT` and is developer scaffolding, not something to ship.
+`qb-seats` builds it. A screen is seats across the top, the dash down the right, and the
+tape full width along the bottom — the dash reports what is true now, the tape what just
+happened, and a screen wants both. `QB_SEATS_DASH` names the command (default
+`qb-dash-tui`, or `qb-dash` for the plain renderer if a terminal will not forward mouse
+events); **set it to the empty string for a screen with no dash**. `QB_SEATS_DASH_SIZE` is
+its width in columns, default 78.
 
-Adding the dash also needs a wider `pane-border-format` than `qb-seats` sets: its own
-prints `board` for any pane with no seat number, so a second unlabelled pane claims that
-name. The dev script widens it to fall through to a `@qb_label` option; that belongs in
-`qb-seats` proper once this settles.
+`qb-dash` is a **launcher**, not the dashboard: the dashboard is Python needing `rich`,
+`textual` and `mcp_server`, none of which a plain `python3` has, so a shebang would be
+rewritten by `patchShebangs` to an interpreter that dies on the first import. It hunts for
+one that can, the way `qb-board` does — `QB_DASH_PYTHON` names one outright,
+`QUARTERBACK_REPO` points at a checkout whose `mcp/.venv` is built.
+
+Prefer the INSTALLED dash over a checkout, which is why `qb-seats` resolves it that way: a
+uv-standalone python has no CA bundle, and a dash running under one reports "board
+unreachable" against a board that is up, beside a shell where the same URL works.
+
+This used to be `harness/dev/seats-extras.sh`, which stapled two unlanded worktrees
+together for a smoke test and hardcoded both paths. It is gone; the lessons it paid for —
+place the dash AFTER `select-layout` and never spread the window afterwards, reassert the
+width because attaching redistributes the row — are comments in `qb-seats` and assertions
+in `harness/tests/test_qb_seats.py`.
 
 ## How it works
 
