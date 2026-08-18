@@ -177,9 +177,15 @@
           # path argument stays explicit for the same reason it always was.
           ini=$PWD/sandbox-pytest.ini
           log=$PWD/pytest.log
-          cat > "$ini" <<'EOF'
-          [pytest]
-          EOF
+          # Written with printf rather than a heredoc deliberately. `<<'EOF'` needs its
+          # closing delimiter at column zero of the shell text this string becomes, and it
+          # only lands there because Nix strips the indentation every line in this script
+          # happens to share. That common prefix is not a property of this heredoc: a
+          # future line indented less than the rest shrinks it, leaves EOF indented, and
+          # the heredoc then runs to end of input — silently swallowing the remainder of
+          # the build script into the ini file. `<<-` is no help either, since it strips
+          # leading tabs and not spaces. A one-line file does not need a heredoc at all.
+          printf '[pytest]\n' > "$ini"
 
           cd repo/harness
           # -rs: print the reason for every skip. This check exists because eight
@@ -200,6 +206,14 @@
           # branches this suite exists for. The reasons are the constant. Any
           # other test that starts skipping is the failure this whole check is
           # about, and it fails here rather than reading green.
+          #
+          # The two strings below are the same coupling the `cp` list has, and it
+          # is guarded the same way rather than by remembering:
+          # `test_the_flake_skip_allowlist_matches_the_reasons_this_suite_can_produce`
+          # in the suite reads them back out of this expression and compares them
+          # against the `pytest.skip` reasons, in both directions — so rewording a
+          # reason, or leaving a stale one here, goes red in a developer's plain
+          # `pytest harness/tests` instead of in a nix build nobody ran.
           if grep '^SKIPPED' "$log" |
                grep -qv -e 'git is not on PATH' -e 'nothing unstamped'; then
             echo "release-metadata-tests: a test skipped for a reason this check" >&2

@@ -480,23 +480,50 @@ as state rather than as a reason (#135).
 ```
 qb-next                     # PRs, then the plan, then what is held and what is blocked
 qb-next --repo owner/name   # another repo's plan
-qb-next --limit 10          # more of the free list (5 by default)
+qb-next --limit 10          # more rows in the free and uncertain lists (5 by default)
+qb-next --limit 0           # how many there are, without listing any of them
 qb-next --json              # the same join, for a hook or another tool
 ```
 
-Four sections: every open PR with what CI says and therefore what it is asking for; the
-free items in plan order, with the board's own pick for what is next marked as such; what
-is held, by whom, and how long the claim has left; what is blocked and on what. **Every
-line carries its reason.** `#44 free` is what the plan already told you; `#44 — rank 2,
-free, unblocked` is the line worth ten tool calls. When `--limit` cuts the free list it
-says how many it left out, so a short list is not read as a short backlog.
+Four sections when every source answers: every open PR with what CI says and therefore
+what it is asking for; the free items in plan order, with the board's own pick for what is
+next marked as such; what is held, by whom, and how long the claim has left; what is
+blocked and on what. **Every line carries its reason.** `#44 free` is what the plan
+already told you; the row it prints instead — `→ #44   <title>  rank 2, free, unblocked` —
+is worth ten tool calls. When `--limit` cuts the free list it says how many it left out,
+so a short list is not read as a short backlog.
 
 **A source that died is named, not hidden.** A section left empty because the board is
 unreachable looks exactly like a section left empty because there is nothing in it, so an
 unreachable source prints as a warning under the answer and the exit code separates the
 cases: `3` when part of the answer is missing, `1` for a configuration error (no board
-URL), `2` from argparse for a usage error. The text prints either way — somebody asking
-what to do is better served by the sections that did answer than by a stack trace.
+URL), `2` from argparse for a usage error, `4` when the command itself broke on what it
+was handed. `1` and `4` are apart on purpose — "fix your `QUARTERBACK_BASE_URL`" and "this
+tool cannot read that payload" want opposite responses from a hook. The text prints either
+way — somebody asking what to do is better served by the sections that did answer than by
+a stack trace.
+
+**And a fifth section when one did not.** An item is offered as free only if every source
+that could have contradicted it answered. When one did not — `/claims` down or capped, so
+a claim taken outside the plan would not be visible; GitHub's blocked-by read down or
+capped; the plan itself answering with an error beside its payload — the item is
+deliberately withheld from the free list and listed under UNCERTAIN instead, one row each
+naming what is missing, capped by the same `--limit` as the free list:
+
+```
+  ? #44   <title>   GitHub's blocked-by edges could not be read
+```
+
+UNCERTAIN never appears without a `!` line under it and exit `3` with it. It is there
+because otherwise the dangerous half of a partial answer reads exactly like the safe half.
+
+A dead plan source is the case that mechanism cannot cover, because there are then no
+items to mark: the header reads `PLAN — could not be read` and the board's pick reads
+`unknown` rather than the empty-plan text, which would otherwise be a confident "there is
+nothing to do" printed off a source that never answered. A plan page that is merely
+**capped** is the opposite case — the items it did send are whole — so nothing is hedged
+and the header counts `at least N open` instead. Each of the three counts turns into an
+`at least` when the source that could have raised it is the one that is missing.
 
 Stdlib only, and no launcher, unlike the dash: a one-shot answer printed to a pipe needs
 no renderer, so this keeps a plain shebang `patchShebangs` can rewrite and runs on

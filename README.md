@@ -577,8 +577,9 @@ full — including what was broken before it, which is the part no diff recovers
   open PRs with what CI says about each, the free items in plan order with the board's own pick
   marked, what is held and for how long, what is blocked and on what — every line carrying its
   reason rather than only its fact. `--json` for a hook, `--limit` for the top of the list,
-  `--repo` for another repo's plan. An unreachable source is named under the answer and exits 3,
-  because a section empty because the board is down reads exactly like one empty for want of work.
+  `--repo` for another repo's plan. An unreachable source is named under the answer and the
+  command exits 3, because a section empty because the board is down reads exactly
+  like one empty for want of work.
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
   roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps

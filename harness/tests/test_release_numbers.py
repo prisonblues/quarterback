@@ -116,6 +116,29 @@ _V = rf"v\d+(?:\.\d+)?{_END}"
 PLACEHOLDER = "vNEXT"
 
 
+#: Every reason this suite skips for, named once rather than written at the `pytest.skip`
+#: call sites. They are not local strings: `flake.nix`'s release-metadata-tests check greps
+#: its build log for two of them by substring and fails the build on any skip whose reason
+#: is not in that allowlist, so a reword at a call site turns a green nix build red for a
+#: reason that has nothing to do with release numbers. Naming them here is what lets
+#: `test_the_flake_skip_allowlist_matches_the_reasons_this_suite_can_produce` compare the
+#: two lists from this side, in the `pytest harness/tests` a developer runs before pushing.
+#:
+#: Adding a skip reason is therefore a two-file change: add the constant, and — if the new
+#: skip can fire inside the nix sandbox — add a matching `-e '…'` to that check's allowlist
+#: and list it in `_ALLOWED_SKIP_REASONS` below.
+_SKIP_NO_GIT = "git is not on PATH, so there is no set of tracked files to check"
+_SKIP_NOT_A_CHECKOUT = "not a git checkout (an export or a tarball), so nothing here is tracked"
+_SKIP_NOTHING_UNSTAMPED = "nothing unstamped — this branch is not writing a release"
+_SKIP_NO_FLAKE = "no flake.nix beside this checkout, so there is no check to compare against"
+
+#: The subset of the above that the nix sandbox actually produces, and therefore the subset
+#: `flake.nix` has to tolerate. The other two cannot fire there: git is absent from that
+#: check's `nativeBuildInputs` on purpose, so the OSError path wins over "not a checkout";
+#: and `flake.nix` is one of the files copied in, so the flake guards never miss it.
+_ALLOWED_SKIP_REASONS = (_SKIP_NO_GIT, _SKIP_NOTHING_UNSTAMPED)
+
+
 #: A fence line: three or more backticks or tildes, then whatever info string follows. Both
 #: groups are load-bearing — see the closer rule in `_without_fenced_blocks` — and the
 #: indentation is unbounded rather than CommonMark's three spaces, because this repo's command
@@ -345,7 +368,7 @@ def test_an_unstamped_entry_is_at_the_top(changelog_prose, changelog_releases):
     would then fail on the release AFTER the mistake, pointing at the wrong commit."""
     placeholder = re.search(rf"^## {PLACEHOLDER}\b", changelog_prose, flags=re.MULTILINE)
     if not placeholder:
-        pytest.skip("nothing unstamped — this branch is not writing a release")
+        pytest.skip(_SKIP_NOTHING_UNSTAMPED)
     first_numbered = re.search(rf"^## {_V}", changelog_prose, flags=re.MULTILINE)
     assert first_numbered and placeholder.start() < first_numbered.start(), (
         f"CHANGELOG.md's `## {PLACEHOLDER}` entry sits below "
@@ -371,6 +394,30 @@ def test_the_changelog_and_the_readme_are_unstamped_together(changelog_prose, re
         f"README.md {'has' if in_readme else 'has no'} `- **{PLACEHOLDER}**` bullet")
 
 
+def _tracked_files() -> list[str]:
+    """Every path this repo tracks, repo-root-relative, or a skip when git cannot say.
+
+    Two callers ask git the same question — "what does this repo actually contain" — and it is
+    asked in one place so that the answer, and the two ways it can be unavailable, are spelled
+    once. It also keeps this file down to a SINGLE bare `REPO_ROOT`:
+    `test_every_use_of_repo_root_here_is_a_join_or_the_known_exception` accounts for every
+    `REPO_ROOT` that is not a `/` join naming a file to read, and a second subprocess passing
+    the directory around would have to be added to that accounting by hand.
+
+    Skips rather than returns a sentinel because both callers would do nothing else with one,
+    and a caller that forgot to check it would assert against an empty file list — which is
+    "nothing is wrong" for every question asked here, the silent pass this whole file argues
+    against. Both reasons are `_SKIP_*` constants: see the note there about `flake.nix`."""
+    try:
+        proc = subprocess.run(["git", "-C", str(REPO_ROOT), "ls-files", "-z"],
+                              capture_output=True, text=True, check=False)
+    except OSError:
+        pytest.skip(_SKIP_NO_GIT)
+    if proc.returncode != 0:
+        pytest.skip(_SKIP_NOT_A_CHECKOUT)
+    return [p for p in proc.stdout.split("\0") if p]
+
+
 def test_no_test_file_is_named_after_a_release():
     """`tests/test_v234.py` is a release number a branch had to guess before landing, and
     two branches guessing the same one add the same PATH with different contents — which
@@ -389,14 +436,7 @@ def test_no_test_file_is_named_after_a_release():
     the other way got a red suite from a vendored file they do not control and cannot fix. "Is
     it committed here" is the question that was actually being asked, and git answers it without
     a list that grows every time somebody's setup differs."""
-    try:
-        proc = subprocess.run(["git", "-C", str(REPO_ROOT), "ls-files", "-z"],
-                              capture_output=True, text=True, check=False)
-    except OSError:
-        pytest.skip("git is not on PATH, so there is no set of tracked files to check")
-    if proc.returncode != 0:
-        pytest.skip("not a git checkout (an export or a tarball), so nothing here is tracked")
-    named = sorted(p for p in proc.stdout.split("\0")
+    named = sorted(p for p in _tracked_files()
                    if re.fullmatch(r"test_v\d[^/]*\.py", p.rpartition("/")[2]))
     assert not named, (
         "test files are named after their subject, not the release that shipped them: "
@@ -532,8 +572,14 @@ def test_an_unclosed_fence_says_which_line_opened_it():
         _without_fenced_blocks("intro\n\n```md\n## vNEXT — a sample entry\n")
 
 
-#: A `cp ${./some/path}` inside the flake's release-metadata check.
-_FLAKE_COPY = re.compile(r"\$\{\./([^}]+)\}")
+#: A `cp ${./some/path}` inside the flake's release-metadata check — anchored on the `cp`, not
+#: just on the interpolation. Matching `${./…}` anywhere in the script was the earlier shape and
+#: it read the wrong direction: a comment naming a path, or an `echo` mentioning one, would tell
+#: the guard below that the file is copied when nothing copies it, which is precisely the missing
+#: `cp` the guard exists to catch. Optional flags are allowed between the two because the flake's
+#: other checks copy directories with `cp -r`, and a `cp` that grows a flag here should not
+#: silently stop counting.
+_FLAKE_COPY = re.compile(r"^[ \t]*cp\s+(?:-\S+\s+)*\$\{\./([^}]+)\}", re.MULTILINE)
 
 #: Where the check's build script begins. `pkgs.runCommand` is part of the anchor rather than
 #: just the attribute name, because what is being sliced is that call's script, and an
@@ -551,11 +597,17 @@ _FLAKE_CHECK_START = re.compile(r"^\s*release-metadata-tests\s*=\s*pkgs\.runComm
 #: has nothing to complain about.
 _FLAKE_CHECK_END = re.compile(r"^[ \t]*'';[ \t]*$", re.MULTILINE)
 
-#: The conftest files pytest would load beside this suite in a developer's checkout. Neither
-#: exists today. They are spelled relative to `harness/` rather than as `REPO_ROOT / …` joins
-#: deliberately: they are not repo-root reads, and writing them that way would enrol them in
-#: the flake-copy guard below, which would then demand a `cp` for a file that does not exist.
-_CONFTESTS = ("conftest.py", "tests/conftest.py")
+#: Every place pytest would load a conftest.py from while collecting this file: the repo root
+#: — which is pytest's rootdir in the `pytest harness/tests` a developer runs, since that is
+#: where `pyproject.toml` is — and then `harness/` and `harness/tests/` on the way down. The
+#: root one was missing from this list and is the one that would bite hardest, being furthest
+#: from the suite it changes. None of the three exists today.
+#:
+#: Spelled as plain repo-root-relative strings rather than as `REPO_ROOT / …` joins,
+#: deliberately, and the reason survives the root entry joining them: a join here is what
+#: `_repo_root_uses` reads as a file this suite READS, which would enrol these paths in the
+#: flake-copy guard below and have it demand a `cp` for files that do not exist.
+_CONFTESTS = ("conftest.py", "harness/conftest.py", "harness/tests/conftest.py")
 
 
 def _flake_release_check(text: str) -> str:
@@ -581,6 +633,84 @@ def _flake_release_check(text: str) -> str:
 def _flake_copies(text: str) -> set[str]:
     """The repo paths the release-metadata check copies into its sandbox."""
     return set(_FLAKE_COPY.findall(_flake_release_check(text)))
+
+
+#: The check's skip allowlist: `grep -qv -e '…' -e '…'`, applied to the SKIPPED lines pytest
+#: prints under `-rs`. Anchored on `grep -qv` rather than on `-e` alone so the second gate's
+#: `grep -q 'SKIPPED.*…'` below cannot be mistaken for part of it.
+_FLAKE_SKIP_ALLOWLIST = re.compile(r"grep\s+-qv\s+((?:-e\s+'[^']*'\s*)+)")
+
+#: One `-e '…'` out of the run the pattern above captured.
+_FLAKE_SKIP_REASON = re.compile(r"-e\s+'([^']*)'")
+
+#: The second gate: the one skip that must happen every time, since git is deliberately left
+#: out of that check's build inputs. `SKIPPED.*` is grep's, not part of the reason.
+_FLAKE_REQUIRED_SKIP = re.compile(r"grep\s+-q\s+'SKIPPED\.\*([^']*)'")
+
+
+def _flake_skip_allowlist(script: str) -> list[str]:
+    """The skip-reason substrings the release-metadata check tolerates.
+
+    Asserts rather than returning an empty list, for the reason `_flake_release_check`'s
+    anchors do: an allowlist nobody could find compares equal to nothing missing, so the
+    coupling this parses would go unguarded in exactly the build that removed it."""
+    run = _FLAKE_SKIP_ALLOWLIST.search(script)
+    assert run, (
+        "flake.nix's release-metadata-tests check has no `grep -qv -e '…'` allowlist of "
+        "tolerated skip reasons. If that gate was reshaped or dropped, teach this parser the "
+        "new shape or delete this guard deliberately — silently parsing nothing out of it "
+        "leaves the reasons in this file free to drift from the ones the build accepts")
+    return _FLAKE_SKIP_REASON.findall(run.group(1))
+
+
+def _flake_required_skip(script: str) -> str:
+    """The reason substring the release-metadata check demands it sees at least once."""
+    m = _FLAKE_REQUIRED_SKIP.search(script)
+    assert m, (
+        "flake.nix's release-metadata-tests check no longer greps for a `SKIPPED.*<reason>` "
+        "it requires. That gate is what notices git arriving in the sandbox; if it moved, "
+        "teach this parser where")
+    return m.group(1)
+
+
+def _skip_reasons(source: str | None = None) -> tuple[set[str], list[str]]:
+    """Every reason a `pytest.skip(…)` in this file can print, and every call that could not
+    be read as one.
+
+    Read from the source rather than from the runtime, because the question is what this file
+    CAN print, not what today's repo happened to make it print — the whole point is to compare
+    the set against an allowlist written in another file entirely.
+
+    A call whose argument is neither a string literal nor a module-level string constant is
+    reported instead of dropped, the same bargain `_repo_root_uses` makes: a reason this
+    parser cannot see is a reason that can drift out of the flake's allowlist with nothing
+    going red, which is the failure the comparison exists to prevent."""
+    text = Path(__file__).read_text(encoding="utf-8") if source is None else source
+    tree = ast.parse(text)
+    consts: dict[str, str] = {}
+    for node in tree.body:
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Constant):
+            continue
+        if not isinstance(node.value.value, str):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                consts[target.id] = node.value.value
+    reasons: set[str] = set()
+    unreadable: list[str] = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "skip" and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "pytest"):
+            continue
+        arg = node.args[0] if node.args else None
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            reasons.add(arg.value)
+        elif isinstance(arg, ast.Name) and arg.id in consts:
+            reasons.add(consts[arg.id])
+        else:
+            unreadable.append(f"line {node.lineno}")
+    return reasons, unreadable
 
 
 def _repo_root_uses(source: str | None = None) -> tuple[set[str], list[str]]:
@@ -646,6 +776,45 @@ def _paths_this_suite_reads(source: str | None = None) -> set[str]:
     return _repo_root_uses(source)[0]
 
 
+def _reported_line(entry: str) -> int:
+    """The line number out of one `_repo_root_uses` report, `line 42: proc = subprocess…`."""
+    m = re.match(r"line (\d+):", entry)
+    assert m, f"a _repo_root_uses report is `line N: <source>` and this is not: {entry!r}"
+    return int(m.group(1))
+
+
+def _ls_files_call_lines(source: str | None = None) -> range:
+    """The lines spanned by the `git ls-files` subprocess call — the one place a bare
+    `REPO_ROOT` legitimately appears.
+
+    The accounting test used to recognise that one exception by looking for the substring
+    `ls-files` in the source LINE `_repo_root_uses` reported, which made a formatting choice
+    load-bearing: split the call across lines so that `cwd=REPO_ROOT` sits on its own, and the
+    reported line no longer says `ls-files` even though nothing whatever is wrong. The suite
+    then fails claiming an unreadable `REPO_ROOT` use — a false failure about false failures,
+    in the file that argues at length they are what gets a check deleted.
+
+    A span is the stable fact instead. The call is located once by its own contents, and any
+    `REPO_ROOT` inside its parentheses is the known exception however the call is laid out.
+
+    Asserts when there is no such call: without it every bare use looks unaccounted for, so
+    a caller comparing against this range would go red for the wrong reason, and one that
+    fell back to an empty range would wave the real thing through."""
+    text = Path(__file__).read_text(encoding="utf-8") if source is None else source
+    tree = ast.parse(text)
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "run" and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "subprocess"):
+            continue
+        if any(isinstance(c, ast.Constant) and c.value == "ls-files" for c in ast.walk(node)):
+            return range(node.lineno, (node.end_lineno or node.lineno) + 1)
+    raise AssertionError(
+        "no `subprocess.run([… 'ls-files' …])` call here, so the one bare `REPO_ROOT` use this "
+        "file allows has no home. If the tracked-files question is now asked some other way, "
+        "point this helper at it — the accounting test has nothing to excuse without it")
+
+
 def test_the_flake_check_supplies_every_repo_root_file_this_suite_reads():
     """The enumeration in `flake.nix` is the thing that goes stale, so nothing relies on
     somebody remembering it.
@@ -664,7 +833,7 @@ def test_the_flake_check_supplies_every_repo_root_file_this_suite_reads():
     a sandbox, and a check that cannot see the expression cannot judge it."""
     flake = REPO_ROOT / "flake.nix"
     if not flake.is_file():
-        pytest.skip("no flake.nix beside this checkout, so there is no check to compare against")
+        pytest.skip(_SKIP_NO_FLAKE)
     missing = sorted(_paths_this_suite_reads()
                      - _flake_copies(flake.read_text(encoding="utf-8")))
     assert not missing, (
@@ -676,24 +845,35 @@ def test_the_flake_check_supplies_every_repo_root_file_this_suite_reads():
 def test_the_flake_check_supplies_every_conftest_that_would_load_beside_this_suite():
     """The guard above compares the flake's `cp` list against the files this suite READS, and
     a conftest is read by nothing here — pytest imports it before collection, from wherever it
-    sits at or above the test file's directory. So neither `harness/conftest.py` nor
-    `harness/tests/conftest.py` is in that comparison, and the day somebody adds one the nix
-    sandbox starts collecting this file without the fixtures, markers or collection hooks a
-    developer's `pytest harness/tests` gives it. The two runs are then running different suites
-    and the nix one is still green.
+    sits at or above the test file's directory. So none of the three `_CONFTESTS` locations is
+    in that comparison, and the day somebody adds one the nix sandbox starts collecting this
+    file without the fixtures, markers or collection hooks a developer's `pytest harness/tests`
+    gives it. The two runs are then running different suites and the nix one is still green.
 
-    Neither file exists as this is written, so this pins a coupling rather than fixing a bug.
-    It is written down because the cost of learning it the other way is a check that passes in
-    the store and fails on the machine, or the reverse.
+    None of the three exists as this is written, so this pins a coupling rather than fixing a
+    bug. It is written down because the cost of learning it the other way is a check that
+    passes in the store and fails on the machine, or the reverse.
 
-    Same skip-when-absent treatment as the guard above, for the same reason: this file is also
-    collected from a sandbox with no flake.nix in it to judge."""
+    **Asked of git, not of the filesystem, and this is the whole of the fix.** The earlier
+    version asked `(HARNESS_ROOT / rel).is_file()`, which answers about whatever tree it
+    happens to be running in. In a developer's checkout that is the repo and the question is
+    the right one. In the nix sandbox it is a directory holding five copied files: a conftest
+    that was added to the repo and never copied in does not exist THERE either, so `is_file()`
+    says no and the guard passes — from inside the very build it was written to protect, and
+    silently, which is the failure mode this file spends its docstrings on. The filesystem
+    under this suite is not the repo, and only git knows the difference.
+
+    So a skip rather than a pass when git cannot answer (`_tracked_files` decides which
+    reason). The sandbox has no git on purpose, so this guard skips there and the flake's
+    own `-rs` gate prints the reason — the honest outcome for a question that genuinely
+    cannot be answered from inside a partial tree. It is not going unchecked: CI runs this
+    suite in a real checkout on every push, which is where the answer exists."""
     flake = REPO_ROOT / "flake.nix"
     if not flake.is_file():
-        pytest.skip("no flake.nix beside this checkout, so there is no check to compare against")
+        pytest.skip(_SKIP_NO_FLAKE)
+    tracked = set(_tracked_files())
     copied = _flake_copies(flake.read_text(encoding="utf-8"))
-    uncopied = [f"harness/{rel}" for rel in _CONFTESTS
-                if (HARNESS_ROOT / rel).is_file() and f"harness/{rel}" not in copied]
+    uncopied = [rel for rel in _CONFTESTS if rel in tracked and rel not in copied]
     assert not uncopied, (
         "pytest loads " + ", ".join(uncopied) + " beside this suite, and flake.nix's "
         "release-metadata-tests check does not copy it into its sandbox — so the nix run "
@@ -727,11 +907,25 @@ def test_every_use_of_repo_root_here_is_a_join_or_the_known_exception():
 
     A second one means a read went unseen. Rewrite it as a plain chain of string literals, or
     teach `_repo_root_uses` the new shape — widening this count is the one repair that puts
-    the hole back."""
+    the hole back.
+
+    The exception is identified by WHERE it is, not by what its line happens to say. Asserting
+    `"ls-files" in others[0]` was the earlier shape, and it made the call's formatting part of
+    the contract: move `cwd=REPO_ROOT` onto its own line and the reported line stops containing
+    `ls-files`, so a correct file fails with a message swearing its `REPO_ROOT` use is
+    unreadable. `_ls_files_call_lines` finds the call and this asks whether the reported line
+    falls inside it, which survives any layout and still refuses a second use anywhere else."""
     _, others = _repo_root_uses()
-    assert len(others) == 1 and "ls-files" in others[0], (
+    assert len(others) == 1, (
         "REPO_ROOT is used here in a way `_repo_root_uses` cannot read as a path, so the "
-        "flake-copy guard cannot see it: " + "; ".join(others))
+        "flake-copy guard cannot see it. Exactly one such use is allowed — the directory "
+        "handed to the `git ls-files` subprocess, which is not a file read. Found: "
+        + "; ".join(others))
+    inside = _ls_files_call_lines()
+    assert _reported_line(others[0]) in inside, (
+        "the one bare REPO_ROOT allowed here is the `cwd` of the `git ls-files` subprocess "
+        f"call (lines {inside.start} to {inside.stop - 1}), and this one is somewhere else, so "
+        "it is a read the flake-copy guard cannot see: " + others[0])
 
 
 def test_a_join_this_parser_cannot_read_is_reported_rather_than_dropped():
@@ -746,6 +940,139 @@ def test_a_join_this_parser_cannot_read_is_reported_rather_than_dropped():
         paths, others = _repo_root_uses(source)
         assert not paths, source
         assert len(others) == 1, source
+
+
+def test_the_known_repo_root_exception_survives_being_reformatted():
+    """The false failure the accounting test used to be one `black` run away from.
+
+    `cwd=REPO_ROOT` on a line of its own is the ordinary result of splitting a long call, and
+    the reported source line then says nothing about `ls-files`. Under the old substring check
+    that was a red suite on a file where nothing had changed but the whitespace. Keyed on the
+    call's line span it is still the one known exception."""
+    source = ('proc = subprocess.run(\n'
+              '    ["git", "ls-files", "-z"],\n'
+              '    cwd=REPO_ROOT,\n'
+              '    capture_output=True,\n'
+              ')\n')
+    paths, others = _repo_root_uses(source)
+    assert not paths
+    assert len(others) == 1
+    assert "ls-files" not in others[0], "the reported line is the point: it no longer says it"
+    assert _reported_line(others[0]) in _ls_files_call_lines(source)
+
+
+def test_a_second_bare_repo_root_is_not_excused_by_the_known_exception():
+    """Tolerating reformatting must not turn into tolerating a second use. The `joinpath` here
+    is a real repo-root read the flake-copy guard cannot see, and it is outside the call's
+    span, so it stays reportable however the call above it is laid out."""
+    source = ('proc = subprocess.run(["git", "ls-files", "-z"], cwd=REPO_ROOT)\n'
+              'other = REPO_ROOT.joinpath("CHANGELOG.md")\n')
+    paths, others = _repo_root_uses(source)
+    assert not paths
+    assert len(others) == 2
+    inside = _ls_files_call_lines(source)
+    assert [o for o in others if _reported_line(o) not in inside]
+
+
+def test_the_known_exception_has_to_be_findable_at_all():
+    """No `git ls-files` call means nothing excuses a bare `REPO_ROOT`, and a helper that
+    returned an empty span instead of saying so would wave every one of them through."""
+    with pytest.raises(AssertionError, match="ls-files"):
+        _ls_files_call_lines('REPO_ROOT / "CHANGELOG.md"\n')
+
+
+def test_only_a_cp_counts_as_a_copy_into_the_sandbox():
+    """A `${./path}` is a Nix interpolation wherever it appears, and appearing is not copying.
+
+    A comment naming the file it means, or an `echo` quoting one, would have satisfied the
+    earlier pattern — so the flake-copy guard would report a file as supplied while the sandbox
+    ran without it, which is the FileNotFoundError the guard exists to prevent, now with a
+    green test in front of it. The `cp -r` and long-flag forms are here because the flake's
+    other checks use them and a copy that grows a flag must not stop counting."""
+    text = ('      checks = {\n'
+            '        release-metadata-tests = pkgs.runCommand "quarterback-release" { } \'\'\n'
+            '          # ${./COMMENTED.md} is named here and copied by nothing\n'
+            '          echo "one day this will copy ${./ECHOED.md}"\n'
+            '          cp ${./CHANGELOG.md} repo/CHANGELOG.md\n'
+            '          cp -r ${./app} repo/app\n'
+            '          cp --preserve=mode ${./flake.nix} repo/flake.nix\n'
+            '        \'\';\n'
+            '      };\n')
+    assert _flake_copies(text) == {"CHANGELOG.md", "app", "flake.nix"}
+
+
+def test_the_flake_skip_allowlist_matches_the_reasons_this_suite_can_produce():
+    """The other stale enumeration in that check, guarded the way the `cp` list is.
+
+    `flake.nix`'s release-metadata-tests check fails the build on any skip whose reason is not
+    one of two substrings written into a `grep -qv`, and those substrings are `pytest.skip`
+    reasons from this file, copied by hand into another language. Nothing tied the two
+    together: reword a reason here and the nix build goes red claiming an unexpected skip;
+    leave a reason there after deleting the skip and the gate quietly guards nothing.
+
+    Asserted in both directions for that reason — every reason the sandbox produces has to be
+    allowed there, and every entry in the allowlist has to correspond to a reason this file can
+    actually print. And the second gate too, the unconditional `SKIPPED.*<reason>` that notices
+    git arriving in the sandbox: it names a reason, so it can go stale the same way.
+
+    Skipped when `flake.nix` is absent, like the two guards above and with the same reason
+    string — deliberately not a new one, since a new skip reason is exactly what this test is
+    about and would have to be taught to the flake before it could be used here."""
+    flake = REPO_ROOT / "flake.nix"
+    if not flake.is_file():
+        pytest.skip(_SKIP_NO_FLAKE)
+    script = _flake_release_check(flake.read_text(encoding="utf-8"))
+    allowed = _flake_skip_allowlist(script)
+    produced, unreadable = _skip_reasons()
+    assert not unreadable, (
+        "a `pytest.skip` here is called with something this parser cannot read as a reason, so "
+        "it cannot be compared against flake.nix's allowlist: " + ", ".join(unreadable))
+
+    for reason in _ALLOWED_SKIP_REASONS:
+        assert reason in produced, (
+            f"_ALLOWED_SKIP_REASONS names {reason!r}, which no `pytest.skip` here passes. "
+            "Either the skip went away — drop it here and from flake.nix's `grep -qv` — or it "
+            "was reworded at the call site instead of here")
+        assert any(pattern in reason for pattern in allowed), (
+            f"this suite can skip with {reason!r} inside the nix sandbox, and flake.nix's "
+            f"release-metadata-tests check allows only {allowed} — so that build fails "
+            "claiming an unexpected skip. Add a matching `-e '<substring>'` there")
+
+    for pattern in allowed:
+        assert any(pattern in reason for reason in produced), (
+            f"flake.nix's release-metadata-tests check tolerates skips matching {pattern!r} "
+            "and no `pytest.skip` here can print that any more. A stale allowlist entry hides "
+            "the next skip that happens to match it — drop it there")
+
+    required = _flake_required_skip(script)
+    assert any(required in reason for reason in _ALLOWED_SKIP_REASONS), (
+        f"flake.nix's release-metadata-tests check requires a skip matching {required!r} on "
+        "every build, and that is not a reason this suite produces in the sandbox — so the "
+        "check fails every time, for a reason that is not about release numbers")
+
+
+def test_a_skip_reason_this_parser_cannot_read_is_reported_rather_than_dropped():
+    """`_skip_reasons` reads literals and module-level constants, which is every reason this
+    file writes. Anything else — a computed string, a reason built at the call site — is
+    reported rather than silently omitted, because a reason nobody can see is a reason free to
+    drift out of flake.nix's allowlist with nothing going red."""
+    reasons, unreadable = _skip_reasons(
+        '_R = "a reason bound to a name"\n'
+        'pytest.skip("a literal reason")\n'
+        'pytest.skip(_R)\n'
+        'pytest.skip(f"a {computed} reason")\n')
+    assert reasons == {"a literal reason", "a reason bound to a name"}
+    assert len(unreadable) == 1
+
+
+def test_the_flake_skip_gates_say_so_when_they_cannot_be_found():
+    """Both parsers assert rather than return nothing, for the reason `_flake_release_check`'s
+    anchors do: an allowlist read as empty compares equal to "nothing to allow", so a reshaped
+    gate would take the coupling above out of service and pass while doing it."""
+    with pytest.raises(AssertionError, match="allowlist"):
+        _flake_skip_allowlist("          pytest -q -rs tests\n")
+    with pytest.raises(AssertionError, match="SKIPPED"):
+        _flake_required_skip("          pytest -q -rs tests\n")
 
 
 def test_the_flake_slice_stops_at_the_script_and_not_at_the_first_quote_pair():

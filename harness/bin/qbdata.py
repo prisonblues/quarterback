@@ -19,20 +19,33 @@ from datetime import datetime, timezone
 REPO = "prisonblues/quarterback"
 REPO_URL = f"https://github.com/{REPO}"
 
-# How much of each list is asked for. Every one of these is a CAP, not a page
+# How much of each list is REPORTED ON. Every one of these is a CAP, not a page
 # size — `gh` pages internally until it has `--limit` rows, and /claims takes a
 # limit of its own — so the only thing a caller can get wrong is believing a
 # capped list is the whole list. Each fetch below therefore says so out loud when
-# it comes back full, because "showing the first N" and "there are N" differ by
+# there is more, because "showing the first N" and "there are N" differ by
 # exactly the work somebody would otherwise pick up twice.
-CLAIM_LIMIT = 1000                                # the /claims endpoint's maximum
+#
+# Which is why every fetch OVER-ASKS BY ONE: it requests `limit + 1` rows, trims
+# what it uses back to `limit`, and treats the extra row as the evidence. A read
+# that came back holding exactly `limit` rows cannot tell "there are exactly this
+# many" from "there are more", and guessing the second put a false "this is a
+# partial answer" on every single run of a repo that happened to sit on the
+# number — which, for issues and claims, marks every plan item UNCERTAIN.
+CLAIM_LIMIT = 999                                 # /claims maxes out at 1000, so this + 1
 ISSUE_LIMIT = 600                                 # open issues read for blocked-by edges
 PR_LIMIT = 100                                    # open PRs listed
 
 
 def truncated(rows: list, limit: int, what: str) -> str | None:
-    """The 'this list is not all of it' message, or None when it is all of it."""
-    if len(rows) < limit:
+    """The 'this list is not all of it' message, or None when it is all of it.
+
+    The caller must have asked its source for `limit + 1` rows and be about to
+    display `limit` of them. `len(rows) == limit` is ambiguous — a repo with
+    exactly that many is indistinguishable from one with a thousand more — and
+    the row nobody displays is what resolves it.
+    """
+    if len(rows) <= limit:
         return None
     return f"showing the first {limit} {what} — there are more, so this is a partial answer"
 
@@ -89,11 +102,28 @@ def short_key(key: str) -> str:
     return key.split("/", 1)[-1] if key.count("/") == 1 else key
 
 
-#: Every C0 control character plus DEL, mapped to nothing — except the three
-#: that are whitespace, which become a space. Dropping a newline outright would
-#: JOIN the words either side of it, so "a\nb" would read as one word "ab".
-_CONTROL = dict.fromkeys([*range(32), 127])
-_CONTROL.update({0x09: " ", 0x0A: " ", 0x0D: " "})
+#: Everything a terminal reads as an instruction rather than as text, mapped to
+#: nothing. Three families, because C0 alone is only the famous one:
+#:
+#:   * the C0 controls and DEL — ESC, BEL, and the rest of range(32) plus 127;
+#:   * the C1 controls, U+0080 to U+009F. U+009B is CSI, which a terminal in an
+#:     8-bit mode acts on exactly as it does on the two-character ESC-[, so a
+#:     filter that stops at C0 stops one encoding short of the same attack;
+#:   * the bidi and format overrides — U+061C, U+200E/F, U+202A to U+202E and
+#:     U+2066 to U+2069 — which reorder what is rendered with no escape sequence
+#:     at all, so a title can display in an order its characters are not in.
+#:
+#: The whitespace ones become a SPACE instead, because deleting a line break
+#: JOINS the words either side of it: "a\nb" would read as the one word "ab".
+#: That covers \t \n \v \f \r and U+0085 NEL — `str.split()` in `plain` already
+#: treats every one of those as whitespace, so this is belt-and-braces rather
+#: than a live fix, and it is here so the map does not have to be read against
+#: str.split's list to know which characters survive.
+_CONTROL = dict.fromkeys([*range(32), 127, *range(0x80, 0xA0)])
+_CONTROL.update(dict.fromkeys([0x061C, 0x200E, 0x200F,
+                               *range(0x202A, 0x202F), *range(0x2066, 0x206A)]))
+# After the C1 fill, not before it: U+0085 is in that range and is a line break.
+_CONTROL.update({0x09: " ", 0x0A: " ", 0x0B: " ", 0x0C: " ", 0x0D: " ", 0x85: " "})
 
 
 def plain(value: object) -> str:
@@ -102,9 +132,11 @@ def plain(value: object) -> str:
     A PR title, a claim holder and a `gh` error all arrive from somewhere else,
     and a terminal reads an ESC in any of them as an instruction rather than as
     text — so a crafted title could redraw a section header or hide the line
-    below it. Collapsing whitespace already removed newlines and tabs; this
-    removes the rest, in the one function every caller already goes through
-    instead of at each of the thirty places that interpolate a remote string.
+    below it. This removes the C0 controls and DEL, the C1 controls (CSI among
+    them) and the bidi overrides that reorder a line without an escape sequence,
+    turning the whitespace ones into a space; see `_CONTROL`. In the one function
+    every caller already goes through, instead of at each of the thirty places
+    that interpolate a remote string.
     """
     text = value if isinstance(value, str) else ("" if value is None else str(value))
     return " ".join(text.translate(_CONTROL).split())
@@ -218,10 +250,12 @@ class BoardClient:
     def active(self) -> dict:
         return self.get("/active")
 
-    def claims(self, limit: int = CLAIM_LIMIT) -> dict:
+    def claims(self, limit: int = CLAIM_LIMIT + 1) -> dict:
         # The endpoint's own default is 100 and its maximum is 1000. Asked for
         # explicitly because a truncated claims page is not a shorter list, it is
         # a claim the caller cannot see — and an unseen claim reads as free work.
+        # The maximum precisely: CLAIM_LIMIT is 999, so a full 1000 rows is the
+        # unambiguous "there are more" that 999 displayed rows cannot be.
         return self.get(f"/claims?{urllib.parse.urlencode({'limit': limit})}")
 
     def plan(self, repo: str | None = None) -> dict:
@@ -237,19 +271,69 @@ def board_client():
     return BoardClient(cfg), cfg
 
 
+def _list_field(payload: dict, key: str, where: str) -> tuple[list, str | None]:
+    """One list off a JSON object, or the reason it cannot be read as one.
+
+    An absent key, or an explicit null, is an empty list and no complaint. A key
+    holding anything else is a complaint, because the alternative is what this
+    used to do: filter the wrong object with an isinstance comprehension, come
+    back with nothing, and report an unparseable source as "nobody has claimed
+    anything" — the one answer this data must never invent.
+    """
+    value = payload.get(key)
+    if value is None:
+        return [], None
+    if not isinstance(value, list):
+        return [], f"{where} returned {type(value).__name__} for {key!r}, not a list"
+    return value, None
+
+
 def fetch_board(client) -> dict:
-    """Everything the board can tell us. Never raises — a dead board is a state."""
+    """Everything the board can tell us. Never raises — a dead board is a state.
+
+    The two GETs are in SEPARATE try blocks on purpose. Sharing one meant a
+    failing /active jumped past the claims call before it was ever made, so a
+    perfectly good claims answer was discarded along with the failure — and
+    qb-next, which reads neither `agents` nor `subagents`, then marked every plan
+    item unverifiable over a section it does not print. When both fail, both
+    reasons are in the error; one line naming one of two dead sources sends
+    somebody to check the half that was fine.
+    """
     out: dict = {"agents": [], "subagents": [], "claims": [], "error": None}
+    problems: list[str] = []
+
     try:
         active = client.active()
-        out["agents"] = active.get("agents", [])
-        out["subagents"] = active.get("subagents", [])
-        rows = client.claims().get("claims", []) or []
-        out["claims"] = [c for c in rows
-                         if isinstance(c, dict) and not c.get("released") and not c.get("lapsed")]
-        out["error"] = truncated(rows, CLAIM_LIMIT, "claims")
+        if not isinstance(active, dict):
+            problems.append(f"/active returned {type(active).__name__}, not an object")
+        else:
+            out["agents"], why_agents = _list_field(active, "agents", "/active")
+            out["subagents"], why_subs = _list_field(active, "subagents", "/active")
+            problems += [why for why in (why_agents, why_subs) if why]
     except Exception as exc:                      # noqa: BLE001 — display it, don't die
-        out["error"] = f"{type(exc).__name__}: {exc}"
+        problems.append(f"{type(exc).__name__}: {exc}")
+
+    try:
+        answer = client.claims()
+        if not isinstance(answer, dict):
+            problems.append(f"/claims returned {type(answer).__name__}, not an object")
+        else:
+            rows, why = _list_field(answer, "claims", "/claims")
+            if why:
+                problems.append(why)
+            else:
+                # Trimmed to the cap, then measured against it: the row past the
+                # cap exists to answer "is there more", not to be displayed.
+                out["claims"] = [c for c in rows[:CLAIM_LIMIT]
+                                 if isinstance(c, dict)
+                                 and not c.get("released") and not c.get("lapsed")]
+                partial = truncated(rows, CLAIM_LIMIT, "claims")
+                if partial:
+                    problems.append(partial)
+    except Exception as exc:                      # noqa: BLE001 — display it, don't die
+        problems.append(f"{type(exc).__name__}: {exc}")
+
+    out["error"] = "; ".join(problems) or None
     return out
 
 
@@ -269,39 +353,68 @@ def fetch_plan(client, repo: str | None = REPO) -> dict:
     `update` and not a field-by-field copy: a response missing a key keeps the
     default above, and a response carrying `error` overwrites this one's None,
     which is the shape a board that answered-but-refused sends.
+
+    Which is also why the type of `items` is checked and not just the type of the
+    response. `update` copies whatever that key holds, and the caller's
+    `plan.get("items") or []` cannot fall back from a truthy dict or string — so
+    the loop iterates the wrong object, every entry fails its isinstance guard,
+    and an unusable plan source comes out as a plan with nothing open in it and
+    an exit code of 0.
     """
     out: dict = {"items": [], "next": None, "counts": {}, "error": None}
     try:
         got = client.plan(repo)
         if not isinstance(got, dict):
             return {**out, "error": f"/plan returned {type(got).__name__}, not an object"}
+        problems: list[str] = []
+        if "items" in got and not isinstance(got["items"], list):
+            problems.append(
+                f"/plan returned {type(got['items']).__name__} for 'items', not a list")
+        if "counts" in got and not isinstance(got["counts"], dict):
+            problems.append(
+                f"/plan returned {type(got['counts']).__name__} for 'counts', not an object")
+        if problems:
+            return {**out, "error": "; ".join(problems)}
         out.update(got)
     except Exception as exc:                      # noqa: BLE001 — display it, don't die
         out["error"] = f"{type(exc).__name__}: {exc}"
     return out
 
 
-def _blocker_nodes(issue: dict) -> list[dict]:
-    """The `blockedBy` edges on one issue, whichever of the two shapes it is in.
+def _blocker_nodes(issue: dict) -> tuple[list[dict], bool]:
+    """The `blockedBy` edges on one issue, and whether they could be read at all.
 
     `gh issue list --json blockedBy` returns the GraphQL connection —
     `{"nodes": [...], "totalCount": n}` — and that is what this reads. It also
     accepts a bare list, because a field that is a connection today is a list in
     half of GitHub's other payloads and the cost of being wrong is not a
-    TypeError: it is the bare `except` below turning one unexpected shape into
-    "no blockers anywhere in this repo", which reads as everything unblocked.
+    TypeError: it is one unexpected shape turning into "no blockers anywhere in
+    this repo", which reads as everything unblocked.
 
-    An explicit `"nodes": null` is why the `or` is on the INNER get as well: the
-    key is present, so a default cannot fire, and `for b in None` raises.
+    That is what the second half of the return is for. Anything else — a string,
+    a number, a connection whose `nodes` holds something that is not a list — is
+    UNREADABLE rather than empty, and the caller counts the record as bad instead
+    of publishing "nothing blocks this" from a field it could not parse. A `[]`
+    with no signal beside it was the same silent lie in a smaller place.
+
+    Two absences are readable-and-empty on purpose: an explicit `"nodes": null`,
+    which is the documented shape of a connection with no edges, and a missing
+    `blockedBy` key, because an issue with no edges at all is the normal case.
     """
-    field = issue.get("blockedBy")
+    if "blockedBy" not in issue:
+        return [], True
+    field = issue["blockedBy"]
     if isinstance(field, list):
         nodes = field
     elif isinstance(field, dict):
-        nodes = field.get("nodes") or []
+        if "nodes" not in field or field["nodes"] is None:
+            return [], True
+        if not isinstance(field["nodes"], list):
+            return [], False
+        nodes = field["nodes"]
     else:
-        nodes = []
-    return [b for b in nodes if isinstance(b, dict)]
+        return [], False
+    return [b for b in nodes if isinstance(b, dict)], True
 
 
 def fetch_blocked(repo: str = REPO) -> tuple[dict[int, list[int]], str | None]:
@@ -328,7 +441,7 @@ def fetch_blocked(repo: str = REPO) -> tuple[dict[int, list[int]], str | None]:
     try:
         raw = subprocess.run(
             ["gh", "issue", "list", "--repo", repo, "--state", "open",
-             "--limit", str(ISSUE_LIMIT), "--json", "number,blockedBy"],
+             "--limit", str(ISSUE_LIMIT + 1), "--json", "number,blockedBy"],
             capture_output=True, text=True, timeout=45,
         )
         if raw.returncode != 0:
@@ -338,17 +451,42 @@ def fetch_blocked(repo: str = REPO) -> tuple[dict[int, list[int]], str | None]:
             return {}, f"gh returned {type(issues).__name__}, not a list of issues"
         blocked: dict[int, list[int]] = {}
         bad = 0
-        for issue in issues:
+        # Trimmed to the cap: the row past it was asked for to answer `truncated`
+        # a few lines down, and reading it would make the cap one issue wrong.
+        for issue in issues[:ISSUE_LIMIT]:
             # Per-issue rather than per-fetch: one malformed record used to take
             # the whole repo's blocker data down with it, and "no blockers at
             # all" is the answer that gets somebody working on blocked work.
-            try:
-                open_blockers = sorted(b["number"] for b in _blocker_nodes(issue)
-                                       if str(b.get("state", "")).upper() == "OPEN")
-                if open_blockers:
-                    blocked[issue["number"]] = open_blockers
-            except (KeyError, TypeError, ValueError):
+            #
+            # A guard has to cover its own edges, though. A record that is not an
+            # object at all — None, a string, a bare number in the list — raises
+            # AttributeError on the first `.get`, which the except tuple did not
+            # name, so it escaped to the outer handler and took every good record
+            # read before it down anyway. Hence the isinstance first.
+            if not isinstance(issue, dict):
                 bad += 1
+                continue
+            nodes, readable = _blocker_nodes(issue)
+            if not readable:
+                bad += 1
+                continue
+            open_blockers = []
+            for node in nodes:
+                # A node loop and not a generator expression: a generator aborts
+                # on the first raise, so one edge missing `number` used to cost
+                # the issue its OTHER blockers — including well-formed OPEN ones
+                # standing beside it, which is the reading that says "free".
+                if str(node.get("state", "")).upper() != "OPEN":
+                    continue
+                if node.get("number") is None:
+                    bad += 1
+                    continue
+                open_blockers.append(node["number"])
+            if open_blockers:
+                try:
+                    blocked[issue["number"]] = sorted(open_blockers)
+                except (KeyError, TypeError, ValueError):
+                    bad += 1
         error = truncated(issues, ISSUE_LIMIT, "open issues")
         if bad:
             error = f"{bad} issue record(s) in a shape this cannot read" + (
@@ -369,7 +507,7 @@ def fetch_prs(repo: str = REPO) -> tuple[list[dict], str | None]:
     try:
         raw = subprocess.run(
             ["gh", "pr", "list", "--repo", repo, "--state", "open",
-             "--limit", str(PR_LIMIT), "--json", fields],
+             "--limit", str(PR_LIMIT + 1), "--json", fields],
             capture_output=True, text=True, timeout=45,
         )
         if raw.returncode != 0:
@@ -377,7 +515,9 @@ def fetch_prs(repo: str = REPO) -> tuple[list[dict], str | None]:
         prs = json.loads(raw.stdout)
         if not isinstance(prs, list):
             return [], f"gh returned {type(prs).__name__}, not a list of PRs"
-        return prs, truncated(prs, PR_LIMIT, "open PRs")
+        # The row past the cap is asked for to answer "is there more", never to
+        # be listed — a section headed with a count must not include it.
+        return prs[:PR_LIMIT], truncated(prs, PR_LIMIT, "open PRs")
     except Exception as exc:                      # noqa: BLE001
         return [], f"{type(exc).__name__}: {exc}"
 

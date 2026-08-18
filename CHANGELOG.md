@@ -24,19 +24,29 @@ with the reading left to do.
 `qb-next` (#135) is that join, printed once. Open PRs with what CI says and
 therefore what each is asking for; the free items in plan order, with the board's
 own pick for what is next marked as such; what is held, by whom, and how long the
-claim has left; what is blocked and on what. Every line carries its reason —
-`#44 free` is what the plan already told you, `#44 — rank 2, free, unblocked` is
-the line that saves the ten calls. `--repo` asks about another repo's plan,
-`--limit` trims the free list and says how many it left out, `--json` emits the
-joined data for a hook or another tool.
+claim has left; what is blocked and on what. Every line carries its reason.
+`#44 free` is what the plan already told you; the row it prints instead —
+`→ #44   <title>  rank 2, free, unblocked` — is what saves the ten calls.
+`--repo` asks about another repo's plan, `--limit` trims the free and uncertain
+lists and says how many it left out (`--limit 0` prints those counts and nothing
+else), `--json` emits the joined data for a hook or another tool.
 
 **A source that died must not read as "no work".** A section left empty because
 the board is unreachable looks exactly like a section left empty because there is
-nothing in it, so a failed source is named under the answer and the exit code
-separates the cases: 3 when part of the answer is missing, 1 for a configuration
-error, 2 from argparse for a usage error. The text prints either way, because
-somebody asking what to pick up is better served by the sections that did answer
-than by a stack trace.
+nothing in it, so a failed source is named under the answer, anything that source
+could have contradicted moves out of the free list into an UNCERTAIN section
+carrying the reason, and the exit code separates the cases: 3 when part of the
+answer is missing, 1 for a configuration error, 2 from argparse for a usage
+error, 4 when the command broke on the payload rather than on its configuration.
+The text prints either way, because somebody asking what to pick up is better
+served by the sections that did answer than by a stack trace.
+
+The same rule applies to the headings, which is the harder half. A count is a
+claim about the world, so `PLAN — 12 open, 0 held, 0 blocked` printed with
+`/claims` down asserts that nobody is on any of it off a source that did not
+answer; each count now reads `at least N` when the source that could have raised
+it is the missing one. A plan that could not be read at all says so where the
+counts would be, rather than falling through to "the plan has no open items".
 
 **Stdlib only, and no launcher**, which is v2.43's packaging lesson applied rather
 than an oversight. `qb-dash` needs `rich`, so it needs a bash script to find an

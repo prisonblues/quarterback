@@ -9,7 +9,8 @@ an untracked file (#135).
   qb-next              PRs, then the plan, then what is held and what is blocked
   qb-next --json       the same data, for a hook or another tool
   qb-next --repo R     a different repo's plan
-  qb-next --limit N    how many free items to print (0 prints the count alone)
+  qb-next --limit N    how many rows the free and uncertain lists print (0 prints
+                       the counts alone; both lists say how many they left out)
 
 STDLIB ONLY, AND NO LAUNCHER — unlike qb-dash, which needs `rich` and therefore a
 bash script to find an interpreter that has it. A one-shot answer printed to a
@@ -19,8 +20,11 @@ dependency here without also adding the launcher, because the failure mode is
 `qb next` dying on an import the day after a rebuild, which is exactly what the
 comment at the top of qb-dash exists to describe.
 
-Every line answers WHY, not just WHAT. "#44 free" is the thing you could already
-get by reading the plan; "#44 free — rank 2, nothing blocking it, nobody on it"
+Every line answers WHY, not just WHAT. "#44" is the thing you could already get by
+reading the plan; the row this prints —
+
+  → #44   teach the panel to re-review its own fix    rank 2, free, unblocked
+
 is the thing that saves the ten calls.
 
 EXIT CODES, because a hook reads them and two of them used to be the same number:
@@ -31,6 +35,10 @@ EXIT CODES, because a hook reads them and two of them used to be the same number
   3  a PARTIAL answer: some source could not be reached, the `!` lines say
      which, and anything that source could have contradicted is listed as
      uncertain rather than as free
+  4  this command broke — an unreadable payload or a defect in here, named on
+     stderr. Separate from 1 because they want opposite responses: 1 is "fix
+     your QUARTERBACK_BASE_URL" and 4 is "this tool cannot read what it was
+     handed", and a hook that retries the first should not retry the second.
 
 That 3 is the whole reason this file has an exit-code section. It used to be 2,
 which argparse had already spent on "you typed it wrong" — so a script could not
@@ -68,7 +76,37 @@ CI_REASON = {
 UNKNOWN_WHY = {
     "claims": "a claim taken outside the plan would not be visible",
     "github": "GitHub's blocked-by edges could not be read",
+    "plan": "the plan answered with an error, so what it did send may be partial",
+    "blockers": "this item's dependency list is in a shape this cannot read",
 }
+
+#: The longest run of digits an issue number may have. GitHub's largest issue
+#: number is nowhere near seven figures, and the cap is here for the other end:
+#: `int()` refuses a string of more than 4300 digits outright (CPython's
+#: integer-conversion limit), which would raise from inside the join.
+_MAX_ISSUE_DIGITS = 9
+
+
+def _issue_number(value: object) -> int | None:
+    """A positive decimal issue number written any of the ways one arrives.
+
+    One parse, used by `_issue_of`, by the claim-key join and by
+    `_blocker_label`, because the three disagreeing is how the same malformed
+    ref came to mean "issue 44" on one line and "no issue at all" on another.
+
+    `str.isdigit()` alone is not that parse. It is true for characters `int()`
+    rejects — `"²"` raises ValueError — and true for full-width digits, where
+    `int("４４")` quietly returns 44 and matches an issue nobody wrote. So the
+    text must be ASCII as well as digits, and short. Zero is refused because
+    GitHub has no issue 0, and a leading `#` is tolerated exactly once: a ref
+    may arrive already prefixed, but `##44` is not a spelling of anything.
+    """
+    text = plain(value)
+    if text.startswith("#"):
+        text = text[1:]
+    if not text or len(text) > _MAX_ISSUE_DIGITS or not (text.isascii() and text.isdigit()):
+        return None
+    return int(text) or None
 
 
 def _issue_of(item: dict) -> int | None:
@@ -77,16 +115,12 @@ def _issue_of(item: dict) -> int | None:
     `ref` is `{"kind": ..., "value": ...}` and nothing else. A bare number or a
     string where that object should be is a malformed item, and `.get` on one
     used to raise AttributeError from inside the join rather than read as "no
-    issue". The parse is strict for the same reason: `lstrip("#")` accepted
-    `##44` and `int()` accepted `-44`, neither of which is an issue number, and
-    both of which then quietly missed every lookup they were used for.
+    issue".
     """
     ref = item.get("ref")
     if not isinstance(ref, dict) or ref.get("kind") != "issue":
         return None
-    value = plain(ref.get("value"))
-    body = value[1:] if value.startswith("#") else value
-    return int(body) if body.isdigit() else None
+    return _issue_number(ref.get("value"))
 
 
 def _live(claim: dict) -> bool:
@@ -99,12 +133,19 @@ def _live(claim: dict) -> bool:
     because `--repo` can be pointed at any board, including one older than that
     contract. An expiry that will not parse counts as live: unreadable is not
     evidence of gone.
+
+    `released` and `lapsed` are read here too. `fetch_board` filters both off
+    the `/claims` rows, but a claim attached to a plan ITEM never went past that
+    filter — so a released-but-unexpired claim on an item read as live, which
+    hides work that is genuinely available.
     """
+    if claim.get("released") or claim.get("lapsed"):
+        return False
     left = minutes_left(claim.get("expires"))
     return left is None or left >= 0
 
 
-def _blocker_label(blocker: object, repo: str) -> str:
+def _blocker_label(blocker: object, repo_key: str) -> str:
     """How one plan dependency is written on a BLOCKED line.
 
     `/plan` sends each blocker as `{"item_id", "title", "ref", "repo"}`, where
@@ -114,21 +155,32 @@ def _blocker_label(blocker: object, repo: str) -> str:
     structured ref, and `##44` for one that arrived already prefixed. The last
     also defeated the dedup below, since GitHub's edges format as `#44` and the
     two would not compare equal. So both sources go through one function.
+
+    A blocker that is a bare number rather than an object goes through
+    `_issue_number` as well, and for the same dedup: `44` printed unprefixed sat
+    next to GitHub's `#44` on the line as a second, imaginary dependency.
+
+    `repo_key` is already `plain(repo).lower()` — the caller normalises it once
+    for the claim-key join, and normalising it again per blocker was a second
+    place for the two spellings to drift apart.
     """
     if not isinstance(blocker, dict):
-        return plain(blocker) or "?"
+        number = _issue_number(blocker)
+        return f"#{number}" if number is not None else (plain(blocker) or "?")
     ref = blocker.get("ref")
     if isinstance(ref, dict):
         ref = ref.get("value")
-    number = plain(ref).lstrip("#").strip()
-    if not number:
+    number = _issue_number(ref)
+    if number is None:
         # The board names a ref-less blocker by its title in its own claim note,
-        # for the same reason: a title is all such an item has.
-        return clip(blocker.get("title"), 40) or "an item with no ref"
+        # for the same reason: a title is all such an item has. A ref that is
+        # present but is not an issue number lands here too rather than being
+        # half-normalised into something that looks like one.
+        return clip(blocker.get("title"), 40) or clip(ref, 40) or "an item with no ref"
     where = plain(blocker.get("repo"))
     # A fleet-wide plan item has no repo, and this repo's own is not worth the
     # twelve columns. Another repo's is the whole point of naming it.
-    elsewhere = bool(where) and where.lower() != plain(repo).lower()
+    elsewhere = bool(where) and where.lower() != repo_key
     return f"{where}#{number}" if elsewhere else f"#{number}"
 
 
@@ -146,22 +198,31 @@ def _settled(future, fallback):
         return fallback(f"{type(exc).__name__}: {exc}")
 
 
-def collect(repo: str) -> dict:
+def collect(repo: str, client=None) -> dict:
     """Everything the three sources know, joined.
 
-    The four fetches never raise: a dead source is a value they return. The
-    `board_client()` above them can — resolving the config reads a file and runs
-    the user's token command — and "no board configured" is a sentence for a
-    person rather than a section of a report, which is why `main` catches it and
-    this does not.
+    The four fetches never raise: a dead source is a value they return. Building
+    the client can — resolving the config reads a file and runs the user's token
+    command — and "no board configured" is a sentence for a person rather than a
+    section of a report. `main` therefore resolves it FIRST, outside this, so
+    that failure is reported as itself; the default here is for a caller that
+    has no client of its own.
 
     They run CONCURRENTLY. Two HTTP GETs and two `gh` subprocesses, each of the
     latter with a 45-second timeout, ran in series: a degraded GitHub could hold
     a perfectly good board answer for a minute and a half, from the command whose
-    pitch is that it replaces ten tool calls with one fast one. They share no
-    state and none needs another's result.
+    pitch is that it replaces ten tool calls with one fast one.
+
+    None needs another's result, and the state they do share is safe to share:
+    `fetch_board` and `fetch_plan` are handed the SAME `BoardClient`. That is
+    fine because the client holds one immutable `BoardConfig` and nothing else —
+    no cached token, no reused opener, no connection pool. Every call builds its
+    own `Request` and its own SSL context, and `resolve_config()` (which runs a
+    subprocess for the token) has already happened above, on this thread. Add a
+    cache to `BoardClient` and this comment becomes wrong before the code does.
     """
-    client, _cfg = board_client()
+    if client is None:
+        client, _cfg = board_client()
     # A repo is case-insensitive on GitHub but a claim key is a string. `--repo
     # PrisonBlues/Quarterback` queried the plan and GitHub happily and then
     # matched no claim keyed `prisonblues/quarterback#N` — held work offered as
@@ -182,10 +243,24 @@ def collect(repo: str) -> dict:
         blocked, blocked_error = _settled(futures["github"], lambda e: ({}, e))
 
     board_error, plan_error = board.get("error"), plan.get("error")
-    if plan.get("truncated"):
+    # A capped plan page and a plan that answered with an error are DIFFERENT
+    # partial answers and are kept apart deliberately. A cap means there are
+    # items this never saw, so the header below counts "at least" — but the
+    # items it DID see are whole, dependencies and all, so nothing about them is
+    # unverifiable. An error alongside a payload means the payload itself is
+    # suspect, which is what marks each item uncertain further down.
+    plan_capped = bool(plan.get("truncated"))
+    # The board's OWN error, read before the truncation note is folded into it
+    # below — the two must not become one string here, because only the first of
+    # them makes an item's classification unverifiable.
+    plan_refused = bool(plan.get("error"))
+    if plan_capped:
         # The endpoint says so itself rather than leaving it to be worked out by
         # comparing lengths; passing it on keeps that true one hop further.
-        plan_error = "; ".join(filter(None, [plan_error, "the plan is longer than one page"]))
+        # `plain` because `error` is a remote field: a structured value there
+        # made `join` raise TypeError with all four answers already in hand.
+        capped = "the plan is longer than one page"
+        plan_error = f"{plain(plan_error)}; {capped}" if plan_error else capped
 
     # Claim keys are `<owner>/<repo>#<number>`. Matched on the WHOLE repo rather
     # than the trailing number: #163 exists in every repo the fleet touches, and
@@ -195,8 +270,9 @@ def collect(repo: str) -> dict:
         if not isinstance(claim, dict):
             continue
         claim_repo, hashed, number = plain(claim.get("key")).rpartition("#")
-        if hashed and claim_repo.lower() == repo_key and number.isdigit() and _live(claim):
-            held.setdefault(int(number), claim)
+        issue_number = _issue_number(number) if hashed else None
+        if issue_number is not None and claim_repo.lower() == repo_key and _live(claim):
+            held.setdefault(issue_number, claim)
 
     items = []
     for item in plan.get("items") or []:
@@ -210,6 +286,12 @@ def collect(repo: str) -> dict:
         claim = own if isinstance(own, dict) and _live(own) else None
         if claim is None and issue is not None:
             claim = held.get(issue)
+        # A dependency list that is not a list is not an empty one. Iterating a
+        # dict here walked its KEYS and printed `item_id` as a phantom blocker;
+        # skipping it silently would be the other half of that mistake, so the
+        # item is marked unverifiable instead.
+        raw_blockers = item.get("blocked_by")
+        blockers = raw_blockers if isinstance(raw_blockers, list) else []
         # WHICH source could have contradicted this item, and did not answer.
         # Without this the join classified an item off an empty map as free and
         # unblocked and left the `!` line at the bottom to be noticed — so the
@@ -219,6 +301,10 @@ def collect(repo: str) -> dict:
             unknown.append("claims")
         if blocked_error and issue is not None:
             unknown.append("github")
+        if plan_refused:
+            unknown.append("plan")
+        if raw_blockers is not None and not isinstance(raw_blockers, list):
+            unknown.append("blockers")
         items.append({
             "rank": item.get("rank"),
             "title": item.get("title", ""),
@@ -227,8 +313,7 @@ def collect(repo: str) -> dict:
             "claim": claim,
             # The board decides blocked-ness for plan dependencies; GitHub's
             # graph covers the issues the plan does not model. Either is enough.
-            "blocked_by_plan": [_blocker_label(b, repo_key)
-                                for b in item.get("blocked_by") or []],
+            "blocked_by_plan": [_blocker_label(b, repo_key) for b in blockers],
             "blocked_by_github": blocked.get(issue, []) if issue is not None else [],
             "unknown": unknown,
         })
@@ -239,6 +324,11 @@ def collect(repo: str) -> dict:
         "items": items,
         "prs": prs,
         "counts": plan.get("counts", {}),
+        # Whether the plan source answered at all, and whether what it sent was
+        # the whole list. `render` needs both to know which of its headings it
+        # is entitled to state as fact.
+        "plan_answered": not (plan_error and not items),
+        "plan_capped": plan_capped,
         "errors": {k: v for k, v in {
             "board": board_error, "plan": plan_error,
             "prs": pr_error, "github": blocked_error,
@@ -246,29 +336,51 @@ def collect(repo: str) -> dict:
     }
 
 
-def _pr_lines(prs: list[dict]) -> list[str]:
+def _pr_rows(prs: object) -> list[tuple[dict, int | None]]:
+    """The PRs worth printing, in number order, each with its parsed number.
+
+    Sorted on a PARSED number rather than on `p.get("number", 0)`. That default
+    fires only for an absent key, so an explicit `{"number": null}` — or a
+    number sent as a string — put None or a str into the sort and raised
+    TypeError from `render`, which runs outside `main`'s guard: a bare traceback
+    in place of the whole answer, over one PR record. Anything without a
+    readable number sorts last rather than sorting as zero.
+    """
+    rows = [(p, _issue_number(p.get("number")))
+            for p in (prs if isinstance(prs, list) else []) if isinstance(p, dict)]
+    rows.sort(key=lambda row: (row[1] is None, row[1] or 0))
+    return rows
+
+
+def _pr_lines(prs: object) -> list[str]:
     out = []
-    for pr in sorted((p for p in prs if isinstance(p, dict)), key=lambda p: p.get("number", 0)):
+    for pr, number in _pr_rows(prs):
         glyph, _colour = ci_state(pr)
         state, why = CI_REASON.get(glyph, UNMODELLED_CI)
         if pr.get("isDraft"):
             # Draft wins over the check state deliberately: whether a draft's
             # checks are green is not the question anybody is asking of it.
             state, why = "draft", "marked draft, so not asking to land"
-        ref = f"#{plain(pr.get('number')) or '?'}"
-        out.append(f"  {glyph} {ref:<6} {clip(pr.get('title'), 58):<58}  "
+        out.append(f"  {glyph} {_number_ref(number):<6} {clip(pr.get('title'), 58):<58}  "
                    f"{state} — {why}")
     return out
 
 
-def _ref(item: dict) -> str:
-    """`#44`, or an em dash for a plan item that points at no issue.
+def _number_ref(number: int | None) -> str:
+    """`#44`, or an em dash when there is no readable number.
 
-    `is not None` rather than truthiness: the question is whether the item has a
-    number, and `if issue` also answers "no" for zero. GitHub has no issue 0 so
-    nothing breaks today, but the guard should say what it means.
+    One spelling for "no reference", because a PR row printed `#?` while a plan
+    row printed `—` for the same condition.
+
+    `is not None` rather than truthiness: the question is whether there IS a
+    number, and `if number` also answers "no" for zero.
     """
-    return f"#{item['issue']}" if item["issue"] is not None else "—"
+    return f"#{number}" if number is not None else "—"
+
+
+def _ref(item: dict) -> str:
+    """`#44`, or an em dash for a plan item that points at no issue."""
+    return _number_ref(item["issue"])
 
 
 def _is_free(item: dict) -> bool:
@@ -277,8 +389,13 @@ def _is_free(item: dict) -> bool:
     The third clause is the one that took a defect to write down. An item off a
     failed claims fetch has no claim on it in the same way an unclaimed item
     does, and only one of those is safe to hand somebody.
+
+    `claim is not None` and not `item["claim"]`. An empty `{}` where a claim
+    record should be is falsy, so a malformed-but-PRESENT claim read as no claim
+    at all and the item went into the free list — the one direction this command
+    must never get wrong. A claim it cannot read is still a claim.
     """
-    return not (item["claim"] or item["blocked_by_plan"]
+    return not (item["claim"] is not None or item["blocked_by_plan"]
                 or item["blocked_by_github"] or item["unknown"])
 
 
@@ -296,28 +413,51 @@ def _free_lines(items: list[dict], limit: int) -> list[str]:
     out = []
     for item in shown:
         ref = _ref(item)
+        # `rank` is remote text like every other field on this line. It was the
+        # one interpolated raw, so a rank carrying a newline or an ESC could
+        # forge a section header from inside the free list — the very thing
+        # `plain` exists in one place to stop.
         out.append(f"  → {ref:<6} {clip(item['title'], 58):<58}  "
-                   f"rank {item['rank']}, free, unblocked")
+                   f"rank {clip(item['rank'], 12) or '?'}, free, unblocked")
     if len(free) > len(shown):
         out.append(f"  … and {len(free) - len(shown)} more free — "
                    "raise --limit to see them")
     return out
 
 
-def _uncertain_lines(items: list[dict]) -> list[str]:
-    """Items that would be offered as free if every source had answered."""
+def _uncertain(items: list[dict]) -> list[dict]:
+    """The items nothing can vouch for — one definition, used by the header too.
+
+    The section's count and the section's rows were computed from two copies of
+    this filter, which is one of them going stale.
+    """
+    return [item for item in items
+            if item["claim"] is None and not item["blocked_by_plan"]
+            and not item["blocked_by_github"] and item["unknown"]]
+
+
+def _uncertain_lines(items: list[dict], limit: int) -> list[str]:
+    """Items that would be offered as free if every source had answered.
+
+    Capped by the same `--limit` as the free list, and for the same reason. This
+    section had no cap at all, so `--limit 0` still printed a row per item and a
+    large plan meeting a claims outage made the HEDGE the longest thing on
+    screen — a flag documented as "how many rows to print" that one section
+    ignored. The count in the header is the total either way.
+    """
+    unsure = _uncertain(items)
+    shown = unsure[:max(limit, 0)]
     out = []
-    for item in items:
-        if item["claim"] or item["blocked_by_plan"] or item["blocked_by_github"]:
-            continue
-        if not item["unknown"]:
-            continue
+    for item in shown:
         why = "; ".join(UNKNOWN_WHY.get(s, s) for s in item["unknown"])
         out.append(f"  ? {_ref(item):<6} {clip(item['title'], 58):<58}  {why}")
+    if len(unsure) > len(shown):
+        out.append(f"  … and {len(unsure) - len(shown)} more uncertain — "
+                   "raise --limit to see them")
     return out
 
 
-def _next_line(nxt: object) -> str:
+def _next_line(nxt: object, answered: bool) -> str:
     """The board's own answer, printed above the list this command recomputes.
 
     `/plan` computes `next` from the dependencies IT holds. The list below adds
@@ -325,45 +465,86 @@ def _next_line(nxt: object) -> str:
     can differ — and when they do, the board's is the one another agent asking
     `plan_read` has already been given. Printing only the recomputed list would
     hide that disagreement; printing only `next` would hide the reasons under it.
+
+    `answered` is the difference between "the board says nothing is next" and
+    "the board did not say". Both used to print the first, so a dead plan source
+    produced a confident "no open item is both free and unblocked" sitting above
+    the `!` line that said the plan had never been read.
     """
+    if not answered:
+        return "  the board's next: unknown — the plan could not be read"
     if not isinstance(nxt, dict):
         return "  the board's next: nothing — no open item is both free and unblocked"
-    issue = _issue_of(nxt)
-    ref = f"#{issue}" if issue is not None else "—"
-    return f"  the board's next: {ref} {clip(nxt.get('title'), 58)}"
+    return f"  the board's next: {_number_ref(_issue_of(nxt))} {clip(nxt.get('title'), 58)}"
+
+
+def _at_least(count: int, floor_only: bool) -> str:
+    """`3`, or `at least 3` when a source that could have raised it is missing.
+
+    The header used to state every count as fact. With `/claims` down that made
+    it print "12 open, 0 held, 0 blocked" directly above an UNCERTAIN section
+    saying nothing was confirmed free — a positive assertion that nobody is on
+    any of it, in the one direction this command must never be wrong in.
+    """
+    return f"at least {count}" if floor_only else str(count)
 
 
 def render(data: dict, limit: int) -> str:
     lines = [f"NEXT — {plain(data['repo'])}", ""]
 
+    # Counted from the rows that will actually print, not from `len(data["prs"])`
+    # — the raw list can carry records `_pr_lines` drops, and a header that
+    # counts what the section does not show is the disagreement below.
     prs = _pr_lines(data["prs"])
-    lines += [f"OPEN PRS ({len(data['prs'])})"] + (prs or ["  none"]) + [""]
+    lines += [f"OPEN PRS ({len(prs)})"] + (prs or ["  none"]) + [""]
 
-    held = [i for i in data["items"] if i["claim"]]
+    items = data["items"]
+    # `is not None`, not truthiness: an empty `{}` claim record is falsy, and
+    # reading it as "no claim" dropped a held item into the free list.
+    held = [i for i in items if i["claim"] is not None]
     # Every item with a blocker, whether or not somebody also holds it. Filtering
     # the held ones out here made the header's word "blocked" quietly mean
     # "blocked and unheld", so a plan reading "1 held, 0 blocked" could have a
     # live dependency in it. An item in both sections is in both states.
-    waiting = [i for i in data["items"] if i["blocked_by_plan"] or i["blocked_by_github"]]
+    waiting = [i for i in items if i["blocked_by_plan"] or i["blocked_by_github"]]
 
-    free = _free_lines(data["items"], limit)
-    unsure = _uncertain_lines(data["items"])
+    free = _free_lines(items, limit)
+    unsure = _uncertain_lines(items, limit)
+    unsure_total = len(_uncertain(items))
+    answered = data.get("plan_answered", True)
     # Counted from the joined view, NOT from the plan's own `counts`. The board
     # can only count the dependencies it holds, so its `blocked` is smaller than
     # what is printed below the moment GitHub's graph contributes an edge — and a
     # header disagreeing with the section under it is worse than no header.
-    header = (f"PLAN — {len(data['items'])} open, "
-              f"{len(held)} held, {len(waiting)} blocked")
-    if not data["items"]:
-        empty = "  the plan has no open items"
-    elif unsure:
-        empty = "  nothing is confirmed free — see UNCERTAIN below"
+    #
+    # Each count is a FLOOR rather than a total whenever the source that could
+    # have raised it did not answer: a capped plan page hides open items, a dead
+    # /claims hides holders, a dead blocked-by read hides dependencies.
+    if not answered:
+        header = "PLAN — could not be read"
+        empty = "  the plan could not be read — the ! line below says why"
     else:
-        empty = "  nothing free — everything open is held or blocked"
-    lines += [header, _next_line(data.get("next"))] + (free or [empty]) + [""]
+        # A plan that answered with an error beside its payload undermines all
+        # three counts at once, because what it sent may be a subset of what it
+        # holds; a capped page costs only the open count; a dead /claims or a
+        # dead blocked-by read costs one each.
+        unsure_plan = any("plan" in i["unknown"] for i in items)
+        open_count = _at_least(len(items), data.get("plan_capped", False) or unsure_plan)
+        held_count = _at_least(len(held),
+                               unsure_plan or any("claims" in i["unknown"] for i in items))
+        blocked_count = _at_least(len(waiting),
+                                  unsure_plan or any("github" in i["unknown"] for i in items))
+        header = f"PLAN — {open_count} open, {held_count} held, {blocked_count} blocked"
+        if not items:
+            empty = "  the plan has no open items"
+        elif unsure_total:
+            empty = "  nothing is confirmed free — see UNCERTAIN below"
+        else:
+            empty = "  nothing free — everything open is held or blocked"
+    lines += [header, _next_line(data.get("next"), answered)] + (free or [empty]) + [""]
 
-    if unsure:
-        lines.append(f"UNCERTAIN ({len(unsure)}) — free as far as the sources that answered")
+    if unsure_total:
+        lines.append(f"UNCERTAIN ({unsure_total}) — free as far as the sources that answered")
         lines += [*unsure, ""]
 
     if held:
@@ -379,9 +560,11 @@ def render(data: dict, limit: int) -> str:
     if waiting:
         lines.append(f"BLOCKED ({len(waiting)})")
         for item in waiting:
-            on = [f"#{b}" for b in item["blocked_by_github"]]
+            # `plain` on GitHub's numbers too: they come out of `gh`'s JSON and
+            # are ints today, but the value is remote either way.
+            on = [f"#{plain(b)}" for b in item["blocked_by_github"]]
             on += [b for b in item["blocked_by_plan"] if b not in on]
-            also = " (and held)" if item["claim"] else ""
+            also = " (and held)" if item["claim"] is not None else ""
             lines.append(f"  {_ref(item):<6} waits on {', '.join(on)}{also}")
         lines.append("")
 
@@ -411,20 +594,41 @@ def main() -> int:
     parser.add_argument("--repo", default=REPO, help=f"which repo's plan (default {REPO})")
     parser.add_argument("--json", action="store_true", help="emit the joined data instead")
     parser.add_argument("--limit", type=_nonnegative, default=5,
-                        help="free items to show, 0 for the count alone (default 5)")
+                        help="rows the free and uncertain lists show, "
+                             "0 for the counts alone (default 5)")
     args = parser.parse_args()
 
+    # Resolving the config is its OWN failure, and the only one that means "no
+    # board configured". Doing it inside `collect` put it behind the same broad
+    # except as a schema drift and a defect in here, so a hook reading the exit
+    # code could not tell "fix your QUARTERBACK_BASE_URL" from "this tool broke
+    # on the data it was handed" — two problems wanting opposite responses.
     try:
-        data = collect(args.repo)
+        client, _cfg = board_client()
     except Exception as exc:                      # noqa: BLE001 — a config error is a message
         print(f"qb-next: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
 
-    if args.json:
-        json.dump(data, sys.stdout, indent=2, default=str)
-        sys.stdout.write("\n")
-    else:
-        sys.stdout.write(render(data, args.limit))
+    # `render` and the JSON emit are INSIDE this, not after it. They were
+    # outside, so a formatting defect — a sort key meeting a value it could not
+    # order was the live one — printed a bare traceback in place of the one-line
+    # message the exit codes above promise, and lost every section with it.
+    try:
+        data = collect(args.repo, client)
+        if args.json:
+            json.dump(data, sys.stdout, indent=2, default=str)
+            sys.stdout.write("\n")
+        else:
+            sys.stdout.write(render(data, args.limit))
+    except BrokenPipeError:
+        # `qb-next | head -20` closes the pipe part-way through the write.
+        # Nothing went wrong with the answer, so this is not one of the failures
+        # above — and the reader asked for the truncation.
+        return 0
+    except Exception as exc:                      # noqa: BLE001 — name it, don't traceback
+        print(f"qb-next: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 4
+
     # A dead source is worth a non-zero exit for a script, but never an empty
     # answer for a person — the text above has already said what is missing. 3
     # rather than 2 because argparse owns 2, and "the board is down" and "you
