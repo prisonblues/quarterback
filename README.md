@@ -67,7 +67,11 @@ GET   /stream            (SSE; ?since=<id> to replay backlog then go live)
 PUT   /blob/{sha}        (body = bytes; sha256 verified)  -> {sha, size, created}
 GET   /blob/{sha}                                          -> bytes | 404
 POST  /lease             { session, device, ttl=300, cwd?, repo?, branch?, title?, recap?,
-                           model? }                     -> {lease_id, expires, renewed}
+                           model?, state? }             -> {lease_id, expires, renewed}
+                         (state = working|waiting|input — what the holder is DOING.
+                          Returned by /active and /overlap with a `state_at`, and the
+                          two are read together: `stalled` is what a reader concludes
+                          from an old `working`, never something a holder reports.)
 POST  /lease/renew       { lease_id }
 POST  /lease/release     { lease_id }
 POST  /handoff           { session, blob, cwd?, title?, recap?, model? }

@@ -172,11 +172,37 @@ Set QB_SEATS_BOARD to run something else in this pane."
 # distinguishable from any other; and a click on the topmost border row — where
 # seat 1's title is drawn — is not delivered at all. Measured on tmux 3.6a; the
 # same note is in qb-seat-click, which is where anyone chasing this will look.
+# A seat cell is coloured by what the agent in it is DOING, not merely by whether
+# a pane is there. `@qb_state` is set on the pane by the lifecycle hook (nix-fleet's
+# home/bin/qb-hook, which knows the transitions and is the only thing that does);
+# an unset option is the ordinary case — a pane with no agent, or a fleet whose
+# hook predates this — and falls through to the colour the bar always had.
+#
+# Only the two states that WANT something get their own colour. `working` is most
+# panes most of the time and colouring it would make the row uniformly loud again,
+# which is the opposite of what a glance needs.
+#
+# `stalled` is not here, and cannot be: it is a conclusion drawn from how OLD a
+# state is, tmux has no clock arithmetic worth doing this in, and the two readers
+# that can do it — the dashboard and the pane's own footer — both already say it.
+#
+# Each arm is a whole literal style string rather than a format substituted INTO
+# one (`#[fg=#{@qb_state}]`-style): style parsing and format expansion are
+# different passes in tmux and the nested spelling is the one that survives both.
+seat_state_style() {   # <active|idle>
+  local on="$1"
+  if [ "$on" = active ]; then
+    printf '%s' '#{?#{==:#{@qb_state},waiting},#[fg=black]#[bg=colour214],#{?#{==:#{@qb_state},input},#[fg=black]#[bg=colour176],#[fg=black]#[bg=colour109]}}'
+  else
+    printf '%s' '#{?#{==:#{@qb_state},waiting},#[fg=colour214],#{?#{==:#{@qb_state},input},#[fg=colour176],#[fg=colour109]}}'
+  fi
+}
+
 seat_bar() {
   printf '%s' \
 '#[align=left]'\
 '#{P:#{?@qb_seat,'\
-'#[range=user|seat#{@qb_seat}]#{?pane_active,#[fg=black]#[bg=colour109],#[fg=colour109]}'\
+'#[range=user|seat#{@qb_seat}]'"#{?pane_active,$(seat_state_style active),$(seat_state_style idle)}"\
 ' seat #{@qb_seat} #[default]#[norange]'\
 '#[range=user|kill#{@qb_seat}]#[fg=colour167] ✕ #[default]#[norange] '\
 ',}}'\
