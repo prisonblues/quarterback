@@ -72,6 +72,109 @@ independent, and on a repo that leaves it off the signal would stay dead. The
 state is a flag rather than a deletion precisely so that half can flip it: a seat
 that could have read the tree and still could not answer is describing the round,
 and has to cost it.
+## v2.49 — the guard that could not fire
+
+`create-worktree`'s isolated-database step reads the main database name out of the
+worktree's `.env`, and there is a `die` under that read whose whole job is to explain
+the case where it finds nothing. That `die` was unreachable by the one input it
+existed for.
+
+The script runs under `set -euo pipefail`. `MAIN_DB_NAME` was only ever assigned
+*inside* the branches above the guard, so when `database.url_env` was declared but
+absent from `.env`, nothing assigned it and the first reader was the guard's own
+`[[ -z "$MAIN_DB_NAME" ]]` — an unset dereference. The run died on
+`MAIN_DB_NAME: unbound variable` at precisely the instruction written to say
+"Could not determine main database name from .env". One line (`MAIN_DB_NAME=""`
+before the branches) makes the message reachable.
+
+Measured on this repo, twice, because the first time looked like a fluke:
+quarterback's `.env` carries `POSTGRES_PASSWORD` and nothing else.
+
+**The two config keys now cascade instead of excluding each other.**
+`database.url_env` and `database.name_env` name two places the same fact can live,
+and the old `if/else` meant declaring the first *disabled* the second. A repo that
+assembles its URL at runtime, or keeps the database name in `docker-compose.yml`
+while only the password reaches `.env`, could therefore never use an isolated
+database — and got an unbound-variable crash rather than a reason. URL still wins
+where both are set: it is what the application actually connects with.
+
+**And the failure no longer leaves an unusable worktree without saying so.** The
+database step is 3 of 10, so dying there left a directory that is a real checkout on
+a real branch with none of what follows: no `.venv` symlink, no assigned port, no
+`CLAUDE.local.md`, no `.gitignore` entry. It looks provisioned enough to `cd` into
+and then fails later in ways that have nothing to do with the database. `die_half_built`
+says the worktree is incomplete and gives the two commands out. It does not clean up
+automatically — by then the directory is a checkout the caller may be looking at,
+`remove-worktree` also drops the branch, and an error path that deletes things is a
+bad thing to have on a hair trigger; the rest of this script degrades the same way,
+by leaving the state and naming it.
+
+The hint passes `$BRANCH_NAME`, not the directory. `remove-worktree` takes a branch
+and derives the path itself, so pasting the basename the sentence above it names —
+the first thing anyone reaches for — fails with a confusing "no such worktree". The
+first version of the warning got exactly that wrong, and a test now pins it.
+
+**Every pasteable hint is now shell-quoted, including three that predate this
+change.** Git's refname rules forbid far less than a shell's parser does — `$`,
+backtick, `;`, `>`, `&`, `|`, `(` and `'` are all legal in a branch name, and nothing
+validates them — so `remove-worktree feat$(id)` was a hint that ran `id` on the
+reader's machine when pasted, and `feat>out` truncated a file. Nothing was executed
+by the script itself; a variable's value is never re-parsed inside double quotes. The
+hazard was entirely in what we printed for a human to copy. `printf %q` leaves an
+ordinary `feat/thing` untouched so the common case stays readable, and escapes the
+rest. Applied at all four sites, one of which writes into `CLAUDE.local.md` and so
+outlives the run that printed it. Found by a second model reviewing the diff.
+
+Tests extract the block from the shipping script by sentinel marker rather than
+copying it, the way `test_create_worktree_rerere.py` does, so a refactor that moves
+the code fails there instead of leaving the suite green about code nobody runs.
+Reverting the block to its previous shape reproduces `MAIN_DB_NAME: unbound variable`
+and fails three of them; neutering `sh_quote` fails the paste-safety one.
+
+## v2.48 — a lease says what its holder is doing, not just where
+
+A lease has always answered *who* is on a session and *where* — holder, cwd,
+repo, branch, and the ai-title of what they are up to. It never answered whether
+they were moving, and for a wall of seats that is the whole question: a pane that
+finished ten minutes ago, a pane stopped at a permission prompt, and a pane
+thinking hard render identically to anyone looking at them. The screen the last
+two releases built shows N agents and cannot say which one wants you.
+
+`POST /lease` now takes `state` — `working | waiting | input` — and `/active` and
+`/overlap` return it. The vocabulary is closed at the edge (a Literal, so an
+unknown value is a 422 rather than a row) because it is rendered as a word in a
+footer and a colour in a dashboard, and there is no reader that can do anything
+with a fourth spelling.
+
+**`state_at` is not `updated_at`, and the field is useless without it.** A state
+is only as good as its age: `working` last reported twenty minutes ago describes
+a pane that looks busy and has not moved, which is the failure this exists to
+catch — the one v2.46 named when it took the permission prompts away ("a prompt
+no one answers is an outage that looks like progress"). Removing the prompt
+removed the version of that a human could see, not the shape. Neither timestamp
+already on the row can stand in: `acquired_at` is fixed at first claim and
+`expires_at` moves on every heartbeat whether or not anything changed. So the
+pair travels together and each reader picks its own staleness threshold.
+
+**`stalled` is not a value anybody can report.** It is a conclusion drawn from a
+state and its age, and a holder cannot know it is in it — that is precisely the
+state where the holder has stopped talking. Two readers draw it today (the
+dashboards here, via `qbdata.agent_state`, and the pane's own footer in
+nix-fleet), and they share a threshold constant rather than a definition, because
+the same seat described differently by the bar and the dashboard is worse than
+either threshold being wrong.
+
+**Nothing infers it.** "The agent finished its turn" is a fact only the lifecycle
+hook is told; guessing it from lease traffic reads a slow turn as a finished one.
+The hook sends it on the events it already leases for, so the field costs no new
+request — and a heartbeat that knows no state leaves the last report, and its age,
+alone.
+
+Also here: both dashboards grow a `state` column, and a seat cell on the tmux bar
+takes its colour from `@qb_state` on the pane — set by the hook, unset on a fleet
+whose hook predates this, which falls through to the colour the bar always had.
+Only `waiting` and `input` get a colour of their own; `working` is most panes most
+of the time and colouring it would make the row uniformly loud again.
 
 ## v2.47 — the dashboard grows hands, and its tests start running
 

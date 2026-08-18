@@ -132,6 +132,45 @@ def minutes_left(stamp: str | None) -> int | None:
     return int((then - datetime.now(timezone.utc)).total_seconds() // 60)
 
 
+#: How long a `working` may stand before a reader calls it stalled. Tool calls
+#: refresh it, so the gap this has to clear is the longest a session legitimately
+#: goes without one — a long think, a slow build, a big edit in a single pass.
+#:
+#: It MUST agree with the same constant in the footer (nix-fleet's
+#: home/claude/scripts/statusline.sh, STALL_AFTER). Two readers of one beacon
+#: disagreeing about when it goes stale is worse than either threshold being
+#: wrong: the dashboard and the pane's own bar would describe the same seat
+#: differently, and there is no way to tell from the outside which one to believe.
+STALL_AFTER = 480
+
+
+def agent_state(agent: dict) -> tuple[str, str]:
+    """(word, style) for what a live agent is doing — '' when it never said.
+
+    The board stores what the holder reported; `stalled` is concluded HERE, from
+    the age of that report, and is the reason `state_at` travels with `state`.
+    A pane that said `working` and then went quiet is the failure this whole
+    field exists to surface: it looks identical to a busy one from the outside.
+
+    `waiting` and `input` do not go stale. A pane that has been waiting on a
+    human since lunch is still waiting on that human — ageing it into `stalled`
+    would hide the one state somebody is actually scanning for.
+    """
+    state = agent.get("state") or ""
+    if not state:
+        return "", "grey50"
+    if state == "working":
+        try:
+            then = datetime.fromisoformat((agent.get("state_at") or "").replace("Z", "+00:00"))
+        except ValueError:
+            return "working", "grey50"
+        if (datetime.now(timezone.utc) - then).total_seconds() >= STALL_AFTER:
+            return "stalled", "bold red"
+        return "working", "grey50"
+    return {"waiting": ("waiting", "bold yellow"),
+            "input": ("input", "bold magenta")}.get(state, (state, "grey50"))
+
+
 def short_key(key: str) -> str:
     """'prisonblues/quarterback:2.40' → 'quarterback:2.40'.
 
