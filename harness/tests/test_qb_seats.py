@@ -211,6 +211,21 @@ def test_qb_seat_knobs_reach_the_panes(screen):
     assert "QB_SEAT_AGENT=some-stand-in" in env
 
 
+def test_no_yolo_reaches_the_panes(screen):
+    """The flag is the env knob with the value supplied by the layout, so there
+    is one mechanism to test and nothing that can drift between the two."""
+    screen("--no-yolo", "-n", "1")
+    assert "QB_SEAT_YOLO=0" in screen.tmux("show-environment", "-t", "t").stdout
+
+
+def test_a_plain_screen_leaves_the_knob_unset(screen):
+    """Not "sets it to on" — an unset variable is how qb-seat is told the question
+    was not answered, and answering it here would be a second place for the
+    default to live and to drift from."""
+    screen("-n", "1")
+    assert "QB_SEAT_YOLO" not in screen.tmux("show-environment", "-t", "t").stdout
+
+
 def test_the_inherited_instance_is_stripped_from_the_session(screen):
     """Panes split off later must not pick one up either."""
     screen("-n", "1")

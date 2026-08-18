@@ -369,6 +369,7 @@ per-branch database), assign work, or drive the agent past starting it.
 | `QB_SEAT_BRIEF` | the built-in brief | Replaces it wholesale; empty means no brief at all |
 | `QB_SEAT_AGENT` | `claude` | The agent to start |
 | `QB_SEAT_FORCE` | unset | Start anyway when this seat number looks already taken. Truthy values only (`1`, `yes`, `true`, `on`) — `QB_SEAT_FORCE=0` leaves the guard on |
+| `QB_SEAT_YOLO` | **on** | Permission prompts. A seat starts with them off (`--dangerously-skip-permissions`) because nobody is watching the pane to answer one; `QB_SEAT_YOLO=0` (or any of `no`, `false`, `off`) gives them back. The flag is claude's spelling: point `QB_SEAT_AGENT` at a wrapper for anything else |
 | `QUARTERBACK_BASE_URL`, `QUARTERBACK_TOKEN` / `QUARTERBACK_TOKEN_CMD` | from the config file | The board to register the name with |
 | `QUARTERBACK_CONFIG` | `$XDG_CONFIG_HOME/quarterback/config`, else `~/.config/quarterback/config` | Where those three are read from when the environment does not supply them. Sourced in a subshell, and only those three are read back out of it, so nothing else the file sets can reach the seat or the agent |
 
@@ -391,6 +392,7 @@ qb-b 3                # three seats plus the board, in the current repo (the sho
 qb-seats              # the same, three by default
 qb-seats 10           # ten: five across, two down
 qb-seats --staged     # built, each seat waiting on Enter
+qb-seats --no-yolo    # seats that stop and ask, as agents normally do
 qb-seats --add        # add a seat to a running screen
 ssh box -t qb-seats   # reattach from anywhere
 ```
@@ -423,6 +425,21 @@ Two things to know before you run it:
   half of that guarantee is to strip any inherited value, from the session as well as the
   panes, so nothing split off later picks one up. Nothing in your shell profile should set
   it.
+
+**Seats start with permission prompts off, and that is the default on purpose.** A seat is
+a pane nobody is watching. The first tool call wanting a permission the agent does not
+already hold stops it dead, and it stops in the one way this design cannot recover from: the
+pane looks busy, the board shows a live agent holding a claim, and the work is not moving.
+There is no operator to answer the question — that is what a seat *is*. So each seat gets
+`--dangerously-skip-permissions`, and a screen you bring up works rather than waiting to be
+asked something.
+
+It is a real trade and it is made deliberately: it hands a full shell to N agents at once in
+a repo whose tests, hooks and scripts all run as you. What decides it is the blast radius
+either way — a seat that cannot act is useless to everybody, while a seat that can act is
+dangerous in a repo you already trusted enough to point a fleet at. Say `--no-yolo` for one
+screen, or export `QB_SEAT_YOLO=0` to have prompts back everywhere. The flag and the
+variable are the same mechanism, so they cannot drift.
 
 `qb-seats` deliberately does not create worktrees (a self-selecting seat does not know its
 branch until it has claimed), does not assign work, and does not drive the agents past

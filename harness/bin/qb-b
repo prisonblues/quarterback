@@ -3,6 +3,7 @@
 #
 #   qb-b            2 seats plus the tape, in the current repo
 #   qb-b -n 4       four seats
+#   qb-b --yolo     seats that do not stop to ask for permission
 #   qb-b --add      one more seat on a running screen
 #   qb-b --kill     tear it down
 #

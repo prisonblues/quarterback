@@ -3,6 +3,8 @@
 #
 # Usage: qb-seats [-n N] [-C DIR] [-s NAME]   bring up (or reattach to) a screen
 #        qb-seats --staged                    build it with each seat awaiting Enter
+#        qb-seats --no-yolo                   seats that stop and ask, as agents
+#                                             normally do
 #        qb-seats --add                       add one seat to a running screen
 #        qb-seats --kill                      tear the screen down
 #        qb-seats -h|--help                   this text
@@ -100,23 +102,32 @@ MAX_SEATS=10            # five across, two down — see the layout note below
 REPO=""                 # default: the git repo you ran this from
 SESSION=""              # default: seats-<repo basename>
 STAGED=0                # 1 = pane waits on Enter before starting its agent
+YOLO=""                 # "" = as it comes (on), 1 = force on, 0 = prompts back
 BOARD_SIZE="25%"        # board pane height, bottom of the window, full width
 ACTION="up"
 
 usage() {
   cat <<EOF
-usage: $PROG [N] [-C DIR] [-s NAME] [--staged] [--add] [--kill]
+usage: $PROG [N] [-C DIR] [-s NAME] [--staged] [--no-yolo] [--add] [--kill]
 
   N           number of seats, 1-$MAX_SEATS (default $SEATS); -n N also works
   -C DIR      repo the seats run in (default: the git root of \$PWD)
   -s NAME     tmux session name (default: seats-<repo basename>)
   --staged    build the screen with each seat waiting on Enter, so the layout
               can be eyeballed before N agents start claiming
+  --no-yolo   give the seats their permission prompts back. They start without
+              them, because a pane nobody is watching cannot answer one and a
+              seat waiting to be asked a question is a seat that has stopped.
+              QB_SEAT_YOLO=0 in your environment is the same thing said once
+  --yolo      the default, said out loud — useful only to override a
+              QB_SEAT_YOLO=0 you have exported
   --add       add one seat to an already-running screen and reflow
   --kill      kill the screen
 
 Environment:
   QB_SEATS_BOARD   command for the board pane, overriding the default
+  QB_SEAT_YOLO     0 to give the seats their permission prompts back (--no-yolo)
+  QB_SEAT_AGENT    the agent binary a seat runs, instead of \`claude\`
 EOF
 }
 
@@ -210,6 +221,8 @@ while [ $# -gt 0 ]; do
     -C) REPO=${2:-}; shift 2 ;;
     -s) SESSION=${2:-}; shift 2 ;;
     --staged) STAGED=1; shift ;;
+    --yolo) YOLO=1; shift ;;
+    --no-yolo) YOLO=0; shift ;;
     --add)  ACTION="add";  shift ;;
     --kill) ACTION="kill"; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -255,7 +268,14 @@ if [ "$ACTION" = add ]; then
   # pane-base-index says, and a config setting it to 1 — a common one — leaves
   # every `.0` target failing with "can't find pane: 0".
   first_seat=$(seat_panes | awk 'NR == 1 { print $1 }')
-  pane=$(tmux split-window -h -P -F '#{pane_id}' -t "$first_seat" -c "$REPO")
+  # A pane inherits the SESSION environment as it is created, so a seat added to
+  # a screen built with --no-yolo already has that and this adds nothing. Passing
+  # either flag to --add is the other case: -e scopes it to the pane being added
+  # rather than rewriting the session under the seats already working in it.
+  add_env=()
+  [ -n "$YOLO" ] && add_env=(-e "QB_SEAT_YOLO=$YOLO")
+  pane=$(tmux split-window -h -P -F '#{pane_id}' -t "$first_seat" -c "$REPO" \
+    ${add_env[@]+"${add_env[@]}"})
   tmux set-option -p -t "$pane" @qb_seat "$next"
   tmux select-layout -t "$pane" -E 2>/dev/null || true
   start_seat "$pane" "$next"
@@ -304,8 +324,16 @@ require_qb_seat
 # QB_SEAT_AGENT_ARGS got here — qb-seat takes agent arguments positionally, so no
 # such variable was ever read — and how this list said QB_SEAT_AGENT while qb-seat
 # said QB_SEAT_CLAUDE, which is board finding 3632.
+#
+# --yolo/--no-yolo are not a fourth mechanism, they are this one with the value
+# supplied here: the flags set the variable qb-seat already reads, so a flag and
+# an exported QB_SEAT_YOLO cannot diverge in behaviour and there is one thing to
+# test. Neither flag given leaves the variable alone entirely — an unset variable
+# is how qb-seat is told "not answered", and answering it here with a default of
+# our own would be a second place for the default to live and drift.
 seat_env=()
-for v in QB_SEAT_AGENT QB_SEAT_BRIEF QB_SEAT_FORCE; do
+[ -n "$YOLO" ] && QB_SEAT_YOLO="$YOLO"
+for v in QB_SEAT_AGENT QB_SEAT_BRIEF QB_SEAT_FORCE QB_SEAT_YOLO; do
   [ -n "${!v:-}" ] && seat_env+=(-e "$v=${!v}")
 done
 
