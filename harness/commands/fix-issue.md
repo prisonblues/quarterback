@@ -286,10 +286,24 @@ given them:
 - the patch you did not write (the special case you declined to add);
 - the `--ask` verdict, if you put the premise to the seats
   (`fails` / `holds` / `unresolved` / `unchallenged` / `not run`).
-  Drop step 3a's `--pr` when you run it here: that flag only links
-  the ask to a PR for the board to render, and an `--ask` with no
-  `--pr` is accepted — which is the only form available before one
-  exists.
+
+Step 3a's invocation with its `--pr` dropped — that flag only links
+the ask to a PR for the board to render, and there is no PR yet; an
+`--ask` carrying no `--pr` is accepted, and it is the only form
+available here:
+
+```bash
+premise=$(cat <<'PREMISE'
+<the premise, in one sentence>
+PREMISE
+)
+timeout 120 python3 ~/.claude/loops/panel.py --ask "$premise" \
+    --context "<the file:first-last the premise lives in>"
+```
+
+Keep the quoted heredoc — step 3a says why, and the short version is
+that a premise about code carries backticks and `$(…)`, which bash
+executes inside a double-quoted argument.
 
 After fixing, re-run the quality pipeline. Iterate until clean.
 

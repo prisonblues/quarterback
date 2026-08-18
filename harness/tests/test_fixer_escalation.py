@@ -51,6 +51,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 #: README and the app, and every path printed on the way out is a path a reader can type.
 REVIEW_PR = "harness/commands/review-pr.md"
 
+#: The author's own fix pass, and the one loop that runs before a PR exists — so the only
+#: place the premise check is shown without `--pr`. Named, like `REVIEW_PR`, because two
+#: things read it: the `FIX_LOOPS` entry below and the guard on that snippet.
+FIX_ISSUE = "harness/commands/fix-issue.md"
+
 #: The script step 3a tells the fixer to run, and the repo file this suite reads its flags out
 #: of. One file at two spellings: `~/.claude/loops` is the installed copy — here a nix store
 #: symlink, so it can be a generation behind the checkout and is not byte-identical to it. What
@@ -120,7 +125,7 @@ FIX_LOOPS = {
         behaviour_is="that the driver reads each relay before the epic→base PR and carries the "
                      "escalation into that PR's body, the merge already having happened",
     ),
-    "harness/commands/fix-issue.md": Loop(
+    FIX_ISSUE: Loop(
         why="runs its own fix pass over review findings, as the code's AUTHOR",
         behaviour=("change the approach", "the patch you did not write"),
         behaviour_is="that the author may take the redesign — the one path where that is its "
@@ -486,6 +491,83 @@ def test_the_premise_is_not_interpolated_into_a_shell_string(escalation: str):
     assert "not run" in normalised(escalation), (
         f"step {ESCALATION_STEP} bounds the ask without saying how a killed run is reported; "
         "'not run' is the verdict slot step 6 already has for it")
+
+
+def test_the_pr_less_premise_check_is_shown_and_is_still_a_valid_invocation():
+    """The same anchor outwards, from the one loop that runs before a PR exists.
+
+    `fix-issue.md` is the author's own fix pass: nothing is merged, no PR has been opened, and so
+    step 3a's invocation cannot be run as written — its `--pr` has nothing to name. That file used
+    to say so in prose and show no command, which asks a reader following it alone to mentally
+    edit a snippet they were never shown, and left the claim underneath ("an `--ask` with no
+    `--pr` is accepted") resting on nothing: step 3a's own guard reads the flags of the form WITH
+    `--pr`, so if `panel.py` ever required a PR number — outright, or whenever `--context` is
+    given — the paragraph would keep saying otherwise and the ask would exit non-zero into a
+    "skip silently" instruction.
+
+    Two halves, both checkable: the command is in the file and uses only flags `panel.py`
+    declares, without `--pr`; and `panel.py` still reaches the ask without one. The second is
+    asserted as an ORDERING — the `--ask` early return sits above the `--pr`-required guard — and
+    keyed to the source text rather than to a line number, since a line number is exactly the
+    fact that rots. `--context` is checked into the same window for the compound form, which is
+    the shape this snippet actually uses.
+    """
+    fences = re.findall(r"```bash\n(.*?)```", doc(FIX_ISSUE), re.DOTALL)
+    asks = [f for f in fences if "--ask" in f]
+    assert len(asks) == 1, (
+        f"{FIX_ISSUE} shows {len(asks)} `--ask` invocations, not 1 — the paragraph on step "
+        f"{ESCALATION_STEP}'s fields has to show the PR-less command itself, and exactly one of "
+        "them, or this guard is reading something else")
+    snippet = asks[0]
+    invoked = re.search(r"python3\s+(\S*panel\.py)", snippet)
+    assert invoked and invoked.group(1) == PANEL_PY_INSTALLED, (
+        f"{FIX_ISSUE}'s block runs {invoked.group(1) if invoked else None!r}, not "
+        f"{PANEL_PY_INSTALLED!r} — the path whose repo copy ({PANEL_PY}) the flags are read from")
+    panel_py = doc(PANEL_PY)
+    flags = sorted(set(re.findall(r"--[a-z][a-z-]+", snippet)))
+    assert "--ask" in flags, f"{FIX_ISSUE}'s block does not run `--ask`"
+    assert "--pr" not in flags, (
+        f"{FIX_ISSUE} shows `--pr` in the invocation an author runs before any PR exists; the "
+        "flag has no number to carry there, which is the whole reason this file shows its own "
+        f"copy of step {ESCALATION_STEP}'s command")
+    for flag in flags:
+        assert f'"{flag}"' in panel_py, (
+            f"{FIX_ISSUE} passes {flag}, which {PANEL_PY} does not declare — and step "
+            f"{ESCALATION_STEP}'s 'skip silently' makes that a no-op, not an error")
+    # The safe-quoting property step 3a established, carried over rather than restated: this is
+    # the same premise text, going to the same flag, and a copy that lost the heredoc would run
+    # the backticks in it.
+    assert re.search(r"<<\s*'[A-Z]+'", snippet), (
+        f"{FIX_ISSUE}'s copy no longer builds the premise in a QUOTED heredoc, so the shell "
+        "expands whatever it substitutes")
+    ask = re.search(r"--ask\s+(\S+)", snippet)
+    assert ask and re.fullmatch(r'"\$[A-Za-z_]\w*"', ask.group(1)), (
+        f"`--ask` is given {ask.group(1) if ask else None!r} rather than a quoted variable "
+        "holding the heredoc's value, which puts the premise on the command line")
+    assert re.search(r'--context\s+"', snippet), (
+        "`--context` is unquoted, so a path or line range with a space or a glob breaks argument "
+        "splitting")
+    # Now the claim the prose makes about panel.py. `--pr` is optional at the parser (no
+    # `required=True`) and the ask returns before the guard that demands it, so neither `--ask`
+    # alone nor `--ask --context` needs a PR number.
+    declared = _located(panel_py, 'ap.add_argument("--pr"', "the --pr declaration",
+                        where=PANEL_PY)
+    decl_end = _located(panel_py, "ap.add_argument(", "the flag declared after --pr",
+                        declared + 1, where=PANEL_PY)
+    assert "required=True" not in panel_py[declared:decl_end], (
+        f"{PANEL_PY} now declares --pr as required=True, so argparse rejects the PR-less ask "
+        f"{FIX_ISSUE} tells an author to run before argv is ever inspected")
+    returns_the_ask = _located(panel_py, "return ask(", "the --ask early return", where=PANEL_PY)
+    for guard, why in (
+        ("--pr is required",
+         "a bare `--ask` would be rejected for having no PR number"),
+        ("belongs to --ask",
+         "`--ask --context` — the form this snippet uses — would be rejected as a PR review"),
+    ):
+        at = _located(panel_py, guard, f"the {guard!r} guard", where=PANEL_PY)
+        assert returns_the_ask < at, (
+            f"{PANEL_PY} now reaches its {guard!r} guard before returning from `--ask`, so "
+            f"{why} — and {FIX_ISSUE} tells an author to run exactly that")
 
 
 # --------------------------------------------------- 3. an outcome the database will accept
