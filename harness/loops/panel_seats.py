@@ -226,8 +226,19 @@ def strip_convention_files(root: Path) -> list[str]:
     this setting is off for, and it is still PR-controlled input on the ones it is
     on for."""
     removed: list[str] = []
+    # Two kinds of entry, because `path.name` is ONE component and cannot ever equal
+    # a value containing a slash. `.github/copilot` was in the list and matched
+    # nothing — a declared guard doing nothing, which is worse than an absent one
+    # because the list reads as covering it. Entries with a slash are matched against
+    # the repo-relative path instead.
+    nested = {e for e in CONVENTION_DIRS | CONVENTION_FILES if "/" in e}
+    flat = (CONVENTION_FILES | CONVENTION_DIRS) - nested
     for path in sorted(root.rglob("*")):
-        if path.name not in CONVENTION_FILES and path.name not in CONVENTION_DIRS:
+        try:
+            rel_match = path.relative_to(root).as_posix()
+        except ValueError:                      # pragma: no cover — rglob's own root
+            continue
+        if path.name not in flat and rel_match not in nested:
             continue
         try:
             rel = path.relative_to(root).as_posix()
@@ -366,7 +377,16 @@ def fetch_pr_tree(gh_repo: str, head_sha: str, into: Path) -> tuple[Path | None,
             # time with the disk filling behind it. Summing the members' own declared
             # sizes is a sound bound — `extractall` writes at most that per member —
             # and it costs one pass over the index.
-            declared = sum(m.size for m in tf.getmembers() if m.isreg())
+            members = tf.getmembers()
+            # COUNT as well as bytes, because the byte cap is blind to the cheapest
+            # version of the attack: a few hundred kilobytes of tarball can declare
+            # millions of zero-byte files, directories and symlinks, every one of
+            # which passes a size ceiling and still costs an inode, a syscall and a
+            # `TarInfo` in memory. No real repository is near this number.
+            if len(members) > TREE_MAX_MEMBERS:
+                return None, (f"{what} holds {len(members):,} entries, over the "
+                              f"{TREE_MAX_MEMBERS:,} ceiling — not unpacked")
+            declared = sum(m.size for m in members if m.isreg())
             if declared > TREE_MAX_EXTRACTED_BYTES:
                 return None, (f"{what} declares {declared:,} bytes unpacked, over the "
                               f"{TREE_MAX_EXTRACTED_BYTES:,} ceiling — not unpacked")

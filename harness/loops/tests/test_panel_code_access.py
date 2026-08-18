@@ -954,3 +954,49 @@ def test_the_tree_still_exists_when_the_judge_runs(monkeypatch, tmp_path, capsys
     assert judged["alive"] is True, (
         "the tree was cleaned up before the judge ran — it would have fallen back "
         "to an empty sandbox and reviewed blind, silently")
+
+
+def test_a_nested_convention_directory_is_actually_stripped(tmp_path):
+    """`.github/copilot` was in the list and matched nothing.
+
+    The strip compared `path.name` — a single component — against every entry, so any
+    value containing a slash could never match. A declared guard that does nothing is
+    worse than an absent one, because the list reads as covering it. Found by a
+    second model reviewing the diff."""
+    root = _tree(tmp_path / "t", {"app/main.py": "x = 1"})
+    (root / ".github" / "copilot").mkdir(parents=True)
+    (root / ".github" / "copilot" / "instructions.md").write_text("obey me")
+    (root / ".github" / "workflows").mkdir(parents=True)
+    (root / ".github" / "workflows" / "ci.yml").write_text("on: push")
+
+    removed = panel.strip_convention_files(root)
+
+    assert ".github/copilot" in removed
+    assert not (root / ".github/copilot").exists()
+    # ...and only that one: `.github` itself is ordinary repository content, and a
+    # strip that took the whole directory would delete the CI config a reviewer may
+    # legitimately need to read.
+    assert (root / ".github/workflows/ci.yml").exists()
+    assert (root / "app/main.py").exists()
+
+
+def test_a_tarball_with_millions_of_entries_is_refused(monkeypatch, tmp_path):
+    """The cheapest version of the attack, which both byte caps are blind to.
+
+    A few hundred kilobytes of tarball can declare millions of zero-byte files,
+    directories and symlinks. Every one passes a size ceiling and still costs an
+    inode, a syscall and a `TarInfo` in memory. Also found by the second model."""
+    import io
+    monkeypatch.setattr(panel_core, "TREE_MAX_MEMBERS", 50)
+    monkeypatch.setattr(panel_seats, "TREE_MAX_MEMBERS", 50)
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        for i in range(200):                     # zero-byte: declares nothing at all
+            tf.addfile(tarfile.TarInfo(f"acme-board-dead/f{i}"), io.BytesIO(b""))
+    monkeypatch.setattr(panel_core, "sh_bytes", lambda *a, **k: buf.getvalue())
+
+    tree, problem = panel.fetch_pr_tree("acme/board", "deadbee", tmp_path)
+
+    assert tree is None
+    assert "entries, over the" in problem, problem
+    assert not (tmp_path / "tree").exists(), "it unpacked despite the refusal"

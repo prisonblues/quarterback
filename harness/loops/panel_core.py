@@ -144,6 +144,13 @@ TREE_FETCH_TIMEOUT = 120
 TREE_MAX_BYTES = 256 * 1024 * 1024
 TREE_MAX_EXTRACTED_BYTES = 2 * 1024 * 1024 * 1024
 
+# And a ceiling on the NUMBER of members, which the byte caps are blind to: a small
+# tarball can declare millions of zero-byte entries, each costing an inode, a syscall
+# and a TarInfo in memory while passing every size check. The largest repositories in
+# real use are a few hundred thousand files, so this is far above legitimate and far
+# below painful.
+TREE_MAX_MEMBERS = 500_000
+
 # How long a blank reply may take and still be worth retrying. A zero exit with
 # no output is retried because it is often a flake — but a blank run does NOT
 # fail fast the way a non-zero exit does, so three of them is up to three whole
@@ -1700,6 +1707,7 @@ __all__ = [
     "argparse", "base64", "difflib", "errno",
     "hashlib", "json", "os", "re",
     "TREE_FETCH_TIMEOUT", "TREE_MAX_BYTES", "TREE_MAX_EXTRACTED_BYTES",
+    "TREE_MAX_MEMBERS",
     "shutil", "ssl", "subprocess", "sys",
     "tarfile", "tempfile", "time", "urllib", "uuid", "sh_bytes",
     "Counter", "Callable", "ThreadPoolExecutor", "dataclass",

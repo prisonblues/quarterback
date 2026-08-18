@@ -71,6 +71,14 @@ transient 5xx gets three attempts, a 404 gets one — it is a settled answer abo
 sha. Without the retry the feature would have stopped applying a noticeable fraction
 of the time while its config said it was on, which is the worst of the three states.
 
+**Two holes in the new guards, found by a second model reviewing the diff.**
+`.github/copilot` was in the strip's directory list and matched nothing: the check
+compared `path.name`, a single component, so any entry containing a slash could never
+fire — a declared guard doing nothing, which reads as coverage it did not provide.
+And the extraction ceiling counted declared BYTES only, so a few hundred kilobytes of
+tarball could declare millions of zero-byte entries, each passing every size check
+while still costing an inode, a syscall and a `TarInfo`. Member count is capped too.
+
 **Every failure degrades to the OFF posture, loudly.** A fetch that 502s, a tarball
 that will not unpack or arrives in an unexpected shape, a copy that runs out of disk:
 the seat is blind, recorded as blind, and the round says why. Three of those paths were
