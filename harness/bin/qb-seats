@@ -358,9 +358,17 @@ screen_names() { screens | cut -f4-; }
 
 # The numbered list a human reads and `resume` counts against. Both call this, so
 # the number beside a screen cannot come to mean two different things.
+#
+# THE ROWS GO TO STDOUT AND THE HINT UNDER THEM TO STDERR. A list of names is only
+# half an answer — the next command has to be visible from the list, because
+# `resume` is not guessable from `--add` and `--kill` — but a caller that pipes
+# this must still get rows and nothing else. Both land on a terminal in order, so
+# the split costs the human reading it nothing.
 list_screens() {
-  local seats att path name i=0 home=${HOME:-}
-  screens | while IFS=$'\t' read -r seats att path name; do
+  local seats att path name i=0 home=${HOME:-} rows ex_n ex_name count
+  rows=$(screens)
+  [ -n "$rows" ] || return 0
+  printf '%s\n' "$rows" | while IFS=$'\t' read -r seats att path name; do
     i=$((i + 1))
     # ~ for $HOME, because the repo path is the column a human scans to tell two
     # screens apart and the prefix is the same on every row.
@@ -371,6 +379,23 @@ list_screens() {
       "$i" "$name" "$seats" "$([ "$seats" = 1 ] || printf s)" "$path" \
       "$([ "$att" = 0 ] || printf '  (attached)')"
   done
+
+  # The worked example names a DETACHED screen wherever there is one: that is the
+  # row somebody reading this list is looking for. Both spellings are shown
+  # because both work and the name is the half that survives a screen being
+  # closed further up the list.
+  ex_n=$(printf '%s\n' "$rows" | awk -F'\t' '$2 == 0 { print NR; exit }')
+  [ -n "$ex_n" ] || ex_n=1
+  ex_name=$(printf '%s\n' "$rows" | sed -n "${ex_n}p" | cut -f4-)
+  count=$(printf '%s\n' "$rows" | wc -l)
+  if [ "$count" -eq 1 ]; then
+    # One screen up takes no argument at all, so say that rather than a number
+    # whose only value is being the only one.
+    printf '\n  open it:  %s resume\n' "$PROG" >&2
+  else
+    printf '\n  open one: %s resume %s   (or by name: %s resume %s)\n' \
+      "$PROG" "$ex_n" "$PROG" "$ex_name" >&2
+  fi
   return 0
 }
 
