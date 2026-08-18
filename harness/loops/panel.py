@@ -829,6 +829,10 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # there rather than here. `--no-code-access` turns it off for one run, the
     # same shape as `--reviewers`: a switch this file honours over the config.
     want_code = code_access_wanted(panel, no_code_access, notes)
+    # Read even when code access is off, so a misconfigured value is reported on
+    # the round that carries it rather than staying silent until someone turns
+    # access on months later and wonders why the cap is not applying.
+    budget_usd = code_budget(panel, notes)
     #: The seats that both were ASKED for and could use it. Computed before the
     #: fetch so a repo whose only enabled seats are code-blind ones pays no
     #: download at all — the tree would be built and then handed to nobody.
@@ -889,7 +893,8 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 tasks[name] = ex.submit(review_llm, name, models[name],
                                         prompt_for(budgets[name], reads),
                                         efforts.get(name, ""),
-                                        code_tree=code_tree)
+                                        code_tree=code_tree,
+                                        budget_usd=budget_usd if reads else None)
         sonar_future = None
         sonar_filed = False
         if "sonarqube" in selected:

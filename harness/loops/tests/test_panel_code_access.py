@@ -364,9 +364,10 @@ def _round(monkeypatch, tmp_path, capsys, *, cfg_extra=None, tree=None,
     if tree is not None:
         monkeypatch.setattr(panel_core, "sh_bytes", lambda *a, **k: tree)
 
-    def reviewer(name, model, prompt, effort="", code_tree=None):
+    def reviewer(name, model, prompt, effort="", code_tree=None, budget_usd=None):
         seen["prompts"][name] = prompt
         seen["trees"][name] = code_tree
+        seen.setdefault("budgets", {})[name] = budget_usd
         return panel.ReviewerRun(list(findings), None, 10, [],
                                  code_blind=not (code_tree is not None
                                                  and name in panel.SEAT_READS_CODE))
@@ -730,3 +731,122 @@ def test_a_slow_fetch_is_not_retried(monkeypatch, tmp_path):
 
     assert tree is None and "TimeoutExpired" in problem
     assert len(calls) == 1, "a deliberately small bound was spent three times"
+
+
+# ------------------------------------------------- the spend cap
+
+@pytest.mark.parametrize("raw,want,noted", [
+    (None, None, False),
+    ("", None, False),
+    (10, 10.0, False),
+    (2.5, 2.5, False),
+    ("7.5", 7.5, False),
+    # Refused, loudly, and uncapped rather than nonsense-capped.
+    ("lots", None, True),
+    (0, None, True),
+    (-1, None, True),
+    # `True` is an int in Python, so a hand-written `true` would otherwise arrive
+    # as a one-dollar cap and end every seat seconds in.
+    (True, None, True),
+])
+def test_a_cap_that_is_not_a_positive_number_runs_uncapped_and_says_so(raw, want, noted):
+    """The same two refusals `diff_budget` makes, for the same reason: silently
+    honouring a nonsense cap loses the seat on every round, and silently dropping
+    one leaves you believing a ceiling you never got."""
+    notes = []
+    got = panel.code_budget({"reviewer_code_budget_usd": raw}, notes)
+    assert got == want, raw
+    assert bool(notes) is noted, notes
+
+
+def test_the_cap_reaches_only_the_seat_that_got_the_tree(monkeypatch, tmp_path):
+    """A diff-only seat makes one call with a bounded prompt — a cap there adds a
+    way to LOSE the seat and buys nothing, because reaching the cap is a skip
+    rather than a cheaper review."""
+    tree = _tree(tmp_path / "src", {"app/main.py": "x = 1"})
+
+    seen = _seat_run(monkeypatch)
+    panel.review_llm("claude", "sonnet", "p", code_tree=tree, budget_usd=12.5)
+    assert "--max-budget-usd" in seen["args"]
+    assert seen["args"][seen["args"].index("--max-budget-usd") + 1] == "12.5"
+
+    # Same budget, no tree: the flag must not appear.
+    seen = _seat_run(monkeypatch)
+    panel.review_llm("claude", "sonnet", "p", budget_usd=12.5)
+    assert "--max-budget-usd" not in seen["args"]
+
+
+def test_a_whole_dollar_cap_is_not_rendered_as_a_float(monkeypatch, tmp_path):
+    """`%g`, not `%s` on a float: the CLI echoes the value back in its own error
+    message, and `10.0` reads as a rounding of something else where `10` reads as
+    the number somebody wrote."""
+    tree = _tree(tmp_path / "src", {"app/main.py": "x = 1"})
+    seen = _seat_run(monkeypatch)
+    panel.review_llm("claude", "sonnet", "p", code_tree=tree, budget_usd=10.0)
+    assert seen["args"][seen["args"].index("--max-budget-usd") + 1] == "10"
+
+
+def test_reaching_the_cap_is_named_and_never_retried(monkeypatch):
+    """The trap this guard exists for, and both halves of it are measured.
+
+    `claude --max-budget-usd` exits 1, writes its message to STDOUT, and leaves
+    stderr EMPTY (verified on 2.1.232). `run_cli` builds its skip reason from
+    stderr and decides retryability from stderr, so without this branch the seat
+    dies as a bare "exited 1" with no cause — the confusing death #19 exists
+    against — and then the attempt is repeated three times, re-burning a cap that
+    is by definition already spent.
+
+    Asserted on the ATTEMPT COUNT as much as the message: a fix that named the
+    cause but still retried would triple the spend the cap was set to bound."""
+    calls = []
+
+    def fake_run(argv, **kw):
+        calls.append(argv)
+        return type("P", (), {"returncode": 1,
+                              "stdout": "Error: Exceeded USD budget (0.001)",
+                              "stderr": ""})()
+
+    monkeypatch.setattr(panel.subprocess, "run", fake_run)
+    out, err = panel.run_cli(["claude", "-p"], "claude (sonnet)")
+
+    assert out is None
+    assert panel.BUDGET_EXHAUSTED in err
+    assert err.startswith("claude (sonnet): ")
+    assert len(calls) == 1, f"the spent cap was re-burned {len(calls)} times"
+
+
+def test_an_ordinary_failure_is_still_retried(monkeypatch):
+    """The floor under the branch above: it must key on the budget marker, not on
+    "exited 1 with an empty stderr" generally, or every transient non-zero exit
+    stops being retried and one flake costs a vendor."""
+    calls = []
+
+    def fake_run(argv, **kw):
+        calls.append(argv)
+        return type("P", (), {"returncode": 1, "stdout": "", "stderr": "boom"})()
+
+    monkeypatch.setattr(panel.subprocess, "run", fake_run)
+    out, err = panel.run_cli(["claude", "-p"], "claude (sonnet)")
+
+    assert out is None and panel.BUDGET_EXHAUSTED not in err
+    assert len(calls) == 3, "an ordinary failure must still get its retries"
+
+
+def test_a_capped_seat_that_is_cut_off_records_a_skip_and_vetoes(monkeypatch):
+    """Reaching the cap is a LOST seat, not a cheaper one — which is the whole
+    reason the default is uncapped. It records a skip, and a skip is not exempt
+    from the coverage veto (only an absent CLI is), so the round cannot claim a
+    confident stop on a review that was cut off mid-way."""
+    monkeypatch.setattr(panel.shutil, "which", lambda name: "/usr/bin/" + name)
+    monkeypatch.setattr(panel_seats, "claude_usage", lambda _s: None)
+    monkeypatch.setattr(panel.subprocess, "run", lambda *a, **k: type(
+        "P", (), {"returncode": 1, "stdout": "Error: Exceeded USD budget (5)",
+                  "stderr": ""})())
+
+    got = panel.review_llm("claude", "sonnet", "p")
+
+    assert got.skip and panel.BUDGET_EXHAUSTED in got.skip
+    assert got.absent is False, "a spent cap is not a missing CLI"
+    veto = panel.coverage_veto(
+        {"claude": {"ran": False, "skip": got.skip, "absent": False}}, None, 0, 1_000)
+    assert any(panel.BUDGET_EXHAUSTED in v for v in veto)

@@ -159,6 +159,19 @@ BLANK_RETRY_MAX_S = 60
 # ReviewerRun.absent, not this string.
 CLI_ABSENT = "CLI absent"
 
+#: What `claude` prints when `--max-budget-usd` is reached. Matched against
+#: STDOUT, not stderr: the CLI exits 1, writes this line to stdout, and leaves
+#: stderr EMPTY — verified on 2.1.232. That combination defeats both of
+#: `run_cli`'s failure readers, which is why this constant exists rather than a
+#: generic non-zero-exit path handling it.
+BUDGET_MARKER = "Exceeded USD budget"
+
+#: The skip reason a budget-exhausted seat records. Its own sentence because
+#: "exited 1" with an empty stderr is exactly the confusing death #19 is about:
+#: the cap is the cause, the cap is actionable, and nothing else in the output
+#: says so.
+BUDGET_EXHAUSTED = "spend cap reached mid-review"
+
 # Linux caps ONE argv string at MAX_ARG_STRLEN = 131,072 bytes, independently of
 # the much larger total ARG_MAX; cross it and execve fails with E2BIG before the
 # CLI starts. Every reviewer whose prompt travels on stdin is free of this, and
@@ -1688,6 +1701,7 @@ __all__ = [
     "DEFAULT_ROUND_SCOPE", "ROUND_SCOPES", "CLI_TIMEOUT", "BLANK_RETRY_MAX_S",
     "CLI_ABSENT", "ARGV_PROMPT_MAX_BYTES", "SEVERITIES", "MAX_LISTING_CHARS",
     "LISTING_ACCOUNT_CHARS", "COMMENT_CHARS", "ROUNDS_HEADING", "LLM_REVIEWERS",
+    "BUDGET_MARKER", "BUDGET_EXHAUSTED",
     "ALL_REVIEWERS", "CLI_BIN", "SEAT_MODEL_DEFAULTS", "REVIEW_PROMPT",
     "CODE_ACCESS_BRIEF",
     "JUDGE_PROMPT", "ASK_PROMPT", "Finding", "ReviewerRun",

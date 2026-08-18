@@ -217,6 +217,25 @@ DEFAULTS: dict = {
         # a seat that can read the tree while another cannot is a bigger confound
         # than an unpinned model.
         "reviewer_code_access": True,
+        # Dollars one code-reading seat may spend per CLI invocation, via
+        # `claude --max-budget-usd`. `null` — the default — means no cap, and that
+        # default is chosen for the reason `max_diff_chars` gives for its own: a
+        # number this file invents would silently degrade reviews on repos that
+        # never asked for one, and a seat cut off mid-review is a LOST seat, not a
+        # cheaper one (it records a skip, which vetoes the round's confident stop).
+        #
+        # Set one from your own numbers. Measured here for calibration, one seat
+        # on a 75,628-char diff (PR #214, sonnet): 7,879,643 input tokens of which
+        # 97% were cache reads, 71,674 output — about $4 at list rates, against
+        # about $0.70 for the same seat reviewing the diff alone. Roughly 6x in
+        # money, not the 49x the raw input-token ratio suggests, because cache
+        # reads bill at a tenth of the input rate.
+        #
+        # Applies only to a seat that actually got the tree: a diff-only seat
+        # makes one call with a bounded prompt, so capping it adds a way to lose
+        # the seat and buys nothing. Note the cap is per INVOCATION and `run_cli`
+        # may make a reparse retry, so one seat can spend up to twice this.
+        "reviewer_code_budget_usd": None,
     },
     "loops": {
         "dependabot_lander": False,

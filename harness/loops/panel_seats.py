@@ -701,6 +701,15 @@ def run_cli(args: list[str] | Callable[[], list[str]], label: str, timeout: int 
         if not outcome:
             return proc.stdout, None
         took = time.monotonic() - started
+        # A spend cap that has been reached is the most deterministic failure this
+        # function has, and it is the one both readers below miss: `claude
+        # --max-budget-usd` exits 1, writes BUDGET_MARKER to STDOUT, and leaves
+        # stderr EMPTY (verified on 2.1.232). So `stderr_gist` produces no reason
+        # (the seat dies as a bare "exited 1" — the confusing death #19 exists
+        # against) and `is_deterministic_failure` sees nothing to short-circuit on,
+        # retrying three times and re-burning a cap that is already spent.
+        if BUDGET_MARKER in (proc.stdout or ""):
+            return None, f"{label}: {BUDGET_EXHAUSTED}"
         msg = stderr_gist(proc.stderr or "")
         last = f"{label}: {outcome}" + (f" ({msg})" if msg else "")
         if is_deterministic_failure(proc.stderr or ""):
@@ -999,7 +1008,41 @@ def reviewer_label(name: str, model: str, effort: str = "") -> str:
 READ_ONLY_TOOLS = ("Read", "Grep", "Glob")
 
 
-def claude_args(model: str, session_id: str, reads_code: bool = False) -> list[str]:
+def code_budget(panel: dict, notes: list[str]) -> float | None:
+    """Dollars a code-reading seat may spend per invocation, from config, or None.
+
+    Validated the way :func:`diff_budget` validates a diff budget, and refused in
+    the same two cases — a value that is not a number, or one that is not positive
+    (a cap of zero would end the seat before it read anything). Both fall back to
+    uncapped and SAY so: silently honouring a nonsense cap loses the seat on every
+    round, and silently dropping one leaves you believing a ceiling you never got.
+
+    `True` is refused explicitly, because it is an `int` in Python: a hand-written
+    `"reviewer_code_budget_usd": true` would otherwise arrive as a one-dollar cap
+    — a plausible slip on a key whose value is a bare number, and one that would
+    end every seat a few seconds in."""
+    raw = panel.get("reviewer_code_budget_usd")
+    if raw is None or raw == "":
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, (int, float, str)):
+        notes.append(f"`reviewer_code_budget_usd`={raw!r} is not a number — the "
+                     "code-reading seat runs uncapped")
+        return None
+    try:
+        usd = float(raw)
+    except ValueError:
+        notes.append(f"`reviewer_code_budget_usd`={raw!r} is not a number — the "
+                     "code-reading seat runs uncapped")
+        return None
+    if usd <= 0:
+        notes.append(f"`reviewer_code_budget_usd`={usd} would end the seat before it "
+                     "read anything — running uncapped instead")
+        return None
+    return usd
+
+
+def claude_args(model: str, session_id: str, reads_code: bool = False,
+                budget_usd: float | None = None) -> list[str]:
     """`claude -p` argv for a panel seat.
 
     **The tool pin is only applied when the seat has a tree to read**, and the
@@ -1028,6 +1071,15 @@ def claude_args(model: str, session_id: str, reads_code: bool = False) -> list[s
     if reads_code:
         args += ["--permission-mode", "manual",
                  "--allowedTools", *READ_ONLY_TOOLS]
+        # Only on the seat that got the tree. A diff-only seat makes one call with
+        # a bounded prompt, so a cap there adds a way to LOSE the seat and buys
+        # nothing — reaching the cap is not a cheaper review, it is a skip, and a
+        # skip vetoes the round's confident stop.
+        if budget_usd is not None:
+            # `%g`, not a bare float: the CLI echoes the value back in its own
+            # error message, and `10.0` reads as a rounding of something else
+            # where `10` reads as the number somebody wrote.
+            args += ["--max-budget-usd", f"{budget_usd:g}"]
     return args
 
 
@@ -1539,7 +1591,8 @@ class SeatTurn(NamedTuple):
 
 def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
              parse: Callable[[str], SeatParsed | None] | None = None,
-             code_tree: Path | None = None) -> SeatTurn:
+             code_tree: Path | None = None,
+             budget_usd: float | None = None) -> SeatTurn:
     """Put one question to a headless LLM CLI and return what came back.
 
     `parse` reads the reply, and returning None from it means "I could not read
@@ -1689,7 +1742,8 @@ def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
                 # downgrades that variable, and the argv has to follow it down or
                 # the seat is pinned to read-only tools for a checkout it does not
                 # have — the pin and the cwd disagreeing about the same fact.
-                return claude_args(model, new_session(), reads_code=reads_code)
+                return claude_args(model, new_session(), reads_code=reads_code,
+                                   budget_usd=budget_usd)
         elif cmd_name == "antigravity":
             # Not instrumented: `agy` has no session-id to pin, and its usage
             # lives only in the JSON mode this design declines. It reviews
@@ -1794,8 +1848,9 @@ def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
                         code_blind=blind)
 
 
-def review_llm(cmd_name: str, model: str, prompt: str,
-               effort: str = "", code_tree: Path | None = None) -> ReviewerRun:
+def review_llm(cmd_name: str, model: str, prompt: str, effort: str = "",
+               code_tree: Path | None = None,
+               budget_usd: float | None = None) -> ReviewerRun:
     """Run a headless LLM CLI reviewer. Returns a :class:`ReviewerRun` — what it
     found, what it could not judge, and what it cost.
 
@@ -1804,7 +1859,7 @@ def review_llm(cmd_name: str, model: str, prompt: str,
     an ask."""
     turn = run_seat(cmd_name, model, prompt, effort,
                     parse=lambda text: parse_reply(cmd_name, text),
-                    code_tree=code_tree)
+                    code_tree=code_tree, budget_usd=budget_usd)
     if turn.skip:
         return ReviewerRun(skip=turn.skip, duration_ms=turn.duration_ms,
                            usage=turn.usage, absent=turn.absent,
@@ -1987,7 +2042,7 @@ __all__ = [
     "is_deterministic_failure", "member_sandbox", "run_cli", "record_run",
     "SEAT_READS_CODE", "CONVENTION_FILES", "CONVENTION_DIRS",
     "strip_convention_files", "fetch_pr_tree", "seat_checkout",
-    "code_access_wanted", "_fetch_tarball", "TREE_RETRY_STATUSES",
+    "code_access_wanted", "_fetch_tarball", "TREE_RETRY_STATUSES", "code_budget",
     "READ_ONLY_TOOLS", "claude_args",
     "QB_NO_SUBCOMMAND", "record_ask", "diff_budget", "resolve_round_scope",
     "fit_argv_budget", "argv_clamp", "reviewer_label", "codex_args",
