@@ -39,7 +39,16 @@ answers, and a fixture cannot see those. Call it and hand the result to
 ``monkeypatch.setattr(panel, "sh", …)``.
 """
 
+import io
 import json
+import sys
+import tarfile
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import panel_core  # noqa: E402  — the `gh` seam every stub here replaces
 
 #: Sentinel for "the caller said nothing", so a test can ask for a value that is
 #: genuinely ``None`` — a read that FAILED — as distinct from not specifying one.
@@ -70,6 +79,53 @@ class _Meta(dict):
     """
 
 
+@pytest.fixture(autouse=True)
+def _no_real_tarball_fetch(monkeypatch):
+    """Every test gets a PR tarball without touching the network.
+
+    Autouse, and that is the point rather than convenience. `sh_bytes` is a SECOND
+    place the panel shells out to `gh`, so every suite that stubs `panel_core.sh`
+    and nothing else — most of them, each with its own hand-rolled `fake_sh` — left
+    this one live. `reviewer_code_access` defaults on, so every `run()` test reached
+    it: the suite kept passing, quietly made a real API call per test, and went from
+    7 seconds to 30. A hole that makes tests slower and network-dependent while
+    staying green is the shape that survives review, so it is closed here, once, for
+    everything.
+
+    A test that wants a fetch FAILURE overrides this itself — `monkeypatch` inside
+    the test runs after the fixture and wins."""
+    monkeypatch.setattr(panel_core, "sh_bytes", lambda *a, **k: pr_tarball())
+
+
+def pr_tarball(files=None, prefix="acme-board-aaa1110"):
+    """A gzipped tar shaped like GitHub's `repos/{repo}/tarball/{sha}` response: one
+    top-level `owner-repo-sha/` directory with the tree inside it.
+
+    The wrapper directory is the part worth reproducing rather than simplifying
+    away — `fetch_pr_tree` unwraps it, and a stub that skipped it would let a bug in
+    that unwrapping pass every test while every real run came out rooted one
+    directory off, with every path a reviewer quotes subtly wrong.
+
+    `files` maps repo-relative path to text. The default is ORDINARY source and
+    deliberately carries no vendor instruction file: the strip reports what it
+    removed into `config_notes`, so a default that shipped an `AGENTS.md` would put
+    a note on every run() test in the suite and break the several that assert
+    `config_notes == []` about something else entirely. A test exercising the strip
+    passes its own `files` and says so."""
+    if files is None:
+        files = {"app/main.py": "def main():\n    return 1\n",
+                 "README.md": "# acme board\n"}
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        for rel, text in files.items():
+            data = text.encode()
+            info = tarfile.TarInfo(f"{prefix}/{rel}")
+            info.size = len(data)
+            info.mode = 0o644
+            tf.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
 def pr_meta(title="feat: a thing", *, additions=20, deletions=2,
             base_ref="main", head_ref="feat/x", head=DEFAULT_HEAD,
             merge_base=DEFAULT_MERGE_BASE, files=UNSET, changed_files=UNSET,
@@ -96,7 +152,7 @@ def pr_meta(title="feat: a thing", *, additions=20, deletions=2,
 def gh_stub(*, meta=UNSET, diff=PR_DIFF, base_tip=DEFAULT_BASE_TIP,
             head=UNSET, head_moves_to=None, merge_base=UNSET,
             merge_base_after=UNSET, compare=UNSET, compare_diff="",
-            calls=None, strict=True):
+            tree=UNSET, calls=None, strict=True):
     """A `panel.sh` double answering every `gh` call panel.py makes.
 
     Every answer takes a value, a `BaseException` to raise, or None meaning "the
@@ -136,6 +192,10 @@ def gh_stub(*, meta=UNSET, diff=PR_DIFF, base_tip=DEFAULT_BASE_TIP,
     else:
         base = _Meta({**pr_meta(), **meta})
     the_head = base.get("headRefOid", DEFAULT_HEAD) if head is UNSET else head
+    # The tarball bytes for the PR-tree fetch. A real gzip of a real (tiny) tree by
+    # default, because a `b""` would exercise the unpack-failure path on every test
+    # rather than the success path they are all implicitly on.
+    tree = pr_tarball() if tree is UNSET else tree
     the_merge_base = (base.get("baseRefOid") if merge_base is UNSET else merge_base)
     head_reads = []
 
@@ -188,6 +248,13 @@ def gh_stub(*, meta=UNSET, diff=PR_DIFF, base_tip=DEFAULT_BASE_TIP,
                 if "Accept: application/vnd.github.diff" in args:
                     return answer(compare_diff)
                 return answer("" if compare is UNSET else compare)
+            if "/tarball/" in path:
+                # The PR's own tree (#113). Answered by DEFAULT, and that matters:
+                # `reviewer_code_access` defaults on, so every run() test reaches
+                # this call. Left unanswered it fell through to the network — the
+                # suite kept passing and went from 7 seconds to 30, which is the
+                # slowest possible way to learn that a stub had a hole in it.
+                return answer(tree)
 
         if strict:
             raise AssertionError(

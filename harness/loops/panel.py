@@ -303,6 +303,14 @@ def _payload_defaults() -> dict:
         "judge_skip": None,
         "reviewers_ran": [],
         "reviewers": {},
+        # Nulls rather than `{"setting": true, "seats": []}`, for the reason the
+        # file-count key above gives: a run that never got as far as asking cannot
+        # claim the setting was on and bought nothing. `seats: []` on a skipped
+        # round would read as "code access was available and no seat used it",
+        # which is a finding about the panel rather than about a round that never
+        # ran one.
+        "code_access": {"setting": None, "seats": None,
+                        "convention_files_removed": None},
         "reviewers_selected": [],
         "reviewers_override": None,
         "to_fix": [],
@@ -376,7 +384,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         reviewers: str | None = None, json_file: str = "", record: bool = True,
         round_no: int = 1, baseline: list[str] | None = None,
         max_rounds: int | None = None, scope: str = "auto",
-        since: str = "") -> int:
+        since: str = "", no_code_access: bool = False) -> int:
     # A cycle is something the CALLER drives, and only /panel-review-pr does:
     # naming a cap (or a round, or a baseline) is what says this run is part of
     # one. A review-only /panel run left to the default is a single pass, and
@@ -685,9 +693,13 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         result.skipped.append(ci_skip)
     ci_text = ci_brief(ci_status, ci_failing, ci_skip)
 
-    def prompt_for(budget: int | None) -> str:
+    def prompt_for(budget: int | None, reads_code: bool = False) -> str:
+        # `reads_code` defaults False so the one-argument callers keep working —
+        # `fit_argv_budget` takes this as a single-arg render, and antigravity is
+        # never a code-reading seat, so that path is unaffected by construction.
         return REVIEW_PROMPT.format(n=pr_number, repo=gh_repo, base=base,
-                                    ci=ci_text, diff=review.material(budget)[0])
+                                    ci=ci_text, diff=review.material(budget)[0],
+                                    code=CODE_ACCESS_BRIEF if reads_code else "")
 
     # `agy` is the only reviewer whose prompt must travel in argv, so it is the
     # only one the kernel can veto. Clamp it to what execve will carry and say
@@ -811,14 +823,73 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     efforts = {n: rev.get(n, {}).get("effort", "") for n in EFFORTS}
     labels = {n: reviewer_label(n, models[n], efforts.get(n, "")) for n in LLM_REVIEWERS}
 
+    # May the seats read the PR's code (#113)? A per-repo setting, ON by default,
+    # and the seats that can actually use it are `SEAT_READS_CODE` — three of the
+    # four vendors cannot express "read but do not execute", which is recorded
+    # there rather than here. `--no-code-access` turns it off for one run, the
+    # same shape as `--reviewers`: a switch this file honours over the config.
+    want_code = code_access_wanted(panel, no_code_access, notes)
+    #: The seats that both were ASKED for and could use it. Computed before the
+    #: fetch so a repo whose only enabled seats are code-blind ones pays no
+    #: download at all — the tree would be built and then handed to nobody.
+    code_seats = sorted(n for n in selected if n in SEAT_READS_CODE)
+    code_tree: Path | None = None
+    stripped: list[str] = []
+    #: Where the round's single copy of the tree lives, or None when nothing needed
+    #: one. Removed after the seats have finished copying out of it — see the
+    #: cleanup below the executor, which is why this is a plain mkdtemp rather than
+    #: a `with`: the tree has to outlive the dispatch and die before the report.
+    code_dir: Path | None = None
+    if want_code and code_seats:
+        # One fetch and one strip for the whole round, copied per seat by
+        # `seat_checkout`. Doing it per seat would download the same tarball up to
+        # four times and give the strip four chances to differ.
+        code_dir = Path(tempfile.mkdtemp(prefix="panel-tree-"))
+        code_tree, problem = fetch_pr_tree(gh_repo, meta["headRefOid"], code_dir)
+        if problem:
+            # A note, not a failure: a round that reviews from the diff is the OFF
+            # posture, which works, and every seat records itself as blind so the
+            # coverage veto reads the round correctly without being told twice.
+            notes.append(f"{problem} — the seats review from the diff alone this round")
+            code_tree = None
+        else:
+            try:
+                stripped = strip_convention_files(code_tree)
+            except OSError as e:
+                # The strip is not optional. A tree that keeps its instruction
+                # files is the injection channel this whole design turns off to,
+                # so a strip that cannot finish means no seat gets the tree.
+                notes.append(f"a vendor instruction file in the PR's tree could not be "
+                             f"removed ({e}) — no seat was given the code, because a "
+                             "checkout that keeps them can instruct its own reviewer")
+                code_tree = None
+    elif want_code and not code_seats:
+        notes.append("`reviewer_code_access` is on, but no seat on this panel can use "
+                     "it — see SEAT_READS_CODE; only claude can be given read tools "
+                     "without also being given a shell")
+    if stripped:
+        # Said out loud, per round. A silent strip makes a PR that shipped an
+        # `AGENTS.md` indistinguishable from one that did not, on the single axis
+        # where the difference is worth knowing.
+        notes.append(f"removed {len(stripped)} vendor instruction file(s) from the "
+                     f"reviewers' checkout: {', '.join(stripped[:8])}"
+                     + (f" and {len(stripped) - 8} more" if len(stripped) > 8 else ""))
+
     tasks = {}
     with ThreadPoolExecutor(max_workers=len(ALL_REVIEWERS) + 1) as ex:
         # Every selected LLM reviewer runs — no de-minimis gate. If we asked for
         # the panel, we want each vendor's eyes regardless of diff size.
         for name in LLM_REVIEWERS:
             if name in selected:
+                # The prompt differs per seat now: a seat with the tree is TOLD so,
+                # because the default frame is "here is a diff" and a reviewer
+                # following it faithfully declares gaps it could have opened a file
+                # to close. See CODE_ACCESS_BRIEF.
+                reads = code_tree is not None and name in SEAT_READS_CODE
                 tasks[name] = ex.submit(review_llm, name, models[name],
-                                        prompt_for(budgets[name]), efforts.get(name, ""))
+                                        prompt_for(budgets[name], reads),
+                                        efforts.get(name, ""),
+                                        code_tree=code_tree)
         sonar_future = None
         sonar_filed = False
         if "sonarqube" in selected:
@@ -905,6 +976,23 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 # anything into the population the judge clusters, and only this
                 # branch can. See `filers`.
                 sonar_filed = bool(soft)
+
+    # The executor has joined, so every seat has finished copying out of the tree
+    # and nothing reads it again. Removed HERE rather than at the end of `run`
+    # because a PR's checkout is the largest thing this process holds and the
+    # report, the judge and the board write-up all still have to run; and rather
+    # than in a `with`, because the reviewers are dispatched inside another block
+    # and nesting a third would re-indent the whole panel. `ignore_errors`, since a
+    # tree that will not delete is a disk problem and not a reason to lose a review
+    # that has already happened — the directory is under the system temp root and
+    # the next reboot takes it.
+    #: Whether a tree was actually built and handed out, recorded BEFORE the
+    #: directory goes away. `code_tree` stays a valid Path object after the rmtree,
+    #: pointing at nothing, so a later reader of it would be asking a question the
+    #: variable can no longer answer honestly.
+    code_tree_used = code_tree is not None
+    if code_dir is not None:
+        shutil.rmtree(code_dir, ignore_errors=True)
 
     # Pre-cluster as a hint, then let the master MERGE the duplicates and rule on
     # each issue in one step (no consensus gate). Dedup cannot happen upstream of
@@ -1217,6 +1305,26 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         "judge_skip": judge_skip,
         "reviewers_ran": ran_llm,
         "reviewers": reviewer_meta,
+        # Whether the seats could read the code, at the grain a later comparison
+        # needs (#113). `setting` is what the repo (or --no-code-access) asked for;
+        # `seats` is who actually got it, read back from what each seat RECORDED
+        # rather than from the intent — a fetch or a copy that failed leaves the
+        # setting on and the seat blind, and only the second is true of the round.
+        #
+        # Both, because they answer different questions. Comparing rounds across
+        # the change needs the setting; reading one round's coverage needs the
+        # seats. And a repo that turned it on while every seat it enables is
+        # code-blind is a configuration doing nothing, which is visible in the
+        # difference and invisible in either half alone.
+        "code_access": {
+            "setting": want_code,
+            "seats": sorted(n for n, m in reviewer_meta.items()
+                            if m.get("ran") and m.get("code_blind") is False),
+            # What the strip took out of the reviewers' checkout. `[]` is "the PR
+            # carried none", which is a different fact from the null a round that
+            # never fetched a tree records.
+            "convention_files_removed": stripped if code_tree_used else None,
+        },
         "reviewers_selected": sorted(selected),
         "reviewers_override": override_note,
         # `new_this_round` is added HERE rather than on the record: it is a fact
@@ -1432,6 +1540,30 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     else:
         judge_txt = f"⚠️ {judge_skip} — all findings KEPT unjudged (re-run to get a verdict)"
     lines.append(f"**Master judge:** {judge_txt}")
+    # Which seats could read the code, stated on the PR comment (#113). It belongs
+    # next to the reviewer list because it is a property OF that list, and it has to
+    # be visible: a reader weighing "codex could not assess the caller" against
+    # "claude read it and disagreed" is comparing two seats that were given
+    # different evidence, and that is a bigger confound than an unpinned model. It
+    # is also the line that explains why some declarations cost the round its
+    # confidence and others did not.
+    read_code = sorted(n for n, m in reviewer_meta.items()
+                       if m.get("ran") and m.get("code_blind") is False)
+    diff_only = sorted(n for n, m in reviewer_meta.items()
+                       if m.get("ran") and m.get("code_blind"))
+    if read_code:
+        lines.append(f"**Code access:** {', '.join(read_code)} read the PR's tree at "
+                     f"{(meta.get('headRefOid') or '')[:8]}"
+                     + (f"; {', '.join(diff_only)} reviewed the diff alone"
+                        if diff_only else "")
+                     + " — a seat's own `could_not_assess` counts against the round "
+                       "only where it could have opened the file")
+    elif want_code and diff_only:
+        # The configured-but-unusable case, said once rather than left to be
+        # inferred from an absence. A repo that switched this on and sees nothing
+        # about it in the report would reasonably conclude it is working.
+        lines.append("**Code access:** on, but no seat on this panel can take it — "
+                     f"{', '.join(diff_only)} reviewed the diff alone")
     for note in notes:
         lines.append(f"  - ⚠️ config: {note}")
     if truncated:
@@ -1628,6 +1760,13 @@ def main() -> int:
                          f"configured set ({', '.join(ALL_REVIEWERS)}); e.g. "
                          "--reviewers codex for a single-vendor read. "
                          "Default: whatever .harness-rules enables")
+    ap.add_argument("--no-code-access", action="store_true", dest="no_code_access",
+                    help="review from the diff alone, even where .harness-rules sets "
+                         "`review_panel.reviewer_code_access: true`. One run's override "
+                         "of the repo's setting, the same shape as --reviewers; there is "
+                         "deliberately no flag the other way, because turning code "
+                         "access ON for a repo that switched it off is a decision about "
+                         "trusting that repo's contributors and belongs in its config")
     ap.add_argument("--json-file", metavar="PATH", default="", dest="json_file",
                     help="also write the JSON payload here, keeping the report "
                          "(and --post) — unlike --json, which replaces them")
@@ -1730,7 +1869,7 @@ def main() -> int:
                          "this run actually is")
     return run(args.repo, args.pr, args.post, args.json_out, args.reviewers,
                args.json_file, args.record, round_no, args.baseline,
-               args.max_rounds, args.scope, args.since)
+               args.max_rounds, args.scope, args.since, args.no_code_access)
 
 
 if __name__ == "__main__":

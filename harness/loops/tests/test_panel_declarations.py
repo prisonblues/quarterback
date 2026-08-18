@@ -70,7 +70,7 @@ def _echoed(prompt: str, **fields) -> str:
 
 
 REVIEW_ECHO = _echoed(panel.REVIEW_PROMPT, n=1, repo="acme/board", base="main",
-                      ci="", diff="")
+                      ci="", diff="", code="")
 JUDGE_ECHO = _echoed(panel.JUDGE_PROMPT, findings="", coverage="", ci="", diff="")
 
 

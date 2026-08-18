@@ -613,7 +613,7 @@ def _panel_round(monkeypatch, tmp_path, round_no, findings, head, baseline=(),
         compare=FIX_COMPARE if compare is None else compare,
         diff=PR_DIFF)
 
-    def fake_review(name, model, prompt, effort=""):
+    def fake_review(name, model, prompt, effort="", **_kw):  # **_kw: code_tree since #113
         # Only the first seat files, so two seats do not produce two canonical
         # records of one defect. What the extra seats are here for is the diff
         # budget they carry.

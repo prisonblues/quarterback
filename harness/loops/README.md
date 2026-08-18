@@ -101,6 +101,7 @@ Detected from the checkout, **not settable** here: `path`, `github`, `default_br
 | `review_panel.judge_model` | Claude model for the master judge — `sonnet`, deliberately **not** `reviewers.claude.model`; see below. An explicit `""` is passed through as empty and lets the CLI pick, which is NOT the same as omitting the key (that gets the default). |
 | `review_panel.ask_quorum` / `ask_threshold` | `--ask`'s tally rules: how many seats must have **answered** for the vote to mean anything, and how many must have said the same thing for it to be that answer. Both **2** — one seat agreeing with the agent that wrote the premise is not a challenge. A rule above the number of seats on the ask is warned about: it can never be met. |
 | `review_panel.ask_max_context_chars` | Total `--context` material one ask may hand its seats, across every spec. **60,000** (~15k tokens). Over budget is clamped and SAID, per spec — an ask's whole claim is that it is the cheap check, and unbounded context is the #117 cost shape on the path advertised as costing a minute. |
+| `review_panel.reviewer_code_access` | May a seat READ the code under review? **true**. `false` is the old posture — every seat in an empty repo, the diff its only evidence — and is what a repo taking UNTRUSTED contributions selects. On does not mean every seat gets it: only a CLI that can express "read but do not execute" is handed the tree (today just `claude`), and which seats did is recorded per seat. `--no-code-access` turns it off for one run. See below. |
 | `loops` | `dependabot_lander` / `stacked_driver` / `issue_executor` — which loops may run. |
 | `epic` | Epic-driver settings — see below. |
 | `preland.disabled_checks` | Checks `preland.py` must not run, by name. Empty by default — every guardrail it can detect, it runs. A name nothing answers to is a **hard error**, not a warning; see below. |
@@ -319,6 +320,46 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   on — never the PR's code, which the panel reads as a diff and never checks out. A
   seat pointed there can quote a different branch as the code under review. The
   members need no working directory at all; they need a reproducible one.
+- **The seats can read the PR's code, per repo, on by default** (#113). Each seat that
+  can take it runs in a checkout of the PR **at its head**, fetched from GitHub's
+  tarball endpoint — never from `cfg["path"]`, which is the main checkout on whatever
+  branch it was last left on and is the failure #75 measured. Why it is on: the
+  blindness was expensive and it did not merely lose findings, it manufactured wrong
+  ones. On PR #160's round 1, nine of nineteen veto lines were seats declaring they
+  could not read a file this repo answers — all nine closed with `grep` in four
+  minutes. On #64 the proposed fix *was* the bug; on #90 a P1 inferred a missing
+  `--json` field from its absence in the diff when it was already there; on #123 no
+  seat could see `migrations/versions/`, the tool's entire subject.
+  - **Only a seat that can express "read but do not execute" gets it**, which is
+    `SEAT_READS_CODE` and today means **claude alone**. #92 answered "may reviewers
+    execute?" with no. Verified by running each CLI: claude names a tool set
+    (`--allowedTools Read Grep Glob`, no `Bash`) and enforces a working-directory
+    boundary of its own; codex's `-c` knobs only REMOVE tools and its single read path
+    is the shell, so granting reads grants execution and re-opens the tool-hunt that
+    once spent 99% of a run; pi's `--no-tools` is all-or-nothing over read/bash/edit/
+    write; antigravity has no tool mechanism at all. A seat that cannot read keeps its
+    empty sandbox — standing in a checkout it cannot open buys the instruction-file
+    channel for nothing.
+  - **Vendor convention files are stripped before any CLI starts** — `CLAUDE.md`,
+    `AGENTS.md`, `GEMINI.md`, `.claude/`, `.codex/` and the rest of
+    `CONVENTION_FILES`/`CONVENTION_DIRS`, at every depth, because a nested one is
+    read too. This is a **denylist and it will rot**; that is an accepted cost where
+    the contributors are your own agents and exactly why `false` is right where they
+    are strangers. Symlinks are unlinked, never followed: a `.claude ->` pointing out
+    of the tree would otherwise send `rmtree` at the real one. What was removed is
+    named in `config_notes` and in the payload, so a PR that shipped one is
+    distinguishable from a PR that did not.
+  - **Recorded per seat**, which is what makes the measurement possible:
+    `reviewers.<name>.code_blind` and a `code_access` block holding the setting, the
+    seats that actually got it, and the files stripped. A seat that can read the tree
+    while another cannot is a bigger confound than an unpinned model.
+  - **Every failure degrades to the OFF posture, loudly.** A fetch that 502s, a
+    tarball that will not unpack or has an unexpected shape, a copy that runs out of
+    disk: the seat is blind, recorded as blind, and the round says why in
+    `config_notes`. A review that would have happened always happens.
+  - **The judge is not given the tree.** Out of scope here and worth its own change:
+    #90's wrong P1 was a reviewer finding the judge *confirmed*, so a reading judge is
+    the natural next step rather than a detail of this one.
 - **A short panel says so.** The report states seats filled against seats configured
   on every run, and calls the panel degraded above the findings when they differ — a
   weaker review, not a cleaner one. A CLI the host does not carry is exempt (it is a

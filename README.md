@@ -577,7 +577,7 @@ full — including what was broken before it, which is the part no diff recovers
   a repo name, and treat the string itself as untrusted input on the way back in: the board bounds
   its length at `PATH_MAX` and normalises nothing else, so quote it, and do not hand a value
   beginning with `-` to `git` as anything but an operand.
-- **vNEXT** — the coverage veto stops reporting a constant. `confident` is `not veto`, so a
+- **vNEXT** — the panel stops reviewing blind (#113, both halves). *The veto split:* `confident` is `not veto`, so a
   veto line that fires every round makes a confident stop unreachable rather than rare. Two
   did: a seat that cannot read the code (every seat — an empty sandbox and no tools) declaring
   gaps about code outside the diff, and antigravity's argv ceiling, which the kernel sets at
@@ -587,6 +587,16 @@ full — including what was broken before it, which is the part no diff recovers
   still reported, and both have a floor so exempting seats one at a time cannot empty the veto
   on a round nothing read. Truncation by a `max_diff_chars` somebody typed still vetoes. First
   half of #113; code access as a per-repo setting is the second and lands separately.
+  *Code access:* `review_panel.reviewer_code_access`, on by default, runs each seat that
+  can take it in a checkout of the PR at its head — fetched from GitHub's tarball
+  endpoint, never from the main checkout, whose branch is not the PR's. It buys ONE seat:
+  only `claude` can be told "read but do not execute" (`--allowedTools Read Grep Glob`,
+  no `Bash`), while codex's only read path is its shell, pi's `--no-tools` is
+  all-or-nothing and antigravity has no tools at all — so the other three keep the empty
+  sandbox. Vendor convention files are stripped at every depth before any CLI starts
+  (symlinks unlinked, never followed), which is a denylist and says so. Every failure
+  degrades to reviewing from the diff, recorded per seat. `--no-code-access` opts out for
+  one run; `false` is what a repo taking untrusted contributions sets.
 - **v2.47** — the dashboard grows hands, and its tests start running. The SEATS panel
   closes a seat and adds one, and tmux grows a clickable bar of the same widgets above the
   seat row — both through `qb-seat-click`, which `qb-dash-tui` had been calling since the
