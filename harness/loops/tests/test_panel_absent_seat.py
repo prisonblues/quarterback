@@ -33,12 +33,25 @@ These tests pin both halves, because they fail on different days: the writer
 (`load_baseline`, so payloads already written stop re-introducing it — baselines
 outlive the release that wrote them and `--baseline` is fed them by design).
 
+**The reader's exemption is `absent`, not `ran`, and both directions are pinned
+here.** `ran` is `not skip`, false for every way of not running, so exempting on
+it would also drop the truncation of a seat that was INSTALLED, read a real
+prefix, and then crashed or timed out — a genuine tail nobody read, silently
+un-banked, in the fail-open direction on a `confident` veto. `coverage_veto` in
+the same file is the model: it exempts `absent` specifically and says in as many
+words that every other way of not running still vetoes. Keying on `absent` also
+keeps pre-`ran` payloads reading exactly as they always did, since they carry
+neither field.
+
 **Every test here pins the host.** `seat_installed` consults PATH, so a test that
 leaves it alone asserts on which vendor CLIs the machine happens to carry — green
 on a workstation, red on a CI runner that has none of them, and green for the
 wrong reason on a box that has all four. That is the same trap the pre-flight
 suite documents, and it is sharper here because this whole module is *about* the
-predicate.
+predicate. It is also why this module takes no package-wide pin: `conftest`'s
+`every_seat_installed` is requested by the modules that need a stated host,
+never applied to everything, so the one module whose subject is absence cannot be
+silently flipped to asserting presence.
 """
 
 import json
@@ -85,29 +98,40 @@ def _cfg(**seats):
 
 
 def _host(monkeypatch, present):
-    """Pin which seats this box carries, for BOTH callers of the predicate.
+    """Pin which seats this box carries, for every caller of the predicate.
 
-    `panel.py` and `panel_seats.py` each resolve `seat_installed` through their own
-    module globals (both star-import it), so patching one leaves the other reading
-    the real PATH — and the two disagreeing about which seats exist is precisely
-    the bug this module is about.
+    `panel.py`, `panel_seats.py` and `panel_rounds.py` each resolve
+    `seat_installed` through their own module globals (all three star-import it),
+    so patching one leaves the others reading the real PATH — and two consumers
+    disagreeing about which seats exist is precisely the bug this module is about.
+
+    `panel_core` is patched last and for a different reason: nothing exercised
+    through `run()` resolves the name there, so this one is inert for the
+    end-to-end tests. It exists for the predicate tests below, which call
+    `panel_core.seat_installed` directly, and for a future caller that has not
+    star-imported it.
     """
     def installed(name):
         return name in present
     monkeypatch.setattr(panel, "seat_installed", installed)
     monkeypatch.setattr(panel_seats, "seat_installed", installed)
+    monkeypatch.setattr(panel_rounds, "seat_installed", installed)
     monkeypatch.setattr(panel_core, "seat_installed", installed)
 
 
-def _round(monkeypatch, tmp_path, cfg, *, present, diff=BIG, baselines=()):
+def _round(monkeypatch, tmp_path, cfg, *, present, diff=BIG, baselines=(),
+           judge_budget=None):
     seen = {"prompts": {}}
+    if judge_budget is not None:
+        cfg = {**cfg, "review_panel": {**cfg.get("review_panel", {}),
+                                       "judge_max_diff_chars": judge_budget}}
     _host(monkeypatch, present)
 
     def fake_review(name, model, prompt, effort=""):
         seen["prompts"][name] = prompt
-        # The real `run_cli` refuses an absent seat before it spends anything; this
-        # double stands in for that, so the test exercises `run()`'s bookkeeping
-        # rather than the CLI layer.
+        # The real `run_seat` refuses an absent seat before it spends anything;
+        # this double stands in for that, so the test exercises `run()`'s
+        # bookkeeping rather than the CLI layer.
         if not panel.seat_installed(name):
             return panel.ReviewerRun([], f"{name}: {panel.CLI_ABSENT}", 1, None,
                                      absent=True)
@@ -126,6 +150,22 @@ def _round(monkeypatch, tmp_path, cfg, *, present, diff=BIG, baselines=()):
 
 # ------------------------------------------------------------------ the predicate
 
+def _never_run(*a, **kw):
+    """A `run_cli` double for the paths that must not reach a CLI at all. Raising
+    rather than returning: a seat that got this far has already been let past the
+    absence check, and a quiet stub would let that regression read as a pass."""
+    raise AssertionError("run_seat reached the CLI for a seat it should have refused")
+
+
+def _record_run(seen):
+    """A `run_cli` double that notes it was called and reports a failure, so the
+    seat returns a skip of its own rather than spawning anything or being parsed."""
+    def fake(*a, **kw):
+        seen.append(a)
+        return None, "stubbed by the test"
+    return fake
+
+
 def test_seat_installed_asks_about_the_COMMAND_not_the_seat_name(monkeypatch):
     """The reviewer is `antigravity`; the command is `agy`. Asking PATH for
     "antigravity" reports the one argv-bound seat absent on every box — the
@@ -139,24 +179,109 @@ def test_seat_installed_asks_about_the_COMMAND_not_the_seat_name(monkeypatch):
     assert asked[-1] == "claude"
 
 
-def test_run_cli_and_budgets_ask_the_SAME_predicate(monkeypatch):
-    """One question, one implementation. `run_cli` used its own inline
-    `shutil.which(CLI_BIN.get(...))`; two copies are two chances to disagree, and
-    the disagreement is silent — a seat skipped as absent while its budget record
-    says it was handed 116,287 chars."""
-    src = Path(panel_seats.__file__).read_text()
-    assert "shutil.which(CLI_BIN" not in src, "run_cli grew its own copy again"
-    assert "seat_installed(" in src
+def test_seat_installed_is_FALSE_and_a_bool_when_the_command_is_not_there(monkeypatch):
+    """The other direction, and the type. `which` returns a PATH or None, and the
+    `bool(...)` around it is load-bearing rather than decoration: every `is True` /
+    `is False` assertion in this module — and `not m.get("absent")` in
+    `load_baseline` — reads an identity, and a bare path string would satisfy the
+    truthiness while failing the identity."""
+    monkeypatch.setattr(panel_core.shutil, "which", lambda c: None)
+    assert panel_core.seat_installed("antigravity") is False
+    assert panel_core.seat_installed("claude") is False
+
+
+def test_run_seat_and_budgets_ask_the_SAME_predicate(monkeypatch):
+    """One question, one implementation, pinned by BEHAVIOUR. `run_seat` used its
+    own inline `shutil.which(CLI_BIN.get(...))`; two copies are two chances to
+    disagree, and the disagreement is silent — a seat skipped as absent while its
+    budget record says it was handed 116,287 chars.
+
+    This used to read `panel_seats.py` and grep it for `shutil.which(CLI_BIN`,
+    which is a test of the SPELLING: an alias, a line break or a rename defeats it,
+    a legitimate use elsewhere in the file false-fires it, and the `seat_installed(`
+    half was satisfied by the comment sitting two lines above the real call. So it
+    patches the shared predicate instead and asks `run_seat` what it does — the
+    only thing that proves the two are one question.
+    """
+    # PATH says the binary IS there, the shared predicate says it is not. A
+    # `run_seat` still carrying its own `shutil.which` would sail past the patch
+    # and spawn the CLI; one asking the predicate refuses. Nothing may reach a
+    # subprocess either way, so the runner is doubled into a hard failure.
+    monkeypatch.setattr(panel_core.shutil, "which", lambda c: "/x/bin/" + c)
+    monkeypatch.setattr(panel_seats, "seat_installed", lambda name: False)
+    monkeypatch.setattr(panel_seats, "run_cli", _never_run)
+    got = panel_seats.run_seat("claude", "sonnet", "prompt")
+    assert got.absent is True
+    assert got.skip.endswith(panel.CLI_ABSENT)
+
+    # And the refusal really is the predicate's answer rather than a seat that
+    # never runs: flip the same predicate and the seat gets as far as the CLI.
+    reached = []
+    monkeypatch.setattr(panel_seats, "seat_installed", lambda name: True)
+    monkeypatch.setattr(panel_seats, "run_cli", _record_run(reached))
+    got = panel_seats.run_seat("claude", "sonnet", "prompt")
+    assert reached, "an installed seat was refused anyway"
+    assert got.absent is False
 
 
 # ------------------------------------------------------------------ the writer
 
 def test_an_absent_seat_gets_no_budget(monkeypatch, tmp_path):
-    """The root. Everything below is a consequence of this dict."""
+    """The root. Everything below is a consequence of this dict.
+
+    A NULL rather than a missing key: the internal dict genuinely drops the seat,
+    because everything that iterates it reads a null as "uncapped" and would
+    compose the whole diff for a reviewer that never ran — but the PAYLOAD keeps
+    every selected seat, so a board reading `diff_budgets[name]` for a configured
+    seat does not start raising KeyError on the unattended hosts this is for."""
     got, _ = _round(monkeypatch, tmp_path, _cfg(claude=None, antigravity=None),
                     present={"claude"})
     assert got["diff_budgets"]["claude"] is None
-    assert "antigravity" not in got["diff_budgets"]
+    assert got["diff_budgets"]["antigravity"] is None
+    assert set(got["diff_budgets"]) == {"claude", "antigravity", "judge"}
+
+
+def test_an_absent_seat_is_not_handed_the_diff_it_will_never_read(monkeypatch,
+                                                                 tmp_path):
+    """No budget means `prompt_for(None)`, which means the WHOLE diff — rendered
+    per absent seat, per round, for `run_seat` to throw away a moment later. It
+    also bounds the blast radius if the round's PATH read and `run_seat`'s ever
+    disagree: a seat decided absent here can never carry an uncapped prompt into
+    `agy`'s argv, which is the E2BIG `ARGV_PROMPT_MAX_BYTES` exists to prevent."""
+    got, seen = _round(monkeypatch, tmp_path, _cfg(claude=None, antigravity=None),
+                       present={"claude"})
+    assert seen["prompts"]["antigravity"] == ""
+    assert len(seen["prompts"]["claude"]) > len(BIG)
+    # And the seat still reported itself absent, which is the property the empty
+    # prompt must not have cost.
+    assert got["reviewers"]["antigravity"]["absent"] is True
+
+
+def test_the_JUDGE_gets_no_budget_on_a_box_that_cannot_run_it_either(monkeypatch,
+                                                                    tmp_path):
+    """The consumer sitting one line below the fix, and missed by the first pass.
+    `adjudicate` runs the judge through the `claude` CLI and refuses when it is
+    absent — asking this same predicate — so a judge budget there is the same
+    statement about a reviewer that never read a byte, and "the judge saw 60,000
+    of 177,872 chars" is the same footnote-that-is-a-lie.
+
+    Not cosmetic either: a judge shortfall is appended to `veto` as well as to
+    `config_notes`, and `confident` is `not veto` — so a box without `claude` and a
+    configured `judge_max_diff_chars` bought every one of its rounds a standing
+    veto about an adjudication that never happened. The same shape of failure as
+    the reviewer half, one line down."""
+    got, _ = _round(monkeypatch, tmp_path, _cfg(antigravity=None),
+                    present={"antigravity"}, judge_budget=200)
+    assert got["diff_budgets"]["judge"] is None
+    assert not any("the judge" in n for n in got["config_notes"]), got["config_notes"]
+    assert not any("the judge" in v for v in got["round_stop"]["veto"]), \
+        got["round_stop"]["veto"]
+    # The other direction: with `claude` on the box the judge budget is honoured
+    # and the shortfall is reported, exactly as before.
+    got, _ = _round(monkeypatch, tmp_path, _cfg(claude=None),
+                    present={"claude"}, judge_budget=200)
+    assert got["diff_budgets"]["judge"] == 200
+    assert any("the judge" in n for n in got["config_notes"]), got["config_notes"]
 
 
 def test_an_absent_seat_is_still_DISPATCHED_and_still_reports_itself_absent(
@@ -237,7 +362,8 @@ def test_a_box_carrying_no_seat_at_all_still_produces_a_payload(monkeypatch,
     correct answer."""
     got, _ = _round(monkeypatch, tmp_path, _cfg(claude=None, antigravity=None),
                     present=set())
-    assert got["diff_budgets"] == {"judge": None}
+    assert got["diff_budgets"] == {"claude": None, "antigravity": None,
+                                   "judge": None}
     assert got["reviewers_ran"] == []
     assert got["diff_truncated"] is False
     assert any("no reviewer ran" in v for v in got["round_stop"]["veto"])
@@ -274,26 +400,65 @@ def test_an_absent_seats_truncation_does_not_bank_a_truncated_round(tmp_path):
 
 
 def test_a_seat_that_RAN_and_was_truncated_still_banks_one(tmp_path):
-    """The signal, unharmed. `ran and truncated` must not become `not truncated`."""
+    """The signal, unharmed. The exemption must not become "never truncated"."""
     real = _payload(tmp_path, "r1.json",
                     {"claude": {"ran": True, "truncated": True}})
     assert _baseline([real]).truncated_rounds == {1}
 
 
+def test_a_seat_that_was_CUT_and_then_CRASHED_still_banks_a_truncated_round(tmp_path):
+    """The over-correction this exemption must not make, and the reason it is
+    keyed on `absent` rather than on `ran`.
+
+    `ran` is `not skip` — false for EVERY way of not running. An INSTALLED seat
+    with a small `max_diff_chars` is handed a genuine prefix and then times out,
+    exits non-zero, or is refused for a bad effort pin: it is written
+    `ran: False, absent: False, truncated: True`, because `truncated` is keyed off
+    `truncated_for`, which is built from `budgets`, and an installed seat still has
+    a budget. A tail of that round really was read by nobody. Dropping it is a
+    fail-open on a `confident` veto — the phantom-inverse of the bug this fixes,
+    and the direction this repo consistently refuses.
+
+    `coverage_veto` is the model: it exempts `absent` specifically and states that
+    every other way of not running still vetoes. So does this."""
+    crashed = _payload(tmp_path, "r1.json",
+                       {"claude": {"ran": False, "absent": False, "truncated": True,
+                                   "skip": "claude (sonnet): timed out after 900s",
+                                   "max_diff_chars": 200}})
+    assert _baseline([crashed]).truncated_rounds == {1}
+
+
 @pytest.mark.parametrize("member", [
-    {"truncated": True},                       # pre-v2.15: no `ran` recorded
-    {"ran": None, "truncated": True},
     {"ran": True, "truncated": None},
+    {"ran": False, "absent": True},
     {},
 ])
-def test_a_payload_that_does_not_say_banks_nothing(tmp_path, member):
-    """`ran` absent means an older panel wrote it, not that the seat ran. Reading
-    a missing field as True would restore the phantom for exactly the payloads
-    this cannot verify — and `load_baseline`'s standing rule is that a payload it
-    cannot read costs a `problems` entry, never a wrong inference."""
+def test_a_payload_that_says_nothing_about_truncation_banks_nothing(tmp_path, member):
+    """No recorded truncation is no gap to bank. `load_baseline`'s standing rule is
+    that a payload it cannot read costs a `problems` entry, never a wrong
+    inference, and inferring a cut from a member that never claimed one is the
+    wrong inference in the expensive direction — it is a `confident` veto."""
     p = _payload(tmp_path, "r1.json", {"claude": member})
-    b = _baseline([p])
-    assert b.truncated_rounds == set()
+    assert _baseline([p]).truncated_rounds == set()
+
+
+@pytest.mark.parametrize("member", [
+    {"truncated": True},                       # pre-v2.15: no `ran` recorded
+    {"ran": None, "truncated": True},          # recorded, unreadably
+])
+def test_an_OLD_payload_that_recorded_a_truncation_still_banks_it(tmp_path, member):
+    """A payload written before the panel recorded `ran` per member says nothing
+    about whether the seat ran — but it does say the seat was CUT, and that is the
+    fact this reads. `not absent` is True for it, so the truncation banks, which is
+    exactly what the pre-#222 reader did with it.
+
+    The first version of this fix required `ran` and therefore silently dropped
+    these, with no `problems` entry and no trace: an old baseline recording a real
+    coverage gap would have made a later round look better covered than it was, and
+    the operator would have had no way to see it happen. Keying on the absence the
+    payload can actually be asked about costs nothing here and loses nothing."""
+    p = _payload(tmp_path, "r1.json", {"claude": member})
+    assert _baseline([p]).truncated_rounds == {1}
 
 
 def test_a_phantom_truncation_no_longer_vetoes_a_later_SCOPED_round(monkeypatch,

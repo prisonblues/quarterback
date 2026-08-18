@@ -202,10 +202,19 @@ def seat_installed(name: str) -> bool:
     (#222). One predicate, in the module both callers already import, is what
     stops the panel holding two opinions about which seats exist.
 
-    :func:`panel_seats.run_cli` asks the same question, through this function
-    rather than through its own copy of it: two spellings of "is this seat here"
-    is how they come to disagree, and the disagreement is silent — a seat skipped
-    as absent while its budget says it was handed 116,287 chars.
+    :func:`panel_seats.run_seat` and :func:`panel_rounds.adjudicate` ask the same
+    question, through this function rather than through their own copies of it:
+    two spellings of "is this seat here" is how they come to disagree, and the
+    disagreement is silent — a seat skipped as absent while its budget says it was
+    handed 116,287 chars.
+
+    The command it looks for comes from :data:`CLI_BIN`, falling back to the seat's
+    own name. A vendor that renames its binary and is not recorded there reads as
+    absent on every box, and since #222 that costs more than a visible
+    `CLI ABSENT` skip line: the seat also loses its budget and its `config_notes`
+    line, so it disappears from the run's configuration report rather than
+    appearing in it as skipped. :data:`CLI_BIN` is the single place to record such
+    a divergence, and this is the reason to keep it current.
     """
     return bool(shutil.which(CLI_BIN.get(name, name)))
 

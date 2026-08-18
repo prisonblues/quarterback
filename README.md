@@ -600,9 +600,14 @@ full — including what was broken before it, which is the part no diff recovers
   as truncated and the next round reported code as "read by no round of this cycle" when nothing
   had been cut, which is a `confident` veto — so every multi-round cycle on such a box was
   non-confident from round 2 onward, permanently. `seat_installed` now lives in `panel_core`
-  beside `CLI_BIN`, `budgets` is filtered by it, and `run_cli` shares it rather than keeping its
-  own copy. The absent seat is still dispatched and still records itself absent; it just gets no
-  budget, and its null budget sits beside `truncated: false` so the two agree.
+  beside `CLI_BIN`, is read once per round, and `budgets`, `run_seat` and the judge's own
+  `adjudicate` all share it rather than keeping their own copies. The absent seat is still
+  dispatched and still records itself absent; it just gets no budget — and with no budget, no
+  rendered prompt it was never going to read. In the payload it records a `null` budget rather
+  than losing its `diff_budgets` key, so nothing downstream starts raising `KeyError` on the
+  unattended hosts this is for. `load_baseline` banks a round as truncated on
+  `truncated and not absent` — the exemption `coverage_veto` already makes, keyed on the same
+  field, so a seat that was installed, read a real prefix and then crashed still counts.
 - **v2.47** — the dashboard grows hands, and its tests start running. The SEATS panel
   closes a seat and adds one, and tmux grows a clickable bar of the same widgets above the
   seat row — both through `qb-seat-click`, which `qb-dash-tui` had been calling since the

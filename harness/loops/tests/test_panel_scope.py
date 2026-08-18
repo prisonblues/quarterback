@@ -32,6 +32,14 @@ import panel_scope  # noqa: E402  — scope/range readers moved here in #129
 import panel_core  # noqa: E402  — `sh` is defined here since #129
 import panel_seats  # noqa: E402  — these seats moved here in #129
 
+#: This module states its HOST (#222). `budgets` is built from the seats this box
+#: can actually run, so six tests below — budgets, truncation, the frame that
+#: cannot be paid for — would otherwise be assertions about which vendor CLIs the
+#: machine happens to carry: green on a workstation, red on a bare CI runner.
+#: Requested here rather than applied package-wide, so a module whose subject IS
+#: absence (`test_panel_absent_seat.py`) is not silently pinned to the opposite.
+pytestmark = pytest.mark.usefixtures("every_seat_installed")
+
 
 def chunk(path: str, body: str) -> str:
     """One file's worth of unified diff, in the shape `gh pr diff` emits."""

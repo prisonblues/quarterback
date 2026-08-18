@@ -36,29 +36,51 @@ round 2 onward, permanently.** That is the failure the absent-CLI exemption exis
 to prevent, arriving through the one consumer nobody exempted.
 
 **Filtered at the source rather than at each consumer.** `seat_installed` now
-lives in `panel_core` beside `CLI_BIN`, `budgets` is filtered by it, and
-`panel_seats.run_cli` asks the same predicate instead of its own inline
-`shutil.which` — two copies being two chances to disagree, silently, about which
-seats this box has. The absent seat is still **dispatched** and still records
+lives in `panel_core` beside `CLI_BIN`, `budgets` is filtered by it, and both
+`panel_seats.run_seat` and `panel_rounds.adjudicate` ask the same predicate
+instead of their own inline `shutil.which` — copies being chances to disagree,
+silently, about which seats this box has. It is read **once per round** and
+snapshotted, so the budget, the argv clamp, the prompt and the payload all
+describe one host. The absent seat is still **dispatched** and still records
 itself absent, because that record is what the veto exemption and the report both
-read; what it no longer gets is a budget. Its `max_diff_chars` is `null` beside
-`truncated: false`, so the two fields agree about whether it existed. Fixing it
-here closes all four artefacts at once; a fifth consumer added later inherits it.
+read; what it no longer gets is a budget, and with no budget it is no longer
+handed a rendered prompt it was never going to read. The judge is filtered by the
+same predicate: `adjudicate` runs it through the `claude` CLI, so a box without
+that gets no `judge_max_diff_chars` and no "the judge saw …" note either.
+
+**`diff_budgets` keeps every selected seat.** In the payload an absent seat
+records `null` rather than losing its key — the same answer
+`reviewers.<name>.max_diff_chars` gives it — so a board or dashboard reading
+`diff_budgets[name]` for a configured seat does not begin raising `KeyError` on
+exactly the unattended hosts this fix is for. The internal dict does drop the
+seat, and has to: everything that iterates it reads a `null` as *uncapped*. What
+the null-beside-`truncated: false` pairing guarantees is only that a null budget
+can never sit beside `truncated: true`; it does not identify an absent seat, since
+an installed one with no configured budget records the same pair. `absent` is the
+field that carries that, which is why the reader below keys on it.
 
 **And the reader was fixed too, because baselines outlive the writer.**
-`load_baseline` now requires `ran and truncated`. Every payload already on disk
-carries the old pairing and `--baseline` is fed them by design, so cleaning only
-the writer would leave every cycle already in flight banking phantom gaps until it
-ended. A member that records no `ran` at all — an older panel — banks nothing
-rather than being assumed to have run.
+`load_baseline` now banks a round as truncated on `truncated and not absent` —
+the same exemption `coverage_veto` makes, keyed on the same field. Every payload
+already on disk carries the old pairing and `--baseline` is fed them by design, so
+cleaning only the writer would leave every cycle already in flight banking phantom
+gaps until it ended. Deliberately **not** `ran and truncated`: `ran` is false for
+every way of not running, so that would also drop the truncation of a seat that
+was installed, read a genuine prefix, and then crashed or timed out — a real tail
+nobody read, un-banked, in the fail-open direction on a `confident` veto. Keying
+on `absent` also leaves pre-`ran` payloads reading exactly as they always did,
+since they carry neither field.
 
 **A note for anyone writing tests here.** `seat_installed` is a PATH read on the
 critical path of every round, which makes host capability a test-outcome
 dependency: nine existing tests pass on a workstation and fail on a CI runner
 carrying none of the four CLIs, while testing budgets, scope and truncation. The
-shared `conftest.py` now pins every seat present by default, and
-`test_panel_absent_seat.py` overrides it per test. That pin is on `panel` only and
-deliberately not on `panel_seats` — forcing `run_cli` to believe an absent binary
+shared `conftest.py` grows an `every_seat_installed` fixture, **requested by the
+three modules that need a stated host rather than applied package-wide** — a pin
+that reaches tests nobody chose it for turns every absence assertion in the
+directory into a presence assertion, silently, and `test_panel_absent_seat.py` is
+a whole module whose subject is absence. That pin is on `panel` only and
+deliberately not on `panel_seats` — forcing `run_seat` to believe an absent binary
 exists makes it exec `agy` and retry with backoff, which hangs the suite rather
 than failing it.
 

@@ -486,7 +486,13 @@ def adjudicate(clusters: list[list[Finding]], diff: str, model: str, pr: int,
         return [_unmerged(f, pr, i + 1, "unjudged", "unjudged")
                 for i, f in enumerate(flat)], reason, note
 
-    if not shutil.which("claude"):
+    # Through the shared predicate (#222), not an inline `shutil.which`: `run()`
+    # now withholds `judge_max_diff_chars` from a box with no `claude` for the same
+    # reason it withholds a reviewer's budget, and the gate that decides that has
+    # to be the gate that decides this. Two spellings of "is the judge here" is how
+    # they come to disagree — a judge skipped as absent while `diff_budgets.judge`
+    # says it was given 60,000 chars.
+    if not seat_installed("claude"):
         return unruled("judge: claude CLI absent")
     # On stdin, like the reviewers, and for a sharper reason: the judge's prompt
     # is the only one with a component no budget could cover. The findings
@@ -911,19 +917,30 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
         #: `members` because `reread` below needs POSITIVE evidence, and an empty
         #: list of records is the shape both "nobody said" cases arrive in.
         recorded = [m for m in members if isinstance(m, dict)]
-        # `ran AND truncated`, never `truncated` alone (#222). A member that did
-        # not run cannot have been cut, and until this release an absent seat was
-        # recorded `truncated: True` anyway — so this banked a truncated round on
-        # every cycle of every box configuring a seat it cannot carry, and the
-        # inherited veto below then told a later round that code had "been read by
-        # no round of this cycle" when nothing had been cut off from anything.
+        # `truncated AND NOT absent` (#222) — the same exemption `coverage_veto`
+        # below makes, keyed on the same field, and deliberately not a narrower
+        # one. Until this release an absent seat was recorded `truncated: True`
+        # anyway, so this banked a truncated round on every cycle of every box
+        # configuring a seat it cannot carry, and the inherited veto then told a
+        # later round that code had "been read by no round of this cycle" when
+        # nothing had been cut off from anything.
         #
-        # The budgets fix upstream stops NEW payloads carrying that pairing. This
-        # is what stops OLD ones re-introducing it: baselines outlive the release
-        # that wrote them, `--baseline` is fed payloads from earlier rounds by
-        # design, and a fix that only cleans the writer leaves every cycle already
-        # in flight banking phantom gaps until it ends.
-        cut = any(m.get("ran") and m.get("truncated") for m in recorded)
+        # NOT `ran and truncated`, which was the first spelling of this fix and
+        # over-corrects in the optimistic direction: `ran` is `not skip`, false for
+        # EVERY way of not running. An INSTALLED seat with a small budget reads a
+        # genuine prefix and then times out, crashes, or is skipped for a bad
+        # effort pin — it is written `ran: False, truncated: True`, and a real tail
+        # that nobody read would stop being banked. `absent` is the one absence
+        # that is a fact about the HOST rather than about the round; every other
+        # way of not running still counts here, exactly as it still vetoes there.
+        #
+        # It is also what keeps OLD payloads honest, which is why the reader had to
+        # be fixed at all: baselines outlive the release that wrote them and
+        # `--baseline` is fed earlier rounds' payloads by design. A pre-`ran`
+        # payload has neither field, so `not absent` is True and its recorded
+        # truncation is banked — the old reading, preserved, rather than a real
+        # coverage gap silently dropped because the writer was too old to say.
+        cut = any(m.get("truncated") and not m.get("absent") for m in recorded)
         if cut:
             b.truncated_rounds.add(was)
         # Two facts about coverage that only matter once a later round stops

@@ -23,10 +23,19 @@ Run: pytest harness/loops/tests
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
 import panel_core  # noqa: E402  — `sh` is defined here since #129
 from conftest import gh_stub  # noqa: E402
+
+#: This module states its HOST (#222). The end-to-end tests below assert on what a
+#: seat's PROMPT contained, and a seat this box cannot run is dispatched with an
+#: empty prompt — it will never read one, and rendering the whole diff for it is
+#: work thrown away. Without a stated host those assertions are about which vendor
+#: CLIs the machine happens to carry.
+pytestmark = pytest.mark.usefixtures("every_seat_installed")
 
 #: Every state `review_ci` can return. Named here so a new one added to the
 #: reader without a matching branch in `ci_brief` fails the sweep below rather

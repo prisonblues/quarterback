@@ -30,6 +30,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
 import panel_scope  # noqa: E402  — scope/range readers moved here in #129
@@ -37,7 +39,12 @@ import panel_seats  # noqa: E402
 import panel_core  # noqa: E402  — `sh` is defined here since #129
 from conftest import gh_stub  # noqa: E402
 
-
+#: This module states its HOST (#222). `budgets` is built from the seats this box
+#: can actually run, and the three truncation-provenance tests below need real
+#: budgets on real seats — without a stated host they assert on which vendor CLIs
+#: the machine happens to carry. Requested here rather than applied package-wide,
+#: so a module whose subject IS absence is not silently pinned to the opposite.
+pytestmark = pytest.mark.usefixtures("every_seat_installed")
 
 
 
