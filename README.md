@@ -586,6 +586,19 @@ full — including what was broken before it, which is the part no diff recovers
   trap that made the ＋ do nothing in silence: a mouse binding gets no `$TMUX_PANE` and the
   tmux server's PATH usually predates the harness. And the dashboard's seven tests, which had
   skipped every CI run since they were written, now execute.
+- **vNEXT** — a pinned reviewer model no host can serve stops costing the whole seat. A model
+  pin is one value for the fleet and a *deployment* is per-host: codex on the work box routes
+  through an employer gateway deploying `gpt-5.5` while `.harness-rules` pins `gpt-5.6-luna`,
+  so the seat 404s and a four-vendor panel silently became one — on PR #207, 25 findings all
+  from `claude`, reviewing a PR `claude` wrote, and on #217 a round where nobody ran at all.
+  Both codex pins are refused here independently (the `max` effort as well as the model), so
+  each is now lowered on its own, at most once, and the header says which
+  (`codex (CLI default; pinned gpt-5.6-luna unavailable, effort max unsupported)`), with
+  the substitution recorded as state in the payload so the board never averages a swapped run
+  in as the pinned one. Both halves of the old failure were the wrong stream: codex writes its
+  errors to stdout under `--json` while stderr holds a progress banner, so the diagnosis said
+  `exited 1 (Reading prompt from stdin...)` about a 404 — and the retry decision read the same
+  empty stream, retrying a settled failure at ten minutes a go.
 - **v2.46** — a screen you ask for by number, and seats that do not stop to ask. `qb-b 3`
   is the seat count, the default is 3 and the ceiling is 10; past five, seats are five across
   and two down, built rather than left to `select-layout tiled`, which picks the wrong axis

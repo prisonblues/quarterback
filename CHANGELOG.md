@@ -11,6 +11,108 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
+## vNEXT — a pinned model no host can serve stops costing the whole seat
+
+A four-seat panel became a one-seat panel, quietly, and said `exited 1 (Reading prompt from
+stdin...)` about it.
+
+**The cause is a pin that cannot be right everywhere.** `.harness-rules` pins reviewer model
+slugs so a finding stays attributable — "codex found 9 issues" means nothing later without the
+model behind it. But a pin is one value for the whole fleet and a *deployment* is per-host. On
+daedalus, codex routes through an employer Azure gateway that deploys `gpt-5.5`, while the
+rules pin `gpt-5.6-luna`; there is no deployment for that slug, so the seat 404s, reconnects
+ten times and gives up. On PR #207 the result was 25 master-confirmed findings **all
+attributed to `claude`** — one vendor reviewing a PR that vendor had written, with the panel
+correctly reporting that no consensus was possible. A review with no independent vendor in it
+is the situation the pinning rationale exists to protect against, and the pin is what caused
+it.
+
+**Two bugs stood between that and being diagnosable, and both were the wrong stream.** codex
+under `--json` writes its event stream to **stdout**, so the account of what happened —
+`{"type":"error","message":"Reconnecting... 1/10 (unexpected status 404 Not Found: The API
+deployment for this resource does not exist ...)"}` — lands there, while **stderr** holds
+exactly one line: `Reading prompt from stdin...`, a progress banner printed before the request
+was even made.
+
+- **The diagnosis read stderr only.** `stderr_gist` was not picking the wrong line; it picked
+  the only line it had. So a config mismatch was reported as something that reads like broken
+  stdin plumbing, and it cost two wrong diagnoses — one of them mine, in a session that also
+  looked at `codex login status`, which says "Not logged in" on this box even though codex
+  works, because the gateway is configured rather than logged into. Two misleading signals in
+  front of a one-line problem.
+- **So did the retry decision, and nobody had noticed.** `is_deterministic_failure` keys on
+  `is_rejection`, which matches 4xx invalid-request markers and an explicit `"status":400` and
+  deliberately excludes 429. A gateway **404** is neither, so an unservable pin read as a flake
+  worth retrying — and each outer attempt spent the seat's whole budget, ten minutes at a time,
+  to arrive at the identical 404. codex had already reconnected ten times internally before the
+  panel even considered going again.
+
+Both now build their answer from stderr **and** the error envelopes lifted off stdout
+(`error_events`, strict enough — a line counts only if it parses as a JSON object whose `type`
+is `error` — to run safely over the seats whose stdout is their reply). `cli_hint` gains the
+branch that names a missing deployment, checked *before* the CLI-too-old branch because the two
+overlap in wording and telling someone to upgrade a current CLI is the confident wrong answer
+that function exists to stop giving.
+
+**There are TWO unsatisfiable pins, not one, and that broke the first version of this fix.**
+`.harness-rules` pins codex twice — a slug and a reasoning effort — and this gateway refuses
+both, separately::
+
+    gpt-5.6-luna + max    ->  404, no deployment for that model
+    gpt-5.5      + max    ->  {"param": "reasoning.effort", "code": "unsupported_value"}
+    gpt-5.5      + high   ->  works
+
+So "on a 404, retry with the CLI's default model" keeps `-c model_reasoning_effort=max` and
+loses the seat on the next knob. `panel_seats`' own comment already said the API "rules on the
+model/effort pair"; nothing acted on it until a **zero-seat** round on PR #217 — `LLM reviewers
+ran: none — 0 of 4 configured`, `to_fix: 0` — made it visible. That round is one careless glance
+from reading as a clean review. The two pins are now lowered independently, each only when the
+error names it, at most once each.
+
+The two refusals also overlap in *wording* and must not overlap in meaning: the effort rejection
+reads "Unsupported value: 'max' is not supported with this model", which names the model while
+blaming the effort. Read as a model problem it drops the wrong pin — recovering anyway on the
+next pass, but recording `model_unavailable` for a model that was perfectly servable. The effort
+refusal therefore wins the tie.
+
+**And the seat is recovered rather than lost.** On an unsatisfiable pin a seat lowers it and
+reviews anyway. A degraded seat beats an empty
+one — but only if the record is honest about it, so the substitution is carried as state
+(`ReviewerRun.pinned_unavailable`, alongside `absent` and for the same reason: a message tail is
+free text) and rendered in the header as `codex (CLI default, max; pinned gpt-5.6-luna
+unavailable)`. It is in the JSON payload too, because the board is where "which reviewer earns
+its cost" is answered from accumulated runs and a run whose model was swapped must not be
+averaged in as the pinned one. `CLI default` rather than the resolved slug because nothing here
+knows it — the model is chosen inside the CLI from its own config, and naming it would mean
+parsing another tool's configuration.
+
+The fallback is deliberately narrow: only for a pin that was actually set, only for the two
+causes above, and at most once per pin — so it is bounded at two attempts and cannot become
+"retry with fewer constraints until something answers", which would review on a weaker seat for
+reasons nobody chose.
+
+**codex only, and that is a real limit rather than caution.** Lowering a pin means rebuilding the
+argv without it, which needs a seat whose argv can *say* "use your default": `codex_args("")`
+omits `--model` entirely. `claude` takes `--model` unconditionally and would be handed an empty
+string; `agy` builds its argv eagerly, before any failure exists to react to. The first draft
+gated on nothing and would have re-sent the identical bad value for those seats and then labelled
+it a fallback — a false record on top of a futile retry. Caught in review by codex, on a diff
+about codex.
+
+An `--ask` run falls back the same way and reports it the same way: `SeatAnswer` carries the same
+two fields, because the first draft dropped them there and the Seats line would have named the
+pin while the CLI default answered the premise. Both new fields sit at the END of their
+dataclasses — `SeatAnswer` is constructed positionally, and inserting ahead of `verdict` rebound
+every ask's verdict to a new field, which surfaced as 19 tests reporting wrong verdicts rather
+than as a type error.
+
+Eighteen tests in `test_panel_reviewer_model.py`, against the real captured streams and the real
+refusal envelopes. Two go red on their assertion against the pre-fix code — the retry decision
+and the missing hint, both fed a literal 404 string precisely so they test behaviour rather than
+the existence of a new function. The rest cover new symbols and are `red/green: N-A (new code
+path)`: reaching for a new name fails the old code with an `AttributeError`, which proves only
+that the name is new.
+
 ## v2.47 — the dashboard grows hands, and its tests start running
 
 The seat screen could tell you what was happening and not much else could be

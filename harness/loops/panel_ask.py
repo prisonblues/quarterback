@@ -770,8 +770,17 @@ def ask(repo_name: str | None, premise: str, contexts: list[str] | None = None,
             f"`{c.path}:{c.first}-{c.last}`" if c.first else f"`{c.path}`" for c in read))
     else:
         lines.append("**Context:** none given — the seats answered from the premise alone")
-    lines.append("**Seats:** " + (", ".join(reviewer_label(n, models[n], efforts.get(n, ""))
-                                            for n in seats) or "none"))
+    # `fallback_label`, not `reviewer_label`: a seat that could not use its pins
+    # answered on something else, and the Seats line is where a reader learns which
+    # brain settled the premise (#215).
+    lines.append("**Seats:** " + (", ".join(
+        fallback_label(n,
+                       "" if answers.get(n) and answers[n].model_unavailable else models[n],
+                       "" if answers.get(n) and answers[n].effort_unsupported
+                       else efforts.get(n, ""),
+                       answers[n].model_unavailable if answers.get(n) else "",
+                       answers[n].effort_unsupported if answers.get(n) else "")
+        for n in seats) or "none"))
     if asker:
         # Only the seats on THIS ask have a vote to be the only one, so
         # `--reviewers codex --asker claude` gets the other sentence: the first

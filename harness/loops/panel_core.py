@@ -373,6 +373,17 @@ class ReviewerRun:
     #: coverage veto, and silently restores the veto the moment the absent
     #: branch's wording gains a suffix.
     absent: bool = False
+    #: The pinned model, and the pinned reasoning effort, this host's provider
+    #: could not serve — when the seat lowered them and reviewed anyway (#215).
+    #: State, for the same reason as `absent`: the report has to say what actually
+    #: did the review, and deriving that from a message tail is how a record comes
+    #: to claim a model that never ran. `""` = the pin was honoured.
+    #:
+    #: Two fields because the provider refuses them independently: on the gateway
+    #: that motivated this, `gpt-5.6-luna` has no deployment AND `max` effort is an
+    #: `unsupported_value`, so a seat can end up having dropped either or both.
+    model_unavailable: str = ""
+    effort_unsupported: str = ""
 
 
 @dataclass
@@ -1259,6 +1270,17 @@ class SeatAnswer:
     duration_ms: int = 0
     usage: dict | None = None
     absent: bool = False
+    #: As `ReviewerRun.model_unavailable` / `.effort_unsupported`. An `--ask` run
+    #: falls back exactly as a review does, and without these the tally renders the
+    #: PIN while the CLI default answered — the same false record, one report over.
+    #:
+    #: **At the end, deliberately.** This class is built positionally
+    #: (`SeatAnswer(verdict, reason, ...)`), so a field inserted ahead of `verdict`
+    #: rebinds every ask's verdict to it — 19 tests, all reporting a wrong verdict
+    #: rather than a type error.
+    model_unavailable: str = ""
+    effort_unsupported: str = ""
+
 
 
 class AskTally(NamedTuple):

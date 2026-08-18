@@ -846,6 +846,13 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 # coverage_veto, which is the one consumer that treats it
                 # differently from every other way of not running.
                 "absent": got.absent,
+                # Which pin this host could not serve, when the seat reviewed on
+                # the CLI default instead (#215). In the payload as well as the
+                # header because the board is where "is the expensive tier worth
+                # it" gets answered from accumulated runs, and a run whose model
+                # was substituted must not be averaged in as the pinned one.
+                "model_unavailable": got.model_unavailable or None,
+                "effort_unsupported": got.effort_unsupported or None,
                 # Spread, not nested: a member whose usage could not be read
                 # contributes no keys at all, so the board stores nulls and
                 # renders "not recorded" — rather than a zero it would average in
@@ -856,7 +863,17 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 result.skipped.append(got.skip)
                 llm_skipped.append(got.skip)
             else:
-                ran_llm.append(labels[name])
+                # The label the seat EARNED, not the one it was configured with. A
+                # seat that fell back to the CLI default (#215) reviewed on a
+                # different model than `.harness-rules` names, and printing the pin
+                # here would put a model in the record that never ran — the exact
+                # attributability the pins exist to protect, broken in the
+                # direction that looks correct.
+                ran_llm.append(fallback_label(
+                    name,
+                    "" if got.model_unavailable else models[name],
+                    "" if got.effort_unsupported else efforts.get(name, ""),
+                    got.model_unavailable, got.effort_unsupported))
                 ran_names.append(name)
                 llm_findings.extend(got.findings)
         if sonar_future:
