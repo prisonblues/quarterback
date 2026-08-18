@@ -722,7 +722,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     budgets = {name: diff_budget(rev.get(name, {}), "max_diff_chars", panel_budget, notes)
                for name in LLM_REVIEWERS if name in selected}
     # The judge's budget is NOT in `budgets` and so is not weighed by the pre-flight
-    # verdict below. That is a boundary, not an oversight, and `smallest_cap` states
+    # verdict below. That is a boundary, not an oversight, and `seat_ceilings` states
     # the argument: the verdict decides whether to dispatch the SEATS and what to
     # hand them, and `judge_max_diff_chars` is a statement about what adjudication
     # is worth rather than about whether a round can be read. Counted here, that
@@ -791,19 +791,33 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # inconsistency this path is built to avoid. `refusal_report` states that
         # gate was not evaluated so its absence cannot read as a pass.
         ci_status, ci_failing, ci_skip = review_ci(gh_repo, pr_number)
+        # `review_ci` returns its skip reason ALREADY LABELLED — `ci: TimeoutExpired`
+        # — because the ordinary path puts that string straight into
+        # `result.skipped`, which is parsed board-side as "<reviewer>: <reason>".
+        # Neither consumer on this path parses it that way, and both were adding a
+        # second label to the first: `config_notes` renders "⚠️ config: ci:
+        # TimeoutExpired", filing a CI outage as a config key called `ci`, and
+        # `_ci_line` renders "could NOT be read (ci: timed out)". So the bare reason
+        # is what travels here and each renderer says what it is for itself.
+        ci_why = (ci_skip or "").removeprefix("ci: ")
         if ci_skip:
             # `config_notes` and not `skipped`, unlike the ordinary path's
-            # `result.skipped`: there is no `PanelResult` here, and `skipped` is
-            # parsed board-side as "<reviewer>: <reason>" — a `ci: TimeoutExpired`
-            # entry there would be filed as a reviewer named "ci" that failed to
+            # `result.skipped`: there is no `PanelResult` here, and a `ci:` entry
+            # in `skipped` would be filed as a reviewer named "ci" that failed to
             # run, in the table that answers which reviewer finds the real issues.
-            notes.append(ci_skip)
+            notes.append(f"CI could not be read — {ci_why}")
         report = refusal_report(repo_name, pr_number, title, base, pre,
-                                ci_status, tuple(ci_failing), ci_skip or "")
+                                ci_status, tuple(ci_failing), ci_why)
         # One short sentence per seat: the per-seat answer to "why is this row
         # empty". The whole reason is in `skip_reason` and `preflight.reason`.
+        #
+        # `pre.measured`/`pre.cap_unit` rather than `pre.shape.chars` and the word
+        # "chars": the ceiling that refused this round may be antigravity's argv
+        # limit, which is in bytes, and a per-seat skip reason that states a
+        # character count against a byte ceiling disagrees with `skip_reason` in the
+        # same payload. See `panel_preflight.Ceiling`.
         refused_by = (f"not dispatched — the panel refused this round "
-                      f"({pre.shape.chars:,} chars against {pre.cap:,})")
+                      f"({pre.measured:,} {pre.cap_unit} against {pre.cap:,})")
         print(report, file=chatter)
         refuse_payload = {
             **_payload_defaults(),
@@ -1665,7 +1679,8 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                      f"{pre.shape.moved:,} of "
                      f"{max(pre.shape.added, pre.shape.removed):,} changed lines "
                      f"({pre.shape.move_ratio * 100:.1f}%) are relocated text, and the "
-                     f"diff is {pre.shape.chars:,} chars against {pre.cap_seat}'s "
+                     f"diff is {pre.measured:,} {pre.cap_unit} against "
+                     f"{pre.cap_seat}'s "
                      f"{pre.cap:,}. The seats were asked what MOVED, what did not "
                      "survive, and what changed besides moving. **The moved code "
                      "itself was not read by anybody** — treat its correctness as "
@@ -1676,7 +1691,8 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                      f"verdict** — the panel judged this round "
                      f"{'not worth running' if pre.would_have == 'refuse' else 'unreadable as content'}"
                      " and was overruled. What follows is a content review of a "
-                     f"{pre.shape.chars:,}-char diff against a {pre.cap:,}-char "
+                     f"{pre.measured:,}-{pre.cap_unit_adj} diff against a "
+                     f"{pre.cap:,}-{pre.cap_unit_adj} "
                      "ceiling: most of each seat's budget went somewhere, and it was "
                      "not necessarily where the change is.")
     if seats_absent:

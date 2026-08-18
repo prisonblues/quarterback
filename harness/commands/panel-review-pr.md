@@ -150,6 +150,14 @@ payload is marked `reviewed: false`), so exit 0 always means the file is there.
   or re-run with `--force` — and let the user choose. Never add `--force` on your
   own initiative; the refusal is the panel's decision about a diff it measured, and
   overriding it unasked is exactly the failure the check was built to stop.
+  **Relay `ci_status` and `ci_failing` with it.** A refusal still reads the CI gate
+  — that is size-independent and cost the round one API call, and it exists in the
+  payload because a refusal that lost the build status left this step telling the
+  user to stop with nothing said about a red suite. If `ci_status` is `FAIL`, say
+  so and name the checks: the PR is broken by something the project already tests,
+  and nobody had to read the diff to know it. `PASS`, `PENDING`, `none` and
+  `unknown` are four different statements and none of them is "reviewed" — say
+  which one it was, never that CI was fine.
 - `manifest` — the change is move-shaped and the seats were asked what *moved*, not
   whether the code is correct. The cycle runs normally, but the findings are answers
   about the move and **the moved code was not read by anybody**. Say so in the relay

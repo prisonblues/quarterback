@@ -596,7 +596,7 @@ CFG = {
 def every_seat_is_on_this_box(monkeypatch):
     """Pin the HOST out of every round in this file.
 
-    #138's `smallest_cap` skips a seat whose CLI is not on PATH — an uninstalled
+    #138's `seat_ceilings` skips a seat whose CLI is not on PATH — an uninstalled
     `agy` must not hold a ceiling on a round it cannot read — so a test that leaves
     the real predicate in place is asserting on which vendor CLIs the machine
     running the suite happens to carry. Locally that passes quietly; on a CI runner,

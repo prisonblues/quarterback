@@ -23,7 +23,7 @@ Three verdicts, and the second is the interesting one:
 ``run``
     Nothing here objects. Byte-identical behaviour to every release before this
     one, which is deliberately the answer whenever no seat declares a cap at all
-    (see :func:`smallest_cap`).
+    (see :func:`seat_ceilings`).
 
 ``manifest``
     The diff does not fit, AND it is move-shaped: the added lines are a
@@ -138,6 +138,15 @@ MANIFEST_LINE_CHARS = 120
 #: rather than an absence, exactly as it is in the manifest.
 PAYLOAD_FILE_ROWS = 40
 
+#: One level of nested angle brackets, which is what a TS generic parameter list
+#: is: `<T>`, `<T, U>`, `<T extends string>` and `<T extends Foo<Bar>>`. Written
+#: once, named, and defined AHEAD of the `_DEF_PATTERNS` doc-comment rather than
+#: between it and the tuple: a `#:` block documents the NEXT binding, so a constant
+#: dropped in the middle would have quietly taken that block for its own. Written
+#: with an explicit nesting alternation rather than `<.*?>`, because the lazy form
+#: matches the `<` of a comparison and stops at the next `>`.
+_TS_GENERICS = r"<[^<>]*(?:<[^<>]*>[^<>]*)*>"
+
 #: What a definition looks like, for the duplicate check. Python and the JS/TS
 #: spellings only, because those are what the fleet's repos are written in and a
 #: pattern that matches nothing is worse than an absent section: it reads as
@@ -151,7 +160,13 @@ PAYLOAD_FILE_ROWS = 40
 #: "JavaScript/TypeScript" — the same false all-clear the tunable above exists to
 #: avoid, inside a language the manifest named. So: brace-style classes, `export`
 #: and `export default`, generators, arrow and function-expression bindings, and
-#: the TS type-level declarations.
+#: the TS type-level declarations — and then, because the first pass at those left
+#: gaps in the middle of spellings it had just claimed, GENERIC arrows
+#: (`const f = <T>(x: T) => x`), function-TYPED bindings
+#: (`const f: (x: T) => U = x => x`), `const enum` and `export declare class`.
+#: Each of those was a name the section would have found nothing for while telling
+#: the reader it had looked, which is the failure this whole tunable's comment is
+#: about.
 #:
 #: Class and object METHODS (`name(args) {`) are deliberately NOT matched, and
 #: that is a limit rather than an oversight. A bare `name(args) {` is spelled
@@ -165,20 +180,36 @@ PAYLOAD_FILE_ROWS = 40
 _DEF_PATTERNS = (
     re.compile(r"^\s*(?:async\s+)?def\s+([A-Za-z_]\w*)\s*\("),
     # `class Foo:` / `class Foo(Base):` (Python) and `class Foo {` /
-    # `class Foo extends Bar {` / `export default class Foo` (JS/TS), in one
-    # pattern: the name is the signal and what follows it differs only by dialect.
-    re.compile(r"^\s*(?:export\s+(?:default\s+)?)?(?:abstract\s+)?"
+    # `class Foo extends Bar {` / `export default class Foo` /
+    # `export declare class Foo` (JS/TS), in one pattern: the name is the signal
+    # and what follows it differs only by dialect.
+    re.compile(r"^\s*(?:export\s+(?:default\s+)?)?(?:declare\s+)?(?:abstract\s+)?"
                r"class\s+([A-Za-z_$][\w$]*)\b"),
     re.compile(r"^\s*(?:export\s+(?:default\s+)?)?(?:async\s+)?"
                r"function\s*\*?\s*([A-Za-z_$][\w$]*)\s*\("),
     # `const f = () => {}`, `const f = async (x) => x`, `let f = function () {}`,
-    # `export const f: Handler = x => x`. The right-hand side is required to be a
+    # `export const f: Handler = x => x`, `const f = <T>(x: T) => x`,
+    # `const f: (x: T) => U = x => x`. The right-hand side is required to be a
     # function of some spelling — a bare `= (` would match `const n = (a + b);`
     # and file an arithmetic expression as a definition.
+    #
+    # Two of those forms were misses in the shipped pattern, both inside a spelling
+    # `_DEF_SPELLINGS` told the reader had been covered: the parenthesised arrow
+    # alternative required `(` immediately, so no GENERIC arrow matched, and the
+    # type annotation was `[^=]+?`, which cannot cross the `=` of a `=>` and so
+    # gave up on every function-typed variable. Hence `_TS_GENERICS` before the
+    # parameter list, and an annotation body that admits `=>` and nothing else
+    # containing `=` — the restriction is what keeps `const a = b, c = (x) => y`
+    # from being filed under the name `a`.
     re.compile(r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*"
-               r"(?::[^=]+?)?=\s*(?:async\s+)?"
-               r"(?:function\b|\([^)]*\)\s*(?::[^=]*?)?=>|[A-Za-z_$][\w$]*\s*=>)"),
-    re.compile(r"^\s*(?:export\s+)?(?:declare\s+)?(?:interface|enum)\s+"
+               r"(?::(?:[^=]|=>)+?)?=\s*(?:async\s+)?"
+               rf"(?:function\b|(?:{_TS_GENERICS}\s*)?\([^)]*\)\s*(?::[^=]*?)?=>"
+               r"|[A-Za-z_$][\w$]*\s*=>)"),
+    # `const enum Colour {` is admitted alongside `enum`/`interface`: it matches
+    # neither the plain enum spelling (which allowed only `export`/`declare`
+    # before the keyword) nor the binding pattern above (which requires an `=`),
+    # so it was a silent miss in the middle of a covered spelling.
+    re.compile(r"^\s*(?:export\s+)?(?:declare\s+)?(?:const\s+)?(?:interface|enum)\s+"
                r"([A-Za-z_$][\w$]*)\b"),
     # `type X = …` and `type X<T> = …`. The `=`/`<` is required: without it this
     # matches a line that merely starts with the word "type".
@@ -203,8 +234,9 @@ _DEF_LANGUAGES = ("Python", "JavaScript/TypeScript")
 #: wrapped signature was not looked at can go and look at it themselves.
 _DEF_SPELLINGS = (
     "`def`", "`class`", "`function`",
-    "`const`/`let`/`var` bound to an arrow or function expression",
-    "`interface`/`enum`/`type`",
+    "`const`/`let`/`var` bound to an arrow (generic and function-typed forms "
+    "included) or a function expression",
+    "`interface`/`enum`/`const enum`/`type`",
 )
 
 
@@ -268,8 +300,18 @@ class DiffShape:
     #: Defaulted so a hand-built `DiffShape` in a test stays a two-line literal;
     #: :func:`diff_shape` always measures it.
     nbytes: int = 0
-    files_added_only: tuple[str, ...] = ()
-    files_removed_only: tuple[str, ...] = ()
+    #: KEYWORD-ONLY, and that is a guard rather than a style. `nbytes` was inserted
+    #: ahead of these two, which changed what the sixth POSITIONAL argument means
+    #: without changing the arity: an existing
+    #: `DiffShape(chars, added, removed, moved, files, added_only, removed_only)`
+    #: would bind a tuple of paths to an `int` field and serialise
+    #: `"bytes": ["a.py"]` into every board record for that PR, with no TypeError
+    #: anywhere to notice it. Nothing in this repo constructs it that way — the
+    #: class is exported, though, and its docstring invites hand-built instances —
+    #: so the seventh positional argument is made an error instead of a silent
+    #: rebinding. Costs a keyword at the one real call site.
+    files_added_only: tuple[str, ...] = field(default=(), kw_only=True)
+    files_removed_only: tuple[str, ...] = field(default=(), kw_only=True)
 
     @property
     def move_ratio(self) -> float:
@@ -451,19 +493,97 @@ def seat_installed(name: str) -> bool:
     return bool(shutil.which(CLI_BIN.get(name, name)))
 
 
-def smallest_cap(budgets: dict[str, int | None],
-                 installed=None) -> tuple[int | None, str]:
-    """``(chars, whose)`` — the tightest ceiling any seat that can actually RUN
-    here is under.
+@dataclass(frozen=True)
+class Ceiling:
+    """One ceiling a round is under, CARRYING THE UNIT IT IS EXPRESSED IN.
 
-    A seat's cap is its configured `max_diff_chars`, and for `antigravity` it is
-    additionally the kernel's: that seat's prompt travels in argv, so
-    :data:`ARGV_PROMPT_MAX_BYTES` applies to it whether or not the repo set a
-    number. Compared against the constant rather than against
+    The unit is not decoration and it is not derivable from the number. A repo's
+    `max_diff_chars` is a count of CHARACTERS; :data:`ARGV_PROMPT_MAX_BYTES` is the
+    kernel's `MAX_ARG_STRLEN`, a count of BYTES. For an all-ASCII diff the two
+    readings of a size are the same integer and nothing about which one is meant
+    can be observed; for this repo's own diffs — em-dashes, arrows and box
+    characters in every comment and every report — they differ by a factor that
+    runs entirely in the direction of letting an over-cap round through.
+
+    This type exists because that fact was carried OUT of BAND and rebuilt by
+    every reader. `smallest_cap`, which :func:`seat_ceilings` and
+    :func:`tightest_ceiling` replace, returned a bare `(int, seat)` and its callers
+    worked the unit back out — `seat == "antigravity" and cap == ARGV_PROMPT_MAX_BYTES`
+    in :func:`preflight`, and nothing at all in `refusal_report` or in the three
+    `panel.py` banners, which printed "chars" over a ratio computed in bytes.
+    Worse, the SELECTION itself compared the two: `min()` over a dict holding a
+    character budget and a byte ceiling picked whichever was the smaller integer,
+    which is a comparison of two different quantities and had no defined answer.
+
+    So a ceiling is a value with a unit, every measurement is taken through it
+    (:meth:`of` and :meth:`of_text`), and every renderer asks it what to print
+    (:attr:`noun`, :attr:`adjective`). A reader who wants to check a multiple by
+    hand is given the two numbers it was computed from, in the unit it was
+    computed in.
+    """
+
+    #: The number, in :attr:`unit`.
+    limit: int
+    #: ``"chars"`` or ``"bytes"``. Only those two: they are the only two units any
+    #: ceiling in this harness is expressed in, and a third would need a reading on
+    #: :class:`DiffShape` to measure it against.
+    unit: str
+    #: The seat this ceiling belongs to. Named in the refusal's reason, so a reader
+    #: can go and look at that seat's configuration.
+    seat: str
+
+    @property
+    def noun(self) -> str:
+        """``chars``/``bytes`` — what a quantity of diff is called in this unit."""
+        return self.unit
+
+    @property
+    def adjective(self) -> str:
+        """``char``/``byte`` — for `120,000-byte ceiling`."""
+        return "byte" if self.unit == "bytes" else "char"
+
+    def of(self, shape: DiffShape) -> int:
+        """This diff's size READ IN THIS CEILING'S UNIT."""
+        return shape.nbytes if self.unit == "bytes" else shape.chars
+
+    def of_text(self, text: str) -> int:
+        """The same reading of a string that is not the diff — the manifest, whose
+        fit against this ceiling decides whether it can be substituted."""
+        return len(text.encode()) if self.unit == "bytes" else len(text)
+
+    def over(self, shape: DiffShape) -> float:
+        """How many times over this ceiling the diff is, in this ceiling's unit.
+
+        Guarded against a `limit` of 0 — `max_diff_chars: 0` is a value a repo can
+        write, and a ZeroDivisionError raised from the middle of a verdict would
+        take down a round over a config value that deserves a note at worst.
+        """
+        return self.of(shape) / self.limit if self.limit else 0.0
+
+
+def seat_ceilings(budgets: dict[str, int | None], installed=None) -> tuple[Ceiling, ...]:
+    """Every ceiling the seats that can actually RUN here are under, each with its
+    unit. Empty when there is none.
+
+    A seat's ceiling is its configured `max_diff_chars`, in characters. `antigravity`
+    is additionally under the kernel's, in bytes: that seat's prompt travels in
+    argv, so :data:`ARGV_PROMPT_MAX_BYTES` applies to it whether or not the repo set
+    a number. Compared against the constant rather than against
     :func:`panel_seats.fit_argv_budget`'s exact answer, which is a few hundred
     bytes lower once the template is counted — a verdict about whether a diff is
     3x or 6x over does not turn on that, and depending on the render closure
     would make this callable only after the prompt exists.
+
+    **Antigravity with a configured cap declares TWO ceilings, and that is the
+    correction rather than an elaboration.** This used to collapse them with
+    `min(cap, ARGV_PROMPT_MAX_BYTES)` — one number, chosen by comparing a character
+    budget against a byte limit. A repo setting `antigravity.max_diff_chars:
+    100_000` therefore hid the 120,000-BYTE argv ceiling behind the smaller
+    integer, and a 100,000-character diff at two bytes per character sailed past a
+    verdict that had measured 100,000 against 100,000 — into an `execve` that
+    cannot carry 200,000 bytes. Two ceilings, both real, both evaluated: whichever
+    binds first on THIS diff is the one that decides, and :func:`tightest_ceiling`
+    is where that is worked out.
 
     **A seat whose CLI this box does not carry declares no ceiling here.** It is a
     fact about the HOST, not about the round — the same distinction `coverage_veto`
@@ -498,26 +618,62 @@ def smallest_cap(budgets: dict[str, int | None],
     `judge_material` composes the manifest too, and a judge cut by its own budget
     is reported as truncation exactly as a seat is.
 
-    ``(None, "")`` when no runnable seat declares a cap, and that answer is
+    The EMPTY tuple when no runnable seat declares a cap, and that answer is
     load-bearing: it is what keeps this file from becoming the default diff budget
     #49 refused. A repo running claude and codex off stdin with no `max_diff_chars`
     has declared no ceiling, so there is no size for a refusal to be measured
     against and the round proceeds exactly as it always has.
     """
     here = installed or seat_installed
-    caps: dict[str, int] = {}
+    out: list[Ceiling] = []
     for name, budget in budgets.items():
         if not here(name):
             continue
-        cap = budget
+        if budget is not None:
+            out.append(Ceiling(budget, "chars", name))
         if name == "antigravity":
-            cap = ARGV_PROMPT_MAX_BYTES if cap is None else min(cap, ARGV_PROMPT_MAX_BYTES)
-        if cap is not None:
-            caps[name] = cap
-    if not caps:
-        return None, ""
-    whose = min(caps, key=lambda n: (caps[n], n))
-    return caps[whose], whose
+            out.append(Ceiling(ARGV_PROMPT_MAX_BYTES, "bytes", name))
+    return tuple(out)
+
+
+def tightest_ceiling(budgets: dict[str, int | None], shape: DiffShape,
+                     installed=None) -> Ceiling | None:
+    """Which of :func:`seat_ceilings`' ceilings binds FIRST on this diff, or None.
+
+    **Tightest means the largest RATIO, not the smallest number, and the
+    distinction is the whole point of this function.** The predecessor took
+    `min()` across every seat's cap and returned the smallest integer — with a
+    character budget and a byte limit in the same dict. That comparison has no
+    answer: 100,000 characters and 120,000 bytes are not two sizes of the same
+    thing, and which of them a diff crosses first depends entirely on how much of
+    the diff is not ASCII. On this repo's own diffs a 100,000-character budget won
+    the `min()`, the round was then measured in characters, and antigravity's
+    120,000-byte ceiling — genuinely tighter at ~60,000 characters for a
+    two-bytes-per-character diff — went unevaluated. The verdict was computed
+    against the looser real ceiling and `over` understated it, which is the exact
+    error class :attr:`DiffShape.nbytes` was added to remove.
+
+    So each ceiling is measured against the diff IN ITS OWN UNIT and the ratios are
+    compared. Ratios are dimensionless, so this is the one comparison that is
+    defined across units, and it is the one the verdict actually needs: "how far
+    past this ceiling is this diff" is the question both the refusal multiple and
+    the manifest substitution are asked.
+
+    Ties are broken by the smaller `limit` and then by seat name. That secondary
+    key compares numbers across units, which the primary key exists to stop doing —
+    it is allowed here and only here because a tie in the RATIO means both ceilings
+    return the same verdict, the same multiple and the same fit, so this chooses
+    which ceiling is NAMED and can never change what is decided. Determinism is why
+    it is broken at all: the seat's name goes in the refusal's reason, and a reason
+    that names a different seat on two runs of the same round is a reason nobody can
+    check. The empty diff is the case that makes the tie ordinary rather than
+    exotic — every ratio is 0.0 — and there the smaller number is also the answer
+    the predecessor gave.
+    """
+    ranked = seat_ceilings(budgets, installed)
+    if not ranked:
+        return None
+    return min(ranked, key=lambda c: (-c.over(shape), c.limit, c.seat))
 
 
 #: The spellings :func:`_flag` accepts for a hand-written boolean. JSON's own two
@@ -527,7 +683,8 @@ _TRUE_WORDS = frozenset({"true", "yes", "on", "1"})
 _FALSE_WORDS = frozenset({"false", "no", "off", "0"})
 
 
-def _rule(panel: dict, key: str, fallback, notes: list[str], high: float | None = None):
+def _rule(panel: dict, key: str, fallback, notes: list[str], high: float | None = None,
+          off: str = ""):
     """One numeric pre-flight setting, with the same manners
     :func:`panel_seats.diff_budget` gives a diff budget: unset is silent, and a
     value that cannot be the thing at all falls back and SAYS so.
@@ -544,10 +701,22 @@ def _rule(panel: dict, key: str, fallback, notes: list[str], high: float | None 
     setting in this harness reads it as "inherit".
 
     `false`, the other way an operator writes "off", is rejected as a non-number
-    rather than reinterpreted, and the note says which number to write instead. It
-    is tempting to read it as 0 and it would be wrong: `move_shape_ratio: false`
-    would then mean a threshold of 0, at which every diff with one relocated line
-    is a move — the switch flipped to "off" turning the feature all the way on.
+    rather than reinterpreted. It is tempting to read it as 0 and it would be
+    wrong: `move_shape_ratio: false` would then mean a threshold of 0, at which
+    every diff with one relocated line is a move — the switch flipped to "off"
+    turning the feature all the way on.
+
+    **`off` is what the note tells that operator to write instead, and it is a
+    per-key argument because the two keys have different answers.** It used to be
+    the literal string "(write `0` to switch it off)", emitted for every key — so
+    `move_shape_ratio: false` was answered with advice to write the one value the
+    paragraph above says is the trap: an operator who complied got a threshold of
+    0, at which every over-ceiling diff with a single relocated line is a move and
+    is handed a manifest. `0` is the off switch for `refuse_over_cap_multiple` and
+    for nothing else. `move_shape_ratio` has no off at all — it is a fraction, and
+    the switch an operator reaching for one wants is `manifest_moves: false` — so
+    its note says that instead. Omitted, the note simply names the default it fell
+    back to, which is the right answer for a key where "off" is not a thing.
 
     `high`, where given, is the largest value the setting can mean. Only
     `move_shape_ratio` has one: it is relocated lines as a fraction of the larger
@@ -570,7 +739,7 @@ def _rule(panel: dict, key: str, fallback, notes: list[str], high: float | None 
     if isinstance(raw, bool) or not isinstance(raw, (int, float, str)):
         # Bools first: `isinstance(True, int)` is True, so without this the
         # `float()` below would quietly turn `false` into the threshold 0.
-        extra = " (write `0` to switch it off)" if raw is False else ""
+        extra = f" ({off})" if raw is False and off else ""
         notes.append(f"`{key}`={raw!r} is not a number — using {fallback}{extra}")
         return fallback
     try:
@@ -608,16 +777,35 @@ def _flag(panel: dict, key: str, fallback: bool, notes: list[str]) -> bool:
     value had been validated.
 
     The string spellings are accepted rather than rejected because this key is
-    written by hand and `"false"` is what a hand writes. Anything else — a number,
-    a list, a word that is not a boolean — falls back and says so, which is the
-    half that makes the accepted spellings safe: the reader of a note knows the
-    value did not apply, and silence means it did.
+    written by hand and `"false"` is what a hand writes. Anything else — a list, a
+    word that is not a boolean, a number that is not 0 or 1 — falls back and says
+    so, which is the half that makes the accepted spellings safe: the reader of a
+    note knows the value did not apply, and silence means it did.
+
+    **The bare numbers 0 and 1 are accepted too, and leaving them out was a split
+    nothing could justify.** `_FALSE_WORDS` already contains the STRING `"0"`, so
+    `manifest_moves: "0"` switched the manifest off while `manifest_moves: 0` — the
+    natural spelling in a JSON `.harness-rules`, where an unquoted number needs no
+    quoting decision — fell through to "is not true or false" and left it ON. And
+    `0` is the documented, only spelling of off for `refuse_over_cap_multiple`
+    sitting in the same block, so an operator writing
+    `{"manifest_moves": 0, "refuse_over_cap_multiple": 0}` had every reason to
+    expect both switched off and got one. Of the three consistent answers —
+    accept both spellings, reject both, or the split that shipped — the split was
+    the only one no reader could predict.
+
+    `isinstance(raw, bool)` is tested first because `isinstance(True, int)` is
+    True, and a float `0.0`/`1.0` is admitted with the ints: it is the same value
+    written by a generator that had a float in hand, and `2` (or `0.5`) still falls
+    back and says so.
     """
     raw = panel.get(key)
     if raw is None or raw == "":
         return fallback
     if isinstance(raw, bool):
         return raw
+    if isinstance(raw, (int, float)) and raw in (0, 1):
+        return bool(raw)
     if isinstance(raw, str) and raw.strip().lower() in _TRUE_WORDS | _FALSE_WORDS:
         return raw.strip().lower() in _TRUE_WORDS
     notes.append(f"`{key}`={raw!r} is not true or false — using {fallback}")
@@ -638,13 +826,16 @@ class Preflight:
     verdict: str
     reason: str
     shape: DiffShape
-    #: The tightest seat ceiling and which seat is under it; None when no seat
-    #: declares one, in which case nothing here ever fires.
-    cap: int | None = None
-    cap_seat: str = ""
-    #: How many times over the cap the diff is. 0.0 with no cap — and `as_dict`
-    #: emits it as null only in that case, never for a measured ratio that happens
-    #: to round to 0.00.
+    #: The ceiling that bound first on this diff, WITH ITS UNIT; None when no
+    #: runnable seat declares one, in which case nothing here ever fires. Carried
+    #: whole rather than as a bare number and a seat name, because every renderer
+    #: below and in `panel.py` has to say what it measured and the unit is not
+    #: recoverable from the number — see :class:`Ceiling`. `cap`, `cap_seat`,
+    #: `cap_unit` and `measured` read off it, so the four cannot drift apart.
+    ceiling: Ceiling | None = None
+    #: How many times over the ceiling the diff is, in that ceiling's unit. 0.0
+    #: with no ceiling — and `as_dict` emits it as null only in that case, never
+    #: for a measured ratio that happens to round to 0.00.
     over: float = 0.0
     #: Did `--force` overrule a refusal or a manifest? Recorded rather than
     #: inferred from `verdict == "run"`, because "the tool chose to run" and "a
@@ -665,6 +856,41 @@ class Preflight:
     def refused(self) -> bool:
         return self.verdict == "refuse"
 
+    # The ceiling, spelled the four ways its readers need it. Properties rather
+    # than fields, so there is exactly one place the unit and the number can come
+    # from: the previous shape of this class stored `cap` and `cap_seat` as
+    # separate fields with the unit nowhere at all, and every renderer that wanted
+    # it either re-derived it (`seat == "antigravity" and cap == ARGV_…`) or, more
+    # often, assumed characters and printed a byte ratio under a "chars" label.
+    @property
+    def cap(self) -> int | None:
+        return self.ceiling.limit if self.ceiling else None
+
+    @property
+    def cap_seat(self) -> str:
+        return self.ceiling.seat if self.ceiling else ""
+
+    @property
+    def cap_unit(self) -> str:
+        """``chars``/``bytes`` — the unit `cap`, `over` and `measured` are all in.
+        ``chars`` with no ceiling, because nothing was measured and a caller
+        formatting the shape's own size has the character reading in hand."""
+        return self.ceiling.noun if self.ceiling else "chars"
+
+    @property
+    def cap_unit_adj(self) -> str:
+        """``char``/``byte``, for `a 120,000-byte ceiling`."""
+        return self.ceiling.adjective if self.ceiling else "char"
+
+    @property
+    def measured(self) -> int:
+        """The diff's size AS THE VERDICT READ IT — `shape.nbytes` under a byte
+        ceiling, `shape.chars` otherwise. This is the numerator of `over`, so it is
+        the number a reader divides by `cap` to check the multiple, and printing
+        `shape.chars` in its place is what made a refusal notice say "100,000 chars
+        … exceeded 2.2x" against a 120,000 ceiling."""
+        return self.ceiling.of(self.shape) if self.ceiling else self.shape.chars
+
     def as_dict(self) -> dict:
         # `round(self.over, 2) or None` collapsed a measured 0.00 into the same
         # null that means "no ceiling was declared" — reachable on any small diff
@@ -672,12 +898,22 @@ class Preflight:
         # `preflight` block's own documentation makes that exact distinction
         # load-bearing one level up ("null means the run never reached the
         # verdict … which is a different statement"), and reusing null for
-        # "measured, and small" inside it undercuts the same argument. The cap is
-        # what decides whether there was a measurement, so the cap is what is
-        # asked.
+        # "measured, and small" inside it undercuts the same argument. The
+        # CEILING is what decides whether there was a measurement, so the ceiling
+        # is what is asked — `if self.cap` would have made a configured
+        # `max_diff_chars: 0` indistinguishable from no ceiling at all, which is
+        # the same collapse one value along.
+        #
+        # `cap_unit` rides beside `cap`, and it is not optional: `cap` and
+        # `over_cap` are a number and a ratio whose unit is a property of which
+        # seat won, and a consumer holding `shape.chars`, `shape.bytes` and a
+        # ratio it cannot attribute to either cannot check the verdict at all.
+        # That is the whole claim `shape` carrying both readings was added to
+        # make good on.
         return {"verdict": self.verdict, "reason": self.reason or None,
                 "cap": self.cap, "cap_seat": self.cap_seat or None,
-                "over_cap": round(self.over, 2) if self.cap else None,
+                "cap_unit": self.cap_unit if self.ceiling else None,
+                "over_cap": round(self.over, 2) if self.ceiling else None,
                 "forced": self.forced, "would_have": self.would_have or None,
                 "thresholds": self.thresholds, "shape": self.shape.as_dict()}
 
@@ -715,32 +951,37 @@ def preflight(diff: str, budgets: dict[str, int | None], panel: dict,
     acceptable at this size, and a refusal invented above that would be this module
     deciding a budget question it has no business deciding.
 
-    Sizes are measured in the ceiling's OWN unit. A configured `max_diff_chars` is
-    characters; the kernel's argv limit is bytes; they are the same number only for
-    an all-ASCII diff. See :attr:`DiffShape.nbytes`.
+    Sizes are measured in the ceiling's OWN unit, and the ceiling that binds is
+    chosen by comparing those measurements rather than the ceilings themselves. A
+    configured `max_diff_chars` is characters; the kernel's argv limit is bytes;
+    they are the same number only for an all-ASCII diff. See :class:`Ceiling` and
+    :func:`tightest_ceiling`.
     """
     parts = _hunk_bodies(diff)
     shape = _shape_of(parts, diff)
     ratio = _rule(panel, "move_shape_ratio", DEFAULT_MOVE_SHAPE_RATIO, notes,
-                  high=1.0)
+                  high=1.0, off="`manifest_moves: false` is the switch; this key is "
+                                "a threshold and has no off")
     multiple = _rule(panel, "refuse_over_cap_multiple",
-                     DEFAULT_REFUSE_OVER_CAP_MULTIPLE, notes)
+                     DEFAULT_REFUSE_OVER_CAP_MULTIPLE, notes,
+                     off="write `0` to switch it off")
     manifest_on = _flag(panel, "manifest_moves", True, notes)
     thresholds = {"move_shape_ratio": ratio, "refuse_over_cap_multiple": multiple,
                   "manifest_moves": manifest_on}
-    cap, seat = smallest_cap(budgets, installed)
-    # WHICH UNIT the ceiling is in. `smallest_cap` returns the kernel's argv limit
-    # unchanged when it is the binding one, and that limit is bytes; every
-    # configured `max_diff_chars` is characters. The equality test is exact rather
-    # than a flag threaded back out of `smallest_cap`, whose two-tuple several
-    # callers and tests compare directly; a repo that configures a cap of exactly
-    # ARGV_PROMPT_MAX_BYTES for antigravity is then read in bytes, which is the
-    # same ceiling by a different name and errs toward measuring MORE of the diff
-    # rather than less.
-    by_bytes = seat == "antigravity" and cap == ARGV_PROMPT_MAX_BYTES
-    size = shape.nbytes if by_bytes else shape.chars
-    unit, unit_adj = ("bytes", "byte") if by_bytes else ("chars", "char")
-    over = (size / cap) if cap else 0.0
+    # The ceiling that binds first on THIS diff, carrying the unit it is expressed
+    # in. Nothing below asks what unit that is: `ceiling.of()` reads the shape,
+    # `ceiling.of_text()` reads the manifest, and `ceiling.noun`/`.adjective` write
+    # the words. This used to be a bare `(int, seat)` and a `by_bytes` flag
+    # reconstructed here by equality against ARGV_PROMPT_MAX_BYTES — a derivation
+    # only this function made, which is why every other renderer of the verdict
+    # went on printing "chars" over a ratio that was sometimes bytes.
+    ceiling = tightest_ceiling(budgets, shape, installed)
+    cap = ceiling.limit if ceiling else None
+    seat = ceiling.seat if ceiling else ""
+    size = ceiling.of(shape) if ceiling else shape.chars
+    unit = ceiling.noun if ceiling else "chars"
+    unit_adj = ceiling.adjective if ceiling else "char"
+    over = ceiling.over(shape) if ceiling else 0.0
 
     def verdict(name: str, reason: str, manifest: str = "",
                 forced_reason: str = "") -> Preflight:
@@ -761,12 +1002,12 @@ def preflight(diff: str, budgets: dict[str, int | None], panel: dict,
         # forced form keeps the diagnosis and replaces the outcome.
         if name != "run" and forced:
             return Preflight("run", f"--force: {forced_reason or reason}", shape,
-                             cap, seat, over, forced=True, would_have=name,
+                             ceiling, over, forced=True, would_have=name,
                              thresholds=thresholds)
-        return Preflight(name, reason, shape, cap, seat, over,
+        return Preflight(name, reason, shape, ceiling, over,
                          thresholds=thresholds, manifest=manifest)
 
-    if cap is None:
+    if ceiling is None:
         return verdict("run", "")
     if size <= cap:
         return verdict("run", "")
@@ -791,9 +1032,25 @@ def preflight(diff: str, budgets: dict[str, int | None], panel: dict,
                           "is off for this repo, so there is no manifest to offer "
                           "instead")
     elif is_move:
+        # Built even under --force, and that is not waste. Which of the three
+        # branches below a forced round was in is what decides its `would_have` and
+        # which diagnosis it records — "the MANIFEST that would have been sent was
+        # overruled" against "a manifest of it came to N and so would replace the
+        # problem with a copy of it" — and there is no way to know that without
+        # measuring the manifest. An early bail on `forced` would buy one pass over
+        # the diff and pay for it by recording the wrong reason, which is the exact
+        # trade `forced_reason` exists to refuse.
         text = move_manifest(diff, shape, parts)
-        fitted = len(text.encode()) if by_bytes else len(text)
-        if fitted < min(cap, size):
+        fitted = ceiling.of_text(text)
+        # `<= cap`, matching the `size <= cap` the diff itself is admitted by a few
+        # lines up. This was `< min(cap, size)`, which rejected a manifest whose
+        # length was EXACTLY the ceiling and then explained itself with the "still
+        # over the ceiling" sentence below — a claim that is false at the boundary:
+        # a manifest of exactly `cap` fits, is not truncated, and is precisely the
+        # substitution this branch exists to make. Two comparisons of the same
+        # quantity against the same ceiling have to agree about the boundary, and
+        # this is the one that was out of step.
+        if fitted <= cap and fitted < size:
             return verdict(
                 "manifest",
                 f"this change is move-shaped — {shape_said}, so they "
@@ -893,6 +1150,18 @@ def duplicate_definitions(def_sites: dict[str, Counter]) -> dict[str, Counter]:
     :func:`move_manifest`, which is the only thing that has an opinion about how a
     duplicate reads.
 
+    **And "more than once" is not the same as "wrong", which is why the manifest
+    names the ordinary reasons beside the limits.** The test is
+    `sum(files.values()) > 1` over a name, so a `@typing.overload` stub chain, an
+    `if TYPE_CHECKING:`/`else:` pair and a platform-conditional `def` pair are each
+    reported — all three define one name several times in ONE file, on purpose.
+    Widening the check to tell them apart means reading the enclosing block, which
+    is a parser rather than a per-line pattern and would have every one of the
+    ambiguities `_DEF_PATTERNS` refuses to guess at. So they stay reported and the
+    section says what they are: a reviewer who is told the shape spends a second on
+    it, and one who is not learns to distrust the whole section on its first
+    `@overload`.
+
     Takes :attr:`DiffParts.def_sites` rather than the diff or the added multiset:
     `added` is keyed by BODY and has no idea which file a body came from, which is
     exactly why the locations could not be filled in before.
@@ -938,6 +1207,26 @@ def _listing(bodies: Counter, cap: int) -> tuple[list[str], int]:
     shown = [_quote(b) + ("" if bodies[b] == 1 else f"   (x{bodies[b]:,})")
              for b in ordered[:cap]]
     return shown, max(0, len(ordered) - cap)
+
+
+def _residue_count(bodies: Counter) -> str:
+    """``N line(s)`` — and ``, D distinct`` when the two differ.
+
+    The section headers count OCCURRENCES and everything under them counts
+    DISTINCT lines: :func:`_listing` iterates distinct bodies, carries the
+    repetition as an `xN` multiplier, and elides against the distinct total. So a
+    residue of 500 copies of one line plus 5 unique ones rendered as "505 line(s)"
+    followed by six quoted entries and no "and N more" note — two numbers in
+    different units in adjacent lines, with nothing saying which was which. The
+    multiplier makes it reconstructable and that is not the same as stating it.
+
+    Both numbers only when they differ, because on the ordinary residue — every
+    line unique — "12 line(s), 12 distinct" is a second number that says nothing
+    and one more thing between the reader and the listing.
+    """
+    total, distinct = sum(bodies.values()), len(bodies)
+    return (f"{total:,} line(s)" if total == distinct else
+            f"{total:,} line(s), {distinct:,} distinct")
 
 
 def move_manifest(diff: str, shape: DiffShape | None = None,
@@ -998,7 +1287,7 @@ def move_manifest(diff: str, shape: DiffShape | None = None,
                    "not listed")
 
     out += ["", f"WHAT DID NOT SURVIVE — deleted and not re-added anywhere "
-                f"({sum(lost.values()):,} line(s))"]
+                f"({_residue_count(lost)})"]
     if lost:
         shown, elided = _listing(lost, MANIFEST_RESIDUE_LINES)
         out += [f"  - {b}" for b in shown]
@@ -1008,7 +1297,7 @@ def move_manifest(diff: str, shape: DiffShape | None = None,
         out.append("  (nothing — every deleted line reappears somewhere)")
 
     out += ["", f"WHAT CHANGED BESIDES MOVING — added and not deleted anywhere "
-                f"({sum(gained.values()):,} line(s))"]
+                f"({_residue_count(gained)})"]
     if gained:
         shown, elided = _listing(gained, MANIFEST_RESIDUE_LINES)
         out += [f"  + {b}" for b in shown]
@@ -1029,11 +1318,31 @@ def move_manifest(diff: str, shape: DiffShape | None = None,
                    "earlier one is dead. Each name above is added by this change in "
                    "more than one place.")
     else:
-        out.append(f"  (none found, over {' and '.join(_DEF_LANGUAGES)} — "
-                   f"{', '.join(_DEF_SPELLINGS)}. Class and object METHODS, any "
-                   "definition whose signature wraps onto a second line, and every "
-                   "other language are NOT covered by this check, and you should say "
-                   "so.)")
+        out.append("  (none found.)")
+    # The coverage disclaimer is UNCONDITIONAL, and it used to print only in the
+    # empty branch. That inverted this module's own rule — "a pattern that matches
+    # nothing is worse than an absent section: it reads as 'checked, and clean'" —
+    # one step along: a section that found ONE duplicate read as having found THE
+    # duplicates, with nothing beside it about what the scan cannot see. A TS move
+    # that duplicates a `function` and a class METHOD listed the function, and the
+    # reviewer filed the section as exhaustively answered. The limits are the same
+    # limits whether the scan fired or not, so they are stated the same way — as
+    # the unseeable-original note in WHAT IS NOT HERE already is.
+    out.append(f"  Scanned over {' and '.join(_DEF_LANGUAGES)} — "
+               f"{', '.join(_DEF_SPELLINGS)}. Class and object METHODS, any "
+               "definition whose signature wraps onto a second line, and every "
+               "other language are NOT covered, so this section can be empty or "
+               "short and still be wrong — say so.")
+    # The false positives, named beside the false negatives for the same reason.
+    # The check is "this name is added more than once", which several legitimate
+    # idioms are by design, and a section whose heading tells a reviewer "each name
+    # above is a finding unless there is a reason it is not" has to say which
+    # reasons are ordinary. Otherwise the first `@overload` chain it flags teaches
+    # the reader to stop believing the section, which costs more than the miss.
+    out.append("  Nor is every hit a fault: an `@typing.overload` stub chain, an "
+               "`if TYPE_CHECKING:`/`else:` pair and platform-conditional "
+               "definitions all define one name more than once ON PURPOSE, in one "
+               "file. Those are the expected shape, not the trap.")
 
     out += ["", "WHAT IS NOT HERE",
             "  Test counts before and after, and whether any module now reaches "
@@ -1114,15 +1423,36 @@ def refusal_report(repo_name: str, pr_number: int, title: str,
     below raises ``TypeError`` from the middle of report construction. Nothing here
     is hot, so an explicit test costs nothing worth counting.
 
-    **The two HARD gates are read here too, on the round that dispatched nobody.**
-    CI is size-independent, costs one `gh pr checks`, and is the one part of a
-    round a 763 KB diff cannot make useless — a refusal that also lost the build
-    status left `/panel-review-pr` told to stop the cycle with nothing said about a
-    red suite. Sonar is different and is NOT read: it is a selected panel MEMBER,
-    with a `ran: false` row in the payload like every other seat, and dispatching
-    it while telling the board no member ran would be the inconsistency this whole
-    path exists to avoid. So the notice states that gate was not evaluated rather
-    than quietly leaving its default to be read as a pass.
+    **The two HARD gates are REPORTED here, and neither is read here.** This
+    function calls nothing: `ci_status`/`ci_failing`/`ci_skip` arrive as arguments,
+    and the `gh pr checks` that produced them is made by `panel.run`, in the
+    refusal branch, before this is called. The distinction is worth the sentence
+    because the docstring used to claim the read, and a reader auditing where a
+    refusal's one extra API call happens was sent to the wrong function — the same
+    class of wrong-place claim the rest of this module is careful about. `ci_skip`
+    arrives as the BARE reason (`TimeoutExpired`), not the `ci: TimeoutExpired`
+    form `review_ci` returns for `PanelResult.skipped`; :func:`_ci_line` supplies
+    its own label.
+
+    What is worth stating is WHY a refusal carries them at all. CI is
+    size-independent, costs one `gh pr checks`, and is the one part of a round a
+    763 KB diff cannot make useless — a refusal that also lost the build status
+    left `/panel-review-pr` told to stop the cycle with nothing said about a red
+    suite. Sonar is different and is not read at all: it is a selected panel
+    MEMBER, with a `ran: false` row in the payload like every other seat, and
+    dispatching it while telling the board no member ran would be the inconsistency
+    this whole path exists to avoid. So the notice states that gate was not
+    evaluated rather than quietly leaving its default to be read as a pass.
+
+    **Every measurement below is printed in the unit the verdict was made in.**
+    `pre.over` is a ratio of a size to a ceiling, and which of `shape.chars` and
+    `shape.bytes` is its numerator depends on which seat's ceiling bound — see
+    :class:`Ceiling`. Printing `shape.chars` under a byte-derived ratio produced a
+    notice that refuted itself in three lines: "100,000 chars … tightest seat
+    ceiling: 120,000 chars, exceeded 2.2x", where the reader who divides gets 0.83x
+    and concludes the tool is broken. Both readings are printed whenever they
+    differ, so the multiple can be checked by hand from the numbers on the page
+    rather than from an encoding the reader would have to guess.
     """
     if not pre.refused or pre.cap is None:
         raise ValueError(
@@ -1149,19 +1479,38 @@ def refusal_report(repo_name: str, pr_number: int, title: str,
         "dispatched — read its absence here as unknown, never as a pass.",
         "",
         "**The measurement:**",
-        f"  - diff: {s.chars:,} chars, {s.files:,} file(s), "
-        f"+{s.added:,} / -{s.removed:,} non-blank lines",
+        # Both readings whenever they differ, because the ratio two lines down was
+        # computed from exactly one of them and a reader with only the other cannot
+        # check it. Identical on an all-ASCII diff, where a second copy of the same
+        # number would be noise.
+        f"  - diff: {s.chars:,} chars"
+        + (f" / {s.nbytes:,} bytes" if s.nbytes != s.chars else "")
+        + f", {s.files:,} file(s), +{s.added:,} / -{s.removed:,} non-blank lines",
         f"  - relocated: {s.moved:,} of {widest:,} ({s.move_ratio * 100:.1f}%) — "
         f"the move threshold is {pre.thresholds.get('move_shape_ratio'):g}",
-        f"  - tightest seat ceiling: {pre.cap:,} chars ({pre.cap_seat}), "
-        f"exceeded {pre.over:.1f}x — the refusal threshold is "
-        f"{pre.thresholds.get('refuse_over_cap_multiple'):g}x",
+        f"  - tightest seat ceiling: {pre.cap:,} {pre.cap_unit} ({pre.cap_seat}), "
+        f"exceeded {pre.over:.1f}x by this diff's {pre.measured:,} "
+        f"{pre.cap_unit} — the refusal threshold is "
+        f"{pre.thresholds.get('refuse_over_cap_multiple'):g}x"
+        + (" (that seat's prompt travels in argv, so the kernel's ceiling is in "
+           "BYTES rather than characters)" if pre.cap_unit == "bytes" else ""),
         "",
         "**What to do,** in the order they are worth doing:",
         "  1. Split the PR. A diff this far over every seat's ceiling is a diff "
         "no reviewer reads in one sitting either.",
-        "  2. Raise `review_panel.max_diff_chars` (or the cap of the one seat "
-        "holding the floor) if a model you run can genuinely take it.",
+        # Remedy 2 depends on WHOSE ceiling this was, and the byte case is the one
+        # where the obvious advice is wrong. `ARGV_PROMPT_MAX_BYTES` is the kernel's
+        # `MAX_ARG_STRLEN`: no key in `.harness-rules` raises it, and an operator
+        # who follows a "raise `max_diff_chars`" line here gets the same refusal
+        # back and no idea why. This case only became visible when the notice
+        # started saying which unit it measured in — before that it read as an
+        # ordinary configured ceiling, which is exactly the confusion.
+        ("  2. Drop the `antigravity` seat for this PR, or split it. This ceiling "
+         "is the kernel's argv limit rather than a configured budget, and no "
+         "setting raises it — that seat is the only one whose prompt cannot travel "
+         "on stdin." if pre.cap_unit == "bytes" else
+         "  2. Raise `review_panel.max_diff_chars` (or the cap of the one seat "
+         "holding the floor) if a model you run can genuinely take it."),
         "  3. `--force` to review it anyway, and read the result knowing most of "
         "each seat's budget went on text it could not usefully judge.",
     ]
@@ -1182,6 +1531,6 @@ __all__ = [
     "MANIFEST_TABLE_ROWS", "MANIFEST_RESIDUE_LINES", "MANIFEST_LINE_CHARS",
     "MOVE_MANIFEST_HEADER", "PAYLOAD_FILE_ROWS",
     "DiffShape", "DiffParts", "Preflight", "diff_shape", "seat_installed",
-    "smallest_cap", "preflight",
+    "Ceiling", "seat_ceilings", "tightest_ceiling", "preflight",
     "move_manifest", "duplicate_definitions", "refusal_report",
 ]

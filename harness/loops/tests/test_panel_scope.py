@@ -972,11 +972,14 @@ def test_rounds_are_named_in_the_plural_when_there_are_several():
 #: truncation these tests exist to pin. None of the fixtures here is move-shaped
 #: today, so nothing was wrong — but that made the suite a fixture edit away from a
 #: false green, in a file whose whole subject is what a budget does to a prompt.
+NO_REFUSAL = {"refuse_over_cap_multiple": 0, "manifest_moves": False}
+
+
 @pytest.fixture(autouse=True)
 def every_seat_is_on_this_box(monkeypatch):
     """Pin the HOST out of every round in this file.
 
-    #138's `smallest_cap` skips a seat whose CLI is not on PATH — an uninstalled
+    #138's `seat_ceilings` skips a seat whose CLI is not on PATH — an uninstalled
     `agy` must not hold a ceiling on a round it cannot read — so a test that leaves
     the real predicate in place is asserting on which vendor CLIs the machine
     running the suite happens to carry. Locally that passes quietly; on a CI runner,
@@ -991,8 +994,6 @@ def every_seat_is_on_this_box(monkeypatch):
     """
     monkeypatch.setattr(pf, "seat_installed", lambda name: True)
 
-
-NO_REFUSAL = {"refuse_over_cap_multiple": 0, "manifest_moves": False}
 
 CFG = {"github": "acme/board", "path": "/tmp/acme-board", "name": "board",
        "reviewers": {"claude": {"enabled": True, "model": "sonnet"}},

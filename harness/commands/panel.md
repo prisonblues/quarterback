@@ -51,7 +51,9 @@ panel just adds independent reviewers + hard CI/Sonar gates on top of that bar.
      declined, quote its reason, and give the user the remedies it named (split the PR, raise
      the cap, or re-run with `--force`). Do not pass `--force` yourself unless the user asks
      for it — the refusal is the tool's decision, and overriding it silently is the bug the
-     check exists to prevent.
+     check exists to prevent. A refusal still reads CI, so report `ci_status`/`ci_failing`
+     alongside it — a red build is the one hard fact a refused round still has, and it is why
+     the extra API call is made.
    - `manifest` — the change is move-shaped and the seats were asked what *moved*, not whether
      the code is correct. **The moved code was not read by anybody.** Report the findings as
      answers about the move (what did not survive, what changed besides moving, duplicated

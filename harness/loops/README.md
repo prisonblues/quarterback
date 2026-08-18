@@ -207,10 +207,15 @@ of the larger side of a diff must be relocated text before the change counts as 
 *move*; a fraction, so values above `1.0` are rejected with a `config_notes` line
 rather than silently making the threshold unsatisfiable.
 `review_panel.manifest_moves` (default: **true**) — review a move-shaped over-ceiling
-diff as a manifest rather than as content. All three are validated: a value that cannot
-be what the key means falls back to the default and *says so* in `config_notes`, which
-covers `"false"` on the boolean (honoured) and `false` on either number (rejected, with
-the note naming `0`). All three are the pre-flight verdict, below.
+diff as a manifest rather than as content; `false`, `"false"`/`"off"`/`"no"` and the bare
+`0` all switch it off, and `true`/`1` all leave it on. All three keys are validated: a
+value that cannot be what the key means falls back to the default and *says so* in
+`config_notes`. `false` on a *number* is rejected rather than read as 0 — and the note
+then names the right way to say "off" **for that key**: `refuse_over_cap_multiple: 0`
+switches the refusal off, while `move_shape_ratio` is a threshold with no off at all (a
+ratio of `0` turns the feature all the way *on* — every diff with one relocated line
+becomes a move), so its note points at `manifest_moves` instead. All three are the
+pre-flight verdict, below.
 
 ### The SonarQube token
 
@@ -479,10 +484,18 @@ silent, and it is not: the `run` verdict then carries a `reason` naming the mani
 it measured, and why the substitution did not happen. An empty `reason` on a `run` means
 "nothing objected", and only that.
 
-**Sizes are compared in the ceiling's own unit.** A configured `max_diff_chars` is characters;
-the kernel's argv limit is *bytes*, and the two differ by the diff's non-ASCII density — this
-repo's own diffs are full of em-dashes and arrows. `preflight.shape` carries `chars` and
-`bytes` both, so which reading a verdict used is checkable rather than assumed.
+**Every ceiling carries its unit, and the one that binds is chosen by ratio rather than by
+number.** A configured `max_diff_chars` is characters; the kernel's argv limit is *bytes*, and
+the two differ by the diff's non-ASCII density — this repo's own diffs are full of em-dashes
+and arrows. Those are not two sizes of the same thing, so `min()` across them had no defined
+answer: a repo setting `antigravity.max_diff_chars: 100_000` hid the 120,000-**byte** argv
+ceiling behind the smaller integer, and at two bytes per character that seat's real ceiling is
+~60,000 characters — tighter than the one that won. So `agy` with a configured cap declares
+**two** ceilings, each is measured against the diff in its own unit, and the tightest *ratio*
+decides. `preflight.shape` carries `chars` and `bytes` both and `preflight.cap_unit` names
+which of them `cap` and `over_cap` are in, so the multiple can be checked by hand rather than
+assumed — and every renderer of the verdict (the refusal notice, the manifest banner, the
+`--force` banner, each seat's skip reason) states the unit it measured in.
 
 **The judge's `judge_max_diff_chars` is deliberately not one of the ceilings.** This verdict
 decides whether to dispatch the *seats* and what to hand them; that key says what adjudication
@@ -537,8 +550,14 @@ evidence that bears.** The manifest is:
   `gh pr diff`. Detecting it needs the PR checked out, which the panel never has, so the claim
   was narrowed to what is checked rather than the check widened to a promise it cannot keep.
   The spellings covered are Python `def`/`class` and the JS/TS `function`, brace-class,
-  `const`/`let`/`var`-bound-arrow and `interface`/`type`/`enum` forms; class and object
-  *methods*, wrapped signatures and every other language are named as not covered
+  `const`/`let`/`var`-bound-arrow (generic and function-typed forms included), `const enum`
+  and `interface`/`type`/`enum` forms. What is *not* covered is named too, and named
+  **whether or not the section found anything** — class and object *methods*, wrapped
+  signatures and every other language, so a section that found one duplicate cannot read as
+  having found them all. So are the ordinary reasons a name is defined twice on purpose
+  (`@typing.overload` chains, `if TYPE_CHECKING:`/`else:` pairs, platform-conditional
+  definitions), because a reviewer who is not told about them stops believing the section on
+  its first false positive
 - **what is not here** — test counts before and after, whether a module now reaches backward
   into another, and the unseeable half of the duplicate trap above. All three need the branch
   checked out. They are *named as unmeasured* rather than claimed, and the brief tells the
@@ -609,7 +628,9 @@ A refusal:
 - **reads the CI gate anyway, and says so under the notice.** CI is size-independent, costs one
   `gh pr checks`, and consumes no seat's budget — it is the one part of a round a 763 KB diff
   cannot make useless, and a refusal that lost it left `/panel-review-pr` told to stop the cycle
-  with nothing said about a red build. `ci_status`/`ci_failing` are recorded. **Sonar is not
+  with nothing said about a red build. `ci_status`/`ci_failing` are recorded, and both
+  `/panel-review-pr` and `/panel` are told to relay them with the refusal — the capability is
+  worth nothing if the consumer it was added for is not asked to read it. **Sonar is not
   read**: it is a panel *member*, with a `ran: false` row like every other seat, and dispatching
   one while telling the board none ran would be the inconsistency this path exists to avoid — so
   the notice states that gate was **not evaluated**, rather than letting its default read as a
@@ -777,7 +798,7 @@ Run-level fields worth knowing about because their meaning is conditional:
 | `scope` | `pr` \| `increment` — what this round actually reviewed. Recorded rather than inferred from the round number, because scope falls back to `pr` whenever the anchor is missing or the range is unusable, so "round 2" does not imply "increment" |
 | `since_sha` | the anchor the increment was taken from; null under `pr` scope |
 | `diff_chars` | the size of the **review target** — the whole PR under `pr` scope, the increment under `increment`. Read `scope` beside it: plotting this across a cycle's rounds without doing so shows a cliff at round 2 and reads as a shrinking PR |
-| `preflight` | the verdict the round was weighed against before it ran, on every exit that reached it: `verdict` (`run`/`manifest`/`refuse`), `reason`, `cap`/`cap_seat`/`over_cap`, `forced`/`would_have`, the `thresholds` in force, and `shape` (`chars`, `bytes`, `added`, `removed`, `moved`, `move_ratio`, `files`, plus `files_added_only`/`files_removed_only` — the one-sided file lists, capped at 40 paths each with a `_elided` count beside them, because this block rides in every board record and a 700-file refactor wrote 700 paths into each one). `over_cap` is null when and only when no ceiling was declared: a measured ratio is emitted even where it rounds to 0.0, so "small against a real ceiling" and "no ceiling" stay different answers. **`null` means the run never reached the verdict** — the title-pattern skip returns before it — which is a different statement from a `run` verdict, and the difference is what answers "was this PR ever weighed?" |
+| `preflight` | the verdict the round was weighed against before it ran, on every exit that reached it: `verdict` (`run`/`manifest`/`refuse`), `reason`, `cap`/`cap_seat`/`cap_unit`/`over_cap`, `forced`/`would_have`, the `thresholds` in force, and `shape` (`chars`, `bytes`, `added`, `removed`, `moved`, `move_ratio`, `files`, plus `files_added_only`/`files_removed_only` — the one-sided file lists, capped at 40 paths each with a `_elided` count beside them, because this block rides in every board record and a 700-file refactor wrote 700 paths into each one). `cap_unit` is `chars` or `bytes` and says which reading of `shape` the `cap` and the `over_cap` beside it are in — a ratio a consumer cannot attribute to one of the two readings cannot be checked at all. `over_cap` is null when and only when no ceiling was declared: a measured ratio is emitted even where it rounds to 0.0, so "small against a real ceiling" and "no ceiling" stay different answers. **`null` means the run never reached the verdict** — the title-pattern skip returns before it — which is a different statement from a `run` verdict, and the difference is what answers "was this PR ever weighed?" |
 | `preflight.shape` | measured on the **review target**, so it is scope-dependent exactly as `diff_chars` is: the whole PR under `pr` scope, the increment under `increment`. Read `scope` beside it. Under a `manifest` verdict it is also the only place the target's *pre-substitution* size appears, because `diff_chars` then measures the manifest — which is what was reviewed |
 | `context_chars` | everything prepared *alongside* the target; 0 under `pr` scope. With `diff_chars` this is what an uncapped reviewer was given. Neither is a per-reviewer number — budgets are, so a seat that got less says so in `reviewers.<name>.max_diff_chars` and `.truncated`, and a seat that got the whole target and only part of the context is named in `config_notes` |
 

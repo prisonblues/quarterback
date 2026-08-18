@@ -86,7 +86,25 @@ to start*, and only ever against a ceiling the repo or the kernel already declar
 On a repo with `max_diff_chars` unset and no argv-bound seat enabled there is no
 ceiling, none of this fires, and no number it invented reaches anyone's diff. Three
 keys govern it: `refuse_over_cap_multiple` (3), `move_shape_ratio` (0.9),
-`manifest_moves` (true).
+`manifest_moves` (true). `0` is the only spelling of *off* for the refusal and for
+the manifest alike (`manifest_moves` also takes `false`/`"off"`); `move_shape_ratio`
+is a threshold and has no off, because a ratio of `0` turns the feature all the way
+*on*.
+
+**A ceiling carries its unit, and the tightest one is the tightest *ratio*.** A
+configured `max_diff_chars` counts characters; the kernel's argv limit counts bytes,
+and this repo's own diffs — em-dashes, arrows, box characters in every comment — run
+well over two bytes per character. Those are not two sizes of the same thing, so
+taking the smaller *number* had no defined answer: a repo setting
+`antigravity.max_diff_chars: 100_000` hid the 120,000-**byte** argv ceiling behind
+the smaller integer, and at two bytes per character that seat's real ceiling is
+~60,000 characters — genuinely the tighter of the two, and unevaluated. So `agy`
+with a configured cap declares **two** ceilings, each is measured against the diff in
+its own unit, and the one that binds first decides. `preflight.cap_unit` records
+which reading `cap` and `over_cap` are in, `shape` carries both, and every renderer —
+the refusal notice, the manifest and `--force` banners, each seat's skip reason —
+states the unit it measured in, so a reader who divides the two numbers on the page
+gets the multiple printed beside them.
 
 **Two guards, both for cases that read plausibly when wrong.** A manifest is
 substituted only when it is *smaller* than the diff **and** under the ceiling — its

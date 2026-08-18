@@ -245,22 +245,76 @@ def test_no_configured_cap_means_there_is_nothing_to_refuse_against():
     """The answer that keeps this from becoming the default diff budget. A repo
     running claude and codex off stdin with no `max_diff_chars` has declared no
     ceiling, so no size this file invented is ever applied to its diffs."""
-    assert pf.smallest_cap(UNCAPPED, ALL_HERE) == (None, "")
+    assert pf.seat_ceilings(UNCAPPED, ALL_HERE) == ()
+    assert pf.tightest_ceiling(UNCAPPED, pf.diff_shape(SPLIT), ALL_HERE) is None
 
 
 def test_antigravity_is_capped_by_the_kernel_whether_or_not_a_repo_says_so():
     """That seat's prompt travels in argv, so `MAX_ARG_STRLEN` applies to it
     without anybody configuring anything. It is the only cap PR #137's repo had,
     and therefore the only reason the case is catchable at all."""
-    cap, seat = pf.smallest_cap({"claude": None, "antigravity": None}, ALL_HERE)
-    assert (cap, seat) == (panel_core.ARGV_PROMPT_MAX_BYTES, "antigravity")
+    got = pf.tightest_ceiling({"claude": None, "antigravity": None},
+                              pf.diff_shape(SPLIT), ALL_HERE)
+    assert got == pf.Ceiling(panel_core.ARGV_PROMPT_MAX_BYTES, "bytes", "antigravity")
 
 
-def test_a_smaller_configured_budget_beats_the_kernel_and_a_bigger_one_does_not():
-    small = panel_core.ARGV_PROMPT_MAX_BYTES // 2
-    assert pf.smallest_cap({"antigravity": small}, ALL_HERE) == (small, "antigravity")
+def test_a_configured_antigravity_cap_does_not_HIDE_the_kernels():
+    """The mixed-unit collapse, and the reason this is two ceilings rather than a
+    `min()` of them.
+
+    `min(cap, ARGV_PROMPT_MAX_BYTES)` compared a CHARACTER budget against a BYTE
+    limit and kept whichever was the smaller integer, so a repo setting
+    `antigravity.max_diff_chars: 100_000` hid the 120,000-byte argv ceiling behind
+    the smaller number. On a diff averaging two bytes per character that seat's
+    real ceiling is ~60,000 characters — genuinely tighter than the one that won —
+    and the round was measured against the looser one and let through.
+    """
+    argv = panel_core.ARGV_PROMPT_MAX_BYTES
+    small = argv // 2
+    both = pf.seat_ceilings({"antigravity": small}, ALL_HERE)
+    assert both == (pf.Ceiling(small, "chars", "antigravity"),
+                    pf.Ceiling(argv, "bytes", "antigravity")), \
+        "both are declared, both are real"
+
+    # ASCII: the two readings of the size are the same number, so the smaller
+    # ceiling binds and it is the configured one — the old answer, still right.
+    ascii_shape = pf.diff_shape(FRESH * 40)
+    assert ascii_shape.chars == ascii_shape.nbytes, "fixture drifted: not ASCII"
+    assert pf.tightest_ceiling({"antigravity": small}, ascii_shape, ALL_HERE).unit \
+        == "chars"
+
+    # A diff the CHARACTER budget fits whole and the kernel's BYTE limit does not.
+    # Under `min()` the configured ceiling won on being the smaller integer, the
+    # round was measured in characters, `size <= cap` held and the verdict was
+    # `run` — handing `execve` a prompt it cannot carry.
+    text = _file("w.py", added=[f"    # 全角の行 {i} — 相当な長さの説明があります"
+                                for i in range(2600)])
+    wide = pf.diff_shape(text)
+    assert wide.nbytes > argv > wide.chars, f"fixture drifted: {wide}"
+    cap = wide.chars + 1
+    assert cap < argv, "the numeric min() would have chosen the configured cap"
+    assert pf.tightest_ceiling({"antigravity": cap}, wide, ALL_HERE) \
+        == pf.Ceiling(argv, "bytes", "antigravity")
+    # End to end, which is the half a unit test of the selection cannot show. Read
+    # in characters this diff FITS (`size <= cap`, so `run` with an empty reason and
+    # nothing said anywhere); read in the bytes the kernel actually counts it is
+    # half again over the argv ceiling. The threshold is written down rather than
+    # left at 3 because CJK is three bytes per character at most, so no fixture can
+    # be 3x over in bytes while still fitting a character ceiling.
+    assert wide.chars <= cap, "read in characters, this diff fitted"
+    got = _pre(text, {"antigravity": cap}, {"refuse_over_cap_multiple": 1}, [])
+    assert got.refused, got.reason
+    assert got.cap_unit == "bytes" and got.measured == wide.nbytes
+    assert got.over == pytest.approx(wide.nbytes / argv)
+    assert f"{argv:,}-byte ceiling" in got.reason
+
+
+def test_a_bigger_configured_budget_leaves_the_kernel_holding_the_floor():
+    """The other side of the pair above: a cap looser than the kernel's changes
+    nothing, because the kernel's applies to that seat regardless."""
     big = panel_core.ARGV_PROMPT_MAX_BYTES * 4
-    assert pf.smallest_cap({"antigravity": big}, ALL_HERE)[0] == panel_core.ARGV_PROMPT_MAX_BYTES
+    got = pf.tightest_ceiling({"antigravity": big}, pf.diff_shape(SPLIT), ALL_HERE)
+    assert got.limit == panel_core.ARGV_PROMPT_MAX_BYTES and got.unit == "bytes"
 
 
 def test_a_seat_whose_CLI_is_ABSENT_declares_no_ceiling_here():
@@ -274,9 +328,9 @@ def test_a_seat_whose_CLI_is_ABSENT_declares_no_ceiling_here():
     cap at all."""
     budgets = {"claude": None, "antigravity": None}
     no_agy = {"claude": True, "antigravity": False}.get
-    assert pf.smallest_cap(budgets, no_agy) == (None, "")
+    assert pf.seat_ceilings(budgets, no_agy) == ()
     # The same round, on a box that HAS it: the ceiling is real and applies.
-    assert pf.smallest_cap(budgets, ALL_HERE)[1] == "antigravity"
+    assert pf.seat_ceilings(budgets, ALL_HERE)[0].seat == "antigravity"
     # End to end: the verdict follows.
     big = FRESH * 40
     assert _pre(big, budgets, {}, [], installed=no_agy).verdict == "run"
@@ -292,7 +346,7 @@ def test_a_box_carrying_no_seat_at_all_refuses_nothing():
     def none_here(name):
         return False
 
-    assert pf.smallest_cap({"claude": 10, "antigravity": 10}, none_here) == (None, "")
+    assert pf.seat_ceilings({"claude": 10, "antigravity": 10}, none_here) == ()
     assert _pre(FRESH * 40, {"claude": 10}, {}, [], installed=none_here).verdict == "run"
 
 
@@ -304,7 +358,7 @@ def test_the_host_predicate_is_resolved_in_the_BODY_so_it_can_be_replaced(monkey
     pin it. That is the shape of failure a CI runner finds and a workstation does
     not: ten tests here passed locally and failed with the vendor CLIs hidden."""
     monkeypatch.setattr(pf, "seat_installed", lambda name: False)
-    assert pf.smallest_cap({"antigravity": None}) == (None, "")
+    assert pf.seat_ceilings({"antigravity": None}) == ()
     assert pf.preflight(FRESH * 40, {"antigravity": None}, {}, []).verdict == "run"
 
 
@@ -324,9 +378,18 @@ def test_the_tightest_seat_holds_the_floor_and_ties_break_by_name():
     """Deterministically, because the seat's name goes in the refusal's reason and
     a reason that names a different seat on two runs of the same round is a reason
     nobody can check."""
-    assert pf.smallest_cap({"claude": 50, "codex": 10, "pi": 90}, ALL_HERE) == (10, "codex")
+    shape = pf.diff_shape(FRESH)
+    assert pf.tightest_ceiling({"claude": 50, "codex": 10, "pi": 90}, shape,
+                               ALL_HERE) == pf.Ceiling(10, "chars", "codex")
     for _ in range(5):
-        assert pf.smallest_cap({"pi": 10, "codex": 10}, ALL_HERE)[1] == "codex"
+        assert pf.tightest_ceiling({"pi": 10, "codex": 10}, shape,
+                                   ALL_HERE).seat == "codex"
+    # And the tie an EMPTY diff makes ordinary: every ratio is 0.0, so the
+    # secondary key decides and it is the smaller number, exactly as the
+    # numeric `min()` this replaced would have said.
+    nothing = pf.diff_shape("")
+    assert pf.tightest_ceiling({"claude": 50, "codex": 10, "pi": 90}, nothing,
+                               ALL_HERE) == pf.Ceiling(10, "chars", "codex")
 
 
 # ----------------------------------------------------------------------------- verdict
@@ -494,6 +557,37 @@ def test_a_manifest_SMALLER_than_the_diff_but_over_the_CEILING_is_not_substitute
     assert (ran.verdict, ran.manifest) == ("run", "")
 
 
+def test_a_manifest_EXACTLY_the_size_of_the_ceiling_still_fits():
+    """The two comparisons have to agree about the boundary, and they did not. A
+    diff is admitted by `size <= cap` — inclusive — while the manifest was
+    substituted only on `fitted < min(cap, size)`, so a manifest whose length was
+    exactly the ceiling fell through to the branch that says a seat "would read a
+    prefix of a manifest". At `fitted == cap` nothing is truncated and no prefix is
+    read: the sentence was simply false, and the substitution this whole path exists
+    to make was declined at the one size where it is exactly affordable."""
+    cap = len(pf.move_manifest(SPLIT))
+    assert cap < len(SPLIT), "fixture drifted: the manifest is not smaller"
+    got = _pre(SPLIT, {"claude": cap}, {}, [])
+    assert got.verdict == "manifest"
+    assert len(got.manifest) == cap, "exactly at the ceiling, and it fits"
+    # One character tighter is over, and that IS the prefix case.
+    over = _pre(SPLIT, {"claude": cap - 1}, {}, [])
+    assert over.verdict != "manifest"
+    assert "prefix of a manifest" in over.reason
+
+
+def test_a_manifest_EXACTLY_the_size_of_the_diff_is_still_no_saving():
+    """The other end of the same comparison, which the fix must not loosen:
+    `fitted < size` stays strict, because a manifest the same length as the diff
+    replaces the problem with a copy of it rather than solving anything."""
+    tiny = [f"    x{i} = {i}" for i in range(6)]
+    diff = _file("from.py", removed=tiny) + _file("to.py", added=tiny)
+    assert len(pf.move_manifest(diff)) > len(diff), "fixture drifted"
+    got = _pre(diff, {"claude": len(diff) // 10}, {}, [])
+    assert got.verdict != "manifest"
+    assert "replace the problem with a copy of it" in got.reason
+
+
 def test_a_manifest_that_fits_BOTH_the_diff_and_the_ceiling_is_still_substituted():
     """The other side of the guard above, so it cannot become a switch that turns the
     feature off: a ceiling the manifest comfortably fits under still gets one."""
@@ -561,6 +655,20 @@ def test_the_argv_ceiling_is_measured_in_BYTES_not_characters():
     assert f"{shape.chars // 2:,}-char ceiling" in chars.reason
 
 
+def test_the_one_sided_file_LISTS_cannot_be_passed_positionally():
+    """`nbytes` was inserted ahead of them, which changed what the sixth positional
+    argument means without changing the arity: an existing
+    `DiffShape(chars, added, removed, moved, files, added_only, removed_only)` bound
+    a tuple of paths to an `int` field and serialised `"bytes": ["a.py"]` into every
+    board record for that PR, with no TypeError anywhere to notice it. Keyword-only
+    turns a silent rebinding into an error at the call site."""
+    with pytest.raises(TypeError):
+        pf.DiffShape(100, 5, 5, 5, 2, 100, ("a.py",), ("b.py",))
+    # And the short hand-built literal the class's docstring invites still works.
+    s = pf.DiffShape(100, 5, 5, 5, 2)
+    assert (s.chars, s.nbytes, s.files_added_only) == (100, 0, ())
+
+
 def test_both_readings_of_the_size_are_serialised():
     """So which one a verdict used is checkable rather than taken on trust."""
     d = pf.diff_shape("diff --git a/x b/x\n@@ -1 +1 @@\n+é\n").as_dict()
@@ -615,7 +723,12 @@ def test_force_overrides_a_refusal_and_records_what_it_overrode():
 
 
 def test_force_overrides_a_manifest_too():
-    got = _pre(SPLIT, {"claude": len(SPLIT) // 10}, {}, [], forced=True)
+    # The ceiling has to be one the MANIFEST fits under, or the verdict being
+    # overridden is the refusal and this test pins nothing it means to. Asserted
+    # rather than assumed: the manifest's fixed overhead is prose, and prose grows.
+    cap = len(SPLIT) // 4
+    assert len(pf.move_manifest(SPLIT)) < cap, "fixture drifted: manifest over the cap"
+    got = _pre(SPLIT, {"claude": cap}, {}, [], forced=True)
     assert (got.verdict, got.would_have, got.forced) == ("run", "manifest", True)
 
 
@@ -723,6 +836,31 @@ def test_FALSE_on_a_numeric_threshold_is_refused_and_told_which_number_to_write(
     assert any("write `0` to switch it off" in n for n in notes), notes
 
 
+def test_FALSE_on_the_MOVE_RATIO_is_not_told_to_write_the_value_that_is_the_trap():
+    """The `0` hint was emitted for every key, `move_shape_ratio` included — and
+    `_rule`'s own docstring argues at length that reading `false` as 0 would be
+    wrong there because "every diff with one relocated line is a move: the switch
+    flipped to off turning the feature all the way on". So the note refused to
+    INTERPRET `false` as 0 and then told the operator to type it by hand. An
+    operator who complied got the exact behaviour the paragraph warns about.
+
+    `move_shape_ratio` has no off. The switch somebody reaching for one wants is
+    `manifest_moves`, and that is what the note now names."""
+    notes = []
+    got = _pre(SPLIT, {"claude": len(SPLIT) // 4}, {"move_shape_ratio": False}, notes)
+    assert got.thresholds["move_shape_ratio"] == pf.DEFAULT_MOVE_SHAPE_RATIO
+    assert len(notes) == 1, notes
+    assert "is not a number" in notes[0]
+    assert "write `0`" not in notes[0], "that is the trap, not the remedy"
+    assert "manifest_moves" in notes[0]
+    # And 0 really is the trap: at a threshold of 0 a diff with one relocated line
+    # is a move, which is what the advice would have produced.
+    barely = _file("a.py", removed=["shared = 1"] + [f"x{i} = {i}" for i in range(80)],
+                   added=["shared = 1"])
+    assert not pf.diff_shape(barely).is_move(), "not a move at the default"
+    assert pf.diff_shape(barely).is_move(0), "and every diff is one at 0"
+
+
 def test_NULL_on_the_refusal_multiple_means_the_DEFAULT_and_not_off():
     """Two docstrings said null switched the refusal off while `_rule` read it as
     "use the default", so an operator who wrote `refuse_over_cap_multiple: null` to
@@ -743,7 +881,11 @@ def test_NULL_on_the_refusal_multiple_means_the_DEFAULT_and_not_off():
 @pytest.mark.parametrize("raw,off", [(False, True), ("false", True), ("off", True),
                                      ("no", True), ("0", True), (True, False),
                                      ("true", False), ("YES", False), ("", False),
-                                     (None, False)])
+                                     (None, False),
+                                     # The bare numbers, which `_FALSE_WORDS`
+                                     # accepted as STRINGS while rejecting as
+                                     # integers — see the test below.
+                                     (0, True), (1, False), (0.0, True), (1.0, False)])
 def test_manifest_moves_is_VALIDATED_as_a_boolean(raw, off):
     """It was `panel.get("manifest_moves", True)` — raw truthiness — while both
     numeric settings introduced beside it went through `_rule` on purpose, so that a
@@ -766,6 +908,27 @@ def test_a_manifest_moves_value_that_is_NOT_a_boolean_falls_back_and_says_so():
     assert got.thresholds["manifest_moves"] is True
     assert got.verdict == "manifest"
     assert any("is not true or false" in n for n in notes), notes
+    # A number that is not a boolean is still junk, so 0/1 widening the accepted
+    # set has not turned the key into "any truthy value".
+    more = []
+    _pre(SPLIT, {"claude": len(SPLIT) // 4}, {"manifest_moves": 2}, more)
+    assert any("is not true or false" in n for n in more), more
+
+
+def test_manifest_moves_reads_the_SAME_off_switch_its_neighbour_documents():
+    """`_FALSE_WORDS` contains the string `"0"`, so `manifest_moves: "0"` switched
+    the manifest off while the bare `manifest_moves: 0` — the natural spelling in a
+    JSON `.harness-rules`, where a number needs no quoting decision — fell through
+    to "is not true or false" and left it ON with a note. And `0` is the documented,
+    only spelling of off for `refuse_over_cap_multiple`, which sits in the same
+    block: an operator writing both expected both off and got one."""
+    notes = []
+    got = _pre(SPLIT, {"claude": len(SPLIT) // 4},
+               {"manifest_moves": 0, "refuse_over_cap_multiple": 0}, notes)
+    assert got.thresholds["manifest_moves"] is False
+    assert got.thresholds["refuse_over_cap_multiple"] == 0
+    assert got.verdict == "run", "both switched off, so the round is an ordinary one"
+    assert notes == [], "and neither needed explaining"
 
 
 def test_a_measured_ratio_of_zero_is_not_serialised_as_NO_CEILING():
@@ -822,6 +985,57 @@ def test_the_refusal_notice_names_the_measurement_and_the_remedies():
     # not, or a reader gets a run of spaces mid-sentence.
     for line in text.splitlines():
         assert "  " not in line.strip(), line
+
+
+def test_the_refusal_notice_ADDS_UP_when_the_verdict_was_measured_in_BYTES():
+    """The notice is the human-facing artefact: it goes on the PR, and a reader who
+    divides the two numbers it prints must get the multiple it prints.
+
+    It did not. `over` came from UTF-8 bytes whenever antigravity's argv ceiling
+    bound, and every line of the report said "chars" and quoted `shape.chars` — so a
+    100,000-character / 260,000-byte diff against a 120,000-BYTE ceiling posted
+    "100,000 chars … tightest seat ceiling: 120,000 chars, exceeded 2.2x". Divide
+    and you get 0.83x, and the only honest conclusion is that the tool is broken.
+    Nothing covered it: the byte work was pinned on `reason` alone.
+    """
+    argv = panel_core.ARGV_PROMPT_MAX_BYTES
+    wide = [f"    # 全角の行 {i} — 相当な長さの説明があります" for i in range(6000)]
+    diff = _file("w.py", added=wide)
+    s = pf.diff_shape(diff)
+    assert s.nbytes > argv * 3 and s.nbytes > s.chars * 2, f"fixture drifted: {s}"
+    got = _pre(diff, {"antigravity": None}, {}, [])
+    assert got.refused and got.cap_unit == "bytes"
+
+    text = pf.refusal_report("board", 137, "a title", "main", got)
+    # The ceiling, the size it was compared against and the multiple are all in the
+    # SAME unit, and the multiple is what dividing them gives.
+    assert f"{argv:,} bytes (antigravity)" in text
+    assert f"{s.nbytes:,} bytes" in text
+    assert f"exceeded {s.nbytes / argv:.1f}x" in text
+    assert "in BYTES rather than characters" in text
+    # Both readings of the diff, because the ratio was computed from one of them.
+    assert f"{s.chars:,} chars / {s.nbytes:,} bytes" in text
+    # And the remedy that cannot work is not offered: no setting raises the
+    # kernel's argv limit, so "raise `max_diff_chars`" would send an operator round
+    # the loop for the same refusal. That advice only reads as plausible while the
+    # notice is silent about which ceiling it means.
+    assert "Raise `review_panel.max_diff_chars`" not in text
+    assert "Drop the `antigravity` seat" in text
+    for line in text.splitlines():
+        assert "  " not in line.strip(), line
+
+
+def test_an_ASCII_refusal_does_not_print_the_same_number_twice():
+    """The other half of the rule above: on a diff whose two readings agree, a
+    second copy of the same figure is noise between the reader and the measurement."""
+    got = _pre(FRESH, {"claude": len(FRESH) // 10}, {}, [])
+    assert got.shape.chars == got.shape.nbytes, "fixture drifted: not ASCII"
+    text = pf.refusal_report("board", 137, "a title", "main", got)
+    assert f"{got.shape.chars:,} chars," in text
+    assert "bytes" not in text
+    assert f"{got.cap:,} chars (claude)" in text
+    # …and the configured-ceiling remedy is the one that applies here.
+    assert "Raise `review_panel.max_diff_chars`" in text
 
 
 def test_the_refusal_notice_MARKS_a_truncated_title():
@@ -967,7 +1181,23 @@ def test_no_duplicate_says_which_languages_it_actually_looked_at():
     not apply rather than left with a false all-clear."""
     text = pf.move_manifest(SPLIT)
     assert "Python" in text and "JavaScript/TypeScript" in text
-    assert "NOT covered by this check" in text
+    assert "NOT covered" in text
+
+
+def test_the_coverage_DISCLAIMER_survives_a_section_that_found_something():
+    """It used to print only in the empty branch, which inverted the rule it was
+    written for. "A pattern that matches nothing is worse than an absent section:
+    it reads as 'checked, and clean'" — and a section that found ONE duplicate
+    reads as having found THE duplicates. A TS move that duplicates a `function`
+    and a class METHOD lists the function, and the method is never mentioned."""
+    diff = (_file("from.ts", removed=["export function pick(x) {"])
+            + _file("a.ts", added=["export function pick(x) {"])
+            + _file("b.ts", added=["export function pick(x) {"]))
+    text = pf.move_manifest(diff)
+    assert "! pick" in text, "the section fired"
+    assert "NOT covered" in text, "and still said what it cannot see"
+    assert "METHODS" in text
+    assert "@typing.overload" in text, "and which of its hits are ordinary"
 
 
 @pytest.mark.parametrize("line,name", [
@@ -995,6 +1225,16 @@ def test_no_duplicate_says_which_languages_it_actually_looked_at():
     ("interface Widget extends Base {", "Widget"),
     ("export enum Colour {", "Colour"),
     ("export type Handler<T> = (x: T) => void", "Handler"),
+    # The spellings the JS/TS pass claimed and still did not have. Each was a
+    # silent miss INSIDE a spelling `_DEF_SPELLINGS` told the reader was covered,
+    # which is the false all-clear the whole section is written against.
+    ("const identity = <T>(x: T) => x", "identity"),                  # generic arrow
+    ("const wrap = async <T, U>(x: T): U => cast(x)", "wrap"),        # …and async
+    ("const pick = <T extends Foo<Bar>>(x: T) => x", "pick"),         # …and nested
+    ("const send: (x: T) => U = x => transform(x)", "send"),          # function-TYPED
+    ("const enum Colour {", "Colour"),
+    ("export declare class Remote extends Base {", "Remote"),
+    ("declare class Ambient {", "Ambient"),
 ])
 def test_the_definition_shapes_it_recognises(line, name):
     assert pf._def_name(line) == name
@@ -1015,6 +1255,13 @@ def test_the_definition_shapes_it_recognises(line, name):
     "    const total = (a + b);",
     "    const label = words.map(w => w).join(' ');",
     "    return compute(x)",
+    "    for (const item of items) {",
+    "    const same = a === b ? f : g;",
+    # A multi-declarator line: the arrow belongs to `c`, not to `a`. The
+    # function-typed annotation admits `=>` and nothing else containing `=`,
+    # precisely so this cannot be filed under the first name on the line — a
+    # wrong name in the duplicate section is worse than a missing one.
+    "    const a = b, c = (x) => y;",
 ])
 def test_the_shapes_it_deliberately_does_not_recognise(line):
     assert pf._def_name(line) == ""
@@ -1114,6 +1361,34 @@ def test_a_repeated_residue_line_does_not_consume_the_whole_listing():
     for line in unique:
         assert line.strip() in text, "a unique residue line was crowded out"
     assert "not listed" not in text.split("WHAT DID NOT SURVIVE")[1].split("WHAT CHANGED")[0]
+
+
+def test_the_residue_HEADER_says_which_of_its_two_numbers_the_listing_counts():
+    """The header counted OCCURRENCES and everything under it counts DISTINCT
+    lines: `_listing` iterates distinct bodies, carries repetition as `xN` and
+    elides against the distinct total. So 500 copies of one line plus 5 unique ones
+    rendered as "505 line(s)" over six quoted entries and no "and N more" note — two
+    numbers in different units in adjacent lines, with nothing saying which was
+    which."""
+    boiler = "        raise NotImplementedError('this subclass owes an implementation')"
+    unique = [f"        if guard_{i} is None: return None" for i in range(5)]
+    diff = (_file("from.py", removed=BODY + [boiler] * 500 + unique)
+            + _file("to.py", added=BODY))
+    text = pf.move_manifest(diff)
+    head = next(ln for ln in text.splitlines()
+                if ln.startswith("WHAT DID NOT SURVIVE"))
+    assert "505 line(s), 6 distinct" in head, head
+
+
+def test_an_UNREPEATED_residue_does_not_state_the_same_number_twice():
+    """Both figures only when they differ. On the ordinary residue — every line
+    unique — "12 line(s), 12 distinct" is a second number that says nothing and one
+    more thing between the reader and the listing."""
+    orphans = [f"unique orphan {i}" for i in range(12)]
+    diff = _file("from.py", removed=BODY + orphans) + _file("to.py", added=BODY)
+    head = next(ln for ln in pf.move_manifest(diff).splitlines()
+                if ln.startswith("WHAT DID NOT SURVIVE"))
+    assert head.endswith("(12 line(s))"), head
 
 
 def test_a_file_with_no_counted_lines_is_not_labelled_BOTH():
@@ -1273,6 +1548,91 @@ def test_a_refused_round_records_the_CI_gate_and_not_the_SONAR_one(monkeypatch,
     printed = capsys.readouterr().out
     assert "CI: FAILED" in printed
     assert "SonarCloud: NOT evaluated" in printed
+
+
+def test_an_UNREADABLE_CI_gate_on_a_refusal_is_labelled_ONCE(monkeypatch, tmp_path,
+                                                             capsys):
+    """`review_ci` returns its skip reason already labelled — `ci: TimeoutExpired` —
+    because the ordinary path puts that string straight into `PanelResult.skipped`,
+    which is parsed board-side as "<reviewer>: <reason>". Neither consumer on the
+    refusal path parses it that way, and both added a second label to the first:
+    `config_notes` rendered "⚠️ config: ci: TimeoutExpired", filing a CI outage as a
+    config key called `ci`, and `_ci_line` rendered "could NOT be read (ci: timed
+    out)". Both read as though something had been mislabelled, which is the
+    impression a refusal notice can least afford."""
+    cfg = {**_panel(max_diff_chars=len(FRESH) // 10),
+           "reviewers": {"claude": {"enabled": True, "model": "sonnet"}}}
+    monkeypatch.setattr(panel, "load_repo_cfg", lambda name: cfg)
+    monkeypatch.setattr(pf, "seat_installed", ALL_HERE)
+    monkeypatch.setattr(panel_core, "sh", gh_stub(diff=FRESH))
+    monkeypatch.setattr(panel, "review_llm",
+                        lambda *a, **k: pytest.fail("a seat was dispatched"))
+    monkeypatch.setattr(panel, "review_ci",
+                        lambda *a: ("unknown", [], "ci: TimeoutExpired"))
+    out = tmp_path / "refused.json"
+    assert panel.run("e2e", 137, post=False, json_file=str(out), record=False) == 0
+    got = json.loads(out.read_text())
+    note = next(n for n in got["config_notes"] if "TimeoutExpired" in n)
+    assert note == "CI could not be read — TimeoutExpired"
+    printed = capsys.readouterr().out
+    assert "could NOT be read (TimeoutExpired)" in printed
+    assert "ci: TimeoutExpired" not in printed
+    # And it is still not filed as a reviewer that failed to run.
+    assert not any("ci" in r for r in got["reviewers"])
+
+
+def _wide_move(lines):
+    """A move-shaped diff whose BYTE count runs well ahead of its character count,
+    for the renderers that have to name which of the two they measured."""
+    body = [f"    # 全角の行 {i} — 相当な長さの説明があります" for i in range(lines)]
+    return (_file("big.py", removed=body)
+            + _file("part_a.py", added=body[:lines // 2])
+            + _file("part_b.py", added=body[lines // 2:]))
+
+
+def test_every_BANNER_on_a_byte_measured_round_names_the_unit(monkeypatch, tmp_path,
+                                                              capsys):
+    """The verdict knew, and none of its renderers did. `preflight` computed `over`
+    from UTF-8 bytes whenever antigravity's argv ceiling bound, while the manifest
+    banner, the `--force` banner and every per-seat skip reason printed
+    `shape.chars` beside the word "chars" — so the report stated a character count
+    against a byte ceiling and a multiple that matched neither."""
+    argv = panel_core.ARGV_PROMPT_MAX_BYTES
+    diff = _wide_move(1400)
+    s = pf.diff_shape(diff)
+    assert s.nbytes > argv > s.chars, f"fixture drifted: {s}"
+
+    # A manifest round: the banner above the findings.
+    _, got, _ = _run(monkeypatch, tmp_path, diff, _panel(), seats=("antigravity",))
+    assert got["preflight"]["verdict"] == "manifest"
+    assert got["preflight"]["cap_unit"] == "bytes"
+    printed = capsys.readouterr().out
+    assert f"diff is {s.nbytes:,} bytes against antigravity's {argv:,}" in printed
+
+    # The same round forced: the `--force` banner.
+    _, got, _ = _run(monkeypatch, tmp_path, diff, _panel(), seats=("antigravity",),
+                     force=True)
+    assert got["preflight"]["would_have"] == "manifest"
+    assert f"{s.nbytes:,}-byte diff against a {argv:,}-byte ceiling" \
+        in capsys.readouterr().out
+
+
+def test_a_byte_measured_REFUSAL_says_bytes_in_every_seats_skip_reason(monkeypatch,
+                                                                      tmp_path):
+    """`skipped` is parsed board-side and `reviewers[n]["skip"]` is the structured
+    twin, so a per-seat reason stating characters against a byte ceiling disagrees
+    with `skip_reason` in the same payload — and does it in the table that answers
+    which reviewer finds the real issues."""
+    argv = panel_core.ARGV_PROMPT_MAX_BYTES
+    diff = _wide_move(3000) + FRESH * 30      # over the multiple, not move-shaped
+    s = pf.diff_shape(diff)
+    assert not s.is_move() and s.nbytes > argv * 3, f"fixture drifted: {s}"
+    _, got, _ = _run(monkeypatch, tmp_path, diff, _panel(),
+                     seats=("antigravity", "claude"))
+    assert got["preflight"]["verdict"] == "refuse"
+    want = f"({s.nbytes:,} bytes against {argv:,})"
+    assert all(want in row for row in got["skipped"]), got["skipped"]
+    assert all(want in r["skip"] for r in got["reviewers"].values())
 
 
 def test_a_refused_SCOPED_round_records_what_it_was_going_to_review(monkeypatch,
