@@ -154,6 +154,15 @@ don't just note them. Update the stale docs. Propagate renames/patterns to
 sibling code. After fixing, re-read the full diff of your fixes and fix any new
 issues they introduce.
 
+**Commit before you break something on purpose.** Proving a new test bites — by
+mutating the code it guards and watching it go red — is worth doing and is the
+only way to know a guard is not vacuous. But the revert is `git checkout --
+<file>`, which discards **your own uncommitted work** in that file with no
+warning and nothing to undo it from. Two fixers hit this on PR #212 within an
+hour, both while checking guards they had just written; both were lucky enough to
+notice. Commit (or `git stash`) first, and mutate a file you have not edited
+where you have the choice.
+
 **Once the list is triaged, decide *how* to fix it.** Serially yourself is the
 default; for a big, clean list, fan the fixes out to `general-purpose` sub-agents
 running in parallel instead. Fan out only when all three hold:
