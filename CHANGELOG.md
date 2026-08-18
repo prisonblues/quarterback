@@ -11,6 +11,47 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
+## vNEXT — a screen you ask for by number, and seats that do not stop to ask
+
+Three of the four changes here are about typing `qb-b 3`. The seat count was the
+only argument that ever varied and it took `-n` in front of it every time; the
+default was 2 and the ceiling was 2, chosen because integration cost grows
+quadratically in open PRs — still true, still the reason for a ceiling, and not
+a reason for the ceiling to sit below what one human can follow. A bare number
+is now the count, the default is 3 and the ceiling is 10. `-n N` still works.
+
+Past five seats the row becomes two rows, and they are BUILT rather than chosen.
+`select-layout tiled` picks its arrangement from the window's aspect ratio and
+gives six seats as 2 across by 3 down, which is the wrong axis: a seat wants
+width, for prose and diffs, and only enough height for the last few turns. Ten
+seats are five across and two down; an odd count puts the extra one on top.
+Seat numbers also read left to right now — a tmux split lands to the RIGHT of
+its target, so splitting the first pane each time built `1,5,4,3,2` across the
+row, and the number is how a human addresses one of these.
+
+**A seat no longer stops to ask for permission, and that is the fix, not the
+convenience.** A seat is a pane nobody is watching. The first tool call wanting
+a permission the agent did not already hold stopped it dead, and it stopped in
+the one way this design cannot recover from: the pane looks busy, the board
+shows a live agent holding a claim, and the work is not moving. A prompt no one
+answers is an outage that looks like progress, and N of them is a row of stuck
+panes that reads as a working fleet.
+
+Each seat now starts with `--dangerously-skip-permissions` unless told
+otherwise — `qb-seats --no-yolo` for one screen, `QB_SEAT_YOLO=0` for all of
+them, falsy values only, mirroring `QB_SEAT_FORCE` because unset and empty both
+mean "not answered". The default lives in `qb-seat` rather than in the screen:
+`qb-seat` is what execs the agent, so a seat started by hand gets what a seat
+the screen builds gets, and there is one place for it rather than two that can
+drift. The flags are not a second mechanism — they set the variable `qb-seat`
+already reads.
+
+It is a real trade and it is made deliberately: it hands a full shell to N
+agents at once in a repo whose tests, hooks and scripts all run as the operator.
+What decides it is the blast radius either way — a seat that cannot act is
+useless to everybody, while a seat that can act is dangerous in a repo you
+already trusted enough to point a fleet at.
+
 ## v2.45 — a peer's working directory, so "same repo" stops meaning "same tree"
 `/overlap` told an agent who else was live in its repo and left out where they
 were standing. Every peer therefore read the same, and so did the advice built on
