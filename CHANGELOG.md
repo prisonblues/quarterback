@@ -11,7 +11,7 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
-## vNEXT — the dashboard shows the work nobody has taken yet
+## vNEXT — the dashboard shows the work nobody has taken yet, and a peer's working directory
 
 The dash listed open PRs, which is what you look at when work is finishing. It said
 nothing about work that has not started — and a seat's whole job is to pick an unclaimed
@@ -36,7 +36,7 @@ rather than a rule against it.
 `qb-dash`, the printed one, grew the same panel capped at twelve rows with a count of the
 rest. It cannot scroll, and thirty issues there would push the fleet off the top of a pane.
 
-## vNEXT — a peer's working directory, so "same repo" stops meaning "same tree"
+**A peer's working directory came with it, so "same repo" stops meaning "same tree".**
 
 `/overlap` told an agent who else was live in its repo and left out where they
 were standing. Every peer therefore read the same, and so did the advice built on
