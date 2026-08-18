@@ -22,10 +22,16 @@ silent and expensive:
 Run: pytest harness/tests
 """
 
+import contextlib
+import fcntl
 import os
+import pty
 import shutil
+import struct
 import subprocess
 import tempfile
+import termios
+import threading
 import time
 from pathlib import Path
 
@@ -55,9 +61,17 @@ def screen(tmp_path):
     # build sandbox, and a stub that cannot exec makes every test here fail for a
     # reason that has nothing to do with the code under test. The shipped scripts
     # dodge this via patchShebangs; a stub written at runtime cannot.
+    #
+    # The brief is recorded with `${VAR+set}`/`${VAR-unset}`, the same distinction
+    # qb-seat itself draws: set-and-empty means "no brief, wait" and unset means
+    # "use the built-in one", and a test that cannot tell them apart cannot pin the
+    # bug that forwarded the wrong one. It has to be logged rather than read back
+    # off tmux, because --add passes it with `split-window -e`, which sets the
+    # environment of the PANE — and there is no tmux command that shows that.
     stub.write_text(
         "#!/bin/sh\n"
-        'printf "seat=%s instance=%s cwd=%s\\n" "$1" "${QUARTERBACK_INSTANCE:-unset}" "$PWD"'
+        'printf "seat=%s instance=%s cwd=%s brief=%s\\n" "$1"'
+        ' "${QUARTERBACK_INSTANCE:-unset}" "$PWD" "${QB_SEAT_BRIEF+set:}${QB_SEAT_BRIEF-unset}"'
         f' >> {tmp_path / "seats.log"}\n'
         "exec sleep 300\n"
     )
@@ -91,7 +105,16 @@ def screen(tmp_path):
         # time. Unset both, so a run from inside tmux is a run outside it.
         "HOME": str(home),
         "XDG_CONFIG_HOME": str(home / ".config"),
-        "PATH": f"{stub_dir}:{os.environ['PATH']}",
+        # THE SCRIPTS UNDER TEST GO ON PATH, ahead of any installed copy. Not
+        # cosmetic: qb-seats records `beside_me qb-seats` on the session for the ＋
+        # to shell out to, and beside_me asks PATH first — so with only the
+        # developer's PATH here, the ＋ tests, the ✕ tests and the dash's resize
+        # hook were all driving the INSTALLED qb-seats and qb-seat-click and not
+        # these ones. They passed while proving nothing about the working tree, and
+        # the same rule the tmux.conf is an input for applies: what the machine
+        # happens to carry is not something a test may consult. The stub qb-seat
+        # still comes first, since that one has to win over the real thing.
+        "PATH": f"{stub_dir}:{BIN}:{os.environ['PATH']}",
         # -L would be cleaner than an env var, but the script builds its own tmux
         # command lines; TMUX_TMPDIR isolates the server without touching them.
         "TMUX_TMPDIR": socket_dir,
@@ -99,13 +122,19 @@ def screen(tmp_path):
         # script has to defend against, so the fixture always supplies one.
         "QUARTERBACK_INSTANCE": "leaked-host-wide",
         # NO DASH unless a test asks for one. Left alone, dash_cmd() resolves
-        # whatever qb-dash-tui happens to be installed on the machine running the
+        # whatever qb-dash happens to be installed on the machine running the
         # suite, so a third of these tests would depend on that — and would start
         # a real dashboard, against a real board, in every screen they build. Same
         # rule the tmux.conf above is an input for: what the developer's machine
         # carries is not something a test may consult. Tests that want a dash set
-        # QB_SEATS_DASH themselves, to a stub.
+        # QB_SEATS_DASH themselves, to a stub; the two that are ABOUT the default
+        # unset it again and put stubs named qb-dash/qb-dash-tui on PATH instead.
         "QB_SEATS_DASH": "",
+        # AND NO REAL TAPE EITHER, for the same reason one line up: qb-board is on
+        # the PATH above, so every screen these tests build would otherwise start
+        # `qb-board --follow` against the real board — fifty of them in a run.
+        # A test may not need the network to be up to pass.
+        "QB_SEATS_BOARD": "printf tape-stub",
     }
     sessions = []
 
@@ -139,6 +168,7 @@ def screen(tmp_path):
     _run.tmux_conf = tmux_conf     # write to this BEFORE the first call: tmux
                                    # reads its config when the server starts
     _run.repo = repo
+    _run.stub_dir = stub_dir       # the stub qb-seat, for tests that rebuild PATH
     _run.log = tmp_path / "seats.log"
     _run.env = env
     yield _run
@@ -163,18 +193,169 @@ def panes(run, name="t"):
     ]
 
 
-def labels(run, name="t"):
-    """{@qb_label: (width, top)} for the panes that are NOT seats."""
+def aux_panes(run, name="t"):
+    """[(label, width, top)] for the panes that are NOT seats — one entry each.
+
+    A list and not a dict, because the count is an assertion some tests make: two
+    unlabelled panes both key on "" and the second would silently overwrite the
+    first, so `len()` on the dict cannot support "the tape is the only auxiliary
+    pane" — which is exactly the regression the no-dash test exists to catch.
+    """
     out = run.tmux("list-panes", "-t", f"{name}:seats", "-F",
                    "#{@qb_seat}\t#{@qb_label}\t#{pane_width}\t#{pane_top}").stdout
-    got = {}
+    got = []
     for line in out.splitlines():
         if not line:
             continue
         seat, label, width, top = line.split("\t")
         if not seat:
-            got[label] = (int(width), int(top))
+            got.append((label, int(width), int(top)))
     return got
+
+
+def labels(run, name="t"):
+    """{@qb_label: (width, top)}, for the tests that look one pane up by name."""
+    got = {}
+    for label, width, top in aux_panes(run, name):
+        assert label not in got, f"two auxiliary panes are both labelled {label!r}"
+        got[label] = (width, top)
+    return got
+
+
+def pane_id(run, label, name="t"):
+    """The pane id carrying @qb_label, or None."""
+    out = run.tmux("list-panes", "-t", f"{name}:seats", "-F",
+                   "#{pane_id}\t#{@qb_label}").stdout
+    for line in out.splitlines():
+        if line and line.split("\t")[1] == label:
+            return line.split("\t")[0]
+    return None
+
+
+def border_label(run, pane, name="t"):
+    """What pane-border-format actually RENDERS for a pane, stripped.
+
+    Every other assertion here reads `#{@qb_label}` directly, which only proves the
+    script SET an option. The border is what a user sees, and it reaches the label
+    through a nested conditional in pane-border-format — so if that middle case
+    were missing, every pane with no seat number would read 'board' and every
+    label assertion in this file would still pass. This closes that gap by
+    expanding the window's real format against the pane.
+    """
+    fmt = run.tmux("show-options", "-w", "-t", f"{name}:seats", "-v",
+                   "pane-border-format").stdout.strip()
+    assert fmt, "the window has no pane-border-format"
+    return run.tmux("display-message", "-p", "-t", pane, fmt).stdout.strip(" *\n")
+
+
+def wait_for_pane(run, pane, want, timeout=20):
+    """Poll a pane's visible text for `want`.
+
+    The pane's shell, the command typed into it and this process are all concurrent
+    — the same shape wait_for_log exists for.
+    """
+    deadline = time.time() + timeout
+    seen = ""
+    while time.time() < deadline:
+        seen = run.tmux("capture-pane", "-p", "-t", pane).stdout
+        if want in seen:
+            return seen
+        time.sleep(0.2)
+    return seen
+
+
+def wait_for_dash_width(run, want, name="t", timeout=20):
+    """Poll the dash's width. The resize hooks fire `run-shell -b`, i.e. in the
+    background, so the refit lands some moments after the window resize does."""
+    deadline = time.time() + timeout
+    got = None
+    while time.time() < deadline:
+        got = dict((lbl, w) for lbl, w, _ in aux_panes(run, name)).get("dash")
+        if got == want:
+            return got
+        time.sleep(0.2)
+    return got
+
+
+@contextlib.contextmanager
+def attached_client(run, cols, rows, name="t"):
+    """A REAL tmux client attached at a size of the test's choosing.
+
+    Nothing else in this file has one, and that is how a 78-column dash that came
+    out at 32 on every attach got as far as review: a detached session is exactly
+    the -x/-y it was built with, so every pane-width assertion made without a
+    client is made about a window no user ever looks at. Attaching is what resizes
+    the window and rescales every pane in the dash's row.
+
+    tmux will only attach to a real terminal, hence the pty; the winsize is set on
+    the slave BEFORE the client starts, so the very first thing it reports is the
+    size under test. The master end has to be drained continuously or tmux blocks
+    writing its first redraw into a full pty buffer and the window never resizes at
+    all — hence the pump thread.
+    """
+    master, slave = pty.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+    stop = threading.Event()
+
+    def pump():
+        while not stop.is_set():
+            try:
+                if not os.read(master, 1 << 16):
+                    return
+            except BlockingIOError:
+                time.sleep(0.05)
+            except OSError:
+                return
+
+    os.set_blocking(master, False)
+    client = subprocess.Popen(
+        ["tmux", "attach-session", "-t", f"={name}"],
+        env={**run.env, "TERM": "xterm-256color"},
+        stdin=slave, stdout=slave, stderr=slave, start_new_session=True,
+    )
+    os.close(slave)
+    pumping = threading.Thread(target=pump, daemon=True)
+    pumping.start()
+    try:
+        got = None
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            got = run.tmux("display-message", "-p", "-t", f"{name}:seats",
+                           "#{window_width}").stdout.strip()
+            if got == str(cols):
+                break
+            time.sleep(0.2)
+        assert got == str(cols), f"the client never resized the window to {cols}: {got}"
+        yield client
+    finally:
+        stop.set()
+        run.tmux("detach-client", "-s", f"={name}")
+        client.terminate()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            client.wait(timeout=10)
+        pumping.join(timeout=2)
+        os.close(master)
+
+
+def path_with_no_dash_on_it(tmp_path, run):
+    """A PATH carrying what qb-seats needs to run and nothing named like a dash.
+
+    Filtering the real PATH by directory cannot work here: a nix profile keeps tmux
+    and qb-dash in the SAME bin directory, so dropping the directory that has a
+    dash in it takes the multiplexer with it. The tools are therefore linked in by
+    name — and the test asserts the run succeeded, so a tool missing from this list
+    fails loudly instead of turning the test into a no-op.
+    """
+    d = tmp_path / "nodash"
+    d.mkdir(exist_ok=True)
+    for tool in ("env", "bash", "sh", "tmux", "git", "awk", "sort", "dirname",
+                 "sleep", "cat"):
+        found = shutil.which(tool)
+        if found and not (d / tool).exists():
+            (d / tool).symlink_to(found)
+    # The stub qb-seat still has to be findable, or require_qb_seat falls back to
+    # the real one beside the script under test and starts a real agent.
+    return f"{run.stub_dir}:{d}"
 
 
 def wait_for_log(path, count, timeout=20):
@@ -540,7 +721,10 @@ def test_the_screen_records_what_the_plus_needs(screen):
     assert screen.tmux("show-options", "-v", "-t", "=t:", "@qb_repo").stdout.strip() \
         == str(screen.repo)
     recorded = screen.tmux("show-options", "-v", "-t", "=t:", "@qb_seats_bin").stdout.strip()
-    assert recorded.endswith("qb-seats") and Path(recorded).exists(), recorded
+    # The one under test, exactly. `endswith("qb-seats")` was satisfied by the copy
+    # installed on the machine running the suite, which is how the ＋ and ✕ tests
+    # came to be driving that one instead of this working tree.
+    assert recorded == str(QB_SEATS), recorded
 
 
 def test_the_cross_closes_that_seat_and_reflows_the_row(screen):
@@ -628,35 +812,153 @@ def test_a_range_that_means_nothing_here_changes_nothing(screen):
 DASH_STUB = "printf dash-stub; sleep 300"
 
 
-def test_a_dash_pane_is_built_by_default(screen):
+def dash_stubs(tmp_path, *names):
+    """A bin directory holding a stub for each name, each printing its own marker.
+
+    Every other dash test pins QB_SEATS_DASH to a command, which says nothing about
+    how an UNSET one resolves — the PATH probe, its preference order, and the
+    placeholder when neither binary is there had no coverage at all. These stubs are
+    what let that be asserted without consulting the machine the suite runs on.
+    """
+    d = tmp_path / "dashbin"
+    d.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        stub = d / name
+        stub.write_text(f"#!/bin/sh\nprintf {name}-ran\nexec sleep 300\n")
+        stub.chmod(0o755)
+    return d
+
+
+def test_a_dash_pane_is_built_by_default(screen, tmp_path):
     """Default-ON is a deliberate divergence from #174, which asked for a flag.
-    A screen whose whole job is situational awareness should not need one."""
+    A screen whose whole job is situational awareness should not need one.
+
+    Unset, not empty: this is the resolution path, so QB_SEATS_DASH is removed from
+    the environment rather than set to a stub.
+    """
+    del screen.env["QB_SEATS_DASH"]
+    screen.env["PATH"] = f"{dash_stubs(tmp_path, 'qb-dash')}:{screen.env['PATH']}"
+    screen("-n", "2")
+    dash = pane_id(screen, "dash")
+    assert dash, "no pane labelled 'dash'"
+    assert "qb-dash-ran" in wait_for_pane(screen, dash, "qb-dash-ran")
+
+
+def test_the_default_dash_is_the_plain_one_never_the_tui(screen, tmp_path):
+    """qb-dash-tui is the nicer renderer and cannot be the default: it keys its seat
+    rows by seat name, every screen numbers its seats from 1, so the second screen
+    anywhere on the box turns this pane into a Textual traceback (#209, underlying
+    cause #208). A default has to work on the second screen as well as the first.
+
+    Both installed, so this pins the preference order rather than availability —
+    and the fallback that used to reach the TUI whenever qb-dash was missing is
+    gone with it, since a partial install is no reason to hand somebody the
+    renderer that crashes.
+    """
+    del screen.env["QB_SEATS_DASH"]
+    bindir = dash_stubs(tmp_path, "qb-dash", "qb-dash-tui")
+    screen.env["PATH"] = f"{bindir}:{screen.env['PATH']}"
+    screen("-n", "1")
+    seen = wait_for_pane(screen, pane_id(screen, "dash"), "qb-dash-ran")
+    assert "qb-dash-ran" in seen
+    assert "qb-dash-tui-ran" not in seen, "the TUI became the default"
+
+    # ...and with only the TUI installed the default is still not the TUI: the pane
+    # says what to set instead, which is the one thing that cannot crash.
+    only_tui = dash_stubs(tmp_path / "tui-only", "qb-dash-tui")
+    screen.env["PATH"] = f"{only_tui}:{path_with_no_dash_on_it(tmp_path, screen)}"
+    assert screen("-n", "1", name="tuionly").returncode == 0
+    seen = wait_for_pane(screen, pane_id(screen, "dash", "tuionly"),
+                         "QB_SEATS_DASH=qb-dash-tui")
+    assert "QB_SEATS_DASH=qb-dash-tui" in seen, seen
+    assert "qb-dash-tui-ran" not in seen, "the TUI was started as the default"
+
+
+def test_with_no_dash_installed_the_pane_explains_itself(screen, tmp_path):
+    """Neither binary on PATH is a pane with a reason in it, not a missing pane.
+
+    The message is typed into the pane's shell, so this is also the regression test
+    for how it is quoted: `printf %%s\\n %q` emitted a `\\n` that the pane shell ate
+    on its way past, printing `...yet.n` and running into the next prompt, and %q
+    on a message containing a newline emits bash's `$'...'` form, which a POSIX
+    /bin/sh pane prints verbatim. Both are visible in the pane and nowhere else.
+    """
+    del screen.env["QB_SEATS_DASH"]
+    screen.env["PATH"] = path_with_no_dash_on_it(tmp_path, screen)
+    assert screen("-n", "1").returncode == 0
+    dash = pane_id(screen, "dash")
+    assert dash, "no dash pane at all — the explanation has nowhere to go"
+    seen = wait_for_pane(screen, dash, "nothing to show here yet")
+    assert "dash pane: qb-dash is not on PATH" in seen, seen
+    assert "$'" not in seen, "the message arrived in bash's ANSI-C quoting form"
+    assert "yet.n" not in seen, "the trailing newline was eaten by the pane's shell"
+    # One argument per line, so each line of the message is its own line in the pane.
+    assert "Set QB_SEATS_DASH" in seen.split("nothing to show here yet.")[1]
+
+
+def test_a_named_dash_command_is_actually_RUN_in_the_pane(screen):
+    """Every geometry assertion below would pass on a pane the send-keys never
+    reached: keys typed before the shell was ready, a value send-keys read as a key
+    NAME rather than as text, an unresolvable command. The pane's own output is the
+    only witness that the dash was started rather than merely placed."""
     screen.env["QB_SEATS_DASH"] = DASH_STUB
     screen("-n", "2")
-    assert "dash" in labels(screen), "no pane labelled 'dash'"
+    dash = pane_id(screen, "dash")
+    assert dash, "no pane labelled 'dash'"
+    assert "dash-stub" in wait_for_pane(screen, dash, "dash-stub")
+
+
+def test_a_dash_command_that_collides_with_a_key_name_is_still_typed(screen):
+    """`send-keys` looks its argument up as a key name before falling back to text,
+    so a one-word command called `Enter`, `Space` or `Tab` used to be sent as that
+    KEY — the pane got a keystroke and no command, silently. -l is the fix."""
+    stub = Path(screen.env["PATH"].split(":")[0]) / "Space"
+    stub.write_text("#!/bin/sh\nprintf space-stub-ran\nexec sleep 300\n")
+    stub.chmod(0o755)
+    screen.env["QB_SEATS_DASH"] = "Space"
+    screen("-n", "1")
+    dash = pane_id(screen, "dash")
+    assert "space-stub-ran" in wait_for_pane(screen, dash, "space-stub-ran")
 
 
 def test_no_dash_command_means_no_dash_pane(screen):
     """Set-and-empty is the off switch, matching QB_SEAT_BRIEF's spelling."""
     screen.env["QB_SEATS_DASH"] = ""
     screen("-n", "2")
-    got = labels(screen)
-    assert "dash" not in got
-    assert len(got) == 1, "the tape should be the only auxiliary pane"
+    got = aux_panes(screen)
+    assert [label for label, _, _ in got] == [""], "the tape should be the only one"
 
 
 def test_the_tape_is_named_tape_only_when_a_dash_shares_the_screen(screen):
     """pane-border-format falls back to 'board' for an unlabelled pane, which is
     what the bottom pane has always read. Renaming it for everybody to solve a
     problem only the two-pane screen has would be a gratuitous break — so the
-    label arrives with the dash and not before."""
+    label arrives with the dash and not before.
+
+    The label is all this pins. Asserting the width and top as well made a change
+    to either default fail here, with a message about the tape's NAME.
+    """
     screen.env["QB_SEATS_DASH"] = ""
     screen("-n", "1", name="plain")
-    assert labels(screen, "plain") == {"": (240, 45)}, "the lone pane must stay unlabelled"
+    assert list(labels(screen, "plain")) == [""], "the lone pane must stay unlabelled"
 
     screen.env["QB_SEATS_DASH"] = DASH_STUB
     screen("-n", "1", name="withdash")
     assert set(labels(screen, "withdash")) == {"dash", "tape"}
+
+
+def test_the_pane_border_renders_the_label_and_not_board(screen):
+    """The whole argument for @qb_label over a name of its own is that the border
+    reads one option. Everything else here reads @qb_label directly, which proves
+    only that the script SET it: if pane-border-format's middle case were missing or
+    broken, both auxiliary panes would render as 'board' and every other assertion
+    in this file would stay green."""
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen("-n", "2")
+    assert border_label(screen, pane_id(screen, "dash")) == "dash"
+    assert border_label(screen, pane_id(screen, "tape")) == "tape"
+    seat = [p for p, n in panes(screen) if n == "1"][0]
+    assert border_label(screen, seat) == "seat 1"
 
 
 def test_the_dash_is_a_column_above_the_tape_not_beside_it(screen):
@@ -691,6 +993,21 @@ def test_the_dash_width_is_configurable(screen):
     assert labels(screen)["dash"][0] == 40
 
 
+def test_a_dash_width_that_is_not_a_number_is_refused_before_anything_is_built(screen):
+    """The value reaches `split-window -l` verbatim, inside a command substitution
+    under `set -e`. A typo therefore used to kill the script with the session, the
+    seats and the tape already created but no agent started — on a bare tmux error
+    naming neither the variable nor the fix, and with a session name that then made
+    the obvious rerun fail too."""
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen.env["QB_SEATS_DASH_SIZE"] = "78px"
+    done = screen("-n", "2")
+    assert done.returncode == 1, done
+    assert "QB_SEATS_DASH_SIZE" in done.stderr, done.stderr
+    assert screen.tmux("has-session", "-t", "=t").returncode != 0, \
+        "a half-built screen was left behind"
+
+
 def test_add_does_not_squeeze_the_dash(screen):
     """`select-layout -E` spreads the row the new seat lands in, and the dash is
     in it. Without a reassert, every --add narrows the dashboard a little more."""
@@ -702,14 +1019,124 @@ def test_add_does_not_squeeze_the_dash(screen):
     assert labels(screen)["dash"][0] == 50, "the dash was resized by --add"
 
 
+def test_add_takes_the_width_from_the_screen_and_not_from_its_own_environment(screen):
+    """The requested width is per-screen state, read once when the screen is built
+    and recorded on the pane. Resolving QB_SEATS_DASH_SIZE afresh on every
+    invocation meant `QB_SEATS_DASH_SIZE=50 qb-seats` followed by a plain
+    `qb-seats --add` — from any other shell, or from the ＋ on the seat bar, whose
+    environment is the tmux server's — silently resized the dash back to the 78
+    nobody asked for. The fixture used to hide this by exporting the variable for
+    both calls."""
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen.env["QB_SEATS_DASH_SIZE"] = "50"
+    screen("-n", "2")
+    assert labels(screen)["dash"][0] == 50
+    del screen.env["QB_SEATS_DASH_SIZE"]
+    screen("--add")
+    assert labels(screen)["dash"][0] == 50, "--add took the width from its environment"
+
+
+def test_a_width_set_by_hand_survives_an_add(screen):
+    """Dragging the border is the other way to set this, and a reflow is no reason
+    to undo it: --add reasserts the width the dash HAD, not the one the screen was
+    built asking for. Same reassert, better input."""
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen("-n", "2")
+    dash = pane_id(screen, "dash")
+    screen.tmux("resize-pane", "-t", dash, "-x", "70")
+    assert labels(screen)["dash"][0] == 70
+    screen("--add")
+    assert labels(screen)["dash"][0] == 70, "--add overrode a width set by hand"
+
+
+def test_closing_a_seat_does_not_squeeze_the_dash(screen):
+    """qb-seat-click's reflow runs the same `select-layout -E` for the same reason,
+    on the same row, so it needs the same reassert. Only --add had one: three ✕s in
+    a row left a dashboard nobody chose the width of."""
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen.env["QB_SEATS_DASH_SIZE"] = "50"
+    screen("-n", "3")
+    wait_for_log(screen.log, 3)
+    assert labels(screen)["dash"][0] == 50
+    assert click(screen, "kill3", "t").returncode == 0
+    assert sorted(n for _, n in panes(screen) if n) == ["1", "2"]
+    assert labels(screen)["dash"][0] == 50, "closing a seat resized the dash"
+
+
+def test_a_client_attaching_does_not_narrow_the_dash(screen):
+    """THE ONE THAT MATTERED, and the one nothing here could catch.
+
+    A detached session is exactly the 240 columns it was built with. Attaching a
+    client resizes the WINDOW to the client and rescales every pane in the dash's
+    row proportionally — measured on tmux 3.6a: 78 columns asked for, 32 found after
+    a 100-column client attached. The reassert this feature shipped with ran at
+    BUILD time, before the attach it was written to defend against, so it could not
+    survive it: `qb-seats` then `tmux attach` from an ordinary terminal still landed
+    on a narrowed dash. The fix is a window hook that runs afterwards. Every other
+    test in this file asserts widths on a window no user ever looks at, which is
+    precisely how that got as far as review.
+    """
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen.env["QB_SEATS_DASH_SIZE"] = "60"
+    screen("-n", "2")
+    assert labels(screen)["dash"][0] == 60, "wrong before a client even attached"
+    with attached_client(screen, 200, 50):
+        # 60 of 200 columns is inside the third the dash may take, so it is asked
+        # for in full. Unfixed, this comes out at 50 — 60 * 200/240, the rescale.
+        assert wait_for_dash_width(screen, 60) == 60
+
+
+def test_a_narrow_client_costs_the_dash_and_not_the_seats(screen):
+    """Why the reassert is clamped rather than absolute. Holding the 78-column
+    default on a 100-column window is worse than the bug it fixes: measured, it left
+    the two seats 19 columns and ONE column, i.e. it spent the whole terminal on the
+    dashboard and none of it on the agents. A third of the window is the ceiling, so
+    what a narrow terminal costs is dash.
+    """
+    screen.env["QB_SEATS_DASH"] = DASH_STUB          # the 78-column default
+    screen("-n", "2")
+    with attached_client(screen, 100, 30):
+        # A third of the window it is actually in, not the 78 it asked for — and not
+        # the 78 an unclamped reassert would hold on to.
+        assert wait_for_dash_width(screen, 100 // 3) == 100 // 3, "the dash was not clamped"
+        rows = screen.tmux("list-panes", "-t", "t:seats", "-F",
+                           "#{@qb_seat}\t#{pane_width}").stdout.splitlines()
+        seats = [int(r.split("\t")[1]) for r in rows if r and r.split("\t")[0]]
+        assert len(seats) == 2, rows
+        assert min(seats) >= 25, f"a seat was starved to fit the dash: {seats}"
+
+
 def test_an_empty_brief_reaches_the_panes(screen):
     """The one value QB_SEAT_BRIEF exists to express, and a `-n` forwarding test
     silently dropped it: nothing arrived in the pane, qb-seat saw unset, and the
     seat started on the full built-in brief — a screen asked for waiting seats
     that went and claimed work instead, reporting nothing wrong.
+
+    Asserted line-wise and not as a substring. `"QB_SEAT_BRIEF=" in env` also
+    matches `QB_SEAT_BRIEF=go and claim something`, so a regression that forwarded
+    the built-in default instead of the empty string — the precise failure above —
+    would have kept it green.
     """
     screen.env["QB_SEAT_BRIEF"] = ""
     screen("-n", "1")
-    env = screen.tmux("show-environment", "-t", "t").stdout
-    assert "QB_SEAT_BRIEF=" in env, "set-and-empty must be forwarded, not dropped"
+    env = screen.tmux("show-environment", "-t", "t").stdout.splitlines()
+    assert "QB_SEAT_BRIEF=" in env, f"set-and-empty must arrive as itself: {env}"
     assert "-QB_SEAT_BRIEF" not in env, "must not be marked for removal"
+    # And the seat that received it agrees, which is the half tmux cannot be asked.
+    assert wait_for_log(screen.log, 1)[0].endswith("brief=set:")
+
+
+def test_an_empty_brief_reaches_a_seat_added_later(screen):
+    """--add builds its own -e list, and for a while that list was written out by
+    hand rather than being the forwarder's: `QB_SEAT_BRIEF= qb-seats --add` onto a
+    screen built without the variable forwarded nothing at all, qb-seat saw unset,
+    and the added seat went off on the full built-in brief — the same silent failure
+    the `up` path had, in the half of the code that had no test.
+    """
+    screen("-n", "1")
+    assert wait_for_log(screen.log, 1)[0].endswith("brief=unset")
+    screen.env["QB_SEAT_BRIEF"] = ""
+    screen("--add")
+    lines = wait_for_log(screen.log, 2)
+    assert len(lines) == 2, lines
+    assert lines[1].endswith("brief=set:"), lines

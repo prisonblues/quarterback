@@ -507,8 +507,27 @@ happened, and a screen wants both. `QB_SEATS_DASH` names the command; **set it t
 empty string for a screen with no dash**. The default is the plain `qb-dash` rather than
 the nicer clickable `qb-dash-tui`, because the TUI crashes with `DuplicateKey` once a
 second screen exists (#209, underlying cause #208) — `QB_SEATS_DASH=qb-dash-tui` opts in,
-and it should become the default once that is fixed. `QB_SEATS_DASH_SIZE` is
-its width in columns, default 78.
+and it should become the default once that is fixed. Nothing falls back to the TUI on its
+own, not even when `qb-dash` is the one that is missing: with neither installed the pane
+holds a shell and a line saying which command to set, rather than the screen quietly
+being one pane short.
+
+`QB_SEATS_DASH_SIZE` is its width in columns, default 78 — what the dashboard's own table
+wants before it wraps — **and never more than a third of the window**. That ceiling is
+the interesting half: a client attaching resizes the window and rescales every pane in the
+dash's row, so the width has to be reasserted afterwards rather than at build time, and 78
+columns reasserted on a 100-column terminal leaves the two seats 19 columns and one. A
+narrow terminal therefore costs dash, not seats, and `qb-seats` says so on stderr when the
+clamp bites. This is also the first release where **a screen loses columns by default**:
+existing callers get seats a third narrower than before, and `QB_SEATS_DASH=` is how to
+have the old screen back.
+
+The width is per-screen state, read from the environment once when the screen is built and
+recorded on the pane. So `--add` and the seat bar's ✕ put the dash back to the width *that
+screen* asked for — including one set by dragging the border, which a reflow will not
+undo — rather than to whatever `QB_SEATS_DASH_SIZE` says in the shell that happened to run
+them. `--add` never *creates* a dash: a screen built with `QB_SEATS_DASH=` stays a screen
+with no dash until it is rebuilt.
 
 `qb-dash` is a **launcher**, not the dashboard: the dashboard is Python needing `rich`,
 `textual` and `mcp_server`, none of which a plain `python3` has, so a shebang would be
@@ -524,7 +543,9 @@ This used to be `harness/dev/seats-extras.sh`, which stapled two unlanded worktr
 together for a smoke test and hardcoded both paths. It is gone; the lessons it paid for —
 place the dash AFTER `select-layout` and never spread the window afterwards, reassert the
 width because attaching redistributes the row — are comments in `qb-seats` and assertions
-in `harness/tests/test_qb_seats.py`.
+in `harness/tests/test_qb_seats.py`. The dev script only ever produced the right width
+because a human ran it by hand *after* attaching; the reassert is a `window-resized` hook
+precisely so that nobody has to.
 
 ## How it works
 

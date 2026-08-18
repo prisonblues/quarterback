@@ -98,12 +98,27 @@ seat_number() {
 # pane's neighbours into it — the same call --add uses, and for the same reason:
 # the board was split off full-width, so even-horizontal on the whole window
 # would fold it back into the row.
+#
+# THE DASH IS IN THAT ROW, so -E re-equalises it along with the seats: without the
+# two lines below, closing a seat narrows the dashboard exactly the way an --add
+# used to, and clicking three ✕s in a row leaves a dash nobody chose the width of.
+# So its width is read first and put back afterwards. Nothing about the WINDOW
+# changed here, so the width it has right now is the right answer — including one
+# the user set by dragging the border. qb-seats' own dash_resize is the same
+# reassert with a clamp against a window that HAS changed size; this path does not
+# need the clamp, because a width that fitted a second ago still fits.
 reflow() {
-  local survivor
+  local survivor dash was=""
   survivor=$(tmux list-panes -s -t "=$session" -F '#{pane_id} #{@qb_seat}' \
     | awk '$2 != "" { print $1; exit }')
   [ -n "$survivor" ] || return 0
+  dash=$(tmux list-panes -s -t "=$session" -F '#{pane_id} #{@qb_label}' \
+    | awk '$2 == "dash" { print $1; exit }')
+  [ -z "$dash" ] || was=$(tmux display-message -p -t "$dash" '#{pane_width}')
   tmux select-layout -t "$survivor" -E 2>/dev/null || true
+  # Tolerated, not silenced: a refused resize leaves the dash a little narrow,
+  # which is not worth failing a ✕ that has already closed the pane it was asked to.
+  [ -z "$dash" ] || tmux resize-pane -t "$dash" -x "$was" || true
 }
 
 case "$range" in
