@@ -577,7 +577,7 @@ full — including what was broken before it, which is the part no diff recovers
   a repo name, and treat the string itself as untrusted input on the way back in: the board bounds
   its length at `PATH_MAX` and normalises nothing else, so quote it, and do not hand a value
   beginning with `-` to `git` as anything but an operand.
-- **vNEXT** — a screen you ask for by number, and seats that do not stop to ask. `qb-b 3`
+- **v2.46** — a screen you ask for by number, and seats that do not stop to ask. `qb-b 3`
   is the seat count, the default is 3 and the ceiling is 10; past five, seats are five across
   and two down, built rather than left to `select-layout tiled`, which picks the wrong axis
   for a pane that wants width. Seat numbers read left to right. And a seat starts with

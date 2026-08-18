@@ -11,7 +11,7 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
-## vNEXT — a screen you ask for by number, and seats that do not stop to ask
+## v2.46 — a screen you ask for by number, and seats that do not stop to ask
 
 Three of the four changes here are about typing `qb-b 3`. The seat count was the
 only argument that ever varied and it took `-n` in front of it every time; the
