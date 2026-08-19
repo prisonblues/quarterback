@@ -42,6 +42,11 @@
     }
   },
 
+  "review_panel": {
+    "reviewer_code_access": true,
+    "_reviewer_code_access": "Left at the default, and stated anyway, because this is the one governance key whose right value depends on WHO opens the PRs. On, because this repo's contributors are the fleet's own agents \u2014 they already hold a shell on this box as this user, so a hostile AGENTS.md smuggled into a reviewer's cwd is not a door any of them needs. The convention-file strip is a DENYLIST and will rot as vendors add files; that is the accepted cost here, and it is exactly why a repo taking outside contributions sets this false instead. #52's epic, which points the panel at PRs that are not ours, is the first caller expected to want it off.",
+    "_reviewer_code_access_reach": "It buys ONE seat today. Only claude can be told 'read but do not execute' (--allowedTools Read Grep Glob, no Bash) and it enforces a working-directory boundary of its own; codex's -c knobs only REMOVE tools and its single read path is the shell, so granting reads grants execution (against #92) and re-opens the tool-hunt that once spent 99% of a run; pi's --no-tools is all-or-nothing over read/bash/edit/write; antigravity has no tool mechanism at all. So codex, pi and antigravity keep the empty sandbox, and their could_not_assess entries stay exempt from the coverage veto while claude's count again. That split is recorded per round in the payload (code_access.seats) \u2014 a seat that can read the tree while another cannot is a bigger confound than an unpinned model."
+  },
   "preland": {
     "disabled_checks": [],
     "_": "Every check preland.py can detect, it runs here. Stated explicitly rather than omitted, for the same reason as sonarqube and epic.sub_pr_merge below: the default is an empty list too, and a reader should not have to guess whether the absence was a decision. It was.",

@@ -118,6 +118,22 @@ class ReviewRun(Base):
     #: ``MissingGreenlet`` rather than quietly issuing a second query.
     #: ``GET /review/{id}`` asks with ``undefer()``; nothing else should need to.
     unread_files: Mapped[list[Any] | None] = mapped_column(JSONB, deferred=True)
+    #: Whether this round ASKED for its seats to read the code
+    #: (``review_panel.reviewer_code_access``, #113). The per-seat answer is
+    #: ``review_reviewers.code_blind``; this is the setting, and the two are
+    #: different facts worth keeping apart — a round with the setting on and every
+    #: seat blind is a configuration doing nothing, which is visible in the
+    #: difference and invisible in either column alone. NULL = the panel didn't
+    #: say, which is also every round before the setting existed.
+    code_access: Mapped[bool | None] = mapped_column(Boolean)
+    #: Vendor instruction files removed from the reviewers' checkout before any CLI
+    #: started — ``CLAUDE.md``, ``AGENTS.md``, ``.claude/`` and the rest, at any
+    #: depth. Stored because a PR that shipped one is worth being able to find
+    #: later: it is the clearest signal available that a contribution tried to
+    #: instruct the reviewer judging it, and a silent strip makes that PR
+    #: indistinguishable from one that shipped nothing. ``[]`` = a tree was built
+    #: and carried none; NULL = no tree was built (access off, or the fetch failed).
+    convention_files_removed: Mapped[list[Any] | None] = mapped_column(JSONB)
     #: The panel's own tally of :data:`app.api.reviews.PROVENANCE` buckets over
     #: the findings the cycle still has to clear, verbatim (v2.26).
     #:
@@ -287,6 +303,30 @@ class ReviewReviewer(Base):
     #: apart. Without it an unparsed reviewer is invisible to the honesty stats,
     #: which is the same NULL/[] collapse one level up. NULL = the panel didn't say.
     unstructured: Mapped[bool | None] = mapped_column(Boolean)
+    #: This box does not carry the reviewer's CLI (#113). A fact about the HOST
+    #: rather than about the round — it is absent every round — which is why
+    #: `coverage_veto` reports it without spending the round's confidence on it.
+    #: Stored because the exemption is only defensible if the thing being exempted
+    #: is visible: an unattended host that quietly reviews with two of four seats
+    #: looks identical to a full panel in every other column here.
+    #: NULL = the panel didn't say (every payload before this release).
+    absent: Mapped[bool | None] = mapped_column(Boolean)
+    #: This member reviewed from the diff alone — no reading of the code under
+    #: review (#113). The single most important confound in this table: a seat that
+    #: could open the caller and one that could not are not comparable on findings,
+    #: precision, or `could_not_assess`, and until this column existed nothing
+    #: recorded which was which. Also what makes the veto exemption auditable — a
+    #: blind seat's declarations are reported and not counted, and that is only a
+    #: defensible trade if you can later ask how often it applied.
+    #: NULL = the panel didn't say.
+    code_blind: Mapped[bool | None] = mapped_column(Boolean)
+    #: This member's ``truncated`` was the KERNEL's doing, not a budget's (#113).
+    #: `agy`'s prompt travels in argv and one element is capped, so on a large diff
+    #: it structurally cannot be handed all of it. Separated from `truncated`
+    #: because the two have opposite remedies: a budget can be raised and is
+    #: evidence about the round, while this is a property of the box and is
+    #: exempted from the veto. NULL = the panel didn't say.
+    argv_capped: Mapped[bool | None] = mapped_column(Boolean)
     #: Findings this member flagged as needing the FIX re-read. With the next
     #: round's new findings this is the accuracy check on the declaration itself —
     #: the raw material for honesty per reviewer, which precision cannot show.

@@ -158,7 +158,7 @@ def _run(monkeypatch, tmp_path, title="feat: a thing", merge_base="0ddba5e0",
                       head_moves_to=moves_to, base_tip=base_tip,
                       diff=PR_DIFF, calls=calls)
 
-    def fake_review(name, model, prompt, effort=""):
+    def fake_review(name, model, prompt, effort="", **_kw):  # **_kw: code_tree since #113
         return panel.ReviewerRun([], None, 800, None)
 
     monkeypatch.setattr(panel, "load_repo_cfg", lambda name: cfg or CFG)

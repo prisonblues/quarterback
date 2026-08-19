@@ -581,6 +581,21 @@ full — including what was broken before it, which is the part no diff recovers
   a repo name, and treat the string itself as untrusted input on the way back in: the board bounds
   its length at `PATH_MAX` and normalises nothing else, so quote it, and do not hand a value
   beginning with `-` to `git` as anything but an operand.
+- **v2.51** — reviewers can read the code, per repo, on by default (#113's second half).
+  `review_panel.reviewer_code_access` runs each seat that can take it in a checkout of the
+  PR at its head — fetched from GitHub's tarball endpoint, never from the main checkout,
+  whose branch is not the PR's. It buys ONE seat: only `claude` can be told "read but do
+  not execute" (`--allowedTools Read Grep Glob`, no `Bash`), while codex's only read path
+  is its shell, pi's `--no-tools` is all-or-nothing and antigravity has no tools at all —
+  so the other three keep the empty sandbox. The judge reads too, and is the party that
+  most needed to: the wrong findings #113 was filed over were *confirmed*, not merely
+  raised. Vendor convention files are stripped at every depth before any CLI starts
+  (symlinks unlinked, never followed), which is a denylist and says so. Every failure
+  degrades to reviewing from the diff, recorded per seat — and the board now stores that
+  rather than dropping it at ingest (migration `0023`). Measured at roughly 6x the cost in
+  money for one seat, so `reviewer_code_budget_usd` can cap it; uncapped by default,
+  because reaching a cap is a lost seat rather than a cheap one. `--no-code-access` opts
+  out for one run; `false` is what a repo taking untrusted contributions sets.
 - **v2.50** — the coverage veto stops reporting a constant. `confident` is `not veto`, so a
   veto line that fires every round makes a confident stop unreachable rather than rare. Two
   did: a seat that cannot read the code (every seat — an empty sandbox and no tools) declaring

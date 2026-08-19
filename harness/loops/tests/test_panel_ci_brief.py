@@ -100,7 +100,8 @@ def test_both_prompts_have_a_slot_for_it():
     """Rendering with the slot missing is a KeyError, so this is the guard that
     the wiring did not get reverted while the helper survived."""
     for name, fields in (("REVIEW_PROMPT", {"n": 1, "repo": "a/b", "base": "main",
-                                            "ci": "CI-MARKER", "diff": ""}),
+                                            "ci": "CI-MARKER", "diff": "",
+                                            "code": ""}),
                          ("JUDGE_PROMPT", {"findings": "", "coverage": "",
                                            "ci": "CI-MARKER", "diff": ""})):
         rendered = getattr(panel, name).format(**fields)
@@ -123,7 +124,7 @@ def test_the_reviewers_prompt_carries_the_real_result(monkeypatch, tmp_path):
                         lambda *a: ("FAIL", ["app suite"], None))
     monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], None, ""))
 
-    def fake_review(name, model, prompt, effort=""):
+    def fake_review(name, model, prompt, effort="", **_kw):  # **_kw: code_tree since #113
         prompts.append(prompt)
         return panel.ReviewerRun([], None, 800, None)
 
@@ -151,7 +152,7 @@ def test_the_seat_is_told_before_it_is_dispatched(monkeypatch, tmp_path):
         order.append("ci")
         return ("PASS", [], None)
 
-    def fake_review(name, model, prompt, effort=""):
+    def fake_review(name, model, prompt, effort="", **_kw):  # **_kw: code_tree since #113
         order.append("seat")
         return panel.ReviewerRun([], None, 800, None)
 

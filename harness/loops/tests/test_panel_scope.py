@@ -998,7 +998,7 @@ def budget_for_partial_context() -> int:
 
 
 def _judge(seen):
-    def fake(clusters, diff, model, pr, budget=None, coverage=None, ci=""):
+    def fake(clusters, diff, model, pr, budget=None, coverage=None, ci="", **_kw):
         seen["diff"], seen["budget"] = diff, budget
         return [], None, ""
     return fake
@@ -1038,7 +1038,7 @@ def _stub_run(monkeypatch, seen, *, cfg=None, findings=(), increment=INCREMENT,
     said = dict(FACTS, files=len([f for f in panel._diff_by_file(increment) if f]))
     said.update(facts or {})
     monkeypatch.setattr(panel_scope, "compare_facts", lambda *a: said)
-    def reviewer(name, model, prompt, effort=""):
+    def reviewer(name, model, prompt, effort="", **_kw):  # **_kw: code_tree since #113
         seen.setdefault("prompts", {})[name] = prompt
         return panel.ReviewerRun(list(findings), None, 10, [])
     monkeypatch.setattr(panel, "review_llm", reviewer)

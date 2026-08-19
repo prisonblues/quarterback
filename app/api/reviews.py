@@ -824,6 +824,22 @@ class ReviewerIn(BaseModel):
     #: it is a coverage failure in its own right — the panel already vetoes a stop
     #: over it, so the board must be able to see it too. None = the panel didn't say.
     unstructured: bool | None = None
+    #: This box does not carry the reviewer's CLI. The panel has sent this since
+    #: v2.32 and ingest dropped it, because this model declares
+    #: ``populate_by_name=True`` with no ``extra=`` and pydantic's default is
+    #: ``extra="ignore"`` — the exact silent-drop this file's v2.26 note is about
+    #: (#93). Landed now with the two below it.
+    absent: bool | None = None
+    #: This member reviewed from the diff alone — it could not read the code under
+    #: review (#113). The most important confound in the reviewer table: a seat that
+    #: could open the caller and one that could not are not comparable on findings
+    #: or on ``could_not_assess``, and a leaderboard that ranks them together is
+    #: measuring two different jobs.
+    code_blind: bool | None = None
+    #: This member's ``truncated`` was the kernel's doing rather than a budget's
+    #: (#113) — its prompt travels in argv and one element is capped. Kept apart
+    #: from ``truncated`` because the two have opposite remedies.
+    argv_capped: bool | None = None
 
     #: EVERY prompt-side token, cache hits included. Vendors disagree about this
     #: — Claude's own `input_tokens` is the uncached remainder and pi reports
@@ -1050,6 +1066,31 @@ class ChangedFileIn(BaseModel):
         if isinstance(v, float) and n != v:
             return None
         return n if n >= 0 else None
+
+
+class CodeAccessIn(BaseModel):
+    """Whether this round's seats could read the code under review (#113).
+
+    A nested object rather than three flat fields because the panel sends it as
+    one, and because the three answer one question at different grains: what was
+    ASKED for (`setting`), who actually got it (`seats`), and what had to be taken
+    out of the tree first (`convention_files_removed`).
+
+    ``seats`` is accepted and deliberately NOT stored: it is exactly the set of
+    reviewers whose ``code_blind`` is False, so a column would be a second copy of
+    a fact already on those rows — free to disagree with them, and the reviewer
+    rows are the ones a stats query joins. Accepting it keeps the payload
+    round-trippable without inventing a second source of truth."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    #: What the repo (or `--no-code-access`) asked for. None = the panel didn't say.
+    setting: bool | None = None
+    #: Who actually got it. Recorded on the reviewer rows, not here — see above.
+    seats: list[str] | None = None
+    #: Vendor instruction files removed before any CLI started. ``[]`` = a tree was
+    #: built and carried none; None = no tree was built.
+    convention_files_removed: list[str] | None = None
 
 
 class ReviewIn(BaseModel):
@@ -1370,6 +1411,9 @@ class ReviewIn(BaseModel):
     #: none and the members are inferred from finding attribution, with no model
     #: recorded — a run that can still be counted, just not tiered.
     reviewers: dict[str, ReviewerIn] = Field(default_factory=dict)
+    #: Whether the seats could read the code (#113). Optional: a panel that predates
+    #: the setting sends none, and every field inside it is independently nullable.
+    code_access: CodeAccessIn | None = None
 
     to_fix: list[FindingIn] = Field(default_factory=list)
     dismissed: list[FindingIn] = Field(default_factory=list)
@@ -1633,6 +1677,9 @@ def _scorecards(
             duration_ms=c.duration_ms if c else None,
             could_not_assess=c.could_not_assess if c else None,
             unstructured=c.unstructured if c else None,
+            absent=c.absent if c else None,
+            code_blind=c.code_blind if c else None,
+            argv_capped=c.argv_capped if c else None,
             input_tokens=c.input_tokens if c else None,
             output_tokens=c.output_tokens if c else None,
             cached_input_tokens=c.cached_input_tokens if c else None,
@@ -1709,6 +1756,11 @@ async def record_review(
         judge_model=body.judge_model or None,
         judge_skip=body.judge_skip,
         coverage_note=body.coverage_note or None,
+        # Flattened onto the run from the nested object, minus `seats` — that one
+        # lives on the reviewer rows it describes (see CodeAccessIn).
+        code_access=body.code_access.setting if body.code_access else None,
+        convention_files_removed=(body.code_access.convention_files_removed
+                                  if body.code_access else None),
         round=body.round,
         cycle=body.cycle or None,
         new_findings=body.new_findings,
@@ -2657,6 +2709,12 @@ def _card_view(c: ReviewReviewer, run: ReviewRun) -> dict:
         "duration_ms": c.duration_ms,
         "could_not_assess": c.could_not_assess,
         "unstructured": c.unstructured,
+        # #113. Read back out as well as stored: a column nothing exposes is a
+        # column nothing can be measured with, which is the same half-built shape
+        # v2.26 records for the four fields it landed (#93) — stored is not shipped.
+        "absent": c.absent,
+        "code_blind": c.code_blind,
+        "argv_capped": c.argv_capped,
         "rereview_flagged": c.rereview_flagged,
         "input_tokens": c.input_tokens,
         "output_tokens": c.output_tokens,
@@ -3872,6 +3930,15 @@ async def get_review(
         # was cut, and folding one into the other on read would hand every
         # consumer the collapse the storage side is built to prevent.
         "unread_files": run.unread_files,
+        # #113: what this round ASKED for, kept apart from the per-seat answer in
+        # `reviewers[].code_blind`. A round with the setting on and every seat
+        # blind is a configuration doing nothing, and only the difference shows it.
+        "code_access": run.code_access,
+        # Unmasked for the reason `unread_files` above is: [] means a tree was
+        # built and carried no instruction files, NULL means no tree was built at
+        # all, and folding them together loses which PRs tried to instruct their
+        # own reviewer.
+        "convention_files_removed": run.convention_files_removed,
         # Read `changed_files_total` against `len(changed_files)` before building
         # anything on this list: they are allowed to disagree, and when they do
         # the list is a PREFIX of what the PR touches.

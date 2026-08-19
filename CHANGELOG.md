@@ -11,6 +11,149 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
+## v2.51 — reviewers can read the code, per repo, on by default
+
+The panel reviewed from a diff and nothing else. Every seat ran in an empty `git init`
+repo, so a reviewer that wanted to check the caller, the test, or the migration the
+diff refers to could only declare that it could not — and that is what it did, at
+scale. On PR #160's round 1, nine `could_not_assess` entries asked about a file in
+this very repo; the orchestrator answered all nine with `grep` in about four minutes.
+
+Worse than the findings it lost are the ones it invented. On #64, three of six P2s
+were conditional worries about code outside the diff and the code answered all three —
+`package.nix` globs, so the script *is* installed; `sed -n '4,34p'` already ends on the
+last `--help` line, so the proposed `4,40p` would have printed shell code into the
+help. **The proposed fix was the bug.** On #90 a P1 said `headRefOid` was read but
+never added to the `--json` field list; it was already there, so it never appeared in
+the diff, and the reviewer inferred absence from invisibility. On #123 no seat could
+see `migrations/versions/`, the tool's entire subject.
+
+So `review_panel.reviewer_code_access` — **on by default**. Where it is on, a seat runs
+in a checkout of the PR at its head, fetched from GitHub's tarball endpoint rather than
+from `cfg["path"]`, which is the main checkout on whatever branch it was last left on
+and is the failure #75 measured.
+
+**It buys one seat, and finding that out took running all four CLIs.** The issue
+assumed codex could be given read-only tools because "codex has the `-c` knobs" — those
+knobs only REMOVE tools. `-s read-only` governs model-generated *shell* commands, so
+codex's single read path IS the shell, and turning it back on grants execution (against
+#92) and re-opens the tool-hunt `codex_args` measured: five of seven runs went looking
+for the code anyway, a median third of the run and at worst 99% of it, still calling
+tools at 1133s. `pi`'s `--no-tools` is all-or-nothing over read/bash/edit/write.
+`antigravity` has no tool mechanism at all. Only `claude` can name a tool set, so
+`SEAT_READS_CODE` is an allowlist of one and the other three keep the empty sandbox —
+a seat that cannot read gains nothing from standing in a checkout and still pays #75's
+instruction-file channel for it.
+
+**The claude seat was never toolless, which `member_sandbox` claimed it was.** Measured
+on 2.1.232: a bare `claude -p` in an empty repo read a file in its cwd and ran
+`echo TOOLS-OK-$((6*7))` through `Bash`. What has been containing it is the CLI's own
+working-directory boundary — the same run was refused `head` on a path outside the cwd
+— plus an empty cwd to be bounded to. Give it the PR's tree and only the boundary is
+left, so the seat now gets `--allowedTools Read Grep Glob` and
+`--permission-mode manual`. No `Bash`: #92 answered "may reviewers execute?" with no,
+and a PR's own tree is the worst place to grant it — `pytest` in a contributor's
+checkout runs the contributor's code.
+
+**Convention files are stripped before any CLI starts**, at every depth, because
+`claude` reads a `CLAUDE.md` beside the file it is looking at. Symlinks are unlinked
+and never followed: `Path.is_dir()` is true of a link to a directory, so a
+`.claude -> ~/.claude` in a PR's tarball would have sent `rmtree` at the real one. The
+list is a **denylist and it will rot** — an accepted cost where the contributors are
+your own agents, and precisely why `false` is right where they are strangers. What was
+removed is named per round, so a PR that shipped an `AGENTS.md` is distinguishable from
+one that did not.
+
+**The tarball endpoint is flaky and is retried.** Five hand-run fetches of one sha
+while building this returned two 502s and a 503; GitHub packs a repository on demand
+here and it is much less reliable than the JSON API the rest of the panel uses. A
+transient 5xx gets three attempts, a 404 gets one — it is a settled answer about that
+sha. Without the retry the feature would have stopped applying a noticeable fraction
+of the time while its config said it was on, which is the worst of the three states.
+
+**Two holes in the new guards, found by a second model reviewing the diff.**
+`.github/copilot` was in the strip's directory list and matched nothing: the check
+compared `path.name`, a single component, so any entry containing a slash could never
+fire — a declared guard doing nothing, which reads as coverage it did not provide.
+And the extraction ceiling counted declared BYTES only, so a few hundred kilobytes of
+tarball could declare millions of zero-byte entries, each passing every size check
+while still costing an inode, a syscall and a `TarInfo`. Member count is capped too.
+
+**Every failure degrades to the OFF posture, loudly.** A fetch that 502s, a tarball
+that will not unpack or arrives in an unexpected shape, a copy that runs out of disk:
+the seat is blind, recorded as blind, and the round says why. Three of those paths were
+found by writing the tests — an empty tarball made `iterdir` raise
+`FileNotFoundError` straight out of a function whose contract is that it never raises.
+
+**A per-repo spend cap, defaulting to uncapped.**
+`review_panel.reviewer_code_budget_usd` passes `--max-budget-usd` to the seat that got
+the tree — not to a diff-only seat, which makes one bounded call and would only gain a
+way to be lost. Uncapped by default for the reason `max_diff_chars` gives: a number
+invented here would silently degrade reviews on repos that never asked for one, and
+reaching the cap is a LOST seat rather than a cheap one — it records a skip, and a skip
+vetoes the round's confident stop. The measured figures below live in the key's comment
+so a repo setting a cap is not guessing.
+
+Reaching the cap needed a guard nothing about the flag suggests, and both halves were
+measured on claude 2.1.232: it exits 1, writes its message to **stdout**, and leaves
+**stderr empty**. `run_cli` builds its skip reason from stderr and decides retryability
+from stderr, so without the guard the seat died as a bare "exited 1" with no cause and
+the attempt was then retried three times, re-burning a cap already spent. The test
+asserts the attempt count as well as the message — a fix that named the cause and still
+retried would triple the spend the cap was set to bound.
+
+**Measured, on this repo's own PR.** One seat, sonnet, PR #214's 75,628-char diff, run
+twice with only this feature differing: 922s against 372s of wall clock, 7,879,643
+against 159,520 input tokens (97% of the larger figure cached, so the billed multiple is
+far below the raw one), 71,674 against 36,364 output. In exchange, `could_not_assess`
+went from four entries to none — and the blind run filed a **false** finding the sighted
+one did not, having seen a diff line that mentions `argv_capped`, been unable to tell
+which function it belonged to, guessed `accounts()`, and concluded the name was
+undefined. #90's failure mode, reproduced without being asked for. The cost is per seat
+per round and `/panel-review-pr` fans out four concurrent panels, so bounding it with
+`claude`'s `--max-budget-usd` (which works with `--print`) is the obvious follow-up.
+
+**Recorded per seat**, which is the half that makes any of this measurable:
+`reviewers.<name>.code_blind` plus a `code_access` block holding the setting, the seats
+that actually got it, and the files stripped. Read back from what each seat recorded
+rather than from the intent, because a fetch that failed leaves the setting on and the
+seat blind, and only the second is true of the round.
+
+**The judge reads too, and it is the party that most needed to.** It is a `claude`
+seat, so it takes the same stripped checkout, the same read-only pin and the same
+spend cap. This is the half the reviewer change alone does not fix: the wrong findings
+#113 was filed over were **confirmed**, not merely raised. On #90 a reviewer inferred
+a missing `--json` field from its absence in the diff, and a judge with the same
+blindness had no way to check; on #64 three of six confirmed P2s were conditionals
+from a reviewer that had *declared* it could not assess the condition. Dismissing
+false positives is the judge's stated job and it cannot do it from the diff that
+produced them. One ordering trap, now pinned: the tree's cleanup has to run after
+`adjudicate`, or the judge is handed a path to a deleted directory and degrades to an
+empty sandbox — reviewing blind while the payload still says access was on. The
+degrade path working correctly is exactly what made that silent.
+
+**And the board stores all of it, instead of dropping it at ingest.** Migration `0024`
+adds `absent`, `code_blind` and `argv_capped` to `review_reviewers`, and `code_access`
+and `convention_files_removed` to `review_runs`; the read path returns them too,
+because a column nothing exposes cannot measure anything. `absent` had been sent since
+v2.32 and silently discarded — `ReviewerIn` declares `populate_by_name=True` with no
+`extra=`, so pydantic's `extra="ignore"` applied, which is precisely the drop v2.26
+records for `head_sha`, `unread_files`, `provenance_counts` and per-finding
+`provenance` (#93). #113 was about to add two more to the same hole.
+
+`code_blind` is the column that matters most: a seat that can open the caller and one
+that cannot are not comparable on findings, on precision, or on `could_not_assess`, so
+`/review/stats` would be averaging two different jobs. #113's own rule was "either
+every seat gets it, or the payload records which did" — this makes the second half
+true of the database and not only of a JSON file on somebody's disk. Every column is
+nullable with no backfill: NULL means "the panel did not say", the honest value for
+every round already recorded, and a manufactured `false` would assert coverage those
+rounds may never have had.
+
+Second half of #113. `--no-code-access` overrides the config for one run; there is
+deliberately no flag the other way, because turning access on for a repo that switched
+it off is a decision about trusting that repo's contributors.
+
 ## v2.50 — the coverage veto stops reporting a constant
 
 `round_stop` computes `confident` as `not veto`, so anything `coverage_veto`

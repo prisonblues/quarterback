@@ -101,6 +101,8 @@ Detected from the checkout, **not settable** here: `path`, `github`, `default_br
 | `review_panel.judge_model` | Claude model for the master judge — `sonnet`, deliberately **not** `reviewers.claude.model`; see below. An explicit `""` is passed through as empty and lets the CLI pick, which is NOT the same as omitting the key (that gets the default). |
 | `review_panel.ask_quorum` / `ask_threshold` | `--ask`'s tally rules: how many seats must have **answered** for the vote to mean anything, and how many must have said the same thing for it to be that answer. Both **2** — one seat agreeing with the agent that wrote the premise is not a challenge. A rule above the number of seats on the ask is warned about: it can never be met. |
 | `review_panel.ask_max_context_chars` | Total `--context` material one ask may hand its seats, across every spec. **60,000** (~15k tokens). Over budget is clamped and SAID, per spec — an ask's whole claim is that it is the cheap check, and unbounded context is the #117 cost shape on the path advertised as costing a minute. |
+| `review_panel.reviewer_code_access` | May a seat READ the code under review? **true**. `false` is the old posture — every seat in an empty repo, the diff its only evidence — and is what a repo taking UNTRUSTED contributions selects. On does not mean every seat gets it: only a CLI that can express "read but do not execute" is handed the tree (today just `claude`), and which seats did is recorded per seat. `--no-code-access` turns it off for one run. See below. |
+| `review_panel.reviewer_code_budget_usd` | Dollars the code-reading seat may spend per invocation (`claude --max-budget-usd`). **`null`** — uncapped — for the reason `max_diff_chars` is: reaching the cap is a LOST seat (a skip, which vetoes), not a cheaper review. Measured for calibration: ~$4 for one seat on a 75,628-char diff against ~$0.70 diff-only. Applies only to a seat that got the tree; the cap is per invocation and a reparse retry can spend it twice. |
 | `loops` | `dependabot_lander` / `stacked_driver` / `issue_executor` — which loops may run. |
 | `epic` | Epic-driver settings — see below. |
 | `preland.disabled_checks` | Checks `preland.py` must not run, by name. Empty by default — every guardrail it can detect, it runs. A name nothing answers to is a **hard error**, not a warning; see below. |
@@ -319,6 +321,97 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   on — never the PR's code, which the panel reads as a diff and never checks out. A
   seat pointed there can quote a different branch as the code under review. The
   members need no working directory at all; they need a reproducible one.
+- **The seats can read the PR's code, per repo, on by default** (#113). Each seat that
+  can take it runs in a checkout of the PR **at its head**, fetched from GitHub's
+  tarball endpoint — never from `cfg["path"]`, which is the main checkout on whatever
+  branch it was last left on and is the failure #75 measured. Why it is on: the
+  blindness was expensive and it did not merely lose findings, it manufactured wrong
+  ones. On PR #160's round 1, nine of nineteen veto lines were seats declaring they
+  could not read a file this repo answers — all nine closed with `grep` in four
+  minutes. On #64 the proposed fix *was* the bug; on #90 a P1 inferred a missing
+  `--json` field from its absence in the diff when it was already there; on #123 no
+  seat could see `migrations/versions/`, the tool's entire subject.
+  - **Only a seat that can express "read but do not execute" gets it**, which is
+    `SEAT_READS_CODE` and today means **claude alone**. #92 answered "may reviewers
+    execute?" with no. Verified by running each CLI: claude names a tool set
+    (`--allowedTools Read Grep Glob`, no `Bash`) and enforces a working-directory
+    boundary of its own; codex's `-c` knobs only REMOVE tools and its single read path
+    is the shell, so granting reads grants execution and re-opens the tool-hunt that
+    once spent 99% of a run; pi's `--no-tools` is all-or-nothing over read/bash/edit/
+    write; antigravity has no tool mechanism at all. A seat that cannot read keeps its
+    empty sandbox — standing in a checkout it cannot open buys the instruction-file
+    channel for nothing.
+  - **Vendor convention files are stripped before any CLI starts** — `CLAUDE.md`,
+    `AGENTS.md`, `GEMINI.md`, `.claude/`, `.codex/` and the rest of
+    `CONVENTION_FILES`/`CONVENTION_DIRS`, at every depth, because a nested one is
+    read too. This is a **denylist and it will rot**; that is an accepted cost where
+    the contributors are your own agents and exactly why `false` is right where they
+    are strangers. Symlinks are unlinked, never followed: a `.claude ->` pointing out
+    of the tree would otherwise send `rmtree` at the real one. What was removed is
+    named in `config_notes` and in the payload, so a PR that shipped one is
+    distinguishable from a PR that did not.
+  - **Recorded per seat**, which is what makes the measurement possible:
+    `reviewers.<name>.code_blind` and a `code_access` block holding the setting, the
+    seats that actually got it, and the files stripped. A seat that can read the tree
+    while another cannot is a bigger confound than an unpinned model.
+  - **Every failure degrades to the OFF posture, loudly.** A fetch that 502s, a
+    tarball that will not unpack or has an unexpected shape, a copy that runs out of
+    disk: the seat is blind, recorded as blind, and the round says why in
+    `config_notes`. A review that would have happened always happens.
+  - **A transient fetch failure is retried, a settled one is not.** Measured: five
+    hand-run fetches of one sha during development returned two 502s and a 503 —
+    GitHub packs a repository on demand for this endpoint and it is markedly flakier
+    than the JSON API the rest of the panel uses. That matters more than the rate
+    suggests, because the degrade is silent in *effect*: one note among several, and
+    an ordinary-looking report. A feature that quietly stops applying a third of the
+    time is worse than one that is off, because the config still says it is on. A 404
+    is not retried — it is a settled answer about that sha (a fork PR, most likely),
+    and `run_cli` already draws that line for reviewer CLIs.
+  - **A per-repo spend cap, defaulting to uncapped** —
+    `review_panel.reviewer_code_budget_usd` passes `--max-budget-usd` to the seat that
+    got the tree. Uncapped by default because a number invented here would silently
+    degrade reviews on repos that never asked for one, and because reaching the cap is
+    not a cheaper review: the seat is lost, records a skip, and the skip vetoes the
+    round's confident stop. Reaching it needs a guard nothing about the flag suggests —
+    `claude` exits 1, writes its message to **stdout**, and leaves **stderr empty**, so
+    `run_cli`'s stderr-based reason and stderr-based retry decision would give a bare
+    "exited 1" and then repeat the attempt three times, re-burning a cap already spent.
+  - **What it costs, measured** (one seat, sonnet, PR #214's own 75,628-char diff,
+    run twice with only this feature differing): wall clock **922s vs 372s** (2.5×),
+    input tokens **7,879,643 vs 159,520** (49×, though 97% of the larger figure was
+    cached so the billed multiple is well below that), output 71,674 vs 36,364.
+    Against that: `could_not_assess` went **4 → 0**, and the blind run filed a FALSE
+    finding the sighted one did not — it saw a diff line mentioning `argv_capped`,
+    could not tell which function it belonged to, guessed `accounts()`, and concluded
+    the name was undefined. That is #90's failure mode reproduced unprompted.
+    The cost lands per seat per round, and `/panel-review-pr` fans out up to four
+    concurrent panels, so this seat is also the critical path. `claude` documents
+    `--max-budget-usd`, which works with `--print`; bounding the hunting with it is
+    the obvious follow-up and is deliberately not in this change.
+  - **The judge gets the tree too, on the same terms.** It is a `claude` seat, so it
+    takes the same stripped checkout, the same `Read Grep Glob` pin and the same spend
+    cap — and it is the party best placed to use them, because the wrong findings #113
+    was filed over were **confirmed**, not merely raised. On #90 a reviewer inferred a
+    missing `--json` field from its absence in the diff and a judge with the same
+    blindness had no way to check; on #64 three of six confirmed P2s were conditionals
+    from a reviewer that had *declared* it could not assess the condition. Dismissing
+    false positives is the judge's stated job and it cannot do it from the same diff
+    that produced them. One ordering trap, pinned by a test: the tree's cleanup must
+    run **after** `adjudicate`, or the judge gets a path to a deleted directory,
+    degrades to an empty sandbox, and reviews blind with the setting still reading
+    true — the silent failure that the degrade path's own correctness makes possible.
+  - **The board stores it, rather than dropping it at ingest.** `absent`,
+    `code_blind` and `argv_capped` per reviewer, plus `code_access` and
+    `convention_files_removed` per run (migration `0024`), read back out of
+    `GET /review/{id}` as well as written. `absent` had been sent since v2.32 and
+    silently discarded, because `ReviewerIn` inherits pydantic's `extra="ignore"` —
+    the same drop v2.26 records for `head_sha` and `unread_files` (#93). `code_blind`
+    is the one that matters most for anything ranking reviewers: a seat that could
+    open the caller and one that could not are not comparable on findings or on
+    `could_not_assess`, and a leaderboard averaging them measures two different jobs.
+    All columns nullable with no backfill — NULL is "the panel did not say", which is
+    the honest value for every round recorded before this, and inventing `false` would
+    assert coverage those rounds may not have had.
 - **A short panel says so.** The report states seats filled against seats configured
   on every run, and calls the panel degraded above the findings when they differ — a
   weaker review, not a cleaner one. A CLI the host does not carry is exempt (it is a
