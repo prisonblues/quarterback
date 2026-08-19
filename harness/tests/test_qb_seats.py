@@ -1148,7 +1148,15 @@ def hook_binary(run, name="t"):
     m = re.search(r"run-shell -b \"'([^']+)'", resize_hook(run, name))
     if not m:
         return ""
-    return re.sub(r"\\(.)", r"\1", m.group(1).replace("##", "#"))
+    # `\\+` — ANY RUN of backslashes, not one. How many layers `show-hooks` prints
+    # is not portable: the same hook, set the same way on tmux 3.6a, read back with
+    # one backslash before the `$` on this box and two on GitHub's runner, so a
+    # single-layer peel passed here and failed there. Nothing about the escaping
+    # under test differs between them — only how tmux renders it back — and the
+    # question this helper exists to answer is "did the path arrive intact", which
+    # is the same answer either way. No test puts a literal backslash in a
+    # directory name, so collapsing runs cannot lose one that mattered.
+    return re.sub(r"\\+(.)", r"\1", m.group(1).replace("##", "#"))
 
 
 def stale_qb_seats(tmp_path):
