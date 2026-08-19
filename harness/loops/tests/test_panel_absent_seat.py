@@ -92,9 +92,22 @@ def test_the_fixture_really_is_over_the_kernels_argv_ceiling():
 
 
 def _cfg(**seats):
-    return {**CFG, "reviewers": {n: {"enabled": True, "model": "sonnet",
-                                     **({} if b is None else {"max_diff_chars": b})}
-                                 for n, b in seats.items()}}
+    """Seats with per-seat budgets, and #138's pre-flight verdict switched off.
+
+    The budgets here are truncation DEVICES — `_cfg(claude=200)` exists to make a
+    seat read a prefix — and a budget that far under the diff is also what the
+    pre-flight verdict refuses a round for, or replaces with a move manifest. Either
+    would substitute the round this module is measuring, so both are disabled: the
+    refusal by `refuse_over_cap_multiple: 0`, the manifest by `manifest_moves:
+    false`. The verdict has its own suite; what matters here is absence.
+    """
+    return {**CFG,
+            "review_panel": {**CFG.get("review_panel", {}),
+                             "refuse_over_cap_multiple": 0,
+                             "manifest_moves": False},
+            "reviewers": {n: {"enabled": True, "model": "sonnet",
+                              **({} if b is None else {"max_diff_chars": b})}
+                          for n, b in seats.items()}}
 
 
 def _host(monkeypatch, present):

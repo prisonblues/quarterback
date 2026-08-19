@@ -629,8 +629,41 @@ class ReviewScope:
     #: supply them separately is letting the three disagree.
     near: str = field(default="", init=False)
     far: str = field(default="", init=False)
+    #: What labels the material under "pr" scope. Defaults to
+    #: :data:`PR_SCOPE_HEADER`, so every round that has ever run is byte-identical
+    #: to before; it is a parameter at all because #138's move manifest travels
+    #: through this class as its `diff` and must not be announced as one.
+    #:
+    #: Substituting the material rather than adding a fifth review mode is what
+    #: keeps the manifest inside the machinery it needs: per-seat budgets, the
+    #: truncation measurement, the judge seeing what the parties saw, the board
+    #: record and the rounds arithmetic all work on `diff` and none of them had to
+    #: learn a new shape. What they then measure is the manifest's own length,
+    #: which is the honest thing to measure — "was this seat handed the whole
+    #: manifest" is the question, and the PR's char count is recorded separately
+    #: in the pre-flight block.
+    #:
+    #: **Only meaningful under "pr" scope, and enforced rather than documented.**
+    #: `_compose` interpolates it in the whole-target branch; the increment branch
+    #: renders a brief and three labelled tiers, and there is no place in that
+    #: layout for a single header that would be true of all of them. Today's only
+    #: caller that sets one also sets `scope="pr"` (the manifest, which IS a whole
+    #: target by construction), so nothing is wrong — but a future caller passing
+    #: both would have got no error and no header, which is the class of quiet
+    #: mismatch every other field on this class is written to prevent.
+    header: str = PR_SCOPE_HEADER
 
     def __post_init__(self) -> None:
+        if self.header != PR_SCOPE_HEADER and self.scope == "increment":
+            # Raised rather than noted: this is a caller holding two settings that
+            # contradict each other, which is a bug in the caller, and a scoped
+            # prompt silently missing a header it was told to carry is exactly the
+            # kind of failure that reads as fine until somebody compares two rounds.
+            raise ValueError(
+                f"header={self.header!r} was given with scope='increment', which "
+                "composes a brief and three labelled tiers and has nowhere to put "
+                "one — a custom header is only meaningful for a whole-target 'pr' "
+                "scope, and being ignored in silence is worse than being refused")
         if self.scope != "increment":
             return
         # Real file keys only. A preamble is keyed by "" in every mapping, so
@@ -850,7 +883,7 @@ class ReviewScope:
             # what it has always been. The overhead below is a fact about the
             # scoped prompt, which did not exist before v2.28.
             body = _fit_parts([self.diff], budget)[0]
-            return f"{PR_SCOPE_HEADER}\n{body}", len(body), 0
+            return f"{self.header}\n{body}", len(body), 0
 
         brief = brief_template.format(
             round_no=self.round_no,

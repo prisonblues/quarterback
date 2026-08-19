@@ -244,10 +244,21 @@ def test_the_clamped_budget_still_fits_when_the_diff_is_multibyte():
 
 # ------------------------------------- the exemption is assembled from both halves
 
+#: The pre-flight verdict is OFF here (#138), and both halves of it.
+#:
+#: These tests exist to measure the ARGV CLAMP and the truncation it produces, and
+#: they get there with budgets far under the diff — `agy_budget=5_000` against a
+#: 270 KB diff is the whole device. That is also, to the pre-flight verdict, a diff
+#: 54x over the tightest ceiling: it would refuse the round, dispatch nobody, and
+#: the payload would carry no `truncated` key at all for the test to read. A
+#: move-shaped fixture would be replaced by a manifest for the same reason. So the
+#: refusal is switched off with `0` and the manifest with `false`; the verdict has
+#: its own suite, and what these tests need is for the round to happen.
 AGY_CFG = {"github": "acme/board", "path": "/tmp/acme-board",
            "reviewers": {"claude": {"enabled": True, "model": "sonnet"},
                          "antigravity": {"enabled": True, "model": "m", "effort": ""}},
-           "review_panel": {}}
+           "review_panel": {"refuse_over_cap_multiple": 0,
+                            "manifest_moves": False}}
 
 
 def _agy_round(monkeypatch, tmp_path, capsys, diff, agy_budget=None):

@@ -701,6 +701,19 @@ class Baseline:
     #: :func:`coverage_veto`, or the cheaper round quietly buys its saving out of
     #: coverage nobody is told it lost.
     truncated_rounds: set[int] = field(default_factory=set)
+    #: Earlier rounds that read a MOVE MANIFEST rather than a diff (#138).
+    #:
+    #: Its own set rather than a reading of the other two, because it is a third
+    #: thing. `unread_rounds` means no seat ran; `truncated_rounds` means a seat
+    #: got a prefix of its target. A manifest round's seats all ran and all got
+    #: their whole target — the target WAS the manifest — so neither is true of it
+    #: and the code it reviewed was still read by nobody.
+    #:
+    #: It matters twice. It must not count as having re-read the PR (see `reread`
+    #: below, whose `scope == "pr"` test a manifest round passes while having read
+    #: no code at all), and under increment scope the next round's anchor steps
+    #: over the code it did not read, exactly as it does past an unread round.
+    manifest_rounds: set[int] = field(default_factory=set)
     #: Files that preceding round could not read in full (:func:`_diff_files_cut`).
     #: A new finding in one of them is a coverage failure, not a reviewer miss.
     unread_files: set[str] = field(default_factory=set)
@@ -1028,27 +1041,38 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
         # as having re-read the PR if at least one seat recorded that it was
         # there. The conservative direction: an old baseline keeps an inherited
         # veto standing rather than silently clearing it.
-        # `ran`, not `not absent` (225-R4-F13): a seat that was present and then
-        # crashed is "not absent" while having read nothing, so the weaker test let
-        # a round where every seat failed still qualify to erase earlier gaps.
+        # A manifest round (#138) reviewed the SHAPE of a move and none of its
+        # code. Read off the payload's own verdict, defensively: a payload written
+        # before `preflight` existed has no such key and is not a manifest round,
+        # which is both true and the conservative direction.
+        pre = payload.get("preflight")
+        was_manifest = (isinstance(pre, dict)
+                        and str(pre.get("verdict") or "") == "manifest")
+        if was_manifest:
+            b.manifest_rounds.add(was)
+        # `ran`, not `not absent` (#222): a seat that was present and then crashed
+        # is "not absent" while having read nothing, so the weaker test let a round
+        # where every seat failed still qualify to erase earlier gaps.
         read_something = any(m.get("ran") for m in recorded)
         ran = payload.get("reviewers_ran")
         if isinstance(ran, list) and not ran:
             b.unread_rounds.add(was)
-        # `read_something` is the positive evidence `reread` needs and
-        # `truncated_any` cannot supply (225-R3-F01). Exempting `absent` from
-        # `truncated_any` is right for a round where seats ran, but it makes an
-        # ALL-absent round indistinguishable from one that read everything: both
-        # come out False. The branch above catches that whenever `reviewers_ran` is
-        # a list, which every payload this release writes has — but a hand-edited or
-        # truncated one may not, and `reread` is the single most destructive thing
-        # in this function: one entry erases every earlier round's recorded gap. So
-        # it takes evidence that somebody was actually there, on the same principle
-        # the `reread` comment below already states for `recorded`.
-        elif (recorded and read_something and not truncated_any
+        # FOUR terms, and each rules out a different way a round can look like it
+        # read the whole PR without having done so. `reread` erases every earlier
+        # round's recorded gap, so it is the most destructive thing in this
+        # function and every one of them is load-bearing:
+        #
+        #   `recorded`      — somebody wrote a per-seat record at all.
+        #   `read_something`— at least one seat actually RAN (#222).
+        #   `truncated_any` — no seat read a prefix of its target (#113).
+        #   `not was_manifest` (#138) — the round read a diff, not a description of
+        #     one. A manifest round records `scope: "pr"` (the manifest travels as
+        #     the round's material, so it is a whole-target round by construction)
+        #     with nothing truncated, because the manifest fitted. It therefore
+        #     satisfies every OTHER term here while having read not one line of the
+        #     diff, which would make it the round that closes everyone else's gaps.
+        elif (recorded and read_something and not truncated_any and not was_manifest
                 and str(payload.get("scope") or "pr") == "pr"):
-            # `truncated_any`, not `cut`: clearing an earlier gap is a claim that
-            # this round READ the region, and a kernel-capped seat did not.
             reread.add(was)
         for bucket in ("to_fix", "dismissed", "sonar_findings"):
             for f in payload.get(bucket) or []:
@@ -1073,6 +1097,10 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
         newest = max(reread)
         b.truncated_rounds = {r for r in b.truncated_rounds if r > newest}
         b.unread_rounds = {r for r in b.unread_rounds if r > newest}
+        # A manifest round's gap closes the same way and for the same reason: a
+        # later whole-PR round read the code the manifest only described, so a veto
+        # saying otherwise states something the baselines themselves disprove.
+        b.manifest_rounds = {r for r in b.manifest_rounds if r > newest}
     # The commit and the coverage record come from the END of the set rather than
     # from a merge of all of it: `keys` and `titles` are a union over every earlier
     # round ("has anyone raised this before"), while "which commit did the fix pass

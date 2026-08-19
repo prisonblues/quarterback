@@ -140,6 +140,30 @@ again at round 1 rather than carrying on — never re-run this round on its own.
 Every non-error exit writes it, including a PR skipped by title pattern (its
 payload is marked `reviewed: false`), so exit 0 always means the file is there.
 
+**A round the panel REFUSED did not happen either, and it exits 0.** Read
+`preflight.verdict` from the payload before doing anything with the findings:
+
+- `refuse` — no seat was dispatched (`reviewed: false`, with `skip_reason`). **Stop
+  the cycle here.** Do NOT go to §4: a fix pass briefed with zero findings from a
+  round nobody ran is a fixer told the PR is clean. Relay the panel's reason and
+  the remedies it named — split the PR, raise the cap for a seat that can take it,
+  or re-run with `--force` — and let the user choose. Never add `--force` on your
+  own initiative; the refusal is the panel's decision about a diff it measured, and
+  overriding it unasked is exactly the failure the check was built to stop.
+  **Relay `ci_status` and `ci_failing` with it.** A refusal still reads the CI gate
+  — that is size-independent and cost the round one API call, and it exists in the
+  payload because a refusal that lost the build status left this step telling the
+  user to stop with nothing said about a red suite. If `ci_status` is `FAIL`, say
+  so and name the checks: the PR is broken by something the project already tests,
+  and nobody had to read the diff to know it. `PASS`, `PENDING`, `none` and
+  `unknown` are four different statements and none of them is "reviewed" — say
+  which one it was, never that CI was fine.
+- `manifest` — the change is move-shaped and the seats were asked what *moved*, not
+  whether the code is correct. The cycle runs normally, but the findings are answers
+  about the move and **the moved code was not read by anybody**. Say so in the relay
+  (§6), and keep it out of "reviewed and clean": its correctness is carried over
+  from when it landed on the base branch.
+
 **Not** a fixed `/tmp/panel-<pr>-r<n>.json`. Two reasons, both real on a shared
 host: the panel writes that path with `Path.write_text`, which follows symlinks,
 so a pre-planted `/tmp/panel-34-r1.json → ~/.ssh/authorized_keys` is a write
@@ -364,6 +388,10 @@ Two things this must NOT do:
   itself re-reviewed".
 - **Never re-run a round to get a nicer answer.** Each panel run is recorded on
   the board as an observation; re-rolling one corrupts the record it exists to be.
+- **Never `--force` past a refusal to keep the cycle moving.** A refused round is
+  the panel declining to manufacture work, and a forced one hands the fixer findings
+  about code that is already in the base branch — the failure mode in full, with the
+  check bypassed on the way. It is the user's call, and it is recorded either way.
 
 ## 6. Relay the result
 
