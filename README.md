@@ -155,9 +155,11 @@ GET   /review/findings   ?repo=&pr=&limit=                       (one PR's findi
                           summarise ONE cycle, so all four are null unless every traced run
                           belongs to the same one (#44). `cycles` counts the groups and counts
                           BUCKETS, not loops: every run carrying no cycle is one bucket
-                          together, so a PR read once outside a loop — one `/panel`, or a
-                          round predating the cycle column — reads `cycles: 2` with a null
-                          summary until that run leaves the window. Read the four with an
+                          together, so a cycle-less run — one `/panel`, or a round
+                          predating the cycle column — sharing a window with a real
+                          cycle reads `cycles: 2` with a null summary until it leaves
+                          the window. It takes the mixture: an all-one-cycle window
+                          summarises, and so does an all-cycle-less one. Read the four with an
                           identity test, never for truthiness: null is "no attributable cycle
                           said", which is neither `false` nor `[]` (`[]` is "the stopping rule
                           ran and vetoed nothing"). Narrowing `limit` can recover a summary,
@@ -723,7 +725,7 @@ full — including what was broken before it, which is the part no diff recovers
   round CLOSES earlier gaps, exempts `absent` but not `argv_capped`: a capped seat ran and saw
   a prefix, so the round did not read its target whole; an absent one is no evidence either
   way.
-- **vNEXT** — one cycle's ending stops describing another's. `GET /review/findings` took its
+- **v2.54** — one cycle's ending stops describing another's. `GET /review/findings` took its
   `stopped`/`stop_reason`/`stop_confident`/`stop_veto` summary from the newest run in the window
   whatever cycle that run belonged to, so a second loop — or one review-only `/panel` read — made
   an older cycle read as complete, unfinished or unconfident on somebody else's evidence. All four

@@ -439,12 +439,14 @@ async def test_a_review_only_run_makes_the_summary_unattributable(client):
     around it. Adjacency said otherwise and the summary took its word for it.
 
     This is the COMMON shape, not the exotic one, and it is worth being blunt
-    about: it takes one `/panel` read outside a loop — or one round recorded before
-    the cycle column existed — for a PR to read as unattributable at the default
-    `limit`, and it keeps reading that way until that run falls out of the window.
-    The docstring on the endpoint says so in those words rather than framing this
-    as the rare two-agents case, because a reader who believes it is rare will read
-    a null summary as a bug."""
+    about: one `/panel` read outside a loop — or one round recorded before the
+    cycle column existed — is enough to make a PR read as unattributable at the
+    default `limit`, for as long as that run stays in the window. What it takes is
+    that run sharing the window with a real cycle, which is the MIXTURE and not the
+    cycle-less run by itself: `test_history_recorded_before_cycles_existed_still_summarises`
+    is the all-cycle-less window, and it summarises. The docstring on the endpoint
+    draws the same line, rather than framing this as the rare two-agents case,
+    because a reader who believes it is rare will read a null summary as a bug."""
     await record(client, 6152, cycle="cycle-A")
     await record(client, 6152, cycle=None, round=1, new_findings=0, to_fix=[],
                  round_stop={"stop": True, "reason": "one-shot read", "confident": True,
@@ -516,6 +518,53 @@ async def test_narrowing_the_window_costs_the_finding_history_it_narrows(client)
         h = (await client.get(f"/review/findings?repo={REPO}&pr=6155&limit={lim}",
                               headers=AGENT)).json()
         assert h["stopped"] is not False, "no window reports cycle A's own ending"
+
+
+async def test_an_attributable_run_that_recorded_no_veto_answer_reads_null(client):
+    """The three-state rule has to hold hardest in the branch that DOES summarise.
+    The window is one cycle, so the summary speaks for exactly one run — and that
+    run recorded no `round_stop` at all, so its `stop_veto` is NULL. `or []` here
+    reported the opposite of the truth about the very run the summary rests on:
+    `[]` is "the stopping rule ran and vetoed nothing", and nothing ran.
+
+    `GET /review/{id}` has always returned it raw; this endpoint now agrees rather
+    than contradicting its sibling about one stored row."""
+    await record(client, 6160, cycle="cycle-A", round_stop=None)
+    h = (await client.get(f"/review/findings?repo={REPO}&pr=6160", headers=AGENT)).json()
+    assert h["cycles"] == 1, "one bucket, so this window is summarisable"
+    assert h["stop_veto"] is None, "NULL, not [] — that round recorded no veto answer"
+    # The other three are null for the same reason, and were already.
+    assert h["stopped"] is None and h["stop_reason"] is None
+    assert h["stop_confident"] is None
+
+
+async def test_the_per_run_rows_carry_a_null_veto_unaltered(client):
+    """`runs[]` is what the docstring, the README and the CHANGELOG all point
+    callers at as the better answer, on the stated promise that each round's own
+    four ride there UNALTERED at any window size. An `or []` made that promise
+    false for a round with no recorded veto — and made one stored row read
+    differently through this endpoint than through `GET /review/{id}`, which is the
+    disagreement `test_a_nested_stop_that_did_not_say_records_no_stop` pins from
+    the other side."""
+    run_id = await record(client, 6161, cycle="cycle-A", round_stop=None)
+    h = (await client.get(f"/review/findings?repo={REPO}&pr=6161", headers=AGENT)).json()
+    row = next(r for r in h["runs"] if r["id"] == run_id)
+    assert row["stop_veto"] is None, "unaltered means NULL stays NULL"
+    # ...and the two endpoints agree about the same row, which is the point.
+    assert (await detail(client, run_id))["stop_veto"] is None
+
+
+async def test_a_recorded_empty_veto_is_still_an_empty_list(client):
+    """The other half of the distinction, or the fix above would just be a new way
+    of losing information: a round that DID run its stopping rule and vetoed
+    nothing recorded `[]`, and `[]` is what it must read as — through the summary
+    and through the per-run row alike."""
+    run_id = await record(client, 6162, cycle="cycle-A",
+                          round_stop={"stop": True, "reason": "dry", "confident": True,
+                                      "veto": []})
+    h = (await client.get(f"/review/findings?repo={REPO}&pr=6162", headers=AGENT)).json()
+    assert h["stop_veto"] == [], "the rule ran and vetoed nothing — not null"
+    assert next(r for r in h["runs"] if r["id"] == run_id)["stop_veto"] == []
 
 
 # ---- the page's half of #44 -------------------------------------------------

@@ -11,7 +11,7 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
-## vNEXT — one cycle's ending stopped describing another's
+## v2.54 — one cycle's ending stopped describing another's
 
 `GET /review/findings` answers "how did this PR's review end?" with `stopped`, `stop_reason`,
 `stop_confident` and `stop_veto`. It took all four from the newest run in the window whatever
@@ -30,8 +30,11 @@ its `stop_veto` is null too, not `[]`.
 number: every run carrying no cycle is one bucket together, because a run outside any cycle never
 ended the cycle running around it. So one real cycle plus one standalone `/panel` read is
 `cycles: 2` with one loop in it — which also means this is the ordinary case, not the exotic one.
-Any PR read once outside a loop, or carrying a round recorded before the cycle column existed, has
-a null summary at the default `limit` until that run falls out of the window. The reviews page
+A cycle-less run sharing a window with a real cycle's rounds — a standalone `/panel`, or a round
+recorded before the cycle column existed — is enough to null the summary at the default `limit`,
+and it stays null until that run falls out of the window. It takes the mixture: a window that is
+entirely one cycle summarises, and so does one that is entirely cycle-less, which is what keeps the
+whole pre-cycle archive reading as it always did. The reviews page
 says "mixed cycles: N separate groups of runs, no single stop state" rather than rendering the
 absent ending as blank, which would read as "nothing recorded".
 

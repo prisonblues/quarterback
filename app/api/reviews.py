@@ -3624,12 +3624,13 @@ async def pr_finding_history(
     null summary.
 
     That is the ordinary case rather than a rare one, and this docstring will not
-    pretend otherwise: it is not only "two agents looped this PR". ANY PR that has
-    been read once outside a loop — one ``/panel`` with no cycle, one round
-    recorded before cycles were stored — has a null summary at the default
-    ``limit`` for as long as that run stays in the window. Only a window that is
-    entirely one cycle, or entirely cycle-less (which is the whole pre-cycle
-    archive), summarises.
+    pretend otherwise: it is not only "two agents looped this PR". A cycle-less run
+    landing BESIDE a real cycle's rounds — one standalone ``/panel``, or one round
+    predating the cycle column sharing a window with a modern one — is enough, and
+    the summary stays null for as long as that run is in the window. What it takes
+    is the MIXTURE, not the cycle-less run on its own: a window that is entirely
+    one cycle summarises, and so does one that is entirely cycle-less (which is the
+    whole pre-cycle archive, and why that archive still reads as it always did).
 
     The four are therefore three-state, and must be read with ``is None`` rather
     than for truthiness: ``stopped: null`` is "no attributable cycle said", which
@@ -3942,7 +3943,14 @@ async def pr_finding_history(
         # `test_the_page_never_reads_the_summary_stop_veto_unguarded` counts the
         # mentions in the file that ships, so a future `for (const v of
         # h.stop_veto)` fails a test instead of throwing in a browser.
-        "stop_veto": (last.stop_veto or []) if summarisable else None,
+        #
+        # `last.stop_veto` RAW, never `or []`. The attributable case is exactly
+        # where the three-state contract has to hold: a stored NULL on the one run
+        # this summary speaks for means "that round recorded no veto answer", and
+        # coercing it to [] reports the opposite — "the stopping rule ran and
+        # vetoed nothing" — about the run whose evidence the whole summary rests
+        # on. `GET /review/{id}` returns it raw for this reason; so does this.
+        "stop_veto": last.stop_veto if summarisable else None,
         # More runs exist than the window traced, so `first_run` and a `gone`
         # status describe the window, not the PR's whole history.
         "truncated": truncated,
@@ -3974,7 +3982,14 @@ async def pr_finding_history(
              "unjudged": r.n_unjudged, "sonar": r.n_sonar,
              "round": r.round, "cycle": r.cycle, "new_findings": r.new_findings,
              "stopped": r.stopped, "stop_reason": r.stop_reason,
-             "stop_confident": r.stop_confident, "stop_veto": r.stop_veto or [],
+             # RAW, for the same reason as the summary above and with one more on
+             # top: the docstring, the README and the CHANGELOG all promise these
+             # four ride here UNALTERED at any window size, and point callers at
+             # them as the better answer precisely because the summary can be
+             # unattributable. An `or []` here made that promise false for a run
+             # with no recorded veto, and made the same run read differently
+             # through this endpoint than through `GET /review/{id}`.
+             "stop_confident": r.stop_confident, "stop_veto": r.stop_veto,
              # Findings this round declared worth re-reading, and whether the
              # round that followed found anything where it pointed — file-grain,
              # over confirmed findings only. None = no round followed it in this
