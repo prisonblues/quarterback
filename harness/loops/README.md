@@ -402,7 +402,7 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
     true — the silent failure that the degrade path's own correctness makes possible.
   - **The board stores it, rather than dropping it at ingest.** `absent`,
     `code_blind` and `argv_capped` per reviewer, plus `code_access` and
-    `convention_files_removed` per run (migration `0023`), read back out of
+    `convention_files_removed` per run (migration `0024`), read back out of
     `GET /review/{id}` as well as written. `absent` had been sent since v2.32 and
     silently discarded, because `ReviewerIn` inherits pydantic's `extra="ignore"` —
     the same drop v2.26 records for `head_sha` and `unread_files` (#93). `code_blind`

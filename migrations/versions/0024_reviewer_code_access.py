@@ -71,16 +71,24 @@ deliberately not stored: it is exactly the reviewers whose `code_blind` is False
 so a column would be a second copy of a fact already on those rows, free to
 disagree with them — and the reviewer rows are what a stats query joins.
 
-Revision ID: 0023
-Revises: 0022
+Revision ID: 0024
+Revises: 0023
+
+Renumbered from 0023, which v2.48's `0023_lease_state` took while this branch
+was open. Migration ids are a shared namespace with no lock, exactly like release
+numbers — and unlike release numbers there is no placeholder convention, so the
+collision surfaces as two heads and `test_the_repos_own_migration_chain_is_single_headed`
+is what catches it. Chained after lease_state rather than beside it: these two
+touch different tables and either order works, so the one that landed first keeps
+its place.
 """
 
 import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision: str = "0023"
-down_revision: str | None = "0022"
+revision: str = "0024"
+down_revision: str | None = "0023"
 branch_labels = None
 depends_on = None
 

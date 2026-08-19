@@ -132,7 +132,7 @@ produced them. One ordering trap, now pinned: the tree's cleanup has to run afte
 empty sandbox — reviewing blind while the payload still says access was on. The
 degrade path working correctly is exactly what made that silent.
 
-**And the board stores all of it, instead of dropping it at ingest.** Migration `0023`
+**And the board stores all of it, instead of dropping it at ingest.** Migration `0024`
 adds `absent`, `code_blind` and `argv_capped` to `review_reviewers`, and `code_access`
 and `convention_files_removed` to `review_runs`; the read path returns them too,
 because a column nothing exposes cannot measure anything. `absent` had been sent since
