@@ -681,8 +681,19 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     #
     # Read ONCE per round rather than per consumer. `run_seat` asks the same
     # predicate again when the seat is dispatched, and two independently-timed PATH
-    # reads can disagree; a snapshot is what makes every consumer below — the
+    # reads can disagree; a snapshot is what makes the consumers below — the
     # budget, the argv clamp, the prompt, the payload — describe one host.
+    #
+    # "Below" is the literal scope and not a claim about the whole round
+    # (225-R2-F02). `run_seat` re-reads PATH per seat and `adjudicate` re-reads it
+    # for `claude`; neither takes this set, and threading it through both would
+    # change their signatures for a race nothing has observed. What bounds the
+    # damage is that the two disagreements are already handled at the far end: a
+    # seat that appears after this line is dispatched with an empty prompt and
+    # refused by `run_seat` as absent, and one that vanishes after it is refused
+    # there too. The snapshot exists so the RECORD is self-consistent — a null
+    # budget beside `absent: true`, never a budget beside a seat the payload also
+    # calls missing — not to make the round atomic.
     installed = {name for name in LLM_REVIEWERS if seat_installed(name)}
     budgets = {name: diff_budget(rev.get(name, {}), "max_diff_chars", panel_budget, notes)
                for name in LLM_REVIEWERS if name in selected and name in installed}

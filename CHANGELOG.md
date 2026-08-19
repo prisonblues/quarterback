@@ -60,8 +60,18 @@ an installed one with no configured budget records the same pair. `absent` is th
 field that carries that, which is why the reader below keys on it.
 
 **And the reader was fixed too, because baselines outlive the writer.**
-`load_baseline` now banks a round as truncated on `truncated and not absent` —
-the same exemption `coverage_veto` makes, keyed on the same field. Every payload
+`load_baseline` now banks a round as truncated on `truncated and not argv_capped
+and not absent` — the same exemptions `coverage_veto` makes, each keyed on its own
+recorded field. Both terms are needed: `argv_capped` (v2.50, landed while this was
+in review) covers only seats the kernel bounded, so an absent `pi` or `codex`
+carrying a configured `max_diff_chars` under the target lands in `truncated_for`
+with `argv_capped` False and would still bank a phantom round under that exemption
+alone. Its sibling `truncated_any` — which decides whether a round CLOSES every
+earlier round's gap — exempts `absent` and deliberately not `argv_capped`: a capped
+seat RAN and saw a prefix, so the round did not read its target whole and cannot be
+the one that clears an older gap; an absent seat read nothing and is no evidence
+either way, and leaving it in let one legacy payload block `reread` forever, which
+is the permanent veto this release exists to remove. Every payload
 already on disk carries the old pairing and `--baseline` is fed them by design, so
 cleaning only the writer would leave every cycle already in flight banking phantom
 gaps until it ended. Deliberately **not** `ran and truncated`: `ran` is false for

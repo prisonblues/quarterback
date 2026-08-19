@@ -926,7 +926,21 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
         # PR, so it cannot be the round that closes every earlier round's gap.
         # Exempting a seat says "this gap will never close, stop vetoing on it" —
         # it must not also say "this round closed everyone else's".
-        truncated_any = any(m.get("truncated") for m in recorded)
+        # `absent` is exempt HERE as well, and `argv_capped` is not — the two
+        # exemptions genuinely differ on this question (225-R2-F01).
+        #
+        # An argv-capped seat RAN and saw a prefix, so the round really did not read
+        # its target whole and cannot be the round that closes an earlier gap. An
+        # ABSENT seat read nothing and is no evidence either way: the seats that did
+        # run may have read everything, and on a box where a configured seat can
+        # never be installed there is no future round that would clear the gap
+        # either. Leaving it in was the first spelling of this merge and it looked
+        # like the safe direction; it is not. It lets one legacy payload's phantom
+        # record block `reread` forever, which keeps every earlier gap open and the
+        # cycle non-confident — the exact permanent veto #222 exists to remove,
+        # surviving in the one path the fix had not reached.
+        truncated_any = any(m.get("truncated") and not m.get("absent")
+                            for m in recorded)
         # `cut` — does this round leave an inherited veto? Here two exemptions
         # apply, for two different reasons, and neither subsumes the other.
         #

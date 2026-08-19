@@ -369,6 +369,53 @@ def test_a_box_carrying_no_seat_at_all_still_produces_a_payload(monkeypatch,
     assert any("no reviewer ran" in v for v in got["round_stop"]["veto"])
 
 
+def test_the_real_adjudicate_refuses_a_box_that_cannot_run_the_judge(monkeypatch):
+    """The judge's own gate, exercised for real (225-R2-F03).
+
+    Every end-to-end test here replaces `adjudicate` wholesale, so nothing reached
+    the refusal inside it — and the budget half is only half the change. The two
+    gates have to be ONE predicate: a judge skipped as absent while
+    `diff_budgets.judge` records 60,000 chars is the same contradiction between two
+    fields that #222 is about, one seat over.
+
+    `run_cli` is doubled into a hard failure so a regression cannot quietly spawn a
+    real `claude` instead of failing the assertion — and it is doubled on
+    `panel_seats`, which is where `adjudicate` calls it from. Patching
+    `panel_rounds.run_cli` looks right, does nothing, and lets the test spawn a real
+    reviewer: that is how the first version of this test was written, and it took
+    twelve seconds and a live CLI to notice.
+    """
+    monkeypatch.setattr(panel_rounds, "seat_installed", lambda name: False)
+    monkeypatch.setattr(panel_seats, "run_cli", _never_run)
+    findings, skip, note = panel_rounds.adjudicate(
+        [[panel.Finding("claude", "P2", "a.py", 1, "t", "d")]],
+        "diff text", "sonnet", 34)
+    assert skip == "judge: claude CLI absent"
+    # Nothing is suppressed by the refusal: every finding survives, unruled.
+    assert len(findings) == 1
+    assert note == ""
+
+
+def test_the_real_adjudicate_proceeds_when_the_judge_IS_there(monkeypatch):
+    """The other direction, so the guard above cannot be satisfied by a predicate
+    that is simply always False."""
+    reached = {}
+    monkeypatch.setattr(panel_rounds, "seat_installed", lambda name: True)
+
+    def fake_run_cli(*a, **kw):
+        reached["yes"] = True
+        raise AssertionError("stop here — reaching the CLI is the assertion")
+
+    monkeypatch.setattr(panel_seats, "run_cli", fake_run_cli)
+    try:
+        panel_rounds.adjudicate(
+            [[panel.Finding("claude", "P2", "a.py", 1, "t", "d")]],
+            "diff text", "sonnet", 34)
+    except AssertionError as e:
+        assert "stop here" in str(e)
+    assert reached.get("yes"), "the judge was refused on a box that has claude"
+
+
 # ------------------------------------------------------------------ the reader
 
 def _payload(tmp_path, name, reviewers, **kw):

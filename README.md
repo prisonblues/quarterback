@@ -625,8 +625,14 @@ full — including what was broken before it, which is the part no diff recovers
   rendered prompt it was never going to read. In the payload it records a `null` budget rather
   than losing its `diff_budgets` key, so nothing downstream starts raising `KeyError` on the
   unattended hosts this is for. `load_baseline` banks a round as truncated on
-  `truncated and not absent` — the exemption `coverage_veto` already makes, keyed on the same
-  field, so a seat that was installed, read a real prefix and then crashed still counts.
+  `truncated and not argv_capped and not absent` — two exemptions, each keyed on its own
+  recorded field, and neither subsuming the other: `argv_capped` (v2.50) covers only what the
+  kernel bounded, so an absent `pi` or `codex` with a configured budget under the target would
+  still bank a phantom round under it alone. A seat that was installed, read a real prefix and
+  then crashed still counts, under both. The sibling `truncated_any`, which decides whether a
+  round CLOSES earlier gaps, exempts `absent` but not `argv_capped`: a capped seat ran and saw
+  a prefix, so the round did not read its target whole; an absent one is no evidence either
+  way.
 - **v2.47** — the dashboard grows hands, and its tests start running. The SEATS panel
   closes a seat and adds one, and tmux grows a clickable bar of the same widgets above the
   seat row — both through `qb-seat-click`, which `qb-dash-tui` had been calling since the
