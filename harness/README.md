@@ -644,10 +644,10 @@ Keys the script reads: `project`, `framework`, `base_port`, `app_port`,
 `server.{workers_env,workers_default}`, `env.copy_from`, `workspace.{enabled,editor_cli}`,
 and the arrays `symlinks`, `copies`, `reserved_names`, `gitignore_additions`.
 
-### Two prerequisites for database isolation
+### Three prerequisites for database isolation
 
-Both are easy to miss, and missing either gets you a worktree that *looks* isolated while
-running against shared data.
+All three are easy to miss, and missing any of them gets you a worktree that *looks*
+isolated while running against shared data — or, for the third, no usable worktree at all.
 
 **1. The main checkout needs a `.env`.** It is the file `create-worktree` copies into the
 worktree and then rewrites the database name in. There is nothing else for it to derive
@@ -655,7 +655,24 @@ credentials from, so with no `.env` the DB step has nothing to copy and says so 
 `cp .env.example .env` is part of setting a repo up, not an optional nicety. (A repo that
 keeps its env elsewhere can point `env.copy_from` at that file instead.)
 
-**2. Your test suite must honour that `.env`.** This is the one that bites hardest, because
+**2. That `.env` must actually name the database.** `create-worktree` has to know which
+database to copy, and it looks in two places: `database.url_env` (default unset) and
+`database.name_env` (default `POSTGRES_DB`). Declaring the first no longer disables the
+second — it *cascades*, so a repo whose URL is assembled at runtime, or that keeps the name
+in `docker-compose.yml` and only the password in `.env`, resolves through `POSTGRES_DB`.
+quarterback itself is that shape: its `.env` carries `POSTGRES_PASSWORD` and nothing else,
+so isolated mode cannot work here until `POSTGRES_DB=quarterback` is added to it.
+
+When neither variable is set the run stops at the database step and names both variables and
+the file it read. It stops *after* the git worktree exists, so it also says the worktree is
+incomplete and gives the two commands out — a directory with a checkout but no `.venv`
+symlink, no port and no `CLAUDE.local.md` looks provisioned enough to `cd` into and then
+fails later for reasons that have nothing to do with the database. Before this was fixed the
+run died on `MAIN_DB_NAME: unbound variable` instead: the guard written to explain the case
+was the first thing to dereference the unset variable, so `set -u` killed the script at the
+exact line that existed to say what was wrong.
+
+**3. Your test suite must honour that `.env`.** This is the one that bites hardest, because
 provisioning succeeds and the damage happens later. A suite that decides its own database
 URL — the near-universal
 

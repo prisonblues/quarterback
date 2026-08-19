@@ -30,14 +30,14 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
 import panel_scope  # noqa: E402  — scope/range readers moved here in #129
 import panel_seats  # noqa: E402
 import panel_core  # noqa: E402  — `sh` is defined here since #129
 from conftest import gh_stub  # noqa: E402
-
-
 
 
 
@@ -613,7 +613,7 @@ def _panel_round(monkeypatch, tmp_path, round_no, findings, head, baseline=(),
         compare=FIX_COMPARE if compare is None else compare,
         diff=PR_DIFF)
 
-    def fake_review(name, model, prompt, effort=""):
+    def fake_review(name, model, prompt, effort="", **_kw):  # **_kw: code_tree since #113
         # Only the first seat files, so two seats do not produce two canonical
         # records of one defect. What the extra seats are here for is the diff
         # budget they carry.
@@ -621,7 +621,7 @@ def _panel_round(monkeypatch, tmp_path, round_no, findings, head, baseline=(),
             [panel.Finding("claude", "P2", f, ln, t, "detail")
              for f, ln, t in findings] if name == "claude" else [], None, 800, None)
 
-    def fake_adjudicate(clusters, diff, model, pr, budget=None, coverage=None, ci=""):
+    def fake_adjudicate(clusters, diff, model, pr, budget=None, coverage=None, ci="", **_kw):  # **_kw: code_tree/budget_usd since #113
         return ([panel.Canonical(id=panel._finding_id(pr, i + 1), severity="P2",
                                  file=f.file, line=f.line, synthesis=f.title,
                                  verdict="confirmed", detail="detail",

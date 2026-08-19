@@ -178,6 +178,7 @@ class Dash(App):
         self.cfg = None
         self.rows: dict[str, dict] = {}       # row key → the record behind it
         self.seats: list[dict] = []           # the seat PANES, off tmux
+        self.seat_states: dict[int, dict] = {}  # seat number -> the board's live agent
         self.prs: list[dict] = []
         self.issues: list[dict] = []
         self.issue_err: str | None = None
@@ -220,8 +221,8 @@ class Dash(App):
         yield Footer()
 
     def on_mount(self) -> None:
-        self.query_one("#seats", DataTable).add_columns("", "✕", "seat", "running", "where")
-        self.query_one("#fleet", DataTable).add_columns("who", "repo", "what", "ttl")
+        self.query_one("#seats", DataTable).add_columns("", "✕", "seat", "state", "running", "where")
+        self.query_one("#fleet", DataTable).add_columns("who", "state", "repo", "what", "ttl")
         self.query_one("#claims", DataTable).add_columns("who", "key", "left")
         self.query_one("#plan", DataTable).add_columns(
             "", "⚒", "repo", "ref", "title", "who")
@@ -289,10 +290,19 @@ class Dash(App):
             key = f"seat:{s['seat']}"
             self.rows[key] = s
             live = s.get("command") not in ("bash", "sh", "zsh", "fish", "")
+            # A pane can be running an agent and still be doing nothing you want
+            # to know about, or be waiting on you and look identical. `running`
+            # is tmux's answer (is a process there); `state` is the agent's own.
+            try:
+                agent = self.seat_states.get(int(s["seat"]), {})
+            except (KeyError, ValueError):
+                agent = {}
+            word, style = qd.agent_state(agent)
             table.add_row(
                 Text("●" if live else "·", style="green" if live else "grey50"),
                 Text("✕", style="bold red"),                 # click to close it
                 Text(f"seat {s['seat']}", style="bold"),
+                Text(word or "—", style=style),
                 Text(qd.clip(s.get("command") or "—", 12),
                      style="white" if live else "grey50"),
                 Text(qd.clip(os.path.basename(s.get("path") or "") or "—", 22),
@@ -305,7 +315,7 @@ class Dash(App):
         # it is dropped on the floor.
         self.rows["seat:add"] = {"add": True}
         table.add_row(Text(""), Text("＋", style="bold cyan"),
-                      Text("add seat", style="cyan"), Text(""), Text(""),
+                      Text("add seat", style="cyan"), Text(""), Text(""), Text(""),
                       key="seat:add")
         title = f"SEATS · {len(seats)}" if seats else "SEATS · none on this screen"
         self.query_one("#t_seats", Static).update(title)
@@ -330,8 +340,10 @@ class Dash(App):
             self.rows[key] = a
             seat = qd.seat_number(a.get("holder"))
             who = (a.get("holder") or "?").split("/", 1)[-1]
+            word, style = qd.agent_state(a)
             table.add_row(
                 Text(qd.clip(who, 13), style="bold green" if seat else "bold"),
+                Text(word or "—", style=style),
                 Text(qd.clip(a.get("repo") or "—", 11),
                      style=qd.repo_colour(a.get("repo") or "—")),
                 Text(qd.clip(a.get("title") or a.get("branch") or "—", 40),
@@ -340,6 +352,17 @@ class Dash(App):
                 key=key,
             )
         self.query_one("#t_fleet", Static).update(f"FLEET · {len(agents)}")
+        # Keep what the board said about each SEAT, keyed by seat number, so the
+        # panel below can say what a pane is doing. The two panels answer
+        # different questions from different sources — tmux knows which panes
+        # exist, only the board knows what the agent in one is doing — and this
+        # is the single point where they meet.
+        # Stashed, not rendered: SEATS has its own refresh worker and re-entering
+        # its table from this one raises DuplicateKey mid-rebuild. The state
+        # appears on the next seats tick, which is seconds, and it is a state a
+        # human is reading rather than a countdown.
+        self.seat_states = {n: a for a in agents
+                            if (n := qd.seat_number(a.get("holder"))) is not None}
 
         claims = sorted(data.get("claims", []), key=lambda c: c.get("expires") or "")
         ctable = self.query_one("#claims", DataTable)

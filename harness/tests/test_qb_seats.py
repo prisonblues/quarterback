@@ -1136,7 +1136,7 @@ def resize_hook(run, name="t"):
 
 
 def hook_binary(run, name="t"):
-    """The qb-seats the resize hook will actually run.
+    r"""The qb-seats the resize hook will actually run.
 
     TWO LAYERS COME OFF, and both are the point of the escaping this pins. The hook is
     stored as a tmux command string, so what show-hooks prints is still tmux-escaped:
@@ -1508,6 +1508,30 @@ def test_list_with_nothing_up_prints_nothing_and_says_so(screen):
     assert out.returncode == 0, out.stderr
     assert out.stdout == "", out.stdout
     assert "no screens" in out.stderr, out.stderr
+
+
+def test_the_list_says_how_to_open_one(screen):
+    """A list of names is only half an answer. `resume` is not guessable from
+    `--add` and `--kill`, so the list has to carry the next command — and a WORKED
+    one, since the difficulty it exists to solve is not knowing what your screens
+    are called."""
+    screen("-n", "1", name="t")
+    screen("-n", "1", name="t2")
+    out = qb(screen, "list")
+    assert "resume 1" in out.stderr, out.stderr
+    assert "resume t)" in out.stderr, "and by name, the spelling that survives"
+    # STDOUT STAYS ROWS AND NOTHING ELSE, or every caller that pipes this breaks.
+    # `listing()` in this file is one of them: it would read the hint as a screen.
+    assert len(out.stdout.splitlines()) == 2, out.stdout
+
+
+def test_one_screen_needs_no_number_and_the_hint_says_so(screen):
+    """`resume` takes no argument when there is nothing to choose between, and a
+    hint that printed `resume 1` anyway would teach the longer of the two."""
+    screen("-n", "1")
+    out = qb(screen, "list")
+    assert "open it:" in out.stderr, out.stderr
+    assert out.stderr.rstrip().endswith("resume"), out.stderr
 
 
 def test_resume_takes_the_number_from_the_list(screen):

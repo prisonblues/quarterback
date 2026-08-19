@@ -801,6 +801,43 @@ def test_an_earlier_rounds_truncation_is_carried_forward(tmp_path):
     assert load([write(tmp_path, "clean.json", clean)]).truncated_rounds == set()
 
 
+def test_a_kernel_capped_truncation_is_not_carried_forward(tmp_path):
+    """The exemption has to hold HERE too, and missing it undid the whole change
+    for the cycles that matter.
+
+    An earlier round's truncation is carried because increment scope makes it
+    permanent — a later round reads only the fix commit and never returns to what
+    round 1 was cut off from. But a seat cut by the KERNEL was never going to be
+    closed by a later round either, on this box at this diff size, so carrying it
+    forward is not "a gap the cheap round failed to re-read": it is the same
+    constant arriving one round later and then standing for the rest of the cycle.
+    `/panel-review-pr` drives several rounds, so the loop would have gone straight
+    back to never stopping confidently while round 1's veto list looked fixed —
+    the change would have measured as working and not worked.
+
+    Truncation by a BUDGET still carries, which is what telling them apart buys:
+    raise the number and the next round really does read what this one could not."""
+    kernel = payload(1, head_sha="1111111111",
+                     reviewers={"antigravity": {"ran": True, "truncated": True,
+                                                "argv_capped": True},
+                                "claude": {"ran": True, "truncated": False}})
+    assert load([write(tmp_path, "kernel.json", kernel)]).truncated_rounds == set()
+
+    budget = payload(1, head_sha="1111111111",
+                     reviewers={"antigravity": {"ran": True, "truncated": True,
+                                                "argv_capped": False},
+                                "claude": {"ran": True, "truncated": False}})
+    assert load([write(tmp_path, "budget.json", budget)]).truncated_rounds == {1}
+
+    # An older payload that records no `argv_capped` at all still carries, which is
+    # the conservative direction this loader takes everywhere: "nobody said" is not
+    # "nothing happened", and an inherited veto left standing costs a round its
+    # confidence where clearing one wrongly claims coverage nothing had.
+    silent = payload(1, head_sha="1111111111",
+                     reviewers={"antigravity": {"ran": True, "truncated": True}})
+    assert load([write(tmp_path, "silent.json", silent)]).truncated_rounds == {1}
+
+
 def test_a_later_whole_pr_round_closes_an_earlier_rounds_gap(tmp_path):
     """The set was accumulate-only, so a round 3 still vetoed on round 1's
     truncation even when round 2 had re-read the whole PR untruncated in between —
@@ -961,7 +998,7 @@ def budget_for_partial_context() -> int:
 
 
 def _judge(seen):
-    def fake(clusters, diff, model, pr, budget=None, coverage=None, ci=""):
+    def fake(clusters, diff, model, pr, budget=None, coverage=None, ci="", **_kw):
         seen["diff"], seen["budget"] = diff, budget
         return [], None, ""
     return fake
@@ -1001,7 +1038,7 @@ def _stub_run(monkeypatch, seen, *, cfg=None, findings=(), increment=INCREMENT,
     said = dict(FACTS, files=len([f for f in panel._diff_by_file(increment) if f]))
     said.update(facts or {})
     monkeypatch.setattr(panel_scope, "compare_facts", lambda *a: said)
-    def reviewer(name, model, prompt, effort=""):
+    def reviewer(name, model, prompt, effort="", **_kw):  # **_kw: code_tree since #113
         seen.setdefault("prompts", {})[name] = prompt
         return panel.ReviewerRun(list(findings), None, 10, [])
     monkeypatch.setattr(panel, "review_llm", reviewer)
@@ -1209,3 +1246,36 @@ def test_a_round_one_run_reviews_the_whole_pr_and_says_nothing_about_it(monkeypa
     assert got["scope"] == "pr" and got["diff_chars"] == len(PR)
     assert got["context_chars"] == 0 and got["config_notes"] == []
     assert seen["prompts"]["claude"].count(panel.PR_SCOPE_HEADER) == 1
+
+
+def test_an_argv_capped_round_does_not_clear_an_earlier_rounds_gap(tmp_path):
+    """The fail-open half of the argv exemption, found by a second model.
+
+    `cut` answers two different questions, and the exemption is only correct for
+    one of them. It decides whether this round leaves an inherited veto (the cap IS
+    exempt — no later round on this box could close a kernel gap either), and it
+    used to also decide `reread`, which ERASES every earlier round's recorded gap.
+
+    Under the exemption an argv-capped round has `cut == False`, so it qualified as
+    "a whole-PR round with nothing truncated" and wiped truncations that were
+    genuinely still open. Exempting the cap says "this gap will never close, stop
+    vetoing on it"; it must not also say "this round closed everyone else's"."""
+    r1 = payload(1, head_sha="1111111111",
+                 reviewers={"claude": {"ran": True, "truncated": True}})
+    # Round 2 read the whole PR, but its kernel-capped seat saw a prefix of it.
+    r2 = payload(2, head_sha="2222222222", scope="pr",
+                 reviewers={"antigravity": {"ran": True, "truncated": True,
+                                            "argv_capped": True},
+                            "claude": {"ran": True, "truncated": False}})
+    base = load([write(tmp_path, "r1.json", r1), write(tmp_path, "r2.json", r2)])
+
+    assert base.truncated_rounds == {1}, (
+        "round 2 was treated as having re-read the PR and cleared round 1's "
+        "truncation, but its argv-capped seat never saw the whole thing")
+
+    # ...and a round with genuinely nothing truncated still clears it, which is the
+    # behaviour this must not break.
+    clean2 = payload(2, head_sha="2222222222", scope="pr",
+                     reviewers={"claude": {"ran": True, "truncated": False}})
+    base = load([write(tmp_path, "r1.json", r1), write(tmp_path, "c2.json", clean2)])
+    assert base.truncated_rounds == set()

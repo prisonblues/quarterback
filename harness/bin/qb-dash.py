@@ -31,8 +31,8 @@ from rich.text import Text
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from qbdata import (  # noqa: E402
-    ago, board_client, ci_state, claim_label, clip, fetch_board, fetch_issues, fetch_plan,
-    fetch_prs, claims_by_issue, issue_key, plan_counts, plan_ref, plan_state, plan_who,
+    agent_state, ago, board_client, ci_state, claim_label, clip, fetch_board, fetch_issues,
+    fetch_plan, fetch_prs, claims_by_issue, issue_key, plan_counts, plan_ref, plan_state, plan_who,
     repo_colour, short_repo, sort_issues, sort_plan, until,
 )
 
@@ -50,24 +50,27 @@ def panel_agents(data: dict, width: int) -> Panel:
 
     t = Table.grid(padding=(0, 1), expand=True)
     t.add_column(width=13, no_wrap=True)          # who
+    t.add_column(width=7, no_wrap=True)           # state
     t.add_column(width=11, no_wrap=True)          # repo
     t.add_column(ratio=1, no_wrap=True)           # what
     t.add_column(width=5, justify="right", no_wrap=True)   # ttl
 
-    body = max(18, width - 37)
+    body = max(18, width - 45)
     for a in agents:
         who = (a.get("holder") or "?").split("/", 1)[-1]
         repo = a.get("repo") or "—"
         title = a.get("title") or a.get("branch") or "—"
         is_seat = "/seat-" in (a.get("holder") or "")
+        word, style = agent_state(a)
         t.add_row(
             Text(clip(who, 13), style="bold white on dark_green" if is_seat else "bold"),
+            Text(word or "—", style=style),
             Text(clip(repo, 11), style=repo_colour(repo)),
             Text(clip(title, body), style="white" if is_seat else "grey70"),
             Text(until(a.get("expires")), style="grey50"),
         )
     if not agents:
-        t.add_row(Text("nobody home", style="grey50"), "", "", "")
+        t.add_row(Text("nobody home", style="grey50"), "", "", "", "")
 
     subs = len(data.get("subagents") or [])
     head = f"[bold]FLEET[/] [grey50]{len(agents)} live"
