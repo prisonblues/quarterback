@@ -5,7 +5,7 @@ CLI, in another repo) and is READ here rather than sourced from there — the sa
 choice ``harness/bin/worktree-holder`` makes, and for the same reason: the client
 has to work on a host that installed the board tooling without installing ``qb``.
 
-Two rules are inherited verbatim and are the whole point of not re-deriving them:
+Three rules are inherited verbatim and are the whole point of not re-deriving them:
 
 * **There is deliberately no default base URL.** An unset variable means "this
   machine has not been told which board it belongs to", and guessing points the
@@ -13,6 +13,12 @@ Two rules are inherited verbatim and are the whole point of not re-deriving them
   wrong guess reaches a real board rather than failing.
 * **Environment beats the config file**, token command included, so a single
   invocation can override any of it without editing anything.
+* **The agent name is resolved before the token command runs**, and exported into
+  it. ``QUARTERBACK_TOKEN_CMD`` is permitted to reference ``$QUARTERBACK_AGENT``
+  — the fleet's own generated config uses ``sed -n s/^$QUARTERBACK_AGENT://p`` to
+  pick this host's line out of a shared token file — so a client that resolves the
+  name afterwards expands it to empty and reads no token from a file that was
+  present and valid the whole time (#201). ``qb-env`` sets it first; so does this.
 """
 
 from __future__ import annotations
@@ -30,6 +36,10 @@ LEGACY_TOKEN_FILE = Path("/run/op-secrets/quarterback-token")
 
 _VARS = ("QUARTERBACK_BASE_URL", "QUARTERBACK_TOKEN", "QUARTERBACK_TOKEN_CMD")
 
+#: Named because the timeout is quoted in the diagnostic when it is hit, and a
+#: number that appears in a message the operator acts on should have one place.
+_TOKEN_CMD_TIMEOUT = 15
+
 
 class NoBoardConfigured(RuntimeError):
     """Raised when no base URL is set — the one thing that must never be guessed."""
@@ -43,6 +53,11 @@ class BoardConfig:
     token: str | None
     agent: str
     config_path: Path
+    #: Why there is no token, when a credential source was configured and did not
+    #: yield one. ``None`` both when a token was resolved and when nothing was
+    #: configured to resolve it — those are the two cases where there is nothing
+    #: to explain, and the caller's message for the second one is already right.
+    token_problem: str | None = None
 
     @property
     def authenticated(self) -> bool:
@@ -99,27 +114,42 @@ def _read_config_file(path: Path, env: dict[str, str]) -> dict[str, str]:
     return {name: parts[i] for i, name in enumerate(_VARS) if parts[i]}
 
 
-def _run_token_cmd(cmd: str, env: dict[str, str]) -> str | None:
-    """First line of ``QUARTERBACK_TOKEN_CMD``'s output, or None unless it succeeded.
+def _run_token_cmd(cmd: str, env: dict[str, str]) -> tuple[str | None, str]:
+    """First line of ``QUARTERBACK_TOKEN_CMD``'s output, and why there is not one.
 
-    Kept cheap by contract — it runs on every call — so the timeout is short and a
-    failure is silent: an unresolvable token is reported once, by the caller, as
-    "no token", not as a stack trace per attempt.
+    Kept cheap by contract — it runs on every call — so the timeout is short and no
+    failure raises: an unresolvable token is reported once, by the caller, not as a
+    stack trace per attempt.
+
+    Quiet is not the same as nameless, though, and this used to be both. Every way of
+    not producing a token came back as a bare ``None`` and was reported to the
+    operator as "this machine has no token" — which sent people to add a token
+    command to a config file that already had a working one (#201). The three cases
+    are remedied in three different places, so each says which one happened. Nothing
+    interpolates ``cmd`` or the command's own output: both can carry the credential,
+    and a diagnostic is printed to a terminal and pasted into an issue.
     """
     try:
         proc = subprocess.run(
-            cmd, shell=True, capture_output=True, text=True, timeout=15, env=env
+            cmd, shell=True, capture_output=True, text=True, timeout=_TOKEN_CMD_TIMEOUT, env=env
         )
-    except (OSError, subprocess.SubprocessError):
-        return None
+    except subprocess.TimeoutExpired:
+        # Not `str(e)`: TimeoutExpired renders the command it ran, and this string is
+        # printed. A `QUARTERBACK_TOKEN_CMD` of `echo <literal>` is a real site shape.
+        return None, f"the token command was still running after {_TOKEN_CMD_TIMEOUT}s"
+    except (OSError, subprocess.SubprocessError) as e:
+        return None, f"the token command could not be run ({e.__class__.__name__})"
     # Exit status, not just output. `op read …` and friends print partial or stale
     # material and *then* fail, and a client that took the first line anyway would
     # authenticate with a credential the provider had just disowned — arriving as a
     # 401 loop against the board rather than as the "no token" this reports.
     if proc.returncode != 0:
-        return None
+        return None, f"the token command exited {proc.returncode}"
     token = proc.stdout.split("\n", 1)[0].strip()
-    return token or None
+    if not token:
+        # The #201 shape exactly: a command that ran, succeeded, and matched nothing.
+        return None, "the token command succeeded but produced no output"
+    return token, ""
 
 
 def _hostname() -> str:
@@ -134,6 +164,18 @@ def resolve(env: dict[str, str] | None = None) -> BoardConfig:
     what is set is not one.
     """
     env = dict(os.environ if env is None else env)
+
+    # FIRST, and exported into every child this function starts. The contract
+    # permits `QUARTERBACK_TOKEN_CMD` to reference `$QUARTERBACK_AGENT`, and the
+    # fleet's generated config does; resolved seven lines below the command that
+    # needs it — where it used to be — the variable expanded to empty, the site's
+    # `sed -n s/^$QUARTERBACK_AGENT://p` became `s/^://p`, and every Python client
+    # on the host reported "no token" against a valid token file (#201). The
+    # precedence is untouched, and it is the same one `qb-env:44` implements:
+    # environment if set, else this machine's short hostname.
+    agent = env.get("QUARTERBACK_AGENT") or _hostname()
+    env["QUARTERBACK_AGENT"] = agent
+
     path = config_path(env)
     from_file = _read_config_file(path, env)
 
@@ -162,17 +204,27 @@ def resolve(env: dict[str, str] | None = None) -> BoardConfig:
         )
 
     token = env.get("QUARTERBACK_TOKEN") or from_file.get("QUARTERBACK_TOKEN")
+    token_problem: str | None = None
     if not token:
         cmd = env.get("QUARTERBACK_TOKEN_CMD") or from_file.get("QUARTERBACK_TOKEN_CMD")
         if cmd:
-            token = _run_token_cmd(cmd, env)
+            token, problem = _run_token_cmd(cmd, env)
+            token_problem = problem or None
     if not token and LEGACY_TOKEN_FILE.is_file():
         try:
             token = LEGACY_TOKEN_FILE.read_text().strip() or None
         except OSError:
             token = None
+    # A token found after a failed command is still a token, and the failure is then
+    # history rather than a diagnosis: reporting it would describe a client that is
+    # authenticated as one that is not.
+    if token:
+        token_problem = None
 
-    agent = env.get("QUARTERBACK_AGENT") or _hostname()
     return BoardConfig(
-        base_url=base_url.rstrip("/"), token=token or None, agent=agent, config_path=path
+        base_url=base_url.rstrip("/"),
+        token=token or None,
+        agent=agent,
+        config_path=path,
+        token_problem=token_problem,
     )

@@ -931,6 +931,16 @@ the board client work whether or not that CLI is installed. There is deliberatel
 default board URL**: unset means this machine has not been told which board it belongs to,
 and guessing would point the query at somebody else's.
 
+**`QUARTERBACK_TOKEN_CMD` may reference `$QUARTERBACK_AGENT`, so the agent name has to be
+resolved before the command runs.** One generated config across N hosts, each picking its
+own line out of a shared token file — `sed -n s/^$QUARTERBACK_AGENT://p ~/.config/quarterback/api-tokens`
+— is the shape this exists for, and it only works if the client defaults the name
+(environment, else `hostname -s`) *first* and exports it into the command's environment.
+A client that resolves it afterwards expands the variable to empty and reports "no token"
+against a token file that is present and valid, which presents as intermittent because it
+then depends on whether the invoking shell happened to carry the variable (#201). `qb-board`
+does this; the remaining harness-side readers are tracked in #235.
+
 ## Caveats
 
 Read these before adopting rather than after.

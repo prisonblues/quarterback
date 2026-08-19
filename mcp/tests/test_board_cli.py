@@ -26,8 +26,10 @@ from mcp_server.board.__main__ import (
 class Cfg:
     base_url = "https://board.example"
     token = "tok"
+    agent = "daedalus"
     config_path = "/home/rich/.config/quarterback/config"
     authenticated = True
+    token_problem = None
 
 
 def parse(*argv):
@@ -108,6 +110,44 @@ def test_with_no_token_a_dead_board_is_reported_as_down():
     err = io.StringIO()
     assert _report_health(DownClient(), Cfg(), err) == 1
     assert "DOWN" in err.getvalue()
+
+
+def test_a_token_source_that_answered_nothing_is_not_reported_as_an_unset_one():
+    """#201: the message sent operators to configure what was already configured.
+
+    On the host this was found on the token file was present and valid and the
+    config was correct per the documented contract; the client had failed to supply
+    a variable it defines itself. "Set QUARTERBACK_TOKEN_CMD" is then advice to edit
+    a generated file to work around a client bug — so when a credential source did
+    run, the report names the event and the identity it ran under instead.
+    """
+
+    class Failed(Cfg):
+        token = None
+        authenticated = False
+        token_problem = "the token command succeeded but produced no output"
+
+    err = io.StringIO()
+    assert _report_health(HealthyClient(), Failed(), err) == 1
+    out = err.getvalue()
+    assert "is up" in out
+    assert "produced no output" in out
+    assert "daedalus" in out  # the agent the command expanded to: the whole bug
+    # And NOT the old instruction, which is the part that cost the operator the hour.
+    assert "Set QUARTERBACK_TOKEN" not in out
+
+
+def test_the_set_one_message_survives_for_a_host_that_genuinely_has_none():
+    """The old wording is correct in the case it was written for, and stays."""
+
+    class Bare(Cfg):
+        token = None
+        authenticated = False
+        token_problem = None
+
+    err = io.StringIO()
+    assert _report_health(HealthyClient(), Bare(), err) == 1
+    assert "Set QUARTERBACK_TOKEN or QUARTERBACK_TOKEN_CMD" in err.getvalue()
 
 
 # -- resume ------------------------------------------------------------
