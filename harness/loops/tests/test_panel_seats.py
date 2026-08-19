@@ -189,6 +189,103 @@ def test_a_real_sandbox_is_a_real_repo(tmp_path):
     assert inside.stdout.strip() == "true", inside.stderr
 
 
+# ------------------------------------------------- the sandbox's cost, recorded
+
+def _seat_returning(monkeypatch, out, err=None, reply="[]"):
+    """One seat run to completion with `run_cli` replaced. `out` is its stdout;
+    `err` a failure reason; `reply` what a parser should be able to read."""
+    monkeypatch.setattr(panel.shutil, "which", lambda name: "/usr/bin/" + name)
+    monkeypatch.setattr(panel_seats, "claude_usage", lambda _sids: None)
+    monkeypatch.setattr(panel.subprocess, "run", lambda *a, **k: type(
+        "P", (), {"returncode": 0, "stdout": "", "stderr": ""})())
+    calls = {"n": 0}
+
+    def fake_run_cli(args, label, timeout=panel.CLI_TIMEOUT, attempts=3,
+                     stdin_text=None, on_output=None, replied=None, cwd=None):
+        calls["n"] += 1
+        return (out, err)
+
+    monkeypatch.setattr(panel_seats, "run_cli", fake_run_cli)
+    return calls
+
+
+def test_every_shape_of_turn_records_the_seat_as_blind(monkeypatch):
+    """The flag has to survive all four exits `run_seat` has after the sandbox
+    exists, because `coverage_veto` fails CLOSED on it: a path that forgets to set
+    it does not crash, it silently restores the standing veto the exemption was
+    added to remove — and the symptom is a confidence signal that goes quiet again
+    weeks later, with every test still green.
+
+    The four are a CLI that failed after starting, a reply that parsed, a reply
+    neither attempt could parse, and a retry that landed."""
+    # 1. a reply that parses
+    _seat_returning(monkeypatch, '[]')
+    assert panel.review_llm("claude", "sonnet", "p").code_blind is True
+
+    # 2. the CLI failed after the sandbox was made
+    _seat_returning(monkeypatch, None, err="claude (sonnet): exited 1 (boom)")
+    got = panel.review_llm("claude", "sonnet", "p")
+    assert got.skip and got.code_blind is True
+
+    # 3. neither attempt's reply could be read — kept as one raw finding
+    _seat_returning(monkeypatch, "I am prose, not JSON")
+    got = panel.review_llm("claude", "sonnet", "p")
+    assert got.unstructured is True and got.code_blind is True
+
+    # 4. the reparse retry is what landed. The replies actually HANDED OVER are
+    # asserted, not just the findings: an empty findings list is what the
+    # parsed-first-time branch returns too, so without this the retry exit could
+    # stop being taken and the test would still pass on the path it exists for.
+    monkeypatch.setattr(panel.shutil, "which", lambda name: "/usr/bin/" + name)
+    monkeypatch.setattr(panel_seats, "claude_usage", lambda _sids: None)
+    replies = ["prose first", "[]"]
+    handed = []
+
+    def two_tries(args, label, timeout=panel.CLI_TIMEOUT, attempts=3,
+                  stdin_text=None, on_output=None, replied=None, cwd=None):
+        handed.append(replies[len(handed)])
+        return (handed[-1], None)
+
+    monkeypatch.setattr(panel_seats, "run_cli", two_tries)
+    got = panel.review_llm("claude", "sonnet", "p")
+    assert handed == replies, "the retry exit was not the one taken"
+    assert got.findings == [] and got.unstructured is False
+    assert got.code_blind is True
+
+
+def test_a_seat_that_never_reached_a_sandbox_is_not_recorded_as_blind(monkeypatch):
+    """The default is False and these are the paths that keep it.
+
+    A seat refused before any sandbox exists — its CLI is not installed, or its
+    effort is a typo — has no coverage to characterise, and saying it "could not
+    read the code" would be describing a run that never happened. `absent` already
+    carries the one of the two that `coverage_veto` exempts, and the typo is a
+    config error that should keep vetoing."""
+    monkeypatch.setattr(panel.shutil, "which", lambda _n: None)
+    got = panel.review_llm("antigravity", "m", "p")
+    assert got.absent is True and got.code_blind is False
+
+    monkeypatch.setattr(panel.shutil, "which", lambda name: "/usr/bin/" + name)
+    got = panel.review_llm("codex", "gpt", "p", effort="wrongo")
+    assert got.skip and "unknown reasoning effort" in got.skip
+    assert got.code_blind is False
+
+
+def test_the_shared_seat_runner_is_where_blindness_comes_from(monkeypatch):
+    """`review_llm` and `ask_llm` both go through `run_seat`, which is the only
+    place the sandbox is made — so the flag is set once, for both.
+
+    Pinned on `run_seat` itself because that is the claim worth protecting: an ask
+    has nowhere to put the flag today (`SeatAnswer` carries no coverage field), and
+    the day it grows one the value has to come from here rather than from a second
+    copy of the reasoning that can drift out of step with the review path. A second
+    `run_seat` is the defect class this whole module exists to close."""
+    _seat_returning(monkeypatch, "[]")
+    assert panel_seats.run_seat("claude", "sonnet", "p").code_blind is True
+    # ...and the review path READS that field rather than deciding for itself.
+    assert panel.review_llm("claude", "sonnet", "p").code_blind is True
+
+
 # ---------------------------------------------------------------- what a lost seat says
 
 def _stub_panel(monkeypatch, findings=None, cfg=TWO_SEAT_CFG, runs=None):

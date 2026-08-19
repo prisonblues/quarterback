@@ -173,6 +173,79 @@ decision and the missing hint among them, fed a literal 404 string precisely so 
 behaviour rather than the existence of a new function. The rest cover new symbols and are
 `red/green: N-A (new code path)`: reaching for a new name fails the old code with an
 `AttributeError`, which proves only that the name is new.
+## v2.50 — the coverage veto stops reporting a constant
+
+`round_stop` computes `confident` as `not veto`, so anything `coverage_veto`
+files permanently costs the panel its confident stop. Three of the things it
+filed were true of **every** round, which makes them worth nothing as evidence
+and expensive as noise: the signal that decides whether to spend another round
+was never positive, and a signal that is never positive trains its reader to
+skip it.
+
+**A reviewer that cannot read the code declares gaps it will declare every
+round.** Every seat reviews from the diff alone — an empty `member_sandbox` cwd
+and no file tools — so `could_not_assess` fills up with questions about code the
+diff does not show. That is a fact about how the panel is BUILT, not about the PR
+in front of it, and it fired on any PR that so much as referenced a file it did
+not change. Measured on PR #160's round 1: 19 veto lines, 16 of them
+declarations, and **nine of those asked about a file in this very repo** — whether
+`mcp_server/__init__.py` imports the MCP SDK, `QuarterbackClient`'s default
+timeout, `worktree-holder`'s exit codes 3 and 4. The orchestrator answered all
+nine with `grep` in about four minutes. Recorded now as `ReviewerRun.code_blind`,
+reported on the PR comment under a line saying so, and kept out of the veto.
+
+**antigravity cannot be handed a large diff, and the kernel is not negotiable.**
+`agy` is the only seat whose prompt travels in argv, and the kernel caps one
+element at 120,000 bytes — on PR #160 it saw 116,771 of 175,547 chars, 66.5%. A
+budget is a different fact: someone typed it and can raise it, so truncation by
+`max_diff_chars` still vetoes. `argv_clamp` tells them apart and requires the
+kernel to be the **binding** constraint, so a dropped zero in a config cannot
+hide behind it.
+
+**Both are exempted off recorded state, never off the wording of a message.** The
+declarations are free-form model prose and the skip lines are free text, so a
+regex over either would exempt a genuine round-specific gap whose phrasing
+happened to match while still counting the structural one that did not — and
+would silently change which rounds can stop confidently the first time a vendor
+reworded something. This is the argument `ReviewerRun.absent` already made; the
+exemption now generalises to the whole class.
+
+**The argv exemption is applied twice, and the second place is the one that
+matters.** The baseline loader carries an earlier round's truncation forward,
+because increment scope never returns to what round 1 was cut off from. A seat cut
+by the kernel was not going to be closed by a later round either, so carrying it
+put the constant back one round later and left it standing for the whole cycle —
+and `/panel-review-pr` drives several rounds, so exempting only `coverage_veto`
+would have made round 1 look fixed while the loop went right back to never stopping
+confidently. Found by a second model reviewing this branch, which is the argument
+for having one.
+
+**The exemption is narrower than "ignore truncation", in two places a second model
+had to point out.** An argv-capped round still counts as truncated when the question
+is *did this round read the whole PR* — because `reread` erases every earlier round's
+recorded gap, and a round whose kernel-capped seat saw two thirds of the diff cannot
+be the round that closed everyone else's. Exempting the cap says "this gap will never
+close, stop vetoing on it"; it must not also say "this round closed the others". And
+the floor counts LLM seats only: `sonarqube` shares the same mapping and carries no
+`truncated` key, so counting every entry let one running static analyser switch the
+floor off — a confident stop with `--reviewers antigravity` and no LLM having read
+the diff whole. Sonar is the hard gate beside the panel, not a reviewer reading the
+change.
+
+**And each has a floor**, because exempting seats one at a time is how a veto
+list ends up empty on a round nothing read. A panel whose every running seat was
+cut by the argv ceiling vetoes — reachable with `--reviewers antigravity`, and it
+lands on the unattended loops where a confident stop is believed. That is the
+same floor the absent-CLI exemption needed for the same reason.
+
+This is the first half of #113. The second — code access as a per-repo setting,
+defaulting ON, with the empty sandbox as what untrusted-contributor repos turn
+off to — is deliberately separate: landing them together would make turning
+access on **look** like it fixed the confidence signal, when the two changes are
+independent, and on a repo that leaves it off the signal would stay dead. The
+state is a flag rather than a deletion precisely so that half can flip it: a seat
+that could have read the tree and still could not answer is describing the round,
+and has to cost it.
 ## v2.49 — the guard that could not fire
 
 `create-worktree`'s isolated-database step reads the main database name out of the
