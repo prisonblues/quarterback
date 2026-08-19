@@ -161,6 +161,11 @@ Environment:
   QB_SEATS_BAR        0 to leave the status line and the mouse alone (see below)
   QB_SEAT_YOLO        0 to give the seats their permission prompts back
   QB_SEAT_AGENT       the agent binary a seat runs, instead of \`claude\`
+  QB_SEAT_SCOPE       what the seats are called after — \`seat-<scope>-<n>\`.
+                      Defaults to the repository's directory name, which is what
+                      makes two screens on two projects able to both number from
+                      1; set it when two screens share ONE repository, or set it
+                      empty for the machine-wide numbering this had before
 
 The seat bar is a second status line above the seats, one clickable cell per
 seat: the name jumps to that pane, the ✕ closes it after a y/n, and ＋ adds one.
@@ -863,6 +868,17 @@ beside_me() {
 # answer, so `-n` is the honest test for them and forwarding an empty value would
 # only add a variable that says nothing.
 #
+# QB_SEAT_SCOPE goes with QB_SEAT_BRIEF and not with those three, for exactly the
+# same reason: qb-seat reads it with `${QB_SEAT_SCOPE+set}` because empty is the
+# one value that asks for the machine-wide seat numbering it had before #208, and
+# a `-n` test here would drop that request on the floor and give the screen the
+# per-project default it was told not to use.
+#
+# NOTHING IS FORWARDED WHEN IT IS UNSET, which is the whole default: the panes are
+# created with `-c "$REPO"`, so each seat derives the same scope from its own cwd
+# that this screen would have computed for it. A default written out here as well
+# would be a second place for it to live and drift.
+#
 # THIS IS A FUNCTION BECAUSE BOTH PATHS NEED IT, and for a while only one had it.
 # `up` puts the list on the SESSION, so every pane split off later inherits it;
 # --add puts the same list on the one pane it creates, with -e, so it does not
@@ -880,6 +896,7 @@ seat_env_fill() {
     [ -n "${!v:-}" ] && seat_env+=(-e "$v=${!v}")
   done
   [ -n "${QB_SEAT_BRIEF+set}" ] && seat_env+=(-e "QB_SEAT_BRIEF=$QB_SEAT_BRIEF")
+  [ -n "${QB_SEAT_SCOPE+set}" ] && seat_env+=(-e "QB_SEAT_SCOPE=$QB_SEAT_SCOPE")
   # Said out loud, because the last test is allowed to be false and this script
   # runs under `set -e`: a function whose final command is a failed `[` returns 1,
   # and a bare call to it would then take the whole screen down.
@@ -1017,6 +1034,12 @@ if [ "$ACTION" = add ]; then
   pane=$(tmux split-window -h -P -F '#{pane_id}' -t "$first_seat" -c "$REPO" \
     ${seat_env[@]+"${seat_env[@]}"})
   tmux set-option -p -t "$pane" @qb_seat "$next"
+  # Recorded as well as forwarded, and see the note by the session-wide one: the
+  # variable tells the SEAT what it is called, this tells everything that reads
+  # the screen from outside — and --add scopes it to the pane it just made, for
+  # the same reason its -e list is scoped there.
+  [ -z "${QB_SEAT_SCOPE+set}" ] \
+    || tmux set-option -p -t "$pane" @qb_scope "$QB_SEAT_SCOPE"
   tmux select-layout -t "$pane" -E 2>/dev/null || true
   [ -z "$dash_was" ] || dash_resize "$dash_was"
   start_seat "$pane" "$next"
@@ -1121,6 +1144,22 @@ tmux set-option -w -t "$SESSION:seats" pane-border-format \
 # until somebody cds.
 SELF=$(beside_me qb-seats)
 tmux set-option -t "=$SESSION:" @qb_repo "$REPO"
+
+# THE SCOPE IS RECORDED AS WELL AS FORWARDED, and the two are for different
+# readers. The variable tells the seat what to call itself; this tells whatever
+# reads the screen from OUTSIDE which board identity a pane holds — the dashboard
+# joins `zeus/seat-lexray-1` to a tmux pane, and `@qb_repo` alone answers for the
+# default scope only. Two screens on ONE repository with different scopes is the
+# case the knob exists for, and it is exactly the case the repository cannot
+# distinguish (#208).
+#
+# Only when a scope was actually given. Unset means the seats derive the default
+# from their own cwd, which `@qb_repo` already says — and an explicitly EMPTY one
+# is indistinguishable from unset in a tmux format, which costs nothing: an empty
+# scope asks for machine-wide numbering, in which no second screen can hold the
+# same seat number for a reader to confuse it with.
+[ -z "${QB_SEAT_SCOPE+set}" ] \
+  || tmux set-option -t "=$SESSION:" @qb_scope "$QB_SEAT_SCOPE"
 tmux set-option -t "=$SESSION:" @qb_seats_bin "$SELF"
 
 # The bar is opt-out because turning it on is not free: it takes over the status

@@ -25,6 +25,7 @@ import importlib.machinery
 import importlib.util
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -559,3 +560,164 @@ def test_with_no_seat_row_to_join_a_review_still_gets_somewhere():
     calls, windowed = asyncio.run(_drive_review_pane([]))
     assert windowed == ["panel-42"]
     assert not any("split-window" in c for c in calls), calls
+
+
+# ---- two screens on one machine (#208) ---------------------------------------
+#
+# `list-panes -a` is the whole tmux server, so since seats became per-project the
+# dashboard sees two seat 1s and has to tell them apart. Everything below is
+# synchronous: it exercises the joins, not the widgets, and does not need a pilot.
+
+
+def _dash():
+    return _load_app().Dash(interval=3600, gh_interval=3600)
+
+
+def _agents(*holders):
+    return {"agents": [{"holder": h, "state": "working", "reported": None}
+                       for h in holders], "claims": []}
+
+
+def _stated(app, **seat):
+    """A pane record as tmux_seats returns one, filled in only where it matters."""
+    return app.seat_state({"pane": "%0", "repo": "", "scope": "", **seat})
+
+
+def test_a_seat_pane_is_matched_to_its_own_screens_agent():
+    """The number alone is no longer a name. Matching on it shows one screen's
+    agent against the other screen's pane — a wrong answer that looks exactly
+    like a right one."""
+    app = _dash()
+    app.seat_states = {("zeus", "lexray", 1): {"holder": "zeus/seat-lexray-1"},
+                       ("zeus", "nix-fleet", 1): {"holder": "zeus/seat-nix-fleet-1"}}
+    assert _stated(app, seat="1", repo="/home/rich/lexray")["holder"] \
+        == "zeus/seat-lexray-1"
+    assert _stated(app, seat="1", repo="/home/rich/nix-fleet")["holder"] \
+        == "zeus/seat-nix-fleet-1"
+
+
+def test_two_screens_on_one_repository_are_told_apart_by_the_scope_they_were_given():
+    """The case QB_SEAT_SCOPE exists for, and the one @qb_repo cannot answer."""
+    app = _dash()
+    app.seat_states = {("zeus", "review", 1): {"holder": "zeus/seat-review-1"},
+                       ("zeus", "build", 1): {"holder": "zeus/seat-build-1"}}
+    assert _stated(app, seat="1", repo="/home/rich/lexray", scope="review")["holder"] \
+        == "zeus/seat-review-1"
+    assert _stated(app, seat="1", repo="/home/rich/lexray", scope="build")["holder"] \
+        == "zeus/seat-build-1"
+
+
+def test_another_machines_seat_is_not_shown_against_a_local_pane():
+    """The board is the whole FLEET, so `zeus/seat-lexray-1` and
+    `laptop/seat-lexray-1` are both on it and the scope cannot separate them."""
+    app = _dash()
+    app.cfg = SimpleNamespace(agent="zeus")
+    app.seat_states = {("zeus", "lexray", 1): {"holder": "zeus/seat-lexray-1"},
+                       ("laptop", "lexray", 1): {"holder": "laptop/seat-lexray-1"}}
+    assert _stated(app, seat="1", repo="/home/rich/lexray")["holder"] \
+        == "zeus/seat-lexray-1"
+
+    # The machine is the harness's guess at this host's board name, and it may be
+    # wrong. Then the set stays ambiguous and the cell stays empty — a wrong guess
+    # costs the state, it never fills it in with somebody else's agent.
+    app.cfg = SimpleNamespace(agent="not-this-host")
+    assert _stated(app, seat="1", repo="/home/rich/lexray") == {}
+
+
+def test_a_screen_too_old_to_say_its_repo_still_matches_when_it_can():
+    """@qb_repo is newer than @qb_seat. One agent with that number is not a
+    guess; two is, and a coin toss is the bug this join exists to avoid."""
+    app = _dash()
+    app.seat_states = {("zeus", "lexray", 1): {"holder": "zeus/seat-lexray-1"}}
+    assert _stated(app, seat="1")["holder"] == "zeus/seat-lexray-1"
+
+    app.seat_states[("zeus", "nix-fleet", 1)] = {"holder": "zeus/seat-nix-fleet-1"}
+    assert _stated(app, seat="1") == {}
+
+
+def test_a_pane_with_no_agent_on_the_board_is_not_given_someone_elses():
+    app = _dash()
+    app.seat_states = {("zeus", "lexray", 1): {"holder": "zeus/seat-lexray-1"}}
+    assert _stated(app, seat="2", repo="/home/rich/lexray") == {}
+    assert _stated(app, seat="", repo="/home/rich/lexray") == {}
+
+
+def test_the_fleet_table_stashes_a_seat_under_its_machine_and_project():
+    """render_board is what fills seat_states, and the key it uses is the join."""
+    app = _dash()
+    app.query_one = lambda *a, **k: _Sink()
+    # The header line names the board, and there is not one configured in CI.
+    app.cfg = SimpleNamespace(base_url="https://board.example", agent="zeus")
+    app.render_board(_agents("zeus/seat-lexray-1", "laptop/seat-lexray-1",
+                             "zeus/seat-3", "zeus/amber-otter"))
+    assert set(app.seat_states) == {("zeus", "lexray", 1), ("laptop", "lexray", 1),
+                                    ("zeus", None, 3)}
+
+
+class _Sink:
+    """Every widget render_board reaches for, doing nothing. The join is what is
+    under test here; the widgets have their own pilot-driven tests above."""
+
+    row_count = 0
+
+    def update(self, *a, **k): pass
+    def clear(self, *a, **k): pass
+    def add_row(self, *a, **k): pass
+
+
+def test_a_fleet_click_jumps_to_the_pane_in_the_same_project(monkeypatch):
+    """A FLEET row carries a board identity. Jumping to whichever pane tmux
+    listed first is a jump to the wrong project half the time."""
+    module = _load_app()
+    # Built BEFORE the stub goes in: Dash.__init__ shells out to git for the repo
+    # slug, and `module.subprocess` is the stdlib module itself, so patching .run
+    # on it patches it for every caller in the process.
+    app = module.Dash(interval=3600, gh_interval=3600)
+    monkeypatch.setenv("TMUX", "/tmp/whatever,1,0")
+    panes = ["%0\t1\t/home/rich/lexray\t", "%9\t1\t/home/rich/nix-fleet\t"]
+    selected: list[str] = []
+
+    class Done:
+        @property
+        def stdout(self):
+            return "\n".join(panes) + "\n"
+
+    def fake_run(argv, **kw):
+        if "select-pane" in argv:
+            selected.append(argv[-1])
+        return Done()
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    assert app.jump_to_seat(1, "nix-fleet") is True
+    assert selected == ["%9"]
+
+    # No scope to match and more than one candidate: no jump rather than a guess.
+    selected.clear()
+    assert app.jump_to_seat(1, None) is False
+    assert selected == []
+
+    # One candidate and nothing to match it on: the click still works.
+    panes[:] = ["%0\t1\t\t"]
+    assert app.jump_to_seat(1, "lexray") is True
+    assert selected == ["%0"]
+
+
+def test_a_repository_path_with_a_space_in_it_still_finds_its_pane(monkeypatch):
+    """The pane list is tab-separated because @qb_repo is a filesystem path — a
+    space-split returned three fields and matched no seat at all."""
+    module = _load_app()
+    app = module.Dash(interval=3600, gh_interval=3600)      # before the stub; see above
+    monkeypatch.setenv("TMUX", "/tmp/whatever,1,0")
+    selected: list[str] = []
+
+    class Done:
+        stdout = "%4\t2\t/home/rich/my repos/lexray\t\n"
+
+    def fake_run(argv, **kw):
+        if "select-pane" in argv:
+            selected.append(argv[-1])
+        return Done()
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    assert app.jump_to_seat(2, "lexray") is True
+    assert selected == ["%4"]

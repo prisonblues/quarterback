@@ -27,6 +27,23 @@ import pytest
 
 QB_SEAT = Path(__file__).resolve().parent.parent / "bin" / "qb-seat"
 
+#: The scope every seat in this suite gets. A seat is named after the PROJECT it
+#: sits in as well as its number (#208), and the `repo` fixture below is
+#: `tmp_path/"repo"` — so a seat here is `seat-repo-3`, with a pane marker to
+#: match. Spelled once, because the scope appears in about thirty assertions and
+#: in every one of them the subject is the number.
+SCOPE = "repo"
+
+
+def seat_name(n):
+    """What seat `n` calls itself on the board when it works in the `repo` fixture."""
+    return f"seat-{SCOPE}-{n}"
+
+
+def marker_name(n):
+    """The pane marker for seat `n`, which has to agree with the board name."""
+    return f"qb-{seat_name(n)}.pid"
+
 
 @pytest.fixture
 def repo(tmp_path):
@@ -272,7 +289,7 @@ def test_a_working_directory_that_does_not_exist_is_refused(run, tmp_path):
 def test_the_instance_is_per_seat(run):
     """One value for the whole box gives n seats one ask cursor between them —
     whichever polls first swallows the rest's mail."""
-    assert "instance: seat-3" in run("3", "--dry-run").stdout
+    assert f"instance: {seat_name(3)}" in run("3", "--dry-run").stdout
 
 
 def test_each_seat_gets_a_different_instance(run):
@@ -289,7 +306,7 @@ def test_the_agent_is_started_with_the_instance_exported(run, agent):
     """Exported rather than passed: the hook and the MCP server are separate
     processes that have to arrive at the same identity."""
     assert run("4").returncode == 0
-    assert json.loads(agent.read_text())["instance"] == "seat-4"
+    assert json.loads(agent.read_text())["instance"] == seat_name(4)
 
 
 def test_the_agent_is_started_inside_the_repository(run, agent, repo):
@@ -335,9 +352,9 @@ def test_every_seat_gets_the_same_brief_but_its_own_number(run):
     not, there is a dispatcher again."""
     one = run("1", "--dry-run").stdout
     two = run("2", "--dry-run").stdout
-    assert one.replace("seat 1", "seat N").replace("seat-1", "seat-N") == two.replace(
+    assert one.replace("seat 1", "seat N").replace(seat_name(1), "seat-N") == two.replace(
         "seat 2", "seat N"
-    ).replace("seat-2", "seat-N")
+    ).replace(seat_name(2), "seat-N")
 
 
 def test_the_brief_tells_the_seat_to_claim_before_it_works(run):
@@ -376,7 +393,7 @@ def test_qb_seat_claude_chooses_the_agent(run, agent, fake_bin, tmp_path):
     fake_bin("other-agent", _fake_agent_body(other_record))
     assert run("1", env={"QB_SEAT_AGENT": "other-agent"}).returncode == 0
     assert not agent.exists()
-    assert json.loads(other_record.read_text())["instance"] == "seat-1"
+    assert json.loads(other_record.read_text())["instance"] == seat_name(1)
 
 
 # ---- yolo -------------------------------------------------------------------
@@ -501,7 +518,8 @@ def board(fake_bin, tmp_path):
     calls = tmp_path / "curl.args"
     stdin = tmp_path / "curl.stdin"
 
-    def _board(agent_identity="zeus/seat-1", status="200", body=None):
+    def _board(agent_identity=None, status="200", body=None):
+        agent_identity = agent_identity or f"zeus/{seat_name(1)}"
         if body is None:
             body = f'{{"agent":"{agent_identity}","machine":"zeus"}}'
         fake_bin(
@@ -542,16 +560,16 @@ def test_the_name_is_requested_at_first_contact(run, board, agent):
     """The board designates names on FIRST contact and ignores a request from
     anything that arrives after. The lifecycle hook gets there first (it fires
     on SessionStart and sends the instance as a bare key), so a seat that does
-    not ask up front comes up as two random words instead of seat-3."""
-    calls = board("zeus/seat-3")
+    not ask up front comes up as two random words instead of seat-repo-3."""
+    calls = board(f"zeus/{seat_name(3)}")
     result = run(
         "3",
         env={"QUARTERBACK_BASE_URL": "https://board.example", "QUARTERBACK_TOKEN": "t0ken"},
     )
     assert result.returncode == 0
     sent = _sent(calls)
-    assert "X-Agent-Key: seat-3" in sent
-    assert "X-Agent-Name: seat-3" in sent
+    assert f"X-Agent-Key: {seat_name(3)}" in sent
+    assert f"X-Agent-Name: {seat_name(3)}" in sent
     assert "https://board.example/whoami" in sent
     assert "Authorization: Bearer t0ken" in _fed(board)
 
@@ -731,7 +749,7 @@ def test_the_config_file_cannot_reach_the_agent_or_rename_the_seat(run, agent, t
     config.write_text("QUARTERBACK_INSTANCE=hijacked\nexport QB_SEAT_LEAKED=yes\n")
     assert run("1", env={"QUARTERBACK_CONFIG": str(config)}).returncode == 0
     started = json.loads(agent.read_text())
-    assert started["instance"] == "seat-1"
+    assert started["instance"] == seat_name(1)
     assert started["leaked"] is None
 
 
@@ -741,7 +759,7 @@ def test_no_home_does_not_stop_the_seat(run, agent, tmp_path):
     then end a seat over a registration documented as best-effort."""
     result = run("1", unset=("HOME", "QUARTERBACK_CONFIG", "XDG_CONFIG_HOME"))
     assert result.returncode == 0
-    assert json.loads(agent.read_text())["instance"] == "seat-1"
+    assert json.loads(agent.read_text())["instance"] == seat_name(1)
 
 
 def test_no_token_anywhere_means_no_call(run, board, agent):
@@ -763,7 +781,7 @@ def test_a_name_the_board_would_not_give_us_is_reported(run, board, agent):
 
 
 def test_the_expected_name_is_reported_silently(run, board, agent):
-    board("zeus/seat-1")
+    board(f"zeus/{seat_name(1)}")
     result = run(
         "1", env={"QUARTERBACK_BASE_URL": "https://board.example", "QUARTERBACK_TOKEN": "t"}
     )
@@ -771,10 +789,10 @@ def test_the_expected_name_is_reported_silently(run, board, agent):
 
 
 def test_a_name_with_a_json_escape_in_it_is_not_warned_about(run, board, agent):
-    """The reply is read with sed, which does not decode JSON: `zeus\\u002fseat-1`
-    IS zeus/seat-1, and comparing the undecoded form warns about our own parser
-    rather than about the name."""
-    board(body=r'{"agent":"zeus\u002fseat-1","machine":"zeus"}')
+    """The reply is read with sed, which does not decode JSON:
+    `zeus\\u002fseat-repo-1` IS zeus/seat-repo-1, and comparing the undecoded form
+    warns about our own parser rather than about the name."""
+    board(body=r'{"agent":"zeus\u002fseat-repo-1","machine":"zeus"}')
     result = run(
         "1", env={"QUARTERBACK_BASE_URL": "https://board.example", "QUARTERBACK_TOKEN": "t"}
     )
@@ -783,10 +801,10 @@ def test_a_name_with_a_json_escape_in_it_is_not_warned_about(run, board, agent):
 
 
 def test_a_board_that_answers_with_a_bare_name_is_not_warned_about(run, board, agent):
-    """Matched as `!= */seat-N`, a reply with no slash in it warns every seat on
+    """Matched as `!= */seat-…`, a reply with no slash in it warns every seat on
     every start — and three lines nobody needs on every start is how an operator
     learns to skip the one message here that means something."""
-    board("seat-1")
+    board(seat_name(1))
     result = run(
         "1", env={"QUARTERBACK_BASE_URL": "https://board.example", "QUARTERBACK_TOKEN": "t"}
     )
@@ -802,7 +820,7 @@ def test_a_board_that_is_down_does_not_stop_the_seat(run, fake_bin, agent):
     )
     assert result.returncode == 0
     assert "did not answer" in result.stderr
-    assert json.loads(agent.read_text())["instance"] == "seat-2"
+    assert json.loads(agent.read_text())["instance"] == seat_name(2)
 
 
 def test_a_board_that_refuses_the_token_says_so(run, board, agent):
@@ -842,6 +860,153 @@ def test_a_success_with_no_name_in_it_is_passed_over_in_silence(run, board, agen
     assert agent.exists()
 
 
+# ---- the scope: which project a seat belongs to ------------------------------
+#
+# #208. `seat-3` alone makes the NAMESPACE the machine while the NUMBERING is per
+# screen — `qb-seats` numbers from 1 every time it builds one — so the second
+# screen on a box could not start a single seat. These are the tests for the half
+# of the name that fixes it, and the ones that matter most are the two either side
+# of the line: two projects each holding a seat 1, and one project refusing to hold
+# it twice.
+
+
+@pytest.fixture
+def other_repo(tmp_path):
+    """A second git repository, standing in for the second screen's project."""
+    d = tmp_path / "elsewhere"
+    d.mkdir()
+    subprocess.run(["git", "init", "-q", str(d)], check=True)
+    return d
+
+
+def test_two_projects_can_each_hold_the_same_seat_number(run, agent, other_repo,
+                                                         runtime_dir):
+    """The bug, reduced to two calls (#208).
+
+    One screen per project is the obvious way to work, and `qb-seats` numbers
+    every screen's seats from 1 — so before the scope existed this was not an
+    unlucky collision but the guaranteed outcome of starting a second screen.
+    """
+    live = subprocess.Popen(["sleep", "30"])
+    try:
+        (runtime_dir / marker_name(1)).write_text(str(live.pid))
+        result = run("1", cwd=other_repo)
+        assert result.returncode == 0, result.stderr
+        assert json.loads(agent.read_text())["instance"] == "seat-elsewhere-1"
+    finally:
+        live.kill()
+        live.wait()
+
+
+def test_one_project_still_refuses_the_same_seat_twice(run, other_repo, runtime_dir):
+    """The other half, and the reason the guard was never the thing to remove:
+    two panes on ONE seat share a board identity and an ask cursor, and one of
+    them silently eats the other's mail."""
+    live = subprocess.Popen(["sleep", "30"])
+    try:
+        (runtime_dir / "qb-seat-elsewhere-1.pid").write_text(str(live.pid))
+        result = run("1", cwd=other_repo)
+        assert result.returncode == 3
+        assert "seat-elsewhere-1 is already running" in result.stderr
+    finally:
+        live.kill()
+        live.wait()
+
+
+def test_the_marker_and_the_board_name_are_the_same_string(run, agent, runtime_dir):
+    """They have to agree or the guard protects something other than the identity
+    it describes — a marker on the bare number would refuse the second screen's
+    seat 1 while the board happily gave it its own name."""
+    run("6")
+    instance = json.loads(agent.read_text())["instance"]
+    assert (runtime_dir / f"qb-{instance}.pid").exists()
+
+
+def test_the_scope_can_be_named(run, agent):
+    """For the case the default cannot read: two screens on ONE repository."""
+    assert run("1", env={"QB_SEAT_SCOPE": "review"}).returncode == 0
+    assert json.loads(agent.read_text())["instance"] == "seat-review-1"
+
+
+def test_an_empty_scope_asks_for_the_old_machine_wide_numbering(run, agent,
+                                                                runtime_dir):
+    """Set-and-empty is an answer, not a missing one — the same spelling
+    QB_SEAT_BRIEF uses, and the only way to say "number these across the box"."""
+    assert run("4", env={"QB_SEAT_SCOPE": ""}).returncode == 0
+    assert json.loads(agent.read_text())["instance"] == "seat-4"
+    assert (runtime_dir / "qb-seat-4.pid").exists()
+
+
+def test_a_repository_reached_through_a_symlink_is_the_same_seat(run, agent,
+                                                                 repo, tmp_path):
+    """The scope comes off the PHYSICAL path. A seat that got a second identity
+    out of how its directory was spelled would be this bug again with a longer
+    story."""
+    link = tmp_path / "by-another-name"
+    link.symlink_to(repo)
+    assert run("1", cwd=link).returncode == 0
+    assert json.loads(agent.read_text())["instance"] == seat_name(1)
+
+
+# The board is the authority on what a name may be: `X-Agent-Name` is refused with
+# a 400 unless it matches this, and the key header's alphabet is no wider. A repo
+# called `Foo.Bar_2` would otherwise make every seat in it fail registration — so
+# the rule is asserted here rather than described in a comment.
+BOARD_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+BOARD_NAME_MAX = 40
+
+
+@pytest.mark.parametrize(
+    "dirname, expected",
+    [
+        ("Foo.Bar_2", "seat-foo-bar-2-3"),          # case, dots and underscores
+        ("nix-fleet", "seat-nix-fleet-3"),          # a hyphen of its own survives
+        ("-leading-and-trailing-", "seat-leading-and-trailing-3"),
+        ("dots...and___runs", "seat-dots-and-runs-3"),   # runs squeeze to one
+        ("2024", "seat-2024-3"),                    # digits are a fine scope
+        ("a" * 60, "seat-" + "a" * 32 + "-3"),      # capped, not refused
+        ("also-far-too-long-" * 4, "seat-also-far-too-long-also-far-too-l-3"),
+        # The cut lands ON a hyphen here, which is the case that matters: a name
+        # ending in one is refused by the board outright, so the cap trims again
+        # after it truncates.
+        ("abc-" * 9, "seat-" + "-".join(["abc"] * 8) + "-3"),
+    ],
+)
+def test_a_scope_is_slugged_into_something_the_board_will_take(
+    run, agent, tmp_path, dirname, expected
+):
+    d = tmp_path / dirname
+    d.mkdir()
+    subprocess.run(["git", "init", "-q", str(d)], check=True)
+    assert run("3", cwd=d).returncode == 0
+    instance = json.loads(agent.read_text())["instance"]
+    assert instance == expected
+    assert BOARD_NAME_RE.match(instance), f"the board would refuse {instance!r} with a 400"
+    assert len(instance) <= BOARD_NAME_MAX
+
+
+def test_a_scope_that_slugs_away_to_nothing_says_so(run, agent, tmp_path):
+    """The quiet version of this is the bug the scope exists to fix: a seat back
+    in the machine-wide namespace, where the next screen's seat of that number
+    cannot start. An invented project name would be worse."""
+    d = tmp_path / "___"
+    d.mkdir()
+    subprocess.run(["git", "init", "-q", str(d)], check=True)
+    result = run("3", cwd=d)
+    assert result.returncode == 0
+    assert json.loads(agent.read_text())["instance"] == "seat-3"
+    assert "numbered across the whole machine" in result.stderr
+
+
+def test_an_explicitly_empty_scope_is_not_complained_about(run, agent):
+    """It asked for exactly that, so telling it is noise on every start — and
+    noise on every start is how an operator learns to skip the line that means
+    something."""
+    result = run("3", env={"QB_SEAT_SCOPE": ""})
+    assert result.returncode == 0
+    assert result.stderr == ""
+
+
 # ---- one pane per seat ------------------------------------------------------
 #
 # The board cannot catch this one: two panes on the same seat number send the
@@ -853,7 +1018,7 @@ def test_a_success_with_no_name_in_it_is_passed_over_in_silence(run, board, agen
 def test_a_seat_already_running_here_is_refused(run, agent, runtime_dir):
     live = subprocess.Popen(["sleep", "30"])
     try:
-        (runtime_dir / "qb-seat-1.pid").write_text(str(live.pid))
+        (runtime_dir / marker_name(1)).write_text(str(live.pid))
         result = run("1", env={"XDG_RUNTIME_DIR": str(runtime_dir)})
         assert result.returncode == 3
         assert "already running" in result.stderr
@@ -866,7 +1031,7 @@ def test_a_seat_already_running_here_is_refused(run, agent, runtime_dir):
 def test_a_seat_running_elsewhere_does_not_block_this_one(run, agent, runtime_dir):
     live = subprocess.Popen(["sleep", "30"])
     try:
-        (runtime_dir / "qb-seat-1.pid").write_text(str(live.pid))
+        (runtime_dir / marker_name(1)).write_text(str(live.pid))
         assert run("2", env={"XDG_RUNTIME_DIR": str(runtime_dir)}).returncode == 0
     finally:
         live.kill()
@@ -888,12 +1053,12 @@ def _never_live_pid():
 def test_a_marker_left_by_a_seat_that_ended_is_taken_over(run, agent, runtime_dir):
     """A seat that dies leaves its marker behind — nothing cleans it up, and a
     pane that could never be restarted would be worse than the collision."""
-    (runtime_dir / "qb-seat-1.pid").write_text(str(_never_live_pid()))
+    (runtime_dir / marker_name(1)).write_text(str(_never_live_pid()))
     assert run("1", env={"XDG_RUNTIME_DIR": str(runtime_dir)}).returncode == 0
 
 
 def test_a_corrupt_marker_does_not_block_the_seat(run, agent, runtime_dir):
-    (runtime_dir / "qb-seat-1.pid").write_text("not-a-pid")
+    (runtime_dir / marker_name(1)).write_text("not-a-pid")
     assert run("1", env={"XDG_RUNTIME_DIR": str(runtime_dir)}).returncode == 0
 
 
@@ -903,11 +1068,11 @@ def test_the_refusal_can_be_overridden(run, agent, runtime_dir):
     being wrong about it is the shared-inbox bug with nothing on screen."""
     live = subprocess.Popen(["sleep", "30"])
     try:
-        (runtime_dir / "qb-seat-1.pid").write_text(str(live.pid))
+        (runtime_dir / marker_name(1)).write_text(str(live.pid))
         result = run("1", env={"XDG_RUNTIME_DIR": str(runtime_dir), "QB_SEAT_FORCE": "1"})
         assert result.returncode == 0
         assert "QB_SEAT_FORCE is set, starting anyway" in result.stderr
-        assert (runtime_dir / "qb-seat-1.pid").read_text() != str(live.pid)
+        assert (runtime_dir / marker_name(1)).read_text() != str(live.pid)
     finally:
         live.kill()
         live.wait()
@@ -919,7 +1084,7 @@ def test_the_override_needs_a_truthy_value(run, agent, runtime_dir, value):
     "off" that way turns the guard ON."""
     live = subprocess.Popen(["sleep", "30"])
     try:
-        (runtime_dir / "qb-seat-1.pid").write_text(str(live.pid))
+        (runtime_dir / marker_name(1)).write_text(str(live.pid))
         result = run("1", env={"XDG_RUNTIME_DIR": str(runtime_dir), "QB_SEAT_FORCE": value})
         assert result.returncode == 3
         assert not agent.exists()
@@ -933,7 +1098,7 @@ def test_starting_a_seat_records_the_pid_of_the_agent_itself(run, agent, runtime
     process that BECAME the agent. A refactor that backgrounded the agent instead
     would still write a marker and still hold a plausible number."""
     run("5", env={"XDG_RUNTIME_DIR": str(runtime_dir)})
-    marker = runtime_dir / "qb-seat-5.pid"
+    marker = runtime_dir / marker_name(5)
     assert marker.read_text() == str(json.loads(agent.read_text())["pid"])
 
 
@@ -980,11 +1145,11 @@ def test_a_marker_path_pointed_at_something_else_is_not_written_through(
     at the destination, which is most of why it is the primitive here."""
     target = tmp_path / "precious"
     target.write_text("do not overwrite me")
-    (runtime_dir / "qb-seat-1.pid").symlink_to(target)
+    (runtime_dir / marker_name(1)).symlink_to(target)
     result = run("1", env={"XDG_RUNTIME_DIR": str(runtime_dir)})
     assert result.returncode == 0
     assert target.read_text() == "do not overwrite me"
-    marker = runtime_dir / "qb-seat-1.pid"
+    marker = runtime_dir / marker_name(1)
     assert not marker.is_symlink()
     assert marker.read_text() == str(json.loads(agent.read_text())["pid"])
 
@@ -998,19 +1163,19 @@ def test_the_marker_falls_back_to_a_per_user_path(run, agent, tmp_path):
     tmpdir.mkdir()
     result = run("7", env={"TMPDIR": str(tmpdir)}, unset=("XDG_RUNTIME_DIR",))
     assert result.returncode == 0
-    assert (tmpdir / f"qb-seat-{os.getuid()}-7.pid").exists()
+    assert (tmpdir / f"qb-{os.getuid()}-{seat_name(7)}.pid").exists()
 
 
 def test_a_dry_run_is_told_about_a_collision_but_leaves_no_marker(run, agent, runtime_dir):
     live = subprocess.Popen(["sleep", "30"])
     try:
-        (runtime_dir / "qb-seat-1.pid").write_text(str(live.pid))
+        (runtime_dir / marker_name(1)).write_text(str(live.pid))
         assert run("1", "--dry-run", env={"XDG_RUNTIME_DIR": str(runtime_dir)}).returncode == 3
     finally:
         live.kill()
         live.wait()
     run("2", "--dry-run", env={"XDG_RUNTIME_DIR": str(runtime_dir)})
-    assert not (runtime_dir / "qb-seat-2.pid").exists()
+    assert not (runtime_dir / marker_name(2)).exists()
 
 
 def test_the_registration_is_skipped_for_a_dry_run(run, board):

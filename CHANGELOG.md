@@ -11,6 +11,64 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
+## v2.57 — a seat is its number *and* its project, so a second screen can start
+
+One screen per project is the obvious way to work a fleet, and it did not work. Two repos, two
+screens, `qb-b -n 2` in each: the second screen's seats refused to start, every one of them.
+
+**The namespace was the machine while the numbering was per screen.** A seat's identity was
+`seat-<n>` with nothing else in it, and `qb-seats` numbers every screen's seats from 1 — so the
+second screen asked for seat 1, found the first screen's seat 1 holding the pane marker, and
+exited 3. Not an edge case reached by an unlucky choice of number: the guaranteed outcome of
+starting a second screen. `QB_SEAT_FORCE=1` was never the way round it either — it exists for a
+stale marker whose pid got reused, and using it here creates exactly the shared-identity state the
+refusal describes.
+
+**The guard was right; its key was too coarse.** Two panes on one seat really do share a board
+identity *and* an ask cursor, and one of them really does silently eat the other's mail — nothing
+here argues for removing the check. So the key grew a scope instead: a seat is
+`seat-<project>-<n>`, `seat-lexray-1` and `seat-nix-fleet-1` are two seats, and `seat-lexray-1`
+started twice is still one. One identity per pane, one ask cursor per identity, unchanged.
+
+**The scope defaults to the repository's own directory name**, because a screen is per repository —
+so the reproduction above now just works, with nothing to configure and no numbers for a human to
+track across screens. `QB_SEAT_SCOPE` names it explicitly for the two cases that default cannot
+read: two screens on *one* repository, and anyone who wants the old machine-wide numbering back
+(`QB_SEAT_SCOPE=`, empty and meaning it, the same set-and-empty spelling `QB_SEAT_BRIEF` uses).
+
+**It is slugged, and that is not cosmetic.** The board refuses an `X-Agent-Name` that does not match
+`^[a-z0-9]+(?:-[a-z0-9]+)*$` within 40 characters, so a repository called `Foo.Bar_2` would have
+made every seat in it fail registration with a 400. The basename is folded to lower case, every run
+of anything else becomes one hyphen, the ends are trimmed and the middle is capped at 32 — and
+trimmed *again* after the cap, because a cut that lands on a hyphen is a name the board rejects. A
+scope that slugs away to nothing (a directory named `___`) leaves the bare `seat-3` and says so on
+stderr, rather than inventing a project name nobody could type.
+
+**The pane marker moved with it**, because the marker and the board name have to agree or the guard
+protects something other than the identity it describes: `$XDG_RUNTIME_DIR/qb-seat-lexray-1.pid`,
+or `${TMPDIR:-/tmp}/qb-<uid>-seat-lexray-1.pid` where there is no runtime dir. A seat already
+running across this upgrade holds its old marker under the old name; it is not seen by the new one,
+and is left behind for the same reason every stale marker is — nothing cleans them up, and they are
+taken over rather than honoured.
+
+**The dashboard now tells two screens apart**, which it could not before because it never had to.
+`qd.seat_number()` reads the new spelling and the old one; `qd.seat_machine()`, `qd.seat_scope()`
+and `qd.pane_scope()` are the join between a board identity and a tmux pane, and a test asks
+`qb-seat` itself what a scope comes out as rather than asserting on either side's source. A screen
+records `@qb_scope` beside `@qb_repo` so the one case the repository cannot answer for — two screens
+on *one* repository, which is what `QB_SEAT_SCOPE` is for — is answerable too.
+
+The SEATS panel keys its rows on the pane id: two screens each with a seat 1 gave a `DataTable` the
+same row key twice, so the panel that exists to show the second screen was the thing that could not
+survive one. It labels a seat with its project when more than one screen is up, and matches a pane
+by narrowing — every agent with that seat number, then the ones in this pane's project, then the
+ones on this machine, and a match only if exactly one survives. **The machine half is new and not
+only a #208 consequence:** the board is the whole fleet, so `zeus/seat-lexray-1` and
+`laptop/seat-lexray-1` are both on it, and the old key (the bare number) collided across machines
+exactly as it collided across screens. A FLEET row's click narrows the same way over tmux panes, and
+declines rather than guessing when two answer to the number and nothing says which.
+
+Fixes #208.
 ## v2.56 — what this machine serves is one file per box, not one per checkout
 
 `.harness-rules` answers "what will THIS MACHINE's providers actually serve?" — a fact about the
