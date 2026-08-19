@@ -28,3 +28,7 @@ CLAUDE.local.md
 # here, not a pinned input. It reached main once via a stray `git add -A` (99ba651).
 # Tracking it is a reasonable choice — but a deliberate one, not an accidental one.
 uv.lock
+
+# The per-box, per-repo overlay (untracked). What one MACHINE will serve differs
+# from what the fleet pins: see .harness-rules.sample and harness_rules.py.
+.harness-rules

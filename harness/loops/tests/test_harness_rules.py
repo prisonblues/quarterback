@@ -719,18 +719,60 @@ def test_the_local_overlay_cannot_change_policy(repo, capsys):
         f"who set it is otherwise certain it took effect. stderr was: {err!r}")
 
 
-def test_the_local_overlay_may_not_set_reviewer_fields_other_than_enabled(repo, capsys):
-    """`model` and `effort` are policy: they decide what a review costs.
+def test_the_local_overlay_sets_the_model_and_effort_a_provider_will_serve(repo):
+    """The case the per-box file exists for, and a reversal of this test's own
+    earlier assertion.
 
-    Availability is the machine's business; which model the seat spends is the
-    repo's. A box that could pin `model` locally could quietly move the panel onto
-    a tier nobody agreed to pay for."""
-    write_sample(repo, {"reviewers": {"codex": {"enabled": True, "model": "cheap"}}})
-    write_local(repo, {"reviewers": {"codex": {"enabled": False, "model": "expensive"}}})
+    It used to assert the opposite — that `model` and `effort` are policy, because
+    "a box that could pin `model` locally could quietly move the panel onto a tier
+    nobody agreed to pay for". That cost concern is real and is not what happens
+    here: what a provider WILL SERVE is a fact about the machine, not a preference
+    about spend. On this host codex routes through an employer Azure gateway
+    serving gpt-5.5 while the fleet pins gpt-5.6-luna at `max`, and the gateway
+    refuses both, independently (#215). With the pin unsettable per box the only
+    outcomes are a lost seat or a runtime fallback that reviews on an unnamed
+    model — and the fallback is what shipped, so the board's cost history now
+    records `codex (CLI default)`, which is the exact vagueness the pins exist to
+    prevent.
+
+    The residual risk is kept honest rather than argued away: a local file CAN
+    move a seat to a costlier model, and what stops that being silent is that the
+    panel names the model that actually ran in its header and records it per seat
+    on the board. A spend that nobody agreed to is visible in the same place the
+    agreement would have been.
+    """
+    write_sample(repo, {"reviewers": {"codex": {"enabled": True, "model": "gpt-5.6-luna",
+                                                "effort": "max"}}})
+    write_local(repo, {"reviewers": {"codex": {"model": "gpt-5.5", "effort": "high"}}})
     cfg = hr.resolve_repo(str(repo), from_default_branch=False)
-    assert cfg["reviewers"]["codex"]["enabled"] is False
-    assert cfg["reviewers"]["codex"]["model"] == "cheap"
-    assert "model" in capsys.readouterr().err
+    assert cfg["reviewers"]["codex"]["model"] == "gpt-5.5"
+    assert cfg["reviewers"]["codex"]["effort"] == "high"
+    assert cfg["reviewers"]["codex"]["enabled"] is True, (
+        "a key the overlay does not mention must keep the sample's value")
+
+
+def test_the_local_overlay_still_cannot_set_anything_that_decides_a_merge(repo, capsys):
+    """The line that did NOT move when model/effort crossed it.
+
+    An untracked file is reviewed by nobody, so it must not be able to widen
+    `auto_merge` or open a merge gate. A pin is a fact about a provider; a merge
+    gate is a policy, and policy stays in the tracked sample where a human
+    reviewing a branch can see it."""
+    write_sample(repo, {"auto_merge": "none", "epic": {"sub_pr_merge": "gate"},
+                        "reviewers": {"codex": {"model": "gpt-5.6-luna"}}})
+    write_local(repo, {"auto_merge": "all",
+                       "epic": {"sub_pr_merge": "auto"},
+                       "reviewers": {"codex": {"model": "gpt-5.5",
+                                               "max_diff_chars": 999}}})
+    cfg = hr.resolve_repo(str(repo), from_default_branch=False)
+    assert cfg["auto_merge"] == "none", "the local file must not widen auto-merge"
+    assert cfg["epic"]["sub_pr_merge"] == "gate", "nor open a merge gate"
+    assert cfg["reviewers"]["codex"]["model"] == "gpt-5.5", "but the pin still applies"
+    err = capsys.readouterr().err
+    assert "auto_merge" in err and "epic" in err and "max_diff_chars" in err, (
+        f"every dropped key must be REPORTED — a budget is not a provider fact "
+        f"either, and someone who set one is otherwise certain it took effect. "
+        f"stderr was: {err!r}")
 
 
 def test_an_unknown_seat_in_the_local_overlay_is_reported_not_applied(repo, capsys):

@@ -74,13 +74,33 @@ RULES_FILENAME = ".harness-rules"
 # rather than on which files happen to exist.
 SAMPLE_FILENAME = ".harness-rules.sample"
 
-# What the untracked overlay is allowed to say, and it is deliberately one thing.
+# What the untracked overlay is allowed to say, and it is deliberately narrow.
 # An untracked file is reviewed by nobody — it never appears in a PR, so branch
 # protection cannot see it — which is precisely what makes it right for machine
 # capability and wrong for policy. Left unrestricted it would be a way to widen
 # `auto_merge` on a box with no review at all, and the timers would honour it.
+#
+# Three keys, and all three answer the same question: what will this machine's
+# provider actually serve? `enabled` covers a CLI that is not installed —
+# daedalus deliberately carries no `agy` and no `pi`. `model` and `effort` cover
+# a CLI that IS installed and refuses the pin anyway, which is #215: codex here
+# routes through an employer Azure gateway serving gpt-5.5, while the fleet pins
+# gpt-5.6-luna at `max` effort, and the gateway refuses BOTH — independently.
+#
+# Those two are the reason a per-box file had to exist at all rather than a
+# per-box `enabled` toggle. #215 shipped a runtime fallback that lowers an
+# unsatisfiable pin and recovers the seat, which is the right floor but not a
+# plan: it spends two extra CLI round-trips on every panel, and it records
+# `codex (CLI default)` in the board's cost history — the exact vagueness the
+# pins exist to prevent. Naming `gpt-5.5, high` here records the brain that
+# actually reviewed.
+#
+# What stays OUT is everything that decides what may be merged: `auto_merge`,
+# the epic and preland blocks, budgets, title patterns. A pin is a fact about a
+# provider; a merge gate is a policy, and policy belongs in the tracked sample
+# where a human reviewing a branch can see it.
 _LOCAL_BLOCK = "reviewers"
-_LOCAL_KEYS = ("enabled",)
+_LOCAL_KEYS = ("enabled", "model", "effort")
 
 # Where a bare `--repo <name>` is looked up when it isn't a path.
 REPO_ROOT = Path(os.environ.get("HARNESS_REPO_ROOT") or Path.home() / "source")
