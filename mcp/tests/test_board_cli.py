@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import io
 import os
+import re
+import shutil
+import subprocess
 
 import httpx
 import pytest
@@ -11,6 +14,7 @@ from mcp_server.board import __main__ as cli
 from mcp_server.board.__main__ import (
     RecipientUnresolved,
     _client,
+    _no_token_source_remedy,
     _project_dir,
     _report_health,
     _strip_verb,
@@ -135,7 +139,15 @@ def test_a_token_source_that_answered_nothing_is_not_reported_as_an_unset_one():
     assert "produced no output" in out
     assert "daedalus" in out  # the agent the command expanded to: the whole bug
     # And NOT the old instruction, which is the part that cost the operator the hour.
-    assert "Set QUARTERBACK_TOKEN" not in out
+    #
+    # The whole sentence, and case-insensitively, because the round-1 form of this guard
+    # (`"Set QUARTERBACK_TOKEN" not in out`) had stopped biting: the branch offers
+    # "Or export QUARTERBACK_TOKEN in the environment", and an earlier wording of it said
+    # "Or set QUARTERBACK_TOKEN…" — missed on the capital S alone. Passing on
+    # capitalisation is not passing, so the assertion names the remedy that must not
+    # appear (configure a token source, i.e. `_no_token_source_remedy`) rather than a
+    # prefix of it that the legitimate one-shot advice also starts with.
+    assert "set quarterback_token or quarterback_token_cmd" not in out.lower()
 
 
 def test_the_token_problem_report_says_what_to_do_next():
@@ -183,9 +195,11 @@ def test_a_problem_with_no_command_configured_gets_the_other_remedy():
     out = err.getvalue()
     assert "could not be read" in out  # still named, which is the point of #201
     assert "Set QUARTERBACK_TOKEN or QUARTERBACK_TOKEN_CMD" in out
-    # And NOT the command remedy, which there is no command to re-run for.
+    # And NOT the command remedy, which there is no command to re-run for. Matched on
+    # "not the remedy" rather than a longer quotation of the sentence, so rewording the
+    # command branch's prose cannot quietly turn this guard into a tautology.
     assert "eval" not in out
-    assert "setting one is not the remedy" not in out
+    assert "not the remedy" not in out.lower()
 
 
 def test_an_awkward_agent_name_stays_copy_pasteable_in_the_remedy():
@@ -218,6 +232,150 @@ def test_the_set_one_message_survives_for_a_host_that_genuinely_has_none():
     err = io.StringIO()
     assert _report_health(HealthyClient(), Bare(), err) == 1
     assert "Set QUARTERBACK_TOKEN or QUARTERBACK_TOKEN_CMD" in err.getvalue()
+
+
+def _cmd_failure_report(config_path, agent="daedalus"):
+    """The `token_cmd_configured` diagnostic, as stderr text, for `config_path`.
+
+    Instance attributes over another `Cfg` subclass per test: the recipe interpolates
+    both of these, so every guard below wants its own path and name rather than the
+    module-level default.
+    """
+    cfg = Cfg()
+    cfg.token = None
+    cfg.authenticated = False
+    cfg.token_problem = "the token command succeeded but produced no output"
+    cfg.config_path = str(config_path)
+    cfg.agent = agent
+    err = io.StringIO()
+    assert _report_health(HealthyClient(), cfg, err) == 1
+    return err.getvalue()
+
+
+def _recipe_lines(out):
+    """The shell lines offered for copy-pasting, in the order they are printed.
+
+    The recipe is indented twelve spaces and the prose around it eight, which is what
+    tells them apart — and is why a prose line that grew a deeper indent would show up
+    here as a broken shell command rather than passing unnoticed.
+    """
+    return [line[12:] for line in out.splitlines() if line.startswith(" " * 12)]
+
+
+def _run_recipe(recipe):
+    """Run the printed lines the way an operator would paste them into a shell.
+
+    Nothing of this process's environment goes in but `PATH`: the recipe's own export is
+    what has to establish `QUARTERBACK_AGENT`, and inheriting one would hide the very
+    ordering bug this checks for.
+    """
+    bash = shutil.which("bash")
+    if bash is None:  # pragma: no cover - no bash to source the config with
+        pytest.skip("no bash to run the suggested reproduction with")
+    proc = subprocess.run(
+        [bash, "-c", "\n".join(recipe)],
+        capture_output=True,
+        text=True,
+        env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+    )
+    assert proc.returncode == 0, proc.stderr
+    return proc.stdout
+
+
+def test_the_suggested_reproduction_runs_under_the_identity_the_client_used(tmp_path):
+    """Copy-paste the recipe and you get the client's identity, not the file's.
+
+    `config.resolve` puts the resolved agent name into the environment *first* and then
+    sources the config, and it deliberately ignores a `QUARTERBACK_AGENT=` line in the
+    file — the divergence from `qb-env` that config.py's docstring argues for. So a
+    recipe that exports the name and *then* sources the file hands that ignored line the
+    chance to overwrite it, and the command runs as somebody else: a reproduction of a
+    bug the client never had, offered by the message whose entire subject is which
+    identity the command ran under (#201).
+
+    Proved by running the printed lines through bash against a config that pins a
+    different name, rather than by asserting on their order — the order only matters
+    because of what bash does with it, so bash is what should answer.
+    """
+    # A plain assignment, which is the shape `qb-env` honours and this client does not,
+    # and a single-quoted command, which is the documented form: the reference is expanded
+    # by the shell that runs the command, so it sees whichever name is exported by then.
+    # The pinned name is one byte long, so `wc -c` alone separates the two identities.
+    config = tmp_path / "config"
+    config.write_text(
+        "QUARTERBACK_AGENT=a\nQUARTERBACK_TOKEN_CMD='printf %s \"tok-$QUARTERBACK_AGENT\"'\n"
+    )
+    out = _run_recipe(_recipe_lines(_cmd_failure_report(config)))
+    # len("tok-daedalus") == 12; the file's pin would have made it len("tok-a") == 5.
+    assert out.split() == ["12"]
+
+
+def test_the_suggested_reproduction_keeps_the_credential_out_of_the_terminal(tmp_path):
+    """It promises not to print the token, so it must not tell you to print it.
+
+    Two lines above the recipe the message explains that the command's output is not
+    repeated here *because it can be the token*; a bare `eval "$QUARTERBACK_TOKEN_CMD"`
+    then puts it in scrollback, and in shell history if it was typed. The failure being
+    diagnosed is "no output", which a byte count answers — and the operator can drop the
+    pipe deliberately when they do want the value.
+    """
+    config = tmp_path / "config"
+    config.write_text("QUARTERBACK_TOKEN_CMD='printf %s s3cret-bearer'\n")
+    out = _cmd_failure_report(config)
+    assert 'eval "$QUARTERBACK_TOKEN_CMD" | wc -c' in out
+    # And no line is the bare eval — the piped form contains the unpiped one as a
+    # substring, so only an anchored match can tell the two apart.
+    assert not re.search(r'^\s*eval "\$QUARTERBACK_TOKEN_CMD"\s*$', out, re.M)
+    pasted = _run_recipe(_recipe_lines(out))
+    assert "s3cret" not in pasted
+    assert pasted.split() == ["13"]  # len("s3cret-bearer"), and nothing else
+
+
+def test_every_recipe_line_keeps_its_own_comment_on_its_own_line():
+    """The missing-comma shape, pinned as output rather than as source.
+
+    `f"… {path}"` and `"   # skip if yours…"` were adjacent literals in the `lines` list
+    with no comma between them — implicitly concatenated, which happened to produce the
+    intended line. Putting the comma back (or losing one from a neighbour) changes the
+    printed message without failing anything, so what is asserted is the message: each
+    shell line carries its own trailing comment, and no line of the output is a stray
+    comment fragment standing on its own.
+    """
+    out = _cmd_failure_report("/home/rich/.config/quarterback/config")
+    recipe = _recipe_lines(out)
+    assert len(recipe) == 3
+    assert all("   # " in line for line in recipe)
+    assert recipe[0].endswith("# skip if yours is in the environment")
+    assert not [line for line in out.splitlines() if line.strip().startswith("#")]
+
+
+def test_the_no_token_source_remedy_is_one_text_in_both_places():
+    """The two "configure a token source" arms print the same string, not two copies.
+
+    A named failure whose source was not a token command, and a host that configured
+    nothing at all, get the same advice — and it was written out twice, a dozen lines
+    apart, which is the arrangement where one copy gets reworded and the other does not.
+    """
+
+    class NoCommand(Cfg):
+        token = None
+        authenticated = False
+        token_problem = "/run/op-secrets/quarterback-token is empty"
+        token_cmd_configured = False
+
+    class Nothing(Cfg):
+        token = None
+        authenticated = False
+        token_problem = None
+
+    remedy = "\n".join(_no_token_source_remedy(Cfg()))
+    assert "QUARTERBACK_TOKEN_CMD" in remedy  # a remedy, not an empty string to match
+    for cfg in (NoCommand(), Nothing()):
+        err = io.StringIO()
+        assert _report_health(HealthyClient(), cfg, err) == 1
+        assert remedy in err.getvalue()
+    # And absent from the branch it would be wrong in: that host has a command already.
+    assert remedy not in _cmd_failure_report(Cfg.config_path)
 
 
 # -- resume ------------------------------------------------------------

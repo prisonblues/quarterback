@@ -202,6 +202,24 @@ def resolve_recipient(client: QuarterbackClient, to: str | None) -> str | None:
         raise RecipientUnresolved(str(e)) from e
 
 
+def _no_token_source_remedy(cfg) -> list[str]:
+    """What to do when nothing on this host can produce a token — written once.
+
+    Two callers, a dozen lines apart in :func:`_report_health`: the named-failure
+    branch whose failing source was *not* a token command, and the plain "nothing was
+    configured at all" ending. They said almost the same thing in almost the same
+    words, which is the shape that drifts — one gets reworded, the other does not, and
+    the same host gets different advice depending on which arm it lands in. The act
+    being recommended is identical, so the text is built here and each caller prefixes
+    only the sentence that genuinely differs.
+    """
+    return [
+        "        Set QUARTERBACK_TOKEN or QUARTERBACK_TOKEN_CMD in",
+        f"        {cfg.config_path}, or export QUARTERBACK_TOKEN for this",
+        "        invocation.",
+    ]
+
+
 def _report_health(client: QuarterbackClient, cfg, err) -> int:
     """The tokenless answer: up or down, rather than a stack trace.
 
@@ -236,9 +254,13 @@ def _report_health(client: QuarterbackClient, cfg, err) -> int:
         #
         # Which remedy is the right one is `token_cmd_configured`'s question, not a
         # question about the wording of `token_problem`: the source that failed can be
-        # the legacy token file on a host that configures no command at all, and
-        # telling *that* operator "setting one is not the remedy" would be this bug
-        # over again — a confident instruction that is false on the box reading it.
+        # the legacy token file on a host that configures no command at all, and telling
+        # *that* operator "adding or editing a token command is not the remedy" would be
+        # this bug over again — a confident instruction that is false on the box reading
+        # it. Which is also why the two arms below say different things about the same
+        # variable: adding or editing a token *command* is what is not the remedy here,
+        # while exporting `QUARTERBACK_TOKEN` is a one-shot bypass of the command and is
+        # available on every host, working or not.
         lines = [
             f"{_PROG}: {cfg.base_url} is up, but no token could be resolved, so the",
             "        board itself cannot be read.",
@@ -247,33 +269,59 @@ def _report_health(client: QuarterbackClient, cfg, err) -> int:
         if cfg.token_cmd_configured:
             # `shlex.quote` because an agent name is environment-overridable, and a
             # line offered for copy-pasting has to survive whatever is in it.
+            #
+            # The order of the three recipe lines is load-bearing, and it is the reverse
+            # of the one that reads naturally. `config.resolve` puts the resolved name
+            # into the environment FIRST — before it sources the file, before the command
+            # runs — and deliberately does not honour a `QUARTERBACK_AGENT=` line in the
+            # file at all; that divergence from `qb-env` is argued in config.py's
+            # docstring. Sourcing after the export would hand exactly that ignored line
+            # the chance to overwrite the name, so the paste would run the command under
+            # an identity the client never used. A reproduction that reproduces something
+            # else is worse than none here, because naming the identity the command ran
+            # under IS this message (#201).
+            #
+            # And `wc -c` rather than a bare eval: two lines above, this promises not to
+            # repeat the command's output because it can be the token. Telling the
+            # operator to print it themselves puts the credential in scrollback — and in
+            # shell history, if typed — to answer a question that a byte count already
+            # answers, since the failure being diagnosed is "no output".
+            cfg_file, agent = shlex.quote(str(cfg.config_path)), shlex.quote(cfg.agent)
             lines += [
                 "        The command is the environment's QUARTERBACK_TOKEN_CMD, or the",
                 f"        one in {cfg.config_path} — one of the two is",
-                "        already set, so setting one is not the remedy. To see what it",
-                "        says, run it yourself under that name; its own output is",
-                "        deliberately not repeated here, because it can be the token:",
-                f"            export QUARTERBACK_AGENT={shlex.quote(cfg.agent)}",
-                f"            . {shlex.quote(str(cfg.config_path))}"
-                "   # skip if yours is in the environment",
-                '            eval "$QUARTERBACK_TOKEN_CMD"',
-                "        Or set QUARTERBACK_TOKEN in the environment: a one-shot override",
-                "        that bypasses the command without editing a generated config.",
+                "        already set, so adding or editing a token command is not the",
+                "        remedy. To see what it says, run it yourself under that name;",
+                "        its own output is deliberately not repeated here, because it",
+                "        can be the token:",
+                f"            . {cfg_file}   # skip if yours is in the environment",
+                f"            export QUARTERBACK_AGENT={agent}   # after the source, not before",
+                '            eval "$QUARTERBACK_TOKEN_CMD" | wc -c   # bytes, not the token',
+                "        The export goes AFTER the source on purpose: this client ignores",
+                "        a QUARTERBACK_AGENT= line in the file, so sourcing last would run",
+                "        the command as a name the client never used. And 0 bytes is the",
+                "        failure above, reproduced, with nothing secret in your",
+                "        scrollback — drop the pipe once you need the value itself.",
+                "        Or export QUARTERBACK_TOKEN in the environment — a one-shot override",
+                "        that bypasses the command rather than fixing it, and needs no edit",
+                "        to a generated config.",
             ]
         else:
             lines += [
                 "        Nothing configured a token command, so that was the last-resort",
                 "        fallback failing rather than your own configuration.",
-                "        Set QUARTERBACK_TOKEN or QUARTERBACK_TOKEN_CMD in",
-                f"        {cfg.config_path}, or export QUARTERBACK_TOKEN for this",
-                "        invocation.",
+                *_no_token_source_remedy(cfg),
             ]
         print("\n".join(lines), file=err)
         return 1
     print(
-        f"{_PROG}: {cfg.base_url} is up, but this machine has no token, so the board\n"
-        f"        itself cannot be read. Set QUARTERBACK_TOKEN or QUARTERBACK_TOKEN_CMD\n"
-        f"        in {cfg.config_path}.",
+        "\n".join(
+            [
+                f"{_PROG}: {cfg.base_url} is up, but this machine has no token, so the",
+                "        board itself cannot be read.",
+                *_no_token_source_remedy(cfg),
+            ]
+        ),
         file=err,
     )
     return 1

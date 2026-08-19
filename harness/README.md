@@ -934,18 +934,42 @@ and guessing would point the query at somebody else's.
 **`QUARTERBACK_TOKEN_CMD` may reference `$QUARTERBACK_AGENT`, so the agent name has to be
 resolved before the command runs.** One generated config across N hosts, each picking its
 own line out of a shared token file is the shape this exists for, and it only works if the
-client defaults the name (environment, else the config file, else `hostname -s`) *first*
-and exports it into the command's environment. A client that resolves it afterwards
-expands the variable to empty and reports "no token" against a token file that is present
-and valid, which presents as intermittent because it then depends on whether the invoking
-shell happened to carry the variable (#201). `qb-board` does this; the remaining
-harness-side readers are tracked in #235.
+client resolves the name (environment, else `hostname -s`) *first* and exports it into the
+command's environment. A client that resolves it afterwards expands the variable to empty
+and reports "no token" against a token file that is present and valid, which presents as
+intermittent because it then depends on whether the invoking shell happened to carry the
+variable (#201). `qb-board` does this; the remaining harness-side readers are tracked in
+#235.
 
-Write the selector as a **literal** comparison rather than a regex:
+What the board client resolves, and from where:
+
+| Variable | Resolved from | Notes |
+|---|---|---|
+| `QUARTERBACK_BASE_URL` | environment, else the config file | No default at all: unset is an error rather than a guess at somebody else's board |
+| `QUARTERBACK_TOKEN` / `QUARTERBACK_TOKEN_CMD` | each: environment, else the config file | A static token wins over a command *whatever source each came from* — the command runs only when neither the environment nor the file set `QUARTERBACK_TOKEN`. So a one-shot `QUARTERBACK_TOKEN=…` overrides everything, while a one-shot `QUARTERBACK_TOKEN_CMD=…` does not override a static token in the file |
+| `QUARTERBACK_AGENT` | environment, else `hostname -s` — **never the config file** | Resolved and exported before the token command runs, so that command may reference it. A `QUARTERBACK_AGENT=…` line in the config file is **not** honoured by this client, though `qb-env` honours one |
+| `QUARTERBACK_CONFIG` | environment | Which file the above is read from; `$XDG_CONFIG_HOME/quarterback/config`, else `~/.config/quarterback/config` |
+
+**That third row is a deliberate divergence from `qb-env`, not an oversight.** `qb-env`
+sources the config into the calling shell and only *then* applies
+`QUARTERBACK_AGENT="${QUARTERBACK_AGENT:-$(hostname -s)}"`, so on the shell side a plain
+`QUARTERBACK_AGENT=daedalus` in the file overwrites whatever the environment said. Buying
+that parity here means reproducing bash's interleaving of assignments and source-time
+expansions in Python, and the implementation that tried produced a **split identity**:
+with a pinned name and a *double*-quoted token command, one agent's credential was fetched
+while the client posted as another. The fleet's generated config names no agent at all, so
+the pin is a shape the contract allows and no host writes — declining it costs less than
+fetching daedalus's token and posting as atlas. Which is also why the token command below
+is **single-quoted**: nothing in it expands when the file is sourced, and
+`$QUARTERBACK_AGENT` is expanded by the shell that runs it, against the name the client
+has by then resolved.
+
+Write the selector as a **literal** comparison rather than a regex, and have it print
+everything after the first colon:
 
 ```sh
 QUARTERBACK_TOKEN_CMD='awk -F: -v a="$QUARTERBACK_AGENT" \
-    "\$1 == a { print \$2; exit }" ~/.config/quarterback/api-tokens'
+    "\$1 == a { sub(/^[^:]*:/, \"\"); print; exit }" ~/.config/quarterback/api-tokens'
 ```
 
 The obvious `sed -n s/^$QUARTERBACK_AGENT://p …` is what the fleet generates today and it
@@ -953,8 +977,18 @@ works for the names the fleet uses, but it interpolates the agent name into *bot
 word and a regex — so a name containing `.` silently matches a different host's line, one
 containing `/` breaks the `s///` delimiter, and one containing whitespace splits into two
 `sed` arguments. The name is environment-overridable, so none of those is hypothetical;
-`awk` with `-v` takes it as data and compares it whole. The escaping burden is the token
-command's either way — the client exports the name and does not quote it for you.
+`awk` with `-v` takes it as data and compares it whole — with one caveat, since `-v` does
+perform backslash-escape processing on the value: a name containing `\t` or `\\` still does
+not arrive whole, and matches nothing rather than the wrong line. For the three characters
+above the claim holds.
+
+The `sub()` matters as much as the comparison does. Under `-F:`, `print $2` is only the
+*first* colon-delimited field of the token, so a structured `daedalus:v1:abc123…` line
+authenticates with a truncated bearer — where the `sed` form it replaces printed
+everything after the first colon, which is what `sub(/^[^:]*:/, "")` restores. No issue
+tracks migrating the generator, and none is needed for correctness: the `sed` form remains
+supported for the names the fleet uses, and the escaping burden is the token command's
+either way — the client exports the name and does not quote it for you.
 
 ## Caveats
 
