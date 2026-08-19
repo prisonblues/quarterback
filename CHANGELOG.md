@@ -11,6 +11,97 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
+## vNEXT — a seat this box cannot run stops declaring things about the round
+
+`coverage_veto` already knew that an absent reviewer CLI is a fact about the
+**host**, not about the round: it is absent every round, so vetoing on it makes
+`confident` permanently unreachable on exactly the unattended boxes where the
+signal has to mean something. That exemption was applied to the veto and to
+nothing else.
+
+**`budgets` was still built from the configured set.** So a seat with no CLI on
+the box acquired a diff budget, an argv clamp, a `config_notes` line saying it
+"gets 116,287 of 177,872 diff chars", and a `truncated: true` record — four
+statements about a reviewer that was never going to read a byte. Measured on a box
+without `agy`: `antigravity: ran=False absent=True truncated=True`, run-level
+`diff_truncated: true`, and **nothing that actually ran was cut**.
+
+**The last one was not cosmetic.** `load_baseline` read `any(m.get("truncated"))`
+over every member regardless of whether it ran, so the round was banked as
+truncated and the next round inherited *"whatever that round was cut off from has
+now been read by no round of this cycle, and re-reviewing the fix commit does not
+reach it"*. False on that host — and a `confident` veto, so **every multi-round
+cycle on a box configuring an argv-bound seat it cannot run was non-confident from
+round 2 onward, permanently.** That is the failure the absent-CLI exemption exists
+to prevent, arriving through the one consumer nobody exempted.
+
+**Filtered at the source rather than at each consumer.** `seat_installed` now
+lives in `panel_core` beside `CLI_BIN`, `budgets` is filtered by it, and both
+`panel_seats.run_seat` and `panel_rounds.adjudicate` ask the same predicate
+instead of their own inline `shutil.which` — copies being chances to disagree,
+silently, about which seats this box has. It is read **once per round** and
+snapshotted, so the budget, the argv clamp, the prompt and the payload all
+describe one host. The absent seat is still **dispatched** and still records
+itself absent, because `run_seat` is the single authority on absence — and not
+only a PATH check: it answers a typo'd reasoning effort as the config error it is,
+BEFORE looking for the binary, which a round that decided absence for itself would
+skip. What the seat no longer gets is a budget, and with no budget it is no longer
+handed a rendered prompt it was never going to read.
+
+`budgets` is decided before dispatch and `run_seat` decides absence after it, so
+the emitted record is **reconciled against what actually happened** rather than
+read straight off `budgets`: a seat the run found absent records a null budget and
+no truncation. Without that, the one round where the two PATH reads disagree writes
+a real `max_diff_chars` beside `absent: true` — the contradictory pairing this
+release exists to remove, produced by the fix meant to have removed it. The judge is filtered by the
+same predicate: `adjudicate` runs it through the `claude` CLI, so a box without
+that gets no `judge_max_diff_chars` and no "the judge saw …" note either.
+
+**`diff_budgets` keeps every selected seat.** In the payload an absent seat
+records `null` rather than losing its key — the same answer
+`reviewers.<name>.max_diff_chars` gives it — so a board or dashboard reading
+`diff_budgets[name]` for a configured seat does not begin raising `KeyError` on
+exactly the unattended hosts this fix is for. The internal dict does drop the
+seat, and has to: everything that iterates it reads a `null` as *uncapped*. What
+the null-beside-`truncated: false` pairing guarantees is only that a null budget
+can never sit beside `truncated: true`; it does not identify an absent seat, since
+an installed one with no configured budget records the same pair. `absent` is the
+field that carries that, which is why the reader below keys on it.
+
+**And the reader was fixed too, because baselines outlive the writer.**
+`load_baseline` now banks a round as truncated on `truncated and not argv_capped
+and not absent` — the same exemptions `coverage_veto` makes, each keyed on its own
+recorded field. Both terms are needed: `argv_capped` (v2.50, landed while this was
+in review) covers only seats the kernel bounded, so an absent `pi` or `codex`
+carrying a configured `max_diff_chars` under the target lands in `truncated_for`
+with `argv_capped` False and would still bank a phantom round under that exemption
+alone. Its sibling `truncated_any` — which decides whether a round CLOSES every
+earlier round's gap — exempts `absent` and deliberately not `argv_capped`: a capped
+seat RAN and saw a prefix, so the round did not read its target whole and cannot be
+the one that clears an older gap; an absent seat read nothing and is no evidence
+either way, and leaving it in let one legacy payload block `reread` forever, which
+is the permanent veto this release exists to remove. Every payload
+already on disk carries the old pairing and `--baseline` is fed them by design, so
+cleaning only the writer would leave every cycle already in flight banking phantom
+gaps until it ended. Deliberately **not** `ran and truncated`: `ran` is false for
+every way of not running, so that would also drop the truncation of a seat that
+was installed, read a genuine prefix, and then crashed or timed out — a real tail
+nobody read, un-banked, in the fail-open direction on a `confident` veto. Keying
+on `absent` also leaves pre-`ran` payloads reading exactly as they always did,
+since they carry neither field.
+
+**A note for anyone writing tests here.** `seat_installed` is a PATH read on the
+critical path of every round, which makes host capability a test-outcome
+dependency: nine existing tests pass on a workstation and fail on a CI runner
+carrying none of the four CLIs, while testing budgets, scope and truncation. The
+shared `conftest.py` grows an `every_seat_installed` fixture, **requested by the
+three modules that need a stated host rather than applied package-wide** — a pin
+that reaches tests nobody chose it for turns every absence assertion in the
+directory into a presence assertion, silently, and `test_panel_absent_seat.py` is
+a whole module whose subject is absence. That pin is on `panel` only and
+deliberately not on `panel_seats` — forcing `run_seat` to believe an absent binary
+exists makes it exec `agy` and retry with backoff, which hangs the suite rather
+than failing it.
 ## v2.51 — reviewers can read the code, per repo, on by default
 
 The panel reviewed from a diff and nothing else. Every seat ran in an empty `git init`

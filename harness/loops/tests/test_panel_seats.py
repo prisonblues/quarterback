@@ -35,6 +35,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
 import panel_core  # noqa: E402  — `sh` is defined here since #129

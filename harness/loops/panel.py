@@ -678,9 +678,36 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # Only for the reviewers actually running: a budget warning about a model
     # this run never asked for is noise, and a "truncated for antigravity" footnote
     # under a claude-only panel is a lie.
+    #
+    # "Actually running" means SELECTED *and* INSTALLED (#222): a seat whose CLI is
+    # not on this box cannot be handed a diff, so a budget for it is the root of
+    # four statements about a reviewer that never read a byte — the last of which,
+    # a `truncated: True` record, `load_baseline` banked as a coverage gap the next
+    # round inherited. `seat_installed`'s docstring in panel_core carries the whole
+    # reasoning; it is filtered HERE rather than at each consumer so that a fifth
+    # consumer added later inherits the fix instead of needing its own.
+    #
+    # Read ONCE per round rather than per consumer. `run_seat` asks the same
+    # predicate again when the seat is dispatched, and two independently-timed PATH
+    # reads can disagree; a snapshot is what makes the consumers below — the
+    # budget, the argv clamp, the prompt, the payload — describe one host.
+    #
+    # This set is now the round's ONE answer to "which seats are here": a seat it
+    # excludes is never dispatched, so `run_seat`'s own PATH read cannot contradict
+    # it (see the dispatch loop). `adjudicate` still asks independently for
+    # `claude`, which is a separate seat with a separate record, and its own gate
+    # refuses it the same way.
+    installed = {name for name in LLM_REVIEWERS if seat_installed(name)}
     budgets = {name: diff_budget(rev.get(name, {}), "max_diff_chars", panel_budget, notes)
-               for name in LLM_REVIEWERS if name in selected}
-    judge_budget = diff_budget(panel, "judge_max_diff_chars", panel_budget, notes)
+               for name in LLM_REVIEWERS if name in selected and name in installed}
+    # The judge is a seat on this box too: `adjudicate` runs it through the
+    # `claude` CLI and refuses when that is absent, asking this same predicate. So
+    # it gets no budget and no `config_notes` line there either — it was the one
+    # consumer sitting adjacent to the fix and missed by it, and a "the judge saw
+    # 60,000 of 177,872 chars" note about an adjudication that never happened is
+    # the same lie as the reviewer footnote above.
+    judge_budget = (diff_budget(panel, "judge_max_diff_chars", panel_budget, notes)
+                    if "claude" in installed else None)
 
     # Read BEFORE the seats are dispatched, because its result now travels in
     # their prompt (#91). It used to run concurrently with them and be collected
@@ -890,8 +917,17 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 # following it faithfully declares gaps it could have opened a file
                 # to close. See CODE_ACCESS_BRIEF.
                 reads = code_tree is not None and name in SEAT_READS_CODE
-                tasks[name] = ex.submit(review_llm, name, models[name],
-                                        prompt_for(budgets[name], reads),
+                # A seat this box cannot run gets NO prompt (#222). Every SELECTED
+                # seat is still dispatched, because `run_seat` is the single
+                # authority on absence and is not only a PATH check — it answers a
+                # typo'd reasoning effort as the config error it is, before looking
+                # for the binary. But `budgets` has no entry for an absent seat, and
+                # `prompt_for(None, …)` means "uncapped", so rendering one would
+                # compose the entire diff — per absent seat, per round — for
+                # `run_seat` to discard a moment later.
+                prompt = (prompt_for(budgets[name], reads) if name in budgets
+                          else "")
+                tasks[name] = ex.submit(review_llm, name, models[name], prompt,
                                         efforts.get(name, ""),
                                         code_tree=code_tree,
                                         budget_usd=budget_usd if reads else None)
@@ -925,11 +961,33 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 "effort": efforts.get(name) or None,
                 "ran": not got.skip,
                 "skip": got.skip,
-                "max_diff_chars": budgets[name],
+                # Reconciled against `got.absent`, not read straight off `budgets`
+                # (225-R3-F05). `budgets` is decided before dispatch and `run_seat`
+                # decides absence after it, so on the one round where those two
+                # disagree the payload would otherwise carry a real budget beside
+                # `absent: true` — the contradictory pairing #222 exists to remove,
+                # written by the fix meant to have removed it. Whatever happened,
+                # happened: a seat the run found absent had no budget and read no
+                # prefix, and both fields say so.
+                #
+                # None for a seat this box cannot run (#222) — it had no budget,
+                # rather than a budget it failed to spend. `truncated` below is
+                # keyed off `truncated_for`, which is built from the same dict, so
+                # what the pair now guarantees is that a null budget can NEVER sit
+                # beside a `truncated: True` — the pairing that made a round look
+                # cut when nothing that ran was.
+                #
+                # That is the whole of it, and deliberately less than it looks: an
+                # INSTALLED seat with no `max_diff_chars` configured records the
+                # same null beside the same false, so the pair does not tell an
+                # absent seat from an uncapped one. `absent` below is the field
+                # that carries that distinction, and it is the one `coverage_veto`
+                # and `load_baseline` read for exactly this reason.
+                "max_diff_chars": None if got.absent else budgets.get(name),
                 # The mechanical half of "did this reviewer see the whole thing":
                 # checked against the budget rather than asked for, because the
                 # one thing a truncated reviewer cannot notice is the truncation.
-                "truncated": name in truncated_for,
+                "truncated": not got.absent and name in truncated_for,
                 # WHY it was truncated, where the answer is the kernel rather than
                 # a number in a config file. Same shape of fact as `absent` and
                 # treated the same way by coverage_veto.
@@ -1160,10 +1218,13 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # therefore empty on every run this ever made — the `missed-unread` bucket
     # unreachable in production while 487 unit tests, which call the helpers
     # directly with correct inputs, stayed green over it.
-    # Defensive rather than expected: `budgets` is built over the same selected
-    # seats `tasks` is, so a seat that ran normally has an entry (possibly None,
-    # meaning uncapped). It survives so a future change to how `budgets` is built
-    # cannot quietly turn "no budget recorded" into "read nothing".
+    # Defensive rather than expected: `budgets` covers the seats that are both
+    # selected and installed (#222), and `run_seat` refuses an absent seat before
+    # it can run — so a seat in `ran_names` has an entry (possibly None, meaning
+    # uncapped). It survives so a future change to how `budgets` is built cannot
+    # quietly turn "no budget recorded" into "read nothing", and it is the note a
+    # test double that replaces `review_llm` wholesale would trip, since such a
+    # double never reaches that refusal.
     no_budget = [n for n in ran_names if n not in budgets]
     if no_budget:
         notes.append("no diff budget is recorded for " + ", ".join(sorted(no_budget))
@@ -1314,7 +1375,19 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # front of an uncapped reviewer, and the pair is the measurement issue #41
         # exists to produce.
         "context_chars": len(review.near) + len(review.far),
-        "diff_budgets": {**budgets, "judge": judge_budget},
+        # Every SELECTED seat still has a key here, as it always has — a seat this
+        # box cannot run records `null` rather than vanishing (#222). The internal
+        # `budgets` dict genuinely OMITS it, and has to: everything that iterates
+        # that dict (`composed`, `truncated_for`, the argv clamp) reads a null as
+        # "uncapped" and would compose the whole diff for a seat that never ran.
+        # The payload has no such reader and one shape to keep — a board or
+        # dashboard doing `payload["diff_budgets"][name]` for a configured seat
+        # must not start raising KeyError on exactly the unattended hosts this fix
+        # is for. `null` is the same answer `reviewers.<name>.max_diff_chars`
+        # already gives for that seat, and `reviewers.<name>.absent` is what says
+        # which kind of null it is.
+        "diff_budgets": {**{n: None for n in LLM_REVIEWERS if n in selected},
+                         **budgets, "judge": judge_budget},
         "config_notes": notes,
         "sonar_gate": result.sonar_gate,
         "ci_status": ci_status,

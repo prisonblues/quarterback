@@ -20,6 +20,7 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
 from sqlalchemy import text
 
 from app.api.reviews import _derive_key
@@ -36,6 +37,35 @@ import panel
 
 REPO = "acme/v215repo"
 AGENT = {**LAPTOP, "X-Agent-Instance": "d14d14"}
+
+
+@pytest.fixture(autouse=True)
+def _every_seat_installed(monkeypatch):
+    """This box has every seat, for every test in this module (#222).
+
+    `budgets` is built from the seats the HOST can actually run, so a panel round
+    driven from here otherwise depends on which vendor CLIs the machine happens to
+    carry: on a CI runner, which carries none, `claude` and `codex` get no budget
+    at all, and an assertion that codex's 40-char budget CUT the diff fails with
+    `assert False is True` — while `fake_review` has them running perfectly
+    happily. That pairing (a seat that ran with no budget) is a doubles artefact
+    and not a state production can reach, because `run_seat` refuses an absent seat
+    before it can run; the doubles replace `review_llm` wholesale and so never
+    reach that refusal.
+
+    A fixture rather than a line inside one helper: this is the only module in the
+    app suite that drives `panel.run()`, and the next test written here inherits
+    the pin instead of rediscovering the failure on CI. It is scoped to this module
+    for the same reason `harness/loops/tests` does not make it package-wide — a
+    test whose subject is a seat's ABSENCE must not be silently pinned to the
+    opposite. Nothing here has that subject; if something does, it overrides this
+    the way `test_panel_absent_seat.py` does.
+
+    No `raising=False`: the attribute is guaranteed to exist for the pin to have a
+    purpose, and tolerating its absence is how a rename turns it into a silent
+    no-op that hands this module back to the host's PATH.
+    """
+    monkeypatch.setattr(panel, "seat_installed", lambda name: True)
 
 
 def payload(pr: int, **over) -> dict:

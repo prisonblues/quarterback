@@ -434,6 +434,47 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   confident stop: it is absent every round, so it says nothing about the round —
   otherwise a repo listing a workstation-only vendor would buy every unattended
   run on a headless box a standing veto. Every other way of not running does veto.
+- **An absent seat gets no diff budget either, and that is the same rule reaching
+  the other four places it was missing.** The exemption above was applied to the
+  veto and to nothing else, while `budgets` was still built from the *configured*
+  set — so a seat with no CLI on the box acquired a budget, an argv clamp, a
+  `config_notes` line saying it "gets 116,287 of 177,872 diff chars", and a
+  `truncated: true` record. Four statements about a reviewer that was never going
+  to read a byte, and the last one was not cosmetic: `diff_truncated` went true on
+  rounds where nothing that *ran* was cut, `load_baseline` banked the round as
+  truncated, and the next round inherited *"whatever that round was cut off from
+  has now been read by no round of this cycle"* — a `confident` veto, so every
+  multi-round cycle on such a box was non-confident from round 2 onward,
+  permanently. `budgets` is now filtered by `seat_installed` (in `panel_core`,
+  beside `CLI_BIN`, read once per round and shared with `run_seat` and with the
+  judge's own `adjudicate`, so no two of them can come to disagree about which
+  seats exist), which closes all four at once. The seat is still **dispatched**
+  and still records itself absent — that record is what the exemption above reads
+  — but it is no longer handed a rendered prompt either, since a seat with no
+  budget would otherwise be given the whole diff to throw away. Its
+  `max_diff_chars` is `null` and its `truncated` is `false`, which is the pairing
+  that broke; that guarantees a null budget can never sit beside `truncated: true`
+  and nothing stronger, because an *installed* seat with no configured budget
+  records the same pair. `absent` is the field that tells them apart.
+  In the payload the seat keeps its `diff_budgets` key with a `null` value rather
+  than vanishing, so a consumer reading `diff_budgets[name]` for a configured seat
+  does not begin raising `KeyError` on exactly the boxes this is for.
+  `load_baseline` banks a round as truncated on `truncated and not argv_capped and
+  not absent` — both exemptions, each keyed on its own recorded field — because
+  baselines written before either release still carry the old pairings. Its sibling
+  `truncated_any`, which decides whether a round may **close** every earlier round's
+  gap, exempts `absent` and deliberately **not** `argv_capped`: a capped seat ran and
+  saw a prefix, so the round did not read its target whole and cannot be the one that
+  clears an older gap, while an absent seat read nothing and is no evidence either
+  way. It also requires positive evidence that a seat actually RAN, so a round in
+  which every seat was absent — or present and crashed — cannot erase a gap banked
+  by a round whose seats worked. The two do
+  not subsume each other: `argv_capped` covers only what the kernel bounded, so an
+  absent `pi` or `codex` with a configured budget smaller than the target would
+  still bank a phantom round under the argv exemption alone. And not
+  `ran and truncated`: `ran` is false for *every* way of not running, so that would
+  also drop the truncation of a seat that was installed, read a real prefix and then
+  crashed — a genuine coverage gap, and the fail-open direction.
 - **A constant never vetoes, and three of them used to** (#113). The rule
   generalises the absent-CLI exemption above: an observation that is true of every
   round cannot tell a quiet round from a broken one, and because `confident` is

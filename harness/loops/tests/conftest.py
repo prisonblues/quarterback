@@ -47,8 +47,64 @@ from pathlib import Path
 
 import pytest
 
+# The modules under test are scripts in the parent directory, not an installed
+# package. Every test module here inserts that directory itself; doing it HERE too
+# is what makes the insert a property of the package rather than of whichever
+# module pytest happened to collect first — `import panel` below used to work only
+# because some other module's insert had already run, so selecting a single node
+# (`pytest tests/test_x.py::test_y`) in a module that does not insert could raise
+# ModuleNotFoundError out of a fixture that has nothing to do with the panel.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import panel  # noqa: E402
 import panel_core  # noqa: E402  — the `gh` seam every stub here replaces
+
+
+@pytest.fixture(autouse=True)
+def every_seat_installed(monkeypatch):
+    """Pin every seat as present on this box (#222).
+
+    `budgets` is built from the seats this host can actually RUN, not merely the
+    configured ones — a seat with no CLI cannot be handed a diff, so it must not
+    acquire a budget, an argv clamp, a `config_notes` line, or a truncation record.
+    That makes `seat_installed` a PATH read on the critical path of every round, and
+    therefore a test-outcome dependency on which vendor CLIs the machine running the
+    suite happens to carry.
+
+    Left unpinned, tests across `test_panel_scope`, `test_panel_provenance`,
+    `test_panel_argv_limit`, `test_panel_declarations` and `test_panel_code_access`
+    fail on a CI runner (which carries none of the four) and pass on a workstation
+    (which carries some) — while testing budgets, scope, prompts and truncation,
+    none of which is about host capability. They fail through a test-double artefact
+    rather than a real state: those suites replace `review_llm` wholesale, so a seat
+    "runs" without reaching `run_seat`'s absence check. Production cannot produce
+    that pairing, because `run_seat` refuses an absent seat before it runs.
+
+    **Autouse, and it was opt-in first.** Opt-in is the tidier argument — a pin
+    nobody chose could turn an absence assertion into a presence assertion — but it
+    put the cost on the wrong people. Three of the five modules above arrived from
+    other branches while this was in review, and each landed green on its author's
+    workstation and red here, for a reason having nothing to do with their work.
+
+    Autouse puts that cost back on this feature. The failure mode it risks is
+    confined to one module — `test_panel_absent_seat.py`, the only one whose subject
+    IS absence — and that module does not rely on this default: its `_host()` helper
+    states the host per test, for every module the predicate is resolved through, and
+    a fixture runs before the test body that overrides it. Its predicate tests patch
+    `panel_core.shutil.which` directly, and its reader tests never touch PATH.
+
+    **On `panel` only — deliberately not on `panel_seats`.** `budgets` is the
+    consumer this restores; `run_seat`'s own check is a real safety mechanism in a
+    test suite, because it is what stops a test reaching `subprocess.run(["agy",
+    ...])` for a binary this box does not have. Forcing it True hangs the run: the
+    exec fails and the seat retries with backoff, on every test that dispatches.
+    Not hypothetical — it is what the first version of this fixture did.
+    """
+    # No `raising=False`. The attribute is guaranteed to exist for this fixture to
+    # have a purpose, and tolerating its absence is how the pin fails OPEN: rename
+    # `seat_installed`, or drop the star-import that puts it in `panel`'s globals,
+    # and `setattr` becomes a silent no-op that hands every dependent test back to
+    # the host's PATH with nothing anywhere reporting it.
+    monkeypatch.setattr(panel, "seat_installed", lambda name: True)
 
 #: Sentinel for "the caller said nothing", so a test can ask for a value that is
 #: genuinely ``None`` — a read that FAILED — as distinct from not specifying one.

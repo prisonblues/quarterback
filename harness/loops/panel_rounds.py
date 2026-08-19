@@ -488,7 +488,13 @@ def adjudicate(clusters: list[list[Finding]], diff: str, model: str, pr: int,
         return [_unmerged(f, pr, i + 1, "unjudged", "unjudged")
                 for i, f in enumerate(flat)], reason, note
 
-    if not shutil.which("claude"):
+    # Through the shared predicate (#222), not an inline `shutil.which`: `run()`
+    # now withholds `judge_max_diff_chars` from a box with no `claude` for the same
+    # reason it withholds a reviewer's budget, and the gate that decides that has
+    # to be the gate that decides this. Two spellings of "is the judge here" is how
+    # they come to disagree — a judge skipped as absent while `diff_budgets.judge`
+    # says it was given 60,000 chars.
+    if not seat_installed("claude"):
         return unruled("judge: claude CLI absent")
     # On stdin, like the reviewers, and for a sharper reason: the judge's prompt
     # is the only one with a component no budget could cover. The findings
@@ -936,36 +942,74 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
         #: `members` because `reread` below needs POSITIVE evidence, and an empty
         #: list of records is the shape both "nobody said" cases arrive in.
         recorded = [m for m in members if isinstance(m, dict)]
-        # `argv_capped` is exempted HERE as well as in `coverage_veto`, and missing
-        # it here would have undone the exemption entirely for the cycles that
-        # matter. An earlier round's truncation is carried because increment scope
-        # makes it permanent — but a seat cut by the KERNEL was never going to be
-        # closed by a later round either, on this box, at this diff size. So the
-        # inherited veto it buys is not "a gap this cheaper round failed to
-        # re-read", it is the same constant arriving one round later and standing
-        # for the whole rest of the cycle: `/panel-review-pr` drives multiple
-        # rounds, so the loop would have gone right back to never stopping
-        # confidently while the round-1 veto list looked fixed.
-        #
-        # Truncation by a BUDGET still carries, which is the whole point of telling
-        # them apart: raise the number and the next round genuinely does read what
-        # this one could not.
         # TWO questions, and one variable used to answer both — which is how the
         # argv exemption turned into a fail-open bug the first time it was written.
         #
-        # `truncated_any` — did any seat read a PREFIX of its target? That is the
-        # question `reread` below needs, and the argv cap must NOT be exempted from
-        # it: a round where the kernel-capped seat saw two thirds of the diff did
-        # not read the whole PR, so it cannot be the round that closes every
-        # earlier round's gap. Exempting the cap says "this gap will never close,
-        # stop vetoing on it" — it must not also say "this round closed everyone
-        # else's".
+        # `truncated_any` — did any seat read a PREFIX of its target? That is what
+        # `reread` below needs, and only ONE exemption applies to it — `absent`,
+        # never `argv_capped` (the asymmetry is argued where it is applied): a round where
+        # the kernel-capped seat saw two thirds of the diff did not read the whole
+        # PR, so it cannot be the round that closes every earlier round's gap.
+        # Exempting a seat says "this gap will never close, stop vetoing on it" —
+        # it must not also say "this round closed everyone else's".
+        # `absent` is exempt HERE as well, and `argv_capped` is not — the two
+        # exemptions genuinely differ on this question (225-R2-F01).
         #
-        # `cut` — does this round leave an inherited veto for a scoped round after
-        # it? Here the cap IS exempt, because no later round on this box could have
-        # closed it either (see coverage_veto).
-        truncated_any = any(m.get("truncated") for m in recorded)
-        cut = any(m.get("truncated") and not m.get("argv_capped") for m in recorded)
+        # An argv-capped seat RAN and saw a prefix, so the round really did not read
+        # its target whole and cannot be the round that closes an earlier gap. An
+        # ABSENT seat read nothing and is no evidence either way: the seats that did
+        # run may have read everything, and on a box where a configured seat can
+        # never be installed there is no future round that would clear the gap
+        # either. Leaving it in was the first spelling of this merge and it looked
+        # like the safe direction; it is not. It lets one legacy payload's phantom
+        # record block `reread` forever, which keeps every earlier gap open and the
+        # cycle non-confident — the exact permanent veto #222 exists to remove,
+        # surviving in the one path the fix had not reached.
+        truncated_any = any(m.get("truncated") and not m.get("absent")
+                            for m in recorded)
+        # `cut` — does this round leave an inherited veto? Here two exemptions
+        # apply, for two different reasons, and neither subsumes the other.
+        #
+        # `argv_capped` (#113): a seat the KERNEL cut was never going to be closed
+        # by a later round either, on this box, at this diff size. The veto it buys
+        # is not "a gap this cheaper round failed to re-read", it is the same
+        # constant arriving one round later and standing for the rest of the cycle
+        # — `/panel-review-pr` drives multiple rounds, so the loop would go right
+        # back to never stopping confidently. Truncation by a BUDGET still carries,
+        # which is the whole point of telling them apart: raise the number and the
+        # next round genuinely does read what this one could not.
+        #
+        # `absent` (#222): a seat that never ran cannot have been cut. Until #222 it
+        # was recorded `truncated: True` anyway, because `budgets` was built from
+        # the CONFIGURED seats, so this banked a truncated round on every cycle of
+        # every box configuring a seat it cannot carry — and the inherited veto then
+        # told a later round that code had "been read by no round of this cycle"
+        # when nothing had been cut off from anything.
+        #
+        # Both terms are needed. `argv_capped` covers only seats the kernel bounded
+        # — antigravity — so an absent `pi` or `codex` carrying a configured
+        # `max_diff_chars` smaller than the target lands in `truncated_for` with
+        # `argv_capped` False, and the argv exemption alone would still bank a
+        # phantom round for it.
+        #
+        # NOT `ran and truncated`, which was #222's first spelling and over-corrects
+        # in the optimistic direction: `ran` is `not skip`, false for EVERY way of
+        # not running. An INSTALLED seat with a small budget reads a genuine prefix
+        # and then times out, crashes, or is skipped for a bad effort pin — it is
+        # written `ran: False, truncated: True`, and a real tail nobody read would
+        # stop being banked. `absent` is the one absence that is a fact about the
+        # HOST rather than about the round; every other way of not running still
+        # counts here, exactly as it still vetoes in `coverage_veto`.
+        #
+        # Both exemptions are also what keep OLD payloads honest, which is why the
+        # reader had to be fixed at all: baselines outlive the release that wrote
+        # them, and `--baseline` is fed earlier rounds' payloads by design. A
+        # payload written before either field existed has neither, so both `not`
+        # terms are True and its recorded truncation is banked — the old reading,
+        # preserved, rather than a real coverage gap silently dropped because the
+        # writer was too old to say.
+        cut = any(m.get("truncated") and not m.get("argv_capped")
+                  and not m.get("absent") for m in recorded)
         if cut:
             b.truncated_rounds.add(was)
         # Two facts about coverage that only matter once a later round stops
@@ -984,10 +1028,24 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
         # as having re-read the PR if at least one seat recorded that it was
         # there. The conservative direction: an old baseline keeps an inherited
         # veto standing rather than silently clearing it.
+        # `ran`, not `not absent` (225-R4-F13): a seat that was present and then
+        # crashed is "not absent" while having read nothing, so the weaker test let
+        # a round where every seat failed still qualify to erase earlier gaps.
+        read_something = any(m.get("ran") for m in recorded)
         ran = payload.get("reviewers_ran")
         if isinstance(ran, list) and not ran:
             b.unread_rounds.add(was)
-        elif (recorded and not truncated_any
+        # `read_something` is the positive evidence `reread` needs and
+        # `truncated_any` cannot supply (225-R3-F01). Exempting `absent` from
+        # `truncated_any` is right for a round where seats ran, but it makes an
+        # ALL-absent round indistinguishable from one that read everything: both
+        # come out False. The branch above catches that whenever `reviewers_ran` is
+        # a list, which every payload this release writes has — but a hand-edited or
+        # truncated one may not, and `reread` is the single most destructive thing
+        # in this function: one entry erases every earlier round's recorded gap. So
+        # it takes evidence that somebody was actually there, on the same principle
+        # the `reread` comment below already states for `recorded`.
+        elif (recorded and read_something and not truncated_any
                 and str(payload.get("scope") or "pr") == "pr"):
             # `truncated_any`, not `cut`: clearing an earlier gap is a claim that
             # this round READ the region, and a kernel-capped seat did not.
