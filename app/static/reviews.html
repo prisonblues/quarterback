@@ -676,11 +676,51 @@ async function renderHistory(box, repo, pr){
   // finished.
   const why = (h.stop_veto || []).length
     ? ` <span class="dim" title="${esc(h.stop_veto.join(" | "))}">(${h.stop_veto.length} veto)</span>` : "";
-  const ending = h.stopped === false
+  // More than one group of runs in the window and there is no single ending to
+  // print — the API nulls the summary rather than letting the newest loop describe
+  // an older one. Said out loud instead of rendered as blank: an absent ending
+  // otherwise reads as "nothing recorded", which is a different thing from "two
+  // loops ran here and neither speaks for the other".
+  //
+  // "separate groups of runs", not "N cycles": `h.cycles` counts BUCKETS, and
+  // every run carrying no cycle is one bucket together, so one real cycle plus a
+  // standalone /panel read is 2 with only one loop in it. Printing "2 cycles"
+  // asserts something the data does not support.
+  //
+  // --warn, like every other ending on this line that says something is wrong with
+  // the review. This is the most surprising state here and the comment above is
+  // the argument for saying it out loud; dimming it to the weight of the
+  // incidental veto count would bury the one thing this arm exists to say.
+  //
+  // FIRST, ahead of `h.stopped === false`: with mixed buckets `h.stopped` is null,
+  // and null is not false, so a later position would fall through to the
+  // `h.stop_reason` arm and print nothing at all. A cached response from before
+  // #44 has no `cycles` key, `undefined > 1` is false, and it falls through to
+  // exactly the pre-#44 rendering — the right answer for a payload with no better
+  // one in it. `why` is deliberately not appended here and nothing is lost by
+  // that: the API nulls `stop_veto` under this same condition, so `why` is already
+  // the empty string.
+  // `cycles` counts cycles, so this copy can say what the number is. A run
+  // carrying no cycle is skipped rather than counted, which is why this arm now
+  // means what it reads as: two loops really did run here, and neither one's
+  // ending speaks for the other. `--warn` is right for that — it is a genuinely
+  // unusual state, not the ordinary one an earlier rule made it.
+  const mixedTitle = "two or more review cycles ran on this PR — a second agent, "
+    + "or a loop restarted — and no one of them ended it";
+  const ending = h.cycles > 1
+    ? ` · <span style="color:var(--warn)" title="${esc(mixedTitle)}">${esc(h.cycles)} cycles ran here — no single stop state</span>`
+    : h.stopped === false
     ? ` · <span style="color:var(--warn)">not stopped: ${esc(h.stop_reason || "another round is due")}</span>`
     : h.stop_reason ? ` · stopped: ${esc(h.stop_reason)}${
         h.stop_confident === false
-          ? ' <span style="color:var(--warn)">(not convergence)</span>' + why : ""}` : "";
+          ? ' <span style="color:var(--warn)">(not convergence)</span>' + why : ""}${
+        // One bucket in the window is not one bucket in the PR. `limit` trims the
+        // old end, so an older cycle can sit outside it and this ending then
+        // speaks for what was traced rather than for the PR — which is exactly
+        // the misattribution #44 is about, arrived at by round count instead of
+        // by adjacency. `cycles` alone cannot say so; `truncated` is the half
+        // that can, and the reader is told rather than left to join them.
+        h.truncated ? ' <span class="dim">(this window only — older rounds exist)</span>' : ""}` : "";
   box.innerHTML = `<div class="dim" style="margin:4px 0 6px">
       ${h.rounds} run${h.rounds === 1 ? "" : "s"} on this PR${h.truncated ? " (window truncated)" : ""}
       · <b>gone</b> = raised earlier, not in the latest run${ending}

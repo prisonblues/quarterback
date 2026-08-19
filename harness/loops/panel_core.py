@@ -32,6 +32,7 @@ import shutil
 import ssl
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import urllib.error
@@ -121,6 +122,35 @@ ROUND_SCOPES = ("auto", "pr", "increment")
 # silently reviews on a five-minute clock while the report claims thirty.
 CLI_TIMEOUT = 1800
 
+# How long the PR's tree may take to arrive. Far below CLI_TIMEOUT and separate
+# from it on purpose: this is one HTTP download that happens before any seat
+# starts, so every second of it is added to the whole round rather than spent
+# inside one reviewer's budget. A tarball this slow is a network problem, and the
+# answer to a network problem here is to review from the diff — which is the OFF
+# posture, still works, and is what the caller falls back to.
+TREE_FETCH_TIMEOUT = 120
+
+# Ceilings on the PR's tarball, which is INPUT THE CONTRIBUTOR CONTROLS. Without
+# them a PR can hand the panel a tree that fills the disk, and gzip makes that
+# cheap to post: a few megabytes of tarball can declare gigabytes of files, so the
+# dangerous number is the decompressed one and it is checked separately from the
+# download. Both refuse rather than truncate — half a tree is worse than no tree,
+# because a reviewer reads the half it got as the whole repository.
+#
+# 256MB compressed is far above any repo the panel is pointed at and far below
+# anything that hurts; 2GB extracted is the same judgement one decompression step
+# later. A legitimate repo over either is a real answer ("too big to review this
+# way"), not a reason to raise them blindly.
+TREE_MAX_BYTES = 256 * 1024 * 1024
+TREE_MAX_EXTRACTED_BYTES = 2 * 1024 * 1024 * 1024
+
+# And a ceiling on the NUMBER of members, which the byte caps are blind to: a small
+# tarball can declare millions of zero-byte entries, each costing an inode, a syscall
+# and a TarInfo in memory while passing every size check. The largest repositories in
+# real use are a few hundred thousand files, so this is far above legitimate and far
+# below painful.
+TREE_MAX_MEMBERS = 500_000
+
 # How long a blank reply may take and still be worth retrying. A zero exit with
 # no output is retried because it is often a flake — but a blank run does NOT
 # fail fast the way a non-zero exit does, so three of them is up to three whole
@@ -135,6 +165,19 @@ BLANK_RETRY_MAX_S = 60
 # that CLI. The wording is free to change — what coverage_veto branches on is
 # ReviewerRun.absent, not this string.
 CLI_ABSENT = "CLI absent"
+
+#: What `claude` prints when `--max-budget-usd` is reached. Matched against
+#: STDOUT, not stderr: the CLI exits 1, writes this line to stdout, and leaves
+#: stderr EMPTY — verified on 2.1.232. That combination defeats both of
+#: `run_cli`'s failure readers, which is why this constant exists rather than a
+#: generic non-zero-exit path handling it.
+BUDGET_MARKER = "Exceeded USD budget"
+
+#: The skip reason a budget-exhausted seat records. Its own sentence because
+#: "exited 1" with an empty stderr is exactly the confusing death #19 is about:
+#: the cap is the cause, the cap is actionable, and nothing else in the output
+#: says so.
+BUDGET_EXHAUSTED = "spend cap reached mid-review"
 
 # Linux caps ONE argv string at MAX_ARG_STRLEN = 131,072 bytes, independently of
 # the much larger total ARG_MAX; cross it and execve fails with E2BIG before the
@@ -181,6 +224,42 @@ ALL_REVIEWERS = LLM_REVIEWERS + ("sonarqube",)
 # command, not the thing having the opinion.
 CLI_BIN = {"antigravity": "agy"}
 
+
+def seat_installed(name: str) -> bool:
+    """Can this seat run on THIS box at all — is its CLI on PATH?
+
+    A fact about the HOST, not about the round, and the distinction is one this
+    file's neighbours already make at length: `coverage_veto` exempts an absent
+    seat from vetoing a confident stop, because a reviewer whose CLI is not
+    installed is absent every round and vetoing on it makes `confident`
+    permanently unreachable on exactly the unattended boxes where the signal has
+    to mean something.
+
+    It lives HERE, beside :data:`CLI_BIN`, because that exemption was applied to
+    the veto and to nothing else — and the seats' budgets were built from the
+    CONFIGURED set, so a seat this box cannot run still acquired a diff budget, an
+    argv clamp, a `config_notes` line about how much diff it "gets", and a
+    `truncated: True` record. On a repo enabling a workstation-only vendor that
+    made `diff_truncated` true on rounds where nothing that ran was cut, and
+    `load_baseline` then banked it as a coverage gap the next round inherited
+    (#222). One predicate, in the module both callers already import, is what
+    stops the panel holding two opinions about which seats exist.
+
+    :func:`panel_seats.run_seat` and :func:`panel_rounds.adjudicate` ask the same
+    question, through this function rather than through their own copies of it:
+    two spellings of "is this seat here" is how they come to disagree, and the
+    disagreement is silent — a seat skipped as absent while its budget says it was
+    handed 116,287 chars.
+
+    The command it looks for comes from :data:`CLI_BIN`, falling back to the seat's
+    own name. A vendor that renames its binary and is not recorded there reads as
+    absent on every box, and since #222 that costs more than a visible
+    `CLI ABSENT` skip line: the seat also loses its budget and its `config_notes`
+    line, so it disappears from the run's configuration report rather than
+    appearing in it as skipped. :data:`CLI_BIN` is the single place to record such
+    a divergence, and this is the reason to keep it current.
+    """
+    return bool(shutil.which(CLI_BIN.get(name, name)))
 # Reviewer name -> the model used when its config says nothing, where that is not
 # simply "whatever the CLI defaults to". Only claude has one: its CLI's own
 # default is the account's top model, which is the wrong seat to spend by
@@ -189,6 +268,53 @@ CLI_BIN = {"antigravity": "agy"}
 # this exception inline, in two places, as a second line that rebuilt one entry
 # of the dict just built above it.
 SEAT_MODEL_DEFAULTS = {"claude": "sonnet"}
+
+#: The reply contract, shared VERBATIM by every prompt that asks a seat for
+#: findings — the review and the move manifest (#138). Shared rather than copied
+#: because :data:`SCHEMA_ECHOES` identifies a prompt's own example by comparing a
+#: reply against it: two prompts with two hand-kept copies of this block are one
+#: edit away from a manifest run in which the example parses as a finding nobody
+#: made. One string means the echo detection covers both by construction.
+#:
+#: It ends with the material itself, so both prompts take the same `.format` keys
+#: (`ci`, `code`, `n`, `repo`, `base`, `diff`) and a caller can swap one for the
+#: other without knowing which it holds. `{code}` arrived in v2.51 and is in HERE
+#: rather than in each prompt for the same reason as the rest: a slot added to one
+#: template and forgotten in the other is a `KeyError` at `.format` on whichever
+#: round happens to select the stale one.
+#:
+#: For that to hold the wording has to be neutral about WHAT the material is, and
+#: it was not: "only if the diff is genuinely flawless" and "a file the diff does
+#: not include" arrived verbatim under a prompt whose first sentence is "you are
+#: deliberately NOT being given its diff", contradicting it on the one point a
+#: manifest round hinges on. Forking the block would have been the wrong fix —
+#: `SCHEMA_ECHOES` recognises a prompt's own example by comparing a reply against
+#: it, and two hand-kept copies are one edit away from a manifest run in which the
+#: example parses as a finding nobody made — so it says "the material below"
+#: instead, which is true of a diff and of a manifest alike.
+_FINDINGS_ENVELOPE = """Return ONLY a JSON object (no prose):
+  {{"findings": [{{"severity": "P1|P2|P3|P4", "file": "path", "line": <int|null>,
+                  "title": "...", "detail": "...", "needs_rereview": true|false}}],
+    "could_not_assess": ["..."]}}
+An empty `findings` array only if the material below is genuinely flawless.
+
+The last two keys are OBSERVATIONS about your own pass, not predictions. Do NOT forecast
+whether another review will be needed — you cannot observe findings you have not made.
+
+- `could_not_assess`: things in scope you could not judge from what you were given — a file
+  the material below does not include, a runtime behaviour, a schema you cannot see, a caller
+  you cannot check. One short phrase each; `[]` if you could genuinely assess everything.
+  "I found nothing" and "I could not tell" are different answers and only you know which
+  this was.
+- `needs_rereview` (per finding): true when fixing it takes a STRUCTURAL change whose
+  RESULT should be read again — the fix can create new interactions the current diff does
+  not contain. False for a local edit whose correctness is evident from the fix itself.
+
+{ci}
+{code}
+PR #{n} ({repo}), base={base}:
+{diff}
+"""
 
 REVIEW_PROMPT = """You are reviewing a pull request diff to the same exhaustive standard as a
 senior reviewer whose bar is "nothing left to improve". The marginal cost of completeness is
@@ -211,27 +337,95 @@ Severity: P1 blocks merge (correctness/security) · P2 important (error handling
 logic flaws) · P3 should fix (style, naming, simplifications) · P4 polish (minor consistency).
 Report all of them.
 
-Return ONLY a JSON object (no prose):
-  {{"findings": [{{"severity": "P1|P2|P3|P4", "file": "path", "line": <int|null>,
-                  "title": "...", "detail": "...", "needs_rereview": true|false}}],
-    "could_not_assess": ["..."]}}
-An empty `findings` array only if the diff is genuinely flawless.
+""" + _FINDINGS_ENVELOPE
 
-The last two keys are OBSERVATIONS about your own pass, not predictions. Do NOT forecast
-whether another review will be needed — you cannot observe findings you have not made.
+MOVE_MANIFEST_PROMPT = """You are reviewing a MOVE, and you are deliberately NOT being given its
+diff. Read the brief below before the manifest — the question you are being asked is not the one
+a diff review asks, and answering the other one would waste the round.
 
-- `could_not_assess`: things in scope you could not judge from what you were given — a file
-  the diff does not include, a runtime behaviour, a schema you cannot see, a caller you
-  cannot check. One short phrase each; `[]` if you could genuinely assess everything.
-  "I found nothing" and "I could not tell" are different answers and only you know which
-  this was.
-- `needs_rereview` (per finding): true when fixing it takes a STRUCTURAL change whose
-  RESULT should be read again — the fix can create new interactions the current diff does
-  not contain. False for a local edit whose correctness is evident from the fix itself.
+This change is move-shaped: its added lines are a near-permutation of its deleted ones, measured
+mechanically, so almost every line in the diff appears TWICE — once as a delete and once as an
+add. It is a rename, a file split, a relocation, or several of those. The bulk of that text is
+code nobody changed, and it is code that is already in the base branch and was already reviewed
+when it landed there. A finding about it is a finding about the base branch: it costs the cycle a
+fixer briefed to resolve it against a refactor, and it is worth less than nothing.
 
-{ci}
-PR #{n} ({repo}), base={base}:
-{diff}
+So do not review the moved code. Review the MOVE. Four questions, and they are the whole job:
+
+1. **What did not survive.** Lines deleted and not re-added anywhere are listed below. For each,
+   is it a deliberate deletion or a casualty of the move? A dropped guard clause, an `except`
+   arm, a decorator, a default argument or a `del`/cleanup line is the failure this section
+   exists to catch. Say which you cannot tell from the manifest alone.
+2. **What changed besides moving.** Lines added and not deleted anywhere are listed below: this
+   is the ONLY genuinely new code in the change, and it is where a content review belongs. Read
+   it as closely as you would read a small PR. A move that quietly rewrites logic while nobody
+   is reading is the thing a manifest review is most likely to miss.
+3. **Duplicated definitions.** A move that keeps BOTH copies of a definition is a clean merge, a
+   green test run and a silent bug — the later binding wins, the earlier one is dead, and the
+   dead one is the one anybody reading the old file will find. Names this change ADDS in more
+   than one place are listed, with the files each copy landed in; each one is a finding unless
+   there is a reason it is not. That is only HALF of the trap, and the other half **cannot be
+   seen from a diff at all**: an original left exactly where it was, in a file this change never
+   touches, appears as neither an added nor a deleted line, so nothing below can list it. If a
+   name that moved looks like it may still exist at its old address, that belongs in
+   `could_not_assess` — checking it needs the branch checked out, and nobody here has it.
+4. **What the manifest cannot tell you.** Say it. Test counts before and after, whether a module
+   now reaches backward into another, and whether the destination files import what they now
+   need are all facts about a move that the diff cannot answer — they need the branch checked
+   out. Put each one in `could_not_assess` rather than assuming it is fine, and rather than
+   guessing.
+
+Do NOT report: relocated code, its style, its naming, or anything you would only have seen by
+reading the moved text. There is none of it here to read, and inventing findings about it from
+the file names in the manifest is the failure mode this prompt replaces.
+
+Severity: P1 blocks merge (something was lost, or a definition is duplicated) · P2 important (new
+logic smuggled into a move, an unverifiable claim nobody has checked) · P3 should fix · P4 polish.
+Report all of them.
+
+""" + _FINDINGS_ENVELOPE
+
+#: The judge prompt's placeholder for the code-access brief. A literal token
+#: replaced at call time rather than a `{}` format field, because `JUDGE_PROMPT`
+#: is rendered by `.format()` in one place and its findings listing is built from
+#: model-authored text — adding a format field means every caller must pass it and
+#: every stray brace in a finding title becomes a KeyError. A token that nothing
+#: else in the prompt can produce is inert until it is deliberately swapped.
+JUDGE_CODE_SLOT = "<<<CODE_ACCESS_BRIEF>>>"
+
+#: What a seat that was handed the PR's tree is told about it. Empty for every seat
+#: that was not — see SEAT_READS_CODE — so those seats' prompts are unchanged.
+#:
+#: A seat has to be TOLD, or the access buys nothing: the prompt's whole frame is
+#: "here is a diff", the `could_not_assess` instruction explicitly offers "a file the
+#: diff does not include" as a valid answer, and a reviewer following those
+#: instructions faithfully will declare a gap it could have closed by opening the
+#: file. Half of #113's measured cost was seats doing exactly that.
+#:
+#: It also states the LIMITS, and not out of politeness. A seat told it has the code
+#: but not that it has no shell tries to run the tests, and a seat not told the
+#: convention files were removed can read their absence as a finding ("this repo has
+#: no CLAUDE.md") — a wrong finding manufactured by the fix for wrong findings.
+CODE_ACCESS_BRIEF = """YOU HAVE THE CODE. Your working directory is a checkout of this PR at its head
+commit — the same code the diff below was taken from. Use it. Read the callers, the
+siblings, the tests, the config, the migration the diff refers to but does not contain.
+A question you can answer by opening a file is not a coverage gap, and reporting it as
+one is the failure this access exists to remove: check before you declare, and before
+you raise a conditional finding about code you cannot see, look at it.
+
+Three limits, so you do not spend the round discovering them. None of the three is a
+coverage gap and none is a finding — they are how this checkout is built:
+- You have Read, Grep and Glob. You have NO shell and cannot run anything — not the
+  tests, not the linter, not git. A behaviour you can only establish by RUNNING it is
+  still a legitimate `could_not_assess` entry; "I could not run git" is not.
+- There is NO git history. This is the tree as it stands at one commit, not a clone:
+  no commits, no branches, no blame. Do not report that, and do not conclude from it
+  that the diff was reverted or that the file is untracked.
+- Vendor instruction files (CLAUDE.md, AGENTS.md, .claude/ and the like) have been
+  REMOVED from this checkout on purpose, so that a PR cannot instruct its own reviewer.
+  Their absence is not a finding and says nothing about the real repository.
+
+`could_not_assess` now means what you could not resolve WITH the code in front of you.
 """
 
 JUDGE_PROMPT = """You are the lead reviewer ("master") making the FINAL call on review findings for
@@ -289,6 +483,7 @@ Reports:
 Coverage declared by the reviewers:
 {coverage}
 {ci}
+<<<CODE_ACCESS_BRIEF>>>
 {diff}
 """
 
@@ -373,6 +568,38 @@ class ReviewerRun:
     #: coverage veto, and silently restores the veto the moment the absent
     #: branch's wording gains a suffix.
     absent: bool = False
+    #: The pinned model, and the pinned reasoning effort, this host's provider
+    #: could not serve — when the seat lowered them and reviewed anyway (#215).
+    #: State, for the same reason as `absent`: the report has to say what actually
+    #: did the review, and deriving that from a message tail is how a record comes
+    #: to claim a model that never ran. `""` = the pin was honoured.
+    #:
+    #: Two fields because the provider refuses them independently: on the gateway
+    #: that motivated this, `gpt-5.6-luna` has no deployment AND `max` effort is an
+    #: `unsupported_value`, so a seat can end up having dropped either or both.
+    model_unavailable: str = ""
+    effort_unsupported: str = ""
+    #: This seat had no way to READ the code under review — an empty
+    #: `member_sandbox` cwd and no file tools, so the diff in its prompt was the
+    #: whole of its evidence. Every LLM seat is blind today; the flag exists
+    #: because that is a property of how the panel is BUILT, not of the round it
+    #: just ran, and `coverage_veto` has to be able to tell the difference.
+    #:
+    #: What it buys: a blind seat's `could_not_assess` entries are reported and do
+    #: not veto. "I could not read a function this diff does not change" is true
+    #: of every round a blind seat sits, so it separates no quiet round from a
+    #: broken one — and `round_stop` computes `confident` as `not veto`, so a
+    #: constant there made a confident stop unreachable on any PR that so much as
+    #: mentions a file it does not touch. Measured on PR #160's round 1: 16 of 19
+    #: veto lines were declarations, and nine of those asked about a file in this
+    #: repo, answered with `grep` in four minutes.
+    #:
+    #: Set from the sandbox the seat actually ran in (see :func:`run_seat`),
+    #: never assumed here: #113's second half makes code access a per-repo
+    #: setting, and on a repo that turns it ON the same entry stops being
+    #: structural and must veto again — it is then a fact about the round. A
+    #: hard-coded exemption would keep silently discarding it.
+    code_blind: bool = False
 
 
 @dataclass
@@ -386,6 +613,19 @@ class PanelResult:
 
 def sh(args: list[str], **kw) -> str:
     return subprocess.run(args, capture_output=True, text=True, check=True, **kw).stdout
+
+
+def sh_bytes(args: list[str], **kw) -> bytes:
+    """:func:`sh` for output that is not text. Same contract, same seam.
+
+    A separate function rather than a `text=` parameter on `sh`, because the two
+    return different types and every caller of `sh` treats its result as a string.
+    It exists at all so the ONE binary reader in the panel — the PR tarball — is
+    interceptable where every other `gh` call already is: the suites stub
+    `panel_core.sh` to answer `gh`, and a reader that reached for `subprocess`
+    directly was invisible to that stub, so the whole suite started making real
+    network calls and slowed from 7 seconds to 30 while still passing."""
+    return subprocess.run(args, capture_output=True, check=True, **kw).stdout
 
 
 def load_repo_cfg(name: str) -> dict:
@@ -1259,6 +1499,16 @@ class SeatAnswer:
     duration_ms: int = 0
     usage: dict | None = None
     absent: bool = False
+    #: As `ReviewerRun.model_unavailable` / `.effort_unsupported`. An `--ask` run
+    #: falls back exactly as a review does, and without these the tally renders the
+    #: PIN while the CLI default answered — the same false record, one report over.
+    #:
+    #: **At the end, deliberately.** This class is built positionally
+    #: (`SeatAnswer(verdict, reason, ...)`), so a field inserted ahead of `verdict`
+    #: rebinds every ask's verdict to it — 19 tests, all reporting a wrong verdict
+    #: rather than a type error.
+    model_unavailable: str = ""
+    effort_unsupported: str = ""
 
 
 class AskTally(NamedTuple):
@@ -1584,8 +1834,10 @@ def _unquote_path(tok: str) -> str:
 __all__ = [
     "argparse", "base64", "difflib", "errno",
     "hashlib", "json", "os", "re",
+    "TREE_FETCH_TIMEOUT", "TREE_MAX_BYTES", "TREE_MAX_EXTRACTED_BYTES",
+    "TREE_MAX_MEMBERS",
     "shutil", "ssl", "subprocess", "sys",
-    "tempfile", "time", "urllib", "uuid",
+    "tarfile", "tempfile", "time", "urllib", "uuid", "sh_bytes",
     "Counter", "Callable", "ThreadPoolExecutor", "dataclass",
     "field", "Path", "NamedTuple", "harness_rules",
     "DENIAL_MARKERS", "REJECTION_MARKERS", "RepoNotFound", "cli_outcome",
@@ -1594,7 +1846,10 @@ __all__ = [
     "DEFAULT_ROUND_SCOPE", "ROUND_SCOPES", "CLI_TIMEOUT", "BLANK_RETRY_MAX_S",
     "CLI_ABSENT", "ARGV_PROMPT_MAX_BYTES", "SEVERITIES", "MAX_LISTING_CHARS",
     "LISTING_ACCOUNT_CHARS", "COMMENT_CHARS", "ROUNDS_HEADING", "LLM_REVIEWERS",
-    "ALL_REVIEWERS", "CLI_BIN", "SEAT_MODEL_DEFAULTS", "REVIEW_PROMPT",
+    "BUDGET_MARKER", "BUDGET_EXHAUSTED", "JUDGE_CODE_SLOT",
+    "ALL_REVIEWERS", "CLI_BIN", "seat_installed", "SEAT_MODEL_DEFAULTS",
+    "_FINDINGS_ENVELOPE", "REVIEW_PROMPT", "MOVE_MANIFEST_PROMPT",
+    "CODE_ACCESS_BRIEF",
     "JUDGE_PROMPT", "ASK_PROMPT", "Finding", "ReviewerRun",
     "PanelResult", "sh", "load_repo_cfg", "_spans",
     "ENVELOPE_KEYS", "DECLARATION_KEYS", "_scalar", "_Tok",

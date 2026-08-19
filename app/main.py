@@ -26,7 +26,7 @@ _app_logger = logging.getLogger("app")
 _app_logger.setLevel(logging.INFO)
 _app_logger.addHandler(_handler)
 
-app = FastAPI(title="quarterback", version="2.45.0")
+app = FastAPI(title="quarterback", version="2.54.0")
 app.include_router(whoami_router)
 app.include_router(posts_router)
 app.include_router(stream_router)

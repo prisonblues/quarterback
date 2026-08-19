@@ -11,6 +11,780 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
+## v2.54 — one cycle's ending stopped describing another's
+
+`GET /review/findings` answers "how did this PR's review end?" with `stopped`, `stop_reason`,
+`stop_confident` and `stop_veto`. It took all four from the newest run in the window whatever
+cycle that run belonged to — so two agents looping one PR, or a single review-only `/panel` read
+landing between rounds, and cycle B's last round decided how cycle A read: complete, unfinished,
+or unconfident. The per-finding join in the same response has refused that inference since cycles
+became a stored fact; the summary above it was still guessing.
+
+It now summarises only what it can attribute. All four are null unless the traced runs hold no more
+than one cycle, and a new `cycles` says how many they held. **The four are three-state and must be
+read with an identity test** — null is "no attributable cycle said", which is neither `false` nor
+`[]`, and a truthiness test reads a null `stopped` as "still going". The unreviewed PR follows the
+same rule: its `stop_veto` is null too, not `[]`.
+
+**A run carrying no cycle is skipped, not counted.** A standalone `/panel` read, or anything
+recorded before the cycle column existed, never ended the cycle running around it — so it has no
+ending to offer, and by the same token no standing to withhold one. One loop plus a one-shot read
+is `cycles: 1` and summarises, from that loop's own last round; where the cycle-less run is the
+newest in the window, the ending still comes from the cycle's last round rather than from the run
+that happened to land after it. `cycles: 0` is a real answer and means no cycle ran in the window
+at all, which is what keeps the whole pre-cycle archive reading as it always did.
+
+That is narrower than the rule this change first shipped with, which treated a cycle-less run as a
+group of its own and so nulled the summary whenever one shared a window with a loop — the ordinary
+case for any PR ever read outside its loop. The premise was right and the conclusion did not follow
+from it: a run that ended nothing cannot contradict the ending of a loop it was no part of. Three
+panel rounds raised it. What is NOT allowed back is attribution by adjacency — "the newest cycle
+forms a contiguous tail" reports B's confident stop as the PR's ending when A-r1 is followed by
+B-r1, which is what #44 was filed about. This rule counts distinct cycles and never consults
+position.
+
+The reviews page says "N cycles ran here — no single stop state" rather than rendering the absent
+ending as blank, which would read as "nothing recorded". A summary drawn from a truncated window
+now says so too: `cycles` is computed over the traced window like everything else, so an older
+cycle outside `limit` leaves a window that summarises what it can see and not the PR. Read
+`cycles` and `truncated` together — `cycles <= 1 and not truncated` is the only pair that speaks
+for the whole recorded history.
+
+Narrowing `limit` brings a summary back, and it is a trade rather than an escape hatch: the window
+only trims the old end, so the sole summary it recovers is the newest cycle's, and it is the same
+window that decides `first_run`, the `gone` status and new-vs-old detection. The per-run rows in
+`runs[]` carry each round's own four unaltered at any `limit` — including a null `stop_veto`, which
+is why they are read `(r.stop_veto || [])` — and reading those is usually the better answer.
+
+Closes #44.
+
+## v2.53 — a pinned model no host can serve stops costing the whole seat
+
+A four-seat panel became a one-seat panel, quietly, and said `exited 1 (Reading prompt from
+stdin...)` about it.
+
+**The cause is a pin that cannot be right everywhere.** `.harness-rules` pins reviewer model
+slugs so a finding stays attributable — "codex found 9 issues" means nothing later without the
+model behind it. But a pin is one value for the whole fleet and a *deployment* is per-host. On
+daedalus, codex routes through an employer Azure gateway that deploys `gpt-5.5`, while the
+rules pin `gpt-5.6-luna`; there is no deployment for that slug, so the seat 404s, reconnects
+ten times and gives up. On PR #207 the result was 25 master-confirmed findings **all
+attributed to `claude`** — one vendor reviewing a PR that vendor had written, with the panel
+correctly reporting that no consensus was possible. A review with no independent vendor in it
+is the situation the pinning rationale exists to protect against, and the pin is what caused
+it.
+
+**Two bugs stood between that and being diagnosable, and both were the wrong stream.** codex
+under `--json` writes its event stream to **stdout**, so the account of what happened —
+`{"type":"error","message":"Reconnecting... 1/10 (unexpected status 404 Not Found: The API
+deployment for this resource does not exist ...)"}` — lands there, while **stderr** holds
+exactly one line: `Reading prompt from stdin...`, a progress banner printed before the request
+was even made.
+
+- **The diagnosis read stderr only.** `stderr_gist` was not picking the wrong line; it picked
+  the only line it had. So a config mismatch was reported as something that reads like broken
+  stdin plumbing, and it cost two wrong diagnoses — one of them mine, in a session that also
+  looked at `codex login status`, which says "Not logged in" on this box even though codex
+  works, because the gateway is configured rather than logged into. Two misleading signals in
+  front of a one-line problem.
+- **So did the retry decision, and nobody had noticed.** `is_deterministic_failure` keys on
+  `is_rejection`, which matches 4xx invalid-request markers and an explicit `"status":400` and
+  deliberately excludes 429. A gateway **404** is neither, so an unservable pin read as a flake
+  worth retrying — and each outer attempt spent the seat's whole budget, ten minutes at a time,
+  to arrive at the identical 404. codex had already reconnected ten times internally before the
+  panel even considered going again.
+
+Both now build their answer from stderr **and** the error envelopes lifted off stdout
+(`error_events`, strict enough — a line counts only if it parses as a JSON object whose `type`
+is `error` — to run safely over the seats whose stdout is their reply). `cli_hint` gains the
+branch that names a missing deployment, checked *before* the CLI-too-old branch because the two
+overlap in wording and telling someone to upgrade a current CLI is the confident wrong answer
+that function exists to stop giving.
+
+**There are TWO unsatisfiable pins, not one, and that broke the first version of this fix.**
+`.harness-rules` pins codex twice — a slug and a reasoning effort — and this gateway refuses
+both, separately:
+
+    gpt-5.6-luna + max    ->  404, no deployment for that model
+    gpt-5.5      + max    ->  {"param": "reasoning.effort", "code": "unsupported_value"}
+    gpt-5.5      + high   ->  works
+
+So "on a 404, retry with the CLI's default model" keeps `-c model_reasoning_effort=max` and
+loses the seat on the next knob. `panel_seats`' own comment already said the API "rules on the
+model/effort pair"; nothing acted on it until a **zero-seat** round on PR #217 — `LLM reviewers
+ran: none — 0 of 4 configured`, `to_fix: 0` — made it visible. That round is one careless glance
+from reading as a clean review. The two pins are now lowered independently, each only when the
+error names it, at most once each.
+
+The two refusals also overlap in *wording* and must not overlap in meaning: the effort rejection
+reads "Unsupported value: 'max' is not supported with this model", which names the model while
+blaming the effort. Read as a model problem it drops the wrong pin — recovering anyway on the
+next pass, but recording `model_unavailable` for a model that was perfectly servable. The effort
+refusal therefore wins the tie.
+
+**And the seat is recovered rather than lost.** On an unsatisfiable pin a seat lowers it and
+reviews anyway. A degraded seat beats an empty
+one — but only if the record is honest about it, so the substitution is carried as state
+(`ReviewerRun.model_unavailable` / `.effort_unsupported`, alongside `absent` and for the same
+reason: a message tail is
+free text) and rendered in the header as `codex (CLI default, max; pinned gpt-5.6-luna
+unavailable)`. It is in the JSON payload too, because the board is where "which reviewer earns
+its cost" is answered from accumulated runs and a run whose model was swapped must not be
+averaged in as the pinned one. `CLI default` rather than the resolved slug because nothing here
+knows it — the model is chosen inside the CLI from its own config, and naming it would mean
+parsing another tool's configuration.
+
+The fallback is deliberately narrow: only for a pin that was actually set, only for the two
+causes above, and at most once per pin — so it is bounded at two attempts and cannot become
+"retry with fewer constraints until something answers", which would review on a weaker seat for
+reasons nobody chose.
+
+**codex only, and that is a real limit rather than caution.** Lowering a pin means rebuilding the
+argv without it, which needs a seat whose argv can *say* "use your default": `codex_args("")`
+omits `--model` entirely. `claude` takes `--model` unconditionally and would be handed an empty
+string; `agy` builds its argv eagerly, before any failure exists to react to. The first draft
+gated on nothing and would have re-sent the identical bad value for those seats and then labelled
+it a fallback — a false record on top of a futile retry. Caught in review by codex, on a diff
+about codex.
+
+An `--ask` run falls back the same way and reports it the same way: `SeatAnswer` carries the same
+two fields, because the first draft dropped them there and the Seats line would have named the
+pin while the CLI default answered the premise. Both new fields sit at the END of their
+dataclasses — `SeatAnswer` is constructed positionally, and inserting ahead of `verdict` rebound
+every ask's verdict to a new field, which surfaced as 19 tests reporting wrong verdicts rather
+than as a type error.
+
+**What this does NOT ship, and why that is the interesting part.** Round 1 raised a speculative
+finding — what if a seat exits 0 having printed nothing but its provider's refusal — which its own
+judge called "plausible and untested". The fix for it was a predicate, `stdout_is_only_errors`,
+and across rounds 2 and 3 that predicate accumulated roughly seven P1/P2 findings of its own. It
+went through three shapes and each was wrong in a new way: dead in both directions at once, then
+blind to the reply nested one level inside `item.completed`, then unable to recognise the very
+`{"error":{...}}` envelope the gateway actually sends. The round-3 finding that settled it: for a
+seat that replies in a FILE — codex, the seat it existed for — the predicate can only ever take a
+review away, because `replied` has already answered the success question. And the real 404 exits
+1, so `cli_outcome` catches it without any of this.
+
+So it is cut, along with the line-anchoring added beside it, which broke recognition of
+`ERROR: {"type":"error",...}` — the shape this module's own `TOO_OLD` fixture uses — in order to
+defend against prose that quotes an envelope. Both were hardening against cases nobody had seen,
+and both cost more than they bought. Three rounds found 22, 24 and 16 findings, of which 18 and 14
+were introduced by the fix pass before them; almost all of that churn was these two. What remains
+is what #215 asked for and what four consecutive live runs demonstrate works.
+
+**Round 2 got the seat back and then found five more things, four of them introduced by the
+fix pass.** With both pins lowered, codex ran for the first time on this host — the first
+two-vendor panel here, and it immediately produced findings claude and codex agreed on, which
+was structurally impossible while the panel was one seat. What it found:
+
+- The new "exited 0 but reported only errors" predicate was **dead in both directions**. It was
+  asked only when `replied is None` — the seats whose stdout IS their reply and which never emit
+  that event shape — while codex answered a different question one branch up and never reached
+  it. And it demanded that everything outside the ERROR events be blank, which no real stream can
+  satisfy: codex always prints `thread.started` and `turn.started`. It now asks whether every JSON
+  value is a typed EVENT, at least one is an error, and none carries reply text — keyed on the
+  payload rather than a list of event names, because the names are the CLI's to change and "did it
+  say anything" is not. Asked of every seat.
+- Widening the scan from line-anchored to any `{` fixed a false negative and bought a false
+  POSITIVE: prose quoting an envelope — a stack trace, a reviewer's reply, this file's own
+  fixtures — was decoded as though the CLI had emitted it. These values suppress retries and drop
+  pins, so a `{` now has to open a line. Indented bodies still qualify, which is the whole reason
+  the scan was widened.
+- The elapsed guard bounded when a lowering may START and nothing else, so an attempt beginning
+  just under the line still ran a full `CLI_TIMEOUT` past it. A lowered attempt now gets the
+  budget that is LEFT, floored so a remainder of thirty seconds is not handed to a reviewer and
+  called a review.
+- The branch that can turn a working seat into a lost one had no test at all — the highest-risk
+  addition in the round, and the one whose absence hid the dead wiring above.
+
+One P1 was **refuted**: `class CliFailure(str)` was reported as a `NameError` at import from its
+own `-> CliFailure` annotation, which `from __future__ import annotations` on line 14 makes a
+string that is never evaluated. The judge said plainly that it could not execute the claim and
+kept it under "when unsure, mark it real" — the right policy, and the reason `record-outcome`
+exists to say afterwards which way it fell. Recorded, unattested.
+
+**The panel reviewed this change and its own run demonstrated the bug it found.** Round 1 on
+PR #219 lowered the model correctly, kept `max`, and lost the seat anyway — recording
+`model_unavailable: gpt-5.6-luna`, `effort_unsupported: null`. The reviewer named the cause
+independently: the fallback was re-classifying `run_cli`'s human-facing summary rather than the
+full diagnostic, and the gist it had (`"type": "invalid_request_error",`, one fragment of a
+pretty-printed envelope) named neither pin. `run_cli` now returns a `CliFailure` — a `str`
+subclass carrying the streams on `.diag`, so every existing reader is untouched and only the
+classifier looks deeper. `error_events` keeps each envelope's `param`, parses pretty-printed
+JSON, and the seat gets one flake allowance and a wall-clock bound so a recovered seat is not
+lost to a single 500 or given three budgets to burn.
+
+Twenty-three new tests in `test_panel_reviewer_model.py`, against the real captured streams and
+the real refusal envelopes. Those that CAN go red against the pre-fix code do — the retry
+decision and the missing hint among them, fed a literal 404 string precisely so they test
+behaviour rather than the existence of a new function. The rest cover new symbols and are
+`red/green: N-A (new code path)`: reaching for a new name fails the old code with an
+`AttributeError`, which proves only that the name is new.
+## v2.52 — the panel decides whether a round is worth running, and stops asking seats that are not here
+
+### Whether the round is worth running at all (#138)
+
+
+A panel was launched on PR #137 and killed five minutes in by a human asking *"is
+this a crazy token count?"*. It was, and the more important half is that **the
+output would have been worth less than nothing.** Nothing in the harness knew
+that. It dispatched four seats at full effort against a diff it could not usefully
+read, and would have gone on to brief a boil-the-ocean fixer with whatever came
+back.
+
+**The pieces to catch it all existed and none of them was wired to the decision.**
+The truncation report says `N of M configured` and names the cut seats — in
+`config_notes`, after the round, when it is already spent. The ~120,000-byte argv
+ceiling is written down as a permanent property of the harness and gates nothing.
+Increment scope makes *later* rounds cheaper, and round 1 on a 763 KB diff is
+exactly the case it does not help. So the gap was specific: there was no
+pre-flight verdict on whether a round was worth starting at all.
+
+**Size and shape are different quantities and the panel only modelled one.** PR
+#137's diff was 763,375 chars, 6.4× the ceiling, on a change that was a **pure
+move** — `panel.py` split into six modules with nothing retyped. Every relocated
+line appears twice, once as a delete and once as an add, so the bulk of that
+763 KB is code nobody changed, already in `main` and already reviewed when it
+landed there. A finding about it is a finding about the base branch. The token
+cost is the second problem; the first is that a truncated read which *produces
+findings* is worse than no review, because the next step of the cycle briefs a
+fixer to resolve every one of them to a "nothing left to improve" bar. The review
+manufactures work.
+
+**A move is now identified mechanically and reviewed as a manifest.** Its added
+lines are a near-permutation of its deleted ones — a multiset comparison of the
+diff text already in hand, needing no `git diff -M` and no checkout of a PR the
+panel never checks out. A move-shaped diff over a seat's ceiling gets a **manifest**
+instead of content: what moved where, what did NOT survive, what changed *besides*
+moving, and which definitions the change **adds** in more than one place, with the
+files each copy landed in. That last one is half of the duplicate-copy trap — a merge
+that keeps both copies of a moved function is a clean merge, a green test run and a
+silent bug, because the later binding wins and the dead one is what anybody reading
+the old file finds. Only half, and the manifest says which half: the *other* original
+sits in a file the merge never touched, so it appears in the diff as neither an added
+nor a deleted line and no amount of parsing recovers it from `gh pr diff`. Finding it
+needs the branch, so it is listed as unmeasured beside the two facts below rather than
+claimed. The manifest's size tracks the change's shape rather than the diff's length:
+the 428 KB worked example in the suite produces 1.3 KB. It travels as the round's
+review material, so the per-seat budgets, the truncation measurement, the judge and
+the board record all keep working unchanged.
+
+**What it cannot measure, it names.** PR #137 was also judged on identical test
+counts before and after and an AST closure check showing no module reaching
+backward into another. Both need the branch checked out and the panel has only the
+diff, so the manifest lists them as unmeasured and the brief tells the reviewer to
+declare them — rather than inventing the two facts a reader would most want to rely
+on.
+
+**A diff far over the ceiling with no smaller honest question is refused, loudly.**
+Printed under "Panel REFUSED — no review happened", stating in its first sentence
+that this is not a clean review, followed by the measurement and the remedies.
+`reviewed: false`, a `skip_reason`, the full `preflight` block in the payload, the
+`scope` and `since_sha` the round was going to review — **and recorded on the board**,
+unlike the title-pattern skip. It still reads the **CI gate**, which no diff size can
+defeat and which costs one API call, and states that the Sonar gate was **not
+evaluated** rather than letting its default read as a pass: Sonar is a panel member,
+and no member was dispatched. That difference is the design: a title skip says this
+PR was never worth a panel, a refusal says a panel was wanted and this diff defeated
+it. Under `--post` it goes on the PR too, because the terminal copy is read by whoever
+is watching and under the epic driver nobody is. `--force` overrides it and cannot
+erase it: `preflight.would_have` records the verdict, and both the report and the PR
+comment carry the warning.
+
+**It is not a default diff budget and it must not become one.** v2.16 refused one
+on evidence — truncating when nothing forces it biases toward false positives — and
+that reasoning is untouched. A budget answers *what to send*; this answers *whether
+to start*, and only ever against a ceiling the repo or the kernel already declared.
+On a repo with `max_diff_chars` unset and no argv-bound seat enabled there is no
+ceiling, none of this fires, and no number it invented reaches anyone's diff. Three
+keys govern it: `refuse_over_cap_multiple` (3), `move_shape_ratio` (0.9),
+`manifest_moves` (true). `0` is the only spelling of *off* for the refusal and for
+the manifest alike (`manifest_moves` also takes `false`/`"off"`); `move_shape_ratio`
+is a threshold and has no off, because a ratio of `0` turns the feature all the way
+*on*.
+
+**A ceiling carries its unit, and the tightest one is the tightest *ratio*.** A
+configured `max_diff_chars` counts characters; the kernel's argv limit counts bytes,
+and this repo's own diffs — em-dashes, arrows, box characters in every comment — run
+well over two bytes per character. Those are not two sizes of the same thing, so
+taking the smaller *number* had no defined answer: a repo setting
+`antigravity.max_diff_chars: 100_000` hid the 120,000-**byte** argv ceiling behind
+the smaller integer, and at two bytes per character that seat's real ceiling is
+~60,000 characters — genuinely the tighter of the two, and unevaluated. So `agy`
+with a configured cap declares **two** ceilings, each is measured against the diff in
+its own unit, and the one that binds first decides. `preflight.cap_unit` records
+which reading `cap` and `over_cap` are in, `shape` carries both, and every renderer —
+the refusal notice, the manifest and `--force` banners, each seat's skip reason —
+states the unit it measured in, so a reader who divides the two numbers on the page
+gets the multiple printed beside them.
+
+**Two guards, both for cases that read plausibly when wrong.** A manifest is
+substituted only when it is *smaller* than the diff **and** under the ceiling — its
+brief is a fixed ~1.3 KB, so on a small move over a small ceiling the substitution
+would hand a seat more text than the diff did, and ~35 KB of manifest is smaller than
+a 763 KB diff while still being a prefix-read against a low-thousands ceiling. Both
+are measured, not assumed, and a manifest that does not help falls through to the
+refusal above the multiple and to an ordinary truncated content review below it —
+never silently, because the `run` verdict then carries a reason naming the manifest
+path and what it measured. And the refusal notice refuses to render a verdict that is
+not a refusal: handed a `run` it would print "**Why:** ." over a measurement table and
+a list of remedies, a document that reads exactly like a refusal and names no reason.
+That is not hypothetical — it is what the first hand-run of it produced.
+
+**And two ways a refusal or a manifest could still have read as a clean round.**
+A refused run is recorded, so it now sends a `reviewers` block marking every
+selected seat as not run: the board builds a scorecard row per name in
+`reviewers_selected` and, with no such block, assumes a member ran unless `skipped`
+names it — so a refusal would have been filed as a clean review *per reviewer*, in
+the table that answers which reviewer finds the real issues. And a manifest's
+material is a whole-target composition, which flipped `scope` from `increment` to
+`pr` and silently skipped the inherited coverage vetoes gated on it — so a
+move-shaped round 2 could stop confidently over gaps earlier rounds left. What a
+round **targeted** and the shape of the material it composed are two different
+facts; only the second one changes.
+
+**A seat whose CLI this box does not carry declares no ceiling.** `agy` is a
+workstation package, so on a headless box this repo's rules enable a seat that
+records "antigravity: CLI absent" and never runs — and its argv ceiling would
+otherwise have refused rounds on behalf of a reviewer that was never going to read
+anything, on exactly the unattended hosts where nobody is watching to pass
+`--force`. The host predicate is resolved in the function body rather than as a
+default argument, which is what makes it replaceable: bound in the signature it made
+`monkeypatch.setattr` a no-op, and ten tests passed on a workstation while reading
+the real PATH. The suite now runs green both with the vendor CLIs present and with
+them hidden.
+
+**A manifest round does not count as having re-read the PR.** It records `scope:
+"pr"` with nothing truncated — the manifest travels as the round's material and it
+fitted — so it satisfied every term of the baseline's re-read test while having read
+no code at all, and one such entry erases *every* earlier round's truncation record.
+It is now tracked as its own thing (`Baseline.manifest_rounds`), it vetoes a
+confident stop on the round itself, and under increment scope a later round carries
+a veto naming it, because the anchor steps over the code the manifest only described.
+A round that genuinely re-reads the whole PR clears it. And the verdict is weighed on
+the **review target** rather than the PR, so a round 2 whose material is a 3 KB fix
+commit is not refused for the size of the 763 KB PR it lands in.
+
+**One behaviour change to know about:** a tightly configured `max_diff_chars` can
+now trigger a refusal. `max_diff_chars: 30` on a 1,559-char diff is 52× over, and a
+seat handed 2% of a PR produces exactly the review this prevents — but a repo that
+chose a small budget deliberately gets a new answer. `refuse_over_cap_multiple: 0`
+switches the refusal off and keeps the manifest.
+
+The irony worth keeping: the PR that makes every module fit the seat that has to
+read it produced a diff that same seat could not read.
+### A seat this box cannot run declares nothing about it (#222)
+
+
+`coverage_veto` already knew that an absent reviewer CLI is a fact about the
+**host**, not about the round: it is absent every round, so vetoing on it makes
+`confident` permanently unreachable on exactly the unattended boxes where the
+signal has to mean something. That exemption was applied to the veto and to
+nothing else.
+
+**`budgets` was still built from the configured set.** So a seat with no CLI on
+the box acquired a diff budget, an argv clamp, a `config_notes` line saying it
+"gets 116,287 of 177,872 diff chars", and a `truncated: true` record — four
+statements about a reviewer that was never going to read a byte. Measured on a box
+without `agy`: `antigravity: ran=False absent=True truncated=True`, run-level
+`diff_truncated: true`, and **nothing that actually ran was cut**.
+
+**The last one was not cosmetic.** `load_baseline` read `any(m.get("truncated"))`
+over every member regardless of whether it ran, so the round was banked as
+truncated and the next round inherited *"whatever that round was cut off from has
+now been read by no round of this cycle, and re-reviewing the fix commit does not
+reach it"*. False on that host — and a `confident` veto, so **every multi-round
+cycle on a box configuring an argv-bound seat it cannot run was non-confident from
+round 2 onward, permanently.** That is the failure the absent-CLI exemption exists
+to prevent, arriving through the one consumer nobody exempted.
+
+**Filtered at the source rather than at each consumer.** `seat_installed` now
+lives in `panel_core` beside `CLI_BIN`, `budgets` is filtered by it, and both
+`panel_seats.run_seat` and `panel_rounds.adjudicate` ask the same predicate
+instead of their own inline `shutil.which` — copies being chances to disagree,
+silently, about which seats this box has. It is read **once per round** and
+snapshotted, so the budget, the argv clamp, the prompt and the payload all
+describe one host. The absent seat is still **dispatched** and still records
+itself absent, because `run_seat` is the single authority on absence — and not
+only a PATH check: it answers a typo'd reasoning effort as the config error it is,
+BEFORE looking for the binary, which a round that decided absence for itself would
+skip. What the seat no longer gets is a budget, and with no budget it is no longer
+handed a rendered prompt it was never going to read.
+
+`budgets` is decided before dispatch and `run_seat` decides absence after it, so
+the emitted record is **reconciled against what actually happened** rather than
+read straight off `budgets`: a seat the run found absent records a null budget and
+no truncation. Without that, the one round where the two PATH reads disagree writes
+a real `max_diff_chars` beside `absent: true` — the contradictory pairing this
+release exists to remove, produced by the fix meant to have removed it. The judge is filtered by the
+same predicate: `adjudicate` runs it through the `claude` CLI, so a box without
+that gets no `judge_max_diff_chars` and no "the judge saw …" note either.
+
+**`diff_budgets` keeps every selected seat.** In the payload an absent seat
+records `null` rather than losing its key — the same answer
+`reviewers.<name>.max_diff_chars` gives it — so a board or dashboard reading
+`diff_budgets[name]` for a configured seat does not begin raising `KeyError` on
+exactly the unattended hosts this fix is for. The internal dict does drop the
+seat, and has to: everything that iterates it reads a `null` as *uncapped*. What
+the null-beside-`truncated: false` pairing guarantees is only that a null budget
+can never sit beside `truncated: true`; it does not identify an absent seat, since
+an installed one with no configured budget records the same pair. `absent` is the
+field that carries that, which is why the reader below keys on it.
+
+**And the reader was fixed too, because baselines outlive the writer.**
+`load_baseline` now banks a round as truncated on `truncated and not argv_capped
+and not absent` — the same exemptions `coverage_veto` makes, each keyed on its own
+recorded field. Both terms are needed: `argv_capped` (v2.50, landed while this was
+in review) covers only seats the kernel bounded, so an absent `pi` or `codex`
+carrying a configured `max_diff_chars` under the target lands in `truncated_for`
+with `argv_capped` False and would still bank a phantom round under that exemption
+alone. Its sibling `truncated_any` — which decides whether a round CLOSES every
+earlier round's gap — exempts `absent` and deliberately not `argv_capped`: a capped
+seat RAN and saw a prefix, so the round did not read its target whole and cannot be
+the one that clears an older gap; an absent seat read nothing and is no evidence
+either way, and leaving it in let one legacy payload block `reread` forever, which
+is the permanent veto this release exists to remove. Every payload
+already on disk carries the old pairing and `--baseline` is fed them by design, so
+cleaning only the writer would leave every cycle already in flight banking phantom
+gaps until it ended. Deliberately **not** `ran and truncated`: `ran` is false for
+every way of not running, so that would also drop the truncation of a seat that
+was installed, read a genuine prefix, and then crashed or timed out — a real tail
+nobody read, un-banked, in the fail-open direction on a `confident` veto. Keying
+on `absent` also leaves pre-`ran` payloads reading exactly as they always did,
+since they carry neither field.
+
+**A note for anyone writing tests here.** `seat_installed` is a PATH read on the
+critical path of every round, which makes host capability a test-outcome
+dependency: nine existing tests pass on a workstation and fail on a CI runner
+carrying none of the four CLIs, while testing budgets, scope and truncation. The
+shared `conftest.py` grows an `every_seat_installed` fixture, **requested by the
+three modules that need a stated host rather than applied package-wide** — a pin
+that reaches tests nobody chose it for turns every absence assertion in the
+directory into a presence assertion, silently, and `test_panel_absent_seat.py` is
+a whole module whose subject is absence. That pin is on `panel` only and
+deliberately not on `panel_seats` — forcing `run_seat` to believe an absent binary
+exists makes it exec `agy` and retry with backoff, which hangs the suite rather
+than failing it.
+## v2.51 — reviewers can read the code, per repo, on by default
+
+The panel reviewed from a diff and nothing else. Every seat ran in an empty `git init`
+repo, so a reviewer that wanted to check the caller, the test, or the migration the
+diff refers to could only declare that it could not — and that is what it did, at
+scale. On PR #160's round 1, nine `could_not_assess` entries asked about a file in
+this very repo; the orchestrator answered all nine with `grep` in about four minutes.
+
+Worse than the findings it lost are the ones it invented. On #64, three of six P2s
+were conditional worries about code outside the diff and the code answered all three —
+`package.nix` globs, so the script *is* installed; `sed -n '4,34p'` already ends on the
+last `--help` line, so the proposed `4,40p` would have printed shell code into the
+help. **The proposed fix was the bug.** On #90 a P1 said `headRefOid` was read but
+never added to the `--json` field list; it was already there, so it never appeared in
+the diff, and the reviewer inferred absence from invisibility. On #123 no seat could
+see `migrations/versions/`, the tool's entire subject.
+
+So `review_panel.reviewer_code_access` — **on by default**. Where it is on, a seat runs
+in a checkout of the PR at its head, fetched from GitHub's tarball endpoint rather than
+from `cfg["path"]`, which is the main checkout on whatever branch it was last left on
+and is the failure #75 measured.
+
+**It buys one seat, and finding that out took running all four CLIs.** The issue
+assumed codex could be given read-only tools because "codex has the `-c` knobs" — those
+knobs only REMOVE tools. `-s read-only` governs model-generated *shell* commands, so
+codex's single read path IS the shell, and turning it back on grants execution (against
+#92) and re-opens the tool-hunt `codex_args` measured: five of seven runs went looking
+for the code anyway, a median third of the run and at worst 99% of it, still calling
+tools at 1133s. `pi`'s `--no-tools` is all-or-nothing over read/bash/edit/write.
+`antigravity` has no tool mechanism at all. Only `claude` can name a tool set, so
+`SEAT_READS_CODE` is an allowlist of one and the other three keep the empty sandbox —
+a seat that cannot read gains nothing from standing in a checkout and still pays #75's
+instruction-file channel for it.
+
+**The claude seat was never toolless, which `member_sandbox` claimed it was.** Measured
+on 2.1.232: a bare `claude -p` in an empty repo read a file in its cwd and ran
+`echo TOOLS-OK-$((6*7))` through `Bash`. What has been containing it is the CLI's own
+working-directory boundary — the same run was refused `head` on a path outside the cwd
+— plus an empty cwd to be bounded to. Give it the PR's tree and only the boundary is
+left, so the seat now gets `--allowedTools Read Grep Glob` and
+`--permission-mode manual`. No `Bash`: #92 answered "may reviewers execute?" with no,
+and a PR's own tree is the worst place to grant it — `pytest` in a contributor's
+checkout runs the contributor's code.
+
+**Convention files are stripped before any CLI starts**, at every depth, because
+`claude` reads a `CLAUDE.md` beside the file it is looking at. Symlinks are unlinked
+and never followed: `Path.is_dir()` is true of a link to a directory, so a
+`.claude -> ~/.claude` in a PR's tarball would have sent `rmtree` at the real one. The
+list is a **denylist and it will rot** — an accepted cost where the contributors are
+your own agents, and precisely why `false` is right where they are strangers. What was
+removed is named per round, so a PR that shipped an `AGENTS.md` is distinguishable from
+one that did not.
+
+**The tarball endpoint is flaky and is retried.** Five hand-run fetches of one sha
+while building this returned two 502s and a 503; GitHub packs a repository on demand
+here and it is much less reliable than the JSON API the rest of the panel uses. A
+transient 5xx gets three attempts, a 404 gets one — it is a settled answer about that
+sha. Without the retry the feature would have stopped applying a noticeable fraction
+of the time while its config said it was on, which is the worst of the three states.
+
+**Two holes in the new guards, found by a second model reviewing the diff.**
+`.github/copilot` was in the strip's directory list and matched nothing: the check
+compared `path.name`, a single component, so any entry containing a slash could never
+fire — a declared guard doing nothing, which reads as coverage it did not provide.
+And the extraction ceiling counted declared BYTES only, so a few hundred kilobytes of
+tarball could declare millions of zero-byte entries, each passing every size check
+while still costing an inode, a syscall and a `TarInfo`. Member count is capped too.
+
+**Every failure degrades to the OFF posture, loudly.** A fetch that 502s, a tarball
+that will not unpack or arrives in an unexpected shape, a copy that runs out of disk:
+the seat is blind, recorded as blind, and the round says why. Three of those paths were
+found by writing the tests — an empty tarball made `iterdir` raise
+`FileNotFoundError` straight out of a function whose contract is that it never raises.
+
+**A per-repo spend cap, defaulting to uncapped.**
+`review_panel.reviewer_code_budget_usd` passes `--max-budget-usd` to the seat that got
+the tree — not to a diff-only seat, which makes one bounded call and would only gain a
+way to be lost. Uncapped by default for the reason `max_diff_chars` gives: a number
+invented here would silently degrade reviews on repos that never asked for one, and
+reaching the cap is a LOST seat rather than a cheap one — it records a skip, and a skip
+vetoes the round's confident stop. The measured figures below live in the key's comment
+so a repo setting a cap is not guessing.
+
+Reaching the cap needed a guard nothing about the flag suggests, and both halves were
+measured on claude 2.1.232: it exits 1, writes its message to **stdout**, and leaves
+**stderr empty**. `run_cli` builds its skip reason from stderr and decides retryability
+from stderr, so without the guard the seat died as a bare "exited 1" with no cause and
+the attempt was then retried three times, re-burning a cap already spent. The test
+asserts the attempt count as well as the message — a fix that named the cause and still
+retried would triple the spend the cap was set to bound.
+
+**Measured, on this repo's own PR.** One seat, sonnet, PR #214's 75,628-char diff, run
+twice with only this feature differing: 922s against 372s of wall clock, 7,879,643
+against 159,520 input tokens (97% of the larger figure cached, so the billed multiple is
+far below the raw one), 71,674 against 36,364 output. In exchange, `could_not_assess`
+went from four entries to none — and the blind run filed a **false** finding the sighted
+one did not, having seen a diff line that mentions `argv_capped`, been unable to tell
+which function it belonged to, guessed `accounts()`, and concluded the name was
+undefined. #90's failure mode, reproduced without being asked for. The cost is per seat
+per round and `/panel-review-pr` fans out four concurrent panels, so bounding it with
+`claude`'s `--max-budget-usd` (which works with `--print`) is the obvious follow-up.
+
+**Recorded per seat**, which is the half that makes any of this measurable:
+`reviewers.<name>.code_blind` plus a `code_access` block holding the setting, the seats
+that actually got it, and the files stripped. Read back from what each seat recorded
+rather than from the intent, because a fetch that failed leaves the setting on and the
+seat blind, and only the second is true of the round.
+
+**The judge reads too, and it is the party that most needed to.** It is a `claude`
+seat, so it takes the same stripped checkout, the same read-only pin and the same
+spend cap. This is the half the reviewer change alone does not fix: the wrong findings
+#113 was filed over were **confirmed**, not merely raised. On #90 a reviewer inferred
+a missing `--json` field from its absence in the diff, and a judge with the same
+blindness had no way to check; on #64 three of six confirmed P2s were conditionals
+from a reviewer that had *declared* it could not assess the condition. Dismissing
+false positives is the judge's stated job and it cannot do it from the diff that
+produced them. One ordering trap, now pinned: the tree's cleanup has to run after
+`adjudicate`, or the judge is handed a path to a deleted directory and degrades to an
+empty sandbox — reviewing blind while the payload still says access was on. The
+degrade path working correctly is exactly what made that silent.
+
+**And the board stores all of it, instead of dropping it at ingest.** Migration `0024`
+adds `absent`, `code_blind` and `argv_capped` to `review_reviewers`, and `code_access`
+and `convention_files_removed` to `review_runs`; the read path returns them too,
+because a column nothing exposes cannot measure anything. `absent` had been sent since
+v2.32 and silently discarded — `ReviewerIn` declares `populate_by_name=True` with no
+`extra=`, so pydantic's `extra="ignore"` applied, which is precisely the drop v2.26
+records for `head_sha`, `unread_files`, `provenance_counts` and per-finding
+`provenance` (#93). #113 was about to add two more to the same hole.
+
+`code_blind` is the column that matters most: a seat that can open the caller and one
+that cannot are not comparable on findings, on precision, or on `could_not_assess`, so
+`/review/stats` would be averaging two different jobs. #113's own rule was "either
+every seat gets it, or the payload records which did" — this makes the second half
+true of the database and not only of a JSON file on somebody's disk. Every column is
+nullable with no backfill: NULL means "the panel did not say", the honest value for
+every round already recorded, and a manufactured `false` would assert coverage those
+rounds may never have had.
+
+Second half of #113. `--no-code-access` overrides the config for one run; there is
+deliberately no flag the other way, because turning access on for a repo that switched
+it off is a decision about trusting that repo's contributors.
+
+## v2.50 — the coverage veto stops reporting a constant
+
+`round_stop` computes `confident` as `not veto`, so anything `coverage_veto`
+files permanently costs the panel its confident stop. Three of the things it
+filed were true of **every** round, which makes them worth nothing as evidence
+and expensive as noise: the signal that decides whether to spend another round
+was never positive, and a signal that is never positive trains its reader to
+skip it.
+
+**A reviewer that cannot read the code declares gaps it will declare every
+round.** Every seat reviews from the diff alone — an empty `member_sandbox` cwd
+and no file tools — so `could_not_assess` fills up with questions about code the
+diff does not show. That is a fact about how the panel is BUILT, not about the PR
+in front of it, and it fired on any PR that so much as referenced a file it did
+not change. Measured on PR #160's round 1: 19 veto lines, 16 of them
+declarations, and **nine of those asked about a file in this very repo** — whether
+`mcp_server/__init__.py` imports the MCP SDK, `QuarterbackClient`'s default
+timeout, `worktree-holder`'s exit codes 3 and 4. The orchestrator answered all
+nine with `grep` in about four minutes. Recorded now as `ReviewerRun.code_blind`,
+reported on the PR comment under a line saying so, and kept out of the veto.
+
+**antigravity cannot be handed a large diff, and the kernel is not negotiable.**
+`agy` is the only seat whose prompt travels in argv, and the kernel caps one
+element at 120,000 bytes — on PR #160 it saw 116,771 of 175,547 chars, 66.5%. A
+budget is a different fact: someone typed it and can raise it, so truncation by
+`max_diff_chars` still vetoes. `argv_clamp` tells them apart and requires the
+kernel to be the **binding** constraint, so a dropped zero in a config cannot
+hide behind it.
+
+**Both are exempted off recorded state, never off the wording of a message.** The
+declarations are free-form model prose and the skip lines are free text, so a
+regex over either would exempt a genuine round-specific gap whose phrasing
+happened to match while still counting the structural one that did not — and
+would silently change which rounds can stop confidently the first time a vendor
+reworded something. This is the argument `ReviewerRun.absent` already made; the
+exemption now generalises to the whole class.
+
+**The argv exemption is applied twice, and the second place is the one that
+matters.** The baseline loader carries an earlier round's truncation forward,
+because increment scope never returns to what round 1 was cut off from. A seat cut
+by the kernel was not going to be closed by a later round either, so carrying it
+put the constant back one round later and left it standing for the whole cycle —
+and `/panel-review-pr` drives several rounds, so exempting only `coverage_veto`
+would have made round 1 look fixed while the loop went right back to never stopping
+confidently. Found by a second model reviewing this branch, which is the argument
+for having one.
+
+**The exemption is narrower than "ignore truncation", in two places a second model
+had to point out.** An argv-capped round still counts as truncated when the question
+is *did this round read the whole PR* — because `reread` erases every earlier round's
+recorded gap, and a round whose kernel-capped seat saw two thirds of the diff cannot
+be the round that closed everyone else's. Exempting the cap says "this gap will never
+close, stop vetoing on it"; it must not also say "this round closed the others". And
+the floor counts LLM seats only: `sonarqube` shares the same mapping and carries no
+`truncated` key, so counting every entry let one running static analyser switch the
+floor off — a confident stop with `--reviewers antigravity` and no LLM having read
+the diff whole. Sonar is the hard gate beside the panel, not a reviewer reading the
+change.
+
+**And each has a floor**, because exempting seats one at a time is how a veto
+list ends up empty on a round nothing read. A panel whose every running seat was
+cut by the argv ceiling vetoes — reachable with `--reviewers antigravity`, and it
+lands on the unattended loops where a confident stop is believed. That is the
+same floor the absent-CLI exemption needed for the same reason.
+
+This is the first half of #113. The second — code access as a per-repo setting,
+defaulting ON, with the empty sandbox as what untrusted-contributor repos turn
+off to — is deliberately separate: landing them together would make turning
+access on **look** like it fixed the confidence signal, when the two changes are
+independent, and on a repo that leaves it off the signal would stay dead. The
+state is a flag rather than a deletion precisely so that half can flip it: a seat
+that could have read the tree and still could not answer is describing the round,
+and has to cost it.
+## v2.49 — the guard that could not fire
+
+`create-worktree`'s isolated-database step reads the main database name out of the
+worktree's `.env`, and there is a `die` under that read whose whole job is to explain
+the case where it finds nothing. That `die` was unreachable by the one input it
+existed for.
+
+The script runs under `set -euo pipefail`. `MAIN_DB_NAME` was only ever assigned
+*inside* the branches above the guard, so when `database.url_env` was declared but
+absent from `.env`, nothing assigned it and the first reader was the guard's own
+`[[ -z "$MAIN_DB_NAME" ]]` — an unset dereference. The run died on
+`MAIN_DB_NAME: unbound variable` at precisely the instruction written to say
+"Could not determine main database name from .env". One line (`MAIN_DB_NAME=""`
+before the branches) makes the message reachable.
+
+Measured on this repo, twice, because the first time looked like a fluke:
+quarterback's `.env` carries `POSTGRES_PASSWORD` and nothing else.
+
+**The two config keys now cascade instead of excluding each other.**
+`database.url_env` and `database.name_env` name two places the same fact can live,
+and the old `if/else` meant declaring the first *disabled* the second. A repo that
+assembles its URL at runtime, or keeps the database name in `docker-compose.yml`
+while only the password reaches `.env`, could therefore never use an isolated
+database — and got an unbound-variable crash rather than a reason. URL still wins
+where both are set: it is what the application actually connects with.
+
+**And the failure no longer leaves an unusable worktree without saying so.** The
+database step is 3 of 10, so dying there left a directory that is a real checkout on
+a real branch with none of what follows: no `.venv` symlink, no assigned port, no
+`CLAUDE.local.md`, no `.gitignore` entry. It looks provisioned enough to `cd` into
+and then fails later in ways that have nothing to do with the database. `die_half_built`
+says the worktree is incomplete and gives the two commands out. It does not clean up
+automatically — by then the directory is a checkout the caller may be looking at,
+`remove-worktree` also drops the branch, and an error path that deletes things is a
+bad thing to have on a hair trigger; the rest of this script degrades the same way,
+by leaving the state and naming it.
+
+The hint passes `$BRANCH_NAME`, not the directory. `remove-worktree` takes a branch
+and derives the path itself, so pasting the basename the sentence above it names —
+the first thing anyone reaches for — fails with a confusing "no such worktree". The
+first version of the warning got exactly that wrong, and a test now pins it.
+
+**Every pasteable hint is now shell-quoted, including three that predate this
+change.** Git's refname rules forbid far less than a shell's parser does — `$`,
+backtick, `;`, `>`, `&`, `|`, `(` and `'` are all legal in a branch name, and nothing
+validates them — so `remove-worktree feat$(id)` was a hint that ran `id` on the
+reader's machine when pasted, and `feat>out` truncated a file. Nothing was executed
+by the script itself; a variable's value is never re-parsed inside double quotes. The
+hazard was entirely in what we printed for a human to copy. `printf %q` leaves an
+ordinary `feat/thing` untouched so the common case stays readable, and escapes the
+rest. Applied at all four sites, one of which writes into `CLAUDE.local.md` and so
+outlives the run that printed it. Found by a second model reviewing the diff.
+
+Tests extract the block from the shipping script by sentinel marker rather than
+copying it, the way `test_create_worktree_rerere.py` does, so a refactor that moves
+the code fails there instead of leaving the suite green about code nobody runs.
+Reverting the block to its previous shape reproduces `MAIN_DB_NAME: unbound variable`
+and fails three of them; neutering `sh_quote` fails the paste-safety one.
+
+## v2.48 — a lease says what its holder is doing, not just where
+
+A lease has always answered *who* is on a session and *where* — holder, cwd,
+repo, branch, and the ai-title of what they are up to. It never answered whether
+they were moving, and for a wall of seats that is the whole question: a pane that
+finished ten minutes ago, a pane stopped at a permission prompt, and a pane
+thinking hard render identically to anyone looking at them. The screen the last
+two releases built shows N agents and cannot say which one wants you.
+
+`POST /lease` now takes `state` — `working | waiting | input` — and `/active` and
+`/overlap` return it. The vocabulary is closed at the edge (a Literal, so an
+unknown value is a 422 rather than a row) because it is rendered as a word in a
+footer and a colour in a dashboard, and there is no reader that can do anything
+with a fourth spelling.
+
+**`state_at` is not `updated_at`, and the field is useless without it.** A state
+is only as good as its age: `working` last reported twenty minutes ago describes
+a pane that looks busy and has not moved, which is the failure this exists to
+catch — the one v2.46 named when it took the permission prompts away ("a prompt
+no one answers is an outage that looks like progress"). Removing the prompt
+removed the version of that a human could see, not the shape. Neither timestamp
+already on the row can stand in: `acquired_at` is fixed at first claim and
+`expires_at` moves on every heartbeat whether or not anything changed. So the
+pair travels together and each reader picks its own staleness threshold.
+
+**`stalled` is not a value anybody can report.** It is a conclusion drawn from a
+state and its age, and a holder cannot know it is in it — that is precisely the
+state where the holder has stopped talking. Two readers draw it today (the
+dashboards here, via `qbdata.agent_state`, and the pane's own footer in
+nix-fleet), and they share a threshold constant rather than a definition, because
+the same seat described differently by the bar and the dashboard is worse than
+either threshold being wrong.
+
+**Nothing infers it.** "The agent finished its turn" is a fact only the lifecycle
+hook is told; guessing it from lease traffic reads a slow turn as a finished one.
+The hook sends it on the events it already leases for, so the field costs no new
+request — and a heartbeat that knows no state leaves the last report, and its age,
+alone.
+
+Also here: both dashboards grow a `state` column, and a seat cell on the tmux bar
+takes its colour from `@qb_state` on the pane — set by the hook, unset on a fleet
+whose hook predates this, which falls through to the colour the bar always had.
+Only `waiting` and `input` get a colour of their own; `working` is most panes most
+of the time and colouring it would make the row uniformly loud again.
+
 ## v2.47 — the dashboard grows hands, and its tests start running
 
 The seat screen could tell you what was happening and not much else could be

@@ -19,6 +19,13 @@ import panel_seats                  # noqa: F401
 from panel_scope import *        # noqa: F401,F403  — re-exported for callers
 import panel_scope               # noqa: F401
 
+# Named directly, and BELOW the star imports on purpose: `escalated: Iterable[str]`
+# has to still mean `collections.abc.Iterable` the day one of those modules
+# re-exports the name, and the last import wins. Placed above, the guarantee would
+# have been a claim about another module's current contents rather than a property
+# of this file.
+from collections.abc import Iterable          # noqa: E402
+
 # ----------------------------------------------------------------------------- synthesis
 
 def cluster_findings(llm_findings: list[Finding]) -> list[list[Finding]]:
@@ -128,6 +135,66 @@ def _key_from_title(file: str | None, title: str) -> str:
     payload rather than off a Finding."""
     return hashlib.md5(f"{file or ''}|{_norm_title(title)}".encode(),
                        usedforsecurity=False).hexdigest()[:16]
+
+
+#: What a finding key looks like — :func:`_key_from_title` writes exactly 16 hex
+#: characters, and the board's `_derive_key` writes the same. The range is wider
+#: than that on purpose: a hand-written baseline or a future digest length should
+#: not be rejected, while anything carrying markdown, a newline or a paragraph of
+#: prose should be.
+_KEY_RE = re.compile(r"[0-9a-f]{8,64}")
+
+
+def _key_norm(value: object) -> str:
+    """A key as the register stores it: surrounding whitespace gone, lower-cased.
+
+    Applied wherever a key arrives from OUTSIDE — a caller's ``--escalated`` and a
+    baseline's register — and applied before :func:`_is_key` decides, because this
+    is the one input read out of a fixer's PROSE report and retyped by a human or
+    an orchestrator. ``DEADBEEFDEADBEEF`` and a copy-paste carrying a trailing
+    newline both NAME the right finding; rejecting them produced a note blaming
+    the caller for a value a human reads as correct and left the escalation
+    uncounted, which is the #221 jam with a misleading diagnostic on top.
+
+    It cannot admit anything ``_KEY_RE`` would not: case and surrounding blanks
+    are all it touches, and :func:`_key_from_title` writes lower-case hex — so the
+    normalised value is the one that matches a finding, and it is what the
+    register must store."""
+    return str(value).strip().lower()
+
+
+def _is_key(value: object) -> bool:
+    """Is this the shape a finding key comes in?
+
+    Keys reach the loop from a caller's ``--escalated``, which a human or an
+    orchestrator read out of a fixer's PROSE report — the one input here that was
+    never machine-generated. An unchecked value is interpolated into a
+    ``config_notes`` line that ``--post`` puts in a public PR comment, and the
+    same value is written into the payload every later round inherits, so the
+    shape is checked at the door rather than at the point of use.
+
+    Judged on the NORMALISED value (:func:`_key_norm`), which every caller of this
+    must then store rather than the raw one."""
+    return isinstance(value, str) and bool(_KEY_RE.fullmatch(_key_norm(value)))
+
+
+def _key_gist(value: object, limit: int = 24) -> str:
+    """A malformed key, cut and flattened to something safe to name in a report.
+
+    The note has to say WHICH value was rejected or it cannot be acted on, and it
+    is posted to the PR — so everything that is not plainly a key character
+    becomes ``?``, and the result is short. Quoting the raw value would put a
+    caller's arbitrary string, markdown and all, into a public comment.
+
+    ASCII alphanumerics only, and that restriction is the whole point of the
+    excerpt: ``str.isalnum`` is true for letters and digits in every script, so a
+    value made of Cyrillic or Greek homoglyphs (or full-width digits) came through
+    verbatim and rendered on the PR as a plausible-looking key — safe as markdown,
+    and useless for the one job the excerpt has, which is letting a human
+    recognise WHICH value was wrong."""
+    flat = "".join(ch if (ch.isascii() and ch.isalnum()) or ch in "-_." else "?"
+                   for ch in str(value))
+    return (flat[:limit] + "…" if len(flat) > limit else flat) or "(empty)"
 
 
 def _defect_title(reports: list[Finding]) -> str:
@@ -426,7 +493,9 @@ def _parse_verdicts(parsed: list, flat: list[Finding], pr: int) -> list[Canonica
 def adjudicate(clusters: list[list[Finding]], diff: str, model: str, pr: int,
                budget: int | None = DEFAULT_DIFF_BUDGET,
                coverage: dict[str, list[str]] | None = None,
-               ci: str = ""
+               ci: str = "",
+               code_tree: Path | None = None,
+               budget_usd: float | None = None
                ) -> tuple[list[Canonical], str | None, str]:
     """The 'master' rules on every finding, merges the duplicates it finds, AND
     rules on the coverage the reviewers declared about themselves.
@@ -486,7 +555,13 @@ def adjudicate(clusters: list[list[Finding]], diff: str, model: str, pr: int,
         return [_unmerged(f, pr, i + 1, "unjudged", "unjudged")
                 for i, f in enumerate(flat)], reason, note
 
-    if not shutil.which("claude"):
+    # Through the shared predicate (#222), not an inline `shutil.which`: `run()`
+    # now withholds `judge_max_diff_chars` from a box with no `claude` for the same
+    # reason it withholds a reviewer's budget, and the gate that decides that has
+    # to be the gate that decides this. Two spellings of "is the judge here" is how
+    # they come to disagree — a judge skipped as absent while `diff_budgets.judge`
+    # says it was given 60,000 chars.
+    if not seat_installed("claude"):
         return unruled("judge: claude CLI absent")
     # On stdin, like the reviewers, and for a sharper reason: the judge's prompt
     # is the only one with a component no budget could cover. The findings
@@ -500,13 +575,36 @@ def adjudicate(clusters: list[list[Finding]], diff: str, model: str, pr: int,
     prompt = JUDGE_PROMPT.format(findings=listing, coverage=stated,
                                  ci=ci or ci_brief("unknown", [], "not computed for this run"),
                                  diff=diff_text)
-    args = ["claude", "-p"] + (["--model", model] if model else [])
     # The judge gets a sandbox of its own on the same reasoning as the reviewers,
     # and one sharper argument: it is the seat whose loss is worst (a judge that
     # dies takes every finding through `unjudged`), so it is the last place to
     # leave depending on the caller's shell.
+    #
+    # **And it gets the code on the same terms they do** (#113). This is the half
+    # the reviewer change alone does not fix: the wrong findings #113 was filed
+    # over were not merely raised, they were CONFIRMED. PR #90's round-2 P1 said
+    # `headRefOid` was read but never added to the `gh pr view --json` field list;
+    # it was already there, so it never appeared in the diff, and the reviewer
+    # inferred absence from invisibility — and then a judge with the same blindness
+    # had no way to check and confirmed it. On PR #64 three of six confirmed P2s
+    # were conditionals from a reviewer that had DECLARED it could not assess the
+    # condition, and the judge confirmed them because they are well argued. A judge
+    # that can open the file is the only party in the loop positioned to catch
+    # that, and dismissing a false positive is its stated job.
     with tempfile.TemporaryDirectory(prefix="panel-judge-") as tmp:
-        sandbox = member_sandbox(Path(tmp) / "cwd")
+        if code_tree is not None:
+            sandbox, reads_code = panel_seats.seat_checkout(code_tree, Path(tmp) / "cwd")
+        else:
+            sandbox, reads_code = member_sandbox(Path(tmp) / "cwd"), False
+        if reads_code:
+            # Told, and pinned, exactly as a reviewer seat is — the brief is what
+            # stops it treating the diff as the whole record, and the pin is what
+            # keeps "read" from meaning "run" in a contributor's checkout.
+            prompt = prompt.replace(JUDGE_CODE_SLOT, CODE_ACCESS_BRIEF)
+        else:
+            prompt = prompt.replace(JUDGE_CODE_SLOT, "")
+        args = panel_seats.claude_args(model, str(uuid.uuid4()), reads_code=reads_code,
+                                      budget_usd=budget_usd if reads_code else None)
         out, err = panel_seats.run_cli(args, "judge", stdin_text=prompt, cwd=sandbox)
         if err:
             return unruled(err)
@@ -670,6 +768,19 @@ class Baseline:
     #: :func:`coverage_veto`, or the cheaper round quietly buys its saving out of
     #: coverage nobody is told it lost.
     truncated_rounds: set[int] = field(default_factory=set)
+    #: Earlier rounds that read a MOVE MANIFEST rather than a diff (#138).
+    #:
+    #: Its own set rather than a reading of the other two, because it is a third
+    #: thing. `unread_rounds` means no seat ran; `truncated_rounds` means a seat
+    #: got a prefix of its target. A manifest round's seats all ran and all got
+    #: their whole target — the target WAS the manifest — so neither is true of it
+    #: and the code it reviewed was still read by nobody.
+    #:
+    #: It matters twice. It must not count as having re-read the PR (see `reread`
+    #: below, whose `scope == "pr"` test a manifest round passes while having read
+    #: no code at all), and under increment scope the next round's anchor steps
+    #: over the code it did not read, exactly as it does past an unread round.
+    manifest_rounds: set[int] = field(default_factory=set)
     #: Files that preceding round could not read in full (:func:`_diff_files_cut`).
     #: A new finding in one of them is a coverage failure, not a reviewer miss.
     unread_files: set[str] = field(default_factory=set)
@@ -680,6 +791,21 @@ class Baseline:
     #: later coverage failure into a reviewer miss, and erases the truncation
     #: record of the last round that did read something.
     read_nothing: bool = False
+    #: Finding keys an earlier round's fixer ESCALATED instead of patching
+    #: (`review-pr.md` step 3a), mapped to the round each was first declared in.
+    #:
+    #: Inherited rather than re-declared because an escalation is answered by a
+    #: human, on their own clock, and nothing about a later round makes it stop
+    #: being open. A cycle that forgot one between rounds would go straight back
+    #: to counting it as work the loop can do — which is the failure this whole
+    #: register exists to prevent, arriving one round later.
+    #:
+    #: The round is kept, not just the key, because "when was this first said"
+    #: is the only thing here an auditor can check against the record: the
+    #: declaration is a caller's `--escalated`, and #221's honest caveat is that
+    #: the loop is trusting a report by the same agent whose fix pass produced
+    #: it. Earliest wins on a merge, for the same reason the cycle id does.
+    escalated: dict[str, int] = field(default_factory=dict)
     problems: list[str] = field(default_factory=list)
 
     def raised_before(self, finding: Canonical) -> bool:
@@ -911,7 +1037,74 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
         #: `members` because `reread` below needs POSITIVE evidence, and an empty
         #: list of records is the shape both "nobody said" cases arrive in.
         recorded = [m for m in members if isinstance(m, dict)]
-        cut = any(m.get("truncated") for m in recorded)
+        # TWO questions, and one variable used to answer both — which is how the
+        # argv exemption turned into a fail-open bug the first time it was written.
+        #
+        # `truncated_any` — did any seat read a PREFIX of its target? That is what
+        # `reread` below needs, and only ONE exemption applies to it — `absent`,
+        # never `argv_capped` (the asymmetry is argued where it is applied): a round where
+        # the kernel-capped seat saw two thirds of the diff did not read the whole
+        # PR, so it cannot be the round that closes every earlier round's gap.
+        # Exempting a seat says "this gap will never close, stop vetoing on it" —
+        # it must not also say "this round closed everyone else's".
+        # `absent` is exempt HERE as well, and `argv_capped` is not — the two
+        # exemptions genuinely differ on this question (225-R2-F01).
+        #
+        # An argv-capped seat RAN and saw a prefix, so the round really did not read
+        # its target whole and cannot be the round that closes an earlier gap. An
+        # ABSENT seat read nothing and is no evidence either way: the seats that did
+        # run may have read everything, and on a box where a configured seat can
+        # never be installed there is no future round that would clear the gap
+        # either. Leaving it in was the first spelling of this merge and it looked
+        # like the safe direction; it is not. It lets one legacy payload's phantom
+        # record block `reread` forever, which keeps every earlier gap open and the
+        # cycle non-confident — the exact permanent veto #222 exists to remove,
+        # surviving in the one path the fix had not reached.
+        truncated_any = any(m.get("truncated") and not m.get("absent")
+                            for m in recorded)
+        # `cut` — does this round leave an inherited veto? Here two exemptions
+        # apply, for two different reasons, and neither subsumes the other.
+        #
+        # `argv_capped` (#113): a seat the KERNEL cut was never going to be closed
+        # by a later round either, on this box, at this diff size. The veto it buys
+        # is not "a gap this cheaper round failed to re-read", it is the same
+        # constant arriving one round later and standing for the rest of the cycle
+        # — `/panel-review-pr` drives multiple rounds, so the loop would go right
+        # back to never stopping confidently. Truncation by a BUDGET still carries,
+        # which is the whole point of telling them apart: raise the number and the
+        # next round genuinely does read what this one could not.
+        #
+        # `absent` (#222): a seat that never ran cannot have been cut. Until #222 it
+        # was recorded `truncated: True` anyway, because `budgets` was built from
+        # the CONFIGURED seats, so this banked a truncated round on every cycle of
+        # every box configuring a seat it cannot carry — and the inherited veto then
+        # told a later round that code had "been read by no round of this cycle"
+        # when nothing had been cut off from anything.
+        #
+        # Both terms are needed. `argv_capped` covers only seats the kernel bounded
+        # — antigravity — so an absent `pi` or `codex` carrying a configured
+        # `max_diff_chars` smaller than the target lands in `truncated_for` with
+        # `argv_capped` False, and the argv exemption alone would still bank a
+        # phantom round for it.
+        #
+        # NOT `ran and truncated`, which was #222's first spelling and over-corrects
+        # in the optimistic direction: `ran` is `not skip`, false for EVERY way of
+        # not running. An INSTALLED seat with a small budget reads a genuine prefix
+        # and then times out, crashes, or is skipped for a bad effort pin — it is
+        # written `ran: False, truncated: True`, and a real tail nobody read would
+        # stop being banked. `absent` is the one absence that is a fact about the
+        # HOST rather than about the round; every other way of not running still
+        # counts here, exactly as it still vetoes in `coverage_veto`.
+        #
+        # Both exemptions are also what keep OLD payloads honest, which is why the
+        # reader had to be fixed at all: baselines outlive the release that wrote
+        # them, and `--baseline` is fed earlier rounds' payloads by design. A
+        # payload written before either field existed has neither, so both `not`
+        # terms are True and its recorded truncation is banked — the old reading,
+        # preserved, rather than a real coverage gap silently dropped because the
+        # writer was too old to say.
+        cut = any(m.get("truncated") and not m.get("argv_capped")
+                  and not m.get("absent") for m in recorded)
         if cut:
             b.truncated_rounds.add(was)
         # Two facts about coverage that only matter once a later round stops
@@ -930,11 +1123,91 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
         # as having re-read the PR if at least one seat recorded that it was
         # there. The conservative direction: an old baseline keeps an inherited
         # veto standing rather than silently clearing it.
+        # A manifest round (#138) reviewed the SHAPE of a move and none of its
+        # code. Read off the payload's own verdict, defensively: a payload written
+        # before `preflight` existed has no such key and is not a manifest round,
+        # which is both true and the conservative direction.
+        pre = payload.get("preflight")
+        was_manifest = (isinstance(pre, dict)
+                        and str(pre.get("verdict") or "") == "manifest")
+        if was_manifest:
+            b.manifest_rounds.add(was)
+        # `ran`, not `not absent` (#222): a seat that was present and then crashed
+        # is "not absent" while having read nothing, so the weaker test let a round
+        # where every seat failed still qualify to erase earlier gaps.
+        read_something = any(m.get("ran") for m in recorded)
         ran = payload.get("reviewers_ran")
         if isinstance(ran, list) and not ran:
             b.unread_rounds.add(was)
-        elif recorded and not cut and str(payload.get("scope") or "pr") == "pr":
+        # FOUR terms, and each rules out a different way a round can look like it
+        # read the whole PR without having done so. `reread` erases every earlier
+        # round's recorded gap, so it is the most destructive thing in this
+        # function and every one of them is load-bearing:
+        #
+        #   `recorded`      — somebody wrote a per-seat record at all.
+        #   `read_something`— at least one seat actually RAN (#222).
+        #   `truncated_any` — no seat read a prefix of its target (#113).
+        #   `not was_manifest` (#138) — the round read a diff, not a description of
+        #     one. A manifest round records `scope: "pr"` (the manifest travels as
+        #     the round's material, so it is a whole-target round by construction)
+        #     with nothing truncated, because the manifest fitted. It therefore
+        #     satisfies every OTHER term here while having read not one line of the
+        #     diff, which would make it the round that closes everyone else's gaps.
+        elif (recorded and read_something and not truncated_any and not was_manifest
+                and str(payload.get("scope") or "pr") == "pr"):
             reread.add(was)
+        # Tolerant of both shapes on purpose: this run writes a {key: round}
+        # object, and a payload from before the field (or a hand-written one)
+        # may carry a bare list. A list is attributed to the round that wrote it,
+        # which is the only answer available and never later than the truth.
+        #
+        # Anything else is REPORTED, not dropped. Same rule as every other field
+        # this function reads, and it matters more here than most: an unreadable
+        # register reverts the cycle to counting an escalated finding as work a
+        # fix round can clear, which is the exact failure the register exists to
+        # prevent — and it would arrive with nothing said.
+        esc = payload.get("escalated")
+        if isinstance(esc, dict):
+            declared = list(esc.items())
+        elif isinstance(esc, list):
+            declared = [(k, was) for k in esc]
+        else:
+            declared = []
+            if esc is not None:
+                b.problems.append(
+                    f"baseline {path} has an `escalated` field that is neither an "
+                    f"object nor a list ({type(esc).__name__}) — round {was}'s "
+                    "escalations were NOT inherited, so a finding only a human can "
+                    "close counts as work a fix round can clear again")
+        for k, when in declared:
+            if not _is_key(k):
+                # A key the payload carries but nothing can match: it would sit in
+                # the register forever, matching no finding, and the caller would
+                # read the cycle's silence as the escalation being honoured.
+                b.problems.append(
+                    f"baseline {path} carries `{_key_gist(k)}` in its `escalated` "
+                    "register, which is not the shape of a finding key — it was "
+                    "NOT inherited")
+                continue
+            # The NORMALISED key, which is what `_is_key` judged and what a
+            # finding's own key will equal — storing the raw one would put a
+            # padded or upper-case spelling in the register, matching nothing.
+            key = _key_norm(k)
+            # The declaration round is the one auditable fact in a register the
+            # loop otherwise takes on trust, so it is range-checked rather than
+            # coerced. `bool` is excluded explicitly: it is an `int` subclass, so
+            # `True` would otherwise be read as "declared in round 1". Out of
+            # range falls back to the round of the payload carrying it — the same
+            # answer a bare list gets, and never later than the truth.
+            ok = isinstance(when, int) and not isinstance(when, bool) and 1 <= when <= was
+            if not ok:
+                b.problems.append(
+                    f"baseline {path} dates escalation {key} to {when!r}, which is not "
+                    f"a round of this cycle at or before {was} — read as round {was}, "
+                    "so the round shown against it is this payload's, not the "
+                    "declaration's")
+            first = when if ok else was
+            b.escalated[key] = min(first, b.escalated.get(key, first))
         for bucket in ("to_fix", "dismissed", "sonar_findings"):
             for f in payload.get(bucket) or []:
                 if not isinstance(f, dict):
@@ -958,6 +1231,10 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
         newest = max(reread)
         b.truncated_rounds = {r for r in b.truncated_rounds if r > newest}
         b.unread_rounds = {r for r in b.unread_rounds if r > newest}
+        # A manifest round's gap closes the same way and for the same reason: a
+        # later whole-PR round read the code the manifest only described, so a veto
+        # saying otherwise states something the baselines themselves disprove.
+        b.manifest_rounds = {r for r in b.manifest_rounds if r > newest}
     # The commit and the coverage record come from the END of the set rather than
     # from a merge of all of it: `keys` and `titles` are a union over every earlier
     # round ("has anyone raised this before"), while "which commit did the fix pass
@@ -1025,8 +1302,25 @@ def coverage_veto(reviewer_meta: dict[str, dict], judge_skip: str | None,
     at the same budget, so treating that as a reason to go again is a loop with no
     exit. It is a reason to stop CLAIMING the PR is clean.
 
-    The one absence that is not an observation about the round is a reviewer
-    whose CLI this box does not carry — see below."""
+    **What does NOT belong here is a constant.** Three of these observations are
+    true of every round the panel runs, so they distinguish nothing and cost the
+    signal everything: a reviewer whose CLI this box does not carry
+    (:attr:`ReviewerRun.absent`), a seat that cannot read the code it is reviewing
+    (:attr:`ReviewerRun.code_blind`, whose `could_not_assess` entries are
+    therefore reported and not counted), and the one seat the kernel cannot hand a
+    whole diff to (`argv_capped` — `agy`'s prompt travels in argv). All three are
+    facts about the HOST or about the panel's DESIGN. Because `round_stop`
+    computes `confident` as `not veto`, leaving them in made a confident stop
+    unreachable — permanently on a headless box, and on any PR that so much as
+    mentions a file it does not change. A signal that is never positive carries no
+    information and trains its reader to ignore it, which is worse than not
+    emitting it.
+
+    Each is exempted off RECORDED STATE, never off the wording of a message or a
+    declaration, and each has a floor beneath it so that exempting seats one at a
+    time cannot empty the list on a round where nothing was read. Every other way
+    of coming up short — a crash, a timeout, a budget someone typed, a reply that
+    would not parse — is about THIS run and still vetoes."""
     out = []
     for name, meta in sorted(reviewer_meta.items()):
         if not meta.get("ran"):
@@ -1053,13 +1347,33 @@ def coverage_veto(reviewer_meta: dict[str, dict], judge_skip: str | None,
                 continue
             out.append(f"{name} did not run ({skip or 'no reason recorded'})")
             continue
-        if meta.get("truncated"):
+        if meta.get("truncated") and not meta.get("argv_capped"):
             budget = meta.get("max_diff_chars") or 0
             out.append(f"{name} saw {budget:,} of {diff_chars:,} diff chars")
         if meta.get("unstructured"):
             out.append(f"{name} returned no structured reply — its coverage is unknown")
-        for gap in meta.get("could_not_assess") or []:
-            out.append(f"{name} could not assess: {gap}")
+        # A blind seat's declarations are reported and do not vote. See
+        # `ReviewerRun.code_blind`: with an empty sandbox and no file tools the
+        # diff is the seat's whole evidence, so "I could not read a function this
+        # diff does not change" is true of every round it sits. A constant cannot
+        # distinguish a quiet round from a broken one, which is the only thing
+        # this function is for — and `confident` being `not veto` meant one
+        # unreadable neighbour permanently denied a confident stop to any PR that
+        # merely REFERENCES a file it does not touch. That is most of them.
+        #
+        # Kept out on recorded state, never by reading the entries: they are
+        # free-form model prose, and a regex over them would exempt a genuine
+        # round-specific gap whose wording happened to match while missing the
+        # structural one that did not. Same argument, and the same failure in both
+        # directions, as `absent` a few lines up.
+        #
+        # A seat that CAN read the tree (#113's per-repo setting, second half)
+        # comes back with `code_blind` False and its declarations veto again,
+        # which is right: at that point "I could not read it" is a fact about the
+        # round and worth the round's confidence.
+        if not meta.get("code_blind"):
+            for gap in meta.get("could_not_assess") or []:
+                out.append(f"{name} could not assess: {gap}")
     # The floor under the absence exemption above. Exempting absent seats one by
     # one means a box carrying NONE of the reviewer CLIs produces an empty veto
     # list, and `confident` is `not veto` — a confident stop on a diff nobody
@@ -1068,6 +1382,27 @@ def coverage_veto(reviewer_meta: dict[str, dict], judge_skip: str | None,
     # reviewer has to have actually run.
     if not any(m.get("ran") for m in reviewer_meta.values()):
         out.append("no reviewer ran — nothing read this diff")
+    # The same floor, one storey up, and it exists for the same reason: the
+    # `argv_capped` exemption is applied per seat, so a panel whose every running
+    # seat was cut by the kernel produces an empty veto list and a confident stop
+    # on a diff nobody saw whole. Today that means an antigravity-only panel —
+    # `--reviewers antigravity`, or a repo that switched the others off — which is
+    # a narrow case and exactly the kind that reaches an unattended loop and is
+    # believed. A budget-truncated panel does not need this: those seats already
+    # filed their own lines above.
+    # Over the LLM seats only, not every entry. `sonarqube` shares this mapping and
+    # carries no `truncated` key, so counting it made one running static analyser
+    # silently switch this floor off — a round could then stop confidently with
+    # `--reviewers antigravity` and sonar enabled, no LLM having read the diff
+    # whole. Sonar is the hard gate alongside the panel, not a substitute for a
+    # reviewer reading the change, so it cannot stand in for one here. The floor
+    # above it asks a different question ("did ANYTHING run?") and counts sonar
+    # deliberately, which is why the two are separate.
+    ran = [m for n, m in reviewer_meta.items()
+           if m.get("ran") and n in LLM_REVIEWERS]
+    if ran and all(m.get("truncated") and m.get("argv_capped") for m in ran):
+        out.append("every reviewer that ran was cut by the argv ceiling — "
+                   "nothing read this diff whole")
     if judge_skip:
         # Phrased for both halves of the judge's job: on a round with no findings
         # it is the coverage split that went unadjudicated, not the findings.
@@ -1079,7 +1414,8 @@ def coverage_veto(reviewer_meta: dict[str, dict], judge_skip: str | None,
 
 def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
                outstanding: list[Canonical], veto: list[str],
-               baseline_ok: bool = True, repeated: int = 0) -> dict:
+               baseline_ok: bool = True, repeated: Iterable[str] = (),
+               escalated: Iterable[str] = ()) -> dict:
     """Whether the panel/fix cycle should go again, and what decided it.
 
     ``outstanding`` is every finding the cycle still has to clear, which is wider
@@ -1099,26 +1435,151 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
 
     1. findings this round that no earlier round raised -> go again;
     2. a P1/P2 still outstanding -> go again, whatever anyone declared (a blocker
-       raised again is a blocker that was not fixed);
-    3. ``repeated`` — a finding an earlier round already raised that is STILL
-       outstanding, at any severity -> go again. The fixer was told about it and
-       it is still there, and ``/panel-review-pr``'s bar is every finding fixed,
-       not every P1/P2. This used to only cost the stop its confidence, which
-       ended the cycle with a judge-confirmed defect present and nothing acting on
-       the veto that said so;
+       raised again is a blocker that was not fixed) — **except one in**
+       ``escalated``, which the filter below has already subtracted. Said here
+       rather than left to the filter's own paragraph because it is the largest
+       behavioural consequence of #221 and it reverses this rule's own sentence:
+       a declaration now DOES override rule 2, and a cycle whose only remaining
+       work is an escalated P1 stops with that blocker present. That is the point
+       of the feature — no fix round may touch such a finding, so another round
+       buys nothing — and the stop is never dressed up as convergence: it takes a
+       veto line, ``confident`` is false, and ``reason`` says a human is owed an
+       answer;
+    3. ``repeated`` — the KEYS of findings an earlier round already raised that
+       are STILL outstanding, at any severity -> go again. The fixer was told
+       about them and they are still there, and ``/panel-review-pr``'s bar is
+       every finding fixed, not every P1/P2. This used to only cost the stop its
+       confidence, which ended the cycle with a judge-confirmed defect present and
+       nothing acting on the veto that said so. Keys rather than a count so the
+       escalation filter below can subtract the escalated ones: a count computed
+       before this function sees it puts the jam straight back, filtered by
+       whichever caller remembered to, which is not a rule but a convention with
+       one participant;
     4. otherwise dry -> stop.
 
     The cap is what stops rule 3 running forever when two reviewers disagree
     about a P4 — the cycle ends either way, and a cap reached with work
-    outstanding is recorded as such rather than as convergence."""
-    blockers = [c for c in outstanding if c.severity in ("P1", "P2")]
-    if new_keys:
-        stop, reason = False, (f"{len(new_keys)} finding(s) no earlier round raised")
+    outstanding is recorded as such rather than as convergence.
+
+    ``escalated`` is not a fifth rule but a FILTER in front of all four (#221), and
+    it is the exception none of them can express. A finding whose fixer reported
+    that the APPROACH is wrong rather than the code (``review-pr.md`` step 3a) is
+    outstanding, correctly, and may never be handed to another fixer, correctly —
+    so under the four rules alone it returns ``stop: False`` every round until the
+    cap, on a finding no round can close. The mechanism built to stop a loop
+    circling a premise instead guaranteed it ran to the cap. So escalated keys are
+    subtracted from ``new_keys``, from ``outstanding`` and from ``repeated`` before
+    the rules are applied: what remains is the work a fix round can actually clear,
+    and the cycle goes again exactly while there is some. The mixed case falls out
+    — one escalation beside two real findings goes again for the two, and stops
+    when they are gone rather than when the counter runs out.
+
+    Only the escalated keys THIS round raised do that. The register is inherited
+    and only grows, so a key that no longer names anything — a premise a human has
+    since answered, a finding withdrawn, a caller's typo — must not go on costing
+    every later round its confidence. A round that is genuinely dry is reported as
+    dry even while the cycle's register is non-empty; the open question lives in
+    the relay and its issue, which is where a human is looking for it.
+
+    **A stop that is HOLDING an escalation is never reported as convergence.** It
+    takes a veto line, which costs ``confident`` by the existing rule, and it says
+    so in ``reason``: the loop has finished, and the PR has a question on it that
+    only a human closes. Reporting that as dry would be the "clean" this whole
+    payload is organised against. Note the exact scope of the guarantee, which is
+    the paragraph above read the other way round: it covers the round that RAISED
+    the escalated finding again, not every later round of the cycle. A round under
+    ``--scope increment`` that reviews only a fix commit, or a round whose fresh
+    panel words the same premise differently enough to mint a new key, raises
+    nothing the register matches and is reported dry and confident with the
+    question still open. What tracks an open premise across a whole cycle is the
+    relay and its issue, not this field.
+
+    Two honest caveats, recorded here because they are properties of the design
+    and not of the code, and because this docstring is where they are KEPT — the
+    READMEs and ``panel-review-pr.md`` point at it rather than restating it, since
+    five paraphrases of one rule is five things to keep in step:
+
+    - The keys arrive from the caller, which read them out of a fixer's prose
+      report. The loop is therefore trusting a claim by the same agent whose fix
+      pass produced the finding — the one signal #67's own evidence says cannot be
+      self-reported. What that buys is convergence; what it costs is that a fixer
+      can end its own cycle by calling a finding a premise. ``escalated`` rides in
+      the payload with the round each key was first declared in so the claim is at
+      least auditable after the fact, and the cap still binds.
+    - A key is not a premise. The register identifies an escalation by the
+      finding key it was declared under, which holds exactly while a later round
+      re-derives that key — and a fresh panel over the same code very often words
+      the same premise differently, which mints a new one
+      (``panel-review-pr.md`` §5 says so in as many words). The caller carries
+      that gap: it must escalate the NEW key when it recognises the premise
+      restated. Closing it mechanically needs premise-level identity, which is
+      #67's first piece and is not built. The register also only grows — there is
+      no retraction — so once a human ANSWERS a premise the answer ends the cycle:
+      the key would otherwise go on subtracting its finding from the work a fix
+      round can clear, and go on rendering ⛔, for every round that inherits the
+      baseline."""
+    # Both key collections are checked at the door, the way every other shape in
+    # this file is, because both wrong shapes fail SILENTLY and both failures are
+    # the #221 jam this function exists to close.
+    #
+    # A bare `str` is itself iterable, so `escalated=key` instead of
+    # `escalated=[key]` — the natural slip now that these take keys — makes `held`
+    # a set of single characters, leaves `blocking` empty against real
+    # multi-character keys, and ignores the escalation while the cycle runs to its
+    # cap. `repeated="<key>"` is the same slip in the other direction and worse: it
+    # reports "N finding(s) an earlier round already raised" with an N invented out
+    # of the string's distinct characters.
+    #
+    # `repeated` also took an `int` COUNT until #221, so a caller outside this diff
+    # still on the old contract arrives here; it is named rather than left to a
+    # bare `TypeError: 'int' object is not iterable`, which says nothing about what
+    # to pass instead.
+    #
+    # A `dict` is deliberately NOT rejected: it iterates its keys, which is correct
+    # and is what the production call site passes (the register itself).
+    for name, value in (("repeated", repeated), ("escalated", escalated)):
+        if isinstance(value, str):
+            raise TypeError(
+                f"round_stop({name}=...) takes a COLLECTION of finding keys, not one "
+                f"string ({_key_gist(value)!r}): a bare str iterates character by "
+                f"character, so it matches no finding and says nothing — pass a list")
+        if isinstance(value, int):
+            raise TypeError(
+                f"round_stop({name}=...) takes finding KEYS, not a count ({value!r}): "
+                "the escalated ones are subtracted here, and a count computed by the "
+                "caller cannot express that")
+    held = frozenset(k for k in escalated if k)
+    # The escalated keys THIS round actually saw. The register is a property of
+    # the cycle and only grows; what is blocking is a property of the round, and
+    # conflating them meant one stale or mistyped key made every later round of
+    # the cycle non-confident forever — including rounds that were genuinely dry,
+    # and including after a human had answered the premise and the code moved.
+    # A permanently vetoed cycle is the "loud and wrong" a reader learns to
+    # ignore, which is worse than the jam this whole rule closes.
+    blocking = held & ({*new_keys} | {c.key for c in outstanding})
+    # The work a fix round can actually clear, under names of their own. The
+    # subtraction happens ONCE, before the rules, because every rule below asks
+    # "is there work outstanding" and an escalated finding is precisely work the
+    # cycle has been forbidden to do — but the parameters keep meaning what they
+    # are called, so the cap message and anything else downstream that wants "what
+    # the cycle still has to clear, escalations and all" can still say so.
+    clearable_new = [k for k in new_keys if k not in held]
+    clearable = [c for c in outstanding if c.key not in held]
+    repeats = len({k for k in repeated if k and k not in held})
+    blockers = [c for c in clearable if c.severity in ("P1", "P2")]
+    if clearable_new:
+        stop, reason = False, (f"{len(clearable_new)} finding(s) no earlier round raised")
     elif blockers:
         stop, reason = False, f"{len(blockers)} P1/P2 still outstanding after the fix"
-    elif repeated:
-        stop, reason = False, (f"{repeated} finding(s) an earlier round already raised "
+    elif repeats:
+        stop, reason = False, (f"{repeats} finding(s) an earlier round already raised "
                                "are still outstanding")
+    elif blocking:
+        # Not "dry": something WAS raised and is unanswered. A reader reconciling
+        # "dry" against a PR carrying an open premise question would be told
+        # something untrue about why the loop stopped.
+        stop, reason = True, (f"nothing left that a fix round can clear — "
+                              f"{len(blocking)} escalated finding(s) await a human")
     else:
         stop, reason = True, ("dry — nothing raised that an earlier round had not"
                               if round_no > 1 else "dry — no findings to fix")
@@ -1131,12 +1592,25 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     # reason — printing it there told a reader that a round which was not quiet
     # had untrustworthy quiet. `confident` is unaffected: it already requires
     # `stop`.
-    if repeated and stop:
-        veto = [*veto, f"{repeated} finding(s) an earlier round already raised are "
+    if repeats and stop:
+        veto = [*veto, f"{repeats} finding(s) an earlier round already raised are "
                        "still outstanding — the fix for them did not land"]
+    # Same "only on a STOP" rule as the repeat above, and the same reason: on a
+    # `go again` round the escalation is not why the round was not quiet.
+    if blocking and stop:
+        veto = [*veto, f"{len(blocking)} finding(s) escalated instead of patched are "
+                       "outstanding and no round can close them — a human answers "
+                       "these, not another fix pass"]
     return {
         "stop": stop,
         "reason": reason,
+        # What this ROUND was holding — the register it was given, narrowed to the
+        # keys this round raised. Named apart from the payload's `escalated`,
+        # which is the cycle's whole register and only grows: a reader asking
+        # "what stopped round 3" wants the first, and a later round inheriting the
+        # question wants the second. Sorted, so a round that declares the same set
+        # twice writes the same bytes and a diff means something changed.
+        "escalated_outstanding": sorted(blocking),
         # "Nothing left to find" is a claim; "the counter hit zero" is not the
         # same claim, and the difference is exactly what a reader of a clean
         # verdict needs to see.
@@ -1155,6 +1629,7 @@ __all__ = [
     "panel_core", "panel_seats", "cluster_findings", "_account",
     "_fold_reports", "_NOT_WORD", "_norm_title", "_key_from_title",
     "_defect_title", "_defect_key", "_finding_id", "Canonical",
+    "_KEY_RE", "_key_norm", "_is_key", "_key_gist",
     "_unmerged", "_judge_listing", "_parse_verdicts", "adjudicate",
     "REWORD_RATIO", "_TITLE_NOISE", "_stem", "_same_words",
     "Baseline", "_baseline_title", "_SHA_RE", "_mtime",

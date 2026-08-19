@@ -140,6 +140,30 @@ again at round 1 rather than carrying on — never re-run this round on its own.
 Every non-error exit writes it, including a PR skipped by title pattern (its
 payload is marked `reviewed: false`), so exit 0 always means the file is there.
 
+**A round the panel REFUSED did not happen either, and it exits 0.** Read
+`preflight.verdict` from the payload before doing anything with the findings:
+
+- `refuse` — no seat was dispatched (`reviewed: false`, with `skip_reason`). **Stop
+  the cycle here.** Do NOT go to §4: a fix pass briefed with zero findings from a
+  round nobody ran is a fixer told the PR is clean. Relay the panel's reason and
+  the remedies it named — split the PR, raise the cap for a seat that can take it,
+  or re-run with `--force` — and let the user choose. Never add `--force` on your
+  own initiative; the refusal is the panel's decision about a diff it measured, and
+  overriding it unasked is exactly the failure the check was built to stop.
+  **Relay `ci_status` and `ci_failing` with it.** A refusal still reads the CI gate
+  — that is size-independent and cost the round one API call, and it exists in the
+  payload because a refusal that lost the build status left this step telling the
+  user to stop with nothing said about a red suite. If `ci_status` is `FAIL`, say
+  so and name the checks: the PR is broken by something the project already tests,
+  and nobody had to read the diff to know it. `PASS`, `PENDING`, `none` and
+  `unknown` are four different statements and none of them is "reviewed" — say
+  which one it was, never that CI was fine.
+- `manifest` — the change is move-shaped and the seats were asked what *moved*, not
+  whether the code is correct. The cycle runs normally, but the findings are answers
+  about the move and **the moved code was not read by anybody**. Say so in the relay
+  (§6), and keep it out of "reviewed and clean": its correctness is carried over
+  from when it landed on the base branch.
+
 **Not** a fixed `/tmp/panel-<pr>-r<n>.json`. Two reasons, both real on a shared
 host: the panel writes that path with `Path.write_text`, which follows symlinks,
 so a pre-planted `/tmp/panel-34-r1.json → ~/.ssh/authorized_keys` is a write
@@ -226,6 +250,12 @@ with these overrides:
 - **A later round gets its own fixer, briefed with that round's findings only.**
   Re-briefing it with round 1's list has it re-examine work already done and
   buries the new finding — which is the one the round existed to catch.
+- **The brief's step 3a (escalate, don't patch) applies to panel findings too**,
+  and this is where it earns its keep: a panel finding can be a premise finding
+  rather than a defect — #132's P1 was one — and the fixer is the only reader
+  positioned to notice, because it is the one being asked to write the special
+  case. An escalation from this fixer is **not** a finding left outstanding for
+  the next round to pick up; §5 says what happens to it.
 
 ## 4b. Record what actually happened to each finding
 
@@ -271,7 +301,22 @@ One of four per finding:
   point**: you are already writing the refutation into the PR comment and the fix
   commit, in prose nothing can count. A bare `refuted` is the same
   confident-assertion-with-nothing-behind-it the release exists to measure.
-- **`deferred`** — real, not now. Put where it went in `deferred_to`.
+- **`deferred`** — real, not now. Put where it went in `deferred_to`. This is
+  also where an **escalated** finding goes (the brief's step 3a): the defect is
+  real and the fix is what is in dispute, so `refuted` would be a lie about the
+  finding and `fixed` a lie about the code, and there is no fifth outcome to
+  invent — the vocabulary is a database constraint, not a convention. Recording it
+  does **not** settle the question or take the finding off §5's outstanding list:
+  that list is computed from the round's own payload, never from this table, and the
+  escalation stays open until a human answers it. `deferred_to` names the premise
+  issue, and that issue does not exist yet at this point in the run — so **the
+  escalated row is the one you record last**: relay (§6), open the issue there,
+  then come back and record this row naming it. You open it, never the fixer, and
+  it is an issue that *asks* the question in the fixer's own five fields
+  (premise, what it explains, what removing it costs, the patch not written, the
+  `--ask` verdict) rather than one that picks an answer. When the human's answer
+  lands, the row moves: `revisions` and `prior_outcome` exist because a `deferred`
+  that later becomes `fixed` is the expected lifecycle, not an anomaly.
 - **`superseded`** — a later finding replaced it; name that finding's key in
   `superseded_by`, which is **required** for the same reason a note is required
   for a refutation: without it the row records "replaced by something".
@@ -358,12 +403,125 @@ no with complete confidence):
   no baseline to compare against. The `veto` list says which. Report it as a stop,
   never as "clean".
 
+**An escalation ends the fix half of the cycle for that finding — tell the loop,
+with `--escalated`.** Pass the key on the round you learn of it:
+
+```
+python3 ~/.claude/loops/panel.py --pr <pr> --post --round <r> --max-rounds <N> \
+    --escalated <the key the fixer escalated> \
+    --baseline /tmp/tmp.AbC123/r1.json [--baseline …] \
+    --json-file /tmp/tmp.AbC123/r<r>.json
+```
+
+Without it the cycle jams, and the jam is the mechanism defeating itself: the
+finding is outstanding (correctly), no fixer may touch it (correctly), so
+`round_stop` returned `stop: false` every round until the cap — the thing built to
+stop a loop circling a premise guaranteed it ran to the cap. With it, the key is
+subtracted from the work a fix round can clear: the cycle goes again exactly while
+there is other work, and stops as soon as only escalations remain. The finding
+stays in the report, marked ⛔. `round_stop`'s docstring
+(`harness/loops/panel_rounds.py`) is where the rule and its limits are kept; what
+follows is only what YOU have to do.
+
+**Pass each key once — and pass a NEW key when the premise comes back under one.**
+A key rides in the payload as `escalated: {key: round}` and every later round
+inherits it through `--baseline`, so a cycle cannot lose the question by forgetting
+a flag, and re-passing a key you inherited is harmless (the round it was FIRST
+declared in survives, a re-declaration cannot re-date the claim, and a repeated
+flag is deduplicated rather than noted twice). Pass it **with the round flags** —
+`--escalated` without `--round`/`--max-rounds`/`--baseline` is refused, because it
+names work a later round must not count and a single-pass review has no later
+round. What inheritance
+cannot do is follow a premise into a different key, and §5 below is the case where
+that happens: a fresh panel over the same code very often words the same premise
+differently, which mints a new `finding_key`. Nothing mechanical connects the two.
+So when §5's re-read finds a premise you have already relayed wearing a new key,
+add that key to `--escalated` as well — otherwise rule 1 fires on it as brand-new
+work, it reaches a fixer with no ⛔ mark, and the cycle runs to the cap on a
+finding no fixer may patch. Escalating by premise is yours; the loop only knows
+keys.
+
+**A stop that is HOLDING an escalation is never convergence — and that is
+narrower than "the cycle can never converge with a question open".** When the
+round that stops still raises the escalated finding, the stop takes a veto line,
+`confident` is false, and the reason says a human is owed an answer. When it does
+not raise it — a round under `--scope increment` reviewing only the fix commit,
+or a round whose fresh panel gave the premise a new key — that round is genuinely
+dry and is reported `confident: true` with the question still open. `confident`
+is a claim about the ROUND, never a claim that the PR has nothing outstanding.
+What tracks the open premise across the cycle is your relay and its issue (§4b),
+which is where the human is looking for it.
+
+**When a human ANSWERS the premise, the cycle is over — start a fresh one.** The
+register only grows: there is no un-escalate, and no way to drop one key without
+throwing away the whole baseline. So an answered premise's key would go on
+subtracting its finding from the work a fix round can clear, and go on rendering
+⛔, for every round that inherits the baseline. Take the answer as the end of this
+cycle, land the work it calls for, and open a new cycle over the result.
+
+**The honest limit, and the reason this is a flag rather than a detector.** The
+loop is taking your word for it, and you read that word out of a fixer's prose —
+so the agent whose fix pass produced the finding is, one step removed, the agent
+ending the cycle over it. That is the signal #67's own evidence says cannot be
+self-reported. The key and its round are recorded so the claim is auditable after
+the fact, and the cap still binds; nothing here detects a premise on its own
+(#67's first piece, still unbuilt). Do not escalate to end a cycle you find
+tedious — that is not a loophole, it is the one way to make this number lie.
+
+**A key that names nothing, or is not a key at all, is reported.** A value that is
+not 8-64 hex characters is rejected outright, and a well-formed key matching no
+finding this cycle has ever seen lands in `config_notes` saying so. Both are said
+out loud because the failure they would otherwise cause is invisible: the loop
+carries on counting a finding you believe you excluded. A round the panel SKIPPED
+(a merge-title match) records no new key at all — it reviewed nothing — and says
+which key it dropped; pass it again on the next round that runs.
+
+- **Never re-brief an escalated finding to a fixer.** Not this round, not a later
+  one. It goes to the human with the write-up the fixer produced (§6). The ⛔ mark
+  in the panel's own **To fix** and **SonarCloud issues** lists is there so a
+  brief built from either cannot include it by accident.
+- **Match it by premise, not by key.** The next round is a fresh panel over the
+  same code, so it will very likely report the same premise defect again — with a
+  **new** `finding_key`, at a different line, in different words, and nothing
+  mechanical will connect the two (`superseded_by` records the opposite direction:
+  a finding a *later* one replaced). You are the only reader who has both, because
+  you ran both rounds. So before briefing a round's **To fix** list, read it
+  against every escalation you have already relayed and pull out anything that is
+  the same premise wearing a new key. It does not go in the brief, and it **does**
+  go into the next round's `--escalated` under its new key — inheritance follows
+  keys, not premises, so nothing else will hold it. It **does** get
+  its own `deferred` row, naming the same premise issue in `deferred_to` — it is a
+  real finding nobody fixed, and a key recorded nowhere is the gap §4b exists to
+  close. Two rows do not double-count one premise: only `fixed` and `refuted` are
+  in the precision ratio (`OUTCOMES_SCORED`, `app/api/reviews.py`), so `deferred`
+  says what happened without scoring anyone. One premise is still one open
+  question — it lives in the issue and in the relay, re-stated under `Escalated`
+  as still open, naming the round that first raised it and the key this round gave
+  it. If you genuinely cannot tell whether it is the same premise, say that in the
+  relay and leave it out of the brief: a premise question asked twice costs a
+  paragraph, and a premise question patched costs the round.
+- **The rest of the cycle carries on.** Findings that WERE fixed still get their
+  re-review round, and `round_stop` still decides that — you are not overruling it
+  for them, only declining to send one finding back through a pass that has
+  already been tried on it.
+- **If the escalated premise is what most of the round hangs off, stop the cycle**
+  and say so. Another round would review code whose shape is the open question,
+  and #67's whole observation is that this is where the loop spends the most for
+  the least.
+- **`--ask` is evidence, not the decision.** A premise that survives a challenge
+  may still be the wrong premise, and the seats were never asked whether the
+  redesign is worth its cost. `holds` is not permission to go back and patch.
+
 Two things this must NOT do:
 - **Never let a fix ride out unreviewed silently.** At the cap, if the last fix
   pass changed anything, say so in the relay: "the round-N fix commit was not
   itself re-reviewed".
 - **Never re-run a round to get a nicer answer.** Each panel run is recorded on
   the board as an observation; re-rolling one corrupts the record it exists to be.
+- **Never `--force` past a refusal to keep the cycle moving.** A refused round is
+  the panel declining to manufacture work, and a forced one hands the fixer findings
+  about code that is already in the base branch — the failure mode in full, with the
+  check bypassed on the way. It is the user's call, and it is recorded either way.
 
 ## 6. Relay the result
 
@@ -390,6 +548,14 @@ Then the part that is new, and is the point of running more than one round:
   than either verdict on its own.
 - **Flagged for re-review:** findings whose reporter said the FIX needs re-reading,
   and whether the following round did find something there.
+- **Escalated:** any finding a fixer reported as the approach being wrong rather
+  than the code, with its premise, what it explains, what removing it would cost,
+  and its `--ask` verdict if one was run. Say it even when the answer is none. This
+  is the one item in the relay that is a question rather than a report: it is
+  outstanding until a human answers it, and no round will close it. Having relayed
+  it, open the issue that **asks** it — the fixer's five fields, no answer picked —
+  and then record the finding `deferred` with that issue in `deferred_to` (§4b),
+  which is the step §4b deferred to here.
 
 ## 7. Merging (only if the user asks)
 

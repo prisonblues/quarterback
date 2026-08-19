@@ -263,6 +263,48 @@ valid skip is a genuine false positive where re-examination
 confirms the code is correct. "Not worth the churn" is not valid.
 "Can do later" is not valid.
 
+One finding can be neither: it says the *approach* you chose is
+wrong rather than the code, and fixing it where it points means
+adding a special case to keep that approach standing (`/review-pr`'s
+step 3a has the test and why it matters — #67). Step 3a tells a
+fixer never to redesign on its own authority; here the opposite
+applies, and **authorship is the whole difference**. A fixer is
+changing somebody else's shipped decision on a PR under review, so
+its output is a question. You are the author, nothing is merged and
+no PR exists yet, so the decision is still yours to make and this is
+the cheapest moment in the cycle to make it: change the approach,
+and say in the PR body which finding made you.
+
+If you judge the redesign too big for this issue, do not bury it in
+a patch — write it up in the PR body with step 3a's five fields, so
+a reviewer inherits exactly what a fixer's escalation would have
+given them:
+
+- the premise, in one sentence;
+- the findings it explains;
+- what removing it would cost, and where;
+- the patch you did not write (the special case you declined to add);
+- the `--ask` verdict, if you put the premise to the seats
+  (`fails` / `holds` / `unresolved` / `unchallenged` / `not run`).
+
+Step 3a's invocation with its `--pr` dropped — that flag only links
+the ask to a PR for the board to render, and there is no PR yet; an
+`--ask` carrying no `--pr` is accepted, and it is the only form
+available here:
+
+```bash
+premise=$(cat <<'PREMISE'
+<the premise, in one sentence>
+PREMISE
+)
+timeout 120 python3 ~/.claude/loops/panel.py --ask "$premise" \
+    --context "<the file:first-last the premise lives in>"
+```
+
+Keep the quoted heredoc — step 3a says why, and the short version is
+that a premise about code carries backticks and `$(…)`, which bash
+executes inside a double-quoted argument.
+
 After fixing, re-run the quality pipeline. Iterate until clean.
 
 ## 9. Commit and push

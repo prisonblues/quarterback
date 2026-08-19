@@ -20,6 +20,7 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
 from sqlalchemy import text
 
 from app.api.reviews import _derive_key
@@ -36,6 +37,35 @@ import panel
 
 REPO = "acme/v215repo"
 AGENT = {**LAPTOP, "X-Agent-Instance": "d14d14"}
+
+
+@pytest.fixture(autouse=True)
+def _every_seat_installed(monkeypatch):
+    """This box has every seat, for every test in this module (#222).
+
+    `budgets` is built from the seats the HOST can actually run, so a panel round
+    driven from here otherwise depends on which vendor CLIs the machine happens to
+    carry: on a CI runner, which carries none, `claude` and `codex` get no budget
+    at all, and an assertion that codex's 40-char budget CUT the diff fails with
+    `assert False is True` — while `fake_review` has them running perfectly
+    happily. That pairing (a seat that ran with no budget) is a doubles artefact
+    and not a state production can reach, because `run_seat` refuses an absent seat
+    before it can run; the doubles replace `review_llm` wholesale and so never
+    reach that refusal.
+
+    A fixture rather than a line inside one helper: this is the only module in the
+    app suite that drives `panel.run()`, and the next test written here inherits
+    the pin instead of rediscovering the failure on CI. It is scoped to this module
+    for the same reason `harness/loops/tests` does not make it package-wide — a
+    test whose subject is a seat's ABSENCE must not be silently pinned to the
+    opposite. Nothing here has that subject; if something does, it overrides this
+    the way `test_panel_absent_seat.py` does.
+
+    No `raising=False`: the attribute is guaranteed to exist for the pin to have a
+    purpose, and tolerating its absence is how a rename turns it into a silent
+    no-op that hands this module back to the host's PATH.
+    """
+    monkeypatch.setattr(panel, "seat_installed", lambda name: True)
 
 
 def payload(pr: int, **over) -> dict:
@@ -355,6 +385,333 @@ async def test_one_cycles_re_review_is_not_credited_to_anothers_declaration(clie
     assert a1["rereview_hit"] is True
     # ...and B's declaration is unanswered, not vindicated by somebody else's round.
     assert b1["rereview_flagged"] == 1 and b1["rereview_hit"] is None
+
+
+async def test_a_pr_running_one_cycle_still_summarises_its_stop_state(client):
+    """The control for the four below: nothing about #44 costs the ordinary PR its
+    summary, which is what the endpoint is for."""
+    await record(client, 6150, cycle="cycle-A")
+    await record(client, 6150, cycle="cycle-A", round=2, new_findings=0,
+                 round_stop={"stop": True, "reason": "dry — nothing raised that an "
+                             "earlier round had not", "confident": True, "veto": []})
+    h = (await client.get(f"/review/findings?repo={REPO}&pr=6150", headers=AGENT)).json()
+    assert h["cycles"] == 1
+    assert h["stopped"] is True and h["stop_confident"] is True
+    assert h["stop_reason"].startswith("dry") and h["stop_veto"] == []
+
+
+async def test_two_cycles_on_one_pr_do_not_summarise_each_other(client):
+    """#44: `stopped`, `stop_reason`, `stop_confident` and `stop_veto` came from
+    `runs[-1]` whatever cycle it belonged to, so B's last round decided how A read.
+    Here A is explicitly still going and B has stopped, confidently — the old
+    summary reported this PR as a confident convergence, and the reader has no way
+    to tell that the round which said so belongs to somebody else's loop.
+
+    The per-finding join in the same response has refused this inference since
+    cycles became a stored fact. A summary that contradicts the rows underneath it
+    is worse than an absent one."""
+    await record(client, 6151, cycle="cycle-A")   # A is going again: stop False
+    await record(client, 6151, cycle="cycle-B", round=1, new_findings=0, to_fix=[],
+                 round_stop={"stop": True, "reason": "dry — nothing raised that an "
+                             "earlier round had not", "confident": True, "veto": []})
+    h = (await client.get(f"/review/findings?repo={REPO}&pr=6151", headers=AGENT)).json()
+    assert h["cycles"] == 2
+    assert h["stopped"] is None and h["stop_reason"] is None
+    assert h["stop_confident"] is None
+    # NULL, not []: the same distinction `GET /review/{id}` draws. [] would say the
+    # stopping rule ran and vetoed nothing.
+    assert h["stop_veto"] is None
+    # Only the SUMMARY is withheld. The rounds and the chains are per-run facts and
+    # are unaffected — withholding them would answer less than the record supports.
+    assert h["rounds"] == 2 and len(h["runs"]) == 2
+    # BOTH values, because the point of this test is the disagreement between them:
+    # A is explicitly still going while B has confidently stopped. Asserting only
+    # B's leaves the test passing if A's per-run `stopped` regressed to True or
+    # null, which is the half that made the old summary a lie.
+    assert h["runs"][0]["cycle"] == "cycle-A" and h["runs"][0]["stopped"] is False
+    assert h["runs"][1]["cycle"] == "cycle-B" and h["runs"][1]["stopped"] is True
+
+
+async def test_a_review_only_run_neither_ends_a_cycle_nor_hides_one(client):
+    """A standalone `/panel` read carries no cycle, so it never ended the cycle
+    running around it. That premise cuts one way only: the run is SKIPPED, not
+    counted as a rival. It cannot supply the ending, and it cannot veto the ending
+    of a loop it was no part of.
+
+    The rule that shipped first counted it as a bucket of its own and so nulled the
+    summary here — which made the common shape (any PR read once outside its loop)
+    unattributable for as long as that read stayed in the window, on the strength
+    of a run that ended nothing. Three panel rounds raised it before it changed.
+
+    The cycle-less run is NEWEST here on purpose: that is the arrangement where
+    `runs[-1]` is the wrong run, so this pins the ending coming from cycle A's own
+    last round rather than from the read that happened to land after it."""
+    await record(client, 6152, cycle="cycle-A", round=1)
+    await record(client, 6152, cycle="cycle-A", round=2, new_findings=0,
+                 round_stop={"stop": True, "reason": "dry — nothing raised that an "
+                             "earlier round had not", "confident": True, "veto": []})
+    await record(client, 6152, cycle=None, round=1, new_findings=0, to_fix=[],
+                 round_stop={"stop": True, "reason": "one-shot read", "confident": False,
+                             "veto": ["a one-shot read is not a cycle"]})
+    h = (await client.get(f"/review/findings?repo={REPO}&pr=6152", headers=AGENT)).json()
+    assert h["cycles"] == 1, "one loop ran here, and one is what it says"
+    assert h["stopped"] is True
+    # Cycle A's ending, NOT the cycle-less run's — which is newer, and says
+    # something different about both the reason and the confidence.
+    assert h["stop_reason"].startswith("dry"), "the read that ended nothing did not speak"
+    assert h["stop_confident"] is True and h["stop_veto"] == []
+    # The run is still reported, just not as an ending: withholding it would answer
+    # less than the record supports.
+    assert h["rounds"] == 3 and h["runs"][-1]["cycle"] is None
+
+
+async def test_history_recorded_before_cycles_existed_still_summarises(client):
+    """Every run predating the cycle column has a null one, so a window of them is
+    one bucket and reads exactly as it always did. Treating null as "unknown, and
+    therefore ambiguous" would have withheld the summary from all of the archive to
+    describe a case that cannot arise in it."""
+    await record(client, 6153, cycle=None)
+    await record(client, 6153, cycle=None, round=2, new_findings=0,
+                 round_stop={"stop": True, "reason": "dry", "confident": True, "veto": []})
+    h = (await client.get(f"/review/findings?repo={REPO}&pr=6153", headers=AGENT)).json()
+    assert h["cycles"] == 0, "no cycle ran here, and zero is a real answer"
+    assert h["stopped"] is True and h["stop_reason"] == "dry"
+
+
+async def test_narrowing_the_window_to_one_cycle_brings_the_summary_back(client):
+    """What a caller does about a null summary, and the reason nulling is not a
+    dead end: `limit` decides the window, so a window of one cycle summarises. The
+    docstring says so, which makes it a promise worth pinning."""
+    await record(client, 6154, cycle="cycle-A")
+    await record(client, 6154, cycle="cycle-B", round=1, new_findings=0, to_fix=[],
+                 round_stop={"stop": True, "reason": "dry", "confident": True, "veto": []})
+    wide = (await client.get(f"/review/findings?repo={REPO}&pr=6154",
+                             headers=AGENT)).json()
+    assert wide["cycles"] == 2 and wide["stopped"] is None
+    narrow = (await client.get(f"/review/findings?repo={REPO}&pr=6154&limit=1",
+                               headers=AGENT)).json()
+    assert narrow["cycles"] == 1 and narrow["stopped"] is True
+    # ...and it says so: the window it summarises is not the PR's whole history.
+    assert narrow["truncated"] is True
+
+
+async def test_narrowing_the_window_costs_the_finding_history_it_narrows(client):
+    """The other half of that remedy, which the docstring used to present as a
+    clean escape hatch and now presents as a trade.
+
+    `limit` is ONE window: the same runs that decide whether there is a summary
+    decide `first_run`, the `gone` status and what counts as new. So the response
+    that got its summary back is a response with less history in it — here cycle
+    A's round and the chain it opened are simply not in the answer any more.
+
+    And the escape only ever reaches one direction. `limit` trims from the OLD end,
+    so the summary it recovers is always the NEWEST bucket's; no value of it
+    recovers cycle A's ending, which is the one a reader of cycle A wants."""
+    await record(client, 6155, cycle="cycle-A")
+    await record(client, 6155, cycle="cycle-B", round=1, new_findings=0, to_fix=[
+        {"severity": "P3", "file": "app/late.py", "line": 4, "title": "B's own find",
+         "reviewers": ["claude"], "reason": "real"}],
+        round_stop={"stop": True, "reason": "dry", "confident": True, "veto": []})
+    wide = (await client.get(f"/review/findings?repo={REPO}&pr=6155",
+                             headers=AGENT)).json()
+    narrow = (await client.get(f"/review/findings?repo={REPO}&pr=6155&limit=1",
+                               headers=AGENT)).json()
+    assert wide["stopped"] is None and narrow["stopped"] is True
+    # What it cost: A's round, and the chain that only A ever raised.
+    assert wide["rounds"] == 2 and narrow["rounds"] == 1
+    assert len(narrow["findings"]) < len(wide["findings"])
+    assert not [c for c in narrow["findings"] if c["file"] == "app/sync.py"]
+    # There is no `limit` that summarises cycle A instead: the window only ever
+    # trims the old end, so A's ending is unreachable from this endpoint.
+    for lim in (1, 2, 50):
+        h = (await client.get(f"/review/findings?repo={REPO}&pr=6155&limit={lim}",
+                              headers=AGENT)).json()
+        assert h["stopped"] is not False, "no window reports cycle A's own ending"
+
+
+async def test_two_real_cycles_stay_unattributable_whichever_one_ends_newest(client):
+    """The rule counts distinct cycles and never consults position, and this is
+    where that has to hold: interleave the two loops so the OLDER cycle owns the
+    newest round. Any rule reaching for `runs[-1]`, or for "the newest cycle forms
+    a contiguous tail", reports an ending here. There isn't one to report."""
+    await record(client, 6170, cycle="cycle-A", round=1)
+    await record(client, 6170, cycle="cycle-B", round=1, new_findings=0, to_fix=[],
+                 round_stop={"stop": True, "reason": "dry", "confident": True, "veto": []})
+    await record(client, 6170, cycle="cycle-A", round=2, new_findings=0,
+                 round_stop={"stop": True, "reason": "dry", "confident": True, "veto": []})
+    h = (await client.get(f"/review/findings?repo={REPO}&pr=6170", headers=AGENT)).json()
+    assert h["cycles"] == 2, "two loops, interleaved, still two"
+    assert h["stopped"] is None and h["stop_veto"] is None, (
+        "adjacency is not attribution — the count of distinct cycles decides")
+    assert h["rounds"] == 3
+
+
+async def test_cycles_is_a_count_and_not_a_boolean_in_disguise(client):
+    """Three buckets read as three. Nothing downstream should be able to get away
+    with treating the field as "1 or many"."""
+    await record(client, 6171, cycle="cycle-A")
+    await record(client, 6171, cycle="cycle-B", round=1)
+    await record(client, 6171, cycle="cycle-C", round=1)
+    await record(client, 6171, cycle=None, round=1, new_findings=0, to_fix=[])
+    h = (await client.get(f"/review/findings?repo={REPO}&pr=6171", headers=AGENT)).json()
+    assert h["cycles"] == 3, "three loops ran; the cycle-less read is not a fourth"
+    assert h["stopped"] is None
+
+
+async def test_one_bucket_in_the_window_is_not_one_bucket_in_the_pr(client):
+    """The summary is a claim about the WINDOW. An older cycle that falls outside
+    `limit` leaves a window holding one bucket, so the endpoint summarises — and
+    what it summarises is the newest cycle's ending, not the PR's.
+
+    That is not nulled away, because `limit`-narrowing is the documented way to
+    recover a summary and it truncates on purpose. It is `truncated` that carries
+    the scope, which is why the docstring no longer calls `cycles` the single
+    field answering "can I trust the summary": read together or not at all."""
+    await record(client, 6172, cycle="cycle-A", round=1)          # older, falls outside
+    await record(client, 6172, cycle="cycle-B", round=1, new_findings=0, to_fix=[],
+                 round_stop={"stop": True, "reason": "dry", "confident": True, "veto": []})
+    wide = (await client.get(f"/review/findings?repo={REPO}&pr=6172", headers=AGENT)).json()
+    assert wide["cycles"] == 2 and wide["stopped"] is None, "both cycles visible: no claim"
+    narrow = (await client.get(f"/review/findings?repo={REPO}&pr=6172&limit=1",
+                               headers=AGENT)).json()
+    assert narrow["cycles"] == 1, "cycle A is outside the window, so it is not counted"
+    assert narrow["stopped"] is True, "and the window's one bucket summarises"
+    # The pair is the contract: a summary with `truncated` set describes the
+    # window. Either field alone reads as a statement about the PR, and is not.
+    assert narrow["truncated"] is True
+
+
+async def test_an_attributable_run_that_recorded_no_veto_answer_reads_null(client):
+    """The three-state rule has to hold hardest in the branch that DOES summarise.
+    The window is one cycle, so the summary speaks for exactly one run — and that
+    run recorded no `round_stop` at all, so its `stop_veto` is NULL. `or []` here
+    reported the opposite of the truth about the very run the summary rests on:
+    `[]` is "the stopping rule ran and vetoed nothing", and nothing ran.
+
+    `GET /review/{id}` has always returned it raw; this endpoint now agrees rather
+    than contradicting its sibling about one stored row."""
+    await record(client, 6160, cycle="cycle-A", round_stop=None)
+    h = (await client.get(f"/review/findings?repo={REPO}&pr=6160", headers=AGENT)).json()
+    assert h["cycles"] == 1, "one bucket, so this window is summarisable"
+    assert h["stop_veto"] is None, "NULL, not [] — that round recorded no veto answer"
+    # The other three are null for the same reason, and were already.
+    assert h["stopped"] is None and h["stop_reason"] is None
+    assert h["stop_confident"] is None
+
+
+async def test_the_per_run_rows_carry_a_null_veto_unaltered(client):
+    """`runs[]` is what the docstring, the README and the CHANGELOG all point
+    callers at as the better answer, on the stated promise that each round's own
+    four ride there UNALTERED at any window size. An `or []` made that promise
+    false for a round with no recorded veto — and made one stored row read
+    differently through this endpoint than through `GET /review/{id}`, which is the
+    disagreement `test_a_nested_stop_that_did_not_say_records_no_stop` pins from
+    the other side."""
+    run_id = await record(client, 6161, cycle="cycle-A", round_stop=None)
+    h = (await client.get(f"/review/findings?repo={REPO}&pr=6161", headers=AGENT)).json()
+    row = next(r for r in h["runs"] if r["id"] == run_id)
+    assert row["stop_veto"] is None, "unaltered means NULL stays NULL"
+    # ...and the two endpoints agree about the same row, which is the point.
+    assert (await detail(client, run_id))["stop_veto"] is None
+
+
+async def test_a_recorded_empty_veto_is_still_an_empty_list(client):
+    """The other half of the distinction, or the fix above would just be a new way
+    of losing information: a round that DID run its stopping rule and vetoed
+    nothing recorded `[]`, and `[]` is what it must read as — through the summary
+    and through the per-run row alike."""
+    run_id = await record(client, 6162, cycle="cycle-A",
+                          round_stop={"stop": True, "reason": "dry", "confident": True,
+                                      "veto": []})
+    h = (await client.get(f"/review/findings?repo={REPO}&pr=6162", headers=AGENT)).json()
+    assert h["stop_veto"] == [], "the rule ran and vetoed nothing — not null"
+    assert next(r for r in h["runs"] if r["id"] == run_id)["stop_veto"] == []
+
+
+# ---- the page's half of #44 -------------------------------------------------
+# There is no JS runner in this repo (no package.json, no jest/vitest config), so
+# these grep the file that ships, the way `test_reviewer_cost.py` already does for
+# its coverage markers. Crude, and the rendering itself remains unexercised — but
+# it is the only thing standing between a re-edit and the two claims the API's
+# comments rest on. Synchronous and fixture-free: they read a file that ships,
+# and nothing about them wants a database.
+
+def test_the_page_never_reads_the_summary_stop_veto_unguarded():
+    """The load-bearing safety argument for making a list field nullable is that
+    every consumer reads it as `stop_veto || []`, and until now that was enforced
+    by prose in a Python comment about a JavaScript file.
+
+    reviews.html is the only consumer of `GET /review/findings` in the repo, and
+    the summary's `stop_veto` is null whenever the window holds more than one
+    bucket. A future `for (const v of h.stop_veto)` would throw on exactly the
+    mixed window this feature creates, so the count is pinned: one guard, and two
+    mentions inside the ternary that guard opens. Any new use fails here and has to
+    be re-read rather than discovered in a browser."""
+    page = (Path(__file__).resolve().parents[1] / "app/static/reviews.html").read_text(
+        encoding="utf-8")
+    assert page.count("(h.stop_veto || [])") == 1, "the summary's veto list has one guard"
+    assert page.count("h.stop_veto") == 3, (
+        "the guard, plus `.join` and `.length` in its true arm — a fourth mention "
+        "is a read this test has not seen and cannot vouch for")
+
+
+def test_the_page_never_reads_a_PER_RUN_stop_veto_unguarded():
+    """`runs[].stop_veto` became nullable in the same change and for the same
+    reason, and it is a SECOND field under a different name: the audit above
+    reasons only about the summary, so a row renderer doing `r.stop_veto.length`
+    was invisible to it. This is that field's own pin.
+
+    Verified rather than assumed: the page reads a per-run veto in three places
+    (the run card's count, its title, and the expanded round's list), and every one
+    of them opens with `(r.stop_veto || [])` and short-circuits on `.length` before
+    anything calls `.join`/`.map` — so a null row renders as no vetoes rather than
+    throwing. `harness/loops/preland.py` is NOT a consumer of either field: it
+    rules on rows from `GET /reviews`, a different endpoint."""
+    page = (Path(__file__).resolve().parents[1] / "app/static/reviews.html").read_text(
+        encoding="utf-8")
+    assert page.count("(r.stop_veto || [])") == 2, (
+        "both entry points to a per-run veto are guarded — the run card and the "
+        "expanded round")
+    # Every mention is inside a guard or inside the arm one opened. A new read
+    # outside them lands here rather than in a browser on a pre-cycle row.
+    assert page.count("r.stop_veto") == 5, (
+        "two guards, plus `.join`/`.length` in the card's arm and `.map` in the "
+        "round's — a sixth mention is a read this test has not seen")
+
+
+def test_the_page_reads_the_cycle_count_before_the_stop_state():
+    """The rendering branch the API tests above justify, pinned as far as a repo
+    with no DOM harness can pin it.
+
+    Order is the substance: with two cycles `h.stopped` is null, and null is not
+    `false`, so a check placed after the `h.stopped === false` arm would fall
+    through and print nothing — the blank the API's comment says must not happen.
+
+    Every marker is checked for existence before it is used, so a reformat of the
+    file fails here with a sentence about what broke rather than an `IndexError`
+    from `split(...)[1]` — which is the whole point of a test that exists to be
+    read by whoever next edits the page."""
+    page = (Path(__file__).resolve().parents[1] / "app/static/reviews.html").read_text(
+        encoding="utf-8")
+    for marker in ("const ending = ", "box.innerHTML", "h.cycles > 1",
+                   "h.stopped === false"):
+        assert marker in page, f"the page no longer contains {marker!r} — this test " \
+                               "pins the ending ternary and cannot find it"
+    ending = page.split("const ending = ", 1)[1].split("box.innerHTML", 1)[0]
+    assert ending.index("h.cycles > 1") < ending.index("h.stopped === false"), (
+        "the cycle arm must come first: `h.stopped` is null here, not false")
+    mixed = ending.split("h.stopped === false", 1)[0]
+    # Said as loudly as the other endings that report something wrong with the
+    # review, not dimmed to the weight of the incidental veto count beside it.
+    # Defensible because the arm is now RARE: it takes two real cycles, not one
+    # stray cycle-less read.
+    assert "var(--warn)" in mixed and 'class="dim"' not in mixed
+    # Escaped like every other server value on this line, however integral `len()`
+    # makes it — the convention is what stops the next value being interpolated raw.
+    assert "esc(h.cycles)" in mixed and "${h.cycles}" not in mixed
+    # `cycles` counts cycles, so the copy is allowed to say so plainly. It was not
+    # allowed to when the same field counted buckets.
+    assert "cycles ran here" in mixed
 
 
 async def test_a_finding_older_than_the_window_is_not_new_inside_it(client):
@@ -750,18 +1107,24 @@ def _panel_round(monkeypatch, tmp_path, round_no, title, baseline=()):
     """One panel run with every process it would spawn replaced — the reviewers,
     the judge, the CI check — so what is under test is the payload the panel
     builds, not the CLIs."""
-    def fake_review(name, model, prompt, effort=""):
+    def fake_review(name, model, prompt, effort="", code_tree=None, budget_usd=None):
         if name == "codex":
+            # Blind and kernel-capped: codex cannot be given read tools at all
+            # (its only read path is its shell), and it stands in here for the
+            # seat whose truncation is the box's rather than a budget's — so this
+            # row exercises every one of #113's new reviewer columns at once.
             return panel.ReviewerRun(
                 [panel.Finding("codex", "P2", "app/sync.py", 12, title,
                                "detail", needs_rereview=True)],
-                None, 900, ["the migration, which the diff omits"])
+                None, 900, ["the migration, which the diff omits"],
+                code_blind=True)
         # claude answered in the old bare-array shape: it declared NOTHING, which
         # is None all the way to the column — not [], which would say it was asked
-        # and had no gap.
-        return panel.ReviewerRun([], None, 800, None)
+        # and had no gap. It DID read the code, which is what makes its declaring
+        # nothing a fact about the round.
+        return panel.ReviewerRun([], None, 800, None, code_blind=False)
 
-    def fake_adjudicate(clusters, diff, model, pr, budget=None, coverage=None, ci=""):
+    def fake_adjudicate(clusters, diff, model, pr, budget=None, coverage=None, ci="", **_kw):  # **_kw: code_tree/budget_usd since #113
         """The judge confirms what it was shown, keeping every reporter's own
         report on the record — which is where the per-reviewer declarations the
         board scores live."""
@@ -814,6 +1177,20 @@ async def test_a_real_panel_payload_records_and_reads_back(client, monkeypatch, 
     assert card(run, "claude")["could_not_assess"] is None
     assert card(run, "codex")["rereview_flagged"] == 1
     assert run["findings"][0]["new_this_round"] is True
+
+    # #113's columns, asserted on the way BACK OUT of the database — which is the
+    # half that was missing. The panel has sent `absent` since v2.32 and ingest
+    # dropped it, because `ReviewerIn` inherits pydantic's `extra="ignore"`; that
+    # is the same silent drop this file's v2.26 note records for `head_sha` and
+    # `unread_files` (#93). A test that only checked the payload would have passed
+    # throughout, which is precisely how four fields went missing last time.
+    assert card(run, "codex")["code_blind"] is True
+    assert card(run, "claude")["code_blind"] is False, \
+        "a seat that read the code must not read back as blind"
+    # The round-level setting is kept apart from the per-seat answer on purpose: a
+    # round with the setting ON and every seat blind is a configuration doing
+    # nothing, and only the difference between the two shows it.
+    assert run["code_access"] is True
 
     # Round 2 raises the SAME finding again, against round 1 as its baseline.
     _, r2 = _panel_round(monkeypatch, tmp_path, 2, "half-stale node", baseline=[r1_path])
