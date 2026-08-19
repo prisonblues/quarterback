@@ -37,6 +37,13 @@ def repo(tmp_path):
     return d
 
 
+#: The only shebang a stub written at runtime may carry. `/bin/sh` is the one interpreter a nix
+#: build sandbox is guaranteed to have at an absolute path: there is no `/usr/bin/env` there and
+#: no `/bin/bash` either, and `patchShebangs` rewrites the scripts shipped in `harness/bin` at
+#: build time but cannot reach a file a test writes while it runs.
+_SANDBOX_SAFE_SHEBANG = "#!/bin/sh\n"
+
+
 @pytest.fixture
 def fake_bin(tmp_path):
     """A PATH entry we own, for standing in the agent and curl.
@@ -46,13 +53,29 @@ def fake_bin(tmp_path):
     every test here fail for a reason that has nothing to do with the code under
     test. The shipped scripts dodge this via patchShebangs; a stub written at
     runtime cannot.
+
+    Asserted rather than only written down, because writing it down is what was already
+    true. Nothing in this suite fails on a developer's machine when a stub names
+    /usr/bin/env — the file is there, every one of these tests passes, and the only
+    reader is a `nix build .#checks.<system>.worktree-tests` that no CI job runs (#179).
+    That is how the same mistake reached a third suite in a week (#177). The four call
+    sites below all come through here, so here is where it costs nothing to check.
     """
     d = tmp_path / "bin"
     d.mkdir()
 
     def _install(name, body):
+        assert body.startswith(_SANDBOX_SAFE_SHEBANG), (
+            f"the `{name}` stub begins {body.partition(chr(10))[0]!r}, and this fixture installs "
+            f"only stubs a nix build sandbox can exec — {_SANDBOX_SAFE_SHEBANG.strip()!r}. "
+            "Nothing here will fail on your machine if you change that: /usr/bin/env exists "
+            "locally, so the suite stays green and only the worktree-tests nix check goes red, "
+            "43 tests at a time, every one of them blaming the code under test for a `bad "
+            "interpreter` in a stderr nobody reads. Keep the body POSIX — the stubs here need "
+            "nothing bash has"
+        )
         path = d / name
-        path.write_text(body)
+        path.write_text(body, encoding="utf-8")
         path.chmod(0o755)
         return path
 
@@ -133,6 +156,22 @@ def run(repo, fake_bin, tmp_path, runtime_dir):
         )
 
     return _run
+
+
+# ---- the fixtures' own stubs ------------------------------------------------
+
+
+def test_a_stub_the_sandbox_could_not_exec_is_refused(fake_bin):
+    """The regression test this fix would otherwise not have.
+
+    Reverting any of the four `#!/bin/sh` stubs to `#!/usr/bin/env bash` leaves all 84 tests
+    in this file green, because the shebang is only wrong somewhere nothing here runs. So the
+    guard is what a local `pytest harness/tests` can catch the fourth instance with, and this
+    is what proves the guard is not decoration. A missing shebang is refused for the same
+    reason it would be a bug: what exec'ing it does then depends on the caller's shell."""
+    for body in ("#!/usr/bin/env bash\nexit 0\n", "#!/bin/bash\nexit 0\n", "exit 0\n"):
+        with pytest.raises(AssertionError, match="nix build sandbox can exec"):
+            fake_bin("curl", body)
 
 
 # ---- the seat number --------------------------------------------------------

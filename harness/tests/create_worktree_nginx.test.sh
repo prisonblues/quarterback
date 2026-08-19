@@ -1,4 +1,19 @@
 #!/usr/bin/env bash
+#
+# Not executable, deliberately: the mode bit is off and the shebang above is a
+# dialect note for editors and shellcheck rather than something that ever runs.
+# This file needs bash — `${BASH_SOURCE[0]}`, the `BOXES` array, the `<<<`
+# here-strings and printf's `%q` are all bash — and it is copied into the
+# `worktree-tests` nix check, where NO shebang naming bash can work: a build
+# sandbox has no /usr/bin/env and no /bin/bash, only /bin/sh, and `patchShebangs`
+# in that check is pointed at harness/bin rather than at harness/tests. So the one
+# way to start this suite is `bash <path>`, which is what
+# test_create_worktree_nginx.py does. Leaving the mode bit on would advertise a
+# way of running it that fails in the sandbox and nowhere else — the same trap the
+# docker stub below was fixed for, one level up. If it ever does have to be
+# directly executable in the sandbox, the repair is `patchShebangs harness/tests`
+# in that check, not a shebang this file can carry on its own.
+#
 # nginx-block tests for harness/bin/create-worktree and harness/bin/remove-worktree
 # (found via lexray #1501).
 #
@@ -30,7 +45,9 @@
 #   - a configured-but-missing nginx config is reported, and the sub-path URL is
 #     not advertised — the silent skip #1501 was filed for.
 #
-# Run: bash tests/create-worktree-nginx.test.sh
+# Run: pytest harness/tests/test_create_worktree_nginx.py — or, for the report on
+# stdout, `bash harness/tests/create_worktree_nginx.test.sh`. Started with `bash`
+# explicitly, for the reason at the top of this file.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
