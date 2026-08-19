@@ -37,15 +37,47 @@ def repo(tmp_path):
     return d
 
 
+#: The only shebang a stub written at runtime may carry. `/bin/sh` is the one interpreter a nix
+#: build sandbox is guaranteed to have at an absolute path: there is no `/usr/bin/env` there and
+#: no `/bin/bash` either, and `patchShebangs` rewrites the scripts shipped in `harness/bin` at
+#: build time but cannot reach a file a test writes while it runs.
+_SANDBOX_SAFE_SHEBANG = "#!/bin/sh\n"
+
+
 @pytest.fixture
 def fake_bin(tmp_path):
-    """A PATH entry we own, for standing in the agent and curl."""
+    """A PATH entry we own, for standing in the agent and curl.
+
+    Stubs installed here get `#!/bin/sh`, never `#!/usr/bin/env bash`: there is no
+    /usr/bin/env inside the nix build sandbox, and a stub that cannot exec makes
+    every test here fail for a reason that has nothing to do with the code under
+    test. The shipped scripts dodge this via patchShebangs; a stub written at
+    runtime cannot.
+
+    Asserted rather than only written down, because writing it down is what was already
+    true. Until the assertion below existed, nothing in this suite failed on a developer's
+    machine when a stub named /usr/bin/env — the file is there, every test here passed, and
+    the only reader was a `nix build .#checks.<system>.worktree-tests` that no CI job runs
+    (#179). That is how the same mistake reached a third suite in a week (#177). The four
+    call sites below all come through here, so here is where it costs nothing to check.
+    Note the present tense is now the other way round: a stub named /usr/bin/env fails here,
+    locally, immediately — that is the whole point, and it is what the guard changed.
+    """
     d = tmp_path / "bin"
     d.mkdir()
 
     def _install(name, body):
+        assert body.startswith(_SANDBOX_SAFE_SHEBANG), (
+            f"the `{name}` stub begins {body.partition(chr(10))[0]!r}, and this fixture installs "
+            f"only stubs a nix build sandbox can exec — {_SANDBOX_SAFE_SHEBANG.strip()!r}. "
+            "Nothing here will fail on your machine if you change that: /usr/bin/env exists "
+            "locally, so the suite stays green and only the worktree-tests nix check goes red, "
+            "43 tests at a time, every one of them blaming the code under test for a `bad "
+            "interpreter` in a stderr nobody reads. Keep the body POSIX — the stubs here need "
+            "nothing bash has"
+        )
         path = d / name
-        path.write_text(body)
+        path.write_text(body, encoding="utf-8")
         path.chmod(0o755)
         return path
 
@@ -62,7 +94,7 @@ def _fake_agent_body(record):
     marker, still hold a plausible number, and still be wrong.
     """
     return (
-        "#!/usr/bin/env bash\n"
+        "#!/bin/sh\n"
         "export FAKE_AGENT_PID=$$\n"
         'python3 -c "\n'
         "import json, os, sys\n"
@@ -132,6 +164,24 @@ def run(repo, fake_bin, tmp_path, runtime_dir):
         )
 
     return _run
+
+
+# ---- the fixtures' own stubs ------------------------------------------------
+
+
+def test_a_stub_the_sandbox_could_not_exec_is_refused(fake_bin):
+    """The regression test this fix would otherwise not have.
+
+    Before the `fake_bin` assertion existed, reverting any of the four `#!/bin/sh` stubs to
+    `#!/usr/bin/env bash` left every test in this file green, because the shebang is only
+    wrong somewhere nothing here runs. No count is quoted: it would age with the next test
+    added and would not make the guard any stronger. So the guard is what a local
+    `pytest harness/tests` can catch the fourth instance with, and this is what proves the
+    guard is not decoration. A missing shebang is refused for the same
+    reason it would be a bug: what exec'ing it does then depends on the caller's shell."""
+    for body in ("#!/usr/bin/env bash\nexit 0\n", "#!/bin/bash\nexit 0\n", "exit 0\n"):
+        with pytest.raises(AssertionError, match="nix build sandbox can exec"):
+            fake_bin("curl", body)
 
 
 # ---- the seat number --------------------------------------------------------
@@ -456,7 +506,7 @@ def board(fake_bin, tmp_path):
             body = f'{{"agent":"{agent_identity}","machine":"zeus"}}'
         fake_bin(
             "curl",
-            "#!/usr/bin/env bash\n"
+            "#!/bin/sh\n"
             f'printf "%s\\n" "$@" >> {calls}\n'
             f"cat >> {stdin}\n"
             f"printf '%s' {shlex.quote(body)}\n"
@@ -746,7 +796,7 @@ def test_a_board_that_answers_with_a_bare_name_is_not_warned_about(run, board, a
 
 def test_a_board_that_is_down_does_not_stop_the_seat(run, fake_bin, agent):
     """No network is a normal state for a laptop and must not cost a seat."""
-    fake_bin("curl", "#!/usr/bin/env bash\nexit 7\n")
+    fake_bin("curl", "#!/bin/sh\nexit 7\n")
     result = run(
         "2", env={"QUARTERBACK_BASE_URL": "https://board.example", "QUARTERBACK_TOKEN": "t"}
     )
@@ -897,7 +947,7 @@ def test_panes_started_at_the_same_instant_leave_exactly_one_seat(
     starts = tmp_path / "starts"
     fake_bin(
         "claude",
-        f'#!/usr/bin/env bash\nprintf "%s\\n" "$$" >> {starts}\nsleep 2\n',
+        f'#!/bin/sh\nprintf "%s\\n" "$$" >> {starts}\nsleep 2\n',
     )
     with ThreadPoolExecutor(max_workers=8) as pool:
         results = [f.result() for f in [pool.submit(run, "1") for _ in range(8)]]
