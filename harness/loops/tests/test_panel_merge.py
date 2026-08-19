@@ -723,6 +723,20 @@ def test_escalating_outside_a_cycle_is_refused_rather_than_inventing_one(
         panel.main()
     assert "--escalated needs a cycle" in str(bad.value)
 
+    # `--round 1` is NOT a cycle, and the first version of this guard let it
+    # through — found by the codex seat on the very commit that added the guard.
+    # It asked "was --round passed?" while `in_cycle` asks `round_no > 1`, so
+    # `--round 1 --escalated <key>` satisfied the door and then built a
+    # single-pass run: the flag accepted outside a cycle, which is the one case
+    # the refusal exists for. Two conditions for one predicate is how that
+    # happens, so the guard now uses `in_cycle`'s own terms.
+    monkeypatch.setattr(sys, "argv",
+                        ["panel.py", "--pr", "1609", "--round", "1",
+                         "--escalated", "deadbeefdeadbeef"])
+    with pytest.raises(SystemExit) as still_bad:
+        panel.main()
+    assert "--escalated needs a cycle" in str(still_bad.value)
+
     # And the inference is gone from `run` itself, not only from the CLI: a
     # programmatic caller that passes the flag with no cycle flag gets a
     # single-pass run that claims no rounds, rather than a round 1 of a cap
@@ -842,8 +856,19 @@ def test_a_DISMISSED_finding_is_never_recorded_as_escalated(monkeypatch, capsys)
     report, recorded = run_panel(monkeypatch, reply, [found], capsys, round_no=2,
                                  max_rounds=5, escalated=[key])
     assert [c["escalated"] for c in recorded["dismissed"]] == [False]
-    assert any("DISMISSED" in n for n in recorded["config_notes"])
     assert "⛔" not in report
+
+    # The note said the declaration "changes nothing here", and the key goes into
+    # the register anyway — inherited by every later round, where a master that
+    # rules the SAME defect real will hold it. "Changes nothing" was therefore
+    # true of this round and false of the cycle, which the codex seat caught. The
+    # register keeping it is deliberate (a dismissal is a claim about the finding;
+    # an escalation is a claim about the approach, and only a human closes that),
+    # so the note is what had to change.
+    note = next(n for n in recorded["config_notes"] if "DISMISSED" in n)
+    assert "changes nothing about THIS round" in note
+    assert "inherited" in note and "later round" in note
+    assert recorded["escalated"] == {key: 2}
 
 
 def test_every_finding_bucket_is_keyed_in_the_same_order(monkeypatch, capsys):

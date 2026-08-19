@@ -1599,8 +1599,10 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                        - {c.key for c in outstanding})
     for key in ruled_out:
         notes.append(f"--escalated {key} names a finding this round's master DISMISSED "
-                     "as not real — a dismissed finding is not work a fix round can "
-                     "clear either way, so the declaration changes nothing here")
+                     "as not real, so it changes nothing about THIS round's stop — but "
+                     "the key is still recorded and inherited, and a later round that "
+                     "rules the same defect real will hold it there. Withdraw it from "
+                     "the next round's --escalated if that is not what you meant")
     # The repeat KEYS, not a count of them: `round_stop` subtracts the escalated
     # ones itself, so the rule lives in one place instead of depending on every
     # caller to filter first. It takes keys and nothing else — the count overload
@@ -2477,12 +2479,22 @@ def main() -> int:
     # escalation is by construction read out of a fix pass that followed a review
     # round, so arriving without one of these three is a caller error: it is much
     # more likely a forgotten --round than a considered single-pass declaration.
-    if args.escalated and not (args.round_no is not None
-                               or args.max_rounds is not None or args.baseline):
-        raise SystemExit("--escalated needs a cycle to mean anything: pass --round and "
-                         "--max-rounds (plus the earlier rounds' --baseline). It names "
-                         "work a LATER round must not count, and a single-pass review "
-                         "has no later round")
+    #
+    # The condition is `round_no > 1`, NOT "was --round passed", because that is
+    # what `run()`'s `in_cycle` tests. Asking a different question here let
+    # `--round 1 --escalated <key>` past both doors — the guard saw a --round and
+    # allowed it, `in_cycle` saw round 1 with no cap or baseline and built a
+    # single-pass run — so the flag was accepted outside a cycle, which is exactly
+    # the case this refusal exists for. Two conditions for one predicate is how
+    # that happened, so they are spelled the same way and `in_cycle`'s own terms
+    # are the ones used.
+    if args.escalated and not (round_no > 1 or args.max_rounds is not None
+                               or args.baseline):
+        raise SystemExit("--escalated needs a cycle to mean anything: pass --round (2 or "
+                         "more) and --max-rounds, plus the earlier rounds' --baseline. "
+                         "It names work a LATER round must not count, and a single-pass "
+                         "review — which `--round 1` on its own still is — has no later "
+                         "round")
     return run(args.repo, args.pr, args.post, args.json_out, args.reviewers,
                args.json_file, args.record, round_no, args.baseline,
                args.max_rounds, args.scope, args.since, args.force,
