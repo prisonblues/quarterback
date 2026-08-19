@@ -445,12 +445,15 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # one. A review-only /panel run left to the default is a single pass, and
     # must not report itself as "round 1 of at most 2 — go again", promising a
     # re-review nothing will run.
-    # `--escalated` joins them: the flag does nothing at all outside a cycle —
-    # it names work a LATER round must not count — so a single-pass run that
-    # accepted it would give the caller none of the behaviour it was passed for,
-    # silently, which is the exact failure mode this whole flag exists to close.
-    in_cycle = (max_rounds is not None or round_no > 1 or bool(baseline)
-                or bool(escalated))
+    # `--escalated` is deliberately NOT one of them, and `main` refuses the flag
+    # unless one of the three is given. It names work a LATER round must not count,
+    # and it is read out of a fix pass that by construction followed a review
+    # round — so `--escalated` with no round, cap or baseline is a caller error,
+    # and the loud refusal at the edge is the whole of the answer. Treating the
+    # flag as evidence of a cycle (the shape this had for one round) produced
+    # exactly what the comment above forbids: "round 1 of at most 2 — go again",
+    # promising a re-review nothing will run.
+    in_cycle = max_rounds is not None or round_no > 1 or bool(baseline)
     cap = DEFAULT_MAX_ROUNDS if max_rounds is None else max_rounds
     # Idempotency key for the board record, minted once per process so a retry of
     # the POST cannot double-count the run into the stats. A fresh panel run is a
@@ -535,11 +538,36 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # public PR comment. Rejected rather than passed on, reported rather than
     # dropped: the note names a flattened, truncated excerpt, which says which
     # value was wrong without putting a caller's arbitrary markdown on the PR.
+    #
+    # Deduplicated, because `panel-review-pr.md` documents re-passing a key you
+    # inherited as harmless and it has to actually be: this loop and the skip
+    # branch's below both iterate the values, so `--escalated K --escalated K`
+    # wrote the same note twice — into the payload, and with `--post` into a public
+    # PR comment. On the value as WRITTEN (a `str()` of it), not on the value
+    # itself: one duplicate note per spelling the caller used, and nothing here
+    # assumes the caller passed something hashable.
     declared: list[str] = []
+    reported: set[str] = set()
     for raw in (escalated or []):
+        if str(raw) in reported:
+            continue
+        reported.add(str(raw))
         if _is_key(raw):
-            declared.append(str(raw))
-        elif str(raw or ""):
+            # The NORMALISED key: a value transcribed out of prose arrives
+            # upper-cased or newline-padded often enough, and the register has to
+            # hold the spelling a finding's own key equals.
+            key = _key_norm(raw)
+            if key not in declared:
+                declared.append(key)
+        else:
+            # EVERY value that is not a key, the EMPTY one included. The
+            # `elif str(raw or "")` this replaces let `--escalated ""` take neither
+            # branch — no key recorded and no note, which is the one outcome this
+            # flag's design rules out — and the empty value is the likeliest of all
+            # to arrive: `--escalated "$KEY"` with an unset shell variable, or an
+            # orchestrator interpolating a `Key:` line the fixer's report never
+            # carried. `_key_gist` renders it `(empty)`, which is what that
+            # fallback was written for.
             notes.append(f"--escalated `{_key_gist(raw)}` is not the shape of a finding "
                          "key (8-64 hex characters) — it was ignored, so the finding it "
                          "meant still counts as work a fix round can clear")
@@ -1531,17 +1559,48 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # Declared this round, plus every key an earlier round declared. The earliest
     # round that said so owns the answer, so `prior` wins a collision — a caller
     # re-passing a key it inherited must not re-date the claim to now.
-    held = {**{k: round_no for k in declared}, **prior.escalated}
+    #
+    # Sorted, for the same reason `round_stop`'s `escalated_outstanding` is: this
+    # dict is serialised straight into the payload, so the order of the
+    # `--escalated` flags and of the baseline reads must not change the artifact's
+    # bytes. A diff between two payloads has to mean something changed.
+    held = dict(sorted({**{k: round_no for k in declared}, **prior.escalated}.items()))
     # A key naming no finding this cycle has ever seen is almost always a typo,
     # and a typo here is silent by construction: the loop would simply carry on
     # counting a finding the caller believes it excluded. Said out loud rather
     # than corrected, because the other reading — a key from a cycle whose payload
     # was lost — is legitimate and this cannot tell them apart.
-    seen = {c.key for c in (*to_fix, *sonar, *dismissed)} | prior.keys
+    #
+    # `prior.escalated` counts as seen, and that is not redundant with
+    # `prior.keys`: the register is inherited TRANSITIVELY (every payload carries
+    # the whole register forward, and the skip path copies it) while the finding
+    # RECORD is not. So passing only the latest baseline — which the docs allow —
+    # inherits a key whose finding no bucket carries any more, and a premise
+    # re-worded under a new key (`panel-review-pr.md` §5 says that happens very
+    # often) drops out of every later round's buckets too. Without this the note
+    # then fired every round for the rest of the cycle on a key that was never
+    # mistyped, which is exactly the false positive that teaches a reader to skip
+    # it. A key an earlier payload's register carries is by construction a key an
+    # earlier round knew.
+    seen = ({c.key for c in (*to_fix, *sonar, *dismissed)}
+            | prior.keys | set(prior.escalated))
     for key in sorted(k for k in held if k not in seen):
         notes.append(f"--escalated {key} names no finding this round raised and no "
                      "earlier round's payload carries — check the key, or the "
                      "baseline it should have come in on")
+    # Not a typo and not work either: the master ruled this finding not real, so
+    # there is nothing for a fix round to clear and nothing for a human to answer.
+    # Said rather than left implicit, because the escalation of a dismissed finding
+    # is otherwise invisible — the key passes the typo check above (`seen` includes
+    # `dismissed`), it is not in `outstanding` so no stop rule ever consults it, and
+    # neither the record nor the report marks the row (see the `escalated` field on
+    # the `dismissed` bucket below).
+    ruled_out = sorted(({c.key for c in dismissed} & set(held))
+                       - {c.key for c in outstanding})
+    for key in ruled_out:
+        notes.append(f"--escalated {key} names a finding this round's master DISMISSED "
+                     "as not real — a dismissed finding is not work a fix round can "
+                     "clear either way, so the declaration changes nothing here")
     # The repeat KEYS, not a count of them: `round_stop` subtracts the escalated
     # ones itself, so the rule lives in one place instead of depending on every
     # caller to filter first. It takes keys and nothing else — the count overload
@@ -1550,6 +1609,30 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     stop = round_stop(round_no, cap, new_keys, outstanding, veto, not prior.problems,
                       repeated={c.key for c in outstanding if not is_new(c)},
                       escalated=held)
+    # An escalated SonarCloud issue is still a RED GATE, and "the approach is wrong,
+    # a human must answer the premise" does not turn it green. `round_stop` counts
+    # it like any other escalation — correctly, since it is work no fix round may
+    # do — so a cycle whose only remaining item is an escalated `python:S2259`
+    # stops with "nothing left that a fix round can clear", which is true of the
+    # ROUND and reads as a clean finish on a PR that cannot merge.
+    #
+    # Named here rather than fixed by keeping gate issues out of the register:
+    # `outstanding` is `to_fix + sonar` and the stop rule already acted on the key,
+    # so a record that showed the issue as ordinary work would contradict the rule
+    # that stopped the cycle. `preland.py` HOLDs on `sonar_gate == "ERROR"`
+    # independently, so nothing lands on this silently — but that is a different
+    # script, and this panel's own verdict has to say it too: in `reason`, which a
+    # loop reads, and in `veto`, which a human reads. `confident` is already false
+    # (holding an escalation takes a veto line of its own), so this adds no verdict
+    # it has not already earned.
+    held_gate = sorted({c.key for c in sonar} & set(stop["escalated_outstanding"]))
+    if stop["stop"] and held_gate and result.sonar_gate == "ERROR":
+        stop["reason"] += " — and the SonarCloud quality gate is still FAILING"
+        stop["veto"] = [*stop["veto"],
+                        f"{len(held_gate)} escalated finding(s) are SonarCloud gate "
+                        "issues and the gate reads ERROR — a premise answer does not "
+                        "clear an external merge gate, so this PR cannot land until "
+                        "the issue is resolved or excluded in SonarCloud"]
     # Whether a CYCLE exists at all, and the one predicate that decides it — for
     # the report's Rounds block and for the payload alike. They used to disagree:
     # the report suppressed the block for a review-only run while the payload sent
@@ -1804,8 +1887,17 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # the register is already subtracted from the work `round_stop` counts,
         # and a record that showed it as ordinary work would contradict the stop
         # rule that acted on it. `dismissed` is not work at all, but it is keyed
-        # the same way and a consumer reading one bucket's shape should not find a
-        # different one in the next.
+        # the same way — same fields, in the same ORDER, so a consumer reading one
+        # bucket's shape does not find a different one in the next and a payload
+        # diff does not move three keys around.
+        #
+        # `escalated` is always FALSE on a dismissed finding, and that is not an
+        # oversight: the master ruled it not real, so "escalated — awaiting a human"
+        # says the opposite about the same row. Nothing else treats it as escalated
+        # either — it is not in `outstanding`, so no stop rule consults it, and the
+        # report renders ⛔ only in the two lists a fixer's brief can be built from.
+        # A caller who does escalate a dismissed key gets a `config_notes` line
+        # saying so, rather than a record that contradicts the report.
         "to_fix": [{**c.as_dict(), "new_this_round": is_new(c),
                     "provenance": provenance_of(c),
                     "escalated": c.key in held} for c in to_fix],
@@ -1813,8 +1905,8 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                             "provenance": provenance_of(c),
                             "escalated": c.key in held} for c in sonar],
         "dismissed": [{**c.as_dict(), "new_this_round": is_new(c),
-                       "escalated": c.key in held,
-                       "provenance": provenance_of(c)} for c in dismissed],
+                       "provenance": provenance_of(c),
+                       "escalated": False} for c in dismissed],
         "provenance_counts": provenance_counts,
         "skipped": result.skipped,
         "run_key": run_key,
@@ -2288,8 +2380,9 @@ def main() -> int:
                          "stays outstanding and stays in the report, but no longer "
                          "counts as work a fix round can clear — otherwise the cycle "
                          "runs to its cap on a finding only a human can close. "
-                         "Repeatable; declares the run part of a cycle, and is "
-                         "inherited by later rounds through --baseline")
+                         "Repeatable; needs a cycle (--round/--max-rounds/--baseline) "
+                         "to mean anything, and is inherited by later rounds through "
+                         "--baseline")
     ap.add_argument("--scope", choices=ROUND_SCOPES, default="auto",
                     help="what a round past the first REVIEWS. increment: the "
                          "commits since the last round's head, with the rest of the "
@@ -2376,6 +2469,20 @@ def main() -> int:
         raise SystemExit(f"--round {round_no} is past --max-rounds "
                          f"{cap}{default_note}: raise the cap, or pass the round "
                          "this run actually is")
+    # `--escalated` only means something ACROSS rounds: it names work a later round
+    # must not count. A run that is not part of a cycle has no later round, so
+    # accepting the flag there leaves two options and both are worse than refusing
+    # it — drop the declaration silently, or invent a cycle to hold it and print
+    # "round 1 of at most 2 — go again" for a re-review nobody will run. And an
+    # escalation is by construction read out of a fix pass that followed a review
+    # round, so arriving without one of these three is a caller error: it is much
+    # more likely a forgotten --round than a considered single-pass declaration.
+    if args.escalated and not (args.round_no is not None
+                               or args.max_rounds is not None or args.baseline):
+        raise SystemExit("--escalated needs a cycle to mean anything: pass --round and "
+                         "--max-rounds (plus the earlier rounds' --baseline). It names "
+                         "work a LATER round must not count, and a single-pass review "
+                         "has no later round")
     return run(args.repo, args.pr, args.post, args.json_out, args.reviewers,
                args.json_file, args.record, round_no, args.baseline,
                args.max_rounds, args.scope, args.since, args.force,

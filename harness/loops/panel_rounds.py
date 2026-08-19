@@ -145,6 +145,24 @@ def _key_from_title(file: str | None, title: str) -> str:
 _KEY_RE = re.compile(r"[0-9a-f]{8,64}")
 
 
+def _key_norm(value: object) -> str:
+    """A key as the register stores it: surrounding whitespace gone, lower-cased.
+
+    Applied wherever a key arrives from OUTSIDE — a caller's ``--escalated`` and a
+    baseline's register — and applied before :func:`_is_key` decides, because this
+    is the one input read out of a fixer's PROSE report and retyped by a human or
+    an orchestrator. ``DEADBEEFDEADBEEF`` and a copy-paste carrying a trailing
+    newline both NAME the right finding; rejecting them produced a note blaming
+    the caller for a value a human reads as correct and left the escalation
+    uncounted, which is the #221 jam with a misleading diagnostic on top.
+
+    It cannot admit anything ``_KEY_RE`` would not: case and surrounding blanks
+    are all it touches, and :func:`_key_from_title` writes lower-case hex — so the
+    normalised value is the one that matches a finding, and it is what the
+    register must store."""
+    return str(value).strip().lower()
+
+
 def _is_key(value: object) -> bool:
     """Is this the shape a finding key comes in?
 
@@ -153,8 +171,11 @@ def _is_key(value: object) -> bool:
     never machine-generated. An unchecked value is interpolated into a
     ``config_notes`` line that ``--post`` puts in a public PR comment, and the
     same value is written into the payload every later round inherits, so the
-    shape is checked at the door rather than at the point of use."""
-    return isinstance(value, str) and bool(_KEY_RE.fullmatch(value))
+    shape is checked at the door rather than at the point of use.
+
+    Judged on the NORMALISED value (:func:`_key_norm`), which every caller of this
+    must then store rather than the raw one."""
+    return isinstance(value, str) and bool(_KEY_RE.fullmatch(_key_norm(value)))
 
 
 def _key_gist(value: object, limit: int = 24) -> str:
@@ -163,8 +184,16 @@ def _key_gist(value: object, limit: int = 24) -> str:
     The note has to say WHICH value was rejected or it cannot be acted on, and it
     is posted to the PR — so everything that is not plainly a key character
     becomes ``?``, and the result is short. Quoting the raw value would put a
-    caller's arbitrary string, markdown and all, into a public comment."""
-    flat = "".join(ch if ch.isalnum() or ch in "-_." else "?" for ch in str(value))
+    caller's arbitrary string, markdown and all, into a public comment.
+
+    ASCII alphanumerics only, and that restriction is the whole point of the
+    excerpt: ``str.isalnum`` is true for letters and digits in every script, so a
+    value made of Cyrillic or Greek homoglyphs (or full-width digits) came through
+    verbatim and rendered on the PR as a plausible-looking key — safe as markdown,
+    and useless for the one job the excerpt has, which is letting a human
+    recognise WHICH value was wrong."""
+    flat = "".join(ch if (ch.isascii() and ch.isalnum()) or ch in "-_." else "?"
+                   for ch in str(value))
     return (flat[:limit] + "…" if len(flat) > limit else flat) or "(empty)"
 
 
@@ -1160,7 +1189,10 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
                     "register, which is not the shape of a finding key — it was "
                     "NOT inherited")
                 continue
-            key = str(k)
+            # The NORMALISED key, which is what `_is_key` judged and what a
+            # finding's own key will equal — storing the raw one would put a
+            # padded or upper-case spelling in the register, matching nothing.
+            key = _key_norm(k)
             # The declaration round is the one auditable fact in a register the
             # loop otherwise takes on trust, so it is range-checked rather than
             # coerced. `bool` is excluded explicitly: it is an `int` subclass, so
@@ -1403,7 +1435,16 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
 
     1. findings this round that no earlier round raised -> go again;
     2. a P1/P2 still outstanding -> go again, whatever anyone declared (a blocker
-       raised again is a blocker that was not fixed);
+       raised again is a blocker that was not fixed) — **except one in**
+       ``escalated``, which the filter below has already subtracted. Said here
+       rather than left to the filter's own paragraph because it is the largest
+       behavioural consequence of #221 and it reverses this rule's own sentence:
+       a declaration now DOES override rule 2, and a cycle whose only remaining
+       work is an escalated P1 stops with that blocker present. That is the point
+       of the feature — no fix round may touch such a finding, so another round
+       buys nothing — and the stop is never dressed up as convergence: it takes a
+       veto line, ``confident`` is false, and ``reason`` says a human is owed an
+       answer;
     3. ``repeated`` — the KEYS of findings an earlier round already raised that
        are STILL outstanding, at any severity -> go again. The fixer was told
        about them and they are still there, and ``/panel-review-pr``'s bar is
@@ -1477,6 +1518,36 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
       the key would otherwise go on subtracting its finding from the work a fix
       round can clear, and go on rendering ⛔, for every round that inherits the
       baseline."""
+    # Both key collections are checked at the door, the way every other shape in
+    # this file is, because both wrong shapes fail SILENTLY and both failures are
+    # the #221 jam this function exists to close.
+    #
+    # A bare `str` is itself iterable, so `escalated=key` instead of
+    # `escalated=[key]` — the natural slip now that these take keys — makes `held`
+    # a set of single characters, leaves `blocking` empty against real
+    # multi-character keys, and ignores the escalation while the cycle runs to its
+    # cap. `repeated="<key>"` is the same slip in the other direction and worse: it
+    # reports "N finding(s) an earlier round already raised" with an N invented out
+    # of the string's distinct characters.
+    #
+    # `repeated` also took an `int` COUNT until #221, so a caller outside this diff
+    # still on the old contract arrives here; it is named rather than left to a
+    # bare `TypeError: 'int' object is not iterable`, which says nothing about what
+    # to pass instead.
+    #
+    # A `dict` is deliberately NOT rejected: it iterates its keys, which is correct
+    # and is what the production call site passes (the register itself).
+    for name, value in (("repeated", repeated), ("escalated", escalated)):
+        if isinstance(value, str):
+            raise TypeError(
+                f"round_stop({name}=...) takes a COLLECTION of finding keys, not one "
+                f"string ({_key_gist(value)!r}): a bare str iterates character by "
+                f"character, so it matches no finding and says nothing — pass a list")
+        if isinstance(value, int):
+            raise TypeError(
+                f"round_stop({name}=...) takes finding KEYS, not a count ({value!r}): "
+                "the escalated ones are subtracted here, and a count computed by the "
+                "caller cannot express that")
     held = frozenset(k for k in escalated if k)
     # The escalated keys THIS round actually saw. The register is a property of
     # the cycle and only grows; what is blocking is a property of the round, and
@@ -1558,7 +1629,7 @@ __all__ = [
     "panel_core", "panel_seats", "cluster_findings", "_account",
     "_fold_reports", "_NOT_WORD", "_norm_title", "_key_from_title",
     "_defect_title", "_defect_key", "_finding_id", "Canonical",
-    "_KEY_RE", "_is_key", "_key_gist",
+    "_KEY_RE", "_key_norm", "_is_key", "_key_gist",
     "_unmerged", "_judge_listing", "_parse_verdicts", "adjudicate",
     "REWORD_RATIO", "_TITLE_NOISE", "_stem", "_same_words",
     "Baseline", "_baseline_title", "_SHA_RE", "_mtime",

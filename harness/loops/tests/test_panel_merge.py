@@ -16,6 +16,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
 import panel_core  # noqa: E402  — `sh` is defined here since #129
@@ -480,17 +482,19 @@ def test_a_cluster_of_empty_groups_is_not_a_judge_failure(monkeypatch):
 # ------------------------------------------------------------------- the payload shape
 
 def run_panel(monkeypatch, judge_reply, findings, capsys, json_out=False, sonar=(),
-              **run_kwargs):
+              sonar_gate="OK", **run_kwargs):
     """Drive `run()` with every subprocess stubbed. Returns (report, payload).
 
     `run_kwargs` reaches `run()` untouched, for the round arguments a cycle
     passes (`round_no`, `baseline`, `escalated`) — the default call is still the
-    single-pass review every existing caller here means."""
+    single-pass review every existing caller here means. `sonar_gate` is the gate
+    VERDICT beside those issues, which is a separate fact from the issues
+    themselves: a gate can read ERROR over a condition no issue represents."""
     reviewers = {"codex": {"enabled": True}, "claude": {"enabled": True}}
     if sonar:
         reviewers["sonarqube"] = {"enabled": True}
         monkeypatch.setattr(panel, "review_sonarqube",
-                            lambda *a, **k: ("OK", list(sonar), [], None))
+                            lambda *a, **k: (sonar_gate, list(sonar), [], None))
     monkeypatch.setattr(panel, "load_repo_cfg", lambda name: {
         "github": "o/r", "path": "/tmp/r",
         "reviewers": reviewers,
@@ -703,17 +707,193 @@ def test_an_escalated_value_that_is_not_a_key_never_reaches_the_report(
     assert recorded["escalated"] == {}
 
 
-def test_escalating_makes_the_run_part_of_a_cycle(monkeypatch, capsys):
+def test_escalating_outside_a_cycle_is_refused_rather_than_inventing_one(
+        monkeypatch, capsys):
     """`--escalated` names work a LATER round must not count, so it means nothing
-    outside a cycle. A single-pass run that accepted it recorded the register and
-    gave the caller none of the behaviour the flag exists for — silently, which is
-    the failure mode the flag was added to close."""
+    outside a cycle — and there were three ways to answer that, not two. Accepting
+    it silently gives the caller none of the behaviour; INFERRING a cycle from it
+    reports "round 1 of at most 2 — go again" for a re-review nothing will run,
+    which is exactly what the comment beside `in_cycle` forbids. Refusing it is the
+    third: an escalation is by construction read out of a fix pass that followed a
+    review round, so the flag with no round, cap or baseline is a caller error and
+    a loud error beats a fabricated cycle."""
+    monkeypatch.setattr(sys, "argv",
+                        ["panel.py", "--pr", "1609", "--escalated", "deadbeefdeadbeef"])
+    with pytest.raises(SystemExit) as bad:
+        panel.main()
+    assert "--escalated needs a cycle" in str(bad.value)
+
+    # And the inference is gone from `run` itself, not only from the CLI: a
+    # programmatic caller that passes the flag with no cycle flag gets a
+    # single-pass run that claims no rounds, rather than a round 1 of a cap
+    # nobody set.
     reply = '[{"id":"F1","members":[0],"real":true,"reason":"real"}]'
     found = find()
     key = panel._defect_key(found.file, [found])
     _, recorded = run_panel(monkeypatch, reply, [found], capsys, escalated=[key])
-    assert recorded["round_stop"] is not None
+    assert recorded["round_stop"] is None
+    assert recorded["stop_reason"] is None and recorded["cycle"] is None
+
+
+@pytest.mark.parametrize("cycle", [{"round_no": 2}, {"max_rounds": 5}])
+def test_any_one_cycle_flag_is_enough_for_an_escalation_to_count(
+        monkeypatch, capsys, cycle):
+    """The refusal above must not become "you need all three": a caller naming the
+    round, or the cap, or a baseline is in a cycle, and the register reaches the
+    stop rule from any of them."""
+    reply = '[{"id":"F1","members":[0],"real":true,"reason":"real"}]'
+    found = find()
+    key = panel._defect_key(found.file, [found])
+    _, recorded = run_panel(monkeypatch, reply, [found], capsys,
+                            escalated=[key], **cycle)
     assert recorded["round_stop"]["escalated_outstanding"] == [key]
+
+
+def test_an_EMPTY_escalated_value_is_reported_rather_than_dropped(monkeypatch, capsys):
+    """The door check took neither branch for `""` — not a key, and not truthy
+    either — so `--escalated ""` was dropped in total silence. It is also the
+    likeliest wrong value to arrive: `--escalated "$KEY"` with the variable unset,
+    or an orchestrator interpolating a `Key:` line the fixer never wrote. Silence
+    is the one outcome this flag's design rules out, so the empty value gets the
+    same note as any other non-key."""
+    reply = '[{"id":"F1","members":[0],"real":true,"reason":"real"}]'
+    _, recorded = run_panel(monkeypatch, reply, [find()], capsys,
+                            round_no=2, max_rounds=5, escalated=[""])
+    notes = " ".join(recorded["config_notes"])
+    assert "not the shape of a finding key" in notes and "(empty)" in notes
+    assert recorded["escalated"] == {}
+
+
+def test_a_key_transcribed_in_upper_case_or_padded_still_names_its_finding(
+        monkeypatch, capsys):
+    """This is the one input read out of a fixer's PROSE report and retyped, so an
+    upper-case key or one carrying a copy-paste newline is the caller naming the
+    right finding. Rejecting it left the escalation uncounted — the #221 jam —
+    under a note blaming the caller for a correct value."""
+    reply = '[{"id":"F1","members":[0],"real":true,"reason":"real"}]'
+    found = find()
+    key = panel._defect_key(found.file, [found])
+    _, recorded = run_panel(monkeypatch, reply, [found], capsys, round_no=2,
+                            max_rounds=5, escalated=[f"  {key.upper()}\n"])
+    assert recorded["escalated"] == {key: 2}, "normalised, not stored as typed"
+    assert [f["escalated"] for f in recorded["to_fix"]] == [True]
+    assert not any("not the shape" in n for n in recorded["config_notes"])
+
+
+def test_the_same_key_passed_twice_is_recorded_and_reported_once(monkeypatch, capsys):
+    """`panel-review-pr.md` documents re-passing a key you inherited as harmless,
+    and both consumers of the list iterated it raw — so a duplicate wrote its note
+    twice, into the payload and (with `--post`) into a public PR comment."""
+    reply = '[{"id":"F1","members":[0],"real":true,"reason":"real"}]'
+    found = find()
+    key = panel._defect_key(found.file, [found])
+    _, recorded = run_panel(monkeypatch, reply, [found], capsys, round_no=2,
+                            max_rounds=5, escalated=[key, key, "nope", "nope"])
+    assert recorded["escalated"] == {key: 2}
+    assert sum("not the shape" in n for n in recorded["config_notes"]) == 1
+
+
+def test_the_register_is_serialised_in_key_order(monkeypatch, capsys):
+    """It goes straight into the payload, so flag order must not change the bytes —
+    the same rule `escalated_outstanding` is sorted for. Two runs of one round that
+    declare the same set have to produce the same artifact or a diff means
+    nothing."""
+    reply = '[{"id":"F1","members":[0],"real":true,"reason":"real"}]'
+    keys = ["ff00ff00ff00ff00", "00ff00ff00ff00ff"]
+    _, recorded = run_panel(monkeypatch, reply, [find()], capsys, round_no=2,
+                            max_rounds=5, escalated=keys)
+    assert list(recorded["escalated"]) == sorted(keys)
+
+
+def test_a_key_only_an_earlier_REGISTER_carries_is_not_reported_as_a_typo(
+        monkeypatch, capsys, tmp_path):
+    """The register is inherited transitively — every payload carries the whole of
+    it forward — while the finding RECORD is not. So passing only the latest
+    baseline (which the docs allow) inherits a key whose finding no bucket carries
+    any more, which is the normal shape after a fresh panel re-words the premise
+    under a new key. Keying the typo check on the buckets alone reported that as a
+    mistyped key every round for the rest of the cycle."""
+    prior = tmp_path / "r2.json"
+    gone = "b1b2b3b4b5b6b7b8"
+    prior.write_text(json.dumps({
+        "repo": "r", "github": "o/r", "pr": 1609, "round": 2,
+        # The register carries it; round 2's own buckets no longer do, because the
+        # panel that ran it worded the premise differently.
+        "escalated": {gone: 1}, "to_fix": [{"key": "aaaabbbbccccdddd",
+                                            "file": "z.py", "title": "something else"}],
+    }))
+    reply = '[{"id":"F1","members":[0],"real":true,"reason":"real"}]'
+    _, recorded = run_panel(monkeypatch, reply, [find()], capsys,
+                            round_no=3, max_rounds=5, baseline=[str(prior)],
+                            escalated=[gone])
+    assert not any("names no finding" in n for n in recorded["config_notes"])
+    assert recorded["escalated"] == {gone: 1}
+
+
+def test_a_DISMISSED_finding_is_never_recorded_as_escalated(monkeypatch, capsys):
+    """"Escalated — awaiting a human" on a row the master ruled not real says the
+    opposite about the same finding, and the report renders ⛔ only in the two lists
+    a fixer's brief is built from — so `true` there was the one place the record
+    disagreed with the report. Nothing prevents the declaration (the typo check
+    counts dismissed keys as seen, correctly), so it is answered with a note."""
+    reply = '[{"id":"F1","members":[0],"real":false,"reason":"not real"}]'
+    found = find()
+    key = panel._defect_key(found.file, [found])
+    report, recorded = run_panel(monkeypatch, reply, [found], capsys, round_no=2,
+                                 max_rounds=5, escalated=[key])
+    assert [c["escalated"] for c in recorded["dismissed"]] == [False]
+    assert any("DISMISSED" in n for n in recorded["config_notes"])
+    assert "⛔" not in report
+
+
+def test_every_finding_bucket_is_keyed_in_the_same_order(monkeypatch, capsys):
+    """The three buckets are deliberately one shape — a consumer reading one should
+    not find a different one in the next — and key ORDER is the respect in which
+    `dismissed` had drifted, which shows up in every serialised payload diff."""
+    hard = [F(reviewer="sonarqube", severity="P2", file="b.py", line=3,
+              title="null deref", detail="python:S2259")]
+    reply = ('[{"id":"F1","members":[0],"real":true,"reason":"real"},'
+             '{"id":"F2","members":[1],"real":false,"reason":"not real"}]')
+    _, payload = run_panel(monkeypatch, reply,
+                           [find(reviewer="codex"), find(reviewer="claude", title="u")],
+                           capsys, sonar=hard)
+    shapes = {tuple(bucket[0]) for bucket in
+              (payload["to_fix"], payload["sonar_findings"], payload["dismissed"])}
+    assert len(shapes) == 1, payload
+
+
+def test_an_escalated_GATE_issue_does_not_report_the_stop_as_clear(monkeypatch, capsys):
+    """A premise answer does not clear an external merge gate. `round_stop` counts
+    an escalated gate issue like any other escalation — correctly, since no fix
+    round may touch it — so the cycle stopped saying "nothing left that a fix round
+    can clear" on a PR whose gate was red, and neither the reason nor the veto said
+    so. (`preland.py` HOLDs on the gate independently; this is the panel's own
+    verdict saying it.)"""
+    hard = [F(reviewer="sonarqube", severity="P2", file="b.py", line=3,
+              title="null deref", detail="python:S2259")]
+    gate_key = panel._defect_key("b.py", hard)
+    reply = '[{"id":"F1","members":[0],"real":false,"reason":"not real"}]'
+    _, payload = run_panel(monkeypatch, reply, [find(reviewer="codex")], capsys,
+                           sonar=hard, sonar_gate="ERROR", round_no=2, max_rounds=5,
+                           escalated=[gate_key])
+    stop = payload["round_stop"]
+    assert stop["stop"] is True and stop["confident"] is False
+    assert "gate is still FAILING" in stop["reason"]
+    assert any("gate reads ERROR" in v for v in stop["veto"])
+
+
+def test_a_PASSING_gate_adds_nothing_to_the_stop_it_holds(monkeypatch, capsys):
+    """The other side of it, so the line above is a fact about a red gate and not
+    something this prints whenever Sonar ran."""
+    hard = [F(reviewer="sonarqube", severity="P2", file="b.py", line=3,
+              title="null deref", detail="python:S2259")]
+    gate_key = panel._defect_key("b.py", hard)
+    reply = '[{"id":"F1","members":[0],"real":false,"reason":"not real"}]'
+    _, payload = run_panel(monkeypatch, reply, [find(reviewer="codex")], capsys,
+                           sonar=hard, sonar_gate="OK", round_no=2, max_rounds=5,
+                           escalated=[gate_key])
+    assert "FAILING" not in payload["round_stop"]["reason"]
+    assert not any("gate reads ERROR" in v for v in payload["round_stop"]["veto"])
 
 
 def test_a_skipped_round_carries_the_register_forward_and_adds_nothing(
@@ -737,12 +917,23 @@ def test_a_skipped_round_carries_the_register_forward_and_adds_nothing(
             "headRefName": "h", "headRefOid": "abc"}
     monkeypatch.setattr(panel_core, "sh", gh_stub(meta=meta))
     assert panel.run("r", 1609, post=False, json_out=True, round_no=2,
-                     baseline=[str(prior)], escalated=["d1d2d3d4d5d6d7d8"]) == 0
+                     baseline=[str(prior)],
+                     escalated=["d1d2d3d4d5d6d7d8", "not a key"]) == 0
     skipped = json.loads(capsys.readouterr().out)
 
     assert skipped["escalated"] == {old: 1}
     assert any("reviewed nothing" in n and "d1d2d3d4d5d6d7d8" in n
                for n in skipped["config_notes"])
+    # The malformed value never becomes `declared`, so it gets the door-check note
+    # and NOT a second "reviewed nothing" one — and the order of the two kinds is
+    # asserted because this path assembles `config_notes` by concatenation
+    # (`notes + skip_prior.problems`) and the door check runs before the branch:
+    # rejected values first, then what this round dropped, then anything wrong with
+    # the baseline.
+    notes = skipped["config_notes"]
+    assert sum("reviewed nothing" in n for n in notes) == 1
+    assert [i for i, n in enumerate(notes) if "not the shape" in n] \
+        < [i for i, n in enumerate(notes) if "reviewed nothing" in n]
 
 
 def test_sonar_gate_issues_become_canonical_records_of_their_own(monkeypatch, capsys):
@@ -778,14 +969,17 @@ def test_an_escalated_SONAR_issue_is_marked_and_flagged_like_a_judged_one(
     up the one finding §5 forbids handing to a fixer."""
     hard = [F(reviewer="sonarqube", severity="P2", file="b.py", line=3,
               title="null deref", detail="python:S2259")]
+    # Derived the way the judged key is, rather than read off a first run whose
+    # `report` and `payload` the second one then shadowed: a Sonar issue is a
+    # `Canonical` over its own single account, so its key is `_defect_key` of the
+    # file and that account. One run, and no assertion below can be misread as
+    # applying to a run it does not.
+    gate_key = panel._defect_key("b.py", hard)
     reply = '[{"id":"F1","members":[0],"real":true,"reason":"real"}]'
-    report, payload = run_panel(monkeypatch, reply, [find(reviewer="codex")],
-                                capsys, sonar=hard, round_no=2, max_rounds=5)
-    gate_key = payload["sonar_findings"][0]["key"]
-
     report, payload = run_panel(monkeypatch, reply, [find(reviewer="codex")],
                                 capsys, sonar=hard, round_no=2, max_rounds=5,
                                 escalated=[gate_key])
+    assert payload["sonar_findings"][0]["key"] == gate_key
     assert [c["escalated"] for c in payload["sonar_findings"]] == [True]
     assert [c["escalated"] for c in payload["to_fix"]] == [False]
     assert payload["round_stop"]["escalated_outstanding"] == [gate_key]

@@ -427,7 +427,11 @@ follows is only what YOU have to do.
 A key rides in the payload as `escalated: {key: round}` and every later round
 inherits it through `--baseline`, so a cycle cannot lose the question by forgetting
 a flag, and re-passing a key you inherited is harmless (the round it was FIRST
-declared in survives; a re-declaration cannot re-date the claim). What inheritance
+declared in survives, a re-declaration cannot re-date the claim, and a repeated
+flag is deduplicated rather than noted twice). Pass it **with the round flags** —
+`--escalated` without `--round`/`--max-rounds`/`--baseline` is refused, because it
+names work a later round must not count and a single-pass review has no later
+round. What inheritance
 cannot do is follow a premise into a different key, and §5 below is the case where
 that happens: a fresh panel over the same code very often words the same premise
 differently, which mints a new `finding_key`. Nothing mechanical connects the two.

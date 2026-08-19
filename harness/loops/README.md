@@ -835,6 +835,7 @@ Two guards worth knowing, because both are cases that read plausibly when wrong:
   produces exactly the review this feature exists to prevent — but it is a behaviour change
   for a repo that set a small budget on purpose. `refuse_over_cap_multiple: 0` switches the
   refusal off and keeps the manifest.
+
 ### A finding no round can close (`--escalated`)
 
 `--escalated <key>` (repeatable) tells a round that a finding's fixer reported the
@@ -869,12 +870,31 @@ what the flag touches outside that function:
   finding in `to_fix`, `sonar_findings` and `dismissed` also carries
   `escalated: true|false`, and the report marks it ⛔ in the two lists a fixer's
   brief can be built from.
+- **It needs a cycle to mean anything, and is refused without one.**
+  `--escalated` names work a LATER round must not count, and it is read out of a
+  fix pass that followed a review round — so the flag without `--round`,
+  `--max-rounds` or `--baseline` exits non-zero saying so. The two alternatives
+  were dropping the declaration silently and inventing a cycle to hold it, and the
+  second one printed "round 1 of at most 2 — go again" for a re-review nobody
+  would run.
 - **A key naming nothing is reported** in `config_notes` rather than ignored, and
   a value that is not a finding key (8-64 hex characters) is rejected before it
-  reaches the register or a PR comment. The alternative failure is silent: the
-  loop simply carries on counting a finding the caller believes it excluded. A
-  round the panel SKIPPED adds no key — it reviewed nothing — but carries the
-  inherited register forward and names the key it dropped.
+  reaches the register or a PR comment — including the empty string, which is the
+  likeliest one to arrive (`--escalated "$KEY"` with the variable unset). The
+  alternative failure is silent: the loop simply carries on counting a finding the
+  caller believes it excluded. Keys are lower-cased and stripped first, because
+  this value is transcribed out of a fixer's prose by hand, and repeated flags are
+  deduplicated, so re-passing an inherited key really is harmless. A key naming a
+  finding this round's master DISMISSED is reported too: that is not work either
+  way, so the declaration changes nothing. A round the panel SKIPPED adds no key —
+  it reviewed nothing — but carries the inherited register forward and names the
+  key it dropped.
+- **An escalated SonarCloud gate issue does not make the gate green.** A premise
+  answer is not a fix, and the gate is an external merge blocker, so a stop whose
+  only remaining work is an escalated gate issue names the failing gate in both
+  `reason` and `veto` instead of reporting "nothing left that a fix round can
+  clear" on its own. (`preland.py` HOLDs on that gate independently; this is the
+  panel saying it in its own verdict.)
 
 ### The premise check (`--ask`)
 

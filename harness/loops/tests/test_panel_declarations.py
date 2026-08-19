@@ -786,6 +786,32 @@ def test_a_malformed_escalated_key_is_not_echoed_raw_into_the_report(tmp_path):
     assert len(problems) < 300
 
 
+@pytest.mark.parametrize("typed", ["DEADBEEFDEADBEEF", " deadbeefdeadbeef",
+                                   "deadbeefdeadbeef\n", "  DeadBeefDeadBeef  "])
+def test_a_key_a_HUMAN_retyped_is_normalised_rather_than_rejected(tmp_path, typed):
+    """This is the one value the design says is read out of a fixer's PROSE report
+    and retyped, so an upper-case key or one carrying a copy-paste newline is the
+    caller naming exactly the right finding. Rejecting it produced a note blaming
+    the caller for a correct value AND left the escalation uncounted — the jam, with
+    a misleading diagnostic on top. Normalising cannot admit anything `_KEY_RE`
+    would not: case and surrounding blanks are all it touches."""
+    assert panel._is_key(typed) and panel._key_norm(typed) == GOOD
+    path = _payload(tmp_path, "r.json", 1, ["a"], escalated={typed: 1})
+    b = panel.load_baseline([path], LATER)
+    assert b.problems == []
+    assert b.escalated == {GOOD: 1}, "stored as a finding's own key is spelled"
+
+
+def test_a_homoglyph_excerpt_is_flattened_like_any_other_junk():
+    """`_key_gist`'s excerpt is published by `--post`, and its job is to let a human
+    recognise WHICH value was rejected. `str.isalnum` is true for letters and digits
+    in every script, so a Cyrillic look-alike came through verbatim and rendered as
+    a plausible key — harmless as markdown, useless as an excerpt."""
+    assert panel._key_gist("\u0430\u0435\u043e\u0440\u0441\u0443\u0445") == "?" * 7
+    assert panel._key_gist("\uff11\uff12\uff13") == "???"
+    assert panel._key_gist(GOOD) == GOOD, "a real key still reads as itself"
+
+
 def test_a_baseline_reads_the_key_the_payload_carries(tmp_path):
     """The panel sends a key with every finding, and it is the same identity the
     board chains runs on. Re-deriving one here — from the judge's freshly-worded
@@ -1193,6 +1219,55 @@ def test_a_typo_does_not_quietly_end_the_cycle_either():
     d = panel.round_stop(3, 5, [], [live], [], repeated={live.key},
                          escalated=["a0b1c2d3e4f56789"])
     assert d["stop"] is False and "P1/P2" in d["reason"]
+
+
+def test_an_escalated_P1_alone_stops_the_cycle_with_the_blocker_PRESENT():
+    """Rule 2 says a P1/P2 outstanding earns a round "whatever anyone declared",
+    and this is the case where a declaration overrides it — the largest behavioural
+    consequence of #221, and the one a reader of rule 2 will get wrong. Asserted
+    deliberately at P1, the severity the other tests here do not use: the loop
+    stops with a judge-confirmed BLOCKER present, because no fix round may touch
+    it, and it says so rather than reporting convergence."""
+    p1 = _c("P1")
+    assert panel.round_stop(2, 5, [], [p1], [])["stop"] is False
+    d = panel.round_stop(2, 5, [], [p1], [], escalated=[p1.key])
+    assert d["stop"] is True and d["confident"] is False
+    assert "P1/P2" not in d["reason"] and "await a human" in d["reason"]
+    assert d["escalated_outstanding"] == [p1.key]
+
+
+@pytest.mark.parametrize("field", ["repeated", "escalated"])
+def test_a_bare_STRING_of_keys_is_refused_rather_than_iterated(field):
+    """A `str` is itself iterable, so `escalated=key` instead of `escalated=[key]`
+    — the natural slip now that both take keys — made `held` a set of single
+    characters, `blocking` empty against real keys, and the escalation silently
+    ignored while the cycle ran to its cap: the #221 jam, from inside the fix for
+    it. `repeated="<key>"` is the same slip the other way and reports a repeat
+    count invented out of the string's distinct characters."""
+    c = _c("P3")
+    with pytest.raises(TypeError) as bad:
+        panel.round_stop(2, 5, [], [c], [], **{field: c.key})
+    assert "not one string" in str(bad.value)
+
+
+def test_the_COUNT_this_used_to_take_is_named_rather_than_left_to_a_TypeError():
+    """`repeated` was `int = 0` until #221. A caller outside that change still
+    passing a count now fails — which is right, since a count cannot express the
+    escalation subtraction — but `'int' object is not iterable` says nothing about
+    what to pass instead."""
+    c = _c("P3")
+    with pytest.raises(TypeError) as bad:
+        panel.round_stop(2, 5, [], [c], [], repeated=1)
+    assert "not a count" in str(bad.value)
+
+
+def test_a_DICT_of_keys_is_still_read_as_its_keys():
+    """The production call site passes the register itself (`{key: round}`), so the
+    guard above must reject only the shapes that iterate into something other than
+    keys."""
+    c = _c("P3")
+    d = panel.round_stop(2, 5, [], [c], [], escalated={c.key: 1})
+    assert d["stop"] is True and d["escalated_outstanding"] == [c.key]
 
 
 def test_an_empty_declaration_changes_nothing():
