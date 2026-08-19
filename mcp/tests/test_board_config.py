@@ -186,3 +186,50 @@ def test_missing_config_file_is_not_an_error_when_the_env_has_the_url(tmp_path):
         )
     )
     assert cfg.base_url == "https://board.example" and cfg.token is None
+
+
+def test_the_token_command_sees_the_agent_name_it_needs(tmp_path, monkeypatch):
+    r"""#201: the fleet's selector picks this host's line out of a shared token file.
+
+    `QUARTERBACK_TOKEN_CMD` is permitted to reference `$QUARTERBACK_AGENT`, and the
+    generated config does — `sed -n s/^$QUARTERBACK_AGENT://p "$HOME/.tok"`, single-quoted
+    so the reference is expanded when the command RUNS. Resolved after the command, as it
+    was, the variable was unset in the child's environment and the selector became
+    `s/^://p`: it matched no line, and a host with a present and valid token file was told
+    it had no token at all.
+
+    Two agents in the file, so a selector that matched everything or nothing is a
+    different answer from the right one rather than accidentally the same.
+    """
+    monkeypatch.setattr(boardcfg, "_hostname", lambda: "daedalus")
+    (tmp_path / ".tok").write_text("atlas:tok-ATLAS\ndaedalus:tok-DAEDALUS\n")
+    path = write_config(
+        tmp_path,
+        "QUARTERBACK_BASE_URL=https://board.example\n"
+        """QUARTERBACK_TOKEN_CMD='sed -n s/^$QUARTERBACK_AGENT://p "$HOME/.tok"'\n""",
+    )
+    cfg = resolve(env_for(tmp_path, QUARTERBACK_CONFIG=str(path)))
+    assert cfg.agent == "daedalus"
+    assert cfg.token == "tok-DAEDALUS"
+
+
+def test_an_environment_agent_is_the_one_the_token_command_sees(tmp_path, monkeypatch):
+    """The name is overridable for one invocation, and the command must follow it.
+
+    A contract test, not a second proof of #201: this one passes with or without the
+    reordering above, because a `QUARTERBACK_AGENT` the CALLER exported is already in the
+    dict handed to the child and reaches the command either way. The test that discriminates
+    is the one above, where the name comes from the hostname default and so exists only if
+    this function put it there. Kept because the override is documented behaviour and
+    nothing else pins it end to end — `agent` and the token must come from the same name.
+    """
+    monkeypatch.setattr(boardcfg, "_hostname", lambda: "daedalus")
+    (tmp_path / ".tok").write_text("atlas:tok-ATLAS\ndaedalus:tok-DAEDALUS\n")
+    path = write_config(
+        tmp_path,
+        "QUARTERBACK_BASE_URL=https://board.example\n"
+        """QUARTERBACK_TOKEN_CMD='sed -n s/^$QUARTERBACK_AGENT://p "$HOME/.tok"'\n""",
+    )
+    cfg = resolve(env_for(tmp_path, QUARTERBACK_CONFIG=str(path), QUARTERBACK_AGENT="atlas"))
+    assert cfg.agent == "atlas"
+    assert cfg.token == "tok-ATLAS"
