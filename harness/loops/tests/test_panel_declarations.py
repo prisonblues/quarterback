@@ -1041,8 +1041,8 @@ def test_a_dry_round_of_polish_is_finished():
 
 
 def test_the_cap_stops_the_loop_but_is_not_recorded_as_convergence():
-    """"We ran out of rounds" and "there was nothing left" are different facts,
-    and only one of them is a clean bill of health."""
+    """A verdict of "we ran out of rounds" and one of "there was nothing left"
+    are different facts, and only one of them is a clean bill of health."""
     d = panel.round_stop(2, 2, ["k1", "k2"], [_confirmed("P1")], [])
     assert d["stop"] is True and d["confident"] is False
     assert "round cap (2)" in d["reason"] and "unreviewed" in d["reason"]
