@@ -997,13 +997,15 @@ def test_forwarded_knobs_are_all_read():
     seats = (QB_SEAT.parent / "qb-seats").read_text()
     seat = QB_SEAT.read_text()
 
-    forwarded = set()
-    for line in seats.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("for v in QB_SEAT"):
-            forwarded = set(stripped[len("for v in "):].split(";")[0].split())
-            break
-    assert forwarded, "could not find qb-seats' forwarding loop — has it been rewritten?"
+    # The whole body of the forwarding function, not just its loop. QB_SEAT_BRIEF is
+    # forwarded on a line of its own — it is read with `${VAR+set}` rather than
+    # `${VAR:-}`, so the loop's `-n` test cannot express it — and a parser that only
+    # read the loop stopped checking the one knob whose forwarding has already
+    # been got wrong once.
+    body = seats.split("seat_env_fill() {", 1)
+    assert len(body) == 2, "could not find qb-seats' forwarding function seat_env_fill"
+    forwarded = set(re.findall(r"QB_SEAT_[A-Z_]+", body[1].split("\n}", 1)[0]))
+    assert forwarded, "seat_env_fill forwards nothing — has it been rewritten?"
 
     read = set(re.findall(r"\$\{(QB_SEAT_[A-Z_]+)", seat))
     assert read, "could not find any QB_SEAT_* reads in qb-seat"
