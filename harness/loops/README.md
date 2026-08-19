@@ -847,30 +847,34 @@ ever handing it to another fixer — so `round_stop` returned `stop: false` ever
 round until the cap, and the mechanism meant to stop a cycle circling a premise
 guaranteed it ran to the cap instead (#221).
 
+**The rule, its exact scope and its two caveats live in one place: `round_stop`'s
+docstring in `panel_rounds.py`.** What a caller has to DO about it lives in
+`panel-review-pr.md`. Neither is paraphrased here — this rationale was restated
+five ways once, and two of the copies had already drifted into saying something
+untrue by the time anyone read them together. What is worth recording here is only
+what the flag touches outside that function:
+
 - **The mixed case is why this is a filter and not "stop on any escalation".** One
   escalation beside a live P2 still goes again, for the P2; the cycle stops when
   the fixable work is gone rather than when the counter runs out. Stopping the
   whole cycle on any escalation would throw away the re-review of fixes made in
   the same pass — the round that, on PR #212, found 16 defects the previous fix
   introduced.
-- **The stop is never convergence.** It takes a veto line, so `confident` is
-  false by the rule that was already there, and `reason` says a human is owed an
-  answer instead of saying `dry`. Every existing consumer of `confident` — the
-  report, the board record, `preland.py` — needs no new field to get this right.
-- **Declared once, inherited after.** The payload carries `escalated: {key: round}`
-  and later rounds read it out of `--baseline`, so a cycle cannot lose an open
-  premise question by forgetting a flag. The earliest declaration wins a merge:
-  re-passing a key cannot re-date the claim. A skipped round carries the register
-  forward too — it can neither answer an escalation nor add one.
-- **A key naming nothing is reported** in `config_notes` rather than ignored: the
-  alternative failure is silent, since the loop simply carries on counting a
-  finding the caller believes it excluded.
-- **It takes the caller's word, and that is the design's cost.** The keys come
-  from a fixer's prose report, so the agent whose fix pass produced the finding is
-  one step removed from the agent ending the cycle over it — the signal #67 argues
-  cannot be self-reported. The round each key was first declared in is recorded so
-  the claim is auditable, and the cap still binds. Detecting a premise mechanically
-  is #67's first piece and is not built.
+- **What it writes.** The payload carries `escalated: {key: round}` — the cycle's
+  whole register, which later rounds read out of `--baseline` and which only ever
+  grows — and `round_stop.escalated_outstanding`, the sorted subset of it that
+  THIS round raised. The two are deliberately different questions: "what is this
+  cycle holding" and "what stopped round 3". `escalated_outstanding` is the one
+  that earned the veto line, so it is the one a consumer usually wants. Every
+  finding in `to_fix`, `sonar_findings` and `dismissed` also carries
+  `escalated: true|false`, and the report marks it ⛔ in the two lists a fixer's
+  brief can be built from.
+- **A key naming nothing is reported** in `config_notes` rather than ignored, and
+  a value that is not a finding key (8-64 hex characters) is rejected before it
+  reaches the register or a PR comment. The alternative failure is silent: the
+  loop simply carries on counting a finding the caller believes it excluded. A
+  round the panel SKIPPED adds no key — it reviewed nothing — but carries the
+  inherited register forward and names the key it dropped.
 
 ### The premise check (`--ask`)
 

@@ -651,6 +651,100 @@ def test_a_run_that_escalates_nothing_says_so_in_the_same_shape(monkeypatch, cap
     assert [f["escalated"] for f in recorded["to_fix"]] == [False]
 
 
+def test_an_escalated_key_naming_nothing_is_reported_not_silently_ignored(
+        monkeypatch, capsys):
+    """The true-positive half of the typo check. A mistyped key fails silently by
+    construction — the loop simply carries on counting a finding the caller
+    believes it excluded — so it is said out loud instead."""
+    reply = '[{"id":"F1","members":[0],"real":true,"reason":"real"}]'
+    _, recorded = run_panel(monkeypatch, reply, [find()], capsys,
+                            round_no=2, max_rounds=5,
+                            escalated=["a0b1c2d3e4f56789"])
+    assert any("names no finding" in n for n in recorded["config_notes"])
+    # Reported, not corrected: the other reading — a key from a cycle whose
+    # payload was lost — is legitimate, and the register still carries it.
+    assert recorded["escalated"] == {"a0b1c2d3e4f56789": 2}
+
+
+def test_a_key_an_earlier_ROUND_carried_is_not_reported_as_a_typo(
+        monkeypatch, capsys, tmp_path):
+    """The false-positive half, which is the one that trains a reader to skip the
+    note. An escalation stays open across rounds whether or not a reviewer words
+    the finding again, so a key that only the BASELINE knows about is the normal
+    case, not a mistake."""
+    prior = tmp_path / "r1.json"
+    gone = "b1b2b3b4b5b6b7b8"
+    prior.write_text(json.dumps({
+        "repo": "r", "github": "o/r", "pr": 1609, "round": 1,
+        "escalated": {gone: 1},
+        "to_fix": [{"key": gone, "file": "z.py", "title": "the premise finding"}],
+    }))
+    reply = '[{"id":"F1","members":[0],"real":true,"reason":"real"}]'
+    _, recorded = run_panel(monkeypatch, reply, [find()], capsys,
+                            round_no=2, max_rounds=5, baseline=[str(prior)],
+                            escalated=[gone])
+    assert not any("names no finding" in n for n in recorded["config_notes"])
+    assert recorded["escalated"] == {gone: 1}
+
+
+def test_an_escalated_value_that_is_not_a_key_never_reaches_the_report(
+        monkeypatch, capsys):
+    """`--escalated` is read out of a fixer's PROSE report, and its value is
+    interpolated into a `config_notes` line that `--post` puts on a public PR
+    comment. Checked at the door: rejected, named by a flattened excerpt, and kept
+    out of the register every later round inherits."""
+    reply = '[{"id":"F1","members":[0],"real":true,"reason":"real"}]'
+    evil = "[pwn](http://x) `$(id)` " + "y" * 400
+    _, recorded = run_panel(monkeypatch, reply, [find()], capsys,
+                            round_no=2, max_rounds=5, escalated=[evil])
+    notes = " ".join(recorded["config_notes"])
+    assert "not the shape of a finding key" in notes
+    assert "](" not in notes and "$(" not in notes and "y" * 30 not in notes
+    assert recorded["escalated"] == {}
+
+
+def test_escalating_makes_the_run_part_of_a_cycle(monkeypatch, capsys):
+    """`--escalated` names work a LATER round must not count, so it means nothing
+    outside a cycle. A single-pass run that accepted it recorded the register and
+    gave the caller none of the behaviour the flag exists for — silently, which is
+    the failure mode the flag was added to close."""
+    reply = '[{"id":"F1","members":[0],"real":true,"reason":"real"}]'
+    found = find()
+    key = panel._defect_key(found.file, [found])
+    _, recorded = run_panel(monkeypatch, reply, [found], capsys, escalated=[key])
+    assert recorded["round_stop"] is not None
+    assert recorded["round_stop"]["escalated_outstanding"] == [key]
+
+
+def test_a_skipped_round_carries_the_register_forward_and_adds_nothing(
+        monkeypatch, capsys, tmp_path):
+    """It is the baseline the next round inherits, so a register that emptied
+    whenever a title matched /^Merge / would lose the question on the quietest
+    round of the cycle. It reviewed nothing, though, so it cannot date a
+    declaration to itself or run the typo check over findings it does not have —
+    a key handed to it is dropped and SAID, never dropped in silence."""
+    prior = tmp_path / "r1.json"
+    old = "c1c2c3c4c5c6c7c8"
+    prior.write_text(json.dumps({
+        "repo": "r", "github": "o/r", "pr": 1609, "round": 1,
+        "escalated": {old: 1}, "to_fix": [{"key": old, "file": "z.py", "title": "t"}],
+    }))
+    monkeypatch.setattr(panel, "load_repo_cfg", lambda name: {
+        "github": "o/r", "path": "/tmp/r", "reviewers": {},
+        "review_panel": {"skip_title_patterns": ["^Merge "]},
+    })
+    meta = {"title": "Merge test into main", "additions": 1, "deletions": 0,
+            "headRefName": "h", "headRefOid": "abc"}
+    monkeypatch.setattr(panel_core, "sh", gh_stub(meta=meta))
+    assert panel.run("r", 1609, post=False, json_out=True, round_no=2,
+                     baseline=[str(prior)], escalated=["d1d2d3d4d5d6d7d8"]) == 0
+    skipped = json.loads(capsys.readouterr().out)
+
+    assert skipped["escalated"] == {old: 1}
+    assert any("reviewed nothing" in n and "d1d2d3d4d5d6d7d8" in n
+               for n in skipped["config_notes"])
+
+
 def test_sonar_gate_issues_become_canonical_records_of_their_own(monkeypatch, capsys):
     """They never reach the judge, so this is the one record built outside
     `_parse_verdicts` — and its ids are offset past the judged findings because
@@ -673,6 +767,29 @@ def test_sonar_gate_issues_become_canonical_records_of_their_own(monkeypatch, ca
     assert sonar_recs[0]["reported_by"][0]["reviewer"] == "sonarqube"
     assert sonar_recs[0]["key"] != sonar_recs[1]["key"]
     assert "### SonarCloud issues (2)" in report
+
+
+def test_an_escalated_SONAR_issue_is_marked_and_flagged_like_a_judged_one(
+        monkeypatch, capsys):
+    """`outstanding` is `to_fix + sonar`, so a Sonar gate issue in the register is
+    already subtracted from the work `round_stop` counts. Marking only **To fix**
+    left the stop rule acting on a finding both the record and the report
+    presented as ordinary work — and a brief built from the Sonar list could pick
+    up the one finding §5 forbids handing to a fixer."""
+    hard = [F(reviewer="sonarqube", severity="P2", file="b.py", line=3,
+              title="null deref", detail="python:S2259")]
+    reply = '[{"id":"F1","members":[0],"real":true,"reason":"real"}]'
+    report, payload = run_panel(monkeypatch, reply, [find(reviewer="codex")],
+                                capsys, sonar=hard, round_no=2, max_rounds=5)
+    gate_key = payload["sonar_findings"][0]["key"]
+
+    report, payload = run_panel(monkeypatch, reply, [find(reviewer="codex")],
+                                capsys, sonar=hard, round_no=2, max_rounds=5,
+                                escalated=[gate_key])
+    assert [c["escalated"] for c in payload["sonar_findings"]] == [True]
+    assert [c["escalated"] for c in payload["to_fix"]] == [False]
+    assert payload["round_stop"]["escalated_outstanding"] == [gate_key]
+    assert "null deref ⛔" in report
 
 
 def test_a_finding_the_master_never_ruled_on_says_so_in_the_report(monkeypatch, capsys):

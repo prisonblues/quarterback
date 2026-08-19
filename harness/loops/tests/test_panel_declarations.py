@@ -722,13 +722,68 @@ def test_a_bare_list_of_escalated_keys_is_read_as_that_round_s(tmp_path):
     assert panel.load_baseline([path], THIS_RUN).escalated == {"00ff00ff00ff00ff": 1}
 
 
-def test_a_junk_escalated_field_costs_nothing(tmp_path):
-    """Same rule as every other field here: a bad payload costs a `problems`
-    entry at worst, never a review that every reviewer CLI has been paid for."""
-    for junk in ("a string", 7, {"": 1}, {"k": "not a round"}, None):
-        path = _payload(tmp_path, "r.json", 1, ["a"], escalated=junk)
-        b = panel.load_baseline([path], THIS_RUN)
-        assert b.escalated in ({}, {"k": 1}), junk
+LATER = {**THIS_RUN, "round": 4}
+GOOD = "deadbeefdeadbeef"
+
+
+@pytest.mark.parametrize("junk,register,complaint", [
+    # The CONTAINER is the wrong shape: nothing can be read out of it, and the
+    # register reverting to empty in silence is the #221 jam arriving with no
+    # diagnostic at all.
+    ("a string", {}, "neither an object nor a list"),
+    (7, {}, "neither an object nor a list"),
+    # `None` is the absent field, which is not a fault: every payload written
+    # before #221 has one, and they are the common case, not the corrupt one.
+    (None, {}, None),
+    # A key nothing can ever match. It would sit in the register forever while
+    # the caller read the cycle's silence as the escalation being honoured.
+    ({"": 1}, {}, "not the shape of a finding key"),
+    ({"not a key": 1}, {}, "not the shape of a finding key"),
+    ({"NOTHEXNOTHEXNOTH": 1}, {}, "not the shape of a finding key"),
+    # A real key, dated with something that is not a round of this cycle. The key
+    # is kept — losing it is the failure that matters — and the date falls back to
+    # the round of the payload carrying it, which is never later than the truth.
+    ({GOOD: "not a round"}, {GOOD: 3}, "not a round of this cycle"),
+    ({GOOD: 0}, {GOOD: 3}, "not a round of this cycle"),
+    ({GOOD: -2}, {GOOD: 3}, "not a round of this cycle"),
+    ({GOOD: 9}, {GOOD: 3}, "not a round of this cycle"),
+    ({GOOD: 2.9}, {GOOD: 3}, "not a round of this cycle"),
+    # `bool` is an `int` subclass, so an unguarded `int(when)` reads `True` as
+    # "declared in round 1" — a plausible-looking round number invented out of a
+    # payload that carries none.
+    ({GOOD: True}, {GOOD: 3}, "not a round of this cycle"),
+    # ...and the shapes that are fine, so the complaint above is not just noise
+    # this asserts against everything.
+    ({GOOD: 2}, {GOOD: 2}, None),
+    ([GOOD], {GOOD: 3}, None),
+])
+def test_what_a_malformed_escalated_field_costs(tmp_path, junk, register, complaint):
+    """Same rule as every other field this function reads: a bad payload costs a
+    `problems` entry, never a review every reviewer CLI has been paid for — and
+    never silence. Silence is the expensive one here: an unreadable register puts
+    a finding only a human can close back into the work a fix round counts, which
+    is precisely the jam the register exists to prevent.
+
+    One expected result per input, because these fail in five different ways and a
+    disjunction over all of them passes for implementations that are wrong."""
+    path = _payload(tmp_path, "r.json", 3, ["a"], escalated=junk)
+    b = panel.load_baseline([path], LATER)
+    assert b.escalated == register
+    if complaint is None:
+        assert b.problems == []
+    else:
+        assert any(complaint in x for x in b.problems), b.problems
+
+
+def test_a_malformed_escalated_key_is_not_echoed_raw_into_the_report(tmp_path):
+    """`problems` becomes a veto line, and the veto list is posted to the PR. A
+    key is 8-64 hex characters; anything else is named by a flattened, truncated
+    excerpt so a corrupt payload cannot put markdown on a public comment."""
+    evil = "[click](http://x)\n\n# heading " + "z" * 200
+    path = _payload(tmp_path, "r.json", 3, ["a"], escalated={evil: 1})
+    problems = " ".join(panel.load_baseline([path], LATER).problems)
+    assert "](" not in problems and "\n" not in problems and "# heading" not in problems
+    assert len(problems) < 300
 
 
 def test_a_baseline_reads_the_key_the_payload_carries(tmp_path):
@@ -1006,7 +1061,8 @@ def test_a_finding_still_there_after_the_fix_earns_another_round():
     told about and did not fix. Recording a veto and stopping anyway ended the cycle
     with a confirmed defect present — /panel-review-pr's bar is every confirmed
     finding, not every P1/P2."""
-    d = panel.round_stop(2, 3, [], [_confirmed("P3")], [], repeated=1)
+    c = _confirmed("P3")
+    d = panel.round_stop(2, 3, [], [c], [], repeated={c.key})
     assert d["stop"] is False and "still outstanding" in d["reason"]
     # No veto, though: the veto list answers "why this round's QUIET is not
     # evidence of a quiet PR", and this round was not quiet — its repeat is
@@ -1017,7 +1073,8 @@ def test_a_finding_still_there_after_the_fix_earns_another_round():
 def test_the_cap_is_what_ends_an_argument_about_a_repeated_p4():
     """Two reviewers can disagree about a P4 forever, so rule 3 needs a floor. The
     cap is it — and a cap reached with work outstanding is not convergence."""
-    d = panel.round_stop(2, 2, [], [_confirmed("P4")], [], repeated=1)
+    c = _confirmed("P4")
+    d = panel.round_stop(2, 2, [], [c], [], repeated={c.key})
     assert d["stop"] is True and d["confident"] is False
     assert "round cap (2)" in d["reason"] and "unreviewed" in d["reason"]
 
@@ -1069,8 +1126,8 @@ def test_a_stop_holding_an_escalation_is_never_convergence():
 
 
 def test_it_is_never_reported_as_dry():
-    """"Dry" is a claim that nothing was raised. Something was raised, and is
-    unanswered — a reader reconciling "dry" against an open premise question is
+    """A "dry" verdict is a claim that nothing was raised. Something was raised,
+    and is unanswered — a reader reconciling "dry" against an open premise question is
     being told something untrue about why the loop stopped."""
     c = _c("P4")
     d = panel.round_stop(2, 5, [], [c], [], escalated=[c.key])

@@ -12,17 +12,19 @@ why that distinction is not optional.
 
 from __future__ import annotations
 
-# Named directly rather than taken from the star imports below: nothing in
-# panel_core re-exports it, so `escalated: Iterable[str]` would be a promise this
-# module cannot keep the moment anything resolves its annotations.
-from collections.abc import Iterable
-
 from panel_core import *            # noqa: F401,F403
 import panel_core                   # noqa: F401
 from panel_seats import *           # noqa: F401,F403
 import panel_seats                  # noqa: F401
 from panel_scope import *        # noqa: F401,F403  — re-exported for callers
 import panel_scope               # noqa: F401
+
+# Named directly, and BELOW the star imports on purpose: `escalated: Iterable[str]`
+# has to still mean `collections.abc.Iterable` the day one of those modules
+# re-exports the name, and the last import wins. Placed above, the guarantee would
+# have been a claim about another module's current contents rather than a property
+# of this file.
+from collections.abc import Iterable          # noqa: E402
 
 # ----------------------------------------------------------------------------- synthesis
 
@@ -133,6 +135,37 @@ def _key_from_title(file: str | None, title: str) -> str:
     payload rather than off a Finding."""
     return hashlib.md5(f"{file or ''}|{_norm_title(title)}".encode(),
                        usedforsecurity=False).hexdigest()[:16]
+
+
+#: What a finding key looks like — :func:`_key_from_title` writes exactly 16 hex
+#: characters, and the board's `_derive_key` writes the same. The range is wider
+#: than that on purpose: a hand-written baseline or a future digest length should
+#: not be rejected, while anything carrying markdown, a newline or a paragraph of
+#: prose should be.
+_KEY_RE = re.compile(r"[0-9a-f]{8,64}")
+
+
+def _is_key(value: object) -> bool:
+    """Is this the shape a finding key comes in?
+
+    Keys reach the loop from a caller's ``--escalated``, which a human or an
+    orchestrator read out of a fixer's PROSE report — the one input here that was
+    never machine-generated. An unchecked value is interpolated into a
+    ``config_notes`` line that ``--post`` puts in a public PR comment, and the
+    same value is written into the payload every later round inherits, so the
+    shape is checked at the door rather than at the point of use."""
+    return isinstance(value, str) and bool(_KEY_RE.fullmatch(value))
+
+
+def _key_gist(value: object, limit: int = 24) -> str:
+    """A malformed key, cut and flattened to something safe to name in a report.
+
+    The note has to say WHICH value was rejected or it cannot be acted on, and it
+    is posted to the PR — so everything that is not plainly a key character
+    becomes ``?``, and the result is short. Quoting the raw value would put a
+    caller's arbitrary string, markdown and all, into a public comment."""
+    flat = "".join(ch if ch.isalnum() or ch in "-_." else "?" for ch in str(value))
+    return (flat[:limit] + "…" if len(flat) > limit else flat) or "(empty)"
 
 
 def _defect_title(reports: list[Finding]) -> str:
@@ -1098,6 +1131,12 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
         # object, and a payload from before the field (or a hand-written one)
         # may carry a bare list. A list is attributed to the round that wrote it,
         # which is the only answer available and never later than the truth.
+        #
+        # Anything else is REPORTED, not dropped. Same rule as every other field
+        # this function reads, and it matters more here than most: an unreadable
+        # register reverts the cycle to counting an escalated finding as work a
+        # fix round can clear, which is the exact failure the register exists to
+        # prevent — and it would arrive with nothing said.
         esc = payload.get("escalated")
         if isinstance(esc, dict):
             declared = list(esc.items())
@@ -1105,14 +1144,37 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
             declared = [(k, was) for k in esc]
         else:
             declared = []
+            if esc is not None:
+                b.problems.append(
+                    f"baseline {path} has an `escalated` field that is neither an "
+                    f"object nor a list ({type(esc).__name__}) — round {was}'s "
+                    "escalations were NOT inherited, so a finding only a human can "
+                    "close counts as work a fix round can clear again")
         for k, when in declared:
-            key = str(k or "")
-            if not key:
+            if not _is_key(k):
+                # A key the payload carries but nothing can match: it would sit in
+                # the register forever, matching no finding, and the caller would
+                # read the cycle's silence as the escalation being honoured.
+                b.problems.append(
+                    f"baseline {path} carries `{_key_gist(k)}` in its `escalated` "
+                    "register, which is not the shape of a finding key — it was "
+                    "NOT inherited")
                 continue
-            try:
-                first = int(when)
-            except (TypeError, ValueError):
-                first = was
+            key = str(k)
+            # The declaration round is the one auditable fact in a register the
+            # loop otherwise takes on trust, so it is range-checked rather than
+            # coerced. `bool` is excluded explicitly: it is an `int` subclass, so
+            # `True` would otherwise be read as "declared in round 1". Out of
+            # range falls back to the round of the payload carrying it — the same
+            # answer a bare list gets, and never later than the truth.
+            ok = isinstance(when, int) and not isinstance(when, bool) and 1 <= when <= was
+            if not ok:
+                b.problems.append(
+                    f"baseline {path} dates escalation {key} to {when!r}, which is not "
+                    f"a round of this cycle at or before {was} — read as round {was}, "
+                    "so the round shown against it is this payload's, not the "
+                    "declaration's")
+            first = when if ok else was
             b.escalated[key] = min(first, b.escalated.get(key, first))
         for bucket in ("to_fix", "dismissed", "sonar_findings"):
             for f in payload.get(bucket) or []:
@@ -1320,7 +1382,7 @@ def coverage_veto(reviewer_meta: dict[str, dict], judge_skip: str | None,
 
 def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
                outstanding: list[Canonical], veto: list[str],
-               baseline_ok: bool = True, repeated: int | Iterable[str] = 0,
+               baseline_ok: bool = True, repeated: Iterable[str] = (),
                escalated: Iterable[str] = ()) -> dict:
     """Whether the panel/fix cycle should go again, and what decided it.
 
@@ -1342,32 +1404,34 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     1. findings this round that no earlier round raised -> go again;
     2. a P1/P2 still outstanding -> go again, whatever anyone declared (a blocker
        raised again is a blocker that was not fixed);
-    3. ``repeated`` — a finding an earlier round already raised that is STILL
-       outstanding, at any severity -> go again. Pass the KEYS; a bare int is
-       accepted for a caller that has only a count, and is the one input this
-       function cannot apply the ``escalated`` rule to. The fixer was told about it and
-       it is still there, and ``/panel-review-pr``'s bar is every finding fixed,
-       not every P1/P2. This used to only cost the stop its confidence, which
-       ended the cycle with a judge-confirmed defect present and nothing acting on
-       the veto that said so;
+    3. ``repeated`` — the KEYS of findings an earlier round already raised that
+       are STILL outstanding, at any severity -> go again. The fixer was told
+       about them and they are still there, and ``/panel-review-pr``'s bar is
+       every finding fixed, not every P1/P2. This used to only cost the stop its
+       confidence, which ended the cycle with a judge-confirmed defect present and
+       nothing acting on the veto that said so. Keys rather than a count so the
+       escalation filter below can subtract the escalated ones: a count computed
+       before this function sees it puts the jam straight back, filtered by
+       whichever caller remembered to, which is not a rule but a convention with
+       one participant;
     4. otherwise dry -> stop.
 
     The cap is what stops rule 3 running forever when two reviewers disagree
     about a P4 — the cycle ends either way, and a cap reached with work
     outstanding is recorded as such rather than as convergence.
 
-    ``escalated`` is the exception the other four rules cannot express (#221).
-    A finding whose fixer reported that the APPROACH is wrong rather than the code
-    (``review-pr.md`` step 3a) is outstanding, correctly, and may never be handed
-    to another fixer, correctly — so under rules 1-3 alone it returns
-    ``stop: False`` every round until the cap, on a finding no round can close.
-    The mechanism built to stop a loop circling a premise instead guaranteed it
-    ran to the cap. So escalated keys are removed from ``new_keys`` and from
-    ``outstanding`` before the rules are applied: what remains is the work a fix
-    round can actually clear, and the cycle goes again exactly while there is
-    some. The mixed case falls out — one escalation beside two real findings goes
-    again for the two, and stops when they are gone rather than when the counter
-    runs out.
+    ``escalated`` is not a fifth rule but a FILTER in front of all four (#221), and
+    it is the exception none of them can express. A finding whose fixer reported
+    that the APPROACH is wrong rather than the code (``review-pr.md`` step 3a) is
+    outstanding, correctly, and may never be handed to another fixer, correctly —
+    so under the four rules alone it returns ``stop: False`` every round until the
+    cap, on a finding no round can close. The mechanism built to stop a loop
+    circling a premise instead guaranteed it ran to the cap. So escalated keys are
+    subtracted from ``new_keys``, from ``outstanding`` and from ``repeated`` before
+    the rules are applied: what remains is the work a fix round can actually clear,
+    and the cycle goes again exactly while there is some. The mixed case falls out
+    — one escalation beside two real findings goes again for the two, and stops
+    when they are gone rather than when the counter runs out.
 
     Only the escalated keys THIS round raised do that. The register is inherited
     and only grows, so a key that no longer names anything — a premise a human has
@@ -1376,20 +1440,43 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     dry even while the cycle's register is non-empty; the open question lives in
     the relay and its issue, which is where a human is looking for it.
 
-    **A stop with escalations outstanding is never convergence.** It takes a veto
-    line, which costs ``confident`` by the existing rule, and it says so in
-    ``reason``: the loop has finished, and the PR has a question on it that only a
-    human closes. Reporting it as dry would be the "clean" this whole payload is
-    organised against.
+    **A stop that is HOLDING an escalation is never reported as convergence.** It
+    takes a veto line, which costs ``confident`` by the existing rule, and it says
+    so in ``reason``: the loop has finished, and the PR has a question on it that
+    only a human closes. Reporting that as dry would be the "clean" this whole
+    payload is organised against. Note the exact scope of the guarantee, which is
+    the paragraph above read the other way round: it covers the round that RAISED
+    the escalated finding again, not every later round of the cycle. A round under
+    ``--scope increment`` that reviews only a fix commit, or a round whose fresh
+    panel words the same premise differently enough to mint a new key, raises
+    nothing the register matches and is reported dry and confident with the
+    question still open. What tracks an open premise across a whole cycle is the
+    relay and its issue, not this field.
 
-    The honest caveat, recorded here because it is a property of the design and
-    not of the code: the keys arrive from the caller, which read them out of a
-    fixer's prose report. The loop is therefore trusting a claim by the same agent
-    whose fix pass produced the finding — the one signal #67's own evidence says
-    cannot be self-reported. What that buys is convergence; what it costs is that
-    a fixer can end its own cycle by calling a finding a premise. ``escalated``
-    rides in the payload with the round each key was first declared in so the
-    claim is at least auditable after the fact, and the cap still binds."""
+    Two honest caveats, recorded here because they are properties of the design
+    and not of the code, and because this docstring is where they are KEPT — the
+    READMEs and ``panel-review-pr.md`` point at it rather than restating it, since
+    five paraphrases of one rule is five things to keep in step:
+
+    - The keys arrive from the caller, which read them out of a fixer's prose
+      report. The loop is therefore trusting a claim by the same agent whose fix
+      pass produced the finding — the one signal #67's own evidence says cannot be
+      self-reported. What that buys is convergence; what it costs is that a fixer
+      can end its own cycle by calling a finding a premise. ``escalated`` rides in
+      the payload with the round each key was first declared in so the claim is at
+      least auditable after the fact, and the cap still binds.
+    - A key is not a premise. The register identifies an escalation by the
+      finding key it was declared under, which holds exactly while a later round
+      re-derives that key — and a fresh panel over the same code very often words
+      the same premise differently, which mints a new one
+      (``panel-review-pr.md`` §5 says so in as many words). The caller carries
+      that gap: it must escalate the NEW key when it recognises the premise
+      restated. Closing it mechanically needs premise-level identity, which is
+      #67's first piece and is not built. The register also only grows — there is
+      no retraction — so once a human ANSWERS a premise the answer ends the cycle:
+      the key would otherwise go on subtracting its finding from the work a fix
+      round can clear, and go on rendering ⛔, for every round that inherits the
+      baseline."""
     held = frozenset(k for k in escalated if k)
     # The escalated keys THIS round actually saw. The register is a property of
     # the cycle and only grows; what is blocking is a property of the round, and
@@ -1399,28 +1486,22 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     # A permanently vetoed cycle is the "loud and wrong" a reader learns to
     # ignore, which is worse than the jam this whole rule closes.
     blocking = held & ({*new_keys} | {c.key for c in outstanding})
-    # `repeated` takes the repeat KEYS, and takes a bare count only for a caller
-    # that has nothing better. The keys are what let rule 3 obey the escalation
-    # rule below: an escalated finding raised again next round is a repeat, and a
-    # count computed before this function sees it puts the jam straight back —
-    # filtered by whichever caller remembers to, which is not a rule, it is a
-    # convention with one participant. A count passed with escalations held is
-    # therefore reported as the mismatch it is rather than silently trusted.
-    if not isinstance(repeated, int):
-        repeated = len({k for k in repeated if k and k not in held})
-    if held:
-        # Before the rules, not inside them: every rule below asks "is there work
-        # outstanding", and an escalated finding is precisely work the cycle has
-        # been forbidden to do.
-        new_keys = [k for k in new_keys if k not in held]
-        outstanding = [c for c in outstanding if c.key not in held]
-    blockers = [c for c in outstanding if c.severity in ("P1", "P2")]
-    if new_keys:
-        stop, reason = False, (f"{len(new_keys)} finding(s) no earlier round raised")
+    # The work a fix round can actually clear, under names of their own. The
+    # subtraction happens ONCE, before the rules, because every rule below asks
+    # "is there work outstanding" and an escalated finding is precisely work the
+    # cycle has been forbidden to do — but the parameters keep meaning what they
+    # are called, so the cap message and anything else downstream that wants "what
+    # the cycle still has to clear, escalations and all" can still say so.
+    clearable_new = [k for k in new_keys if k not in held]
+    clearable = [c for c in outstanding if c.key not in held]
+    repeats = len({k for k in repeated if k and k not in held})
+    blockers = [c for c in clearable if c.severity in ("P1", "P2")]
+    if clearable_new:
+        stop, reason = False, (f"{len(clearable_new)} finding(s) no earlier round raised")
     elif blockers:
         stop, reason = False, f"{len(blockers)} P1/P2 still outstanding after the fix"
-    elif repeated:
-        stop, reason = False, (f"{repeated} finding(s) an earlier round already raised "
+    elif repeats:
+        stop, reason = False, (f"{repeats} finding(s) an earlier round already raised "
                                "are still outstanding")
     elif blocking:
         # Not "dry": something WAS raised and is unanswered. A reader reconciling
@@ -1440,8 +1521,8 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     # reason — printing it there told a reader that a round which was not quiet
     # had untrustworthy quiet. `confident` is unaffected: it already requires
     # `stop`.
-    if repeated and stop:
-        veto = [*veto, f"{repeated} finding(s) an earlier round already raised are "
+    if repeats and stop:
+        veto = [*veto, f"{repeats} finding(s) an earlier round already raised are "
                        "still outstanding — the fix for them did not land"]
     # Same "only on a STOP" rule as the repeat above, and the same reason: on a
     # `go again` round the escalation is not why the round was not quiet.
@@ -1477,6 +1558,7 @@ __all__ = [
     "panel_core", "panel_seats", "cluster_findings", "_account",
     "_fold_reports", "_NOT_WORD", "_norm_title", "_key_from_title",
     "_defect_title", "_defect_key", "_finding_id", "Canonical",
+    "_KEY_RE", "_is_key", "_key_gist",
     "_unmerged", "_judge_listing", "_parse_verdicts", "adjudicate",
     "REWORD_RATIO", "_TITLE_NOISE", "_stem", "_same_words",
     "Baseline", "_baseline_title", "_SHA_RE", "_mtime",
