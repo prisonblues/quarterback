@@ -41,3 +41,12 @@ uv.lock
 #     git rm --cached .harness-rules
 # which untracks it while keeping it on disk. See harness/loops/README.md.
 .harness-rules
+
+# Per-machine agent config. Neither was tracked before fc0834b, which committed
+# them as ABSOLUTE symlinks from inside a worktree via a stray `git add -A`.
+# Checked out into the main repo those paths point at themselves, so every read
+# fails ELOOP — and every worktree linking here dead-ends at the same loop.
+# create-worktree writes these links itself, relative and per-machine; git must
+# not also own them.
+.claude/
+CLAUDE.md
