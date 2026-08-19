@@ -634,6 +634,40 @@ def write_local(repo, obj):
     (repo / hr.RULES_FILENAME).write_text(json.dumps(obj))
 
 
+def write_tracked_legacy(repo, obj):
+    """The mid-migration state: `.harness-rules` still COMMITTED beside the sample.
+
+    Distinct from `write_local`, which leaves it untracked — trackedness is what
+    decides whether the second file is superseded policy or this box's overlay, so a
+    test about the former cannot use the helper for the latter.
+    """
+    (repo / hr.RULES_FILENAME).write_text(json.dumps(obj))
+    _commit(repo, hr.RULES_FILENAME)
+
+
+def _second_repo(tmp_path):
+    """A second checkout with its own origin, for the multi-repo dedupe tests.
+
+    Its own bare remote rather than a clone of the first: the point of the tests
+    using it is two repos reaching the SAME diagnostic text, which needs two
+    independent branch reads to fail rather than one shared one.
+    """
+    work = tmp_path / "otherrepo"
+    work.mkdir()
+    git(work, "init", "-q", "-b", "main")
+    git(work, "config", "user.email", "t@example.com")
+    git(work, "config", "user.name", "T")
+    (work / "README").write_text("y\n")
+    git(work, "add", "-A")
+    git(work, "commit", "-qm", "init")
+    bare = tmp_path / "otherorigin.git"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(bare)], check=True)
+    git(work, "remote", "add", "origin", str(bare))
+    git(work, "push", "-q", "origin", "main")
+    git(work, "remote", "set-head", "origin", "main")
+    return work
+
+
 def test_the_sample_supplies_the_baseline(repo):
     """`.harness-rules.sample` is read where `.harness-rules` used to be."""
     write_sample(repo, {"auto_merge": "none", "loops": {"dependabot_lander": True}})
@@ -1157,6 +1191,83 @@ def test_a_branch_that_cannot_be_read_is_not_a_repo_with_no_rules(repo, capsys):
     assert cfg["_rules_baseline"] == ""
     assert "unreadable" in cfg["_rules_from"]
     assert "could not be read" in capsys.readouterr().err
+
+
+# ------------------------------------- a file the branch carries but cannot serve
+
+def test_a_present_but_unreadable_file_never_defers_to_the_one_beside_it(repo, monkeypatch):
+    """#238-F01. `ls-tree` confirming a path and `git show` then failing is git
+    failing, not the file being absent — and the old code appended a `problems` line
+    and `continue`d, which handed the run to the legacy `.harness-rules` sitting
+    beside the sample. On a repo mid-migration that is superseded policy governing a
+    run whose operator believes the sample is in force, selected by a transient error
+    and announced in a line nobody has to read. `_baseline_json` states the rule this
+    restores: fall back past a name the branch does not carry, never past one it
+    cannot read."""
+    write_sample(repo, {"reviewers": {"pi": {"enabled": True}}})
+    write_tracked_legacy(repo, {"reviewers": {"pi": {"enabled": False}}})
+    real = hr._git
+
+    def flaky(path, *args):
+        if args[0] == "show" and args[1].endswith(hr.SAMPLE_FILENAME):
+            return subprocess.CompletedProcess(
+                args, 128, "", "fatal: unable to read sha1 file\n")
+        return real(path, *args)
+
+    monkeypatch.setattr(hr, "_git", flaky)
+    with pytest.raises(SystemExit) as e:
+        hr.resolve_repo(str(repo), from_default_branch=True)
+    said = str(e.value)
+    assert hr.SAMPLE_FILENAME in said and "could not be read" in said
+    assert "refusing to fall back" in said, (
+        "the exit has to say WHY it did not use the file beside it, or the next "
+        "reader restores the fallback as an obvious improvement")
+
+
+def test_the_block_shape_is_checked_before_anything_walks_the_blocks(repo):
+    """#238-F06. `_check_block_shape` used to run after `warn_unknown_keys` and the
+    unknown-key drop, both of which walk `_DEEP_BLOCKS` as mappings — so
+    `{"reviewers": "all"}` reached them first and raised whatever a string raises: an
+    AttributeError with no filename in it, which is the outcome the shape check was
+    written to replace. Near miss worth naming: `'pi' in 'all'` is a substring test
+    that answers True, so a malformed block could be read as a membership answer."""
+    write_sample(repo, {"reviewers": "all"})
+    with pytest.raises(SystemExit) as e:
+        hr.resolve_repo(str(repo), from_default_branch=False)
+    said = str(e.value)
+    assert "`reviewers` must be a JSON object" in said
+    assert hr.SAMPLE_FILENAME in said, "the exit names the file, which is the point"
+
+
+def test_an_unknown_seat_is_still_dropped_rather_than_type_checked(repo, capsys):
+    """The other half of #238-F06, and the reason the check was SPLIT rather than
+    moved. `reviewers.gemini` names a seat nothing reads; the answer to an unknown
+    NAME is the warning plus a drop, not a hard exit about the type it happened to
+    hold. Moving the whole shape check earlier would have turned every unknown seat
+    into a fatal error on the strength of its value — the version-pin failure
+    `warn_unknown_keys` exists to avoid."""
+    write_sample(repo, {"reviewers": {"gemini": True}})
+    cfg = hr.resolve_repo(str(repo), from_default_branch=False)
+    assert "gemini" not in cfg["reviewers"], "warned about AND removed"
+    assert "unknown reviewer" in capsys.readouterr().err
+
+
+def test_two_repos_hitting_one_branch_failure_both_get_told(repo, tmp_path, capsys):
+    """#238-F04. `_report` deduped on `(where, problem)`, and on the unattended read
+    `where` is `origin/main:.harness-rules.sample` — true of every checkout on the
+    box, with no repo identity in the problem sentence either. A timer looping
+    `discover()` printed the first repo's diagnostic and then treated every later
+    repo's identical text as the noise the dedupe exists to suppress, which inverts
+    it: the diagnostics reaching this reporter are the ones saying policy went
+    silent."""
+    second = _second_repo(tmp_path)
+    for r in (repo, second):
+        git(r, "update-ref", "-d", "refs/remotes/origin/main")
+        hr.resolve_repo(str(r), from_default_branch=True)
+    err = capsys.readouterr().err
+    assert err.count("could not be read") == 2, (
+        "one line per repo — the second is a different repo's policy going silent, "
+        f"not a repeat of the first. got:\n{err}")
 
 
 # --------------------------------------------- the shape of the baseline's blocks

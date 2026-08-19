@@ -1372,3 +1372,40 @@ def test_an_unconfigured_repo_is_REFUSED_rather_than_asked(monkeypatch, capsys,
     assert payload["verdict"] is None
     assert harness_rules.SAMPLE_FILENAME in payload["skip_reason"]
     assert "refusing to ask" in capsys.readouterr().out
+
+
+def test_the_ask_payload_has_the_same_shape_on_both_exits(monkeypatch, cfg, repo,
+                                                          tmp_path, capsys):
+    """#238-F07. The review path spreads `_payload_defaults()` into its refusal so a
+    consumer reading any key need not know which exit produced the payload; the ask
+    path hand-built thirteen keys against the nineteen a real ask emits, so
+    `context`, `context_problems`, `quorum`, `threshold`, `answered`, `counts` and
+    `seats_override` raised KeyError on exactly the exit with least else to go on.
+    And there was no test, so nothing caught it drifting further — which is the half
+    of the finding that matters most."""
+    monkeypatch.setattr(panel_ask, "record_ask", lambda payload: None)
+    monkeypatch.setattr(panel_ask, "ask_llm",
+                        lambda *a, **k: panel.SeatAnswer("holds", "r"))
+    ok_file = tmp_path / "ok.json"
+    panel.ask(cfg["path"], "p", [], reviewers="claude", json_file=str(ok_file))
+    answered = json.loads(ok_file.read_text())
+
+    conf = copy.deepcopy(harness_rules.DEFAULTS)
+    conf |= {"name": "stranger", "github": "me/demo", "path": str(repo),
+             "_rules_baseline": "", "_rules_from": "none (defaults)"}
+    monkeypatch.setattr(panel_ask, "load_repo_cfg", lambda name: conf)
+    monkeypatch.setattr(panel_ask, "record_ask",
+                        lambda payload: pytest.fail("a refused ask is not recorded"))
+    refused_file = tmp_path / "refused.json"
+    assert panel.ask(str(repo), "p", json_file=str(refused_file)) == 0
+    refused = json.loads(refused_file.read_text())
+
+    assert set(refused) == set(answered), (
+        "one shape on both exits, or the refusal is the payload nobody tested: "
+        f"only when answered={sorted(set(answered) - set(refused))}, "
+        f"only when refused={sorted(set(refused) - set(answered))}"
+    )
+    # `reviewed` is the one key that MUST differ in value — it is what tells
+    # "asked and unresolved" from "never asked".
+    assert answered["reviewed"] is True and refused["reviewed"] is False
+    assert refused["run_key"] and refused["verdict"] is None

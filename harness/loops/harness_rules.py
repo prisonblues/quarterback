@@ -496,7 +496,7 @@ _RENAMED: dict[str, dict[str, str]] = {"reviewers": {"gemini": "antigravity"}}
 # panel.py, which resolves again in its own process — so an undeduped warning
 # prints several times per epic run and trains the reader to skip the one
 # message that is supposed to be loud. Rare is what keeps it loud.
-_warned: set[tuple[str, str, str]] = set()
+_warned: set[tuple[str, str, str, str]] = set()
 
 # The same treatment for the diagnostics that are not about a key NAME — a shadowed
 # baseline file, a value the overlay may not hold, a seat that does not exist. Keyed
@@ -505,7 +505,7 @@ _warned: set[tuple[str, str, str]] = set()
 # `_warned`: `resolve_repo` runs per loop tick and per invocation under the
 # unattended timers, and a real diagnostic repeated forever is a diagnostic people
 # learn to filter out — which is the same failure as not printing it.
-_reported: set[tuple[str, str]] = set()
+_reported: set[tuple[str, str, str]] = set()
 
 
 class RepoNotFound(Exception):
@@ -655,8 +655,8 @@ def _rules_on_branch(root: Path, default_branch: str) -> tuple[list[str], str]:
 
 
 def _read_rules(root: Path, default_branch: str,
-                from_default_branch: bool) -> tuple[dict, str, str, list[str]]:
-    """Return (rules, provenance, baseline_filename, problems).
+                from_default_branch: bool) -> tuple[dict, str, str, list[str], bool]:
+    """Return (rules, provenance, baseline_filename, problems, unreadable).
 
     Missing file is not an error — it means 'use the defaults', which is the whole
     point of dropping the registry. The third element names WHICH file supplied the
@@ -666,6 +666,14 @@ def _read_rules(root: Path, default_branch: str,
     be done safely, since `.harness-rules.sample` contains `.harness-rules`. It is
     also what the panel reads to refuse reviewing a repo nobody configured, which
     is the second reason it is a field rather than a substring.
+
+    The fifth says the baseline is empty because the branch could not be READ, which
+    is a different fact from the branch carrying no rules file and has a different
+    remedy — fetch the branch, versus commit a file. It is a flag rather than
+    something a caller infers from the provenance sentence, because that sentence is
+    written for a human at the top of a report and a gate reading English out of it
+    is a gate one rewording away from refusing every repo (the rule
+    `review_refusal` already follows for `_rules_baseline`).
 
     The fourth element is anything the caller has to SAY about how the baseline was
     chosen — a shadowed file, a branch that would not answer. Returned rather than
@@ -685,22 +693,35 @@ def _read_rules(root: Path, default_branch: str,
             return ({}, f"unreadable on {where} (defaults)", "",
                     [f"the branch could not be read ({unreadable}), so this run is on "
                      f"built-in defaults — which is not the same thing as this repo "
-                     f"having no rules file. Fetch the branch, or check the remote"])
+                     f"having no rules file. Fetch the branch, or check the remote"],
+                    True)
         for name in present:
             r = _git(root, "show", f"{where}:{name}")
             if r.returncode != 0:
                 # ls-tree just said the branch carries this path, so a failure here
-                # is git failing rather than the file being absent. Said, not
-                # silently skipped past — that distinction is the whole of #238-F06.
-                problems.append(f"{where}:{name} is on the branch but could not be read "
-                                f"({stderr_gist(r.stderr) or f'exited {r.returncode}'})")
-                continue
+                # is git failing rather than the file being absent — and FATAL for
+                # the reason `_baseline_json` gives about a corrupt file: falling
+                # back past a name the branch does not carry is the point of the
+                # loop, and falling back past one it DOES carry but could not read
+                # hands the run to whatever policy sits beside it. On a repo
+                # mid-migration that is the superseded `.harness-rules` governing a
+                # run whose operator believes the sample is in force, chosen by a
+                # transient git error and announced as a `problems` line nobody has
+                # to read. Absence means "use the defaults"; unreadable-but-present
+                # means the file was written to say something and this run cannot
+                # know what, which is policy going silent.
+                raise SystemExit(
+                    f"{where}:{name} is on the branch but could not be read "
+                    f"({stderr_gist(r.stderr) or f'exited {r.returncode}'}) — refusing "
+                    f"to fall back to the file beside it, whose policy this run has no "
+                    f"reason to believe is the one in force. Retry, or fetch "
+                    f"origin/{default_branch} again")
             # Everything `present` names is on the branch, so every loser here is
             # tracked by definition — the working-tree read below has to establish
             # that for itself.
             return (_baseline_json(r.stdout, f"{where}:{name}"), f"{where}:{name}", name,
-                    problems + _shadowed(name, [n for n in present if n != name]))
-        return {}, f"none on {where} (defaults)", "", problems
+                    problems + _shadowed(name, [n for n in present if n != name]), False)
+        return {}, f"none on {where} (defaults)", "", problems, False
 
     # Preference order, not iteration order: `present` is built in it, so the
     # sample wins where both exist and `_shadowed` says the other one lost.
@@ -713,8 +734,8 @@ def _read_rules(root: Path, default_branch: str,
         # no extra git call happens on the common path.
         lost = [n for n in present[1:] if _is_tracked(root, n)]
         return (_baseline_json(f.read_text(), str(f)), str(f), present[0],
-                _shadowed(present[0], lost))
-    return {}, "none (defaults)", "", []
+                _shadowed(present[0], lost), False)
+    return {}, "none (defaults)", "", [], False
 
 
 def _is_tracked(root: Path, name: str) -> bool:
@@ -1018,7 +1039,7 @@ def unknown_keys(rules: dict) -> dict[str, list[str]]:
     return out
 
 
-def warn_unknown_keys(rules: dict, provenance: str) -> dict[str, list[str]]:
+def warn_unknown_keys(rules: dict, provenance: str, repo: str = "") -> dict[str, list[str]]:
     """Shout about them, once per name per process. Returns them by block, and
     the caller DROPS them — the warning says 'ignored', so they have to be.
 
@@ -1030,8 +1051,11 @@ def warn_unknown_keys(rules: dict, provenance: str) -> dict[str, list[str]]:
     unknown = unknown_keys(rules)
     known = {label: allowed for label, _over, allowed in _validated(rules)}
     for block, names in unknown.items():
-        fresh = [n for n in names if (provenance, block, n) not in _warned]
-        _warned.update((provenance, block, n) for n in names)
+        # `repo` for the reason `_report` carries it: `provenance` is repo-independent
+        # on the unattended read, so without it the second repo in a multi-repo
+        # process is silently told nothing.
+        fresh = [n for n in names if (repo, provenance, block, n) not in _warned]
+        _warned.update((repo, provenance, block, n) for n in names)
         if not fresh:
             continue
         renamed = _RENAMED.get(block, {})
@@ -1046,8 +1070,17 @@ def warn_unknown_keys(rules: dict, provenance: str) -> dict[str, list[str]]:
     return unknown
 
 
-def _check_shape(rules: dict, provenance: str) -> None:
+def _check_block_shape(rules: dict, provenance: str) -> None:
     """Refuse a baseline whose BLOCKS are not the shape everything downstream reads.
+
+    SEPARATE from `_check_seat_shape`, and called EARLIER, because the two halves
+    guard different traversals and only one of them can wait. `warn_unknown_keys`
+    and the drop loop after it both walk `_DEEP_BLOCKS` assuming each block is a
+    mapping, so `{"reviewers": "all"}` reaches them first and raises whatever a
+    string raises — an AttributeError with no filename in it, which is the exact
+    outcome this function was written to replace. Worse than the crash is the near
+    miss: `'pi' in 'all'` is a substring test that answers True, so a malformed
+    block can be read as a membership answer rather than refused.
 
     The merge in `resolve_repo` is deliberately blind — that is what lets a repo set
     one reviewer without restating the others — so a block of the wrong type travels
@@ -1069,6 +1102,18 @@ def _check_shape(rules: dict, provenance: str) -> None:
             raise SystemExit(f"{provenance}: `{block}` must be a JSON object, not "
                              f"{type(rules[block]).__name__} — every setting in it is "
                              f"addressed as `{block}.<name>`")
+
+
+def _check_seat_shape(rules: dict, provenance: str) -> None:
+    """Refuse a SEAT entry that is not an object, after unknown seats are dropped.
+
+    This half is the one that must wait, and the ordering is a decision rather than
+    an accident: `{"reviewers": {"gemini": true}}` names a seat nothing reads, and
+    the answer to an unknown NAME is the rename hint plus a drop, not a hard exit
+    about the type it happened to hold. Running this before the drop would turn
+    every unknown seat into a fatal error on the strength of its value, which is the
+    version-pin failure `warn_unknown_keys` exists to avoid.
+    """
     for seat, entry in (rules.get(_LOCAL_BLOCK) or {}).items():
         if not isinstance(entry, dict):
             raise SystemExit(f"{provenance}: `{_LOCAL_BLOCK}.{seat}` must be a JSON "
@@ -1077,16 +1122,27 @@ def _check_shape(rules: dict, provenance: str) -> None:
                              f"is an object of objects")
 
 
-def _report(where: str, problems: list[str]) -> None:
+def _report(where: str, problems: list[str], repo: str = "") -> None:
     """Print each problem once per process, naming the file it came from.
 
     One reporter for every diagnostic that is about a VALUE rather than a key name,
     so the dedupe cannot be got right in one place and forgotten in the other.
+
+    KEYED ON THE REPO as well as the file, and that is not belt-and-braces. `where`
+    is per-repo only on the working-tree read, where it is an absolute path. On the
+    unattended read it is `origin/main:.harness-rules.sample` — true of every
+    checkout on the box — and the problem sentences carry no repo identity either.
+    Any process resolving more than one repo (a timer looping `discover()`, a sweep
+    over several checkouts) would print the first repo's diagnostic and then treat
+    every later repo's identical-text diagnostic as the noise this dedupe exists to
+    suppress. That inverts it: "a repeated diagnostic becomes noise" becomes "a real
+    diagnostic is never printed at all" for every repo after the first, and the
+    diagnostics reaching this reporter are the ones saying policy went silent.
     """
     for problem in problems:
-        if (where, problem) in _reported:
+        if (repo, where, problem) in _reported:
             continue
-        _reported.add((where, problem))
+        _reported.add((repo, where, problem))
         print(f"{where}: {problem}", file=sys.stderr)
 
 
@@ -1113,14 +1169,17 @@ def resolve_repo(spec: str | None, *, from_default_branch: bool | None = None) -
 
     root = find_repo(spec)
     default_branch = detect_default_branch(root)
-    rules, provenance, baseline, problems = _read_rules(root, default_branch,
-                                                        from_default_branch)
+    rules, provenance, baseline, problems, unreadable = _read_rules(
+        root, default_branch, from_default_branch)
     rules = strip_comments(rules)
-    _report(provenance, problems)
+    # BEFORE `warn_unknown_keys` and the drop below it, both of which traverse
+    # `_DEEP_BLOCKS` as mappings. See `_check_block_shape`.
+    _check_block_shape(rules, provenance)
+    _report(provenance, problems, str(root))
     # Warned about AND removed. A name only warned about survives the merge into
     # cfg["reviewers"], which makes the word "ignored" false and leaves every
     # caller iterating the resolved mapping looking at a phantom seat.
-    for block, names in warn_unknown_keys(rules, provenance).items():
+    for block, names in warn_unknown_keys(rules, provenance, str(root)).items():
         target = rules
         for part in (block.split(".") if block else []):
             target = target[part]
@@ -1129,7 +1188,7 @@ def resolve_repo(spec: str | None, *, from_default_branch: bool | None = None) -
     # AFTER the drop, so a name nothing reads is warned about and removed rather than
     # type-checked: `reviewers.gemini` is an unknown seat whatever it holds, and the
     # answer to it is the rename hint, not a hard exit about its shape.
-    _check_shape(rules, provenance)
+    _check_seat_shape(rules, provenance)
 
     cfg = {**DEFAULTS, **rules}
     for block in _DEEP_BLOCKS:
@@ -1193,7 +1252,7 @@ def resolve_repo(spec: str | None, *, from_default_branch: bool | None = None) -
     # Attributed to the file that said it: the baseline's problems were reported
     # against `provenance` above, and these belong to the local file. One `where`
     # for both would send someone editing the wrong half of the split.
-    _report(local_from, problems)
+    _report(local_from, problems, str(root))
 
     # Detected, never declared — a rules file that sets these is ignored, since
     # the checkout in front of us is the authority on where and what it is.
@@ -1208,6 +1267,8 @@ def resolve_repo(spec: str | None, *, from_default_branch: bool | None = None) -
     # cannot be done safely — `.harness-rules.sample` contains `.harness-rules` — and
     # a gate that greps English is a gate one rewording away from failing open.
     cfg["_rules_baseline"] = baseline
+    # Why the baseline is empty, when it is. See `_read_rules`' fifth element.
+    cfg["_rules_unreadable"] = unreadable
     # Names what was actually overlaid, not merely that something was. `(seats)`
     # went on the end whenever any overlay applied, so an overlay that repinned
     # codex to gpt-5.5/high reported itself as a seat change — in the one string

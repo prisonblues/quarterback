@@ -669,11 +669,31 @@ def review_refusal(cfg: dict) -> str:
     grepping it is a gate one rewording away from reviewing everything; and
     `.harness-rules.sample` contains `.harness-rules` as a substring, so even the
     filename cannot be sniffed back out of it safely.
+
+    TWO REFUSALS, because an empty baseline has two causes and only one of them has
+    the remedy this used to print. A repo that carries no rules file is fixed by
+    committing one. A repo whose `origin/<default>` could not be READ — no remote, no
+    fetch, a git error — is very possibly fully enrolled, and telling its operator to
+    commit a file they already committed sends them to the wrong place while the
+    unattended timer keeps refusing every round. Which of the two happened is taken
+    from `_rules_unreadable`, a flag `resolve_repo` stamps, for the same reason the
+    baseline is a field: the sentence that distinguishes them is written for a human.
+    Both still refuse, and that is deliberate — an unreadable branch is not evidence
+    the repo is configured the way this run would guess.
     """
     if cfg.get("_rules_baseline"):
         return ""
-    return (f"{cfg.get('name') or 'this repo'} has no {SAMPLE_FILENAME} and no "
-            f"{RULES_FILENAME} — {cfg.get('_rules_from') or 'no rules were read'}. A "
+    who = cfg.get("name") or "this repo"
+    said = cfg.get("_rules_from") or "no rules were read"
+    if cfg.get("_rules_unreadable"):
+        return (f"{who}'s rules could not be read — {said}. A panel review is not run "
+                f"on built-in defaults: which seats, which models and which judge "
+                f"review this repo is a decision, and a review nobody configured "
+                f"still briefs a fixer that edits the code. This is a read failure "
+                f"rather than a missing file, so committing one will not clear it — "
+                f"fetch the default branch, or check the remote, and re-run")
+    return (f"{who} has no {SAMPLE_FILENAME} and no "
+            f"{RULES_FILENAME} — {said}. A "
             f"panel review is not run on built-in defaults: which seats, which models "
             f"and which judge review this repo is a decision, and a review nobody "
             f"configured still briefs a fixer that edits the code. Commit a "

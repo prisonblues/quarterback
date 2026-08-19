@@ -1162,6 +1162,31 @@ def test_the_refusal_payload_has_the_SAME_SHAPE_as_a_reviewed_one(monkeypatch, c
     assert refused["title"] is None and refused["head_sha"] is None
 
 
+def test_an_unreadable_branch_is_refused_differently_from_a_missing_file():
+    """#238-F05. An empty baseline has two causes and only one is fixed by committing
+    a file. A repo whose `origin/<default>` could not be READ may be fully enrolled,
+    and the old message told its operator to commit what they already committed —
+    while the unattended timer, which is the path that produces this, kept refusing
+    every round. Both still refuse: an unreadable branch is not evidence the repo is
+    configured the way the run would guess."""
+    absent = {"name": "stranger", "_rules_baseline": "",
+              "_rules_from": "none on origin/main (defaults)"}
+    unread = {"name": "enrolled", "_rules_baseline": "", "_rules_unreadable": True,
+              "_rules_from": "unreadable on origin/main (defaults)"}
+    assert panel_core.review_refusal({"_rules_baseline": ".harness-rules.sample"}) == ""
+
+    said_absent = panel_core.review_refusal(absent)
+    assert "has no" in said_absent and "Commit a" in said_absent
+
+    said_unread = panel_core.review_refusal(unread)
+    assert said_unread, "still a refusal — unreadable is not permission to guess"
+    assert "could not be read" in said_unread
+    assert "Commit a" not in said_unread, (
+        "committing a file cannot clear a fetch failure, and sending the operator "
+        "to do it is the whole defect")
+    assert "fetch the default branch" in said_unread.lower()
+
+
 def test_the_refusal_writes_the_json_file_the_caller_asked_for(monkeypatch, capsys,
                                                                tmp_path):
     """`--json-file` is honoured on every non-error exit, and its failure fails the
