@@ -11,6 +11,53 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
+## v2.54 — one cycle's ending stopped describing another's
+
+`GET /review/findings` answers "how did this PR's review end?" with `stopped`, `stop_reason`,
+`stop_confident` and `stop_veto`. It took all four from the newest run in the window whatever
+cycle that run belonged to — so two agents looping one PR, or a single review-only `/panel` read
+landing between rounds, and cycle B's last round decided how cycle A read: complete, unfinished,
+or unconfident. The per-finding join in the same response has refused that inference since cycles
+became a stored fact; the summary above it was still guessing.
+
+It now summarises only what it can attribute. All four are null unless the traced runs hold no more
+than one cycle, and a new `cycles` says how many they held. **The four are three-state and must be
+read with an identity test** — null is "no attributable cycle said", which is neither `false` nor
+`[]`, and a truthiness test reads a null `stopped` as "still going". The unreviewed PR follows the
+same rule: its `stop_veto` is null too, not `[]`.
+
+**A run carrying no cycle is skipped, not counted.** A standalone `/panel` read, or anything
+recorded before the cycle column existed, never ended the cycle running around it — so it has no
+ending to offer, and by the same token no standing to withhold one. One loop plus a one-shot read
+is `cycles: 1` and summarises, from that loop's own last round; where the cycle-less run is the
+newest in the window, the ending still comes from the cycle's last round rather than from the run
+that happened to land after it. `cycles: 0` is a real answer and means no cycle ran in the window
+at all, which is what keeps the whole pre-cycle archive reading as it always did.
+
+That is narrower than the rule this change first shipped with, which treated a cycle-less run as a
+group of its own and so nulled the summary whenever one shared a window with a loop — the ordinary
+case for any PR ever read outside its loop. The premise was right and the conclusion did not follow
+from it: a run that ended nothing cannot contradict the ending of a loop it was no part of. Three
+panel rounds raised it. What is NOT allowed back is attribution by adjacency — "the newest cycle
+forms a contiguous tail" reports B's confident stop as the PR's ending when A-r1 is followed by
+B-r1, which is what #44 was filed about. This rule counts distinct cycles and never consults
+position.
+
+The reviews page says "N cycles ran here — no single stop state" rather than rendering the absent
+ending as blank, which would read as "nothing recorded". A summary drawn from a truncated window
+now says so too: `cycles` is computed over the traced window like everything else, so an older
+cycle outside `limit` leaves a window that summarises what it can see and not the PR. Read
+`cycles` and `truncated` together — `cycles <= 1 and not truncated` is the only pair that speaks
+for the whole recorded history.
+
+Narrowing `limit` brings a summary back, and it is a trade rather than an escape hatch: the window
+only trims the old end, so the sole summary it recovers is the newest cycle's, and it is the same
+window that decides `first_run`, the `gone` status and new-vs-old detection. The per-run rows in
+`runs[]` carry each round's own four unaltered at any `limit` — including a null `stop_veto`, which
+is why they are read `(r.stop_veto || [])` — and reading those is usually the better answer.
+
+Closes #44.
+
 ## v2.53 — a pinned model no host can serve stops costing the whole seat
 
 A four-seat panel became a one-seat panel, quietly, and said `exited 1 (Reading prompt from

@@ -151,6 +151,17 @@ GET   /review/findings   ?repo=&pr=&limit=                       (one PR's findi
                                                                   was borne out, and each
                                                                   defect's outcome beside
                                                                   its status)
+                          the top-level `stopped`/`stop_reason`/`stop_confident`/`stop_veto`
+                          summarise ONE cycle: null unless the window holds no more
+                          than one, which `cycles` counts (a run carrying no cycle is
+                          skipped, not counted) (#44). Read all four with an identity
+                          test, never for truthiness — null is "no attributable cycle
+                          said", which is neither `false` nor `[]`. `cycles <= 1 and
+                          not truncated` is the only pair that speaks for the PR's
+                          whole history; `runs[]` carries each round's own four
+                          unaltered at any `limit` and is usually the better answer.
+                          The handler's docstring is the full contract — this is the
+                          summary of it, not a second copy
 GET   /panel             (browser view — the leaderboard)
 
 # the plan: what is next, in what order, and who has it (v2.39)
@@ -710,6 +721,14 @@ full — including what was broken before it, which is the part no diff recovers
   round CLOSES earlier gaps, exempts `absent` but not `argv_capped`: a capped seat ran and saw
   a prefix, so the round did not read its target whole; an absent one is no evidence either
   way.
+- **v2.54** — one cycle's ending stops describing another's. `GET /review/findings` took its
+  `stopped`/`stop_reason`/`stop_confident`/`stop_veto` summary from the newest run in the window
+  whatever cycle that run belonged to, so a second loop — or one review-only `/panel` read — made
+  an older cycle read as complete, unfinished or unconfident on somebody else's evidence. All four
+  are null now unless the traced runs hold no more than one cycle, which `cycles` counts — a run
+  carrying no cycle ended none, so it is skipped rather than counted against the loop it sat
+  beside. They are three-state: null is "no attributable cycle said", which is neither `false`
+  nor `[]`, so read them with an identity test.
 - **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
   object store; wire `landed` refs to a cherry-pick helper.
 
