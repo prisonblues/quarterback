@@ -3614,23 +3614,22 @@ async def pr_finding_history(
     not convergence. It is not the reason string: that states a reason to go again
     just as often, so naming the ending after it called a running cycle finished.
 
-    Those four describe **one** cycle, so this endpoint reports them only when
-    every traced run belongs to the same one, and nulls all four otherwise (#44).
-    ``cycles`` says how many groups the window held — and it is a BUCKET count,
-    not a census of loops. Every run carrying no cycle at all (a standalone
-    ``/panel`` read, or anything recorded before the cycle column existed) is one
-    bucket together, because a run outside any cycle never ended the cycle running
-    around it. So one real cycle plus one cycle-less run is ``cycles: 2`` with a
-    null summary.
+    Those four describe **one** cycle, so this endpoint reports them only when the
+    traced runs hold no more than one, and nulls all four otherwise (#44).
+    ``cycles`` says how many the window held, and it counts what its name says.
 
-    That is the ordinary case rather than a rare one, and this docstring will not
-    pretend otherwise: it is not only "two agents looped this PR". A cycle-less run
-    landing BESIDE a real cycle's rounds — one standalone ``/panel``, or one round
-    predating the cycle column sharing a window with a modern one — is enough, and
-    the summary stays null for as long as that run is in the window. What it takes
-    is the MIXTURE, not the cycle-less run on its own: a window that is entirely
-    one cycle summarises, and so does one that is entirely cycle-less (which is the
-    whole pre-cycle archive, and why that archive still reads as it always did).
+    A run carrying no cycle at all — a standalone ``/panel`` read, or anything
+    recorded before the cycle column existed — is **skipped, not counted**. It
+    never ended the cycle running around it, so it has no ending to offer; by the
+    same token it has no standing to withhold one. One loop plus a one-shot read is
+    ``cycles: 1`` and summarises, from that loop's own last round. Where a
+    cycle-less run is the newest in the window, the ending still comes from the
+    cycle's last round rather than from the run that happened to land after it.
+
+    ``cycles: 0`` is a real answer, not an absent one: every traced run predates the
+    column or was a one-shot read, there is nothing to misattribute between, and the
+    window summarises — which is what keeps the pre-cycle archive reading as it
+    always did.
 
     The four are therefore three-state, and must be read with ``is None`` rather
     than for truthiness: ``stopped: null`` is "no attributable cycle said", which
@@ -3638,8 +3637,17 @@ async def pr_finding_history(
     for truthiness it calls a finished cycle unfinished. Same for ``stop_veto``,
     where ``[]`` is "the stopping rule ran and vetoed nothing" and null is "nobody
     attributable said" — the distinction ``GET /review/{id}`` already draws.
-    ``cycles`` is the single field that answers "can I trust the summary?": one
-    means yes.
+    ``cycles`` answers "is the summary attributable **within this window**?": 0 or
+    1 means yes. It is NOT on its own the answer to "does this describe the PR",
+    and this docstring used to say it was. ``cycles`` is computed over the traced
+    window like everything else here, so a PR with more rounds than ``limit`` can
+    show one cycle while an older one sits outside it — the summary is then a
+    true statement about the window and not about the PR. ``truncated`` is the
+    other half and must be read with it: ``cycles <= 1 and not truncated`` is the
+    only combination that speaks for the PR's whole recorded history. That is not
+    a defect to be nulled away, because narrowing ``limit`` to recover a summary
+    deliberately truncates — it is a claim whose scope the caller has to keep
+    hold of, and the two fields together are what state that scope.
 
     Narrowing ``limit`` can bring a summary back, but it is a trade, not a clean
     escape hatch, and both halves belong here. ``limit`` trims from the OLD end
@@ -3852,45 +3860,48 @@ async def pr_finding_history(
         })
     out.sort(key=lambda c: (c["severity"] or "P9", order[c["first_run"]], c["key"]))
 
-    # Whether this PR's stop state is one thing to report. Runs bucket by cycle id,
-    # and a null cycle is its own identity here rather than a wildcard: a run
-    # outside any cycle — a review-only `/panel`, or anything recorded before
-    # cycles were stored — cannot be said to have ended a cycle it was never part
-    # of, so a window mixing one with a real cycle is exactly as unattributable as
-    # one holding two. A window that is ALL nulls is one bucket and still
-    # summarises, which keeps pre-cycle history reading as it always did.
+    # Whether this PR's stop state is one thing to report. The question is how many
+    # CYCLES the window holds, and a run carrying no cycle is not one: a review-only
+    # `/panel`, or anything recorded before cycles were stored, never ended the cycle
+    # running around it — so it has no ending to contribute and cannot contradict
+    # one either. It is skipped, not counted.
     #
-    # `summarisable`, not `one_cycle`: a window of only cycle-less runs passes this
-    # and holds ZERO cycles, so the name would assert the opposite of the case it
-    # was written for. What is being asked is whether there is one bucket to
-    # attribute a summary to.
+    # This is narrower than the rule that shipped first, which bucketed by cycle id
+    # with null as its own bucket and so nulled the summary whenever a single
+    # standalone read shared a window with a loop. That premise — a cycle-less run
+    # never ended the cycle around it — is right, and it argues for IGNORING that
+    # run rather than for letting it veto an attribution it is no part of. Three
+    # panel rounds said so before this changed.
     #
-    # The reach of this is wide and the docstring says so plainly: one standalone
-    # `/panel` read is enough, so any PR ever read outside a loop reads as
-    # unattributable at the default `limit` until that run leaves the window. The
-    # obvious narrower rule — summarise when the newest cycle forms a contiguous
-    # tail of the window — is not an improvement, it is the bug: A-r1 followed by
-    # B-r1 has B as a contiguous tail, and reporting B's confident stop as this
-    # PR's ending is exactly what #44 was filed about.
-    buckets = {r.cycle for r in runs}
-    summarisable = len(buckets) == 1
-    last = runs[-1]
+    # The narrower rule that IS the bug, and is not this one: "summarise when the
+    # newest cycle forms a contiguous tail of the window". A-r1 followed by B-r1 has
+    # B as a contiguous tail, and reporting B's confident stop as this PR's ending is
+    # exactly what #44 was filed about. That rule keys off ADJACENCY; this one counts
+    # distinct real cycles and never consults position.
+    cycles_present = {r.cycle for r in runs if r.cycle is not None}
+    summarisable = len(cycles_present) <= 1
+    # NOT `runs[-1]`. With cycle-less runs skipped rather than counted, the newest
+    # run in the window may be one of them — and a run that ended no cycle must not
+    # supply the ending. Take the newest run that belongs to the one cycle; where
+    # there is no cycle at all (the pre-cycle archive), every run qualifies and this
+    # is `runs[-1]` again, which is what that archive has always reported.
+    last = next(r for r in reversed(runs)
+                if not cycles_present or r.cycle in cycles_present)
 
     return {
         "repo": repo,
         "pr": pr,
         "rounds": len(runs),
-        # How many groups the traced runs fall into, which is what makes the four
-        # fields below readable: one, and only one, summarises.
+        # How many distinct CYCLES the traced runs belong to, which is what makes
+        # the four fields below readable: 0 or 1 summarises, more does not.
         #
-        # It counts BUCKETS, not loops, and the difference is not pedantry. Every
-        # run carrying no cycle is one bucket together, so one real cycle plus a
-        # standalone `/panel` read reports 2 while only one loop ever ran here.
-        # The page therefore says "separate groups of runs" rather than claiming a
-        # cycle count, and nothing should read this number as "N agents looped this
-        # PR". What it does say exactly — and all a caller needs — is whether the
-        # window holds one attributable thing (1) or not (anything else).
-        "cycles": len(buckets),
+        # It counts what its name says. Runs carrying no cycle are not counted,
+        # because they are in no cycle — so a PR read once by a standalone `/panel`
+        # beside one loop reports 1, which is the number of loops that ran. Zero is
+        # a real answer and means every traced run predates the cycle column (or was
+        # a one-shot read): there is nothing to misattribute between, so it
+        # summarises, and the pre-cycle archive reads as it always did.
+        "cycles": len(cycles_present),
         # What ended the cycle, from the last round that ran — and whether that
         # was convergence or merely a stop. A PR whose panel gave up at the round
         # cap, or stopped while a reviewer was reading half the diff, must not
@@ -3989,6 +4000,15 @@ async def pr_finding_history(
              # unattributable. An `or []` here made that promise false for a run
              # with no recorded veto, and made the same run read differently
              # through this endpoint than through `GET /review/{id}`.
+             #
+             # This is a SECOND nullable field under a different name, and the
+             # audit above covers only the summary's. Checked separately rather
+             # than assumed to follow: reviews.html reads a per-run veto in three
+             # places and each opens `(r.stop_veto || [])`, short-circuiting on
+             # `.length` before any `.join`/`.map`, so a null row renders as no
+             # vetoes. `test_the_page_never_reads_a_PER_RUN_stop_veto_unguarded`
+             # is that field's own pin, because the summary's test counts
+             # `h.stop_veto` and can never see a read of this one.
              "stop_confident": r.stop_confident, "stop_veto": r.stop_veto,
              # Findings this round declared worth re-reading, and whether the
              # round that followed found anything where it pointed — file-grain,

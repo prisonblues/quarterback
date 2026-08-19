@@ -20,29 +20,41 @@ landing between rounds, and cycle B's last round decided how cycle A read: compl
 or unconfident. The per-finding join in the same response has refused that inference since cycles
 became a stored fact; the summary above it was still guessing.
 
-It now summarises only what it can attribute. All four are null unless every traced run belongs to
-one cycle, and a new `cycles` says why. **The four are three-state and must be read with an
-identity test** — null is "no attributable cycle said", which is neither `false` nor `[]`, and a
-truthiness test reads a null `stopped` as "still going". The unreviewed PR follows the same rule:
-its `stop_veto` is null too, not `[]`.
+It now summarises only what it can attribute. All four are null unless the traced runs hold no more
+than one cycle, and a new `cycles` says how many they held. **The four are three-state and must be
+read with an identity test** — null is "no attributable cycle said", which is neither `false` nor
+`[]`, and a truthiness test reads a null `stopped` as "still going". The unreviewed PR follows the
+same rule: its `stop_veto` is null too, not `[]`.
 
-`cycles` counts BUCKETS rather than loops, and the difference is worth knowing before reading the
-number: every run carrying no cycle is one bucket together, because a run outside any cycle never
-ended the cycle running around it. So one real cycle plus one standalone `/panel` read is
-`cycles: 2` with one loop in it — which also means this is the ordinary case, not the exotic one.
-A cycle-less run sharing a window with a real cycle's rounds — a standalone `/panel`, or a round
-recorded before the cycle column existed — is enough to null the summary at the default `limit`,
-and it stays null until that run falls out of the window. It takes the mixture: a window that is
-entirely one cycle summarises, and so does one that is entirely cycle-less, which is what keeps the
-whole pre-cycle archive reading as it always did. The reviews page
-says "mixed cycles: N separate groups of runs, no single stop state" rather than rendering the
-absent ending as blank, which would read as "nothing recorded".
+**A run carrying no cycle is skipped, not counted.** A standalone `/panel` read, or anything
+recorded before the cycle column existed, never ended the cycle running around it — so it has no
+ending to offer, and by the same token no standing to withhold one. One loop plus a one-shot read
+is `cycles: 1` and summarises, from that loop's own last round; where the cycle-less run is the
+newest in the window, the ending still comes from the cycle's last round rather than from the run
+that happened to land after it. `cycles: 0` is a real answer and means no cycle ran in the window
+at all, which is what keeps the whole pre-cycle archive reading as it always did.
+
+That is narrower than the rule this change first shipped with, which treated a cycle-less run as a
+group of its own and so nulled the summary whenever one shared a window with a loop — the ordinary
+case for any PR ever read outside its loop. The premise was right and the conclusion did not follow
+from it: a run that ended nothing cannot contradict the ending of a loop it was no part of. Three
+panel rounds raised it. What is NOT allowed back is attribution by adjacency — "the newest cycle
+forms a contiguous tail" reports B's confident stop as the PR's ending when A-r1 is followed by
+B-r1, which is what #44 was filed about. This rule counts distinct cycles and never consults
+position.
+
+The reviews page says "N cycles ran here — no single stop state" rather than rendering the absent
+ending as blank, which would read as "nothing recorded". A summary drawn from a truncated window
+now says so too: `cycles` is computed over the traced window like everything else, so an older
+cycle outside `limit` leaves a window that summarises what it can see and not the PR. Read
+`cycles` and `truncated` together — `cycles <= 1 and not truncated` is the only pair that speaks
+for the whole recorded history.
 
 Narrowing `limit` brings a summary back, and it is a trade rather than an escape hatch: the window
-only trims the old end, so the sole summary it recovers is the newest bucket's, and it is the same
+only trims the old end, so the sole summary it recovers is the newest cycle's, and it is the same
 window that decides `first_run`, the `gone` status and new-vs-old detection. The per-run rows in
-`runs[]` carry each round's own four unaltered at any `limit`, and reading those is usually the
-better answer.
+`runs[]` carry each round's own four unaltered at any `limit` — including a null `stop_veto`, which
+is why they are read `(r.stop_veto || [])` — and reading those is usually the better answer.
 
 Closes #44.
 
@@ -1059,6 +1071,7 @@ resolves only when exactly one repo on the board owns that name half; zero or
 several and a human names the owner. On this board there are two such rows and
 one candidate, so nothing is asked of anyone.
 
+
 ## v2.40 — two agents could talk, and no third agent could ever find out
 
 Claude Code 2.1.232 gave agents a direct channel to each other: `SendMessage`, and `@name` in the
@@ -1099,6 +1112,7 @@ type, and both its consumers (the human board, and #110's `qb board --follow`) w
 This is the server half of #155. The transport half — intercepting `SendMessage` and routing it
 here — lives in nix-fleet's `qb-hook` and is blocked on #157, where an injected peer message is
 already being claimed as the recipient's own work.
+
 
 ## v2.39 — the board knew who was here and not what was next
 
