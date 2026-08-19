@@ -684,16 +684,11 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # reads can disagree; a snapshot is what makes the consumers below — the
     # budget, the argv clamp, the prompt, the payload — describe one host.
     #
-    # "Below" is the literal scope and not a claim about the whole round
-    # (225-R2-F02). `run_seat` re-reads PATH per seat and `adjudicate` re-reads it
-    # for `claude`; neither takes this set, and threading it through both would
-    # change their signatures for a race nothing has observed. What bounds the
-    # damage is that the two disagreements are already handled at the far end: a
-    # seat that appears after this line is dispatched with an empty prompt and
-    # refused by `run_seat` as absent, and one that vanishes after it is refused
-    # there too. The snapshot exists so the RECORD is self-consistent — a null
-    # budget beside `absent: true`, never a budget beside a seat the payload also
-    # calls missing — not to make the round atomic.
+    # This set is now the round's ONE answer to "which seats are here": a seat it
+    # excludes is never dispatched, so `run_seat`'s own PATH read cannot contradict
+    # it (see the dispatch loop). `adjudicate` still asks independently for
+    # `claude`, which is a separate seat with a separate record, and its own gate
+    # refuses it the same way.
     installed = {name for name in LLM_REVIEWERS if seat_installed(name)}
     budgets = {name: diff_budget(rev.get(name, {}), "max_diff_chars", panel_budget, notes)
                for name in LLM_REVIEWERS if name in selected and name in installed}
@@ -849,18 +844,36 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # the panel, we want each vendor's eyes regardless of diff size.
         for name in LLM_REVIEWERS:
             if name in selected:
-                # Every SELECTED seat is dispatched, including one this box cannot
-                # run (#222): an absent seat has to reach `run_seat` to report
-                # itself absent, and that record is what `coverage_veto` and the
-                # report both read. What it is NOT handed is a prompt. `budgets`
-                # has no entry for it, and `prompt_for(None)` means "uncapped", so
-                # rendering one would compose the entire diff — hundreds of KB, per
-                # absent seat, per round — for `run_seat` to discard on the PATH
-                # check a moment later. The empty string also bounds the damage if
-                # the two PATH reads ever disagree: a seat this round decided was
-                # absent can never carry an uncapped prompt into `agy`'s argv.
-                prompt = prompt_for(budgets[name]) if name in budgets else ""
-                tasks[name] = ex.submit(review_llm, name, models[name], prompt,
+                # A seat this box cannot run is NOT dispatched, and its record is
+                # written here instead (225-R3-F05). Dispatching it was the first
+                # shape of #222 and it left the PATH race open in both directions,
+                # because `run_seat` re-reads PATH and the two reads can disagree:
+                #
+                #   appeared since the snapshot — no budget, so it was handed an
+                #   EMPTY prompt, `run_seat` found the CLI present and did not
+                #   refuse it, and a real vendor CLI was spawned on an empty prompt.
+                #   That is a garbage review recorded `ran: True` with a null
+                #   budget, feeding findings and counting toward `coverage_veto` as
+                #   a reviewer that read the diff.
+                #
+                #   vanished since the snapshot — a real budget and a
+                #   `truncated_for` entry were already written, then `run_seat`
+                #   refused it and set `absent`. The payload then carries a real
+                #   `max_diff_chars` beside `absent: true`, which is exactly the
+                #   contradictory pairing #222 exists to remove, reproduced by the
+                #   writer meant to have fixed it.
+                #
+                # One decision, acted on consistently, has neither failure. The
+                # record is byte-identical to `run_seat`'s own — same skip text,
+                # same `absent` flag — because `coverage_veto`, the report and the
+                # board all read it and none of them should be able to tell which
+                # branch wrote it.
+                if name not in installed:
+                    tasks[name] = ex.submit(
+                        absent_seat_run, f"{labels[name]}: {CLI_ABSENT}")
+                    continue
+                tasks[name] = ex.submit(review_llm, name, models[name],
+                                        prompt_for(budgets[name]),
                                         efforts.get(name, ""))
         sonar_future = None
         sonar_filed = False

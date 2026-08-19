@@ -27,6 +27,15 @@ import panel_core  # noqa: E402  — `sh` is defined here since #129
 import panel_seats  # noqa: E402  — run_cli lives here since #129
 from conftest import gh_stub  # noqa: E402
 
+#: This module states its HOST (#222, 225-R3-F05). Its tests stub `review_llm` and
+#: expect the seats to run — but the round now decides absence BEFORE that seam, so
+#: a seat this box cannot carry is never dispatched and the stub never fires. On a
+#: CI runner, which has none of the four CLIs, every declaration these tests assert
+#: on would be missing. That the decision moved above the stub boundary is the cost
+#: of closing the PATH race; the price is one stated host per module that drives
+#: `run()`, and this comment so the next one is a line rather than a puzzle.
+pytestmark = pytest.mark.usefixtures("every_seat_installed")
+
 
 
 

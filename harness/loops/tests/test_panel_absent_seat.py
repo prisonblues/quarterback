@@ -241,20 +241,31 @@ def test_an_absent_seat_gets_no_budget(monkeypatch, tmp_path):
     assert set(got["diff_budgets"]) == {"claude", "antigravity", "judge"}
 
 
-def test_an_absent_seat_is_not_handed_the_diff_it_will_never_read(monkeypatch,
-                                                                 tmp_path):
-    """No budget means `prompt_for(None)`, which means the WHOLE diff — rendered
-    per absent seat, per round, for `run_seat` to throw away a moment later. It
-    also bounds the blast radius if the round's PATH read and `run_seat`'s ever
-    disagree: a seat decided absent here can never carry an uncapped prompt into
-    `agy`'s argv, which is the E2BIG `ARGV_PROMPT_MAX_BYTES` exists to prevent."""
+def test_an_absent_seat_is_NOT_DISPATCHED_at_all(monkeypatch, tmp_path):
+    """The round decides absence ONCE and acts on it, rather than dispatching the
+    seat and letting `run_seat`'s own PATH read decide again (225-R3-F05).
+
+    Dispatching it left the race open in both directions. A seat that APPEARED
+    since the snapshot had no budget, so it was handed an empty prompt — and
+    `run_seat`, re-reading PATH, found the CLI present and did not refuse it: a
+    real vendor CLI spawned on an empty prompt, recorded `ran: True` with a null
+    budget, feeding findings and counting as a reviewer that read the diff. A seat
+    that VANISHED since already had a real budget and a `truncated_for` entry
+    written, and then came back `absent` — the contradictory pairing #222 exists to
+    remove, reproduced by the writer meant to have fixed it.
+
+    Not dispatching also saves rendering the whole diff — `prompt_for(None)` means
+    uncapped — once per absent seat per round, for nothing."""
     got, seen = _round(monkeypatch, tmp_path, _cfg(claude=None, antigravity=None),
                        present={"claude"})
-    assert seen["prompts"]["antigravity"] == ""
+    assert "antigravity" not in seen["prompts"], "the absent seat reached review_llm"
     assert len(seen["prompts"]["claude"]) > len(BIG)
-    # And the seat still reported itself absent, which is the property the empty
-    # prompt must not have cost.
-    assert got["reviewers"]["antigravity"]["absent"] is True
+    # And its record is indistinguishable from the one `run_seat` writes, which is
+    # what `coverage_veto`, the report and the board all read.
+    meta = got["reviewers"]["antigravity"]
+    assert meta["absent"] is True and meta["ran"] is False
+    assert panel.CLI_ABSENT in meta["skip"]
+    assert meta["max_diff_chars"] is None and meta["truncated"] is False
 
 
 def test_the_JUDGE_gets_no_budget_on_a_box_that_cannot_run_it_either(monkeypatch,
@@ -386,11 +397,17 @@ def test_the_real_adjudicate_refuses_a_box_that_cannot_run_the_judge(monkeypatch
     twelve seconds and a live CLI to notice.
     """
     monkeypatch.setattr(panel_rounds, "seat_installed", lambda name: False)
-    monkeypatch.setattr(panel_seats, "run_cli", _never_run)
+    def _judge_never_runs(*a, **kw):
+        # Its own double rather than `_never_run`, whose message names `run_seat`
+        # (225-R3-F08). The judge does not go through `run_seat`, so on failure that
+        # message would send a reader to the wrong function.
+        raise AssertionError("adjudicate reached the CLI on a box with no claude")
+
+    monkeypatch.setattr(panel_seats, "run_cli", _judge_never_runs)
     findings, skip, note = panel_rounds.adjudicate(
         [[panel.Finding("claude", "P2", "a.py", 1, "t", "d")]],
         "diff text", "sonnet", 34)
-    assert skip == "judge: claude CLI absent"
+    assert skip.startswith("judge: ") and panel.CLI_ABSENT in skip
     # Nothing is suppressed by the refusal: every finding survives, unruled.
     assert len(findings) == 1
     assert note == ""
@@ -402,17 +419,22 @@ def test_the_real_adjudicate_proceeds_when_the_judge_IS_there(monkeypatch):
     reached = {}
     monkeypatch.setattr(panel_rounds, "seat_installed", lambda name: True)
 
+    # A dedicated sentinel, not a bare AssertionError (225-R3-F11): an
+    # `AssertionError` raised here is indistinguishable from a genuine assertion
+    # failing inside `adjudicate`, so a real regression could be caught by the
+    # `except` and read as this test passing. `_Reached` can only come from below.
+    class _Reached(Exception):
+        pass
+
     def fake_run_cli(*a, **kw):
         reached["yes"] = True
-        raise AssertionError("stop here — reaching the CLI is the assertion")
+        raise _Reached
 
     monkeypatch.setattr(panel_seats, "run_cli", fake_run_cli)
-    try:
+    with pytest.raises(_Reached):
         panel_rounds.adjudicate(
             [[panel.Finding("claude", "P2", "a.py", 1, "t", "d")]],
             "diff text", "sonnet", 34)
-    except AssertionError as e:
-        assert "stop here" in str(e)
     assert reached.get("yes"), "the judge was refused on a box that has claude"
 
 
@@ -428,10 +450,17 @@ def _payload(tmp_path, name, reviewers, **kw):
     return str(p)
 
 
-def _baseline(paths):
+def _baseline(paths, round_no=2):
+    """`load_baseline` as the round after the baselines would call it.
+
+    `round_no` must be LATER than every payload passed, or the payload is refused
+    as "not an earlier round" and silently contributes nothing — which reads
+    exactly like a payload that contributed and had nothing to say. A two-round
+    baseline therefore needs `round_no=3`.
+    """
     return panel_rounds.load_baseline(list(paths), {"repo": "board",
                                                     "github": "acme/board",
-                                                    "pr": 34, "round": 2})
+                                                    "pr": 34, "round": round_no})
 
 
 def test_an_absent_seats_truncation_does_not_bank_a_truncated_round(tmp_path):
@@ -506,6 +535,66 @@ def test_an_OLD_payload_that_recorded_a_truncation_still_banks_it(tmp_path, memb
     payload can actually be asked about costs nothing here and loses nothing."""
     p = _payload(tmp_path, "r1.json", {"claude": member})
     assert _baseline([p]).truncated_rounds == {1}
+
+
+# ------------------------------- `truncated_any`: which rounds may CLOSE a gap
+
+def test_an_ABSENT_seats_truncation_does_not_stop_a_round_closing_earlier_gaps(tmp_path):
+    """`truncated_any` drives `reread`, which erases every earlier round's recorded
+    gap. Exempting `absent` there is the other half of #222 (225-R2-F01): leaving it
+    in let one legacy payload's phantom record block `reread` forever, keeping every
+    earlier gap open and the cycle permanently non-confident — the exact veto this
+    release removes, surviving in the one path the first fix had not reached."""
+    cut = _payload(tmp_path, "r1.json", {"claude": {"ran": True, "truncated": True}},
+                   round=1)
+    phantom = _payload(tmp_path, "r2.json",
+                       {"claude": {"ran": True, "truncated": False},
+                        "antigravity": {"ran": False, "absent": True,
+                                        "truncated": True}},
+                       round=2)
+    b = _baseline([cut, phantom], round_no=3)
+    assert b.truncated_rounds == set(), "round 2 read everything and closed round 1's gap"
+
+
+def test_an_ARGV_CAPPED_truncation_still_stops_a_round_closing_earlier_gaps(tmp_path):
+    """The asymmetry, pinned — without this, adding `not argv_capped` to
+    `truncated_any` to "match" `cut` would pass the suite unnoticed.
+
+    A kernel-capped seat RAN and saw a prefix, so the round genuinely did not read
+    its target whole and cannot be the one that clears an older gap. An absent seat
+    read nothing and is no evidence either way. `cut` exempts both because neither
+    gap will ever close on this box; `truncated_any` exempts only the one that is
+    not evidence of a short read."""
+    cut = _payload(tmp_path, "r1.json", {"claude": {"ran": True, "truncated": True}},
+                   round=1)
+    capped = _payload(tmp_path, "r2.json",
+                      {"claude": {"ran": True, "truncated": False},
+                       "antigravity": {"ran": True, "argv_capped": True,
+                                       "truncated": True}},
+                      round=2)
+    b = _baseline([cut, capped], round_no=3)
+    assert b.truncated_rounds == {1}, "a capped round must not close round 1's gap"
+
+
+def test_a_round_where_NOBODY_ran_cannot_close_anyone_elses_gap(tmp_path):
+    """The positive-evidence guard (225-R3-F01). Exempting `absent` from
+    `truncated_any` makes an all-absent round come out False — identical to a round
+    that read everything — so without a companion check a round in which nothing ran
+    could erase a real gap banked by a round that did. The `reviewers_ran == []`
+    branch catches this for every payload this release writes; a hand-edited or
+    truncated one need not carry that key, and `reread` is the most destructive
+    thing in this function."""
+    cut = _payload(tmp_path, "r1.json", {"claude": {"ran": True, "truncated": True}},
+                   round=1)
+    nobody = tmp_path / "r2.json"
+    body = json.loads(Path(_payload(tmp_path, "r2.json",
+                                    {"claude": {"ran": False, "absent": True},
+                                     "antigravity": {"ran": False, "absent": True}},
+                                    round=2)).read_text())
+    body.pop("reviewers_ran")          # the key a hand-edited payload may lack
+    nobody.write_text(json.dumps(body))
+    b = _baseline([cut, str(nobody)], round_no=3)
+    assert b.truncated_rounds == {1}, "a round nobody ran closed a real gap"
 
 
 def test_a_phantom_truncation_no_longer_vetoes_a_later_SCOPED_round(monkeypatch,

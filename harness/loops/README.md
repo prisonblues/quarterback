@@ -368,7 +368,14 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   does not begin raising `KeyError` on exactly the boxes this is for.
   `load_baseline` banks a round as truncated on `truncated and not argv_capped and
   not absent` — both exemptions, each keyed on its own recorded field — because
-  baselines written before either release still carry the old pairings. The two do
+  baselines written before either release still carry the old pairings. Its sibling
+  `truncated_any`, which decides whether a round may **close** every earlier round's
+  gap, exempts `absent` and deliberately **not** `argv_capped`: a capped seat ran and
+  saw a prefix, so the round did not read its target whole and cannot be the one that
+  clears an older gap, while an absent seat read nothing and is no evidence either
+  way. It also requires positive evidence that somebody was there, so a round in
+  which every seat was absent cannot erase a gap banked by a round that had seats
+  running. The two do
   not subsume each other: `argv_capped` covers only what the kernel bounded, so an
   absent `pi` or `codex` with a configured budget smaller than the target would
   still bank a phantom round under the argv exemption alone. And not

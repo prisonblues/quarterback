@@ -921,7 +921,8 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
         # argv exemption turned into a fail-open bug the first time it was written.
         #
         # `truncated_any` — did any seat read a PREFIX of its target? That is what
-        # `reread` below needs, and NEITHER exemption applies to it: a round where
+        # `reread` below needs, and only ONE exemption applies to it — `absent`,
+        # never `argv_capped` (the asymmetry is argued where it is applied): a round where
         # the kernel-capped seat saw two thirds of the diff did not read the whole
         # PR, so it cannot be the round that closes every earlier round's gap.
         # Exempting a seat says "this gap will never close, stop vetoing on it" —
@@ -1002,10 +1003,21 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
         # as having re-read the PR if at least one seat recorded that it was
         # there. The conservative direction: an old baseline keeps an inherited
         # veto standing rather than silently clearing it.
+        read_something = any(not m.get("absent") for m in recorded)
         ran = payload.get("reviewers_ran")
         if isinstance(ran, list) and not ran:
             b.unread_rounds.add(was)
-        elif (recorded and not truncated_any
+        # `read_something` is the positive evidence `reread` needs and
+        # `truncated_any` cannot supply (225-R3-F01). Exempting `absent` from
+        # `truncated_any` is right for a round where seats ran, but it makes an
+        # ALL-absent round indistinguishable from one that read everything: both
+        # come out False. The branch above catches that whenever `reviewers_ran` is
+        # a list, which every payload this release writes has — but a hand-edited or
+        # truncated one may not, and `reread` is the single most destructive thing
+        # in this function: one entry erases every earlier round's recorded gap. So
+        # it takes evidence that somebody was actually there, on the same principle
+        # the `reread` comment below already states for `recorded`.
+        elif (recorded and read_something and not truncated_any
                 and str(payload.get("scope") or "pr") == "pr"):
             # `truncated_any`, not `cut`: clearing an earlier gap is a claim that
             # this round READ the region, and a kernel-capped seat did not.

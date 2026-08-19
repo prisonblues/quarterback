@@ -218,6 +218,24 @@ def seat_installed(name: str) -> bool:
     """
     return bool(shutil.which(CLI_BIN.get(name, name)))
 
+
+def absent_seat_run(skip: str) -> "ReviewerRun":
+    """The record a seat gets when this box cannot run it, without dispatching it.
+
+    Byte-identical to what :func:`panel_seats.run_seat` writes on its own PATH
+    check — same skip text, same `absent` flag, a nominal duration — because
+    `coverage_veto`, the report and the board all read this record and none of them
+    should be able to tell which branch produced it.
+
+    It exists so the round can act ONCE on :func:`seat_installed` (#222,
+    225-R3-F05). Dispatching an absent seat and letting `run_seat` refuse it leaves
+    two PATH reads that can disagree: a seat that appeared since is spawned on an
+    empty prompt and recorded as having run, and one that vanished since keeps the
+    budget already written beside an `absent: true` — the contradictory pairing the
+    fix exists to remove.
+    """
+    return ReviewerRun([], skip, 1, None, absent=True)
+
 # Reviewer name -> the model used when its config says nothing, where that is not
 # simply "whatever the CLI defaults to". Only claude has one: its CLI's own
 # default is the account's top model, which is the wrong seat to spend by
@@ -1652,7 +1670,8 @@ __all__ = [
     "DEFAULT_ROUND_SCOPE", "ROUND_SCOPES", "CLI_TIMEOUT", "BLANK_RETRY_MAX_S",
     "CLI_ABSENT", "ARGV_PROMPT_MAX_BYTES", "SEVERITIES", "MAX_LISTING_CHARS",
     "LISTING_ACCOUNT_CHARS", "COMMENT_CHARS", "ROUNDS_HEADING", "LLM_REVIEWERS",
-    "ALL_REVIEWERS", "CLI_BIN", "seat_installed", "SEAT_MODEL_DEFAULTS",
+    "ALL_REVIEWERS", "CLI_BIN", "seat_installed", "absent_seat_run",
+    "SEAT_MODEL_DEFAULTS",
     "REVIEW_PROMPT",
     "JUDGE_PROMPT", "ASK_PROMPT", "Finding", "ReviewerRun",
     "PanelResult", "sh", "load_repo_cfg", "_spans",
