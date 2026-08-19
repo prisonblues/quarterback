@@ -729,6 +729,16 @@ full — including what was broken before it, which is the part no diff recovers
   carrying no cycle ended none, so it is skipped rather than counted against the loop it sat
   beside. They are three-state: null is "no attributable cycle said", which is neither `false`
   nor `[]`, so read them with an identity test.
+- **v2.55** — a stub a test writes at runtime cannot name `/usr/bin/env`. There is none inside a nix
+  build sandbox, and `patchShebangs` reaches the scripts in `harness/bin` at build time but never a
+  file written while a test runs — so 43 assertions in `test_qb_seat.py` failed `assert 126 == 0`,
+  and `create_worktree_nginx.test.sh` failed *silently*: `command -v docker` passes on a stub that
+  exists and is `+x`, the exec fails, and `create-worktree` then skips nginx exactly as designed,
+  leaving 18 assertions blaming innocent nginx code and a 7/25 score made entirely of negative
+  assertions that are trivially true when the suite does nothing. The rule is now asserted in the
+  `fake_bin` factory all four stub sites come through, not just written above them — reverting one
+  stub costs 52 errors locally, where the old comment cost nothing until a sandbox no CI job enters
+  (#179) went red.
 - **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
   object store; wire `landed` refs to a cherry-pick helper.
 

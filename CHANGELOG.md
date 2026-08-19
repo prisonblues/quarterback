@@ -11,6 +11,47 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
+## v2.55 — a stub written at runtime cannot name `/usr/bin/env`, and now says so where it is written
+
+`nix build .#checks.x86_64-linux.worktree-tests` failed sixty-one assertions across two suites for a
+reason that had nothing to do with the code under test, and eighteen of them named innocent code.
+
+**There is no `/usr/bin/env` inside a nix build sandbox.** `patchShebangs` rewrites the scripts
+shipped in `harness/bin` at build time, but it cannot reach a file a test writes *while it runs* — so
+a stub carrying `#!/usr/bin/env bash` is unrunnable there. `test_qb_seats.py` (plural) hit this and
+fixed it with `/bin/sh` in #171; two suites still carried the old form, and this was the third
+instance in a week. #177 asks for the guard that would stop a fourth.
+
+**`test_qb_seat.py` (singular) — 43 failures, all legible.** Every one `assert 126 == 0`, with `bad
+interpreter: No such file or directory` in stderr. Four stub sites: the fake agent, the fake curl,
+the board-is-down curl, and the concurrency stub.
+
+**`create_worktree_nginx.test.sh` — 18 failures, and it failed silently.** Its stub is `docker`,
+exec'd by `create-worktree` rather than by the test, and `command -v docker` passes on a file that
+exists and is `chmod +x`. The exec then fails, `create-worktree` reads an empty container list,
+concludes there is no container to proxy to, and skips the nginx step *exactly as designed*. Result:
+rc=1, **empty stderr**, and eighteen assertions complaining that nginx blocks are missing. It scored
+`passed 7, failed 18` rather than 0/25 because the seven that passed were the negative assertions —
+*no route advertised*, *no slash in a backend host*, *block is gone*, *surrounding config intact* —
+all trivially true when the suite does nothing at all. A suite that does nothing scores 7/25, which
+is the most misleading number a report can carry.
+
+**The rule is now asserted where the stubs are written, not only documented.** `fake_bin`'s
+`_install` is the one factory all four stub sites come through, and it refuses a body that does not
+begin `#!/bin/sh`. That matters because the old comment was unfalsifiable in the place it was read:
+revert any stub to `#!/usr/bin/env bash` and every test in the file stayed green, since the shebang
+is only wrong inside a sandbox no CI job enters (#179). That is precisely how the same mistake
+reached a third suite. Reverting one now costs 52 errors, locally, immediately.
+
+**The nginx suite lost its executable bit rather than its shebang.** It genuinely needs bash —
+`${BASH_SOURCE[0]}`, the `BOXES` array, two `<<<` here-strings, `printf %q` — and no shebang naming
+bash can work in the sandbox, which has no `/usr/bin/env` and no `/bin/bash`, and whose
+`patchShebangs` is pointed at `harness/bin` rather than `harness/tests`. So `bash <path>` is the only
+way to start it, which is what `test_create_worktree_nginx.py` already does; the mode bit was
+advertising a second way that fails in the sandbox and nowhere else. If it ever must be directly
+executable there, the repair is `patchShebangs harness/tests` in that check, not a shebang this file
+can carry on its own.
+
 ## v2.54 — one cycle's ending stopped describing another's
 
 `GET /review/findings` answers "how did this PR's review end?" with `stopped`, `stop_reason`,
