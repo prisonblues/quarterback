@@ -97,6 +97,24 @@ where it stops being prose nothing can count. Do not mark your own findings refu
 the board records who set it (from your token) and who you SAY signed it off — `attested_by` is a
 claim you are making, not a signature the board checked — and `/panel` shows the split.
 
+The fixer has one more permitted outcome than "fixed" and "false positive", and it exists
+because of what the other two cost. A fix that patches a wrong assumption produces the next
+round's findings; a fix that removes the assumption does not — PR #61 spent two rounds and two
+fixes on one unexamined premise, and PR #88 had a fixer circle its own previous fix inside a
+single commit. So `review-pr.md`'s brief (step 3a) lets a fixer report that a finding says the
+**approach** is wrong rather than the code, and write no patch for it: stated, with the premise
+in one sentence and what removing it would cost, rather than answered with a special case. It is
+narrow on purpose — three conditions that must all hold — and it never authorises a redesign,
+because the output is "stop and ask" and the evidence behind it is still two PRs (#67). The
+premise can be put to the seats first with `panel.py --ask`, which is exactly the shape of
+question that path exists for. An escalated finding is recorded as `deferred` by the
+orchestrator, which relays it, opens an issue that **asks** the premise, and names that issue in
+`deferred_to`. `harness/tests/test_fixer_escalation.py` guards the wiring rather than the
+judgement: that the permission and its report ship together, that the cross-file references to
+step 3a resolve, and that `deferred` is a value the database accepts. What is NOT
+here is measuring recurrence — asking mechanically whether a round is circling the last round's
+fix — which is #67's other half and needs the provenance work in #48.
+
 The same rule shapes how a run's **cost** is measured. Each member is timed, and each one that
 can be is also asked what it spent in tokens — but never by switching its CLI to a JSON output
 mode. Those modes all move the reply inside an envelope (`.result`, `.response`,

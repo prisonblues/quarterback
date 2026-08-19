@@ -250,6 +250,12 @@ with these overrides:
 - **A later round gets its own fixer, briefed with that round's findings only.**
   Re-briefing it with round 1's list has it re-examine work already done and
   buries the new finding — which is the one the round existed to catch.
+- **The brief's step 3a (escalate, don't patch) applies to panel findings too**,
+  and this is where it earns its keep: a panel finding can be a premise finding
+  rather than a defect — #132's P1 was one — and the fixer is the only reader
+  positioned to notice, because it is the one being asked to write the special
+  case. An escalation from this fixer is **not** a finding left outstanding for
+  the next round to pick up; §5 says what happens to it.
 
 ## 4b. Record what actually happened to each finding
 
@@ -295,7 +301,22 @@ One of four per finding:
   point**: you are already writing the refutation into the PR comment and the fix
   commit, in prose nothing can count. A bare `refuted` is the same
   confident-assertion-with-nothing-behind-it the release exists to measure.
-- **`deferred`** — real, not now. Put where it went in `deferred_to`.
+- **`deferred`** — real, not now. Put where it went in `deferred_to`. This is
+  also where an **escalated** finding goes (the brief's step 3a): the defect is
+  real and the fix is what is in dispute, so `refuted` would be a lie about the
+  finding and `fixed` a lie about the code, and there is no fifth outcome to
+  invent — the vocabulary is a database constraint, not a convention. Recording it
+  does **not** settle the question or take the finding off §5's outstanding list:
+  that list is computed from the round's own payload, never from this table, and the
+  escalation stays open until a human answers it. `deferred_to` names the premise
+  issue, and that issue does not exist yet at this point in the run — so **the
+  escalated row is the one you record last**: relay (§6), open the issue there,
+  then come back and record this row naming it. You open it, never the fixer, and
+  it is an issue that *asks* the question in the fixer's own five fields
+  (premise, what it explains, what removing it costs, the patch not written, the
+  `--ask` verdict) rather than one that picks an answer. When the human's answer
+  lands, the row moves: `revisions` and `prior_outcome` exist because a `deferred`
+  that later becomes `fixed` is the expected lifecycle, not an anomaly.
 - **`superseded`** — a later finding replaced it; name that finding's key in
   `superseded_by`, which is **required** for the same reason a note is required
   for a refutation: without it the row records "replaced by something".
@@ -382,6 +403,46 @@ no with complete confidence):
   no baseline to compare against. The `veto` list says which. Report it as a stop,
   never as "clean".
 
+**An escalation ends the fix half of the cycle for that finding, and `round_stop`
+cannot see it.** The rule is mechanical, computed from the rounds' payloads, so a
+finding the fixer escalated instead of patching is simply *outstanding* at the next
+round — correctly, because it is — and `stop: false` sends it back to §4. A fresh
+fixer, briefed with that round's findings and no memory of the escalation, then
+writes the patch the last one declined to write: the round that manufactures the
+next round's findings, arriving through the rule that exists to prevent them.
+
+- **Never re-brief an escalated finding to a fixer.** Not this round, not a later
+  one. It goes to the human with the write-up the fixer produced (§6).
+- **Match it by premise, not by key.** The next round is a fresh panel over the
+  same code, so it will very likely report the same premise defect again — with a
+  **new** `finding_key`, at a different line, in different words, and nothing
+  mechanical will connect the two (`superseded_by` records the opposite direction:
+  a finding a *later* one replaced). You are the only reader who has both, because
+  you ran both rounds. So before briefing a round's **To fix** list, read it
+  against every escalation you have already relayed and pull out anything that is
+  the same premise wearing a new key. It does not go in the brief. It **does** get
+  its own `deferred` row, naming the same premise issue in `deferred_to` — it is a
+  real finding nobody fixed, and a key recorded nowhere is the gap §4b exists to
+  close. Two rows do not double-count one premise: only `fixed` and `refuted` are
+  in the precision ratio (`OUTCOMES_SCORED`, `app/api/reviews.py`), so `deferred`
+  says what happened without scoring anyone. One premise is still one open
+  question — it lives in the issue and in the relay, re-stated under `Escalated`
+  as still open, naming the round that first raised it and the key this round gave
+  it. If you genuinely cannot tell whether it is the same premise, say that in the
+  relay and leave it out of the brief: a premise question asked twice costs a
+  paragraph, and a premise question patched costs the round.
+- **The rest of the cycle carries on.** Findings that WERE fixed still get their
+  re-review round, and `round_stop` still decides that — you are not overruling it
+  for them, only declining to send one finding back through a pass that has
+  already been tried on it.
+- **If the escalated premise is what most of the round hangs off, stop the cycle**
+  and say so. Another round would review code whose shape is the open question,
+  and #67's whole observation is that this is where the loop spends the most for
+  the least.
+- **`--ask` is evidence, not the decision.** A premise that survives a challenge
+  may still be the wrong premise, and the seats were never asked whether the
+  redesign is worth its cost. `holds` is not permission to go back and patch.
+
 Two things this must NOT do:
 - **Never let a fix ride out unreviewed silently.** At the cap, if the last fix
   pass changed anything, say so in the relay: "the round-N fix commit was not
@@ -418,6 +479,14 @@ Then the part that is new, and is the point of running more than one round:
   than either verdict on its own.
 - **Flagged for re-review:** findings whose reporter said the FIX needs re-reading,
   and whether the following round did find something there.
+- **Escalated:** any finding a fixer reported as the approach being wrong rather
+  than the code, with its premise, what it explains, what removing it would cost,
+  and its `--ask` verdict if one was run. Say it even when the answer is none. This
+  is the one item in the relay that is a question rather than a report: it is
+  outstanding until a human answers it, and no round will close it. Having relayed
+  it, open the issue that **asks** it — the fixer's five fields, no answer picked —
+  and then record the finding `deferred` with that issue in `deferred_to` (§4b),
+  which is the step §4b deferred to here.
 
 ## 7. Merging (only if the user asks)
 
