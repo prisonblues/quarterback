@@ -1168,7 +1168,12 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     models = {n: rev.get(n, {}).get("model", SEAT_MODEL_DEFAULTS.get(n, ""))
               for n in LLM_REVIEWERS}
     efforts = {n: rev.get(n, {}).get("effort", "") for n in EFFORTS}
-    labels = {n: reviewer_label(n, models[n], efforts.get(n, "")) for n in LLM_REVIEWERS}
+    # No precomputed `labels` map: the label is not a property of the CONFIG any
+    # more. A seat that could not use its pins reviewed on something else (#215),
+    # so the only place the label can be built is where the run that earned it is
+    # in hand — `seat_label(…, got)`, below. The map that used to be here was left
+    # behind by that change with nothing reading it, which is a copy of the report's
+    # header free to drift out of agreement with the header.
 
     # May the seats read the PR's code (#113)? A per-repo setting, ON by default,
     # and the seats that can actually use it are `SEAT_READS_CODE` — three of the
@@ -1319,6 +1324,13 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 # coverage_veto, which is the one consumer that treats it
                 # differently from every other way of not running.
                 "absent": got.absent,
+                # Which pin this host could not serve, when the seat reviewed on
+                # the CLI default instead (#215). In the payload as well as the
+                # header because the board is where "is the expensive tier worth
+                # it" gets answered from accumulated runs, and a run whose model
+                # was substituted must not be averaged in as the pinned one.
+                "model_unavailable": got.model_unavailable or None,
+                "effort_unsupported": got.effort_unsupported or None,
                 # A fact about the panel's DESIGN rather than about the round: an
                 # empty sandbox and no file tools, so this seat's declarations
                 # about code outside the diff are constants. coverage_veto is
@@ -1334,7 +1346,14 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 result.skipped.append(got.skip)
                 llm_skipped.append(got.skip)
             else:
-                ran_llm.append(labels[name])
+                # The label the seat EARNED, not the one it was configured with. A
+                # seat that fell back to the CLI default (#215) reviewed on a
+                # different model than `.harness-rules` names, and printing the pin
+                # here would put a model in the record that never ran — the exact
+                # attributability the pins exist to protect, broken in the
+                # direction that looks correct.
+                ran_llm.append(seat_label(name, models[name],
+                                          efforts.get(name, ""), got))
                 ran_names.append(name)
                 llm_findings.extend(got.findings)
         if sonar_future:

@@ -742,6 +742,12 @@ def ask(repo_name: str | None, premise: str, contexts: list[str] | None = None,
                         "verdict": a.verdict, "reason": a.reason, "gist": a.gist or None,
                         "skip": a.skip, "unreadable": a.unreadable, "absent": a.absent,
                         "model": models[n] or None, "effort": efforts.get(n) or None,
+                        # Beside `model`, and for the reason the round records it
+                        # too (#215): `model` is the pin, and these two say whether
+                        # it was the pin that answered. A board row carrying only
+                        # the pin averages a swapped seat in as the pinned one.
+                        "model_unavailable": a.model_unavailable or None,
+                        "effort_unsupported": a.effort_unsupported or None,
                         "duration_ms": a.duration_ms}
                     for n, a in sorted(answers.items())},
         "config_notes": notes,
@@ -770,8 +776,15 @@ def ask(repo_name: str | None, premise: str, contexts: list[str] | None = None,
             f"`{c.path}:{c.first}-{c.last}`" if c.first else f"`{c.path}`" for c in read))
     else:
         lines.append("**Context:** none given — the seats answered from the premise alone")
-    lines.append("**Seats:** " + (", ".join(reviewer_label(n, models[n], efforts.get(n, ""))
-                                            for n in seats) or "none"))
+    # `seat_label`, not `reviewer_label`: a seat that could not use its pins
+    # answered on something else, and the Seats line is where a reader learns which
+    # brain settled the premise (#215). It is also the line that must NOT name a
+    # substitute for a seat that answered nothing at all — `seat_label` owns that
+    # distinction, and owns it in one place because the round's header asks the
+    # identical question and the copy written out here got it wrong.
+    lines.append("**Seats:** " + (", ".join(
+        seat_label(n, models[n], efforts.get(n, ""), answers.get(n)) for n in seats)
+        or "none"))
     if asker:
         # Only the seats on THIS ask have a vote to be the only one, so
         # `--reviewers codex --asker claude` gets the other sentence: the first

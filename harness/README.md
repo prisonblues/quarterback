@@ -49,6 +49,41 @@ comments; `/panel-review-pr` takes the confirmed findings, has a sub-agent fix e
 them, and then **panels the fix commit** — one round leaves the fixer's own work read by
 nobody, and a structural fix creates interactions no earlier round could have seen.
 
+**A pinned model that this host's provider cannot serve no longer costs the seat.** Model
+slugs are pinned in `.harness-rules` so that "codex found 9 issues" still means something
+six weeks later — but a pin is one value for the whole fleet and a *deployment* is per-host,
+so a slug that is right everywhere else can be unservable on one box. On daedalus, codex
+routes through an employer Azure gateway deploying `gpt-5.5` while the rules pin
+`gpt-5.6-luna`: the seat 404s ten times and the panel loses a whole vendor, which on PR #207
+left 25 findings all attributed to `claude` — reviewing a PR `claude` had written. There are
+**two** such pins and this
+gateway refuses both independently — `gpt-5.6-luna+max` 404s, `gpt-5.5+max` is an
+`unsupported_value` on `reasoning.effort`, `gpt-5.5+high` works — so dropping only the model
+loses the seat on the next knob, which is how PR #217 got a round where *no* reviewer ran at
+all. Each pin is now lowered on its own, only when the error names it, at most once each, and
+the report says what happened: `codex (CLI default; pinned gpt-5.6-luna unavailable, effort max
+unsupported)`. The substitution is recorded as
+state (`model_unavailable` / `effort_unsupported`) in the payload as well as the header,
+because the board is where
+"is the expensive tier worth it" gets answered from accumulated runs, and a run whose model
+was swapped must not be averaged in as the pinned one. Deliberately narrow: only for a pin
+that was set,
+only for those two causes, at most once each — a general "retry with fewer constraints" would
+quietly review on a weaker seat for reasons nobody chose. **codex only**, because lowering a pin
+means rebuilding the argv without it and only its argv can express "use your default":
+`claude` takes `--model` unconditionally and `agy` builds its argv before any failure exists.
+
+Two things about that failure were wrong before it could be fixed, and both were about
+reading the wrong stream. codex under `--json` puts its event stream on **stdout** —
+including `{"type":"error","message":"... 404 ... deployment ... does not exist"}` — while
+stderr holds one line, `Reading prompt from stdin...`, printed before the request was made.
+The panel diagnosed from stderr alone, so it reported `exited 1 (Reading prompt from
+stdin...)` for a config mismatch and sent two people to debug stdin plumbing. Worse, the
+same stderr-only view fed the retry decision: `is_rejection` keys on 4xx invalid-request
+markers and an explicit `"status":400`, so a gateway **404** read as a flake worth another
+go — and each attempt spent the seat's full budget, ten minutes at a time, to reach the
+identical answer. Both now read stdout's error envelopes too (`error_events`).
+
 Each reviewer also declares what it could *not* assess, and the panel records which of them
 saw only a prefix of the diff. A finding count reports "clean" and "I could not tell" as the
 same zero; those two columns are what tell them apart, on the PR comment and on the board.

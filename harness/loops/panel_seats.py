@@ -29,6 +29,26 @@ PI_EFFORTS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
 AGY_EFFORTS = ("low", "medium", "high")
 EFFORTS = {"codex": CODEX_EFFORTS, "pi": PI_EFFORTS, "antigravity": AGY_EFFORTS}
 
+# How long a seat may ALREADY have spent and still be allowed to lower an
+# unsatisfiable pin and go again (#215). A count of attempts is not a bound on
+# cost: every lowering is another whole CLI_TIMEOUT, serially, held against the
+# joined futures of the entire panel — so an unguarded fallback turns one
+# thirty-minute seat into three and can push a round past a deadline nothing here
+# can see. The case the fallback exists for is nowhere near this bound, because a
+# provider with no deployment for a slug refuses in SECONDS without ever running
+# the request; what the guard stops is a seat that already burned real time,
+# failing for something that merely mentioned a model, going twice more. It also
+# subsumes "never retry a timeout" — a timeout arrives having spent exactly
+# CLI_TIMEOUT — which is the rule `run_cli` already keeps for its own retries, and
+# the same argument as BLANK_RETRY_MAX_S's, one retry class over.
+FALLBACK_MAX_ELAPSED_S = CLI_TIMEOUT
+
+#: Floor for a lowered attempt's own timeout. The bound above is spent-so-far, so
+#: the remaining budget can be small; handing a reviewer thirty seconds and calling
+#: the result a review would be worse than not trying, and a seat killed mid-thought
+#: costs the tokens anyway.
+FALLBACK_MIN_TIMEOUT_S = 120
+
 #: Which seats may be handed the PR's own tree to read, when
 #: `review_panel.reviewer_code_access` is on (#113).
 #:
@@ -109,6 +129,14 @@ def cli_hint(cmd_name: str, err: str, model: str) -> str:
     if cmd_name != "codex" or "exited" not in err:
         return ""
     low = err.lower()
+    # Checked BEFORE the CLI-version branch, because the two overlap in wording
+    # and only one of them is true here: a gateway 404 is not an old client, and
+    # telling someone to upgrade codex when the deployment is what is missing is
+    # the confident wrong answer this function was written to stop giving.
+    if "404" in low and ("deployment" in low or "does not exist" in low):
+        pin = f"`{model}`" if model else "the pinned model"
+        return (f" — {pin} has no deployment on this host's provider; this is a "
+                "per-host mismatch, not a bad pin (see #215)")
     if "newer version" in low or "unknown model" in low or "not supported" in low:
         pin = f"`{model}`" if model else "the pinned model"
         return (f" — {pin} is unusable by the installed codex; upgrade the CLI "
@@ -160,10 +188,240 @@ def is_permission_denied(stderr: str) -> bool:
     return False
 
 
-def is_deterministic_failure(stderr: str) -> bool:
-    """Will another identical attempt fail in the identical way? Either settled
-    cause counts — a request the server refused, or a tool the CLI refused."""
-    return is_rejection(stderr) or is_permission_denied(stderr)
+#: One decoder, reused: `raw_decode` keeps no state between calls and building a
+#: fresh one per JSON value in a seat's whole stdout is pure allocation.
+_DECODER = json.JSONDecoder()
+
+
+def _json_values(text: str):
+    """Every JSON value in `text`, as `(start, end, value)` — however it is laid out.
+
+    A scan with `raw_decode` rather than a parse per line, because the
+    line-oriented version of this assumed strict JSONL and silently skipped a
+    PRETTY-PRINTED body — which is exactly the shape the gateway's effort refusal
+    arrives in, indented across seven lines. Nothing recognised it, so `stderr_gist`
+    fell back to ranking those lines as prose and quoted one fragment of it
+    (`"type": "invalid_request_error",`), which names neither the parameter nor the
+    value that was refused. That is #215's own bug one layer in: a false NEGATIVE
+    from being strict, where the docstring only justified the guard against false
+    positives.
+
+    Concatenated objects (codex's JSONL event stream) and indented ones both fall
+    out of looking for a `{` and letting the decoder say where the value ends. A
+    brace that starts nothing steps forward by one rather than ending the scan: a
+    `{` inside prose must not hide a real envelope printed after it.
+
+"""
+    at = text.find("{")
+    while at >= 0:
+        try:
+            value, end = _DECODER.raw_decode(text, at)
+        except ValueError:
+            at = text.find("{", at + 1)
+            continue
+        yield at, end, value
+        at = text.find("{", max(end, at + 1))
+
+
+def _error_body(value: object) -> dict | None:
+    """The part of one error envelope that carries the fields, or None if `value` is
+    not an error envelope at all.
+
+    Two shapes, because two layers produce them: a stream event that IS the error
+    (`{"type":"error","message":…}`, which is codex's) and the provider's own error
+    body relayed verbatim under an `error` key (`{"error":{"param":…,"code":…}}`,
+    which is the gateway's). The second is the only one that carries `param`, and
+    `param` is the only field that says WHICH pin was refused.
+    """
+    if not isinstance(value, dict):
+        return None
+    inner = value.get("error")
+    if isinstance(inner, dict):
+        return inner
+    return value if value.get("type") == "error" else None
+
+
+def error_events(stdout: str) -> list[dict]:
+    """The `error` envelopes a JSON event stream puts on STDOUT — whole, not summarised.
+
+    This exists because the seat whose failures are hardest to read is the one
+    that does not write them to stderr. Under `--json` codex puts its whole event
+    stream on stdout — `thread.started`, `turn.started`, and crucially
+    `{"type":"error","message":"Reconnecting... 1/10 (unexpected status 404 Not
+    Found: The API deployment for this resource does not exist ...)"}` — while
+    stderr carries exactly one line, `Reading prompt from stdin...`, which is a
+    progress banner printed before anything can have gone wrong.
+
+    So a diagnosis built from stderr alone reported `exited 1 (Reading prompt from
+    stdin...)` for a pinned model the provider does not deploy (#215), which reads
+    like broken stdin plumbing and sent two people looking at exactly that. It was
+    not `stderr_gist` picking the wrong line: it picked the only line it had.
+
+    The envelopes THEMSELVES, and the first version of this returned their
+    `message` strings joined into one text. That cost the effort fallback on the
+    very run it was written for: the gateway says which pin it refused in `param`
+    (`reasoning.effort`) and NOT in the message ("Unsupported value: 'max' is not
+    supported with this model", which names the model while blaming the effort), so
+    a classifier reading messages alone dropped the MODEL pin, failed again on the
+    effort, and had nothing left to recognise. `error_text` is the flattening; the
+    structure has to survive as far as the classifiers.
+
+    Strict about what it lifts, so it is safe to run over EVERY seat's stdout
+    including the seats whose stdout is their reply: a value counts only if it
+    parses as a JSON object that is an error envelope by one of `_error_body`'s two
+    shapes. Reviewer prose does not, and a findings array does not. The cost of a
+    false positive is bounded anyway — this is only ever consulted once a seat has
+    already failed — a stdout that is nothing
+    else.
+    """
+    text = stdout or ""
+    # The cheap gate first: with no `"error"` anywhere there is no envelope to
+    # find, and this runs over the whole stdout of every failed seat.
+    if '"error"' not in text:
+        return []
+    return [value for _s, _e, value in _json_values(text)
+            if _error_body(value) is not None]
+
+
+#: What an error envelope can carry that is worth putting in a diagnosis. `param`
+#: and `code` are here because the message alone cannot say which pin was refused
+#: (see :func:`is_effort_unsupported`); an envelope with none of the three is a
+#: marker rather than an account of anything.
+_ERROR_FIELDS = ("message", "param", "code")
+
+
+def error_text(stdout: str) -> str:
+    """:func:`error_events`, flattened to the text `stderr_gist` and the classifiers read.
+
+    One line per envelope, re-serialised compactly, and both halves of that are
+    deliberate. COMPACT, because `stderr_gist` ranks and picks whole LINES: an
+    envelope spread over seven pretty-printed lines gets quoted as whichever
+    fragment happens to rank, and on the run this fixes that fragment was `"type":
+    "invalid_request_error",`. WHOLE, because the field that says which pin the
+    provider refused is `param`, not `message` — and the retry decision and the pin
+    fallback both read this text.
+
+    An envelope with nothing to say is dropped: `{"type":"error"}` is a marker, and
+    putting it in a diagnosis would only push a line that says something out of
+    `stderr_gist`'s pick.
+    """
+    lines = []
+    for ev in error_events(stdout):
+        body = _error_body(ev) or {}
+        if not any(str(body.get(k) or "").strip() for k in _ERROR_FIELDS):
+            continue
+        lines.append(json.dumps(ev, ensure_ascii=False, separators=(",", ":")))
+    return "\n".join(lines)
+
+
+def is_effort_unsupported(diag: str) -> bool:
+    """Did the provider refuse the reasoning EFFORT, independently of the model?
+
+    The second pin, and the one that makes "fall back on a model 404" insufficient
+    on the host this was written for. `.harness-rules` pins codex twice — a slug
+    and an effort — and the employer gateway refuses both, separately::
+
+        gpt-5.6-luna + max    ->  404, no deployment for that model
+        gpt-5.5      + max    ->  {"param": "reasoning.effort", "code": "unsupported_value"}
+        gpt-5.5      + high   ->  works
+
+    So a fallback that drops only the model keeps `-c model_reasoning_effort=max`
+    and loses the seat anyway, on the next knob. `panel_seats`' own comment already
+    said the API "rules on the model/effort pair"; nothing acted on it until a
+    zero-seat round on PR #217 made it visible.
+
+    Keyed on the parameter name rather than on `unsupported_value` alone, because
+    that code is generic — a rejected sampling parameter or tool spec would carry
+    it too, and lowering the effort would not fix either.
+
+    `param` is where that name actually lives, which is why `error_events` keeps
+    whole envelopes rather than their messages. The quoted-LEVEL branch is the belt
+    to that braces, and it is not hypothetical tidiness: the message on its own
+    ("Unsupported value: 'max' is not supported with this model") contains neither
+    the word `reasoning` nor the word `effort`, so any path that reaches here with
+    the message alone — a summarised gist, a provider that omits `param`, a stream
+    read from somewhere new — used to fall through to `is_model_unavailable`'s bare
+    "not supported" and drop the WRONG pin, recording `model_unavailable` for a
+    model that was perfectly servable. The value it names is one of the CLI's own
+    effort levels; nothing else in this vocabulary is called `max` or `xhigh`.
+    Backslashes are stripped first because the same sentence arrives escaped when it
+    arrives inside a JSON envelope.
+    """
+    low = (diag or "").lower()
+    if "unsupported_value" not in low and "unsupported value" not in low:
+        return False
+    if "reasoning" in low or "effort" in low:
+        return True
+    plain = low.replace("\\", "")
+    return any(f"{q}{level}{q} is not supported" in plain
+               for level in CODEX_EFFORTS for q in ("'", '"'))
+
+
+def is_model_unavailable(diag: str) -> bool:
+    """Is this failure "the model you pinned is not servable here"?
+
+    Three spellings of one cause, and they arrive from different layers: the CLI
+    refusing a slug it is too old to know (`unknown model`, `not supported`), the
+    API refusing a slug that needs a newer client (`requires a newer version`),
+    and the gateway having no DEPLOYMENT for it — which is what a corporate Azure
+    front end returns, as a 404 naming the resource rather than the model.
+
+    That last one is the case #215 is about and the only one that is not obviously
+    about a model at all: `codex` on this box routes through an employer gateway
+    deploying `gpt-5.5`, so a `.harness-rules` pin of `gpt-5.6-luna` 404s ten
+    times and gives up. A pin is per-fleet and a deployment is per-host, so this
+    is a mismatch no single committed value can avoid.
+    """
+    # The two refusals OVERLAP in wording and must not overlap in meaning: the
+    # gateway's effort rejection reads "Unsupported value: 'max' is not supported
+    # with this model", which names the model while blaming the effort. Matched as a
+    # model problem it drops the wrong pin — recovering anyway on the next pass, but
+    # recording `model_unavailable` for a model that was perfectly servable, which is
+    # the false record this state exists to prevent. So the effort refusal wins.
+    if is_effort_unsupported(diag):
+        return False
+    low = (diag or "").lower()
+    if "unknown model" in low or "newer version" in low:
+        return True
+    # Line by line, and never on a bare "not supported": this predicate now decides
+    # whether a failure is RETRYABLE for every seat on the panel, and whether codex
+    # drops its model pin and re-runs. `agy`'s "web search is not supported in this
+    # region" and claude's "sandbox mode is not supported on this platform" are
+    # neither of those things — matched, the first makes a transient failure
+    # permanently unretryable and the second drops a pin the provider never refused
+    # and then records `model_unavailable` against it. So the words have to
+    # CO-OCCUR ON ONE LINE with the thing being refused, which is the same
+    # narrowing, for the same reason, as `is_permission_denied`'s.
+    for line in low.splitlines():
+        if "not supported" in line and ("model" in line or "deployment" in line):
+            return True
+        if "404" in line and ("deployment" in line or "does not exist" in line):
+            return True
+    return False
+
+
+def is_deterministic_failure(diag: str, /) -> bool:
+    """Will another identical attempt fail in the identical way? Every settled
+    cause counts — a request the server refused, a tool the CLI refused, or a
+    model this host's provider does not deploy.
+
+    The third is #215 and it was the one getting retried. `is_rejection` keys on
+    4xx invalid-request markers and an explicit `"status":400`, deliberately
+    excluding 429; a gateway's `404 ... deployment for this resource does not
+    exist` is neither, so a pin no provider here serves read as a flake worth
+    another go. It is not a flake: codex had already reconnected ten times on its
+    own before exiting, and each outer attempt spent the seat's full budget —
+    ten minutes at a time — to arrive at the identical 404.
+
+    POSITIONAL-ONLY, and the marker earns its keep rather than decorating: the
+    parameter used to be called `stderr` and this function is exported, so any
+    caller passing `stderr=…` by keyword would have broken on the rename with a
+    TypeError. `/` says what is actually true — the name is not part of the
+    contract, and what this reads is both streams now (see `run_cli`), so the next
+    widening should not be another rename either.
+    """
+    return (is_rejection(diag) or is_permission_denied(diag)
+            or is_model_unavailable(diag) or is_effort_unsupported(diag))
 
 
 def code_access_wanted(panel: dict, no_code_access: bool, notes: list[str]) -> bool:
@@ -578,6 +836,45 @@ def member_sandbox(where: Path) -> str:
     return str(where)
 
 
+class CliFailure(str):
+    """The one sentence a report shows about a failed CLI run, carrying the FULL
+    diagnostic it was summarised from.
+
+    A `str` subclass, so every existing reader of `run_cli`'s error keeps working
+    untouched — it is printed, concatenated with `cli_hint`, stored as a seat's
+    `skip`, and stubbed as a plain string by four dozen tests, and none of those
+    want the streams. What DID want them is the pin fallback in `run_seat`, and
+    reading them off the summary is precisely how the second lowering failed to
+    fire on the run this was written for (#215): `stderr_gist` had picked `"type":
+    "invalid_request_error",` out of a pretty-printed envelope, and that fragment
+    contains neither `unsupported_value` nor `effort`, so a refusal that was
+    entirely about the effort was classified as being about nothing.
+
+    So: classify against `.diag`, render the sentence. :func:`failure_diag` is how,
+    and it answers for a plain string too — which is what a stubbed `run_cli`
+    returns, and what a timeout or an OSError has instead of streams.
+    """
+
+    def __new__(cls, sentence: str, diag: str = "") -> CliFailure:
+        self = super().__new__(cls, sentence)
+        # Never empty: a caller that classifies `.diag` must not have to know
+        # whether this failure had streams to summarise.
+        self.diag = diag or sentence
+        return self
+
+
+def failure_diag(err: str | None) -> str:
+    """Everything known about why a `run_cli` call failed.
+
+    Both streams where the failure carries them (see :class:`CliFailure`), and
+    otherwise the sentence itself, which is then all there is: a timeout, an
+    OSError, or a test's stubbed string. Every classification of a seat failure
+    goes through here rather than reading `err` directly, because the summary is
+    lossy BY DESIGN — it is one ranked line, cut at 200 characters, for a human.
+    """
+    return getattr(err, "diag", None) or (err or "")
+
+
 def run_cli(args: list[str] | Callable[[], list[str]], label: str, timeout: int = CLI_TIMEOUT,
             attempts: int = 3, stdin_text: str | None = None,
             on_output: Callable[[str | None], None] | None = None,
@@ -718,6 +1015,22 @@ def run_cli(args: list[str] | Callable[[], list[str]], label: str, timeout: int 
         # that actually carries its reply.
         if not outcome and replied is not None and not replied():
             outcome = "exited 0 but wrote no reply"
+        # BOTH streams, because the seat with the worst failure messages does not
+        # use stderr for them. See `error_events`: codex under `--json` reports a
+        # provider 404 on stdout and leaves stderr holding a progress banner, so
+        # everything below — the sentence a human reads AND the settled-cause
+        # short-circuit — was being decided from the one stream that could not
+        # know. That cost the diagnosis (#215) and then cost it twice, because an
+        # unrecognised rejection is retried: a deterministic 404 burned the seat's
+        # whole budget again, 10 minutes at a time, to fail identically.
+        #
+        # Lifted BEFORE the success check, not after it, because they can also
+        # settle whether this run succeeded at all. `cli_outcome` asks whether
+        # stdout is empty, and a stdout carrying nothing but the provider's refusal
+        # is not empty: exit 0 plus that stream used to return here as a SUCCESS
+        # whose reply merely could not be parsed, so the seat's own error text was
+        # reported as an unreadable reply and kept as a raw finding for the judge —
+        errors = error_text(proc.stdout or "")
         if not outcome:
             return proc.stdout, None
         took = time.monotonic() - started
@@ -730,12 +1043,23 @@ def run_cli(args: list[str] | Callable[[], list[str]], label: str, timeout: int 
         # retrying three times and re-burning a cap that is already spent.
         if BUDGET_MARKER in (proc.stdout or ""):
             return None, f"{label}: {BUDGET_EXHAUSTED}"
-        msg = stderr_gist(proc.stderr or "")
-        last = f"{label}: {outcome}" + (f" ({msg})" if msg else "")
-        if is_deterministic_failure(proc.stderr or ""):
+        # stderr first and the lifted envelopes last, which is load-bearing rather
+        # than arbitrary: `stderr_gist` ranks the lines and takes the LAST of the
+        # best rank, so a progress banner can neither outrank a real error nor win a
+        # tie with one. Asserted end to end (against what this function composes,
+        # not against a diag built by hand in a test) because the ordering and that
+        # ranking are only correct together.
+        diag = "\n".join(x for x in (proc.stderr or "", errors) if x)
+        msg = stderr_gist(diag)
+        # The sentence for a human, carrying the diagnostic for a classifier: see
+        # `CliFailure`. `run_seat`'s pin fallback re-classifies this failure, and
+        # doing that against the gist is how it dropped one pin and then missed the
+        # other on the run this fixes.
+        last = CliFailure(f"{label}: {outcome}" + (f" ({msg})" if msg else ""), diag)
+        if is_deterministic_failure(diag):
             return None, last
         if not proc.returncode and took >= BLANK_RETRY_MAX_S:
-            return None, f"{last} after {int(took)}s — not retried"
+            return None, CliFailure(f"{last} after {int(took)}s — not retried", diag)
     return None, last
 
 
@@ -1595,6 +1919,11 @@ class SeatTurn(NamedTuple):
     duration_ms: int = 0
     usage: dict | None = None
     absent: bool = False
+    #: The pinned model / reasoning effort this host's provider would not serve,
+    #: when the turn lowered it and carried on. "" = the pin was honoured. See
+    #: `ReviewerRun.model_unavailable`.
+    model_unavailable: str = ""
+    effort_unsupported: str = ""
     #: This seat ran with no way to read the code under review. True from the
     #: point :func:`member_sandbox` hands it an empty repo — which is every seat
     #: that gets as far as starting a CLI today. False on the paths that return
@@ -1607,6 +1936,65 @@ class SeatTurn(NamedTuple):
     #: When a seat is handed the PR's tree, this is the line that turns False and
     #: its declarations start counting again.
     code_blind: bool = False
+
+
+def fallback_label(name: str, model: str, effort: str,
+                   dropped_model: str = "", dropped_effort: str = "") -> str:
+    """How a seat that did not review on its pins is named.
+
+    `model` and `effort` are what it ACTUALLY used, after any lowering; the two
+    `dropped_*` arguments are what it could not use. With neither, this is just
+    :func:`reviewer_label`.
+
+    Rendered rather than stored, and it has to reach the header rather than only a
+    log: `.harness-rules` pins these values precisely so that "codex found 9
+    issues" still means something six weeks later, and a report naming the PIN
+    while something else did the work breaks exactly the attributability the pin
+    exists for — quietly, and in the flattering direction.
+
+    `CLI default` rather than the resolved slug because nothing here knows it: the
+    model is chosen inside the CLI from its own config (an employer gateway, in
+    the case that motivated this), so naming it would mean parsing another tool's
+    configuration. Honest and cheap beats guessed.
+    """
+    if not (dropped_model or dropped_effort):
+        return reviewer_label(name, model, effort)
+    spec = ", ".join(x for x in (model or "CLI default", effort) if x)
+    notes = []
+    if dropped_model:
+        notes.append(f"pinned {dropped_model} unavailable")
+    if dropped_effort:
+        notes.append(f"effort {dropped_effort} unsupported")
+    return f"{name} ({spec}; {', '.join(notes)})"
+
+
+def seat_label(name: str, model: str, effort: str, ran: object = None) -> str:
+    """The label a seat EARNED, given the pins it was configured with and whatever
+    it returned — a :class:`ReviewerRun`, a :class:`SeatAnswer`, or None.
+
+    One function because there are two reports and they must not disagree: a round
+    prints this above its findings and an ask prints it on its Seats line, and both
+    had the same four-fold `answers.get(n)` / `"" if …model_unavailable else …`
+    expression written out inline, in different shapes, guarding the same two cases.
+    That is not a readability complaint — the second copy was written wrong (#219
+    review), and there is no third place to notice it from.
+
+    A seat that produced NOTHING is named by its configuration, not by its
+    substitute. This is the case that copy got wrong: a seat that lowered its pin
+    and then failed anyway was rendered `codex (CLI default; pinned gpt-5.6-luna
+    unavailable)` — truthful about the pin and misleading about the brain, because
+    no brain answered. Which pin could not be served still reaches the reader; it is
+    in the skip reason, where the failure it explains is. What is above the findings
+    names what did the work, and nothing did.
+    """
+    dropped_model = getattr(ran, "model_unavailable", "") or ""
+    dropped_effort = getattr(ran, "effort_unsupported", "") or ""
+    if getattr(ran, "skip", None):
+        return reviewer_label(name, model, effort)
+    return fallback_label(name,
+                          "" if dropped_model else model,
+                          "" if dropped_effort else effort,
+                          dropped_model, dropped_effort)
 
 
 def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
@@ -1752,6 +2140,11 @@ def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
         # in argv that failure lands at execve, before the reviewer exists, as an
         # error with nothing in it. On stdin there is no such ceiling.
         stdin_text: str | None = prompt
+        #: What this seat actually asks for — the pins until a fallback lowers one.
+        #: One-element lists because the argv thunk below closes over them and a
+        #: rebind in this scope has to reach it. Two, not one, because the provider
+        #: refuses them independently (see `is_effort_unsupported`).
+        asked_model, asked_effort = [model], [effort]
         # A thunk, not a fixed argv, for the seats that pin a session: run_cli
         # retries a flake up to three times, and each attempt needs its own id.
         args: list[str] | Callable[[], list[str]]
@@ -1779,7 +2172,11 @@ def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
         else:
             def args():
                 replies.append(tmpdir / f"reply-{len(replies)}.txt")
-                return codex_args(model, effort, replies[-1])
+                # `asked[0]`, not `model`: a fallback (#215) lowers the seat to the
+                # CLI's default between run_cli calls, and every attempt after that
+                # has to ask for the lowered value. A plain closure over `model`
+                # would keep re-sending the pin the provider just refused.
+                return codex_args(asked_model[0], asked_effort[0], replies[-1])
 
         #: Every attempt's stdout, failed ones included — codex reads its usage
         #: from there, and an attempt that burned tokens before exiting non-zero
@@ -1839,12 +2236,94 @@ def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
                        and replies[-1].read_text().strip()) if replies_used else None
         out, err = run_cli(args, label, stdin_text=stdin_text, on_output=collect,
                            replied=wrote_reply, cwd=sandbox)
+        #: Which pins this host could not serve, once we have stopped trying them.
+        dropped_model = dropped_effort = ""
+        #: Has the recovered seat already been given its one extra go? See the
+        #: flake branch below — once per seat, not once per lowering.
+        flaked = False
+        # A pin is a fleet-wide value; what a provider will serve is per-host. On
+        # the box this was written for, `.harness-rules` pins `gpt-5.6-luna` at
+        # `max` effort and the employer gateway serves neither — 404 for the model,
+        # `unsupported_value` on `reasoning.effort` for the effort — so the panel
+        # lost a whole vendor and, on PR #217, every vendor. Reviewing on the CLI's
+        # own defaults beats not reviewing, PROVIDED the report says so, which is
+        # what the `*_unavailable`/`*_unsupported` state carries and
+        # `fallback_label` renders.
+        #
+        # **codex only, and that is a real limit rather than caution.** This lowers
+        # a pin by rebuilding the argv without it, which needs a seat whose argv can
+        # SAY "use your default": `codex_args("")` omits `--model` entirely. claude
+        # takes `--model` unconditionally and would be handed an empty string; `agy`
+        # builds its argv eagerly, before any failure exists to react to. Running
+        # this for them would re-send the identical bad value and then label it as a
+        # fallback — a false record on top of a futile retry.
+        #
+        # At most one lowering PER PIN, each justified by the error naming that pin,
+        # plus one retry for a flake on the recovered seat — so three extra attempts
+        # at the very most, bounded in wall clock as well (FALLBACK_MAX_ELAPSED_S),
+        # and it cannot become "retry with fewer constraints until something
+        # answers", which would quietly review on a weaker seat for reasons nobody
+        # chose.
+        while err and cmd_name == "codex":
+            #: Everything the failed run said, not the one line it was summarised
+            #: into. THE bug the first version of this shipped: `run_cli` classifies
+            #: correctly on the full diagnostic and returns a `stderr_gist` of it,
+            #: and re-classifying that gist is how the effort lowering never fired
+            #: on the run this was written for — the gist it had was `"type":
+            #: "invalid_request_error",`, one fragment of a pretty-printed envelope,
+            #: naming neither `unsupported_value` nor `effort`. The model was
+            #: dropped, the effort was not, and the seat was lost anyway.
+            diag = failure_diag(err)
+            spent = int(time.monotonic() - started)
+            if spent >= FALLBACK_MAX_ELAPSED_S:
+                # See FALLBACK_MAX_ELAPSED_S: a bound on cost and not just on
+                # attempts. Said out loud, because a seat that could have been
+                # recovered and was not is exactly the kind of silence #215 is about.
+                print(f"panel: {cmd_name} failed after {spent}s — not lowering its "
+                      f"pins, there is no budget left to review in", file=sys.stderr)
+                break
+            if asked_model[0] and is_model_unavailable(diag):
+                dropped_model, asked_model[0] = asked_model[0], ""
+                note = f"model {dropped_model} not served here — retrying without it"
+            elif asked_effort[0] and is_effort_unsupported(diag):
+                dropped_effort, asked_effort[0] = asked_effort[0], ""
+                note = f"effort {dropped_effort} not served here — retrying without it"
+            elif ((dropped_model or dropped_effort) and not flaked
+                    and not is_deterministic_failure(diag)):
+                # The lowered seat was not refused — it flaked. The pinned attempt
+                # had three tries at that and the recovered one was getting exactly
+                # one, so a single 500 lost the vendor this whole path exists to
+                # keep, by the other road. One more go: once per SEAT rather than
+                # once per lowering, and never for a failure another attempt cannot
+                # change, which is the same rule `run_cli` retries under.
+                flaked = True
+                note = "flaked on the lowered pins rather than being refused — one more go"
+            else:
+                break
+            label = fallback_label(cmd_name, asked_model[0], asked_effort[0],
+                                   dropped_model, dropped_effort)
+            print(f"panel: {cmd_name} {note}", file=sys.stderr)
+            # The budget that is LEFT, not a fresh one. Checking elapsed time before
+            # starting an attempt bounds when a lowering may begin and nothing else,
+            # so an attempt starting just under the line could still run a full
+            # CLI_TIMEOUT past it — up to one whole timeout of overshoot per
+            # remaining lowering, on a guard whose stated job is bounding the seat
+            # (#219 review, codex). Floored well above zero: a one-second timeout is
+            # not a review, it is a kill dressed as one, and the elapsed check above
+            # is what stops us getting here with nothing left.
+            out, err = run_cli(args, label, attempts=1, stdin_text=stdin_text,
+                               timeout=max(FALLBACK_MIN_TIMEOUT_S,
+                                           FALLBACK_MAX_ELAPSED_S - spent),
+                               on_output=collect, replied=wrote_reply, cwd=sandbox)
         if err:
+            # `model` and not `asked[0]`: the hint explains the PIN, and after a
+            # failed fallback the thing worth naming is still what was configured.
             err += cli_hint(cmd_name, err, model)
             # A member that burned tokens and then failed still spent them, so
             # the usage is reported on this path too.
             return SeatTurn(skip=err, duration_ms=elapsed(), usage=usage_of(),
-                            code_blind=blind)
+                            model_unavailable=dropped_model,
+                            effort_unsupported=dropped_effort, code_blind=blind)
 
         text = reply_of(out)
         parsed = parse(text) if parse else None
@@ -1863,12 +2342,15 @@ def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
                 retried = parse(retry_text)
                 if retried is not None:
                     return SeatTurn(retry_text, retried, duration_ms=elapsed(),
-                                    usage=usage_of(), code_blind=blind)
+                                    usage=usage_of(), model_unavailable=dropped_model,
+                                    effort_unsupported=dropped_effort, code_blind=blind)
                 text = retry_text
             return SeatTurn(text, None, duration_ms=elapsed(), usage=usage_of(),
-                            code_blind=blind)
+                            model_unavailable=dropped_model,
+                            effort_unsupported=dropped_effort, code_blind=blind)
         return SeatTurn(text, parsed, duration_ms=elapsed(), usage=usage_of(),
-                        code_blind=blind)
+                        model_unavailable=dropped_model,
+                        effort_unsupported=dropped_effort, code_blind=blind)
 
 
 def review_llm(cmd_name: str, model: str, prompt: str, effort: str = "",
@@ -1883,14 +2365,21 @@ def review_llm(cmd_name: str, model: str, prompt: str, effort: str = "",
     turn = run_seat(cmd_name, model, prompt, effort,
                     parse=lambda text: parse_reply(cmd_name, text),
                     code_tree=code_tree, budget_usd=budget_usd)
+    #: Threaded through EVERY return below as one value, not repeated as two kwargs
+    #: per site. The version that repeated them missed one — the "produced no
+    #: output" skip — and a seat that had lowered its pin and then said nothing
+    #: recorded `model_unavailable: null`: a run reported as having honoured a pin it
+    #: could not use, which is the false attributability this state exists to
+    #: prevent. `ask_llm` had it right; this is the same dict, for the same reason.
+    fell_back = {"model_unavailable": turn.model_unavailable,
+                 "effort_unsupported": turn.effort_unsupported}
     if turn.skip:
         return ReviewerRun(skip=turn.skip, duration_ms=turn.duration_ms,
-                           usage=turn.usage, absent=turn.absent,
-                           code_blind=turn.code_blind)
+                           usage=turn.usage, absent=turn.absent, code_blind=turn.code_blind, **fell_back)
     if turn.parsed is not None:
         findings, declared = turn.parsed
         return ReviewerRun(findings, None, turn.duration_ms, declared, usage=turn.usage,
-                           code_blind=turn.code_blind)
+                           code_blind=turn.code_blind, **fell_back)
     # Neither attempt's reply could be read. Rather than drop the reviewer's
     # work, keep the raw text as a single markdown finding for the judge.
     raw = (turn.reply or "").strip()
@@ -1905,13 +2394,15 @@ def review_llm(cmd_name: str, model: str, prompt: str, effort: str = "",
     # file, so an unreadable one is empty here with stdout non-empty and the
     # run_cli invariant untouched.
     if not raw:
-        return ReviewerRun(skip=f"{reviewer_label(cmd_name, model, effort)}: "
+        # `seat_label`, not `reviewer_label`: this seat RAN — it just said nothing —
+        # so if it ran on the CLI's default, the brain that produced no output is
+        # the one to name. The pin here would attribute a silent run to a model that
+        # never started, which is the same false record one report over.
+        return ReviewerRun(skip=f"{seat_label(cmd_name, model, effort, turn)}: "
                                 "produced no output",
-                           duration_ms=turn.duration_ms, usage=turn.usage,
-                           code_blind=turn.code_blind)
+                           duration_ms=turn.duration_ms, usage=turn.usage, code_blind=turn.code_blind, **fell_back)
     return ReviewerRun([_raw_finding(cmd_name, raw)], None, turn.duration_ms,
-                       unstructured=True, usage=turn.usage,
-                       code_blind=turn.code_blind)
+                       unstructured=True, usage=turn.usage, code_blind=turn.code_blind, **fell_back)
 
 
 def ask_llm(cmd_name: str, model: str, prompt: str, effort: str = "") -> SeatAnswer:
@@ -1924,30 +2415,37 @@ def ask_llm(cmd_name: str, model: str, prompt: str, effort: str = "") -> SeatAns
     answer, so a reply carrying none is a seat that did not answer, recorded as
     such and shown in the report rather than folded into `cannot tell`."""
     turn = run_seat(cmd_name, model, prompt, effort, parse=parse_answer)
-    label = reviewer_label(cmd_name, model, effort)
+    # The label this seat EARNED. A fallback (#215) means something other than the
+    # pin answered, and saying otherwise is a false record whether the report is a
+    # review or an ask. `seat_label` because it is the same question the two reports
+    # ask, and this expression written out per site is what let the ask's copy be
+    # written wrong.
+    label = seat_label(cmd_name, model, effort, turn)
+    fell_back = {"model_unavailable": turn.model_unavailable,
+                 "effort_unsupported": turn.effort_unsupported}
     if turn.skip:
         return SeatAnswer(skip=turn.skip, duration_ms=turn.duration_ms,
-                          usage=turn.usage, absent=turn.absent)
+                          usage=turn.usage, absent=turn.absent, **fell_back)
     # Narrowed rather than trusted: `parse_answer` is the only parser this call
     # passes, so anything else is a bug — and a bug that surfaces as an
     # unreadable reply is one this function already knows how to report, where an
     # AttributeError would take the whole ask down with it.
     if isinstance(turn.parsed, Answer):
         return SeatAnswer(turn.parsed.verdict, turn.parsed.reason,
-                          duration_ms=turn.duration_ms, usage=turn.usage)
+                          duration_ms=turn.duration_ms, usage=turn.usage, **fell_back)
     # Same guard, and the same reasoning, as the review path's: a seat that said
     # nothing at all is a different report from one that said something
     # unreadable, and only the second is worth quoting back at whoever tunes the
     # prompt.
     if not (turn.reply or "").strip():
         return SeatAnswer(skip=f"{label}: produced no output",
-                          duration_ms=turn.duration_ms, usage=turn.usage)
+                          duration_ms=turn.duration_ms, usage=turn.usage, **fell_back)
     # In `gist`, never in `reason`: a quote of what the seat said is not the seat
     # stating a reason, and one key carrying both is how a rambling preamble ends
     # up rendered as a justification by any consumer that reads `reason` without
     # also branching on `unreadable`.
     return SeatAnswer(unreadable=True, gist=_ask_gist(turn.reply or ""),
-                      duration_ms=turn.duration_ms, usage=turn.usage)
+                      duration_ms=turn.duration_ms, usage=turn.usage, **fell_back)
 
 
 def _ask_gist(reply: str, limit: int = 120) -> str:
@@ -2061,14 +2559,17 @@ import panel_scope               # noqa: F401
 #: is exported without anyone remembering to list it.
 __all__ = [
     "panel_core", "CODEX_EFFORTS", "PI_EFFORTS", "AGY_EFFORTS",
-    "EFFORTS", "cli_hint", "is_rejection", "is_permission_denied",
+    "EFFORTS", "FALLBACK_MAX_ELAPSED_S", "FALLBACK_MIN_TIMEOUT_S",
+    "CliFailure", "failure_diag", "cli_hint", "is_rejection", "is_permission_denied",
     "is_deterministic_failure", "member_sandbox", "run_cli", "record_run",
     "SEAT_READS_CODE", "CONVENTION_FILES", "CONVENTION_DIRS",
     "strip_convention_files", "fetch_pr_tree", "seat_checkout",
     "code_access_wanted", "_fetch_tarball", "TREE_RETRY_STATUSES", "code_budget",
     "READ_ONLY_TOOLS", "claude_args",
     "QB_NO_SUBCOMMAND", "record_ask", "diff_budget", "resolve_round_scope",
-    "fit_argv_budget", "argv_clamp", "reviewer_label", "codex_args",
+    "fit_argv_budget", "argv_clamp", "reviewer_label", "fallback_label",
+    "seat_label", "error_events", "error_text",
+    "is_model_unavailable", "is_effort_unsupported", "codex_args",
     "antigravity_args",
     "pi_args", "select_reviewers", "_int", "_jsonl",
     "_usage", "claude_usage", "pi_usage", "codex_usage",
