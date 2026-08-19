@@ -55,11 +55,13 @@ def fake_bin(tmp_path):
     runtime cannot.
 
     Asserted rather than only written down, because writing it down is what was already
-    true. Nothing in this suite fails on a developer's machine when a stub names
-    /usr/bin/env — the file is there, every one of these tests passes, and the only
-    reader is a `nix build .#checks.<system>.worktree-tests` that no CI job runs (#179).
-    That is how the same mistake reached a third suite in a week (#177). The four call
-    sites below all come through here, so here is where it costs nothing to check.
+    true. Until the assertion below existed, nothing in this suite failed on a developer's
+    machine when a stub named /usr/bin/env — the file is there, every test here passed, and
+    the only reader was a `nix build .#checks.<system>.worktree-tests` that no CI job runs
+    (#179). That is how the same mistake reached a third suite in a week (#177). The four
+    call sites below all come through here, so here is where it costs nothing to check.
+    Note the present tense is now the other way round: a stub named /usr/bin/env fails here,
+    locally, immediately — that is the whole point, and it is what the guard changed.
     """
     d = tmp_path / "bin"
     d.mkdir()
@@ -164,10 +166,12 @@ def run(repo, fake_bin, tmp_path, runtime_dir):
 def test_a_stub_the_sandbox_could_not_exec_is_refused(fake_bin):
     """The regression test this fix would otherwise not have.
 
-    Reverting any of the four `#!/bin/sh` stubs to `#!/usr/bin/env bash` leaves all 84 tests
-    in this file green, because the shebang is only wrong somewhere nothing here runs. So the
-    guard is what a local `pytest harness/tests` can catch the fourth instance with, and this
-    is what proves the guard is not decoration. A missing shebang is refused for the same
+    Before the `fake_bin` assertion existed, reverting any of the four `#!/bin/sh` stubs to
+    `#!/usr/bin/env bash` left every test in this file green, because the shebang is only
+    wrong somewhere nothing here runs. No count is quoted: it would age with the next test
+    added and would not make the guard any stronger. So the guard is what a local
+    `pytest harness/tests` can catch the fourth instance with, and this is what proves the
+    guard is not decoration. A missing shebang is refused for the same
     reason it would be a bug: what exec'ing it does then depends on the caller's shell."""
     for body in ("#!/usr/bin/env bash\nexit 0\n", "#!/bin/bash\nexit 0\n", "exit 0\n"):
         with pytest.raises(AssertionError, match="nix build sandbox can exec"):
