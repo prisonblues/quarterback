@@ -581,6 +581,21 @@ full — including what was broken before it, which is the part no diff recovers
   a repo name, and treat the string itself as untrusted input on the way back in: the board bounds
   its length at `PATH_MAX` and normalises nothing else, so quote it, and do not hand a value
   beginning with `-` to `git` as anything but an operand.
+- **v2.51** — reviewers can read the code, per repo, on by default (#113's second half).
+  `review_panel.reviewer_code_access` runs each seat that can take it in a checkout of the
+  PR at its head — fetched from GitHub's tarball endpoint, never from the main checkout,
+  whose branch is not the PR's. It buys ONE seat: only `claude` can be told "read but do
+  not execute" (`--allowedTools Read Grep Glob`, no `Bash`), while codex's only read path
+  is its shell, pi's `--no-tools` is all-or-nothing and antigravity has no tools at all —
+  so the other three keep the empty sandbox. The judge reads too, and is the party that
+  most needed to: the wrong findings #113 was filed over were *confirmed*, not merely
+  raised. Vendor convention files are stripped at every depth before any CLI starts
+  (symlinks unlinked, never followed), which is a denylist and says so. Every failure
+  degrades to reviewing from the diff, recorded per seat — and the board now stores that
+  rather than dropping it at ingest (migration `0023`). Measured at roughly 6x the cost in
+  money for one seat, so `reviewer_code_budget_usd` can cap it; uncapped by default,
+  because reaching a cap is a lost seat rather than a cheap one. `--no-code-access` opts
+  out for one run; `false` is what a repo taking untrusted contributions sets.
 - **v2.50** — the coverage veto stops reporting a constant. `confident` is `not veto`, so a
   veto line that fires every round makes a confident stop unreachable rather than rare. Two
   did: a seat that cannot read the code (every seat — an empty sandbox and no tools) declaring
@@ -657,6 +672,44 @@ full — including what was broken before it, which is the part no diff recovers
   this machine's checkout, cherry-pick a located SHA, resume a session — and the refusals those
   inherit, where "could not tell" counts as a no. Not a third client: it consumes the same
   `mcp/mcp_server/client.py` the MCP server does, which is also how that package finally got CI.
+- **v2.52** — the panel decides whether the round is worth running. It used to dispatch every
+  configured seat at full effort whatever the diff: on PR #137 that was four seats against
+  763,375 chars, 6.4× the argv ceiling of the one seat whose prompt travels in argv, on a change
+  that was a *pure move* — `panel.py` split into six modules with nothing retyped. Every
+  relocated line appears twice in a diff, so the bulk of it was code already in `main` and
+  already reviewed, and a finding about it is a finding about the base branch. The token cost was
+  the second problem; the first is that a truncated read which produces findings is worse than no
+  review, because the next step briefs a fixer to resolve every one of them. The panel now
+  measures **shape** as well as size — a move's added lines are a near-permutation of its deleted
+  ones — and either reads the diff, reads a **manifest** of a move (what moved where, what did not
+  survive, what changed besides moving, which definitions the change adds in more than one
+  place), or **refuses** the round loudly: printed, `reviewed: false`, recorded on the board, and
+  posted to the PR under `--post`, because "no review" must never read as "clean". A refusal still
+  reads the CI gate, which no diff size can defeat. `--force` overrides it and is recorded doing
+  so. None of it fires where no ceiling was declared: this decides *whether to start*, never *what
+  to send*, and v2.16's refusal of a default diff budget stands.
+  It also stops the panel asking seats that are not here: a seat this box cannot run stops declaring things about the round. The panel
+  already knew an absent reviewer CLI is a fact about the *host* and must not veto a confident
+  stop, but `budgets` was still built from the *configured* set — so a seat with no CLI
+  acquired a diff budget, an argv clamp, a `config_notes` line saying how much diff it "gets",
+  and a `truncated: true` record. That last one was inherited: `load_baseline` banked the round
+  as truncated and the next round reported code as "read by no round of this cycle" when nothing
+  had been cut, which is a `confident` veto — so every multi-round cycle on such a box was
+  non-confident from round 2 onward, permanently. `seat_installed` now lives in `panel_core`
+  beside `CLI_BIN`, is read once per round, and `budgets`, `run_seat` and the judge's own
+  `adjudicate` all share it rather than keeping their own copies. The absent seat is still
+  dispatched and still records itself absent; it just gets no budget — and with no budget, no
+  rendered prompt it was never going to read. In the payload it records a `null` budget rather
+  than losing its `diff_budgets` key, so nothing downstream starts raising `KeyError` on the
+  unattended hosts this is for. `load_baseline` banks a round as truncated on
+  `truncated and not argv_capped and not absent` — two exemptions, each keyed on its own
+  recorded field, and neither subsuming the other: `argv_capped` (v2.50) covers only what the
+  kernel bounded, so an absent `pi` or `codex` with a configured budget under the target would
+  still bank a phantom round under it alone. A seat that was installed, read a real prefix and
+  then crashed still counts, under both. The sibling `truncated_any`, which decides whether a
+  round CLOSES earlier gaps, exempts `absent` but not `argv_capped`: a capped seat ran and saw
+  a prefix, so the round did not read its target whole; an absent one is no evidence either
+  way.
 - **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
   object store; wire `landed` refs to a cherry-pick helper.
 

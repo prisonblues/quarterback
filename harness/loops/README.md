@@ -101,6 +101,8 @@ Detected from the checkout, **not settable** here: `path`, `github`, `default_br
 | `review_panel.judge_model` | Claude model for the master judge — `sonnet`, deliberately **not** `reviewers.claude.model`; see below. An explicit `""` is passed through as empty and lets the CLI pick, which is NOT the same as omitting the key (that gets the default). |
 | `review_panel.ask_quorum` / `ask_threshold` | `--ask`'s tally rules: how many seats must have **answered** for the vote to mean anything, and how many must have said the same thing for it to be that answer. Both **2** — one seat agreeing with the agent that wrote the premise is not a challenge. A rule above the number of seats on the ask is warned about: it can never be met. |
 | `review_panel.ask_max_context_chars` | Total `--context` material one ask may hand its seats, across every spec. **60,000** (~15k tokens). Over budget is clamped and SAID, per spec — an ask's whole claim is that it is the cheap check, and unbounded context is the #117 cost shape on the path advertised as costing a minute. |
+| `review_panel.reviewer_code_access` | May a seat READ the code under review? **true**. `false` is the old posture — every seat in an empty repo, the diff its only evidence — and is what a repo taking UNTRUSTED contributions selects. On does not mean every seat gets it: only a CLI that can express "read but do not execute" is handed the tree (today just `claude`), and which seats did is recorded per seat. `--no-code-access` turns it off for one run. See below. |
+| `review_panel.reviewer_code_budget_usd` | Dollars the code-reading seat may spend per invocation (`claude --max-budget-usd`). **`null`** — uncapped — for the reason `max_diff_chars` is: reaching the cap is a LOST seat (a skip, which vetoes), not a cheaper review. Measured for calibration: ~$4 for one seat on a 75,628-char diff against ~$0.70 diff-only. Applies only to a seat that got the tree; the cap is per invocation and a reparse retry can spend it twice. |
 | `loops` | `dependabot_lander` / `stacked_driver` / `issue_executor` — which loops may run. |
 | `epic` | Epic-driver settings — see below. |
 | `preland.disabled_checks` | Checks `preland.py` must not run, by name. Empty by default — every guardrail it can detect, it runs. A name nothing answers to is a **hard error**, not a warning; see below. |
@@ -198,6 +200,25 @@ kernel bounds it. The panel clamps that seat to what `execve` will carry and
 reports it as ordinary truncation rather than dying at exec — which is what it
 used to do, reporting "LLM reviewers ran: none" as a clean review.
 
+`review_panel.refuse_over_cap_multiple` (default: **3**) — how many times over the
+**tightest seat ceiling** a diff may be before the round is *refused* instead of
+truncated; `0` switches the refusal off and keeps the manifest, and `0` is the only
+spelling of off (`null` and an absent key mean "use the default", here as everywhere
+else in this file). `review_panel.move_shape_ratio` (default: **0.9**) — what fraction
+of the larger side of a diff must be relocated text before the change counts as a
+*move*; a fraction, so values above `1.0` are rejected with a `config_notes` line
+rather than silently making the threshold unsatisfiable.
+`review_panel.manifest_moves` (default: **true**) — review a move-shaped over-ceiling
+diff as a manifest rather than as content; `false`, `"false"`/`"off"`/`"no"` and the bare
+`0` all switch it off, and `true`/`1` all leave it on. All three keys are validated: a
+value that cannot be what the key means falls back to the default and *says so* in
+`config_notes`. `false` on a *number* is rejected rather than read as 0 — and the note
+then names the right way to say "off" **for that key**: `refuse_over_cap_multiple: 0`
+switches the refusal off, while `move_shape_ratio` is a threshold with no off at all (a
+ratio of `0` turns the feature all the way *on* — every diff with one relocated line
+becomes a move), so its note points at `manifest_moves` instead. All three are the
+pre-flight verdict, below.
+
 ### The SonarQube token
 
 Resolved in this order, first hit wins:
@@ -293,7 +314,9 @@ PR) / `--json` (the run as JSON on stdout — nothing else, progress goes to std
 knows what the earlier rounds raised, and where it sits in the caller's cycle) /
 `--scope pr|increment|auto` + `--since <sha>` (what a later round reads — see below;
 `auto` is the default and needs no flag) /
-`--ask "<premise>"` (one question to the seats instead of a review — see below).
+`--ask "<premise>"` (one question to the seats instead of a review — see below) /
+`--force` (review the diff as content even when the pre-flight verdict refuses the round
+or rules the change move-shaped — see below).
 
 Read-only, so it runs in **any** repo — an unconfigured one just uses the defaults.
 
@@ -301,8 +324,12 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   quality-gate pass/fail), Claude (SOFT, read-only), Codex (SOFT, different vendor).
 - **Skip patterns:** PRs matching `skip_title_patterns` are skipped entirely — but that
   is still a payload, marked `reviewed: false`, on `--json` *and* in `--json-file` (an
-  empty stdout, or a missing baseline, would read as a clean PR). Otherwise all enabled
-  reviewers run — no diff-size de-minimis.
+  empty stdout, or a missing baseline, would read as a clean PR).
+- **Pre-flight verdict** (see below): before any seat is dispatched, the panel rules on
+  whether the round is worth running and whether the diff or a *manifest* of it is what a
+  seat should read. There is still **no diff-size de-minimis** — nothing is skipped for
+  being small, and nothing is refused against a ceiling the repo or the kernel did not
+  already declare.
 - **Master judgment, no consensus gate:** a master reviewer judges every finding on
   its merits. A real defect flagged by only ONE reviewer is still fixed — agreement
   shows as a `⋆consensus` confidence marker, never a filter. Only clear false
@@ -319,6 +346,97 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   on — never the PR's code, which the panel reads as a diff and never checks out. A
   seat pointed there can quote a different branch as the code under review. The
   members need no working directory at all; they need a reproducible one.
+- **The seats can read the PR's code, per repo, on by default** (#113). Each seat that
+  can take it runs in a checkout of the PR **at its head**, fetched from GitHub's
+  tarball endpoint — never from `cfg["path"]`, which is the main checkout on whatever
+  branch it was last left on and is the failure #75 measured. Why it is on: the
+  blindness was expensive and it did not merely lose findings, it manufactured wrong
+  ones. On PR #160's round 1, nine of nineteen veto lines were seats declaring they
+  could not read a file this repo answers — all nine closed with `grep` in four
+  minutes. On #64 the proposed fix *was* the bug; on #90 a P1 inferred a missing
+  `--json` field from its absence in the diff when it was already there; on #123 no
+  seat could see `migrations/versions/`, the tool's entire subject.
+  - **Only a seat that can express "read but do not execute" gets it**, which is
+    `SEAT_READS_CODE` and today means **claude alone**. #92 answered "may reviewers
+    execute?" with no. Verified by running each CLI: claude names a tool set
+    (`--allowedTools Read Grep Glob`, no `Bash`) and enforces a working-directory
+    boundary of its own; codex's `-c` knobs only REMOVE tools and its single read path
+    is the shell, so granting reads grants execution and re-opens the tool-hunt that
+    once spent 99% of a run; pi's `--no-tools` is all-or-nothing over read/bash/edit/
+    write; antigravity has no tool mechanism at all. A seat that cannot read keeps its
+    empty sandbox — standing in a checkout it cannot open buys the instruction-file
+    channel for nothing.
+  - **Vendor convention files are stripped before any CLI starts** — `CLAUDE.md`,
+    `AGENTS.md`, `GEMINI.md`, `.claude/`, `.codex/` and the rest of
+    `CONVENTION_FILES`/`CONVENTION_DIRS`, at every depth, because a nested one is
+    read too. This is a **denylist and it will rot**; that is an accepted cost where
+    the contributors are your own agents and exactly why `false` is right where they
+    are strangers. Symlinks are unlinked, never followed: a `.claude ->` pointing out
+    of the tree would otherwise send `rmtree` at the real one. What was removed is
+    named in `config_notes` and in the payload, so a PR that shipped one is
+    distinguishable from a PR that did not.
+  - **Recorded per seat**, which is what makes the measurement possible:
+    `reviewers.<name>.code_blind` and a `code_access` block holding the setting, the
+    seats that actually got it, and the files stripped. A seat that can read the tree
+    while another cannot is a bigger confound than an unpinned model.
+  - **Every failure degrades to the OFF posture, loudly.** A fetch that 502s, a
+    tarball that will not unpack or has an unexpected shape, a copy that runs out of
+    disk: the seat is blind, recorded as blind, and the round says why in
+    `config_notes`. A review that would have happened always happens.
+  - **A transient fetch failure is retried, a settled one is not.** Measured: five
+    hand-run fetches of one sha during development returned two 502s and a 503 —
+    GitHub packs a repository on demand for this endpoint and it is markedly flakier
+    than the JSON API the rest of the panel uses. That matters more than the rate
+    suggests, because the degrade is silent in *effect*: one note among several, and
+    an ordinary-looking report. A feature that quietly stops applying a third of the
+    time is worse than one that is off, because the config still says it is on. A 404
+    is not retried — it is a settled answer about that sha (a fork PR, most likely),
+    and `run_cli` already draws that line for reviewer CLIs.
+  - **A per-repo spend cap, defaulting to uncapped** —
+    `review_panel.reviewer_code_budget_usd` passes `--max-budget-usd` to the seat that
+    got the tree. Uncapped by default because a number invented here would silently
+    degrade reviews on repos that never asked for one, and because reaching the cap is
+    not a cheaper review: the seat is lost, records a skip, and the skip vetoes the
+    round's confident stop. Reaching it needs a guard nothing about the flag suggests —
+    `claude` exits 1, writes its message to **stdout**, and leaves **stderr empty**, so
+    `run_cli`'s stderr-based reason and stderr-based retry decision would give a bare
+    "exited 1" and then repeat the attempt three times, re-burning a cap already spent.
+  - **What it costs, measured** (one seat, sonnet, PR #214's own 75,628-char diff,
+    run twice with only this feature differing): wall clock **922s vs 372s** (2.5×),
+    input tokens **7,879,643 vs 159,520** (49×, though 97% of the larger figure was
+    cached so the billed multiple is well below that), output 71,674 vs 36,364.
+    Against that: `could_not_assess` went **4 → 0**, and the blind run filed a FALSE
+    finding the sighted one did not — it saw a diff line mentioning `argv_capped`,
+    could not tell which function it belonged to, guessed `accounts()`, and concluded
+    the name was undefined. That is #90's failure mode reproduced unprompted.
+    The cost lands per seat per round, and `/panel-review-pr` fans out up to four
+    concurrent panels, so this seat is also the critical path. `claude` documents
+    `--max-budget-usd`, which works with `--print`; bounding the hunting with it is
+    the obvious follow-up and is deliberately not in this change.
+  - **The judge gets the tree too, on the same terms.** It is a `claude` seat, so it
+    takes the same stripped checkout, the same `Read Grep Glob` pin and the same spend
+    cap — and it is the party best placed to use them, because the wrong findings #113
+    was filed over were **confirmed**, not merely raised. On #90 a reviewer inferred a
+    missing `--json` field from its absence in the diff and a judge with the same
+    blindness had no way to check; on #64 three of six confirmed P2s were conditionals
+    from a reviewer that had *declared* it could not assess the condition. Dismissing
+    false positives is the judge's stated job and it cannot do it from the same diff
+    that produced them. One ordering trap, pinned by a test: the tree's cleanup must
+    run **after** `adjudicate`, or the judge gets a path to a deleted directory,
+    degrades to an empty sandbox, and reviews blind with the setting still reading
+    true — the silent failure that the degrade path's own correctness makes possible.
+  - **The board stores it, rather than dropping it at ingest.** `absent`,
+    `code_blind` and `argv_capped` per reviewer, plus `code_access` and
+    `convention_files_removed` per run (migration `0024`), read back out of
+    `GET /review/{id}` as well as written. `absent` had been sent since v2.32 and
+    silently discarded, because `ReviewerIn` inherits pydantic's `extra="ignore"` —
+    the same drop v2.26 records for `head_sha` and `unread_files` (#93). `code_blind`
+    is the one that matters most for anything ranking reviewers: a seat that could
+    open the caller and one that could not are not comparable on findings or on
+    `could_not_assess`, and a leaderboard averaging them measures two different jobs.
+    All columns nullable with no backfill — NULL is "the panel did not say", which is
+    the honest value for every round recorded before this, and inventing `false` would
+    assert coverage those rounds may not have had.
 - **A short panel says so.** The report states seats filled against seats configured
   on every run, and calls the panel degraded above the findings when they differ — a
   weaker review, not a cleaner one. A CLI the host does not carry is exempt (it is a
@@ -341,6 +459,47 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   confident stop: it is absent every round, so it says nothing about the round —
   otherwise a repo listing a workstation-only vendor would buy every unattended
   run on a headless box a standing veto. Every other way of not running does veto.
+- **An absent seat gets no diff budget either, and that is the same rule reaching
+  the other four places it was missing.** The exemption above was applied to the
+  veto and to nothing else, while `budgets` was still built from the *configured*
+  set — so a seat with no CLI on the box acquired a budget, an argv clamp, a
+  `config_notes` line saying it "gets 116,287 of 177,872 diff chars", and a
+  `truncated: true` record. Four statements about a reviewer that was never going
+  to read a byte, and the last one was not cosmetic: `diff_truncated` went true on
+  rounds where nothing that *ran* was cut, `load_baseline` banked the round as
+  truncated, and the next round inherited *"whatever that round was cut off from
+  has now been read by no round of this cycle"* — a `confident` veto, so every
+  multi-round cycle on such a box was non-confident from round 2 onward,
+  permanently. `budgets` is now filtered by `seat_installed` (in `panel_core`,
+  beside `CLI_BIN`, read once per round and shared with `run_seat` and with the
+  judge's own `adjudicate`, so no two of them can come to disagree about which
+  seats exist), which closes all four at once. The seat is still **dispatched**
+  and still records itself absent — that record is what the exemption above reads
+  — but it is no longer handed a rendered prompt either, since a seat with no
+  budget would otherwise be given the whole diff to throw away. Its
+  `max_diff_chars` is `null` and its `truncated` is `false`, which is the pairing
+  that broke; that guarantees a null budget can never sit beside `truncated: true`
+  and nothing stronger, because an *installed* seat with no configured budget
+  records the same pair. `absent` is the field that tells them apart.
+  In the payload the seat keeps its `diff_budgets` key with a `null` value rather
+  than vanishing, so a consumer reading `diff_budgets[name]` for a configured seat
+  does not begin raising `KeyError` on exactly the boxes this is for.
+  `load_baseline` banks a round as truncated on `truncated and not argv_capped and
+  not absent` — both exemptions, each keyed on its own recorded field — because
+  baselines written before either release still carry the old pairings. Its sibling
+  `truncated_any`, which decides whether a round may **close** every earlier round's
+  gap, exempts `absent` and deliberately **not** `argv_capped`: a capped seat ran and
+  saw a prefix, so the round did not read its target whole and cannot be the one that
+  clears an older gap, while an absent seat read nothing and is no evidence either
+  way. It also requires positive evidence that a seat actually RAN, so a round in
+  which every seat was absent — or present and crashed — cannot erase a gap banked
+  by a round whose seats worked. The two do
+  not subsume each other: `argv_capped` covers only what the kernel bounded, so an
+  absent `pi` or `codex` with a configured budget smaller than the target would
+  still bank a phantom round under the argv exemption alone. And not
+  `ran and truncated`: `ran` is false for *every* way of not running, so that would
+  also drop the truncation of a seat that was installed, read a real prefix and then
+  crashed — a genuine coverage gap, and the fail-open direction.
 - **A constant never vetoes, and three of them used to** (#113). The rule
   generalises the absent-CLI exemption above: an observation that is true of every
   round cannot tell a quiet round from a broken one, and because `confident` is
@@ -454,6 +613,288 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   and then panels the fix commit, 2 rounds by default (`--rounds N`), so the fixer's
   own work is read by somebody. `panel.py` itself stays read-only either way: the
   fix/verify/commit lives in the skill, and so does the loop.
+
+### The pre-flight verdict — whether a round is worth running
+
+A panel was launched on PR #137 and killed five minutes in by a human asking *"is this a
+crazy token count?"*. It was. The more important half is that **the output would have been
+worth less than nothing**, and nothing in the harness knew that.
+
+That PR's diff was **763,375 chars — 6.4× `agy`'s 120,000-byte argv ceiling — on a change
+that was a pure move**: `panel.py` split into six modules with nothing retyped. Every
+relocated line appears *twice*, once as a delete and once as an add, so the overwhelming
+bulk of that 763 KB is code nobody changed. A seat spends its whole budget re-reading
+relocated text, and whatever it reports is a finding about code that was already in the
+base branch and already reviewed when it landed there.
+
+**The token cost is the second problem. The first is that a truncated read which produces
+findings is worse than no review,** because the next step of the cycle briefs a fixer to
+resolve every one of them to a "nothing left to improve" bar.
+
+Every piece needed to catch this already existed and none was wired to the decision: the
+truncation report (above) fires *after* the round, the argv ceiling is documented as a
+permanent property of the harness and gates nothing, and increment scope makes only *later*
+rounds cheaper. So the panel now rules before it dispatches, and the ruling is its own
+rather than the caller's.
+
+**Three verdicts.**
+
+| verdict | when | what happens |
+|---|---|---|
+| `run` | the diff fits every seat's ceiling; or no seat declares one; or it is over but under the refusal multiple | exactly what every release before this one did, truncation report included |
+| `manifest` | over a ceiling **and** move-shaped **and** a manifest of it is smaller than *both* the diff and the ceiling | the seats are handed a *manifest* instead of the diff |
+| `refuse` | over a ceiling by `refuse_over_cap_multiple` with no smaller honest question to ask — not move-shaped, or move-shaped with no manifest to substitute | nobody is dispatched; the refusal is printed, recorded, and posted under `--post` |
+
+A move-shaped diff over a ceiling therefore has three outcomes, not one. It gets the manifest
+whenever there IS one to substitute; when there is not — `manifest_moves` is off, or the
+manifest came out no smaller than the diff, or smaller than the diff and still over the
+ceiling — the refusal multiple decides as it does for content, and *below* the multiple the
+round runs as an ordinary truncated content review. That last case is the one that must not be
+silent, and it is not: the `run` verdict then carries a `reason` naming the manifest path, what
+it measured, and why the substitution did not happen. An empty `reason` on a `run` means
+"nothing objected", and only that.
+
+**Every ceiling carries its unit, and the one that binds is chosen by ratio rather than by
+number.** A configured `max_diff_chars` is characters; the kernel's argv limit is *bytes*, and
+the two differ by the diff's non-ASCII density — this repo's own diffs are full of em-dashes
+and arrows. Those are not two sizes of the same thing, so `min()` across them had no defined
+answer: a repo setting `antigravity.max_diff_chars: 100_000` hid the 120,000-**byte** argv
+ceiling behind the smaller integer, and at two bytes per character that seat's real ceiling is
+~60,000 characters — tighter than the one that won. So `agy` with a configured cap declares
+**two** ceilings, each is measured against the diff in its own unit, and the tightest *ratio*
+decides. `preflight.shape` carries `chars` and `bytes` both and `preflight.cap_unit` names
+which of them `cap` and `over_cap` are in, so the multiple can be checked by hand rather than
+assumed — and every renderer of the verdict (the refusal notice, the manifest banner, the
+`--force` banner, each seat's skip reason) states the unit it measured in.
+
+**The judge's `judge_max_diff_chars` is deliberately not one of the ceilings.** This verdict
+decides whether to dispatch the *seats* and what to hand them; that key says what adjudication
+is worth, not whether a round is readable, and counting it would let it refuse a round every
+reviewer could read whole. The judge is not left out in the cold: a manifest substitution
+replaces the round's *material*, so the judge composes the manifest too, and a judge cut by its
+own budget is reported as truncation exactly as a seat is. (`diff_budgets` in the payload does
+include `judge` — that is the budget record, not the ceiling list.)
+
+**A seat whose CLI this box does not carry declares no ceiling here.** That is the same
+host-versus-round distinction the coverage veto makes for an absent seat, and it matters most
+where it is least visible: `agy` is a workstation package, so on a headless box this repo's own
+rules enable a seat that records "antigravity: CLI absent" and never runs. Counting its argv
+ceiling would refuse rounds on behalf of a reviewer that was never going to read anything, on
+exactly the unattended hosts where nobody is watching to pass `--force`, while the seats that
+did run were reading off stdin with no cap at all. A box carrying no seat at all therefore has
+no ceiling and refuses nothing — the round runs and `coverage_veto` says "no reviewer ran",
+which is the existing and correct answer.
+
+**Both questions are asked of the review target, not of the PR.** Under `pr` scope those are
+the same string, so round 1 — always whole-PR, and the case #137 was — is unaffected either
+way. Under increment scope they are not: the target is the fix commit and the PR is
+everything, so weighing the PR would refuse (or hand a manifest to) a round whose actual
+material is a 3 KB increment, because of a size that round was never going to send. A round 2
+fix commit is neither large nor move-shaped just because the PR it lands in is.
+
+**The shape is measured, not guessed.** A rename, a split or a relocation all look the same
+mechanically: the added lines are a near-permutation of the deleted ones. The panel takes
+the multiset intersection of the `+` and `-` bodies and divides by the larger side — no
+`git diff -M`, because rename detection is a property of the git invocation and the panel's
+diff comes from `gh pr diff` over the API, having never checked the PR out. Blank lines are
+excluded from both sides (a blank matches every other blank), and only lines *inside a hunk*
+are counted, because `--- a/x` and `+++ b/x` begin with the same characters a content line
+can.
+
+**A move is reviewed as a manifest, because for a move the mechanical evidence is the only
+evidence that bears.** The manifest is:
+
+- **what moved where** — each file's `+`/`-` tally, and whether it only gained or only lost
+- **what did not survive** — lines deleted and not re-added anywhere. A dropped guard
+  clause, `except` arm or decorator is invisible in a content review of the destination
+- **what changed besides moving** — lines added and not deleted anywhere. This is the only
+  genuinely new code in the change, and the one place a content review belongs
+- **definitions the change adds in more than one place**, with the files each copy landed in —
+  half of the duplicate-copy trap: a merge that keeps both copies of a moved function is a
+  clean merge, a green test run and a silent bug, because the later binding wins and the dead
+  one is what anybody reading the old file finds. Only *half*, and the manifest says which
+  half. What is detectable from a diff is a definition **added** in two or more places. The
+  more common accident — the original left exactly where it was, in a file the merge never
+  touched, while a copy arrives somewhere new — puts no `+` and no `-` line in the diff for
+  that original: it is not in the diff, it is in the base branch, and nothing recovers it from
+  `gh pr diff`. Detecting it needs the PR checked out, which the panel never has, so the claim
+  was narrowed to what is checked rather than the check widened to a promise it cannot keep.
+  The spellings covered are Python `def`/`class` and the JS/TS `function`, brace-class,
+  `const`/`let`/`var`-bound-arrow (generic and function-typed forms included), `const enum`
+  and `interface`/`type`/`enum` forms. What is *not* covered is named too, and named
+  **whether or not the section found anything** — class and object *methods*, wrapped
+  signatures and every other language, so a section that found one duplicate cannot read as
+  having found them all. So are the ordinary reasons a name is defined twice on purpose
+  (`@typing.overload` chains, `if TYPE_CHECKING:`/`else:` pairs, platform-conditional
+  definitions), because a reviewer who is not told about them stops believing the section on
+  its first false positive
+- **what is not here** — test counts before and after, whether a module now reaches backward
+  into another, and the unseeable half of the duplicate trap above. All three need the branch
+  checked out. They are *named as unmeasured* rather than claimed, and the brief tells the
+  reviewer to declare them
+
+Its size is a function of the change's **shape**, not of the diff's length: the 428 KB
+worked example in the test suite produces a 1.3 KB manifest. It travels as the round's
+review material, so the per-seat budgets, the truncation measurement, the judge and the
+board record all keep working unchanged — and all measure the manifest, which is the thing
+that was actually sent.
+
+The material it replaces is a whole-target composition (there are no context tiers in a
+manifest), so a *scoped* round whose increment is itself move-shaped keeps `scope:
+"increment"` and its `since_sha` regardless: what the round **targeted** and the shape of the
+material it composed are two different facts, and the inherited coverage vetoes are gated on
+the first. Read `preflight.verdict` beside `scope` to know whether a round read its target or
+a description of it.
+
+> **A manifest round's findings answer a different question.** The report says so above the
+> findings, because "no correctness findings" would otherwise read as "the moved code is
+> correct". Nobody read the moved code.
+
+It also **vetoes a confident stop**, mechanically. That is the least trustworthy quiet the
+panel produces and the one nothing else catches: every other coverage veto keys off a seat
+being short of what it was *sent*, and a manifest round's seats got the whole manifest, so
+`truncated` is false for all of them. Without the veto a cycle could stop `confident: true`
+having had nobody read a line of the moved code. The brief does ask each seat to declare the
+facts a manifest cannot carry, and a seat that does adds its own `could_not_assess` veto — but
+"was the moved code read" is something the panel *knows* from the material it composed, and
+what can be measured is never left to a model to volunteer. A **forced** round needs no such
+veto: its seats are cut by the ceiling that caused the refusal, so the ordinary truncation
+veto already says so with the numbers.
+
+**And the gap it leaves is inherited.** A manifest round is recorded on the baseline
+(`Baseline.manifest_rounds`), for two reasons. It must not count as having **re-read the PR**:
+it records `scope: "pr"` — the manifest travels as the round's material — with nothing
+truncated, because the manifest fitted, so it satisfied every term of that test while having
+read no code at all, and one such entry erases *every* earlier round's truncation and unread
+record. And under increment scope the next round's anchor steps over the code it did not read,
+so a later scoped round carries its own veto naming it. A round that genuinely re-reads the
+whole PR clears it, on the same terms as the other two — the veto must not become permanent. A
+payload written before `preflight` existed is not a manifest round: the field's absence is
+evidence about the writer, not about the round.
+
+**This is not a diff budget, and that distinction is the whole design.** v2.16 refused a
+default budget on evidence — truncating when nothing forces it biases toward false
+positives — and that reasoning is untouched. A budget answers *what to send*; this answers
+*whether to start*, and only ever against a ceiling that already exists. **On a repo with
+`max_diff_chars` unset and no argv-bound seat enabled there is no ceiling, so none of this
+ever fires** and no number it invented reaches anyone's diff.
+
+**Nor is it a silent skip.** A panel that quietly declines is a merge gate trusting a proxy.
+A refusal:
+
+- prints a notice headed **"Panel REFUSED — no review happened"**, stating in the first
+  sentence that this is not a clean review, followed by the measurement and the remedies
+- carries `reviewed: false`, a `skip_reason` and the full `preflight` block in `--json` and
+  `--json-file`
+- **is recorded on the board**, unlike the title-pattern skip — and that difference is
+  deliberate. A title skip says *this PR was never worth a panel*; a refusal says *a panel
+  was wanted and this diff defeated it*, which is the observation worth accumulating
+- carries a `reviewers` block marking every selected seat `ran: false`, and the matching
+  `skipped` entries. Not optional: the board builds a scorecard row for each name in
+  `reviewers_selected` and, absent a `reviewers` block, assumes a member ran unless `skipped`
+  names it — deliberately, so a quiet reviewer is not filed as broken. Sending the selection
+  and nothing else would file a refusal as a clean review *per reviewer*, in the table that
+  answers "which reviewer finds the real issues"
+- **reads the CI gate anyway, and says so under the notice.** CI is size-independent, costs one
+  `gh pr checks`, and consumes no seat's budget — it is the one part of a round a 763 KB diff
+  cannot make useless, and a refusal that lost it left `/panel-review-pr` told to stop the cycle
+  with nothing said about a red build. `ci_status`/`ci_failing` are recorded, and both
+  `/panel-review-pr` and `/panel` are told to relay them with the refusal — the capability is
+  worth nothing if the consumer it was added for is not asked to read it. **Sonar is not
+  read**: it is a panel *member*, with a `ran: false` row like every other seat, and dispatching
+  one while telling the board none ran would be the inconsistency this path exists to avoid — so
+  the notice states that gate was **not evaluated**, rather than letting its default read as a
+  pass
+- **records what it was going to review** — `scope` and `since_sha`, the same way the ordinary
+  payload does. A refusal under `--scope increment --since <sha>` otherwise publishes the field
+  defaults, and nothing then distinguishes it from a refused whole-PR round
+- is posted to the PR under `--post`. The terminal copy is read by whoever is watching, and
+  under the epic driver nobody is
+
+**`--force` overrides both the refusal and the manifest** and reviews the diff as content.
+The verdict it overrode is *not* erased: `preflight.forced` and `preflight.would_have`
+record it, a `config_notes` line says so, and the report carries a warning above the
+findings. An override is a decision, and it must not look like the tool having decided to
+run.
+
+Two guards worth knowing, because both are cases that read plausibly when wrong:
+
+- **A manifest is only substituted when it is smaller than the diff *and* under the ceiling.**
+  Its body scales with the change's shape but its brief and section headers are a fixed
+  ~1.3 KB, so on a small move over a small ceiling the substitution would hand a seat *more*
+  text than the diff did and then have it truncated. Testing it against the diff alone was not
+  enough: 200 table rows plus 240 quoted residue lines is ~35 KB of manifest, which is smaller
+  than a 763 KB diff and still over a low-thousands `max_diff_chars` — a seat reading a
+  *prefix of a manifest*, reported as a clean `manifest` verdict beside
+  `diff_truncated: true`. Both are measured, not assumed; when the manifest does not fit,
+  the round falls through to the refusal above the multiple and to an ordinary truncated
+  content review below it, and either way the `reason` says the manifest was tried and why it
+  did not help.
+- **A tightly configured `max_diff_chars` can now trigger a refusal.** `max_diff_chars: 30`
+  on a 1,559-char diff is 52× over. That is the intended reading — a seat handed 2% of a PR
+  produces exactly the review this feature exists to prevent — but it is a behaviour change
+  for a repo that set a small budget on purpose. `refuse_over_cap_multiple: 0` switches the
+  refusal off and keeps the manifest.
+
+### A finding no round can close (`--escalated`)
+
+`--escalated <key>` (repeatable) tells a round that a finding's fixer reported the
+**approach** wrong rather than the code and wrote no patch — `review-pr.md` step
+3a. The key stops counting as work a fix round can clear.
+
+It exists because the two rules around it are individually right and were jointly
+a trap. An escalated finding is outstanding, and `panel-review-pr.md` §5 forbids
+ever handing it to another fixer — so `round_stop` returned `stop: false` every
+round until the cap, and the mechanism meant to stop a cycle circling a premise
+guaranteed it ran to the cap instead (#221).
+
+**The rule, its exact scope and its two caveats live in one place: `round_stop`'s
+docstring in `panel_rounds.py`.** What a caller has to DO about it lives in
+`panel-review-pr.md`. Neither is paraphrased here — this rationale was restated
+five ways once, and two of the copies had already drifted into saying something
+untrue by the time anyone read them together. What is worth recording here is only
+what the flag touches outside that function:
+
+- **The mixed case is why this is a filter and not "stop on any escalation".** One
+  escalation beside a live P2 still goes again, for the P2; the cycle stops when
+  the fixable work is gone rather than when the counter runs out. Stopping the
+  whole cycle on any escalation would throw away the re-review of fixes made in
+  the same pass — the round that, on PR #212, found 16 defects the previous fix
+  introduced.
+- **What it writes.** The payload carries `escalated: {key: round}` — the cycle's
+  whole register, which later rounds read out of `--baseline` and which only ever
+  grows — and `round_stop.escalated_outstanding`, the sorted subset of it that
+  THIS round raised. The two are deliberately different questions: "what is this
+  cycle holding" and "what stopped round 3". `escalated_outstanding` is the one
+  that earned the veto line, so it is the one a consumer usually wants. Every
+  finding in `to_fix`, `sonar_findings` and `dismissed` also carries
+  `escalated: true|false`, and the report marks it ⛔ in the two lists a fixer's
+  brief can be built from.
+- **It needs a cycle to mean anything, and is refused without one.**
+  `--escalated` names work a LATER round must not count, and it is read out of a
+  fix pass that followed a review round — so the flag without `--round`,
+  `--max-rounds` or `--baseline` exits non-zero saying so. The two alternatives
+  were dropping the declaration silently and inventing a cycle to hold it, and the
+  second one printed "round 1 of at most 2 — go again" for a re-review nobody
+  would run.
+- **A key naming nothing is reported** in `config_notes` rather than ignored, and
+  a value that is not a finding key (8-64 hex characters) is rejected before it
+  reaches the register or a PR comment — including the empty string, which is the
+  likeliest one to arrive (`--escalated "$KEY"` with the variable unset). The
+  alternative failure is silent: the loop simply carries on counting a finding the
+  caller believes it excluded. Keys are lower-cased and stripped first, because
+  this value is transcribed out of a fixer's prose by hand, and repeated flags are
+  deduplicated, so re-passing an inherited key really is harmless. A key naming a
+  finding this round's master DISMISSED is reported too: that is not work either
+  way, so the declaration changes nothing. A round the panel SKIPPED adds no key —
+  it reviewed nothing — but carries the inherited register forward and names the
+  key it dropped.
+- **An escalated SonarCloud gate issue does not make the gate green.** A premise
+  answer is not a fix, and the gate is an external merge blocker, so a stop whose
+  only remaining work is an escalated gate issue names the failing gate in both
+  `reason` and `veto` instead of reporting "nothing left that a fix round can
+  clear" on its own. (`preland.py` HOLDs on that gate independently; this is the
+  panel saying it in its own verdict.)
 
 ### The premise check (`--ask`)
 
@@ -587,6 +1028,8 @@ Run-level fields worth knowing about because their meaning is conditional:
 | `scope` | `pr` \| `increment` — what this round actually reviewed. Recorded rather than inferred from the round number, because scope falls back to `pr` whenever the anchor is missing or the range is unusable, so "round 2" does not imply "increment" |
 | `since_sha` | the anchor the increment was taken from; null under `pr` scope |
 | `diff_chars` | the size of the **review target** — the whole PR under `pr` scope, the increment under `increment`. Read `scope` beside it: plotting this across a cycle's rounds without doing so shows a cliff at round 2 and reads as a shrinking PR |
+| `preflight` | the verdict the round was weighed against before it ran, on every exit that reached it: `verdict` (`run`/`manifest`/`refuse`), `reason`, `cap`/`cap_seat`/`cap_unit`/`over_cap`, `forced`/`would_have`, the `thresholds` in force, and `shape` (`chars`, `bytes`, `added`, `removed`, `moved`, `move_ratio`, `files`, plus `files_added_only`/`files_removed_only` — the one-sided file lists, capped at 40 paths each with a `_elided` count beside them, because this block rides in every board record and a 700-file refactor wrote 700 paths into each one). `cap_unit` is `chars` or `bytes` and says which reading of `shape` the `cap` and the `over_cap` beside it are in — a ratio a consumer cannot attribute to one of the two readings cannot be checked at all. `over_cap` is null when and only when no ceiling was declared: a measured ratio is emitted even where it rounds to 0.0, so "small against a real ceiling" and "no ceiling" stay different answers. **`null` means the run never reached the verdict** — the title-pattern skip returns before it — which is a different statement from a `run` verdict, and the difference is what answers "was this PR ever weighed?" |
+| `preflight.shape` | measured on the **review target**, so it is scope-dependent exactly as `diff_chars` is: the whole PR under `pr` scope, the increment under `increment`. Read `scope` beside it. Under a `manifest` verdict it is also the only place the target's *pre-substitution* size appears, because `diff_chars` then measures the manifest — which is what was reviewed |
 | `context_chars` | everything prepared *alongside* the target; 0 under `pr` scope. With `diff_chars` this is what an uncapped reviewer was given. Neither is a per-reviewer number — budgets are, so a seat that got less says so in `reviewers.<name>.max_diff_chars` and `.truncated`, and a seat that got the whole target and only part of the context is named in `config_notes` |
 
 Each finding record:

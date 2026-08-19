@@ -35,6 +35,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
 import panel_core  # noqa: E402  — `sh` is defined here since #129
@@ -310,7 +312,7 @@ def _stub_panel(monkeypatch, findings=None, cfg=TWO_SEAT_CFG, runs=None):
     monkeypatch.setattr(panel, "review_llm", review)
 
 
-def _confirm_everything(clusters, diff, model, pr, budget=None, coverage=None, ci=""):
+def _confirm_everything(clusters, diff, model, pr, budget=None, coverage=None, ci="", **_kw):  # **_kw: code_tree/budget_usd since #113
     flat = [f for grp in clusters for f in grp]
     return ([panel.Canonical(id=panel._finding_id(pr, i + 1), severity=f.severity,
                              file=f.file, line=f.line, synthesis=f.title,

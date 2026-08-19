@@ -20,6 +20,19 @@ This is the hybrid path: the guardrails of a guided integration merge (lexray's 
    (a slow reviewer outlives the 10-minute foreground Bash cap, which would kill the panel) — and run
    `/review-pr <pr>` to address findings. Repeat review→fix until the panel's **To fix** list is
    empty and CI is green.
+
+   **An escalated finding stops this loop; it does not go round again.** `/review-pr`'s brief lets a
+   fixer report that a finding says the *approach* is wrong rather than the code (`/review-pr`'s
+   step 3a) instead of patching it. Such a finding never leaves the **To fix** list, so "repeat
+   until empty" would either spin or — worse — hand it to a fresh fixer who writes the patch the
+   last one declined to write, which is #67's whole observation about where a fix round's findings
+   come from. This loop has no human in it to ask, so: post the escalation as a PR comment (the
+   premise, what it explains, what removing it would cost, the `--ask` verdict if there was one), do
+   **not** merge, and stop for a human. A redesign is never this loop's call — that is the one
+   judgement it exists not to make on its own, and it sits beside the confidence gate in step 5
+   rather than inside it, because preland cannot see it either: the escalation reaches preland only
+   as an unresolved confirmed finding, and a HOLD saying "1 finding unresolved" is not the same
+   sentence as "the approach is in question".
 4. **Pre-land gate (mechanical).** Work in the PR branch's checkout and ask for the verdict.
    Do not re-derive it:
    ```bash

@@ -88,6 +88,28 @@ Each reviewer also declares what it could *not* assess, and the panel records wh
 saw only a prefix of the diff. A finding count reports "clean" and "I could not tell" as the
 same zero; those two columns are what tell them apart, on the PR comment and on the board.
 
+Before any of that, the panel **rules on whether the round is worth running**. It used to
+dispatch every configured seat at full effort whatever the diff, and on PR #137 that meant
+four seats against 763,375 chars — 6.4× the argv ceiling of the one seat whose prompt travels
+in argv — on a change that was a *pure move*, `panel.py` split into six modules with nothing
+retyped. Every relocated line appears twice in a diff, so the bulk of that was code nobody
+changed, and a finding about it is a finding about the base branch. The token cost was the
+second problem; the first is that a truncated read which produces findings is worse than no
+review, because the next step briefs a fixer to resolve every one of them.
+
+So the panel now measures the diff's **shape** as well as its size — a move is mechanically
+identifiable, because its added lines are a near-permutation of its deleted ones — and does
+one of three things. A diff that fits runs as it always did. A move-shaped diff that does not
+fit is reviewed as a **manifest**: what moved where, what did *not* survive, what changed
+besides moving, and which definitions the change *adds* in more than one place. A diff far over
+every seat's ceiling with no smaller honest question to ask is **refused**, loudly — printed,
+recorded on the board, and posted to the PR under `--post`, because "no review" must never read
+as "clean". A refused round still reads the CI gate, which is size-independent and costs one API
+call, and says that the Sonar gate was not evaluated rather than leaving its default to read as a
+pass. `--force` overrides it on the record. None of it fires on a repo that declared no
+ceiling: this decides *whether to start*, never *what to send*, and the deliberate absence of
+a default diff budget stands. `loops/README.md` has the whole rule.
+
 This is the piece with the tightest board coupling, and the reason the two halves ship
 together. A panel run is a controlled comparison — one diff, several models, one judge —
 and it used to evaporate when the process exited. Each run now records itself
@@ -109,6 +131,38 @@ refutation is the one that pays, and it is already being written into the PR com
 where it stops being prose nothing can count. Do not mark your own findings refuted unattended:
 the board records who set it (from your token) and who you SAY signed it off — `attested_by` is a
 claim you are making, not a signature the board checked — and `/panel` shows the split.
+
+The fixer has one more permitted outcome than "fixed" and "false positive", and it exists
+because of what the other two cost. A fix that patches a wrong assumption produces the next
+round's findings; a fix that removes the assumption does not — PR #61 spent two rounds and two
+fixes on one unexamined premise, and PR #88 had a fixer circle its own previous fix inside a
+single commit. So `review-pr.md`'s brief (step 3a) lets a fixer report that a finding says the
+**approach** is wrong rather than the code, and write no patch for it: stated, with the premise
+in one sentence and what removing it would cost, rather than answered with a special case. It is
+narrow on purpose — three conditions that must all hold — and it never authorises a redesign,
+because the output is "stop and ask" and the evidence behind it is still two PRs (#67). The
+premise can be put to the seats first with `panel.py --ask`, which is exactly the shape of
+question that path exists for. An escalated finding is recorded as `deferred` by the
+orchestrator, which relays it, opens an issue that **asks** the premise, and names that issue in
+`deferred_to`. `harness/tests/test_fixer_escalation.py` guards the wiring rather than the
+judgement: that the permission and its report ship together, that the cross-file references to
+step 3a resolve, and that `deferred` is a value the database accepts.
+
+The loop knows about it, which took a second change (#221). An escalated finding is outstanding
+and no fixer may touch it, so under the original stopping rule it earned another round every time
+until the cap ran out — the mechanism built to stop a cycle circling a premise guaranteed it ran
+to the cap. `panel.py --escalated <key>` subtracts the key from the work a fix round can clear,
+so the cycle goes again for everything else and stops as soon as only escalations remain. The
+rule and the exact scope of what it guarantees are kept in `round_stop`'s docstring
+(`harness/loops/panel_rounds.py`), and what a caller must do about it in
+`harness/commands/panel-review-pr.md`; they are not restated here.
+
+What is NOT here is measuring recurrence — asking mechanically whether a round is circling the
+last round's fix — which is #67's other half and needs the provenance work in #48. Nor is
+premise identity: the register holds a finding KEY, and a fresh panel that re-words the same
+premise mints a new one, so the caller re-escalates it. Until those exist, an escalation is a
+caller's declaration read out of a fixer's own report: the loop takes it on trust, records the
+round it was first made in so it can be audited afterwards, and keeps the cap as the backstop.
 
 The same rule shapes how a run's **cost** is measured. Each member is timed, and each one that
 can be is also asked what it spent in tokens — but never by switching its CLI to a JSON output
@@ -550,20 +604,61 @@ Adding another verb is three things: an entry in `BINDINGS`, an `action_*` metho
 it wants an icon — a column, since a click carries the column it landed in and that is how
 one row offers more than one verb.
 
-Not wired into `qb-seats` yet. `qb-dash` is a **launcher**, not the dashboard: the dashboard
-is Python needing `rich`, `textual` and `mcp_server`, none of which a plain `python3` has, so
-a shebang would be rewritten by `patchShebangs` to an interpreter that dies on the first
-import. It hunts for one that can, the way `qb-board` does — `QB_DASH_PYTHON` names one
-outright, `QUARTERBACK_REPO` points at a checkout whose `mcp/.venv` is built. Until
-`mcp_server` is packaged, that venv is the only thing that satisfies it. Bring one
-up beside a running screen with `harness/dev/seats-extras.sh <session> <width>`, which also
-relabels the board pane — that script hardcodes local checkout paths behind
-`QB_MCP_CHECKOUT` and is developer scaffolding, not something to ship.
+`qb-seats` builds it. A screen is seats across the top, the dash down the right, and the
+tape full width along the bottom — the dash reports what is true now, the tape what just
+happened, and a screen wants both. `QB_SEATS_DASH` names the command; **set it to the
+empty string for a screen with no dash**. The default is the plain `qb-dash` rather than
+the nicer clickable `qb-dash-tui`, because the TUI crashes with `DuplicateKey` once a
+second screen exists (#209, underlying cause #208) — `QB_SEATS_DASH=qb-dash-tui` opts in,
+and it should become the default once that is fixed. Nothing falls back to the TUI on its
+own, not even when `qb-dash` is the one that is missing: with neither installed the pane
+holds a shell and a line saying which command to set, rather than the screen quietly
+being one pane short.
 
-Adding the dash also needs a wider `pane-border-format` than `qb-seats` sets: its own
-prints `board` for any pane with no seat number, so a second unlabelled pane claims that
-name. The dev script widens it to fall through to a `@qb_label` option; that belongs in
-`qb-seats` proper once this settles.
+`QB_SEATS_DASH_SIZE` is its width in columns, default 78 — what the dashboard's own table
+wants before it wraps — **and never more than a third of the window**. That ceiling is
+the interesting half: a client attaching resizes the window and rescales every pane in the
+dash's row, so the width has to be reasserted afterwards rather than at build time, and 78
+columns reasserted on a 100-column terminal leaves the two seats 19 columns and one. A
+narrow terminal therefore costs dash, not seats, and `qb-seats` says so on stderr when the
+clamp bites. This is also the first release where **a screen loses columns by default**:
+existing callers get seats a third narrower than before, and `QB_SEATS_DASH=` is how to
+have the old screen back.
+
+The width is per-screen state, read from the environment once when the screen is built and
+recorded on the pane. So `--add` and the seat bar's ✕ put the dash back to the width *that
+screen* asked for — including one set by dragging the border, which a reflow will not
+undo — rather than to whatever `QB_SEATS_DASH_SIZE` says in the shell that happened to run
+them. `--add` never *creates* a dash: a screen built with `QB_SEATS_DASH=` stays a screen
+with no dash until it is rebuilt.
+
+`qb-dash` is a **launcher**, not the dashboard: the dashboard is Python needing `rich`,
+`textual` and `mcp_server`, none of which a plain `python3` has, so a shebang would be
+rewritten by `patchShebangs` to an interpreter that dies on the first import. It hunts for
+one that can, the way `qb-board` does — `QB_DASH_PYTHON` names one outright,
+`QUARTERBACK_REPO` points at a checkout whose `mcp/.venv` is built.
+
+Prefer the INSTALLED dash over a checkout, which is why `qb-seats` resolves it that way: a
+uv-standalone python has no CA bundle, and a dash running under one reports "board
+unreachable" against a board that is up, beside a shell where the same URL works.
+
+This used to be `harness/dev/seats-extras.sh`, which stapled two unlanded worktrees
+together for a smoke test and hardcoded both paths. It is gone; the lessons it paid for —
+place the dash AFTER `select-layout` and never spread the window afterwards, reassert the
+width because attaching redistributes the row — are comments in `qb-seats` and assertions
+in `harness/tests/test_qb_seats.py`. The dev script only ever produced the right width
+because a human ran it by hand *after* attaching; the reassert is a `window-resized` hook
+precisely so that nobody has to.
+
+That hook has to name a `qb-seats` by absolute path, because a `run-shell` in a hook
+inherits the tmux *server's* PATH and the server usually predates anything that put this
+harness on one. Which copy is not obvious, and getting it wrong is silent: PATH's `qb-seats`
+is preferred everywhere else, so mid-rollout the working tree installed a hook pointing at
+an *installed* copy with no `--dash-fit` — which exits 2 into a `run-shell -b` that discards
+both streams, on every resize, saying nothing. So the copy is asked before the hook goes in:
+PATH's if it answers the flag, otherwise the one that is running, and otherwise no hook at
+all plus a line on stderr naming what it tried. A screen that does not re-fit is honest; a
+hook that fails invisibly is not.
 
 ## How it works
 
