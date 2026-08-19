@@ -61,6 +61,27 @@ from typing import Any, TextIO
 
 RULES_FILENAME = ".harness-rules"
 
+# The TRACKED half. Policy — merge gates, bases, budgets, title patterns — lives
+# here, on the protected branch, because the unattended read exists to stop a
+# poisoned PR rewriting the rules governing its own review. `.harness-rules`
+# beside it is the UNTRACKED half: one machine's answer to "which reviewer CLIs
+# does this box actually have", which is not a fact about the repo and cannot be
+# committed to it without forcing a reviewer onto every other box.
+#
+# A repo with no sample is the legacy layout and still works unchanged: its
+# tracked `.harness-rules` is read as the baseline exactly as before. See
+# `_read_rules`, and `_local_overlay` for why the overlay turns on TRACKEDNESS
+# rather than on which files happen to exist.
+SAMPLE_FILENAME = ".harness-rules.sample"
+
+# What the untracked overlay is allowed to say, and it is deliberately one thing.
+# An untracked file is reviewed by nobody — it never appears in a PR, so branch
+# protection cannot see it — which is precisely what makes it right for machine
+# capability and wrong for policy. Left unrestricted it would be a way to widen
+# `auto_merge` on a box with no review at all, and the timers would honour it.
+_LOCAL_BLOCK = "reviewers"
+_LOCAL_KEYS = ("enabled",)
+
 # Where a bare `--repo <name>` is looked up when it isn't a path.
 REPO_ROOT = Path(os.environ.get("HARNESS_REPO_ROOT") or Path.home() / "source")
 
@@ -344,25 +365,103 @@ def detect_default_branch(root: Path) -> str:
     return "main"
 
 
-def _read_rules(root: Path, default_branch: str, from_default_branch: bool) -> tuple[dict, str]:
-    """Return (rules, provenance). Missing file is not an error — it means
-    'use the defaults', which is the whole point of dropping the registry."""
-    if from_default_branch:
-        r = _git(root, "show", f"origin/{default_branch}:{RULES_FILENAME}")
-        if r.returncode != 0:
-            return {}, f"none on origin/{default_branch} (defaults)"
-        try:
-            return json.loads(r.stdout), f"origin/{default_branch}"
-        except json.JSONDecodeError as e:
-            raise SystemExit(f"{RULES_FILENAME} on origin/{default_branch} is not valid JSON: {e}")
+def _read_rules(root: Path, default_branch: str,
+                from_default_branch: bool) -> tuple[dict, str, str]:
+    """Return (rules, provenance, baseline_filename).
 
+    Missing file is not an error — it means 'use the defaults', which is the whole
+    point of dropping the registry. The third element names WHICH file supplied the
+    baseline (`SAMPLE_FILENAME`, `RULES_FILENAME`, or `""` for none), because that
+    is what decides whether an untracked `.harness-rules` is an overlay or is
+    itself the config — and sniffing it back out of the provenance string cannot
+    be done safely, since `.harness-rules.sample` contains `.harness-rules`.
+    """
+    if from_default_branch:
+        for name in (SAMPLE_FILENAME, RULES_FILENAME):
+            r = _git(root, "show", f"origin/{default_branch}:{name}")
+            if r.returncode != 0:
+                continue
+            try:
+                return json.loads(r.stdout), f"origin/{default_branch}:{name}", name
+            except json.JSONDecodeError as e:
+                raise SystemExit(f"{name} on origin/{default_branch} is not valid JSON: {e}")
+        return {}, f"none on origin/{default_branch} (defaults)", ""
+
+    for name in (SAMPLE_FILENAME, RULES_FILENAME):
+        p = root / name
+        if not p.is_file():
+            continue
+        try:
+            return json.loads(p.read_text()), str(p), name
+        except json.JSONDecodeError as e:
+            raise SystemExit(f"{p} is not valid JSON: {e}")
+    return {}, "none (defaults)", ""
+
+
+def _is_tracked(root: Path, name: str) -> bool:
+    """Is `name` committed to this repo?
+
+    The whole safety argument rests on this one question. A TRACKED
+    `.harness-rules` can arrive from any branch, including the branch of the PR
+    under review — that is the vector the unattended read was written against, so
+    a tracked file is never treated as a local override. An UNTRACKED one cannot
+    have come from a PR: git will not deliver a file it is not carrying.
+
+    Asked of git rather than inferred from whether a sample exists beside it.
+    "There is a sample, so the other file must be local" is a guess that is wrong
+    for exactly the case that matters — a repo mid-migration, with the sample
+    added and `.harness-rules` not yet untracked, would have its committed rules
+    silently demoted to an overlay and most of its policy dropped.
+    """
+    return _git(root, "ls-files", "--error-unmatch", "--", name).returncode == 0
+
+
+def _local_overlay(root: Path, baseline: str) -> tuple[dict, str, list[str]]:
+    """This machine's `.harness-rules`, narrowed to reviewer availability.
+
+    Returns `(overlay, provenance, ignored)`. `overlay` is shaped like the
+    `reviewers` block and holds nothing but `enabled` flags; `ignored` names every
+    key dropped, so a local file that tries to set policy is reported rather than
+    half-honoured. An empty overlay is the answer whenever the file is absent, or
+    is tracked (the legacy layout, where it IS the baseline `_read_rules` just
+    read).
+    """
+    # BOTH conditions, and the first is the one a plausible-looking shortcut gets
+    # wrong. Untracked alone does not mean "overlay": a repo whose only config is
+    # an uncommitted `.harness-rules` — mid-migration, a fresh clone, a test
+    # fixture — would have its whole policy demoted to a seat toggle and silently
+    # dropped. The overlay exists only where a `.sample` supplied the baseline.
+    if baseline != SAMPLE_FILENAME:
+        return {}, "", []
     p = root / RULES_FILENAME
-    if not p.is_file():
-        return {}, "none (defaults)"
+    if not p.is_file() or _is_tracked(root, RULES_FILENAME):
+        return {}, "", []
     try:
-        return json.loads(p.read_text()), str(p)
+        raw = strip_comments(json.loads(p.read_text()))
     except json.JSONDecodeError as e:
         raise SystemExit(f"{p} is not valid JSON: {e}")
+    if not isinstance(raw, dict):
+        raise SystemExit(f"{p} must hold a JSON object, not {type(raw).__name__}")
+
+    overlay: dict = {}
+    ignored: list[str] = []
+    for key, val in raw.items():
+        if key != _LOCAL_BLOCK:
+            ignored.append(key)
+            continue
+        if not isinstance(val, dict):
+            ignored.append(key)
+            continue
+        for seat, cfg in val.items():
+            if not isinstance(cfg, dict):
+                ignored.append(f"{key}.{seat}")
+                continue
+            kept = {k: v for k, v in cfg.items() if k in _LOCAL_KEYS}
+            dropped = sorted(set(cfg) - set(kept))
+            ignored.extend(f"{key}.{seat}.{k}" for k in dropped)
+            if kept:
+                overlay.setdefault(seat, {}).update(kept)
+    return overlay, str(p), sorted(ignored)
 
 
 def strip_comments(obj: Any) -> Any:
@@ -512,7 +611,7 @@ def resolve_repo(spec: str | None, *, from_default_branch: bool | None = None) -
 
     root = find_repo(spec)
     default_branch = detect_default_branch(root)
-    rules, provenance = _read_rules(root, default_branch, from_default_branch)
+    rules, provenance, baseline = _read_rules(root, default_branch, from_default_branch)
     rules = strip_comments(rules)
     # Warned about AND removed. A name only warned about survives the merge into
     # cfg["reviewers"], which makes the word "ignored" false and leaves every
@@ -536,6 +635,28 @@ def resolve_repo(spec: str | None, *, from_default_branch: bool | None = None) -
                         merged[rname] = {**rbase, **over[rname]}
             cfg[block] = merged
 
+    # The untracked, per-machine overlay, applied AFTER the baseline merge and
+    # able to touch nothing but which seats are on. A box without `agy` or `pi`
+    # says so here rather than in a committed file that would turn the seat off
+    # for every other box too — and a seat enabled in the sample but absent from
+    # this machine would otherwise veto every round's `confident` for ever, since
+    # panel.py counts a reviewer that never ran as coverage it did not get.
+    overlay, local_from, ignored = _local_overlay(root, baseline)
+    for seat, flags in overlay.items():
+        if seat not in cfg[_LOCAL_BLOCK]:
+            # A seat name the panel does not have. Reported, not applied: silently
+            # accepting `reviewers.gemini.enabled` leaves someone certain they
+            # disabled a reviewer that was never called that.
+            ignored.append(f"{_LOCAL_BLOCK}.{seat}")
+            continue
+        cfg[_LOCAL_BLOCK][seat] = {**cfg[_LOCAL_BLOCK][seat], **flags}
+    if ignored:
+        print(f"{RULES_FILENAME} ({local_from or root}): ignored "
+              f"{', '.join(sorted(set(ignored)))} — the untracked overlay may set "
+              f"only {_LOCAL_BLOCK}.<seat>.{'/'.join(_LOCAL_KEYS)}; policy comes "
+              f"from {SAMPLE_FILENAME} on the protected branch",
+              file=sys.stderr)
+
     # Detected, never declared — a rules file that sets these is ignored, since
     # the checkout in front of us is the authority on where and what it is.
     cfg["path"] = str(root)
@@ -543,7 +664,7 @@ def resolve_repo(spec: str | None, *, from_default_branch: bool | None = None) -
     cfg["default_branch"] = default_branch
     cfg["github"] = detect_github(root)
     cfg.setdefault("executor_pr_base", default_branch)
-    cfg["_rules_from"] = provenance
+    cfg["_rules_from"] = provenance + (f" + {local_from} (seats)" if overlay else "")
 
     if not cfg["github"]:
         raise SystemExit(

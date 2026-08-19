@@ -417,7 +417,13 @@ def test_unattended_honours_committed_rules(repo):
     write_rules(repo, {"loops": {"dependabot_lander": True}}, commit=True)
     cfg = hr.resolve_repo(str(repo), from_default_branch=True)
     assert cfg["loops"]["dependabot_lander"] is True
-    assert cfg["_rules_from"] == "origin/main"
+    # The branch AND the file. This used to assert `== "origin/main"`, which was
+    # enough while one filename could ever be the answer; two can now
+    # (`.harness-rules.sample` is preferred, `.harness-rules` is the legacy
+    # fallback) and `describe()` puts this string in front of a human so that
+    # which rules applied is "never a guess" — a provenance that names the branch
+    # and not the file is exactly the guess it promises not to be.
+    assert cfg["_rules_from"] == f"origin/main:{hr.RULES_FILENAME}"
 
 
 def test_a_pr_branch_cannot_escalate_itself(repo):
@@ -596,3 +602,158 @@ def test_the_epic_ceiling_is_pinned_to_what_the_old_fallback_resolved_to():
     independent keys, and it is asserted where it lives: `resolve_ceiling` in
     `harness/loops/tests/test_epic_model_ceiling.py`, which calls the wiring."""
     assert hr.DEFAULTS["epic"]["model_ceiling"] == "opus"
+
+
+# ------------------------------------------- the tracked/untracked split (#207 fleet)
+
+def write_sample(repo, obj, commit=True):
+    """The TRACKED half — policy, on the protected branch."""
+    (repo / hr.SAMPLE_FILENAME).write_text(json.dumps(obj))
+    if commit:
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "sample")
+        git(repo, "push", "-q", "origin", "main")
+
+
+def write_local(repo, obj):
+    """The UNTRACKED half — this machine's answer to which reviewer CLIs exist.
+
+    Deliberately never committed: the whole safety argument is that a file git is
+    not carrying cannot arrive from the branch of the PR under review.
+    """
+    (repo / hr.RULES_FILENAME).write_text(json.dumps(obj))
+
+
+def test_the_sample_supplies_the_baseline(repo):
+    """`.harness-rules.sample` is read where `.harness-rules` used to be."""
+    write_sample(repo, {"auto_merge": "none", "loops": {"dependabot_lander": True}})
+    for unattended in (False, True):
+        cfg = hr.resolve_repo(str(repo), from_default_branch=unattended)
+        assert cfg["auto_merge"] == "none", f"unattended={unattended}"
+        assert cfg["loops"]["dependabot_lander"] is True
+        assert hr.SAMPLE_FILENAME in cfg["_rules_from"]
+
+
+def test_a_repo_with_only_the_legacy_file_is_unchanged(repo):
+    """Every repo in the fleet on the day this shipped, and the reason the reader
+    falls back rather than switching over.
+
+    A tracked `.harness-rules` and no sample is the old layout. It has to resolve
+    exactly as before — attended and unattended — or this change is a silent
+    policy wipe across three repos rather than a migration."""
+    write_rules(repo, {"auto_merge": "none", "epic": {"sub_pr_merge": "auto"}},
+                commit=True)
+    for unattended in (False, True):
+        cfg = hr.resolve_repo(str(repo), from_default_branch=unattended)
+        assert cfg["auto_merge"] == "none", f"unattended={unattended}"
+        assert cfg["epic"]["sub_pr_merge"] == "auto"
+
+
+def test_an_untracked_rules_file_with_no_sample_is_still_the_whole_config(repo):
+    """The regression this file exists for, and it was a live bug for one commit.
+
+    "Untracked" alone was the first gate on the overlay, which is wrong for the
+    repo that has not committed its rules yet — mid-migration, a fresh clone, or
+    a test fixture. Its entire policy was being demoted to a seat toggle and
+    dropped on the floor, with a warning that read like the file was at fault.
+    The overlay needs BOTH: a sample supplied the baseline, AND this file is
+    untracked."""
+    write_local(repo, {"auto_merge": "none", "headless_permission_mode": "bypassPermissions"})
+    cfg = hr.resolve_repo(str(repo), from_default_branch=False)
+    assert cfg["auto_merge"] == "none", (
+        "an untracked .harness-rules with no sample beside it is the legacy "
+        "layout, not an overlay — its policy must still apply")
+    assert cfg["headless_permission_mode"] == "bypassPermissions"
+
+
+def test_a_tracked_rules_file_beside_a_sample_is_not_an_overlay(repo):
+    """Mid-migration: the sample added, the old file not yet untracked.
+
+    Treated as an overlay, the committed rules would be narrowed to seats and the
+    rest of the policy silently lost — on a repo whose only mistake was doing the
+    two halves of the migration in two commits."""
+    write_sample(repo, {"auto_merge": "none"}, commit=False)
+    write_rules(repo, {"epic": {"sub_pr_merge": "auto"}}, commit=True)
+    cfg = hr.resolve_repo(str(repo), from_default_branch=False)
+    # The sample wins as baseline, and the tracked file is not applied as an
+    # overlay — but nothing is silently reinterpreted either.
+    assert cfg["auto_merge"] == "none"
+
+
+def test_the_local_overlay_turns_a_seat_off(repo):
+    """The case this whole split is for: a box without `agy` on PATH.
+
+    A seat enabled in the sample but absent from the machine would otherwise veto
+    every round's `confident` for ever, because panel.py counts a reviewer that
+    never ran as coverage it did not get."""
+    write_sample(repo, {"reviewers": {"antigravity": {"enabled": True},
+                                      "pi": {"enabled": True}}})
+    write_local(repo, {"reviewers": {"antigravity": {"enabled": False},
+                                     "pi": {"enabled": False}}})
+    cfg = hr.resolve_repo(str(repo), from_default_branch=False)
+    assert cfg["reviewers"]["antigravity"]["enabled"] is False
+    assert cfg["reviewers"]["pi"]["enabled"] is False
+    assert cfg["reviewers"]["claude"]["enabled"] is True, "untouched seats stay as they were"
+    assert hr.RULES_FILENAME in cfg["_rules_from"], (
+        "a resolved config the overlay changed must say so — describe() is what a "
+        "human reads to know which rules applied")
+
+
+def test_the_local_overlay_cannot_change_policy(repo, capsys):
+    """The security property, and the reason the overlay is narrowed at all.
+
+    An untracked file is reviewed by nobody: it never appears in a PR, so branch
+    protection cannot see it. Left unrestricted it is a way to widen `auto_merge`
+    on a box with no review — and the unattended timers would honour it."""
+    write_sample(repo, {"auto_merge": "none", "epic": {"sub_pr_merge": "gate"}})
+    write_local(repo, {"auto_merge": "all",
+                       "epic": {"sub_pr_merge": "auto"},
+                       "reviewers": {"pi": {"enabled": False}}})
+    cfg = hr.resolve_repo(str(repo), from_default_branch=False)
+    assert cfg["auto_merge"] == "none", "the local file must not widen auto-merge"
+    assert cfg["epic"]["sub_pr_merge"] == "gate", "nor open a merge gate"
+    assert cfg["reviewers"]["pi"]["enabled"] is False, "the seat toggle still applies"
+    err = capsys.readouterr().err
+    assert "auto_merge" in err and "epic" in err, (
+        f"a dropped policy key must be REPORTED, not silently ignored — someone "
+        f"who set it is otherwise certain it took effect. stderr was: {err!r}")
+
+
+def test_the_local_overlay_may_not_set_reviewer_fields_other_than_enabled(repo, capsys):
+    """`model` and `effort` are policy: they decide what a review costs.
+
+    Availability is the machine's business; which model the seat spends is the
+    repo's. A box that could pin `model` locally could quietly move the panel onto
+    a tier nobody agreed to pay for."""
+    write_sample(repo, {"reviewers": {"codex": {"enabled": True, "model": "cheap"}}})
+    write_local(repo, {"reviewers": {"codex": {"enabled": False, "model": "expensive"}}})
+    cfg = hr.resolve_repo(str(repo), from_default_branch=False)
+    assert cfg["reviewers"]["codex"]["enabled"] is False
+    assert cfg["reviewers"]["codex"]["model"] == "cheap"
+    assert "model" in capsys.readouterr().err
+
+
+def test_an_unknown_seat_in_the_local_overlay_is_reported_not_applied(repo, capsys):
+    """lexray's `.harness-rules` sets `reviewers.gemini`, which is not a seat name
+    (`antigravity` is). Silently accepting it leaves someone certain they turned a
+    reviewer off that was never called that — and it stays on."""
+    write_sample(repo, {"reviewers": {"antigravity": {"enabled": True}}})
+    write_local(repo, {"reviewers": {"gemini": {"enabled": False}}})
+    cfg = hr.resolve_repo(str(repo), from_default_branch=False)
+    assert "gemini" not in cfg["reviewers"]
+    assert cfg["reviewers"]["antigravity"]["enabled"] is True
+    assert "gemini" in capsys.readouterr().err
+
+
+def test_unattended_honours_the_local_seat_overlay(repo):
+    """The timers need it too, and it is safe for them for the same reason.
+
+    A missing CLI is missing whoever started the run, so an unattended panel must
+    not enable a seat this box cannot run. The file is untracked, so no PR branch
+    can have introduced it — which is the entire distinction the two-ref rule is
+    protecting, and it is not weakened by reading a file git never carried."""
+    write_sample(repo, {"auto_merge": "none", "reviewers": {"pi": {"enabled": True}}})
+    write_local(repo, {"reviewers": {"pi": {"enabled": False}}})
+    cfg = hr.resolve_repo(str(repo), from_default_branch=True)
+    assert cfg["reviewers"]["pi"]["enabled"] is False
+    assert cfg["auto_merge"] == "none", "policy still comes from the protected branch"
