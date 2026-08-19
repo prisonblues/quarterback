@@ -478,10 +478,11 @@ def test_a_config_file_agent_pin_is_deliberately_not_honoured(tmp_path, pinned_h
     fires as well. Matching that here means reproducing bash's interleaving of
     assignments and source-time expansions in Python, and the implementation that
     tried produced a **split identity**: with a plainly-pinned name and a
-    double-quoted token command, one agent's credential was fetched while the client
-    posted as another. The fleet's generated config pins no agent at all, so the pin
-    is a shape the contract allows and no host writes — and fetching daedalus's token
-    while posting as atlas is a worse failure than declining to honour it.
+    double-quoted token command, the credential was fetched under the file's name while
+    `cfg.agent` reported another. The fleet's generated config pins no agent at all, so
+    the pin is a shape the contract allows and no host writes — and a client whose
+    `cfg.agent` disagrees with the identity its bearer proves to the board is a worse
+    failure than declining to honour it.
 
     Asserted rather than left latent: this is a decision, and a decision nothing
     checks is a surprise waiting for the next reader.
@@ -495,19 +496,31 @@ def test_a_config_file_agent_pin_is_deliberately_not_honoured(tmp_path, pinned_h
     assert pinned_host != "pinned-by-file"  # so the assertion above is not vacuous
 
 
-def test_the_config_file_is_not_read_for_an_agent_name_at_all(tmp_path, pinned_host):
-    """The mechanism, not only the outcome.
+def test_a_config_file_agent_pin_decides_nothing_at_all(tmp_path, pinned_host):
+    """Not the name, and nothing else the file can set either.
 
-    An implementation that read the pin back and then chose not to use it would pass
-    the test above and leave the next reader one `or` away from the split identity the
-    module docstring describes. So the variable list itself is what is asserted.
+    This used to assert the contents of `_VARS`, which pinned a *mechanism*: the pin is
+    read back now — a file that assigns the name over the seeded one is the only
+    evidence that a double-quoted command was expanded against it, which is what
+    `_agent_baked_into` exists to notice — and an assertion about the variable list
+    forbids the one implementation that can warn about the split it was written to fear.
+
+    What has to stay true is that reading it resolves nothing: the name is the
+    environment's or the hostname's, the value never reaches `values`, so it can be
+    neither honoured as an identity nor mistaken for one of the three variables that do
+    decide something.
     """
-    assert "QUARTERBACK_AGENT" not in boardcfg._VARS
     path = write_config(
         tmp_path,
         "QUARTERBACK_BASE_URL=https://board.example\nQUARTERBACK_AGENT=pinned-by-file\n",
     )
-    assert "QUARTERBACK_AGENT" not in boardcfg._read_config_file(path, env_for(tmp_path)).values
+    cfg = resolve(env_for(tmp_path, QUARTERBACK_CONFIG=str(path)))
+    assert cfg.agent == pinned_host
+    assert pinned_host != "pinned-by-file"  # so the assertion above is not vacuous
+    assert (cfg.token, cfg.token_problem) == (None, None)
+    got = boardcfg._read_config_file(path, env_for(tmp_path))
+    assert "QUARTERBACK_AGENT" not in got.values
+    assert got.agent == "pinned-by-file"  # seen, and kept out of the way
 
 
 def test_the_fleets_single_quoted_selector_runs_under_the_resolved_agent(tmp_path, pinned_host):
@@ -540,6 +553,11 @@ def test_the_fleets_single_quoted_selector_runs_under_the_resolved_agent(tmp_pat
     from_env = resolve({**env, "QUARTERBACK_AGENT": "atlas"})
     assert (from_env.agent, from_env.token) == ("atlas", "tok-atlas")
 
+    # And nothing is reported about the pin. The split-identity check below withholds a
+    # token whose identity disagrees with `cfg.agent`; here they agree, so a diagnosis
+    # would be a false alarm — on the shape every host in the fleet actually has.
+    assert (defaulted.token_problem, from_env.token_problem) == (None, None)
+
 
 def test_the_environment_agent_beats_everything_a_file_can_say(tmp_path, pinned_host):
     """Environment beats the config file throughout — the agent name most of all."""
@@ -555,6 +573,215 @@ def test_a_file_that_names_no_agent_leaves_the_hostname_default(tmp_path, pinned
     """The ordinary fleet host: the generated config names no agent, so the hostname is it."""
     path = write_config(tmp_path, "QUARTERBACK_BASE_URL=https://board.example\n")
     assert resolve(env_for(tmp_path, QUARTERBACK_CONFIG=str(path))).agent == pinned_host
+
+
+# -- the one split bash's semantics allow: detected, and the token withheld ----
+
+
+def hostile_config(tmp_path, tokens, pin: str):
+    """The measured split shape: a plain pin, and a **double**-quoted command using it.
+
+    Bash expands the double-quoted value as it sources the file — after the file's own
+    assignment has overwritten the seeded name — so the selector arrives with `pin`
+    baked in, whatever this client resolved and whenever it resolved it. Nothing on the
+    Python side can prevent that, which is why the only available answer is to notice.
+    """
+    return write_config(
+        tmp_path,
+        "QUARTERBACK_BASE_URL=https://board.example\n"
+        f"QUARTERBACK_AGENT={pin}\n"
+        f'QUARTERBACK_TOKEN_CMD="sed -n s/^$QUARTERBACK_AGENT://p {sh(tokens)}"\n',
+    )
+
+
+def test_a_pinned_name_baked_into_the_command_withholds_the_token(tmp_path, pinned_host):
+    """The credential the file's own name selects is not this client's, so it is refused.
+
+    Measured before this check existed: `agent='atlas'`, `token='tok-daedalus'`,
+    `token_problem=None` — a *successful* resolution of exactly the split the module
+    docstring calls dangerous, and silent. `cfg.agent` would then name somebody the
+    bearer does not prove, so every consumer that trusts it — the no-token diagnostic's
+    own "running as agent", `@me`, device selection — is confidently wrong.
+
+    Treated like every other "a credential source was present and did not yield what it
+    should have" case here: named, and the token withheld rather than handed over with a
+    warning attached that most callers do not read.
+    """
+    tokens = write_token_file(tmp_path, {"daedalus": "tok-daedalus", "atlas": "tok-atlas"})
+    path = hostile_config(tmp_path, tokens, pin="daedalus")
+    cfg = resolve(env_for(tmp_path, QUARTERBACK_CONFIG=str(path), QUARTERBACK_AGENT="atlas"))
+    assert cfg.agent == "atlas"
+    assert cfg.token is None, "a token fetched under another name must not be returned"
+    assert cfg.token_problem is not None
+    # The situation and both remedies, so the operator can act without reading config.py.
+    assert "QUARTERBACK_AGENT" in cfg.token_problem
+    assert "single-quote" in cfg.token_problem
+    assert str(path) in cfg.token_problem
+    # Still a configured command: the remedy lines that depend on this fact are about
+    # whether the site has one, not about whether it worked.
+    assert cfg.token_cmd_configured is True
+
+
+def test_the_split_diagnostic_repeats_neither_the_command_nor_the_name_it_used(
+    tmp_path, pinned_host
+):
+    """A file is free to write `QUARTERBACK_AGENT="$(cat /run/secret)"`.
+
+    The pinned name is expanded by bash before this module sees it, so it is site output
+    like any other and this string is printed to terminals and pasted into issues. The
+    command is withheld for the reasons `_run_token_cmd` gives; the name is withheld for
+    this one.
+    """
+    tokens = write_token_file(tmp_path, {"s3cr3t-name": "tok-secret"})
+    path = hostile_config(tmp_path, tokens, pin="s3cr3t-name")
+    cfg = resolve(env_for(tmp_path, QUARTERBACK_CONFIG=str(path), QUARTERBACK_AGENT="atlas"))
+    assert cfg.token_problem is not None
+    assert "s3cr3t-name" not in cfg.token_problem
+    assert "tok-secret" not in cfg.token_problem
+    assert "sed" not in cfg.token_problem
+
+
+def test_the_fleets_own_shape_never_trips_the_split_check(tmp_path, pinned_host):
+    """The overwhelmingly common case: single-quoted command, no pin in the file.
+
+    A false positive here withholds a token on every host in the fleet, so both routes
+    to the name are checked — an exported `QUARTERBACK_AGENT`, and the hostname default
+    that the host #201 was found on took. The token that comes back has to be the one
+    belonging to whichever name that was, with nothing to explain.
+    """
+    tokens = write_token_file(tmp_path, {pinned_host: "tok-thishost", "atlas": "tok-atlas"})
+    path = write_config(
+        tmp_path,
+        "QUARTERBACK_BASE_URL=https://board.example\n"
+        f"QUARTERBACK_TOKEN_CMD='sed -n s/^$QUARTERBACK_AGENT://p {sh(tokens)}'\n",
+    )
+    env = env_for(tmp_path, QUARTERBACK_CONFIG=str(path))
+
+    defaulted = resolve(env)
+    assert (defaulted.agent, defaulted.token, defaulted.token_problem) == (
+        pinned_host,
+        "tok-thishost",
+        None,
+    )
+
+    from_env = resolve({**env, "QUARTERBACK_AGENT": "atlas"})
+    assert (from_env.agent, from_env.token, from_env.token_problem) == (
+        "atlas",
+        "tok-atlas",
+        None,
+    )
+
+
+def test_a_pin_beside_a_command_that_never_names_the_agent_is_inert(tmp_path, pinned_host):
+    """A pin only splits anything if the command was expanded against it.
+
+    `QUARTERBACK_TOKEN_CMD="cat $HOME/.tok"` selects nothing by identity, so the pinned
+    name reaches neither the command nor the credential and the token is this machine's
+    either way. Withholding it would be a false alarm — which is why the check requires
+    the pinned name to actually appear in the command it is about to run.
+    """
+    (tmp_path / ".tok").write_text("tok-machine\n")
+    path = write_config(
+        tmp_path,
+        "QUARTERBACK_BASE_URL=https://board.example\n"
+        "QUARTERBACK_AGENT=pinned-by-file\n"
+        'QUARTERBACK_TOKEN_CMD="cat $HOME/.tok"\n',
+    )
+    cfg = resolve(env_for(tmp_path, QUARTERBACK_CONFIG=str(path), QUARTERBACK_AGENT="atlas"))
+    assert (cfg.agent, cfg.token, cfg.token_problem) == ("atlas", "tok-machine", None)
+
+
+def test_a_surviving_reference_is_safe_even_when_the_pinned_name_is_in_the_command(
+    tmp_path, pinned_host
+):
+    """The condition that carries the actual semantics, reached in isolation.
+
+    A single-quoted selector reading a path that contains the pinned name — a per-host
+    directory, an ordinary layout — satisfies the other two halves of the check on its
+    own: the file pins a name this client does not use, and that name appears in the
+    command. What makes it safe is the third half. `$QUARTERBACK_AGENT` survived
+    sourcing, so the shell that *runs* the command expands it against the resolved name
+    and the token that comes back belongs to the resolved name. Nothing else here
+    reaches that condition — every other pinned shape is already stopped by the name not
+    being in the command — so without this the deferred case is unguarded.
+    """
+    home = tmp_path / "daedalus"
+    home.mkdir()
+    tokens = write_token_file(home, {"atlas": "tok-atlas", "daedalus": "tok-daedalus"})
+    assert "daedalus" in str(tokens)  # the premise: the pin is a substring of the command
+    path = write_config(
+        tmp_path,
+        "QUARTERBACK_BASE_URL=https://board.example\n"
+        "QUARTERBACK_AGENT=daedalus\n"
+        f"QUARTERBACK_TOKEN_CMD='sed -n s/^$QUARTERBACK_AGENT://p {sh(tokens)}'\n",
+    )
+    cfg = resolve(env_for(tmp_path, QUARTERBACK_CONFIG=str(path), QUARTERBACK_AGENT="atlas"))
+    assert (cfg.agent, cfg.token, cfg.token_problem) == ("atlas", "tok-atlas", None)
+
+
+def test_a_pin_that_agrees_with_the_resolved_name_is_not_a_split(tmp_path, pinned_host):
+    """Two sources naming the same agent is agreement, not disagreement.
+
+    The pin is still not *honoured* — it happens to say what the environment already
+    said — so the command it baked in selects the credential this client will post
+    under, and there is nothing to report.
+    """
+    tokens = write_token_file(tmp_path, {"atlas": "tok-atlas", "daedalus": "tok-daedalus"})
+    path = hostile_config(tmp_path, tokens, pin="atlas")
+    cfg = resolve(env_for(tmp_path, QUARTERBACK_CONFIG=str(path), QUARTERBACK_AGENT="atlas"))
+    assert (cfg.agent, cfg.token, cfg.token_problem) == ("atlas", "tok-atlas", None)
+
+
+def test_an_environment_command_cannot_be_poisoned_by_a_file_pin(tmp_path, pinned_host):
+    """The environment's command was never sourced, so the file's assignment never saw it.
+
+    Both halves of why the check is scoped to the file's own command. The selector form
+    is expanded by the shell that runs it, against the resolved name, so it is safe for
+    the ordinary reason. The second command is the one that matters: it names no agent
+    at all and simply reads a path that happens to contain the pinned name, which is
+    every condition the check looks at except the one being proved here. A pin in a file
+    is evidence about the command that file's *sourcing* rewrote and about nothing else —
+    this module has never inspected the content of a token command for any purpose, and
+    the diagnostic it would print names the config file as where the command came from,
+    which would be false.
+    """
+    tokens = write_token_file(tmp_path, {"atlas": "tok-atlas", "daedalus": "tok-daedalus"})
+    path = hostile_config(tmp_path, tokens, pin="daedalus")
+    env = env_for(tmp_path, QUARTERBACK_CONFIG=str(path), QUARTERBACK_AGENT="atlas")
+
+    selector = resolve(
+        {**env, "QUARTERBACK_TOKEN_CMD": f"sed -n s/^$QUARTERBACK_AGENT://p {sh(tokens)}"}
+    )
+    assert (selector.agent, selector.token, selector.token_problem) == (
+        "atlas",
+        "tok-atlas",
+        None,
+    )
+
+    named_path = tmp_path / "daedalus"
+    named_path.mkdir()
+    (named_path / "machine.tok").write_text("tok-machine\n")
+    by_path = resolve({**env, "QUARTERBACK_TOKEN_CMD": f"cat {sh(named_path / 'machine.tok')}"})
+    assert (by_path.agent, by_path.token, by_path.token_problem) == ("atlas", "tok-machine", None)
+
+
+def test_a_split_command_is_not_run_at_all(tmp_path, pinned_host):
+    """Refused, not run and discarded.
+
+    The command's whole job is to fetch a credential; fetching one this client has
+    already decided it must not use puts another identity's secret into whatever cache,
+    audit log or rate limit the helper touches, and buys nothing with it.
+    """
+    marker = tmp_path / "ran"
+    path = write_config(
+        tmp_path,
+        "QUARTERBACK_BASE_URL=https://board.example\n"
+        "QUARTERBACK_AGENT=daedalus\n"
+        f'QUARTERBACK_TOKEN_CMD="touch {sh(marker)}-$QUARTERBACK_AGENT; echo tok"\n',
+    )
+    cfg = resolve(env_for(tmp_path, QUARTERBACK_CONFIG=str(path), QUARTERBACK_AGENT="atlas"))
+    assert cfg.token is None
+    assert not (tmp_path / "ran-daedalus").exists()
 
 
 # -- the agent-name default's own fallbacks ----------------------------
@@ -865,6 +1092,86 @@ def test_a_command_that_cannot_be_run_at_all_is_distinguishable(tmp_path):
     # short chunk as well as the whole filler, so a truncated leak is caught too.
     assert filler not in problem
     assert "x" * 200 not in problem
+
+
+def test_the_token_command_runs_under_bash_like_qb_env_does(tmp_path):
+    """`[[ … ]]` is a bash construct, and the installed contract permits one.
+
+    `qb_resolve_token` does `eval "$QUARTERBACK_TOKEN_CMD"` inside a bash script, so a
+    site command using `[[ ]]`, an array or `$'…'` is valid under the authority. Run
+    through `shell=True` — `/bin/sh`, which is dash on Debian and Ubuntu — the same
+    command exits 127 and the host reports "no token" against a readable token file:
+    #201's shape, arrived at from the other end.
+
+    **This assertion cannot fail on a host whose `/bin/sh` is already bash**, which many
+    developer boxes are — so on those it proves the contract rather than the fix, and the
+    test below is the one that bites there. CI runs on `ubuntu-latest`, whose `/bin/sh`
+    *is* dash, so this does bite in the place that gates the merge. That `dash` really
+    rejects the construct was checked directly:
+    `dash -c '[[ -n x ]] && printf tok'` exits 127 with `dash: 1: [[: not found`.
+    """
+    tok = tmp_path / "bashonly.tok"
+    tok.write_text("tok-bash-only\n")
+    path = write_config(
+        tmp_path,
+        "QUARTERBACK_BASE_URL=https://board.example\n"
+        f"QUARTERBACK_TOKEN_CMD='[[ -r {sh(tok)} ]] && cat {sh(tok)}'\n",
+    )
+    cfg = resolve(env_for(tmp_path, QUARTERBACK_CONFIG=str(path)))
+    assert (cfg.token, cfg.token_problem) == ("tok-bash-only", None)
+
+
+def test_the_token_command_goes_to_the_bash_on_PATH_and_not_to_bin_sh(tmp_path, monkeypatch):
+    """Which interpreter runs it, asserted where the answer is observable.
+
+    The test above cannot tell the two apart on a bash-`/bin/sh` host, which is what the
+    developer box this was written on has. `shell=True` hardcodes `/bin/sh` and consults
+    no `PATH`,
+    while `_run_token_cmd` locates bash exactly as `_read_config_file` does — so a
+    `bash` earlier on `PATH` than the real one is run by the fix and ignored without it,
+    whatever `/bin/sh` happens to be.
+
+    The command and the base URL come from the environment on purpose: the shim answers
+    every invocation with its marker, and a config file sourced through it would come
+    back with nothing in it.
+    """
+    shim = tmp_path / "shim"
+    shim.mkdir()
+    fake = shim / "bash"
+    fake.write_text("#!/bin/sh\nprintf 'tok-via-located-bash'\n")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{shim}{os.pathsep}{os.environ['PATH']}")
+    cfg = resolve(
+        env_for(
+            tmp_path,
+            QUARTERBACK_CONFIG=str(tmp_path / "absent"),
+            QUARTERBACK_BASE_URL="https://board.example",
+            QUARTERBACK_TOKEN_CMD="printf tok-via-bin-sh",
+        )
+    )
+    assert cfg.token == "tok-via-located-bash", "the command did not go through located bash"
+
+
+def test_a_host_with_no_bash_at_all_still_runs_a_posix_token_command(tmp_path, monkeypatch):
+    """The documented fallback, exercised rather than asserted in a docstring.
+
+    No bash on `PATH` narrows the semantics to `/bin/sh`, and that is the deliberate
+    trade: such a host still has one, nearly every site command is plain POSIX, and
+    refusing to run it would withhold a token that resolves — #201's mistake with a
+    different cause. `_read_config_file` goes the other way in the same situation
+    because half a sourced config is worse than none, which is why this is checked
+    against an environment-supplied command.
+    """
+    monkeypatch.setattr(boardcfg.shutil, "which", lambda name: None)
+    cfg = resolve(
+        env_for(
+            tmp_path,
+            QUARTERBACK_CONFIG=str(tmp_path / "absent"),
+            QUARTERBACK_BASE_URL="https://board.example",
+            QUARTERBACK_TOKEN_CMD="printf tok-posix",
+        )
+    )
+    assert (cfg.token, cfg.token_problem) == ("tok-posix", None)
 
 
 def test_output_that_is_not_decodable_text_is_a_diagnostic_not_a_traceback(tmp_path):

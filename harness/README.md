@@ -923,31 +923,37 @@ The panel looks for a `qb` CLI to record runs. With none on `PATH`, it no-ops si
 everything else works unchanged. Point `qb` at your board to light up `GET /review/stats`
 and the board's `/panel` page.
 
-`worktree-holder` and `qb-board` read the same per-host site config —
+`worktree-holder` and `qb-board` read the same per-host site config file —
 `QUARTERBACK_BASE_URL` and `QUARTERBACK_TOKEN_CMD` from
 `${XDG_CONFIG_HOME:-~/.config}/quarterback/config`, either overridable from the
-environment — but read it directly rather than through `qb`, so the occupancy check and
-the board client work whether or not that CLI is installed. There is deliberately **no
+environment — and both read it directly rather than through `qb`, so the occupancy check
+and the board client work whether or not that CLI is installed. There is deliberately **no
 default board URL**: unset means this machine has not been told which board it belongs to,
 and guessing would point the query at somebody else's.
+
+The parity stops at the file, and the difference is #201 itself:
+**only `qb-board` resolves and exports the agent name before running the token command.**
+`worktree-holder` sets `QUARTERBACK_AGENT` nowhere and then runs
+`eval "$QUARTERBACK_TOKEN_CMD"`, so a selector referencing `$QUARTERBACK_AGENT` still
+expands to the empty string there unless the *calling* shell already exported the name —
+the dependence on the invoking shell that made #201 present as intermittent.
 
 **`QUARTERBACK_TOKEN_CMD` may reference `$QUARTERBACK_AGENT`, so the agent name has to be
 resolved before the command runs.** One generated config across N hosts, each picking its
 own line out of a shared token file is the shape this exists for, and it only works if the
 client resolves the name (environment, else `hostname -s`) *first* and exports it into the
 command's environment. A client that resolves it afterwards expands the variable to empty
-and reports "no token" against a token file that is present and valid, which presents as
-intermittent because it then depends on whether the invoking shell happened to carry the
-variable (#201). `qb-board` does this; the remaining harness-side readers are tracked in
-#235.
+and reports "no token" against a token file that is present and valid (#201). `qb-board`
+does this; the remaining harness-side Python readers are tracked in #235. `worktree-holder`
+is neither of those — it is described above, and it needs the name from its caller.
 
 What the board client resolves, and from where:
 
 | Variable | Resolved from | Notes |
 |---|---|---|
 | `QUARTERBACK_BASE_URL` | environment, else the config file | No default at all: unset is an error rather than a guess at somebody else's board |
-| `QUARTERBACK_TOKEN` / `QUARTERBACK_TOKEN_CMD` | each: environment, else the config file | A static token wins over a command *whatever source each came from* — the command runs only when neither the environment nor the file set `QUARTERBACK_TOKEN`. So a one-shot `QUARTERBACK_TOKEN=…` overrides everything, while a one-shot `QUARTERBACK_TOKEN_CMD=…` does not override a static token in the file |
-| `QUARTERBACK_AGENT` | environment, else `hostname -s` — **never the config file** | Resolved and exported before the token command runs, so that command may reference it. A `QUARTERBACK_AGENT=…` line in the config file is **not** honoured by this client, though `qb-env` honours one |
+| `QUARTERBACK_TOKEN` / `QUARTERBACK_TOKEN_CMD` | each: environment, else the config file | A static token wins over a command *whatever source each came from* — the command runs only when neither the environment nor the file set `QUARTERBACK_TOKEN`. So a one-shot `QUARTERBACK_TOKEN=…` overrides everything, while a one-shot `QUARTERBACK_TOKEN_CMD=…` does not override a static token in the file. That matches `qb_resolve_token`, which returns on a non-empty `QUARTERBACK_TOKEN` before it looks at the command. The command runs under **bash**, as `qb-env` runs it, so `[[ … ]]` and the rest of the contract as installed work on hosts whose `/bin/sh` is dash |
+| `QUARTERBACK_AGENT` | environment, else `hostname -s` — **never the config file** | Resolved and exported before the token command runs, so that command may reference it. A `QUARTERBACK_AGENT=…` line in the config file is **not** honoured by this client, though `qb-env` honours one. It is read back for one purpose: a file that pins a name *and* double-quotes a command using it has the pinned name baked in at source time, and that is reported as a token problem with the token withheld rather than fetched under a name `cfg.agent` does not report |
 | `QUARTERBACK_CONFIG` | environment | Which file the above is read from; `$XDG_CONFIG_HOME/quarterback/config`, else `~/.config/quarterback/config` |
 
 **That third row is a deliberate divergence from `qb-env`, not an oversight.** `qb-env`
@@ -956,13 +962,17 @@ sources the config into the calling shell and only *then* applies
 `QUARTERBACK_AGENT=daedalus` in the file overwrites whatever the environment said. Buying
 that parity here means reproducing bash's interleaving of assignments and source-time
 expansions in Python, and the implementation that tried produced a **split identity**:
-with a pinned name and a *double*-quoted token command, one agent's credential was fetched
-while the client posted as another. The fleet's generated config names no agent at all, so
-the pin is a shape the contract allows and no host writes — declining it costs less than
-fetching daedalus's token and posting as atlas. Which is also why the token command below
-is **single-quoted**: nothing in it expands when the file is sourced, and
-`$QUARTERBACK_AGENT` is expanded by the shell that runs it, against the name the client
-has by then resolved.
+with a pinned name and a *double*-quoted token command, the credential was fetched under
+the file's name while `cfg.agent` reported another. The board itself is not fooled by that
+— the machine identity follows the **bearer** (`_match_bearer`), and the client never sends
+`cfg.agent` at all — so what a split breaks is everything *local* that trusts the
+attribute: the "running as agent" line in the no-token diagnostic, `@me` resolution, the
+TUI's device selection. Two names for one host is not harmless just because the board only
+ever hears one of them, so that shape is now refused rather than resolved. The fleet's
+generated config names no agent at all, so the pin is a shape the contract allows and no
+host writes — declining it costs less than that. Which is also why the token command below
+is **single-quoted**: nothing in it expands when the file is sourced, and `$QUARTERBACK_AGENT`
+is expanded by the shell that runs it, against the name the client has by then resolved.
 
 Write the selector as a **literal** comparison rather than a regex, and have it print
 everything after the first colon:

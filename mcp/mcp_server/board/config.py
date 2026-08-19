@@ -12,13 +12,24 @@ papered over:
   machine has not been told which board it belongs to", and guessing points the
   client at another island's board — ``qb.fo.ls`` resolves on public DNS, so the
   wrong guess reaches a real board rather than failing.
-* **Environment beats the config file** for ``QUARTERBACK_BASE_URL``,
-  ``QUARTERBACK_TOKEN`` and ``QUARTERBACK_TOKEN_CMD``, so a single invocation can
-  override any of it without editing anything. That is this module's own choice and
-  not something read off ``qb-env`` — ``qb-env`` sources the file into the calling
-  shell, where a plain assignment overwrites the environment — because a one-shot
-  override has to work here: the fleet's config is generated and stamped "do not
-  edit", so "export it for this command" is the only override an operator has.
+* **Environment beats the config file, per variable**, for
+  ``QUARTERBACK_BASE_URL``, ``QUARTERBACK_TOKEN`` and ``QUARTERBACK_TOKEN_CMD``: each
+  is taken from the environment if set there and from the file otherwise, so a single
+  invocation can override any *one* of them without editing anything. That is this
+  module's own choice and not something read off ``qb-env`` — ``qb-env`` sources the
+  file into the calling shell, where a plain assignment overwrites the environment —
+  because a one-shot override has to work here: the fleet's config is generated and
+  stamped "do not edit", so "export it for this command" is the only override an
+  operator has.
+
+  Per variable is not the same as per *outcome*, and one pair does not compose the way
+  the sentence above might suggest: a resolved static ``QUARTERBACK_TOKEN``
+  short-circuits ``QUARTERBACK_TOKEN_CMD`` whichever source each of the two came from,
+  so an environment ``QUARTERBACK_TOKEN_CMD`` does not override a static token the
+  *file* sets. That is deliberate and matches the authority — ``qb_resolve_token``
+  returns on ``[ -n "${QUARTERBACK_TOKEN:-}" ]`` before it ever looks at the command,
+  with no regard for which source set which. The override that always works is
+  ``QUARTERBACK_TOKEN`` itself.
 * **The agent name is resolved before the token command runs**, and exported into
   it. ``QUARTERBACK_TOKEN_CMD`` is permitted to reference ``$QUARTERBACK_AGENT``
   — the fleet's own generated config uses ``sed -n s/^$QUARTERBACK_AGENT://p`` to
@@ -48,17 +59,36 @@ That is a real difference in behaviour and it is the trade this takes on purpose
 * and parity cost more than it bought. Honouring the pin means reproducing bash's
   interleaving of assignments and source-time expansions in Python, and the
   implementation that tried produced a **split identity**: with a plainly-pinned
-  name and a *double*-quoted token command, one agent's credential was fetched
-  while the client posted as another. Fetching daedalus's token and posting as
-  atlas is a worse failure than declining to honour a pin nothing writes.
+  name and a *double*-quoted token command, the credential was fetched under the
+  file's name while :attr:`BoardConfig.agent` reported another.
 
-One residue of bash's own semantics remains and cannot be removed from this side: a
-file that both assigns ``QUARTERBACK_AGENT`` itself *and* double-quotes a
-``QUARTERBACK_TOKEN_CMD`` referencing it has that reference expanded, at source
-time, against the file's own assignment — while :attr:`BoardConfig.agent` reports
-the environment's name or the hostname. That combination is the only way the two can
-disagree, and it is the reason the documented form single-quotes the command:
-deferred expansion always sees the resolved name.
+  What that costs is worth stating exactly, because it is easy to overstate in
+  either direction. It is *not* "fetching one identity's credential while posting as
+  another": the board identity follows the **bearer**. ``_client`` sends the token
+  plus a key derived from ``QUARTERBACK_INSTANCE`` and never sends
+  :attr:`BoardConfig.agent` at all, and the server derives the machine half of the
+  identity from the token (``_match_bearer`` in ``app/auth.py``). So under a split
+  the board sees the token's owner, correctly, and what is wrong is *local*:
+  :attr:`BoardConfig.agent` claims to be somebody the board does not think you are.
+  Everything downstream of that attribute is then confidently wrong — the "running as
+  agent" line in ``qb-board``'s own no-token diagnostic, ``@me`` resolution
+  (``resolve_recipient``), the TUI's device selection, and any other consumer that
+  trusts it. Two names for one host is not harmless just because the board only ever
+  hears one of them.
+
+One residue of bash's own semantics remains, and since it cannot be *prevented* from
+this side it is **detected** instead: a file that both assigns ``QUARTERBACK_AGENT``
+itself *and* double-quotes a ``QUARTERBACK_TOKEN_CMD`` referencing it has that
+reference expanded, at source time, against the file's own assignment — before this
+module ever sees the command, so no amount of seeding or ordering here can change it.
+That combination is the only way the two can disagree, and it is the reason the
+documented form single-quotes the command: deferred expansion always sees the resolved
+name. When it is present, :func:`resolve` reports a :attr:`BoardConfig.token_problem`
+naming it and withholds the token rather than returning one fetched under a name
+:attr:`BoardConfig.agent` does not report — the same rule every other "a credential
+source was present and did not yield what it should have" case follows here. The
+config file's own ``QUARTERBACK_AGENT`` is read back for that check and for nothing
+else; it is still not honoured.
 """
 
 from __future__ import annotations
@@ -76,11 +106,17 @@ from urllib.parse import urlparse
 #: The pre-config fleet layout, kept so a host that has not been rebuilt still works.
 LEGACY_TOKEN_FILE = Path("/run/op-secrets/quarterback-token")
 
-#: What the config file is read for. ``QUARTERBACK_AGENT`` is deliberately absent —
-#: see the module docstring: this client resolves the agent name from the environment
-#: or the hostname and never from the file, so reading it back here would only make
-#: it look as though the pin were honoured.
+#: What the config file is read for, in the sense of "what a value here can decide".
+#: ``QUARTERBACK_AGENT`` is deliberately absent — see the module docstring: this client
+#: resolves the agent name from the environment or the hostname and never from the file,
+#: and a name in this tuple would be a name the file gets to choose.
 _VARS = ("QUARTERBACK_BASE_URL", "QUARTERBACK_TOKEN", "QUARTERBACK_TOKEN_CMD")
+
+#: Read back from the file *in addition to* :data:`_VARS`, and used for exactly one
+#: thing: recognising the split identity :func:`_agent_baked_into` describes. Kept out
+#: of :data:`_VARS` on purpose — the two are different questions, and conflating them is
+#: what would turn "notice that the pin poisoned the command" into "honour the pin".
+_AGENT_VAR = "QUARTERBACK_AGENT"
 
 #: Named because the timeout is quoted in the diagnostic when it is hit, and a
 #: number that appears in a message the operator acts on should have one place.
@@ -104,6 +140,13 @@ class _FileVars(NamedTuple):
     #: first is the #201 misdiagnosis exactly: a credential source that was present
     #: and did not yield, reported as one that was never configured.
     undecodable: frozenset[str]
+    #: What ``QUARTERBACK_AGENT`` held in the child once the file had been sourced: the
+    #: name the caller seeded, unless the file assigned over it. ``None`` only when it
+    #: ended up empty or undecodable. Reported raw, with no comparison applied — whether
+    #: it *disagrees* with the resolved name is :func:`_agent_baked_into`'s question, and
+    #: one place deciding that beats two. Deliberately **not** in :attr:`values`: it is
+    #: evidence about the command, never a value this module resolves anything from.
+    agent: str | None = None
 
 
 @dataclass(frozen=True)
@@ -202,11 +245,13 @@ def _read_config_file(path: Path, env: dict[str, str]) -> _FileVars:
     Those names are unset in the child's environment first, so what comes back is what
     the FILE said and precedence stays this module's decision.
 
-    ``QUARTERBACK_AGENT`` is neither unset nor read back. It is left in the child's
-    environment because :func:`resolve` has already put the resolved name there and a
-    double-quoted value in the file may reference it, and it is absent from
-    :data:`_VARS` because a name the file pins is deliberately not honoured — see the
-    module docstring.
+    ``QUARTERBACK_AGENT`` is not unset, because :func:`resolve` has already put the
+    resolved name there and a double-quoted value in the file may reference it. It *is*
+    read back — into :attr:`_FileVars.agent`, not :attr:`_FileVars.values` — and only so
+    that a file which overwrote the seeded name can be recognised: with the name it
+    pinned already baked into the command, the sourcing is the moment the split happens
+    and this is the only place that can still see it. Absent from :data:`_VARS`, so a
+    pin remains something reported rather than honoured — see the module docstring.
 
     The output is captured as **bytes**. A config file is site-authored text and can
     carry a byte that is not valid in this process's encoding; ``text=True`` would
@@ -222,14 +267,19 @@ def _read_config_file(path: Path, env: dict[str, str]) -> _FileVars:
     bash = shutil.which("bash")
     if bash is None:  # no bash to source with: env-only is the honest answer
         return empty
-    # Both halves built from _VARS rather than written out, so the names printed, the
+    # Both halves built from `printed` rather than written out, so the names printed, the
     # count printed and the arity check below cannot disagree about how many
     # NUL-separated fields come back. The argument list is the half that matters:
     # `printf` reuses its format until the arguments run out, so a hand-written format
     # survives a fourth variable, while a hand-written argument list drops it in
     # silence — the drift this shape exists to make impossible.
-    fields = " ".join('"${' + name + ':-}"' for name in _VARS)
-    script = '. "$1" >/dev/null 2>&1 || true; printf "' + "%s\\0" * len(_VARS) + '" ' + fields
+    #
+    # `printed` is computed here rather than kept as a module constant so that patching
+    # `_VARS` still drives the whole read, and it puts `_AGENT_VAR` last so the indices
+    # of the `_VARS` fields are the indices of `_VARS` itself.
+    printed = (*_VARS, _AGENT_VAR)
+    fields = " ".join('"${' + name + ':-}"' for name in printed)
+    script = '. "$1" >/dev/null 2>&1 || true; printf "' + "%s\\0" * len(printed) + '" ' + fields
     child_env = {k: v for k, v in env.items() if k not in _VARS}
     try:
         out = subprocess.run(
@@ -241,7 +291,7 @@ def _read_config_file(path: Path, env: dict[str, str]) -> _FileVars:
     except (OSError, subprocess.SubprocessError):
         return empty
     parts = out.split(b"\0")
-    if len(parts) < len(_VARS):
+    if len(parts) < len(printed):
         return empty
     values: dict[str, str] = {}
     undecodable: set[str] = set()
@@ -253,7 +303,51 @@ def _read_config_file(path: Path, env: dict[str, str]) -> _FileVars:
             undecodable.add(name)
         else:
             values[name] = text
-    return _FileVars(values, frozenset(undecodable))
+    # Reported as it came back — the seeded name unless the file assigned over it — and
+    # not compared with anything here: `_agent_baked_into` is where "a name" becomes "a
+    # name we disagree with", and splitting that comparison across two functions is how
+    # one of the halves stops being reachable. Undecodable bytes are simply not a pin: a
+    # name this process cannot read cannot have been baked into a command it could read.
+    return _FileVars(values, frozenset(undecodable), _decode(parts[len(_VARS)]) or None)
+
+
+def _agent_baked_into(cmd: str, pinned: str | None, agent: str) -> bool:
+    """Whether ``cmd`` had ``pinned`` expanded into it in place of ``agent``.
+
+    The split identity the module docstring describes, recognised rather than guessed
+    at. It needs all three of:
+
+    * ``pinned`` — whatever ``QUARTERBACK_AGENT`` held in the child once the file had
+      been sourced — is not the name this client resolved. :func:`resolve` seeds the
+      resolved name before the file is read, so anything else means the file assigned
+      over it; equality covers both the fleet's config, which assigns nothing, and a
+      file whose pin happens to agree, which cannot produce a disagreement;
+    * that name appears in the command. This is not a heuristic in the direction that
+      matters: if the source-time expansion of ``$QUARTERBACK_AGENT`` happened at all
+      then the pinned value *is* in the string, so the absence of it is proof the
+      expansion did not — which is the case of a pin beside a command that never
+      mentions the name (``QUARTERBACK_TOKEN_CMD="cat $HOME/.tok"``), where the pin is
+      inert and withholding the token would be a false alarm on a working host;
+    * and the command carries no ``QUARTERBACK_AGENT`` reference of its own any more.
+      One that survived sourcing — the fleet's single-quoted form — is expanded by the
+      shell that *runs* the command, against the resolved name, so agent and token
+      agree no matter what the file pinned. That is the overwhelmingly common shape and
+      the one a false positive here would break on every host.
+
+    The alternative mechanism, sourcing the file twice under two sentinel agent names
+    and comparing the command that comes back, was not taken. It is exact about a
+    different question than this one: both the hostile shape and the fleet's
+    single-quoted-plus-pin shape return a command that is *identical* for every
+    sentinel — the first because the pin overwrote the sentinel before the expansion,
+    the second because there was no source-time expansion to be sensitive to — so it
+    cannot separate the case that must fire from the case that must not. It also costs
+    a second ``bash`` on a path documented as cheap, which is only the second reason.
+    """
+    if pinned is None or pinned == agent:
+        return False
+    if pinned not in cmd:
+        return False
+    return _AGENT_VAR not in cmd
 
 
 def _run_token_cmd(cmd: str, env: dict[str, str]) -> tuple[str | None, str | None]:
@@ -293,11 +387,30 @@ def _run_token_cmd(cmd: str, env: dict[str, str]) -> tuple[str | None, str | Non
     own words by re-running it, which is what ``qb-board``'s diagnostic now tells them
     to do. ``strerror`` is the one exception and is included: it is the kernel's
     phrase for the failure and has none of the command in it.
+
+    **The shell is bash, located the way :func:`_read_config_file` locates it**, and not
+    ``shell=True``. ``shell=True`` means ``/bin/sh``, which is dash on Debian and
+    Ubuntu, while the authority runs the site's command in bash: ``qb_resolve_token``
+    does ``QUARTERBACK_TOKEN="$(eval "$QUARTERBACK_TOKEN_CMD")"`` inside a bash script.
+    So ``[[ -r /run/tok ]] && cat /run/tok``, an array, a ``$'…'`` — every construct
+    valid under the contract as installed — worked under ``qb-env`` and failed here, on
+    whichever hosts have a non-bash ``/bin/sh`` and nowhere else. That is the same class
+    of defect as a test whose result depends on which shell ``/bin/sh`` is.
+
+    With no bash on ``PATH`` this falls back to ``shell=True``, which is a real
+    narrowing of the semantics and is said out loud rather than left to be discovered:
+    such a host still has a ``/bin/sh``, most site commands are plain POSIX, and
+    refusing to run one at all would withhold a token that would have resolved — #201's
+    mistake again. :func:`_read_config_file` makes the opposite call in the same
+    situation, and for a reason that does not apply here: a bash *fragment* sourced by
+    dash can fail halfway and hand back a partial config, where a single command either
+    runs or does not.
     """
+    bash = shutil.which("bash")
     try:
         proc = subprocess.run(
-            cmd,
-            shell=True,
+            [bash, "-c", cmd] if bash else cmd,
+            shell=bash is None,
             capture_output=True,
             # Bytes, not `text=True`. Decoding is `_decode`'s job precisely because a
             # helper that emits one byte invalid for the process locale raised
@@ -473,16 +586,34 @@ def resolve(env: dict[str, str] | None = None) -> BoardConfig:
     if not token and "QUARTERBACK_TOKEN" in from_file.undecodable:
         token_problem = f"{path} sets QUARTERBACK_TOKEN to something that is not decodable text"
 
-    cmd = env.get("QUARTERBACK_TOKEN_CMD") or from_file.values.get("QUARTERBACK_TOKEN_CMD")
+    env_cmd = env.get("QUARTERBACK_TOKEN_CMD")
+    cmd = env_cmd or from_file.values.get("QUARTERBACK_TOKEN_CMD")
     cmd_unreadable = "QUARTERBACK_TOKEN_CMD" in from_file.undecodable
     if not cmd and cmd_unreadable:
         token_problem = token_problem or (
             f"{path} sets QUARTERBACK_TOKEN_CMD to something that is not decodable text"
         )
     if not token and cmd:
-        token, cmd_problem = _run_token_cmd(cmd, env)
-        # The higher-precedence source keeps the diagnosis, as everywhere else here.
-        token_problem = token_problem or cmd_problem
+        # Only a command that came from the FILE can have been poisoned by the file's own
+        # `QUARTERBACK_AGENT` assignment; one from the environment was never sourced.
+        if not env_cmd and _agent_baked_into(cmd, from_file.agent, agent):
+            # Not run at all, rather than run and its answer discarded: the command's
+            # whole job is to fetch a credential, and fetching one this client has
+            # already decided it must not use is a side effect with nothing to buy it.
+            # Neither the command nor the pinned name is quoted — the first for the
+            # reasons `_run_token_cmd` gives, the second because a file is free to write
+            # `QUARTERBACK_AGENT="$(cat /run/something)"` and this string is printed.
+            token_problem = token_problem or (
+                f"the QUARTERBACK_TOKEN_CMD in {path} had an agent name baked into it "
+                "when the file was sourced, because the file assigns QUARTERBACK_AGENT "
+                "itself, so it would fetch the token for that name and not for the one "
+                "this client resolved (single-quote the command so the reference is "
+                "expanded when it runs, or drop the QUARTERBACK_AGENT line)"
+            )
+        else:
+            token, cmd_problem = _run_token_cmd(cmd, env)
+            # The higher-precedence source keeps the diagnosis, as everywhere else here.
+            token_problem = token_problem or cmd_problem
     if not token:
         token, token_problem = _read_legacy_token(token_problem)
     # A token found after a failed command is still a token, and the failure is then
