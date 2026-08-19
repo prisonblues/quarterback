@@ -233,3 +233,25 @@ def test_an_environment_agent_is_the_one_the_token_command_sees(tmp_path, monkey
     cfg = resolve(env_for(tmp_path, QUARTERBACK_CONFIG=str(path), QUARTERBACK_AGENT="atlas"))
     assert cfg.agent == "atlas"
     assert cfg.token == "tok-ATLAS"
+
+
+def test_the_sourced_config_file_sees_the_agent_name_too(tmp_path, monkeypatch):
+    """The other half of the same export, and the half that pins the ORDERING.
+
+    `_read_config_file` sources the file with the environment `resolve` hands it, and
+    strips only the three variables whose precedence this module owns — so a config file
+    may reference `$QUARTERBACK_AGENT` in a double-quoted value and have it expanded at
+    source time. That only works if the name is in the environment BEFORE the file is
+    sourced, which is a stronger claim than the token-command test above makes: the
+    command runs later, so a resolution moved to just after this read would still satisfy
+    that test and would break this one.
+    """
+    monkeypatch.setattr(boardcfg, "_hostname", lambda: "daedalus")
+    path = write_config(
+        tmp_path,
+        "QUARTERBACK_BASE_URL=https://board.example\n"
+        'QUARTERBACK_TOKEN="tok-$QUARTERBACK_AGENT"\n',
+    )
+    cfg = resolve(env_for(tmp_path, QUARTERBACK_CONFIG=str(path)))
+    assert cfg.agent == "daedalus"
+    assert cfg.token == "tok-daedalus"
