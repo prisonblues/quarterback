@@ -836,6 +836,66 @@ Two guards worth knowing, because both are cases that read plausibly when wrong:
   for a repo that set a small budget on purpose. `refuse_over_cap_multiple: 0` switches the
   refusal off and keeps the manifest.
 
+### A finding no round can close (`--escalated`)
+
+`--escalated <key>` (repeatable) tells a round that a finding's fixer reported the
+**approach** wrong rather than the code and wrote no patch — `review-pr.md` step
+3a. The key stops counting as work a fix round can clear.
+
+It exists because the two rules around it are individually right and were jointly
+a trap. An escalated finding is outstanding, and `panel-review-pr.md` §5 forbids
+ever handing it to another fixer — so `round_stop` returned `stop: false` every
+round until the cap, and the mechanism meant to stop a cycle circling a premise
+guaranteed it ran to the cap instead (#221).
+
+**The rule, its exact scope and its two caveats live in one place: `round_stop`'s
+docstring in `panel_rounds.py`.** What a caller has to DO about it lives in
+`panel-review-pr.md`. Neither is paraphrased here — this rationale was restated
+five ways once, and two of the copies had already drifted into saying something
+untrue by the time anyone read them together. What is worth recording here is only
+what the flag touches outside that function:
+
+- **The mixed case is why this is a filter and not "stop on any escalation".** One
+  escalation beside a live P2 still goes again, for the P2; the cycle stops when
+  the fixable work is gone rather than when the counter runs out. Stopping the
+  whole cycle on any escalation would throw away the re-review of fixes made in
+  the same pass — the round that, on PR #212, found 16 defects the previous fix
+  introduced.
+- **What it writes.** The payload carries `escalated: {key: round}` — the cycle's
+  whole register, which later rounds read out of `--baseline` and which only ever
+  grows — and `round_stop.escalated_outstanding`, the sorted subset of it that
+  THIS round raised. The two are deliberately different questions: "what is this
+  cycle holding" and "what stopped round 3". `escalated_outstanding` is the one
+  that earned the veto line, so it is the one a consumer usually wants. Every
+  finding in `to_fix`, `sonar_findings` and `dismissed` also carries
+  `escalated: true|false`, and the report marks it ⛔ in the two lists a fixer's
+  brief can be built from.
+- **It needs a cycle to mean anything, and is refused without one.**
+  `--escalated` names work a LATER round must not count, and it is read out of a
+  fix pass that followed a review round — so the flag without `--round`,
+  `--max-rounds` or `--baseline` exits non-zero saying so. The two alternatives
+  were dropping the declaration silently and inventing a cycle to hold it, and the
+  second one printed "round 1 of at most 2 — go again" for a re-review nobody
+  would run.
+- **A key naming nothing is reported** in `config_notes` rather than ignored, and
+  a value that is not a finding key (8-64 hex characters) is rejected before it
+  reaches the register or a PR comment — including the empty string, which is the
+  likeliest one to arrive (`--escalated "$KEY"` with the variable unset). The
+  alternative failure is silent: the loop simply carries on counting a finding the
+  caller believes it excluded. Keys are lower-cased and stripped first, because
+  this value is transcribed out of a fixer's prose by hand, and repeated flags are
+  deduplicated, so re-passing an inherited key really is harmless. A key naming a
+  finding this round's master DISMISSED is reported too: that is not work either
+  way, so the declaration changes nothing. A round the panel SKIPPED adds no key —
+  it reviewed nothing — but carries the inherited register forward and names the
+  key it dropped.
+- **An escalated SonarCloud gate issue does not make the gate green.** A premise
+  answer is not a fix, and the gate is an external merge blocker, so a stop whose
+  only remaining work is an escalated gate issue names the failing gate in both
+  `reason` and `veto` instead of reporting "nothing left that a fix round can
+  clear" on its own. (`preland.py` HOLDs on that gate independently; this is the
+  panel saying it in its own verdict.)
+
 ### The premise check (`--ask`)
 
 `python3 ~/.claude/loops/panel.py --ask "<premise>" [--context <path[:first-last]> …]

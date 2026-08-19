@@ -403,16 +403,83 @@ no with complete confidence):
   no baseline to compare against. The `veto` list says which. Report it as a stop,
   never as "clean".
 
-**An escalation ends the fix half of the cycle for that finding, and `round_stop`
-cannot see it.** The rule is mechanical, computed from the rounds' payloads, so a
-finding the fixer escalated instead of patching is simply *outstanding* at the next
-round — correctly, because it is — and `stop: false` sends it back to §4. A fresh
-fixer, briefed with that round's findings and no memory of the escalation, then
-writes the patch the last one declined to write: the round that manufactures the
-next round's findings, arriving through the rule that exists to prevent them.
+**An escalation ends the fix half of the cycle for that finding — tell the loop,
+with `--escalated`.** Pass the key on the round you learn of it:
+
+```
+python3 ~/.claude/loops/panel.py --pr <pr> --post --round <r> --max-rounds <N> \
+    --escalated <the key the fixer escalated> \
+    --baseline /tmp/tmp.AbC123/r1.json [--baseline …] \
+    --json-file /tmp/tmp.AbC123/r<r>.json
+```
+
+Without it the cycle jams, and the jam is the mechanism defeating itself: the
+finding is outstanding (correctly), no fixer may touch it (correctly), so
+`round_stop` returned `stop: false` every round until the cap — the thing built to
+stop a loop circling a premise guaranteed it ran to the cap. With it, the key is
+subtracted from the work a fix round can clear: the cycle goes again exactly while
+there is other work, and stops as soon as only escalations remain. The finding
+stays in the report, marked ⛔. `round_stop`'s docstring
+(`harness/loops/panel_rounds.py`) is where the rule and its limits are kept; what
+follows is only what YOU have to do.
+
+**Pass each key once — and pass a NEW key when the premise comes back under one.**
+A key rides in the payload as `escalated: {key: round}` and every later round
+inherits it through `--baseline`, so a cycle cannot lose the question by forgetting
+a flag, and re-passing a key you inherited is harmless (the round it was FIRST
+declared in survives, a re-declaration cannot re-date the claim, and a repeated
+flag is deduplicated rather than noted twice). Pass it **with the round flags** —
+`--escalated` without `--round`/`--max-rounds`/`--baseline` is refused, because it
+names work a later round must not count and a single-pass review has no later
+round. What inheritance
+cannot do is follow a premise into a different key, and §5 below is the case where
+that happens: a fresh panel over the same code very often words the same premise
+differently, which mints a new `finding_key`. Nothing mechanical connects the two.
+So when §5's re-read finds a premise you have already relayed wearing a new key,
+add that key to `--escalated` as well — otherwise rule 1 fires on it as brand-new
+work, it reaches a fixer with no ⛔ mark, and the cycle runs to the cap on a
+finding no fixer may patch. Escalating by premise is yours; the loop only knows
+keys.
+
+**A stop that is HOLDING an escalation is never convergence — and that is
+narrower than "the cycle can never converge with a question open".** When the
+round that stops still raises the escalated finding, the stop takes a veto line,
+`confident` is false, and the reason says a human is owed an answer. When it does
+not raise it — a round under `--scope increment` reviewing only the fix commit,
+or a round whose fresh panel gave the premise a new key — that round is genuinely
+dry and is reported `confident: true` with the question still open. `confident`
+is a claim about the ROUND, never a claim that the PR has nothing outstanding.
+What tracks the open premise across the cycle is your relay and its issue (§4b),
+which is where the human is looking for it.
+
+**When a human ANSWERS the premise, the cycle is over — start a fresh one.** The
+register only grows: there is no un-escalate, and no way to drop one key without
+throwing away the whole baseline. So an answered premise's key would go on
+subtracting its finding from the work a fix round can clear, and go on rendering
+⛔, for every round that inherits the baseline. Take the answer as the end of this
+cycle, land the work it calls for, and open a new cycle over the result.
+
+**The honest limit, and the reason this is a flag rather than a detector.** The
+loop is taking your word for it, and you read that word out of a fixer's prose —
+so the agent whose fix pass produced the finding is, one step removed, the agent
+ending the cycle over it. That is the signal #67's own evidence says cannot be
+self-reported. The key and its round are recorded so the claim is auditable after
+the fact, and the cap still binds; nothing here detects a premise on its own
+(#67's first piece, still unbuilt). Do not escalate to end a cycle you find
+tedious — that is not a loophole, it is the one way to make this number lie.
+
+**A key that names nothing, or is not a key at all, is reported.** A value that is
+not 8-64 hex characters is rejected outright, and a well-formed key matching no
+finding this cycle has ever seen lands in `config_notes` saying so. Both are said
+out loud because the failure they would otherwise cause is invisible: the loop
+carries on counting a finding you believe you excluded. A round the panel SKIPPED
+(a merge-title match) records no new key at all — it reviewed nothing — and says
+which key it dropped; pass it again on the next round that runs.
 
 - **Never re-brief an escalated finding to a fixer.** Not this round, not a later
-  one. It goes to the human with the write-up the fixer produced (§6).
+  one. It goes to the human with the write-up the fixer produced (§6). The ⛔ mark
+  in the panel's own **To fix** and **SonarCloud issues** lists is there so a
+  brief built from either cannot include it by accident.
 - **Match it by premise, not by key.** The next round is a fresh panel over the
   same code, so it will very likely report the same premise defect again — with a
   **new** `finding_key`, at a different line, in different words, and nothing
@@ -420,7 +487,9 @@ next round's findings, arriving through the rule that exists to prevent them.
   a finding a *later* one replaced). You are the only reader who has both, because
   you ran both rounds. So before briefing a round's **To fix** list, read it
   against every escalation you have already relayed and pull out anything that is
-  the same premise wearing a new key. It does not go in the brief. It **does** get
+  the same premise wearing a new key. It does not go in the brief, and it **does**
+  go into the next round's `--escalated` under its new key — inheritance follows
+  keys, not premises, so nothing else will hold it. It **does** get
   its own `deferred` row, naming the same premise issue in `deferred_to` — it is a
   real finding nobody fixed, and a key recorded nowhere is the gap §4b exists to
   close. Two rows do not double-count one premise: only `fixed` and `refuted` are

@@ -692,6 +692,126 @@ def test_a_baseline_counts_what_was_raised_not_what_was_confirmed(tmp_path):
     assert b.raised_before(_canonical("a.py", "real bug"))
 
 
+def test_an_escalation_is_inherited_by_every_later_round(tmp_path):
+    """An escalation is answered by a human on their own clock, so nothing about
+    a later round makes it stop being open. A cycle that had to re-pass the flag
+    every round would go back to counting it as work the loop can do the first
+    time a caller forgot — the jam returning one round later."""
+    path = _payload(tmp_path, "r1.json", 1, ["real bug"],
+                    escalated={"deadbeefdeadbeef": 1})
+    b = panel.load_baseline([path], THIS_RUN)
+    assert b.problems == [] and b.escalated == {"deadbeefdeadbeef": 1}
+
+
+def test_the_round_an_escalation_was_first_declared_in_survives_a_merge(tmp_path):
+    """Earliest wins, like the cycle id: a later round re-stating a key it
+    inherited must not re-date the claim to now. The round is the only part of
+    this an auditor can check the caller's word against."""
+    first = _payload(tmp_path, "r1.json", 1, ["a"], escalated={"aabbccddeeff0011": 1})
+    later = _payload(tmp_path, "r2.json", 2, ["b"], escalated={"aabbccddeeff0011": 2})
+    assert panel.load_baseline([first, later], {**THIS_RUN, "round": 3}).escalated \
+        == panel.load_baseline([later, first], {**THIS_RUN, "round": 3}).escalated \
+        == {"aabbccddeeff0011": 1}
+
+
+def test_a_bare_list_of_escalated_keys_is_read_as_that_round_s(tmp_path):
+    """A payload written before the field carried a round, or one written by
+    hand. Attributing it to the round that wrote it is the only answer available
+    and is never later than the truth."""
+    path = _payload(tmp_path, "r1.json", 1, ["a"], escalated=["00ff00ff00ff00ff"])
+    assert panel.load_baseline([path], THIS_RUN).escalated == {"00ff00ff00ff00ff": 1}
+
+
+LATER = {**THIS_RUN, "round": 4}
+GOOD = "deadbeefdeadbeef"
+
+
+@pytest.mark.parametrize("junk,register,complaint", [
+    # The CONTAINER is the wrong shape: nothing can be read out of it, and the
+    # register reverting to empty in silence is the #221 jam arriving with no
+    # diagnostic at all.
+    ("a string", {}, "neither an object nor a list"),
+    (7, {}, "neither an object nor a list"),
+    # `None` is the absent field, which is not a fault: every payload written
+    # before #221 has one, and they are the common case, not the corrupt one.
+    (None, {}, None),
+    # A key nothing can ever match. It would sit in the register forever while
+    # the caller read the cycle's silence as the escalation being honoured.
+    ({"": 1}, {}, "not the shape of a finding key"),
+    ({"not a key": 1}, {}, "not the shape of a finding key"),
+    ({"NOTHEXNOTHEXNOTH": 1}, {}, "not the shape of a finding key"),
+    # A real key, dated with something that is not a round of this cycle. The key
+    # is kept — losing it is the failure that matters — and the date falls back to
+    # the round of the payload carrying it, which is never later than the truth.
+    ({GOOD: "not a round"}, {GOOD: 3}, "not a round of this cycle"),
+    ({GOOD: 0}, {GOOD: 3}, "not a round of this cycle"),
+    ({GOOD: -2}, {GOOD: 3}, "not a round of this cycle"),
+    ({GOOD: 9}, {GOOD: 3}, "not a round of this cycle"),
+    ({GOOD: 2.9}, {GOOD: 3}, "not a round of this cycle"),
+    # `bool` is an `int` subclass, so an unguarded `int(when)` reads `True` as
+    # "declared in round 1" — a plausible-looking round number invented out of a
+    # payload that carries none.
+    ({GOOD: True}, {GOOD: 3}, "not a round of this cycle"),
+    # ...and the shapes that are fine, so the complaint above is not just noise
+    # this asserts against everything.
+    ({GOOD: 2}, {GOOD: 2}, None),
+    ([GOOD], {GOOD: 3}, None),
+])
+def test_what_a_malformed_escalated_field_costs(tmp_path, junk, register, complaint):
+    """Same rule as every other field this function reads: a bad payload costs a
+    `problems` entry, never a review every reviewer CLI has been paid for — and
+    never silence. Silence is the expensive one here: an unreadable register puts
+    a finding only a human can close back into the work a fix round counts, which
+    is precisely the jam the register exists to prevent.
+
+    One expected result per input, because these fail in five different ways and a
+    disjunction over all of them passes for implementations that are wrong."""
+    path = _payload(tmp_path, "r.json", 3, ["a"], escalated=junk)
+    b = panel.load_baseline([path], LATER)
+    assert b.escalated == register
+    if complaint is None:
+        assert b.problems == []
+    else:
+        assert any(complaint in x for x in b.problems), b.problems
+
+
+def test_a_malformed_escalated_key_is_not_echoed_raw_into_the_report(tmp_path):
+    """`problems` becomes a veto line, and the veto list is posted to the PR. A
+    key is 8-64 hex characters; anything else is named by a flattened, truncated
+    excerpt so a corrupt payload cannot put markdown on a public comment."""
+    evil = "[click](http://x)\n\n# heading " + "z" * 200
+    path = _payload(tmp_path, "r.json", 3, ["a"], escalated={evil: 1})
+    problems = " ".join(panel.load_baseline([path], LATER).problems)
+    assert "](" not in problems and "\n" not in problems and "# heading" not in problems
+    assert len(problems) < 300
+
+
+@pytest.mark.parametrize("typed", ["DEADBEEFDEADBEEF", " deadbeefdeadbeef",
+                                   "deadbeefdeadbeef\n", "  DeadBeefDeadBeef  "])
+def test_a_key_a_HUMAN_retyped_is_normalised_rather_than_rejected(tmp_path, typed):
+    """This is the one value the design says is read out of a fixer's PROSE report
+    and retyped, so an upper-case key or one carrying a copy-paste newline is the
+    caller naming exactly the right finding. Rejecting it produced a note blaming
+    the caller for a correct value AND left the escalation uncounted — the jam, with
+    a misleading diagnostic on top. Normalising cannot admit anything `_KEY_RE`
+    would not: case and surrounding blanks are all it touches."""
+    assert panel._is_key(typed) and panel._key_norm(typed) == GOOD
+    path = _payload(tmp_path, "r.json", 1, ["a"], escalated={typed: 1})
+    b = panel.load_baseline([path], LATER)
+    assert b.problems == []
+    assert b.escalated == {GOOD: 1}, "stored as a finding's own key is spelled"
+
+
+def test_a_homoglyph_excerpt_is_flattened_like_any_other_junk():
+    """`_key_gist`'s excerpt is published by `--post`, and its job is to let a human
+    recognise WHICH value was rejected. `str.isalnum` is true for letters and digits
+    in every script, so a Cyrillic look-alike came through verbatim and rendered as
+    a plausible key — harmless as markdown, useless as an excerpt."""
+    assert panel._key_gist("\u0430\u0435\u043e\u0440\u0441\u0443\u0445") == "?" * 7
+    assert panel._key_gist("\uff11\uff12\uff13") == "???"
+    assert panel._key_gist(GOOD) == GOOD, "a real key still reads as itself"
+
+
 def test_a_baseline_reads_the_key_the_payload_carries(tmp_path):
     """The panel sends a key with every finding, and it is the same identity the
     board chains runs on. Re-deriving one here — from the judge's freshly-worded
@@ -947,8 +1067,8 @@ def test_a_dry_round_of_polish_is_finished():
 
 
 def test_the_cap_stops_the_loop_but_is_not_recorded_as_convergence():
-    """"We ran out of rounds" and "there was nothing left" are different facts,
-    and only one of them is a clean bill of health."""
+    """A verdict of "we ran out of rounds" and one of "there was nothing left"
+    are different facts, and only one of them is a clean bill of health."""
     d = panel.round_stop(2, 2, ["k1", "k2"], [_confirmed("P1")], [])
     assert d["stop"] is True and d["confident"] is False
     assert "round cap (2)" in d["reason"] and "unreviewed" in d["reason"]
@@ -967,7 +1087,8 @@ def test_a_finding_still_there_after_the_fix_earns_another_round():
     told about and did not fix. Recording a veto and stopping anyway ended the cycle
     with a confirmed defect present — /panel-review-pr's bar is every confirmed
     finding, not every P1/P2."""
-    d = panel.round_stop(2, 3, [], [_confirmed("P3")], [], repeated=1)
+    c = _confirmed("P3")
+    d = panel.round_stop(2, 3, [], [c], [], repeated={c.key})
     assert d["stop"] is False and "still outstanding" in d["reason"]
     # No veto, though: the veto list answers "why this round's QUIET is not
     # evidence of a quiet PR", and this round was not quiet — its repeat is
@@ -978,7 +1099,8 @@ def test_a_finding_still_there_after_the_fix_earns_another_round():
 def test_the_cap_is_what_ends_an_argument_about_a_repeated_p4():
     """Two reviewers can disagree about a P4 forever, so rule 3 needs a floor. The
     cap is it — and a cap reached with work outstanding is not convergence."""
-    d = panel.round_stop(2, 2, [], [_confirmed("P4")], [], repeated=1)
+    c = _confirmed("P4")
+    d = panel.round_stop(2, 2, [], [c], [], repeated={c.key})
     assert d["stop"] is True and d["confident"] is False
     assert "round cap (2)" in d["reason"] and "unreviewed" in d["reason"]
 
@@ -986,6 +1108,177 @@ def test_the_cap_is_what_ends_an_argument_about_a_repeated_p4():
 def test_a_baseline_that_could_not_be_read_also_costs_the_verdict_its_confidence():
     d = panel.round_stop(2, 3, [], [], [], baseline_ok=False)
     assert d["stop"] is True and d["confident"] is False
+
+
+# ---- the finding no round can close (#221) ---------------------------------
+#
+# A fixer may report that a finding says the APPROACH is wrong rather than the
+# code and write no patch (`review-pr.md` step 3a), and `panel-review-pr.md` §5
+# forbids ever handing it to another fixer. Both rules are right and together
+# they jammed the loop: the finding is outstanding, nothing may fix it, so rules
+# 1-3 said "go again" every round until the cap — the mechanism built to stop a
+# cycle circling a premise guaranteed it ran to the cap instead.
+
+
+def _c(sev, file="a.py", title="t"):
+    """A judged finding whose `.key` the test then reads.
+
+    The key is a read-only property derived from the file and the reporters'
+    words (:func:`_defect_key`), so a test cannot hand one in — two findings get
+    two keys by differing in what they are ABOUT, which is also the only way they
+    differ in production."""
+    return _canonical(file, title, severity=sev)
+
+
+def test_an_escalated_finding_alone_does_not_earn_another_round():
+    """The jam itself. Without the register this is `stop: False` at every round
+    until the cap, on a finding no fix pass is allowed to touch."""
+    c = _c("P2")
+    assert panel.round_stop(2, 5, [], [c], [], repeated={c.key})["stop"] is False
+    d = panel.round_stop(2, 5, [], [c], [], repeated={c.key}, escalated=[c.key])
+    assert d["stop"] is True
+    assert "escalated" in d["reason"] and "await a human" in d["reason"]
+
+
+def test_a_stop_holding_an_escalation_is_never_convergence():
+    """It is a stop and it is not clean: the PR carries a question only a human
+    closes. Reported through the existing veto, so `confident` falls out by the
+    rule that was already there and every consumer of it needs no new field."""
+    c = _c("P2")
+    d = panel.round_stop(2, 5, [], [c], [], repeated={c.key}, escalated=[c.key])
+    assert d["confident"] is False
+    assert any("no round can close them" in v for v in d["veto"])
+    assert d["escalated_outstanding"] == [c.key]
+
+
+def test_it_is_never_reported_as_dry():
+    """A "dry" verdict is a claim that nothing was raised. Something was raised,
+    and is unanswered — a reader reconciling "dry" against an open premise question is
+    being told something untrue about why the loop stopped."""
+    c = _c("P4")
+    d = panel.round_stop(2, 5, [], [c], [], escalated=[c.key])
+    assert "dry" not in d["reason"]
+
+
+def test_real_work_beside_an_escalation_still_earns_another_round():
+    """The mixed case, which is the one a "stop on any escalation" rule gets
+    wrong: one escalation beside a live P2 must not end the cycle, or the fixes
+    that WERE made in the same pass go unreviewed."""
+    held, live = _c("P3"), _c("P2", file="b.py", title="a different defect")
+    assert held.key != live.key
+    d = panel.round_stop(2, 5, [], [held, live], [], escalated=[held.key])
+    assert d["stop"] is False and "P1/P2" in d["reason"]
+
+
+def test_the_cycle_stops_as_soon_as_only_escalations_remain():
+    """...and the round after, when the P2 is fixed, it stops — on the work being
+    done rather than on the counter running out. That is the whole point: #67
+    calls the cap arbitrary, and this is the case where the loop can know."""
+    held = _c("P3")
+    d = panel.round_stop(3, 5, [], [held], [], repeated={held.key}, escalated=[held.key])
+    assert d["stop"] is True and d["round"] == 3 and d["max_rounds"] == 5
+
+
+def test_a_finding_escalated_and_raised_again_as_NEW_is_still_held():
+    """A later round can re-derive the same defect under the same key and report
+    it as new. Filtering only `outstanding` would let rule 1 fire on it and buy
+    the round nobody could act on."""
+    held = _c("P3")
+    d = panel.round_stop(2, 5, [held.key], [held], [], escalated=[held.key])
+    assert d["stop"] is True
+
+
+def test_escalating_something_that_is_not_outstanding_costs_nothing():
+    """A key for a finding this round did not raise is not an error — an
+    escalation stays open across rounds whether or not a reviewer mentions it
+    again — but it must not invent a reason to stop or to go on."""
+    fresh = _c("P2")
+    d = panel.round_stop(2, 5, [fresh.key], [fresh], [],
+                         escalated=["a0b1c2d3e4f56789"])
+    assert d["stop"] is False and "1 finding" in d["reason"]
+
+
+def test_a_register_key_this_round_never_raised_does_not_veto_a_dry_round():
+    """Found by the codex seat on this diff's own review. The register is
+    inherited and only grows, so holding the whole of it against every later round
+    meant one stale key — a premise a human has since ANSWERED, a withdrawn
+    finding, a typo — made the cycle permanently unable to report convergence, on
+    rounds that were genuinely dry. A veto that can never be cleared is the loud
+    wrong signal a reader learns to skip past."""
+    d = panel.round_stop(3, 5, [], [], [], escalated=["a0b1c2d3e4f56789"])
+    assert d["stop"] is True and d["confident"] is True
+    assert "dry" in d["reason"] and d["veto"] == []
+    assert d["escalated_outstanding"] == []
+
+
+def test_a_typo_does_not_quietly_end_the_cycle_either():
+    """The same key, with real work outstanding: it must not subtract a finding
+    nobody escalated, and `--escalated` naming nothing is reported in
+    `config_notes` by the caller rather than acted on here."""
+    live = _c("P2")
+    d = panel.round_stop(3, 5, [], [live], [], repeated={live.key},
+                         escalated=["a0b1c2d3e4f56789"])
+    assert d["stop"] is False and "P1/P2" in d["reason"]
+
+
+def test_an_escalated_P1_alone_stops_the_cycle_with_the_blocker_PRESENT():
+    """Rule 2 says a P1/P2 outstanding earns a round "whatever anyone declared",
+    and this is the case where a declaration overrides it — the largest behavioural
+    consequence of #221, and the one a reader of rule 2 will get wrong. Asserted
+    deliberately at P1, the severity the other tests here do not use: the loop
+    stops with a judge-confirmed BLOCKER present, because no fix round may touch
+    it, and it says so rather than reporting convergence."""
+    p1 = _c("P1")
+    assert panel.round_stop(2, 5, [], [p1], [])["stop"] is False
+    d = panel.round_stop(2, 5, [], [p1], [], escalated=[p1.key])
+    assert d["stop"] is True and d["confident"] is False
+    assert "P1/P2" not in d["reason"] and "await a human" in d["reason"]
+    assert d["escalated_outstanding"] == [p1.key]
+
+
+@pytest.mark.parametrize("field", ["repeated", "escalated"])
+def test_a_bare_STRING_of_keys_is_refused_rather_than_iterated(field):
+    """A `str` is itself iterable, so `escalated=key` instead of `escalated=[key]`
+    — the natural slip now that both take keys — made `held` a set of single
+    characters, `blocking` empty against real keys, and the escalation silently
+    ignored while the cycle ran to its cap: the #221 jam, from inside the fix for
+    it. `repeated="<key>"` is the same slip the other way and reports a repeat
+    count invented out of the string's distinct characters."""
+    c = _c("P3")
+    with pytest.raises(TypeError) as bad:
+        panel.round_stop(2, 5, [], [c], [], **{field: c.key})
+    assert "not one string" in str(bad.value)
+
+
+def test_the_COUNT_this_used_to_take_is_named_rather_than_left_to_a_TypeError():
+    """`repeated` was `int = 0` until #221. A caller outside that change still
+    passing a count now fails — which is right, since a count cannot express the
+    escalation subtraction — but `'int' object is not iterable` says nothing about
+    what to pass instead."""
+    c = _c("P3")
+    with pytest.raises(TypeError) as bad:
+        panel.round_stop(2, 5, [], [c], [], repeated=1)
+    assert "not a count" in str(bad.value)
+
+
+def test_a_DICT_of_keys_is_still_read_as_its_keys():
+    """The production call site passes the register itself (`{key: round}`), so the
+    guard above must reject only the shapes that iterate into something other than
+    keys."""
+    c = _c("P3")
+    d = panel.round_stop(2, 5, [], [c], [], escalated={c.key: 1})
+    assert d["stop"] is True and d["escalated_outstanding"] == [c.key]
+
+
+def test_an_empty_declaration_changes_nothing():
+    """`--escalated ''` and no flag at all are the same run. Guarded because the
+    filter is a membership test, and an empty string in the set would quietly
+    match a finding whose key failed to serialise."""
+    c = _c("P2")
+    plain = panel.round_stop(2, 5, [], [c], [], repeated={c.key})
+    empty = panel.round_stop(2, 5, [], [c], [], repeated={c.key}, escalated=["", None])
+    assert plain["stop"] == empty["stop"] is False
+    assert empty["escalated_outstanding"] == []
 
 
 # ---- what makes a quiet round suspect --------------------------------------
