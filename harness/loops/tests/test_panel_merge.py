@@ -497,6 +497,7 @@ def run_panel(monkeypatch, judge_reply, findings, capsys, json_out=False, sonar=
                             lambda *a, **k: (sonar_gate, list(sonar), [], None))
     monkeypatch.setattr(panel, "load_repo_cfg", lambda name: {
         "github": "o/r", "path": "/tmp/r",
+        "_rules_baseline": ".harness-rules.sample",
         "reviewers": reviewers,
         "review_panel": {},
     })
@@ -522,6 +523,7 @@ def test_json_mode_puts_nothing_but_the_payload_on_stdout(monkeypatch, capsys):
     reply = '[{"id":"F1","members":[0],"real":true,"reason":"real"}]'
     monkeypatch.setattr(panel, "load_repo_cfg", lambda name: {
         "github": "o/r", "path": "/tmp/r",
+        "_rules_baseline": ".harness-rules.sample",
         "reviewers": {"codex": {"enabled": True}}, "review_panel": {},
     })
     meta = {"title": "t", "additions": 1, "deletions": 0,
@@ -544,6 +546,7 @@ def test_a_skipped_pr_still_answers_json_mode(monkeypatch, capsys):
     empty stdout, and the second reads as a clean PR."""
     monkeypatch.setattr(panel, "load_repo_cfg", lambda name: {
         "github": "o/r", "path": "/tmp/r", "reviewers": {},
+        "_rules_baseline": ".harness-rules.sample",
         "review_panel": {"skip_title_patterns": ["^Merge "]},
     })
     meta = {"title": "Merge test into main", "additions": 1, "deletions": 0,
@@ -607,6 +610,7 @@ def test_a_skipped_pr_answers_with_the_same_payload_SHAPE_as_a_reviewed_one(
     KeyError on exactly the PR the payload exists for."""
     monkeypatch.setattr(panel, "load_repo_cfg", lambda name: {
         "github": "o/r", "path": "/tmp/r", "reviewers": {},
+        "_rules_baseline": ".harness-rules.sample",
         "review_panel": {"skip_title_patterns": ["^Merge "]},
     })
     meta = {"title": "Merge test into main", "additions": 1, "deletions": 0,
@@ -936,6 +940,7 @@ def test_a_skipped_round_carries_the_register_forward_and_adds_nothing(
     }))
     monkeypatch.setattr(panel, "load_repo_cfg", lambda name: {
         "github": "o/r", "path": "/tmp/r", "reviewers": {},
+        "_rules_baseline": ".harness-rules.sample",
         "review_panel": {"skip_title_patterns": ["^Merge "]},
     })
     meta = {"title": "Merge test into main", "additions": 1, "deletions": 0,
@@ -1082,3 +1087,90 @@ def test_the_serialised_finding_is_the_canonical_record():
         "related": [],
         "rationale": "why",
     }
+
+
+# ------------------------------------- a repo nobody configured is not reviewed
+
+#: The resolved config of a repo with no rules file at all: `_rules_baseline` is
+#: `resolve_repo`'s statement of WHICH file supplied the baseline, and `""` is it
+#: saying there was none. Everything else is the built-in defaults, which is exactly
+#: the review nobody chose.
+UNCONFIGURED_CFG = {
+    "name": "stranger", "github": "o/r", "path": "/tmp/r", "_rules_baseline": "",
+    "_rules_from": "none (defaults)",
+    "reviewers": {"claude": {"enabled": True, "model": "opus"}},
+    "review_panel": {},
+}
+
+
+def test_a_repo_with_no_rules_file_is_REFUSED_rather_than_reviewed(monkeypatch, capsys):
+    """Absence of a rules file means "use the defaults" everywhere else in the
+    harness, and that is right for `epic`, `lander` and `preland` — every default is
+    the safe end of its own switch, so an unconfigured repo gets a run that does LESS.
+
+    A review is not that shape. Its defaults are a two-seat panel on models nobody
+    chose, adjudicated by a judge nobody chose, and its output is not inert: the
+    findings brief a fixer that edits the repo, and a confident stop is read
+    downstream as coverage the PR actually got. So it refuses, and the remedy is one
+    committed file."""
+    monkeypatch.setattr(panel, "load_repo_cfg", lambda name: UNCONFIGURED_CFG)
+    # A `gh` double that fails the test if it is called at all: the refusal is about
+    # the repo, not about the PR, so there is nothing to spend an API round-trip
+    # finding out — and the PR read is the call that used to come first.
+    monkeypatch.setattr(panel_core, "sh", lambda *a, **k: pytest.fail(
+        f"the refusal must precede every `gh` call; this one ran: {a!r}"))
+    assert panel.run("stranger", 1609, post=False, json_out=True) == 0
+    out = capsys.readouterr()
+    payload = json.loads(out.out)
+    assert payload["reviewed"] is False
+    assert payload["to_fix"] == [] and payload["reviewers_ran"] == []
+    assert ".harness-rules.sample" in payload["skip_reason"], (
+        f"the skip_reason names the remedy: {payload['skip_reason']!r}")
+    assert "refusing to review" in out.err
+
+
+def test_the_refusal_is_not_recorded_on_the_board(monkeypatch, capsys):
+    """No review happened, so there is nothing to record — the same rule the
+    title-pattern skip follows. A board row for a run that never read a diff is a
+    panel in the stats that reviewed nothing."""
+    monkeypatch.setattr(panel, "load_repo_cfg", lambda name: UNCONFIGURED_CFG)
+    monkeypatch.setattr(panel_core, "sh", lambda *a, **k: "")
+    monkeypatch.setattr(panel, "record_run",
+                        lambda p: pytest.fail("a refused run must not be recorded"))
+    assert panel.run("stranger", 1609, post=False, json_out=True, record=True) == 0
+    capsys.readouterr()
+
+
+def test_the_refusal_payload_has_the_SAME_SHAPE_as_a_reviewed_one(monkeypatch, capsys):
+    """The rule `_payload_defaults` exists for: a consumer reading `payload['judged']`
+    or `['run_key']` must not have to know which exit produced the payload. The epic's
+    merge gate reads `reviewed`/`skip_reason` off it, and it does so precisely because
+    a zero exit, a push, and the mere existence of a payload have each been mistaken
+    for a review in turn."""
+    monkeypatch.setattr(panel, "load_repo_cfg", lambda name: UNCONFIGURED_CFG)
+    monkeypatch.setattr(panel_core, "sh", lambda *a, **k: "")
+    assert panel.run("stranger", 1609, post=False, json_out=True) == 0
+    refused = json.loads(capsys.readouterr().out)
+
+    reply = '[{"id":"F1","members":[0],"real":true,"reason":"real"}]'
+    out, _ = run_panel(monkeypatch, reply, [find()], capsys, json_out=True)
+    reviewed = json.loads(out)
+    assert set(refused) == set(reviewed)
+    assert refused["run_key"] and refused["judged"] is False
+    # Null, not invented: nothing about the PR was fetched, which is the honest
+    # difference between "we read it and declined" and "we declined before reading".
+    assert refused["title"] is None and refused["head_sha"] is None
+
+
+def test_the_refusal_writes_the_json_file_the_caller_asked_for(monkeypatch, capsys,
+                                                               tmp_path):
+    """`--json-file` is honoured on every non-error exit, and its failure fails the
+    run — the caller is told that if the panel could not write that file, the round did
+    not happen. A refusal that exited 0 leaving no file would give that caller no
+    signal at all."""
+    monkeypatch.setattr(panel, "load_repo_cfg", lambda name: UNCONFIGURED_CFG)
+    monkeypatch.setattr(panel_core, "sh", lambda *a, **k: "")
+    out = tmp_path / "r1.json"
+    assert panel.run("stranger", 1609, post=False, json_file=str(out)) == 0
+    capsys.readouterr()
+    assert json.loads(out.read_text())["reviewed"] is False

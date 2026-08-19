@@ -132,6 +132,7 @@ PR_DIFF = ("diff --git a/a.py b/a.py\n"
            "+first\n")
 
 CFG = {"github": "acme/board", "path": "/tmp/repo",
+       "_rules_baseline": ".harness-rules.sample",
        "review_panel": {"skip_title_patterns": ["^Merge "]},
        "reviewers": {"claude": {"enabled": True, "model": "sonnet"}}}
 

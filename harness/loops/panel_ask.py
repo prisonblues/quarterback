@@ -558,10 +558,39 @@ def ask(repo_name: str | None, premise: str, contexts: list[str] | None = None,
     cfg = load_repo_cfg(repo_name)
     repo_name = cfg.get("name") or repo_name
     rev, panel = cfg["reviewers"], cfg["review_panel"]
-    selected, override_note = select_reviewers(rev, reviewers)
     # Progress and warnings go to stderr under --json, so stdout is the payload
     # and only the payload — the same rule the review path follows.
     chatter = sys.stderr if json_out else sys.stdout
+
+    # Same gate as the review path, for the same reason and through the same
+    # predicate. An ask is cheaper than a round and it is not less configured: which
+    # seats answer, on which models, at which effort, and how many of them make a
+    # verdict (`ask_quorum`/`ask_threshold`) all come out of the rules file — so a
+    # repo that has none gets a tally struck by a panel nobody chose, and the whole
+    # standing of an ask is that it is evidence about a premise. `reviewed: false`
+    # and a `skip_reason`, not recorded, exit 0: the round's shape, because a
+    # consumer must be able to tell "asked and unresolved" from "never asked".
+    refusal = review_refusal(cfg)
+    if refusal:
+        print(f"[{repo_name}] {refusal} — refusing to ask. No seat was called.",
+              file=chatter)
+        payload = {
+            "kind": "ask", "repo": repo_name, "github": cfg["github"],
+            "pr": pr_number, "premise": premise,
+            "reviewed": False, "skip_reason": refusal,
+            # Null rather than one of the four verdicts: no seat was asked, so there
+            # is nothing for `unchallenged` (which means "they answered and it did
+            # not resolve") to be true of.
+            "verdict": None, "verdict_reason": refusal,
+            "answers": {}, "seats_selected": [], "config_notes": [refusal],
+            "run_key": run_key,
+        }
+        write_failed = write_payload(json_file, payload)
+        if json_out:
+            print(json.dumps(payload, indent=2))
+        return finish(write_failed)
+
+    selected, override_note = select_reviewers(rev, reviewers)
 
     notes: list[str] = []
     if "sonarqube" in selected and reviewers:

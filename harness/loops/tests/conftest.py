@@ -37,6 +37,23 @@ This is deliberately a plain factory rather than a fixture: the modules here set
 ``panel.sh`` inside each test, often several times per test with different
 answers, and a fixture cannot see those. Call it and hand the result to
 ``monkeypatch.setattr(panel, "sh", …)``.
+
+THE OTHER DOUBLE, AND ITS ONE REQUIRED KEY: ``load_repo_cfg``.
+
+Most modules here replace ``panel.load_repo_cfg`` with a hand-written cfg literal,
+and every one of those literals carries ``"_rules_baseline"``. That field is
+``resolve_repo``'s statement of WHICH file supplied the baseline
+(``.harness-rules.sample``, ``.harness-rules``, or ``""`` for "there was no rules
+file at all"), and ``run()`` and ``ask()`` REFUSE to review a repo whose answer is
+``""`` — a defaults-only review is a review nobody configured, and its findings then
+brief a fixer that edits the repo.
+
+So a cfg literal without the key is a double claiming something its original cannot
+say, and the refusal it triggers is the test's own fixture being wrong rather than
+the code under test. Set it to ``".harness-rules.sample"`` for an ordinary repo, and
+to ``""`` deliberately when the refusal IS the subject (see
+``test_panel_merge.UNCONFIGURED_CFG``). This is the same lesson as the ``gh`` stub
+above, one seam over: a double that does not know the whole contract fails green.
 """
 
 import io

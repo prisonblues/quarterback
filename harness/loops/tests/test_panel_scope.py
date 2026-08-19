@@ -1033,6 +1033,7 @@ def every_seat_is_on_this_box(monkeypatch):
 
 
 CFG = {"github": "acme/board", "path": "/tmp/acme-board", "name": "board",
+       "_rules_baseline": ".harness-rules.sample",
        "reviewers": {"claude": {"enabled": True, "model": "sonnet"}},
        "review_panel": {}}
 HEAD = "b" * 40

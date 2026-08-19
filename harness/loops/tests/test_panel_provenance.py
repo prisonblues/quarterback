@@ -585,6 +585,7 @@ FIX_COMPARE = _compare()
 CFG = {
     "github": "acme/e2e",
     "path": "/tmp/acme-e2e",
+    "_rules_baseline": ".harness-rules.sample",
     "reviewers": {"claude": {"enabled": True, "model": "sonnet"}},
     "review_panel": {},
 }

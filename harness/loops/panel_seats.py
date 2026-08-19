@@ -24,10 +24,16 @@ import panel_core                 # noqa: F401  — for anything wanting the mod
 # CLI rather than unioned. Per-MODEL support is narrower still and moves with the
 # fleet (gpt-5.6-luna takes `max` but not `ultra`), so this only catches typos —
 # the API rules on the model/effort pair and its sentence is surfaced verbatim.
-CODEX_EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
-PI_EFFORTS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
-AGY_EFFORTS = ("low", "medium", "high")
-EFFORTS = {"codex": CODEX_EFFORTS, "pi": PI_EFFORTS, "antigravity": AGY_EFFORTS}
+#
+# DEFINED one layer down, in harness_rules, and imported back so every name here
+# reads as it always did (`panel.CODEX_EFFORTS` included). The rules resolver has to
+# reject `reviewers.codex.effort: "maxx"` in a config file, and a second copy of the
+# set there would fail SILENTLY: it would not disagree loudly, it would simply stop
+# recognising a level this CLI accepts, or accept one it does not, the first time a
+# vendor adds one. `run_seat` below is the other reader, and both now read the one
+# tuple. Import direction is fixed by panel_core already importing harness_rules.
+from harness_rules import (            # noqa: F401  — re-exported, see __all__
+    AGY_EFFORTS, CODEX_EFFORTS, EFFORTS, PI_EFFORTS)
 
 # How long a seat may ALREADY have spent and still be allowed to lower an
 # unsatisfiable pin and go again (#215). A count of attempts is not a bound on

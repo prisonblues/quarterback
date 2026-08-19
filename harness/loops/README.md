@@ -18,13 +18,57 @@ which remains the reference for the *why*. **The gates are the product.**
 > they import only the stdlib (`certifi` is used when present, with a system-CA
 > fallback at every call site).
 
-## Configuration — `.harness-rules`, in the repo
+## Configuration — `.harness-rules.sample` + `.harness-rules`, in the repo
 
-Each repo describes itself with a `.harness-rules` file in its root, the same
-convention `create-worktree` already uses for `.worktree.json`. **Every key is
-optional**; anything omitted falls back to `DEFAULTS` in `harness_rules.py`, which
-is the safe end of every switch — no auto-merge, no unattended loop, edit-only
-headless agents. A repo with no rules file at all still works.
+Each repo describes itself with a rules file in its root, the same convention
+`create-worktree` already uses for `.worktree.json`. **Every key is optional**;
+anything omitted falls back to `DEFAULTS` in `harness_rules.py`, which is the safe
+end of every switch — no auto-merge, no unattended loop, edit-only headless agents.
+A repo with no rules file at all still works, with one exception: **a panel review
+refuses to run**, see below.
+
+It is **two** files, and which one you edit follows from what you are saying:
+
+| File | Tracked? | Holds |
+|---|---|---|
+| `.harness-rules.sample` | **yes**, on the protected branch | policy — merge gates, bases, budgets, title patterns, the fleet's model pins |
+| `.harness-rules` | **no** (gitignored) | what THIS BOX's providers will actually serve: `reviewers.<seat>.{enabled,model,effort}` and nothing else |
+
+A model pin is one value for the whole fleet; what a provider will serve is a fact
+about one machine, and while the file was tracked those two had to be the same
+thing. On daedalus they are not: codex routes through an employer Azure gateway
+deploying `gpt-5.5` and refuses the fleet's `gpt-5.6-luna` with a 404, then refuses
+`max` effort separately. So the box says so in a file of its own, rather than in a
+committed one that would move the pin for every other box too.
+
+**The overlay may set three keys, and it may only NARROW.** All three answer one
+question — what will this machine serve — so `enabled` can take a seat OFF a box
+whose CLI is missing, and cannot turn one back ON that the sample deliberately
+disabled for cost, policy or merge quorum. Everything that decides what may be
+MERGED (`auto_merge`, the `epic` and `preland` blocks, budgets, title patterns) stays
+in the sample, because an untracked file is reviewed by nobody. Values are checked as
+well as names: `"enabled": "false"` is a truthy string and is **dropped and reported**
+rather than silently keeping a seat on, and an `effort` no CLI serves is refused
+against the same set `run_seat` rules on. Every key it drops is named on stderr.
+
+**Migrating a repo** is one commit, and it is optional — a repo with only a tracked
+`.harness-rules` and no sample resolves exactly as it always did:
+
+```bash
+git mv .harness-rules .harness-rules.sample     # policy, tracked
+```
+
+Two things to know, because this path removes a file that used to be tracked:
+
+- **A checkout with local edits to the old `.harness-rules` should copy it aside
+  before pulling that commit.** That is a plausible state, since it was the only
+  per-repo knob there was — and the rename deletes the tracked path out from under
+  those edits. The copy is what becomes the per-box overlay, gitignored from then on.
+- **Doing the two halves in two commits leaves both files tracked.** That is safe:
+  the sample wins as the baseline and the resolver **says so by name** rather than
+  silently dropping the other one's policy. Finish it with
+  `git rm --cached .harness-rules`, which untracks the file while keeping it on disk,
+  where it is now the overlay.
 
 Two conventions the resolver enforces so a rules file can be read like prose:
 
@@ -58,7 +102,7 @@ Inspect what a repo resolves to:
 ```bash
 python3 ~/.claude/loops/harness_rules.py                 # cwd's repo, one line
 python3 ~/.claude/loops/harness_rules.py --json          # the full merged config
-python3 ~/.claude/loops/harness_rules.py --discover      # repos shipping a rules file
+python3 ~/.claude/loops/harness_rules.py --discover      # repos shipping either rules file
 ```
 
 ### Which ref the rules are read from
@@ -67,8 +111,8 @@ This is the one security-relevant choice in the design.
 
 | Mode | Rules come from | Used by |
 |---|---|---|
-| interactive | the working tree | `/panel`, `/epic`, `/lander` — anything you typed |
-| unattended | `git show origin/<default>:.harness-rules` | the systemd timer (`HARNESS_UNATTENDED=1`) |
+| interactive | the working tree: `.harness-rules.sample`, plus this box's untracked `.harness-rules` overlay | `/panel`, `/epic`, `/lander` — anything you typed |
+| unattended | `git show origin/<default>:.harness-rules.sample` (falling back to `:.harness-rules` for an unmigrated repo), and **nothing** out of the working tree | the systemd timer (`HARNESS_UNATTENDED=1`) |
 
 An in-tree rules file means repo content influences the harness. For the flows a
 human triggers that is not a new door: `/epic`'s executor already runs with
@@ -83,6 +127,32 @@ dependabot branch**. Reading rules from that branch would let a poisoned PR rewr
 the policy governing its own review — reaching something the agent otherwise cannot.
 Hence the split. A human at the keyboard *is* the authorization; unattended runs only
 honour rules already merged to the default branch.
+
+**And the working tree means the whole working tree, tracked or not.** The per-box
+overlay is read on the interactive path only. The first version of this split read it
+unattended too, arguing that an untracked file cannot have come from a PR because git
+will not deliver a file it is not carrying — which is true of what git *checks out*
+and says nothing about what code run from that checkout *writes*. A test suite, a
+build or lint step, a git hook or a Makefile target, invoked while the branch under
+review is checked out, can create `.harness-rules` in the repo root; it is gitignored,
+so `git status` will not even show it; and `{"reviewers": {"<seat>": {"enabled":
+false}}}` planted that way shrinks the panel reviewing that very PR, which panel.py
+counts as coverage it did not get. The cost of closing it is named rather than argued
+away: an unattended panel on a box whose fleet pin is unservable falls back at
+*runtime* (two extra CLI round-trips, and `codex (CLI default)` in the cost history)
+instead of being configured correctly. `describe()`'s provenance line says when an
+overlay went unread for this reason.
+
+**A repo with NO rules file at all is refused a panel review** (`panel.py --pr`, and
+`--ask`), rather than reviewed on the built-in defaults. Absence means "use the
+defaults" for `epic`, `lander` and `preland`, where every default is the safe end of
+its switch and an unconfigured repo simply does less — but a review's defaults are a
+two-seat panel on models nobody chose, adjudicated by a judge nobody chose, and its
+output is not inert: the findings brief a fixer that edits the repo, and a confident
+stop reads downstream as coverage. The refusal prints, writes a payload with
+`reviewed: false` and a `skip_reason` naming the remedy, exits 0, and is **not**
+recorded on the board — no review happened. The remedy is one committed
+`.harness-rules.sample`.
 
 ### Schema
 

@@ -82,6 +82,7 @@ BIG = "".join(
     for i in range(40))
 
 CFG = {"github": "acme/board", "path": "/tmp/acme-board", "name": "board",
+       "_rules_baseline": ".harness-rules.sample",
        "review_panel": {}}
 
 

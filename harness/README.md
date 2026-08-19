@@ -50,7 +50,7 @@ them, and then **panels the fix commit** — one round leaves the fixer's own wo
 nobody, and a structural fix creates interactions no earlier round could have seen.
 
 **A pinned model that this host's provider cannot serve no longer costs the seat.** Model
-slugs are pinned in `.harness-rules` so that "codex found 9 issues" still means something
+slugs are pinned in `.harness-rules.sample` so that "codex found 9 issues" still means something
 six weeks later — but a pin is one value for the whole fleet and a *deployment* is per-host,
 so a slug that is right everywhere else can be unservable on one box. On daedalus, codex
 routes through an employer Azure gateway deploying `gpt-5.5` while the rules pin
@@ -210,7 +210,8 @@ act on the verdict.
 Guardrails are capability-detected, so a repo without `scripts/migration_reconcile.py`
 skips that check and says it skipped it. The board is the one exception — an unreadable
 review state is a HOLD, not a skip, because "nobody reviewed it" and "nobody could tell"
-are the same thing to a merge. `.harness-rules` is where a repo turns that off deliberately.
+are the same thing to a merge. `.harness-rules.sample` is where a repo turns that off
+deliberately.
 
 It reads; it does not act. It reports commands rather than running them and reads merge
 claims rather than taking them, which is what lets it be re-run to check its own advice —

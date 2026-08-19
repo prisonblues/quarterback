@@ -48,12 +48,24 @@ def repo(tmp_path, monkeypatch):
     return work
 
 
+def _commit(repo, *paths):
+    """Commit and push EXACTLY these paths.
+
+    `git add -A` for both writers made one fixture impossible to build: writing the
+    sample uncommitted and then committing the legacy file swept the sample in too,
+    so the test meant to cover "the sample added, the old file not yet untracked"
+    silently built "both files tracked" instead, and could not fail for the reason
+    its own docstring gave. Naming the path is what makes each state expressible.
+    """
+    git(repo, "add", "--", *paths)
+    git(repo, "commit", "-qm", "rules")
+    git(repo, "push", "-q", "origin", "main")
+
+
 def write_rules(repo, obj, commit=False):
     (repo / hr.RULES_FILENAME).write_text(json.dumps(obj))
     if commit:
-        git(repo, "add", "-A")
-        git(repo, "commit", "-qm", "rules")
-        git(repo, "push", "-q", "origin", "main")
+        _commit(repo, hr.RULES_FILENAME)
 
 
 # --------------------------------------------------------------- resolution
@@ -610,9 +622,7 @@ def write_sample(repo, obj, commit=True):
     """The TRACKED half — policy, on the protected branch."""
     (repo / hr.SAMPLE_FILENAME).write_text(json.dumps(obj))
     if commit:
-        git(repo, "add", "-A")
-        git(repo, "commit", "-qm", "sample")
-        git(repo, "push", "-q", "origin", "main")
+        _commit(repo, hr.SAMPLE_FILENAME)
 
 
 def write_local(repo, obj):
@@ -666,18 +676,75 @@ def test_an_untracked_rules_file_with_no_sample_is_still_the_whole_config(repo):
     assert cfg["headless_permission_mode"] == "bypassPermissions"
 
 
-def test_a_tracked_rules_file_beside_a_sample_is_not_an_overlay(repo):
+def test_a_tracked_rules_file_beside_a_sample_is_not_an_overlay(repo, capsys):
     """Mid-migration: the sample added, the old file not yet untracked.
 
     Treated as an overlay, the committed rules would be narrowed to seats and the
     rest of the policy silently lost — on a repo whose only mistake was doing the
-    two halves of the migration in two commits."""
-    write_sample(repo, {"auto_merge": "none"}, commit=False)
+    two halves of the migration in two commits.
+
+    Three assertions, where this used to make one. It asserted only
+    `auto_merge == "none"`, which passes identically whether the tracked file is
+    ignored, overlaid, or merged — so the test could not fail for the reason its own
+    docstring gives. What actually distinguishes the outcomes is whether the
+    SHADOWED file's policy was applied (`epic.sub_pr_merge`, which the shadowed file
+    sets to `auto` and the sample leaves at the `gate` default) and whether the
+    shadowing was reported at all. It also staged with `git add -A`, which swept the
+    "uncommitted" sample into the same commit and built a different state than the
+    one described; `_commit` names its paths for that reason.
+    """
     write_rules(repo, {"epic": {"sub_pr_merge": "auto"}}, commit=True)
+    write_sample(repo, {"auto_merge": "none"}, commit=True)
+    assert hr._is_tracked(repo, hr.RULES_FILENAME), "the fixture must be mid-migration"
     cfg = hr.resolve_repo(str(repo), from_default_branch=False)
-    # The sample wins as baseline, and the tracked file is not applied as an
-    # overlay — but nothing is silently reinterpreted either.
-    assert cfg["auto_merge"] == "none"
+    assert cfg["auto_merge"] == "none", "the sample supplies the baseline"
+    assert cfg["epic"]["sub_pr_merge"] == "gate", (
+        "the shadowed file's policy must NOT be merged — a tracked file can arrive "
+        "from any branch, which is why trackedness is what decides this")
+    err = capsys.readouterr().err
+    assert hr.SAMPLE_FILENAME in err and "was read" in err, (
+        f"a baseline file that exists and was not read must be reported by name, the "
+        f"way the overlay path reports every key it drops. stderr was: {err!r}")
+
+
+def test_the_ORDINARY_overlay_is_not_reported_as_a_half_done_migration(repo, capsys):
+    """The other side of the shadowing report, and the one that decides whether it is
+    readable at all.
+
+    An untracked `.harness-rules` beside a sample is not a shadowed baseline — it is
+    the per-box overlay, which is the normal fully-migrated state and the entire
+    point of the split. Keying the report on "the file exists" rather than on "git is
+    carrying it" printed a migration warning on every resolution of every correctly
+    configured box, which is how a real diagnostic becomes the noise people filter.
+    """
+    write_sample(repo, {"reviewers": {"pi": {"enabled": True}}})
+    write_local(repo, {"reviewers": {"pi": {"enabled": False}}})
+    cfg = hr.resolve_repo(str(repo), from_default_branch=False)
+    assert cfg["reviewers"]["pi"]["enabled"] is False, "the overlay applied"
+    assert "NOTHING in it was read" not in capsys.readouterr().err
+
+
+def test_an_unattended_run_reports_a_shadowed_file_too(repo, capsys):
+    """Both files on the protected branch, read through `git show` rather than off
+    disk — the same event, and the timers are the readers least able to ask anyone
+    what happened to the missing policy."""
+    write_rules(repo, {"epic": {"sub_pr_merge": "auto"}}, commit=True)
+    write_sample(repo, {"auto_merge": "none"}, commit=True)
+    cfg = hr.resolve_repo(str(repo), from_default_branch=True)
+    assert cfg["epic"]["sub_pr_merge"] == "gate"
+    assert hr.RULES_FILENAME in capsys.readouterr().err
+
+
+def test_a_repo_mid_migration_is_told_how_to_finish_it(repo, capsys):
+    """The remedy, not just the diagnosis — the shadowing is one `git rm --cached`
+    from being resolved, and the previously-tracked file is the one plausible
+    pre-migration state a box can be in (it was the only per-repo knob there was).
+    Naming the command is what stops someone deleting the file and losing the local
+    edits it holds."""
+    write_rules(repo, {"epic": {"sub_pr_merge": "auto"}}, commit=True)
+    write_sample(repo, {"auto_merge": "none"}, commit=True)
+    hr.resolve_repo(str(repo), from_default_branch=False)
+    assert f"git rm --cached {hr.RULES_FILENAME}" in capsys.readouterr().err
 
 
 def test_the_local_overlay_turns_a_seat_off(repo):
@@ -787,15 +854,436 @@ def test_an_unknown_seat_in_the_local_overlay_is_reported_not_applied(repo, caps
     assert "gemini" in capsys.readouterr().err
 
 
-def test_unattended_honours_the_local_seat_overlay(repo):
-    """The timers need it too, and it is safe for them for the same reason.
+def test_unattended_does_NOT_read_the_untracked_overlay(repo):
+    """A REVERSAL of what this test asserted, and the reason is that its premise was
+    false.
 
-    A missing CLI is missing whoever started the run, so an unattended panel must
-    not enable a seat this box cannot run. The file is untracked, so no PR branch
-    can have introduced it — which is the entire distinction the two-ref rule is
-    protecting, and it is not weakened by reading a file git never carried."""
-    write_sample(repo, {"auto_merge": "none", "reviewers": {"pi": {"enabled": True}}})
-    write_local(repo, {"reviewers": {"pi": {"enabled": False}}})
+    It used to assert that an unattended run honours the overlay, on the argument
+    that "the file is untracked, so no PR branch can have introduced it — which is
+    the entire distinction the two-ref rule is protecting". That argument covers what
+    git CHECKS OUT and nothing else. It says nothing about what code run FROM that
+    checkout writes: a test suite, a build or lint step, a git hook, a Makefile
+    target — anything invoked while the branch under review is checked out — can
+    create `.harness-rules` in the repo root, and the gitignore added by this same
+    change means `git status` will not even show it. `_is_tracked` then reports a file
+    git is not carrying, the overlay is honoured as this machine's own, and
+    `{"reviewers": {"<seat>": {"enabled": false}}}` planted that way shrinks the panel
+    reviewing that very PR — which panel.py counts as coverage it did not get. That is
+    exactly the poisoning the two-ref read exists to prevent.
+
+    So unattended, the working tree is untrusted, and an untracked file in it is part
+    of the working tree. The price is named rather than argued away: an unattended
+    panel on a box whose fleet pin is unservable falls back at runtime (#215) instead
+    of being configured correctly, which is the right trade for a file nobody can
+    review being unable to change a review.
+    """
+    write_sample(repo, {"auto_merge": "none",
+                        "reviewers": {"pi": {"enabled": True, "model": "fleet/pin"}}})
+    write_local(repo, {"reviewers": {"pi": {"enabled": False, "model": "local/pin"}}})
+
+    unattended = hr.resolve_repo(str(repo), from_default_branch=True)
+    assert unattended["reviewers"]["pi"]["enabled"] is True, (
+        "the working-tree overlay must not reach an unattended run — planting this "
+        "file is a door a PR branch's own test suite can open")
+    assert unattended["reviewers"]["pi"]["model"] == "fleet/pin"
+
+    # Interactive is unchanged, because a human at the keyboard IS the authorization.
+    interactive = hr.resolve_repo(str(repo), from_default_branch=False)
+    assert interactive["reviewers"]["pi"]["enabled"] is False
+    assert interactive["reviewers"]["pi"]["model"] == "local/pin"
+
+
+def test_an_unattended_run_says_the_overlay_went_unread(repo, capsys):
+    """In `describe()`'s line rather than on stderr, and deliberately.
+
+    A box carrying an overlay resolves on every timer tick, so a stderr warning about
+    it would print for ever and become the noise people filter — while the one place
+    a reader asks "why is codex on the fleet pin here?" is the provenance line that
+    exists so which rules applied is never a guess."""
+    write_sample(repo, {"auto_merge": "none",
+                        "reviewers": {"codex": {"model": "fleet/pin"}}})
+    write_local(repo, {"reviewers": {"codex": {"model": "local/pin"}}})
     cfg = hr.resolve_repo(str(repo), from_default_branch=True)
-    assert cfg["reviewers"]["pi"]["enabled"] is False
+    assert hr.RULES_FILENAME in cfg["_rules_from"] and "not read" in cfg["_rules_from"]
+    assert capsys.readouterr().err == "", "not on stderr: this runs on a timer"
     assert cfg["auto_merge"] == "none", "policy still comes from the protected branch"
+
+
+# ------------------------------------- what the overlay SAYS, not just which keys
+
+def test_the_overlay_refuses_a_non_boolean_enabled(repo, capsys):
+    """`"enabled": "false"` was the whole hole, and it is the likeliest hand-edit in
+    the file.
+
+    The key filter checked NAMES and never values, so a quoted `false` — a non-empty
+    string, and therefore truthy — reached the resolved config and kept the seat ON.
+    That is the exact outcome this file exists to prevent, produced by the most
+    natural mistake anyone editing JSON by hand makes."""
+    write_sample(repo, {"reviewers": {"pi": {"enabled": True}}})
+    write_local(repo, {"reviewers": {"pi": {"enabled": "false"}}})
+    cfg = hr.resolve_repo(str(repo), from_default_branch=False)
+    assert cfg["reviewers"]["pi"]["enabled"] is True, (
+        "a value that is not a boolean must be dropped, not coerced — and least of "
+        "all coerced to the opposite of what it says")
+    err = capsys.readouterr().err
+    assert "enabled" in err and "boolean" in err and "TRUTHY" in err, (
+        f"reported, or whoever wrote it stays certain the seat is off. stderr: {err!r}")
+
+
+def test_the_overlay_refuses_an_effort_no_cli_serves(repo, capsys):
+    """A typo'd effort is a config error and is answered as one here, rather than
+    three CLI invocations later."""
+    write_sample(repo, {"reviewers": {"codex": {"effort": "high"}}})
+    write_local(repo, {"reviewers": {"codex": {"effort": "maxx"}}})
+    cfg = hr.resolve_repo(str(repo), from_default_branch=False)
+    assert cfg["reviewers"]["codex"]["effort"] == "high"
+    err = capsys.readouterr().err
+    assert "maxx" in err and "ultra" in err, (
+        f"and it names the levels codex does accept. stderr was: {err!r}")
+
+
+def test_an_effort_on_a_seat_whose_CLI_takes_NONE_is_refused(repo, capsys):
+    """claude has no reasoning-effort knob at all, so `effort` on it is not a typo
+    to be corrected but a key with no meaning — said in those words, which is what
+    `run_seat` says for the same value arriving the same way."""
+    write_sample(repo, {"reviewers": {"claude": {"model": "sonnet"}}})
+    write_local(repo, {"reviewers": {"claude": {"effort": "high"}}})
+    cfg = hr.resolve_repo(str(repo), from_default_branch=False)
+    assert "effort" not in cfg["reviewers"]["claude"]
+    assert "no reasoning effort" in capsys.readouterr().err
+
+
+def test_the_valid_efforts_are_the_ONE_set_the_seats_read():
+    """One tuple, two readers. A second copy of this set would not disagree loudly —
+    it would quietly stop recognising a level a CLI accepts, or accept one it does
+    not, the first time a vendor adds one. `run_seat` rules on the same value this
+    resolver now rejects early, so they must be reading the same object."""
+    import panel_seats
+
+    assert panel_seats.EFFORTS is hr.EFFORTS
+    assert panel_seats.CODEX_EFFORTS is hr.CODEX_EFFORTS
+    assert panel_seats.PI_EFFORTS is hr.PI_EFFORTS
+    assert panel_seats.AGY_EFFORTS is hr.AGY_EFFORTS
+
+
+def test_the_overlay_refuses_a_model_that_would_read_as_another_option(repo, capsys):
+    """No allowlist — a slug list here would refuse tomorrow's model, which is the
+    reason DEFAULTS declines to pin codex globally. A SHAPE check, for the one shape
+    that matters in an argv list: `--model` takes the next element, so a "pin"
+    beginning with `-` adds an option instead of naming a model."""
+    write_sample(repo, {"reviewers": {"codex": {"model": "gpt-5.6-luna"}}})
+    write_local(repo, {"reviewers": {"codex": {"model": "-c sandbox=danger"}}})
+    cfg = hr.resolve_repo(str(repo), from_default_branch=False)
+    assert cfg["reviewers"]["codex"]["model"] == "gpt-5.6-luna"
+    assert "not the shape of a model slug" in capsys.readouterr().err
+
+
+def test_the_overlay_refuses_a_model_that_is_not_a_string(repo, capsys):
+    """`null` and `{}` are the two an editor produces while half-way through a
+    thought, and both used to sail through into a CLI invocation."""
+    write_sample(repo, {"reviewers": {"codex": {"model": "gpt-5.6-luna"}}})
+    write_local(repo, {"reviewers": {"codex": {"model": None}, "pi": {"effort": {}}}})
+    cfg = hr.resolve_repo(str(repo), from_default_branch=False)
+    assert cfg["reviewers"]["codex"]["model"] == "gpt-5.6-luna"
+    err = capsys.readouterr().err
+    assert "codex.model" in err and "pi.effort" in err and "must be a string" in err
+
+
+def test_the_overlay_cannot_ENABLE_a_seat_the_sample_turned_off(repo, capsys):
+    """The overlay narrows and never widens.
+
+    Turning a seat off is a fact about this machine — the CLI is not installed, the
+    gateway refuses the model. Turning one back ON is a decision about this repo: the
+    sample may have disabled it for cost, for policy, or to keep a merge quorum
+    reachable, and none of those is answered by an untracked file that no PR shows and
+    no branch protection can see."""
+    write_sample(repo, {"reviewers": {"pi": {"enabled": False}}})
+    write_local(repo, {"reviewers": {"pi": {"enabled": True}}})
+    cfg = hr.resolve_repo(str(repo), from_default_branch=False)
+    assert cfg["reviewers"]["pi"]["enabled"] is False
+    err = capsys.readouterr().err
+    assert "would ENABLE" in err and "narrow" in err
+
+
+def test_the_overlay_may_still_turn_a_seat_off_that_the_sample_turned_on(repo):
+    """The other direction, asserted beside the refusal so the narrowing rule cannot
+    be "fixed" into refusing both."""
+    write_sample(repo, {"reviewers": {"pi": {"enabled": True}}})
+    write_local(repo, {"reviewers": {"pi": {"enabled": False}}})
+    cfg = hr.resolve_repo(str(repo), from_default_branch=False)
+    assert cfg["reviewers"]["pi"]["enabled"] is False
+
+
+def test_an_unknown_seat_is_told_which_seats_exist(repo, capsys):
+    """The blanket message was misleading for the one author it was most likely to
+    reach: someone who wrote `reviewers.gemini.enabled` — a well-formed key naming a
+    seat that does not exist — was told that `reviewers.<seat>.enabled` is the only
+    allowed shape, which is what they thought they had written."""
+    write_sample(repo, {"reviewers": {"antigravity": {"enabled": True}}})
+    write_local(repo, {"reviewers": {"gemini": {"enabled": False}}})
+    hr.resolve_repo(str(repo), from_default_branch=False)
+    err = capsys.readouterr().err
+    assert "not a seat on this panel" in err
+    assert "renamed to 'antigravity'" in err, "the one unknown name a fleet file carries"
+    for seat in hr.DEFAULTS["reviewers"]:
+        assert seat in err, "and the valid names, so the remedy is in the message"
+
+
+def test_a_non_dict_reviewers_block_in_the_overlay_says_so_as_a_SHAPE(repo, capsys):
+    """`"reviewers": "none"` used to be reported identically to a forbidden key, under
+    a message telling its author that `reviewers.<seat>.*` was the only allowed
+    shape."""
+    write_sample(repo, {"auto_merge": "none"})
+    write_local(repo, {"reviewers": "none"})
+    hr.resolve_repo(str(repo), from_default_branch=False)
+    err = capsys.readouterr().err
+    assert "must be an object of seats" in err and '"codex"' in err
+
+
+def test_a_non_dict_seat_entry_in_the_overlay_says_so(repo, capsys):
+    write_sample(repo, {"auto_merge": "none"})
+    write_local(repo, {"reviewers": {"codex": True}})
+    hr.resolve_repo(str(repo), from_default_branch=False)
+    assert "must be an object of {enabled, model, effort}" in capsys.readouterr().err
+
+
+def test_an_overlay_of_nothing_but_dropped_keys_claims_nothing(repo):
+    """`_rules_from` is what `describe()` prints, so it must not annotate a run the
+    overlay changed nothing about."""
+    write_sample(repo, {"auto_merge": "none"})
+    write_local(repo, {"auto_merge": "all_green"})
+    cfg = hr.resolve_repo(str(repo), from_default_branch=False)
+    assert cfg["_rules_from"].endswith(hr.SAMPLE_FILENAME), (
+        f"nothing was applied, so nothing is claimed: {cfg['_rules_from']!r}")
+
+
+def test_the_provenance_names_WHICH_pins_the_overlay_set(repo):
+    """It said `(seats)` whenever any overlay applied, so an overlay that repinned
+    codex to gpt-5.5 at high effort — touching no seat's on/off state at all — was
+    reported as a seat change, in the one string that exists so which rules applied
+    is never a guess."""
+    write_sample(repo, {"reviewers": {"codex": {"model": "gpt-5.6-luna",
+                                               "effort": "max"}}})
+    write_local(repo, {"reviewers": {"codex": {"model": "gpt-5.5", "effort": "high"}}})
+    cfg = hr.resolve_repo(str(repo), from_default_branch=False)
+    assert cfg["_rules_from"].endswith("(model, effort)"), cfg["_rules_from"]
+    assert "seats" not in cfg["_rules_from"]
+
+
+def test_the_same_overlay_problem_is_printed_once_per_process(repo, capsys):
+    """`resolve_repo` runs per loop tick and per invocation, so a box whose local file
+    carries one stray key would otherwise print the same warning for ever — and a real
+    diagnostic repeated for ever is one people learn to filter out, which is the same
+    outcome as not printing it."""
+    write_sample(repo, {"auto_merge": "none"})
+    write_local(repo, {"auto_merge": "all_green"})
+    hr.resolve_repo(str(repo), from_default_branch=False)
+    assert "auto_merge" in capsys.readouterr().err
+    hr.resolve_repo(str(repo), from_default_branch=False)
+    assert capsys.readouterr().err == ""
+
+
+# --------------------------------------------- a file that cannot be read at all
+
+def test_an_overlay_that_is_not_valid_JSON_names_the_file(repo):
+    write_sample(repo, {"auto_merge": "none"})
+    (repo / hr.RULES_FILENAME).write_text("{oops")
+    with pytest.raises(SystemExit) as e:
+        hr.resolve_repo(str(repo), from_default_branch=False)
+    assert hr.RULES_FILENAME in str(e.value) and "not valid JSON" in str(e.value)
+
+
+def test_an_overlay_that_is_not_an_OBJECT_names_the_file(repo):
+    write_sample(repo, {"auto_merge": "none"})
+    (repo / hr.RULES_FILENAME).write_text('["reviewers"]')
+    with pytest.raises(SystemExit) as e:
+        hr.resolve_repo(str(repo), from_default_branch=False)
+    assert "must hold a JSON object, not list" in str(e.value)
+
+
+@pytest.mark.parametrize("body", ['["auto_merge"]', '"auto_merge"', "null", "3"])
+def test_a_BASELINE_that_is_not_an_object_gets_the_same_answer(repo, body):
+    """The overlay path said this in one line while the baseline path let it through
+    to `strip_comments` and the merge loop, where it surfaced as an AttributeError or
+    a TypeError from somewhere inside `resolve_repo` with no filename in it. One shape
+    of mistake, one shape of answer, whichever half of the split made it."""
+    (repo / hr.SAMPLE_FILENAME).write_text(body)
+    with pytest.raises(SystemExit) as e:
+        hr.resolve_repo(str(repo), from_default_branch=False)
+    assert "must hold a JSON object" in str(e.value)
+    assert hr.SAMPLE_FILENAME in str(e.value)
+
+
+def test_a_baseline_read_from_the_BRANCH_is_checked_the_same_way(repo):
+    """Both refs, because the same file arrives by two routes and only one of them
+    used to be checked."""
+    write_sample(repo, ["not", "an", "object"])
+    with pytest.raises(SystemExit) as e:
+        hr.resolve_repo(str(repo), from_default_branch=True)
+    assert "must hold a JSON object, not list" in str(e.value)
+    assert f"origin/main:{hr.SAMPLE_FILENAME}" in str(e.value)
+
+
+def test_a_corrupt_sample_on_the_branch_names_the_ref_and_the_file(repo):
+    (repo / hr.SAMPLE_FILENAME).write_text("{nope")
+    _commit(repo, hr.SAMPLE_FILENAME)
+    with pytest.raises(SystemExit) as e:
+        hr.resolve_repo(str(repo), from_default_branch=True)
+    assert f"origin/main:{hr.SAMPLE_FILENAME} is not valid JSON" in str(e.value)
+
+
+def test_a_CORRUPT_sample_does_not_fall_back_to_the_legacy_file(repo):
+    """Missing and corrupt are deliberately not the same event.
+
+    Absence means "use the defaults", which is the whole point of dropping the
+    registry. A file written to say something and unreadable must not quietly defer
+    to the stale policy beside it — that is policy going silent, which is the one
+    failure this module is built around."""
+    write_rules(repo, {"auto_merge": "all_green"}, commit=True)
+    (repo / hr.SAMPLE_FILENAME).write_text("{nope")
+    _commit(repo, hr.SAMPLE_FILENAME)
+    with pytest.raises(SystemExit):
+        hr.resolve_repo(str(repo), from_default_branch=True)
+
+
+def test_a_branch_that_cannot_be_read_is_not_a_repo_with_no_rules(repo, capsys):
+    """Two different facts that resolved to one answer. `git show` failing was read
+    as "the branch does not carry this file", so a checkout whose `origin/<default>`
+    is simply not fetched came back "none on origin/main (defaults)" — a claim about
+    the repo it had no evidence for, and now the difference the panel's refusal reads.
+    """
+    git(repo, "update-ref", "-d", "refs/remotes/origin/main")
+    cfg = hr.resolve_repo(str(repo), from_default_branch=True)
+    assert cfg["_rules_baseline"] == ""
+    assert "unreadable" in cfg["_rules_from"]
+    assert "could not be read" in capsys.readouterr().err
+
+
+# --------------------------------------------- the shape of the baseline's blocks
+
+def test_a_reviewers_block_that_is_not_an_object_is_a_clear_exit(repo):
+    """`'pi' in 'all'` is a SUBSTRING match that answers True, and `{**"all"}` then
+    raises a TypeError with no filename in it. The merge below is deliberately blind,
+    so a block of the wrong type travels through it and detonates somewhere else."""
+    write_sample(repo, {"reviewers": "all"})
+    with pytest.raises(SystemExit) as e:
+        hr.resolve_repo(str(repo), from_default_branch=False)
+    assert "`reviewers` must be a JSON object, not str" in str(e.value)
+
+
+def test_a_seat_that_is_not_an_object_is_a_clear_exit(repo):
+    write_sample(repo, {"reviewers": {"pi": True}})
+    with pytest.raises(SystemExit) as e:
+        hr.resolve_repo(str(repo), from_default_branch=False)
+    assert "`reviewers.pi` must be a JSON object, not bool" in str(e.value)
+
+
+def test_a_deep_block_that_is_not_an_object_is_a_clear_exit(repo):
+    """Not reviewers-specific: `"epic": "auto"` would have travelled all the way into
+    epic.py before anything noticed."""
+    write_sample(repo, {"epic": "auto"})
+    with pytest.raises(SystemExit) as e:
+        hr.resolve_repo(str(repo), from_default_branch=False)
+    assert "`epic` must be a JSON object, not str" in str(e.value)
+
+
+def test_an_unknown_seat_is_still_warned_about_rather_than_type_checked(repo, capsys):
+    """The shape check runs AFTER the unknown-name drop, so a name nothing reads gets
+    the rename hint rather than a hard exit about its type — `reviewers.gemini` is an
+    unknown seat whatever it holds."""
+    write_sample(repo, {"reviewers": {"gemini": "off"}})
+    cfg = hr.resolve_repo(str(repo), from_default_branch=False)
+    assert "gemini" not in cfg["reviewers"]
+    assert "renamed to 'antigravity'" in capsys.readouterr().err
+
+
+# ------------------------------------------------- trackedness, when git will not say
+
+def test_a_git_failure_reads_as_TRACKED_rather_than_as_an_overlay(repo, capsys,
+                                                                 monkeypatch):
+    """The single boolean used to carry the whole tracked/untracked argument, and it
+    failed in the PERMISSIVE direction: `returncode == 0` for yes and anything else
+    for no put a missing git binary, a contended index lock and a partial index in the
+    same bucket as a genuinely untracked file. On the mid-migration repo this module
+    worries about, one transient failure was enough to demote a committed rules file
+    to an overlay and drop its policy with a warning blaming the file."""
+    write_sample(repo, {"reviewers": {"pi": {"enabled": True}}})
+    write_local(repo, {"reviewers": {"pi": {"enabled": False}}})
+    real = hr._git
+
+    def flaky(path, *args):
+        if args[:2] == ("ls-files", "--error-unmatch"):
+            return subprocess.CompletedProcess(
+                args, 128, "", "fatal: index file smaller than expected\n")
+        return real(path, *args)
+
+    monkeypatch.setattr(hr, "_git", flaky)
+    cfg = hr.resolve_repo(str(repo), from_default_branch=False)
+    assert cfg["reviewers"]["pi"]["enabled"] is True, (
+        "git could not say, so the file is treated as tracked — the answer that "
+        "cannot honour a file nobody has established is a local one")
+    err = capsys.readouterr().err
+    assert "cannot tell whether git is carrying it" in err and "TRACKED" in err
+
+
+def test_a_genuinely_untracked_file_is_still_an_overlay(repo):
+    """The other exit of the same branch: `ls-files --error-unmatch` exits 1 for "not
+    in the index" and reserves everything else for its own failures, which is what
+    makes the two distinguishable at all."""
+    assert hr._is_tracked(repo, "README") is True
+    assert hr._is_tracked(repo, hr.RULES_FILENAME) is False
+
+
+# ------------------------------------------------- who can see a repo, and gate it
+
+def test_discover_sees_a_repo_that_has_only_migrated_to_the_sample(tmp_path):
+    """The regression the rename would otherwise have shipped: a repo that moved its
+    policy into `.harness-rules.sample` and needs no per-box overlay carries no
+    `.harness-rules` at all, so a sweep looking only for that name stops seeing the
+    repo — silently, and only on the unattended path, which is the one nobody is
+    watching."""
+    (tmp_path / "migrated").mkdir()
+    (tmp_path / "migrated" / hr.SAMPLE_FILENAME).write_text("{}")
+    (tmp_path / "legacy").mkdir()
+    (tmp_path / "legacy" / hr.RULES_FILENAME).write_text("{}")
+    (tmp_path / "both").mkdir()
+    (tmp_path / "both" / hr.SAMPLE_FILENAME).write_text("{}")
+    (tmp_path / "both" / hr.RULES_FILENAME).write_text("{}")
+    (tmp_path / "unenrolled").mkdir()
+    assert hr.discover(tmp_path) == [tmp_path / "both", tmp_path / "legacy",
+                                     tmp_path / "migrated"]
+
+
+@pytest.mark.parametrize("layout,expected", [
+    ("none", ""), ("sample", hr.SAMPLE_FILENAME), ("legacy", hr.RULES_FILENAME),
+])
+def test_resolve_repo_always_says_WHICH_file_supplied_the_baseline(repo, layout,
+                                                                  expected):
+    """The field the review gate reads, pinned on its producer.
+
+    A gate is only as good as the fact it reads, and this one has exactly one
+    producer. `_rules_baseline` is a FILENAME because sniffing it out of the human
+    provenance blurb cannot be done safely — `.harness-rules.sample` contains
+    `.harness-rules` — so the field has to be present on every path resolution can
+    take, including the one where nothing was found."""
+    if layout == "sample":
+        write_sample(repo, {"auto_merge": "none"})
+    elif layout == "legacy":
+        write_rules(repo, {"auto_merge": "none"}, commit=True)
+    for unattended in (False, True):
+        cfg = hr.resolve_repo(str(repo), from_default_branch=unattended)
+        assert cfg["_rules_baseline"] == expected, f"unattended={unattended}"
+
+
+def test_a_repo_with_no_rules_file_still_resolves_for_the_other_loops(repo):
+    """The gate is on the two REVIEW paths and deliberately not here.
+
+    `epic`, `lander` and `preland` all resolve, and every default is the safe end of
+    its own switch — no auto-merge, no unattended loop, edit-only headless agents — so
+    an unconfigured repo gets a run that does LESS rather than one nobody asked for.
+    Refusing in the resolver would take the whole harness down on any repo that has
+    not enrolled."""
+    cfg = hr.resolve_repo(str(repo))
+    assert cfg["_rules_baseline"] == ""
+    assert cfg["auto_merge"] == hr.DEFAULTS["auto_merge"]
+    assert cfg["loops"]["dependabot_lander"] is False

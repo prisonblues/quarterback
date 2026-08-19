@@ -1,6 +1,6 @@
 # Panel Review and Fix PR
 
-@description Like /review-pr, but the findings come from the multi-reviewer PANEL (Claude + Codex + Antigravity + master judge + SonarCloud hard gate) instead of one sub-agent reviewer. Ensures a PR exists, runs ~/.claude/loops/panel.py (which comments the summary on the PR), then a sub-agent fixes every master-confirmed finding boil-the-ocean style and pushes — and the panel then RE-REVIEWS that fix commit, which is the round nobody used to run. Give it several PR numbers and each one is reviewed+fixed by its own sub-agent, in parallel. Panel members default to the repo's .harness-rules and can be named explicitly. Merging stays opt-in.
+@description Like /review-pr, but the findings come from the multi-reviewer PANEL (Claude + Codex + Antigravity + master judge + SonarCloud hard gate) instead of one sub-agent reviewer. Ensures a PR exists, runs ~/.claude/loops/panel.py (which comments the summary on the PR), then a sub-agent fixes every master-confirmed finding boil-the-ocean style and pushes — and the panel then RE-REVIEWS that fix commit, which is the round nobody used to run. Give it several PR numbers and each one is reviewed+fixed by its own sub-agent, in parallel. Panel members default to the repo's .harness-rules.sample and can be named explicitly. Merging stays opt-in.
 @arguments $ARGS: [pr ...] [repo] [--reviewers a,b] [--rounds N|--loop]  (defaults: the current branch's open PR in the cwd's repo, the repo's configured reviewers, and 2 rounds)
 
 You are the **ORCHESTRATOR**. This is `/review-pr` with the panel as the
@@ -37,9 +37,16 @@ buys more.
 - **No PR yet** → push the branch and open one
   (`git push -u <remote> HEAD` then `gh pr create --fill`), then use it. (This
   is the agreed behaviour — auto-create rather than stop.)
-- **No repo enrolment is needed.** The panel is read-only and resolves the repo
-  from the checkout you are in; a repo with no `.harness-rules` runs on safe
-  defaults (Claude + Codex, SonarQube off). Never stop for an "unconfigured repo".
+- **The repo has to be enrolled, and enrolment is one file.** The panel is
+  read-only and resolves the repo from the checkout you are in, but a repo with
+  **no** rules file at all is REFUSED a review rather than reviewed on built-in
+  defaults: those defaults are a two-seat panel on models nobody chose, judged by a
+  judge nobody chose, and the findings then brief a fixer that edits the repo. The
+  refusal prints, writes a payload with `reviewed: false` and a `skip_reason`, exits
+  0, and records nothing on the board. Do not work around it — commit a
+  `.harness-rules.sample` naming the seats, models and judge this repo wants (copy
+  the quarterback repo's and cut it down), then re-run. Every OTHER unconfigured key
+  still falls back to a safe default, so the file can be short.
 
 Capture: `nameWithOwner`, the PR number(s), each PR's base and head branch, and
 the absolute repo path of the working checkout.
@@ -177,7 +184,7 @@ call: a reviewer on a top-tier model at high effort can think for 20+ minutes,
 and the foreground Bash timeout caps at 10 — which kills the whole panel, not
 just the slow seat. Poll the background task instead.
 
-**Panel members** default to the repo's `.harness-rules`; pass no `--reviewers`
+**Panel members** default to the repo's `.harness-rules.sample`; pass no `--reviewers`
 unless the user named who should review ("just codex", "codex and antigravity"), then
 add `--reviewers <comma-list>` from `claude`, `codex`, `antigravity`, `sonarqube`. It
 replaces the configured set rather than filtering it, so a named reviewer runs
