@@ -675,17 +675,26 @@ def test_a_command_that_cannot_be_run_at_all_is_distinguishable(tmp_path):
 
 
 def test_output_that_is_not_decodable_text_is_a_diagnostic_not_a_traceback(tmp_path):
-    """`text=True` decodes, and an invalid byte used to raise straight through `resolve`.
+    r"""`text=True` decodes, and an invalid byte used to raise straight through `resolve`.
 
     UnicodeDecodeError is a ValueError — not an OSError and not a SubprocessError — so
     the handler in `_run_token_cmd` never caught it: a helper emitting one bad byte
     crashed config resolution with a traceback, which is the unexplained failure this
     whole function exists to replace.
+
+    The escape is octal, and it has to stay octal. `\ooo` is the only byte escape
+    POSIX defines for `printf`, and the command runs under `shell=True` — i.e.
+    `/bin/sh`, which is dash on Debian/Ubuntu and bash on a NixOS workstation. The
+    `\xHH` form this test first used is a bash/GNU extension: dash's printf reads
+    `\xff` as codepoint U+00FF and re-encodes it as UTF-8 (`c3 bf`), which decodes
+    cleanly, so the assertions below failed on CI and passed wherever `/bin/sh` was
+    bash. That made the suite's result a property of the `/bin/sh` symlink rather
+    than of the code. `\377\376` is `ff fe` on both, and `ff` is never valid UTF-8.
     """
     path = write_config(
         tmp_path,
         "QUARTERBACK_BASE_URL=https://board.example\n"
-        r"""QUARTERBACK_TOKEN_CMD='printf "\xff\xfe\n"'""" + "\n",
+        r"""QUARTERBACK_TOKEN_CMD='printf "\377\376\n"'""" + "\n",
     )
     cfg = resolve(env_for(tmp_path, QUARTERBACK_CONFIG=str(path)))
     assert cfg.token is None
