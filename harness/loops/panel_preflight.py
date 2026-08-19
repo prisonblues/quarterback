@@ -556,7 +556,19 @@ class Ceiling:
         write, and a ZeroDivisionError raised from the middle of a verdict would
         take down a round over a config value that deserves a note at worst.
         """
-        return self.of(shape) / self.limit if self.limit else 0.0
+        # `inf`, not 0.0, when the limit is zero (217-R3-F02). Guarding the
+        # ZeroDivisionError with 0.0 substitutes the one answer that is wrong in the
+        # most consequential direction: a diff of any nonzero size against a ceiling
+        # of zero is INFINITELY over, and 0.0 reads as comfortably under — in the
+        # function that decides whether to refuse the round. `inf` compares correctly
+        # against every threshold, sorts as the tightest ceiling, and formats as
+        # `inf` rather than lying.
+        #
+        # A zero-size diff against a zero ceiling is 0/0, which is not over
+        # anything: there is nothing to send and nothing to cut.
+        if not self.limit:
+            return float("inf") if self.of(shape) else 0.0
+        return self.of(shape) / self.limit
 
 
 def seat_ceilings(budgets: dict[str, int | None], installed=None) -> tuple[Ceiling, ...]:
@@ -627,7 +639,14 @@ def seat_ceilings(budgets: dict[str, int | None], installed=None) -> tuple[Ceili
     for name, budget in budgets.items():
         if not here(name):
             continue
-        if budget is not None:
+        # `> 0`, not merely `is not None` (217-R3-F02). `diff_budget` already
+        # refuses a non-positive value and falls back with a note, so a zero cannot
+        # reach here from config today — this is latent rather than live, and it is
+        # filtered anyway because `seat_ceilings` is also called with hand-built
+        # budgets (its own tests, and whatever calls it next). A ceiling of zero
+        # admits no diff at all, which is not a ceiling; it is a seat that cannot be
+        # sent anything, and `diff_budget` is the layer that says so.
+        if budget is not None and budget > 0:
             out.append(Ceiling(budget, "chars", name))
         if name == "antigravity":
             out.append(Ceiling(ARGV_PROMPT_MAX_BYTES, "bytes", name))
@@ -973,6 +992,10 @@ def preflight(diff: str, budgets: dict[str, int | None], panel: dict,
     # reconstructed here by equality against ARGV_PROMPT_MAX_BYTES — a derivation
     # only this function made, which is why every other renderer of the verdict
     # went on printing "chars" over a ratio that was sometimes bytes.
+    # The whole set, not only the tightest: the manifest branch has to re-rank
+    # against its OWN text, because the seat that binds for the diff need not be the
+    # seat that binds for a manifest of different size and density (217-R3-F01).
+    ceilings = seat_ceilings(budgets, installed)
     ceiling = tightest_ceiling(budgets, shape, installed)
     cap = ceiling.limit if ceiling else None
     seat = ceiling.seat if ceiling else ""
@@ -1039,7 +1062,22 @@ def preflight(diff: str, budgets: dict[str, int | None], panel: dict,
         # the diff and pay for it by recording the wrong reason, which is the exact
         # trade `forced_reason` exists to refuse.
         text = move_manifest(diff, shape, parts)
-        fitted = ceiling.of_text(text)
+        # Measured against EVERY ceiling, not just the one that was tightest for the
+        # diff (217-R3-F01). `tightest_ceiling` ranks by ratio against the DIFF's own
+        # char/byte density, and the manifest has neither the same density nor the
+        # same absolute size — so the seat that binds for the diff need not be the
+        # seat that binds for the manifest. With `{claude: 60,000 chars,
+        # antigravity: 120,000 bytes}` the ranking can flip between the two texts,
+        # and checking only the diff's winner would substitute a manifest that does
+        # not fit the seat which is actually tightest for it: a seat reading a prefix
+        # of a manifest, which is the confusion this branch exists to avoid.
+        #
+        # `worst` is the ceiling the MANIFEST is furthest over, by the same
+        # ratio-across-units comparison; `ceiling` stays the diff's for every
+        # sentence below, because those explain why the DIFF did not fit.
+        worst = max(ceilings, key=lambda c: c.of_text(text) / c.limit)
+        fitted = worst.of_text(text)
+        cap, unit = worst.limit, worst.unit
         # `<= cap`, matching the `size <= cap` the diff itself is admitted by a few
         # lines up. This was `< min(cap, size)`, which rejected a manifest whose
         # length was EXACTLY the ceiling and then explained itself with the "still

@@ -1123,6 +1123,80 @@ def test_the_private_helpers_are_not_re_exported_under_a_star_import():
     assert callable(pf._rule) and callable(pf._listing) and callable(pf._quote)
 
 
+def test_a_zero_ceiling_is_INFINITELY_over_not_comfortably_under():
+    """`over()` guarded its ZeroDivisionError with 0.0, which is the one answer that
+    is wrong in the most consequential direction (217-R3-F02): a diff of any nonzero
+    size against a ceiling of zero is infinitely over, and 0.0 reads as comfortably
+    under — inside the function that decides whether to refuse the round.
+
+    `seat_ceilings` also filters a non-positive budget now, so config cannot reach
+    this today: `diff_budget` already refuses `<= 0` and falls back with a note. Both
+    halves are pinned because the class is public and its next caller need not go
+    through `diff_budget`."""
+    shape = pf.diff_shape(FRESH)
+    assert pf.Ceiling(0, "chars", "claude").over(shape) == float("inf")
+    # 0/0 is not over anything: nothing to send and nothing to cut.
+    assert pf.Ceiling(0, "chars", "claude").over(pf.diff_shape("")) == 0.0
+    # And a zero budget never becomes a ceiling in the first place.
+    assert pf.seat_ceilings({"claude": 0}, ALL_HERE) == ()
+    assert [c.limit for c in pf.seat_ceilings({"claude": 10}, ALL_HERE)] == [10]
+
+
+#: A move whose DIFF is byte-heavy — em dashes are one char and three bytes — while
+#: a manifest OF it is nearly all ASCII prose. That density gap is what makes the
+#: two texts rank a set of ceilings differently, and it is not contrived: this
+#: repo's own diffs are full of em dashes, which is why `DiffShape` carries `nbytes`
+#: at all.
+DENSE_BODY = [f"    value_{i} = compute({i})  # — — — — — — — — — —" for i in range(200)]
+DENSE_SPLIT = (_file("big.py", removed=DENSE_BODY)
+               + _file("a.py", added=DENSE_BODY[:100])
+               + _file("b.py", added=DENSE_BODY[100:]))
+
+
+def test_the_manifest_ranks_ceilings_by_its_OWN_size_not_the_diffs(monkeypatch):
+    """`tightest_ceiling` ranks by ratio against the DIFF's density, and a manifest
+    has neither the same density nor the same size — so the seat that binds for the
+    diff need not bind for the manifest (217-R3-F01). The substitution therefore
+    measures against every ceiling rather than the diff's winner alone.
+
+    **This is LATENT, not reachable from config today, and the test says so rather
+    than pretending otherwise.** For a byte ceiling to out-rank the char ones on the
+    diff, the char budgets have to exceed ~87,000 (`ARGV_PROMPT_MAX_BYTES` over this
+    repo's ~1.38 bytes/char) — and a manifest is ~2.3 KB, so it then fits them
+    trivially and the two rankings agree. `seat_ceilings` also gives a configured
+    `antigravity: N` a **chars** ceiling plus the kernel's bytes one, so the mixed
+    pair that flips has to be built by hand. What is pinned here is the ranking
+    property itself, which is what the code relies on and what a future ceiling unit
+    would break.
+    """
+    shape = pf.diff_shape(DENSE_SPLIT)
+    text = pf.move_manifest(DENSE_SPLIT, shape)
+    # The density gap is real and is why `DiffShape` carries `nbytes` at all.
+    assert len(DENSE_SPLIT.encode()) / len(DENSE_SPLIT) > 1.3
+    assert len(text.encode()) / len(text) < 1.05
+
+    mixed = (pf.Ceiling(2_000, "chars", "claude"),
+             pf.Ceiling(2_400, "bytes", "antigravity"))
+    by_diff = max(mixed, key=lambda c: c.over(shape))
+    by_manifest = max(mixed, key=lambda c: c.of_text(text) / c.limit)
+    assert by_diff.seat == "antigravity", "the diff is byte-bound"
+    assert by_manifest.seat == "claude", "the manifest is char-bound"
+    # And the consequence the fix exists for: the manifest fits the diff's winner
+    # while overflowing its own, so ranking on the diff alone would substitute a
+    # manifest that one seat can only read a prefix of.
+    assert by_diff.of_text(text) <= by_diff.limit
+    assert by_manifest.of_text(text) > by_manifest.limit
+
+
+def test_a_move_that_cannot_be_manifested_small_enough_is_refused_not_truncated():
+    """The reachable half, end to end: when the manifest does not fit, the round is
+    refused and the reason names the manifest's own measurement — never substituted
+    and then cut, which would leave a seat reading a prefix of a manifest."""
+    got = _pre(DENSE_SPLIT, {"claude": 2_000}, {}, [], installed=ALL_HERE)
+    assert got.refused
+    assert got.manifest == ""
+    assert "a manifest of it came to" in got.reason
+
 # ----------------------------------------------------------------------------- manifest
 
 def test_the_manifest_says_what_moved_where():
