@@ -336,9 +336,14 @@ async def test_history_window_reports_when_it_truncated(client):
 
 
 async def test_history_of_an_unreviewed_pr_is_empty_not_404(client):
+    """...and every field of the summary is null, `stop_veto` included. A PR
+    nobody has reviewed is the clearest case of "the stopping rule never ran",
+    which is what null means here; [] would say it ran and vetoed nothing. This
+    branch used to be the one place in the handler that did not follow its own
+    rule, and this assertion pinned the inconsistency."""
     h = (await client.get(f"/review/findings?repo={REPO}&pr=999999", headers=AGENT_A)).json()
     assert h == {"repo": REPO, "pr": 999999, "rounds": 0, "cycles": 0, "stopped": None,
-                 "stop_reason": None, "stop_confident": None, "stop_veto": [],
+                 "stop_reason": None, "stop_confident": None, "stop_veto": None,
                  "truncated": False, "runs": [], "findings": []}
 
 

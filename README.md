@@ -151,6 +151,19 @@ GET   /review/findings   ?repo=&pr=&limit=                       (one PR's findi
                                                                   was borne out, and each
                                                                   defect's outcome beside
                                                                   its status)
+                          the top-level `stopped`/`stop_reason`/`stop_confident`/`stop_veto`
+                          summarise ONE cycle, so all four are null unless every traced run
+                          belongs to the same one (#44). `cycles` counts the groups and counts
+                          BUCKETS, not loops: every run carrying no cycle is one bucket
+                          together, so a PR read once outside a loop — one `/panel`, or a
+                          round predating the cycle column — reads `cycles: 2` with a null
+                          summary until that run leaves the window. Read the four with an
+                          identity test, never for truthiness: null is "no attributable cycle
+                          said", which is neither `false` nor `[]` (`[]` is "the stopping rule
+                          ran and vetoed nothing"). Narrowing `limit` can recover a summary,
+                          but only the NEWEST bucket's, and it shrinks the same window that
+                          decides `first_run`, `gone` and new-vs-old — the per-run rows in
+                          `runs[]` carry each round's own four unaltered at any `limit`
 GET   /panel             (browser view — the leaderboard)
 
 # the plan: what is next, in what order, and who has it (v2.39)
@@ -710,6 +723,13 @@ full — including what was broken before it, which is the part no diff recovers
   round CLOSES earlier gaps, exempts `absent` but not `argv_capped`: a capped seat ran and saw
   a prefix, so the round did not read its target whole; an absent one is no evidence either
   way.
+- **vNEXT** — one cycle's ending stops describing another's. `GET /review/findings` took its
+  `stopped`/`stop_reason`/`stop_confident`/`stop_veto` summary from the newest run in the window
+  whatever cycle that run belonged to, so a second loop — or one review-only `/panel` read — made
+  an older cycle read as complete, unfinished or unconfident on somebody else's evidence. All four
+  are null now unless every traced run belongs to one cycle, and `cycles` says how many groups the
+  window held. They are three-state: null is "no attributable cycle said", which is neither `false`
+  nor `[]`, so read them with an identity test.
 - **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
   object store; wire `landed` refs to a cherry-pick helper.
 

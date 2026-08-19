@@ -11,6 +11,38 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
+## vNEXT — one cycle's ending stopped describing another's
+
+`GET /review/findings` answers "how did this PR's review end?" with `stopped`, `stop_reason`,
+`stop_confident` and `stop_veto`. It took all four from the newest run in the window whatever
+cycle that run belonged to — so two agents looping one PR, or a single review-only `/panel` read
+landing between rounds, and cycle B's last round decided how cycle A read: complete, unfinished,
+or unconfident. The per-finding join in the same response has refused that inference since cycles
+became a stored fact; the summary above it was still guessing.
+
+It now summarises only what it can attribute. All four are null unless every traced run belongs to
+one cycle, and a new `cycles` says why. **The four are three-state and must be read with an
+identity test** — null is "no attributable cycle said", which is neither `false` nor `[]`, and a
+truthiness test reads a null `stopped` as "still going". The unreviewed PR follows the same rule:
+its `stop_veto` is null too, not `[]`.
+
+`cycles` counts BUCKETS rather than loops, and the difference is worth knowing before reading the
+number: every run carrying no cycle is one bucket together, because a run outside any cycle never
+ended the cycle running around it. So one real cycle plus one standalone `/panel` read is
+`cycles: 2` with one loop in it — which also means this is the ordinary case, not the exotic one.
+Any PR read once outside a loop, or carrying a round recorded before the cycle column existed, has
+a null summary at the default `limit` until that run falls out of the window. The reviews page
+says "mixed cycles: N separate groups of runs, no single stop state" rather than rendering the
+absent ending as blank, which would read as "nothing recorded".
+
+Narrowing `limit` brings a summary back, and it is a trade rather than an escape hatch: the window
+only trims the old end, so the sole summary it recovers is the newest bucket's, and it is the same
+window that decides `first_run`, the `gone` status and new-vs-old detection. The per-run rows in
+`runs[]` carry each round's own four unaltered at any `limit`, and reading those is usually the
+better answer.
+
+Closes #44.
+
 ## v2.53 — a pinned model no host can serve stops costing the whole seat
 
 A four-seat panel became a one-seat panel, quietly, and said `exited 1 (Reading prompt from
@@ -1024,7 +1056,6 @@ resolves only when exactly one repo on the board owns that name half; zero or
 several and a human names the owner. On this board there are two such rows and
 one candidate, so nothing is asked of anyone.
 
-
 ## v2.40 — two agents could talk, and no third agent could ever find out
 
 Claude Code 2.1.232 gave agents a direct channel to each other: `SendMessage`, and `@name` in the
@@ -1065,7 +1096,6 @@ type, and both its consumers (the human board, and #110's `qb board --follow`) w
 This is the server half of #155. The transport half — intercepting `SendMessage` and routing it
 here — lives in nix-fleet's `qb-hook` and is blocked on #157, where an injected peer message is
 already being claimed as the recipient's own work.
-
 
 ## v2.39 — the board knew who was here and not what was next
 

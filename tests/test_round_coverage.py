@@ -424,14 +424,27 @@ async def test_two_cycles_on_one_pr_do_not_summarise_each_other(client):
     # Only the SUMMARY is withheld. The rounds and the chains are per-run facts and
     # are unaffected — withholding them would answer less than the record supports.
     assert h["rounds"] == 2 and len(h["runs"]) == 2
-    assert h["runs"][1]["stopped"] is True
+    # BOTH values, because the point of this test is the disagreement between them:
+    # A is explicitly still going while B has confidently stopped. Asserting only
+    # B's leaves the test passing if A's per-run `stopped` regressed to True or
+    # null, which is the half that made the old summary a lie.
+    assert h["runs"][0]["cycle"] == "cycle-A" and h["runs"][0]["stopped"] is False
+    assert h["runs"][1]["cycle"] == "cycle-B" and h["runs"][1]["stopped"] is True
 
 
 async def test_a_review_only_run_makes_the_summary_unattributable(client):
-    """The other way two cycles land on one PR, and the reason a null cycle is its
-    own identity here rather than a wildcard: a standalone `/panel` read carries no
-    cycle, so it never ended the cycle running around it. Adjacency said otherwise
-    and the summary took its word for it."""
+    """The other way a PR ends up with more than one bucket in its window, and the
+    reason a null cycle is its own identity here rather than a wildcard: a
+    standalone `/panel` read carries no cycle, so it never ended the cycle running
+    around it. Adjacency said otherwise and the summary took its word for it.
+
+    This is the COMMON shape, not the exotic one, and it is worth being blunt
+    about: it takes one `/panel` read outside a loop — or one round recorded before
+    the cycle column existed — for a PR to read as unattributable at the default
+    `limit`, and it keeps reading that way until that run falls out of the window.
+    The docstring on the endpoint says so in those words rather than framing this
+    as the rare two-agents case, because a reader who believes it is rare will read
+    a null summary as a bug."""
     await record(client, 6152, cycle="cycle-A")
     await record(client, 6152, cycle=None, round=1, new_findings=0, to_fix=[],
                  round_stop={"stop": True, "reason": "one-shot read", "confident": True,
@@ -469,6 +482,89 @@ async def test_narrowing_the_window_to_one_cycle_brings_the_summary_back(client)
     assert narrow["cycles"] == 1 and narrow["stopped"] is True
     # ...and it says so: the window it summarises is not the PR's whole history.
     assert narrow["truncated"] is True
+
+
+async def test_narrowing_the_window_costs_the_finding_history_it_narrows(client):
+    """The other half of that remedy, which the docstring used to present as a
+    clean escape hatch and now presents as a trade.
+
+    `limit` is ONE window: the same runs that decide whether there is a summary
+    decide `first_run`, the `gone` status and what counts as new. So the response
+    that got its summary back is a response with less history in it — here cycle
+    A's round and the chain it opened are simply not in the answer any more.
+
+    And the escape only ever reaches one direction. `limit` trims from the OLD end,
+    so the summary it recovers is always the NEWEST bucket's; no value of it
+    recovers cycle A's ending, which is the one a reader of cycle A wants."""
+    await record(client, 6155, cycle="cycle-A")
+    await record(client, 6155, cycle="cycle-B", round=1, new_findings=0, to_fix=[
+        {"severity": "P3", "file": "app/late.py", "line": 4, "title": "B's own find",
+         "reviewers": ["claude"], "reason": "real"}],
+        round_stop={"stop": True, "reason": "dry", "confident": True, "veto": []})
+    wide = (await client.get(f"/review/findings?repo={REPO}&pr=6155",
+                             headers=AGENT)).json()
+    narrow = (await client.get(f"/review/findings?repo={REPO}&pr=6155&limit=1",
+                               headers=AGENT)).json()
+    assert wide["stopped"] is None and narrow["stopped"] is True
+    # What it cost: A's round, and the chain that only A ever raised.
+    assert wide["rounds"] == 2 and narrow["rounds"] == 1
+    assert len(narrow["findings"]) < len(wide["findings"])
+    assert not [c for c in narrow["findings"] if c["file"] == "app/sync.py"]
+    # There is no `limit` that summarises cycle A instead: the window only ever
+    # trims the old end, so A's ending is unreachable from this endpoint.
+    for lim in (1, 2, 50):
+        h = (await client.get(f"/review/findings?repo={REPO}&pr=6155&limit={lim}",
+                              headers=AGENT)).json()
+        assert h["stopped"] is not False, "no window reports cycle A's own ending"
+
+
+# ---- the page's half of #44 -------------------------------------------------
+# There is no JS runner in this repo (no package.json, no jest/vitest config), so
+# these grep the file that ships, the way `test_reviewer_cost.py` already does for
+# its coverage markers. Crude, and the rendering itself remains unexercised — but
+# it is the only thing standing between a re-edit and the two claims the API's
+# comments rest on. Synchronous and fixture-free: they read a file that ships,
+# and nothing about them wants a database.
+
+def test_the_page_never_reads_the_summary_stop_veto_unguarded():
+    """The load-bearing safety argument for making a list field nullable is that
+    every consumer reads it as `stop_veto || []`, and until now that was enforced
+    by prose in a Python comment about a JavaScript file.
+
+    reviews.html is the only consumer of `GET /review/findings` in the repo, and
+    the summary's `stop_veto` is null whenever the window holds more than one
+    bucket. A future `for (const v of h.stop_veto)` would throw on exactly the
+    mixed window this feature creates, so the count is pinned: one guard, and two
+    mentions inside the ternary that guard opens. Any new use fails here and has to
+    be re-read rather than discovered in a browser."""
+    page = (Path(__file__).resolve().parents[1] / "app/static/reviews.html").read_text()
+    assert page.count("(h.stop_veto || [])") == 1, "the summary's veto list has one guard"
+    assert page.count("h.stop_veto") == 3, (
+        "the guard, plus `.join` and `.length` in its true arm — a fourth mention "
+        "is a read this test has not seen and cannot vouch for")
+
+
+def test_the_page_reads_the_bucket_count_before_the_stop_state():
+    """The rendering branch the five API tests above justify, pinned as far as a
+    repo with no DOM harness can pin it.
+
+    Order is the substance: with mixed buckets `h.stopped` is null, and null is not
+    `false`, so a check placed after the `h.stopped === false` arm would fall
+    through and print nothing — the blank the API's comment says must not happen.
+    The copy is the other half: `cycles` counts buckets, so "N cycles" claims
+    something the number does not support."""
+    page = (Path(__file__).resolve().parents[1] / "app/static/reviews.html").read_text()
+    ending = page.split("const ending = ", 1)[1].split("box.innerHTML", 1)[0]
+    assert ending.index("h.cycles > 1") < ending.index("h.stopped === false")
+    mixed = ending.split("h.stopped === false", 1)[0]
+    # Said as loudly as the other endings that report something wrong with the
+    # review, not dimmed to the weight of the incidental veto count beside it.
+    assert "var(--warn)" in mixed and 'class="dim"' not in mixed
+    # Escaped like every other server value on this line, however integral `len()`
+    # makes it — the convention is what stops the next value being interpolated raw.
+    assert "esc(h.cycles)" in mixed and "${h.cycles}" not in mixed
+    assert "separate groups of runs" in mixed
+    assert "cycles in this window" not in page, "a bucket count is not a cycle count"
 
 
 async def test_a_finding_older_than_the_window_is_not_new_inside_it(client):

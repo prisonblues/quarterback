@@ -676,13 +676,32 @@ async function renderHistory(box, repo, pr){
   // finished.
   const why = (h.stop_veto || []).length
     ? ` <span class="dim" title="${esc(h.stop_veto.join(" | "))}">(${h.stop_veto.length} veto)</span>` : "";
-  // More than one cycle in the window and there is no single ending to print —
-  // the API nulls the summary rather than letting the newest loop describe an
-  // older one. Said out loud instead of rendered as blank: an absent ending
+  // More than one group of runs in the window and there is no single ending to
+  // print — the API nulls the summary rather than letting the newest loop describe
+  // an older one. Said out loud instead of rendered as blank: an absent ending
   // otherwise reads as "nothing recorded", which is a different thing from "two
   // loops ran here and neither speaks for the other".
+  //
+  // "separate groups of runs", not "N cycles": `h.cycles` counts BUCKETS, and
+  // every run carrying no cycle is one bucket together, so one real cycle plus a
+  // standalone /panel read is 2 with only one loop in it. Printing "2 cycles"
+  // asserts something the data does not support.
+  //
+  // --warn, like every other ending on this line that says something is wrong with
+  // the review. This is the most surprising state here and the comment above is
+  // the argument for saying it out loud; dimming it to the weight of the
+  // incidental veto count would bury the one thing this arm exists to say.
+  //
+  // FIRST, ahead of `h.stopped === false`: with mixed buckets `h.stopped` is null,
+  // and null is not false, so a later position would fall through to the
+  // `h.stop_reason` arm and print nothing at all. A cached response from before
+  // #44 has no `cycles` key, `undefined > 1` is false, and it falls through to
+  // exactly the pre-#44 rendering — the right answer for a payload with no better
+  // one in it. `why` is deliberately not appended here and nothing is lost by
+  // that: the API nulls `stop_veto` under this same condition, so `why` is already
+  // the empty string.
   const ending = h.cycles > 1
-    ? ` · <span class="dim">${h.cycles} cycles in this window — no single stop state</span>`
+    ? ` · <span style="color:var(--warn)" title="a run carrying no cycle — a standalone /panel read, or anything recorded before cycles were stored — counts as a group of its own">mixed cycles: ${esc(h.cycles)} separate groups of runs, no single stop state</span>`
     : h.stopped === false
     ? ` · <span style="color:var(--warn)">not stopped: ${esc(h.stop_reason || "another round is due")}</span>`
     : h.stop_reason ? ` · stopped: ${esc(h.stop_reason)}${
