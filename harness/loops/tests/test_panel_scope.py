@@ -32,14 +32,6 @@ import panel_scope  # noqa: E402  — scope/range readers moved here in #129
 import panel_core  # noqa: E402  — `sh` is defined here since #129
 import panel_seats  # noqa: E402  — these seats moved here in #129
 
-#: This module states its HOST (#222). `budgets` is built from the seats this box
-#: can actually run, so six tests below — budgets, truncation, the frame that
-#: cannot be paid for — would otherwise be assertions about which vendor CLIs the
-#: machine happens to carry: green on a workstation, red on a bare CI runner.
-#: Requested here rather than applied package-wide, so a module whose subject IS
-#: absence (`test_panel_absent_seat.py`) is not silently pinned to the opposite.
-pytestmark = pytest.mark.usefixtures("every_seat_installed")
-
 
 def chunk(path: str, body: str) -> str:
     """One file's worth of unified diff, in the shape `gh pr diff` emits."""
@@ -1006,7 +998,7 @@ def budget_for_partial_context() -> int:
 
 
 def _judge(seen):
-    def fake(clusters, diff, model, pr, budget=None, coverage=None, ci=""):
+    def fake(clusters, diff, model, pr, budget=None, coverage=None, ci="", **_kw):
         seen["diff"], seen["budget"] = diff, budget
         return [], None, ""
     return fake
@@ -1046,7 +1038,7 @@ def _stub_run(monkeypatch, seen, *, cfg=None, findings=(), increment=INCREMENT,
     said = dict(FACTS, files=len([f for f in panel._diff_by_file(increment) if f]))
     said.update(facts or {})
     monkeypatch.setattr(panel_scope, "compare_facts", lambda *a: said)
-    def reviewer(name, model, prompt, effort=""):
+    def reviewer(name, model, prompt, effort="", **_kw):  # **_kw: code_tree since #113
         seen.setdefault("prompts", {})[name] = prompt
         return panel.ReviewerRun(list(findings), None, 10, [])
     monkeypatch.setattr(panel, "review_llm", reviewer)

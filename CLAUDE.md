@@ -1,0 +1,1 @@
+/home/rich/source/quarterback/CLAUDE.md

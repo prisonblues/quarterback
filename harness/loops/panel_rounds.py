@@ -426,7 +426,9 @@ def _parse_verdicts(parsed: list, flat: list[Finding], pr: int) -> list[Canonica
 def adjudicate(clusters: list[list[Finding]], diff: str, model: str, pr: int,
                budget: int | None = DEFAULT_DIFF_BUDGET,
                coverage: dict[str, list[str]] | None = None,
-               ci: str = ""
+               ci: str = "",
+               code_tree: Path | None = None,
+               budget_usd: float | None = None
                ) -> tuple[list[Canonical], str | None, str]:
     """The 'master' rules on every finding, merges the duplicates it finds, AND
     rules on the coverage the reviewers declared about themselves.
@@ -506,13 +508,36 @@ def adjudicate(clusters: list[list[Finding]], diff: str, model: str, pr: int,
     prompt = JUDGE_PROMPT.format(findings=listing, coverage=stated,
                                  ci=ci or ci_brief("unknown", [], "not computed for this run"),
                                  diff=diff_text)
-    args = ["claude", "-p"] + (["--model", model] if model else [])
     # The judge gets a sandbox of its own on the same reasoning as the reviewers,
     # and one sharper argument: it is the seat whose loss is worst (a judge that
     # dies takes every finding through `unjudged`), so it is the last place to
     # leave depending on the caller's shell.
+    #
+    # **And it gets the code on the same terms they do** (#113). This is the half
+    # the reviewer change alone does not fix: the wrong findings #113 was filed
+    # over were not merely raised, they were CONFIRMED. PR #90's round-2 P1 said
+    # `headRefOid` was read but never added to the `gh pr view --json` field list;
+    # it was already there, so it never appeared in the diff, and the reviewer
+    # inferred absence from invisibility — and then a judge with the same blindness
+    # had no way to check and confirmed it. On PR #64 three of six confirmed P2s
+    # were conditionals from a reviewer that had DECLARED it could not assess the
+    # condition, and the judge confirmed them because they are well argued. A judge
+    # that can open the file is the only party in the loop positioned to catch
+    # that, and dismissing a false positive is its stated job.
     with tempfile.TemporaryDirectory(prefix="panel-judge-") as tmp:
-        sandbox = member_sandbox(Path(tmp) / "cwd")
+        if code_tree is not None:
+            sandbox, reads_code = panel_seats.seat_checkout(code_tree, Path(tmp) / "cwd")
+        else:
+            sandbox, reads_code = member_sandbox(Path(tmp) / "cwd"), False
+        if reads_code:
+            # Told, and pinned, exactly as a reviewer seat is — the brief is what
+            # stops it treating the diff as the whole record, and the pin is what
+            # keeps "read" from meaning "run" in a contributor's checkout.
+            prompt = prompt.replace(JUDGE_CODE_SLOT, CODE_ACCESS_BRIEF)
+        else:
+            prompt = prompt.replace(JUDGE_CODE_SLOT, "")
+        args = panel_seats.claude_args(model, str(uuid.uuid4()), reads_code=reads_code,
+                                      budget_usd=budget_usd if reads_code else None)
         out, err = panel_seats.run_cli(args, "judge", stdin_text=prompt, cwd=sandbox)
         if err:
             return unruled(err)

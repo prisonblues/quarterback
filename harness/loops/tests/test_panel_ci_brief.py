@@ -30,13 +30,6 @@ import panel  # noqa: E402
 import panel_core  # noqa: E402  — `sh` is defined here since #129
 from conftest import gh_stub  # noqa: E402
 
-#: This module states its HOST (#222). The end-to-end tests below assert on what a
-#: seat's PROMPT contained, and a seat this box cannot run is dispatched with an
-#: empty prompt — it will never read one, and rendering the whole diff for it is
-#: work thrown away. Without a stated host those assertions are about which vendor
-#: CLIs the machine happens to carry.
-pytestmark = pytest.mark.usefixtures("every_seat_installed")
-
 #: Every state `review_ci` can return. Named here so a new one added to the
 #: reader without a matching branch in `ci_brief` fails the sweep below rather
 #: than silently falling into the catch-all and reading as "unknown".
@@ -109,7 +102,8 @@ def test_both_prompts_have_a_slot_for_it():
     """Rendering with the slot missing is a KeyError, so this is the guard that
     the wiring did not get reverted while the helper survived."""
     for name, fields in (("REVIEW_PROMPT", {"n": 1, "repo": "a/b", "base": "main",
-                                            "ci": "CI-MARKER", "diff": ""}),
+                                            "ci": "CI-MARKER", "diff": "",
+                                            "code": ""}),
                          ("JUDGE_PROMPT", {"findings": "", "coverage": "",
                                            "ci": "CI-MARKER", "diff": ""})):
         rendered = getattr(panel, name).format(**fields)
@@ -132,7 +126,7 @@ def test_the_reviewers_prompt_carries_the_real_result(monkeypatch, tmp_path):
                         lambda *a: ("FAIL", ["app suite"], None))
     monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], None, ""))
 
-    def fake_review(name, model, prompt, effort=""):
+    def fake_review(name, model, prompt, effort="", **_kw):  # **_kw: code_tree since #113
         prompts.append(prompt)
         return panel.ReviewerRun([], None, 800, None)
 
@@ -160,7 +154,7 @@ def test_the_seat_is_told_before_it_is_dispatched(monkeypatch, tmp_path):
         order.append("ci")
         return ("PASS", [], None)
 
-    def fake_review(name, model, prompt, effort=""):
+    def fake_review(name, model, prompt, effort="", **_kw):  # **_kw: code_tree since #113
         order.append("seat")
         return panel.ReviewerRun([], None, 800, None)
 

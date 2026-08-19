@@ -127,7 +127,11 @@ def _round(monkeypatch, tmp_path, cfg, *, present, diff=BIG, baselines=(),
                                        "judge_max_diff_chars": judge_budget}}
     _host(monkeypatch, present)
 
-    def fake_review(name, model, prompt, effort=""):
+    def fake_review(name, model, prompt, effort="", **kw):
+        # `**kw` swallows whatever `review_llm` has grown since — `code_tree` and
+        # `budget_usd` in v2.51, more later. What this module tests is which seats
+        # get dispatched and what their record says, never the seat's own argument
+        # list, so enumerating it would only break on somebody else's feature.
         seen["prompts"][name] = prompt
         # The real `run_seat` refuses an absent seat before it spends anything;
         # this double stands in for that, so the test exercises `run()`'s
@@ -276,7 +280,7 @@ def test_a_seat_that_VANISHED_since_the_budgets_were_built_records_no_budget(
     # Present when `budgets` is built...
     _host(monkeypatch, {"claude", "antigravity"})
 
-    def vanished(name, model, prompt, effort=""):
+    def vanished(name, model, prompt, effort="", **kw):
         seen["prompts"][name] = prompt
         # ...and gone by the time the seat runs.
         if name == "antigravity":

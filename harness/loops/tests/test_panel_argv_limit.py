@@ -18,18 +18,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
 import panel_core  # noqa: E402  — `sh` is the gh double's seam
 import panel_seats  # noqa: E402  — run_cli lives here since #129
-
-#: This module states its HOST (#222). Its subject IS `antigravity` — the one seat
-#: whose prompt travels in argv — and since #222 a seat this box cannot run gets no
-#: budget, so no argv clamp and no `truncated` record. On a box without `agy` the
-#: kernel-cut assertions below would then be asserting about a seat that was never
-#: dispatched, which is a fact about the machine rather than about the clamp.
-#:
-#: Added when #113's `argv_capped` tests met #222's budget filter: the fixture's
-#: scope was measured against the suite as it stood, and this module joined the set
-#: afterwards. If a new module starts asserting on budgets, prompts or truncation,
-#: it needs this line too — the symptom is a green workstation and a red CI runner.
-pytestmark = pytest.mark.usefixtures("every_seat_installed")
 from conftest import gh_stub  # noqa: E402
 
 # ------------------------------------------------------- the limit is real
