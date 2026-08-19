@@ -344,6 +344,7 @@ def test_a_staging_failure_downgrades_the_seat_rather_than_lying_about_it(monkey
 # --------------------------------------------------------------- through run()
 
 CFG = {"github": "acme/board", "path": "/tmp/acme-board",
+       "_rules_baseline": ".harness-rules.sample",
        "reviewers": {"claude": {"enabled": True, "model": "sonnet"},
                      "codex": {"enabled": True, "model": "", "effort": ""}},
        "review_panel": {}}
@@ -517,6 +518,7 @@ def test_a_skipped_round_records_nulls_rather_than_a_setting_it_never_read(monke
     it was none"."""
     monkeypatch.setattr(panel, "load_repo_cfg", lambda _n: {
         "github": "acme/board", "path": "/tmp/acme-board", "reviewers": {},
+        "_rules_baseline": ".harness-rules.sample",
         "review_panel": {"skip_title_patterns": ["^Merge "]}})
     monkeypatch.setattr(panel_core, "sh", gh_stub(
         meta={"title": "Merge test into main", "additions": 1, "deletions": 0,

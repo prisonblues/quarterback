@@ -109,6 +109,7 @@ def _pre(diff, budgets, panel_cfg, notes, **kw):
 
 def _panel(**over):
     return {"github": "acme/board", "path": "/tmp/acme-board", "name": "board",
+            "_rules_baseline": ".harness-rules.sample",
             "reviewers": {"claude": {"enabled": True, "model": "sonnet"}},
             "review_panel": over}
 
@@ -1720,6 +1721,7 @@ def test_a_refused_SCOPED_round_records_what_it_was_going_to_review(monkeypatch,
     coupling nothing states and nothing enforces."""
     increment = _file("fix.py", added=BODY)
     cfg = {"github": "acme/board", "path": "/tmp/b", "name": "board",
+           "_rules_baseline": ".harness-rules.sample",
            "reviewers": {"claude": {"enabled": True, "model": "sonnet"}},
            # Tight enough that the INCREMENT itself is far over — the verdict is
            # weighed on the target, so refusing takes a target that does not fit.
@@ -1757,6 +1759,7 @@ def test_a_scoped_round_is_NOT_refused_for_the_size_of_its_CONTEXT(monkeypatch,
     increment = _file("fix.py", added=["    the_fix()"])
     pr = FRESH * 4 + increment
     cfg = {"github": "acme/board", "path": "/tmp/b", "name": "board",
+           "_rules_baseline": ".harness-rules.sample",
            "reviewers": {"claude": {"enabled": True, "model": "sonnet"}},
            # Enough to pay for the increment AND the scoped frame — which is over a
            # kilobyte and cannot be cut — so the target is not truncated and the
@@ -1962,6 +1965,7 @@ def test_a_title_skip_never_reaches_the_verdict(monkeypatch, tmp_path):
     calls: list = []
     seen: dict = {"prompts": {}}
     cfg = {"github": "acme/board", "path": "/tmp/acme-board", "name": "board",
+           "_rules_baseline": ".harness-rules.sample",
            "reviewers": {"claude": {"enabled": True, "model": "sonnet"}},
            # A ceiling the fixture diff is far past, so a round that DID reach the
            # verdict would refuse and stamp one — the skip has to beat it there.
@@ -2011,6 +2015,7 @@ def test_a_scoped_round_is_weighed_on_its_INCREMENT_not_on_the_PR(monkeypatch,
     increment = _file("fix.py", added=["    the_fix()"])
     pr = FRESH + increment
     cfg = {"github": "acme/board", "path": "/tmp/b", "name": "board",
+           "_rules_baseline": ".harness-rules.sample",
            "reviewers": {"claude": {"enabled": True, "model": "sonnet"}},
            # A ceiling the PR is far past and the increment is nowhere near.
            "review_panel": {"max_diff_chars": len(FRESH) // 10}}
@@ -2108,6 +2113,7 @@ def test_an_inherited_manifest_round_vetoes_a_later_SCOPED_round(monkeypatch,
     veto says — is false of a manifest round: every seat ran."""
     increment = _file("fix.py", added=["    the_fix()"])
     cfg = {"github": "acme/board", "path": "/tmp/b", "name": "board",
+           "_rules_baseline": ".harness-rules.sample",
            "reviewers": {"claude": {"enabled": True, "model": "sonnet"}},
            "review_panel": {}}
     monkeypatch.setattr(panel, "load_repo_cfg", lambda name: cfg)
@@ -2162,6 +2168,7 @@ def _scoped_manifest_run(monkeypatch, tmp_path, baselines, cap_divisor=4):
     """A round 2 whose INCREMENT is itself move-shaped and over the ceiling."""
     increment = SPLIT
     cfg = {"github": "acme/board", "path": "/tmp/b", "name": "board",
+           "_rules_baseline": ".harness-rules.sample",
            "reviewers": {"claude": {"enabled": True, "model": "sonnet"}},
            "review_panel": {"max_diff_chars": len(SPLIT) // cap_divisor}}
     monkeypatch.setattr(panel, "load_repo_cfg", lambda name: cfg)

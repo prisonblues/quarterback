@@ -59,14 +59,15 @@ suggestion:
 **How to decide:** trust the suggestion when the signals are clear (deps present, or a flat list
 with no phases → integration; independent phases → multi). **Interview the user only when it's
 genuinely borderline** — otherwise state your choice + the one-line reason and proceed. The user
-can always pin it with `--landing` (or `epic.landing` in the repo's `.harness-rules`), which skips the
+can always pin it with `--landing` (or `epic.landing` in the repo's `.harness-rules.sample`), which skips the
 judgment entirely.
 
-**Base branch.** Sub-issues target `executor_pr_base` from the repo's `.harness-rules` by default
-(falling back to its default branch).
+**Base branch.** Sub-issues target `executor_pr_base` from the repo's `.harness-rules.sample` by
+default (falling back to its default branch).
 To land an epic's work into a different branch for one run — a feature branch like `omnibus`, say —
-pass **`--base <branch>`** rather than editing `.harness-rules` (which is committed and easy to forget to
-revert). The base must already exist on the remote (push it first). In integration mode the epic
+pass **`--base <branch>`** rather than editing `.harness-rules.sample` (which is committed and easy
+to forget to revert; and the untracked per-box `.harness-rules` cannot set this — it holds provider
+facts only). The base must already exist on the remote (push it first). In integration mode the epic
 branch is cut off this base; in multi mode each sub-PR targets it directly. Merge to the real
 trunk stays a human step regardless.
 
@@ -81,7 +82,7 @@ trunk stays a human step regardless.
    a judge's warm-up chatter is not why its answer was unusable. Untriaged issues are also skipped
    on `--execute`, like blocked ones, so that reason is the only account of why one was passed over.
 4. If the user asked to `--execute`: this **creates branches/worktrees, runs `/fix-issue` +
-   `/review-pr`, and opens PRs**. It is gated on `loops.issue_executor` in the repo's `.harness-rules` and uses
+   `/review-pr`, and opens PRs**. It is gated on `loops.issue_executor` in the repo's `.harness-rules.sample` and uses
    `headless_permission_mode`. **Confirm with the user and check prerequisites first**, then run
    with `--execute [--max-issues N]`.
    - In **integration mode** with `--sub-pr-merge auto` (the default), `epic.py` runs issues in

@@ -54,6 +54,7 @@ import harness_rules  # noqa: E402
 # re-exported here because they read as part of run_cli's contract at every call
 # site in this file.
 from harness_rules import (DENIAL_MARKERS, REJECTION_MARKERS,  # noqa: E402
+                           RULES_FILENAME, SAMPLE_FILENAME,
                            RepoNotFound, cli_outcome, describe,
                            resolve_repo, stderr_gist)
 
@@ -629,13 +630,75 @@ def sh_bytes(args: list[str], **kw) -> bytes:
 
 
 def load_repo_cfg(name: str) -> dict:
-    """The panel is READ-ONLY, so an unconfigured repo is not an error here —
-    it runs on the built-in defaults (claude + codex, sonarqube off). This is
-    the whole reason /panel and /panel-review-pr now work in any repo."""
+    """The repo's resolved rules, or a clean exit saying the spec did not resolve.
+
+    The panel is READ-ONLY, so an unconfigured repo is not an error at RESOLUTION —
+    it resolves to the built-in defaults exactly as `epic`, `lander` and `preland`
+    do, which is what lets the read-only commands run in any repo at all. Whether a
+    REVIEW may run on those defaults is a separate question and a different answer:
+    see `review_refusal`, which the review and ask paths call and this function
+    deliberately does not.
+    """
     try:
         return resolve_repo(name)
     except RepoNotFound as e:
         sys.exit(str(e))
+
+
+def review_refusal(cfg: dict) -> str:
+    """Why this repo may not be REVIEWED, or `""` when it may.
+
+    Absence of a rules file means "use the built-in defaults" everywhere else in the
+    harness, and that is right for `epic`, `lander` and `preland`: every default is
+    the safe end of its own switch, so an unconfigured repo gets a run that does
+    LESS, never one that does something nobody asked for. Which is why this is a gate
+    on the two review paths and not on `resolve_repo` — putting it there would take
+    the whole harness down on any repo that has not enrolled, including the parts
+    whose defaults are the safe end.
+
+    A review is not that shape. Its defaults are a two-seat panel, on two models
+    nobody chose, adjudicated by a judge nobody chose, at a code-access posture
+    nobody chose — and its OUTPUT is not inert: the findings brief a fixer that then
+    edits the repo, and a `confident` stop is read downstream as coverage the PR
+    actually got. A defaults-only review is a review nobody configured, and the
+    remedy is one committed file. So it is refused, out loud, rather than run.
+
+    Read off `_rules_baseline` — the FILENAME that supplied the baseline, `""` for
+    none — and never by matching English in `_rules_from`. That blurb is written for
+    a human at the top of a report ("none on origin/main (defaults)"), so a gate
+    grepping it is a gate one rewording away from reviewing everything; and
+    `.harness-rules.sample` contains `.harness-rules` as a substring, so even the
+    filename cannot be sniffed back out of it safely.
+
+    TWO REFUSALS, because an empty baseline has two causes and only one of them has
+    the remedy this used to print. A repo that carries no rules file is fixed by
+    committing one. A repo whose `origin/<default>` could not be READ — no remote, no
+    fetch, a git error — is very possibly fully enrolled, and telling its operator to
+    commit a file they already committed sends them to the wrong place while the
+    unattended timer keeps refusing every round. Which of the two happened is taken
+    from `_rules_unreadable`, a flag `resolve_repo` stamps, for the same reason the
+    baseline is a field: the sentence that distinguishes them is written for a human.
+    Both still refuse, and that is deliberate — an unreadable branch is not evidence
+    the repo is configured the way this run would guess.
+    """
+    if cfg.get("_rules_baseline"):
+        return ""
+    who = cfg.get("name") or "this repo"
+    said = cfg.get("_rules_from") or "no rules were read"
+    if cfg.get("_rules_unreadable"):
+        return (f"{who}'s rules could not be read — {said}. A panel review is not run "
+                f"on built-in defaults: which seats, which models and which judge "
+                f"review this repo is a decision, and a review nobody configured "
+                f"still briefs a fixer that edits the code. This is a read failure "
+                f"rather than a missing file, so committing one will not clear it — "
+                f"fetch the default branch, or check the remote, and re-run")
+    return (f"{who} has no {SAMPLE_FILENAME} and no "
+            f"{RULES_FILENAME} — {said}. A "
+            f"panel review is not run on built-in defaults: which seats, which models "
+            f"and which judge review this repo is a decision, and a review nobody "
+            f"configured still briefs a fixer that edits the code. Commit a "
+            f"{SAMPLE_FILENAME} (start from the one in the quarterback repo) and "
+            f"re-run")
 
 
 def _spans(text: str, open_ch: str, close_ch: str) -> list[tuple[int, str]]:
@@ -1851,7 +1914,8 @@ __all__ = [
     "_FINDINGS_ENVELOPE", "REVIEW_PROMPT", "MOVE_MANIFEST_PROMPT",
     "CODE_ACCESS_BRIEF",
     "JUDGE_PROMPT", "ASK_PROMPT", "Finding", "ReviewerRun",
-    "PanelResult", "sh", "load_repo_cfg", "_spans",
+    "PanelResult", "sh", "load_repo_cfg", "review_refusal",
+    "RULES_FILENAME", "SAMPLE_FILENAME", "_spans",
     "ENVELOPE_KEYS", "DECLARATION_KEYS", "_scalar", "_Tok",
     "_TOKEN", "_TOKEN_MARK", "_tokenise", "_schema",
     "SCHEMA_ECHOES", "_example", "SCHEMA_ITEMS", "_standins",

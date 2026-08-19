@@ -1,6 +1,6 @@
 # Loops — Reviewer Panel
 
-@description Run the multi-reviewer panel (Claude + Codex + Antigravity + master judge; SonarCloud hard gate) on a PR and post the summary as a PR comment by default. Give it several PR numbers and each is panelled by its own sub-agent, in parallel. Panel members default to the repo's .harness-rules; name them explicitly to run a subset or a single vendor.
+@description Run the multi-reviewer panel (Claude + Codex + Antigravity + master judge; SonarCloud hard gate) on a PR and post the summary as a PR comment by default. Give it several PR numbers and each is panelled by its own sub-agent, in parallel. Panel members default to the repo's .harness-rules.sample; name them explicitly to run a subset or a single vendor. A repo with no rules file at all is REFUSED rather than reviewed on built-in defaults.
 @arguments $ARGS: <pr ...> [repo] [--no-post] [--reviewers a,b]   (repo defaults to the cwd's repo)
 
 Run the reviewer panel over a pull request. Each reviewer (and the master judge)
@@ -15,7 +15,8 @@ panel just adds independent reviewers + hard CI/Sonar gates on top of that bar.
    parse; an optional non-numeric word (not a `--flag`) is the **repo** (default: the cwd's repo).
    **Default is to post** the summary as a PR comment; pass `--post` only
    when the user said `--no-post` (then omit it and skip the comment for a read-only run).
-2. **Panel members.** Default to the repo's `.harness-rules` — pass no `--reviewers` at all. Pass it
+2. **Panel members.** Default to the repo's `.harness-rules.sample` (narrowed by the box's own
+   untracked `.harness-rules`) — pass no `--reviewers` at all. Pass it
    only when the user named who should review, in any phrasing ("just codex", "codex and antigravity",
    "run the whole panel"): map that to a comma-separated list of `claude`, `codex`, `antigravity`,
    `sonarqube`. The flag REPLACES the configured set rather than filtering it, so naming a reviewer
@@ -77,7 +78,7 @@ Notes:
   rounds are for.
 - First run needs `op signin` once (the SonarCloud token then caches), `codex login` for the Codex
   reviewer and `agy` auth for the Antigravity one; missing reviewers are reported as skipped, not fatal.
-- `antigravity` is off unless a repo's `.harness-rules` enables it — its CLI (`agy`) is workstation-only (personal
+- `antigravity` is off unless a repo's `.harness-rules.sample` enables it — its CLI (`agy`) is workstation-only (personal
   Google account, so it never reaches the work box). `--reviewers` still runs it on demand anywhere
   the CLI exists.
 - `--force` overrides a pre-flight refusal (and the manifest substitution) and reviews the diff

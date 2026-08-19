@@ -174,6 +174,7 @@ def test_every_payload_carries_the_keys_even_when_the_run_never_got_that_far():
 def _gh(monkeypatch, meta_json: str, reviewers: dict) -> None:
     monkeypatch.setattr(panel, "load_repo_cfg", lambda name: {
         "github": "o/r", "path": "/tmp/r", "reviewers": reviewers,
+        "_rules_baseline": ".harness-rules.sample",
         "review_panel": {"skip_title_patterns": ["^Merge "]},
     })
     monkeypatch.setattr(panel_core, "sh", gh_stub(meta=json.loads(meta_json), diff="diff"))

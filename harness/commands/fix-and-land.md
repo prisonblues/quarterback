@@ -56,7 +56,7 @@ This is the hybrid path: the guardrails of a guided integration merge (lexray's 
    written up that precise confusion an hour earlier and had itself recorded the PR as blocked.
 
    - **HOLD** → stop. Post `reasons` as a PR comment and leave it for a human. Do **not** clear a
-     HOLD by re-running with that check turned off; `--skip` and `.harness-rules` exist for repos
+     HOLD by re-running with that check turned off; `--skip` and `.harness-rules.sample` exist for repos
      that genuinely lack the guardrail, not for a verdict you dislike.
    - **RECONCILE** → run every command in `actions`, in order, verbatim. Commit what they produce
      (they deliberately do not commit for you), push, and **run preland again**. Those commits are

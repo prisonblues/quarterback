@@ -51,10 +51,12 @@ REPO = "/tmp/acme-board"
 # Two seats, so a lost one is a DEGRADED panel rather than the whole panel. A
 # one-seat config would conflate the two and is tested separately below.
 TWO_SEAT_CFG = {"github": "acme/board", "path": REPO,
+                "_rules_baseline": ".harness-rules.sample",
                 "reviewers": {"claude": {"enabled": True, "model": "sonnet"},
                               "codex": {"enabled": True, "model": "", "effort": ""}},
                 "review_panel": {}}
 ONE_SEAT_CFG = {"github": "acme/board", "path": REPO,
+                "_rules_baseline": ".harness-rules.sample",
                 "reviewers": {"claude": {"enabled": True, "model": "sonnet"}},
                 "review_panel": {}}
 

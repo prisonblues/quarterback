@@ -255,6 +255,7 @@ def test_the_clamped_budget_still_fits_when_the_diff_is_multibyte():
 #: refusal is switched off with `0` and the manifest with `false`; the verdict has
 #: its own suite, and what these tests need is for the round to happen.
 AGY_CFG = {"github": "acme/board", "path": "/tmp/acme-board",
+           "_rules_baseline": ".harness-rules.sample",
            "reviewers": {"claude": {"enabled": True, "model": "sonnet"},
                          "antigravity": {"enabled": True, "model": "m", "effort": ""}},
            "review_panel": {"refuse_over_cap_multiple": 0,

@@ -25,13 +25,48 @@ dependabot branch. Reading rules from that branch would let a poisoned PR rewrit
 the policy governing its own review, reaching something the agent otherwise
 cannot. So:
 
-    unattended (the timer)  -> git show origin/<default-branch>:.harness-rules
-    interactive (you typed it) -> the working tree
+    unattended (the timer)  -> git show origin/<default-branch>:.harness-rules.sample
+                               (falling back to :.harness-rules for a repo that has
+                               not migrated), and NOTHING out of the working tree
+    interactive (you typed it) -> the working tree: the sample, plus this box's
+                               untracked .harness-rules overlay
 
 A human at the keyboard IS the authorization, and editing the file locally takes
 effect immediately. Unattended runs only honour rules that were merged to the
 default branch. Set HARNESS_UNATTENDED=1 (run-loop.sh does) to select the
 unattended read.
+
+AND THE WORKING TREE MEANS THE WHOLE WORKING TREE — tracked or not. The per-box
+overlay (`.harness-rules`, untracked; see `_local_overlay`) is read on the
+INTERACTIVE path only, and the first version of this split got that wrong. It
+argued that an untracked file cannot have come from a PR because "git will not
+deliver a file it is not carrying". That is true of what git CHECKS OUT and says
+nothing about what code run from that checkout WRITES. The lander's fixer is
+edit-only, but the things that run around a PR are not: a test suite, a build or
+lint step, a git hook, a Makefile target — anything invoked while the branch under
+review is checked out — can create `.harness-rules` in the repo root, and it is
+gitignored now, so `git status` will not even show it. `_is_tracked` then sees a
+file git is not carrying and honours it as this machine's own overlay, and
+`{"reviewers": {"claude": {"enabled": false}}}` planted that way silently shrinks
+the panel reviewing that very PR (panel.py counts a seat that never ran as
+coverage it did not get). That is precisely the poisoning the two-ref rule exists
+to prevent, arriving through the one door the two-ref rule had been argued not to
+need.
+
+So the rule is restated honestly rather than patched with a special case:
+unattended, the working tree is untrusted, and an untracked file sitting in it is
+part of the working tree. It costs something, and the cost is named rather than
+argued away — an unattended panel on a box whose fleet pin is unservable falls
+back at RUNTIME (#215: two extra CLI round-trips per seat, and `codex (CLI
+default)` in the board's cost history) instead of being configured correctly. That
+is the right price for a file nobody can review being unable to change a review.
+
+The `enabled` half of that price is smaller still, and by an existing decision: a
+seat whose CLI is not on this box records `CLI absent` and is reported WITHOUT
+vetoing the round's confidence, because a missing package is a fact about the host
+rather than about the change (see `_headless_cost` in this repo's own sample). So an
+unattended panel on a box lacking `agy` loses that seat either way; what it no
+longer does is take instructions about it from the working tree.
 
 SECOND RESPONSIBILITY: RUNNING HEADLESS CLIs AND READING WHAT THEY SAID.
 
@@ -60,6 +95,96 @@ from pathlib import Path
 from typing import Any, TextIO
 
 RULES_FILENAME = ".harness-rules"
+
+# The TRACKED half. Policy — merge gates, bases, budgets, title patterns — lives
+# here, on the protected branch, because the unattended read exists to stop a
+# poisoned PR rewriting the rules governing its own review. `.harness-rules`
+# beside it is the UNTRACKED half: one machine's answer to "which reviewer CLIs
+# does this box actually have", which is not a fact about the repo and cannot be
+# committed to it without forcing a reviewer onto every other box.
+#
+# A repo with no sample is the legacy layout and still works unchanged: its
+# tracked `.harness-rules` is read as the baseline exactly as before. See
+# `_read_rules`, and `_local_overlay` for why the overlay turns on TRACKEDNESS
+# rather than on which files happen to exist — trackedness answers "which of
+# these two files is which", NOT "which of them may be trusted". The ref answers
+# that, and only the ref does: see the module docstring.
+SAMPLE_FILENAME = ".harness-rules.sample"
+
+# The reasoning levels each reviewer CLI accepts for the shared `effort` key.
+# codex spells it `model_reasoning_effort`, pi spells it `--thinking`, and the two
+# sets genuinely differ (pi has off/minimal, codex has ultra), so they are listed
+# per CLI rather than unioned. Per-MODEL support is narrower still and moves with
+# the fleet (gpt-5.6-luna takes `max` but not `ultra`), so this only catches
+# typos — the API rules on the model/effort pair and its sentence is surfaced
+# verbatim.
+#
+# HERE rather than in panel_seats, where they were written and where `run_seat`
+# still reads them from, because this module has to reject `effort: "maxx"` in a
+# rules file and a second copy of the set would fail SILENTLY: it would not
+# disagree loudly, it would just stop recognising a level a CLI accepts (or accept
+# one it does not) the first time a vendor adds one. panel_seats imports them back,
+# so `panel.CODEX_EFFORTS` is the same tuple it always was. harness_rules is the
+# layer below panel_core, which is why the shared value lives down here.
+CODEX_EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
+PI_EFFORTS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
+AGY_EFFORTS = ("low", "medium", "high")
+EFFORTS = {"codex": CODEX_EFFORTS, "pi": PI_EFFORTS, "antigravity": AGY_EFFORTS}
+
+# What the untracked overlay is allowed to say, and it is deliberately narrow.
+# An untracked file is reviewed by nobody — it never appears in a PR, so branch
+# protection cannot see it — which is precisely what makes it right for machine
+# capability and wrong for policy. Left unrestricted it would be a way to widen
+# `auto_merge` on a box with no review at all, and the timers would honour it.
+#
+# Three keys, and all three answer the same question: what will this machine's
+# provider actually serve? `enabled` covers a CLI that is not installed —
+# daedalus deliberately carries no `agy` and no `pi`. `model` and `effort` cover
+# a CLI that IS installed and refuses the pin anyway, which is #215: codex here
+# routes through an employer Azure gateway serving gpt-5.5, while the fleet pins
+# gpt-5.6-luna at `max` effort, and the gateway refuses BOTH — independently.
+#
+# Those two are the reason a per-box file had to exist at all rather than a
+# per-box `enabled` toggle. #215 shipped a runtime fallback that lowers an
+# unsatisfiable pin and recovers the seat, which is the right floor but not a
+# plan: it spends two extra CLI round-trips on every panel, and it records
+# `codex (CLI default)` in the board's cost history — the exact vagueness the
+# pins exist to prevent. Naming `gpt-5.5, high` here records the brain that
+# actually reviewed.
+#
+# What stays OUT is everything that decides what may be merged: `auto_merge`,
+# the epic and preland blocks, budgets, title patterns. A pin is a fact about a
+# provider; a merge gate is a policy, and policy belongs in the tracked sample
+# where a human reviewing a branch can see it.
+#
+# Three further rules narrow it, and each closes a hole the key list alone left
+# open. State the boundary as all four together, because an auditor reading only
+# the list would conclude something false about every one of them:
+#
+#  1. INTERACTIVE ONLY. Unattended, the overlay is not read at all — the working
+#     tree is untrusted there, and an untracked file in it is part of the working
+#     tree. The module docstring has the vector this closes.
+#  2. VALUES ARE CHECKED, not just names. `"enabled": "false"` is a non-empty
+#     string and therefore TRUTHY, so a name-only filter let the natural hand-edit
+#     do the exact opposite of what this file exists for. See `_overlay_problem`.
+#  3. `enabled` may only NARROW. The overlay can take a seat OFF a box that cannot
+#     run it — the documented case — and cannot turn one back ON that the tracked
+#     sample deliberately disabled for cost, policy or merge-quorum reasons. An
+#     unreviewed file may reduce the panel to what this machine can actually run;
+#     widening it past what the protected branch agreed to is a decision, and
+#     decisions go in the sample.
+#
+# The residual risk that remains after those is a repin to a costlier model on a
+# seat the sample already pays for, and it is accepted rather than clamped: there
+# is no allowlist a model slug could be checked against that would not refuse
+# tomorrow's model (see the DEFAULTS comment on why codex is not pinned globally),
+# and the epic's `model_ceiling` is a spending ceiling for issue implementation
+# that deliberately inherits nothing from who reviews. What keeps it honest is
+# that the seat cannot be ADDED by this file, the panel names the model that
+# actually ran in its header, and it records it per seat on the board — so a spend
+# nobody agreed to is visible in the same place the agreement would have been.
+_LOCAL_BLOCK = "reviewers"
+_LOCAL_KEYS = ("enabled", "model", "effort")
 
 # Where a bare `--repo <name>` is looked up when it isn't a path.
 REPO_ROOT = Path(os.environ.get("HARNESS_REPO_ROOT") or Path.home() / "source")
@@ -371,7 +496,16 @@ _RENAMED: dict[str, dict[str, str]] = {"reviewers": {"gemini": "antigravity"}}
 # panel.py, which resolves again in its own process — so an undeduped warning
 # prints several times per epic run and trains the reader to skip the one
 # message that is supposed to be loud. Rare is what keeps it loud.
-_warned: set[tuple[str, str, str]] = set()
+_warned: set[tuple[str, str, str, str]] = set()
+
+# The same treatment for the diagnostics that are not about a key NAME — a shadowed
+# baseline file, a value the overlay may not hold, a seat that does not exist. Keyed
+# on (where it was read from, the sentence), so a box carrying one stray key says so
+# once per process instead of on every resolution. It matters more here than for
+# `_warned`: `resolve_repo` runs per loop tick and per invocation under the
+# unattended timers, and a real diagnostic repeated forever is a diagnostic people
+# learn to filter out — which is the same failure as not printing it.
+_reported: set[tuple[str, str, str]] = set()
 
 
 class RepoNotFound(Exception):
@@ -439,25 +573,364 @@ def detect_default_branch(root: Path) -> str:
     return "main"
 
 
-def _read_rules(root: Path, default_branch: str, from_default_branch: bool) -> tuple[dict, str]:
-    """Return (rules, provenance). Missing file is not an error — it means
-    'use the defaults', which is the whole point of dropping the registry."""
-    if from_default_branch:
-        r = _git(root, "show", f"origin/{default_branch}:{RULES_FILENAME}")
-        if r.returncode != 0:
-            return {}, f"none on origin/{default_branch} (defaults)"
-        try:
-            return json.loads(r.stdout), f"origin/{default_branch}"
-        except json.JSONDecodeError as e:
-            raise SystemExit(f"{RULES_FILENAME} on origin/{default_branch} is not valid JSON: {e}")
+def _baseline_json(text: str, where: str) -> dict:
+    """Parse a baseline rules file, or exit naming the file and the reason.
 
-    p = root / RULES_FILENAME
-    if not p.is_file():
-        return {}, "none (defaults)"
+    Both diagnostics here are the ones `_local_overlay` already produced for the
+    identical mistakes, and they are shared for that reason: a JSON array (or a
+    string, or `null`) in `.harness-rules.sample` used to flow unchecked into
+    `strip_comments`, the block-merge loop and `cfg.setdefault`, and surfaced as an
+    opaque AttributeError or TypeError from somewhere deep inside `resolve_repo` —
+    while exactly the same array in the untracked half said so in one line. One
+    shape of mistake gets one shape of answer, whichever half of the split made it.
+
+    A CORRUPT file is fatal where a MISSING one is not, and that asymmetry is
+    deliberate rather than incidental. Absence means "use the defaults", which is
+    the whole point of dropping the registry; but a file that was written to say
+    something and cannot be read must not quietly defer to the legacy file beside
+    it, or to DEFAULTS. That is policy going silent, which is the one failure this
+    module exists to prevent. So `_read_rules` falls back past a name the branch
+    does not carry and never past one it cannot parse.
+    """
     try:
-        return json.loads(p.read_text()), str(p)
+        obj = json.loads(text)
     except json.JSONDecodeError as e:
-        raise SystemExit(f"{p} is not valid JSON: {e}")
+        raise SystemExit(f"{where} is not valid JSON: {e}")
+    if not isinstance(obj, dict):
+        raise SystemExit(f"{where} must hold a JSON object, not {type(obj).__name__}")
+    return obj
+
+
+def _shadowed(chosen: str, other: list[str]) -> list[str]:
+    """The note for a baseline file that exists, is TRACKED, and was not read
+    because the sample beside it won.
+
+    Both files tracked is the mid-migration state this module's comments say it must
+    handle safely, and "safely" was doing half the job: the sample was taken as the
+    baseline and every key in the other file vanished with no diagnostic at all — in
+    stark contrast to the untracked-overlay path one function down, which reports
+    every dropped key by name. Same event, so the same courtesy.
+
+    `other` is the caller's list of names that LOST, already narrowed to the tracked
+    ones, and that narrowing is the whole reason it is a parameter. An UNTRACKED
+    `.harness-rules` beside a sample is not a shadowed baseline at all — it is the
+    per-box overlay, which is the normal fully-migrated state and the entire point
+    of the split. Reporting it as a half-done migration would print this warning on
+    every resolution of every correctly-configured box, which is how a real
+    diagnostic becomes noise.
+    """
+    if chosen != SAMPLE_FILENAME or not other:
+        return []
+    # No location in the sentence: `_report` prefixes the one it was read from, and
+    # two of them in one line reads as two different files.
+    return [f"{', '.join(other)} is here too and NOTHING in it was read — the sample is "
+            f"the baseline. Finish the migration: move any policy it still holds into "
+            f"{SAMPLE_FILENAME}, then `git rm --cached {RULES_FILENAME}` (which keeps the "
+            f"file on disk, where it is now the per-box overlay)"]
+
+
+def _rules_on_branch(root: Path, default_branch: str) -> tuple[list[str], str]:
+    """Which of the two rules files the protected branch carries, and why not.
+
+    Returns (names present, why nothing could be read). ONE `git ls-tree` rather
+    than a `git show` per candidate name, and that is not a micro-optimisation.
+    Probing by `show` cannot tell "this branch does not carry that file" from "this
+    branch could not be read at all" without reading stderr and guessing, so a
+    repo whose `origin/<default>` is simply not fetched resolved to the built-in
+    defaults and said "none on origin/main", which is a claim about the repo it had
+    no evidence for. Asking the tree once answers both questions — and it answers a
+    third for free, which is which file was SHADOWED (see `_shadowed`).
+
+    It also stops spawning a child that is guaranteed to fail. Sample-first probing
+    means every repo still on the legacy layout paid for a failing
+    `git show origin/<b>:.harness-rules.sample` on every resolution, and this runs
+    on a timer.
+    """
+    r = _git(root, "ls-tree", "--name-only", f"origin/{default_branch}",
+             "--", SAMPLE_FILENAME, RULES_FILENAME)
+    if r.returncode != 0:
+        return [], stderr_gist(r.stderr) or f"git ls-tree exited {r.returncode}"
+    found = set(r.stdout.split())
+    return [n for n in (SAMPLE_FILENAME, RULES_FILENAME) if n in found], ""
+
+
+def _read_rules(root: Path, default_branch: str,
+                from_default_branch: bool) -> tuple[dict, str, str, list[str], bool]:
+    """Return (rules, provenance, baseline_filename, problems, unreadable).
+
+    Missing file is not an error — it means 'use the defaults', which is the whole
+    point of dropping the registry. The third element names WHICH file supplied the
+    baseline (`SAMPLE_FILENAME`, `RULES_FILENAME`, or `""` for none), because that
+    is what decides whether an untracked `.harness-rules` is an overlay or is
+    itself the config — and sniffing it back out of the provenance string cannot
+    be done safely, since `.harness-rules.sample` contains `.harness-rules`. It is
+    also what the panel reads to refuse reviewing a repo nobody configured, which
+    is the second reason it is a field rather than a substring.
+
+    The fifth says the baseline is empty because the branch could not be READ, which
+    is a different fact from the branch carrying no rules file and has a different
+    remedy — fetch the branch, versus commit a file. It is a flag rather than
+    something a caller infers from the provenance sentence, because that sentence is
+    written for a human at the top of a report and a gate reading English out of it
+    is a gate one rewording away from refusing every repo (the rule
+    `review_refusal` already follows for `_rules_baseline`).
+
+    The fourth element is anything the caller has to SAY about how the baseline was
+    chosen — a shadowed file, a branch that would not answer. Returned rather than
+    printed here so that every diagnostic this module emits goes out through one
+    reporter with one dedupe (`_report`); `resolve_repo` is the only caller, which
+    is what makes widening the tuple cheap.
+    """
+    problems: list[str] = []
+    if from_default_branch:
+        where = f"origin/{default_branch}"
+        present, unreadable = _rules_on_branch(root, default_branch)
+        if unreadable:
+            # NOT the same answer as "the branch carries no rules file", and the
+            # difference reaches a caller: the baseline stays `""`, so the panel
+            # refuses to review rather than reviewing on defaults it invented, and
+            # `describe()` says which of the two happened.
+            return ({}, f"unreadable on {where} (defaults)", "",
+                    [f"the branch could not be read ({unreadable}), so this run is on "
+                     f"built-in defaults — which is not the same thing as this repo "
+                     f"having no rules file. Fetch the branch, or check the remote"],
+                    True)
+        for name in present:
+            r = _git(root, "show", f"{where}:{name}")
+            if r.returncode != 0:
+                # ls-tree just said the branch carries this path, so a failure here
+                # is git failing rather than the file being absent — and FATAL for
+                # the reason `_baseline_json` gives about a corrupt file: falling
+                # back past a name the branch does not carry is the point of the
+                # loop, and falling back past one it DOES carry but could not read
+                # hands the run to whatever policy sits beside it. On a repo
+                # mid-migration that is the superseded `.harness-rules` governing a
+                # run whose operator believes the sample is in force, chosen by a
+                # transient git error and announced as a `problems` line nobody has
+                # to read. Absence means "use the defaults"; unreadable-but-present
+                # means the file was written to say something and this run cannot
+                # know what, which is policy going silent.
+                raise SystemExit(
+                    f"{where}:{name} is on the branch but could not be read "
+                    f"({stderr_gist(r.stderr) or f'exited {r.returncode}'}) — refusing "
+                    f"to fall back to the file beside it, whose policy this run has no "
+                    f"reason to believe is the one in force. Retry, or fetch "
+                    f"origin/{default_branch} again")
+            # Everything `present` names is on the branch, so every loser here is
+            # tracked by definition — the working-tree read below has to establish
+            # that for itself.
+            return (_baseline_json(r.stdout, f"{where}:{name}"), f"{where}:{name}", name,
+                    problems + _shadowed(name, [n for n in present if n != name]), False)
+        return {}, f"none on {where} (defaults)", "", problems, False
+
+    # Preference order, not iteration order: `present` is built in it, so the
+    # sample wins where both exist and `_shadowed` says the other one lost.
+    present = [n for n in (SAMPLE_FILENAME, RULES_FILENAME) if (root / n).is_file()]
+    if present:
+        f = root / present[0]
+        # `_is_tracked` is asked ONLY where a second file actually lost, which is
+        # the mid-migration case alone. On the ordinary layouts — one file, or a
+        # sample plus this box's overlay — the loser list is empty or untracked and
+        # no extra git call happens on the common path.
+        lost = [n for n in present[1:] if _is_tracked(root, n)]
+        return (_baseline_json(f.read_text(), str(f)), str(f), present[0],
+                _shadowed(present[0], lost), False)
+    return {}, "none (defaults)", "", [], False
+
+
+def _is_tracked(root: Path, name: str) -> bool:
+    """Is `name` committed to this repo? FAILS CLOSED — see the last paragraph.
+
+    This answers WHICH OF THE TWO FILES IS WHICH, and it no longer carries the
+    safety argument, because the argument it used to carry was wrong. A TRACKED
+    `.harness-rules` can arrive from any branch, including the branch of the PR
+    under review, so it is never demoted to a per-box overlay; an UNTRACKED one
+    beside a sample is this machine's overlay. What makes reading that overlay safe
+    is NOT its untrackedness — code run from a PR checkout can create an untracked
+    file, which is the vector the module docstring sets out — it is that the overlay
+    is read on the interactive path only.
+
+    Asked of git rather than inferred from whether a sample exists beside it.
+    "There is a sample, so the other file must be local" is a guess that is wrong
+    for exactly the case that matters — a repo mid-migration, with the sample
+    added and `.harness-rules` not yet untracked, would have its committed rules
+    silently demoted to an overlay and most of its policy dropped.
+
+    And every answer that is not git's own "no such path in the index" is read as
+    TRACKED. `returncode == 0` for yes and anything else for no put a missing git
+    binary, a contended index lock, a partial index and a genuinely untracked file
+    in one bucket — and resolved the whole bucket in the permissive direction, so on
+    that same mid-migration repo one transient git failure was enough to demote a
+    committed rules file to an overlay and drop its policy on the floor, with a
+    warning that read as though the file were at fault. `ls-files --error-unmatch`
+    exits 1 for "not in the index" and reserves everything else for its own
+    failures, so the two ARE distinguishable, and the ambiguous half now fails
+    toward keeping the policy rather than toward discarding it.
+    """
+    try:
+        r = _git(root, "ls-files", "--error-unmatch", "--", name)
+    except OSError as e:
+        why = f"git could not be run ({e})"
+    else:
+        if r.returncode in (0, 1):
+            return r.returncode == 0
+        why = stderr_gist(r.stderr) or f"git ls-files exited {r.returncode}"
+    print(f"{name}: cannot tell whether git is carrying it — {why}. Treating it as "
+          f"TRACKED, which is the answer that cannot lose a committed policy: it is "
+          f"not applied as a per-box overlay on this run, and if it IS this repo's "
+          f"rules file it is still read as the baseline",
+          file=sys.stderr)
+    return True
+
+
+#: What the overlay may not say, said once, so every refusal below points at the
+#: same sentence rather than at four paraphrases of it.
+_NOT_A_PROVIDER_FACT = (
+    f"the untracked overlay may set only {_LOCAL_BLOCK}.<seat>."
+    f"{'/'.join(_LOCAL_KEYS)}; policy comes from {SAMPLE_FILENAME} on the "
+    f"protected branch")
+
+
+def _overlay_problem(seat: str, key: str, val: Any) -> str:
+    """Why this seat field cannot be applied, or `""` when it can.
+
+    A NAME filter was not enough, and the gap it left was the whole point of the
+    feature. `_LOCAL_KEYS` accepted `"enabled": "false"` — a non-empty string, and
+    therefore TRUTHY — so the most natural hand-edit in the file did the exact
+    opposite of the one thing this file exists for, which is taking a seat off a box
+    that cannot run it. `null`, `{}` and `"maxx"` reached the seat launcher by the
+    same route, to surface much later as a confusing CLI error, or not at all.
+
+    `effort` is checked against `EFFORTS`, the same mapping `run_seat` rules on, and
+    NOT against a second list written here — which is why those tuples moved down
+    into this module. Membership only, exactly as `run_seat` has it: which efforts a
+    given MODEL accepts is the API's call (luna takes `max` but not `ultra`), and
+    that answer arrives at runtime with the provider's own sentence attached.
+
+    `model` gets a SHAPE check and deliberately no allowlist. Slugs are versioned
+    build names that move with the fleet (see the DEFAULTS comment on why codex is
+    not pinned globally), so a list here would refuse tomorrow's model — but the one
+    shape that matters in an argv list is a value the CLI reads as another OPTION,
+    since `--model` takes the next element and a "pin" of `-c …` would be adding a
+    flag rather than naming a model. Whitespace and control characters go with it: a
+    slug has neither, and both are how a value meant as one argv element becomes
+    two.
+    """
+    label = f"{_LOCAL_BLOCK}.{seat}.{key}"
+    if key == "enabled":
+        if isinstance(val, bool):
+            return ""
+        truthy = (". A non-empty string is TRUTHY, so this would have kept the seat "
+                  "ON — the one outcome this file exists to prevent"
+                  if isinstance(val, str) and val else "")
+        return f"`{label}` must be a JSON boolean, not {val!r} — ignored{truthy}"
+    if not isinstance(val, str):
+        return (f"`{label}` must be a string, not {val!r} — ignored. An empty string "
+                f"is how you say \"whatever the CLI itself defaults to\"")
+    if not val:
+        return ""
+    if key == "effort":
+        valid = EFFORTS.get(seat, ())
+        if val in valid:
+            return ""
+        return (f"`{label}` {val!r} is not a reasoning level {seat} accepts — ignored"
+                + (f"; expected one of {', '.join(valid)}" if valid
+                   else f". {seat} takes no reasoning effort at all"))
+    if key == "model" and (val.startswith("-") or any(c.isspace() or ord(c) < 0x20
+                                                      for c in val)):
+        return (f"`{label}` {val!r} is not the shape of a model slug — ignored. It must "
+                f"not begin with `-` (the CLI would read it as another option) or hold "
+                f"whitespace or control characters")
+    return ""
+
+
+def _local_overlay(root: Path, baseline: str) -> tuple[dict, str, list[str]]:
+    """This machine's untracked `.harness-rules`, narrowed to what a PROVIDER serves.
+
+    Returns `(overlay, provenance, problems)`. `overlay` is shaped like the
+    `reviewers` block and holds nothing but `enabled`, `model` and `effort` — the
+    three provider facts, never merge policy; see the `_LOCAL_KEYS` comment for the
+    three further rules that narrowing rests on. An empty overlay is the answer
+    whenever the file is absent, or is tracked (the legacy layout, where it IS the
+    baseline `_read_rules` just read).
+
+    `problems` is a list of FINISHED SENTENCES, one per thing this file said that
+    was not applied — not a list of key names under one blanket message, which is
+    what it was. That blanket read "the untracked overlay may set only
+    reviewers.<seat>.enabled/model/effort", and it was printed over `reviewers:
+    "none"`, whose author had written that shape and was told it was forbidden, and
+    over `reviewers.gemini.enabled`, a well-formed key naming a seat that does not
+    exist — which is the exact confusion the diagnostic is there to prevent. A
+    problem that cannot say what is wrong with it is not a diagnostic.
+
+    NOT called at all on the unattended path. `resolve_repo` decides that, because
+    it is a property of the RUN and not of the file; see the module docstring.
+    """
+    # BOTH conditions, and the first is the one a plausible-looking shortcut gets
+    # wrong. Untracked alone does not mean "overlay": a repo whose only config is
+    # an uncommitted `.harness-rules` — mid-migration, a fresh clone, a test
+    # fixture — would have its whole policy demoted to a seat toggle and silently
+    # dropped. The overlay exists only where a `.sample` supplied the baseline.
+    if baseline != SAMPLE_FILENAME:
+        return {}, "", []
+    f = root / RULES_FILENAME
+    if not f.is_file() or _is_tracked(root, RULES_FILENAME):
+        return {}, "", []
+    # Through the shared parser, so the two halves of the split answer a JSON array
+    # or a bare string in the same words. That used to be true only here.
+    raw = strip_comments(_baseline_json(f.read_text(), str(f)))
+    overlay: dict = {}
+    problems: list[str] = []
+    for key, val in raw.items():
+        if key != _LOCAL_BLOCK:
+            problems.append(f"`{key}` is not a provider fact — ignored; "
+                            f"{_NOT_A_PROVIDER_FACT}")
+            continue
+        if not isinstance(val, dict):
+            # Its own sentence, because the blanket message told this author that
+            # `reviewers.<seat>.*` was the only allowed shape — which is what they
+            # thought they had written.
+            problems.append(f"`{_LOCAL_BLOCK}` must be an object of seats, not "
+                            f"{type(val).__name__} — the whole block was ignored. "
+                            f'Shape: {{"{_LOCAL_BLOCK}": {{"codex": {{"model": '
+                            f'"gpt-5.5"}}}}}}')
+            continue
+        for seat, cfg in val.items():
+            # The seat name is checked HERE rather than where the overlay is
+            # applied, so that `problems` can never be non-empty while `provenance`
+            # is unset — the print used to carry an `or root` fallback for exactly
+            # that case, which was unreachable and would have named a directory
+            # where a file path belongs. DEFAULTS is the authority on seat names: an
+            # unknown seat in the SAMPLE is dropped by `warn_unknown_keys` before
+            # this runs, so the resolved reviewers block holds exactly these.
+            if seat not in DEFAULTS[_LOCAL_BLOCK]:
+                renamed = _RENAMED.get(_LOCAL_BLOCK, {}).get(seat)
+                problems.append(
+                    f"`{_LOCAL_BLOCK}.{seat}` is not a seat on this panel — ignored"
+                    + (f"; it was renamed to {renamed!r}" if renamed else "")
+                    + f". Seats: {', '.join(sorted(DEFAULTS[_LOCAL_BLOCK]))}")
+                continue
+            if not isinstance(cfg, dict):
+                problems.append(f"`{_LOCAL_BLOCK}.{seat}` must be an object of "
+                                f"{{{', '.join(_LOCAL_KEYS)}}}, not "
+                                f"{type(cfg).__name__} — ignored")
+                continue
+            kept: dict = {}
+            for k, v in sorted(cfg.items()):
+                if k not in _LOCAL_KEYS:
+                    problems.append(f"`{_LOCAL_BLOCK}.{seat}.{k}` is not a provider "
+                                    f"fact — ignored; {_NOT_A_PROVIDER_FACT}")
+                    continue
+                # Name AND value. The name says which question this key answers; the
+                # value has to be an answer to it.
+                why = _overlay_problem(seat, k, v)
+                if why:
+                    problems.append(why)
+                    continue
+                kept[k] = v
+            if kept:
+                overlay.setdefault(seat, {}).update(kept)
+    return overlay, str(f), problems
 
 
 def strip_comments(obj: Any) -> Any:
@@ -566,7 +1039,7 @@ def unknown_keys(rules: dict) -> dict[str, list[str]]:
     return out
 
 
-def warn_unknown_keys(rules: dict, provenance: str) -> dict[str, list[str]]:
+def warn_unknown_keys(rules: dict, provenance: str, repo: str = "") -> dict[str, list[str]]:
     """Shout about them, once per name per process. Returns them by block, and
     the caller DROPS them — the warning says 'ignored', so they have to be.
 
@@ -578,8 +1051,11 @@ def warn_unknown_keys(rules: dict, provenance: str) -> dict[str, list[str]]:
     unknown = unknown_keys(rules)
     known = {label: allowed for label, _over, allowed in _validated(rules)}
     for block, names in unknown.items():
-        fresh = [n for n in names if (provenance, block, n) not in _warned]
-        _warned.update((provenance, block, n) for n in names)
+        # `repo` for the reason `_report` carries it: `provenance` is repo-independent
+        # on the unattended read, so without it the second repo in a multi-repo
+        # process is silently told nothing.
+        fresh = [n for n in names if (repo, provenance, block, n) not in _warned]
+        _warned.update((repo, provenance, block, n) for n in names)
         if not fresh:
             continue
         renamed = _RENAMED.get(block, {})
@@ -594,30 +1070,125 @@ def warn_unknown_keys(rules: dict, provenance: str) -> dict[str, list[str]]:
     return unknown
 
 
+def _check_block_shape(rules: dict, provenance: str) -> None:
+    """Refuse a baseline whose BLOCKS are not the shape everything downstream reads.
+
+    SEPARATE from `_check_seat_shape`, and called EARLIER, because the two halves
+    guard different traversals and only one of them can wait. `warn_unknown_keys`
+    and the drop loop after it both walk `_DEEP_BLOCKS` assuming each block is a
+    mapping, so `{"reviewers": "all"}` reaches them first and raises whatever a
+    string raises — an AttributeError with no filename in it, which is the exact
+    outcome this function was written to replace. Worse than the crash is the near
+    miss: `'pi' in 'all'` is a substring test that answers True, so a malformed
+    block can be read as a membership answer rather than refused.
+
+    The merge in `resolve_repo` is deliberately blind — that is what lets a repo set
+    one reviewer without restating the others — so a block of the wrong type travels
+    through it intact and detonates somewhere else entirely, as a `TypeError` with
+    no filename in it. `"reviewers": "all"` reached the overlay's membership test,
+    where `'pi' in 'all'` is a SUBSTRING match that answers True, and then
+    `{**"all"}` raised; `"reviewers": {"pi": true}` raised on the dict-unpack; and
+    `"epic": "auto"` would have travelled all the way into epic.py.
+
+    A hard exit, unlike an unknown NAME, which is warned about and dropped. The
+    asymmetry is the one `preland.disabled_checks` already draws: an unrecognised
+    name may be a setting only a newer harness knows about, so failing on it would
+    turn every rules file into a version pin, while a value of the wrong TYPE is not
+    version skew in any direction — it is a file that cannot mean what it says. Same
+    precedent the overlay path has always set for a malformed local file.
+    """
+    for block in _DEEP_BLOCKS:
+        if block in rules and not isinstance(rules[block], dict):
+            raise SystemExit(f"{provenance}: `{block}` must be a JSON object, not "
+                             f"{type(rules[block]).__name__} — every setting in it is "
+                             f"addressed as `{block}.<name>`")
+
+
+def _check_seat_shape(rules: dict, provenance: str) -> None:
+    """Refuse a SEAT entry that is not an object, after unknown seats are dropped.
+
+    This half is the one that must wait, and the ordering is a decision rather than
+    an accident: `{"reviewers": {"gemini": true}}` names a seat nothing reads, and
+    the answer to an unknown NAME is the rename hint plus a drop, not a hard exit
+    about the type it happened to hold. Running this before the drop would turn
+    every unknown seat into a fatal error on the strength of its value, which is the
+    version-pin failure `warn_unknown_keys` exists to avoid.
+    """
+    for seat, entry in (rules.get(_LOCAL_BLOCK) or {}).items():
+        if not isinstance(entry, dict):
+            raise SystemExit(f"{provenance}: `{_LOCAL_BLOCK}.{seat}` must be a JSON "
+                             f"object, not {type(entry).__name__} — "
+                             f'e.g. {{"{seat}": {{"enabled": true}}}}. `{_LOCAL_BLOCK}` '
+                             f"is an object of objects")
+
+
+def _report(where: str, problems: list[str], repo: str = "") -> None:
+    """Print each problem once per process, naming the file it came from.
+
+    One reporter for every diagnostic that is about a VALUE rather than a key name,
+    so the dedupe cannot be got right in one place and forgotten in the other.
+
+    KEYED ON THE REPO as well as the file, and that is not belt-and-braces. `where`
+    is per-repo only on the working-tree read, where it is an absolute path. On the
+    unattended read it is `origin/main:.harness-rules.sample` — true of every
+    checkout on the box — and the problem sentences carry no repo identity either.
+    Any process resolving more than one repo (a timer looping `discover()`, a sweep
+    over several checkouts) would print the first repo's diagnostic and then treat
+    every later repo's identical-text diagnostic as the noise this dedupe exists to
+    suppress. That inverts it: "a repeated diagnostic becomes noise" becomes "a real
+    diagnostic is never printed at all" for every repo after the first, and the
+    diagnostics reaching this reporter are the ones saying policy went silent.
+    """
+    for problem in problems:
+        if (repo, where, problem) in _reported:
+            continue
+        _reported.add((repo, where, problem))
+        print(f"{where}: {problem}", file=sys.stderr)
+
+
 def resolve_repo(spec: str | None, *, from_default_branch: bool | None = None) -> dict:
-    """Full config for a repo: built-in defaults, overlaid with its
-    `.harness-rules`, plus the plumbing (path/github/default_branch) detected
-    from the checkout rather than declared.
+    """Full config for a repo: built-in defaults, overlaid with its rules file, plus
+    the plumbing (path/github/default_branch) detected from the checkout rather than
+    declared.
+
+    "Its rules file" is two files now — the tracked `.harness-rules.sample` for
+    policy and, on the interactive path only, this box's untracked `.harness-rules`
+    for what its providers will actually serve. A repo with only the legacy tracked
+    `.harness-rules` resolves exactly as it always did.
 
     The returned dict is the same shape the old load_repo_cfg() produced, so
-    callers read `cfg["github"]`, `cfg["loops"][...]` etc. unchanged.
+    callers read `cfg["github"]`, `cfg["loops"][...]` etc. unchanged. Two private
+    fields describe the read itself: `_rules_from` is the human sentence
+    `describe()` prints, and `_rules_baseline` is the FILENAME that supplied the
+    baseline (`""` for none), which is what a caller gates on — the panel refuses to
+    review a repo nobody configured, and a defaults-only review is one nobody
+    configured.
     """
     if from_default_branch is None:
         from_default_branch = unattended()
 
     root = find_repo(spec)
     default_branch = detect_default_branch(root)
-    rules, provenance = _read_rules(root, default_branch, from_default_branch)
+    rules, provenance, baseline, problems, unreadable = _read_rules(
+        root, default_branch, from_default_branch)
     rules = strip_comments(rules)
+    # BEFORE `warn_unknown_keys` and the drop below it, both of which traverse
+    # `_DEEP_BLOCKS` as mappings. See `_check_block_shape`.
+    _check_block_shape(rules, provenance)
+    _report(provenance, problems, str(root))
     # Warned about AND removed. A name only warned about survives the merge into
     # cfg["reviewers"], which makes the word "ignored" false and leaves every
     # caller iterating the resolved mapping looking at a phantom seat.
-    for block, names in warn_unknown_keys(rules, provenance).items():
+    for block, names in warn_unknown_keys(rules, provenance, str(root)).items():
         target = rules
         for part in (block.split(".") if block else []):
             target = target[part]
         for n in names:
             target.pop(n, None)
+    # AFTER the drop, so a name nothing reads is warned about and removed rather than
+    # type-checked: `reviewers.gemini` is an unknown seat whatever it holds, and the
+    # answer to it is the rename hint, not a hard exit about its shape.
+    _check_seat_shape(rules, provenance)
 
     cfg = {**DEFAULTS, **rules}
     for block in _DEEP_BLOCKS:
@@ -631,6 +1202,58 @@ def resolve_repo(spec: str | None, *, from_default_branch: bool | None = None) -
                         merged[rname] = {**rbase, **over[rname]}
             cfg[block] = merged
 
+    # The untracked, per-machine overlay, applied AFTER the baseline merge and able
+    # to touch nothing but what this box's providers will actually serve: which
+    # seats are on, and the model and effort each one is pinned to. A box without
+    # `agy` or `pi` says so here rather than in a committed file that would turn
+    # the seat off for every other box too — and a seat enabled in the sample but
+    # absent from this machine would otherwise veto every round's `confident` for
+    # ever, since panel.py counts a reviewer that never ran as coverage it did not
+    # get. A box whose gateway refuses the fleet's pin (#215) repins it here rather
+    # than losing the seat or reviewing on an unnamed model.
+    #
+    # INTERACTIVE ONLY, and this is the one line carrying that. Unattended, the
+    # baseline was deliberately fetched from `origin/<default>` so that nothing in
+    # this working tree could change the rules governing its own review — and an
+    # untracked file is IN this working tree, whoever or whatever put it there. The
+    # module docstring has the vector and the price.
+    overlay, local_from, overlay_problems = (
+        ({}, "", []) if from_default_branch else _local_overlay(root, baseline))
+    # A fresh list: the baseline's problems have already been reported, under their
+    # own provenance.
+    problems = list(overlay_problems)
+    applied: set[str] = set()
+    for seat, flags in overlay.items():
+        # A seat this loop does not have to check: `_local_overlay` validated the
+        # name against DEFAULTS, which is where cfg's seat names come from.
+        base_seat = cfg[_LOCAL_BLOCK][seat]
+        keep = {}
+        for key, val in flags.items():
+            # `enabled` NARROWS and never widens. Off-to-on is the sample's
+            # decision to make: a seat it disabled for cost, for policy, or to keep
+            # a merge quorum reachable must not come back through a file nobody
+            # reviewed. Off is a fact about this machine; on is a choice about this
+            # repo.
+            if key == "enabled" and val and not base_seat.get("enabled"):
+                problems.append(
+                    f"`{_LOCAL_BLOCK}.{seat}.enabled: true` would ENABLE a seat "
+                    f"{SAMPLE_FILENAME} has off — ignored. The overlay may only narrow "
+                    f"the panel to what this machine can run; turning a seat on is a "
+                    f"decision about this repo and belongs in the sample")
+                continue
+            keep[key] = val
+        if keep:
+            # REBOUND, never mutated in place. For a seat the rules file did not
+            # mention, `cfg[_LOCAL_BLOCK][seat]` is still the DEFAULTS dict itself —
+            # the block merge copies the mapping, not its values — so an in-place
+            # write would edit the built-in defaults for the rest of the process.
+            cfg[_LOCAL_BLOCK][seat] = {**base_seat, **keep}
+            applied.update(keep)
+    # Attributed to the file that said it: the baseline's problems were reported
+    # against `provenance` above, and these belong to the local file. One `where`
+    # for both would send someone editing the wrong half of the split.
+    _report(local_from, problems, str(root))
+
     # Detected, never declared — a rules file that sets these is ignored, since
     # the checkout in front of us is the authority on where and what it is.
     cfg["path"] = str(root)
@@ -638,7 +1261,29 @@ def resolve_repo(spec: str | None, *, from_default_branch: bool | None = None) -
     cfg["default_branch"] = default_branch
     cfg["github"] = detect_github(root)
     cfg.setdefault("executor_pr_base", default_branch)
-    cfg["_rules_from"] = provenance
+    # WHICH file supplied the baseline, as a field rather than as a substring of the
+    # blurb below: `""` means nothing was found, which is what lets the panel refuse
+    # to review a repo nobody configured. Sniffing it back out of `_rules_from`
+    # cannot be done safely — `.harness-rules.sample` contains `.harness-rules` — and
+    # a gate that greps English is a gate one rewording away from failing open.
+    cfg["_rules_baseline"] = baseline
+    # Why the baseline is empty, when it is. See `_read_rules`' fifth element.
+    cfg["_rules_unreadable"] = unreadable
+    # Names what was actually overlaid, not merely that something was. `(seats)`
+    # went on the end whenever any overlay applied, so an overlay that repinned
+    # codex to gpt-5.5/high reported itself as a seat change — in the one string
+    # `describe()` prints so that "which rules applied is never a guess". In
+    # `_LOCAL_KEYS` order rather than sorted, because that is the order the comment
+    # up there explains them in.
+    pins = ", ".join(k for k in _LOCAL_KEYS if k in applied)
+    cfg["_rules_from"] = provenance + (f" + {local_from} ({pins})" if pins else "")
+    # Said in the line that exists to say which rules applied, rather than shouted on
+    # stderr every tick: the overlay is a per-box file that the unattended path is
+    # never going to read, so a warning about it would be permanent noise, while a
+    # reader asking "why is codex on the fleet pin here?" is reading exactly this.
+    if from_default_branch and (root / RULES_FILENAME).is_file() \
+            and baseline == SAMPLE_FILENAME:
+        cfg["_rules_from"] += f" (unattended: {RULES_FILENAME} not read)"
 
     if not cfg["github"]:
         raise SystemExit(
@@ -1009,11 +1654,20 @@ def discover(root: Path | None = None) -> list[Path]:
     """Repos under the search root that ship a rules file. Used by run-loop.sh
     instead of a central list. Only sees repos whose WORKING TREE has the file —
     a checkout sitting on a branch that deleted it is skipped, which is the safe
-    direction for a sweep that can merge things."""
+    direction for a sweep that can merge things.
+
+    EITHER half of the split counts, and the sample has to be one of them: a repo
+    that migrated its policy into `.harness-rules.sample` and needs no per-box
+    overlay carries no `.harness-rules` at all, so a sweep looking only for that
+    name stops seeing the repo — silently, and only on the unattended path, which is
+    the one nobody is watching. The legacy name still counts on its own, for the
+    unmigrated repo it belongs to.
+    """
     base = Path(root or REPO_ROOT)
     if not base.is_dir():
         return []
-    return sorted(p.parent for p in base.glob(f"*/{RULES_FILENAME}"))
+    return sorted({f.parent for name in (SAMPLE_FILENAME, RULES_FILENAME)
+                   for f in base.glob(f"*/{name}")})
 
 
 if __name__ == "__main__":

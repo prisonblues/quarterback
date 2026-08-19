@@ -1593,6 +1593,7 @@ def test_nothing_found_and_nothing_declared_needs_no_judge(monkeypatch):
 # ---- what the PR comment promises ------------------------------------------
 
 PANEL_CFG = {"github": "acme/board", "path": "/tmp/acme-board",
+             "_rules_baseline": ".harness-rules.sample",
              "reviewers": {"claude": {"enabled": True, "model": "sonnet"}},
              "review_panel": {}}
 

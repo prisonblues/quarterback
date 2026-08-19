@@ -472,6 +472,46 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     gh_repo = cfg["github"]
     rev = cfg["reviewers"]
     panel = cfg["review_panel"]
+
+    # A repo that configured no review does not get one. Before `gh pr view`, and
+    # before the --reviewers check below it, because this refusal is about the repo
+    # and not about the run: there is nothing to spend an API call finding out.
+    #
+    # Shaped exactly like the title-pattern skip forty lines down — a loud line, a
+    # payload with `reviewed: false` and a `skip_reason`, exit 0, and NOT recorded on
+    # the board, because no review happened. That shape is load-bearing on the epic's
+    # merge gate, which reads `reviewed`/`skip_reason` off the payload precisely
+    # because a zero exit, a push and the existence of a payload have each been
+    # mistaken for a review in turn (see `epic.sub_pr_merge` in the sample).
+    refusal = review_refusal(cfg)
+    if refusal:
+        # Its own stream selection rather than `chatter`, which is assigned below the
+        # PR fetch this refusal exists to skip.
+        print(f"[{repo_name}#{pr_number}] {refusal} — refusing to review. No panel ran.",
+              file=sys.stderr if json_out else sys.stdout)
+        unconfigured_payload = {
+            **_payload_defaults(),
+            "repo": repo_name, "github": gh_repo, "pr": pr_number,
+            # Nothing was fetched, so nothing about the PR is known: `title` and
+            # `base` are null here where the title-pattern skip has them, and that
+            # is the honest difference between "we read the PR and declined it" and
+            # "we declined before reading it".
+            "title": None, "base": None,
+            "round": round_no,
+            "skip_reason": refusal,
+            "config_notes": [refusal],
+            "run_key": run_key,
+        }
+        # No `load_baseline` and no cycle bookkeeping, unlike the title skip. That
+        # one is per-PR and the cycle around it goes on; this is per-REPO and
+        # terminal — every round of every cycle here refuses identically until a
+        # rules file is committed, so there is no next round for a baseline to
+        # anchor and nothing an inherited escalation register could be carried by.
+        failed = write_payload(json_file, unconfigured_payload)
+        if json_out:
+            print(json.dumps(unconfigured_payload, indent=2))
+        return finish(failed)
+
     # Resolved before anything is fetched, so a typo'd --reviewers fails on the
     # spot rather than after a PR read and a diff download.
     selected, override_note = select_reviewers(rev, reviewers)

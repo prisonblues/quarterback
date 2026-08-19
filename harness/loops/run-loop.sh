@@ -2,9 +2,14 @@
 # Opportunistic loop runner for zeus (invoked by the systemd user timer).
 #
 # DISCOVERS repos rather than reading a central list: any checkout under
-# $HARNESS_REPO_ROOT (default ~/source) that ships a .harness-rules file is a
-# candidate, and lander.py then skips the ones whose loops.dependabot_lander is
-# not set. Adding a repo to the sweep is a commit in that repo, not an edit here.
+# $HARNESS_REPO_ROOT (default ~/source) that ships a rules file — either the tracked
+# .harness-rules.sample or the legacy .harness-rules — is a candidate, and lander.py
+# then skips the ones whose loops.dependabot_lander is not set. Adding a repo to the
+# sweep is a commit in that repo, not an edit here.
+#
+# EITHER name, and the sample has to be one of them: a repo that migrated its policy
+# into .harness-rules.sample and needs no per-box overlay carries no .harness-rules at
+# all, so looking for that name alone would drop the repo out of this sweep silently.
 #
 # This runs UNATTENDED, so HARNESS_UNATTENDED=1 makes the resolver read each
 # repo's rules from its DEFAULT BRANCH rather than the working tree. The lander's

@@ -1088,6 +1088,12 @@ async def test_the_migrations_sql_derives_the_same_defect_key_too():
 PANEL_CFG = {
     "github": "acme/e2e",
     "path": "/tmp/acme-e2e",
+    # The filename that supplied the baseline, which is what `review_refusal` reads
+    # to tell a CONFIGURED repo from one running on built-in defaults. This fixture
+    # stands in for a configured repo — without the key the panel correctly refuses
+    # to review, and this test's whole subject (the payload the board reads back)
+    # is never produced.
+    "_rules_baseline": ".harness-rules.sample",
     "reviewers": {"claude": {"enabled": True, "model": "sonnet"},
                   "codex": {"enabled": True, "model": "gpt-5.6", "max_diff_chars": 40}},
     "review_panel": {},
