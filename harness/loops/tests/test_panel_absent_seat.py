@@ -241,32 +241,62 @@ def test_an_absent_seat_gets_no_budget(monkeypatch, tmp_path):
     assert set(got["diff_budgets"]) == {"claude", "antigravity", "judge"}
 
 
-def test_an_absent_seat_is_NOT_DISPATCHED_at_all(monkeypatch, tmp_path):
-    """The round decides absence ONCE and acts on it, rather than dispatching the
-    seat and letting `run_seat`'s own PATH read decide again (225-R3-F05).
+def test_an_absent_seat_is_not_handed_the_diff_it_will_never_read(monkeypatch,
+                                                                 tmp_path):
+    """It is still DISPATCHED — `run_seat` is the single authority on absence, and
+    it is not only a PATH check: it answers a typo'd reasoning effort as the config
+    error it is, before looking for the binary. A round that short-circuits dispatch
+    skips that (225-R4-F03).
 
-    Dispatching it left the race open in both directions. A seat that APPEARED
-    since the snapshot had no budget, so it was handed an empty prompt — and
-    `run_seat`, re-reading PATH, found the CLI present and did not refuse it: a
-    real vendor CLI spawned on an empty prompt, recorded `ran: True` with a null
-    budget, feeding findings and counting as a reviewer that read the diff. A seat
-    that VANISHED since already had a real budget and a `truncated_for` entry
-    written, and then came back `absent` — the contradictory pairing #222 exists to
-    remove, reproduced by the writer meant to have fixed it.
-
-    Not dispatching also saves rendering the whole diff — `prompt_for(None)` means
-    uncapped — once per absent seat per round, for nothing."""
+    What it is not handed is a prompt. No budget means `prompt_for(None)`, which
+    means the WHOLE diff — rendered per absent seat, per round, for `run_seat` to
+    throw away. The empty string also bounds the blast radius if the round's PATH
+    read and `run_seat`'s ever disagree: a seat decided absent here can never carry
+    an uncapped prompt into `agy`'s argv, which is the E2BIG that
+    `ARGV_PROMPT_MAX_BYTES` exists to prevent."""
     got, seen = _round(monkeypatch, tmp_path, _cfg(claude=None, antigravity=None),
                        present={"claude"})
-    assert "antigravity" not in seen["prompts"], "the absent seat reached review_llm"
+    assert seen["prompts"]["antigravity"] == ""
     assert len(seen["prompts"]["claude"]) > len(BIG)
-    # And its record is indistinguishable from the one `run_seat` writes, which is
-    # what `coverage_veto`, the report and the board all read.
-    meta = got["reviewers"]["antigravity"]
-    assert meta["absent"] is True and meta["ran"] is False
-    assert panel.CLI_ABSENT in meta["skip"]
-    assert meta["max_diff_chars"] is None and meta["truncated"] is False
+    assert got["reviewers"]["antigravity"]["absent"] is True
 
+
+def test_a_seat_that_VANISHED_since_the_budgets_were_built_records_no_budget(
+        monkeypatch, tmp_path):
+    """The race the record has to survive (225-R3-F05).
+
+    `budgets` is decided before dispatch and `run_seat` decides absence after it, so
+    a seat installed at the first moment and gone at the second gets a real budget
+    written and then comes back `absent`. Read straight off `budgets`, the payload
+    would carry a real `max_diff_chars` — and possibly `truncated: true` — beside
+    `absent: true`: exactly the contradictory pairing #222 exists to remove, written
+    by the fix meant to have removed it. The record is reconciled against what
+    actually happened instead."""
+    seen = {"prompts": {}}
+    # Present when `budgets` is built...
+    _host(monkeypatch, {"claude", "antigravity"})
+
+    def vanished(name, model, prompt, effort=""):
+        seen["prompts"][name] = prompt
+        # ...and gone by the time the seat runs.
+        if name == "antigravity":
+            return panel.ReviewerRun([], f"{name}: {panel.CLI_ABSENT}", 1, None,
+                                     absent=True)
+        return panel.ReviewerRun([], None, 10, None)
+
+    monkeypatch.setattr(panel, "load_repo_cfg",
+                        lambda n: _cfg(claude=None, antigravity=None))
+    monkeypatch.setattr(panel_core, "sh", gh_stub(diff=BIG))
+    monkeypatch.setattr(panel, "review_llm", vanished)
+    monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
+    monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], None, ""))
+    out = tmp_path / "r.json"
+    assert panel.run("e2e", 34, post=False, json_file=str(out), record=False,
+                     max_rounds=2) == 0
+    meta = json.loads(out.read_text())["reviewers"]["antigravity"]
+    assert meta["absent"] is True
+    assert meta["max_diff_chars"] is None, "a budget beside `absent: true`"
+    assert meta["truncated"] is False, "a truncation beside `absent: true`"
 
 def test_the_JUDGE_gets_no_budget_on_a_box_that_cannot_run_it_either(monkeypatch,
                                                                     tmp_path):
@@ -595,6 +625,31 @@ def test_a_round_where_NOBODY_ran_cannot_close_anyone_elses_gap(tmp_path):
     nobody.write_text(json.dumps(body))
     b = _baseline([cut, str(nobody)], round_no=3)
     assert b.truncated_rounds == {1}, "a round nobody ran closed a real gap"
+
+
+def test_a_round_where_every_seat_CRASHED_cannot_close_anyone_elses_gap(tmp_path):
+    """The case that tells `ran` from `not absent` (225-R4-F13).
+
+    A seat that was present and then crashed, timed out, or returned nothing is
+    `absent: False, ran: False` — it was THERE, and it read nothing. The weaker
+    `not absent` test counts it as positive evidence and lets a round in which every
+    seat failed erase a gap banked by a round whose seats worked. `ran` is the field
+    that means somebody actually got through.
+
+    The all-absent case passes under either spelling, which is why it cannot pin
+    this and this test exists."""
+    cut = _payload(tmp_path, "r1.json", {"claude": {"ran": True, "truncated": True}},
+                   round=1)
+    crashed = tmp_path / "r2.json"
+    body = json.loads(Path(_payload(
+        tmp_path, "r2.json",
+        {"claude": {"ran": False, "absent": False, "skip": "claude: timed out"},
+         "codex": {"ran": False, "absent": False, "skip": "codex: exited 1"}},
+        round=2)).read_text())
+    body.pop("reviewers_ran")   # the key a hand-edited payload may lack
+    crashed.write_text(json.dumps(body))
+    b = _baseline([cut, str(crashed)], round_no=3)
+    assert b.truncated_rounds == {1}, "a round where every seat crashed closed a real gap"
 
 
 def test_a_phantom_truncation_no_longer_vetoes_a_later_SCOPED_round(monkeypatch,

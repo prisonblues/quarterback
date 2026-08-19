@@ -844,36 +844,29 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # the panel, we want each vendor's eyes regardless of diff size.
         for name in LLM_REVIEWERS:
             if name in selected:
-                # A seat this box cannot run is NOT dispatched, and its record is
-                # written here instead (225-R3-F05). Dispatching it was the first
-                # shape of #222 and it left the PATH race open in both directions,
-                # because `run_seat` re-reads PATH and the two reads can disagree:
+                # Every SELECTED seat is dispatched, including one this box cannot
+                # run: `run_seat` is the single authority on absence, and it is not
+                # only a PATH check — it answers a typo'd reasoning effort as the
+                # config error it is, BEFORE looking for the binary. Short-circuiting
+                # here skipped that, so a bad `effort` pin on an absent seat went
+                # unreported (225-R4-F03); it also moved the decision above the
+                # `review_llm` seam, which cost two more test modules a stated host
+                # and left a cluster of claims about a race it only half closed.
                 #
-                #   appeared since the snapshot — no budget, so it was handed an
-                #   EMPTY prompt, `run_seat` found the CLI present and did not
-                #   refuse it, and a real vendor CLI was spawned on an empty prompt.
-                #   That is a garbage review recorded `ran: True` with a null
-                #   budget, feeding findings and counting toward `coverage_veto` as
-                #   a reviewer that read the diff.
+                # What it is NOT handed is a prompt. `budgets` has no entry for it,
+                # and `prompt_for(None)` means "uncapped", so rendering one would
+                # compose the entire diff — hundreds of KB, per absent seat, per
+                # round — for `run_seat` to discard a moment later.
                 #
-                #   vanished since the snapshot — a real budget and a
-                #   `truncated_for` entry were already written, then `run_seat`
-                #   refused it and set `absent`. The payload then carries a real
-                #   `max_diff_chars` beside `absent: true`, which is exactly the
-                #   contradictory pairing #222 exists to remove, reproduced by the
-                #   writer meant to have fixed it.
+                # The race that motivated the short-circuit is answered where the
+                # RECORD is written instead (see `reviewer_meta` below), which is
+                # the only place it could produce the contradiction #222 is about:
                 #
-                # One decision, acted on consistently, has neither failure. The
-                # record is byte-identical to `run_seat`'s own — same skip text,
-                # same `absent` flag — because `coverage_veto`, the report and the
-                # board all read it and none of them should be able to tell which
-                # branch wrote it.
-                if name not in installed:
-                    tasks[name] = ex.submit(
-                        absent_seat_run, f"{labels[name]}: {CLI_ABSENT}")
-                    continue
-                tasks[name] = ex.submit(review_llm, name, models[name],
-                                        prompt_for(budgets[name]),
+                # a seat that was installed when `budgets` was built and gone when
+                # `run_seat` looked would otherwise keep the budget already written
+                # beside an `absent: true`.
+                prompt = prompt_for(budgets[name]) if name in budgets else ""
+                tasks[name] = ex.submit(review_llm, name, models[name], prompt,
                                         efforts.get(name, ""))
         sonar_future = None
         sonar_filed = False
@@ -905,6 +898,15 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 "effort": efforts.get(name) or None,
                 "ran": not got.skip,
                 "skip": got.skip,
+                # Reconciled against `got.absent`, not read straight off `budgets`
+                # (225-R3-F05). `budgets` is decided before dispatch and `run_seat`
+                # decides absence after it, so on the one round where those two
+                # disagree the payload would otherwise carry a real budget beside
+                # `absent: true` — the contradictory pairing #222 exists to remove,
+                # written by the fix meant to have removed it. Whatever happened,
+                # happened: a seat the run found absent had no budget and read no
+                # prefix, and both fields say so.
+                #
                 # None for a seat this box cannot run (#222) — it had no budget,
                 # rather than a budget it failed to spend. `truncated` below is
                 # keyed off `truncated_for`, which is built from the same dict, so
@@ -918,11 +920,11 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 # absent seat from an uncapped one. `absent` below is the field
                 # that carries that distinction, and it is the one `coverage_veto`
                 # and `load_baseline` read for exactly this reason.
-                "max_diff_chars": budgets.get(name),
+                "max_diff_chars": None if got.absent else budgets.get(name),
                 # The mechanical half of "did this reviewer see the whole thing":
                 # checked against the budget rather than asked for, because the
                 # one thing a truncated reviewer cannot notice is the truncation.
-                "truncated": name in truncated_for,
+                "truncated": not got.absent and name in truncated_for,
                 # WHY it was truncated, where the answer is the kernel rather than
                 # a number in a config file. Same shape of fact as `absent` and
                 # treated the same way by coverage_veto.

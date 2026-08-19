@@ -373,9 +373,9 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   gap, exempts `absent` and deliberately **not** `argv_capped`: a capped seat ran and
   saw a prefix, so the round did not read its target whole and cannot be the one that
   clears an older gap, while an absent seat read nothing and is no evidence either
-  way. It also requires positive evidence that somebody was there, so a round in
-  which every seat was absent cannot erase a gap banked by a round that had seats
-  running. The two do
+  way. It also requires positive evidence that a seat actually RAN, so a round in
+  which every seat was absent — or present and crashed — cannot erase a gap banked
+  by a round whose seats worked. The two do
   not subsume each other: `argv_capped` covers only what the kernel bounded, so an
   absent `pi` or `codex` with a configured budget smaller than the target would
   still bank a phantom round under the argv exemption alone. And not

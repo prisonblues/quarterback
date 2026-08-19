@@ -43,15 +43,6 @@ import panel_core  # noqa: E402  — `sh` is defined here since #129
 import panel_seats  # noqa: E402  — these seats moved here in #129
 from conftest import gh_stub  # noqa: E402
 
-#: This module states its HOST (#222, 225-R3-F05). Its tests drive `run()` with a
-#: per-seat `ReviewerRun` double — "codex reports absent, pi times out" — and a
-#: double only reaches the seat if the seat is dispatched. Since the round decides
-#: absence ONCE, before dispatch, an un-installed seat is recorded absent and its
-#: double never runs: on a box without `pi`, the seat this test means to have TIMED
-#: OUT would read as absent instead, and the degraded count it asserts would be
-#: about the machine rather than about the code.
-pytestmark = pytest.mark.usefixtures("every_seat_installed")
-
 
 
 

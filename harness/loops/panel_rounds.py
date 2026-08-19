@@ -1003,7 +1003,10 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
         # as having re-read the PR if at least one seat recorded that it was
         # there. The conservative direction: an old baseline keeps an inherited
         # veto standing rather than silently clearing it.
-        read_something = any(not m.get("absent") for m in recorded)
+        # `ran`, not `not absent` (225-R4-F13): a seat that was present and then
+        # crashed is "not absent" while having read nothing, so the weaker test let
+        # a round where every seat failed still qualify to erase earlier gaps.
+        read_something = any(m.get("ran") for m in recorded)
         ran = payload.get("reviewers_ran")
         if isinstance(ran, list) and not ran:
             b.unread_rounds.add(was)

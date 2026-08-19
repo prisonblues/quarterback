@@ -42,9 +42,18 @@ instead of their own inline `shutil.which` — copies being chances to disagree,
 silently, about which seats this box has. It is read **once per round** and
 snapshotted, so the budget, the argv clamp, the prompt and the payload all
 describe one host. The absent seat is still **dispatched** and still records
-itself absent, because that record is what the veto exemption and the report both
-read; what it no longer gets is a budget, and with no budget it is no longer
-handed a rendered prompt it was never going to read. The judge is filtered by the
+itself absent, because `run_seat` is the single authority on absence — and not
+only a PATH check: it answers a typo'd reasoning effort as the config error it is,
+BEFORE looking for the binary, which a round that decided absence for itself would
+skip. What the seat no longer gets is a budget, and with no budget it is no longer
+handed a rendered prompt it was never going to read.
+
+`budgets` is decided before dispatch and `run_seat` decides absence after it, so
+the emitted record is **reconciled against what actually happened** rather than
+read straight off `budgets`: a seat the run found absent records a null budget and
+no truncation. Without that, the one round where the two PATH reads disagree writes
+a real `max_diff_chars` beside `absent: true` — the contradictory pairing this
+release exists to remove, produced by the fix meant to have removed it. The judge is filtered by the
 same predicate: `adjudicate` runs it through the `claude` CLI, so a box without
 that gets no `judge_max_diff_chars` and no "the judge saw …" note either.
 
