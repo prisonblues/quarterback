@@ -7,11 +7,18 @@
 #                                             normally do
 #        qb-seats --add                       add one seat to a running screen
 #        qb-seats --kill                      tear the screen down
+#        qb-seats list                        the screens that are up, numbered
+#        qb-seats resume [ID|NAME]            reattach to one of them, from
+#                                             anywhere — no repo, no -C
+#        qb-seats --dash-fit -s NAME          put the dash back to the width the
+#                                             screen asked for — what its own
+#                                             resize hooks call
 #        qb-seats -h|--help                   this text
 #
 # Exit codes:
-#   0  screen is up, or was reattached, added to, or killed
-#   1  cannot proceed (no tmux, no qb-seat, no repo, no such session)
+#   0  screen is up, or was reattached, added to, or killed; or the list printed
+#   1  cannot proceed (no tmux, no qb-seat, no repo, no such session, or a
+#      `resume` that names no screen or does not say which)
 #   2  malformed arguments — a caller bug, and says so
 #
 # WHAT THIS IS FOR. Working a plan in parallel took five terminals and a human
@@ -103,12 +110,22 @@ REPO=""                 # default: the git repo you ran this from
 SESSION=""              # default: seats-<repo basename>
 STAGED=0                # 1 = pane waits on Enter before starting its agent
 YOLO=""                 # "" = as it comes (on), 1 = force on, 0 = prompts back
-BOARD_SIZE="25%"        # board pane height, bottom of the window, full width
+BOARD_SIZE="25%"        # tape pane height, bottom of the window, full width
+DASH_SIZE="${QB_SEATS_DASH_SIZE:-78}"   # dash width in columns, down the right of
+                        # the window. 78 is what the dashboard's own table wants
+                        # before it starts wrapping, not a taste in proportions
+DASH_SHARE=3            # ...and never more than 1/3 of the window — see dash_resize
+WINDOW_COLS=240         # the window a DETACHED session is built in, and a fiction
+WINDOW_ROWS=60          # until a client attaches — see the -x/-y note further down
 ACTION="up"
+TARGET=""               # which screen `resume` was asked for: a number, a name,
+                        # or empty for "the only one that is up"
 
 usage() {
   cat <<EOF
 usage: $PROG [N] [-C DIR] [-s NAME] [--staged] [--no-yolo] [--add] [--kill]
+       $PROG list
+       $PROG resume [ID|NAME]
 
   N           number of seats, 1-$MAX_SEATS (default $SEATS); -n N also works
   -C DIR      repo the seats run in (default: the git root of \$PWD)
@@ -123,12 +140,27 @@ usage: $PROG [N] [-C DIR] [-s NAME] [--staged] [--no-yolo] [--add] [--kill]
               QB_SEAT_YOLO=0 you have exported
   --add       add one seat to an already-running screen and reflow
   --kill      kill the screen
+  list        the screens that are up — number, name, seats, repo — newest
+              information first-hand from tmux, so a screen whose name it had to
+              mangle is listed under the name it actually has
+  resume      reattach to the screen with that number, or that name. It needs no
+              repo and no -C: a screen already knows the directory it was built
+              in, so this is the command for the ssh link that dropped and the
+              shell that came back up somewhere else. With exactly one screen up
+              the argument is optional
+  --dash-fit  put the dash back to the width the screen was built asking for,
+              clamped to a third of the window. The window's own resize hooks
+              call this; by hand it is only useful after a resize tmux did not
+              notice. Needs -s NAME
 
 Environment:
-  QB_SEATS_BOARD   command for the board pane, overriding the default
-  QB_SEATS_BAR     0 to leave the status line and the mouse alone (see below)
-  QB_SEAT_YOLO     0 to give the seats their permission prompts back (--no-yolo)
-  QB_SEAT_AGENT    the agent binary a seat runs, instead of \`claude\`
+  QB_SEATS_BOARD      command for the tape pane, overriding the default
+  QB_SEATS_DASH       command for the dash pane; empty for a screen with no dash
+  QB_SEATS_DASH_SIZE  dash width in columns (default 78, and never more than a
+                      third of the window — the seats need the rest)
+  QB_SEATS_BAR        0 to leave the status line and the mouse alone (see below)
+  QB_SEAT_YOLO        0 to give the seats their permission prompts back
+  QB_SEAT_AGENT       the agent binary a seat runs, instead of \`claude\`
 
 The seat bar is a second status line above the seats, one clickable cell per
 seat: the name jumps to that pane, the ✕ closes it after a y/n, and ＋ adds one.
@@ -140,23 +172,320 @@ EOF
 
 die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
 
+# For what is worth saying and is not fatal — `list` with nothing up, a `resume`
+# that cannot tell which screen you mean, a dash that could not have the width it
+# asked for. Stderr only, for two reasons that arrived separately and agree: stdout
+# stays the parseable half, so a caller reading the listing gets rows or nothing and
+# never prose; and a resize hook's output goes nowhere regardless, because
+# `run-shell -b` discards both streams. The second is deliberate — the alternative
+# is a display-message nagging the status line on every terminal resize, when the
+# width itself already tells the story. From a command line (`up`, `--add`, `list`,
+# `--dash-fit` by hand) it is seen.
+warn() { printf '%s: %s\n' "$PROG" "$*" >&2; }
+
+
+# ---- what a pane says when the thing it is for is not installed -------------
+# An honest empty pane beats this script growing its own board reader or its own
+# dashboard: a screen carrying a second, worse client is harder to explain than one
+# whose pane says which command is missing.
+#
+# The message is TYPED INTO THE PANE'S SHELL, which means it has to survive two
+# rounds of interpretation — printf's, here, and the pane shell's when the line is
+# entered — and the pane shell is whatever `default-shell` says, not necessarily
+# bash. Both of those have bitten, so neither is left to chance:
+#
+#   * `printf 'printf %%s\n %q'` emits `printf %s\n MSG`, where that backslash is
+#     the only one left. Entered into a shell, an unquoted `\n` is just `n`, so
+#     printf is handed the format `%sn` and the message runs straight into the next
+#     prompt: `printf %s\n hello` prints `hellon`. Measured, not reasoned about.
+#   * `%q` on a string containing a newline emits bash's `$'...'` ANSI-C form,
+#     which a POSIX /bin/sh pane prints verbatim — dollar, backslashes and all.
+#
+# So: single quotes, which mean the same thing in every shell this can land in; one
+# printf argument per line of message, so no newline has to be escaped at all; and
+# the usual `'\''` dance in case a message ever grows an apostrophe.
+placeholder_cmd() {
+  local out="printf '%s\\n'" line q="'\\''"
+  for line in "$@"; do
+    line=${line//"'"/$q}
+    out="$out '$line'"
+  done
+  printf '%s' "$out"
+}
+
 # ---- the board pane ---------------------------------------------------------
 # A process, nothing more — which is what keeps the swap cheap if the follower
 # is ever replaced. `qb-board --follow` tails the board to stdout the way
 # journalctl -f tails a unit.
-#
-# When it is not installed the pane says so and drops to a shell, rather than
-# this script growing its own board reader. A screen with an empty board pane and
-# an honest explanation is better than one carrying a second, worse client.
 board_cmd() {
   if [ -n "${QB_SEATS_BOARD:-}" ]; then printf '%s' "$QB_SEATS_BOARD"; return; fi
   if command -v qb-board >/dev/null 2>&1; then
     printf 'qb-board --follow'
   else
-    printf 'printf %%s\\\\n %q' \
-      "board pane: qb-board is not on PATH, so there is nothing to follow here yet.
-Set QB_SEATS_BOARD to run something else in this pane."
+    placeholder_cmd \
+      'board pane: qb-board is not on PATH, so there is nothing to follow here yet.' \
+      'Set QB_SEATS_BOARD to run something else in this pane.'
   fi
+}
+
+# ---- the dash pane ----------------------------------------------------------
+# The tape says what just happened; the dash says what is true now — fleet, claims,
+# PRs, issues. They are different questions and a screen wants both, which is why
+# this is a second pane and not a swap of QB_SEATS_BOARD.
+#
+# Set QB_SEATS_DASH to the empty string for a screen with no dash at all. Same
+# spelling as qb-seat's QB_SEAT_BRIEF, and for the same reason: `${VAR+set}` so
+# that empty means "none" and unset means "pick for me".
+#
+# The INSTALLED dash is preferred over anything in a checkout, and that is not a
+# style preference. The packaged one carries its own interpreter — the whole point
+# of packaging it — whereas a uv-standalone python has no CA bundle, and a dash
+# run under one shows "board unreachable" against a board that is up, beside a
+# shell where the same URL works. That cost real debugging time while this was
+# scaffolding in dev/seats-extras.sh (since removed); it arrives here with the lesson.
+#
+# THE PLAIN RENDERER IS THE DEFAULT, AND NOT BECAUSE IT IS BETTER. qb-dash-tui is
+# the nicer of the two — clickable rows, and the seat bar has already turned the
+# mouse on for them — and it should take this slot the moment #209 is fixed.
+# Today it cannot: it keys its seat rows by seat name, two screens both number
+# their seats from 1, so the second screen anywhere on the box turns this pane into
+# a Textual traceback (DuplicateKey). A pane that is meant to be what you look at
+# when something is wrong must not be the thing that breaks first, and a default
+# has to work on the second screen as well as the first. QB_SEATS_DASH=qb-dash-tui
+# opts in meanwhile.
+#
+# The underlying collision is #208: seat identities are machine-wide while the
+# numbering is per-screen.
+#
+# ONLY qb-dash IS PROBED, and that follows from the paragraph above rather than
+# contradicting it: falling through to qb-dash-tui when qb-dash happens to be
+# missing — a partial install, or a PATH carrying only the TUI entry point — would
+# make the crash-prone renderer the default on exactly the boxes least able to
+# afford it. If #209 disqualifies it as a default it is disqualified here too, so
+# the not-found message names it as the explicit opt-in instead.
+dash_cmd() {
+  if [ -n "${QB_SEATS_DASH+set}" ]; then printf '%s' "$QB_SEATS_DASH"; return; fi
+  command -v qb-dash >/dev/null 2>&1 && { printf 'qb-dash'; return; }
+  placeholder_cmd \
+    'dash pane: qb-dash is not on PATH, so there is nothing to show here yet.' \
+    'Set QB_SEATS_DASH to a command to run here — QB_SEATS_DASH=qb-dash-tui if' \
+    'that is the one you have installed — or QB_SEATS_DASH= for no dash at all.'
+}
+
+# The dash is addressed by its label, never by index: it is created after the
+# seats and before the tape, and every one of those positions shifts when a seat
+# is added or closed. `exit` after the first, because one is all there can be:
+# two would make this print two ids, `resize-pane -t` rejects a two-id target, and
+# the reassert below would then quietly do nothing at all.
+dash_pane() {
+  tmux list-panes -t "$SESSION:seats" -F '#{pane_id} #{@qb_label}' \
+    | awk '$2 == "dash" { print $1; exit }'
+}
+
+# ---- keeping the dash the width it was asked for ----------------------------
+# THREE DIFFERENT THINGS MOVE THIS PANE and they do not all want the same answer.
+#
+# A REFLOW — `select-layout -E`, which --add runs after splitting a seat and
+# qb-seat-click runs after closing one — re-equalises every pane in the row it
+# spreads, and the dash is in that row. Nothing about the window changed, so the
+# right width is the one the dash had a moment ago; both callers read it off the
+# pane first and pass it in, which also means a width set by dragging the border
+# survives an --add.
+#
+# A WINDOW RESIZE — a client attaching, or the terminal it is in being resized —
+# rescales every pane proportionally instead. Measured on tmux 3.6a: a dash built
+# at 78 of this script's 240 columns comes out at 32 when a 100-column client
+# attaches. No call anywhere in this script can fix that, because every line of it
+# runs BEFORE the attach; that is what dash_hooks is for, and the width it wants is
+# the one the screen was built asking for, recorded on the pane.
+#
+# AND THE CLAMP, WHICH IS NOT POLITENESS. The same measurement with the reassert
+# but no clamp is worse than the bug it fixes: 78 columns held on a 100-column
+# window left the two seats 19 columns and ONE column. So a REQUEST — a number
+# chosen for some other window — is capped at 1/DASH_SHARE of the one actually in
+# front of it, and a narrow client costs the dash rather than the seats. A third of
+# 240 is 80, so the 78-column default is untouched on the window a screen is built
+# in. A width passed in by a reflow is not capped; see dash_resize for why.
+#
+# EVERY tmux READ IN HERE IS TOLERATED, and that is a race rather than a taste for
+# defensive code. --dash-fit is reached from the window-resized hook through
+# `run-shell -b`, i.e. asynchronously, so the pane this is about — or the whole
+# session — can be gone between the hook firing and these commands running, which
+# is the ordinary way a screen ends and not an error. Measured with the session
+# killed: tmux prints "no server running" and exits 1, so under `set -euo pipefail`
+# a bare `p=$(dash_pane)` took the script down through pipefail, and a bare
+# `$(( $(tmux display-message …) / DASH_SHARE ))` was worse — an empty substitution
+# makes that `$(( / 3 ))`, an arithmetic SYNTAX error, which is fatal under `set -e`
+# whatever the surrounding code tolerates. Invisible under a hook that discards
+# both streams; a non-zero exit from --add and from --dash-fit by hand.
+dash_resize() {
+  local want=${1:-} clamp=1 p max win got
+  p=$(dash_pane) || return 0
+  [ -n "$p" ] || return 0
+  # A width passed IN is one the dash had a moment ago, in a window that has not
+  # changed size since — it fitted then and it fits now, so it is taken as given.
+  # A border dragged wider than a third of the window is a deliberate act, and a
+  # row being reflowed under it is no reason to undo it. Only the RECORDED request
+  # is clamped, because that number was chosen for a window the one in front of us
+  # may be nothing like.
+  if [ -n "$want" ]; then
+    clamp=0
+  else
+    want=$(tmux show-options -p -t "$p" -qv @qb_dash_width)
+  fi
+  # Not our pane to resize if nothing recorded a width for it, and an option
+  # somebody else set to a non-number is not fatal. This guard covers $want only —
+  # the window read below needs its own, and did not have one.
+  case "$want" in ''|*[!0-9]*) return 0 ;; esac
+  if [ "$clamp" = 1 ]; then
+    # Read, checked, and only then divided. See the note above the function for
+    # what an unchecked substitution here does to a script under `set -e`.
+    win=$(tmux display-message -p -t "$p" '#{window_width}') || return 0
+    case "$win" in ''|*[!0-9]*) return 0 ;; esac
+    max=$(( win / DASH_SHARE ))
+    [ "$max" -ge 1 ] || max=1
+    if [ "$want" -gt "$max" ]; then
+      warn "dash: $want columns asked for, $max is a third of this window — taking $max"
+      want=$max
+    fi
+  fi
+  # NOT 2>/dev/null. tmux refuses or clamps a resize when the neighbours cannot
+  # give up the columns, and a wrong width here has already cost real debugging
+  # time, so tmux's own explanation belongs on stderr rather than in a bin. Then
+  # what actually landed is read back, because tmux clamps quietly as well as
+  # refusing loudly.
+  tmux resize-pane -t "$p" -x "$want" || true
+  # A read-back that cannot be made has nothing to report: the pane is gone, which
+  # the resize above will already have said on stderr.
+  got=$(tmux display-message -p -t "$p" '#{pane_width}') || return 0
+  [ "$got" = "$want" ] \
+    || warn "dash: asked tmux for $want columns, the pane came out $got"
+}
+
+# ---- getting a shell command through tmux intact ----------------------------
+# TWO QUOTING LAYERS AND A FORMAT EXPANDER sit between this line and the shell that
+# finally runs it, and the session name is whatever the user typed after -s.
+# Interpolating it raw broke all three, measured on tmux 3.6a:
+#
+#   * `-s 'a$Bb'` came out as `--dash-fit -s 'a'`. Inside its own double quotes
+#     tmux expands `$NAME` from its environment, so the hook refit a DIFFERENT
+#     screen, or none.
+#   * a session called `it's` left the shell an unterminated quote, and one
+#     containing `"` truncated the command mid-word.
+#
+# Every one of those is silent: `run-shell -b` discards both streams, so the hook
+# fires on every resize and reports nothing. So each value crosses each layer
+# explicitly, innermost first:
+#
+#   sh_quote    — for the shell that ends up running the line. Single quotes and
+#                 the `'\''` dance, exactly as placeholder_cmd does it.
+#   tmux_quote  — for the command string the hook is STORED as, which tmux parses
+#                 when the hook fires and run-shell then FORMAT-EXPANDS (measured:
+#                 `#{session_name}` in a run-shell argument is substituted before
+#                 the shell sees it). `\`, `"` and `$` are live inside tmux's double
+#                 quotes and `\\`, `\"`, `\$` say them literally; `#` introduces a
+#                 format and `##` is a literal one. The `#` doubling is belt rather
+#                 than braces — tmux expands a format in a session NAME as the
+#                 session is created, so one cannot reach here today — and it costs
+#                 nothing to keep that true from this side too.
+sh_quote() {
+  local q="'\\''"
+  printf "'%s'" "${1//"'"/$q}"
+}
+
+tmux_quote() {
+  local s=$1
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//\$/\\\$}
+  s=${s//\#/\#\#}
+  printf '%s' "$s"
+}
+
+# THIS FILE, absolutely. Not `beside_me qb-seats`, which asks PATH first — see
+# dash_hooks for why a self-referential caller cannot use that answer unchecked.
+myself() { printf '%s/%s' "$(cd -P "$(dirname "$0")" && pwd)" "${0##*/}"; }
+
+# Does the qb-seats at $1 have the flag this hook is about to call? --dash-fit
+# against a session that does not exist is the cheapest question available: a hook
+# left behind by a killed screen is the ordinary way this ends, so a copy that has
+# the flag exits 0 without touching anything, and a copy that predates it falls
+# through its argument parser to `usage; exit 2`.
+#
+# Both streams to /dev/null because the answer is the exit status, and stdin from
+# /dev/null because this runs while a human is looking at a terminal: whatever is
+# on PATH under this name is not necessarily ours, and a probe that inherited the
+# tty could sit there eating the keystrokes meant for the screen being built.
+understands_dash_fit() {
+  [ -x "$1" ] || return 1
+  "$1" --dash-fit -s "qb-seats-flagprobe-$$" </dev/null >/dev/null 2>&1
+}
+
+# The reassert a call in this script cannot be. Everything here runs while the
+# session is still detached at the size it was built at — i.e. BEFORE the attach
+# that rescales it — so the defence has to outlive the build, and a window hook is
+# how tmux lets it.
+#
+# window-resized is the whole of it, and the two obvious other candidates are both
+# deliberately absent. client-attached is a SESSION hook rather than a window one,
+# and it is not needed anyway: an attach that rescales the row IS a window resize,
+# which is what test_a_client_attaching_does_not_narrow_the_dash pins — and an
+# attach that does not change the window's size has not moved anything to put back.
+# window-layout-changed would fire on our own resize-pane, and again every time a
+# user drags a border, so hooking it would both feed itself and make the dash the
+# one pane on the screen that cannot be resized by hand.
+#
+# It calls back into this script because resize-pane cannot do the clamp's
+# arithmetic, and by ABSOLUTE PATH: a run-shell in a hook inherits the tmux
+# SERVER's PATH, and the server usually predates anything that put this harness on
+# one. That is the same trap the ＋ on the seat bar fell into, where it also failed
+# silently.
+#
+# WHICH COPY OF ITSELF A SELF-REFERENTIAL HOOK MEANS, which is the question
+# beside_me cannot answer on its own. It asks PATH before this script's directory,
+# so an installed copy beats a checkout — right for @qb_seats_bin and the ＋, whose
+# path is recorded on the session and has to keep working for as long as the screen
+# does, long after a worktree has been dropped. For a hook calling a flag this
+# feature ADDS it was silently wrong, and reproduced on the host it was written on,
+# whose installed copy is the v2.47 build:
+#
+#     $ harness/bin/qb-seats --staged -n 2 -s hooktest        # i.e. the new code
+#     $ tmux show-hooks -w -t hooktest:seats | grep resized
+#     window-resized[0] run-shell -b "'/etc/profiles/…/bin/qb-seats' --dash-fit …"
+#     $ /etc/profiles/per-user/rich/bin/qb-seats --dash-fit -s hooktest; echo $?
+#     2
+#
+# During any rollout — the normal state of a box — the working tree installed a
+# hook pointing at an older qb-seats with no such flag, which exits 2 into a
+# `run-shell -b` that throws it away. The dash bug this whole function exists to
+# fix was therefore fixed nowhere the installed copy lagged, and nothing said so.
+#
+# The fix is to ASK rather than to invert the preference: PATH still wins, but only
+# if it answers the flag, and the fallback is this very file — which understands it
+# by construction. Both are absolute paths, so the server's PATH remains irrelevant
+# either way. If neither answers, NO HOOK IS INSTALLED and it says why: a dash that
+# does not put itself back after a resize is an honest screen, and one line on
+# stderr at build time is where a version skew can still be acted on. A hook that
+# fails invisibly on every resize is neither.
+dash_hooks() {
+  local self me tried cmd
+  me=$(myself)
+  # Usually the same file twice — PATH finds the checkout that is running when the
+  # checkout is what is on PATH — and then there is one candidate, one probe, and a
+  # warning that does not say "neither X nor X".
+  tried=("$1")
+  [ "$1" = "$me" ] || tried+=("$me")
+  for self in "${tried[@]}"; do
+    understands_dash_fit "$self" || continue
+    cmd="$(sh_quote "$self") --dash-fit -s $(sh_quote "$SESSION")"
+    tmux set-hook -w -t "$SESSION:seats" window-resized \
+      "run-shell -b \"$(tmux_quote "$cmd")\""
+    return 0
+  done
+  warn "dash: no resize hook — no qb-seats here understands --dash-fit (tried
+       ${tried[*]}), so nothing will put the dash back after a client attaches or
+       the terminal is resized. Two copies of the harness have drifted somehow;
+       reinstalling it is the fix."
 }
 
 # ---- the seat bar -----------------------------------------------------------
@@ -172,11 +501,37 @@ Set QB_SEATS_BOARD to run something else in this pane."
 # distinguishable from any other; and a click on the topmost border row — where
 # seat 1's title is drawn — is not delivered at all. Measured on tmux 3.6a; the
 # same note is in qb-seat-click, which is where anyone chasing this will look.
+# A seat cell is coloured by what the agent in it is DOING, not merely by whether
+# a pane is there. `@qb_state` is set on the pane by the lifecycle hook (nix-fleet's
+# home/bin/qb-hook, which knows the transitions and is the only thing that does);
+# an unset option is the ordinary case — a pane with no agent, or a fleet whose
+# hook predates this — and falls through to the colour the bar always had.
+#
+# Only the two states that WANT something get their own colour. `working` is most
+# panes most of the time and colouring it would make the row uniformly loud again,
+# which is the opposite of what a glance needs.
+#
+# `stalled` is not here, and cannot be: it is a conclusion drawn from how OLD a
+# state is, tmux has no clock arithmetic worth doing this in, and the two readers
+# that can do it — the dashboard and the pane's own footer — both already say it.
+#
+# Each arm is a whole literal style string rather than a format substituted INTO
+# one (`#[fg=#{@qb_state}]`-style): style parsing and format expansion are
+# different passes in tmux and the nested spelling is the one that survives both.
+seat_state_style() {   # <active|idle>
+  local on="$1"
+  if [ "$on" = active ]; then
+    printf '%s' '#{?#{==:#{@qb_state},waiting},#[fg=black]#[bg=colour214],#{?#{==:#{@qb_state},input},#[fg=black]#[bg=colour176],#[fg=black]#[bg=colour109]}}'
+  else
+    printf '%s' '#{?#{==:#{@qb_state},waiting},#[fg=colour214],#{?#{==:#{@qb_state},input},#[fg=colour176],#[fg=colour109]}}'
+  fi
+}
+
 seat_bar() {
   printf '%s' \
 '#[align=left]'\
 '#{P:#{?@qb_seat,'\
-'#[range=user|seat#{@qb_seat}]#{?pane_active,#[fg=black]#[bg=colour109],#[fg=colour109]}'\
+'#[range=user|seat#{@qb_seat}]'"#{?pane_active,$(seat_state_style active),$(seat_state_style idle)}"\
 ' seat #{@qb_seat} #[default]#[norange]'\
 '#[range=user|kill#{@qb_seat}]#[fg=colour167] ✕ #[default]#[norange] '\
 ',}}'\
@@ -255,11 +610,155 @@ attach() {
   fi
 }
 
+# ---- the screens that are up ------------------------------------------------
+# WHAT MAKES A TMUX SESSION ONE OF OURS IS A PANE CARRYING @qb_seat, not what the
+# session is called. Three separate reasons the name cannot be the test:
+#
+#   * -s takes anything. The fleet's own screen is `qbseats`, not
+#     `seats-nix-fleet`, and it is no less a screen for it.
+#   * tmux renames what it will not take verbatim — see the note by new-session.
+#     The name you asked for is then not the name that is up, which is precisely
+#     the case a user needs a list to get out of.
+#   * `seats-` is a prefix anyone may have used for something else.
+#
+# The option is set on every seat this script creates and on nothing else, so the
+# panes that have one both identify the screen and count its seats.
+#
+# One `list-panes -s` per session rather than a single `-a` sweep, because a
+# session name is whatever the user gave it and may contain the separator any
+# one-pass format string would have to split on. For the same reason the NAME IS
+# THE LAST FIELD of each record: everything before it is a fixed count of fields,
+# so a reader can take the rest of the line as the name and be right.
+screens() {
+  local s n att path all
+  # READ THE SESSION LIST FIRST, and tolerate it failing. A server with no
+  # sessions at all — which is `list` and `resume` on a box where nothing is up,
+  # the commonest reason to run either — makes `tmux list-sessions` exit 1, and
+  # under `pipefail` that status is the whole pipeline's however the `while`
+  # ends. `set -e` then took the script down before it could say so: measured as
+  # `qb-seats list` printing "no screens are up" and exiting 1 anyway.
+  all=$(tmux list-sessions -F '#{session_name}' 2>/dev/null) || return 0
+  [ -n "$all" ] || return 0
+  printf '%s\n' "$all" | sort | while IFS= read -r s; do
+    n=$(tmux list-panes -s -t "=$s" -F '#{@qb_seat}' 2>/dev/null \
+          | awk 'NF { n++ } END { print n + 0 }')
+    [ "$n" -gt 0 ] || continue
+    # `=$s:` WITH THE COLON, exactly as the set-option calls further down use it
+    # and for the same reason: display-message takes a target-PANE, and a bare
+    # session name is not one. It does not fail loudly either — it prints an
+    # empty line, which is how the first cut of this listed every screen with no
+    # path and every one of them "(attached)".
+    att=$(tmux display-message -p -t "=$s:" '#{session_attached}' 2>/dev/null) || att=
+    path=$(tmux display-message -p -t "=$s:" '#{session_path}' 2>/dev/null) || path=
+    # NO FIELD MAY BE EMPTY. A tab is IFS whitespace, so a reader splitting on one
+    # collapses a run of them: `3\t\t\tname` reads back as two fields, not four,
+    # and the name lands in the second variable. The defaults are therefore not
+    # cosmetic — they are what keeps a session that vanished between the list and
+    # the lookup from silently shifting every column right.
+    printf '%s\t%s\t%s\t%s\n' "$n" "${att:-0}" "${path:-?}" "$s"
+  done
+  return 0
+}
+
+# Just the names, in the order `list` numbers them. Field 4 TO THE END, since the
+# name is the last field and may contain a tab of its own.
+screen_names() { screens | cut -f4-; }
+
+# The numbered list a human reads and `resume` counts against. Both call this, so
+# the number beside a screen cannot come to mean two different things.
+#
+# THE ROWS GO TO STDOUT AND THE HINT UNDER THEM TO STDERR. A list of names is only
+# half an answer — the next command has to be visible from the list, because
+# `resume` is not guessable from `--add` and `--kill` — but a caller that pipes
+# this must still get rows and nothing else. Both land on a terminal in order, so
+# the split costs the human reading it nothing.
+list_screens() {
+  local seats att path name i=0 home=${HOME:-} rows ex_n ex_name count
+  rows=$(screens)
+  [ -n "$rows" ] || return 0
+  printf '%s\n' "$rows" | while IFS=$'\t' read -r seats att path name; do
+    i=$((i + 1))
+    # ~ for $HOME, because the repo path is the column a human scans to tell two
+    # screens apart and the prefix is the same on every row.
+    case "$home" in
+      ?*) case "$path" in "$home"/*) path="~${path#"$home"}" ;; esac ;;
+    esac
+    printf '  %-3s %-24s %2s seat%s  %s%s\n' \
+      "$i" "$name" "$seats" "$([ "$seats" = 1 ] || printf s)" "$path" \
+      "$([ "$att" = 0 ] || printf '  (attached)')"
+  done
+
+  # The worked example names a DETACHED screen wherever there is one: that is the
+  # row somebody reading this list is looking for. Both spellings are shown
+  # because both work and the name is the half that survives a screen being
+  # closed further up the list.
+  ex_n=$(printf '%s\n' "$rows" | awk -F'\t' '$2 == 0 { print NR; exit }')
+  [ -n "$ex_n" ] || ex_n=1
+  ex_name=$(printf '%s\n' "$rows" | sed -n "${ex_n}p" | cut -f4-)
+  count=$(printf '%s\n' "$rows" | wc -l)
+  if [ "$count" -eq 1 ]; then
+    # One screen up takes no argument at all, so say that rather than a number
+    # whose only value is being the only one.
+    printf '\n  open it:  %s resume\n' "$PROG" >&2
+  else
+    printf '\n  open one: %s resume %s   (or by name: %s resume %s)\n' \
+      "$PROG" "$ex_n" "$PROG" "$ex_name" >&2
+  fi
+  return 0
+}
+
+# Which screen `resume` means. Empty output and status 1 for "cannot tell".
+#
+# A NAME BEATS A NUMBER, both passes over the same list. Both spellings are
+# offered because `list` prints both, and a screen that happens to be called `3`
+# while sitting at row 1 has to resume when you type its name — the name is the
+# thing the user can see is unambiguous.
+resolve_screen() {
+  local want=$1 list name i=0
+  list=$(screen_names)
+  [ -n "$list" ] || return 1
+
+  if [ -z "$want" ]; then
+    # A list of one is not a choice to make. `qb-seats resume` on a box with a
+    # single screen up is the whole of what most people mean by it.
+    [ "$(printf '%s\n' "$list" | wc -l)" -eq 1 ] || return 1
+    printf '%s\n' "$list"
+    return 0
+  fi
+
+  while IFS= read -r name; do
+    if [ -n "$name" ] && [ "$name" = "$want" ]; then printf '%s\n' "$name"; return 0; fi
+  done <<EOF
+$list
+EOF
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    i=$((i + 1))
+    if [ "$i" = "$want" ]; then printf '%s\n' "$name"; return 0; fi
+  done <<EOF
+$list
+EOF
+  return 1
+}
+
 # Seats are identified by a pane option, not by index or title: the index shifts
 # when a pane is added, and the agent in the pane rewrites the title.
 seat_panes() {
   tmux list-panes -t "$SESSION:seats" -F '#{pane_id} #{@qb_seat}' \
     | awk '$2 != "" { print $1, $2 }' | sort -k2 -n
+}
+
+# TYPE a line into a pane's shell. -l, because send-keys looks its argument up as a
+# KEY NAME first and only falls back to literal text: a QB_SEATS_DASH of `Enter`,
+# `Space`, `Tab` or `BSpace` would be sent as that key rather than typed, and one
+# beginning with `-` would be read as an option — which is what the `--` is for.
+# The Enter is a second call, since -l disables exactly the lookup that turns
+# `C-m` into one.
+type_into() {
+  local pane=$1 line=$2 enter=${3:-1}
+  tmux send-keys -t "$pane" -l -- "$line"
+  [ "$enter" = 1 ] || return 0
+  tmux send-keys -t "$pane" C-m
 }
 
 # Start a seat by TYPING its command into the pane's shell.
@@ -286,12 +785,12 @@ seat_panes() {
 # --staged is the equivalent of zellij's `start_suspended`, and better: the
 # command is typed but not entered, so it can be read, edited, or abandoned.
 start_seat() {
-  local pane=$1 n=$2
+  local pane=$1 n=$2 enter=1
+  [ "$STAGED" -eq 1 ] && enter=0
   # The bare name when the pane's shell will find it, which is the ordinary case
   # and keeps the command line in the pane readable. Otherwise the absolute path
   # resolved by require_qb_seat — see there for who is short of a PATH.
-  tmux send-keys -t "$pane" "$SEAT_CMD $n"
-  [ "$STAGED" -eq 1 ] || tmux send-keys -t "$pane" C-m
+  type_into "$pane" "$SEAT_CMD $n" "$enter"
 }
 
 SEAT_CMD="qb-seat"      # what start_seat types; require_qb_seat may absolutise it
@@ -328,6 +827,65 @@ beside_me() {
   printf '%s/%s' "$(cd -P "$(dirname "$0")" && pwd)" "$name"
 }
 
+# ---- the knobs qb-seat reads ------------------------------------------------
+# qb-seat's own knobs have to be forwarded explicitly. A pane's environment comes
+# from the tmux SERVER, and the server is usually one that was already running
+# for something else — so `QB_SEAT_AGENT=... qb-seats` would otherwise set a
+# variable in this process that no seat ever sees, and start the real agent while
+# reporting nothing wrong. Found exactly that way: a smoke test meant to run a
+# harmless stand-in launched two live agent sessions instead.
+#
+# This list is exactly the set qb-seat READS, and test_forwarded_knobs_are_all_read
+# pins it that way. Forwarding a name qb-seat does not read is the same silent
+# failure one layer along: the variable arrives in the pane, nothing consults it,
+# and the seat starts the real agent while reporting nothing wrong. That is how
+# QB_SEAT_AGENT_ARGS got here — qb-seat takes agent arguments positionally, so no
+# such variable was ever read — and how this list said QB_SEAT_AGENT while qb-seat
+# said QB_SEAT_CLAUDE, which is board finding 3632.
+#
+# --yolo/--no-yolo are not a fourth mechanism, they are this one with the value
+# supplied here: the flags set the variable qb-seat already reads, so a flag and
+# an exported QB_SEAT_YOLO cannot diverge in behaviour and there is one thing to
+# test. Neither flag given leaves the variable alone entirely — an unset variable
+# is how qb-seat is told "not answered", and answering it here with a default of
+# our own would be a second place for the default to live and drift.
+#
+# THE PREDICATE MIRRORS HOW qb-seat READS EACH NAME, which is not the same test for
+# all of them. qb-seat takes QB_SEAT_BRIEF with `${QB_SEAT_BRIEF+set}` so that
+# set-and-empty means "no brief at all" and unset means "use the built-in one" —
+# those are different answers, and only the first can ask for a waiting seat. A
+# `-n` test here cannot express it: it drops the empty value, nothing arrives in
+# the pane, qb-seat sees unset, and the seat starts on the full brief while
+# reporting nothing wrong. That is the same silent failure the build path already
+# warns about twice, arriving through the forwarder instead of past it.
+#
+# The other three are read with `${VAR:-}`, where empty and unset are the same
+# answer, so `-n` is the honest test for them and forwarding an empty value would
+# only add a variable that says nothing.
+#
+# THIS IS A FUNCTION BECAUSE BOTH PATHS NEED IT, and for a while only one had it.
+# `up` puts the list on the SESSION, so every pane split off later inherits it;
+# --add puts the same list on the one pane it creates, with -e, so it does not
+# rewrite the session under the seats already working in it. But
+# `QB_SEAT_BRIEF= qb-seats --add` onto a screen built without one is the same
+# request as `QB_SEAT_BRIEF= qb-seats`, and a predicate written out in only one of
+# the two places is the same silent failure in half the cases. One list, one set of
+# tests, both callers.
+seat_env=()
+seat_env_fill() {
+  local v
+  seat_env=()
+  [ -n "$YOLO" ] && QB_SEAT_YOLO="$YOLO"
+  for v in QB_SEAT_AGENT QB_SEAT_FORCE QB_SEAT_YOLO; do
+    [ -n "${!v:-}" ] && seat_env+=(-e "$v=${!v}")
+  done
+  [ -n "${QB_SEAT_BRIEF+set}" ] && seat_env+=(-e "QB_SEAT_BRIEF=$QB_SEAT_BRIEF")
+  # Said out loud, because the last test is allowed to be false and this script
+  # runs under `set -e`: a function whose final command is a failed `[` returns 1,
+  # and a bare call to it would then take the whole screen down.
+  return 0
+}
+
 # ---- args -------------------------------------------------------------------
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -339,6 +897,19 @@ while [ $# -gt 0 ]; do
     --no-yolo) YOLO=0; shift ;;
     --add)  ACTION="add";  shift ;;
     --kill) ACTION="kill"; shift ;;
+    # Bare words, and the `--` spellings too, because a user who has just learnt
+    # --add and --kill will type --list and must not be told it is a caller bug.
+    list|--list) ACTION="list"; shift ;;
+    resume|--resume)
+      ACTION="resume"; shift
+      # Its target is positional and has to be taken RIGHT HERE, because a bare
+      # number means the seat count everywhere else on this command line:
+      # `qb-seats resume 2` would otherwise be read as "resume, three seats" and
+      # the 2 would vanish into $SEATS. Anything starting with `-` is left for
+      # the loop, so `resume --help` still prints the help.
+      case "${1:-}" in ''|-*) ;; *) TARGET=$1; shift ;; esac
+      ;;
+    --dash-fit) ACTION="fit"; shift ;;
     -h|--help) usage; exit 0 ;;
     # A bare number is the seat count. `qb-b 3` is the shape this is reached for
     # twenty times a day, and -n is two keystrokes of ceremony on the only
@@ -356,6 +927,50 @@ case "$SEATS" in ''|*[!0-9]*) usage >&2; exit 2 ;; esac
 
 command -v tmux >/dev/null 2>&1 \
   || die "tmux is not installed (home-manager: programs.quarterback-harness.seats.enable)"
+
+# --dash-fit is what the window's resize hooks call, so it must not need anything a
+# hook cannot give it: no repo (a run-shell's cwd is the tmux server's, not the
+# screen's) and no PATH. The session is therefore named on the command line rather
+# than derived from a directory, and a hook left behind by a screen that has since
+# been killed is not an error — it is the ordinary way this ends.
+if [ "$ACTION" = fit ]; then
+  [ -n "$SESSION" ] || die "--dash-fit needs -s SESSION"
+  have_session || exit 0
+  dash_resize
+  exit 0
+fi
+
+# `list` and `resume` are about screens that ALREADY EXIST, so neither may need
+# what building one needs — and in particular neither derives a repo. That is not
+# a shortcut, it is the feature: the whole point of `resume` is that you do not
+# have to be standing in the right directory. The screen already knows the one it
+# was built in and every pane in it is already there, so a dropped ssh link is
+# recovered from whatever shell came back up, in whatever cwd. They run before
+# default_repo for that reason, exactly as --dash-fit does.
+if [ "$ACTION" = list ]; then
+  # An empty list on stdout and a word on stderr: a human running this by hand is
+  # not left staring at silence, and a caller parsing stdout is not handed prose.
+  [ -n "$(screen_names)" ] || warn "no screens are up"
+  list_screens
+  exit 0
+fi
+
+if [ "$ACTION" = resume ]; then
+  if ! SESSION=$(resolve_screen "$TARGET"); then
+    if [ -z "$(screen_names)" ]; then
+      die "no screens are up — start one with \`$PROG\` in the repo you want it in"
+    fi
+    if [ -n "$TARGET" ]; then
+      warn "no screen numbered or named '$TARGET'. These are up:"
+    else
+      warn "more than one screen is up, so say which:"
+    fi
+    list_screens >&2
+    exit 1
+  fi
+  attach
+  exit 0
+fi
 
 [ -n "$REPO" ] || REPO=$(default_repo)
 REPO=$(cd -P "$REPO" 2>/dev/null && pwd) || die "no such directory: $REPO"
@@ -382,16 +997,28 @@ if [ "$ACTION" = add ]; then
   # pane-base-index says, and a config setting it to 1 — a common one — leaves
   # every `.0` target failing with "can't find pane: 0".
   first_seat=$(seat_panes | awk 'NR == 1 { print $1 }')
-  # A pane inherits the SESSION environment as it is created, so a seat added to
-  # a screen built with --no-yolo already has that and this adds nothing. Passing
-  # either flag to --add is the other case: -e scopes it to the pane being added
-  # rather than rewriting the session under the seats already working in it.
-  add_env=()
-  [ -n "$YOLO" ] && add_env=(-e "QB_SEAT_YOLO=$YOLO")
+  # A pane inherits the SESSION environment as it is created, so a seat added to a
+  # screen built with the same knobs already has them and this adds nothing.
+  # Passing one to --add is the other case: -e scopes it to the pane being added
+  # rather than rewriting the session under the seats already working in it. The
+  # list and the predicate are seat_env_fill's, deliberately — see the note there
+  # for why writing them out a second time here is how QB_SEAT_BRIEF got dropped
+  # from this path.
+  seat_env_fill
+  # The dash is in the row `select-layout -E` is about to spread, so note its width
+  # now and put that back afterwards. Nothing about the WINDOW is changing, so the
+  # width it has right this second is the right answer — including one the user set
+  # by dragging the border. Without the reassert an --add narrows the dash every
+  # time it is called, which is how a screen ends up with a 29-column dashboard
+  # nobody chose.
+  dash=$(dash_pane)
+  dash_was=""
+  [ -z "$dash" ] || dash_was=$(tmux display-message -p -t "$dash" '#{pane_width}')
   pane=$(tmux split-window -h -P -F '#{pane_id}' -t "$first_seat" -c "$REPO" \
-    ${add_env[@]+"${add_env[@]}"})
+    ${seat_env[@]+"${seat_env[@]}"})
   tmux set-option -p -t "$pane" @qb_seat "$next"
   tmux select-layout -t "$pane" -E 2>/dev/null || true
+  [ -z "$dash_was" ] || dash_resize "$dash_was"
   start_seat "$pane" "$next"
   printf '%s: added seat %s to %s\n' "$PROG" "$next" "$SESSION"
   exit 0
@@ -405,6 +1032,21 @@ if have_session; then
 fi
 
 require_qb_seat
+
+# QB_SEATS_DASH_SIZE reaches `split-window -l` and `resize-pane -x` verbatim, so it
+# is checked here, where nothing exists yet. `QB_SEATS_DASH_SIZE=78px` makes
+# split-window exit non-zero, and that split runs inside a command substitution
+# under `set -e`: the script would die with the session, the seats and the tape
+# already built but no agent started, on a bare tmux error naming neither the
+# variable that caused it nor the fix — and the rerun then fails on the duplicate
+# session name instead. The ceiling is the window a screen is built in; dash_resize
+# clamps again, against whatever the client actually turns out to be.
+case "$DASH_SIZE" in
+  ''|*[!0-9]*) die "QB_SEATS_DASH_SIZE=$DASH_SIZE: a width in columns, digits only" ;;
+esac
+{ [ "$DASH_SIZE" -ge 1 ] && [ "$DASH_SIZE" -le "$WINDOW_COLS" ]; } \
+  || die "QB_SEATS_DASH_SIZE=$DASH_SIZE: 1 to $WINDOW_COLS columns (a screen is built
+       $WINDOW_COLS wide, and the dash never takes more than a third of the window)"
 
 # QB_SEATS is a contract with the user's shell rc, and it is not cosmetic — on
 # the machine this was written for it is the difference between a screen that
@@ -423,36 +1065,41 @@ require_qb_seat
 # -e sets these on the SESSION, so every pane split off later inherits them.
 #
 # -x/-y because a detached session is 80x24, in which a 25% split is six lines and
-# a fourth seat does not fit at all. tmux resizes to the client on attach.
-# qb-seat's own knobs have to be forwarded explicitly. A pane's environment comes
-# from the tmux SERVER, and the server is usually one that was already running
-# for something else — so `QB_SEAT_AGENT=... qb-seats` would otherwise set a
-# variable in this process that no seat ever sees, and start the real agent while
-# reporting nothing wrong. Found exactly that way: a smoke test meant to run a
-# harmless stand-in launched two live agent sessions instead.
+# a fourth seat does not fit at all. tmux resizes to the client on attach, which is
+# the whole reason dash_hooks exists.
 #
-# This list is exactly the set qb-seat READS, and test_forwarded_knobs_are_all_read
-# pins it that way. Forwarding a name qb-seat does not read is the same silent
-# failure one layer along: the variable arrives in the pane, nothing consults it,
-# and the seat starts the real agent while reporting nothing wrong. That is how
-# QB_SEAT_AGENT_ARGS got here — qb-seat takes agent arguments positionally, so no
-# such variable was ever read — and how this list said QB_SEAT_AGENT while qb-seat
-# said QB_SEAT_CLAUDE, which is board finding 3632.
+# The knobs the seats need come from seat_env_fill — read the note there before
+# changing the list or the tests that pin it.
+seat_env_fill
+# -P -F, because THE NAME TMUX MAKES IS NOT ALWAYS THE NAME IT WAS ASKED FOR, and
+# every `-t` below addresses the session exactly (`=$SESSION`) — so a rename tmux
+# does quietly turns the very next command into a fatal "no such session", with the
+# session, its window and one pane already created and nothing else done. Measured
+# on tmux 3.6a and 3.4, which do not even mangle the same characters:
 #
-# --yolo/--no-yolo are not a fourth mechanism, they are this one with the value
-# supplied here: the flags set the variable qb-seat already reads, so a flag and
-# an exported QB_SEAT_YOLO cannot diverge in behaviour and there is one thing to
-# test. Neither flag given leaves the variable alone entirely — an unset variable
-# is how qb-seat is told "not answered", and answering it here with a default of
-# our own would be a second place for the default to live and drift.
-seat_env=()
-[ -n "$YOLO" ] && QB_SEAT_YOLO="$YOLO"
-for v in QB_SEAT_AGENT QB_SEAT_BRIEF QB_SEAT_FORCE QB_SEAT_YOLO; do
-  [ -n "${!v:-}" ] && seat_env+=(-e "$v=${!v}")
-done
-
-tmux new-session -d -s "$SESSION" -n seats -c "$REPO" -x 240 -y 60 \
-  -e QB_SEATS=1 -e FLEET_NO_MOTD=1 ${seat_env[@]+"${seat_env[@]}"}
+#   qb-seats -s my.screen   → session `my_screen`, both versions. `.` and `:` are
+#                             a target's own separators, so tmux replaces them.
+#   qb-seats -s 'a\b'       → session `a\\b`, both versions: session_check_name
+#                             runs the name through strvis, which escapes what it
+#                             cannot print — and a backslash.
+#   qb-seats -s 'a$Bb'      → kept by 3.6a, escaped to `a\\$Bb` by 3.4. THIS is what
+#                             CI caught: green here, red there, on the same commit.
+#
+# So the created name is read back and used from here on, and tmux is the only
+# authority on what it is — reimplementing its rules would be one more thing to
+# keep in step with a moving target, and 3.4 versus 3.6a is exactly how that fails.
+# The one thing this does NOT buy is reattaching to a renamed screen: a later
+# `qb-seats -s my.screen` still looks for the name it was given, does not find it,
+# and refuses on tmux's own "duplicate session: my_screen" — which at least names
+# the screen it is talking about. The warning below is where a user learns it.
+SESSION_ASKED=$SESSION
+SESSION=$(tmux new-session -d -P -F '#{session_name}' -s "$SESSION" -n seats -c "$REPO" \
+  -x "$WINDOW_COLS" -y "$WINDOW_ROWS" \
+  -e QB_SEATS=1 -e FLEET_NO_MOTD=1 ${seat_env[@]+"${seat_env[@]}"})
+[ "$SESSION" = "$SESSION_ASKED" ] \
+  || warn "tmux would not take '$SESSION_ASKED' as a session name and called this
+       screen '$SESSION' instead — that is the name to reattach to, and the name
+       to pass to --add and --kill."
 
 # Never a shared instance: strip any inherited value from the session
 # environment, so nothing a seat spawns can pick one up. qb-seat sets its own.
@@ -461,11 +1108,10 @@ tmux set-environment -t "=$SESSION" -r QUARTERBACK_INSTANCE
 # Label the panes. Two seats are indistinguishable once both are printing, and
 # being able to address ONE of them is the whole point.
 tmux set-option -w -t "$SESSION:seats" pane-border-status top
-# @qb_label is how a pane that is NOT a seat says what it is: the option
-# dev/seats-extras.sh already labels the dash and the tape with, and the one the
-# dashboard marks a review pane with when it splits one into this row. Without
-# the middle case every such pane is labelled "board", which is the one thing on
-# this screen they are definitely not.
+# @qb_label is how a pane that is NOT a seat says what it is: the option this script
+# labels the dash and the tape with, and the one the dashboard marks a review pane
+# with when it splits one into this row. Without the middle case every such pane is
+# labelled "board", which is the one thing on this screen they are definitely not.
 tmux set-option -w -t "$SESSION:seats" pane-border-format \
   ' #{?@qb_seat,seat #{@qb_seat},#{?@qb_label,#{@qb_label},board}} #{?pane_active,*,} '
 
@@ -473,8 +1119,9 @@ tmux set-option -w -t "$SESSION:seats" pane-border-format \
 # script against this same repo, and it cannot work either out from a pane: PATH
 # in a run-shell is the tmux server's, and the seat panes' cwd is only the repo
 # until somebody cds.
+SELF=$(beside_me qb-seats)
 tmux set-option -t "=$SESSION:" @qb_repo "$REPO"
-tmux set-option -t "=$SESSION:" @qb_seats_bin "$(beside_me qb-seats)"
+tmux set-option -t "=$SESSION:" @qb_seats_bin "$SELF"
 
 # The bar is opt-out because turning it on is not free: it takes over the status
 # line, turns the mouse on (which costs shift-less text selection), and binds a
@@ -525,16 +1172,84 @@ if [ "$SEATS" -gt "$TOP" ]; then
 fi
 [ "$SEATS" -le 5 ] && tmux select-layout -t "$SESSION:seats" even-horizontal
 
-# The board, on the same screen as the seats — full width along the bottom, so
+# The dash, down the right. AFTER the select-layout calls above and BEFORE the
+# tape below, and both halves of that matter:
+#
+#   * after the layouts, because `select-layout` re-equalises every pane in what
+#     it spreads — a dash placed first comes back out at whatever width an even
+#     split gives it, which is the bug the dev scaffolding recorded finding twice.
+#   * before the tape, so the tape's -f split takes its strip from the bottom of
+#     the whole window and the dash ends up ABOVE it rather than beside it. The
+#     dash answers "what is true now" for the screen, not for the seat row, so it
+#     spans both rows when there are two.
+#
+# -f for the same reason the tape uses it: full height of the WINDOW, not a split
+# of the pane it was taken from.
+#
+# The command is typed in later, with the seats, rather than one line after this
+# split — see there. And it is typed rather than being the pane's own command,
+# exactly as start_seat does it: if the dash exits or you Ctrl-C it you get a prompt
+# in the pane, instead of the pane vanishing and the screen quietly losing a
+# quarter of itself.
+DASH_CMD=$(dash_cmd)
+dash=""
+if [ -n "$DASH_CMD" ]; then
+  # Tolerated rather than fatal. This is a command substitution under `set -e`, and
+  # the seats and the session already exist by now: a screen with no dash and a
+  # line saying why beats dying half-built, on a tmux error, with a session name
+  # that then makes the obvious rerun fail too.
+  if ! dash=$(tmux split-window -h -f -l "$DASH_SIZE" -P -F '#{pane_id}' \
+                -t "$SESSION:seats" -c "$REPO"); then
+    warn "no dash: the pane could not be split off at $DASH_SIZE columns"
+    DASH_CMD=""
+    dash=""
+  else
+    tmux set-option -p -t "$dash" @qb_label dash
+    # What this screen asked for, recorded ON THE PANE. --add, qb-seat-click and the
+    # resize hooks all reassert this width, and every one of them would otherwise
+    # have to re-derive it from an environment that need not be the one the screen
+    # was built in — so `QB_SEATS_DASH_SIZE=120 qb-seats` followed by a plain
+    # `qb-seats --add` would put the dash back to the default nobody asked for.
+    # QB_SEATS_DASH_SIZE is read exactly once, here.
+    tmux set-option -p -t "$dash" @qb_dash_width "$DASH_SIZE"
+  fi
+fi
+
+# The tape, on the same screen as the seats — full width along the bottom, so
 # long summaries are read rather than wrapped. -f makes the split span the whole
 # window rather than only the pane it was taken from. It drops to a shell rather
 # than closing if the follower dies, so a board outage does not silently leave a
 # screen with no board on it.
-tmux split-window -v -f -l "$BOARD_SIZE" -t "$first" -c "$REPO" \
-  "$(printf '%s; exec %q -i' "$(board_cmd)" "$SH")"
+tape=$(tmux split-window -v -f -l "$BOARD_SIZE" -P -F '#{pane_id}' \
+  -t "$first" -c "$REPO" "$(printf '%s; exec %q -i' "$(board_cmd)" "$SH")")
 
-# Seats last, once every pane exists and its shell has had the time it took to
-# build the rest of the screen to reach a prompt.
+# Everything here exists only because the dash does, so it is one condition tested
+# once rather than three that a reader has to check are still the same one.
+if [ -n "$DASH_CMD" ]; then
+  # Only name it 'tape' when there is a dash to tell it apart FROM. On a screen
+  # with one auxiliary pane the border has said 'board' since this script existed,
+  # and renaming it for everybody to solve a problem only the two-pane screen has
+  # would be a gratuitous break — pane-border-format's fallback already prints
+  # 'board'.
+  tmux set-option -p -t "$tape" @qb_label tape
+  # The hooks first, because they are the ones that survive this script: the window
+  # is WINDOW_COLS x WINDOW_ROWS until a client attaches, and it is the ATTACH that
+  # redistributes the row the dash is in. See dash_hooks.
+  dash_hooks "$SELF"
+  # Then once here, for the width a detached screen reports and for the case that
+  # never attaches at all — a screen built by a script or a unit, read over ssh
+  # later.
+  dash_resize
+fi
+
+# The commands go in last, once every pane exists and its shell has had the time it
+# took to build the rest of the screen to reach a prompt. The dash is typed here
+# rather than beside its own split for exactly that reason: keystrokes sent into a
+# pane whose shell has not started wait in the pty, but an rc file that reads stdin
+# before its prompt eats them — see QB_SEATS above — and the dash is the one pane
+# whose loss is silent, because an empty pane under a border reading 'dash' looks
+# like a dashboard that has not drawn yet.
+[ -z "$DASH_CMD" ] || type_into "$dash" "$DASH_CMD"
 while read -r pane n; do start_seat "$pane" "$n"; done < <(seat_panes)
 
 # awk rather than `head -1`, which would close the pipe under `set -o pipefail`

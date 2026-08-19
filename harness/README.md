@@ -417,7 +417,21 @@ qb-seats --staged     # built, each seat waiting on Enter
 qb-seats --no-yolo    # seats that stop and ask, as agents normally do
 qb-seats --add        # add a seat to a running screen
 ssh box -t qb-seats   # reattach from anywhere
+qb-b list             # the screens that are up, numbered
+qb-b resume 2         # reattach to the second of them, from any directory
 ```
+
+`qb-seats` on its own reattaches to the screen for **the repo you are standing in**, which
+is the one thing the shell after a dropped ssh link cannot be relied on to be. `list` and
+`resume` are for that shell: neither needs a repo or a `-C`, because a screen already knows
+the directory it was built in. `resume` takes the number from the list or the screen's name,
+and with exactly one screen up it takes no argument at all.
+
+A screen is recognised by a pane carrying `@qb_seat`, never by its name — `-s` takes
+anything, the fleet's own screen is `qbseats` rather than `seats-nix-fleet`, and tmux
+silently renames what it will not take verbatim. So the list is read back from tmux and can
+only print names that really exist, which also makes it the way to reattach to a screen tmux
+renamed under you.
 
 One tmux session: N panes each running `qb-seat <n>`, and one full-width pane along the
 bottom running `qb-board --follow`. Every seat gets the **same** brief — read the board,
@@ -523,20 +537,61 @@ Adding another verb is three things: an entry in `BINDINGS`, an `action_*` metho
 it wants an icon — a column, since a click carries the column it landed in and that is how
 one row offers more than one verb.
 
-Not wired into `qb-seats` yet. `qb-dash` is a **launcher**, not the dashboard: the dashboard
-is Python needing `rich`, `textual` and `mcp_server`, none of which a plain `python3` has, so
-a shebang would be rewritten by `patchShebangs` to an interpreter that dies on the first
-import. It hunts for one that can, the way `qb-board` does — `QB_DASH_PYTHON` names one
-outright, `QUARTERBACK_REPO` points at a checkout whose `mcp/.venv` is built. Until
-`mcp_server` is packaged, that venv is the only thing that satisfies it. Bring one
-up beside a running screen with `harness/dev/seats-extras.sh <session> <width>`, which also
-relabels the board pane — that script hardcodes local checkout paths behind
-`QB_MCP_CHECKOUT` and is developer scaffolding, not something to ship.
+`qb-seats` builds it. A screen is seats across the top, the dash down the right, and the
+tape full width along the bottom — the dash reports what is true now, the tape what just
+happened, and a screen wants both. `QB_SEATS_DASH` names the command; **set it to the
+empty string for a screen with no dash**. The default is the plain `qb-dash` rather than
+the nicer clickable `qb-dash-tui`, because the TUI crashes with `DuplicateKey` once a
+second screen exists (#209, underlying cause #208) — `QB_SEATS_DASH=qb-dash-tui` opts in,
+and it should become the default once that is fixed. Nothing falls back to the TUI on its
+own, not even when `qb-dash` is the one that is missing: with neither installed the pane
+holds a shell and a line saying which command to set, rather than the screen quietly
+being one pane short.
 
-Adding the dash also needs a wider `pane-border-format` than `qb-seats` sets: its own
-prints `board` for any pane with no seat number, so a second unlabelled pane claims that
-name. The dev script widens it to fall through to a `@qb_label` option; that belongs in
-`qb-seats` proper once this settles.
+`QB_SEATS_DASH_SIZE` is its width in columns, default 78 — what the dashboard's own table
+wants before it wraps — **and never more than a third of the window**. That ceiling is
+the interesting half: a client attaching resizes the window and rescales every pane in the
+dash's row, so the width has to be reasserted afterwards rather than at build time, and 78
+columns reasserted on a 100-column terminal leaves the two seats 19 columns and one. A
+narrow terminal therefore costs dash, not seats, and `qb-seats` says so on stderr when the
+clamp bites. This is also the first release where **a screen loses columns by default**:
+existing callers get seats a third narrower than before, and `QB_SEATS_DASH=` is how to
+have the old screen back.
+
+The width is per-screen state, read from the environment once when the screen is built and
+recorded on the pane. So `--add` and the seat bar's ✕ put the dash back to the width *that
+screen* asked for — including one set by dragging the border, which a reflow will not
+undo — rather than to whatever `QB_SEATS_DASH_SIZE` says in the shell that happened to run
+them. `--add` never *creates* a dash: a screen built with `QB_SEATS_DASH=` stays a screen
+with no dash until it is rebuilt.
+
+`qb-dash` is a **launcher**, not the dashboard: the dashboard is Python needing `rich`,
+`textual` and `mcp_server`, none of which a plain `python3` has, so a shebang would be
+rewritten by `patchShebangs` to an interpreter that dies on the first import. It hunts for
+one that can, the way `qb-board` does — `QB_DASH_PYTHON` names one outright,
+`QUARTERBACK_REPO` points at a checkout whose `mcp/.venv` is built.
+
+Prefer the INSTALLED dash over a checkout, which is why `qb-seats` resolves it that way: a
+uv-standalone python has no CA bundle, and a dash running under one reports "board
+unreachable" against a board that is up, beside a shell where the same URL works.
+
+This used to be `harness/dev/seats-extras.sh`, which stapled two unlanded worktrees
+together for a smoke test and hardcoded both paths. It is gone; the lessons it paid for —
+place the dash AFTER `select-layout` and never spread the window afterwards, reassert the
+width because attaching redistributes the row — are comments in `qb-seats` and assertions
+in `harness/tests/test_qb_seats.py`. The dev script only ever produced the right width
+because a human ran it by hand *after* attaching; the reassert is a `window-resized` hook
+precisely so that nobody has to.
+
+That hook has to name a `qb-seats` by absolute path, because a `run-shell` in a hook
+inherits the tmux *server's* PATH and the server usually predates anything that put this
+harness on one. Which copy is not obvious, and getting it wrong is silent: PATH's `qb-seats`
+is preferred everywhere else, so mid-rollout the working tree installed a hook pointing at
+an *installed* copy with no `--dash-fit` — which exits 2 into a `run-shell -b` that discards
+both streams, on every resize, saying nothing. So the copy is asked before the hook goes in:
+PATH's if it answers the flag, otherwise the one that is running, and otherwise no hook at
+all plus a line on stderr naming what it tried. A screen that does not re-fit is honest; a
+hook that fails invisibly is not.
 
 ## How it works
 
@@ -611,10 +666,10 @@ Keys the script reads: `project`, `framework`, `base_port`, `app_port`,
 `server.{workers_env,workers_default}`, `env.copy_from`, `workspace.{enabled,editor_cli}`,
 and the arrays `symlinks`, `copies`, `reserved_names`, `gitignore_additions`.
 
-### Two prerequisites for database isolation
+### Three prerequisites for database isolation
 
-Both are easy to miss, and missing either gets you a worktree that *looks* isolated while
-running against shared data.
+All three are easy to miss, and missing any of them gets you a worktree that *looks*
+isolated while running against shared data — or, for the third, no usable worktree at all.
 
 **1. The main checkout needs a `.env`.** It is the file `create-worktree` copies into the
 worktree and then rewrites the database name in. There is nothing else for it to derive
@@ -622,7 +677,24 @@ credentials from, so with no `.env` the DB step has nothing to copy and says so 
 `cp .env.example .env` is part of setting a repo up, not an optional nicety. (A repo that
 keeps its env elsewhere can point `env.copy_from` at that file instead.)
 
-**2. Your test suite must honour that `.env`.** This is the one that bites hardest, because
+**2. That `.env` must actually name the database.** `create-worktree` has to know which
+database to copy, and it looks in two places: `database.url_env` (default unset) and
+`database.name_env` (default `POSTGRES_DB`). Declaring the first no longer disables the
+second — it *cascades*, so a repo whose URL is assembled at runtime, or that keeps the name
+in `docker-compose.yml` and only the password in `.env`, resolves through `POSTGRES_DB`.
+quarterback itself is that shape: its `.env` carries `POSTGRES_PASSWORD` and nothing else,
+so isolated mode cannot work here until `POSTGRES_DB=quarterback` is added to it.
+
+When neither variable is set the run stops at the database step and names both variables and
+the file it read. It stops *after* the git worktree exists, so it also says the worktree is
+incomplete and gives the two commands out — a directory with a checkout but no `.venv`
+symlink, no port and no `CLAUDE.local.md` looks provisioned enough to `cd` into and then
+fails later for reasons that have nothing to do with the database. Before this was fixed the
+run died on `MAIN_DB_NAME: unbound variable` instead: the guard written to explain the case
+was the first thing to dereference the unset variable, so `set -u` killed the script at the
+exact line that existed to say what was wrong.
+
+**3. Your test suite must honour that `.env`.** This is the one that bites hardest, because
 provisioning succeeds and the damage happens later. A suite that decides its own database
 URL — the near-universal
 

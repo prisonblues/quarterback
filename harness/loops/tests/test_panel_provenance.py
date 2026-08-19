@@ -42,8 +42,6 @@ from conftest import gh_stub  # noqa: E402
 
 
 
-
-
 TWO_FILES = (
     "diff --git a/a.py b/a.py\n"
     "index 1111111..2222222 100644\n"
@@ -652,7 +650,7 @@ def _panel_round(monkeypatch, tmp_path, round_no, findings, head, baseline=(),
         compare=FIX_COMPARE if compare is None else compare,
         diff=PR_DIFF)
 
-    def fake_review(name, model, prompt, effort=""):
+    def fake_review(name, model, prompt, effort="", **_kw):  # **_kw: code_tree since #113
         # Only the first seat files, so two seats do not produce two canonical
         # records of one defect. What the extra seats are here for is the diff
         # budget they carry.
@@ -660,7 +658,7 @@ def _panel_round(monkeypatch, tmp_path, round_no, findings, head, baseline=(),
             [panel.Finding("claude", "P2", f, ln, t, "detail")
              for f, ln, t in findings] if name == "claude" else [], None, 800, None)
 
-    def fake_adjudicate(clusters, diff, model, pr, budget=None, coverage=None, ci=""):
+    def fake_adjudicate(clusters, diff, model, pr, budget=None, coverage=None, ci="", **_kw):  # **_kw: code_tree/budget_usd since #113
         return ([panel.Canonical(id=panel._finding_id(pr, i + 1), severity="P2",
                                  file=f.file, line=f.line, synthesis=f.title,
                                  verdict="confirmed", detail="detail",

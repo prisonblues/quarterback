@@ -367,7 +367,7 @@ def test_seat_installed_asks_about_the_COMMAND_not_the_seat_name(monkeypatch):
     "antigravity" would report the one seat that IS argv-bound as absent on every
     box, which is the direction that quietly switches the ceiling off."""
     asked = []
-    monkeypatch.setattr(pf.shutil, "which", lambda c: asked.append(c) or "/x/bin/agy")
+    monkeypatch.setattr(panel_core.shutil, "which", lambda c: asked.append(c) or "/x/bin/agy")
     assert pf.seat_installed("antigravity") is True
     assert asked == ["agy"]
     assert pf.seat_installed("claude") is True
@@ -1435,7 +1435,7 @@ def _run(monkeypatch, tmp_path, diff, panel_cfg, *, force=False, post=False,
            "reviewers": {n: {"enabled": True, "model": "sonnet"} for n in seats}}
     seen: dict = {"prompts": {}, "posted": [], "recorded": []}
 
-    def fake_review(name, model, prompt, effort=""):
+    def fake_review(name, model, prompt, effort="", **kw):
         seen["prompts"][name] = prompt
         return panel.ReviewerRun([], None, 10, None)
 
@@ -1699,7 +1699,7 @@ def test_a_scoped_round_is_NOT_refused_for_the_size_of_its_CONTEXT(monkeypatch,
                         lambda *a: {"commits": 1, "files": 1, "additions": 1,
                                     "deletions": 0})
     monkeypatch.setattr(panel, "review_llm",
-                        lambda n, m, prompt, effort="":
+                        lambda n, m, prompt, effort="", **kw:
                         panel.ReviewerRun([], None, 10, None))
     monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
     monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], None, ""))
@@ -1814,7 +1814,7 @@ def test_a_manifest_round_vetoes_a_confident_stop(monkeypatch, tmp_path):
     monkeypatch.setattr(pf, "seat_installed", ALL_HERE)
     monkeypatch.setattr(panel_core, "sh", gh_stub(diff=SPLIT))
     monkeypatch.setattr(panel, "review_llm",
-                        lambda n, m, p, effort="": panel.ReviewerRun([], None, 10, None))
+                        lambda n, m, p, effort="", **kw: panel.ReviewerRun([], None, 10, None))
     monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
     monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], None, ""))
     out = tmp_path / "veto.json"
@@ -1841,7 +1841,7 @@ def test_a_forced_round_vetoes_through_the_ORDINARY_truncation_path(monkeypatch,
     monkeypatch.setattr(pf, "seat_installed", ALL_HERE)
     monkeypatch.setattr(panel_core, "sh", gh_stub(diff=FRESH))
     monkeypatch.setattr(panel, "review_llm",
-                        lambda n, m, p, effort="": panel.ReviewerRun([], None, 10, None))
+                        lambda n, m, p, effort="", **kw: panel.ReviewerRun([], None, 10, None))
     monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
     monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], None, ""))
     out = tmp_path / "forced.json"
@@ -1949,7 +1949,7 @@ def test_a_scoped_round_is_weighed_on_its_INCREMENT_not_on_the_PR(monkeypatch,
     monkeypatch.setattr(panel_scope, "compare_facts",
                         lambda *a: {"commits": 1, "files": 1, "additions": 1,
                                     "deletions": 0})
-    def reviewer(name, model, prompt, effort=""):
+    def reviewer(name, model, prompt, effort="", **kw):
         seen["prompt"] = prompt
         return panel.ReviewerRun([], None, 10, None)
 
@@ -2045,7 +2045,7 @@ def test_an_inherited_manifest_round_vetoes_a_later_SCOPED_round(monkeypatch,
                         lambda *a: {"commits": 1, "files": 1, "additions": 1,
                                     "deletions": 0})
     monkeypatch.setattr(panel, "review_llm",
-                        lambda n, m, p, effort="": panel.ReviewerRun([], None, 10, None))
+                        lambda n, m, p, effort="", **kw: panel.ReviewerRun([], None, 10, None))
     monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
     monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], None, ""))
     mani = _payload(tmp_path, "r1.json", round=1,
@@ -2099,7 +2099,7 @@ def _scoped_manifest_run(monkeypatch, tmp_path, baselines, cap_divisor=4):
                         lambda *a: {"commits": 1, "files": 3, "additions": 200,
                                     "deletions": 200})
     monkeypatch.setattr(panel, "review_llm",
-                        lambda n, m, p, effort="": panel.ReviewerRun([], None, 10, None))
+                        lambda n, m, p, effort="", **kw: panel.ReviewerRun([], None, 10, None))
     monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
     monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], None, ""))
     out = tmp_path / "r2.json"
@@ -2193,7 +2193,14 @@ def test_force_reaches_run_from_the_command_line(monkeypatch):
     """The flag is parsed, and it is threaded all the way through. A `--force` that
     argparse accepts and `main` drops is a refusal nobody can get past."""
     got = {}
+    # Bound by NAME, not by position — and read BEFORE `run` is replaced, because
+    # `inspect` on the double reports the double's own `*a, **k`. This asserted on
+    # `args[-1]`, which was `force` until v2.51 added a parameter after it, and then
+    # the test turned on somebody else's argument order rather than on whether
+    # `--force` arrives at all.
+    import inspect
+    at = list(inspect.signature(panel.run).parameters).index("force")
     monkeypatch.setattr(panel, "run", lambda *a, **k: got.update(args=a) or 0)
     monkeypatch.setattr(sys, "argv", ["panel.py", "--pr", "137", "--force"])
     assert panel.main() == 0
-    assert got["args"][-1] is True
+    assert got["args"][at] is True

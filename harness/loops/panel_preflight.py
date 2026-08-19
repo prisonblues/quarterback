@@ -78,11 +78,11 @@ irony this issue was filed about, and not one worth re-earning.
 from __future__ import annotations
 
 import re
-import shutil
 from collections import Counter
 from dataclasses import dataclass, field
 
-from panel_core import ARGV_PROMPT_MAX_BYTES, CLI_BIN, _diff_file_path
+from panel_core import (ARGV_PROMPT_MAX_BYTES, CLI_BIN, seat_installed,
+                        _diff_file_path)
 
 # ----------------------------------------------------------------------------- tunables
 
@@ -483,14 +483,12 @@ def diff_shape(diff: str) -> DiffShape:
 
 # ----------------------------------------------------------------------------- the cap
 
-def seat_installed(name: str) -> bool:
-    """Is this seat's CLI on PATH — i.e. can it run on THIS box at all?
-
-    The same test `run_cli` makes before dispatching a seat, through the same
-    `CLI_BIN` mapping (the reviewer is `antigravity`, the command is `agy`), so the
-    two cannot come to disagree about which seats exist here.
-    """
-    return bool(shutil.which(CLI_BIN.get(name, name)))
+# `seat_installed` is imported from `panel_core` (#222), not defined here. Both
+# halves of this module's own history are the argument for that: this file added one
+# for its ceiling calculation, #222 added another beside `CLI_BIN` for `budgets` and
+# `run_seat`, and two spellings of "is this seat here" is exactly the disagreement
+# that let a seat be skipped as absent while its budget record said it had been
+# handed 116,287 chars. One predicate, in the module that owns `CLI_BIN`.
 
 
 @dataclass(frozen=True)
@@ -1530,7 +1528,7 @@ __all__ = [
     "DEFAULT_MOVE_SHAPE_RATIO", "DEFAULT_REFUSE_OVER_CAP_MULTIPLE",
     "MANIFEST_TABLE_ROWS", "MANIFEST_RESIDUE_LINES", "MANIFEST_LINE_CHARS",
     "MOVE_MANIFEST_HEADER", "PAYLOAD_FILE_ROWS",
-    "DiffShape", "DiffParts", "Preflight", "diff_shape", "seat_installed",
+    "DiffShape", "DiffParts", "Preflight", "diff_shape",
     "Ceiling", "seat_ceilings", "tightest_ceiling", "preflight",
     "move_manifest", "duplicate_definitions", "refusal_report",
 ]

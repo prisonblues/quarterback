@@ -6,6 +6,8 @@
 #   qb-b --yolo     seats that do not stop to ask for permission
 #   qb-b --add      one more seat on a running screen
 #   qb-b --kill     tear it down
+#   qb-b list       the screens that are up, numbered
+#   qb-b resume 2   reattach to the second of them, from any directory
 #
 # Every argument goes straight to `qb-seats`; this is a SPELLING, not a second
 # implementation, and there is deliberately no behaviour here to drift out of

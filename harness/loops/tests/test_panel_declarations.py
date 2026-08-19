@@ -70,7 +70,7 @@ def _echoed(prompt: str, **fields) -> str:
 
 
 REVIEW_ECHO = _echoed(panel.REVIEW_PROMPT, n=1, repo="acme/board", base="main",
-                      ci="", diff="")
+                      ci="", diff="", code="")
 JUDGE_ECHO = _echoed(panel.JUDGE_PROMPT, findings="", coverage="", ci="", diff="")
 
 
@@ -991,10 +991,15 @@ def test_a_baseline_that_could_not_be_read_also_costs_the_verdict_its_confidence
 # ---- what makes a quiet round suspect --------------------------------------
 
 def test_the_veto_names_every_way_a_round_can_look_quiet_without_being_quiet():
+    """`code_blind: False` on pi is load-bearing and spelled out rather than left
+    to the default: a declaration is evidence about the round only from a seat
+    that could have read the answer. The blind case — which is every seat today —
+    is the test below."""
     meta = {
         "claude": {"ran": True, "truncated": True, "max_diff_chars": 60_000},
         "codex": {"ran": False, "skip": "codex (gpt): exited 1 (429 rate limited)"},
-        "pi": {"ran": True, "could_not_assess": ["the amendment path"]},
+        "pi": {"ran": True, "code_blind": False,
+               "could_not_assess": ["the amendment path"]},
         "antigravity": {"ran": True, "unstructured": True},
     }
     why = panel.coverage_veto(meta, judge_skip="judge: claude CLI absent",
@@ -1065,6 +1070,146 @@ def test_a_reviewer_whose_cli_is_missing_records_that_as_state(monkeypatch):
     monkeypatch.setattr(panel.shutil, "which", lambda _: None)
     got = panel.review_llm("antigravity", "m", "p")
     assert got.absent is True and got.skip.endswith(panel.CLI_ABSENT)
+
+
+def test_a_seat_that_cannot_read_the_code_declares_without_vetoing():
+    """The measured cost of the sandbox, and why a constant must not vote.
+
+    Every LLM seat reviews from the diff alone — an empty `member_sandbox` cwd and
+    no file tools — so "I could not read a function this diff does not change" is
+    true of every round it sits. `round_stop` computes `confident` as `not veto`,
+    so leaving it in denied a confident stop to any PR that so much as REFERENCES
+    a file it does not touch, which is most of them: the one signal deciding
+    whether to spend another round carried no information.
+
+    Measured on PR #160 round 1 — 19 veto lines, 16 of them declarations, and
+    NINE of those asked about a file in this very repo (whether
+    `mcp_server/__init__.py` imports the MCP SDK; `QuarterbackClient`'s default
+    timeout; `worktree-holder`'s exit codes). The orchestrator answered all nine
+    with grep in about four minutes. That is work the panel was outsourcing to
+    whoever read its output, and only when somebody happened to.
+
+    The declarations are still REPORTED — `run` renders them from `reviewer_meta`
+    regardless of the veto, and they are worth reading. What they no longer do is
+    spend the round's confidence."""
+    blind = {"claude": {"ran": True, "code_blind": True,
+                        "could_not_assess": ["whether load_repo_cfg validates the path",
+                                             "the other two CI jobs' conventions"]},
+             "codex": {"ran": True, "code_blind": True,
+                       "could_not_assess": ["migrations/versions/"]}}
+    assert panel.coverage_veto(blind, None, 0, 1_000) == []
+    assert panel.round_stop(1, 2, [], [], [])["confident"] is True
+    # A seat that COULD have read the tree is making a claim about this round.
+    sighted = {"claude": {"ran": True, "code_blind": False,
+                          "could_not_assess": ["migrations/versions/"]}}
+    assert panel.coverage_veto(sighted, None, 0, 1_000) == [
+        "claude could not assess: migrations/versions/"]
+
+
+def test_blindness_is_recorded_state_rather_than_read_out_of_the_declaration():
+    """The exemption reads `meta["code_blind"]`, never the text of the gap.
+
+    Both directions are wrong, and they are the same two `absent` records. The
+    entries are free-form prose a model wrote, so a regex over them would exempt a
+    genuine round-specific gap whose wording happened to match ("could not read
+    the fix") while still counting the structural one that did not ("no view of
+    the caller"). And the day a vendor's phrasing drifts, a rule keyed on wording
+    silently changes which rounds can stop confidently, with nothing failing to
+    say so.
+
+    So a blind seat is exempt even when its gap reads like a fact about the round,
+    and a sighted seat's is counted even when it reads like a fact about the
+    design. What decides is how the seat was RUN."""
+    round_shaped = {"codex": {"ran": True, "code_blind": True,
+                              "could_not_assess": ["the fix in this very diff"]},
+                    "claude": {"ran": True, "code_blind": True}}
+    assert panel.coverage_veto(round_shaped, None, 0, 1_000) == []
+    design_shaped = {"codex": {"ran": True, "code_blind": False,
+                               "could_not_assess": ["anything outside the diff"]},
+                     "claude": {"ran": True, "code_blind": False}}
+    assert panel.coverage_veto(design_shaped, None, 0, 1_000) == [
+        "codex could not assess: anything outside the diff"]
+
+
+def test_a_blind_panel_still_vetoes_every_other_way_of_coming_up_short():
+    """The exemption is one line of this function and must not read as a pardon.
+
+    A blind seat that crashed, was cut by a budget, or returned something
+    unparseable has told you something about THIS round, and so has a judge that
+    never ruled. If exempting the declarations quietly took these with it, the
+    change would have replaced a signal that was never positive with one that is
+    never negative — which is the same defect wearing the opposite sign."""
+    meta = {
+        "claude": {"ran": True, "code_blind": True, "truncated": True,
+                   "max_diff_chars": 60_000, "could_not_assess": ["the caller"]},
+        "codex": {"ran": False, "code_blind": True,
+                  "skip": "codex (gpt): exited 1 (429 rate limited)"},
+        "pi": {"ran": True, "code_blind": True, "unstructured": True},
+    }
+    why = panel.coverage_veto(meta, judge_skip="judge: claude CLI absent",
+                              flagged=1, diff_chars=118_402)
+    joined = " | ".join(why)
+    assert "claude saw 60,000 of 118,402" in joined
+    assert "codex did not run" in joined
+    assert "pi returned no structured reply" in joined
+    assert "not adjudicated" in joined
+    assert "1 finding(s) whose reporter said the FIX needs re-reading" in joined
+    # ...and the one thing that IS structural stayed out.
+    assert "could not assess" not in joined
+
+
+def test_a_partial_meta_dict_still_vetoes_its_declarations():
+    """Which way the default falls, pinned deliberately.
+
+    `code_blind` absent from a meta dict means "nobody recorded how this seat was
+    run", and the answer to that has to be the veto. Failing closed costs a round
+    its confidence; failing open claims a diff was read whole on the strength of a
+    key nobody set — and that is the direction every other exemption in this file
+    is written to avoid."""
+    unrecorded = {"claude": {"ran": True, "could_not_assess": ["the caller"]}}
+    assert panel.coverage_veto(unrecorded, None, 0, 1_000) == [
+        "claude could not assess: the caller"]
+
+
+def test_the_kernel_ceiling_is_reported_without_vetoing():
+    """`agy`'s prompt travels in argv and the kernel caps one element, so on a
+    large diff that seat structurally cannot be handed all of it — on PR #160,
+    116,771 of 175,547 chars, 66.5%. Constant, like an absent CLI: it is true of
+    every round on this box at this diff size, so it cannot separate a quiet round
+    from a broken one.
+
+    A BUDGET is a different fact. Someone typed it, it can be raised, and
+    `diff_budget` honours it precisely so the consequence gets surfaced — so
+    truncation by config still vetoes. `argv_capped` is what tells the two
+    apart."""
+    kernel = {"antigravity": {"ran": True, "truncated": True, "argv_capped": True,
+                              "max_diff_chars": 116_771, "code_blind": True},
+              "claude": {"ran": True, "code_blind": True}}
+    assert panel.coverage_veto(kernel, None, 0, 175_547) == []
+    budget = {"antigravity": {"ran": True, "truncated": True, "argv_capped": False,
+                              "max_diff_chars": 6_000, "code_blind": True},
+              "claude": {"ran": True, "code_blind": True}}
+    assert panel.coverage_veto(budget, None, 0, 175_547) == [
+        "antigravity saw 6,000 of 175,547 diff chars"]
+
+
+def test_a_panel_whose_every_running_seat_was_argv_capped_cannot_stop_confidently():
+    """The floor under the exemption above, and it is the same floor the absent
+    seats needed. Exempting per seat means a panel whose ONLY running seat is the
+    argv-bound one produces an empty veto list — and `confident` is `not veto`, so
+    the round claims a confident stop on a diff nothing saw whole. Reachable by
+    `--reviewers antigravity`, or by a repo that switched the others off, and it
+    lands on the unattended loops where the claim is believed."""
+    alone = {"antigravity": {"ran": True, "truncated": True, "argv_capped": True,
+                             "max_diff_chars": 116_771, "code_blind": True}}
+    veto = panel.coverage_veto(alone, None, 0, 175_547)
+    assert veto == ["every reviewer that ran was cut by the argv ceiling — "
+                    "nothing read this diff whole"]
+    assert panel.round_stop(1, 2, [], [], veto)["confident"] is False
+    # One seat that saw the whole thing is enough to lift it — that seat's reading
+    # is what the round rests on, and it is not truncated.
+    beside = dict(alone, claude={"ran": True, "code_blind": True})
+    assert panel.coverage_veto(beside, None, 0, 175_547) == []
 
 
 def test_a_panel_with_nothing_to_declare_vetoes_nothing():
@@ -1159,7 +1304,7 @@ PANEL_CFG = {"github": "acme/board", "path": "/tmp/acme-board",
              "review_panel": {}}
 
 
-def _fake_adjudicate(clusters, diff, model, pr, budget=None, coverage=None, cwd=None, ci=""):
+def _fake_adjudicate(clusters, diff, model, pr, budget=None, coverage=None, cwd=None, ci="", **_kw):  # **_kw: code_tree/budget_usd since #113
     """Every reported finding confirmed, one canonical record each — the judge's
     ruling is not what these tests are about."""
     flat = [f for grp in clusters for f in grp]
@@ -1617,3 +1762,107 @@ def test_the_judge_gets_the_same_one_shot_reparse_the_reviewers_get(monkeypatch)
     out, skip, _ = panel.adjudicate([[leak]], "diff", "", 34)
     assert len(calls) == 2 and calls[1] == 1, "one extra attempt, not another three"
     assert skip is None and [c.verdict for c in out] == ["confirmed"]
+
+
+# ---- the whole round, end to end ------------------------------------------
+
+def _round_declaring(monkeypatch, capsys, tmp_path, gaps, blind, round_no,
+                     baseline=()):
+    """One whole panel run whose seats declare `gaps` and were (or were not) able
+    to read the code. `review_llm` is replaced AFTER `_stub_panel`, which installs
+    its own — patching before it is silently overwritten, and the test then passes
+    on the default seat rather than the one it described."""
+    _stub_panel(monkeypatch, findings=[])
+    monkeypatch.setattr(panel, "review_llm",
+                        lambda *a, **k: panel.ReviewerRun([], None, 10, list(gaps),
+                                                          code_blind=blind))
+    out = tmp_path / f"decl{round_no}-{blind}.json"
+    assert panel.run("board", 34, post=False, json_file=str(out), record=False,
+                     round_no=round_no, baseline=list(baseline), max_rounds=3) == 0
+    return capsys.readouterr().out, json.loads(Path(out).read_text())
+
+
+def test_a_blind_seats_declarations_reach_the_payload_without_costing_the_stop(
+        monkeypatch, capsys, tmp_path):
+    """The change, exercised through a real `run` rather than through
+    `coverage_veto` alone — because the exemption is only worth anything if the
+    flag actually arrives, and there are four hops between the sandbox and the
+    veto (`run_seat` -> `SeatTurn` -> `review_llm` -> `ReviewerRun` ->
+    `reviewer_meta`). A unit test of the last hop passes just as happily when the
+    first one drops the value.
+
+    Three assertions, and they are the whole contract: the round stops CONFIDENTLY
+    with gaps declared, the gaps are still in the report where a reader can act on
+    them, and the payload records `code_blind` so a later round — or the round
+    where #113's setting is turned on — can be told apart from this one."""
+    declared = ["whether load_repo_cfg validates the path",
+                "worktree-holder's exit codes"]
+    # A round 1 to be the baseline: without one, round 2 vetoes on having nothing
+    # to compare against, which would mask exactly what this measures.
+    _, first = _round_declaring(monkeypatch, capsys, tmp_path, [], True, 1)
+    r1 = str(tmp_path / "decl1-True.json")
+    report, payload = _round_declaring(monkeypatch, capsys, tmp_path, declared,
+                                       True, 2, baseline=[r1])
+    stop = payload["round_stop"]
+
+    # 1. it stopped, and it was allowed to mean it.
+    assert stop["stop"] is True
+    assert stop["confident"] is True, stop["veto"]
+    assert not [v for v in stop["veto"] if "could not assess" in v]
+
+    # 2. the declarations are still on the PR — reported, not counted.
+    for gap in declared:
+        assert gap in report
+    assert "did not cost the round its confidence" in report
+
+    # 3. and the state that decided it is in the payload, per seat.
+    ran = [m for m in payload["reviewers"].values() if m.get("ran")]
+    assert ran and all(m["code_blind"] is True for m in ran)
+
+
+def test_a_seat_that_can_read_the_code_puts_its_gaps_back_in_the_veto(
+        monkeypatch, capsys, tmp_path):
+    """The forward-compatibility half, and the reason this is state rather than a
+    deletion. #113's second half makes code access a per-repo setting defaulting
+    ON; a seat that gets the PR's tree and still cannot answer something is making
+    a claim about THIS round, and that claim has to cost the round its confidence
+    again. Nothing else in this suite would notice if turning the setting on left
+    the exemption in place — the veto list would simply stay short, which reads
+    exactly like success."""
+    _, _first = _round_declaring(monkeypatch, capsys, tmp_path, [], False, 1)
+    r1 = str(tmp_path / "decl1-False.json")
+    report, payload = _round_declaring(monkeypatch, capsys, tmp_path,
+                                       ["migrations/versions/"], False, 2,
+                                       baseline=[r1])
+    stop = payload["round_stop"]
+    assert stop["confident"] is False
+    assert any("could not assess: migrations/versions/" in v for v in stop["veto"])
+    # The reader-facing note belongs to the blind case and must not appear here.
+    assert "did not cost the round its confidence" not in report
+
+
+def test_sonarqube_cannot_switch_off_the_argv_floor():
+    """The floor counts LLM seats only, and the second model that read this diff was
+    right that counting everything was too permissive.
+
+    `sonarqube` shares `reviewer_meta` and carries no `truncated` key, so an `all()`
+    over every entry was False the moment sonar ran — switching the floor off. A
+    round could then stop confidently with `--reviewers antigravity` and sonar
+    enabled and no LLM having read the diff whole. Sonar is the hard gate alongside
+    the panel, not a reviewer reading the change, so it cannot stand in for one.
+
+    Note the floor above this one asks a different question — "did ANYTHING run?" —
+    and counts sonar deliberately. That is why they are separate tests as well as
+    separate branches."""
+    capped = {"antigravity": {"ran": True, "truncated": True, "argv_capped": True,
+                              "max_diff_chars": 116_771, "code_blind": True},
+              "sonarqube": {"ran": True, "skip": None}}
+    veto = panel.coverage_veto(capped, None, 0, 175_547)
+    assert any("nothing read this diff whole" in v for v in veto), (
+        "a running sonarqube suppressed the floor")
+    assert panel.round_stop(1, 2, [], [], veto)["confident"] is False
+
+    # An LLM seat that saw the whole diff still lifts it — that seat's reading is
+    # what the round rests on.
+    with_reader = dict(capped, claude={"ran": True, "code_blind": True})
+    assert panel.coverage_veto(with_reader, None, 0, 175_547) == []
