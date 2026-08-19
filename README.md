@@ -659,7 +659,7 @@ full — including what was broken before it, which is the part no diff recovers
   this machine's checkout, cherry-pick a located SHA, resume a session — and the refusals those
   inherit, where "could not tell" counts as a no. Not a third client: it consumes the same
   `mcp/mcp_server/client.py` the MCP server does, which is also how that package finally got CI.
-- **vNEXT** — the panel decides whether the round is worth running. It used to dispatch every
+- **v2.52** — the panel decides whether the round is worth running. It used to dispatch every
   configured seat at full effort whatever the diff: on PR #137 that was four seats against
   763,375 chars, 6.4× the argv ceiling of the one seat whose prompt travels in argv, on a change
   that was a *pure move* — `panel.py` split into six modules with nothing retyped. Every
