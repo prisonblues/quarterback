@@ -933,13 +933,28 @@ and guessing would point the query at somebody else's.
 
 **`QUARTERBACK_TOKEN_CMD` may reference `$QUARTERBACK_AGENT`, so the agent name has to be
 resolved before the command runs.** One generated config across N hosts, each picking its
-own line out of a shared token file — `sed -n s/^$QUARTERBACK_AGENT://p ~/.config/quarterback/api-tokens`
-— is the shape this exists for, and it only works if the client defaults the name
-(environment, else `hostname -s`) *first* and exports it into the command's environment.
-A client that resolves it afterwards expands the variable to empty and reports "no token"
-against a token file that is present and valid, which presents as intermittent because it
-then depends on whether the invoking shell happened to carry the variable (#201). `qb-board`
-does this; the remaining harness-side readers are tracked in #235.
+own line out of a shared token file is the shape this exists for, and it only works if the
+client defaults the name (environment, else the config file, else `hostname -s`) *first*
+and exports it into the command's environment. A client that resolves it afterwards
+expands the variable to empty and reports "no token" against a token file that is present
+and valid, which presents as intermittent because it then depends on whether the invoking
+shell happened to carry the variable (#201). `qb-board` does this; the remaining
+harness-side readers are tracked in #235.
+
+Write the selector as a **literal** comparison rather than a regex:
+
+```sh
+QUARTERBACK_TOKEN_CMD='awk -F: -v a="$QUARTERBACK_AGENT" \
+    "\$1 == a { print \$2; exit }" ~/.config/quarterback/api-tokens'
+```
+
+The obvious `sed -n s/^$QUARTERBACK_AGENT://p …` is what the fleet generates today and it
+works for the names the fleet uses, but it interpolates the agent name into *both* a shell
+word and a regex — so a name containing `.` silently matches a different host's line, one
+containing `/` breaks the `s///` delimiter, and one containing whitespace splits into two
+`sed` arguments. The name is environment-overridable, so none of those is hypothetical;
+`awk` with `-v` takes it as data and compares it whole. The escaping burden is the token
+command's either way — the client exports the name and does not quote it for you.
 
 ## Caveats
 

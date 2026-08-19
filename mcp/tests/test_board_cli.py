@@ -30,6 +30,7 @@ class Cfg:
     config_path = "/home/rich/.config/quarterback/config"
     authenticated = True
     token_problem = None
+    token_cmd_configured = True
 
 
 def parse(*argv):
@@ -135,6 +136,75 @@ def test_a_token_source_that_answered_nothing_is_not_reported_as_an_unset_one():
     assert "daedalus" in out  # the agent the command expanded to: the whole bug
     # And NOT the old instruction, which is the part that cost the operator the hour.
     assert "Set QUARTERBACK_TOKEN" not in out
+
+
+def test_the_token_problem_report_says_what_to_do_next():
+    """A named failure the operator cannot act on is a better diagnosis, same dead end.
+
+    The message deliberately never prints the command or its output, so the only way
+    to see the helper's own words is to re-run it — under the same agent name, or the
+    selector picks a different line. That, and the one-shot QUARTERBACK_TOKEN
+    override, are what turn the diagnosis into something to do.
+    """
+
+    class Failed(Cfg):
+        token = None
+        authenticated = False
+        token_problem = "the token command exited 1"
+
+    err = io.StringIO()
+    assert _report_health(HealthyClient(), Failed(), err) == 1
+    out = err.getvalue()
+    assert "export QUARTERBACK_AGENT=daedalus" in out
+    assert 'eval "$QUARTERBACK_TOKEN_CMD"' in out
+    assert Cfg.config_path in out
+    assert "QUARTERBACK_TOKEN in the environment" in out
+    assert "one-shot override" in out
+
+
+def test_a_problem_with_no_command_configured_gets_the_other_remedy():
+    """The command remedy is false on a host that never configured a command.
+
+    `token_problem` also covers the legacy token file, which is tried whether or not a
+    command exists — so a host with no `QUARTERBACK_TOKEN_CMD` and an unreadable
+    `/run/op-secrets/quarterback-token` has a named failure whose fix genuinely IS to
+    configure a token source. Printing the command remedy there would be this bug
+    again: a confident instruction that is false on the box reading it.
+    """
+
+    class LegacyFailed(Cfg):
+        token = None
+        authenticated = False
+        token_problem = "/run/op-secrets/quarterback-token could not be read (Permission denied)"
+        token_cmd_configured = False
+
+    err = io.StringIO()
+    assert _report_health(HealthyClient(), LegacyFailed(), err) == 1
+    out = err.getvalue()
+    assert "could not be read" in out  # still named, which is the point of #201
+    assert "Set QUARTERBACK_TOKEN or QUARTERBACK_TOKEN_CMD" in out
+    # And NOT the command remedy, which there is no command to re-run for.
+    assert "eval" not in out
+    assert "setting one is not the remedy" not in out
+
+
+def test_an_awkward_agent_name_stays_copy_pasteable_in_the_remedy():
+    """`QUARTERBACK_AGENT` is environment-overridable, so the suggested line is quoted.
+
+    Unquoted, an agent name with a space turns `export QUARTERBACK_AGENT=two words`
+    into an export plus a command called `words` — a remedy that fails differently
+    from the thing it is meant to diagnose.
+    """
+
+    class Spaced(Cfg):
+        agent = "two words"
+        token = None
+        authenticated = False
+        token_problem = "the token command exited 1"
+
+    err = io.StringIO()
+    _report_health(HealthyClient(), Spaced(), err)
+    assert "export QUARTERBACK_AGENT='two words'" in err.getvalue()
 
 
 def test_the_set_one_message_survives_for_a_host_that_genuinely_has_none():

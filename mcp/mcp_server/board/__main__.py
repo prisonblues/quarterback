@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import shlex
 import sys
 import time
 from pathlib import Path
@@ -225,15 +226,49 @@ def _report_health(client: QuarterbackClient, cfg, err) -> int:
         # picks its own line out of a shared token file, so when a command comes back
         # empty the identity it ran under is the first thing worth seeing — and the
         # bug this replaces was that name being empty at exactly this moment.
-        print(
-            f"{_PROG}: {cfg.base_url} is up, but no token could be resolved, so the\n"
-            f"        board itself cannot be read.\n"
-            f"        {cfg.token_problem}, running as agent {cfg.agent!r}.\n"
-            f"        The command is the environment's QUARTERBACK_TOKEN_CMD, or the\n"
-            f"        one in {cfg.config_path} — one of the two is\n"
-            f"        already set, so setting one is not the remedy.",
-            file=err,
-        )
+        #
+        # `config.resolve` populates `token_problem` for every consumer, but this is
+        # so far the only reader of it: the MCP server and the two harness-side
+        # clients still print "no token" for a command that ran. Tracked in #235.
+        #
+        # And it ends with what to DO. A named failure the operator cannot act on is
+        # a better diagnosis and the same dead end.
+        #
+        # Which remedy is the right one is `token_cmd_configured`'s question, not a
+        # question about the wording of `token_problem`: the source that failed can be
+        # the legacy token file on a host that configures no command at all, and
+        # telling *that* operator "setting one is not the remedy" would be this bug
+        # over again — a confident instruction that is false on the box reading it.
+        lines = [
+            f"{_PROG}: {cfg.base_url} is up, but no token could be resolved, so the",
+            "        board itself cannot be read.",
+            f"        {cfg.token_problem}, running as agent {cfg.agent!r}.",
+        ]
+        if cfg.token_cmd_configured:
+            # `shlex.quote` because an agent name is environment-overridable, and a
+            # line offered for copy-pasting has to survive whatever is in it.
+            lines += [
+                "        The command is the environment's QUARTERBACK_TOKEN_CMD, or the",
+                f"        one in {cfg.config_path} — one of the two is",
+                "        already set, so setting one is not the remedy. To see what it",
+                "        says, run it yourself under that name; its own output is",
+                "        deliberately not repeated here, because it can be the token:",
+                f"            export QUARTERBACK_AGENT={shlex.quote(cfg.agent)}",
+                f"            . {shlex.quote(str(cfg.config_path))}"
+                "   # skip if yours is in the environment",
+                '            eval "$QUARTERBACK_TOKEN_CMD"',
+                "        Or set QUARTERBACK_TOKEN in the environment: a one-shot override",
+                "        that bypasses the command without editing a generated config.",
+            ]
+        else:
+            lines += [
+                "        Nothing configured a token command, so that was the last-resort",
+                "        fallback failing rather than your own configuration.",
+                "        Set QUARTERBACK_TOKEN or QUARTERBACK_TOKEN_CMD in",
+                f"        {cfg.config_path}, or export QUARTERBACK_TOKEN for this",
+                "        invocation.",
+            ]
+        print("\n".join(lines), file=err)
         return 1
     print(
         f"{_PROG}: {cfg.base_url} is up, but this machine has no token, so the board\n"
