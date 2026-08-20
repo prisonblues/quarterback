@@ -77,6 +77,12 @@ def brief(name: str) -> Path:
     so this single assertion is what makes that set complete rather than a list somebody has to
     remember to update."""
     rel = f"harness/commands/{name}"
+    # Note the shape of this accessor, and its limit: it takes a bare filename and hard-codes
+    # the briefs directory onto it, so it can only ever express a read inside
+    # `harness/commands/`. That is every filesystem read this suite makes — but it is not every
+    # dependency: the module also does `sys.path.insert` on `harness/loops` and imports
+    # panel_core, which no path gate can see, and which is why `harness/loops` is declared as a
+    # TREE in `_prose_sandbox` rather than as a read here.
     assert rel in READS, (
         f"{rel!r} is read here but is not in READS, so flake.nix's prose-consistency-tests "
         f"check does not know to install it — where this read would error as a FileNotFoundError "
@@ -399,3 +405,13 @@ def test_the_panel_command_describes_the_dimensions_it_actually_sends(briefs):
     assert re.search(r"load-bearing", text, re.IGNORECASE), (
         "panel.md's dimension list does not mention load-bearing tests, which "
         "REVIEW_PROMPT now asks every reviewer for")
+
+
+def test_the_reads_are_declared_rather_than_summarised():
+    """`brief`'s refusal is the mechanism `_prose_sandbox`'s comparison rests on for this suite,
+    and it had no test — an identical mechanism in test_fixer_escalation got one, and a broken
+    refusal here would have gone unnoticed while the guards reported the suite as covered."""
+    with pytest.raises(AssertionError, match="not in READS"):
+        brief("no-such-brief.md")
+    with pytest.raises(AssertionError, match="install it"):
+        brief("loops.md")          # a real file, and still not one this suite declared

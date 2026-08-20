@@ -150,12 +150,20 @@
           # four that failed LOUDLY here — "this suite is now green about nothing" —
           # rather than erroring on a missing file.
           rm harness/tests/test_regression_test_redgreen.py
-          # The category's own guard and its helper go with them: they compare the
-          # prose-consistency check's install list against what its suites read, which
-          # is a question about a different check than this one.
+          # The category's own guards and their helpers go with them: they compare the
+          # prose-consistency check's install list against what its suites read, which is a
+          # question about a different check than this one. test_commands_wired.py is NOT one
+          # of those — it compares hm-module.nix's `commands` default against the briefs
+          # directory and knows nothing about install lists. It leaves for the same reason as
+          # the two suites above it: it reads harness/hm-module.nix and globs harness/commands,
+          # neither of which this check holds. Its module-level `parametrize` calls read both at
+          # COLLECTION time, so it has been erroring here since it landed — which is why the
+          # count of this mechanism's instances is five, not four.
           rm harness/tests/test_commands_wired.py
           rm harness/tests/test_prose_sandbox.py
           rm harness/tests/_prose_sandbox.py
+          rm harness/tests/test_flake_sandbox.py
+          rm harness/tests/_flake_sandbox.py
           # Same treatment the package gets: there is no /usr/bin/env in the
           # sandbox, so an unpatched `#!/usr/bin/env bash` fails to exec at all
           # — and every test then fails for a reason that has nothing to do with
@@ -205,6 +213,7 @@
           # each missing path, and following that advice should not produce a second,
           # unrelated "No such file or directory".
           install -Dm644 ${./harness/tests/test_release_numbers.py} repo/harness/tests/test_release_numbers.py
+          install -Dm644 ${./harness/tests/_flake_sandbox.py} repo/harness/tests/_flake_sandbox.py
           install -Dm644 ${./CHANGELOG.md}   repo/CHANGELOG.md
           install -Dm644 ${./README.md}      repo/README.md
           install -Dm644 ${./pyproject.toml} repo/pyproject.toml
@@ -267,11 +276,19 @@
         # worth more than per-suite precision here, since these sandboxes want the same
         # thing.
         #
-        # Members today: test_fixer_escalation.py (#251) and
-        # test_regression_test_redgreen.py (#257). `_prose_sandbox.MEMBERS` is the list
-        # the guard iterates, and it is held against the suites installed here in both
-        # directions — a suite in the sandbox but not in MEMBERS would have its reads
-        # compared against nothing.
+        # Members are listed in `_prose_sandbox.MEMBERS`, not here: that list is what the
+        # guard iterates, and it is held against the suites installed below in both
+        # directions, so a second copy of it in a comment could only ever go stale. A suite
+        # in this sandbox but absent from MEMBERS would have its reads compared against
+        # nothing, and a member this check does not run would have its declaration checked
+        # against a sandbox it never sees; both are failures, and both are asserted.
+        #
+        # Each member declares its reads and routes every one through an accessor that
+        # refuses an undeclared path — three members, three accessors, no shared name for
+        # them. `test_the_check_supplies_every_path_its_suites_read` and its converse in
+        # `test_prose_sandbox.py` are the comparison; `_flake_sandbox` is the reader they
+        # share with release-metadata-tests, so there is one parser for this file rather
+        # than one per suite.
         #
         # Copied one by one rather than the repo root wholesale, for the reason
         # release-metadata-tests gives: `./.` would drag a developer's `mcp/.venv` and
@@ -296,10 +313,14 @@
           install -Dm644 ${./harness/tests/test_commands_wired.py}           repo/harness/tests/test_commands_wired.py
           install -Dm644 ${./harness/tests/test_prose_sandbox.py}            repo/harness/tests/test_prose_sandbox.py
           install -Dm644 ${./harness/tests/_prose_sandbox.py}                repo/harness/tests/_prose_sandbox.py
-          # The briefs as a tree: between them the two suites read six of the files in
-          # it, and which six is a judgement that moves. Enumerating them bought a
-          # staleness guard over a directory whose whole contents are prose these
-          # suites exist to read.
+          install -Dm644 ${./harness/tests/_flake_sandbox.py}                 repo/harness/tests/_flake_sandbox.py
+          install -Dm644 ${./harness/tests/test_flake_sandbox.py}             repo/harness/tests/test_flake_sandbox.py
+          # The briefs as a tree, and not as a file list, because one of the suites GLOBS
+          # this directory to ask which briefs exist — the directory is the question, so a
+          # list of files could not express it. The others name individual briefs, and which
+          # ones is a judgement that moves as loops are added. No count here on purpose: the
+          # union is in the suites' own READS, and a number in a comment is the thing that
+          # goes stale.
           cp -r ${./harness/commands} repo/harness/commands
           # harness/loops as a tree because it has to be IMPORTABLE, not because its
           # files are read: test_regression_test_redgreen.py asks Python for
@@ -332,10 +353,20 @@
           # flake.nix is not beside the suite — it is installed above precisely so that
           # it is, so a skip from it means that line went away and took this sandbox's
           # only staleness check with it.
+          # The one skip this check expects is none at all, and the reason is specific: the
+          # only test here that can skip is test_prose_sandbox.py's flake_text fixture, when
+          # flake.nix is not beside the suites. It is installed above precisely so that it is,
+          # so a skip from it means that line went away and took the whole comparison with it.
+          #
+          # Named by test rather than counted, because this check serves three suites and a
+          # bare "expect zero" becomes the wrong diagnosis the day any member gains a skipif —
+          # the sibling check above allowlists its skips by reason for the same reason.
           if grep -q '^SKIPPED' report.txt; then
-            echo "a test skipped in the fixer-escalation sandbox, and none is expected." >&2
-            echo "If it is the coupling guard, flake.nix stopped being installed and" >&2
-            echo "nothing is checking this file list any more:" >&2
+            echo "a test skipped in the prose-consistency sandbox, where none is expected." >&2
+            echo "If it is test_prose_sandbox.py's flake_text fixture, flake.nix stopped" >&2
+            echo "being installed and nothing is comparing this check against its suites" >&2
+            echo "any more. If it is a member's own skipif, add its reason to an allowlist" >&2
+            echo "here rather than deleting this guard:" >&2
             grep '^SKIPPED' report.txt >&2
             exit 1
           fi
