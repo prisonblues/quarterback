@@ -11,9 +11,7 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
-<<<<<<< HEAD
 ## vNEXT — an order the rules derive, and a record of what they claimed
-=======
 ## vNEXT — a claim nobody takes: derive the key, make the plan a row, block on pickup
 
 `claims()` returned `[]`. Not filtered — empty, fleet-wide, across every repo and every
@@ -304,7 +302,6 @@ in this repo and about to do substantive work → stopped — is one `qb-claimed
 not in this repo to write. What is here is the primitive it needs, with the exit codes that
 make failing closed possible.
 ## v2.59 — a row key the dashboard can actually tell apart
->>>>>>> origin/main
 
 The plan has had an order since v2.39 and one writer for it: a human. That is the right
 rule — "if any agent may reorder it, the plan thrashes and stops being the shared intent it
@@ -409,7 +406,7 @@ with human privileges, generating #183's confidently-wrong `next` continuously r
 once.
 
 `POST /plan/order-proposal` records a proposal with its evidence in `plan_order_proposals`
-(schema 0025) — **and the caller supplies no order**. The board computes what it stores, so a
+(schema 0026) — **and the caller supplies no order**. The board computes what it stores, so a
 row always says what the *rules* produced rather than what an agent asserted and labelled
 deterministic. An agent's ordering opinion belongs on the board addressed to whoever is
 deciding, which needs no endpoint.

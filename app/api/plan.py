@@ -43,11 +43,7 @@ from typing import Literal, NamedTuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, Field
-<<<<<<< HEAD
-from sqlalchemy import func, or_, select, text, tuple_
-=======
-from sqlalchemy import func, or_, select, text, update
->>>>>>> origin/main
+from sqlalchemy import func, or_, select, text, tuple_, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -66,12 +62,9 @@ from app.api.claims import (
 from app.auth import human, identify, reader
 from app.claimkey import REPO_SHAPE, WORK, BadRef, canonical_repo, derive
 from app.db import get_session
-<<<<<<< HEAD
-from app.models.order_proposal import OrderProposal
-=======
 from app.identity import same_machine
+from app.models.order_proposal import OrderProposal
 from app.models.plan import Plan
->>>>>>> origin/main
 from app.models.plan_item import PlanItem
 from app.models.resource_lease import ResourceLease
 from app.models.review import ReviewFinding, ReviewFindingOutcome, ReviewRun
@@ -1647,7 +1640,6 @@ async def reorder(
     }
 
 
-<<<<<<< HEAD
 # --- suggested order (#232's deterministic slice) ---------------------------
 #
 # Rule 3 above says only a human reorders the plan. That is a rule about who may
@@ -2288,7 +2280,6 @@ async def get_order_proposal(
     if row is None:
         raise HTTPException(404, "order proposal not found")
     return _proposal_view(row, full=True)
-=======
 # ------------------------------------------------------------- plans, as rows
 
 
@@ -2811,4 +2802,3 @@ async def complete_plan(
     return {**await _view_plan(session, plan, None, now),
             "claim_left": None if mine or claim is None else claim_view(claim),
             "items_left": [str(i.id) for i in left]}
->>>>>>> origin/main

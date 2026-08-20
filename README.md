@@ -937,7 +937,6 @@ full — including what was broken before it, which is the part no diff recovers
   followed — but shipped text that already existed is **not** exempt, since a test can assert
   on it, as this change did to its own prompt and briefs. The panel's `REVIEW_PROMPT` also stops asking only whether a test is **absent** —
   #90's fixture answered that correctly — and now asks whether a present test is load-bearing.
-<<<<<<< HEAD
 - **vNEXT** — an order the rules derive, and a record of what they claimed. The plan has had
   one writer for its order since v2.39 — a human, so that it stays shared intent rather than
   something every agent rewrites — and nowhere to put the other thing: *what order do the
@@ -954,12 +953,11 @@ full — including what was broken before it, which is the part no diff recovers
   `displaced` at both ends. `unknown` names what it could not read, changed-file
   overlap included: its collision query is #101 and open, and overlap is a refinement that
   only ever breaks a tie, so its absence widens the ambiguous set and changes nothing else.
-  `POST /plan/order-proposal` writes the proposal and its evidence to a ledger (schema 0025)
+  `POST /plan/order-proposal` writes the proposal and its evidence to a ledger (schema 0026)
   and takes no order from the caller, because #232's planner cannot be told what its last
   orders cost until something has been recording them while they were still predictions — and
   the outcome half is absent rather than stubbed, since a null `outcome` column invites the
   question to be answered by whoever is looking.
-=======
 - **v2.59** — a row key the dashboard can actually tell apart. `qb-dash-tui` dies with
   `DuplicateKey` when two rows want the same key, and that is not a bad-looking row — a
   `DataTable` raises, so the whole dashboard becomes a traceback. #208 fixed the reported
@@ -990,7 +988,6 @@ full — including what was broken before it, which is the part no diff recovers
   own rows were going stale for every open PR. And `preland`'s merge-claim check now **warns when a
   repo claims nothing at all**, because `unclaimed` there was the absence of a record being read as
   evidence.
->>>>>>> origin/main
 - **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
   object store; wire `landed` refs to a cherry-pick helper.
 

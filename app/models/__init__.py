@@ -2,11 +2,8 @@ from app.models.agent_name import AgentName
 from app.models.base import Base
 from app.models.blob import Blob
 from app.models.lease import Lease
-<<<<<<< HEAD
 from app.models.order_proposal import OrderProposal
-=======
 from app.models.plan import Plan
->>>>>>> origin/main
 from app.models.plan_item import PlanItem
 from app.models.post import Post
 from app.models.resource_lease import ResourceLease
@@ -27,11 +24,8 @@ __all__ = [
     "Base",
     "Blob",
     "Lease",
-<<<<<<< HEAD
     "OrderProposal",
-=======
     "Plan",
->>>>>>> origin/main
     "PlanItem",
     "Post",
     "ResourceLease",
