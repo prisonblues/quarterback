@@ -152,7 +152,12 @@ shared mutable state, transaction isolation); performance (N+1, unbounded loops,
 missing indexes for new queries, needless allocations).
 
 **Completeness:** every new code path needs a test; every bug fix a regression
-test; every visible edge case a test. Docs that describe changed behaviour
+test; every visible edge case a test. Review the tests **as tests**, not only for
+their absence: a test that would still pass with the bug put back is a passing
+assertion that the defect is gone, and it will keep passing when the defect returns.
+On PR #90 a deliberate, docstring'd regression test passed because its fixture
+happened to list two baselines in the working order, and the defect it was written
+for had to be found a round later in code that was already "covered". Docs that describe changed behaviour
 (CLAUDE.md, docs/, README, docstrings) get updated. Related code — callers,
 siblings, parallel implementations — is governed by **`reviewer_scope`**: under
 `repo` it gets made consistent (search the codebase, don't just review the diff);
@@ -361,6 +366,70 @@ Read CI config + Makefile to find what the project runs, then:
 4. **Type check** (if used).
 5. **Codegen sync** — if CI has `git diff --exit-code` checks, regenerate.
 
+**Red/green every regression test you wrote.** A regression test written alongside
+its fix has never once run against the broken code, so nothing so far has shown it
+would have caught anything. Before you commit, make each one fail:
+
+```
+git add -N <every file your fix changed OR ADDED>
+git diff HEAD -- <those same files> > .redgreen.patch
+test -s .redgreen.patch || { echo "STOP: captured nothing"; exit 1; }
+git checkout HEAD -- <the files that existed before>   # drop the edits
+rm <the files your fix ADDED>                          # and the additions
+pytest <the new tests>                                 # MUST fail, on the assertion
+git apply .redgreen.patch && rm .redgreen.patch        # put the fix back
+pytest <the new tests>                                 # green again
+```
+
+**Do NOT use `git stash` for this.** Every worktree of a repo shares one
+`refs/stash` — it lives in the common git dir, not the per-worktree one — so a stash
+you push is listed and poppable from every other worktree in the fleet, and
+`stash@{0}` means something different depending on who pushed last. This is not
+theoretical: the PR that added this instruction lost its own working tree to it, when
+a concurrent agent in a sibling worktree popped the red/green stash into its own
+checkout. A patch file is per-worktree by construction and shares nothing.
+
+**`test -s` is the guard, and it has to HALT.** If the capture comes out empty —
+mistyped paths, or a fix already committed — the "red" run executes with the fix still
+in place, comes out **green**, and reads exactly like the step passing. So the guard is
+`|| { echo …; exit 1; }` and not `|| echo …`: a bare `echo` prints a warning, exits 0,
+and carries straight on into the run it was meant to prevent, which is the failure mode
+wearing the costume of a check. Every version
+of this check that trusted something other than "did we actually capture bytes" failed
+on that state: a `git stash list | head -1` label match is answered yes by a leftover
+stash from an earlier run.
+
+**`git add -N` is what makes a file the fix ADDED show up in the patch.** Without
+intent-to-add, `git diff` ignores untracked files, so a fix spanning an edit and a new
+module is half-captured and the red run imports the new half. Those same added files
+are removed with `rm` rather than `git checkout HEAD --`, which cannot restore a path
+that is absent from HEAD. Your new *test* file is not in this list and stays where it
+is — which is the point.
+
+**If your fix is already committed**, there is nothing uncommitted to capture: get the
+pre-fix state with `git checkout <remote>/<base> -- <the files your fix changed>`, run
+the tests, then `git checkout HEAD -- <the same files>` to put your fix back.
+
+Read *how* it failed. A test that errors on an import, a missing fixture or a
+`TypeError` has not demonstrated anything — it has to fail on the assertion that
+names the defect. Stash the **fix**, not the test: stashing both proves only that a
+file you deleted no longer runs.
+
+**Exempt only when there is genuinely nothing to fail against.** A regression test
+for a path the fix *created* — a new function, a new flag, a new file — has no
+pre-fix behaviour to run against. Name those in the summary as `red/green: N-A (new
+code path)`.
+
+**A prompt string, a config default or a doc that already existed is NOT exempt.**
+That text is the artefact, a test can assert on it, and such a test fails against the
+pre-fix text exactly like any other — this instruction arrived in a PR that changed a
+prompt string and a set of markdown briefs, and nine of its eleven tests went red
+against the previous text. Nor is a fix to code that already existed: if that test
+will not go red, it is testing something other than the bug, and the test is the
+thing to fix. The exemption exists so the legitimate case does not have to be lied
+about; an exemption wide enough to cover the awkward cases is how the whole step
+stops happening.
+
 **DB-backed tests:** if the diff touches DB-facing code (models/schema,
 migrations, ORM queries, session/transaction handling, DB-backed routes/tasks),
 the fast suite often **excludes** DB tests and proves nothing about them. Find
@@ -432,8 +501,9 @@ Escalated — the approach, not the code
 
 Tests added: ...
 Docs updated: ... (or "none needed")
-Verification — Tests: pass (N passed, M added) | DB-backed: pass / N-A /
-  unverified | Lint: clean | Format: clean | Types: clean / N-A
+Verification — Tests: pass (N passed, M added) | Red/green: N of M went red
+  (rest N-A: new code path) | DB-backed: pass / N-A / unverified | Lint: clean |
+  Format: clean | Types: clean / N-A
 Commit: <sha> <subject>
 ```
 

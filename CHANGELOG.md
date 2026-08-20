@@ -11,6 +11,90 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
+## v2.58 — a regression test has to fail first
+
+Every fix command in the harness told the fixer to write a regression test. None of
+them asked whether that test would have **caught the defect it was written for**, and
+a test that would not is worse than no test: it is a passing assertion that the bug is
+gone, and it keeps passing after the bug comes back.
+
+**PR #90 is the demonstration, and it cost a round.** Round 1 found that
+`load_baseline`'s anchor selection was order-dependent — baselines `[r2 (no head_sha),
+r1 (head_sha)]` produced `None` where `[r1, r2]` produced the sha, the same set
+decided by `--baseline` argument order. A test for exactly that behaviour already
+existed and passed: `test_an_older_round_still_anchors_when_the_newest_names_no_commit`
+was written deliberately, with a docstring explaining that an older anchor must not be
+cleared by a newer payload naming no commit. Its fixture happened to list the two
+baselines in the working order. The assertion was right; nobody had ever run it against
+the broken code, because the test was written alongside the fix and the broken code no
+longer existed by then. The panel had to find the defect a round later, in code that
+was already "covered".
+
+**The practice already existed informally and was written down nowhere.** The fixer on
+that same PR reported, unprompted, that all 10 of its new positive cases had been
+confirmed to fail against the pre-fix `panel.py`. It found nothing that round, which is
+the point — it is cheap when it passes and it is the only thing that catches the case
+above. `review-pr.md`'s brief said "every bug fix a regression test" and
+`panel-review-pr.md` inherited it; neither said the test must first fail.
+
+So `review-pr.md` (inherited by `/panel-review-pr`), `fix-issue.md` and
+`fix-issue-here.md` now all say the same thing: before committing, capture the **fix**
+as a patch and remove it — not the test — run each new regression test, and confirm it
+fails **on the assertion that names the defect**. Then restore and confirm green.
+Removing both proves only that a file you removed no longer runs, and a test that errors on an import or a missing
+fixture has demonstrated nothing. `/review-pr`'s summary table reports the count, so a
+fixer that skipped the step no longer reads like one that did it.
+
+**The exemption is stated, and it is narrow.** A regression test for a path the fix
+*created* has no pre-fix behaviour to fail against; those report `red/green: N-A (new
+code path)`. An instruction with no exemption for the legitimate case gets worked around
+rather than followed — and a worked-around instruction is worse than an honest `N-A`,
+because it destroys the signal saying which tests were actually proved.
+
+A prompt string, a config default or a doc that **already existed** is not exempt.
+Shipped text is an artefact a test can assert on, and this change proved it while being
+written: it edits `REVIEW_PROMPT` and three markdown briefs, and thirteen of its fifteen new
+tests were confirmed red against the previous text. The first draft of the instruction
+exempted exactly that case, Codex flagged it in review, and the exemption as drafted
+would have excused most of this harness from its own check — which is the failure #114
+predicted in the sentence asking for the exemption to be stated at all.
+
+**The mechanism is a patch file, not `git stash`, and that took three drafts.**
+`refs/stash` lives in the common git dir rather than the per-worktree one, so every
+worktree of a repo shares one stash stack: a stash pushed in one is listed and poppable
+from all the others, and `stash@{0}` resolves to whatever the last pusher meant. This
+harness runs many concurrent worktrees off one `.git` by design, which makes stash the
+wrong primitive here specifically — and this change proved it by losing its own working
+tree, when a concurrent agent in a sibling worktree popped the red/green stash into its
+own checkout and pushed it back. The first draft checked the top stash's label, which a
+leftover `redgreen` entry from an earlier run answers yes to while the push under it
+saved nothing; the second counted entries, which caught the loss but cannot prevent it.
+The third captures a patch, which shares nothing. #210 tracks giving the harness a
+per-worktree stash of its own.
+
+Three details in the sequence exist because the obvious spelling is wrong, all of them
+Codex findings across three review passes. **`test -s` on the captured patch** is the check
+the whole instruction rests on: an empty capture — mistyped paths, or a fix already
+committed — leaves the red run executing with the fix still in place, coming out green,
+reading exactly like the step passing. It is written `|| { echo …; exit 1; }` rather than
+`|| echo …`, because the bare form warns, exits 0 and proceeds into the run it exists to
+prevent — a check wearing the costume of a check, which is the same defect class as the
+vacuous test this whole release is about. **`git add -N`** is what puts a file the fix
+*added* into the patch, because `git diff` ignores untracked files and a half-captured fix
+means the red run imports the new half; those files come back out with `rm`, since `git
+checkout HEAD --` cannot restore a path absent from HEAD. **And the new test file is not
+in the removed set** — take it out along with the fix and the red run collects nothing,
+which exits non-zero with no assertion having failed and reads as red to anything watching
+exit status.
+
+`harness/tests/test_regression_test_redgreen.py` pins all of it: that every
+fix-writing brief carries the instruction, that it names the red half and how to get
+the broken code back, that it says to remove the fix rather than the test, that it
+requires the failure to be the assertion, that the exemption is stated with a
+reportable form, and that the prompt gained the load-bearing dimension without losing
+the absence one. Thirteen of its fifteen tests were confirmed to fail against the pre-#114
+files; the other two are premises that are supposed to hold either way.
+
 ## v2.57 — a seat is its number *and* its project, so a second screen can start
 
 One screen per project is the obvious way to work a fleet, and it did not work. Two repos, two

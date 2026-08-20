@@ -757,6 +757,22 @@ full — including what was broken before it, which is the part no diff recovers
   numbering. The pane marker moved with it, because a marker on the bare number would refuse the
   second screen's seat 1 while the board gave it its own identity — and the dashboard now tells two
   screens apart instead of showing one screen's agent against the other's pane.
+- **v2.58** — a regression test has to fail first. Every fix command told the fixer to write
+  one; none asked whether it would have caught the defect it was written for. PR #90 is the
+  demonstration: a deliberate, docstring'd regression test passed because its fixture happened
+  to list two baselines in the working order, and the order-dependence it was written for had
+  to be found a round later in code that was already "covered". So `review-pr.md` (inherited by
+  `/panel-review-pr`), `fix-issue.md` and `fix-issue-here.md` now say to capture the **fix**
+  as a patch — not the test — remove it, and confirm each new test fails **on the assertion
+  that names the defect** before restoring and confirming green; `/review-pr` reports the
+  count. A patch rather than `git stash` because every worktree of a repo shares one
+  `refs/stash`, which this change discovered by losing its own working tree to a concurrent
+  agent in a sibling worktree (#210). A test for a path the
+  fix *created* is exempt and reports `red/green: N-A`, stated explicitly because an
+  instruction with no exemption for the legitimate case gets worked around rather than
+  followed — but shipped text that already existed is **not** exempt, since a test can assert
+  on it, as this change did to its own prompt and briefs. The panel's `REVIEW_PROMPT` also stops asking only whether a test is **absent** —
+  #90's fixture answered that correctly — and now asks whether a present test is load-bearing.
 - **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
   object store; wire `landed` refs to a cherry-pick helper.
 

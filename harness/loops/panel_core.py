@@ -384,6 +384,10 @@ Review for:
 - Concurrency: async pitfalls, missing awaits, shared mutable state, transaction isolation
 - Performance: N+1 queries, unbounded iterations, missing indexes, unnecessary allocations
 - Test coverage: new code paths, bug fixes, or edge cases visible in the diff that lack a test
+- Load-bearing tests: a test in the diff that is PRESENT but would not have failed against the
+  defect it names — a fixture whose ordering or inputs happen to avoid the bug, an assertion that
+  cannot fail, a mock that satisfies itself. Absence of a test is the easy half; a passing
+  assertion that the bug is gone is worse than no test, because it keeps passing when it returns
 - Documentation: behaviour changes that leave CLAUDE.md, docs, README, or docstrings stale
 - Related code: <<<RELATED_CODE>>>
 - Craft: naming, complexity, dead code, redundant conditions, project-convention/style breaks, DRY

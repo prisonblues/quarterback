@@ -225,6 +225,78 @@ uninstrumented rather than half-converted. A cost in dollars is recorded **only 
 states one** (pi does) and never derived from a price table, and anything unread stays null —
 which the board renders as "not recorded", never as a reviewer that cost nothing.
 
+### Red/green — a regression test that never failed proves nothing
+
+Every fix command in here tells the fixer to write a regression test. None of them used to
+ask whether that test would have **caught the defect it was written for**, and a test that
+would not is worse than no test: it is a passing assertion that the bug is gone, and it will
+keep passing after the bug comes back.
+
+PR #90 is the demonstration. Round 1 found that `load_baseline`'s anchor selection was
+order-dependent — the same two baselines gave the sha or `None` depending on `--baseline`
+argument order. A test for exactly that behaviour already existed, with a docstring
+explaining the intent, and it passed: its fixture happened to list the two baselines in the
+working order. The panel had to find the defect a round later, in code that was already
+"covered". The assertion was right; nobody had ever run it against the broken code, because
+the test was written alongside the fix and the broken code no longer existed by then.
+
+So `review-pr.md`'s brief (inherited by `/panel-review-pr`), `fix-issue.md` and
+`fix-issue-here.md` now all say the same thing: before committing, capture the **fix** as a
+patch and remove it — not the test — run each new regression test, and confirm it fails **on
+the assertion that names the defect**. An import error or a missing fixture demonstrates nothing. Then restore and
+confirm green. Red, then green, in the order that means something. The fixer reports the
+count, so a summary that skipped the step reads as skipped rather than as passed.
+
+The mechanism is a **patch file, not `git stash`**, and that is a fleet property rather
+than a preference. `refs/stash` lives in the common git dir, not the per-worktree one, so
+every worktree of a repo shares one stash stack: a stash pushed in one is listed and
+poppable from all the others, and `stash@{0}` resolves to whatever the last pusher meant.
+This harness runs many concurrent worktrees off one `.git` by design. The PR that added
+this instruction proved the hazard by losing its own working tree to it — a concurrent
+agent in a sibling worktree popped the red/green stash into its own checkout and pushed it
+back. Two earlier drafts tried to make stash safe (a label check, then an entry count);
+the count caught the loss, but nothing local can stop another worktree popping the entry.
+So: `git add -N` the fix's paths, `git diff HEAD` them to a patch, check `test -s`, remove
+them, run red, `git apply` the patch back. See #210 for giving the harness a per-worktree
+stash of its own.
+
+Three details in that sequence exist because the obvious spelling is wrong. **`test -s` is
+the check that matters**: an empty capture — mistyped paths, or a fix already committed —
+leaves the red run executing with the fix still in place, coming out green, reading exactly
+like the step passing. **`git add -N`** is what puts a file the fix *added* into the patch,
+since `git diff` ignores untracked files and a half-captured fix means the red run imports
+the new half; those same files come back out with `rm`, because `git checkout HEAD --`
+cannot restore a path absent from HEAD. **And the new test file stays put** — remove it
+along with the fix and the red run collects nothing, which exits non-zero without any
+assertion having failed.
+
+**The exemption is stated, deliberately — and it is narrow.** A regression test for a path
+the fix *created* has no pre-fix behaviour to fail against; those report `red/green: N-A (new
+code path)`. An instruction with no exemption for the legitimate case gets worked around
+rather than followed, and a worked-around instruction is worse than an honest `N-A` — it
+removes the signal that says which tests were actually proved.
+
+What is **not** exempt is a prompt string, a config default or a doc that already existed.
+Shipped text is an artefact a test can assert on, and the PR that added this instruction
+proved it in the act of being written: it changed `REVIEW_PROMPT` and three markdown briefs,
+and thirteen of `test_regression_test_redgreen.py`'s fifteen tests went red against the
+previous text. The first draft of the instruction *did* exempt that case — Codex flagged it in review —
+and an exemption that wide would have excused most of this harness from its own check, which
+is the failure mode #114 predicted.
+
+The panel carries the cheaper half of the same lever. `REVIEW_PROMPT` used to ask only about
+test **absence** ("new code paths … that lack a test"), which is a question #90's fixture
+answered correctly. It now also asks about tests that are present and not load-bearing — a
+fixture whose ordering or inputs happen to avoid the bug, an assertion that cannot fail, a
+mock that satisfies itself. That is a reviewer reading the tests as tests, and it is far
+cheaper than mutation testing on a diff for most of the same catch.
+
+Why this matters more here than in most repos: the standing rule at the round cap is *"fix
+P1/P2 correctness only, defer the rest"*, explicitly because **the last fix pass is never
+itself reviewed**. Its regression tests are the only thing standing behind it. A fix pass
+whose tests pass vacuously has no backstop at all — and that is precisely the pass this
+repo has decided not to review.
+
 ### `/epic` and `/lander` — the long-running loops
 
 `epic.py` drives a multi-issue epic: it fans sub-issues out into their own worktrees, stacks
