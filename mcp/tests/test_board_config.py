@@ -255,3 +255,23 @@ def test_the_sourced_config_file_sees_the_agent_name_too(tmp_path, monkeypatch):
     cfg = resolve(env_for(tmp_path, QUARTERBACK_CONFIG=str(path)))
     assert cfg.agent == "daedalus"
     assert cfg.token == "tok-daedalus"
+
+
+def test_a_config_file_cannot_set_the_agent_name(tmp_path, monkeypatch):
+    """The divergence from `qb-env`, pinned so it stays a decision rather than a bug.
+
+    `qb-env` sources the config into its own shell, so a plain `QUARTERBACK_AGENT=`
+    line there wins over the environment. Here `_VARS` excludes the name, so the file
+    is never read back for it and `cfg.agent` is the environment's or the hostname's.
+
+    An earlier form of this change honoured a file pin, and the attempt produced a
+    measured split identity — the token fetched for the file's name while `cfg.agent`
+    reported the environment's. No generated fleet config sets the name at all.
+    """
+    monkeypatch.setattr(boardcfg, "_hostname", lambda: "daedalus")
+    path = write_config(
+        tmp_path,
+        "QUARTERBACK_BASE_URL=https://board.example\nQUARTERBACK_AGENT=zeus\n",
+    )
+    cfg = resolve(env_for(tmp_path, QUARTERBACK_CONFIG=str(path)))
+    assert cfg.agent == "daedalus"

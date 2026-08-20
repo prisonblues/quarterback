@@ -146,6 +146,17 @@ def resolve(env: dict[str, str] | None = None) -> BoardConfig:
     #
     # Environment, else this machine's short hostname, matching `qb-env`'s
     # `${QUARTERBACK_AGENT:-$(hostname -s)}`.
+    #
+    # NOT the config file, and that is a deliberate divergence: `qb-env` sources the
+    # file into its own shell, so a plain `QUARTERBACK_AGENT=name` line there wins,
+    # while `_VARS` excludes the name here so a file that sets it cannot change
+    # `cfg.agent`. The file is still sourced with the resolved name exported, so a
+    # file that BOTH pins a name and expands it into a double-quoted value of its own
+    # mints a token for the pinned name while this reports the resolved one. Nothing
+    # detects that: the value the file computed is indistinguishable, after the fact,
+    # from one it was always going to compute. Single-quote the command — as the
+    # generated config does — and the reference is expanded when it runs, against
+    # this name. A test pins the no-honouring half.
     agent = env.get("QUARTERBACK_AGENT") or _hostname()
     env["QUARTERBACK_AGENT"] = agent
 
