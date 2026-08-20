@@ -35,7 +35,6 @@ from pathlib import Path
 
 import httpx
 import pytest
-from fastapi import HTTPException
 from sqlalchemy import select, update
 
 from app.api.claims import ClaimRequest, acquire
@@ -360,15 +359,15 @@ async def test_a_fleet_items_dependency_does_not_bind_to_some_repos_issue(client
     await client.post("/plan/item/done", json={"item_id": fleet["item_id"]}, headers=LAPTOP)
 
 
-async def test_a_phase_filter_is_applied_before_the_limit(client):
+async def test_a_plan_filter_is_applied_before_the_limit(client):
     """Filtering the returned page instead of the query dropped every match past
     the first `limit` rows — and with it `next`, which then read as "nothing to
-    do in this phase" while the phase was full of work."""
-    repo = "acme/phaselimit"
-    await issue(client, repo, 200, phase="stage 1")
-    second = await issue(client, repo, 201, phase="stage 2")
+    do in this plan" while the plan was full of work."""
+    repo = "acme/planlimit"
+    await issue(client, repo, 200, plan="stage 1")
+    second = await issue(client, repo, 201, plan="stage 2")
 
-    plan = await read(client, repo, phase="stage 2", limit=1)
+    plan = await read(client, repo, plan="stage 2", limit=1)
     assert [i["item_id"] for i in plan["items"]] == [second["item_id"]]
     assert plan["next"]["item_id"] == second["item_id"]
 
@@ -1061,15 +1060,19 @@ async def test_acquire_refuses_a_session_with_work_in_flight():
         await s.rollback()
 
 
-async def test_acquire_refuses_a_reserved_kind():
-    """The guard sat in front of one caller of the primitive rather than inside
-    it, so the next caller could write the row v2.33's fix closed off."""
+async def test_acquire_canonicalises_inside_the_primitive_not_at_the_endpoint():
+    """The successor to the reserved-kind guard, and the same lesson (#172).
+
+    That guard sat in front of ONE caller of the primitive rather than inside it,
+    so the next caller could write the row it was meant to prevent. Key
+    derivation had exactly that shape available to it — canonicalise in the
+    endpoint and let the plan router compose its own — so it happens in
+    `ClaimRequest` instead, where no caller of `acquire` can be the one that
+    forgot."""
     async with async_session() as s:
-        with pytest.raises(HTTPException) as e:
-            await acquire(s, ClaimRequest(kind="release", key="acme/x:9.9",
-                                          holder="laptop"))
-    assert e.value.status_code == 409
-    assert "allocated, not taken" in e.value.detail["error"]
+        claim, _ = await acquire(s, ClaimRequest(
+            kind="issue", key="Acme/Canon#77", holder="laptop", sess="s-canon"))
+    assert (claim.kind, claim.key) == (CLAIM_KIND, "acme/canon#77")
 
 
 # ------------------------------------------------------------ the browser page
@@ -1113,9 +1116,9 @@ def test_the_mcp_client_stamps_the_session_on_every_plan_verb():
 def test_the_mcp_client_sends_only_the_plan_filters_it_was_given():
     seen: list[httpx.Request] = []
     client = _mcp_client(seen)
-    client.plan({"repo": "acme/x", "phase": None, "include_done": False, "limit": None})
+    client.plan({"repo": "acme/x", "plan": None, "include_done": False, "limit": None})
     assert seen[0].url.params.get("repo") == "acme/x"
-    assert "phase" not in seen[0].url.params and "limit" not in seen[0].url.params
+    assert "plan" not in seen[0].url.params and "limit" not in seen[0].url.params
 
     client.plan_add({"title": "t", "repo": None})
     assert seen[1].url.path == "/plan/item" and seen[1].method == "POST"

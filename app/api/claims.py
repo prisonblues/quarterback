@@ -1,57 +1,81 @@
-"""Atomic claims on named resources: who is landing, and who owns a number.
+"""Atomic claims on named resources: who is doing this, and who is landing it.
 
-Two issues wanted one primitive. #99: "somebody is landing on ``main`` right
-now." #46: "this branch owns v2.31." Both are a claim on a small shared
-namespace where a collision is silent until it is expensive, and this repo has
-made the case for both the hard way — nine release collisions in two days, the
-last three of which killed the cheap remedy.
+#99 wanted one thing: "somebody is landing on ``main`` right now." It is a claim
+on a small shared namespace where a collision is silent until it is expensive,
+and this repo made the case the hard way — two agents merging within a minute of
+each other, three claiming overlapping work inside 56 seconds.
 
 **Announcing is not claiming, and that is the finding this module exists for.**
-Two agents once announced the same version one second apart and were both
-correct from what they could see. On 2026-08-16 a number claimed on the board at
-10:17 was taken at 11:18 by an agent that picked it by reading ``main`` plus the
-open PRs' CHANGELOGs — a check that cannot see a claim which is not in a file —
-and the renumber off *that* collision landed on a number claimed seven minutes
-earlier. Announcement does not force the next agent to look. Allocation does,
-because the number comes from asking.
+Two agents once announced the same version one second apart and were both correct
+from what they could see. Announcement does not force the next agent to look;
+asking for the resource does, because the answer can be no.
+
+**The key is derived, never composed** — see :mod:`app.claimkey`. The whole of
+#172's evidence is what happens without that rule: the plan wrote
+``kind='work', key='<repo>#163'``, an agent wrote ``kind='issue'`` with the same
+string, and the two subsystems reported different answers about the same issue in
+the same second. Every path here canonicalises through one function, so a caller
+that composes a pair by hand still writes the row every reader looks for.
 
 **Advisory, not a lock, and it must never be described otherwise.** The board
-cannot gate github.com: a human merging in the UI, or an agent not enrolled
-here, lands regardless. What this removes is collisions between agents that ask,
-which is the observed failure mode and the entire claim. The correctness
-backstop stays where it was — the pre-land verdict re-checked after base
-movement (#96), and CI on ``main``. If a skill ever calls this "the merge lock",
-the skill is wrong.
+cannot gate github.com: a human merging in the UI, or an agent not enrolled here,
+lands regardless. What this removes is collisions between agents that ask, which
+is the observed failure mode and the entire claim. The correctness backstop stays
+where it was — the pre-land verdict re-checked after base movement (#96), and CI
+on ``main``. If a skill ever calls this "the merge lock", the skill is wrong.
 
-The two kinds ship off one table on purpose. Two independent implementations of
-"who has this right now" is the outcome #99 was filed to avoid.
+**There is no release allocator here any more (#172).** ``kind='release'`` shipped
+in #46 to stop two branches picking the same version. What actually stopped it was
+``scripts/release_stamp.py`` (v2.34), which takes ``max+1`` at land from the ref
+being merged into — nine releases landed that way in a day with no collisions,
+while the allocator's own rows went stale for every PR still open. A namespace
+nobody claims in does not need an allocator, and a stale record of it is worse
+than none: it is the second spelling this module is now built to prevent.
+
+The endpoints went; the KIND could still be written, because canonicalisation
+passes an unrecognised kind through and the ``RESERVED_KINDS`` guard was deleted
+with the allocator. So ``release`` is now a *retired* kind rather than an unknown
+one (:data:`app.claimkey.RETIRED_KINDS`) and ``POST /claim`` refuses it with 422,
+naming ``release_stamp.py``. A deletion that leaves one path able to write the
+rows is not a deletion.
 """
 
 from __future__ import annotations
 
-import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import AfterValidator, BaseModel, Field
-from sqlalchemy import select, update
+from pydantic import BaseModel, Field, model_validator
+from sqlalchemy import or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import identify, reader
+from app.claimkey import (
+    REF_KINDS,
+    BadRef,
+    board_object,
+    canonical,
+    canonical_kind,
+    canonical_repo,
+    derive,
+    repo_of,
+)
 from app.db import async_session, get_session
-from app.identity import same_machine
+from app.identity import address_clause, resolve_alias, same_machine
+from app.models.plan import Plan
+from app.models.plan_item import PlanItem
 from app.models.resource_lease import ResourceLease
 
 router = APIRouter(tags=["claim"])
 
-#: Default hold, in seconds. A land takes minutes and a release number is held
-#: from "I am writing the CHANGELOG" to "it merged", which on this repo has run
-#: to hours. Long enough not to lapse mid-work, short enough that a crashed
-#: holder frees it within one coffee.
+#: Default hold, in seconds. A land takes minutes and a unit of work is held from
+#: "I have picked this up" to "the PR merged", which on this repo has run to
+#: hours. Long enough not to lapse mid-work, short enough that a crashed holder
+#: frees it within one coffee. (The release number used to be the long case; the
+#: allocator that held it is deleted, and the land is the remaining reason.)
 DEFAULT_TTL = 3600
 MAX_TTL = 86_400
 
@@ -59,94 +83,6 @@ MAX_TTL = 86_400
 #: a short handle; unbounded free text on an identifier is a column of somebody
 #: else's paste, and every free-text field on this table is bounded but this one.
 MAX_SESSION = 200
-
-#: ``2.31`` or ``v2.31`` or ``2.31.0``. The CHANGELOG's grain is two components
-#: (``## v2.31 — …``) and the packaged version's is three (``2.31.0``), so both
-#: are accepted and normalised to two. The patch component is deliberately
-#: dropped rather than tracked: nothing in this repo has ever allocated one, and
-#: a namespace nobody claims in does not need an allocator.
-_VERSION_RE = re.compile(r"\Av?(\d{1,4})\.(\d{1,5})(?:\.\d{1,5})?\Z")
-
-#: ``owner/name``, and nothing else. This is the whole of #148's fix, and it is a
-#: refusal rather than a parser on purpose.
-#:
-#: The allocator handed out 2.36 twice because its key was caller-supplied text:
-#: one agent called itself ``quarterback`` and another ``prisonblues/quarterback``,
-#: so one repo grew two counters. The obvious repair is to canonicalise — accept
-#: every spelling and map them onto one — and it is the wrong one. That input
-#: domain is open (URLs, scp syntax, ``.git`` suffixes, bare names, paths), and an
-#: open domain cannot be enumerated: three review rounds on that parser produced
-#: three more holes, each the previous fix overshooting. See PR #152, closed.
-#:
-#: Closing the domain makes the whole class impossible. Callers do not spell the
-#: repo at all now — the MCP tools read it from ``remote.origin.url`` — so this
-#: is the boundary check for anything reaching the endpoint another way, and the
-#: right answer to a spelling it does not recognise is 422, not a guess. A bare
-#: name is refused precisely because it is the ambiguous one.
-#: A trailing ``.git`` is refused rather than stripped. GitHub does not allow a
-#: repository name to end in ``.git`` either, so the only thing that spelling can
-#: be is a clone URL's suffix — and stripping it would be the first step back
-#: onto the parser this replaces.
-_REPO_RE = re.compile(
-    r"\A[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9][A-Za-z0-9._-]{0,99}\Z(?<!\.git)"
-)
-
-#: The message a refusal carries. Named once so the endpoint, the query parameter
-#: and the migration all say the same thing to whoever hits it.
-REPO_SHAPE = (
-    "repo must be `owner/name` (e.g. `prisonblues/quarterback`). A bare name, a "
-    "URL or an scp remote is refused rather than guessed at: two spellings of one "
-    "repo is how the allocator issued the same number twice. The MCP tools read "
-    "this from your origin remote — you should not be typing it."
-)
-
-
-def _canonical_repo(value: str) -> str:
-    """The repo key, lowercased, or a 422.
-
-    **Case is folded, and that is the one normalisation here.** It looks like the
-    read-time reconciliation this release deletes, and it is not the same
-    operation: ``lower()`` is total and its domain is closed, so unlike an alias
-    enumeration it cannot be incomplete — there is no next case to discover. The
-    parser it replaces failed because "the spellings a repo can sit under" is an
-    open set; "the case a string is in" is not.
-
-    It has to happen because GitHub treats owner and repo names
-    case-insensitively while preserving what you typed, so ``Acme/Widget`` and
-    ``acme/widget`` are one repository with two remotes possible — which is #148
-    exactly, in a spelling the shape rule alone would let through. Refusing the
-    capitalised form instead was the alternative and is worse: a repo genuinely
-    named ``acme/MyProject`` would be unable to allocate at all.
-    """
-    if not _REPO_RE.match(value):
-        raise ValueError(REPO_SHAPE)
-    return value.lower()
-
-
-#: Every repo field on this router. One place, so the claim path, the reclaim path
-#: and the read path cannot drift into disagreeing about what a repo is — which is
-#: the shape of the original bug one level up.
-RepoKey = Annotated[str, AfterValidator(_canonical_repo)]
-
-
-#: Kinds the generic ``POST /claim`` refuses. ``release`` carries invariants no
-#: generic claim can honour — the number is never re-issued, and the allocation
-#: floor only ever rises — and those are enforced in :func:`allocate_release`
-#: alone. Left open, a caller could take `kind='release'` on an already-released
-#: historical key (re-issuing a shipped number), advance the floor forever with
-#: `key='<repo>:9999.1'`, or insert `v2.31` beside a held `2.31` — an alternate
-#: spelling the unique index cannot see, leaving two agents each certain they
-#: hold "the same" number. Round 1's F01.
-RESERVED_KINDS = frozenset({"release"})
-
-#: The largest minor component :data:`_VERSION_RE` can read back. Allocation is
-#: `minor + 1` with unbounded Python arithmetic, so without this a repo at
-#: `9999.99999` would be handed `9999.100000` — a string the parser rejects,
-#: which makes it invisible to `_highest_known` and hands the SAME number to
-#: every caller thereafter. Round 1's F17: the allocator's own output has to stay
-#: inside the grammar the allocator reads.
-MAX_MINOR = 99_999
-MAX_MAJOR = 9_999
 
 
 def _utcnow() -> datetime:
@@ -165,20 +101,6 @@ def clean_session(s: str | None) -> str | None:
     if not isinstance(s, str):
         return None
     return s.strip() or None
-
-
-def _next_version(floor: tuple[int, int]) -> tuple[int, int] | None:
-    """The version after ``floor``, or None if the namespace is exhausted.
-
-    Rolls the major when the minor would leave what :data:`_VERSION_RE` can read
-    back, because an allocated number the allocator cannot re-parse is worse than
-    a refusal: it disappears from `_highest_known` and every later caller is
-    handed it again.
-    """
-    major, minor = floor
-    if minor + 1 <= MAX_MINOR:
-        return (major, minor + 1)
-    return (major + 1, 0) if major + 1 <= MAX_MAJOR else None
 
 
 def may_mutate(claim: ResourceLease, holder: str, session_id: str | None) -> bool:
@@ -236,25 +158,6 @@ def _not_yours(claim: ResourceLease) -> HTTPException:
     })
 
 
-def parse_version(v: str | None) -> tuple[int, int] | None:
-    """``"v2.31"`` -> ``(2, 31)``, or None if it is not a version at all.
-
-    None rather than a raise: a caller's ``after`` is a hint about what it could
-    see, and a hint this board cannot read must degrade to "you told me nothing"
-    rather than costing the caller its allocation. What it must never do is
-    become ``(0, 0)`` — that would silently allocate v0.1 over the top of a live
-    series.
-    """
-    if not isinstance(v, str):
-        return None
-    m = _VERSION_RE.match(v.strip())
-    return (int(m.group(1)), int(m.group(2))) if m else None
-
-
-def fmt_version(v: tuple[int, int]) -> str:
-    return f"{v[0]}.{v[1]}"
-
-
 def claim_view(c: ResourceLease) -> dict:
     return {
         "claim_id": str(c.id),
@@ -275,8 +178,11 @@ async def _sweep_lapsed(session: AsyncSession, kind: str, key: str,
     Passive: it runs only when somebody asks for this exact key, so there is no
     reaper and a quiet key costs nothing. ``lapsed`` is set rather than only
     ``released_at`` because "the holder let go" and "the holder vanished" are
-    different facts — and for a release number that is the difference between
-    shipped and abandoned, which :func:`allocate_release` must not have to guess.
+    different facts: the first is work that finished, the second is a session
+    that stopped answering, and a dashboard that showed them the same way would
+    report an abandoned land as a completed one. ``qbdata`` filters on this column
+    to tell them apart. (The allocator that first needed the distinction is
+    deleted — the distinction outlived it, which is why it is still here.)
     """
     await session.execute(
         update(ResourceLease)
@@ -308,19 +214,6 @@ async def live_claim(session: AsyncSession, kind: str, key: str,
                ResourceLease.expires_at > (now or _utcnow()))
         .limit(1)
     )
-
-
-def _repo_prefix(repo: str):
-    """A LIKE clause matching one repo's release keys, with wildcards escaped.
-
-    ``startswith`` compiles to ``LIKE 'prefix%'`` and does NOT escape ``_`` or
-    ``%``, both of which are LIKE wildcards and both of which occur in real repo
-    names. ``acme/my_repo`` matched ``acme/myXrepo`` (round 1's F19) — so one
-    repo's allocation floor could be raised by another's, and `/releases` could
-    list a neighbour's numbers as its own.
-    """
-    escaped = repo.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-    return ResourceLease.key.like(f"{escaped}:%", escape="\\")
 
 
 #: Postgres' unique-violation SQLSTATE. `_take` must distinguish "somebody else
@@ -405,14 +298,65 @@ def _conflict(kind: str, key: str, held: ResourceLease) -> HTTPException:
     })
 
 
+class ResourceRef(BaseModel):
+    """WHICH resource, so the board can work out the key (#172).
+
+    The preferred way to claim. ``kind`` names a resource this board understands
+    (:data:`app.claimkey.REF_KINDS`) and the key is derived from it, so two agents
+    describing one collision cannot produce two keys — which is what happened for
+    four months and is why ``claims()`` and ``plan_read`` disagreed about the same
+    issue in the same second.
+    """
+
+    kind: str = Field(min_length=1, max_length=32,
+                      description=f"one of: {', '.join(REF_KINDS)}")
+    #: ``owner/name``, and only for the kinds that need one. A plan or an item is
+    #: identified by its board id, so sending a repo alongside would invite two
+    #: keys for one row.
+    repo: str | None = Field(default=None, max_length=256)
+    #: The issue number, PR number, branch name or board id. Free-form because
+    #: what it must be depends on ``kind``, and :mod:`app.claimkey` is the one
+    #: place that decides.
+    value: str = Field(min_length=1, max_length=512)
+
+
 class ClaimIn(BaseModel):
-    kind: str = Field(min_length=1, max_length=64)
-    key: str = Field(min_length=1, max_length=512)
+    """Either a ``ref`` (derived — preferred) or a ``kind``/``key`` pair.
+
+    The composed pair is still accepted, and canonicalised through the same
+    function the derived path uses. Refusing it outright would have been the
+    tidier API and the wrong move: every agent, dashboard and skill on the fleet
+    composes one today, and an endpoint that 422s them all writes no claims at
+    all — which is the state #172 was filed about.
+    """
+
+    ref: ResourceRef | None = None
+    kind: str | None = Field(default=None, min_length=1, max_length=64)
+    key: str | None = Field(default=None, min_length=1, max_length=512)
     ttl: int = Field(default=DEFAULT_TTL, ge=1, le=MAX_TTL)
     session: str | None = Field(default=None, max_length=MAX_SESSION)
     #: What you are doing with it. Optional, and worth sending: it is what the
     #: next agent is shown instead of a bare refusal.
     note: str | None = Field(default=None, max_length=500)
+
+    @model_validator(mode="after")
+    def _one_way_or_the_other(self) -> ClaimIn:
+        if self.ref is None and not (self.kind and self.key):
+            raise ValueError(
+                "send `ref` (preferred: {kind, repo, value} — the board derives the "
+                "key) or both `kind` and `key`")
+        if self.ref is not None and (self.kind or self.key):
+            # Not merged, and not silently preferring one: a request carrying both
+            # is a caller with two ideas about what it is claiming, and guessing
+            # which one it meant is how a claim lands on the wrong resource.
+            raise ValueError("send `ref` OR `kind`/`key`, not both")
+        return self
+
+    def resolve(self) -> tuple[str, str]:
+        """The canonical ``(kind, key)`` this request is for. Raises :class:`BadRef`."""
+        if self.ref is not None:
+            return derive(self.ref.kind, repo=self.ref.repo, value=self.ref.value)
+        return canonical(self.kind or "", self.key or "")
 
 
 class ClaimRefIn(BaseModel):
@@ -423,22 +367,6 @@ class ClaimRefIn(BaseModel):
     #: this line was the #142 bug, and a comment that outlives its rule is how it
     #: got there.
     session: str | None = Field(default=None, max_length=MAX_SESSION)
-
-
-class ReleaseClaimIn(BaseModel):
-    repo: RepoKey = Field(max_length=256)
-    branch: str | None = None
-    #: The highest release the CALLER can see, from the repo it has checked out.
-    #: The board cannot read a CHANGELOG, so allocation is the maximum of what
-    #: the caller knows and what this board has ever handed out — each half
-    #: covering the other's blind spot. The caller's repo scan cannot see a claim
-    #: that is not yet in a file, which is how the eighth collision happened; the
-    #: board cannot see a release that merged without ever being claimed here,
-    #: which is every release before this one.
-    after: str | None = None
-    ttl: int = Field(default=DEFAULT_TTL, ge=1, le=MAX_TTL)
-    session: str | None = Field(default=None, max_length=MAX_SESSION)
-    note: str | None = Field(default=None, max_length=500)
 
 
 @dataclass(frozen=True, slots=True)
@@ -468,6 +396,15 @@ class ClaimRequest:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "sess", clean_session(self.sess))
+        # Canonicalised HERE rather than in the endpoint, so that every caller of
+        # `acquire` gets it — the plan router, the endpoint, and the fourth and
+        # fifth caller this dataclass exists to make cheap. One gate is the whole
+        # lesson of #172: the defect was two subsystems agreeing by convention,
+        # and a normalisation each of them has to remember to call is the same
+        # convention with more steps.
+        kind, key = canonical(self.kind, self.key)
+        object.__setattr__(self, "kind", kind)
+        object.__setattr__(self, "key", key)
 
 
 def _may_renew(claim: ResourceLease, req: ClaimRequest) -> bool:
@@ -533,15 +470,6 @@ async def acquire(session: AsyncSession, req: ClaimRequest) -> tuple[ResourceLea
     work, and rather than leave that as a docstring nobody reads at the call
     site, a session with pending work is refused outright.
     """
-    if req.kind in RESERVED_KINDS:
-        # Inside the primitive, not in front of one caller of it. `release`
-        # carries invariants only `allocate_release` enforces, and the whole
-        # point of extracting `acquire` is that callers three and four will
-        # arrive — each of them able to write the row v2.33 closed off.
-        raise HTTPException(409, detail={
-            "error": f"{req.kind!r} claims are allocated, not taken",
-            "kind": req.kind, "key": req.key,
-            "hint": "use POST /release/claim — see RESERVED_KINDS for why"})
     _refuse_pending_work(session)
     await _sweep_apart(req.kind, req.key, req.now)
 
@@ -582,19 +510,28 @@ async def take_claim(
     holder: str = Depends(identify),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
-    """Claim a named resource, or be told who has it."""
-    if body.kind in RESERVED_KINDS:
-        # `acquire` refuses this too, and must. Kept here for the friendlier
-        # message: this is the endpoint people actually call by hand.
-        raise HTTPException(409, detail={
-            "error": f"{body.kind!r} claims are allocated, not taken",
-            "kind": body.kind,
-            "hint": "use POST /release/claim — see RESERVED_KINDS for why"})
+    """Claim a named resource, or be told who has it.
+
+    Send ``ref`` and the board derives the key. Send ``kind``/``key`` and it is
+    canonicalised onto the same value — and the response says so, because an agent
+    that believes it holds ``issue/<repo>#163`` while the row reads
+    ``work/<repo>#163`` is the #172 defect with the parties swapped.
+    """
+    try:
+        kind, key = body.resolve()
+    except BadRef as e:
+        raise HTTPException(422, str(e)) from None
 
     claim, renewed = await acquire(session, ClaimRequest(
-        kind=body.kind, key=body.key, holder=holder, ttl=body.ttl,
+        kind=kind, key=key, holder=holder, ttl=body.ttl,
         sess=body.session, note=body.note, now=_utcnow()))
-    return {**claim_view(claim), "claimed": True, "renewed": renewed}
+    out = {**claim_view(claim), "claimed": True, "renewed": renewed}
+    if body.ref is None and (body.kind, body.key) != (kind, key):
+        out["derived_from"] = {"kind": body.kind, "key": body.key}
+        out["note_on_key"] = (
+            f"you asked for {body.kind}/{body.key!r}; the board keys that resource "
+            f"as {kind}/{key!r}. Send `ref` instead and you never have to know.")
+    return out
 
 
 @router.post("/claim/renew")
@@ -646,9 +583,9 @@ async def release_claim(
     holder: str = Depends(identify),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
-    """Let go. Idempotent, and never deletes: the row is the history an allocator
-    reads, so a released claim stays on the table as a number that was handed
-    out."""
+    """Let go. Idempotent, and never deletes: the row is the history, so a
+    released claim stays on the table as a record that this agent held this
+    resource between these two times."""
     claim = await session.get(ResourceLease, body.claim_id)
     if claim is None:
         raise HTTPException(404, "claim not found")
@@ -664,6 +601,10 @@ async def release_claim(
 async def list_claims(
     kind: str | None = None,
     key: str | None = None,
+    ref_kind: str | None = Query(default=None,
+                                 description=f"derive the key instead: {', '.join(REF_KINDS)}"),
+    ref_value: str | None = Query(default=None, description="issue/PR number, branch, or id"),
+    repo: str | None = Query(default=None, description="`owner/name`, for a ref that needs one"),
     holder_q: str | None = Query(default=None, alias="holder"),
     include_released: bool = False,
     limit: int = Query(default=100, ge=1, le=1000),
@@ -681,6 +622,52 @@ async def list_claims(
     """
     now = _utcnow()
     stmt = select(ResourceLease)
+    asked = {"kind": kind, "key": key}
+    # Derived here rather than by the caller, for the reason the write path is:
+    # the MCP layer is a separate package with no import of this one, so a client
+    # that composed the lookup key would be a SECOND implementation of the rule —
+    # which is the defect #172 is about, moved into the read path.
+    if ref_kind or ref_value:
+        if not (ref_kind and ref_value):
+            raise HTTPException(422, "ref_kind and ref_value go together: which "
+                                     "issue, PR, branch or id?")
+        if kind or key:
+            # Refused, not silently preferred — the same rule `ClaimIn` applies to
+            # the write, and for the same reason. That validator's argument is
+            # that "a request carrying both is a caller with two ideas about what
+            # it is claiming"; a *read* carrying both is a caller with two ideas
+            # about what it is asking, and answering about one of them without
+            # saying which is how a lookup reports "nobody holds that" about a
+            # row that is right there. One rule, both directions.
+            raise HTTPException(422, "ask by `ref_kind`/`ref_value` (the board "
+                                     "derives the key) OR by `kind`/`key`, not both")
+        try:
+            kind, key = derive(ref_kind, repo=repo, value=ref_value)
+        except BadRef as e:
+            raise HTTPException(422, str(e)) from None
+    elif kind and key:
+        # Canonicalised on the way in, exactly as the write path is. A caller
+        # looking up `kind=issue&key=<repo>#163` is asking about a resource, not
+        # about a string, and answering "no claims" about a row that is right
+        # there is how #172's plan-versus-claims disagreement read from outside.
+        try:
+            kind, key = canonical(kind, key)
+        except BadRef as e:
+            raise HTTPException(422, str(e)) from None
+    elif kind:
+        # A kind with no key. This branch did not exist, so `?kind=issue` filtered
+        # on the literal string `issue` and matched nothing — every claim on a
+        # unit of work is stored under `work` now, and `kind` alone is what the
+        # pre-#172 vocabulary trained every agent, skill and dashboard to send.
+        # An empty answer about held resources is the defect this module's own
+        # docstring names, so the alias is folded here and the fold is REPORTED:
+        # `pr` and `issue` share one kind by design, so this filter is coarser
+        # than the caller asked for and saying nothing about that would trade one
+        # silent wrong answer for another.
+        try:
+            kind = canonical_kind(kind)
+        except BadRef as e:
+            raise HTTPException(422, str(e)) from None
     if kind:
         stmt = stmt.where(ResourceLease.kind == kind)
     if key:
@@ -692,381 +679,185 @@ async def list_claims(
                           ResourceLease.expires_at > now)
     stmt = stmt.order_by(ResourceLease.acquired_at.desc()).limit(limit)
     rows = list(await session.scalars(stmt))
-    return {"claims": [
+    out: dict = {"claims": [
         {**claim_view(c),
          "released": c.released_at.isoformat() if c.released_at else None,
          "lapsed": c.lapsed}
         for c in rows]}
+    if (asked["kind"], asked["key"]) not in ((None, None), (kind, key)):
+        # Said out loud, exactly as `POST /claim` says it: a caller that believes
+        # it asked about `issue/<repo>#163` while the filter read `work/…` is the
+        # #172 defect with the parties swapped.
+        out["filtered_on"] = {"kind": kind, "key": key}
+        out["asked_for"] = asked
+        note = (f"you asked about {asked['kind']}/{asked['key'] or '(any key)'}; the "
+                f"board keys that as {kind}/{key or '(any key)'}")
+        if asked["key"] is None:
+            note += (" — a kind alone can no longer tell an issue from a PR, because "
+                     "the key's shape carries that now. Send `ref_kind`/`ref_value` "
+                     "for one resource, or `kind` and `key` together.")
+        out["note_on_kind"] = note
+    return out
 
 
-# ------------------------------------------------------- the release allocator
+async def _board_scopes(
+    session: AsyncSession, rows: list[ResourceLease]
+) -> dict[tuple[str, str], str]:
+    """The repo each ``plan:``/``item:`` claim among ``rows`` is against (#172).
 
+    ``repo_of`` answers None for a board object and is right to: the key is an id,
+    and an id says nothing about a repository. But the *row* does — a plan carries
+    its scope and an item carries its own — so a claim on the plan for
+    ``prisonblues/quarterback`` **is** a claim in that repo, and reporting it as
+    ``unattributed`` made ``held`` false for an agent holding the plan for the
+    very repo it was asking about. Which is the one thing this endpoint exists to
+    get right: #172's whole design routes the fuzzy case through a plan claim, so
+    a gate blind to plan claims is blind to the intake the issue added.
 
-def release_key(repo: str, version: tuple[int, int]) -> str:
-    return f"{repo}:{fmt_version(version)}"
+    A NULL scope stays unattributed, because a fleet-scoped plan genuinely does
+    not say which repo — that is the open question #172 closes on, and this
+    answers it the way the schema does rather than guessing from the items.
 
-
-async def _highest_known(session: AsyncSession, repo: str) -> tuple[int, int] | None:
-    """The highest release this board has ever handed out for ``repo``.
-
-    Over EVERY row, released and lapsed included — never only the live ones. A
-    number whose claim lapsed is not free: the branch holding it may well have
-    shipped, and re-issuing it would manufacture the exact collision this table
-    exists to prevent. History is why released rows are kept rather than deleted.
+    One statement per table, keyed on the ids actually present, so the endpoint
+    stays two queries whatever the row count.
     """
-    prefix = f"{repo}:"
-    rows = await session.scalars(
-        select(ResourceLease.key)
-        .where(ResourceLease.kind == "release", _repo_prefix(repo))
-    )
-    seen = [v for v in (parse_version(k[len(prefix):]) for k in rows) if v]
-    return max(seen) if seen else None
-
-
-async def _my_live_release(session: AsyncSession, repo: str, holder: str,
-                           sess: str | None, now: datetime) -> ResourceLease | None:
-    """This caller's own live release claim for a repo, or None.
-
-    Scoped by session AND machine. Keying it on the session alone was round 1's
-    F03: session ids are the board's public addressing scheme — peers quote them
-    at each other constantly — so any agent that knew or reused another's session
-    string was handed back that agent's live claim, holder and note included, as
-    if it were its own.
-    """
-    if not sess:
-        return None
-    mine = await session.scalar(
-        select(ResourceLease)
-        .where(ResourceLease.kind == "release", _repo_prefix(repo),
-               ResourceLease.session == sess,
-               ResourceLease.released_at.is_(None),
-               ResourceLease.expires_at > now)
-        .order_by(ResourceLease.acquired_at.desc())
-        .limit(1)
-    )
-    return mine if mine is not None and same_machine(mine.holder, holder) else None
-
-
-@router.post("/release/claim")
-async def allocate_release(
-    body: ReleaseClaimIn,
-    holder: str = Depends(identify),
-    session: AsyncSession = Depends(get_session),
-) -> dict:
-    """Allocate the next free release number for a repo, and hold it.
-
-    #46's expensive half, and the only remedy that survives its own evidence.
-    The board hands the number out, so a second branch asking gets the one after
-    it without anybody noticing there was a race — where announcing left both
-    branches correct and both wrong.
-
-    **Both inputs are needed and neither is sufficient.** The board cannot read a
-    CHANGELOG, so it cannot know about releases that merged before it existed;
-    the caller's repo scan cannot see a claim that is not yet in any file, which
-    is how v2.28 was taken an hour after it was announced. The allocation is the
-    maximum of the two, plus one.
-
-    Retries on a lost race rather than failing: losing means somebody just took
-    the number this caller was about to, so the correct answer is the next one,
-    not an error. Bounded, because an unbounded retry against a genuinely
-    contended key is a spin.
-    """
-    now = _utcnow()
-    told = parse_version(body.after)
-    unreadable = body.after is not None and told is None
-
-    # Idempotency, checked BEFORE allocating rather than as a renew inside the
-    # loop. The loop's candidate is always `highest + 1`, so a number this
-    # session already holds is never the candidate and the renew branch below is
-    # only reachable on a race — which meant a caller retrying a timed-out
-    # request quietly spent a second number. Asked here instead, where the answer
-    # is knowable.
-    #
-    # Scoped to the session AND the machine — see `_my_live_release` for why the
-    # session alone was a hole rather than a shortcut.
-    sess = clean_session(body.session)
-    mine = await _my_live_release(session, body.repo, holder, sess, now)
-    if mine is not None:
-        got = parse_version(mine.key[len(body.repo) + 1:])
-        # ...but only while it still satisfies what the caller asked for. A
-        # caller renumbering off a collision re-runs this with a HIGHER `after`,
-        # and handing back the very number it is trying to escape reports success
-        # for the one thing it asked not to happen (round 1's F20). Below the
-        # floor, fall through and allocate.
-        if got is not None and (told is None or got > told):
-            _renew_onto(mine, holder=holder, ttl=body.ttl, sess=sess,
-                        note=body.note, now=now)
-            await session.commit()
-            return {**claim_view(mine), "version": fmt_version(got),
-                    "claimed": True, "renewed": True,
-                    "after_unreadable": unreadable}
-
-    for _attempt in range(8):
-        # Re-checked every pass, not once before the loop. Two concurrent
-        # requests carrying one session could both pass a pre-loop check (neither
-        # had committed yet), and the insert loser then allocated the NEXT number
-        # instead of finding its twin — one session holding two numbers, which is
-        # exactly what the idempotency was built to prevent (round 1's F06).
-        if _attempt:
-            mine = await _my_live_release(session, body.repo, holder, sess, now)
-            if mine is not None:
-                got = parse_version(mine.key[len(body.repo) + 1:])
-                if got is not None and (told is None or got > told):
-                    return {**claim_view(mine), "version": fmt_version(got),
-                            "claimed": True, "renewed": True,
-                            "after_unreadable": unreadable}
-        known = await _highest_known(session, body.repo)
-        floor = max([v for v in (told, known) if v is not None], default=(0, 0))
-        candidate = _next_version(floor)
-        if candidate is None:
-            raise HTTPException(409, detail={
-                "error": "release namespace exhausted", "repo": body.repo,
-                "floor": fmt_version(floor)})
-        key = release_key(body.repo, candidate)
-
-        await _sweep_lapsed(session, "release", key, now)
-        await session.commit()
-        held = await live_claim(session, "release", key, now)
-        if held is not None:
-            # **The same-machine renew rule of `POST /claim` must NOT apply here,
-            # and a concurrent test is what proved it.** Four callers racing for
-            # one repo's numbers came back `3.1, 3.2, 3.3, 3.2` — the duplicate
-            # being two agents on one box, where the second found the first's
-            # claim, matched on machine and "renewed" into a number that was
-            # already spoken for. That is the exact defect this endpoint exists
-            # to remove, reintroduced by a convenience borrowed from the wrong
-            # kind of claim.
-            #
-            # The two kinds genuinely differ. For a merge claim, a box re-taking
-            # its own claim is an agent recovering from a restart. For a release
-            # number, two agents on one machine are two BRANCHES — and this fleet
-            # runs several agents per box authenticating as that box, which is
-            # precisely the population the allocator is for.
-            #
-            # Idempotency is keyed on the SESSION instead, so a caller retrying a
-            # timed-out request gets its own number back while its co-tenant does
-            # not. No session, no renew: a repeat call spends a number, and a
-            # skipped number costs nothing while a duplicated one costs a rename
-            # across eight files.
-            if sess and held.session and sess == held.session \
-                    and same_machine(held.holder, holder):
-                _renew_onto(held, holder=holder, ttl=body.ttl, sess=sess,
-                            note=body.note, now=now)
-                await session.commit()
-                return {**claim_view(held), "version": fmt_version(candidate),
-                        "claimed": True, "renewed": True,
-                        "after_unreadable": unreadable}
-            # Held, so it is not free however the arithmetic came out.
-            # `_highest_known` will now see it and the next pass moves on.
-            continue
-
-        note = body.note or (f"held for {body.branch}" if body.branch else None)
-        claim = await _take(session, kind="release", key=key, holder=holder,
-                            ttl=body.ttl, sess=sess, note=note, now=now)
-        if claim is None:
-            continue
-        return {**claim_view(claim), "version": fmt_version(candidate),
-                "claimed": True, "renewed": False,
-                # Said rather than swallowed: an `after` this board could not
-                # parse means the allocation rested on board history alone, and a
-                # caller that mistyped its own version wants to know that before
-                # it writes the number into eight files.
-                "after_unreadable": unreadable}
-
-    raise HTTPException(409, detail={
-        "error": "could not allocate a release number: the namespace is contended",
-        "repo": body.repo,
-        "advice": "retry; several agents are allocating for this repo right now"})
-
-
-class ReleaseReclaimIn(BaseModel):
-    """Swap one release number for another, atomically."""
-
-    repo: RepoKey = Field(max_length=256)
-    #: The claim being given up. Named by id rather than by version so a caller
-    #: cannot accidentally release a number it never held.
-    claim_id: uuid.UUID
-    #: Carried onto the new claim, as `POST /release/claim` already does. Its
-    #: absence meant a renumber could not say which branch the new number was
-    #: for, so `GET /releases` lost the "what is landing soon" answer at exactly
-    #: the moment the branch changed number (round 1's F12).
-    branch: str | None = None
-    after: str | None = None
-    ttl: int = Field(default=DEFAULT_TTL, ge=1, le=MAX_TTL)
-    session: str | None = Field(default=None, max_length=MAX_SESSION)
-    note: str | None = Field(default=None, max_length=500)
-
-
-@router.post("/release/reclaim")
-async def reclaim_release(
-    body: ReleaseReclaimIn,
-    holder: str = Depends(identify),
-    session: AsyncSession = Depends(get_session),
-) -> dict:
-    """Give up a number and take the next free one, as ONE step.
-
-    **The renumber is the dangerous moment, not the first pick, and the evidence
-    is that both of 2026-08-16's collisions were renumbers.** Choosing a version
-    at the start feels like a decision, so it gets announced and re-read;
-    replacing one feels like bookkeeping, so it gets neither. Both branches that
-    collided that morning were renumbering off an earlier collision.
-
-    Doing it as release-then-claim through the two endpoints above reopens
-    exactly the race this table closes: between the release and the claim the
-    caller holds nothing, and the window is widest precisely when the namespace
-    is contended — which is the only time anyone renumbers. So it is one call and
-    one transaction.
-
-    **The old claim is given up only if a new one was taken.** A failed
-    allocation leaves the caller holding what it had, because the alternative is
-    an agent with a CHANGELOG full of a number it no longer owns and nothing to
-    replace it with. That asymmetry is the whole reason this is not two calls.
-    """
-    now = now_pre = _utcnow()
-    old = await session.get(ResourceLease, body.claim_id)
-    if old is None:
-        raise HTTPException(404, "claim not found")
-    if not may_mutate(old, holder, body.session):
-        raise _not_yours(old)
-    # Liveness, which `renew_claim` checked and this did not (round 1's F07).
-    # Without it a timed-out retry, a concurrent reclaim of the same id, or
-    # simply an already-released claim all passed every other check and minted
-    # ANOTHER number — the double allocation the session idempotency exists to
-    # prevent, with the renumber path having no equivalent guard. It also stopped
-    # `giving_up.released_at = now` from overwriting a release that had already
-    # happened, rewriting history to say it was let go later than it was.
-    if old.released_at is not None or old.expires_at <= now_pre:
-        raise HTTPException(409, detail={
-            "error": "that claim is no longer held; take a fresh one via POST /release/claim",
-            "key": old.key,
-            "released": old.released_at.isoformat() if old.released_at else None,
-            "lapsed": old.lapsed})
-    if old.kind != "release":
-        raise HTTPException(409, detail={
-            "error": "not a release claim", "kind": old.kind, "key": old.key})
-
-    prefix = f"{body.repo}:"
-    if not old.key.startswith(prefix):
-        raise HTTPException(409, detail={
-            "error": "that claim belongs to another repo",
-            "key": old.key, "repo": body.repo})
-
-    told = parse_version(body.after)
-    unreadable = body.after is not None and told is None
-    # Read off the row ONCE, before any commit or rollback. Both expire every
-    # attribute on the session's objects, and an expired attribute read back
-    # under async SQLAlchemy is a lazy load outside the greenlet — a
-    # `MissingGreenlet` at the exact moment this endpoint is doing its job,
-    # since the retry path is reached only when the namespace is contended.
-    # Found by the concurrent test below and by nothing else.
-    old_id, old_key = old.id, old.key
-    old_session, old_note = old.session, old.note
-    gave_up = parse_version(old_key[len(prefix):])
-
-    for _attempt in range(8):
-        known = await _highest_known(session, body.repo)
-        floor = max([v for v in (told, known) if v is not None], default=(0, 0))
-        candidate = _next_version(floor)
-        if candidate is None:
-            raise HTTPException(409, detail={
-                "error": "release namespace exhausted", "repo": body.repo,
-                "still_holding": fmt_version(gave_up) if gave_up else None})
-        key = release_key(body.repo, candidate)
-
-        await _sweep_lapsed(session, "release", key, now)
-        await session.commit()
-        if await live_claim(session, "release", key, now) is not None:
-            continue
-
-        # Both writes in one transaction: the old row is released in the same
-        # commit that takes the new one, so there is no instant at which this
-        # caller holds neither. If the INSERT loses its race the rollback takes
-        # the release with it, which is what makes the failure path safe rather
-        # than merely unlikely.
-        #
-        # `old` is re-fetched each pass because the commit above expired it.
-        # `old` is re-fetched BEFORE `fresh` is added to the session. Loading a
-        # row whose attributes a commit expired can trigger autoflush, and with
-        # the INSERT already pending that flush emits it outside this
-        # try/except — so a lost race would surface as an unhandled
-        # IntegrityError instead of a retry (round 1's F28).
-        giving_up = await session.get(ResourceLease, old_id)
-        if giving_up is None or giving_up.released_at is not None:
-            raise HTTPException(409, detail={
-                "error": "that claim was released while renumbering; nothing was taken",
-                "key": old_key})
-        note = body.note or (f"held for {body.branch}" if body.branch else old_note)
-        fresh = ResourceLease(kind="release", key=key, holder=holder,
-                              session=clean_session(body.session) or old_session,
-                              note=note,
-                              ttl_seconds=body.ttl,
-                              expires_at=now + timedelta(seconds=body.ttl))
-        session.add(fresh)
-        giving_up.released_at = now
-        try:
-            await session.commit()
-        except IntegrityError as e:
-            await session.rollback()
-            if not is_unique_violation(e):
-                raise
-            continue
-        await session.refresh(fresh)
-        return {**claim_view(fresh), "version": fmt_version(candidate),
-                "claimed": True, "renewed": False,
-                # Named back so the caller can check the swap it just made
-                # against the number it has already written into eight files.
-                "gave_up": fmt_version(gave_up) if gave_up else None,
-                "after_unreadable": unreadable}
-
-    raise HTTPException(409, detail={
-        "error": "could not reclaim: the namespace is contended",
-        "repo": body.repo,
-        "still_holding": fmt_version(gave_up) if gave_up else None,
-        "advice": "you still hold your original number; retry"})
-
-
-@router.get("/releases")
-async def list_releases(
-    repo: RepoKey,
-    limit: int = Query(default=200, ge=1, le=1000),
-    _: str = Depends(reader),
-    session: AsyncSession = Depends(get_session),
-) -> dict:
-    """Every number this board has handed out for a repo, and who has it.
-
-    Also the answer to a question the board could not previously answer at all —
-    "what is landing soon" — which #46 names as a side benefit and is arguably
-    the more useful half day to day.
-    """
-    now = _utcnow()
-    prefix = f"{repo}:"
-    rows = list(await session.scalars(
-        select(ResourceLease)
-        .where(ResourceLease.kind == "release", _repo_prefix(repo))
-        .order_by(ResourceLease.acquired_at.desc())
-        .limit(limit)
-    ))
-    out = []
+    wanted: set[tuple[str, str]] = set()
     for c in rows:
-        v = parse_version(c.key[len(prefix):])
-        out.append({
-            # The id every mutating endpoint requires. Without it a client that
-            # discovered its claim here had to go to `GET /claims` to act on it
-            # (round 1's F31).
-            "claim_id": str(c.id),
-            "version": fmt_version(v) if v else None,
-            "holder": c.holder,
-            "session": c.session,
-            "note": c.note,
-            "acquired": c.acquired_at.isoformat(),
-            "expires": c.expires_at.isoformat(),
-            "held": c.released_at is None and c.expires_at > now,
-            "released": c.released_at.isoformat() if c.released_at else None,
-            "lapsed": c.lapsed,
-        })
-    highest = await _highest_known(session, repo)
-    return {"repo": repo, "releases": out,
-            # What the NEXT call would allocate, absent a higher `after` from the
-            # caller. Advisory and racy by nature — reading it is not claiming it,
-            # which is the distinction this whole module is about.
-            "highest_known": fmt_version(highest) if highest else None}
+        obj = board_object(c.kind, c.key)
+        if obj is not None:
+            wanted.add(obj)
+    if not wanted:
+        return {}
+    out: dict[tuple[str, str], str] = {}
+    for prefix, model in (("plan", Plan), ("item", PlanItem)):
+        ids = [i for kind, i in wanted if kind == prefix]
+        if not ids:
+            continue
+        for row_id, scope in await session.execute(
+            select(model.id, model.repo).where(model.id.in_(ids))
+        ):
+            if not scope:
+                continue
+            try:
+                # `_norm_scope` lower-cases on the way in, so this normally
+                # changes nothing; it runs anyway because a row written before it
+                # did must not silently compare unequal to the `repo` query
+                # parameter, which IS canonicalised.
+                out[(prefix, str(row_id))] = canonical_repo(scope)
+            except BadRef:
+                # A scope that is not a repo shape this board keys. Left out, so
+                # the claim reads as unattributed rather than attributed to a
+                # repo no caller can name in a query.
+                continue
+    return out
+
+
+@router.get("/claim/held")
+async def held_claims(
+    repo: str | None = Query(default=None, description="`owner/name`; omit for every repo"),
+    holder_q: str | None = Query(default=None, alias="holder",
+                                 description="whose claims; defaults to yours"),
+    session_q: str | None = Query(
+        default=None, alias="session",
+        description="narrow to one session's claims — plus any claim that named "
+                    "no session, which belongs to the machine"),
+    caller: str = Depends(identify),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Does this agent hold a live claim in this repository — yes or no (#172).
+
+    The question a pickup gate has to ask, and the reason it is a separate
+    endpoint rather than a filter on ``GET /claims``: enforcement must be a
+    **deterministic boolean**, not a list a caller re-derives the answer from.
+    Three callers re-deriving it is three chances to get the repo attribution
+    wrong, and the fleet has already spent an evening on exactly that — the
+    dashboards' own ``issue_claims`` joins on the key shape while the plan filters
+    on ``kind``, and the two disagreed.
+
+    The repo attribution is :func:`app.claimkey.repo_of`, so it is read off the
+    key rather than from a column a caller fills in — the same rule that makes the
+    key itself derived. A plan or item key names a board object rather than a
+    repo, so the join is finished against the row (:func:`_board_scopes`); a key
+    that still names no repo after that is reported under ``unattributed`` rather
+    than dropped, because "I am holding something, and it does not say which
+    repo" is a different answer from "I am holding nothing", and a gate that
+    collapsed them would stop an agent that is demonstrably working.
+
+    **Whose claims, and the rule is this module's own.** This asked for
+    ``holder == whose`` — plain equality, and the only ownership test on this
+    table that did. Every other one goes through :func:`same_machine`
+    (:func:`may_mutate`, ``_may_renew``, the plan router's ``_is_mine``), because
+    the name half of an identity is *board-allocated per* ``X-Agent-Key`` and is
+    recycled. The two clients that make up this feature do not send the same
+    headers: the MCP server sends ``X-Agent-Key``, so an agent claiming through
+    the ``claim`` tool writes under ``zeus/amber-otter``, while the harness CLIs
+    send only ``Authorization``, so ``qb-claim`` — and therefore
+    ``create-worktree`` — writes under the bare ``zeus``. Under plain equality
+    each was invisible to the other: the pickup gate reported ``held: false`` for
+    an agent that had just claimed through the tool, and the tool reported
+    ``held: false`` for the claim the checkout took on its behalf. The suite could
+    not see it because ``tests/conftest.py`` sends no key, so writer and reader
+    were always the same bare string.
+
+    So the holder filter is :func:`app.identity.address_clause`, the same
+    machine-scoped, alias-aware clause ``GET /active`` already uses on
+    ``Lease.holder``: it matches the machine root, this agent's name and its
+    permanent key form — and *not* a co-tenant's name. An agent that comes back
+    under a different name therefore still sees everything the machine holds and
+    everything its key answers to; a claim written under a name it has since lost
+    is the one case the widening does not recover, and it is the same gap
+    :func:`app.identity.resolve_alias` documents for a retired agent's mail.
+
+    **And the session is what separates co-tenants**, exactly as it does for a
+    mutation: a claim that named a session belongs to that session, and a claim
+    that named none falls back to the machine because there is nothing finer to
+    compare. ``may_mutate``'s rule, read as a filter. That is what lets the
+    checkout claim work: ``create-worktree`` records no session — the agent that
+    will use the tree does not exist yet — so the claim belongs to the box until
+    somebody picks it up, and the session that picks it up can see it.
+    """
+    if repo is not None:
+        try:
+            repo = canonical_repo(repo)
+        except BadRef as e:
+            raise HTTPException(422, str(e)) from None
+    now = _utcnow()
+    # Defaults to the caller. An agent asking "am I holding anything" must not
+    # have to name itself — that is the client-supplied-identity mistake
+    # `identify` exists to avoid, and it is how a co-tenant's claim would come
+    # back as your own.
+    whose, aliases = await resolve_alias(session, holder_q or caller)
+    stmt = select(ResourceLease).where(
+        address_clause(ResourceLease.holder, whose, aliases),
+        ResourceLease.released_at.is_(None),
+        ResourceLease.expires_at > now,
+    )
+    wanted_session = clean_session(session_q)
+    if wanted_session:
+        stmt = stmt.where(or_(ResourceLease.session == wanted_session,
+                             ResourceLease.session.is_(None)))
+    rows = list(await session.scalars(stmt.order_by(ResourceLease.acquired_at.desc())))
+    scopes = await _board_scopes(session, rows)
+
+    in_repo, unattributed = [], []
+    for c in rows:
+        where = repo_of(c.kind, c.key)
+        if where is None:
+            obj = board_object(c.kind, c.key)
+            where = scopes.get(obj) if obj is not None else None
+        if where is None:
+            unattributed.append(claim_view(c))
+        elif repo is None or where == repo:
+            in_repo.append({**claim_view(c), "repo": where})
+    return {
+        "repo": repo,
+        "holder": whose,
+        "session": wanted_session,
+        # The one field a gate reads. `held` is true when this agent holds
+        # something attributable to the repo asked about; with no repo, when it
+        # holds anything attributable at all.
+        "held": bool(in_repo),
+        "claims": in_repo,
+        "unattributed": unattributed,
+        "checked": now.isoformat(),
+    }

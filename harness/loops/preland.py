@@ -580,13 +580,18 @@ def check_merge_claim(repo: str, pr: dict, mine: str) -> Check:
     that already holds one says so: without it, the lander's own claim would hold
     its own merge.
 
-    How much a `passed` here is worth depends on #142. The read is exact — the
-    holder is a full `machine/name`, so a co-tenant's claim is visibly not yours
-    — but `_may_mutate` currently session-scopes only `kind='release'` and
-    authorises every other kind by MACHINE, so a second agent on this box that
-    POSTs the same claim RENEWS it instead of getting a 409. Until that inverts,
-    this says "no other agent's claim is recorded", which is weaker than "no
-    other agent can land". Weaker is still the first thing to read it at all.
+    #142 inverted the authorisation this used to be hedged about: every kind in
+    the claims table is session-owned now, so a co-tenant POSTing the same claim
+    gets a 409 rather than a renew, and a `passed` here means "no other AGENT's
+    claim is recorded" rather than "no other machine's".
+
+    **An empty answer is warned about, not passed silently (#172).** The module
+    docstring's own rule — *"a merge gate that fails open wherever it cannot see
+    is not a gate"* — applies to the claims table as much as to a missing script.
+    A repo where nothing is ever claimed is a repo where agents collide in
+    silence, and `claims()` returned `[]` fleet-wide for four months while
+    thirteen agents worked three shared checkouts. So "unclaimed" is reported as
+    what it is: an answer this check cannot draw a conclusion from.
     """
     key = f"{repo}:{pr['headRefName']}"
     body, err = board_get("claims", {"kind": "merge", "key": key})
@@ -613,8 +618,108 @@ def check_merge_claim(repo: str, pr: dict, mine: str) -> Check:
             "— it is landing this branch")
     if claims and not others:
         c.summary = "held by you"
+    if not claims:
+        c.warnings.extend(_unclaimed_repo_warning(repo))
     c.status = "failed" if c.reasons else "passed"
     return c
+
+
+def _unclaimed_repo_warning(repo: str) -> list[str]:
+    """Why an empty claim answer is not evidence, when the repo claims nothing.
+
+    A warning rather than a HOLD, deliberately: nothing here is wrong with the
+    PR, and holding every merge in every repo that has not enrolled would make
+    this the check people turn off. What it must not do is stay quiet — a `passed`
+    that means "the table is empty" reads identically to one that means "nobody is
+    landing this", and the first is the state #172 was filed about.
+
+    Two questions, because a claim key does not always name a repo: the claims
+    list answers it for issues, PRs and branches, and :func:`_plan_claims_here`
+    answers it for the plan, whose keys are board ids with no repo in them at all.
+    Either one is enough to say this repo claims things.
+
+    Never raises and never blocks on a slow board: a failed read here simply says
+    nothing extra, because the caller already has its own answer about the key.
+    """
+    body, err = board_get("claims", {"limit": "1000"})
+    if err or not isinstance(body, dict):
+        return []
+    claims = body.get("claims")
+    if not isinstance(claims, list):
+        return []
+    # A key on a REPO object is `<owner>/<name>` followed by a SEPARATOR, whatever
+    # the kind — the board derives them all from the repo (`app/claimkey.py`), so
+    # one prefix test covers issues, PRs and branches without this file
+    # re-deriving the rule. The separator is required: `o/r` is a prefix of
+    # `o/rx#1`, and reading a neighbour's claim as this repo's would silence the
+    # warning in the one case it is for.
+    heads = tuple(f"{repo.lower()}{sep}" for sep in "#!:")
+    here = [c for c in claims
+            if str(c.get("key") or "").lower().startswith(heads)]
+    if here:
+        return []
+    # A key on a BOARD object says no repo at all, by design: a plan and an item
+    # are keyed `plan:<uuid>` / `item:<uuid>` because a plan may span several
+    # repos, so `repo_of` returns None for them and no prefix test can ever see
+    # one. The plan-level claim is the *new* half of #172 — the agile intake, the
+    # one coarse grain — so a repo whose agents claim their work that way was the
+    # repo most likely to be told it claims nothing at all. The plan itself is
+    # asked instead.
+    if _plan_claims_here(repo):
+        return []
+    live = len(claims)
+    return [
+        f"nothing in {repo} is claimed by anybody right now"
+        + (f" (the board holds {live} claim(s), all in other repos)" if live else
+           " — and the board holds no claims at all, fleet-wide")
+        + ". So `unclaimed` here is the absence of a record, not evidence that "
+        "nobody else is landing this branch. Agents in a repo that claims nothing "
+        "collide in silence: enrol it (create-worktree takes the claim, "
+        "`qb-claim issue <n>` by hand) or read this check as uninformative."
+    ]
+
+
+def _plan_claims_here(repo: str) -> int:
+    """How much of THIS repo's plan is held right now. 0 if it cannot be read.
+
+    The claims list cannot answer this. A plan claim is keyed `plan:<uuid>` and a
+    ref-less item `item:<uuid>`, with no repo in either — that is deliberate
+    (`app/claimkey.py`: a board object may span repos), and it means "is this repo
+    enrolled" cannot be decided by looking at keys. Asking the plan is not a second
+    implementation of the rule: the board does the attribution, off its own rows,
+    the same way `GET /claim/held` does it for the keys that do carry a repo.
+
+    `counts` rather than the item page, because `counts` is computed over the whole
+    open set while `items` is a page of it — reading the page would make this
+    answer "nothing is claimed" about the rows it did not fetch. And `exact`,
+    because widening a repo read to the fleet-wide list would let another repo's
+    plan silence this repo's warning, which is the mistake the separator test above
+    exists to prevent, one scope up.
+
+    Best-effort like its caller: a failed read returns 0 and the warning is printed
+    on the safe side. A gate that turned an outage into "this repo is fine" would
+    be the fail-open this whole check exists to close.
+    """
+    body, err = board_get("plan", {"repo": repo, "exact": "true", "limit": "1"})
+    if err or not isinstance(body, dict):
+        return 0
+    held = 0
+    counts = body.get("counts")
+    if isinstance(counts, dict):
+        # `claimed` is item by item; `covered` is inside a plan somebody holds as a
+        # unit. Both are agents saying "this is mine" in this repo, which is the
+        # only question here.
+        for name in ("claimed", "covered"):
+            value = counts.get(name)
+            if isinstance(value, int) and value > 0:
+                held += value
+    plans = body.get("plans")
+    if isinstance(plans, list):
+        # A plan claimed while it is still being written has no claimed items yet,
+        # and that is the moment the claim exists FOR: the surveying agent holds
+        # the list before there is anything exact in it to hold.
+        held += sum(1 for p in plans if isinstance(p, dict) and p.get("claim"))
+    return held
 
 
 def check_migrations(root: str, base: BaseRef, versions: str = "") -> Check:

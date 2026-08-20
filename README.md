@@ -47,6 +47,28 @@ front of it. See **Auth** below before exposing it to anything wider.
   the JSONL blob. The board doubles as the lock.
 - **Deploy: any container runtime** — the reference deployment is a Portainer stack, but it is
   three plain containers (secret-resolver, Postgres, app) and ports elsewhere unchanged.
+- **A claim key is derived, never composed** (`app/claimkey.py`, #172). A caller says *which
+  resource* — an issue, a PR, a branch, a plan, a plan item — and the board reads the key off it in
+  one place. The alternative is what shipped for four months: `(kind, key)` is the unique index, so
+  the plan writing `work/<repo>#163` while an agent wrote `issue/<repo>#163` made **two resources
+  out of one issue**, and `plan_read` reported `claimed: 0` in the same second `claims()` showed the
+  live row. Two subsystems agreeing by convention is not a thing anything can check. A pair composed
+  by hand is still accepted and canonicalised onto the same row — and the response says it was,
+  because an agent that believes it holds a key the board does not have is the same defect with the
+  parties swapped. **A key the board does not recognise is left alone**: a real claim here reads
+  `prisonblues/lexray:serving-row:32022R2554`, and canonicalisation that guesses at an open domain
+  is what PR #152 was closed for.
+- **Every key is repo-global, and worktree-blind on purpose.** There is one
+  `prisonblues/quarterback#172` however many checkouts exist on however many machines, so two agents
+  in different worktrees *should* collide on it. No path, machine or worktree ever enters a key. The
+  inverted case — an uncommitted file, contended only by agents sharing a directory — must never
+  enter this namespace, because a path key would block an agent that is entirely free; that is #185,
+  in a namespace of its own.
+- **Enforcement is in tools, not in agent co-operation.** A claim that has to be remembered is a
+  claim that will be forgotten, and prompt-sniffing cannot help: the session that took zero claims
+  while landing ten PRs was driven by "152", "next", "yes". So the write hangs off an action that
+  already happens — `create-worktree` claims the issue its branch names, or refuses — and the read is
+  one deterministic boolean (`GET /claim/held`) that a hook can gate on.
 
 ## API surface (implemented: v1 → v2.12)
 
@@ -164,24 +186,79 @@ GET   /review/findings   ?repo=&pr=&limit=                       (one PR's findi
                           summary of it, not a second copy
 GET   /panel             (browser view — the leaderboard)
 
-# the plan: what is next, in what order, and who has it (v2.39)
-GET   /plan              ?repo=&phase=&include_done=&exact=&limit=200
-                          -> {items:[…], next, counts, truncated}
-                          `next` = the first item that is open, unclaimed and unblocked,
-                          and `counts` describe the whole scope — neither is ever the
-                          page, however small `limit` is (max 1000, `truncated` says so);
-                          ?repo= also returns the fleet-wide (repo-less) items, ranked
-                          after that repo's own; ?exact= keeps a read to one scope
-                          (with no repo, that is the fleet list by itself)
-POST  /plan/item         { title, repo?, ref_kind?, ref_value?, phase?, note?, depends_on? }
-                          one OPEN item per ref — a duplicate is refused, naming the item
+# claims: what you are working on, said before you start (v2.31, derived in #172)
+POST  /claim             { ref:{kind, repo?, value}, ttl=3600, session?, note? }
+                          ref.kind = issue|pr|branch|plan|item, and the BOARD derives
+                          the key from it. { kind, key } is still accepted and is
+                          canonicalised onto the same row, with `derived_from` saying so
+                          — two spellings of one resource is what made `claims()` useless
+                          for four months (#172). 409 names the holder, their session and
+                          what they said they were doing; re-claiming your own SESSION's
+                          claim is a renew
+POST  /claim/renew       { claim_id, session? }        (never revives a lapsed claim)
+POST  /claim/release     { claim_id, session? }        (idempotent; the row is history)
+GET   /claims            ?kind=&key=&holder=&include_released=&limit=
+                          or ?ref_kind=&ref_value=&repo= to have the key derived, which
+                          is the only way a lookup cannot miss a claim by spelling it.
+                          The two spellings are exclusive, as they are on POST /claim.
+                          A kind on its own is folded too (`issue`->`work`), and the
+                          fold is reported: kinds no longer tell an issue from a PR
+GET   /claim/held        ?repo=&holder=&session=   -> {held: bool, claims, unattributed}
+                          the deterministic yes/no a pickup gate reads. `held` is one
+                          boolean rather than a list three callers each re-derive the
+                          repo from; a plan or item claim is attributed by the row's own
+                          scope, and a key that still names no repo (a fleet plan, the
+                          free-text namespace) lands in `unattributed`, because
+                          "working, and the key does not say where" is not "idle".
+                          Whose claims is the machine-scoped, alias-aware rule the rest
+                          of the table already authorises with — the MCP client sends
+                          X-Agent-Key and the harness CLIs do not, so an exact holder
+                          match made each half invisible to the other. `session=`
+                          narrows to one session plus the claims that named none, which
+                          belong to the machine
+
+# the plan: what is next, in what order, and who has it (v2.39; plans are rows in #172)
+GET   /plan              ?repo=&plan=&include_done=&exact=&limit=200&session=
+                          -> {items:[…], plans:[…], next, counts, truncated}
+                          `next` = the first item that is open, unclaimed, unblocked and
+                          not `covered_by` somebody else's plan claim; `counts` describe
+                          the whole scope — neither is ever the page, however small
+                          `limit` is (max 1000, `truncated` says so); ?repo= also returns
+                          the fleet-wide (repo-less) items, ranked after that repo's own;
+                          ?exact= keeps a read to one scope (with no repo, that is the
+                          fleet list by itself); ?plan= narrows to one plan by label or id;
+                          ?session= is your session id, so a plan held by a CO-TENANT on
+                          your machine reads as somebody else's rather than as yours —
+                          without it the answer can only be by machine, which is coarser
+                          and honest rather than wrong
+GET   /plans             ?repo=&exact=&include_closed=&session=
+                          who is holding which plan, and how many open items each has —
+                          the read to make BEFORE you start surveying a vague problem
+POST  /plan/submit       { label, repo?, note?, items:[{title, ref_kind?, ref_value?,
+                           note?, depends_on?}], claim=true, ttl?, session? }
+                          a whole plan in ONE transaction. `depends_on` takes "@2" for
+                          the second item of this submission, so a plan carries its own
+                          dependency graph without being written twice. An eight-item
+                          plan added item by item is a plan a second agent can raid
+                          half-written, which is the same race moved earlier
+POST  /plan/claim        { plan_id, ttl=3600, session?, note? }
+                          "all of this is mine", and the planning pass itself — the one
+                          coarse grain there is, for the one race that is genuinely fuzzy
+POST  /plan/release      { plan_id, session? }         (idempotent)
+POST  /plan/done         { plan_id, session?, note?, force? }
+                          refused while items are still open, naming them
+POST  /plan/item         { title, repo?, ref_kind?, ref_value?, plan?, note?, depends_on? }
+                          one OPEN item per ref — a duplicate is refused, naming the item.
+                          `plan` is a label or an id; an unknown label creates the plan
 POST  /plan/item/claim   { item_id, ttl=3600, session?, note?, force? }
-                          the same claim POST /claim writes; blocked items need force.
-                          Owned by the SESSION: two agents on one box are two workers
+                          the same claim POST /claim writes. Owned by the SESSION: two
+                          agents on one box are two workers. Blocked items need force,
+                          and so does an item inside a plan somebody else holds — a
+                          claim blocks, it is not a note to read past
 POST  /plan/item/release { item_id, session? }         (idempotent)
 POST  /plan/item/done    { item_id, session?, note? }  (records that the ISSUE closed)
 POST  /plan/item/depends { item_id, depends_on:[item_id|"#55"] }   (a dependency is a fact)
-POST  /plan/item/update  { item_id, title?, phase?, note?, state? }     ← human-only
+POST  /plan/item/update  { item_id, title?, plan?, note?, state? }      ← human-only
 POST  /plan/reorder      { repo?, order:[item_id, …] }                  ← human-only
 GET   /plan/view         (browser view — the plan, and where a human reorders it)
 
@@ -311,7 +388,13 @@ push) / `sync_status` (am I stale?); coordination — `active` (who's live in a 
 `peers` (who's on my problem) / `subagent_start` / `subagent_end`; and the plan —
 `plan_read` (what is next, with `next` already worked out — `next` and `counts`
 describe the plan, never the page) / `plan_add` / `plan_claim`
-(before you start, not after) / `plan_release` / `plan_done` / `plan_depends`. There is
+(before you start, not after) / `plan_release` / `plan_done` / `plan_depends`; whole
+plans (#172) — `plans` (who is surveying what) / `plan_submit` (a plan in one call,
+claimed on the way out) / `plan_hold` / `plan_unhold` / `plan_finish`; and claims —
+`claim` / `claims` / `renew_claim` / `release_claim` / `claim_held` (am I holding
+anything here — the check to make before substantive work). **No claim tool takes a repo
+string and none composes a key**: they take a `repo_path` and the board derives both, which
+is #148's rule and #172's. There is
 no `plan_reorder` tool, and that is the feature: reordering is human-only, so a tool for
 it could only ever return a 403. Panel stats are
 deliberately *not* an MCP tool: they are recorded by the panel process itself
@@ -412,11 +495,13 @@ line of its behaviour changing, which is the cost this removes.
 
 Ten collisions in two days made the case, and the tenth landed an hour after the board's allocator
 shipped and worked — two agents simply did not call it, because a lock that has to be remembered is
-a lock that will be forgotten. `POST /release/claim` (#46, #99) is still there, and it is worth
-being plain about what it is: an **announcement, not a reservation**. This flow neither reads it nor
-honours it, so a claim on v2.34 does not keep v2.34 free — the next `apply` on any branch stamps it
-anyway, because a stamped number is only ever "the next one free at the ref I merged into". Claim
-one if it helps a human coordinate; do not rely on it to hold a number.
+a lock that will be forgotten. **That allocator is gone (#172).** `POST /release/claim`,
+`POST /release/reclaim`, `GET /releases` and `kind='release'` were deleted along with the
+`claim_release_number` / `reclaim_release_number` / `releases` tools: this flow never read them, so a
+claim on v2.34 never kept v2.34 free, and what it left instead was a table of numbers going stale
+for every PR still open. A namespace nobody claims in does not need an allocator, and a stale record
+of one is worse than none — it is a second answer to a question that has one, which is exactly the
+defect #172 is about. Nine releases landed in a day off `apply` alone, with no collisions.
 
 For the same reason **test files are named after what they test, not after the release that shipped
 them** — `tests/test_resource_claims.py`, never `tests/test_v231.py`. A version in a filename is a
@@ -786,6 +871,23 @@ full — including what was broken before it, which is the part no diff recovers
   degrades to an extra row and a line in the log rather than taking the other five down
   with it. Both rows rendering is also what makes the ⚖ on a watched repo's PR clickable
   for the first time, so it now refuses one, exactly as the ⚒ on an issue row already did.
+- **vNEXT** — a claim nobody takes. `claims()` returned `[]` fleet-wide for four months while
+  thirteen agents worked three shared checkouts, and both halves of why are fixed here. **The key
+  is derived, never composed** (`app/claimkey.py`): the plan wrote `work/<repo>#163` while an agent
+  wrote `issue/<repo>#163`, and since `(kind, key)` is the unique index those were two resources —
+  so `plan_read` reported `claimed: 0` about an issue three agents were holding, in the same second
+  `claims()` showed the row. `POST /claim` now takes a `ref` and derives the key; a composed pair is
+  canonicalised onto the same row and told so. **A plan is a row**, replacing `phase`-as-a-string:
+  one plan per label per scope as a database fact, a state so it can finish, an id so it can be
+  claimed, and `POST /plan/submit` so a whole plan commits at once instead of being raidable
+  half-written. **Block on pickup**: `GET /claim/held` is one deterministic boolean, `create-worktree`
+  claims the issue its branch names before the tree exists, and `qb-claim` / `qb-claimed` are the
+  write and read halves a hook can call — three exit codes, because a gate that reads "cannot tell"
+  as "nothing held" fails open on every host nobody checked. **The release allocator is deleted**
+  along with `kind='release'`: `release_stamp.py` has done the job since v2.34 and the allocator's
+  own rows were going stale for every open PR. And `preland`'s merge-claim check now **warns when a
+  repo claims nothing at all**, because `unclaimed` there was the absence of a record being read as
+  evidence.
 - **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
   object store; wire `landed` refs to a cherry-pick helper.
 

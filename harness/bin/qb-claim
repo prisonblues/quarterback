@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""qb-claim — take a claim on a named resource. The write half of the pickup gate.
+
+  qb-claim issue 172                    this checkout's repo, issue 172
+  qb-claim pr 207 --note "reviewing"
+  qb-claim branch feat/x --ttl 7200
+  qb-claim item <uuid>                  a plan item, by board id
+
+  0  taken     — it is yours (or renewed, if it already was)
+  1  held      — somebody else has it; who, and what they said they are doing
+  2  unknown   — it is not yours, and not because somebody has it
+
+**The key is not composed here.** The resource is named — kind and value — and the
+board derives the key from it (`app/claimkey.py`). That is the whole of #172: the
+plan wrote `work/<repo>#163`, an agent wrote `issue/<repo>#163`, and the two
+subsystems reported different answers about one issue in the same second. A shell
+tool composing a third spelling would be the same defect with a new party.
+
+**1 and 2 are different exits for the reason `qb-claimed` gives.** "Somebody has
+it" is the board saying something definite and a caller should stop. "Cannot tell"
+covers a board outage, and a checkout that refuses on one makes the board a single
+point of failure for every worktree on the fleet — so the caller decides, and
+`create-worktree --require-claim` is how you ask for the strict reading.
+
+**1 NAMES A HOLDER. 2 is everything else, including a definite refusal.** With
+three codes that is the only place a 401 (rotated token) or a 422 (a ref this
+board does not key, a remote that is not `owner/name`) can go, and it is the right
+one rather than the leftover one: `create-worktree` turns 1 into a `die` telling
+the operator to go and talk to the holder, and a misconfiguration reported as a
+collision sends somebody looking for a peer that does not exist. It is not 0
+either, so `--require-claim` still refuses. What such an answer must not do is
+*read* like an outage — "the board is down" is a thing you wait out and a rotated
+token is not — so the text says which of the two happened even though the exit
+code cannot.
+
+**A 409 that names nobody is not a hold either.** `acquire` answers 409 twice:
+once with the holder, and once with `claim contended; try again` — the losing half
+of an insert race whose winner has already gone, so nobody holds the key at all.
+Read as HELD that became a `die` naming a holder that does not exist. It is
+retried once instead (the race is over by the time we are told about it, so a
+second POST normally takes the claim outright) and only then reported as 2, since
+nobody holds it and neither do we.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import urllib.error
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from qbdata import board_client, repo_slug  # noqa: E402
+
+TAKEN, HELD, UNKNOWN = 0, 1, 2
+
+#: Kinds whose identity is a BOARD id rather than something inside a repository.
+#: Sending a repo alongside one of these would give a single row two keys
+#: depending on which directory the caller happened to be standing in.
+REPOLESS = frozenset({"plan", "item"})
+
+#: HTTP answers where the board DECIDED, rather than being unavailable — and what
+#: to do about each. They exit `UNKNOWN` with every other non-hold answer (there
+#: is no fourth code, and see the docstring on why 1 would be worse), so the
+#: distinction has to live in the text: retrying is the remedy for an outage and
+#: is no remedy at all for any of these.
+DEFINITE = {
+    401: "the token this host resolved was refused — rotate or re-provision it; "
+         "the next attempt fails identically",
+    403: "the board knows this token and refused the claim anyway",
+    422: "the board does not key that resource — check the kind (issue | pr | "
+         "branch | plan | item), the value, and that this checkout's origin "
+         "remote reads `owner/name`",
+}
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        prog="qb-claim", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("kind", help="issue | pr | branch | plan | item")
+    ap.add_argument("value", help="the issue/PR number, branch name, or board id")
+    ap.add_argument("--repo-path", default=".",
+                    help="the checkout whose origin remote names the repo")
+    ap.add_argument("--ttl", type=int, default=None, help="seconds to hold it")
+    ap.add_argument("--note", default=None,
+                    help="what you are doing with it — shown to whoever is refused")
+    ap.add_argument("--session", default=os.environ.get("CLAUDE_CODE_SESSION_ID") or None,
+                    help="your session id (default: $CLAUDE_CODE_SESSION_ID)")
+    ap.add_argument("--json", action="store_true",
+                    help="print the board's whole answer on stdout instead of the id")
+    ap.add_argument("--quiet", "-q", action="store_true",
+                    help="exit code only — nothing on stdout or stderr, and it wins "
+                         "over --json, because that is the stronger promise")
+    args = ap.parse_args()
+
+    def say(message: str) -> None:
+        if not args.quiet:
+            print(message, file=sys.stderr)
+
+    repo = None
+    if args.kind.lower() not in REPOLESS:
+        repo = repo_slug(args.repo_path)
+        if not repo:
+            say(f"unknown: no owner/name could be read from the git remote at "
+                f"{args.repo_path!r} — a claim is keyed on the repo, and guessing "
+                f"one from a directory name is how two agents claimed one issue "
+                f"under two keys")
+            return UNKNOWN
+
+    body: dict = {"note": args.note, "session": args.session}
+    if args.ttl is not None:
+        body["ttl"] = args.ttl
+    body = {k: v for k, v in body.items() if v is not None}
+
+    try:
+        client, _cfg = board_client()
+    except Exception as e:                                        # noqa: BLE001
+        # Resolved once, outside the retry: the config is a shell script and the
+        # token may be a command, so re-resolving it for a second attempt would
+        # run somebody's `pass show` twice for one claim.
+        say(f"unknown: could not reach the board — {e.__class__.__name__}: {e}")
+        return UNKNOWN
+
+    answer = None
+    # Two attempts, and only the contended 409 uses the second one. The retry is
+    # not a general-purpose one: a lost insert race is the single failure here that
+    # is over before it is reported, so asking again is the whole remedy, while
+    # asking again about a held key or a rotated token is just a second wrong
+    # answer at twice the latency.
+    for attempt in (1, 2):
+        try:
+            answer = client.claim_ref(args.kind, args.value, repo, **body)
+            break
+        except urllib.error.HTTPError as e:
+            detail = _detail(e)
+            held = detail if isinstance(detail, dict) else {}
+            if e.code == 409 and not held.get("held_by"):
+                # A 409 with nobody in it is `claim contended; try again`: two
+                # callers reached the INSERT together and the winner had already
+                # gone by the time the board re-read it. Nobody holds this. It was
+                # reported as HELD, which `create-worktree` turns into a hard
+                # refusal naming a holder that does not exist — a phantom peer is
+                # worse than an unknown, because an operator acts on it.
+                if attempt == 1:
+                    continue
+                say(f"unknown: the claim on {held.get('key') or args.value} is "
+                    f"contended — the board lost a write race and nobody ended up "
+                    f"holding it. Asked twice; nothing to talk to, so try again.")
+                return UNKNOWN
+            if e.code == 409:
+                say(f"held: {held.get('held_by')} has "
+                    f"{held.get('key') or args.value} "
+                    f"— {held.get('note') or 'no note'} "
+                    f"(since {held.get('acquired') or '?'}, expires "
+                    f"{held.get('expires') or '?'})")
+                if held.get("session"):
+                    say(f"  their session: {held['session']} — the refusal is somebody "
+                        f"to talk to, not a wall")
+                if args.json and not args.quiet:
+                    print(json.dumps(detail, indent=2))
+                return HELD
+            if e.code in DEFINITE:
+                # Still 2, and said as what it is. "The board refused the claim —
+                # HTTP 422" read as an outage, so `create-worktree` printed "a
+                # board outage must not stop a checkout" over a permanent
+                # misconfiguration and every subsequent checkout repeated it.
+                say(f"unknown: the board REFUSED this claim and will refuse it "
+                    f"again — HTTP {e.code}: {_message(detail)}")
+                say(f"  not an outage: {DEFINITE[e.code]}")
+                return UNKNOWN
+            say(f"unknown: the board answered HTTP {e.code} — {_message(detail)}")
+            return UNKNOWN
+        except Exception as e:                                    # noqa: BLE001
+            # Broad on purpose, and it reports rather than shrugs: an outage, an
+            # unresolvable token command and a TLS failure are all "cannot tell",
+            # and the caller needs the reason in the text to act on it.
+            say(f"unknown: could not reach the board — {e.__class__.__name__}: {e}")
+            return UNKNOWN
+    if answer is None:
+        # Unreachable — attempt 2 either breaks or returns — and here anyway,
+        # because the alternative to a total function is a NameError in the one
+        # tool a hook calls before it lets an agent work.
+        return UNKNOWN
+
+    verb = "renewed" if answer.get("renewed") else "claimed"
+    say(f"{verb}: {answer.get('kind')}/{answer.get('key')} until "
+        f"{answer.get('expires')}")
+    if answer.get("note_on_key"):
+        say(f"  {answer['note_on_key']}")
+    # stdout carries exactly ONE thing, and which one is the caller's choice. The
+    # bare id is what `claim/renew` and `claim/release` want, so it is the default
+    # and it needs no parsing; `--json` replaces it with the whole answer, which
+    # then really is JSON rather than JSON with a line stuck to the end of it; and
+    # `--quiet` means the exit code, which is what "exit code only" says. The
+    # commentary is on stderr throughout.
+    if args.json and not args.quiet:
+        print(json.dumps(answer, indent=2))
+    elif not args.quiet:
+        print(answer.get("claim_id", ""))
+    return TAKEN
+
+
+def _detail(e: urllib.error.HTTPError):
+    """The board's own message, parsed if it is JSON. Never raises."""
+    try:
+        body = json.loads(e.read().decode())
+    except Exception:                                             # noqa: BLE001
+        return e.reason
+    return body.get("detail", body) if isinstance(body, dict) else body
+
+
+def _message(detail) -> str:
+    """One line out of a refusal, whatever shape it arrived in.
+
+    FastAPI's `detail` is a bare string for `HTTPException(422, "…")` and a dict
+    for the structured refusals in this router, so printing it raw put a python
+    dict repr in front of an operator who wanted the sentence inside it.
+    """
+    if isinstance(detail, dict):
+        return str(detail.get("error") or detail)
+    return str(detail)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
