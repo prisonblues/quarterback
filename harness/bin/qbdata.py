@@ -891,6 +891,317 @@ def plan_detail(item: dict) -> str:
     return clip(" · ".join(bits), 400)
 
 
+# ---- one table ---------------------------------------------------------------
+#
+# CLAIMED, PLANS, OPEN PRs and ISSUES were four panels answering one question —
+# what work is there, and who has it — from four sources, about overlapping rows.
+# #255 was a plan item AND an open issue AND a claim held by quill-marble, and
+# soon a PR: four rows on four panels, with nothing on the pane saying they were
+# one thing. Every reader had to do the join by eye, and the panel boundary was
+# hiding the very relation the panels existed to show (#272).
+#
+# So the join happens once, here, and both renderers draw the result. The merge
+# key is `owner/repo#n`, which works because GitHub numbers issues and pull
+# requests out of ONE sequence per repository: #265 is a PR or an issue and can
+# never be both, so no row can be merged onto the wrong thing.
+#
+# WHAT THIS SUPERSEDED, and why it is still above: `sort_plan`, `plan_state`,
+# `plan_counts`, `sort_issues`, `claim_label` and `minutes_left` each drew one of
+# the four panels, and no renderer calls any of them now. They are not deleted in
+# this change because PRs #268 and #270 are open against these same files and
+# still call them from their own copies of the panels — pulling the floor out from
+# under two in-flight branches would cost more than the dead lines do. Their
+# removal is #280, once those have landed. `plan_who`, `plan_ref`, `plan_detail`,
+# `ci_state` and `claims_by_issue` are NOT in that list: the functions below call
+# them, which is the point — one definition of "who has it", not two.
+
+# Rows that are not on the plan have no plan to order them, so they are grouped:
+# held work first (somebody is on it now), then PRs (a human decision is waiting),
+# then issues, newest first.
+WORK_HELD, WORK_PR, WORK_ISSUE = 0, 1, 2
+
+
+def work_rows(plan: list[dict], issues: list[dict], prs: list[dict],
+              claims: list[dict], repos: list[str] | None = None) -> list[dict]:
+    """One row per unit of work: the plan, the issues, the PRs and the claims, joined.
+
+    Each row carries whichever of the four sources knew about it — ``plan``,
+    ``issue``, ``pr``, ``claim`` — plus the fields every renderer needs off the
+    front of it: ``kind``, ``repo``, ``number``, ``title``.
+
+    THE ORDER IS THE PLAN'S ORDER, exactly as the board gave it, whatever state
+    the items are in. That is what a plan is: a human put those items in that
+    sequence, and a dashboard that re-sorted them by how they are going would be
+    substituting its own judgement for the ordering it was asked to display — a
+    blocked item is still the next thing to unblock. Work the plan does not
+    mention is appended below it, because there the dash has no order to honour
+    and has to pick one.
+
+    Sources are merged in the order plan → PRs → issues → claims, so the later
+    ones win on the fields two of them carry: a GitHub title is what the issue is
+    called NOW, and the plan item's copy of it can be months stale.
+    """
+    rows: dict[str, dict] = {}
+    order: list[dict] = []
+
+    def slot(key: str, **fields) -> dict:
+        """The row for `key`, made if this is the first source to mention it.
+
+        None never overwrites: a source that does not know a field must not blank
+        what another source filled in.
+        """
+        row = rows.get(key)
+        if row is None:
+            row = {"key": key, "kind": None, "repo": None, "number": None,
+                   "title": None, "plan": None, "issue": None, "pr": None,
+                   "claim": None, "index": None}
+            rows[key] = row
+            order.append(row)
+        for name, value in fields.items():
+            if value is not None:
+                row[name] = value
+        return row
+
+    # The plan first, because it is the only source with an opinion about order —
+    # and its position is taken from the list the board returned, not recomputed.
+    for index, item in enumerate(plan or []):
+        ref = item.get("ref") or {}
+        value = str(ref.get("value") or "")
+        repo = plan_repo(item, repos)
+        kind = ref.get("kind") if ref.get("kind") in ("issue", "pr") else None
+        # An item whose ref names a number in a repo we can name IS that issue or
+        # PR, and merges with it. One that does not — most plan items — is a line
+        # of plan, and gets a row of its own keyed on the item so it cannot
+        # collide with anything.
+        # The item's OWN claim goes on the row here. /plan embeds it and /active
+        # lists it separately, and taking only the second meant a plan item the
+        # board itself reported as held drew as free whenever the claims list had
+        # not been fetched yet — which is every render before the first board tick.
+        if kind and value.isdigit() and repo:
+            slot(f"{repo}#{value}", kind=kind, repo=repo, number=int(value),
+                 title=item.get("title"), plan=item, index=index,
+                 claim=item.get("claim"))
+        else:
+            slot(f"plan:{item.get('item_id')}", kind="plan", repo=item.get("repo"),
+                 title=item.get("title"), plan=item, index=index,
+                 claim=item.get("claim"))
+
+    for pr in prs or []:
+        slot(issue_key(pr), kind="pr", repo=pr.get("repo") or REPO,
+             number=pr.get("number"), title=pr.get("title"), pr=pr)
+
+    for issue in issues or []:
+        slot(issue_key(issue), kind="issue", repo=issue.get("repo") or REPO,
+             number=issue.get("number"), title=issue.get("title"), issue=issue)
+
+    for claim in sorted(claims or [], key=lambda c: c.get("expires") or ""):
+        key = (claim.get("key") or "").strip()
+        prefix, sep, number = key.rpartition("#")
+        if sep and prefix.count("/") == 1 and number.isdigit():
+            # A claim on an issue or a PR. It may land on a row no other source
+            # produced — a claim on an issue that has since closed — and that row
+            # belongs on the pane: somebody is holding something, and a claim the
+            # dash silently dropped is the one a human needs to see and release.
+            row = slot(f"{prefix}#{number}", repo=prefix, number=int(number))
+            if row["kind"] is None:
+                row["kind"] = "issue"
+        elif key.startswith("plan:"):
+            # Keyed on the ITEM, so it merges with the plan row above — whether
+            # that row is a line of plan or an issue the item points at.
+            item_id = key.split(":", 1)[1]
+            row = next((r for r in order if (r["plan"] or {}).get("item_id") == item_id),
+                       None)
+            row = row if row is not None else slot(key, kind="claim")
+        else:
+            # A lease, a release, a merge — held, but not an issue or a PR. It
+            # keeps its own row rather than being dropped, for the same reason.
+            row = slot(f"claim:{key}", kind="claim", repo=claim_repo(key, plan),
+                       title=claim.get("note"))
+        if row["claim"] is None:
+            row["claim"] = claim
+
+    def rank(row: dict) -> tuple:
+        if row["index"] is not None:
+            return (0, row["index"], 0)
+        group = WORK_HELD if row["claim"] else (
+            WORK_PR if row["kind"] == "pr" else WORK_ISSUE)
+        return (1, group, -(row["number"] or 0))
+
+    return sorted(order, key=rank)
+
+
+def work_state(row: dict) -> tuple[str, str]:
+    """(glyph, colour) for the first column: how this row is GOING.
+
+    A PR's state is its check rollup, even when somebody holds it, because that is
+    the fact a PR row is read for — whether it can land. Who holds it is the last
+    column's job, so nothing is lost by giving this one over to CI.
+    """
+    if row["kind"] == "pr":
+        return ci_state(row["pr"] or {})
+    if row["kind"] == "claim":
+        return "⚑", "yellow"
+    if row["claim"]:
+        return "▶", "green"
+    if (row["plan"] or {}).get("blocked_by"):
+        return "⊘", "grey50"
+    if row["kind"] == "plan":
+        return "≡", "grey70"
+    # Free. Cyan when the plan asked for it, green when it is merely open: both
+    # are takeable, and the first is the one the plan says to take.
+    return "○", ("cyan" if row["plan"] else "green")
+
+
+def work_dim(row: dict) -> bool:
+    """Is this row's TITLE worth dimming — is it here for completeness?
+
+    Two states qualify: blocked, and draft. Both are on the pane because leaving
+    them off would be a lie about what there is, not because anybody can act on
+    them today.
+
+    Read off the row rather than off the state colour, which is what it used to
+    be. `grey50` is also what a PR whose checks have not reported yet wears, and
+    inferring "dim" from it greyed the NEWEST PR on the board — the one most worth
+    reading — for the crime of being too new to have a verdict.
+    """
+    if (row["plan"] or {}).get("blocked_by") and not row["claim"]:
+        return True
+    return bool((row["pr"] or {}).get("isDraft"))
+
+
+#: The board leaves a claim's kind as free text, and the column is five wide. A
+#: WORD each, not a truncation — `clip` would render a release claim as "rele…",
+#: which is not the name of anything and reads as a rendering fault.
+CLAIM_WORDS = {"release": "rel", "lease": "lease", "merge": "merge", "work": "work",
+               "issue": "iss"}
+
+
+def work_kind(row: dict) -> tuple[str, str]:
+    """(word, colour) for the kind column — spelled out rather than sigilled.
+
+    A claim on something that is neither an issue nor a PR wears its own kind: a
+    `lease`, a `release`, a `merge`.
+    """
+    if row["kind"] == "pr":
+        return "pr", "magenta"
+    if row["kind"] == "issue":
+        return "iss", "bright_blue"
+    if row["kind"] == "plan":
+        return "plan", "grey50"
+    kind = (row["claim"] or {}).get("kind") or "held"
+    return CLAIM_WORDS.get(kind, kind[:5]), "yellow"
+
+
+def work_ref(row: dict, scope: "Scope | None" = None) -> str:
+    """'#265', or what a claim on something numberless is on, or nothing."""
+    if row["number"] is not None:
+        return f"#{row['number']}"
+    if row["kind"] == "claim":
+        key = (row["claim"] or {}).get("key") or ""
+        return _unprefixed(short_key(key), scope) if key else ""
+    return ""
+
+
+def work_who(row: dict) -> tuple[str, str]:
+    """(text, colour) for the last column: who has it, what it waits on, or its age.
+
+    Three facts in one column because only one of them is ever true of a row, and
+    the order is the order a reader wants them in — a holder outranks a blocker,
+    and both outrank how long it has been sitting there.
+    """
+    claim = row["claim"]
+    if claim:
+        return (claim.get("holder") or "?").split("/", 1)[-1], "yellow"
+    if row["plan"] is not None:
+        return plan_who(row["plan"])
+    gh = row["pr"] or row["issue"] or {}
+    return ago(gh.get("updatedAt")), "grey50"
+
+
+def work_action(row: dict, repos: list[str] | None = None) -> tuple[str, str, str | None]:
+    """(glyph, colour, verb) — the one thing this row can be told to do.
+
+    Always in the same column, whatever the row is, so "click the icon, not the
+    row" stays one habit. `panel` reviews a PR, `fix` starts work on an issue; a
+    row with no verb keeps a dim placeholder rather than an empty cell, because a
+    gap in a column reads as a rendering fault rather than as "nothing to start".
+    """
+    if row["kind"] == "pr":
+        return "⚖", "bold cyan", "panel"
+    if row["number"] is not None and row["kind"] == "issue":
+        # Dim once somebody holds it — still clickable, because a lapsed claim is
+        # exactly the thing a human picks up, and the confirmation names the holder.
+        return "⚒", ("grey30" if row["claim"] else "bold cyan"), "fix"
+    if row["kind"] == "plan" and plan_issue(row["plan"] or {}, repos) is not None:
+        return "⚒", "bold cyan", "fix"
+    return "·", "grey30", None
+
+
+def work_counts(rows: list[dict]) -> dict[str, int]:
+    """The numbers the panel title reports, counted over the rows it is about."""
+    counts = {"total": len(rows), "running": 0, "review": 0, "blocked": 0, "free": 0}
+    for row in rows:
+        if row["kind"] == "pr":
+            counts["review"] += 1
+        if row["claim"]:
+            counts["running"] += 1
+        elif (row["plan"] or {}).get("blocked_by"):
+            counts["blocked"] += 1
+        elif row["kind"] in ("issue", "plan"):
+            counts["free"] += 1
+    return counts
+
+
+def work_title(rows: list[dict], hidden: int = 0, err: str | None = None) -> str:
+    """'WORK · 34 · 3 running · 7 in review · 12 free · 2 blocked'.
+
+    Every number the four panel titles used to carry, over one set of rows that
+    counts each unit of work once — which the four could not do, because the same
+    issue was a row on three of them.
+    """
+    c = work_counts(rows)
+    head = f"WORK · {c['total']}"
+    for label in ("running", "review", "free", "blocked"):
+        if c[label]:
+            head += f" · {c[label]} {'in review' if label == 'review' else label}"
+    if hidden:
+        head += f" · {hidden} elsewhere"
+    if err:
+        head += f" · {clip(err, 24)}"
+    return head
+
+
+def work_detail(row: dict) -> str:
+    """The whole of a row, for the detail line — everything the cells could not fit.
+
+    The plan's note is the reason this is worth a click: it is why the item sits
+    where it sits in the order, it exists nowhere else, and no column is wide
+    enough for it. A row with no plan behind it still has a claim note, a CI
+    verdict or a title too long for its cell to say.
+    """
+    if row["plan"] is not None:
+        detail = plan_detail(row["plan"])
+        pr = row["pr"]
+        if pr:
+            glyph, _ = ci_state(pr)
+            detail += f" · pr {glyph}"
+        return clip(detail, 400)
+    bits = [f"{short_repo(row['repo'] or 'fleet')} {work_ref(row)}".strip(),
+            row["title"] or "(untitled)"]
+    claim = row["claim"]
+    if claim:
+        held = f"held by {claim.get('holder') or '?'}"
+        if claim.get("note"):
+            held += f" — {claim['note']}"
+        held += f" · {until(claim.get('expires'))} left"
+        bits.append(held)
+    if row["kind"] == "pr":
+        glyph, _ = ci_state(row["pr"] or {})
+        bits.append(f"ci {glyph}")
+        if (row["pr"] or {}).get("isDraft"):
+            bits.append("draft")
+    return clip(" · ".join(b for b in bits if b), 400)
+
 # ---- the tmux screen ---------------------------------------------------------
 # The dashboard reads the seats off tmux rather than off the board, because they
 # are different questions. The board knows which AGENTS are live anywhere on the

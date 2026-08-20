@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
 """qb-dash-tui — the fleet dashboard, clickable.
 
-Same five views as qb-dash (fleet / claims / plan / PRs / issues), but as a
-Textual app, so rows respond to the mouse. What a click does depends on what
-you clicked:
+Same three views as qb-dash (seats / fleet / work), but as a Textual app, so the
+rows respond to the mouse.
+
+WORK is ONE table. It used to be four — CLAIMED, PLANS, OPEN PRs and ISSUES —
+which meant a single unit of work could be four rows on four panels with nothing
+on the pane saying they were one thing (#272). The plan, the issues, the PRs and
+the claims are joined on `owner/repo#n` and drawn in the plan's order, so a row
+is a piece of work and the order is what the fleet agreed to do about it.
+
+What a click does depends on which CELL of the row you hit:
 
   a seat        jump the tmux cursor to that seat's pane — the dashboard is a
                 switcher, which is the whole reason to have it beside the seats.
@@ -11,15 +18,19 @@ you clicked:
                 Both go through qb-seat-click, so they mean exactly what the
                 same widgets on the tmux seat bar mean
   an agent      its cwd, branch, model and session id, in the detail line
-  a claim       the claim note, which is where an agent says what it is doing
-  a plan item   its phase, its note and what it waits on — the reasoning behind
-                its place in the order, which lives on the board and nowhere
-                else — or its ⚒, to start /fix-issue on the issue behind it
-  a PR          open it on GitHub — or its ⚖, to start /panel-review-pr on it
-                in a new pane of the seat row, beside the work it is about
-  an issue      open it on GitHub — or its ⚒, to start /fix-issue on it
+  the ⚖ or ⚒    START it: ⚖ panel-reviews a PR in a new pane of the seat row,
+                beside the work it is about; ⚒ starts /fix-issue on an issue,
+                including the issue behind a plan item
+  the #ref      OPEN it on GitHub
+  anything else EXPLAIN it in the detail line — the plan's note and what the item
+                waits on (the reasoning behind its place in the order, which
+                lives on the board and nowhere else), the claim note, the CI
+                verdict. The default is the harmless one on purpose: a stray
+                click on a 78-column pane should not spend money or take
+                somebody else's work
 
-Keys: r refresh now, o open the selected PR, s widen or narrow the scope, q quit.
+Keys: r refresh now, o open the selected row on GitHub, p panel-review a PR,
+f take an issue, s widen or narrow the scope, q quit.
 
 It opens NARROW: the rows of the project this screen is for (`--repo`, else
 QB_DASH_REPOS, else the cwd's origin), with the repo column dropped, because on a
@@ -138,7 +149,7 @@ class ClickTable(DataTable):
 
 
 class Dash(App):
-    """Five tables and a detail line."""
+    """Three tables and a detail line."""
 
     CSS = """
     Screen { background: $surface; }
@@ -152,15 +163,15 @@ class Dash(App):
     .title { height: 1; padding: 0 1; background: $boost; color: $accent; }
 
     /* A share of the pane each, and each scrolls inside its share. With
-       `height: auto` the four tables simply stack past the bottom of a 42-row
-       pane: the PRs then cannot be clicked, because they are not on screen —
-       which is how the click test caught it. */
-    #seats  { height: 1fr; }
-    #fleet  { height: 2fr; }
-    #claims { height: 1fr; }
-    #plan   { height: 2fr; }
-    #prs    { height: 2fr; }
-    #issues { height: 2fr; }
+       `height: auto` the tables simply stack past the bottom of a 42-row pane
+       and the last of them cannot be clicked, because it is not on screen —
+       which is how the click test caught it.
+
+       WORK takes most of the pane, and should: it is the panel the dashboard is
+       FOR, and merging four tables into one is what freed the rows to give it. */
+    #seats { height: 1fr; }
+    #fleet { height: 2fr; }
+    #work  { height: 6fr; }
     """
 
     BINDINGS = [
@@ -173,18 +184,21 @@ class Dash(App):
         ("question_mark", "help", "keys"),
     ]
 
-    # The ⚖ lives in its own column so that clicking it means something
-    # different from clicking the row. Column 1 of the PR table.
-    PANEL_COLUMN = 1
-    # And column 1 of the SEATS table is the ✕ that closes one. Same column
-    # everywhere on purpose: the action icon is always the second cell, so
-    # "click the icon, not the row" is one habit rather than five.
+    # WORK's columns, by index. The action icon has a column to itself so that
+    # clicking it means something other than clicking the row, and the ref has one
+    # so that "open this on GitHub" is a PLACE rather than a modifier: one row,
+    # three verbs, each of them somewhere you can point at.
+    STATE_COLUMN = 0
+    KIND_COLUMN = 1
+    ACTION_COLUMN = 2
+    # Column 1 of the SEATS table is the ✕ that closes one — the same second cell
+    # as WORK's action icon, on purpose, so "click the icon, not the row" is one
+    # habit rather than two.
     KILL_COLUMN = 1
-    # The same trick on the issue table: column 1 is the ⚒ that takes the issue.
-    # The plan table puts its ⚒ in the same column, for the same reason and with
-    # the same meaning — a plan item that points at an issue is an issue you can
-    # take, and having it in one place means one thing to learn.
-    FIX_COLUMN = 1
+    # The ref's index MOVES, which is why it is not up here with the others: the
+    # repo cell sits between the action icon and the ref and comes and goes with
+    # the scope (#261). `self.ref_column` is set by build_columns, the one place
+    # that knows how many columns the table has.
 
     def __init__(self, interval: float = 4.0, gh_interval: float = 90.0,
                  plan_interval: float = 15.0, scope: "qd.Scope | None" = None) -> None:
@@ -227,7 +241,15 @@ class Dash(App):
         self.issue_err: str | None = None
         self.plan: list[dict] = []
         self.plan_err: str | None = None
-        self.plan_sig: tuple | None = None
+        # WORK is fed by four sources on three clocks, so it is redrawn whenever
+        # any of them answers — and this stops that being a REBUILD every four
+        # seconds. A DataTable rebuilt between the mouse going down and the click
+        # arriving moves the row out from under the pointer, and this is the panel
+        # a reader dwells on.
+        self.work_sig: tuple | None = None
+        # Where the ref cell landed, so a click on it can be told from a click on
+        # the title. build_columns owns it; this is only the value before mount.
+        self.ref_column = 3
         self.held: dict = {}                  # 'owner/repo#n' → the claim on it
         self.detail_text = ""
         self.last_dispatch: tuple[str, float] | None = None
@@ -254,22 +276,16 @@ class Dash(App):
             yield ClickTable(id="seats", cursor_type="row")
             yield Static("FLEET", classes="title", id="t_fleet")
             yield ClickTable(id="fleet", cursor_type="row", zebra_stripes=False)
-            yield Static("CLAIMED", classes="title", id="t_claims")
-            yield ClickTable(id="claims", cursor_type="row")
-            yield Static("PLANS", classes="title", id="t_plan")
-            yield ClickTable(id="plan", cursor_type="row")
-            yield Static("OPEN PRs", classes="title", id="t_prs")
-            yield ClickTable(id="prs", cursor_type="row")
-            yield Static("ISSUES", classes="title", id="t_issues")
-            yield ClickTable(id="issues", cursor_type="row")
-        yield Static("click: seat→pane, ✕→close it, ＋→add one, PR→GitHub, "
-                     "plan row→why, ⚖→panel review, ⚒→fix issue   ? for keys",
+            yield Static("WORK", classes="title", id="t_work")
+            yield ClickTable(id="work", cursor_type="row")
+        yield Static("click: seat→pane, ✕→close it, ＋→add one, #ref→GitHub, "
+                     "⚖→panel review, ⚒→fix, anywhere else on a row→why   "
+                     "? for keys",
                      id="detail")
         yield Footer()
 
     def on_mount(self) -> None:
         self.query_one("#seats", DataTable).add_columns("", "✕", "seat", "state", "running", "where")
-        self.query_one("#claims", DataTable).add_columns("who", "key", "left")
         self.build_columns()
         try:
             self.client, self.cfg = qd.board_client()
@@ -291,7 +307,7 @@ class Dash(App):
         self.set_interval(self.gh_interval, self.refresh_issues)
 
     def build_columns(self) -> None:
-        """Give the four repo-bearing tables their columns, per the current scope.
+        """Give the two repo-bearing tables their columns, per the current scope.
 
         Called on mount and again on every `s`, because the repo cell is not a
         setting on a row — it is a whole column, and adding or removing one means
@@ -299,24 +315,28 @@ class Dash(App):
         call appends a duplicate set and every row is drawn against the wrong
         headers.
 
-        THE ACTION ICONS STAY IN COLUMN 1. `PANEL_COLUMN`, `FIX_COLUMN` and
+        THE ACTION ICON STAYS IN COLUMN 2, whatever the scope: `ACTION_COLUMN` and
         `KILL_COLUMN` are indices into these tables, so the column that comes and
         goes has to be the one AFTER them — click the ⚖ with the repo cell hidden
-        and it must still mean review, not open.
+        and it must still mean review, not open. The ref is the one index that
+        moves, and it is recorded here rather than worked out at click time,
+        because here is where the number of columns is actually known.
         """
         repo = ("repo",) if self.scope.column else ()
         for table_id, columns in (
             ("#fleet", ("who", "state", *repo, "what", "ttl")),
-            ("#plan", ("", "⚒", *repo, "ref", "title", "who")),
-            ("#prs", ("", "⚖", *repo, "pr", "title", "age")),
-            ("#issues", ("", "⚒", *repo, "issue", "title", "who")),
+            ("#work", ("", "kind", "⚒", *repo, "ref", "title", "who")),
         ):
             table = self.query_one(table_id, DataTable)
             table.clear(columns=True)
             table.add_columns(*columns)
+        self.ref_column = 4 if self.scope.column else 3
+        # The rows went with the columns, so nothing on screen answers to the old
+        # signature any more and the next render must rebuild rather than skip.
+        self.work_sig = None
 
     def repo_cell(self, repo: str) -> list[Text]:
-        """The repo cell, or no cell at all — one place, so the four tables agree.
+        """The repo cell, or no cell at all — one place, so both tables agree.
 
         A list rather than an optional value because that is how it is spliced into
         a row: an empty one contributes nothing, and a row built by concatenation
@@ -506,149 +526,87 @@ class Dash(App):
             (qd.seat_machine(a.get("holder")), qd.seat_scope(a.get("holder")), n): a
             for a in agents if (n := qd.seat_number(a.get("holder"))) is not None}
 
-        claims = sorted(data.get("claims", []), key=lambda c: c.get("expires") or "")
-        ctable = self.query_one("#claims", DataTable)
-        ctable.clear()
-        # A claim's repo is in its KEY and nowhere else, and `plan:<uuid>` names an
-        # item rather than a repo — hence the plan alongside it, and hence a claim
-        # neither can attribute staying put (see qbdata.claim_repo).
-        shown, claims_elsewhere = qd.in_scope(
-            claims, self.scope, lambda c: qd.claim_repo(c.get("key"), self.plan))
-        for i, c in enumerate(shown):
-            key = f"claim:{i}"
-            self.rows[key] = c
-            left = qd.minutes_left(c.get("expires"))
-            ctable.add_row(
-                Text(qd.clip((c.get("holder") or "?").split("/", 1)[-1], 13), style="bold"),
-                Text(qd.clip(qd.claim_label(c.get("key") or "?", self.plan, self.scope), 34),
-                     style="yellow" if c.get("kind") == "issue" else "grey70"),
-                Text(qd.until(c.get("expires")),
-                     style="red" if left is not None and left < 10 else "grey50"),
-                key=key,
-            )
-        self.query_one("#t_claims", Static).update(
-            f"CLAIMED · {len(shown)}{_elsewhere(claims_elsewhere)}")
-
-        # Who holds which issue comes off the same claims, and only the holder
-        # is displayed — so compare on that, not on the whole claim. A claim
-        # renewing changes its expiry every time, and rebuilding the issue table
-        # for that would move the cursor out from under a click.
-        # From every claim, NOT the ones this scope shows: an issue on this screen,
-        # held by an agent working out of another repo's checkout, is still held.
-        # Narrowing here would draw it as free and send the next seat into it.
-        held = qd.claims_by_issue(claims)
-        if holders(held) != holders(self.held):
-            self.held = held
-            self.render_issues(self.issues, self.issue_err)
+        # Who holds which issue, kept for the confirmation that names the holder
+        # before a click takes work somebody else already has. From EVERY claim,
+        # not the ones this scope shows: an issue on this screen held by an agent
+        # working out of another repo's checkout is still held, and narrowing here
+        # would draw it as free and send the next seat into it.
+        self.held = qd.claims_by_issue(data.get("claims", []))
+        # The claims have no table of their own any more. A claim IS a row of WORK
+        # — its `who` cell, or a row in its own right when what it holds is a lease
+        # or a release rather than an issue — and it is redrawn from here because
+        # the board clock is the fast one and a claim appearing is the change a
+        # reader most wants to see arrive.
+        self.render_work()
 
     def render_plan(self, items: list[dict], err: str | None) -> None:
-        """The board's plan — every repo's list — running items at the top.
+        """Keep the board's plan; WORK is where it is drawn.
 
-        Rebuilt only when the plan actually changed. The other tables can be
-        redrawn on a clock because their rows carry a countdown, but this one is
-        the panel a reader dwells on, and a rebuild between the mouse going down
-        and the click arriving moves the row out from under the pointer.
+        The WHOLE plan is kept and the scope applied later, in render_work:
+        `self.plan` is also what resolves a `plan:<uuid>` claim to a title and a
+        repo, and a claim from another project must still resolve — otherwise
+        widening the scope would show rows this client could no longer explain.
         """
-        # The WHOLE plan is kept, and the scope applied after: `self.plan` is what
-        # resolves a `plan:<uuid>` claim to a title and a repo, and a claim from
-        # another project must still resolve — otherwise widening the scope would
-        # show rows this client can no longer explain.
         self.plan, self.plan_err = items, err
-        repos = qd.resolve_repos()
-        items, elsewhere = qd.in_scope(items, self.scope)
-        ordered = qd.sort_plan(items, repos)
-        sig = tuple((i.get("item_id"), (i.get("claim") or {}).get("holder"),
-                     len(i.get("blocked_by") or []), i.get("updated")) for i in ordered)
-        if sig == self.plan_sig and not err:
-            return
-        self.plan_sig = sig
-
-        table = self.query_one("#plan", DataTable)
-        table.clear()
-        for item in ordered:
-            glyph, colour = qd.plan_state(item)
-            who, who_colour = qd.plan_who(item)
-            takeable = qd.plan_issue(item, repos) is not None and not item.get("claim")
-            table.add_row(
-                Text(glyph, style=colour),
-                Text("⚒", style="bold cyan" if takeable else "grey30"),
-                *self.repo_cell(qd.short_repo(item.get("repo") or "fleet")),
-                Text(qd.plan_ref(item), style="bold grey70"),
-                Text(qd.clip(item.get("title"), 42 if self.scope.column else 54),
-                     style="grey50" if colour == "grey50" else "white"),
-                Text(qd.clip(who, 13), style=who_colour),
-                key=f"plan:{item.get('item_id')}",
-            )
-            self.rows[f"plan:{item.get('item_id')}"] = item
-        running, blocked = qd.plan_counts(items)
-        title = f"PLANS · {len(items)} open"
-        if running:
-            title += f" · {running} running"
-        if blocked:
-            title += f" · {blocked} blocked"
-        title += _elsewhere(elsewhere)
-        if err:
-            title += f" · board: {qd.clip(err, 24)}"
-        self.query_one("#t_plan", Static).update(title)
+        self.render_work()
 
     def render_prs(self, prs: list[dict], err: str | None) -> None:
         self.prs, self.pr_err = prs, err
-        table = self.query_one("#prs", DataTable)
-        table.clear()
-        red = 0
-        for pr in sorted(prs, key=lambda p: -p.get("number", 0)):
-            glyph, colour = qd.ci_state(pr)
-            red += colour == "red"
-            key = f"pr:{pr.get('number')}"
-            self.rows[key] = pr
-            table.add_row(
-                Text(glyph, style=colour),
-                Text("⚖", style="bold cyan"),          # click to panel-review
-                *self.repo_cell(qd.short_repo(pr.get("repo") or qd.REPO)),
-                Text(f"#{pr.get('number')}", style="bold grey70"),
-                Text(qd.clip(pr.get("title"), 44 if self.scope.column else 56),
-                     style="grey50" if pr.get("isDraft") else "white"),
-                Text(qd.ago(pr.get("updatedAt")), style="grey50"),
-                key=key,
-            )
-        title = f"OPEN PRs · {len(prs)}" + (f" · {red} red" if red else "")
-        if err:
-            title += f" · gh: {qd.clip(err, 24)}"
-        self.query_one("#t_prs", Static).update(title)
+        self.render_work()
 
     def render_issues(self, issues: list[dict], err: str | None) -> None:
-        """Open issues, free ones first, the held ones greyed and named.
-
-        A free issue is the one a seat should take next, so it is what this
-        panel is for: the ⚒ on its row starts /fix-issue on it.
-        """
         self.issues, self.issue_err = issues, err
-        table = self.query_one("#issues", DataTable)
+        self.render_work()
+
+    def render_work(self) -> None:
+        """THE table: the plan, the issues, the PRs and the claims, as one list.
+
+        Called by all four of the things that fetch, because all four of them feed
+        it, and it is the only place that knows what the pane should look like.
+        The signature decides whether the call is a redraw or a rebuild, and what
+        it covers is what a reader can SEE — the rows, their state, their verb,
+        their right-hand cell — and NOT a claim's expiry, which changes on every
+        renewal and lives on the detail line rather than in a cell. Without that,
+        the board's four-second clock would rebuild the table under the pointer.
+
+        Every source's error rides the title. Both `gh` calls and the board fail
+        independently, and a table drawing three sources' rows while silently
+        dropping the fourth's would be claiming to be the whole of the work when
+        it was not.
+        """
+        rows = qd.work_rows(self.plan, self.issues, self.prs,
+                            (self.board or {}).get("claims") or [],
+                            qd.resolve_repos())
+        rows, hidden = qd.in_scope(rows, self.scope)
+        drawn = [(row["key"], qd.work_state(row), qd.work_kind(row),
+                  qd.work_action(row), qd.work_ref(row, self.scope),
+                  row["title"], qd.work_who(row)) for row in rows]
+        errs = [e for e in (self.plan_err, self.pr_err, self.issue_err) if e]
+        sig = (tuple(str(cell) for cell in drawn), self.scope.column, tuple(errs))
+        if sig == self.work_sig:
+            return
+        self.work_sig = sig
+
+        table = self.query_one("#work", DataTable)
         table.clear()
-        free = 0
-        for issue in qd.sort_issues(issues, self.held):
-            number = issue.get("number")
-            claim = self.held.get(qd.issue_key(issue))
-            holder = (claim.get("holder") or "?") if claim else None
-            free += holder is None
-            key = f"issue:{number}"
-            self.rows[key] = issue
+        width = 40 if self.scope.column else 52
+        for row, (_, (glyph, colour), (kind, kind_colour), (icon, icon_colour, _),
+                  ref, title, (who, who_colour)) in zip(rows, drawn):
+            key = f"work:{row['key']}"
+            self.rows[key] = row
             table.add_row(
-                Text("·" if holder else "○", style="grey50" if holder else "green"),
-                Text("⚒", style="grey50" if holder else "bold cyan"),
-                *self.repo_cell(qd.short_repo(issue.get("repo") or qd.REPO)),
-                Text(f"#{number}", style="bold grey70"),
-                Text(qd.clip(issue.get("title"), 44 if self.scope.column else 56),
-                     style="grey50" if holder else "white"),
-                Text(qd.clip(holder.split("/", 1)[-1], 13) if holder
-                     else qd.ago(issue.get("updatedAt")),
-                     style="yellow" if holder else "grey50"),
+                Text(glyph, style=colour),
+                Text(kind, style=kind_colour),
+                Text(icon, style=icon_colour),
+                *self.repo_cell(qd.short_repo(row["repo"] or "fleet")),
+                Text(ref, style="bold grey70"),
+                Text(qd.clip(title or "—", width),
+                     style="grey50" if qd.work_dim(row) else "white"),
+                Text(qd.clip(who, 13), style=who_colour),
                 key=key,
             )
-        title = f"ISSUES · {len(issues)}" + (f" · {free} free" if issues else "")
-        if err:
-            title += f" · gh: {qd.clip(err, 24)}"
-        self.query_one("#t_issues", Static).update(title)
+        self.query_one("#t_work", Static).update(
+            qd.work_title(rows, hidden, " · ".join(errs) or None))
 
     def say(self, text: str) -> None:
         # Kept on the app as well as in the widget: a Static does not hand back
@@ -682,23 +640,54 @@ class Dash(App):
                 self.jump_pane(record)
         elif kind == "agent":
             self.click_agent(record)
-        elif kind == "claim":
-            self.say(qd.clip(record.get("note") or "(no note on this claim)", 400))
-        elif kind == "pr":
-            if column == self.PANEL_COLUMN:
-                self.panel_pr(record)
-            else:
-                self.open_pr(record)
-        elif kind == "plan":
-            if column == self.FIX_COLUMN:
-                self.fix_plan_item(record)
-            else:
-                self.say(qd.plan_detail(record))
-        elif kind == "issue":
-            if column == self.FIX_COLUMN:
-                self.fix_issue(record)
-            else:
-                self.open_issue(record)
+        elif kind == "work":
+            self.click_work(record, column)
+
+    def click_work(self, row: dict, column: int | None) -> None:
+        """One work row, three verbs, each of them in its own cell.
+
+        The icon starts it, the ref opens it, everything else explains it. The
+        EXPLANATION is the default rather than either verb, because it is the only
+        one of the three that cannot cost anything: a stray click on a 78-column
+        pane should not spend money on a review or take an issue somebody else is
+        already on.
+        """
+        if column == self.ACTION_COLUMN:
+            self.start_work(row)
+        elif column == self.ref_column and row["number"] is not None:
+            self.open_work(row)
+        else:
+            self.say(qd.work_detail(row))
+
+    def start_work(self, row: dict) -> None:
+        """The ⚖ or the ⚒: review the PR, or take the issue.
+
+        Which of the two a row offers is qbdata's answer, not this method's —
+        `work_action` is what drew the icon, so asking it again here is what keeps
+        the icon and the click from ever disagreeing. A row offering neither says
+        so rather than doing nothing, because a dim icon that swallows the click is
+        indistinguishable from a broken one.
+        """
+        _, _, verb = qd.work_action(row)
+        if verb == "panel":
+            self.panel_pr(row)
+            return
+        if verb == "fix":
+            # A plan item is not itself an issue: the number and the repo come off
+            # its ref, which is the only thing /fix-issue can be pointed at.
+            issue = row if row["number"] is not None \
+                else qd.plan_issue(row["plan"] or {})
+            if issue is not None:
+                self.fix_issue(issue)
+                return
+        self.say(f"nothing to start on this row — {qd.work_detail(row)}")
+
+    def open_work(self, row: dict) -> None:
+        """The #ref, on GitHub. `pull` or `issues` — the number alone cannot say
+        which, and GitHub redirects the wrong one to the right one only sometimes."""
+        kind = "pull" if row["kind"] == "pr" else "issues"
+        self.open_url(f"https://github.com/{row['repo'] or qd.REPO}"
+                      f"/{kind}/{row['number']}")
 
     # ---- the seats ---------------------------------------------------------
     #
@@ -839,25 +828,6 @@ class Dash(App):
             )
         else:
             self.run_in_pane(f"panel-{number}", command)
-
-    def fix_plan_item(self, item: dict) -> None:
-        """The ⚒ on a plan row: take the issue the item points at.
-
-        Most plan items point at nothing — a line of plan is not an issue — and
-        one that is already claimed is somebody's current work. Both say so
-        rather than doing nothing, because a dim icon that swallows the click is
-        indistinguishable from a broken one.
-        """
-        issue = qd.plan_issue(item)
-        if issue is None:
-            self.say(f"no issue behind this item — {qd.clip(item.get('title'), 60)}")
-            return
-        claim = item.get("claim")
-        if claim:
-            self.say(f"#{issue['number']} is already being worked by "
-                     f"{claim.get('holder') or '?'}")
-            return
-        self.fix_issue(issue)
 
     def fix_issue(self, issue: dict) -> None:
         """Kick off /fix-issue for an issue, the same way ⚖ starts a review.
@@ -1019,13 +989,6 @@ class Dash(App):
             return False
         return True
 
-    def open_pr(self, pr: dict) -> None:
-        self.open_url(f"https://github.com/{pr.get('repo') or qd.REPO}/pull/{pr.get('number')}")
-
-    def open_issue(self, issue: dict) -> None:
-        self.open_url(f"https://github.com/{issue.get('repo') or qd.REPO}"
-                      f"/issues/{issue.get('number')}")
-
     def open_url(self, url: str) -> None:
         try:
             subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL,
@@ -1047,45 +1010,48 @@ class Dash(App):
         """`s` — this project's rows, or the whole fleet's.
 
         Redrawn from what the client already has rather than re-fetched: the board
-        answered four seconds ago and the scope is a decision about how to READ that
-        answer, so a request here would spend a round trip to show the same rows.
-        The plan is the exception in one detail — it redraws only when its contents
-        changed, so its signature has to be dropped or the toggle would leave the
-        one panel that was already on screen exactly as it was.
+        answered four seconds ago and the scope is a decision about how to READ
+        that answer, so a request here would spend a round trip to show the same
+        rows. build_columns drops the work signature on its way past, which is what
+        stops the redraw being skipped as "nothing changed" — the rows did not
+        change, but which of them belong on the pane did.
         """
         self.scope = self.scope.widened()
         self.build_columns()
-        self.plan_sig = None
         if self.board:
-            self.render_board(self.board)
-        self.render_plan(self.plan, self.plan_err)
-        self.render_prs(self.prs, self.pr_err)
-        self.render_issues(self.issues, self.issue_err)
+            self.render_board(self.board)          # which redraws WORK in turn
+        else:
+            self.render_work()
         self.say(f"scope: {self.scope.label()}"
                  + ("" if self.scope.on else " — s to narrow to this screen's"))
 
     def action_panel_pr(self) -> None:
-        record = self.selected_pr()
-        if record:
-            self.panel_pr(record)
+        """`p` — panel-review the selected row, if it is a PR."""
+        row = self.selected_row("#work")
+        if row is None:
+            return
+        if row["kind"] == "pr":
+            self.panel_pr(row)
+        else:
+            self.say(f"not a PR — p reviews a PR, f takes an issue · "
+                     f"{qd.work_detail(row)}")
 
     def action_fix_issue(self) -> None:
-        """`f` takes whatever the table you are in offers: an issue, or the issue
-        behind a plan item."""
-        if getattr(self.focused, "id", None) == "plan":
-            record = self.selected_row("#plan")
-            if record:
-                self.fix_plan_item(record)
+        """`f` — take the selected row's issue, whether the row came from the plan
+        or from GitHub. A PR row has no issue to take, and says so."""
+        row = self.selected_row("#work")
+        if row is None:
             return
-        record = self.selected_row("#issues")
-        if record:
-            self.fix_issue(record)
+        if qd.work_action(row)[2] == "fix":
+            self.start_work(row)
+        else:
+            self.say(f"nothing to fix on this row — {qd.work_detail(row)}")
 
     def action_help(self) -> None:
-        self.say("o open on GitHub · p panel-review · f fix the selected issue or "
-                 "plan item · s this project's rows or the whole fleet's · r refresh · "
-                 "q quit · click ⚖ to review, ⚒ to fix, a plan row for why it is "
-                 "there, a seat to jump to its pane")
+        self.say("o open the selected row on GitHub · p panel-review a PR · f take "
+                 "an issue · s this project's rows or the whole fleet's · r refresh "
+                 "· q quit · click ⚖ to review, ⚒ to fix, a #ref to open, anywhere "
+                 "else on a row for why it is there, a seat to jump to its pane")
 
     def selected_row(self, table_id: str) -> dict | None:
         table = self.query_one(table_id, DataTable)
@@ -1094,19 +1060,16 @@ class Dash(App):
         row = table.coordinate_to_cell_key(table.cursor_coordinate).row_key
         return self.rows.get(str(row.value))
 
-    def selected_pr(self) -> dict | None:
-        return self.selected_row("#prs")
-
     def action_open_pr(self) -> None:
-        """`o` opens whatever is selected in the table you are in."""
-        if getattr(self.focused, "id", None) == "issues":
-            record = self.selected_row("#issues")
-            if record:
-                self.open_issue(record)
+        """`o` — the selected row on GitHub. A row with no number is not a thing
+        GitHub has a page for, so it explains itself instead."""
+        row = self.selected_row("#work")
+        if row is None:
             return
-        record = self.selected_pr()
-        if record:
-            self.open_pr(record)
+        if row["number"] is not None:
+            self.open_work(row)
+        else:
+            self.say(qd.work_detail(row))
 
 
 def main(argv: list[str] | None = None) -> int:

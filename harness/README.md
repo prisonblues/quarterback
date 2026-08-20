@@ -723,21 +723,45 @@ starting them.
 #### The dash — WORK IN PROGRESS
 
 `qb-dash-tui` is a fourth pane for the right-hand side: fleet state, where the board pane
-along the bottom (the **tape**) is the event stream. Who is alive and on what, who holds
-which claim and for how long, what the fleet agreed to do next, every open PR with its CI
-verdict, and every open issue with whoever has claimed it. Rows are clickable — a seat jumps
-the tmux cursor to that seat's pane, a claim shows its note, a plan item explains why it is
-where it is, a PR or an issue opens on GitHub. `qb-dash` is the same five views rendered
-without interaction, for a terminal that will not forward mouse events.
+along the bottom (the **tape**) is the event stream. Three panels — **SEATS**, the panes on
+this screen; **FLEET**, who is alive on the board and on what; and **WORK**, everything
+there is to do. Rows are clickable: a seat jumps the tmux cursor to that seat's pane, a
+`#ref` opens on GitHub, a `⚖` or `⚒` starts work, and anything else on a work row explains
+why it is where it is. `qb-dash` is the same three views rendered without interaction, for a
+terminal that will not forward mouse events.
 
-**It opens on ONE project, and that is the interesting default.** Every panel here is
-fleet-wide by construction — FLEET is every live agent on the board, CLAIMED every claim,
-PLANS every repo's list — while a screen is built for one repository. So most rows were
-somebody else's, and the repo cell was then the same word, eleven columns wide, on every
-line of a 78-column pane (#261). The scope narrows the three board-derived panels to the
-repos this screen watches and drops the column outright; the eleven columns go back to
-`what` an agent is doing and to a plan item's title, and `quarterback#209` in CLAIMED
-becomes `#209`. The repos are the ones the dashboard already resolved for its `gh` calls:
+**WORK is one table, and that is the honest shape (#272).** It was four — CLAIMED, PLANS,
+OPEN PRs, ISSUES — and they were four answers to one question, from four sources, about
+overlapping rows. `#255` was a plan item *and* an open issue *and* a claim held by
+`quill-marble`, and soon a PR: three or four rows on three or four panels, with nothing on
+the pane saying they were one piece of work. Every reader did that join by eye, every time,
+and the panel borders were what made it necessary — CLAIMED showing `plan:9f3c…` and PLANS
+carrying a `⚒` that meant "this row is really an issue" were both the merged table leaking
+through a boundary that should not have been there.
+
+So the join happens once, in `qbdata.work_rows`, and both renderers draw the result. The
+merge key is `owner/repo#n`, which is safe because GitHub numbers issues and pull requests
+out of **one** sequence per repository: `#265` is a PR or an issue and can never be both, so
+no row is merged onto the wrong thing. Two *repos'* `#12` still stay apart — joining them
+would mark ours held because theirs was.
+
+The plan is not a fifth kind of thing alongside issues and PRs. It is the **order** of them,
+so it is not a panel — it is the sort. **The board's order is taken exactly as given**,
+whatever state its items are in: a human put those items in that sequence, and a dash that
+re-sorted them by how they were going would be substituting its own judgement for the
+ordering it was asked to display. A blocked item is still the next thing to unblock. Work
+the plan does not mention is appended below it, where there is no order to honour and the
+dash has to pick one: held first (somebody is on it now), then PRs (a decision is waiting on
+a human), then issues newest first.
+
+**It opens on ONE project, and that is the interesting default.** Both board-derived panels
+are fleet-wide by construction — FLEET is every live agent on the board, WORK every claim and
+every repo's plan — while a screen is built for one repository. So most rows were somebody
+else's, and the repo cell was then the same word, eleven columns wide, on every line of a
+78-column pane (#261). The scope narrows them to the repos this screen watches and drops the
+column outright; the eleven columns go back to `what` an agent is doing and to a row's
+title, and a release claim reading `quarterback:2.41` becomes `2.41`. The repos are the ones
+the dashboard already resolved for its `gh` calls:
 `--repo` (a checkout or an `owner/name` slug, repeatable), else `QB_DASH_REPOS`, else the
 origin of the directory it was started in.
 
@@ -749,13 +773,13 @@ hid** — `FLEET · 3 · 2 elsewhere` — because a filtered pane that reads lik
 is worse than an unfiltered one: it is the same picture with fewer facts, and "nothing
 claimed" and "nothing claimed *here*" are different claims about the world.
 
-Three things stay fleet-wide on purpose. A row whose repo the board cannot name — an agent
-outside a checkout, a `plan:<uuid>` claim this process has not resolved — is kept, because
-no repo is not evidence of another repo and hiding it drops a live peer. The held-issue
-markers come from *every* claim, so an issue held by an agent working out of another repo's
-checkout is still shown as held rather than offered to the next seat. And OPEN PRs and
-ISSUES cannot narrow at all: `gh` was only ever asked about the watched repos, so there is
-no other repo's row there to hide — only their column answers to the scope.
+Two things stay fleet-wide on purpose. A row whose repo the board cannot name — an agent
+outside a checkout, a `plan:<uuid>` claim whose item this process has not fetched — is kept,
+because no repo is not evidence of another repo and hiding it drops a live peer. And the
+held-issue markers come from *every* claim, so an issue held by an agent working out of
+another repo's checkout is still shown as held rather than offered to the next seat. The
+rows `gh` supplies could not narrow much anyway: it was only ever asked about the watched
+repos, so there is rarely another repo's row there to hide.
 
 **The top line is the ceiling every pane below it works towards.** The seats spend one
 Claude subscription between them, so the five-hour and weekly caps are a fleet-wide number
@@ -777,41 +801,65 @@ are minutes old and still roughly true; past ten minutes the line appends a dim 
 than pretending. A 429 backs off for ten minutes, because the failing call is itself the
 thing being rate limited.
 
-**Clicking starts work, not just navigation.** Each PR row carries a `⚖` and each issue row
-a `⚒`; clicking one opens a confirmation showing the exact command, and confirming runs
-`/panel-review-pr <n>` or `/fix-issue <n>` in a detached tmux window of its own — the same
-way `qb-seat` starts an agent, so what it starts is a real session you can attach to, read
-and interrupt. Clicking anywhere else on the row still opens the thing on GitHub. The keys
-are `o` open, `p` panel-review, `f` fix the selected issue or plan item, `s` this project's
-rows or the whole fleet's, `r` refresh, `?` the list, `q` quit.
+**Clicking starts work, not just navigation. One row, three verbs, each in its own cell.**
+The action icon starts it — `⚖` on a PR, `⚒` on an issue — and opens a confirmation showing
+the exact command; confirming runs `/panel-review-pr <n>` or `/fix-issue <n>` the same way
+`qb-seat` starts an agent, so what it starts is a real session you can attach to, read and
+interrupt. The `#ref` opens it on GitHub, as a `pull` or an `issues` URL according to what
+the row actually is — the number alone cannot say which. **Anything else on the row explains
+it**, and that is the default on purpose: it is the only one of the three that cannot cost
+anything, so a stray click in a 78-column pane cannot spend money or take somebody's work.
+The keys are `o` open, `p` panel-review, `f` fix, `s` this project's rows or the whole
+fleet's, `r` refresh, `?` the list, `q` quit.
 
-**The plans panel is the one that says what the work is FOR.** FLEET says who is here and
-CLAIMED says what they hold; neither answers why. `PLANS` is the board's plan — every repo's
-ordered list, plus the fleet-wide one — with the items somebody is running at the top, then
-the ones that are free, then the blocked ones, which are the band a reader can do nothing
-about. Inside each band the board's own order is kept, because the order is the point of a
-plan, and the repos this dashboard watches come before the ones it only overhears. A row
-shows `▶` running with its holder, `○` free with how long it has sat, or `⊘` blocked with
-what it waits on. Clicking one puts its phase, its claim note, its blockers and its own note
-on the detail line: that reasoning lives on the board and nowhere else — a plan item never
-restates its issue — and it does not fit in a title cell.
+The columns are `state · kind · action · [repo] · ref · title · who`, and the action icon
+stays in column 2 whatever the scope: the repo cell that comes and goes is the one *after*
+it, so clicking the `⚖` with the column hidden still means review rather than open. The ref
+is the one index that moves, and `build_columns` records where it landed rather than having
+each click work it out.
 
-A plan item that points at an issue carries a `⚒` like an issue row, so the shortest path
-from "what is next" to somebody doing it is one click. An item pointing at nothing, or one
-somebody already holds, says so rather than swallowing the click. The `⚒` refuses an issue
-belonging to a repo this dashboard only watches: `/fix-issue` takes a bare number and reads
-the repository off the checkout it runs in, so starting one from the wrong pane would land
-that number on whatever issue wears it there. A plan claim is keyed `plan:<uuid>`, which is
-right for a lock and unreadable on a pane, so CLAIMED resolves it against the plan and shows
-the item's title instead.
+**What each column is answering.** `state` is how the row is *going*: `▶` held, `⊘` blocked,
+`○` free — cyan when the plan asked for it, green when it is merely open — `≡` a line of plan
+with no ref, `⚑` a claim on something that is not an issue or a PR. A **PR's** state is its
+check rollup (`✓ ✗ ◐ ·`) even when somebody holds it, because whether it can land is the
+fact a PR row is read for, and who has it is the last column's job. `kind` is spelled out
+(`iss`, `pr`, `plan`, or a claim's own kind) rather than sigilled. `who` carries whichever
+one of three facts is true — the holder, or what it waits on, or how long it has sat — and a
+holder outranks a blocker.
 
-**The issues panel is the one that feeds the fleet.** A seat picks unclaimed work off the
-board, so what matters is which issues nobody holds: the free ones sort to the top, and a
-held one is greyed and carries its holder's name. That marking is the board's own claims,
-joined on the claim key — an issue claim is namespaced `owner/repo#n`, which is the number
-`gh issue list` reports. The `⚒` on a held issue still works and the confirmation names the
-holder: a session that died leaves its claim standing, and picking that work up is a thing
-to warn about, not to forbid.
+**The detail line is where the plan's reasoning survives the merge.** A merged row is drawn
+with the *GitHub* title, because that is what the issue is called now and the plan item's
+copy can be months stale — so the item's own words, its phase, its blockers and its note go
+on the detail line instead. That reasoning is why the item sits where it sits in the order,
+it lives on the board and nowhere else, and no column is wide enough for it. A row with no
+plan behind it still has a claim note, a CI verdict or a title too long for its cell.
+
+**Rows nothing else would keep.** A claim on an issue that has since closed keeps its row:
+`gh` lists only open issues, so a claim can outlive what it is on, and that row is the one a
+human most needs — somebody is holding something finished, and it wants releasing. A claim
+on a release or a lease has no GitHub page at all and still gets a row, because dropping it
+would hide the one line saying somebody already has the thing you were about to take. A
+`plan:<uuid>` claim — right for a lock, unreadable on a pane — resolves by landing on its
+item's own row, which is where the title already was; the old CLAIMED panel had to reach
+into the plan to relabel it.
+
+The `⚒` on a held issue still works and the confirmation names the holder: a session that
+died leaves its claim standing, and picking that work up is a thing to warn about, not to
+forbid. It refuses an issue belonging to a repo this dashboard only *watches* — `/fix-issue`
+takes a bare number and reads the repository off the checkout it runs in, so starting one
+from the wrong pane would land that number on whatever issue wears it there.
+
+`WORK · 45 · 1 running · 8 in review · 34 free · 2 blocked` counts each unit of work **once**,
+which the four panels could not: the same issue was a row on three of them, so their titles
+added up to more work than the fleet had. Every source's failure rides that title too —
+board, `gh pr`, `gh issue` fail independently, and a table drawing two of them while saying
+nothing about the third would be claiming to be the whole of the work when it is not.
+
+The plain renderer prints at most `WORK_ROWS` and then says how many it left out. It has no
+action column at all, because nothing in it can be clicked and an icon offering a verb the
+pane cannot perform is furniture pretending to be a control. Merging four panels into one
+took the frame from 55 rows to 46; whether the frame as a whole fits the pane is a different
+defect, and it is #269's.
 
 The confirmation is deliberate: a panel review costs money, comments on a public PR and
 pushes a fix commit, and `/fix-issue` writes a branch and opens a PR — so a stray click in a

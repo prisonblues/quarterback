@@ -107,43 +107,107 @@ def _need_rows(table, what: str, err: str | None) -> None:
     pytest.skip(f"no open {what} on the repo — nothing to click")
 
 
+def _x_of(table, column: int) -> int:
+    """The x offset to click for a cell in `column`.
+
+    COMPUTED, not hardcoded. The columns are auto-sized to their contents, and the
+    repo cell comes and goes with the scope (#261) — so a literal `offset=(30, 1)`
+    means a different column on every pane. That is not hypothetical: while these
+    tests were being rewritten for the merged table, a hardcoded 9 landed on the ⚒
+    rather than the ref, raised the confirmation, and every later click in the run
+    went to the modal instead of the table. Two "the click did nothing" failures
+    that were entirely the test's fault.
+    """
+    x = 0
+    for i, col in enumerate(table.ordered_columns):
+        width = col.get_render_width(table)
+        if i == column:
+            return x + width // 2
+        x += width
+    raise AssertionError(f"no column {column}: the table has {len(table.ordered_columns)}")
+
+
+def _record_at(app, table, index: int) -> dict | None:
+    """The record behind a rendered row — the join, not the cells drawn from it."""
+    rows = table.ordered_rows
+    if not 0 <= index < len(rows):
+        return None
+    return app.rows.get(str(rows[index].key.value))
+
+
+def _find_row(app, table, want) -> int | None:
+    """The first rendered row whose record satisfies `want`.
+
+    Found rather than assumed: which row is a PR, and which is a free issue,
+    depends on what the fleet has open today, and the whole point of the merged
+    table is that a row's kind is a property of the row rather than of the panel
+    it is in.
+    """
+    for i in range(table.row_count):
+        record = _record_at(app, table, i)
+        if record and want(record):
+            return i
+    return None
+
+
+async def _click(pilot, app, table, index: int, column: int):
+    """Click a cell of row `index`, and answer with the record actually clicked.
+
+    Scrolled to first, and the row is then read back off the table rather than
+    from `index`: scrolling near the end of a list stops short, so the row under
+    the pointer is whichever one the table settled on.
+    """
+    table.scroll_to(y=index, animate=False)
+    await pilot.pause(0.2)
+    landed = _record_at(app, table, table.scroll_offset.y)
+    await pilot.click(table, offset=(_x_of(table, column), 1))
+    await pilot.pause(0.3)
+    return landed
+
+
 @needs_live_data
 def test_a_single_click_acts_on_the_row_under_the_pointer():
     assert asyncio.run(_drive()) == []
 
 
 @needs_live_data
-def test_the_scales_icon_reviews_and_the_rest_of_the_row_opens():
-    """One row, two verbs, told apart by which column was clicked.
+def test_one_row_three_verbs_told_apart_by_the_cell_clicked():
+    """The merged table's whole click contract, on whatever is open today.
 
-    Also covers the confirmation: a panel review costs money and comments on a
-    public PR, so the click must not start one on its own.
+    Three verbs per row, because there is one table now and it has to carry every
+    verb the four panels had between them: the icon starts the work, the ref opens
+    it on GitHub, and anything else explains it. Told apart by COLUMN, which is
+    what makes them one habit rather than three.
+
+    Also covers the confirmation: a panel review costs real money and comments on
+    a public PR, so a click must not start one on its own.
     """
-    assert asyncio.run(_drive_panel()) == []
+    assert asyncio.run(_drive_verbs()) == []
 
 
 @needs_live_data
-def test_a_plan_row_explains_itself_and_its_hammer_takes_the_issue():
-    """The plan panel's two verbs.
+def test_the_hammer_starts_a_fix_on_the_issue_actually_under_the_pointer():
+    """The ⚒ is the shortest path from "what is next" to somebody doing it.
 
-    A plan item's note is the reasoning behind its place in the order — it is on
-    the board and nowhere else, so a click has to be able to reach it. And the ⚒
-    is the shortest path from "what is next" to somebody doing it, which is the
-    whole reason the plan is on this screen at all.
+    What it launches has to be `/fix-issue <n>` for the row clicked — a fix on the
+    wrong issue writes code nobody asked for. It has to work on a row that reached
+    the table as a plan item just as much as on one that reached it from `gh`,
+    which is the merge doing its job: after it, there is no such thing as "the
+    issue panel's ⚒" and "the plan panel's ⚒".
     """
-    assert asyncio.run(_drive_plan()) == []
+    assert asyncio.run(_drive_fix()) == []
 
 
 @needs_live_data
-def test_the_hammer_starts_a_fix_and_the_rest_of_the_issue_row_opens():
-    """The issue panel's two verbs, told apart the same way the PR panel's are.
+def test_a_merged_row_still_explains_why_it_is_where_it_is():
+    """The plan's note has to survive being merged into a GitHub row.
 
-    The panel exists so a free issue can be picked up in one click, so what it
-    launches has to be `/fix-issue <n>` for the issue actually under the pointer
-    — a review of the wrong PR wastes money, and a fix on the wrong issue writes
-    code nobody asked for.
+    It is the reasoning behind the item's place in the order, it is on the board
+    and nowhere else, and the merge is exactly where it could have been lost: the
+    row is drawn from the issue, so the click has to reach past it to the plan
+    item the issue was joined to.
     """
-    assert asyncio.run(_drive_issues()) == []
+    assert asyncio.run(_drive_detail()) == []
 
 
 async def _drive() -> list[str]:
@@ -155,204 +219,90 @@ async def _drive() -> list[str]:
     # about the caps, and a test that reached the network would be its own bug.
     app.refresh_limits = lambda: None
 
-    opened: list[int] = []
+    opened: list[str] = []
     jumped: list[int] = []
-    app.open_pr = lambda pr: (opened.append(pr.get("number")),
-                              app.say(f"opened #{pr.get('number')}"))[1]
-    app.jump_to_seat = lambda seat: (jumped.append(seat), True)[1]
+    app.open_url = lambda url: (opened.append(url), app.say(f"opened {url}"))[1]
+    app.jump_to_seat = lambda seat, scope=None: (jumped.append(seat), True)[1]
 
     failures: list[str] = []
     async with app.run_test(size=(80, 44)) as pilot:
-        for _ in range(40):                        # the first fetch is a network call
-            await pilot.pause(0.25)
-            if app.query_one("#prs").row_count and app.query_one("#fleet").row_count:
-                break
-
-        prs = app.query_one("#prs")
+        await _settle(app, pilot)
+        work = app.query_one("#work")
         fleet = app.query_one("#fleet")
-        claims = app.query_one("#claims")
-        _need_rows(prs, "PRs", app.pr_err)
+        _need_rows(work, "work", app.pr_err or app.issue_err or app.plan_err)
 
         # ONE click, on a row that is not the cursor's, is the whole point.
-        # x=30 is the title column: the first columns are the CI glyph and the
-        # ⚖, which mean something else and are covered by the test below.
-        await pilot.click(prs, offset=(30, 1))
-        await pilot.pause(0.2)
-        if not opened:
-            failures.append("a click on a PR row did not open it")
+        row = await _click(pilot, app, work, 0, app.ref_column)
+        if row is None:
+            failures.append("the top work row has no record behind it")
+        elif row["number"] is None:
+            if not app.detail_text:
+                failures.append("a numberless row's ref said nothing")
+        elif not opened:
+            failures.append("a click on the ref did not open it")
+        elif str(row["number"]) not in opened[-1]:
+            failures.append(f"opened {opened[-1]}, but the row was #{row['number']}")
 
         await pilot.click(fleet, offset=(4, 1))
         await pilot.pause(0.2)
         if not app.detail_text or app.detail_text.startswith("click a row"):
             failures.append("a click on an agent row changed nothing")
 
-        if claims.row_count:
-            await pilot.click(claims, offset=(4, 1))
-            await pilot.pause(0.2)
-
         opened.clear()                             # and the keyboard path still works
-        prs.focus()
+        work.focus()
+        work.scroll_to(y=0, animate=False)
+        await pilot.pause(0.2)
+        top = _record_at(app, work, 0)
         await pilot.press("o")
         await pilot.pause(0.2)
-        if not opened:
-            failures.append("'o' did not open the selected PR")
+        if top and top["number"] is not None and not opened:
+            failures.append("'o' did not open the selected row")
 
     return failures
 
 
-async def _drive_issues() -> list[str]:
-    app_module = _load_app()
-    app = app_module.Dash(interval=3600, gh_interval=3600)
-    app.refresh_limits = lambda: None
+async def _settle(app, pilot, tries: int = 40) -> None:
+    """Wait for the board AND `gh` — three fetches on three clocks feed one table.
 
-    started: list[tuple[str, str]] = []
-    opened: list[int] = []
-    app.run_in_window = lambda name, command: started.append((name, command))
-    app.open_issue = lambda issue: opened.append(issue.get("number"))
-
-    failures: list[str] = []
-    async with app.run_test(size=(90, 50)) as pilot:
-        for _ in range(40):
-            await pilot.pause(0.25)
-            if app.query_one("#issues").row_count:
-                break
-        issues = app.query_one("#issues")
-        _need_rows(issues, "issues", app.issue_err)
-        # Read the number off the RENDERED first row rather than re-deriving the
-        # order here: what the click has to match is the row a human sees. Found
-        # by its "#" rather than by column index — the panels grew a repo column
-        # between the issue number and the icons, and a hardcoded index made this
-        # fail with `int('quarterback')` rather than saying what moved.
-        top = int(_numbered_cell(issues.get_row_at(0)))
-
-        # The ⚒ column asks first, the same as the ⚖ does.
-        await pilot.click(issues, offset=(app_module.Dash.FIX_COLUMN + 2, 1))
-        await pilot.pause(0.3)
-        if started:
-            failures.append("the icon started a fix with no confirmation")
-        if not isinstance(app.screen, app_module.Confirm):
-            failures.append("the icon did not raise the confirmation")
-        else:
-            await pilot.press("enter")
-            await pilot.pause(0.3)
-            if not started:
-                failures.append("confirming did not start the fix")
-            elif f"/fix-issue {top}" not in started[0][1]:
-                failures.append(f"wrong command launched: {started[0][1]}")
-            elif started[0][0] != f"fix-{top}":
-                failures.append(f"wrong window name: {started[0][0]}")
-
-        # A click anywhere else on the row still means "open it on GitHub".
-        started.clear()
-        await pilot.click(issues, offset=(30, 1))
-        await pilot.pause(0.3)
-        if opened != [top]:
-            failures.append(f"clicking the title opened {opened}, expected [{top}]")
-        if started:
-            failures.append("clicking the title started a fix")
-
-        # And the keyboard route to the same verb.
-        issues.focus()
-        await pilot.press("f")
-        await pilot.pause(0.3)
-        if not isinstance(app.screen, app_module.Confirm):
-            failures.append("'f' did not raise the confirmation")
-        else:
-            await pilot.press("escape")
-            await pilot.pause(0.2)
-
-    return failures
+    Waiting only for rows was not enough once they merged: the board answers first,
+    so a table with rows in it can still be the plan alone, and a test that started
+    clicking there would be testing a table with no PRs in it and calling that a
+    pass.
+    """
+    for _ in range(tries):
+        await pilot.pause(0.25)
+        if app.query_one("#work").row_count and app.prs and app.query_one("#fleet").row_count:
+            return
 
 
-async def _drive_plan() -> list[str]:
+async def _drive_verbs() -> list[str]:
     app_module = _load_app()
     app = app_module.Dash(interval=3600, gh_interval=3600, plan_interval=3600)
     app.refresh_limits = lambda: None
 
     started: list[tuple[str, str]] = []
-    app.run_in_window = lambda name, command: started.append((name, command))
-
-    failures: list[str] = []
-    async with app.run_test(size=(100, 50)) as pilot:
-        for _ in range(40):
-            await pilot.pause(0.25)
-            if app.query_one("#plan").row_count:
-                break
-        plan = app.query_one("#plan")
-        _need_rows(plan, "plan items", app.plan_err)
-
-        # Anywhere but the ⚒: the detail line, and it must name the row clicked.
-        await pilot.click(plan, offset=(40, 1))
-        await pilot.pause(0.3)
-        title = str(plan.get_row_at(plan.scroll_offset.y)[4]).rstrip("…")
-        if title and title not in app.detail_text:
-            failures.append(f"the detail line does not describe the row clicked: "
-                            f"{app.detail_text[:80]!r}")
-
-        # The ⚒, on a row that actually has an issue behind it. Which row that is
-        # depends on today's plan, so it is found rather than assumed — and what
-        # it should do is read off the row the table actually scrolled to, not
-        # off the index asked for: scrolling near the end of a list stops short.
-        import qbdata as qd
-        ordered = qd.sort_plan(app.plan)
-        wanted = next((n for n, i in enumerate(ordered)
-                       if qd.plan_issue(i) and not i.get("claim")), None)
-        if wanted is None:
-            pytest.skip("no free issue-backed item on the plan today — nothing to take")
-        plan.scroll_to(y=wanted, animate=False)
-        await pilot.pause(0.3)
-        landed = ordered[plan.scroll_offset.y]
-
-        await pilot.click(plan, offset=(app_module.Dash.FIX_COLUMN + 2, 1))
-        await pilot.pause(0.3)
-        issue = qd.plan_issue(landed)
-        if started:
-            failures.append("the icon started a fix with no confirmation")
-        elif issue is None or landed.get("claim"):
-            # A line of plan with no issue, or somebody's current work: the icon
-            # has to SAY so. Doing nothing is indistinguishable from being broken.
-            if not app.detail_text:
-                failures.append("the icon on an unfixable row said nothing")
-        elif not isinstance(app.screen, app_module.Confirm):
-            failures.append("the icon did not raise the confirmation")
-        else:
-            await pilot.press("enter")
-            await pilot.pause(0.3)
-            if not started:
-                failures.append("confirming did not start the fix")
-            elif f"/fix-issue {issue['number']}" not in started[0][1]:
-                failures.append(f"wrong command launched: {started[0][1]}")
-
-    return failures
-
-
-async def _drive_panel() -> list[str]:
-    app_module = _load_app()
-    app = app_module.Dash(interval=3600, gh_interval=3600)
-    app.refresh_limits = lambda: None
-
-    started: list[tuple[str, str]] = []
     windowed: list[tuple[str, str]] = []
-    opened: list[int] = []
-    # run_in_PANE, not run_in_window: a review now lands in the seat row, beside
-    # the work it is about. Both are stubbed so that a review quietly reverting
-    # to a window shows up here as a failure rather than as a passing test.
+    opened: list[str] = []
+    # run_in_PANE, not run_in_window: a review lands in the seat row, beside the
+    # work it is about. Both are stubbed so a review quietly reverting to a window
+    # shows up here as a failure rather than as a passing test.
     app.run_in_pane = lambda name, command: started.append((name, command))
     app.run_in_window = lambda name, command: windowed.append((name, command))
-    app.open_pr = lambda pr: opened.append(pr.get("number"))
+    app.open_url = lambda url: opened.append(url)
 
     failures: list[str] = []
     async with app.run_test(size=(90, 44)) as pilot:
-        for _ in range(40):
-            await pilot.pause(0.25)
-            if app.query_one("#prs").row_count:
-                break
-        prs = app.query_one("#prs")
-        _need_rows(prs, "PRs", app.pr_err)
+        await _settle(app, pilot)
+        work = app.query_one("#work")
+        _need_rows(work, "work", app.pr_err or app.issue_err)
+        wanted = _find_row(app, work, lambda r: r["kind"] == "pr")
+        if wanted is None:
+            pytest.skip("no open PR on the board today — nothing to review")
 
-        # The ⚖ column asks first and starts nothing by itself.
-        await pilot.click(prs, offset=(app_module.Dash.PANEL_COLUMN + 2, 1))
-        await pilot.pause(0.3)
+        # The ⚖ asks first, and starts nothing by itself.
+        row = await _click(pilot, app, work, wanted, app.ACTION_COLUMN)
+        if row["kind"] != "pr":
+            pytest.skip("the table scrolled to a non-PR row — nothing to review here")
         if started:
             failures.append("the icon started a review with no confirmation")
         if not isinstance(app.screen, app_module.Confirm):
@@ -362,30 +312,41 @@ async def _drive_panel() -> list[str]:
             await pilot.pause(0.3)
             if not started:
                 failures.append("confirming did not start the review")
-            elif "/panel-review-pr" not in started[0][1]:
+            elif f"/panel-review-pr {row['number']}" not in started[0][1]:
                 failures.append(f"wrong command launched: {started[0][1]}")
             if windowed:
                 failures.append("the review opened a window, not a seat-row pane")
 
         # Cancelling starts nothing.
         started.clear()
-        await pilot.click(prs, offset=(app_module.Dash.PANEL_COLUMN + 2, 2))
-        await pilot.pause(0.3)
+        await _click(pilot, app, work, wanted, app.ACTION_COLUMN)
         await pilot.press("escape")
         await pilot.pause(0.3)
         if started:
             failures.append("cancelling still started a review")
 
-        # A click anywhere else on the row still means "open on GitHub".
-        await pilot.click(prs, offset=(30, 1))
-        await pilot.pause(0.3)
+        # The ref opens it — and as a PULL, not an issue: the number alone cannot
+        # say which, and a link to the wrong one is a 404 or somebody else's page.
+        await _click(pilot, app, work, wanted, app.ref_column)
         if not opened:
-            failures.append("clicking the title did not open the PR")
+            failures.append("clicking the ref did not open the PR")
+        elif f"/pull/{row['number']}" not in opened[-1]:
+            failures.append(f"the ref opened {opened[-1]}, not the PR's own page")
         if started:
-            failures.append("clicking the title started a review")
+            failures.append("clicking the ref started a review")
+
+        # And anything else on the row explains it rather than doing anything.
+        started.clear()
+        opened.clear()
+        title_column = app.ref_column + 1
+        await _click(pilot, app, work, wanted, title_column)
+        if opened or started:
+            failures.append("clicking the title opened or started something")
+        if not app.detail_text:
+            failures.append("clicking the title explained nothing")
 
         # And the keyboard route to the same verb.
-        prs.focus()
+        work.focus()
         await pilot.press("p")
         await pilot.pause(0.3)
         if not isinstance(app.screen, app_module.Confirm):
@@ -393,6 +354,91 @@ async def _drive_panel() -> list[str]:
         else:
             await pilot.press("escape")
             await pilot.pause(0.2)
+
+    return failures
+
+
+async def _drive_fix() -> list[str]:
+    app_module = _load_app()
+    app = app_module.Dash(interval=3600, gh_interval=3600, plan_interval=3600)
+    app.refresh_limits = lambda: None
+
+    started: list[tuple[str, str]] = []
+    app.run_in_window = lambda name, command: started.append((name, command))
+
+    failures: list[str] = []
+    async with app.run_test(size=(90, 50)) as pilot:
+        await _settle(app, pilot)
+        work = app.query_one("#work")
+        _need_rows(work, "work", app.issue_err)
+        import qbdata as qd
+        wanted = _find_row(app, work,
+                           lambda r: qd.work_action(r)[2] == "fix" and not r["claim"])
+        if wanted is None:
+            pytest.skip("no free issue on the board today — nothing to take")
+
+        row = await _click(pilot, app, work, wanted, app.ACTION_COLUMN)
+        verb = qd.work_action(row)[2]
+        if started:
+            failures.append("the icon started a fix with no confirmation")
+        elif verb != "fix":
+            # A row with nothing to start has to SAY so: an icon that swallows the
+            # click is indistinguishable from a broken one.
+            if not app.detail_text:
+                failures.append("the icon on an unfixable row said nothing")
+        elif not isinstance(app.screen, app_module.Confirm):
+            failures.append("the icon did not raise the confirmation")
+        else:
+            number = row["number"] if row["number"] is not None \
+                else qd.plan_issue(row["plan"] or {})["number"]
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            if not started:
+                failures.append("confirming did not start the fix")
+            elif f"/fix-issue {number}" not in started[0][1]:
+                failures.append(f"wrong command launched: {started[0][1]}")
+            elif started[0][0] != f"fix-{number}":
+                failures.append(f"wrong window name: {started[0][0]}")
+
+        # And the keyboard route to the same verb.
+        work.focus()
+        work.scroll_to(y=wanted, animate=False)
+        await pilot.pause(0.2)
+        await pilot.press("f")
+        await pilot.pause(0.3)
+        if isinstance(app.screen, app_module.Confirm):
+            await pilot.press("escape")
+            await pilot.pause(0.2)
+        elif not app.detail_text:
+            failures.append("'f' neither asked nor explained why it could not")
+
+    return failures
+
+
+async def _drive_detail() -> list[str]:
+    app_module = _load_app()
+    app = app_module.Dash(interval=3600, gh_interval=3600, plan_interval=3600)
+    app.refresh_limits = lambda: None
+
+    failures: list[str] = []
+    async with app.run_test(size=(100, 50)) as pilot:
+        await _settle(app, pilot)
+        work = app.query_one("#work")
+        _need_rows(work, "work", app.plan_err)
+        wanted = _find_row(app, work, lambda r: r["plan"] is not None)
+        if wanted is None:
+            pytest.skip("nothing on the plan today — no order to explain")
+
+        row = await _click(pilot, app, work, wanted, app.ref_column + 1)
+        if row["plan"] is None:
+            pytest.skip("the table scrolled to an unplanned row")
+        # The PLAN's title, not the row's: a merged row is drawn with the GitHub
+        # title, so finding the plan item's own words in the detail line is what
+        # proves the click reached through the join rather than stopping at it.
+        title = (row["plan"].get("title") or "").strip()
+        if title and title[:24] not in app.detail_text:
+            failures.append(f"the detail line does not carry the plan item's own "
+                            f"words: {app.detail_text[:100]!r}")
 
     return failures
 
@@ -506,6 +552,11 @@ SCOPED_BOARD = {
     "claims": [
         {"holder": "daedalus/one", "kind": "issue", "key": "prisonblues/quarterback#261"},
         {"holder": "zeus/two", "kind": "issue", "key": "prisonblues/nix-fleet#3"},
+        # A claim on something that is NOT an issue or a PR, which is the row shape
+        # that only exists because the four panels became one: it has no GitHub
+        # page and no plan item, and it is still work somebody is holding.
+        {"holder": "daedalus/three", "kind": "release",
+         "key": "prisonblues/quarterback:2.41"},
     ],
 }
 
@@ -531,7 +582,7 @@ def _text(widget) -> str:
 
 def _titles(app) -> dict[str, str]:
     """The panel headings, which are where a narrowed panel admits it narrowed."""
-    return {name: _text(app.query_one(f"#t_{name}")) for name in ("fleet", "claims", "plan")}
+    return {name: _text(app.query_one(f"#t_{name}")) for name in ("fleet", "work")}
 
 
 def _cells(table, row: int) -> list[str]:
@@ -561,7 +612,7 @@ async def _drive_scope() -> list[str]:
         app.render_plan(SCOPED_PLAN, None)
         await pilot.pause()
 
-        fleet, claims, plan = (app.query_one(f"#{n}") for n in ("fleet", "claims", "plan"))
+        fleet, work = app.query_one("#fleet"), app.query_one("#work")
         titles = _titles(app)
 
         # NARROW: this project's rows, the unattributable row kept, no repo cell.
@@ -574,41 +625,67 @@ async def _drive_scope() -> list[str]:
             failures.append(f"narrow FLEET has {len(fleet.columns)} columns, not 4")
         if "1 elsewhere" not in titles["fleet"]:
             failures.append(f"narrow FLEET does not say what it hid: {titles['fleet']!r}")
-        if "1 elsewhere" not in titles["claims"]:
-            failures.append(f"narrow CLAIMED does not say what it hid: {titles['claims']!r}")
-        if "1 elsewhere" not in titles["plan"]:
-            failures.append(f"narrow PLANS does not say what it hid: {titles['plan']!r}")
-        if claims.row_count and _cells(claims, 0)[1] != "#261":
-            failures.append(f"the claim key still carries its repo: {_cells(claims, 0)}")
+        if "2 elsewhere" not in titles["work"]:
+            failures.append(f"narrow WORK does not say what it hid: {titles['work']!r}")
         if "quarterback" not in _text(app.query_one("#head")):
             failures.append("the header does not name the scope it is showing")
 
-        # The icons a click acts on must not have moved with the column that went.
-        if plan.row_count and _cells(plan, 0)[app.FIX_COLUMN] != "⚒":
-            failures.append(f"the ⚒ moved out of column {app.FIX_COLUMN}: {_cells(plan, 0)}")
+        # THE MERGE, on a literal: one plan item, one claim, ONE row — and the row
+        # carries both, the issue number off the item's ref and the holder off the
+        # claim. Two rows here would be the defect this table exists to remove.
+        refs = [_cells(work, i) for i in range(work.row_count)]
+        merged = [r for r in refs if "#261" in r]
+        if len(merged) != 1:
+            failures.append(f"the plan item and the claim on it are not one row: {refs}")
+        elif "one" not in merged[0][-1]:
+            failures.append(f"the merged row does not name its holder: {merged[0]}")
+
+        # A release claim has no GitHub page to be a number, and the narrow view
+        # trims the repo the header already states.
+        release = [r for r in refs if "2.41" in " ".join(r)]
+        if len(release) != 1:
+            failures.append(f"the release claim lost its row: {refs}")
+        elif "quarterback:2.41" in " ".join(release[0]):
+            failures.append(f"the claim key still carries its repo: {release[0]}")
+
+        # The icon a click acts on must not have moved with the column that went.
+        if work.row_count and _cells(work, 0)[app.ACTION_COLUMN] not in ("⚒", "⚖", "·"):
+            failures.append(f"the action icon moved out of column "
+                            f"{app.ACTION_COLUMN}: {_cells(work, 0)}")
 
         await pilot.press("s")
         await pilot.pause()
 
-        fleet, claims = app.query_one("#fleet"), app.query_one("#claims")
+        fleet, work = app.query_one("#fleet"), app.query_one("#work")
         titles = _titles(app)
         if fleet.row_count != 3:
             failures.append(f"the wide view holds {fleet.row_count} agents, not 3")
         if len(fleet.columns) != 5:
             failures.append(f"the wide view has {len(fleet.columns)} columns, not 5")
-        if "elsewhere" in titles["fleet"] or "elsewhere" in titles["plan"]:
+        if "elsewhere" in titles["fleet"] or "elsewhere" in titles["work"]:
             failures.append(f"the wide view still claims to hide rows: {titles}")
-        if claims.row_count != 2 or _cells(claims, 0)[1] != "quarterback#261":
-            failures.append(f"the wide view's claims read {[_cells(claims, i) for i in range(claims.row_count)]}")
+        if work.row_count != 4:
+            failures.append(f"the wide view holds {work.row_count} work rows, not 4: "
+                            f"{[_cells(work, i) for i in range(work.row_count)]}")
         if "all repos" not in _text(app.query_one("#head")):
             failures.append("the header does not say the pane went wide")
-        if plan.row_count and _cells(plan, 0)[app.FIX_COLUMN] != "⚒":
-            failures.append(f"the ⚒ moved when the column came back: {_cells(plan, 0)}")
+        if app.ref_column != 4:
+            failures.append(f"the ref did not move with the repo column: {app.ref_column}")
+        if work.row_count and _cells(work, 0)[app.ACTION_COLUMN] not in ("⚒", "⚖", "·"):
+            failures.append(f"the action icon moved when the column came back: "
+                            f"{_cells(work, 0)}")
+        # And the repo the narrow view trimmed is back, because out here it is the
+        # cell that tells two claims apart.
+        wide = " ".join(" ".join(_cells(work, i)) for i in range(work.row_count))
+        if "quarterback:2.41" not in wide:
+            failures.append(f"the wide view does not name the claim's repo: {wide}")
 
         await pilot.press("s")                     # and back, from cache
         await pilot.pause()
         if app.query_one("#fleet").row_count != 2:
             failures.append("narrowing again did not redraw from what the client had")
+        if app.query_one("#work").row_count != 2:
+            failures.append("narrowing again did not redraw WORK from what it had")
 
     return failures
 

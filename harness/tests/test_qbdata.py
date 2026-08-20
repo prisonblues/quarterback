@@ -722,3 +722,237 @@ def _serve(monkeypatch, payload: dict) -> list:
 
     monkeypatch.setattr(qd.urllib.request, "urlopen", urlopen)
     return calls
+
+
+# ---- one table ---------------------------------------------------------------
+#
+# The four panels became one (#272), and the join that made that possible is the
+# thing worth testing: which sources fold into one row, which get a row of their
+# own, and what order the result comes out in. A wrong answer here is not a
+# cosmetic fault — it is the dash showing one piece of work as two, or hiding a
+# claim, or sending a seat into an issue somebody else already has.
+
+
+def gh(number: int, title: str = "an open thing", repo: str = qd.REPO, **extra) -> dict:
+    """A row shaped the way `gh issue list` / `gh pr list` return one."""
+    return {"number": number, "title": title, "repo": repo,
+            "updatedAt": "2026-08-20T12:00:00Z", **extra}
+
+
+def claim(key: str, holder: str = "zeus/one", kind: str = "issue", **extra) -> dict:
+    """A claim shaped the way the board returns one."""
+    return {"key": key, "holder": holder, "kind": kind, "note": "on it",
+            "expires": "2026-08-20T13:00:00Z", **extra}
+
+
+def checks(*conclusions: str) -> dict:
+    return {"statusCheckRollup": [{"conclusion": c} for c in conclusions]}
+
+
+def keys(rows: list[dict]) -> list[str]:
+    return [r["key"] for r in rows]
+
+
+def test_one_issue_is_one_row_however_many_sources_mention_it():
+    """The whole point. #255 was a plan item AND an issue AND a claim — three rows
+    on three panels, and the reader had to work out they were one thing."""
+    rows = qd.work_rows([item("plan's words", ref=255)], [gh(255, "the issue's words")],
+                        [], [claim(f"{qd.REPO}#255", holder="zeus/quill")], [qd.REPO])
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["plan"] is not None and row["issue"] is not None and row["claim"] is not None
+    assert row["number"] == 255 and row["kind"] == "issue"
+
+
+def test_a_github_title_wins_over_the_plans_stale_copy():
+    """A plan item's copy of the title can be months old; the issue's is what it
+    is called now."""
+    rows = qd.work_rows([item("what we thought it was", ref=255)],
+                        [gh(255, "what it is actually called")], [], [], [qd.REPO])
+    assert rows[0]["title"] == "what it is actually called"
+
+
+def test_the_plans_order_is_the_tables_order_whatever_state_the_items_are_in():
+    """A plan is a human's ordering. Re-sorting it by how the items are GOING would
+    be the dash substituting its own judgement — and a blocked item is still the
+    next thing to unblock."""
+    plan = [item("first", ref=1, blocked=[{"ref": "9"}]),
+            item("second", ref=2, holder="zeus/one"),
+            item("third", ref=3)]
+    rows = qd.work_rows(plan, [], [], [], [qd.REPO])
+    assert [r["number"] for r in rows] == [1, 2, 3]
+
+
+def test_work_the_plan_does_not_mention_comes_after_the_work_it_does():
+    rows = qd.work_rows([item("planned", ref=1)],
+                        [gh(2, "not on the plan"), gh(3, "nor this")], [], [], [qd.REPO])
+    assert [r["number"] for r in rows][0] == 1
+
+
+def test_unplanned_rows_lead_with_what_is_held_then_the_prs():
+    """No plan to obey out here, so the order has to be argued for: somebody is on
+    it, then a decision is waiting on a human, then the rest newest first."""
+    rows = qd.work_rows(
+        [], [gh(10), gh(40)], [gh(20)], [claim(f"{qd.REPO}#30", holder="zeus/one")],
+        [qd.REPO])
+    assert [r["number"] for r in rows] == [30, 20, 40, 10]
+
+
+def test_a_pr_and_an_issue_of_the_same_number_cannot_exist_to_be_confused():
+    """GitHub numbers issues and PRs out of one sequence per repo, which is what
+    makes `owner/repo#n` a safe merge key. Two REPOS' #12 must still stay apart —
+    joining them would mark ours held because theirs was."""
+    rows = qd.work_rows([], [gh(12, "ours")], [gh(12, "theirs", repo="someone/other")],
+                        [], [qd.REPO])
+    assert len(rows) == 2
+    assert sorted(keys(rows)) == ["prisonblues/quarterback#12", "someone/other#12"]
+
+
+def test_a_claim_on_a_closed_issue_keeps_its_row():
+    """`gh` lists open issues only, so a claim can outlive the thing it is on. That
+    row is the one a human most needs — somebody is holding something that is
+    finished, and it wants releasing."""
+    rows = qd.work_rows([], [], [], [claim(f"{qd.REPO}#99", holder="zeus/one")], [qd.REPO])
+    assert len(rows) == 1
+    assert rows[0]["number"] == 99 and rows[0]["issue"] is None
+    assert qd.work_who(rows[0]) == ("one", "yellow")
+
+
+def test_a_claim_on_a_plan_item_lands_on_that_items_row():
+    """`plan:<uuid>` is right for a lock and useless on a screen. It resolves by
+    landing on the item's own row, which is where the title already is — the old
+    CLAIMED panel had to reach into the plan to relabel it."""
+    plan = [item("the item that is held", ref=None)]
+    rows = qd.work_rows(plan, [], [], [claim(f"plan:{plan[0]['item_id']}",
+                                             holder="zeus/two", kind="work")], [qd.REPO])
+    assert len(rows) == 1
+    assert rows[0]["title"] == "the item that is held"
+    assert qd.work_who(rows[0]) == ("two", "yellow")
+    assert qd.work_state(rows[0]) == ("▶", "green")
+
+
+def test_a_claim_on_something_that_is_not_an_issue_gets_a_row_of_its_own():
+    """A release or a lease is held work with no GitHub page. Dropping it would
+    hide the one row saying somebody already has the thing you were about to take."""
+    rows = qd.work_rows([], [], [], [claim(f"{qd.REPO}:2.41", kind="release")], [qd.REPO])
+    assert len(rows) == 1
+    assert rows[0]["kind"] == "claim" and rows[0]["number"] is None
+    assert qd.work_state(rows[0]) == ("⚑", "yellow")
+    assert qd.work_kind(rows[0])[0] == "rel"
+
+
+def test_a_prs_state_is_its_ci_even_when_somebody_holds_it():
+    """The state column answers "can it land"; who has it is the last column's
+    job, so nothing is lost by giving this one over to the checks."""
+    rows = qd.work_rows([], [], [gh(5, **checks("FAILURE"))],
+                        [claim(f"{qd.REPO}#5", holder="zeus/one")], [qd.REPO])
+    assert qd.work_state(rows[0]) == ("✗", "red")
+    assert qd.work_who(rows[0]) == ("one", "yellow")
+
+
+def test_the_state_glyph_says_held_blocked_free_or_a_line_of_plan():
+    plan = [item("held", ref=1, holder="zeus/one"),
+            item("blocked", ref=2, blocked=[{"ref": "9"}]),
+            item("free and planned", ref=3),
+            item("just a line of plan")]
+    rows = qd.work_rows(plan, [gh(4, "free and unplanned")], [], [], [qd.REPO])
+    assert [qd.work_state(r)[0] for r in rows] == ["▶", "⊘", "○", "≡", "○"]
+    # Cyan for what the plan asked for, green for what is merely open: both are
+    # takeable, and the first is the one the plan says to take.
+    assert qd.work_state(rows[2])[1] == "cyan"
+    assert qd.work_state(rows[4])[1] == "green"
+
+
+def test_the_verb_a_row_offers_is_the_one_its_icon_shows():
+    """work_action draws the icon AND answers the click, so the two can never
+    disagree about what a row does."""
+    rows = qd.work_rows([item("a line of plan")], [gh(2)], [gh(3)], [], [qd.REPO])
+    by_kind = {r["kind"]: qd.work_action(r, [qd.REPO]) for r in rows}
+    assert by_kind["pr"] == ("⚖", "bold cyan", "panel")
+    assert by_kind["issue"] == ("⚒", "bold cyan", "fix")
+    assert by_kind["plan"] == ("·", "grey30", None)
+
+
+def test_a_plan_item_pointing_at_an_issue_is_an_issue_you_can_take():
+    rows = qd.work_rows([item("do #7", ref=7)], [], [], [], [qd.REPO])
+    assert qd.work_action(rows[0], [qd.REPO])[2] == "fix"
+
+
+def test_a_held_issue_dims_its_hammer_but_keeps_it():
+    """A lapsed claim is exactly what a human picks up, and the confirmation names
+    the holder — so the icon goes dim rather than away."""
+    rows = qd.work_rows([], [gh(8)], [], [claim(f"{qd.REPO}#8")], [qd.REPO])
+    assert qd.work_action(rows[0], [qd.REPO]) == ("⚒", "grey30", "fix")
+
+
+def test_the_who_column_holds_whichever_of_the_three_facts_is_true():
+    """Only one of them is ever true of a row, and a holder outranks a blocker."""
+    plan = [item("held", ref=1, holder="zeus/amber-otter"),
+            item("waiting", ref=2, blocked=[{"ref": "9"}]),
+            item("free", ref=3, updated="2026-08-20T11:00:00Z")]
+    rows = qd.work_rows(plan, [], [], [], [qd.REPO])
+    assert qd.work_who(rows[0]) == ("amber-otter", "yellow")
+    assert qd.work_who(rows[1]) == ("waits #9", "grey50")
+    assert qd.work_who(rows[2])[1] == "grey50"
+
+
+def test_the_title_counts_each_unit_of_work_once():
+    """Which the four panels could not: the same issue was a row on three of them,
+    so their counts added up to more work than the fleet had."""
+    rows = qd.work_rows([item("held", ref=1, holder="zeus/one"),
+                         item("blocked", ref=2, blocked=[{"ref": "9"}])],
+                        [gh(1), gh(2), gh(3)], [gh(4)],
+                        [claim(f"{qd.REPO}#1", holder="zeus/one")], [qd.REPO])
+    title = qd.work_title(rows)
+    assert title.startswith("WORK · 4 ·"), title
+    assert "1 running" in title and "1 blocked" in title and "1 in review" in title
+
+
+def test_a_narrowed_table_still_says_how_many_rows_it_hid():
+    rows = qd.work_rows([], [gh(1)], [], [], [qd.REPO])
+    assert "3 elsewhere" in qd.work_title(rows, 3)
+
+
+def test_every_sources_failure_reaches_the_title():
+    """Three fetches fail independently. A table drawing two of them while saying
+    nothing about the third claims to be the whole of the work when it is not."""
+    assert "gh exploded" in qd.work_title([], 0, "gh exploded")
+
+
+def test_a_pr_too_new_for_a_verdict_is_not_dimmed_like_a_blocked_one():
+    """Dim means "here for completeness". A PR whose checks have not reported is
+    the newest thing on the board and the most worth reading — it used to go grey
+    because the dimming was inferred from the state colour."""
+    fresh = qd.work_rows([], [], [gh(1)], [], [qd.REPO])[0]
+    draft = qd.work_rows([], [], [gh(2, isDraft=True)], [], [qd.REPO])[0]
+    stuck = qd.work_rows([item("blocked", ref=3, blocked=[{"ref": "9"}])],
+                         [], [], [], [qd.REPO])[0]
+    assert qd.work_state(fresh) == ("·", "grey50")     # the colour that used to dim it
+    assert not qd.work_dim(fresh)
+    assert qd.work_dim(draft) and qd.work_dim(stuck)
+
+
+def test_the_ref_of_a_claim_drops_the_repo_only_when_the_header_states_it():
+    """The same rule the panels apply to their repo column (#261), on the one row
+    shape whose ref is a key rather than a number."""
+    row = qd.work_rows([], [], [], [claim(f"{qd.REPO}:2.41", kind="release")],
+                       [qd.REPO])[0]
+    assert qd.work_ref(row, qd.Scope([qd.REPO])) == "2.41"
+    assert qd.work_ref(row, qd.Scope([qd.REPO], on=False)) == "quarterback:2.41"
+
+
+def test_a_merged_rows_detail_carries_the_plans_reasoning_and_the_prs_verdict():
+    """The note is why a row is worth clicking: it is the reason the item sits where
+    it sits, and it lives on the board and nowhere else."""
+    plan = [item("land it", ref=5, note="blocked on the flake check landing first")]
+    row = qd.work_rows(plan, [], [gh(5, **checks("FAILURE"))], [], [qd.REPO])[0]
+    detail = qd.work_detail(row)
+    assert "blocked on the flake check" in detail
+    assert "pr ✗" in detail
+
+
+def test_a_row_with_no_plan_behind_it_still_explains_itself():
+    row = qd.work_rows([], [], [], [claim(f"{qd.REPO}#99", holder="zeus/one")],
+                       [qd.REPO])[0]
+    detail = qd.work_detail(row)
+    assert "#99" in detail and "held by zeus/one" in detail and "on it" in detail
