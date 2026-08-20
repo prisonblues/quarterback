@@ -194,7 +194,7 @@ _PREMISE_CHECK_SECTION = "The premise check (`--ask`)"
 #: It is a *declaration* rather than a summary because `doc` refuses anything absent from it
 #: (below), so a new read cannot be added without adding it here. That is what the sandbox
 #: needs: this suite lives two directories below the files it reads, and
-#: `nix build .#checks.<system>.fixer-escalation-tests` runs it against a sandbox holding only
+#: `nix build .#checks.<system>.prose-consistency-tests` runs it against a sandbox holding only
 #: what that check copies in. A read nobody copied in does not FAIL there, it ERRORS on a
 #: missing file — which is how #163 sat unnoticed for a day, and #246 after it, and how this
 #: suite's own ten reads sat erroring inside `worktree-tests` (#251).
@@ -227,7 +227,7 @@ def doc(relpath: str) -> str:
     # built inline — cannot chase every way of naming a path and fails silently at the first
     # idiom it misses. Here there is nothing to chase.
     assert relpath in READS, (
-        f"{relpath!r} is read here but is not in READS, so flake.nix's fixer-escalation-tests "
+        f"{relpath!r} is read here but is not in READS, so flake.nix's prose-consistency-tests "
         f"check does not know to copy it into its sandbox — where this read would error as a "
         f"FileNotFoundError rather than be asserted. Add it to READS and add an `install` line "
         f"for it to that check.")
@@ -717,7 +717,7 @@ def test_an_escalation_is_recorded_as_deferred(name: str, outcomes: set[str]):
 # ---- the sandbox holds what this suite reads (#251) --------------------------
 #
 # This suite reads ten repo-root files while living two directories below that root, and
-# `nix build .#checks.<system>.fixer-escalation-tests` runs it against a sandbox holding
+# `nix build .#checks.<system>.prose-consistency-tests` runs it against a sandbox holding
 # only what that check installs. It used to be collected by `worktree-tests` instead,
 # whose sandbox holds neither `app/` nor `harness/commands/`, and all ten reads errored
 # there as FileNotFoundError — not failures, ERROR lines, in a check no workflow ran.
@@ -737,11 +737,11 @@ _FLAKE_INSTALL = re.compile(
 #: here rather than subtracted inline, so a second entry has to be argued for in a diff.
 _INSTALLED_BUT_NOT_READ = frozenset({"flake.nix", "harness/tests/test_fixer_escalation.py"})
 
-_CHECK_NAME = "fixer-escalation-tests"
+_CHECK_NAME = "prose-consistency-tests"
 
 
 def _check_region(flake_text: str) -> str:
-    """The `fixer-escalation-tests` block of `flake.nix`, and only it.
+    """The `prose-consistency-tests` block of `flake.nix`, and only it.
 
     Anchored on the attribute definition at line start, because `flake.nix` discusses this
     check in the prose above it: a first-occurrence search for the bare name would slice from

@@ -192,14 +192,21 @@
           touch $out
         '';
 
-        # The fixer-escalation suite, which like the release-metadata one above is not
-        # a harness suite at all: it asserts that the escalation rules stated in the
-        # command briefs, the loops README and the app's review API still agree with
-        # each other. It reads ten repo-root files across four trees and needs nothing
-        # else — no git, no tmux, no network — and it lived in `worktree-tests`, whose
-        # sandbox holds `harness/bin` and `harness/tests`, where every one of those ten
-        # reads errored on a missing file instead of being asserted (#251). Third
-        # instance of #163's mechanism, found the same way: by finally running the flake.
+        # The prose-consistency suites: the ones under `harness/**/tests` whose subject
+        # is this repo's own text and the code it describes, rather than the worktree
+        # scripts. They read briefs, READMEs and the modules those describe, and need
+        # nothing else — no git, no tmux, no network, no database.
+        #
+        # A check for the CATEGORY rather than one per suite, deliberately. Every one of
+        # these lived in `worktree-tests`, whose sandbox holds `harness/bin` and
+        # `harness/tests`, so their repo-root reads errored on missing files instead of
+        # being asserted — #163's mechanism, and by the time it was counted there were
+        # four instances of it across three checks (#163, #246, #251, #257). A fourth
+        # near-identical check was the alternative; one place to add the fifth suite is
+        # worth more than per-suite precision here, since these sandboxes want the same
+        # thing.
+        #
+        # Members today: test_fixer_escalation.py (#251).
         #
         # Copied one by one rather than the repo root wholesale, for the reason
         # release-metadata-tests gives: `./.` would drag a developer's `mcp/.venv` and
@@ -209,7 +216,7 @@
         # `test_the_check_supplies_every_file_this_suite_reads` compares that set
         # against the `install` lines here in both directions. flake.nix is copied in
         # so that guard runs HERE and not only in a checkout.
-        fixer-escalation-tests = pkgs.runCommand "quarterback-fixer-escalation-tests"
+        prose-consistency-tests = pkgs.runCommand "quarterback-prose-consistency-tests"
           {
             nativeBuildInputs = [ (pkgs.python3.withPackages (ps: [ ps.pytest ])) ];
           } ''
