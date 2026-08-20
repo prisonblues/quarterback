@@ -235,9 +235,32 @@ def test_a_blocked_item_is_not_also_counted_as_running():
 
 def test_the_detail_line_carries_the_note_the_panel_cannot_fit():
     line = qd.plan_detail(item("short title", ref=8, holder="zeus/one",
-                               phase="phase one", note="because the order matters"))
-    assert "#8" in line and "phase one" in line
+                               plan={"label": "stage one"},
+                               note="because the order matters"))
+    assert "#8" in line and "stage one" in line
     assert "zeus/one" in line and "because the order matters" in line
+
+
+def test_an_item_covered_by_somebody_elses_PLAN_claim_says_so():
+    """#172: a plan-level claim over an item nobody has taken individually. Worded
+    differently from "held", because the remedy is different — the whole plan is
+    somebody's, so talk to them rather than lifting one line out of it."""
+    line = qd.plan_detail(item("a line of a held plan", ref=9,
+                               plan={"label": "stage one"},
+                               covered_by={"holder": "zeus/two",
+                                           "note": "working the whole list"}))
+    assert "in stage one held by zeus/two" in line
+    assert "working the whole list" in line
+
+
+def test_an_items_OWN_claim_wins_over_the_plans():
+    """Both would otherwise print, and the item's own holder is the specific fact:
+    a covered item is free to take from its plan's holder, a claimed one is not."""
+    line = qd.plan_detail(item("held outright", ref=10, holder="zeus/one",
+                               plan={"label": "stage one"},
+                               covered_by={"holder": "zeus/two", "note": "the plan"}))
+    assert "held by zeus/one" in line
+    assert "zeus/two" not in line
 
 
 def test_a_plan_claim_shows_the_item_it_holds_and_not_its_uuid():

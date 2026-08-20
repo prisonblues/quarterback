@@ -12,7 +12,7 @@ you clicked:
                 same widgets on the tmux seat bar mean
   an agent      its cwd, branch, model and session id, in the detail line
   a claim       the claim note, which is where an agent says what it is doing
-  a plan item   its phase, its note and what it waits on — the reasoning behind
+  a plan item   its plan, its note and what it waits on — the reasoning behind
                 its place in the order, which lives on the board and nowhere
                 else — or its ⚒, to start /fix-issue on the issue behind it
   a PR          open it on GitHub — or its ⚖, to start /panel-review-pr on it

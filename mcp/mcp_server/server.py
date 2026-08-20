@@ -457,9 +457,17 @@ def release_lease(ctx: Context, lease_id: str) -> dict:
 
 
 @mcp.tool()
-def claim(ctx: Context, kind: str, key: str, ttl: int = 3600,
-          session: str | None = None, note: str | None = None) -> dict:
-    """Claim a shared resource before you touch it — landing, or anything two agents can want at once.
+def claim(ctx: Context, ref_kind: str | None = None, ref_value: str | None = None,
+          repo_path: str = ".", kind: str | None = None, key: str | None = None,
+          ttl: int = 3600, session: str | None = None, note: str | None = None) -> dict:
+    """Claim what you are about to work on, BEFORE you start. This is the post that prevents duplicated work.
+
+    Say WHICH resource and the board works out the key: `ref_kind='issue'`,
+    `ref_value='172'`, and the repo is read from the checkout at `repo_path`. Do
+    not compose a key by hand — that is #172. Two agents describing one collision
+    produced two different keys ("issue/<repo>#163" and "work/<repo>#163"), the
+    plan and the claims table then reported different answers about the same issue
+    in the same second, and nobody could tell who held what.
 
     ADVISORY, not a lock. It cannot stop a merge: a human in the GitHub UI or an
     agent not on this board lands regardless. What it removes is collisions
@@ -472,8 +480,15 @@ def claim(ctx: Context, kind: str, key: str, ttl: int = 3600,
     two agents. A claim that named no session falls back to the machine.
 
     Args:
-        kind: What sort of resource. Use "merge" for landing a branch.
-        key: The resource, namespaced by you — e.g. "prisonblues/quarterback:main".
+        ref_kind: what sort of resource — "issue", "pr", "branch", "plan" or
+            "item". This is the preferred way in.
+        ref_value: the issue number, PR number, branch name or board id.
+        repo_path: the checkout whose origin remote names the repo. Used for
+            issue / pr / branch refs; ignored for plan and item ids, which are
+            already globally unique.
+        kind: the OLD way — a kind you compose yourself. Still accepted and
+            canonicalised onto the derived key, and the answer says so.
+        key: the composed key, with `kind`.
         ttl: Seconds until the claim lapses without a renew (default 3600).
         session: Your session id. Not just so a peer can reach you — it is what
             makes the claim exclusive against your own machine, so send it, and
@@ -483,9 +498,25 @@ def claim(ctx: Context, kind: str, key: str, ttl: int = 3600,
 
     Returns the claim incl. claim_id; remember it to renew or release.
     """
+    body: dict = {"ttl": ttl, "session": session, "note": note}
+    if ref_kind:
+        if not ref_value:
+            raise ToolError("ref_kind needs ref_value: which issue, PR, branch or id?")
+        ref: dict = {"kind": ref_kind, "value": str(ref_value)}
+        # A plan or an item id is globally unique already, so sending a repo
+        # alongside would give one row two keys depending on the caller's cwd.
+        if ref_kind.lower() not in ("plan", "item"):
+            ref["repo"] = _derive_repo(repo_path)
+        body["ref"] = ref
+    elif kind and key:
+        body["kind"], body["key"] = kind, key
+    else:
+        raise ToolError(
+            "say what you are claiming: ref_kind + ref_value (preferred — the board "
+            "derives the key from your checkout), or kind + key if you already have "
+            "a composed one.")
     try:
-        return _get_client(ctx).claim({"kind": kind, "key": key, "ttl": ttl,
-                                       "session": session, "note": note})
+        return _get_client(ctx).claim(body)
     except httpx.HTTPStatusError as e:
         _raise(e, "claim")
 
@@ -522,24 +553,86 @@ def release_claim(ctx: Context, claim_id: str, session: str | None = None) -> di
 
 
 @mcp.tool()
-def claims(ctx: Context, kind: str | None = None, key: str | None = None,
+def claims(ctx: Context, ref_kind: str | None = None, ref_value: str | None = None,
+           repo_path: str = ".", kind: str | None = None, key: str | None = None,
            holder: str | None = None) -> dict:
-    """What is claimed right now, by whom, and why. Read before you queue behind something."""
+    """What is claimed right now, by whom, and why. Read before you queue behind something.
+
+    To ask about ONE resource, describe it — `ref_kind='issue'`, `ref_value='163'`
+    — and the key comes off your checkout, the same way `claim` derives the one it
+    writes. Composing the key here instead is how a lookup misses a claim that is
+    right there: `kind='issue'` and `kind='work'` were two namespaces for one
+    issue, and a caller that guessed the wrong half was told nobody held it.
+
+    Args:
+        ref_kind: "issue", "pr", "branch", "plan" or "item" — the preferred way.
+        ref_value: the number, branch name or board id.
+        repo_path: the checkout whose origin remote names the repo.
+        kind: a composed kind, if you already have one. Canonicalised with `key`.
+        key: the composed key.
+        holder: only this agent's claims.
+    """
+    params: dict = {"holder": holder}
+    if ref_kind:
+        if not ref_value:
+            raise ToolError("ref_kind needs ref_value: which issue, PR, branch or id?")
+        # The ref goes to the BOARD, which derives the key. Deriving it here would
+        # be a second implementation of the rule in a package that cannot import
+        # the first — which is #172's defect with the parties swapped.
+        params["ref_kind"], params["ref_value"] = ref_kind, str(ref_value)
+        if ref_kind.lower() not in ("plan", "item"):
+            params["repo"] = _derive_repo(repo_path)
+    else:
+        params["kind"], params["key"] = kind, key
     try:
-        return _get_client(ctx).claims({"kind": kind, "key": key, "holder": holder})
+        return _get_client(ctx).claims(params)
     except httpx.HTTPStatusError as e:
         _raise(e, "claims")
+
+
+@mcp.tool()
+def claim_held(ctx: Context, repo_path: str = ".", holder: str | None = None,
+               session: str | None = None) -> dict:
+    """Am I holding anything in this repo right now — yes or no.
+
+    The check to make before you start substantive work, and the one a pickup gate
+    makes for you. `held` is the answer; `claims` is what you are holding and
+    `unattributed` is anything whose key does not name a repo (a plan id, or a
+    free-text namespace).
+
+    This exists because presence is the wrong instrument for the question. `active`
+    answers "who is around", double-counts an agent that has two identities, and
+    lists leases inside the display window that already expired — so it
+    systematically overstates how crowded a tree is. A claim is exactly one row per
+    held resource, keyed on the resource rather than the holder, and it cannot be
+    double-counted by an identity mix-up.
+
+    Args:
+        repo_path: the checkout whose origin remote names the repo to ask about.
+        holder: whose claims. Defaults to yours, which is almost always what you
+            want — naming yourself is how a co-tenant's claim comes back as your
+            own.
+        session: narrow to one session's claims.
+    """
+    try:
+        return _get_client(ctx).claim_held(
+            {"repo": _derive_repo(repo_path), "holder": holder, "session": session})
+    except httpx.HTTPStatusError as e:
+        _raise(e, "claim_held")
 
 
 def _derive_repo(repo_path: str) -> str:
     """`owner/name` for the checkout at `repo_path`, or a refusal saying why not.
 
-    The release tools do NOT take a repo string, and that is the whole of #148.
-    They used to, and an agent answering "which repo is this" answers with
-    whichever spelling it has to hand — `quarterback` from the directory it is
-    standing in, `prisonblues/quarterback` from the remote. Both are true, they
-    are not equal, and the allocator keyed on the text, so one repo grew two
-    counters and handed out 2.36 twice.
+    No tool here takes a repo string, and that is the whole of #148. They used to,
+    and an agent answering "which repo is this" answers with whichever spelling it
+    has to hand — `quarterback` from the directory it is standing in,
+    `prisonblues/quarterback` from the remote. Both are true, they are not equal,
+    and the key was the text, so one repo grew two namespaces.
+
+    #172 made this load-bearing rather than local: a repo name is half of every
+    derived claim key now, so the same rule that stopped the allocator issuing
+    2.36 twice is what stops two agents claiming one issue under two keys.
 
     Nothing here is a naming problem: `repo_slug` has been deriving the answer
     from `remote.origin.url` all along, for `sync_status` and `report_git`, and
@@ -549,135 +642,40 @@ def _derive_repo(repo_path: str) -> str:
     is the property the allocator needed and never had.
 
     Refuses rather than falling back to the directory name. That fallback is how
-    the bare spelling entered the table in the first place (it is still in
-    `sync_status`, and goes with this change): a repo whose identity cannot be
-    derived has no business allocating a shared number, and guessing one from a
-    path is the exact guess this deletes.
+    the bare spelling entered the table in the first place: a repo whose identity
+    cannot be derived has no business keying a shared claim, and guessing one from
+    a path is the exact guess this deletes.
     """
     slug = repo_slug(repo_path)
     if not slug:
         raise ToolError(
             f"no owner/name could be read from the git remote at {repo_path!r}. "
-            "The release tools derive the repo rather than taking one, so that "
-            "two seats in one repo cannot disagree about its name. Add an origin "
+            "These tools derive the repo rather than taking one, so that two "
+            "seats in one repo cannot disagree about its name. Add an origin "
             "remote, or pass repo_path pointing at a checkout that has one."
         )
     return slug
 
 
 @mcp.tool()
-def claim_release_number(ctx: Context, repo_path: str = ".", after: str | None = None,
-                         branch: str | None = None, ttl: int = 3600,
-                         session: str | None = None, note: str | None = None) -> dict:
-    """Ask the board for the next free release number, and hold it. Do NOT pick one yourself.
-
-    Reading `main` and taking "the next free number" is how this repo produced
-    nine collisions in two days: every agent was correct from what it could see,
-    and two of them announced the same number one second apart. Announcing does
-    not force the next agent to look — asking does, because the number comes from
-    the board that just handed out the last one.
-
-    Pass `after` as the highest release YOU can see in your checkout. The board
-    cannot read a CHANGELOG and you cannot see a claim that is not yet in a file,
-    so the allocation is the maximum of both, plus one.
-
-    Release it when your PR merges, or let it lapse — either way the number is
-    never re-issued, because your branch may have shipped it.
-
-    Args:
-        repo_path: Path inside the repo (default cwd). The repo's `owner/name` is
-            read from its origin remote — you do not name it, and cannot spell it
-            a second way. See :func:`_derive_repo`.
-        after: Highest version you can see locally ("2.31" or "2.31.0").
-        branch: Your branch, recorded so others can see what is landing soon.
-        ttl: Seconds until the claim lapses (default 3600). Renew for long work.
-        session: Your session id — also what makes a retry idempotent rather than
-            spending a second number.
-        note: One line on what the release is.
-
-    Returns the allocated `version` plus a claim_id.
-    """
-    try:
-        return _get_client(ctx).claim_release({
-            "repo": _derive_repo(repo_path), "after": after, "branch": branch,
-            "ttl": ttl, "session": session, "note": note})
-    except httpx.HTTPStatusError as e:
-        _raise(e, "claim_release_number")
-
-
-@mcp.tool()
-def reclaim_release_number(ctx: Context, claim_id: str, repo_path: str = ".",
-                           after: str | None = None, branch: str | None = None,
-                           ttl: int = 3600, session: str | None = None,
-                           note: str | None = None) -> dict:
-    """Renumber: give up the release number you hold and take the next free one, in ONE step.
-
-    Use this instead of releasing and then claiming again. **The renumber is
-    where this repo's collisions actually happened** — both of them were
-    renumbers off an earlier collision, because picking a number feels like a
-    decision and replacing one feels like bookkeeping, so nobody re-reads. A
-    release followed by a claim leaves you holding nothing in between, and that
-    window is widest exactly when the namespace is contended, which is the only
-    time anyone renumbers.
-
-    If the allocation fails you keep the number you had — better than a CHANGELOG
-    full of a number you no longer own with nothing to replace it.
-
-    Args:
-        claim_id: The claim you are giving up (from `claim_release_number`).
-        repo_path: Path inside the repo (default cwd); its `owner/name` is read
-            from the origin remote rather than named. See :func:`_derive_repo`.
-        after: Highest version you can now see — usually the number that just
-            landed on you and forced the renumber.
-        ttl: Seconds until the new claim lapses (default 3600).
-        session: Your session id.
-        note: One line on what the release is.
-
-    Returns the new `version` plus `gave_up`, so you can check the swap against
-    what you have already written into your files.
-    """
-    try:
-        return _get_client(ctx).reclaim_release({
-            "repo": _derive_repo(repo_path), "claim_id": claim_id, "after": after,
-            "branch": branch, "ttl": ttl, "session": session, "note": note})
-    except httpx.HTTPStatusError as e:
-        _raise(e, "reclaim_release_number")
-
-
-@mcp.tool()
-def releases(ctx: Context, repo_path: str = ".") -> dict:
-    """Every release number the board has handed out for a repo, and who holds what.
-
-    Also the answer to "what is landing soon", which nothing else here can tell
-    you. Reading it is not claiming it — use `claim_release_number` for that.
-
-    The repo is derived from `repo_path`'s origin remote, not named: asking for
-    one spelling and being shown another repo's numbers is the read half of #148.
-    """
-    try:
-        return _get_client(ctx).releases(_derive_repo(repo_path))
-    except httpx.HTTPStatusError as e:
-        _raise(e, "releases")
-
-
-@mcp.tool()
-def plan_read(ctx: Context, repo: str | None = None, phase: str | None = None,
+def plan_read(ctx: Context, repo: str | None = None, plan: str | None = None,
               include_done: bool = False, limit: int | None = None) -> dict:
     """What is next, in order, and who has it. Read this when you start cold.
 
     The board's other tools answer who is here and what they touched; this is the
     only one that answers **what to do next**, which is the question you actually
-    have. `next` is the first item that is open, unclaimed and unblocked — the
-    answer, already worked out. The list shows why the ones above it were passed
-    over: held by somebody (with their identity, so you can go and ask), or
-    waiting on something unfinished.
+    have. `next` is the first item that is open, unclaimed, unblocked and not
+    inside a plan somebody else is holding — the answer, already worked out. The
+    list shows why the ones above it were passed over: held by somebody (with
+    their identity, so you can go and ask), waiting on something unfinished, or
+    `covered_by` an agent that claimed the whole plan.
 
     Items reference issues and never restate them: read the issue for the what
     and the why, and the plan for the order and the reasoning behind it.
 
     Args:
         repo: this repo's items plus the fleet-wide ones. Omit for everything.
-        phase: only one phase ("stage 1").
+        plan: only one plan, by label ("stage 1") or by id.
         include_done: include finished and dropped items (history, not work).
         limit: most items to return, from the TOP of the order (the board caps it
             at 200 by default). `next` and `counts` always describe the whole
@@ -685,7 +683,7 @@ def plan_read(ctx: Context, repo: str | None = None, phase: str | None = None,
     """
     try:
         return _get_client(ctx).plan(
-            {"repo": repo, "phase": phase, "include_done": include_done,
+            {"repo": repo, "plan": plan, "include_done": include_done,
              "limit": limit})
     except httpx.HTTPStatusError as e:
         _raise(e, "plan_read")
@@ -694,7 +692,7 @@ def plan_read(ctx: Context, repo: str | None = None, phase: str | None = None,
 @mcp.tool()
 def plan_add(ctx: Context, title: str, repo: str | None = None,
              ref_kind: str | None = None, ref_value: str | None = None,
-             phase: str | None = None, note: str | None = None,
+             plan: str | None = None, note: str | None = None,
              depends_on: list[str] | None = None) -> dict:
     """Append an item to the plan. Adding is not reordering, so you may.
 
@@ -712,7 +710,10 @@ def plan_add(ctx: Context, title: str, repo: str | None = None,
             fleet-wide item (it shows in every repo's plan read).
         ref_kind: "issue" or "pr".
         ref_value: the number ("60" or "#60").
-        phase: free text, e.g. "stage 1".
+        plan: the plan it belongs to, by label ("stage 1") or id. A label the
+            board does not know creates the plan — one row per label, folded for
+            case, so "stage 1" and "Stage 1" cannot become two. Submitting a whole
+            plan at once is `plan_submit`; this is for appending to one.
         note: why it sits where it sits.
         depends_on: what it waits on — item ids, or issue refs like "#55" that
             resolve against the same repo's items.
@@ -720,7 +721,7 @@ def plan_add(ctx: Context, title: str, repo: str | None = None,
     try:
         return _get_client(ctx).plan_add({
             "title": title, "repo": repo, "ref_kind": ref_kind, "ref_value": ref_value,
-            "phase": phase, "note": note, "depends_on": depends_on or []})
+            "plan": plan, "note": note, "depends_on": depends_on or []})
     except httpx.HTTPStatusError as e:
         _raise(e, "plan_add")
 
@@ -736,9 +737,11 @@ def plan_claim(ctx: Context, item_id: str, ttl: int | None = None,
     has to unassign you.
 
     A refusal names the holder, their session and what they said they were doing,
-    so it is somebody to talk to rather than a wall. An item waiting on
-    unfinished work is refused too; pass `force=True` to take it anyway, which
-    puts "I know it is blocked" in the record.
+    so it is somebody to talk to rather than a wall. Two things are refused: an
+    item waiting on unfinished work, and an item inside a plan somebody ELSE holds
+    (`plan_hold` means "all of this is mine", and a claim blocks rather than being
+    a note to read past). `force=True` takes it anyway in either case, which puts
+    "I know" in the record.
 
     Args:
         item_id: from `plan_read`.
@@ -783,6 +786,117 @@ def plan_done(ctx: Context, item_id: str, note: str | None = None) -> dict:
         return _get_client(ctx).plan_item("done", {"item_id": item_id, "note": note})
     except httpx.HTTPStatusError as e:
         _raise(e, "plan_done")
+
+
+@mcp.tool()
+def plans(ctx: Context, repo: str | None = None, include_closed: bool = False) -> dict:
+    """Which plans exist, who is holding one, and how many open items each has.
+
+    Read this BEFORE you start surveying a vague problem. Two agents working out a
+    plan for the same thing in parallel is the one genuinely fuzzy race left on
+    this board — everything downstream of a plan is exact item keys — and it is the
+    race a plan-level claim exists to cover.
+
+    Args:
+        repo: this repo's plans plus the fleet-wide ones. Omit for everything.
+        include_closed: include finished and dropped plans.
+    """
+    try:
+        return _get_client(ctx).plans({"repo": repo, "include_closed": include_closed})
+    except httpx.HTTPStatusError as e:
+        _raise(e, "plans")
+
+
+@mcp.tool()
+def plan_submit(ctx: Context, label: str, items: list[dict], repo: str | None = None,
+                note: str | None = None, claim: bool = True,
+                ttl: int | None = None) -> dict:
+    """Submit a whole plan — every item, in one transaction — and hold it.
+
+    **Write the plan before you start the work.** Handed a vague problem, your
+    first act is this call, not an edit. It gives the fleet something exact to
+    coordinate on and it gives you the claim that stops a second agent surveying
+    the same ground.
+
+    One call, not a loop over `plan_add`, and that is the point: an eight-item plan
+    added one item at a time lands incrementally, so an agent reading the plan
+    between item three and item four sees a plan that is not the plan and can claim
+    from it. Nothing is written unless all of it is.
+
+    Args:
+        label: what this plan is called — a handle you say out loud. One open plan
+            per label per repo, folded for case.
+        items: the ordered list. Each is a dict:
+            `{"title": ..., "ref_kind": "issue", "ref_value": "172",
+              "note": "why here", "depends_on": ["@1", "#55", "<item id>"]}`
+            `"@1"` means the FIRST item of this submission — which is what lets a
+            plan carry its own dependency graph without being written twice.
+        repo: the repo it belongs to. Omit for a fleet-wide plan; its items can
+            still name repos of their own.
+        note: why this plan, in your words.
+        claim: hold it on the way out (default true — you wrote it).
+        ttl: seconds before that claim lapses. Omit for the board's default.
+    """
+    body: dict = {"label": label, "items": items, "repo": repo, "note": note,
+                  "claim": claim}
+    if ttl is not None:
+        body["ttl"] = ttl
+    try:
+        return _get_client(ctx).plan_submit(body)
+    except httpx.HTTPStatusError as e:
+        _raise(e, "plan_submit")
+
+
+@mcp.tool()
+def plan_hold(ctx: Context, plan_id: str, ttl: int | None = None,
+              note: str | None = None) -> dict:
+    """Take a WHOLE plan — "all of this is mine", including the planning pass itself.
+
+    Not the same as `plan_claim`, which takes one item. Hold a plan when you are
+    surveying (there are no items yet to be exact about) or when you intend to work
+    the whole list; then claim its items as you reach them. Your own plan claim
+    never blocks you from its items.
+
+    Everyone else's `plan_read` shows the items as `covered_by` you, `next` skips
+    them, and `plan_claim` on one of them is refused — so this is how you stop four
+    agents converging on one problem without holding twenty item claims.
+    """
+    body: dict = {"plan_id": plan_id, "note": note}
+    if ttl is not None:
+        body["ttl"] = ttl
+    try:
+        return _get_client(ctx).plan_verb("claim", body)
+    except httpx.HTTPStatusError as e:
+        _raise(e, "plan_hold")
+
+
+@mcp.tool()
+def plan_unhold(ctx: Context, plan_id: str) -> dict:
+    """Put a whole plan back. Idempotent — holding nothing is a fine answer.
+
+    Do it the moment you stop, or every item in it looks covered to everybody else
+    for the rest of your TTL.
+    """
+    try:
+        return _get_client(ctx).plan_verb("release", {"plan_id": plan_id})
+    except httpx.HTTPStatusError as e:
+        _raise(e, "plan_unhold")
+
+
+@mcp.tool()
+def plan_finish(ctx: Context, plan_id: str, note: str | None = None,
+                force: bool = False) -> dict:
+    """Record that a whole plan is finished, and let your hold go with it.
+
+    Refused while it still has open items, naming them — "finished" and "six items
+    outstanding" cannot both be true, and the plan is what the next agent reads.
+    `force=True` closes it over them, deliberately.
+    """
+    try:
+        return _get_client(ctx).plan_verb(
+            "done", {"plan_id": plan_id, "note": note, "force": force})
+    except httpx.HTTPStatusError as e:
+        _raise(e, "plan_finish")
 
 
 @mcp.tool()

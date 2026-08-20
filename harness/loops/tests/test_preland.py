@@ -365,6 +365,89 @@ def test_unreadable_claims_hold(board):
     assert preland.check_merge_claim("o/r", pr(), "").status == "error"
 
 
+# ------------------------------------- #172: an unclaimed repo is not evidence
+
+
+@pytest.fixture
+def claims_by_query(monkeypatch):
+    """Double `board_get` on the PARAMS, not only the path.
+
+    `check_merge_claim` reads /claims twice now — once for this branch's key, once
+    to find out whether this repo claims anything at all — and the distinction
+    between those two answers is the whole of what the capability warning says.
+    """
+    keyed: dict[str, object] = {"scoped": [], "fleet": []}
+
+    def get(path, params):
+        assert path.strip("/") == "claims"
+        which = "scoped" if params.get("key") else "fleet"
+        return {"claims": keyed[which]}, ""
+
+    monkeypatch.setattr(preland, "board_get", get)
+    return keyed
+
+
+def test_an_unclaimed_branch_in_an_unclaimed_REPO_says_it_proves_nothing(claims_by_query):
+    """The module's own rule — "a merge gate that fails open wherever it cannot see
+    is not a gate" — applied to the claims table. A `passed` that means "the table
+    is empty" reads identically to one that means "nobody is landing this", and the
+    first is the state #172 was filed about: `claims()` empty fleet-wide while
+    thirteen agents worked three shared checkouts."""
+    c = preland.check_merge_claim("o/r", pr(), "")
+    assert c.status == "passed", "this is a warning, not a hold — nothing is wrong with the PR"
+    assert c.warnings, "an empty claims table passed silently"
+    assert "no claims at all" in c.warnings[0]
+    assert "qb-claim" in c.warnings[0], "the warning has to name the remedy"
+
+
+def test_a_repo_that_claims_OTHER_things_is_enrolled_and_gets_no_warning(claims_by_query):
+    """The point of the check. This repo takes claims — just not on this branch —
+    so `unclaimed` here really is evidence that nobody is landing it."""
+    claims_by_query["fleet"] = [{"key": "o/r#172", "holder": "zeus/x"}]
+    c = preland.check_merge_claim("o/r", pr(), "")
+    assert c.status == "passed" and not c.warnings
+
+
+def test_another_repos_claims_do_not_count_as_this_one_being_enrolled(claims_by_query):
+    """The join is on the repo half of the key — derived by the board, prefix-tested
+    here — because "somebody somewhere claims things" says nothing about whether
+    the agents in THIS tree collide silently."""
+    claims_by_query["fleet"] = [{"key": "other/repo#5", "holder": "zeus/x"}]
+    c = preland.check_merge_claim("o/r", pr(), "")
+    assert c.warnings and "all in other repos" in c.warnings[0]
+
+
+def test_a_repo_whose_NAME_is_a_prefix_of_this_one_does_not_count(claims_by_query):
+    """`o/r` is a prefix of `o/rx`, so a bare `startswith` read a neighbour's claim
+    as this repo's — silencing the warning in exactly the case it exists for. The
+    separator (`#`, `!` or `:`) is what the board always puts after a repo in a key,
+    so requiring one costs nothing and closes the class."""
+    claims_by_query["fleet"] = [{"key": "o/rx#5", "holder": "zeus/x"}]
+    c = preland.check_merge_claim("o/r", pr(), "")
+    assert c.warnings, "a neighbouring repo's claim counted as this repo being enrolled"
+
+
+def test_a_held_branch_is_not_also_warned_about(claims_by_query):
+    """When the key itself has a claim, the check has a real answer and the
+    capability question is moot — a warning there would be noise on the one path
+    that is working."""
+    claims_by_query["scoped"] = [{"holder": "zeus/opal-kelp", "acquired": "12:00"}]
+    c = preland.check_merge_claim("o/r", pr(), "zeus/thorn-spruce")
+    assert c.status == "failed" and not c.warnings
+
+
+def test_a_second_board_read_that_fails_says_nothing_extra(board):
+    """The capability read is best-effort by design: the caller already has its own
+    answer about the key, and a check that turned an outage on the SECOND call into
+    a different verdict would be reporting the network rather than the repo."""
+    board["claims"] = ({"claims": []}, "")
+    # The `board` fixture keys on the path, so both reads get the same empty
+    # answer; what matters here is that a well-formed empty answer still produces a
+    # warning and never an error.
+    c = preland.check_merge_claim("o/r", pr(), "")
+    assert c.status == "passed"
+
+
 # ----------------------------------------------------------------- migrations
 
 

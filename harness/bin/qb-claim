@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+"""qb-claim — take a claim on a named resource. The write half of the pickup gate.
+
+  qb-claim issue 172                    this checkout's repo, issue 172
+  qb-claim pr 207 --note "reviewing"
+  qb-claim branch feat/x --ttl 7200
+  qb-claim item <uuid>                  a plan item, by board id
+
+  0  taken     — it is yours (or renewed, if it already was)
+  1  held      — somebody else has it; who, and what they said they are doing
+  2  unknown   — no board configured, no origin remote, or the board is down
+
+**The key is not composed here.** The resource is named — kind and value — and the
+board derives the key from it (`app/claimkey.py`). That is the whole of #172: the
+plan wrote `work/<repo>#163`, an agent wrote `issue/<repo>#163`, and the two
+subsystems reported different answers about one issue in the same second. A shell
+tool composing a third spelling would be the same defect with a new party.
+
+**1 and 2 are different exits for the reason `qb-claimed` gives.** "Somebody has
+it" is the board saying something definite and a caller should stop. "Cannot tell"
+is a board outage, and a checkout that refuses on one makes the board a single
+point of failure for every worktree on the fleet — so the caller decides, and
+`create-worktree --require-claim` is how you ask for the strict reading.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import urllib.error
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from qbdata import board_client, repo_slug  # noqa: E402
+
+TAKEN, HELD, UNKNOWN = 0, 1, 2
+
+#: Kinds whose identity is a BOARD id rather than something inside a repository.
+#: Sending a repo alongside one of these would give a single row two keys
+#: depending on which directory the caller happened to be standing in.
+REPOLESS = frozenset({"plan", "item"})
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        prog="qb-claim", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("kind", help="issue | pr | branch | plan | item")
+    ap.add_argument("value", help="the issue/PR number, branch name, or board id")
+    ap.add_argument("--repo-path", default=".",
+                    help="the checkout whose origin remote names the repo")
+    ap.add_argument("--ttl", type=int, default=None, help="seconds to hold it")
+    ap.add_argument("--note", default=None,
+                    help="what you are doing with it — shown to whoever is refused")
+    ap.add_argument("--session", default=os.environ.get("CLAUDE_CODE_SESSION_ID") or None,
+                    help="your session id (default: $CLAUDE_CODE_SESSION_ID)")
+    ap.add_argument("--json", action="store_true",
+                    help="print the board's whole answer on stdout instead of the id")
+    ap.add_argument("--quiet", "-q", action="store_true",
+                    help="exit code only — nothing on stdout or stderr, and it wins "
+                         "over --json, because that is the stronger promise")
+    args = ap.parse_args()
+
+    def say(message: str) -> None:
+        if not args.quiet:
+            print(message, file=sys.stderr)
+
+    repo = None
+    if args.kind.lower() not in REPOLESS:
+        repo = repo_slug(args.repo_path)
+        if not repo:
+            say(f"unknown: no owner/name could be read from the git remote at "
+                f"{args.repo_path!r} — a claim is keyed on the repo, and guessing "
+                f"one from a directory name is how two agents claimed one issue "
+                f"under two keys")
+            return UNKNOWN
+
+    body: dict = {"note": args.note, "session": args.session}
+    if args.ttl is not None:
+        body["ttl"] = args.ttl
+    try:
+        client, _cfg = board_client()
+        answer = client.claim_ref(args.kind, args.value, repo,
+                                  **{k: v for k, v in body.items() if v is not None})
+    except urllib.error.HTTPError as e:
+        detail = _detail(e)
+        if e.code == 409:
+            held = detail if isinstance(detail, dict) else {}
+            say(f"held: {held.get('held_by') or 'somebody else'} has "
+                f"{held.get('key') or args.value} "
+                f"— {held.get('note') or 'no note'} "
+                f"(since {held.get('acquired') or '?'}, expires "
+                f"{held.get('expires') or '?'})")
+            if held.get("session"):
+                say(f"  their session: {held['session']} — the refusal is somebody "
+                    f"to talk to, not a wall")
+            if args.json and not args.quiet:
+                print(json.dumps(detail, indent=2))
+            return HELD
+        say(f"unknown: the board refused the claim — HTTP {e.code}: {detail}")
+        return UNKNOWN
+    except Exception as e:                                        # noqa: BLE001
+        # Broad on purpose, and it reports rather than shrugs: an outage, a
+        # rotated token and a TLS failure are all "cannot tell", and the caller
+        # needs the reason in the text to act on it.
+        say(f"unknown: could not reach the board — {e.__class__.__name__}: {e}")
+        return UNKNOWN
+
+    verb = "renewed" if answer.get("renewed") else "claimed"
+    say(f"{verb}: {answer.get('kind')}/{answer.get('key')} until "
+        f"{answer.get('expires')}")
+    if answer.get("note_on_key"):
+        say(f"  {answer['note_on_key']}")
+    # stdout carries exactly ONE thing, and which one is the caller's choice. The
+    # bare id is what `claim/renew` and `claim/release` want, so it is the default
+    # and it needs no parsing; `--json` replaces it with the whole answer, which
+    # then really is JSON rather than JSON with a line stuck to the end of it; and
+    # `--quiet` means the exit code, which is what "exit code only" says. The
+    # commentary is on stderr throughout.
+    if args.json and not args.quiet:
+        print(json.dumps(answer, indent=2))
+    elif not args.quiet:
+        print(answer.get("claim_id", ""))
+    return TAKEN
+
+
+def _detail(e: urllib.error.HTTPError):
+    """The board's own message, parsed if it is JSON. Never raises."""
+    try:
+        body = json.loads(e.read().decode())
+    except Exception:                                             # noqa: BLE001
+        return e.reason
+    return body.get("detail", body) if isinstance(body, dict) else body
+
+
+if __name__ == "__main__":
+    sys.exit(main())

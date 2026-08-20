@@ -24,6 +24,10 @@ set -euo pipefail
 #   --no-workspace       Skip workspace file generation
 #   --no-fetch           Skip the git fetch (default: fetch origin first, and
 #                        fast-forward an existing local branch to its upstream)
+#   --no-claim           Do not claim the issue this branch names (#172)
+#   --require-claim      Refuse the checkout if the claim cannot be TAKEN, not
+#                        only when somebody else holds it
+#   --claim-ttl <secs>   How long the checkout claim holds (default 28800 = 8h)
 
 # ============================================
 # COLORS
@@ -410,6 +414,80 @@ holder_note() {
     return 0
 }
 
+# >>> claim (extracted verbatim by harness/tests/test_create_worktree_claim.py)
+# The issue number a branch names, or nothing. `feat/issue-172`,
+# `fix/issue-114`, `feat/issue-135-qb-next` — the shapes the fix-issue and epic
+# skills actually produce.
+#
+# DERIVED, and that is the point (#172). The alternative is a `--issue` flag, and
+# a flag is a second place the number is written: an agent that types the wrong
+# one claims somebody else's issue while working its own, which is worse than not
+# claiming at all because the record then reads as authoritative.
+branch_issue() {
+    local b="$1"
+    [[ "$b" =~ (^|/)issue-([0-9]+)(-|$) ]] && printf '%s\n' "${BASH_REMATCH[2]}"
+}
+
+# Take the claim on the issue this branch names, before the tree exists.
+#
+# The structured-pickup half of #172: the unit of work exists before the agent
+# does, so the claim is taken BY THE CHECKOUT and there is nothing to opt into.
+# It runs before `git worktree add` on purpose — a refusal has then cost nothing,
+# and the loser has a directory-free repo rather than a half-built worktree it
+# has to clean up.
+#
+# Three outcomes, and they are deliberately not two:
+#   * taken/renewed -> proceed
+#   * held by somebody else -> REFUSE, always. The board is saying something
+#     definite and two agents on one issue is exactly what this prevents.
+#   * cannot tell (no board, no token, board down, branch names no issue) ->
+#     warn loudly and proceed, unless --require-claim. Failing closed here would
+#     make the board a single point of failure for every worktree on the fleet,
+#     which is a worse outcome than an unclaimed checkout that says so.
+claim_the_branch() {
+    local branch="$1" issue qc rc
+    [[ "$CLAIM" = true ]] || return 0
+
+    issue=$(branch_issue "$branch") || true
+    if [[ -z "$issue" ]]; then
+        # No repo-global work unit to claim. Said out loud rather than skipped:
+        # an unclaimed checkout is one where the next agent has nothing to
+        # collide against, and silence is what let `claims()` stay empty for four
+        # months.
+        echo -e "  ${YELLOW}unclaimed:${NC} '$branch' names no issue, so there is no" >&2
+        echo -e "  repo-global unit of work to claim. Peers cannot see that this is taken." >&2
+        echo -e "  Claim what you are working on by hand:  qb-claim issue <n>" >&2
+        [[ "$REQUIRE_CLAIM" = true ]] && die "--require-claim: refusing an unclaimed checkout"
+        return 0
+    fi
+
+    qc=$(command -v qb-claim 2>/dev/null || true)
+    if [[ -z "$qc" && "$0" == */* ]]; then qc="${0%/*}/qb-claim"; fi
+    if [[ -z "$qc" || ! -x "$qc" ]]; then
+        echo -e "  ${YELLOW}unclaimed:${NC} qb-claim is not on PATH, so issue #$issue was not claimed." >&2
+        [[ "$REQUIRE_CLAIM" = true ]] && die "--require-claim: qb-claim not found"
+        return 0
+    fi
+
+    set +e
+    "$qc" issue "$issue" --repo-path "$MAIN_REPO" --ttl "$CLAIM_TTL" \
+        --note "worktree $branch on $(hostname -s 2>/dev/null || echo host)" >/dev/null
+    rc=$?
+    set -e
+    case "$rc" in
+        0) echo -e "  ${GREEN}claimed${NC} issue #$issue for '$branch'" ;;
+        1) die "issue #$issue is already claimed (see above). Two agents on one issue is
+  what the claim exists to prevent — talk to the holder, take something else, or
+  pass --no-claim if you genuinely mean to work it in parallel." ;;
+        *) echo -e "  ${YELLOW}unclaimed:${NC} the board could not be asked about issue #$issue" >&2
+           echo -e "  (see above). Proceeding — a board outage must not stop a checkout." >&2
+           [[ "$REQUIRE_CLAIM" = true ]] && die "--require-claim: the claim on #$issue could not be taken"
+           ;;
+    esac
+    return 0
+}
+# <<< claim
+
 # Is this repo container-based? (i.e. is there something to build or compose up)
 detect_dockerized() {
     local root="$1"
@@ -435,6 +513,10 @@ SKIP_WORKSPACE=false
 FETCH=true                # fetch origin before worktree-add; --no-fetch to skip
 CONFIG_FILE=""
 CONFIG_JSON=""
+CLAIM=true                # take the issue claim this branch names (#172)
+REQUIRE_CLAIM=false       # ...and refuse the checkout if it cannot be taken
+CLAIM_TTL=28800           # 8h: a worktree outlives an hour, and a lapsed claim
+                          # reads as "free" to the next agent
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -464,6 +546,16 @@ while [[ $# -gt 0 ]]; do
             FETCH=true; shift ;;
         --no-fetch)
             FETCH=false; shift ;;
+        --claim)
+            CLAIM=true; shift ;;
+        --no-claim)
+            CLAIM=false; shift ;;
+        --require-claim)
+            REQUIRE_CLAIM=true; shift ;;
+        --claim-ttl)
+            [[ -z "${2:-}" ]] && die "--claim-ttl requires a number of seconds"
+            [[ "$2" =~ ^[0-9]+$ ]] || die "--claim-ttl takes seconds, got '$2'"
+            CLAIM_TTL="$2"; shift 2 ;;
         --*)
             die "Unknown option: $1" ;;
         *)
@@ -725,6 +817,16 @@ if [[ "$DRY_RUN" = true ]]; then
     echo ""
     local_step=0
 
+    if [[ "$CLAIM" = true ]]; then
+        local_step=$((local_step + 1))
+        dr_issue=$(branch_issue "$BRANCH_NAME") || true
+        if [[ -n "$dr_issue" ]]; then
+            echo -e "  $local_step. Claim issue #$dr_issue for ${CLAIM_TTL}s (refuses if held)"
+        else
+            echo -e "  $local_step. Warn: '$BRANCH_NAME' names no issue, nothing to claim"
+        fi
+    fi
+
     local_step=$((local_step + 1))
     echo -e "  $local_step. Create git worktree at $WORKTREE_DIR"
 
@@ -872,6 +974,9 @@ if [[ "$rerere_is_ours" = true ]]; then
     echo -e "  committing it: it is git's last answer, not necessarily this one's."
 fi
 # <<< rerere
+
+# Before the tree, so a refusal costs nothing to unwind.
+claim_the_branch "$BRANCH_NAME"
 
 step "Creating git worktree and branch..."
 

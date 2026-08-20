@@ -580,13 +580,18 @@ def check_merge_claim(repo: str, pr: dict, mine: str) -> Check:
     that already holds one says so: without it, the lander's own claim would hold
     its own merge.
 
-    How much a `passed` here is worth depends on #142. The read is exact — the
-    holder is a full `machine/name`, so a co-tenant's claim is visibly not yours
-    — but `_may_mutate` currently session-scopes only `kind='release'` and
-    authorises every other kind by MACHINE, so a second agent on this box that
-    POSTs the same claim RENEWS it instead of getting a 409. Until that inverts,
-    this says "no other agent's claim is recorded", which is weaker than "no
-    other agent can land". Weaker is still the first thing to read it at all.
+    #142 inverted the authorisation this used to be hedged about: every kind in
+    the claims table is session-owned now, so a co-tenant POSTing the same claim
+    gets a 409 rather than a renew, and a `passed` here means "no other AGENT's
+    claim is recorded" rather than "no other machine's".
+
+    **An empty answer is warned about, not passed silently (#172).** The module
+    docstring's own rule — *"a merge gate that fails open wherever it cannot see
+    is not a gate"* — applies to the claims table as much as to a missing script.
+    A repo where nothing is ever claimed is a repo where agents collide in
+    silence, and `claims()` returned `[]` fleet-wide for four months while
+    thirteen agents worked three shared checkouts. So "unclaimed" is reported as
+    what it is: an answer this check cannot draw a conclusion from.
     """
     key = f"{repo}:{pr['headRefName']}"
     body, err = board_get("claims", {"kind": "merge", "key": key})
@@ -613,8 +618,51 @@ def check_merge_claim(repo: str, pr: dict, mine: str) -> Check:
             "— it is landing this branch")
     if claims and not others:
         c.summary = "held by you"
+    if not claims:
+        c.warnings.extend(_unclaimed_repo_warning(repo))
     c.status = "failed" if c.reasons else "passed"
     return c
+
+
+def _unclaimed_repo_warning(repo: str) -> list[str]:
+    """Why an empty claim answer is not evidence, when the repo claims nothing.
+
+    A warning rather than a HOLD, deliberately: nothing here is wrong with the
+    PR, and holding every merge in every repo that has not enrolled would make
+    this the check people turn off. What it must not do is stay quiet — a `passed`
+    that means "the table is empty" reads identically to one that means "nobody is
+    landing this", and the first is the state #172 was filed about.
+
+    Never raises and never blocks on a slow board: a failed read here simply says
+    nothing extra, because the caller already has its own answer about the key.
+    """
+    body, err = board_get("claims", {"limit": "1000"})
+    if err or not isinstance(body, dict):
+        return []
+    claims = body.get("claims")
+    if not isinstance(claims, list):
+        return []
+    # Keys are `<owner>/<name>` followed by a SEPARATOR, whatever the kind — the
+    # board derives them all from the repo (`app/claimkey.py`), so one prefix test
+    # covers issues, PRs and branches without this file re-deriving the rule. The
+    # separator is required: `o/r` is a prefix of `o/rx#1`, and reading a
+    # neighbour's claim as this repo's would silence the warning in the one case it
+    # is for.
+    heads = tuple(f"{repo.lower()}{sep}" for sep in "#!:")
+    here = [c for c in claims
+            if str(c.get("key") or "").lower().startswith(heads)]
+    if here:
+        return []
+    live = len(claims)
+    return [
+        f"nothing in {repo} is claimed by anybody right now"
+        + (f" (the board holds {live} claim(s), all in other repos)" if live else
+           " — and the board holds no claims at all, fleet-wide")
+        + ". So `unclaimed` here is the absence of a record, not evidence that "
+        "nobody else is landing this branch. Agents in a repo that claims nothing "
+        "collide in silence: enrol it (create-worktree takes the claim, "
+        "`qb-claim issue <n>` by hand) or read this check as uninformative."
+    ]
 
 
 def check_migrations(root: str, base: BaseRef, versions: str = "") -> Check:

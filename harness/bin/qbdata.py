@@ -15,6 +15,7 @@ import ssl
 import subprocess
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
@@ -367,23 +368,55 @@ def _ssl_context():
 
 
 class BoardClient:
-    """The two GETs this dashboard makes. stdlib only, on purpose."""
+    """The handful of calls the harness makes. stdlib only, on purpose."""
 
     def __init__(self, cfg: BoardConfig) -> None:
         self.cfg = cfg
 
-    def get(self, path: str) -> dict:
-        req = urllib.request.Request(f"{self.cfg.base_url}{path}")
+    def _request(self, req: urllib.request.Request) -> dict:
         if self.cfg.token:
             req.add_header("Authorization", f"Bearer {self.cfg.token}")
         with urllib.request.urlopen(req, timeout=30, context=_ssl_context()) as resp:
             return json.loads(resp.read().decode())
+
+    def get(self, path: str, params: dict | None = None) -> dict:
+        query = urllib.parse.urlencode(
+            {k: v for k, v in (params or {}).items() if v is not None})
+        url = f"{self.cfg.base_url}{path}" + (f"?{query}" if query else "")
+        return self._request(urllib.request.Request(url))
+
+    def post(self, path: str, body: dict) -> dict:
+        req = urllib.request.Request(
+            f"{self.cfg.base_url}{path}",
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST")
+        return self._request(req)
 
     def active(self) -> dict:
         return self.get("/active")
 
     def claims(self) -> dict:
         return self.get("/claims")
+
+    def claim_held(self, repo: str, session: str | None = None) -> dict:
+        """Does this agent hold a live claim in `repo` — the board's own answer.
+
+        Read rather than worked out from `claims()`, because the repo a key
+        belongs to is derived from the key and this file has no business
+        re-deriving it: `issue_claims` below already joins on the key shape while
+        the plan filters on the kind, and #172 is the record of those two
+        disagreeing.
+        """
+        return self.get("/claim/held", {"repo": repo, "session": session})
+
+    def claim_ref(self, ref_kind: str, ref_value: str, repo: str | None = None,
+                  **over) -> dict:
+        """Take a claim by naming the RESOURCE. The board derives the key (#172)."""
+        ref: dict = {"kind": ref_kind, "value": str(ref_value)}
+        if repo is not None:
+            ref["repo"] = repo
+        return self.post("/claim", {"ref": ref, **over})
 
 
 def board_client():
@@ -680,13 +713,23 @@ def plan_detail(item: dict) -> str:
     """
     bits = [f"{short_repo(item.get('repo') or 'fleet')} {plan_ref(item)}".strip(),
             item.get("title") or "(untitled)"]
-    if item.get("phase"):
-        bits.append(f"[{item['phase']}]")
+    plan = item.get("plan") or {}
+    if plan.get("label"):
+        bits.append(f"[{plan['label']}]")
     claim = item.get("claim")
     if claim:
         held = f"held by {claim.get('holder') or '?'}"
         if claim.get("note"):
             held += f" — {claim['note']}"
+        bits.append(held)
+    covered = item.get("covered_by")
+    if covered and not claim:
+        # A plan-level claim over an item nobody has taken individually. Said
+        # differently from "held", because the remedy is: the whole plan is
+        # somebody's, so talk to them rather than taking one line out of it.
+        held = f"in {plan.get('label') or 'a plan'} held by {covered.get('holder') or '?'}"
+        if covered.get("note"):
+            held += f" — {covered['note']}"
         bits.append(held)
     blockers = item.get("blocked_by") or []
     if blockers:

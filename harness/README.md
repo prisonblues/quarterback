@@ -411,6 +411,57 @@ hand in one branch can be committed unread in another. That is not closed here: 
 either explicit staging in those two loops or rerere scoped away from loop-driven
 worktrees, and it is filed rather than guessed at.
 
+### `qb-claim` and `qb-claimed` — what you are working on, before you start
+
+Two scripts, one primitive, and they exist because the board's claim table had never once
+been written to by anything automatic. Thirteen agents worked three shared checkouts and
+`claims()` returned `[]` fleet-wide; the single row that ever appeared was written by hand
+because a human told an agent to (#172).
+
+```bash
+qb-claim issue 172 --note "worktree feat/issue-172"   # 0 taken / 1 held / 2 unknown
+qb-claim pr 207 --ttl 7200
+qb-claimed                                            # 0 held  / 1 free  / 2 unknown
+qb-claimed --json --quiet
+```
+
+**Neither composes a key.** They name the *resource* — kind and value — and the board
+derives the key from it, reading the repo off the checkout's origin remote. That is the
+whole of #172: the plan wrote `work/<repo>#163` while an agent wrote `issue/<repo>#163`,
+and because `(kind, key)` is the unique index those were two resources. A shell tool
+spelling a third would be the same defect with a new party.
+
+**Three exit codes, not two.** `2` means *cannot tell* — no board configured, no origin
+remote, board unreachable — and it is deliberately not `1`. A gate that reads "cannot tell"
+as "nothing held" fails open on every unconfigured host, which is a gate that stops nothing
+on exactly the hosts nobody checked. `preland.py` states the same rule about itself: *"a
+merge gate that fails open wherever it cannot see is not a gate."* The policy is the
+caller's; these two just answer honestly.
+
+`qb-claim` prints the claim id on **stdout** and everything else on stderr, so a caller can
+capture the id for `claim/renew` and `claim/release` without parsing prose.
+
+**`create-worktree` takes the claim for you.** It derives the issue number from the branch
+it is about to make (`feat/issue-172`, `fix/issue-114`, `feat/issue-135-qb-next`) and
+claims it *before* the tree exists, so a refusal costs nothing to unwind:
+
+| flag | what it does |
+| --- | --- |
+| *(default)* | Claim the issue the branch names. Held by somebody else → **refuse**. Cannot tell → warn loudly and carry on |
+| `--no-claim` | Skip it entirely, silently |
+| `--require-claim` | Refuse on *any* uncertainty too — no board, no token, or a branch that names no issue |
+| `--claim-ttl <secs>` | How long to hold it (default 28800 = 8h; a worktree outlives an hour, and a lapsed claim reads as free to the next agent) |
+
+The asymmetry between the two failure modes is the one decision worth arguing with. A 409
+is the board saying something definite and two agents on one issue is exactly what this
+prevents, so it refuses. A board outage is not, and failing closed there would make the
+board a single point of failure for every worktree on the fleet — `--require-claim` is how
+you ask for the strict reading instead.
+
+A branch that names no issue is **warned about** rather than skipped quietly: an unclaimed
+checkout is one where the next agent has nothing to collide against, and silence is what
+let `claims()` stay empty for four months.
+
 ### `worktree-holder` — is somebody else in there?
 
 The fourth script answers one question: **which live agent is working in this
