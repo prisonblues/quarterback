@@ -189,6 +189,28 @@ _STEP_REFERENCE = re.compile(
 _PREMISE_CHECK_SECTION = "The premise check (`--ask`)"
 
 
+#: Every repo-root path this suite reads, declared in one place.
+#:
+#: It is a *declaration* rather than a summary because `doc` refuses anything absent from it
+#: (below), so a new read cannot be added without adding it here. That is what the sandbox
+#: needs: this suite lives two directories below the files it reads, and
+#: `nix build .#checks.<system>.prose-consistency-tests` runs it against a sandbox holding only
+#: what that check copies in. A read nobody copied in does not FAIL there, it ERRORS on a
+#: missing file — which is how #163 sat unnoticed for a day, and #246 after it, and how this
+#: suite's own ten reads sat erroring inside `worktree-tests` (#251).
+#:
+#: Derived from `FIX_LOOPS` and `ANCHOR_DOCS` rather than relisting their entries, so a rename
+#: there still fails in one place with one message.
+READS = frozenset({
+    *FIX_LOOPS,
+    *ANCHOR_DOCS,
+    PANEL_PY,
+    "harness/loops/README.md",
+    "app/api/reviews.py",
+    "app/models/review.py",
+})
+
+
 @functools.lru_cache(maxsize=None)
 def doc(relpath: str) -> str:
     # Encoding spelled out: these files are prose full of em dashes, and `read_text()` takes the
@@ -198,6 +220,17 @@ def doc(relpath: str) -> str:
     #
     # Cached because the parametrised tests read the same handful of files several times each.
     # A plain speed-up: the module-scoped fixtures below still exist, for the slices they name.
+    # Refused rather than read, if it is not in `READS`. One accessor is the whole reason this
+    # works: every read in this suite comes through here, so this single assertion is what makes
+    # `READS` a complete enumeration rather than a list somebody has to remember to update. The
+    # alternative — parsing this file for its reads, as #182 and #246 must, since theirs are
+    # built inline — cannot chase every way of naming a path and fails silently at the first
+    # idiom it misses. Here there is nothing to chase.
+    assert relpath in READS, (
+        f"{relpath!r} is read here but is not in READS, so flake.nix's prose-consistency-tests "
+        f"check does not know to copy it into its sandbox — where this read would error as a "
+        f"FileNotFoundError rather than be asserted. Add it to READS and add an `install` line "
+        f"for it to that check.")
     return (REPO_ROOT / relpath).read_text(encoding="utf-8")
 
 
@@ -679,3 +712,24 @@ def test_an_escalation_is_recorded_as_deferred(name: str, outcomes: set[str]):
         f"{name} discusses recording an escalation without naming `deferred` in the same "
         f"paragraph or bullet; the four values it could be naming instead are {sorted(outcomes)}, "
         "and three of them would be wrong")
+
+# ---- the reads this suite declares (#251, #257) ------------------------------
+#
+# The comparison against flake.nix lives in `_prose_sandbox`, which knows every member of the
+# `prose-consistency-tests` check: the converse direction — does the check install anything
+# nothing reads — cannot be asked from inside one member, since a check serving two suites
+# installs files either one alone does not read.
+#
+# What stays here is the half that belongs beside the reads: the declaration, and `doc`'s
+# refusal of anything absent from it.
+
+
+def test_the_reads_are_declared_rather_than_summarised():
+    """`READS` is only worth comparing if it is what the suite actually reads, and `doc`'s
+    refusal is what makes that true. Asserted rather than trusted: it is the mechanism the
+    sandbox comparison rests on, and one `assert` away from being decoration."""
+    with pytest.raises(AssertionError, match="not in READS"):
+        doc("docs/DEPLOY.md")
+    # And the refusal names what to do about it, in both places that need changing.
+    with pytest.raises(AssertionError, match="install"):
+        doc("app/api/nothing_here.py")

@@ -29,6 +29,16 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 COMMANDS = REPO_ROOT / "harness" / "commands"
 HM_MODULE = REPO_ROOT / "harness" / "hm-module.nix"
 
+#: Every repo path this suite reads, declared for the sandbox that runs it.
+#:
+#: `harness/commands` is the DIRECTORY, not a list of files, because `_shipped` globs it — "which
+#: briefs exist" is the question, so the directory itself is the read and a file list could not
+#: express it. `_prose_sandbox` compares this set against what
+#: `nix build .#checks.<system>.prose-consistency-tests` installs; a read nobody installed does
+#: not FAIL there, it ERRORS on a missing file, which is #163's mechanism and how four suites
+#: before this one sat red in a check no workflow runs (#246, #251, #257).
+READS = frozenset({"harness/commands", "harness/hm-module.nix"})
+
 #: The `commands` option's default: a nix list of bare quoted strings. Read out of the source text
 #: rather than by evaluating the module — the point is to be runnable in CI with no nix at all, and
 #: the value is a literal list of literals, which cannot mean something else.

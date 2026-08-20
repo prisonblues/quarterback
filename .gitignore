@@ -50,3 +50,11 @@ uv.lock
 # not also own them.
 .claude/
 CLAUDE.md
+
+# `nix build`'s output symlink. It points at an absolute /nix/store path, so it
+# is machine-specific and meaningless in the repo — and it is created by every
+# `nix build .#checks...`, which means a `git add -A` from a worktree picks it
+# up. That is how it got committed once (and how fc0834b happened, above), so
+# it is ignored rather than left to whoever remembers to `rm` it.
+/result
+/result-*
