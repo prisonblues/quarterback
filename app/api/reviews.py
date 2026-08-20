@@ -237,6 +237,50 @@ refutation they disagree with. **The gap between
 ``precision`` and ``precision_after`` is the number the panel exists to produce
 and could not.** These are the only counts on that page measured per defect
 rather than per observation, which is why both denominators are published.
+
+**v2.60 — the datum, read back: which other PRs does landing this one disturb?**
+v2.23 recorded the PR's changed FILES and deliberately shipped no query over
+them, because that query had been written twice and pulled twice. A four-seat
+panel reviewed it in two rounds and found the *same* defect in both, and round
+2's instance was introduced by round 1's fix: r1 answered for a rival with its
+newest **file-bearing** run, r2 with its newest **OPEN-state** run. One premise
+behind both — that the rival population can be narrowed by filters composed at
+query level, with the newest-run selection as just another filter in that
+composition. It cannot: any predicate in front of the selection resurrects a run
+the board has already superseded, and hands its answer back in a confident voice.
+
+``GET /review/collisions`` is that design taken out. **Select first, classify
+second.** One unconditional ``DISTINCT ON (pr)`` per rival — repo and window,
+nothing else — is each rival's newest run, full stop; every other question is
+asked afterwards, per selected run, by :func:`app.collisions.classify`. That
+function is pure, takes an already-selected run, and returns exactly one of five
+classes, so a predicate written into it *cannot* change which run answers for a
+PR. The filter-before-select bug has nowhere left to live.
+
+The five, and why they are five: ``collides`` (shares a path), ``partial``
+(answerable, shares nothing, and not shown to be complete — so it may overlap on
+files it never reported), ``unanswerable`` (recorded no list at all),
+``excluded`` (its newest run saw it merged, closed, or drafted when asked), and
+``disjoint`` (counted, complete, sharing nothing). ``counts`` reports all five
+against ``considered``, so a caller can check the partition itself. That is what
+retires ``88-F07`` — a rival claiming 2,500 files with none stored used to pass
+the "has a file list" test, contribute no join rows, and appear in **no** list
+whatsoever, read by a caller as "answered, and disjoint". It is ``partial`` here
+by construction, because "answerable" and "actually contributed paths" are no
+longer separate tests with a gap between them.
+
+``disjoint`` is the only bucket that is a safety claim, and it is the only one
+with a completeness test in front of it: a list nobody counted cannot earn it.
+The subject's own ``files_complete`` is the same guard one level out — a subject
+holding 1 of 2,500 paths under-reports its own collisions, and no per-rival
+verdict can see that from the other side of the join.
+
+Two limits stated in the response rather than only here, because neither is
+discoverable from the numbers: the population is **PRs this board has panelled**
+(an empty ``collides`` means "none of the PRs I have seen", never "none exist" —
+#80's to close), and every cap says what it dropped, per class, ``unanswerable``
+included — it is by construction the largest list, and this is the query an
+automated lander issues in a loop with ``days`` up to 3650.
 """
 
 from __future__ import annotations
@@ -266,9 +310,17 @@ from sqlalchemy import case, func, select, tuple_
 from sqlalchemy import or_ as sa_or
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import undefer
+from sqlalchemy.orm import aliased, undefer
 
 from app.auth import identify, reader
+from app.collisions import (
+    CLASSES,
+    COLLIDES,
+    Rival,
+    Verdict,
+    classify,
+    files_complete,
+)
 from app.db import get_session
 from app.identity import agent_row, compose, machine_of
 from app.models.review import (
@@ -4021,6 +4073,410 @@ async def pr_finding_history(
         ],
         "findings": out,
     }
+
+
+def _has_file_list(run_id):
+    """Did this run RECORD a file list — as opposed to having files in it?
+
+    The query-side spelling of "not :data:`~app.collisions.UNANSWERABLE`", and
+    the distinction the whole endpoint turns on. Keying it on "has rows in
+    ``review_run_files``" makes a PR that legitimately changed **zero** files
+    indistinguishable from a run that recorded nothing at all: the first would
+    404 as a subject and come back unanswered as a rival, when the true answer is
+    "answered, and disjoint from everything". A known empty list is knowledge.
+
+    So the predicate is ``changed_files_total IS NOT NULL`` — the column that
+    means "the panel counted" — **or** the presence of rows, which covers a
+    caller that sent paths without a count.
+    """
+    # The inner ReviewRun is ALIASED. Without it the subquery references the same
+    # table as the caller's outer query, `ReviewRun.id == run_id` reduces to
+    # `ReviewRun.id == ReviewRun.id`, and the whole predicate is a tautology that
+    # answers True for every run — which is how a PR that recorded nothing at all
+    # stopped 404-ing and started reporting itself as an empty subject.
+    counted = aliased(ReviewRun)
+    return sa_or(
+        select(counted.id)
+        .where(counted.id == run_id, counted.changed_files_total.is_not(None))
+        .exists(),
+        select(ReviewRunFile.id).where(ReviewRunFile.run_id == run_id).exists(),
+    )
+
+
+#: How many paths one row of the collision answer may carry before it is trimmed.
+#:
+#: A PR may touch 3,000 files (GitHub's own cap) and share every one of them, and
+#: this endpoint is issued in a loop by an automated lander over a population that
+#: is every PR the board has ever panelled — so an uncapped path list per row is
+#: an unbounded response by two multiplications. The *count* is what a ranking
+#: function weighs by (#232) and it is never trimmed; the paths are for the human
+#: reading the answer, and 200 of them is already more than anyone reads.
+#:
+#: Trimming announces itself in a ``files_dropped`` beside the list, this repo's
+#: standing rule: a cap that trims silently makes the trimmed answer read as the
+#: whole one, which on this endpoint means "shares 200 files" reading as the
+#: complete overlap.
+SHARED_FILES_CAP = 200
+
+
+def _capped(paths: list[str], total: int) -> dict:
+    """The path list trimmed to the cap, with the number trimmed beside it.
+
+    ``total`` is passed rather than measured, because for a rival ``paths`` has
+    already been trimmed in SQL and its length is not the answer to anything.
+    """
+    return {
+        "files": paths[:SHARED_FILES_CAP],
+        "files_dropped": max(0, total - SHARED_FILES_CAP),
+    }
+
+
+def _rival_view(rival: Rival, verdict: Verdict, pr_title: str | None, ts: datetime) -> dict:
+    """One rival, in the SAME shape whichever bucket it landed in.
+
+    Uniform on purpose. The bug this endpoint was pulled for is a rival being
+    representable in no bucket at all, and a shape that varies per bucket is how a
+    caller ends up reading only the buckets it has fields for. Every row says
+    which class it is and every row carries the evidence that put it there, so a
+    caller can re-derive the verdict rather than trust it.
+    """
+    return {
+        "pr": rival.pr,
+        "pr_title": pr_title,
+        # The run that answered, and when it ran. The board is told about panels
+        # and never about pushes, so every fact below is only as current as this.
+        "run_id": rival.run_id,
+        "ts": ts.isoformat(),
+        "pr_state": rival.pr_state,
+        "is_draft": rival.is_draft,
+        "class": verdict.cls,
+        "excluded_because": verdict.because,
+        # GitHub's count against what the board holds, and the verdict the two of
+        # them produce. `files_complete: false` under a `collides` row means the
+        # shared list is a FLOOR on the overlap; under a `partial` row it is the
+        # entire reason the row is not `disjoint`.
+        "changed_files_total": rival.changed_files_total,
+        "files_recorded": rival.files_recorded,
+        "files_complete": files_complete(rival.changed_files_total, rival.files_recorded),
+        # The overlap, and then a sample of it. `shared` is never trimmed — it is
+        # what a ranking function weighs by (#232) — and `files` is what a person
+        # reads, capped, saying how much it left out.
+        "shared": rival.shared_total,
+        **_capped(list(rival.shared), rival.shared_total),
+    }
+
+
+@router.get("/review/collisions")
+async def pr_collisions(
+    _reader: str = Depends(reader),
+    repo: str = Query(..., description="github nameWithOwner"),
+    pr: int = Query(..., ge=1),
+    since: str | None = Query(None, description="ISO timestamp"),
+    days: int = Query(30, ge=1, le=3650,
+                      description="how far back a rival PR's newest run may be"),
+    include_closed: bool = Query(
+        False, description="classify rivals whose last panel saw them merged or closed "
+                           "instead of setting them aside"),
+    exclude_drafts: bool = Query(
+        False, description="set aside rivals whose last panel saw them in draft"),
+    limit: int = Query(100, ge=1, le=500, description="max rows PER class"),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Which other PRs of this repo touch the files this one does.
+
+    The overlap, and only the overlap. Ordering PRs by it — landing the disjoint
+    ones first — is #80's and #232's job and needs a policy about what a collision
+    *costs* that this endpoint has no business presuming; what was missing was the
+    datum, not the ranking.
+
+    **Select first, classify second**, and that shape is the entire point of this
+    version. It was written twice before and a four-seat panel found the same
+    defect both times, the second instance introduced by the fix for the first:
+    round 1 answered for a rival with its newest *file-bearing* run, round 2 with
+    its newest *OPEN-state* run. One premise behind both — that the rival
+    population can be narrowed by filters composed at query level, with the
+    newest-run selection as just another filter in that composition. It cannot;
+    any predicate in front of the selection resurrects a stale run. So:
+
+    1. One unconditional ``DISTINCT ON (pr)`` per rival — this repo, this window,
+       and **nothing else**. That is each rival's newest run, full stop.
+    2. Every other question is asked afterwards, per selected run, in
+       :func:`app.collisions.classify` — one ordered ladder returning exactly one
+       of five classes, where the exhaustiveness is visible and testable without a
+       database.
+
+    ``include_closed`` and ``exclude_drafts`` therefore *reclassify*; neither can
+    change which run answers for a PR, because by the time they are read the run
+    is already chosen.
+
+    **The five classes**, kept apart because collapsing any two of them fails
+    safe-looking:
+
+    * **``collides``** — shares at least one path with the subject. A floor on the
+      overlap, not a ceiling, wherever ``files_complete`` is false.
+    * **``partial``** — answerable, no shared path found, and not shown to be
+      complete: its ``changed_files_total`` says the stored list is a prefix, or
+      nobody counted at all. It may overlap on files it never reported, so it can
+      never be called disjoint. A rival claiming 2,500 files with none stored — a
+      row that used to pass the "has a file list" test, contribute no join rows,
+      and appear in no list whatsoever — lands here by construction.
+    * **``unanswerable``** — its newest run recorded no file list at all (every
+      pre-v2.23 run). Not disjoint: unanswered.
+    * **``excluded``** — its newest run saw it merged or closed, or drafted when
+      ``exclude_drafts`` was asked for. ``excluded_because`` says which.
+    * **``disjoint``** — counted, complete, sharing nothing. The one bucket that
+      is a safety claim, and the only one with a completeness test in front of it.
+
+    Every selected rival appears in exactly one of them, and ``counts`` reports
+    all five against ``considered`` so a caller can check that itself. Absence is
+    not representable, which is what makes this class of bug impossible rather
+    than fixed twice.
+
+    **Read the subject's own ``files_complete`` before trusting any
+    ``disjoint``.** If the subject's list is a prefix, it may collide on paths it
+    never reported, and no per-rival verdict below can see that.
+
+    **Scope, stated because the obvious reading is wider than the truth.** This
+    answers over the PRs *this board has panelled* within the window. A PR nobody
+    ever ran a panel on leaves no row here and cannot be reported at all — not in
+    any of the five classes. Closing that gap needs an open-PR list from GitHub,
+    which is #80's to decide on; until then an empty ``collides`` means "none of
+    the PRs I have seen", never "none exist". It is said in the response and not
+    only here, because it is the one limit a caller cannot discover from the
+    numbers. Two known holes inside even that population: a panel *skipped* run
+    never reaches the board at all (#94), so merges and format-the-world commits —
+    the highest-collision changes there are — are invisible in both directions;
+    and ``pr_state`` is as of each rival's last panel, never live, which is why
+    every row carries its run's ``ts``.
+
+    Caps are per class and each says what it dropped, ``unanswerable`` included:
+    it is by construction the *largest* list — on the day this ships, every PR the
+    board has ever panelled — and ``days=3650`` is a permitted argument on an
+    endpoint an automated lander issues in a loop. Path lists are capped the same
+    way and by the same rule, on the subject and on every row: ``files`` is a
+    sample with its ``files_dropped`` beside it, and the number that is never
+    trimmed is the one a ranking function weighs by — a row's ``shared`` and the
+    subject's ``files_recorded``. ``GET /review/{run_id}`` has a run's paths in
+    full for a caller that wants them.
+    """
+    # ---- the subject.
+    #
+    # The subject alone falls back through earlier runs to find a file list,
+    # where a rival does not, and the asymmetry is the point rather than an
+    # oversight: a caller naming a PR is asking about THAT PR, and answering
+    # "404, its last round recorded nothing" when an earlier round recorded a
+    # perfectly good list serves nobody. For a rival the same fallback would
+    # silently substitute stale data into an answer nobody asked to be
+    # approximate. The subject's `run_id`/`ts` come back so the fallback is
+    # visible; a rival's staleness would not be.
+    #
+    # Note what it does NOT prefer: the newest run that recorded a COMPLETE list.
+    # Reaching further back for a better list would be this endpoint's own
+    # disease in its one sanctioned fallback — the subject's `files_complete`
+    # says the list is a prefix instead, and says it about the newest round that
+    # recorded one.
+    #
+    # It is also unbounded by the window, again deliberately: `days` bounds which
+    # RIVALS are current enough to matter, not how far back the board may look to
+    # learn what the subject itself touches.
+    subject_id = await session.scalar(
+        select(ReviewRun.id)
+        .where(ReviewRun.repo == repo, ReviewRun.pr == pr,
+               _has_file_list(ReviewRun.id))
+        # By timestamp, not by max(id): a surrogate key orders by insertion, and
+        # backfilled or imported runs need not have been inserted in the order
+        # they happened. `id` only breaks ties.
+        .order_by(ReviewRun.ts.desc(), ReviewRun.id.desc())
+        .limit(1)
+    )
+    if subject_id is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            f"no run of {repo}#{pr} recorded a changed-file list — nothing to compare",
+        )
+    subject = await session.get(ReviewRun, subject_id)
+    assert subject is not None  # selected by id in this same session
+
+    cutoff = _since_clause(since, days)
+
+    # ---- 1. SELECT: every rival's newest run, whatever it recorded.
+    #
+    # Repo, not-the-subject, and the window — and the rule for what may join them
+    # is worth stating, because these three ARE predicates in front of a selection
+    # and the next reader will ask why they are allowed when `pr_state` is not.
+    #
+    # A predicate may sit here only if it cannot change WHICH run of a PR is the
+    # newest among the survivors. Two shapes qualify:
+    #
+    #   * constant across a PR's runs — `repo`, and `pr != subject`. It removes
+    #     the whole PR or none of it, so no run is ever promoted over another.
+    #   * monotone in the ordering — `ts >= cutoff`. It can only remove runs OLDER
+    #     than a survivor, so the newest survivor is the newest run outright.
+    #
+    # `pr_state`, "has files" and `is_draft` are neither: they vary run to run
+    # within one PR, so removing the newest matching run silently promotes an
+    # older one and its stale answer. That is exactly what happened, twice.
+    # Whatever the next predicate is, unless it is one of those two shapes it
+    # belongs in `classify`.
+    newest = select(
+        ReviewRun.id.label("run_id"), ReviewRun.pr.label("pr"),
+        ReviewRun.pr_title.label("pr_title"), ReviewRun.ts.label("ts"),
+        ReviewRun.changed_files_total.label("total"),
+        ReviewRun.pr_state.label("pr_state"), ReviewRun.is_draft.label("is_draft"),
+    ).where(ReviewRun.repo == repo, ReviewRun.pr != pr)
+    if cutoff is not None:
+        newest = newest.where(ReviewRun.ts >= cutoff)
+    newest = (
+        newest.distinct(ReviewRun.pr)
+        # DISTINCT ON keeps the first row of each `pr` group in THIS order, so the
+        # order clause is the selection rule and not presentation. Postgres-only,
+        # and that is settled: this service has never been able to run on anything
+        # else — migration 0001 creates a plpgsql function and a NOTIFY trigger,
+        # LISTEN/NOTIFY *is* the SSE live leg, and JSONB, `postgresql.UUID` and
+        # ON CONFLICT are used throughout (#101, `88-F02`).
+        .order_by(ReviewRun.pr, ReviewRun.ts.desc(), ReviewRun.id.desc())
+        .subquery()
+    )
+
+    # How many paths each selected run actually stored. Counted in the database,
+    # not by reading the paths out: only the subject's list and the shared ones are
+    # ever needed as text, and a rival's whole list is up to 3,000 rows nobody
+    # reads. `uq_review_run_file_run_path`'s B-tree on (run_id, path) answers it
+    # from the index.
+    #
+    # A correlated COUNT rather than a grouped join, so that a run with no rows
+    # comes back as 0 and stays in the population by construction — there is no
+    # join for it to fall out of. The rival that recorded nothing is exactly the
+    # one whose absence would read as "answered, and disjoint", so it must not be
+    # possible to lose it here by writing an inner join and forgetting.
+    recorded = (
+        select(func.count())
+        .select_from(ReviewRunFile)
+        .where(ReviewRunFile.run_id == newest.c.run_id)
+        .scalar_subquery()
+    )
+    rows = (await session.execute(
+        select(newest.c.pr, newest.c.pr_title, newest.c.run_id, newest.c.ts,
+               newest.c.total, newest.c.pr_state, newest.c.is_draft, recorded)
+        .order_by(newest.c.pr)
+    )).all()
+    run_ids = [run_id for _pr, _title, run_id, *_rest in rows]
+
+    # ---- the overlap, as a self-join on path.
+    #
+    # Pinned to the run ids just selected, NOT re-derived from `newest`. Two
+    # statements each evaluating that DISTINCT ON are two selections, and between
+    # them a `POST /review` recording a new round for a rival moves the second
+    # one: the paths come back under a run id the classification loop never saw,
+    # the lookup misses, and a colliding rival is reported as sharing nothing.
+    # That is this endpoint's own failure mode arriving by race instead of by
+    # filter, and the fix is the same principle — the selection happens once, and
+    # everything downstream refers to what it chose by id.
+    #
+    # The subject's paths still stay in the database rather than being read out
+    # and sent back as up to 3,000 bind parameters; what crosses is one integer
+    # per rival PR. `ix_review_run_files_path` is (path, run_id) precisely so this
+    # join is answered from the index without a heap fetch per matching row.
+    #
+    # Over every selected rival, including the ones about to be excluded: the join
+    # cannot change which run answers for a PR, so narrowing it would be a
+    # performance decision and not a correctness one, and it is not worth the
+    # second way of asking "is this rival in play".
+    mine = aliased(ReviewRunFile)
+    theirs = aliased(ReviewRunFile)
+    shared_paths: dict[int, list[str]] = {}
+    shared_total: dict[int, int] = {}
+    if run_ids:
+        # The cap is applied HERE and not after the rows land. A rival may share
+        # every one of its up-to-`MAX_CHANGED_FILES` paths, over a population that
+        # is every PR the board has panelled within a window the caller may set to
+        # ten years — so a response cap that trims a list already in memory bounds
+        # the wire and not the process. `row_number()` bounds what is fetched;
+        # `count()` over the same partition keeps the untrimmed total, which is
+        # the number every verdict and every ranking is actually made from.
+        ranked = (
+            select(
+                theirs.run_id.label("run_id"),
+                theirs.path.label("path"),
+                func.row_number().over(partition_by=theirs.run_id,
+                                       order_by=theirs.path).label("rank"),
+                func.count().over(partition_by=theirs.run_id).label("total"),
+            )
+            .join(mine, mine.path == theirs.path)
+            .where(mine.run_id == subject_id, theirs.run_id.in_(run_ids))
+            .subquery()
+        )
+        for run_id, path, _rank, total in (await session.execute(
+            select(ranked.c.run_id, ranked.c.path, ranked.c.rank, ranked.c.total)
+            .where(ranked.c.rank <= SHARED_FILES_CAP)
+            .order_by(ranked.c.run_id, ranked.c.path)
+        )).all():
+            shared_paths.setdefault(run_id, []).append(path)
+            shared_total[run_id] = total
+
+    # ---- 2. CLASSIFY: each SELECTED run into exactly one bucket.
+    buckets: dict[str, list[dict]] = {cls: [] for cls in CLASSES}
+    for pr_no, pr_title, run_id, ts, total, pr_state, is_draft, recorded in rows:
+        rival = Rival(
+            pr=pr_no, run_id=run_id, pr_state=pr_state, is_draft=is_draft,
+            changed_files_total=total, files_recorded=recorded,
+            shared=tuple(shared_paths.get(run_id, ())),
+            shared_total=shared_total.get(run_id, 0),
+        )
+        verdict = classify(rival, include_closed=include_closed,
+                           exclude_drafts=exclude_drafts)
+        buckets[verdict.cls].append(_rival_view(rival, verdict, pr_title, ts))
+
+    # Most shared files first — a description of the overlap, not a recommendation
+    # about it. Every other bucket keeps the query's ascending `pr`, which is the
+    # only ordering that means anything when nothing is shared.
+    buckets[COLLIDES].sort(key=lambda h: (-h["shared"], h["pr"]))
+
+    subject_paths = sorted(
+        (await session.scalars(
+            select(ReviewRunFile.path).where(ReviewRunFile.run_id == subject_id)
+        )).all()
+    )
+    out = {
+        "repo": repo,
+        "pr": pr,
+        "run_id": subject_id,
+        "ts": subject.ts.isoformat(),
+        "pr_state": subject.pr_state,
+        "is_draft": subject.is_draft,
+        # The subject's own three numbers, and `files_complete` is the one to read
+        # first: GitHub caps a PR's file list at 3,000, and a subject whose list is
+        # a prefix under-reports its OWN collisions — a shortfall no per-rival
+        # verdict below can see, because it is on this side of the join.
+        "changed_files_total": subject.changed_files_total,
+        "files_recorded": len(subject_paths),
+        "files_complete": files_complete(subject.changed_files_total, len(subject_paths)),
+        # Fetched whole and capped for the wire: this is ONE run, bounded by the
+        # ingest cap, and `files_recorded` above has to count it.
+        **_capped(subject_paths, len(subject_paths)),
+        # The window the rival population was drawn from, echoed so a caller
+        # logging an answer can say what it was an answer about.
+        "window": {"days": days, "since": since,
+                   "cutoff": cutoff.isoformat() if cutoff is not None else None},
+        # Pre-cap, always, for every class: the cap trims the list it is on and
+        # must never be visible in the arithmetic. `considered` is counted from the
+        # selected rows rather than summed from the classes, so that the two
+        # agreeing is a real check on the ladder's exhaustiveness and not a
+        # tautology — `test_every_selected_rival_lands_in_exactly_one_class` is
+        # the assertion.
+        "counts": {"considered": len(rows),
+                   **{cls: len(buckets[cls]) for cls in CLASSES}},
+        #: PRs this board has never panelled cannot appear in ANY class above, in
+        #: any state. Stated in the response and not only in the docs, because it
+        #: is the one limit a caller cannot discover by reading the numbers.
+        "scope": "PRs this board has panelled within the window",
+    }
+    for cls in CLASSES:
+        out[cls] = buckets[cls][:limit]
+        # Said, never silent: this repo's rule is that a cap which trims an answer
+        # announces itself, or the trimmed answer reads as the whole one.
+        out[f"{cls}_dropped"] = max(0, len(buckets[cls]) - limit)
+    return out
 
 
 @router.get("/review/{run_id}")
