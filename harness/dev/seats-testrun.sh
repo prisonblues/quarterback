@@ -8,7 +8,8 @@
 # borrows tmux from nixpkgs, and starts N real agents in a throwaway repo.
 #
 # The seats are REAL claude sessions on the REAL board. They register as
-# zeus/seat-1 … zeus/seat-N and post presence like any other agent. What bounds
+# zeus/seat-<repo>-1 … zeus/seat-<repo>-N — the project the seat sits in is part
+# of its name (#208) — and post presence like any other agent. What bounds
 # them is the brief, so the default here is a harmless one — say hello, stop.
 # For a genuine self-selecting fleet, run with QB_SEAT_BRIEF unset:
 #

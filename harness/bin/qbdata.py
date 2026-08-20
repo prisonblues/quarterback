@@ -187,12 +187,104 @@ def clip(s: str | None, n: int) -> str:
     return s if len(s) <= n else s[: max(0, n - 1)] + "…"
 
 
-def seat_number(holder: str | None) -> int | None:
-    """1 for 'zeus/seat-1'. None for anything that is not a seat."""
-    if not holder or "/seat-" not in holder:
+#: How a seat spells itself on the board: `seat-<scope>-<n>`, where the scope is
+#: the project the seat sits in and is what stops two screens on one machine both
+#: wanting seat 1 (#208). The scope is optional because a seat whose scope slugged
+#: away to nothing — or that was deliberately started with an empty QB_SEAT_SCOPE —
+#: keeps the bare `seat-<n>` this had before, and the dashboard must go on
+#: recognising those.
+#:
+#: The NUMBER is the last hyphenated field, not the first: a scope may contain
+#: hyphens of its own, and `seat-nix-fleet-3` is seat 3 of nix-fleet rather than
+#: anything about `nix`. The bound is qb-seat's own 1-99.
+SEAT_RE = re.compile(r"^seat-(?:(.+)-)?([1-9][0-9]?)$")
+
+#: The most of `seat-<scope>-<n>` a scope may take, mirroring SEAT_SCOPE_MAX in
+#: qb-seat: the board allows 40 characters and `seat-`, a hyphen and two digits
+#: account for the other eight.
+SCOPE_MAX = 32
+
+
+def _seat(holder: str | None) -> "re.Match[str] | None":
+    """The seat match for a board identity, on the name half of `machine/name`."""
+    if not holder:
         return None
-    tail = holder.split("/seat-", 1)[1]
-    return int(tail) if tail.isdigit() else None
+    return SEAT_RE.match(holder.rsplit("/", 1)[-1])
+
+
+def seat_number(holder: str | None) -> int | None:
+    """1 for 'zeus/seat-lexray-1' and for 'zeus/seat-1'.
+
+    None for anything that is not a seat.
+    """
+    match = _seat(holder)
+    return int(match.group(2)) if match else None
+
+
+def seat_machine(holder: str | None) -> str | None:
+    """'zeus' for 'zeus/seat-lexray-1'. None for anything that is not a seat.
+
+    The board is the FLEET's, not this box's: two machines can each hold a
+    `seat-lexray-1`, so the machine half is part of what identifies a seat and
+    leaving it out shows a remote agent's state against a local pane.
+    """
+    if _seat(holder) is None:
+        return None
+    machine, sep, _ = (holder or "").partition("/")
+    return machine if sep else None
+
+
+def seat_scope(holder: str | None) -> str | None:
+    """'lexray' for 'zeus/seat-lexray-1'.
+
+    None for 'zeus/seat-1', which is a seat numbered across the whole machine,
+    and None for anything that is not a seat at all. The two cases are told
+    apart by :func:`seat_number`, which answers for the first and not the second.
+    """
+    match = _seat(holder)
+    return match.group(1) if match else None
+
+
+def slug_scope(text: str | None) -> str | None:
+    """Turn a requested scope into the one a seat will actually carry.
+
+    MIRRORS `seat_scope_slug` in qb-seat, and is pinned to it by
+    test_the_scope_rule_is_the_one_qb_seat_actually_applies — two implementations
+    of one rule is exactly how a dashboard ends up showing one seat's state
+    against another seat's pane. Case folding is ASCII-only for the same reason:
+    qb-seat folds with `tr '[:upper:]' '[:lower:]'`, which is bytes, where
+    str.lower() is Unicode.
+    """
+    if not text:
+        return None
+    lowered = "".join(chr(ord(c) + 32) if "A" <= c <= "Z" else c for c in text)
+    slug = re.sub(r"[^a-z0-9]+", "-", lowered).strip("-")[:SCOPE_MAX].rstrip("-")
+    return slug or None
+
+
+def scope_of(repo_path: str | None) -> str | None:
+    """The scope qb-seat gives a seat working in ``repo_path`` and told nothing else.
+
+    The default half of the rule: a seat is named after its repository's own
+    directory.
+    """
+    return slug_scope(os.path.basename((repo_path or "").rstrip("/")))
+
+
+def pane_scope(seat: dict) -> str | None:
+    """The scope of the seat in a tmux pane, or None when the pane cannot say.
+
+    `@qb_scope` first, because a screen given an explicit QB_SEAT_SCOPE is the one
+    case the repository cannot answer for: two screens on ONE repository, which is
+    precisely what that knob exists for. `@qb_repo` otherwise, which is the default
+    the seat itself computed from its cwd.
+
+    An explicitly EMPTY scope reads here as "the pane cannot say", and that is the
+    right answer rather than a gap: an empty scope asks for the machine-wide seat
+    numbering, in which a second screen cannot hold the same number at all — so
+    there is never a second candidate for the caller to confuse it with.
+    """
+    return slug_scope(seat.get("scope")) or scope_of(seat.get("repo"))
 
 
 class BoardConfig:
@@ -613,7 +705,7 @@ def plan_detail(item: dict) -> str:
 # ones whose agent has exited and left a shell behind. Only the second can be
 # closed with a click.
 
-SEAT_FIELDS = ("pane", "seat", "session", "window", "command", "path")
+SEAT_FIELDS = ("pane", "seat", "session", "window", "command", "path", "repo", "scope")
 
 
 def tmux_seats() -> list[dict]:
@@ -622,6 +714,15 @@ def tmux_seats() -> list[dict]:
     A seat is a pane carrying the @qb_seat option, which is how qb-seats marks
     them and the only handle that survives a pane being added or closed — the
     index shifts and the agent rewrites the title.
+
+    `@qb_repo` and `@qb_scope` come back with it because `list-panes -a` is the
+    whole SERVER and not this screen: since #208 two screens can each have a seat
+    1, so the number alone no longer says which board identity a pane is. Both are
+    set on the SESSION (or, for `--add`, on the pane) and formats resolve a user
+    option up through the hierarchy, so every pane of a screen answers for its own
+    screen. Either can be empty — `@qb_scope` whenever the screen was not given an
+    explicit one, `@qb_repo` on a screen built by a qb-seats old enough not to set
+    it — which is why the dashboard falls back to matching on the number.
 
     Returns [] rather than raising when there is no tmux, no server, or no
     screen: the dashboard runs inside the screen most of the time and in a bare
@@ -632,7 +733,8 @@ def tmux_seats() -> list[dict]:
         return []
     fmt = "\t".join("#{%s}" % f for f in
                     ("pane_id", "@qb_seat", "session_name", "window_index",
-                     "pane_current_command", "pane_current_path"))
+                     "pane_current_command", "pane_current_path", "@qb_repo",
+                     "@qb_scope"))
     try:
         got = subprocess.run(["tmux", "list-panes", "-a", "-F", fmt],
                              capture_output=True, text=True, timeout=5)
@@ -647,8 +749,12 @@ def tmux_seats() -> list[dict]:
             continue
         seats.append(dict(zip(SEAT_FIELDS, parts)))
     # By seat NUMBER, not by pane order: --add splits off the leftmost pane, so
-    # pane order runs 1, 3, 2 on a screen that has had a seat added to it.
-    return sorted(seats, key=lambda s: int(s["seat"]) if s["seat"].isdigit() else 0)
+    # pane order runs 1, 3, 2 on a screen that has had a seat added to it. By
+    # SCREEN first, because this lists the whole server and two screens now
+    # interleave their 1, 2, 3 otherwise — which reads as one screen with every
+    # seat number twice.
+    return sorted(seats, key=lambda s: (s["session"],
+                                        int(s["seat"]) if s["seat"].isdigit() else 0))
 
 
 # ---- claude code's own limits ------------------------------------------------

@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import subprocess
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -24,6 +26,104 @@ BIN = Path(__file__).resolve().parent.parent / "bin"
 sys.path.insert(0, str(BIN))
 
 import qbdata as qd                                       # noqa: E402
+
+QB_SEAT = BIN / "qb-seat"
+
+
+# ---- reading a seat off the board -------------------------------------------
+#
+# #208 put the project in the name, so `zeus/seat-1` became `zeus/seat-lexray-1`
+# — and everything that joins a board identity to a tmux pane goes through these
+# three. The old spelling has to keep working: a seat whose scope slugged away to
+# nothing, or one deliberately started with an empty QB_SEAT_SCOPE, is still a
+# seat and the dashboard still has to say so.
+
+
+def test_a_scoped_seat_reads_as_its_number_and_its_project():
+    assert qd.seat_number("zeus/seat-lexray-1") == 1
+    assert qd.seat_scope("zeus/seat-lexray-1") == "lexray"
+
+
+def test_the_number_is_the_last_field_not_the_first():
+    """A scope may carry hyphens of its own, and `seat-nix-fleet-3` is seat 3 of
+    nix-fleet rather than anything at all about `nix`."""
+    assert qd.seat_number("zeus/seat-nix-fleet-3") == 3
+    assert qd.seat_scope("zeus/seat-nix-fleet-3") == "nix-fleet"
+
+
+def test_a_seat_numbered_across_the_machine_is_still_a_seat():
+    """The pre-#208 spelling, which QB_SEAT_SCOPE= still asks for on purpose."""
+    assert qd.seat_number("zeus/seat-7") == 7
+    assert qd.seat_scope("zeus/seat-7") is None
+
+
+def test_an_agent_that_is_not_a_seat_is_not_read_as_one():
+    for holder in (None, "", "zeus", "zeus/amber-otter", "zeus/seat-", "zeus/seats-1",
+                   "zeus/seat-lexray-0", "zeus/seat-lexray-100", "zeus/seat-lexray"):
+        assert qd.seat_number(holder) is None, holder
+        assert qd.seat_scope(holder) is None, holder
+
+
+def test_a_machine_is_read_off_a_seat_identity():
+    """The board is the FLEET's: two machines can each hold a `seat-lexray-1`, so
+    the machine half is part of what identifies one."""
+    assert qd.seat_machine("zeus/seat-lexray-1") == "zeus"
+    assert qd.seat_machine("seat-lexray-1") is None
+    assert qd.seat_machine("zeus/amber-otter") is None
+
+
+def test_a_pane_answers_with_the_scope_it_was_told_before_the_one_it_implies():
+    """Two screens on ONE repository is what QB_SEAT_SCOPE exists for, and it is
+    exactly the case @qb_repo cannot distinguish."""
+    assert qd.pane_scope({"repo": "/x/lexray", "scope": "review"}) == "review"
+    assert qd.pane_scope({"repo": "/x/lexray", "scope": "Re View"}) == "re-view"
+    assert qd.pane_scope({"repo": "/x/lexray", "scope": ""}) == "lexray"
+    assert qd.pane_scope({"repo": "", "scope": ""}) is None
+    assert qd.pane_scope({}) is None
+
+
+def test_a_repository_path_becomes_the_scope_its_seats_carry():
+    assert qd.scope_of("/home/rich/lexray") == "lexray"
+    assert qd.scope_of("/home/rich/lexray/") == "lexray"
+    assert qd.scope_of("/home/rich/Foo.Bar_2") == "foo-bar-2"
+    assert qd.scope_of("/x/" + "a" * 60) == "a" * 32
+    assert qd.scope_of("/x/___") is None
+    assert qd.scope_of("") is None
+    assert qd.scope_of(None) is None
+
+
+@pytest.mark.parametrize("dirname", [
+    "lexray", "nix-fleet", "Foo.Bar_2", "dots...and___runs", "-leading-and-trailing-",
+    "2024", "a" * 60, "abc-" * 9, "___",
+])
+def test_the_scope_rule_is_the_one_qb_seat_actually_applies(tmp_path, dirname):
+    """Two implementations of one rule, pinned to each other.
+
+    The dashboard joins a tmux pane to a board identity by turning the screen's
+    repository into the scope qb-seat gave that seat — so a rule that differs in
+    either direction shows one seat's state against another seat's pane, which is
+    a wrong answer that looks exactly like a right one. qb-seat is the authority
+    (it is what the board is told); this asks it, rather than asserting on either
+    side's source.
+    """
+    d = tmp_path / dirname
+    d.mkdir()
+    subprocess.run(["git", "init", "-q", str(d)], check=True)
+    # A runtime dir of our own: --dry-run reads the pane markers, and a suite that
+    # read the developer's would refuse whenever a real seat held that number.
+    run = tmp_path / "run"
+    run.mkdir()
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("QB_SEAT_SCOPE", "QB_SEAT_REPO")}
+    done = subprocess.run(
+        [str(QB_SEAT), "1", "--dry-run"], cwd=str(d), capture_output=True, text=True,
+        env={**env, "XDG_RUNTIME_DIR": str(run), "QB_SEAT_BRIEF": ""},
+    )
+    assert done.returncode == 0, done.stderr
+    instance = next(line.split(":", 1)[1].strip() for line in done.stdout.splitlines()
+                    if line.startswith("instance:"))
+    scope = qd.scope_of(str(d))
+    assert instance == (f"seat-{scope}-1" if scope else "seat-1")
 
 
 def claim(key: str, holder: str = "zeus/seat-1", kind: str = "issue") -> dict:
@@ -167,27 +267,62 @@ def test_no_tmux_means_no_seats_rather_than_an_exception(monkeypatch):
     assert qd.tmux_seats() == []
 
 
-def test_seats_come_back_in_seat_order_not_pane_order(monkeypatch):
-    """--add splits off the LEFTMOST pane, so a grown screen runs 1, 3, 2.
-
-    Sorting on the seat number is what keeps the panel's ✕ next to the seat a
-    human is reading, rather than next to whichever pane tmux listed third.
-    """
+def _tmux_returning(monkeypatch, rows):
+    """Stand in for `tmux list-panes -a`, which is where every seat comes from."""
     monkeypatch.setenv("TMUX", "/tmp/whatever,1,0")
-    rows = ["%0\t1\ts\t0\tclaude\t/repo",
-            "%2\t3\ts\t0\tclaude\t/repo",
-            "%1\t2\ts\t0\tbash\t/repo",
-            "%3\t\ts\t0\tqb-board\t/repo"]        # the board pane: no @qb_seat
 
     class Done:
         returncode = 0
         stdout = "\n".join(rows) + "\n"
 
     monkeypatch.setattr(qd.subprocess, "run", lambda *a, **k: Done())
+
+
+def test_seats_come_back_in_seat_order_not_pane_order(monkeypatch):
+    """--add splits off the LEFTMOST pane, so a grown screen runs 1, 3, 2.
+
+    Sorting on the seat number is what keeps the panel's ✕ next to the seat a
+    human is reading, rather than next to whichever pane tmux listed third.
+    """
+    _tmux_returning(monkeypatch, [
+        "%0\t1\ts\t0\tclaude\t/repo\t/repo\t",
+        "%2\t3\ts\t0\tclaude\t/repo\t/repo\t",
+        "%1\t2\ts\t0\tbash\t/repo\t/repo\t",
+        "%3\t\ts\t0\tqb-board\t/repo\t/repo\t",   # the board pane: no @qb_seat
+    ])
     got = qd.tmux_seats()
     assert [s["seat"] for s in got] == ["1", "2", "3"]
     assert [s["pane"] for s in got] == ["%0", "%1", "%2"]
     assert all(s["command"] for s in got), "the board pane leaked into the seats"
+
+
+def test_two_screens_come_back_grouped_by_screen(monkeypatch):
+    """`list-panes -a` is the whole server, and since #208 two screens can each
+    hold a seat 1. Sorted on the number alone they interleave, and the panel reads
+    as one screen with every number twice."""
+    _tmux_returning(monkeypatch, [
+        "%0\t1\tseats-lexray\t0\tclaude\t/x/lexray\t/x/lexray\t",
+        "%2\t1\tseats-nix-fleet\t0\tclaude\t/x/nix-fleet\t/x/nix-fleet\t",
+        "%3\t2\tseats-nix-fleet\t0\tclaude\t/x/nix-fleet\t/x/nix-fleet\t",
+        "%1\t2\tseats-lexray\t0\tclaude\t/x/lexray\t/x/lexray\t",
+    ])
+    got = qd.tmux_seats()
+    assert [(s["session"], s["seat"]) for s in got] == [
+        ("seats-lexray", "1"), ("seats-lexray", "2"),
+        ("seats-nix-fleet", "1"), ("seats-nix-fleet", "2"),
+    ]
+    # The screen's repository, which is what joins a pane to a board identity.
+    assert [s["repo"] for s in got[:2]] == ["/x/lexray", "/x/lexray"]
+
+
+def test_a_screen_with_no_qb_repo_still_yields_its_seats(monkeypatch):
+    """@qb_repo is newer than @qb_seat, so a screen built by an older qb-seats
+    answers with an empty field. It must cost the scope and not the seat."""
+    _tmux_returning(monkeypatch, ["%0\t1\ts\t0\tclaude\t/repo\t\t"])
+    got = qd.tmux_seats()
+    assert [s["seat"] for s in got] == ["1"]
+    assert got[0]["repo"] == ""
+    assert qd.pane_scope(got[0]) is None
 
 
 def test_a_tmux_that_fails_is_an_empty_screen_not_a_crash(monkeypatch):

@@ -746,6 +746,17 @@ full — including what was broken before it, which is the part no diff recovers
   comes from `$QUARTERBACK_HARNESS_RULES` or `~/.config/quarterback/harness-rules.json`
   for the whole box, with a repo's own untracked `.harness-rules` still winning per key.
   One file per box is also what makes worktree-per-agent safe to turn on.
+- **v2.57** — a seat is its number *and* its project, so a second screen can start. `seat-<n>` made
+  the namespace the machine while `qb-seats` numbers every screen's seats from 1, so the second
+  screen on a box could not start a single seat — one screen per project, the obvious way to work a
+  fleet, was the one thing it could not do (#208). The guard was right (two panes on one seat share
+  a board identity *and* an ask cursor) and its key was too coarse, so the key grew a scope:
+  `seat-lexray-1` and `seat-nix-fleet-1` are two seats, `seat-lexray-1` twice is still one. The
+  scope defaults to the repository's directory name, slugged to what the board will take as a name;
+  `QB_SEAT_SCOPE` names it for two screens on one repo, and empty asks for the old machine-wide
+  numbering. The pane marker moved with it, because a marker on the bare number would refuse the
+  second screen's seat 1 while the board gave it its own identity — and the dashboard now tells two
+  screens apart instead of showing one screen's agent against the other's pane.
 - **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
   object store; wire `landed` refs to a cherry-pick helper.
 

@@ -437,6 +437,65 @@ def test_qb_seat_knobs_reach_the_panes(screen):
     assert "QB_SEAT_AGENT=some-stand-in" in env
 
 
+def test_the_scope_reaches_the_panes(screen):
+    """The knob for the one case the per-project default cannot read: two screens
+    on ONE repository, whose seats would otherwise both be numbered from 1 in the
+    same namespace and collide exactly as two projects used to (#208)."""
+    screen.env["QB_SEAT_SCOPE"] = "review"
+    screen("-n", "1")
+    assert "QB_SEAT_SCOPE=review" in screen.tmux("show-environment", "-t", "t").stdout
+
+
+def test_an_empty_scope_reaches_the_panes(screen):
+    """Set-and-empty is the request for the machine-wide seat numbering this had
+    before #208, and it is the one value a `-n` forwarding predicate drops — which
+    would hand the screen the per-project default it was told not to use.
+
+    Line-wise, not as a substring, for QB_SEAT_BRIEF's reason: `"QB_SEAT_SCOPE=" in
+    env` also matches `QB_SEAT_SCOPE=review`.
+    """
+    screen.env["QB_SEAT_SCOPE"] = ""
+    screen("-n", "1")
+    env = screen.tmux("show-environment", "-t", "t").stdout.splitlines()
+    assert "QB_SEAT_SCOPE=" in env, f"set-and-empty must arrive as itself: {env}"
+    assert "-QB_SEAT_SCOPE" not in env, "must not be marked for removal"
+
+
+def test_a_plain_screen_forwards_no_scope(screen):
+    """The default lives in qb-seat and is derived from the pane's own cwd, which
+    the layout already sets to the repo. Writing it out here as well would be a
+    second place for it to live and to drift from."""
+    screen("-n", "1")
+    assert "QB_SEAT_SCOPE" not in screen.tmux("show-environment", "-t", "t").stdout
+    assert screen.tmux("show-options", "-v", "-t", "t:", "@qb_scope").returncode != 0
+
+
+def test_the_scope_is_recorded_on_the_screen_as_well_as_forwarded(screen):
+    """Two readers, two mechanisms. The variable tells the SEAT what to call
+    itself; the option tells whatever reads the screen from outside — the
+    dashboard joins `zeus/seat-review-1` to a pane, and @qb_repo answers for the
+    default scope only."""
+    screen.env["QB_SEAT_SCOPE"] = "review"
+    screen("-n", "1")
+    assert screen.tmux("show-options", "-v", "-t", "t:", "@qb_scope").stdout.strip() \
+        == "review"
+
+
+def test_a_seat_added_later_carries_the_scope_it_was_added_with(screen):
+    """--add scopes its -e list to the one pane it creates rather than rewriting
+    the session under seats already working in it, and the option goes the same
+    way for the same reason."""
+    screen("-n", "1")
+    screen.env["QB_SEAT_SCOPE"] = "review"
+    screen("--add")
+    panes = dict(line.split("\t", 1) for line in
+                 screen.tmux("list-panes", "-t", "t:", "-F",
+                             "#{@qb_seat}\t#{@qb_scope}").stdout.splitlines())
+    assert panes.get("2") == "review", panes
+    # And NOT on the seat that was already working, whose own scope is the default.
+    assert panes.get("1") == "", panes
+
+
 def test_no_yolo_reaches_the_panes(screen):
     """The flag is the env knob with the value supplied by the layout, so there
     is one mechanism to test and nothing that can drift between the two."""

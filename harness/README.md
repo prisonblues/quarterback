@@ -386,12 +386,35 @@ turns the fleet into a drain, and nothing yet bounds how much work a fleet may t
 cursor on `QUARTERBACK_INSTANCE` (`qb-asks-<agent>-<instance>`), so one value exported for
 the whole box gives n seats *one* cursor between them: whichever seat polls first advances
 it past everyone else's mail and the other n−1 never see an ask addressed to them. Set per
-seat it is the opposite — a stable, typeable `zeus/seat-3` instead of `zeus/a4f81c2e`,
-which survives the seat restarting in the same pane because the board hands a returning
-key its old name back.
+seat it is the opposite — a stable, typeable `zeus/seat-lexray-3` instead of
+`zeus/a4f81c2e`, which survives the seat restarting in the same pane because the board
+hands a returning key its old name back.
+
+**Why the name carries the project as well as the number.** `seat-3` on its own makes the
+*namespace* the machine while the *numbering* is per screen — and `qb-seats` numbers from 1
+every time it builds one. So the second screen on a box asked for seat 1, found the first
+screen's seat 1 holding the pane marker, and refused: not an edge case reached by an unlucky
+choice of number but the guaranteed outcome of starting a second screen, which made one
+screen per project the one thing this could not do (#208).
+
+The guard was right and its key was too coarse, so the key grew a scope. A seat is
+`seat-<project>-<n>`, so `seat-lexray-1` and `seat-nix-fleet-1` are two seats while
+`seat-lexray-1` started twice is still one — every property the refusal names survives.
+The scope defaults to the basename of the seat's own repository, because a screen is per
+repository; `QB_SEAT_SCOPE` overrides it for the two cases that default cannot read, which
+are two screens on *one* repository and anyone who wants the old machine-wide numbering
+back (`QB_SEAT_SCOPE=`, empty and meaning it).
+
+The scope is **slugged**, and that is not cosmetic: an `X-Agent-Name` that does not match
+`^[a-z0-9]+(?:-[a-z0-9]+)*$` within 40 characters is refused with a 400, so a repository
+called `Foo.Bar_2` would otherwise make every seat in it fail registration. The basename is
+folded to lower case, every run of anything else becomes one hyphen, the ends are trimmed
+and the middle is capped at 32. A scope that slugs away to nothing — a directory named
+`___` — leaves the bare `seat-3` and says so on stderr, rather than inventing a project
+name nobody could type.
 
 **Why it registers that name itself, before starting anything.** Since v2.12 the board
-*designates* the name half of an identity, and `QUARTERBACK_INSTANCE=seat-3` is only a
+*designates* the name half of an identity, and `QUARTERBACK_INSTANCE=seat-lexray-3` is only a
 **request** (`X-Agent-Name`) — one the MCP server makes and the lifecycle hook does not.
 Allocation is first-contact-wins, and the hook fires on `SessionStart`, so it usually wins.
 Measured against a live board:
@@ -399,33 +422,36 @@ Measured against a live board:
 | First contact | Later request | Board says |
 |---|---|---|
 | key only, no name (the hook) | — | `zeus/meadow-russet` |
-| key only, no name (the hook) | `seat-9` (the MCP server) | `zeus/meadow-russet` — **the request is ignored** |
-| key **and** `seat-9` together | — | `zeus/seat-9` |
+| key only, no name (the hook) | `seat-lexray-9` (the MCP server) | `zeus/meadow-russet` — **the request is ignored** |
+| key **and** `seat-lexray-9` together | — | `zeus/seat-lexray-9` |
 
 So a seat that does not ask up front comes up as two random words about as often as not,
 losing the one property the numbering was for. `qb-seat` makes a single `GET /whoami`
 carrying both headers before it execs, which settles the row; every process that follows
-resolves to it. It reads back what the board actually said and warns if that is not
-`seat-N`, which happens when the key was bound to a designated name on some earlier run —
-allocation hands a returning key the name it already had, and a request cannot displace one
-that exists.
+resolves to it. It reads back what the board actually said and warns if that is not the name
+it asked for, which happens when the key was bound to a designated name on some earlier run
+— allocation hands a returning key the name it already had, and a request cannot displace
+one that exists.
 
 *Addressing was never at risk either way*, and that is worth knowing before someone
 re-derives the worry: the board resolves `machine/key` as a permanent alias, so an ask sent
-to `zeus/meadow-russet` is returned by a poll that asks for `to=zeus/seat-3`. This is about
-the name a human types and reads on a status bar.
+to `zeus/meadow-russet` is returned by a poll that asks for `to=zeus/seat-lexray-3`. This is
+about the name a human types and reads on a status bar.
 
-**Two panes on one seat number is refused, and the board cannot be the one to refuse it.**
+**Two panes on one seat is refused, and the board cannot be the one to refuse it.**
 They export the same instance, so they send the same key, so the board hands them *one*
 identity — from its side they are indistinguishable by construction. They then share the
 ask-poll cursor, and whichever polls first swallows the other's mail: the exact bug the
 per-seat instance exists to prevent, one level down, and invisible because both seats
 otherwise work. So the check is local, where the panes actually are. `qb-seat` records its
-pid in `$XDG_RUNTIME_DIR/qb-seat-<n>.pid` — or, on a machine with no `XDG_RUNTIME_DIR`
+pid in `$XDG_RUNTIME_DIR/qb-<seat name>.pid` — or, on a machine with no `XDG_RUNTIME_DIR`
 (macOS, most containers, ssh onto a box with no systemd user session), in
-`${TMPDIR:-/tmp}/qb-seat-<uid>-<n>.pid`, where the uid is in the name because `/tmp` is
-shared and a marker there is not. It exits **3** if a live process already holds that
-number. A marker left by a seat that died is taken over rather than honoured, and
+`${TMPDIR:-/tmp}/qb-<uid>-<seat name>.pid`, where the uid is in the name because `/tmp` is
+shared and a marker there is not. The marker is keyed on the **whole name** and not on the
+bare number, because the two have to agree or the guard is protecting something other than
+the identity it describes — a marker on the number alone refused the second screen's seat 1
+while the board would happily have given it its own identity. It exits **3** if a live
+process already holds that seat. A marker left by a seat that died is taken over rather than honoured, and
 `QB_SEAT_FORCE=1` overrides the refusal for a pid that has since been reused by something
 unrelated — noisily, on stderr, because being wrong about that is the shared-inbox bug
 with nothing on screen.
@@ -458,6 +484,7 @@ per-branch database), assign work, or drive the agent past starting it.
 | `QB_SEAT_REPO` | the pane's cwd | Where the seat works; the layout normally sets the cwd instead |
 | `QB_SEAT_BRIEF` | the built-in brief | Replaces it wholesale; empty means no brief at all |
 | `QB_SEAT_AGENT` | `claude` | The agent to start |
+| `QB_SEAT_SCOPE` | the repository directory's name | The project half of `seat-<scope>-<n>`, which is what lets two screens each hold a seat 1. Slugged to what the board will take as a name; set it when two screens share one repository, or set it **empty** for the machine-wide numbering this had before #208 |
 | `QB_SEAT_FORCE` | unset | Start anyway when this seat number looks already taken. Truthy values only (`1`, `yes`, `true`, `on`) — `QB_SEAT_FORCE=0` leaves the guard on |
 | `QB_SEAT_YOLO` | **on** | Permission prompts. A seat starts with them off (`--dangerously-skip-permissions`) because nobody is watching the pane to answer one; `QB_SEAT_YOLO=0` (or any of `no`, `false`, `off`) gives them back. The flag is claude's spelling: point `QB_SEAT_AGENT` at a wrapper for anything else |
 | `QUARTERBACK_BASE_URL`, `QUARTERBACK_TOKEN` / `QUARTERBACK_TOKEN_CMD` | from the config file | The board to register the name with |
@@ -500,6 +527,14 @@ anything, the fleet's own screen is `qbseats` rather than `seats-nix-fleet`, and
 silently renames what it will not take verbatim. So the list is read back from tmux and can
 only print names that really exist, which also makes it the way to reattach to a screen tmux
 renamed under you.
+
+A screen also records **what its seats are called**: `@qb_repo` is the repository it was
+built in, and `@qb_scope` is the explicit `QB_SEAT_SCOPE` if it was given one. Both are set
+on the session — `--add` puts `@qb_scope` on the pane it creates instead, so it does not
+rewrite the session under seats already working in it — and together they are how anything
+reading the screen from outside turns a pane into a board identity. `list-panes -a` is the
+whole tmux server, so since #208 the seat number alone no longer says which seat a pane is;
+the dashboard's SEATS panel and its FLEET-row jump both go through this.
 
 One tmux session: N panes each running `qb-seat <n>`, and one full-width pane along the
 bottom running `qb-board --follow`. Every seat gets the **same** brief — read the board,
