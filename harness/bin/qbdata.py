@@ -90,24 +90,56 @@ def set_repos(repos: list[str]) -> None:
     _repos = cleaned or None
 
 
-def repo_arg(value: str) -> str:
-    """A ``--repo`` argument — a checkout or an ``owner/name`` slug — as a slug.
+#: An owner or a repository name, as GitHub spells one. Anything else in an
+#: ``owner/name`` argument — a space, a quote, a shell metacharacter — is a
+#: malformed slug rather than a repository, and it would reach `gh` as one.
+_SLUG_PART = re.compile(r"[A-Za-z0-9._-]+")
+
+
+def repo_target(value: str) -> tuple[str, str | None]:
+    """A ``--repo`` argument as ``(slug, the checkout it names or None)``.
 
     A directory is asked for its origin, which is how "the project this screen is
-    set up for" is spelled when you are standing in it. A bare name is REFUSED
-    rather than completed: `gh` needs an owner, the fleet works in repos whose
-    owner is not this one's, and inventing one aims the PR panel — and the ⚒ that
-    starts work off it — at somebody else's repository of the same name.
+    set up for" is spelled when you are standing in it — and the directory comes
+    back beside the slug because the clickable renderer LAUNCHES work in it, so
+    ``--repo ~/src/nix-fleet`` has to move the cwd of what the ⚒ starts and not
+    only the rows the panels draw. A slug names a repository this process may have
+    no checkout of, which is why the second half of the answer can be None.
+
+    SHAPE FIRST, the filesystem second. ``--repo prisonblues/quarterback`` run
+    from a ``~/src/<owner>/<repo>`` tree matched ``os.path.isdir`` on a directory
+    that is not itself a checkout, and the plainly valid slug died as "not a git
+    checkout"; deciding on the shape also stops the answer depending on the cwd.
+    The cost is that a two-segment relative path needs its ``./`` — ``owner/name``
+    is a slug, always, because that is what the flag means everywhere else.
+
+    A bare name is REFUSED rather than completed: `gh` needs an owner, the fleet
+    works in repos whose owner is not this one's, and inventing one aims the PR
+    panel — and the ⚒ that starts work off it — at somebody else's repository of
+    the same name.
     """
-    value = (value or "").strip().rstrip("/") or "."
-    if value in (".", "..") or os.path.isdir(value):
-        slug = repo_slug(value)
+    raw = (value or "").strip() or "."
+    # `~` is expanded here because the help text and the README advertise
+    # `--repo ~/src/nix-fleet`, and only an interactive shell expands it: quoted,
+    # built into a QB_SEATS_DASH command string or sent through `tmux send-keys`,
+    # the tilde arrives intact and used to be reported as a bad slug.
+    path = os.path.expanduser(raw).rstrip("/") or "/"
+    parts = path.split("/")
+    if (len(parts) == 2 and not path.startswith(".")
+            and all(_SLUG_PART.fullmatch(part.strip()) for part in parts)):
+        return "/".join(part.strip() for part in parts), None
+    if path.startswith((".", "/")) or "/" in path:
+        slug = repo_slug(path)
         if not slug:
-            raise ValueError(f"{value}: not a git checkout with an origin remote")
-        return slug
-    if value.count("/") == 1 and all(part.strip() for part in value.split("/")):
-        return value
-    raise ValueError(f"{value!r}: neither a checkout nor an owner/name slug")
+            raise ValueError(f"{path}: not a git checkout with an origin remote")
+        return slug, path
+    raise ValueError(f"{raw!r}: neither a checkout nor an owner/name slug — a bare "
+                     "name needs its owner, a relative path its ./")
+
+
+def repo_arg(value: str) -> str:
+    """Just the slug of a ``--repo`` argument, for a renderer that launches nothing."""
+    return repo_target(value)[0]
 
 
 _REPO_COLOURS = ["cyan", "magenta", "green", "yellow", "blue", "red"]
@@ -194,7 +226,20 @@ class Scope:
     def __init__(self, repos: list[str], on: bool = True) -> None:
         self.repos = list(repos)
         self.on = bool(on)
+        #: The bare names, for the header and for comparing against a board row
+        #: that reports no owner (a lease reports the checkout's directory).
         self.names = {n for n in (repo_name(r) for r in self.repos) if n}
+        #: The full slugs of the watched repos that name an owner, and the bare
+        #: names of the ones that do not.
+        self.slugs = {r.strip().lower() for r in self.repos if "/" in r.strip()}
+        self.bare = {n for n in (repo_name(r) for r in self.repos
+                                 if "/" not in r.strip()) if n}
+        #: ONE ENTRY PER REPOSITORY, in the strongest form each was named in. The
+        #: bare names alone folded a fork and its upstream into one — `column` then
+        #: dropped the only cell that told them apart and `keeps` accepted both
+        #: repos' rows — because `len(names) == 1` had stopped meaning "exactly one
+        #: repository", which is what both of them rely on it meaning.
+        self.keys = self.slugs | self.bare
 
     @property
     def column(self) -> bool:
@@ -205,7 +250,7 @@ class Scope:
         for the wide view — telling repos apart is the entire reason to widen — and
         yes for a screen watching two, where the cell still distinguishes rows.
         """
-        return not self.on or len(self.names) != 1
+        return not self.on or len(self.keys) != 1
 
     def keeps(self, repo: str | None) -> bool:
         """Does a row in ``repo`` belong on this pane?
@@ -215,18 +260,39 @@ class Scope:
         — or a claim whose plan item this process has not fetched — on the strength
         of a missing field. The narrow view is a way to read the fleet, not a claim
         to have accounted for all of it.
+
+        Compared on the WHOLE slug when both sides name an owner: ``myuser/quarterback``
+        and ``prisonblues/quarterback`` are two repositories, and a fork whose rows
+        were kept as the upstream's is the one narrowing that reads as a fact. A row
+        that gives only a bare name can only be compared as one — and, per the rule
+        above, a bare name that matches is kept rather than guessed at.
         """
         if not self.on or not self.names:
             return True
         name = repo_name(repo)
-        return name is None or name in self.names
+        if name is None:
+            return True
+        full = (repo or "").strip().lower()
+        if "/" in full:
+            return full in self.slugs or name in self.bare
+        return name in self.names
 
     def label(self) -> str:
         """What the header says this pane is showing, in one phrase."""
-        return ", ".join(sorted(self.names)) if self.on and self.names else "all repos"
+        if not (self.on and self.names):
+            return "all repos"
+        # The bare names, which is all a header needs — unless two of them are the
+        # same word, when the owner is the only thing that says which pane this is.
+        return ", ".join(sorted(self.names if len(self.names) == len(self.keys)
+                                else self.keys))
 
-    def widened(self) -> Scope:
-        """The same watch list, the other way round — what the toggle switches to."""
+    def toggled(self) -> Scope:
+        """The same watch list, the other way round — what the `s` key switches to.
+
+        Named for what it does. It was `widened()`, which promised one direction and
+        delivered two: called on a wide scope it narrows, so the one line in
+        `action_toggle_scope` was also the line that took the pane back.
+        """
         return Scope(self.repos, not self.on)
 
 
@@ -258,6 +324,39 @@ def in_scope(rows: list[dict], scope: Scope | None,
     getter = repo_of or (lambda row: row.get("repo"))
     kept = [row for row in rows if scope.keeps(getter(row))]
     return kept, len(rows) - len(kept)
+
+
+def elsewhere(hidden: int) -> str:
+    """What a narrowed panel adds to its own title, or nothing.
+
+    Every panel that filters says so, because a panel that filtered silently is a
+    panel lying about the fleet: "nothing claimed" and "nothing claimed HERE" are
+    different facts, and the second is the one the reader is being shown.
+
+    Here rather than in a renderer because both of them format it and they have to
+    agree — the two copies this replaces had already drifted by a word.
+    """
+    return f" · {hidden} elsewhere" if hidden else ""
+
+
+def scope_mark(scope: Scope | None, repo: str | None) -> str:
+    """The prefix a row the scope could not attribute wears, or nothing.
+
+    :meth:`Scope.keeps` deliberately keeps a row whose repo nothing could name —
+    an agent outside any checkout, a fleet-wide plan item, a claim whose item this
+    process has not fetched. The repo cell was the only thing that ever SAID so
+    (``—``, ``fleet``), and the narrow view is exactly the view that drops it: with
+    the cell gone and no mark, an agent working nowhere reads as one working here,
+    which is the panel-that-filtered-silently one level down.
+
+    A prefix rather than a cell of its own because a table's columns are fixed for
+    every row: what needs marking is one row in ten, and the pane cannot spend a
+    column on it. Only where the cell is gone — the wide view has the repo itself,
+    which says more than a mark can.
+    """
+    if scope is None or scope.column or repo_name(repo) is not None:
+        return ""
+    return "? "
 
 
 def ago(stamp: str | None) -> str:

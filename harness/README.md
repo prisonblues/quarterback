@@ -739,19 +739,37 @@ repos this screen watches and drops the column outright; the eleven columns go b
 `what` an agent is doing and to a plan item's title, and `quarterback#209` in CLAIMED
 becomes `#209`. The repos are the ones the dashboard already resolved for its `gh` calls:
 `--repo` (a checkout or an `owner/name` slug, repeatable), else `QB_DASH_REPOS`, else the
-origin of the directory it was started in.
+origin of `QB_DASH_REPO`, else of the directory it was started in.
 
-Two repos keep the column — there it still tells rows apart — and so does the wide view,
-which is the whole reason to widen. `s` toggles between them in the TUI, redrawing from
-what the client already has rather than re-fetching; the plain renderer has no keyboard, so
-it takes `--scope all` or `QB_DASH_SCOPE=all`. **A narrowed panel always says what it
+**`--repo <checkout>` moves where work runs, `--repo <owner/name>` does not**, and the
+difference is the point rather than an inconsistency. `/fix-issue` and `/panel-review-pr`
+take a bare number and resolve the repository from the checkout their pane opens in, so a
+slug — which names a repo this machine may have no checkout of — can only filter rows; a
+checkout also becomes the cwd the ⚒ and the ⚖ launch into. Where a row's repo is not the
+one this dashboard runs in, both icons say so and start nothing. The ⚖ had no such guard
+before the scope existed: a review off another repo's PR row would have commented on, and
+pushed a fix commit to, whatever pull request wore that number here.
+
+Two repos keep the column — there it still tells rows apart, and two owners of one name
+(a fork and its upstream) are two repos, compared as whole slugs rather than folded to the
+bare name they share — and so does the wide view, which is the whole reason to widen. `s`
+toggles between them in the TUI, redrawing from what the client already has rather than
+re-fetching; the plain renderer has no keyboard, so it takes `--scope all` or
+`QB_DASH_SCOPE=all`. Widening reaches the three board-derived panels only: OPEN PRs and
+ISSUES stay the watched repos' either way, because `gh` was never asked about any other. **A narrowed panel always says what it
 hid** — `FLEET · 3 · 2 elsewhere` — because a filtered pane that reads like the whole fleet
 is worse than an unfiltered one: it is the same picture with fewer facts, and "nothing
 claimed" and "nothing claimed *here*" are different claims about the world.
 
-Three things stay fleet-wide on purpose. A row whose repo the board cannot name — an agent
-outside a checkout, a `plan:<uuid>` claim this process has not resolved — is kept, because
-no repo is not evidence of another repo and hiding it drops a live peer. The held-issue
+Four things stay fleet-wide on purpose. A row whose repo the board cannot name — an agent
+outside a checkout, a fleet-wide plan item, a `plan:<uuid>` claim this process has not
+resolved — is kept, because no repo is not evidence of another repo and hiding it drops a
+live peer; it wears a `?` in front of its title, since the repo cell (`—`, `fleet`) was
+the only thing that ever said so and the narrow view is exactly the view that drops it.
+The SEATS panel's `state` column reads every agent the board reports rather than the scoped
+ones: `tmux_seats()` lists every seat pane on the whole tmux server, so another screen's
+seat is on that panel either way, and narrowing would leave the cell that says which seat
+is waiting on you reading `—`. The held-issue
 markers come from *every* claim, so an issue held by an agent working out of another repo's
 checkout is still shown as held rather than offered to the next seat. And OPEN PRs and
 ISSUES cannot narrow at all: `gh` was only ever asked about the watched repos, so there is

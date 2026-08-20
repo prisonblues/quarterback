@@ -8,14 +8,15 @@ waiting to land. State, not events.
   qb-dash              live, redrawing
   qb-dash --once       one frame and exit (what the tests and a pipe want)
   qb-dash --width 72   force a width instead of taking the terminal's
-  qb-dash --scope all  every repo on the board, not just this screen's
+  qb-dash --scope all  every repo the BOARD knows, not just this screen's
   qb-dash --repo ~/src/nix-fleet    point it at a project other than the cwd's
 
 By default it shows ONE project's rows — the repos of the checkout it was started
 in — and drops the repo column, because a screen built for one project spends
-eleven columns of a narrow pane restating its name (#261). `--scope all` is the
-fleet-wide view; the clickable renderer toggles between the two with `s`, which
-this one has no keyboard for.
+eleven columns of a narrow pane restating its name (#261). `--scope all` widens the
+three panels that come off the BOARD (FLEET, CLAIMED, PLANS); OPEN PRs and ISSUES
+cannot widen, because `gh` is only ever asked about the repos this dashboard
+watches. The clickable renderer toggles with `s`, which this one has no keyboard for.
 
 Board data comes from the same client the MCP server uses; PRs and issues come
 from `gh`, on a slower clock because that is a network call per refresh and
@@ -42,9 +43,9 @@ from rich.text import Text
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from qbdata import (  # noqa: E402
     LIMITS_EVERY, Scope, agent_state, ago, board_client, ci_state, claim_label, claim_repo, clip,
-    fetch_board, fetch_issues, fetch_limits, fetch_plan, fetch_prs, claims_by_issue, in_scope,
-    issue_key, limit_cells, plan_counts, plan_ref, plan_state, plan_who, repo_arg, repo_colour,
-    resolve_scope, set_repos, short_repo, sort_issues, sort_plan, until,
+    elsewhere, fetch_board, fetch_issues, fetch_limits, fetch_plan, fetch_prs, claims_by_issue,
+    in_scope, issue_key, limit_cells, plan_counts, plan_ref, plan_state, plan_who, repo_arg,
+    repo_colour, resolve_scope, scope_mark, set_repos, short_repo, sort_issues, sort_plan, until,
 )
 
 BOARD_EVERY = 4.0       # seconds; presence changes on this order
@@ -56,18 +57,9 @@ PLAN_ROWS = 10          # the same, for the plan: running items first, then a co
 # ---- panels ------------------------------------------------------------------
 
 
-def _elsewhere(hidden: int) -> str:
-    """What a narrowed panel adds to its own title, or nothing.
-
-    Every panel that filters says so, because a panel that filtered silently is a
-    panel lying about the fleet: "nothing claimed" and "nothing claimed HERE" are
-    different facts, and the second one is the one a reader is being shown.
-    """
-    return f" · {hidden} elsewhere" if hidden else ""
-
 def panel_agents(data: dict, width: int, scope: Scope | None = None) -> Panel:
     agents = sorted(data.get("agents", []), key=lambda a: (a.get("repo") or "", a.get("holder") or ""))
-    agents, elsewhere = in_scope(agents, scope)
+    agents, hidden = in_scope(agents, scope)
     seats = [a for a in agents if "/seat-" in (a.get("holder") or "")]
     show_repo = scope is None or scope.column
 
@@ -95,7 +87,11 @@ def panel_agents(data: dict, width: int, scope: Scope | None = None) -> Panel:
         if show_repo:
             cells.append(Text(clip(repo, 11), style=repo_colour(repo)))
         cells += [
-            Text(clip(title, body), style="white" if is_seat else "grey70"),
+            # The mark rides on the cell the dropped column widened: with no repo
+            # cell, an agent working outside any checkout otherwise reads as one
+            # working here (qbdata.scope_mark).
+            Text(scope_mark(scope, a.get("repo")) + clip(title, body),
+                 style="white" if is_seat else "grey70"),
             Text(until(a.get("expires")), style="grey50"),
         ]
         t.add_row(*cells)
@@ -108,7 +104,7 @@ def panel_agents(data: dict, width: int, scope: Scope | None = None) -> Panel:
         head += f" · [green]{len(seats)} seat{'s' if len(seats) != 1 else ''}[/]"
     if subs:
         head += f" · {subs} sub"
-    head += _elsewhere(elsewhere)
+    head += elsewhere(hidden)
     return Panel(t, title=head + "[/]", title_align="left", border_style="grey35", padding=(0, 1))
 
 
@@ -118,7 +114,7 @@ def panel_claims(data: dict, width: int, scope: Scope | None = None) -> Panel:
     # key names an item rather than a repo — so the plan goes in with it, and a
     # claim neither can attribute stays (see qbdata.claim_repo).
     plan = data.get("plan")
-    claims, elsewhere = in_scope(claims, scope, lambda c: claim_repo(c.get("key"), plan))
+    claims, hidden = in_scope(claims, scope, lambda c: claim_repo(c.get("key"), plan))
     t = Table.grid(padding=(0, 1), expand=True)
     t.add_column(width=13, no_wrap=True)
     t.add_column(ratio=1, no_wrap=True)
@@ -140,7 +136,7 @@ def panel_claims(data: dict, width: int, scope: Scope | None = None) -> Panel:
         # In the WIDE column, not the 13-wide holder one, which rendered this as
         # "nothing clai…" — a panel whose empty state is itself truncated.
         t.add_row("", Text("nothing claimed", style="grey50"), "")
-    return Panel(t, title=f"[bold]CLAIMED[/] [grey50]{len(claims)}{_elsewhere(elsewhere)}[/]",
+    return Panel(t, title=f"[bold]CLAIMED[/] [grey50]{len(claims)}{elsewhere(hidden)}[/]",
                  title_align="left", border_style="grey35", padding=(0, 1))
 
 
@@ -169,7 +165,7 @@ def panel_plan(items: list[dict], err: str | None, width: int,
     # Narrowed BEFORE the print limit, not after: this panel does not scroll, and
     # the whole point of a scoped screen is that another repo's items cannot push
     # this one's past PLAN_ROWS and into the "…and N more" line.
-    items, elsewhere = in_scope(items, scope)
+    items, hidden = in_scope(items, scope)
     ordered = sort_plan(items)
     running, blocked = plan_counts(items)
     filler = [""] * (3 if show_repo else 2)
@@ -182,7 +178,10 @@ def panel_plan(items: list[dict], err: str | None, width: int,
             cells.append(Text(clip(repo, 11), style=repo_colour(repo)))
         cells += [
             Text(plan_ref(item), style="bold grey70"),
-            Text(clip(item.get("title"), max(12, width - (40 if show_repo else 28))),
+            # A fleet-wide item names no repo, and with the column gone it would
+            # read as one of this project's (qbdata.scope_mark).
+            Text(scope_mark(scope, item.get("repo"))
+                 + clip(item.get("title"), max(12, width - (40 if show_repo else 28))),
                  style="white" if colour != "grey50" else "grey50"),
             Text(clip(who, 13), style=who_colour),
         ]
@@ -199,7 +198,7 @@ def panel_plan(items: list[dict], err: str | None, width: int,
         head += f" · [green]{running} running[/]"
     if blocked:
         head += f" · {blocked} blocked"
-    head += _elsewhere(elsewhere)
+    head += elsewhere(hidden)
     return Panel(t, title=head + "[/]", title_align="left", border_style="grey35",
                  padding=(0, 1))
 
@@ -411,18 +410,28 @@ def frame(cfg, data: dict, gh: dict, width: int, caps: dict | None = None,
 
 # ---- main --------------------------------------------------------------------
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    """`argv` so the flags can be driven by a test.
+
+    The clickable renderer's `main` takes one for the same reason: the two
+    decisions in here — which view `--scope` names, and pinning the repos BEFORE
+    the scope is resolved off them — are wiring that fails silently, and a
+    dashboard is the one program whose output nobody diffs.
+    """
     ap = argparse.ArgumentParser(prog="qb-dash", description="fleet state, for a tall pane")
     ap.add_argument("--once", action="store_true", help="render one frame and exit")
     ap.add_argument("--width", type=int, default=None, help="force a width")
     ap.add_argument("--interval", type=float, default=BOARD_EVERY, help="board refresh seconds")
     ap.add_argument("--scope", choices=("repo", "all"), default=None,
                     help="repo (default): only this screen's repos, and no repo column; "
-                         "all: every repo on the board. Overrides QB_DASH_SCOPE")
+                         "all: every repo the board knows, in FLEET/CLAIMED/PLANS — "
+                         "PRs and issues stay the watched repos' either way. "
+                         "Overrides QB_DASH_SCOPE")
     ap.add_argument("--repo", action="append", metavar="PATH|OWNER/NAME",
-                    help="the project this screen is for — a checkout or a slug, "
-                         "repeatable. Overrides QB_DASH_REPOS and the cwd")
-    args = ap.parse_args()
+                    help="the project this screen is for — a checkout or an owner/name "
+                         "slug, repeatable. Overrides QB_DASH_REPOS, QB_DASH_REPO "
+                         "and the cwd")
+    args = ap.parse_args(argv)
 
     console = Console(width=args.width) if args.width else Console()
     width = console.width

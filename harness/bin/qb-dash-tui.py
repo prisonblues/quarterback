@@ -55,16 +55,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import qbdata as qd                                             # noqa: E402
 
 
-def _elsewhere(hidden: int) -> str:
-    """What a narrowed panel adds to its own title, or nothing.
-
-    Every panel that filters says so, because a panel that filtered silently is a
-    panel lying about the fleet: "nothing claimed" and "nothing claimed HERE" are
-    different facts, and the second is the one the reader is being shown.
-    """
-    return f" · {hidden} elsewhere" if hidden else ""
-
-
 def holders(held: dict[str, dict]) -> dict[str, str]:
     """{'owner/repo#n' → who holds it}, which is all of a claim this dashboard shows."""
     return {n: (c.get("holder") or "?") for n, c in held.items()}
@@ -187,7 +177,8 @@ class Dash(App):
     FIX_COLUMN = 1
 
     def __init__(self, interval: float = 4.0, gh_interval: float = 90.0,
-                 plan_interval: float = 15.0, scope: "qd.Scope | None" = None) -> None:
+                 plan_interval: float = 15.0, scope: "qd.Scope | None" = None,
+                 repo: str | None = None) -> None:
         super().__init__()
         # Which project's rows this is about, and whether the repo column is worth
         # its eleven columns — one object, because the two answers have to agree
@@ -232,7 +223,13 @@ class Dash(App):
         self.detail_text = ""
         self.last_dispatch: tuple[str, float] | None = None
         # Where launched work runs, what it runs, and whether it asks first.
-        self.repo = os.environ.get("QB_DASH_REPO") or os.getcwd()
+        # A DIRECTORY, and that is why `--repo` cannot simply be assigned to it:
+        # the flag takes a slug as readily as a checkout, and a slug names a repo
+        # this process may have no checkout of. `--repo <checkout>` therefore moves
+        # this too — the point of pointing a screen at a project is that the ⚒
+        # starts work IN it — while `--repo <slug>` leaves it where it was and the
+        # guards below refuse the rows it cannot reach, out loud.
+        self.repo = repo or os.environ.get("QB_DASH_REPO") or os.getcwd()
         # WHICH repo that directory is, because /fix-issue takes a bare number
         # and resolves the repository from the checkout it runs in. The panels
         # list several repos now, so "issue #12" is not an address on its own.
@@ -455,9 +452,9 @@ class Dash(App):
 
     def render_board(self, data: dict) -> None:
         self.board = data
-        agents = sorted(data.get("agents", []),
-                        key=lambda a: (a.get("repo") or "", a.get("holder") or ""))
-        agents, elsewhere = qd.in_scope(agents, self.scope)
+        every = sorted(data.get("agents", []),
+                       key=lambda a: (a.get("repo") or "", a.get("holder") or ""))
+        agents, elsewhere = qd.in_scope(every, self.scope)
 
         head = self.query_one("#head", Static)
         if data.get("error"):
@@ -485,14 +482,19 @@ class Dash(App):
                 Text(qd.clip(who, 13), style="bold green" if seat else "bold"),
                 Text(word or "—", style=style),
                 *self.repo_cell(a.get("repo") or "—"),
-                Text(qd.clip(a.get("title") or a.get("branch") or "—",
-                             40 if self.scope.column else 52),
+                # The mark goes on the cell the dropped column widened, and marks
+                # the row the scope KEPT without being able to attribute it: with
+                # the repo cell gone, an agent outside any checkout otherwise reads
+                # as one working here (qbdata.scope_mark).
+                Text(qd.scope_mark(self.scope, a.get("repo"))
+                     + qd.clip(a.get("title") or a.get("branch") or "—",
+                               40 if self.scope.column else 50),
                      style="white" if seat else "grey70"),
                 Text(qd.until(a.get("expires")), style="grey50"),
                 key=key,
             )
         self.query_one("#t_fleet", Static).update(
-            f"FLEET · {len(agents)}{_elsewhere(elsewhere)}")
+            f"FLEET · {len(agents)}{qd.elsewhere(elsewhere)}")
         # Keep what the board said about each SEAT, keyed by seat number, so the
         # panel below can say what a pane is doing. The two panels answer
         # different questions from different sources — tmux knows which panes
@@ -502,9 +504,14 @@ class Dash(App):
         # its table from this one raises DuplicateKey mid-rebuild. The state
         # appears on the next seats tick, which is seconds, and it is a state a
         # human is reading rather than a countdown.
+        # FROM EVERY AGENT, not the ones this scope shows. SEATS is deliberately not
+        # FLEET: `tmux_seats()` lists every seat pane on the whole tmux server, so a
+        # pane belonging to another project's screen is on that panel either way, and
+        # narrowing here would leave its `state` cell reading `—` — which is how a
+        # reader sees which seat is waiting on them.
         self.seat_states = {
             (qd.seat_machine(a.get("holder")), qd.seat_scope(a.get("holder")), n): a
-            for a in agents if (n := qd.seat_number(a.get("holder"))) is not None}
+            for a in every if (n := qd.seat_number(a.get("holder"))) is not None}
 
         claims = sorted(data.get("claims", []), key=lambda c: c.get("expires") or "")
         ctable = self.query_one("#claims", DataTable)
@@ -527,7 +534,7 @@ class Dash(App):
                 key=key,
             )
         self.query_one("#t_claims", Static).update(
-            f"CLAIMED · {len(shown)}{_elsewhere(claims_elsewhere)}")
+            f"CLAIMED · {len(shown)}{qd.elsewhere(claims_elsewhere)}")
 
         # Who holds which issue comes off the same claims, and only the holder
         # is displayed — so compare on that, not on the whole claim. A claim
@@ -555,10 +562,17 @@ class Dash(App):
         # show rows this client can no longer explain.
         self.plan, self.plan_err = items, err
         repos = qd.resolve_repos()
-        items, elsewhere = qd.in_scope(items, self.scope)
+        items, hidden = qd.in_scope(items, self.scope)
         ordered = qd.sort_plan(items, repos)
-        sig = tuple((i.get("item_id"), (i.get("claim") or {}).get("holder"),
-                     len(i.get("blocked_by") or []), i.get("updated")) for i in ordered)
+        # THE HIDDEN COUNT IS PART OF THE SIGNATURE, because it is part of the title.
+        # Computed from the visible rows alone, the signature cannot see another
+        # repo's items being added or removed, and the early return then leaves a
+        # stale "N elsewhere" on a panel whose own rows really are unchanged — the
+        # same defect `action_toggle_scope` drops `plan_sig` to avoid, on the poll
+        # path rather than the keypress one.
+        sig = (hidden, tuple((i.get("item_id"), (i.get("claim") or {}).get("holder"),
+                              len(i.get("blocked_by") or []), i.get("updated"))
+                             for i in ordered))
         if sig == self.plan_sig and not err:
             return
         self.plan_sig = sig
@@ -574,7 +588,10 @@ class Dash(App):
                 Text("⚒", style="bold cyan" if takeable else "grey30"),
                 *self.repo_cell(qd.short_repo(item.get("repo") or "fleet")),
                 Text(qd.plan_ref(item), style="bold grey70"),
-                Text(qd.clip(item.get("title"), 42 if self.scope.column else 54),
+                # A fleet-wide item has no repo to name, and with the column gone
+                # it would read as one of this project's (qbdata.scope_mark).
+                Text(qd.scope_mark(self.scope, item.get("repo"))
+                     + qd.clip(item.get("title"), 42 if self.scope.column else 52),
                      style="grey50" if colour == "grey50" else "white"),
                 Text(qd.clip(who, 13), style=who_colour),
                 key=f"plan:{item.get('item_id')}",
@@ -586,7 +603,7 @@ class Dash(App):
             title += f" · {running} running"
         if blocked:
             title += f" · {blocked} blocked"
-        title += _elsewhere(elsewhere)
+        title += qd.elsewhere(hidden)
         if err:
             title += f" · board: {qd.clip(err, 24)}"
         self.query_one("#t_plan", Static).update(title)
@@ -818,6 +835,23 @@ class Dash(App):
 
     # ---- launching work ---------------------------------------------------
 
+    def wrong_repo(self, repo: str | None, what: str) -> str | None:
+        """Why ``what`` cannot be started from this dashboard, or None if it can.
+
+        BOTH launchers need this and for the same reason. `/fix-issue` and
+        `/panel-review-pr` take a bare number and resolve the repository from the
+        checkout the pane opens in, while this dashboard WATCHES repos it may have
+        no checkout of — so a number off another repo's row lands on whatever issue
+        or PR wears it here. For a review that is a comment and a pushed fix commit
+        on a stranger's pull request, which is the one click on this pane that
+        cannot be taken back; `--repo <checkout>` is how a screen gets to start
+        that project's work, because it moves the directory too.
+        """
+        if not repo or not self.repo_slug or repo == self.repo_slug:
+            return None
+        return (f"{what} is in {repo}; this dashboard runs in {self.repo_slug} "
+                "— start it from that checkout")
+
     def panel_pr(self, pr: dict) -> None:
         """Kick off /panel-review-pr for a PR, in a pane of the seat row.
 
@@ -830,6 +864,9 @@ class Dash(App):
         qb-seat does: the brief positionally, after `--`.
         """
         number = pr.get("number")
+        if (why := self.wrong_repo(pr.get("repo"), f"PR #{number}")):
+            self.say(why)
+            return
         command = f"{shlex.quote(self.agent_bin)} -- {shlex.quote(f'/panel-review-pr {number}')}"
         if self.confirm:
             self.push_screen(
@@ -868,15 +905,10 @@ class Dash(App):
         leaves a claim standing that somebody should pick up.
         """
         number = issue.get("number")
-        # /fix-issue takes a bare number and reads the repository off the
-        # checkout it runs in, so an issue from a repo this dashboard only
-        # WATCHES cannot be started here: the number would land on whatever
-        # issue wears it in the repo the window opens in, which is somebody
-        # else's work being redone under the wrong title.
-        repo = issue.get("repo")
-        if repo and self.repo_slug and repo != self.repo_slug:
-            self.say(f"#{number} is in {repo}; this dashboard runs in "
-                     f"{self.repo_slug} — start it from that checkout")
+        # Somebody else's work redone under the wrong title, if this is skipped —
+        # see wrong_repo, which the ⚖ shares because the mistake is the same one.
+        if (why := self.wrong_repo(issue.get("repo"), f"#{number}")):
+            self.say(why)
             return
         command = f"{shlex.quote(self.agent_bin)} -- {shlex.quote(f'/fix-issue {number}')}"
         holder = holders(self.held).get(qd.issue_key(issue))
@@ -1053,7 +1085,7 @@ class Dash(App):
         changed, so its signature has to be dropped or the toggle would leave the
         one panel that was already on screen exactly as it was.
         """
-        self.scope = self.scope.widened()
+        self.scope = self.scope.toggled()
         self.build_columns()
         self.plan_sig = None
         if self.board:
@@ -1122,20 +1154,30 @@ def main(argv: list[str] | None = None) -> int:
                     help="repo (default): only this screen's repos, and no repo column; "
                          "all: every repo on the board. `s` toggles it live")
     ap.add_argument("--repo", action="append", metavar="PATH|OWNER/NAME",
-                    help="the project this screen is for — a checkout or a slug, "
-                         "repeatable. Overrides QB_DASH_REPOS and the cwd")
+                    help="the project this screen is for — a checkout, which also "
+                         "becomes where the ⚒ and ⚖ start work, or an owner/name "
+                         "slug, which only filters. Repeatable; overrides "
+                         "QB_DASH_REPOS, QB_DASH_REPO and the cwd")
     args = ap.parse_args(argv)
-    # Before the app reads it: resolve_repos is cached, and what asks it directly
-    # (the plan's ordering, the `gh` calls, and the ⚒ that needs a slug to fix an
-    # issue in) would otherwise still be watching the cwd.
+    # Two answers out of one flag, and BOTH are needed. `set_repos` redirects what
+    # the panels draw (resolve_repos is cached, and the plan's ordering and the `gh`
+    # calls ask it directly). `repo` redirects where the ⚒ and ⚖ RUN — a checkout
+    # can move that and a slug cannot, and getting only the first half meant the
+    # rows of the named repo were drawn as takeable and then refused one by one.
+    repo = None
     if args.repo:
         try:
-            qd.set_repos([qd.repo_arg(r) for r in args.repo])
+            targets = [qd.repo_target(r) for r in args.repo]
         except ValueError as exc:
             print(f"qb-dash-tui: --repo {exc}", file=sys.stderr)
             return 2
+        qd.set_repos([slug for slug, _ in targets])
+        # The first checkout named wins, because the launchers take one directory
+        # and `--repo` is repeatable: a screen watching three repos still runs its
+        # work somewhere, and the first one asked for is the one to mean it about.
+        repo = next((path for _, path in targets if path), None)
     scope = qd.resolve_scope(on=None if args.scope is None else args.scope == "repo")
-    Dash(scope=scope).run()
+    Dash(scope=scope, repo=repo).run()
     return 0
 
 

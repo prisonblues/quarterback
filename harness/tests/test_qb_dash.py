@@ -284,7 +284,13 @@ async def _drive_plan() -> list[str]:
         # Anywhere but the ⚒: the detail line, and it must name the row clicked.
         await pilot.click(plan, offset=(40, 1))
         await pilot.pause(0.3)
-        title = str(plan.get_row_at(plan.scroll_offset.y)[4]).rstrip("…")
+        # BY THE SCOPE, not by a fixed index: the repo cell comes and goes with
+        # `scope.column` (#261), so column 4 is the title on a wide pane and the
+        # holder on a narrow one — and a narrow pane is now the default. The `? `
+        # mark on an unattributable row is part of the cell but not of the title.
+        title_at = 4 if app.scope.column else 3
+        title = str(plan.get_row_at(plan.scroll_offset.y)[title_at]).removeprefix("? ") \
+            .rstrip("…")
         if title and title not in app.detail_text:
             failures.append(f"the detail line does not describe the row clicked: "
                             f"{app.detail_text[:80]!r}")
@@ -567,9 +573,10 @@ async def _drive_scope() -> list[str]:
         # NARROW: this project's rows, the unattributable row kept, no repo cell.
         # Asserted on the `what` cell, which is the one the dropped column widened.
         shown = sorted(_cells(fleet, i)[2] for i in range(fleet.row_count))
-        if shown != ["here", "nowhere"]:
+        if shown != ["? nowhere", "here"]:
             failures.append(f"narrow FLEET holds {shown}, not this repo's row and the "
-                            "one the board could not attribute")
+                            "one the board could not attribute — marked, because the "
+                            "cell that used to say so is the cell this view drops")
         if len(fleet.columns) != 4:
             failures.append(f"narrow FLEET has {len(fleet.columns)} columns, not 4")
         if "1 elsewhere" not in titles["fleet"]:
@@ -602,6 +609,9 @@ async def _drive_scope() -> list[str]:
             failures.append(f"the wide view's claims read {[_cells(claims, i) for i in range(claims.row_count)]}")
         if "all repos" not in _text(app.query_one("#head")):
             failures.append("the header does not say the pane went wide")
+        wide_rows = [_cells(fleet, i) for i in range(fleet.row_count)]
+        if any(cell.startswith("? ") for row in wide_rows for cell in row):
+            failures.append(f"the wide view still marks an unattributed row: {wide_rows}")
         if plan.row_count and _cells(plan, 0)[app.FIX_COLUMN] != "⚒":
             failures.append(f"the ⚒ moved when the column came back: {_cells(plan, 0)}")
 

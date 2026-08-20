@@ -276,11 +276,54 @@ def test_two_watched_repos_keep_the_cell_that_tells_them_apart():
 
 
 def test_the_wide_view_always_names_the_repo_because_that_is_why_it_is_wide():
-    wide = ONE.widened()
+    wide = ONE.toggled()
     assert wide.on is False
     assert wide.column is True
     assert wide.label() == "all repos"
     assert wide.keeps("someone/else") is True
+
+
+def test_toggling_goes_both_ways_which_is_why_it_is_not_called_widened():
+    """`widened()` narrowed on every other press — the name promised one direction
+    and the method delivered two, which is the whole of the rename."""
+    assert ONE.toggled().on is False
+    assert ONE.toggled().toggled().on is True
+    assert ONE.toggled().repos == ONE.repos
+
+
+def test_two_owners_of_one_name_are_two_repositories():
+    """A fork and its upstream share a bare name and are not the same repo.
+
+    Folded to the bare name they collapsed into a single entry, and both of the
+    things that read `len(names) == 1` then went wrong at once: the column dropped
+    (nothing left to tell the two apart) and `keeps` accepted both repos' rows.
+    """
+    fork = qd.Scope(["myuser/quarterback"])
+    assert fork.keeps("myuser/quarterback")
+    assert not fork.keeps("prisonblues/quarterback")
+    # A row that gives only a bare name can only be compared as one, and is kept.
+    assert fork.keeps("quarterback")
+
+    both = qd.Scope(["myuser/quarterback", "prisonblues/quarterback"])
+    assert both.column is True, "no cell left to tell a fork from its upstream"
+    assert both.label() == "myuser/quarterback, prisonblues/quarterback"
+    assert qd.claim_label("myuser/quarterback#3", [], both) == "quarterback#3"
+
+
+def test_an_unattributable_row_is_marked_where_the_column_is_gone():
+    """The repo cell was the only thing that said "nothing could name this".
+
+    `keeps` deliberately holds on to such a row, and narrow mode is exactly the
+    mode that drops the cell — so without a mark an agent working outside any
+    checkout reads as one working here.
+    """
+    assert qd.scope_mark(ONE, None) == "? "
+    assert qd.scope_mark(ONE, "") == "? "
+    assert qd.scope_mark(ONE, "quarterback") == ""
+    # The wide view has the repo itself, which says more than a mark can.
+    assert qd.scope_mark(ONE.toggled(), None) == ""
+    assert qd.scope_mark(TWO, None) == ""
+    assert qd.scope_mark(None, None) == ""
 
 
 def test_the_three_spellings_of_one_repository_are_one_repository():
@@ -353,7 +396,7 @@ def test_the_claim_key_drops_the_repo_only_when_the_header_states_it():
     project. On a pane showing several, the repo is what tells two claims apart."""
     assert qd.claim_label(f"{qd.REPO}#209", [], ONE) == "#209"
     assert qd.claim_label(f"{qd.REPO}:2.40", [], ONE) == "2.40"
-    assert qd.claim_label(f"{qd.REPO}#209", [], ONE.widened()) == "quarterback#209"
+    assert qd.claim_label(f"{qd.REPO}#209", [], ONE.toggled()) == "quarterback#209"
     assert qd.claim_label(f"{qd.REPO}#209", [], TWO) == "quarterback#209"
     assert qd.claim_label("prisonblues/nix-fleet#3", [], ONE) == "nix-fleet#3"
     assert qd.claim_label(f"{qd.REPO}#209", []) == "quarterback#209"
@@ -404,6 +447,58 @@ def test_clearing_the_pin_falls_back_to_the_environment(watched, monkeypatch):
 def test_a_checkout_is_asked_which_repo_it_is():
     slug = qd.repo_arg(str(Path(__file__).resolve().parent.parent.parent))
     assert slug.count("/") == 1 and slug.endswith("/quarterback")
+
+
+def test_a_checkout_argument_says_where_work_should_run_too():
+    """`--repo <checkout>` moves the ⚒'s cwd, not only the rows the panels draw.
+
+    A SLUG cannot: it names a repository this process may have no checkout of, so
+    the second half of the answer is None and the guards refuse those rows out loud
+    rather than launching `/fix-issue` on a number that means something else here.
+    """
+    here = str(Path(__file__).resolve().parent.parent.parent)
+    slug, path = qd.repo_target(here)
+    assert slug.endswith("/quarterback") and path == here
+    assert qd.repo_target("prisonblues/nix-fleet") == ("prisonblues/nix-fleet", None)
+
+
+def test_a_slug_is_read_as_a_slug_wherever_it_is_typed(tmp_path, monkeypatch):
+    """Shape first, the filesystem second.
+
+    Under a `~/src/<owner>/<repo>` layout, `--repo prisonblues/quarterback` matched
+    `os.path.isdir` on a directory that is not itself a checkout and died as "not a
+    git checkout" — and it made the bare-name test below pass only because no
+    `./quarterback` happened to exist wherever pytest ran.
+    """
+    (tmp_path / "prisonblues" / "quarterback").mkdir(parents=True)
+    monkeypatch.chdir(tmp_path)
+    assert qd.repo_target("prisonblues/quarterback") == ("prisonblues/quarterback", None)
+    # ...and the relative path is still reachable, with the ./ that says so.
+    with pytest.raises(ValueError):
+        qd.repo_target("./prisonblues/quarterback")
+
+
+def test_a_tilde_is_expanded_because_the_help_text_advertises_one(monkeypatch):
+    """Only an interactive shell expands `~`. Quoted, built into a QB_SEATS_DASH
+    command or sent through `tmux send-keys`, it arrives intact — and was reported
+    as a bad slug, which misdiagnoses it."""
+    monkeypatch.setenv("HOME", str(Path(__file__).resolve().parent.parent.parent))
+    slug, path = qd.repo_target("~")
+    assert slug.endswith("/quarterback") and path == os.path.expanduser("~")
+
+
+def test_a_malformed_slug_is_refused_rather_than_handed_to_gh():
+    """It used to validate on the STRIPPED parts and return the RAW value, so a
+    slug's internal space reached `gh` inside a repository name.
+
+    Padding is trimmed, since that is what a repo list does with it everywhere else
+    (`set_repos`); a character no repository name may contain is refused, because
+    the alternative is `gh` being asked about `na@me` and answering about nothing.
+    """
+    assert qd.repo_target("owner/ repo") == ("owner/repo", None)
+    for bad in ("owner/name with space", "owner/na@me", " /name", "owner/"):
+        with pytest.raises(ValueError):
+            qd.repo_target(bad)
 
 
 def test_a_bare_name_is_refused_rather_than_given_an_owner():

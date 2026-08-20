@@ -11,6 +11,39 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
+## vNEXT — a dashboard for one project
+
+The dash was built to answer "who is alive, what do they hold, what is next" for a
+fleet, and then screens turned out to be built for **one project** each. So every
+panel was mostly other people's rows, and the repo cell was the same word — eleven
+columns wide — on every line of a 78-column pane. On the printed panels it cost rows
+as well as columns: another repo's plan items pushed this one's past `PLAN_ROWS` and
+into the "…and N more" line, so the screen's own next task could be the thing that
+did not fit.
+
+`resolve_repos()` already knew which repos a screen was for — it is what the `gh`
+calls have used since v2.44 — and nothing else consulted it. The three board-derived
+panels (FLEET, CLAIMED, PLANS) now do, by default, and the repo column is dropped
+whenever the scope is a single repo: those columns go back to `what` an agent is doing
+and to a plan item's title, and `quarterback#209` in CLAIMED reads `#209`. `s` widens
+the clickable renderer to the whole fleet and brings the column back; the printed one
+has no keyboard, so it takes `--scope repo|all`, and `QB_DASH_SCOPE=all` opens either
+way. `--repo <checkout|owner/name>` points a pane at a project other than the cwd's.
+
+**What a filtered panel must never do is read like an unfiltered one.** Every panel
+that narrows says what it hid — `FLEET · 3 · 2 elsewhere` — and three things stay
+fleet-wide on purpose: a row whose repo the board cannot name (no repo is not evidence
+of another repo, and hiding it drops a live peer), the held-issue markers (an issue
+held by an agent working out of another repo's checkout is still held, or the next seat
+walks into it), and the SEATS panel's state column, which reads every seat pane on the
+tmux server and is not the FLEET panel. A row nothing could attribute wears a `?`
+where the repo cell used to be its only sign.
+
+`--repo` also moves where the ⚒ and ⚖ start work when it names a checkout, and both
+launchers now refuse a row from a repo this checkout is not. The ⚖ had no such guard
+at all: a review started off another repo's PR row would have commented on, and pushed
+a fix commit to, whatever pull request wore that number here.
+
 ## v2.58 — a regression test has to fail first
 
 Every fix command in the harness told the fixer to write a regression test. None of
