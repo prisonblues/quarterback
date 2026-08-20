@@ -11,7 +11,8 @@ board reconnects them.**
 - `loops/` — the engine: the reviewer panel (`panel.py`), the epic driver (`epic.py`), the
   Dependabot lander (`lander.py`), and the per-repo config layer (`harness_rules.py`)
 - `commands/` — Claude Code slash commands (`/panel`, `/panel-review-pr`, `/review-pr`,
-  `/fix-issue`, `/epic`, `/lander`, `/wt`, `/drop-worktree`, `/tree-shake`, …)
+  `/fix-issue`, `/fix-and-review`, `/fix-and-land`, `/epic`, `/lander`, `/wt`,
+  `/drop-worktree`, `/tree-shake`, …)
 - `bin/` — the bash the worktree commands drive (`create-worktree`, `remove-worktree`,
   `prune-worktrees`, `worktree-holder`), plus `qb-stage`, which records the workflow
   stage a session is in for the statusline, `qb-seat`, which turns one pane of a
@@ -296,6 +297,27 @@ P1/P2 correctness only, defer the rest"*, explicitly because **the last fix pass
 itself reviewed**. Its regression tests are the only thing standing behind it. A fix pass
 whose tests pass vacuously has no backstop at all — and that is precisely the pass this
 repo has decided not to review.
+
+### `/fix-and-review` and `/fix-and-land` — an issue, end to end
+
+Both take an issue number and come back with a reviewed PR. They differ in exactly one place, and
+it is the last step: **`/fix-and-review` stops at merge-ready and hands you the merge**, while
+`/fix-and-land` goes on to merge when `preland.py` says READY and the agent states genuine
+confidence. Wanting `/fix-and-review` to merge is the signal to have run `/fix-and-land`, not a
+flag to add.
+
+`/fix-and-review` also spends the review differently: `/panel-review-pr` runs in a **sub-agent that
+did not write the code**. The conversation that implemented the change holds the author's model of
+it — every reason the code is the way it is, and none of a reader's surprise — which is the context
+a review needs not to have, and `/review-pr` says in its own description that fresh eyes are what
+it is for. It is #40's constraint one level up: an agent reviewing its own work is grading itself,
+and the board cannot tell a fixer from a reviewer.
+
+What it deliberately does **not** do as prep is stamp the release number.
+`scripts/release_stamp.py apply` resolves `vNEXT` against the base **as it stands now**, so a
+command that stamps and then leaves the PR for a human has spent a number another branch may take
+in the meantime — after which `apply` refuses, correctly, with a hand-edit as the repair. It runs
+`preflight` instead: the same question, no number spent, and `apply` belongs to whoever merges.
 
 ### `/epic` and `/lander` — the long-running loops
 
@@ -803,9 +825,12 @@ from "what is next" to somebody doing it is one click. An item pointing at nothi
 somebody already holds, says so rather than swallowing the click. The `⚒` refuses an issue
 belonging to a repo this dashboard only watches: `/fix-issue` takes a bare number and reads
 the repository off the checkout it runs in, so starting one from the wrong pane would land
-that number on whatever issue wears it there. A plan claim is keyed `plan:<uuid>`, which is
-right for a lock and unreadable on a pane, so CLAIMED resolves it against the plan and shows
-the item's title instead.
+that number on whatever issue wears it there. **The `⚖` on a PR row refuses for the same
+reason**, and it is the one with more at stake — a panel review spends money, comments on a
+public PR and pushes a fix commit to it. That click only became reachable with #209: two
+repos sharing a PR number used to crash the panel before either row rendered. A plan claim
+is keyed `plan:<uuid>`, which is right for a lock and unreadable on a pane, so CLAIMED
+resolves it against the plan and shows the item's title instead.
 
 **The issues panel is the one that feeds the fleet.** A seat picks unclaimed work off the
 board, so what matters is which issues nobody holds: the free ones sort to the top, and a
@@ -825,13 +850,30 @@ Adding another verb is three things: an entry in `BINDINGS`, an `action_*` metho
 it wants an icon — a column, since a click carries the column it landed in and that is how
 one row offers more than one verb.
 
+Adding another ROW has one rule, and it has now been got wrong twice. **A row key must be
+unique across every repo and every screen the panel can show**, because `DataTable` answers
+a repeat with `DuplicateKey` — which does not degrade the row, it replaces the whole
+dashboard with a traceback. A bare issue or PR number is not unique (`qbdata.repo_ref`
+builds the `owner/repo#n` that is), and neither is a seat number once a second screen
+exists (the pane id is). File the record under the key `add_row` RETURNS rather than the
+one you passed: `ClickTable.add_row` suffixes a collision it was not expecting instead of
+raising, and a row filed under the wrong key renders fine and does nothing when clicked.
+
+That backstop **degrades; it does not report**, and the two are not the same thing. A row
+key is never rendered, so the `~2` is invisible, and in the case it was written for — two
+plan items arriving with no `item_id` — two rows is also what correct data looks like. So
+the collision is written to the app log (`textual console`, or `self.log` in a test), which
+is the only place it can surface at all. Do not read a quiet dashboard as a unique key.
+
 `qb-seats` builds it. A screen is seats across the top, the dash down the right, and the
 tape full width along the bottom — the dash reports what is true now, the tape what just
 happened, and a screen wants both. `QB_SEATS_DASH` names the command; **set it to the
 empty string for a screen with no dash**. The default is the plain `qb-dash` rather than
-the nicer clickable `qb-dash-tui`, because the TUI crashes with `DuplicateKey` once a
-second screen exists (#209, underlying cause #208) — `QB_SEATS_DASH=qb-dash-tui` opts in,
-and it should become the default once that is fixed. Nothing falls back to the TUI on its
+the nicer clickable `qb-dash-tui`; `QB_SEATS_DASH=qb-dash-tui` opts in. The `DuplicateKey`
+crash that used to be the reason for that default is fixed (#208 for the seat rows, #209
+for the rest), so what is left is a packaging question rather than a correctness one:
+`textual` and `rich` are deliberately outside the ordinary dev install, and a default that
+wants them would leave anyone without them looking at a pane that says so. Nothing falls back to the TUI on its
 own, not even when `qb-dash` is the one that is missing: with neither installed the pane
 holds a shell and a line saying which command to set, rather than the screen quietly
 being one pane short.

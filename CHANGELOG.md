@@ -202,6 +202,63 @@ namespace, where the fleet-wide unique index would block an agent that is entire
 in this repo and about to do substantive work → stopped — is one `qb-claimed` call away but
 not in this repo to write. What is here is the primitive it needs, with the exit codes that
 make failing closed possible.
+## v2.59 — a row key the dashboard can actually tell apart
+
+`qb-dash-tui` dies with `DuplicateKey` when two rows want the same key, and a `DataTable`
+raises rather than tolerating one — so the failure is not an odd-looking row, it is the
+whole dashboard replaced by a traceback. That is the worst component in the harness to lose
+on unexpected input: it is what you look at when something is already wrong.
+
+**#208 fixed the reported instance and not the class.** Two seat screens each numbering from
+1 gave the SEATS panel the same key twice; v2.57 re-keyed that panel on the pane id and the
+reproduction in #209 stopped crashing. The other two multi-repo panels were still keyed on a
+bare number. `_gh_list_many` concatenates `gh` output across every repo in `QB_DASH_REPOS`
+and tags each row with where it came from, so OPEN PRs and ISSUES show several repos at
+once — and two repos both reach #42 eventually. Pointing one screen at two active
+repositories, which is the entire purpose of `QB_DASH_REPOS`, was enough.
+
+The same file already knew. `qbdata.issue_key` exists because the *claim* join hit this and
+says so: "The identity of an issue is the repo AND the number. Once the panels show more
+than one repo, a bare number stops being unique." The lesson had been written down for one
+caller and not applied to the panels three functions away. It is now one helper,
+`qbdata.repo_ref`, with `issue_key` delegating to it under the name the board's claim keys
+use.
+
+**The crash was the louder half.** `self.rows` — what a click looks a row up in — was keyed
+the same way, so a collision that somehow did not raise would have pointed one row's click
+at the other repo's record: the ⚖ starting a paid panel review on a PR nobody was looking
+at. Every panel now files its record under the key `add_row` returns rather than the key it
+passed, which is also what makes the backstop below safe.
+
+**And the class is closed rather than the instance, this time.** `ClickTable.add_row`
+suffixes a key the table already holds instead of raising. Every panel's key is believed
+unique and after #208 and #209 they are; this is for the panel nobody has written yet, and
+for the case this end cannot guarantee — PLAN keys on the board's `item_id`, and two items
+arriving without one keyed every such row `plan:None`. A collision is kept as two rows, the
+second under a `~2` key, rather than being fatal — **and it is written to the app log**,
+because degrading is not the same as reporting. A row key is never rendered, so the `~2` is
+invisible, and two plan rows is also what correct data looks like; left silent, a keying bug
+that used to crash the dashboard would now produce nothing at all.
+
+**The ⚖ now refuses another repo's PR**, which is the click #209 made reachable. Two repos
+sharing a number used to take the panel down before either row rendered; both are on the
+screen now, and `/panel-review-pr` takes a bare number and resolves the repository from the
+checkout it runs in — so clicking the watched repo's #42 would have started a paid review of
+*this* repo's #42, commented on it and pushed a fix commit. The ⚒ on an issue row has made
+that check since the panels went multi-repo. The ⚖, which does more, was not making it.
+
+Both halves are pinned by tests that were confirmed to fail against the previous code, each
+on its own assertion: two repos sharing a number render and click independently, and an
+unforeseen duplicate degrades instead of taking the dash down. The `_Sink` double in that
+suite grew a real return value from `add_row` — it had been returning `None`, modelling a
+widget that does not exist, and would have hidden the callers getting this wrong.
+
+Not changed: `QB_SEATS_DASH` still defaults to the plain `qb-dash`. The crash was the
+correctness reason for that default and it is gone, but `textual` and `rich` are
+deliberately outside the ordinary dev install, so flipping it is a packaging decision and
+not this fix's to make.
+
+Fixes #209.
 
 ## v2.58 — a regression test has to fail first
 

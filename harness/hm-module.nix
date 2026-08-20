@@ -19,7 +19,7 @@ in
       type = lib.types.listOf lib.types.str;
       default = [
         "panel" "panel-review-pr" "review-pr"
-        "epic" "lander" "loops" "fix-and-land"
+        "epic" "lander" "loops" "fix-and-land" "fix-and-review"
         "fix-issue" "fix-issue-here"
         "wt" "drop-worktree" "tree-shake"
       ];

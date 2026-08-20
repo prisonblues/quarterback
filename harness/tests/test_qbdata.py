@@ -581,3 +581,39 @@ def _serve(monkeypatch, payload: dict) -> list:
 
     monkeypatch.setattr(qd.urllib.request, "urlopen", urlopen)
     return calls
+
+
+# ---- when `gh` fails ---------------------------------------------------------
+
+def _gh_failing(monkeypatch, stderr: str, code: int = 1) -> None:
+    """Stand in for the `gh <kind> list` every PR and issue row comes from."""
+    class Done:
+        returncode = code
+        stdout = ""
+
+    Done.stderr = stderr
+    monkeypatch.setattr(qd.subprocess, "run", lambda *a, **k: Done())
+
+
+def test_a_failing_gh_reports_the_repo_and_what_it_said(monkeypatch):
+    """One repo of three failing is reported, not fatal — so the line has to name
+    which one, and the panels have no other place to say it."""
+    _gh_failing(monkeypatch, "HTTP 403: Resource not accessible by integration\n")
+    rows, err = qd.fetch_issues(["prisonblues/quarterback"])
+    assert rows == []
+    assert err == "quarterback: HTTP 403: Resource not accessible by integration"
+
+
+def test_a_failing_gh_that_said_nothing_still_names_its_exit_code(monkeypatch):
+    """`quarterback: ` and nothing after it is the one error a reader cannot act on.
+
+    A non-zero exit with an empty stderr is rare and real — killed by a signal, or
+    a failure `gh` wrote to stdout — and the fallback that covers it used to sit
+    outside the f-string, where `or` tested a string holding `": "` and therefore
+    never fired. This pins the fallback rather than the punctuation, which is the
+    part that regressed.
+    """
+    _gh_failing(monkeypatch, "", code=2)
+    rows, err = qd.fetch_issues(["prisonblues/quarterback"])
+    assert rows == []
+    assert err == "quarterback: gh exit 2"

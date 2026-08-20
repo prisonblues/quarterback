@@ -848,6 +848,19 @@ full — including what was broken before it, which is the part no diff recovers
   followed — but shipped text that already existed is **not** exempt, since a test can assert
   on it, as this change did to its own prompt and briefs. The panel's `REVIEW_PROMPT` also stops asking only whether a test is **absent** —
   #90's fixture answered that correctly — and now asks whether a present test is load-bearing.
+- **v2.59** — a row key the dashboard can actually tell apart. `qb-dash-tui` dies with
+  `DuplicateKey` when two rows want the same key, and that is not a bad-looking row — a
+  `DataTable` raises, so the whole dashboard becomes a traceback. #208 fixed the reported
+  instance by re-keying SEATS on the pane id; OPEN PRs and ISSUES were still keyed on a bare
+  number while both panels show several repos at once, and two repos both reach #42
+  eventually. `qbdata.repo_ref` is the `owner/repo#n` identity the claim join already had
+  under `issue_key` and the panels did not. The click half went with it: `self.rows` was
+  keyed the same way, so a collision would have pointed one row's ⚖ at another repo's PR.
+  And the class is closed rather than the instance — `ClickTable.add_row` suffixes a
+  duplicate instead of raising and logs that it did, so the panel nobody has written yet
+  degrades to an extra row and a line in the log rather than taking the other five down
+  with it. Both rows rendering is also what makes the ⚖ on a watched repo's PR clickable
+  for the first time, so it now refuses one, exactly as the ⚒ on an issue row already did.
 - **vNEXT** — a claim nobody takes. `claims()` returned `[]` fleet-wide for four months while
   thirteen agents worked three shared checkouts, and both halves of why are fixed here. **The key
   is derived, never composed** (`app/claimkey.py`): the plan wrote `work/<repo>#163` while an agent
