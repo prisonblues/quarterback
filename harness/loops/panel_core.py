@@ -208,9 +208,14 @@ SEVERITIES = ("P1", "P2", "P3", "P4")
 # default and the applied default disagreeing, silently, in the direction nobody
 # checks.
 
-#: Findings at or above this severity are what a fix round is asked to clear.
-DEFAULT_FIX_SEVERITY_FLOOR = "P2"
-#: New findings at or above this severity are what buys another round.
+#: Findings at or above this severity are what a fix round is asked to clear. P3 and
+#: not P2: severity is model-authored and wrong sometimes, and the defect class a P2
+#: floor systematically misses is correctness expressed as craft. `harness_rules`
+#: carries the argument.
+DEFAULT_FIX_SEVERITY_FLOOR = "P3"
+#: New findings at or above this severity are what buys another round. Stays P2 while
+#: the fix floor is P3, deliberately: fixing a P3 inside a pass that is already open
+#: costs one edit; letting one buy a whole new round costs a panel plus a fix pass.
 DEFAULT_ROUND_TRIGGER_FLOOR = "P2"
 #: The floor value that means "no floor" — the least severe severity there is, so
 #: everything is at or above it. Both floors default to this INSIDE `round_stop`,

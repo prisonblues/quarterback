@@ -174,8 +174,8 @@ Detected from the checkout, **not settable** here: `path`, `github`, `default_br
 | `review_panel.reviewer_code_access` | May a seat READ the code under review? **true**. `false` is the old posture — every seat in an empty repo, the diff its only evidence — and is what a repo taking UNTRUSTED contributions selects. On does not mean every seat gets it: only a CLI that can express "read but do not execute" is handed the tree (today just `claude`), and which seats did is recorded per seat. `--no-code-access` turns it off for one run. See below. |
 | `review_panel.reviewer_code_budget_usd` | Dollars the code-reading seat may spend per invocation (`claude --max-budget-usd`). **`null`** — uncapped — for the reason `max_diff_chars` is: reaching the cap is a LOST seat (a skip, which vetoes), not a cheaper review. Measured for calibration: ~$4 for one seat on a 75,628-char diff against ~$0.70 diff-only. Applies only to a seat that got the tree; the cap is per invocation and a reparse retry can spend it twice. |
 | `review_panel.fixer_may_defer` | May a fixer answer "real, and not this change's job"? **true**. Its two exits were a refuted false positive and an escalation about the *approach*, and the brief then said "'Not now' is not available to you" — so a correct third judgement had no legal way out and the only move left was the patch. Maps to the existing `deferred` outcome; the fixer owes a justification and the orchestrator opens the issue. `false` is the old two-exit behaviour. |
-| `review_panel.fix_severity_floor` | Severity a fix round is asked to clear, at or above. **`P2`**. Below it a finding is reported, marked 🔽 under its own heading, recorded (`below_fix_floor` in the payload) and **not fixed**. Measured: the cut discards 67.3% of findings and loses zero P1s. `P4` fixes everything, the pre-#165 behaviour. |
-| `review_panel.round_trigger_floor` | Severity a NEW finding needs to buy another round. **`P2`**. Below-floor new findings are still reported and recorded; `round_stop`'s reason names the floor and the count. `P4` is the pre-#165 behaviour. |
+| `review_panel.fix_severity_floor` | Severity a fix round is asked to clear, at or above. **`P3`**. Below it a finding is reported, marked 🔽 under its own heading, recorded (`below_fix_floor` in the payload) and **not fixed**. The measured cut is at P2 (67.3% of findings, zero P1s lost) and this deliberately sits a tier below it: severity is model-authored, and the class a P2 floor misses is correctness expressed as craft — a missing regression test on a parser or an auth boundary, a missing timeout or cleanup, a migration rollback gap. Fixing one in a pass already open is one edit; P4 (31.3%, the tier that ballooned #236) stays out. `P4` fixes everything, the pre-#165 behaviour — for `round_stop`'s rules 1 and 3; rule 2's bar is a hardcoded `("P1", "P2")` and only `P1` moves it. A Sonar hard-gate issue is exempt from both floors at every rule. |
+| `review_panel.round_trigger_floor` | Severity a NEW finding needs to buy another round. **`P2`** — a tier above `fix_severity_floor`, because letting a P3 buy a round costs a whole panel plus another fix pass where fixing it in the open pass costs one edit. Below-floor new findings are still reported and recorded; `round_stop`'s reason names the floor and the count. `P4` is the pre-#165 behaviour. |
 | `review_panel.max_fix_growth` | Multiple of the cycle's FIRST round's reviewed size that a later round may review before the cycle stops and says the change wants splitting. **3.0**; `null` switches the check off (the one key here where `null` is not "inherit"). Not dressed up as convergence — it takes a veto line and `confident` is false. |
 | `review_panel.reviewer_scope` | What a reviewer is asked to look for: **`diff`** (defects in the change and its seams; anything outside it is an observation) or `repo` (the pre-#165 wording — "search the codebase, don't just review the diff"). Not how hard anyone looks: every dimension stays in the prompt and a code-reading seat still reads the callers. |
 | `review_panel.require_failing_test` | A finding must carry a reproducible failing test to block. **false, and read-only**: the reviewer-emitted test artefact it needs is not built (#92 — a reviewer emits a test and never runs one; #114 — it must be shown RED pre-fix). Setting it `true` is recorded, reported, and enforces nothing, and the round says so in `config_notes`. |
@@ -332,13 +332,17 @@ the first surfaces an existing constant so a repo can move it, the second reserv
 name for the evidence contract #165 argues is the real termination condition, and reports
 that it is not built rather than pretending to enforce it.
 
-**Every one of the seven is validated, and a bad value is never silent.** It falls back
-to the default and lands a `config_notes` line naming the value and the set that is
-accepted — printed above the findings as "⚠️ config:", carried in the payload, and on the
-PR comment under `--post`. That is `resolve_round_scope`'s and `diff_budget`'s manners; a
-hard exit stays reserved for a rules file that cannot mean what it says at all, because a
-file shared across a fleet of boxes that upgrade at different times must not become a
-version pin on every one of them.
+**Every one of the seven is validated, and a bad value is a hard exit** — the mechanism
+and the sentence shape `harness_rules._check_block_shape` already uses, naming the key,
+the value and the accepted set. The line is drawn between an unknown KEY and a malformed
+VALUE of a known one, and it is the line `_check_block_shape` already draws: an
+unrecognised name may be a setting only a newer harness knows about, so it stays
+warn-and-drop (`warn_unknown_keys`) and a rules file shared across a fleet of boxes that
+upgrade at different times does not become a version pin; a value this harness cannot
+read is not version skew in any direction, it is a typo, and `fix_severity_floor: "p-4"`
+meaning "fix everything" must not quietly become the default and stop the pass fixing
+P3s. Unset — missing, `null`, `""` — is not a mistake and stays silent (and for
+`max_fix_growth` an explicit `null` is the off switch).
 
 **What the round applied is in the artifact.** The report carries a
 **Panel dials** line on every round, at the defaults or not, and the

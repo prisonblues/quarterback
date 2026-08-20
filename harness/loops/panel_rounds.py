@@ -1469,7 +1469,8 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
 
     1. findings this round that no earlier round raised, **at or above**
        ``trigger_floor`` -> go again;
-    2. a P1/P2 still outstanding **at or above** ``fix_floor`` -> go again, whatever
+    2. a P1/P2 still outstanding **at or above** ``fix_floor``, or a Sonar hard-gate
+       issue still outstanding at **any** severity -> go again, whatever
        anyone declared (a blocker
        raised again is a blocker that was not fixed) — **except one in**
        ``escalated``, which the filter below has already subtracted. Said here
@@ -1519,7 +1520,19 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     simply false of it, and left unbounded it would go again until the cap on a P3
     nobody ever intended to fix. Rule 2 takes the same bound for the same reason,
     which matters only where the fix floor is ``P1``: at ``P2`` every P1/P2 is
-    already at or above it and the filter is a no-op.
+    already at or above it and the filter is a no-op. Read the other way round, that
+    is the honest scope of "``P4`` restores the old behaviour" — true of rules 1 and
+    3, and vacuous for rule 2, whose bar is the hardcoded ``("P1", "P2")`` tuple, so
+    a floor can only ever RAISE it and only ``P1`` moves it at all.
+
+    **NEITHER FLOOR APPLIES TO A SONAR HARD-GATE ISSUE**, at any rule. A finding with
+    ``verdict == "sonar"`` in ``outstanding`` is a red quality gate, not a judged
+    opinion about severity, and the floors are a policy about what is worth fixing
+    and what is worth another round — a question a merge gate does not get to be
+    asked. Sonar's own severities are routinely P3/P4, so filtering by them dropped a
+    new gate issue into ``new_below_trigger_floor`` and stopped the cycle
+    ``confident`` with a failing gate on the PR. See the comment on ``exempt``, and
+    the one above ``outstanding = to_fix + sonar`` in `panel.py` that this restores.
 
     **A stop under either floor is reported as what it is, and is NOT vetoed.** The
     ``reason`` names the floor and counts what was left under it, so nothing reads as
@@ -1643,21 +1656,60 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     # `SEVERITIES[0]` fallback), so an unrecognised key costs a round rather than
     # silently dropping a finding out of the loop.
     severity = {c.key: c.severity for c in outstanding}
+    # SONAR'S HARD-GATE ISSUES ARE EXEMPT FROM BOTH FLOORS, AT EVERY RULE, whatever
+    # severity Sonar itself gave them — and Sonar's own severities are routinely P3
+    # and P4. The keys are collected off `outstanding` because that is where the
+    # verdict lives: `panel.py` builds `outstanding` as `to_fix + sonar` precisely
+    # so this function counts them, and the comment above that line says why in its
+    # own words — "Sonar's hard-gate issues MUST end up resolved
+    # (/panel-review-pr §3), so a round whose only outstanding item is a new or
+    # still-open gate issue is not a dry round. Leaving them out classified exactly
+    # that as convergence and ended the cycle without another fixer."
+    #
+    # #165's floors are a policy about what is worth FIXING and what is worth
+    # another ROUND, and a red quality gate is neither: it is a merge gate the repo
+    # does not get to trade against convergence, and a P3 `python:S1481` keeps the
+    # PR unmergeable exactly as a P1 does. Filtered by severity, a new P3 gate issue
+    # dropped out of `triggering`, landed in `quiet_new`, and the cycle stopped with
+    # `confident: True` and "reported, not fixed here" — re-introducing, through the
+    # floors, the bug `outstanding = to_fix + sonar` was written to fix.
+    #
+    # THE EXEMPTION IS THE PROPERTY OF THE KEY, NOT OF ONE RULE. A THIRD FLOOR MUST
+    # GO THROUGH IT TOO: `above` is what rules 1 and 3 ask, and rule 2's own
+    # comprehension names `exempt` first for the same reason. Bounding a new floor by
+    # severity alone would put the gate issues back under it silently, which is how
+    # this came back the first time.
+    exempt = frozenset(c.key for c in outstanding if c.verdict == "sonar")
 
     def above(key: str, floor: str) -> bool:
-        return severity_at_least(severity.get(key, SEVERITIES[0]), floor)
+        return (key in exempt
+                or severity_at_least(severity.get(key, SEVERITIES[0]), floor))
 
     #: New findings that buy a round, and the ones that were raised and do not.
     triggering = [k for k in clearable_new if above(k, trigger_floor)]
     quiet_new = [k for k in clearable_new if not above(k, trigger_floor)]
     repeats = len({k for k in repeated
                    if k and k not in held and above(k, fix_floor)})
-    blockers = [c for c in clearable if c.severity in ("P1", "P2")
-                and severity_at_least(c.severity, fix_floor)]
+    # Rule 2. The hardcoded ``("P1", "P2")`` is what makes the exemption necessary
+    # HERE as well as in `above`: without the first clause a P3 gate issue could not
+    # be a blocker at all, however red the gate, so a still-open one had to fall
+    # through to rule 3 and would be lost with it the moment `repeated` did not
+    # carry the key (a round whose baseline could not be attributed, for one).
+    blockers = [c for c in clearable
+                if c.key in exempt
+                or (c.severity in ("P1", "P2")
+                    and severity_at_least(c.severity, fix_floor))]
+    #: How many of them are gate issues rather than judged P1/P2s — the `reason`
+    #: has to be true of what it counted, and "P1/P2 still outstanding" is not true
+    #: of a P3 `python:S1128`.
+    gated = sum(1 for c in blockers if c.key in exempt)
     if triggering:
         stop, reason = False, (f"{len(triggering)} finding(s) no earlier round raised")
     elif blockers:
-        stop, reason = False, f"{len(blockers)} P1/P2 still outstanding after the fix"
+        stop, reason = False, (
+            f"{len(blockers)} P1/P2 or SonarCloud gate issue(s) still outstanding "
+            "after the fix" if gated else
+            f"{len(blockers)} P1/P2 still outstanding after the fix")
     elif repeats:
         stop, reason = False, (f"{repeats} finding(s) an earlier round already raised "
                                "are still outstanding")

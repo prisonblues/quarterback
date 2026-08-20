@@ -66,7 +66,7 @@ standard is not "good enough" — it's "nothing left to improve".
 tells you which values are in force (`review_panel.*` in `.harness-rules`; a panel
 report prints them on its **Panel dials** line). Three of them define this pass:
 
-- **`fix_severity_floor`** (default `P2`) — the severity at or above which a
+- **`fix_severity_floor`** (default `P3`) — the severity at or above which a
   finding gets fixed. Below it a finding is reported and recorded and **not** fixed
   by this pass. A panel report puts those under their own heading, *Reported, not
   this round's work*, marked 🔽; do not lift them into your list.
@@ -191,8 +191,8 @@ behaviour.
 
 #### 3. Fix everything
 
-Fix every finding at or above `fix_severity_floor` (`P2` by default, so P1 and P2;
-`P4` means all of them). Write the missing tests (edge + error paths) — don't just
+Fix every finding at or above `fix_severity_floor` (`P3` by default, so P1, P2 and
+P3; `P4` means all of them). Write the missing tests (edge + error paths) — don't just
 note them. Update the stale docs. Propagate renames/patterns to
 sibling code. After fixing, re-read the full diff of your fixes and fix any new
 issues they introduce.
@@ -407,8 +407,14 @@ Files reviewed: N | Findings: N | Fixed: N | Deferred: N | Escalated: N | Refute
 
 Deferred — real, and not this change's job
 - Finding: <the number above>
-  Key: <the finding's key, verbatim — the orchestrator records the outcome against
-       it, and a deferral nobody can key is a deferral nothing tracks>
+  ID: <the panel's finding ID for it, verbatim — e.g. `236-F01`, exactly as the
+       report you were briefed from prints it in square brackets. The orchestrator
+       maps ID to key from the round's JSON payload and records the outcome against
+       the key; a deferral nobody can identify is a deferral nothing tracks. Say
+       `none` for a finding you discovered yourself, which has no panel record. Do
+       NOT try to supply the digest key itself — you were never given one, and the
+       report leaves it out on purpose, because a literal key on a PR comment reads
+       as an API key to every secret scanner>
   Why it is real: <one line — this is not a refutation>
   Why not here: <one line — what this change is for, and why the defect sits
        outside it>
@@ -416,8 +422,9 @@ Deferred — real, and not this change's job
 
 Escalated — the approach, not the code
 - Premise: <one sentence>
-  Key: <the finding's key, verbatim — the orchestrator passes this to
-       `panel.py --escalated`, and a premise nobody can key stays in the loop>
+  ID: <the panel's finding ID for it, verbatim — e.g. `236-F01`. The orchestrator
+       maps it to the key and passes THAT to `panel.py --escalated`, and a premise
+       nobody can identify stays in the loop. `none` if you found it yourself>
   Explains: <the finding numbers above it accounts for>
   Removing it costs: <what would have to change, and where>
   Patch not written: <the special case you declined to add>
@@ -457,6 +464,13 @@ board has them, with a `key` each — say what became of them, per the **4b**
 section of `panel-review-pr.md`. The `Resolution` column of the summary table
 above is exactly this information in prose: `fixed`, or `refuted` with the reason
 it was not a defect, or `deferred` with where it went.
+
+**The fixer reports finding IDs; you supply the keys.** The report it was briefed
+from prints `[236-F01]` and never the 16-character key — deliberately, since a
+literal key on a PR comment reads as an API key to every secret scanner
+(`panel-review-pr.md` §4b) — so the fixer's `Deferred` and `Escalated` blocks name
+IDs. Map each one to its key out of the round's JSON payload before you record
+anything or pass `--escalated`; §4b has the `jq` one-liner that prints both.
 
 **Three roads arrive at `deferred` and all three are the same row.** An escalation is
 a deferral you infer (the fixer wrote no patch because the approach is in dispute); a

@@ -143,12 +143,14 @@ repo's open issues are the panel's own deferred-finding overflow. The severity s
 PR and the 67.3% tail beside it is not.
 
 So `.harness-rules.sample` now carries seven `review_panel` dials (#165), and what they
-bound is the tail rather than the signal: `fix_severity_floor` (**P2**) is what a fix round
+bound is the tail rather than the signal: `fix_severity_floor` (**P3**) is what a fix round
 is asked to clear, and below it a finding is reported, marked and recorded rather than
-fixed — the cut that discards 67.3% of findings and loses zero P1s;
+fixed — P4 is 31.3% of findings and the tier that actually ballooned #236;
 `round_trigger_floor` (**P2**) is what a NEW finding needs to buy another round, which is
 the rule that mattered most, because from round 2 the thing under review IS the previous
-round's fix and a termination test fed by its own output can only end on the cap;
+round's fix and a termination test fed by its own output can only end on the cap — the
+two floors differ on purpose, since fixing a P3 in a pass that is already open costs one
+edit while letting a P3 buy another round costs a whole panel plus another fix pass;
 `max_fix_growth` (**3.0**) stops a cycle whose fix pass has multiplied the change instead of
 fixing it; `reviewer_scope` (**diff**) asks reviewers for defects in the change rather than
 in everything it touches; `fixer_may_defer` (**true**) gives the fixer the third exit it did
@@ -158,8 +160,11 @@ because the reviewer-emitted failing test it needs does not exist yet (#92, #114
 
 None of that lowers the bar for what a fix round does take on — in scope, everything still
 gets fixed properly, with a test, and note-and-move-on is still forbidden — and every value
-is validated: a bad one falls back and says which value was wrong and what is accepted, in
-`config_notes`, on the report and on the PR. What the round actually applied is in the
+is validated: a malformed value of one of these keys is a hard exit naming the key, the
+value and what is accepted, because a repo that typed `p-4` meaning "fix everything" must
+not silently get the default instead. An unknown key is the other case and keeps its old
+answer — warned about and dropped, so a rules file shared across a fleet that upgrades at
+different times is not a version pin. What the round actually applied is in the
 artifact, on a **Panel dials** line and in the payload's `review_panel`, because the
 orchestrator that briefs the fixer builds that brief out of the report. #165 proposes about
 fifteen dials; these are the seven whose enforcement point already exists, and the rest stay

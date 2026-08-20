@@ -19,9 +19,14 @@ setting fails:
   mechanism that ships unwired. A key nothing reads is worse than no key: it reads as
   configured.
 * **a bad value being rejected, loudly** — a repo that typed a setting wrong and got
-  default behaviour with nothing said is the failure `warn_unknown_keys` exists to
-  prevent, one level down. Every rejection here lands in `config_notes`, which prints
-  above the findings and travels in the payload and onto the PR.
+  default behaviour is the failure `warn_unknown_keys` exists to prevent one level
+  down, and a `config_notes` line does not stop it, it annotates it: the review still
+  runs, under a policy the file did not ask for, in the round the fixer is briefed
+  from. So a malformed value of a key this harness KNOWS is a hard exit, the same
+  mechanism `harness_rules._check_block_shape` uses. An unknown KEY is the other case
+  and keeps its old answer — warned about and dropped — because that one really is
+  version skew and failing on it would turn every shared rules file into a version
+  pin. Unset is the third and stays silent.
 
 The prose guards are here too rather than in `harness/tests`, because the briefs and
 the code are one feature: `fixer_may_defer` is enforced ONLY in prose (there is no
@@ -83,14 +88,23 @@ def _adjudicate(clusters, diff, model, pr, budget=None, coverage=None, cwd=None,
              for i, f in enumerate(flat)], None, "")
 
 
-def stub(monkeypatch, findings, *, config=None, diff=None, prompts=None):
+def stub(monkeypatch, findings, *, config=None, diff=None, prompts=None, sonar=()):
     """Every process a run would spawn, replaced. `prompts` collects what each seat
     was actually handed, which is the only way to test `reviewer_scope` — its whole
-    enforcement is the text of the brief."""
-    monkeypatch.setattr(panel, "load_repo_cfg", lambda name: config or PANEL_CFG)
+    enforcement is the text of the brief. `sonar` seats SonarCloud with a red gate and
+    those issues as its hard ones, which is the only way to reach the floors' one
+    exemption through the real `run()`."""
+    resolved = config or PANEL_CFG
+    if sonar:
+        resolved = {**resolved,
+                    "reviewers": {**resolved["reviewers"],
+                                  "sonarqube": {"enabled": True}}}
+        monkeypatch.setattr(panel, "review_sonarqube",
+                            lambda *a, **k: ("ERROR", list(sonar), [], None))
+    monkeypatch.setattr(panel, "load_repo_cfg", lambda name: resolved)
     monkeypatch.setattr(panel_core, "sh", gh_stub(
         meta={"title": "fix: a real bug", "additions": 3, "deletions": 1,
-              "headRefOid": "abc"},
+              "headRefName": "h", "headRefOid": "abc"},
         diff=diff or "diff --git a/a.py b/a.py\n+x\n"))
 
     def review(cmd_name, model, prompt, *a, **k):
@@ -105,9 +119,9 @@ def stub(monkeypatch, findings, *, config=None, diff=None, prompts=None):
 
 def run(monkeypatch, capsys, tmp_path, findings, *, round_no=1, baseline=(),
         max_rounds=2, config=None, diff=None, prompts=None, scope="auto",
-        name="r"):
+        name="r", sonar=()):
     """One whole panel run: the report it prints and the payload it writes."""
-    stub(monkeypatch, findings, config=config, diff=diff, prompts=prompts)
+    stub(monkeypatch, findings, config=config, diff=diff, prompts=prompts, sonar=sonar)
     out = tmp_path / f"{name}{round_no}.json"
     assert panel.run("board", 34, post=False, json_file=str(out), record=False,
                      round_no=round_no, baseline=list(baseline),
@@ -117,6 +131,31 @@ def run(monkeypatch, capsys, tmp_path, findings, *, round_no=1, baseline=(),
 
 def finding(severity, title="unvalidated input", file="a.py"):
     return panel.Finding("claude", severity, file, 3, title, "")
+
+
+def gate_issue(severity, title="unused import", file="b.py", rule="python:S1128"):
+    """One SonarCloud hard-gate issue, at whatever severity Sonar gave it — routinely
+    P3 or P4, which is the whole reason the floors need an exemption."""
+    return panel.Finding("sonarqube", severity, file, 7, title, rule)
+
+
+def sonar_canonical(severity, title="unused import", file="b.py"):
+    """The same thing as `panel.py` builds it for `outstanding`: a `Canonical` over its
+    own single account, carrying **Sonar's** severity and `verdict="sonar"` — the field
+    `round_stop` identifies a gate issue by."""
+    reports = [gate_issue(severity, title, file)]
+    return panel.Canonical(id="34-F02", severity=severity, file=file, line=7,
+                           synthesis=title, verdict="sonar", reported_by=reports,
+                           rationale="python:S1128")
+
+
+def judged(severity, title="unvalidated input", file="a.py"):
+    """A judge-confirmed finding, for the tests that have to tell a Sonar exemption from
+    "P3 goes again"."""
+    reports = [panel.Finding("claude", severity, file, 3, title, "")]
+    return panel.Canonical(id="34-F01", severity=severity, file=file, line=3,
+                           synthesis=title, verdict="confirmed", reported_by=reports,
+                           rationale="real")
 
 
 def notes_about(payload, key):
@@ -150,12 +189,88 @@ def test_every_dial_is_a_key_the_rules_file_accepts(key):
 
 
 def test_the_payload_records_every_dial_as_applied(monkeypatch, capsys, tmp_path):
-    """Not as WRITTEN: a repo whose value was rejected has to be able to see which
-    policy actually ran, beside the note saying why its own was not used."""
+    """Not as WRITTEN, and not as DEFAULTED: a reader of the payload has to be able to
+    see the policy this round actually ran under without also holding the rules file
+    and this harness's defaults. (A malformed value cannot reach here at all any more
+    — it is a hard exit — so the interesting case is a legal non-default one.)"""
     _, payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")],
-                        config=cfg(fix_severity_floor="nonsense"))
+                        config=cfg(fix_severity_floor="P1"))
     assert set(payload["review_panel"]) == set(DIALS)
-    assert payload["review_panel"]["fix_severity_floor"] == "P2"
+    assert payload["review_panel"]["fix_severity_floor"] == "P1"
+
+
+# ------------------------------------------ a bad VALUE fails; an unknown KEY does not
+
+#: One malformed value per dial, and the fragment of the accepted set the refusal has to
+#: carry. Seven rows because the answer is now one answer: a value of a key this harness
+#: KNOWS that it cannot read is a typo by the repo's author, and there is no
+#: forward-compatibility argument for tolerating it — no newer harness reads `p-4` as a
+#: severity either.
+BAD_VALUES = [
+    ("fixer_may_defer", "maybe", "true or false"),
+    ("fix_severity_floor", "p-4", "P1, P2, P3, P4"),
+    ("round_trigger_floor", "blocker", "P1, P2, P3, P4"),
+    ("max_fix_growth", "lots", "is not a number"),
+    ("reviewer_scope", "everything", "diff, repo"),
+    ("require_failing_test", "sometimes", "true or false"),
+    ("max_rounds", 2.5, "whole number of rounds >= 1"),
+]
+
+
+@pytest.mark.parametrize("key,bad,accepted", BAD_VALUES)
+def test_a_malformed_value_of_a_known_key_is_a_hard_exit(key, bad, accepted):
+    """All seven, in one table, because the failure they share is the one that matters:
+    a repo that wrote `fix_severity_floor: p-4` intending the pre-#165 "fix everything"
+    silently got the default, stopped fixing P3s and P4s, and the review ran anyway —
+    under a policy the file did not ask for, in the round the fixer was briefed from. A
+    `config_notes` line does not stop that; it annotates it.
+
+    `_check_block_shape`'s mechanism and sentence shape, so there is ONE way to be wrong
+    about a rules file rather than two, and the message names the key, the value and the
+    accepted set — an operator's next action is to edit that key."""
+    notes: list[str] = []
+    with pytest.raises(SystemExit) as refusal:
+        panel_seats.resolve_dials({key: bad}, None, notes)
+    msg = str(refusal.value)
+    assert f"`review_panel.{key}`" in msg, msg
+    assert repr(bad) in msg, msg
+    assert accepted in msg, msg
+    # It names the file the value came out of, the way every other refusal in the rules
+    # resolver does — a message about a key with no file to look in is a hunt.
+    assert ".harness-rules" in msg
+    # And it refuses INSTEAD of noting: a note plus a fallback is the behaviour this
+    # replaced, and a run that emits both is a run that still applied the default.
+    assert notes == []
+
+
+@pytest.mark.parametrize("key,unset", [(k, u) for k, _b, _a in BAD_VALUES
+                                       for u in (None, "")])
+def test_unset_is_still_the_silent_not_configured_reading(key, unset):
+    """The line the hard exit is drawn on has three sides, not two, and this is the
+    third. Missing, `null` and `""` are "nobody wrote anything" everywhere in this
+    harness and none of them is a mistake — `severity_floor`'s docstring says so and is
+    right. `max_fix_growth` is the documented exception in the other direction: a
+    WRITTEN null — `null` or `""`, as against an absent key — is its off switch, which
+    is still not an error."""
+    dials = panel_seats.resolve_dials({key: unset}, None, [])
+    expected = (None if key == "max_fix_growth"
+                else harness_rules.DEFAULTS["review_panel"][key])
+    assert getattr(dials, key) == expected
+
+
+def test_an_unknown_key_is_still_warned_about_and_dropped():
+    """The forward-compatibility case, and NOTHING above touches it. An older harness
+    meeting a newer repo's setting must not die on it, or a rules file shared across a
+    fleet of boxes that upgrade at different times becomes a version pin on every one of
+    them — `warn_unknown_keys`'s own docstring, and `_check_block_shape` draws exactly
+    this line one level up. A malformed value of a key this harness knows is not that
+    case in any direction."""
+    unknown = harness_rules.unknown_keys(
+        {"review_panel": {"fix_severity_floor_typo": "P1"}})
+    assert unknown == {"review_panel": ["fix_severity_floor_typo"]}
+    # And the resolver never sees it: an unknown name is dropped before the dials are
+    # read, so it cannot reach `resolve_dials` and be refused as a bad value.
+    assert panel_seats.resolve_dials({}, None, []).fix_severity_floor == "P3"
 
 
 # ------------------------------------------------------------------- 1. fixer_may_defer
@@ -213,30 +328,33 @@ def test_a_deferral_still_has_to_go_somewhere():
 
 
 @pytest.mark.parametrize("bad", ["maybe", [], 2])
-def test_a_bad_fixer_may_defer_is_reported_and_not_read_as_truthy(bad):
+def test_a_bad_fixer_may_defer_is_refused_and_never_read_as_truthy(bad):
     """`bool("maybe")` is True, and so is `bool([1])`: Python truthiness would turn
-    every junk value into the permissive half of a policy switch. The note names the
-    accepted spellings, because a reader has to be able to tell a rejected value from
-    an honoured one."""
+    every junk value into the permissive half of a policy switch. Refused rather than
+    defaulted, and the message names the accepted spellings — a reader has to be able
+    to tell what to write instead."""
     notes: list[str] = []
-    got = panel_seats.panel_flag({"fixer_may_defer": bad}, "fixer_may_defer",
-                                 True, notes)
-    assert got is True and len(notes) == 1
-    assert "is not true or false" in notes[0] and "yes`/`no" in notes[0]
+    with pytest.raises(SystemExit) as refusal:
+        panel_seats.panel_flag({"fixer_may_defer": bad}, "fixer_may_defer",
+                               True, notes)
+    assert "is not true or false" in str(refusal.value)
+    assert "yes`/`no" in str(refusal.value)
+    assert notes == []
 
 
 # ---------------------------------------------------------------- 2. fix_severity_floor
 
-def test_by_default_a_p3_is_reported_and_is_not_the_fix_rounds_work(monkeypatch, capsys,
+def test_by_default_a_p4_is_reported_and_is_not_the_fix_rounds_work(monkeypatch, capsys,
                                                                     tmp_path):
-    """The measured cut: applied to the seven PRs it discards 99 of 147 findings (67.3%)
-    and loses ZERO P1s. Reported, recorded, marked — and out of the list a fix brief is
-    built from, which is the half that matters, since the fix pass is where the damage
-    comes from."""
+    """The default floor is **P3**, so P4 is the tier held back — 31.3% of findings per
+    #165, and the tier that actually ballooned PR #236 (a 54-line README rewrite and a
+    decode-path rework, both P4). Reported, recorded, marked — and out of the list a fix
+    brief is built from, which is the half that matters, since the fix pass is where the
+    damage comes from."""
     report, payload, _ = run(monkeypatch, capsys, tmp_path,
-                             [finding("P3", "docstring could mention __vNEXT__")])
+                             [finding("P4", "docstring could mention __vNEXT__")])
     assert "### To fix (0)" in report
-    assert "### Reported, not this round's work (1) — below the `P2` fix floor" in report
+    assert "### Reported, not this round's work (1) — below the `P3` fix floor" in report
     assert "🔽" in report
     # Still visible. A cut that HID the finding would be a worse artifact than the one
     # it replaced: the point is that the fixer is not briefed with it, not that nobody
@@ -244,7 +362,20 @@ def test_by_default_a_p3_is_reported_and_is_not_the_fix_rounds_work(monkeypatch,
     assert "docstring could mention __vNEXT__" in report
     assert "Do not build a fix brief from this list" in report
     assert payload["to_fix"][0]["below_fix_floor"] is True
-    assert payload["review_panel"]["fix_severity_floor"] == "P2"
+    assert payload["review_panel"]["fix_severity_floor"] == "P3"
+
+
+def test_a_p3_is_the_fix_rounds_work(monkeypatch, capsys, tmp_path):
+    """The tier the default deliberately KEEPS, and the reason the floor is P3 rather
+    than the measured P2: severity is model-authored and wrong sometimes, and what a P2
+    floor systematically misses is correctness expressed as craft — a missing regression
+    test on a parser or an auth boundary, a missing timeout or cleanup, a migration
+    rollback or idempotency gap, any of which a reviewer may label P3. Fixing one inside
+    a pass that is already open and already being verified costs a single edit."""
+    report, payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P3")])
+    assert "### To fix (1)" in report
+    assert "Reported, not this round's work" not in report
+    assert payload["to_fix"][0]["below_fix_floor"] is False
 
 
 def test_a_p2_is_the_fix_rounds_work(monkeypatch, capsys, tmp_path):
@@ -272,25 +403,26 @@ def test_the_floor_is_read_case_insensitively(monkeypatch, capsys, tmp_path):
     upper-casing, so a floor that did not would make `p2` in a hand-written rules file
     a different floor from `P2` in a reviewer's reply."""
     _, payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")],
-                        config=cfg(fix_severity_floor=" p3 "))
-    assert payload["review_panel"]["fix_severity_floor"] == "P3"
+                        config=cfg(fix_severity_floor=" p1 "))
+    assert payload["review_panel"]["fix_severity_floor"] == "P1"
     assert not notes_about(payload, "fix_severity_floor")
 
 
 @pytest.mark.parametrize("bad", ["P0", "blocker", "p2 or better", 2, ["P2"]])
-def test_a_bad_fix_floor_is_reported_with_the_set_that_is_accepted(monkeypatch, capsys,
-                                                                   tmp_path, bad):
-    """Silently falling back is the failure mode: a repo that meant "only fix blockers"
-    and typed `blocker` would have every P4 fixed and nothing anywhere saying why.
-    Unset is a different case and is deliberately silent — see the test below."""
-    report, payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P3")],
-                             config=cfg(fix_severity_floor=bad))
-    note = notes_about(payload, "fix_severity_floor")
-    assert len(note) == 1 and "P1, P2, P3, P4" in note[0]
-    assert "is not a severity" in note[0]
-    # Loud: on the report, above the findings, and on the PR comment under `--post`.
-    assert f"⚠️ config: {note[0]}" in report
-    assert payload["review_panel"]["fix_severity_floor"] == "P2"
+def test_a_bad_fix_floor_refuses_the_run_and_names_the_accepted_set(monkeypatch, capsys,
+                                                                    tmp_path, bad):
+    """Falling back was the failure mode, note or no note: a repo that wrote `p-4`
+    meaning the pre-#165 "fix everything" got the default instead, stopped fixing P3s
+    and P4s, and the review still RAN — under a policy the file did not ask for, and the
+    round the fixer was briefed from is that round. Unset is a different case and is
+    deliberately silent (the test below); an unknown KEY is a third, and stays
+    warn-and-drop (`test_an_unknown_key_is_still_warned_about_and_dropped`)."""
+    stub(monkeypatch, [finding("P3")], config=cfg(fix_severity_floor=bad))
+    with pytest.raises(SystemExit) as refusal:
+        panel.run("board", 34, post=False, record=False)
+    msg = str(refusal.value)
+    assert "`review_panel.fix_severity_floor`" in msg and repr(bad) in msg
+    assert "P1, P2, P3, P4" in msg and ".harness-rules" in msg
 
 
 def test_an_unset_floor_is_silent(monkeypatch, capsys, tmp_path):
@@ -300,7 +432,7 @@ def test_an_unset_floor_is_silent(monkeypatch, capsys, tmp_path):
         _, payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")],
                             config=cfg(**unset))
         assert not notes_about(payload, "fix_severity_floor")
-        assert payload["review_panel"]["fix_severity_floor"] == "P2"
+        assert payload["review_panel"]["fix_severity_floor"] == "P3"
 
 
 # --------------------------------------------------------------- 3. round_trigger_floor
@@ -342,23 +474,24 @@ def test_a_below_floor_finding_the_fixer_never_had_does_not_repeat_the_cycle_to_
     `fix_severity_floor` is one no fix round was asked to clear, so it is outstanding
     every round by construction — and rule 3 ("an earlier round already raised it and
     it is still there") would go again on it until the cap, which is the
-    non-convergence this whole change exists to remove."""
-    _, _, r1 = run(monkeypatch, capsys, tmp_path, [finding("P3")], round_no=1,
+    non-convergence this whole change exists to remove. P4 findings, because the fix
+    floor defaults to P3 now and a P3 IS work the fix round was asked to clear."""
+    _, _, r1 = run(monkeypatch, capsys, tmp_path, [finding("P4")], round_no=1,
                    max_rounds=3)
-    _, payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P3")], round_no=2,
+    _, payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P4")], round_no=2,
                         baseline=[r1], max_rounds=3, scope="pr")
     stop = payload["round_stop"]
     assert stop["stop"] is True, stop["reason"]
     assert "already raised" not in stop["reason"]
-    assert stop["fix_floor"] == "P2" and stop["trigger_floor"] == "P2"
+    assert stop["fix_floor"] == "P3" and stop["trigger_floor"] == "P2"
 
 
-def test_a_bad_trigger_floor_is_reported(monkeypatch, capsys, tmp_path):
-    _, payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")],
-                        config=cfg(round_trigger_floor="P5"))
-    note = notes_about(payload, "round_trigger_floor")
-    assert len(note) == 1 and "P1, P2, P3, P4" in note[0]
-    assert payload["review_panel"]["round_trigger_floor"] == "P2"
+def test_a_bad_trigger_floor_refuses_the_run(monkeypatch, capsys, tmp_path):
+    stub(monkeypatch, [finding("P2")], config=cfg(round_trigger_floor="P5"))
+    with pytest.raises(SystemExit) as refusal:
+        panel.run("board", 34, post=False, record=False)
+    assert "`review_panel.round_trigger_floor`='P5'" in str(refusal.value)
+    assert "P1, P2, P3, P4" in str(refusal.value)
 
 
 # -------------------------------------------------------------------- 4. max_fix_growth
@@ -429,15 +562,19 @@ def test_an_absent_max_fix_growth_is_the_default_not_off():
                                      (0, "is not above zero"),
                                      (-2, "is not above zero"),
                                      (float("inf"), "is not a finite number")])
-def test_a_bad_max_fix_growth_is_reported_and_never_read_as_a_threshold(bad, why):
+def test_a_bad_max_fix_growth_is_refused_and_never_read_as_a_threshold(bad, why):
     """`false` is the other way an operator writes "off" and is rejected rather than
     reinterpreted: `isinstance(True, int)` is True, so read as a number it would become
     the threshold 1.0 and stop every cycle whose fix commit is bigger than its first
-    round — the switch flipped to "off" turning the feature all the way on."""
+    round — the switch flipped to "off" turning the feature all the way on. Refused
+    rather than defaulted, and the message still names `null` as the off switch, which
+    is what the operator writing `false` was reaching for."""
     notes: list[str] = []
-    assert panel_seats.fix_growth_limit({"max_fix_growth": bad}, notes) == 3.0
-    assert len(notes) == 1 and why in notes[0]
-    assert "null to switch the check off" in notes[0]
+    with pytest.raises(SystemExit) as refusal:
+        panel_seats.fix_growth_limit({"max_fix_growth": bad}, notes)
+    assert why in str(refusal.value)
+    assert "null to switch the check off" in str(refusal.value)
+    assert notes == []
 
 
 # --------------------------------------------------------------------- 5. reviewer_scope
@@ -493,17 +630,15 @@ def test_the_two_briefs_still_take_the_same_format_keys():
     assert panel_core.MOVE_MANIFEST_PROMPT.format(**keys)
 
 
-def test_a_bad_reviewer_scope_is_reported(monkeypatch, capsys, tmp_path):
-    """`resolve_round_scope`'s own lesson, one setting over: a config value nothing
-    checks is read as the fallback, silently, and the round then reports a scope it did
-    not use."""
-    prompts: list[str] = []
-    _, payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")],
-                        config=cfg(reviewer_scope="whole-repo"), prompts=prompts)
-    note = notes_about(payload, "reviewer_scope")
-    assert len(note) == 1 and "diff, repo" in note[0]
-    assert payload["review_panel"]["reviewer_scope"] == "diff"
-    assert "search the codebase" not in prompts[0]
+def test_a_bad_reviewer_scope_refuses_the_run(monkeypatch, capsys, tmp_path):
+    """`resolve_round_scope`'s own lesson, one setting over — except that a config value
+    nothing checks is not merely read as the fallback: the seats are then briefed with a
+    question the repo did not ask, and `whole-repo` was plainly reaching for `repo`."""
+    stub(monkeypatch, [finding("P2")], config=cfg(reviewer_scope="whole-repo"))
+    with pytest.raises(SystemExit) as refusal:
+        panel.run("board", 34, post=False, record=False)
+    assert "`review_panel.reviewer_scope`='whole-repo'" in str(refusal.value)
+    assert "diff, repo" in str(refusal.value)
 
 
 # ---------------------------------------------------------------- 6. require_failing_test
@@ -538,12 +673,12 @@ def test_turning_it_on_is_recorded_and_says_it_is_not_enforced(monkeypatch, caps
     assert payload["round_stop"]["stop"] is False
 
 
-def test_a_bad_require_failing_test_is_reported(monkeypatch, capsys, tmp_path):
-    _, payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")],
-                        config=cfg(require_failing_test="sometimes"))
-    note = notes_about(payload, "require_failing_test")
-    assert len(note) == 1 and "is not true or false" in note[0]
-    assert payload["review_panel"]["require_failing_test"] is False
+def test_a_bad_require_failing_test_refuses_the_run(monkeypatch, capsys, tmp_path):
+    stub(monkeypatch, [finding("P2")], config=cfg(require_failing_test="sometimes"))
+    with pytest.raises(SystemExit) as refusal:
+        panel.run("board", 34, post=False, record=False)
+    assert "`review_panel.require_failing_test`='sometimes'" in str(refusal.value)
+    assert "is not true or false" in str(refusal.value)
 
 
 # ------------------------------------------------------------------------- 7. max_rounds
@@ -603,14 +738,17 @@ def test_a_round_past_the_settings_cap_is_refused(monkeypatch, capsys, tmp_path)
 
 
 @pytest.mark.parametrize("bad", [0, -1, 2.5, "two", True])
-def test_a_bad_max_rounds_is_reported(bad):
+def test_a_bad_max_rounds_is_refused(bad):
     """A bool is rejected before the integer read: `max_rounds: true` is 1 to Python,
     which would cap every cycle at one round on a value that says nothing about rounds.
     A non-integer is refused rather than rounded — a cap silently lowered runs a round
-    the file did not ask for."""
+    the file did not ask for — and now it is refused rather than defaulted, because a
+    cycle that ran to a cap nobody wrote cannot be told from one that converged."""
     notes: list[str] = []
-    assert panel_seats.resolve_max_rounds(None, {"max_rounds": bad}, notes) == 2
-    assert len(notes) == 1 and "whole number of rounds >= 1" in notes[0]
+    with pytest.raises(SystemExit) as refusal:
+        panel_seats.resolve_max_rounds(None, {"max_rounds": bad}, notes)
+    assert "whole number of rounds >= 1" in str(refusal.value)
+    assert notes == []
 
 
 def test_a_whole_float_is_accepted_as_a_cap():
@@ -626,27 +764,152 @@ def test_the_report_states_the_dials_on_every_round(monkeypatch, capsys, tmp_pat
     from whoever remembers the repo's config. Printed at the defaults too: a reader
     weighing a quiet round needs to know whether the quiet was measured or configured."""
     report, _, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")])
-    assert ("**Panel dials** (`review_panel`): fix at/above P2 · another round at/above "
+    assert ("**Panel dials** (`review_panel`): fix at/above P3 · another round at/above "
             "P2 · reviewer scope diff · fix growth cap 3x · fixer may defer yes · "
             "failing test required no") in report
 
 
-def test_a_skipped_round_records_no_dials_but_still_reports_a_bad_value(monkeypatch,
-                                                                       capsys, tmp_path):
-    """Null on the paths that reviewed nothing, for the reason `code_access` is: a round
-    that never dispatched a seat and never briefed a fixer did not apply a review
-    policy. The VALIDATION still travels, because a broken rules file is a fact about
-    the repo rather than about the round."""
-    config = {**cfg(fix_severity_floor="nope"),
-              "review_panel": {"fix_severity_floor": "nope",
-                               "skip_title_patterns": ["^release:"]}}
+def _release_pr(monkeypatch, config):
+    """A PR whose title the repo's `skip_title_patterns` refuses, with `config` in
+    force. The round reviews nothing, which is the case the two tests below split."""
     stub(monkeypatch, [finding("P2")], config=config)
     monkeypatch.setattr(panel_core, "sh", gh_stub(
         meta={"title": "release: v9", "additions": 3, "deletions": 1,
               "headRefOid": "abc"},
         diff="diff --git a/a.py b/a.py\n+x\n"))
+
+
+def test_a_skipped_round_records_no_dials(monkeypatch, capsys, tmp_path):
+    """Null on the paths that reviewed nothing, for the reason `code_access` is: a round
+    that never dispatched a seat and never briefed a fixer did not apply a review
+    policy."""
+    _release_pr(monkeypatch, {**PANEL_CFG,
+                              "review_panel": {"fix_severity_floor": "P1",
+                                               "skip_title_patterns": ["^release:"]}})
     out = tmp_path / "skip.json"
     assert panel.run("board", 34, post=False, json_file=str(out), record=False) == 0
     payload = json.loads(out.read_text())
     assert payload["review_panel"] is None
-    assert notes_about(payload, "fix_severity_floor")
+    assert not notes_about(payload, "fix_severity_floor")
+
+
+def test_a_bad_value_refuses_even_a_round_that_would_have_been_skipped(monkeypatch,
+                                                                      capsys, tmp_path):
+    """The dials are resolved before the PR is fetched, deliberately: a rules file this
+    harness cannot read is a fact about the REPO rather than about the round, so it is
+    answered before anything about this particular PR is known. It used to travel as a
+    `config_notes` line on the skip payload; a hard exit is louder and cannot be read
+    past."""
+    _release_pr(monkeypatch, {**PANEL_CFG,
+                              "review_panel": {"fix_severity_floor": "nope",
+                                               "skip_title_patterns": ["^release:"]}})
+    with pytest.raises(SystemExit) as refusal:
+        panel.run("board", 34, post=False, json_file=str(tmp_path / "skip.json"),
+                  record=False)
+    assert "`review_panel.fix_severity_floor`='nope'" in str(refusal.value)
+
+
+# ---------------------------------------- the floors do NOT apply to the hard gate
+
+def test_a_new_p3_sonar_gate_issue_still_buys_a_round_under_the_default_floors():
+    """The regression the floors reintroduced. `panel.py` builds each Sonar issue as a
+    `Canonical` carrying **Sonar's own** severity — routinely P3/P4 — and puts it in
+    `outstanding` precisely so the stop rule counts it. Filtered by
+    `round_trigger_floor` it dropped out of `triggering`, landed in `quiet_new`, and the
+    cycle stopped `confident: True` saying "reported, not fixed here" — a failing
+    quality gate reported as convergence, on a PR that cannot merge."""
+    gate = sonar_canonical("P3")
+    d = panel.round_stop(2, 5, [gate.key], [gate], [],
+                         trigger_floor="P2", fix_floor="P3")
+    assert d["stop"] is False, d["reason"]
+    assert d["new_below_trigger_floor"] == []
+
+
+def test_a_still_open_p3_sonar_gate_issue_keeps_the_cycle_going():
+    """The other half, and the one rule 1 cannot reach: an issue an earlier round
+    already raised is not new, so it has to be caught by rule 2 or rule 3. Rule 2's bar
+    is a hardcoded `("P1", "P2")` tuple, which a P3 gate issue could not clear at all —
+    however red the gate — so the exemption has to be there too."""
+    gate = sonar_canonical("P3")
+    d = panel.round_stop(2, 5, [], [gate], [], repeated={gate.key},
+                         trigger_floor="P2", fix_floor="P3")
+    assert d["stop"] is False, d["reason"]
+    # The reason names what it counted. "1 P1/P2 still outstanding" would be a false
+    # sentence about a P3 `python:S1128`, and this stop is the one a reader is most
+    # likely to be reconciling against a red gate on the PR.
+    assert "SonarCloud gate issue" in d["reason"]
+    # Rule 3 carries the exemption too, through the shared `above` helper rather than a
+    # second copy of the test — and rule 2 firing first makes that redundant TODAY,
+    # deliberately: the exemption is a property of the key, so a floor added to rule 3
+    # later cannot quietly re-filter the gate.
+    assert "1 finding(s) an earlier round already raised" not in d["reason"]
+
+
+def test_a_new_p3_JUDGED_finding_under_the_same_floors_still_stops_the_cycle():
+    """The discriminator: this suite must be testing "Sonar is exempt" and not "P3 goes
+    again". Same severity, same floors, same round — the only difference is
+    `verdict`."""
+    c = judged("P3")
+    d = panel.round_stop(2, 5, [c.key], [c], [], trigger_floor="P2", fix_floor="P3")
+    assert d["stop"] is True
+    assert "none at or above the P2 round trigger floor" in d["reason"]
+    assert d["new_below_trigger_floor"] == [c.key]
+
+
+def test_a_p4_sonar_issue_is_exempt_too_because_the_gate_does_not_grade_on_severity():
+    """One tier further down, because the argument is not "P3 is close enough to the
+    floor" — it is that a red gate is not a severity judgement at all."""
+    gate = sonar_canonical("P4")
+    assert panel.round_stop(2, 5, [gate.key], [gate], [], trigger_floor="P2",
+                            fix_floor="P3")["stop"] is False
+
+
+def test_a_whole_run_with_only_a_p3_gate_issue_does_not_report_convergence(
+        monkeypatch, capsys, tmp_path):
+    """End to end through the real `run()`, because the exemption is only worth
+    anything if `outstanding` actually carries the verdict this far: the judged half is
+    a below-floor P4 nobody is asked to fix, so the gate issue is the only thing
+    standing between this round and a clean, confident stop."""
+    report, payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P4")],
+                             sonar=[gate_issue("P3")], max_rounds=3)
+    assert payload["sonar_findings"][0]["verdict"] == "sonar"
+    assert payload["round_stop"]["stop"] is False, payload["round_stop"]["reason"]
+    assert payload["round_stop"]["confident"] is False
+    assert "**go again**" in report
+
+
+# ------------------------------------------------- the briefs do not contradict them
+
+def test_the_fixer_has_no_licence_to_fix_whatever_else_it_notices():
+    """FIX 4's contradiction, asserted as an ABSENCE. The escape hatch sat three lines
+    from the instruction that establishes the floor and it bit hardest for exactly the
+    P3/P4 items the floor holds back — and every prose guard in this suite up to now
+    asserts a substring is PRESENT, which is how contradictory text elsewhere in the
+    same brief survives a green suite."""
+    flat = " ".join(PANEL_REVIEW_PR.read_text(encoding="utf-8").split())
+    assert "obvious defects it trips over" not in flat
+    assert "must fix those too" not in flat
+    # The genuine half is not weakened: a defect at or above the floor and inside the
+    # change is still fixed, and a P1 the panel missed is still a P1.
+    assert "subject to the same floor and the same scope as a panel finding" in flat
+    assert "a P1 the panel missed and the fixer walks straight into is still a P1" in flat
+    assert "Below the floor, or outside the change under review, it is **reported in " \
+           "the summary and not fixed**" in flat
+
+
+def test_the_fixer_is_asked_for_the_id_it_was_given_and_never_for_a_key():
+    """FIX 5, also as an absence. The rendered report shows local finding IDs
+    (`[236-F01]`) and never the 16-character digest — deliberately, since a literal key
+    on a PR comment reads as an API key to every secret scanner — so a fixer physically
+    cannot supply one, and a template demanding it produces either a fabricated key or
+    a blank row."""
+    flat = " ".join(REVIEW_PR.read_text(encoding="utf-8").split())
+    assert "Key: <the finding's key, verbatim" not in flat
+    assert "a deferral nobody can key is a deferral nothing tracks" not in flat
+    assert "a premise nobody can key stays in the loop" not in flat
+    assert "ID: <the panel's finding ID for it, verbatim" in flat
+    assert "The fixer reports finding IDs; you supply the keys." in flat
+    # And the orchestrator's own brief states the mapping rather than implying it.
+    panel_md = " ".join(PANEL_REVIEW_PR.read_text(encoding="utf-8").split())
+    assert "Map the fixer's finding IDs to keys first" in panel_md
+    assert '"\\(.id)\\t\\(.key)' in panel_md

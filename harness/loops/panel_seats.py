@@ -1250,21 +1250,66 @@ def resolve_round_scope(asked: str, panel: dict, notes: list[str]) -> str:
 # documented beside it in `harness_rules.DEFAULTS`; what lives here is how a WRITTEN
 # value is turned into an applied one.
 #
-# **What a bad value does, and why it is not a hard exit.** Every reader below falls
-# back to the default and appends a `config_notes` sentence naming the value that was
-# wrong and the set that is accepted. That is the manners :func:`resolve_round_scope`,
-# :func:`diff_budget` and `panel_preflight._rule`/`_flag` already have, and the notes
-# are not a quiet channel: they print above the findings as "⚠️ config:", they travel
-# in the payload, and under `--post` they land in a public PR comment. What is ruled
-# out is SILENCE — a repo that typed a setting wrong and got default behaviour with
-# nothing said, which is exactly what `warn_unknown_keys` exists to prevent one level
-# up. A hard exit is reserved, here as there, for a file that cannot mean what it says
-# at all (`_check_block_shape`); a rules file shared across a fleet of boxes that
-# upgrade at different times must not become a version pin on every one of them.
+# **What a bad value does: it is a HARD EXIT, and the line the exit is drawn on is
+# unknown KEY versus malformed VALUE OF A KNOWN KEY.** The two look alike and are not:
+#
+# * An unknown key is the forward-compatibility case — an older harness reading a
+#   newer repo's rules file, shared across a fleet of boxes that upgrade at different
+#   times. Failing on it would turn every rules file into a version pin on every
+#   machine, so it stays warn-and-drop (`harness_rules.warn_unknown_keys`), and
+#   NOTHING here changes that.
+# * A malformed value of a key THIS harness knows is a typo by the repo's author.
+#   There is no forward-compat argument for tolerating it — no newer harness reads
+#   `fix_severity_floor: "p-4"` as anything either — and the concrete cost is a repo
+#   that wrote that meaning the pre-#165 "fix everything", silently got the default,
+#   and stopped fixing P3s and P4s while believing it had opted into fixing them all.
+#   A `config_notes` line is not enough for that: the review still runs, under a
+#   policy the file did not ask for, and the round it ran under is the one the fixer
+#   was briefed from.
+#
+# So the readers below refuse through :func:`_refuse_value`, which is
+# `harness_rules._check_block_shape`'s mechanism and message style — one way to be
+# wrong about a rules file, not two. `_check_block_shape` draws exactly this line one
+# level up ("an unrecognised name may be a setting only a newer harness knows about …
+# while a value of the wrong TYPE is not version skew in any direction — it is a file
+# that cannot mean what it says").
+#
+# UNSET IS NOT MALFORMED. Missing, `null` and `""` remain the silent "not configured"
+# reading every setting in this harness gives them, and :func:`fix_growth_limit` keeps
+# its own distinction between an absent key and a written `null`.
+#
+# Every reader below still takes `notes`, and none of them writes to it today. Kept
+# rather than pruned from five signatures: `notes` is the channel for what a resolution
+# has to SAY without being an error — `resolve_dials` uses it for exactly that, to
+# report that `require_failing_test: true` is recorded and not enforced — and a
+# resolver acquiring something of that kind is a likelier future than five call sites
+# each growing an argument back.
+
+
+def _refuse_value(key: str, value, accepted: str) -> None:
+    """Refuse a malformed value of a `review_panel` key this harness knows.
+
+    `harness_rules._check_block_shape`'s mechanism (``SystemExit``) and its sentence
+    shape (``<file>: `<what>` is not <accepted> — <how to fix it>``), so a reader who
+    has met one of these has met all of them. The message names the key, the offending
+    value and the accepted set, because the operator's next action is to edit that key
+    and it should not need the source to know what to write.
+
+    No provenance argument: the rules file is named by :data:`RULES_FILENAME` and the
+    resolvers are handed the merged `review_panel` block rather than the read that
+    produced it. Naming the block-qualified key is what locates it — a repo has at
+    most two rules files and `grep` closes the gap.
+    """
+    raise SystemExit(
+        f"{RULES_FILENAME}: `review_panel.{key}`={value!r} is not {accepted} — "
+        "fix the value, or remove the key to take the default. (An unknown KEY is "
+        "warned about and dropped, because it may be a setting only a newer harness "
+        "knows; a known key this harness cannot read is a typo, and applying the "
+        "default anyway would run the review under a policy the file did not ask for.)")
 
 
 #: Spellings of "no" a hand writes in a JSON rules file, mirroring `panel_core._TRUTHY`
-#: for the other half. Both are needed: a value that is neither is REPORTED rather
+#: for the other half. Both are needed: a value that is neither is REFUSED rather
 #: than read as truthy, which is the whole point of not using `bool(raw)` — the empty
 #: string aside, every non-empty string is truthy in Python, `"false"` included.
 _FALSEY = frozenset({"false", "no", "n", "0", "off"})
@@ -1287,15 +1332,20 @@ def severity_floor(panel: dict, key: str, fallback: str, notes: list[str]) -> st
 
     ``P4`` is a legitimate value and is how a repo asks for the pre-#165 behaviour,
     so it is accepted like any other rather than warned about: the report says which
-    floor was in force on every round, which is where a reader learns it is off."""
+    floor was in force on every round, which is where a reader learns it is off.
+
+    Anything else is refused (:func:`_refuse_value`) — `fix_severity_floor: "p-4"`
+    meaning "fix everything" is the exact typo that must not silently become the
+    default. `notes` is kept in the signature: it is what every other resolver here
+    takes, and a bad value is not the only thing a future reading of a floor might
+    have to say."""
     want = panel.get(key)
     if want is None or want == "":
         return fallback
     got = _severity(want, "") if isinstance(want, str) else ""
     if not got:
-        notes.append(f"`{key}`={want!r} is not a severity — accepted values are "
-                     f"{', '.join(SEVERITIES)} (case-insensitive); using {fallback}")
-        return fallback
+        _refuse_value(key, want, "one of "
+                      f"{', '.join(SEVERITIES)} (case-insensitive)")
     return got
 
 
@@ -1311,9 +1361,8 @@ def reviewer_scope(panel: dict, notes: list[str]) -> str:
     if want is None or want == "":
         return DEFAULT_REVIEWER_SCOPE
     if not isinstance(want, str) or want.strip().lower() not in REVIEWER_SCOPES:
-        notes.append(f"`reviewer_scope`={want!r} is not one of "
-                     f"{', '.join(REVIEWER_SCOPES)} — using {DEFAULT_REVIEWER_SCOPE}")
-        return DEFAULT_REVIEWER_SCOPE
+        _refuse_value("reviewer_scope", want,
+                      f"one of {', '.join(REVIEWER_SCOPES)}")
     return want.strip().lower()
 
 
@@ -1344,36 +1393,38 @@ def fix_growth_limit(panel: dict, notes: list[str]) -> float | None:
     if raw is None or raw == "":
         return None
 
-    def refuse(why: str) -> float | None:
-        notes.append(f"`max_fix_growth`={raw!r} {why} — a positive multiple of the "
-                     "first round's reviewed size, or null to switch the check off; "
-                     f"using {DEFAULT_MAX_FIX_GROWTH}")
-        return DEFAULT_MAX_FIX_GROWTH
+    def refuse(what: str) -> float | None:
+        _refuse_value("max_fix_growth", raw,
+                      f"{what} — a positive multiple of the first round's reviewed "
+                      "size, or null to switch the check off")
+        return None            # unreachable; `_refuse_value` always raises
 
     if isinstance(raw, bool) or not isinstance(raw, (int, float, str)):
-        return refuse("is not a number")
+        return refuse("a number")
     try:
         n = float(raw)
     except (TypeError, ValueError):
-        return refuse("is not a number")
+        return refuse("a number")
     if n != n or n in (float("inf"), float("-inf")):
-        return refuse("is not a finite number")
+        return refuse("a finite number")
     if n <= 0:
-        return refuse("is not above zero")
+        return refuse("above zero")
     return n
 
 
 def panel_flag(panel: dict, key: str, fallback: bool, notes: list[str]) -> bool:
     """One boolean `review_panel` setting, with `panel_preflight._flag`'s manners —
     the string spellings a hand writes (``"false"``, ``"off"``) and the bare ``0``/``1``
-    a generator writes are accepted, and anything else falls back and says so.
+    a generator writes are accepted, and anything else is refused.
 
-    Not a call INTO that function, deliberately. `_flag`'s note says "using
-    <fallback>" and nothing else, which is right for a pre-flight threshold and wrong
-    for a policy switch: `fixer_may_defer` decides what a fixer is permitted to do
-    and `require_failing_test` decides what blocks, so the note has to name the two
-    values that are accepted or a reader cannot tell a rejected value from an honoured
-    one."""
+    Not a call INTO that function, deliberately, and now for a second reason: `_flag`
+    falls back with a note, and a malformed value of a key this harness knows is a
+    hard exit here (see :func:`_refuse_value`). The first reason stands too — `_flag`'s
+    note says "using <fallback>" and nothing else, which is right for a pre-flight
+    threshold and wrong for a policy switch: `fixer_may_defer` decides what a fixer is
+    permitted to do and `require_failing_test` decides what blocks, so the message has
+    to name the values that are accepted or a reader cannot tell a rejected value from
+    an honoured one."""
     raw = panel.get(key)
     if raw is None or raw == "":
         return fallback
@@ -1387,10 +1438,9 @@ def panel_flag(panel: dict, key: str, fallback: bool, notes: list[str]) -> bool:
             return True
         if word in _FALSEY:
             return False
-    notes.append(f"`{key}`={raw!r} is not true or false — accepted are true/false "
-                 f"(and the spellings `yes`/`no`, `on`/`off`, `1`/`0`); "
-                 f"using {fallback}")
-    return fallback
+    _refuse_value(key, raw, "true or false (or the spellings `yes`/`no`, `on`/`off`, "
+                            "`1`/`0`)")
+    return fallback            # unreachable; `_refuse_value` always raises
 
 
 def resolve_max_rounds(asked: int | None, panel: dict, notes: list[str]) -> int:
@@ -1426,9 +1476,7 @@ def resolve_max_rounds(asked: int | None, panel: dict, notes: list[str]) -> int:
         except ValueError:
             n = None
     if n is None or n < 1:
-        notes.append(f"`max_rounds`={raw!r} is not a whole number of rounds >= 1 — "
-                     f"using {DEFAULT_MAX_ROUNDS}")
-        return DEFAULT_MAX_ROUNDS
+        _refuse_value("max_rounds", raw, "a whole number of rounds >= 1")
     return n
 
 
@@ -2840,6 +2888,7 @@ __all__ = [
     "QB_NO_SUBCOMMAND", "record_ask", "diff_budget", "resolve_round_scope",
     "severity_floor", "reviewer_scope", "fix_growth_limit", "panel_flag",
     "resolve_max_rounds", "Dials", "resolve_dials", "_FALSEY", "_ABSENT",
+    "_refuse_value",
     "fit_argv_budget", "argv_clamp", "reviewer_label", "fallback_label",
     "seat_label", "error_events", "error_text",
     "is_model_unavailable", "is_effort_unsupported", "codex_args",

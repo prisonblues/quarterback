@@ -467,19 +467,43 @@ DEFAULTS: dict = {
         # it away — `review-pr.md` ranks findings "for the summary table only. All
         # of them get fixed."
         #
-        # P2 because the cut was measured, not guessed: applied to the seven PRs
-        # above it discards 99 of 147 findings (67.3%) and loses ZERO P1s — all six
-        # sit in the kept tier. #223 and #237 already apply this exact rule by hand
-        # ("fix P1/P2 correctness only, defer the rest"), but only AT the cap, after
-        # three rounds of fix passes have already grown the change. This applies it
-        # from round 1, which is the difference between a policy and a post-mortem.
+        # P3, NOT P2, and this is the one place the measured cut is deliberately not
+        # taken at its own line. The measurement is real — applied to the seven PRs
+        # above, a P2 cut discards 99 of 147 findings (67.3%) and loses ZERO P1s, all
+        # six in the kept tier — and #223 and #237 already apply exactly that rule by
+        # hand ("fix P1/P2 correctness only, defer the rest"), though only AT the cap,
+        # after three fix passes have already grown the change. What the P2 default
+        # under-weighted is two things:
+        #
+        # 1. **Severity is model-authored and wrong sometimes.** The defect class a P2
+        #    floor systematically misses is correctness expressed as craft — a missing
+        #    regression test on a parser or an auth boundary, a missing timeout or
+        #    cleanup, a migration rollback or idempotency gap. Every one of those is a
+        #    correctness defect that a reviewer may reasonably label P3, and the floor
+        #    cannot tell a mislabelled P2 from a genuine P3.
+        # 2. **The costs are wildly asymmetric.** Fixing a P3 inside a pass that is
+        #    ALREADY open and already being verified costs one more edit in a diff a
+        #    human is going to read anyway. Letting a P3 buy a whole new round costs a
+        #    full panel run plus another fix pass — and the fix pass is where the
+        #    63.7% comes from. So: fix P3s, do not let a P3 trigger another round.
+        #    That is why this key sits at P3 while `round_trigger_floor` stays at P2;
+        #    the two questions were split into two keys for exactly this answer.
+        #
+        # The convergence win is mostly kept, because P4 — 31.3% of findings per #165,
+        # and the tier that actually ballooned PR #236, where a 54-line README rewrite
+        # and a decode-path rework were both P4 — stays excluded.
         #
         # Below-floor findings are not discarded: the report gives them their own
         # heading and their own mark so a brief built from it cannot pick them up by
         # accident, and the payload marks each one, the same way an escalated
-        # finding is marked ⛔. `"P4"` restores today's behaviour — everything gets
-        # fixed.
-        "fix_severity_floor": "P2",
+        # finding is marked ⛔. `"P4"` restores the pre-#165 fix list — everything gets
+        # fixed — and note the exact reach of that: it restores `round_stop`'s rules 1
+        # and 3, and for rule 2 there is nothing to restore. Rule 2's bar is the
+        # hardcoded `("P1", "P2")` tuple, so a fix floor can only ever RAISE it and
+        # only `"P1"` moves it at all. A Sonar hard-gate issue is exempt from both
+        # floors at every rule, whatever severity Sonar gave it — a red quality gate
+        # is not a severity judgement (`round_stop`'s docstring).
+        "fix_severity_floor": "P3",
         # What buys another ROUND. Only findings no earlier round raised AND at or
         # above this severity make the cycle go again. A new finding below the floor
         # is still reported and still recorded; it just does not by itself purchase
@@ -491,11 +515,14 @@ DEFAULTS: dict = {
         # fed by the loop's own output and can only end on the cap. That is not a
         # theory about the code; it is what all seven panels did.
         #
-        # P2 for the same measured reason as `fix_severity_floor`, and the two are
-        # separate keys on purpose: "worth fixing while we are in here" and "worth
-        # another round of everything" are different questions, and a repo may want
-        # to fix P3s in the pass it is already running without letting one buy a
-        # fourth round. `"P4"` restores today's behaviour.
+        # P2 on the measured cut, and it STAYS at P2 while `fix_severity_floor` sits
+        # at P3 — the two are separate keys on purpose and the defaults are what that
+        # buys. "Worth fixing while we are in here" and "worth another round of
+        # everything" are different questions with wildly different prices: one more
+        # edit in a pass already open and already being verified, against a full panel
+        # run plus another fix pass. So the shipped default fixes P3s in the round it
+        # is already running and refuses to let one buy a fourth. `"P4"` restores
+        # today's behaviour.
         "round_trigger_floor": "P2",
         # A fix pass that MULTIPLIES the diff has written a second change, not a
         # fix. If what a round reviews has grown by more than this multiple of what

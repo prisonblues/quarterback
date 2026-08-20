@@ -1580,6 +1580,13 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # whose only outstanding item is a new or still-open gate issue is not a dry
     # round. Leaving them out classified exactly that as convergence and ended the
     # cycle without another fixer.
+    #
+    # #165's floors do not reach them, and `round_stop` is where that is enforced —
+    # it exempts every key whose `verdict` is `sonar` from BOTH floors at every rule,
+    # because Sonar's own severities are routinely P3/P4 and filtering by them put
+    # this exact bug back: a new P3 gate issue fell out of `triggering`, landed in
+    # `quiet_new`, and the cycle stopped `confident` on a PR that cannot merge. A
+    # third floor has to go through the same exemption.
     outstanding = to_fix + sonar
     new_keys = sorted({c.key for c in outstanding if is_new(c)})
     flagged = sum(1 for c in to_fix if c.needs_rereview)
