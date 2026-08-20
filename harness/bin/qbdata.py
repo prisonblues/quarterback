@@ -421,7 +421,13 @@ def _gh_list(kind: str, repo: str, fields: str) -> tuple[list[dict], str | None]
             capture_output=True, text=True, timeout=45,
         )
         if raw.returncode != 0:
-            return [], f"{short_repo(repo)}: {clip(raw.stderr, 50)}" or f"gh exit {raw.returncode}"
+            # The fallback has to be INSIDE the interpolation. Outside it, `or`
+            # tests the whole f-string, which holds `": "` and so is never falsy —
+            # the exit code was unreachable and a `gh` that failed silently
+            # rendered as a repo name followed by nothing, which is the one error
+            # line a reader cannot act on.
+            why = clip(raw.stderr, 50) or f"gh exit {raw.returncode}"
+            return [], f"{short_repo(repo)}: {why}"
         rows = json.loads(raw.stdout)
         for row in rows:
             row["repo"] = repo
