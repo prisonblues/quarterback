@@ -30,6 +30,13 @@ def repo(tmp_path, monkeypatch):
     remote-HEAD detection both behave like the real thing.
     """
     monkeypatch.delenv("HARNESS_UNATTENDED", raising=False)
+    # The per-box overlay lives OUTSIDE the checkout (#240), so without this every
+    # test in this file reads the developer's own `~/.config/quarterback/
+    # harness-rules.json` and passes or fails on whether that machine happens to pin
+    # a seat. That is the defect in #239 — a suite whose answer depends on the host —
+    # and it must not be reintroduced by the feature that made it possible.
+    monkeypatch.delenv(hr.BOX_RULES_ENV, raising=False)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
     work = tmp_path / "myrepo"
     work.mkdir()
     git(work, "init", "-q", "-b", "main")
@@ -1191,6 +1198,94 @@ def test_a_branch_that_cannot_be_read_is_not_a_repo_with_no_rules(repo, capsys):
     assert cfg["_rules_baseline"] == ""
     assert "unreadable" in cfg["_rules_from"]
     assert "could not be read" in capsys.readouterr().err
+
+
+# ----------------------------------------- the per-box overlay, outside the repo
+
+def write_box(tmp_path, obj):
+    """The PER-BOX half — what this machine's providers serve, for every repo on it."""
+    f = tmp_path / "xdg" / "quarterback" / hr.BOX_RULES_FILENAME
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(json.dumps(obj))
+    return f
+
+
+def test_the_box_file_answers_for_a_repo_that_says_nothing(repo, tmp_path):
+    """#240. The fact is "what will THIS MACHINE serve", so one file on the box has to
+    answer for every checkout and every worktree on it. Storing it per-checkout stored
+    it N times and propagated it none: a fresh worktree resolved the fleet pin, its
+    provider refused it, and the agent holding it rediscovered the machine's own
+    configuration and told its peers in prose."""
+    write_sample(repo, {"reviewers": {"codex": {"model": "gpt-5.6-luna",
+                                                "effort": "max"}}})
+    write_box(tmp_path, {"reviewers": {"codex": {"model": "gpt-5.5", "effort": "high"}}})
+    cfg = hr.resolve_repo(str(repo), from_default_branch=False)
+    assert cfg["reviewers"]["codex"]["model"] == "gpt-5.5"
+    assert cfg["reviewers"]["codex"]["effort"] == "high"
+    assert hr.BOX_RULES_FILENAME in cfg["_rules_from"], (
+        "the line that exists to say which rules applied has to name this one too")
+
+
+def test_the_repo_overlay_wins_per_key_without_erasing_the_box(repo, tmp_path):
+    """Per KEY, not per seat. A box that pins the model and a repo that pins only the
+    effort should end with both — the more specific answer wins where they collide and
+    the machine's survives where they do not."""
+    write_sample(repo, {"reviewers": {"codex": {"model": "gpt-5.6-luna"}}})
+    write_box(tmp_path, {"reviewers": {"codex": {"model": "gpt-5.5", "effort": "high"}}})
+    write_local(repo, {"reviewers": {"codex": {"effort": "medium"}}})
+    cfg = hr.resolve_repo(str(repo), from_default_branch=False)
+    assert cfg["reviewers"]["codex"]["effort"] == "medium", "repo wins the collision"
+    assert cfg["reviewers"]["codex"]["model"] == "gpt-5.5", (
+        "and the box's answer on a key the repo said nothing about survives")
+
+
+def test_the_box_file_corrects_a_legacy_repo_too(repo, tmp_path):
+    """The asymmetric gate, stated as a test because it looks like an oversight. The
+    REPO overlay needs a `.sample` baseline beside it, or a repo whose only config is
+    an uncommitted `.harness-rules` has its whole policy demoted to a seat toggle. The
+    BOX file needs no such guard: it cannot be the baseline, because it is not in the
+    checkout — and a legacy repo whose committed rules name a pin this machine cannot
+    serve is exactly the case that should still be corrected."""
+    write_tracked_legacy(repo, {"reviewers": {"codex": {"model": "gpt-5.6-luna"}}})
+    write_box(tmp_path, {"reviewers": {"codex": {"model": "gpt-5.5"}}})
+    cfg = hr.resolve_repo(str(repo), from_default_branch=False)
+    assert cfg["_rules_baseline"] == hr.RULES_FILENAME, "legacy layout, as set up"
+    assert cfg["reviewers"]["codex"]["model"] == "gpt-5.5"
+
+
+def test_a_box_file_named_but_missing_is_a_hard_exit(repo, tmp_path, monkeypatch):
+    """Somebody pointed at a file. Falling back to "this box has no answer" would be
+    the silent-policy failure this module exists to prevent — and it would present as
+    a seat quietly running an unservable pin, which is the failure we already cannot
+    see. An UNSET variable with no XDG file is the ordinary case and says nothing."""
+    write_sample(repo, {"reviewers": {"codex": {"model": "gpt-5.6-luna"}}})
+    monkeypatch.setenv(hr.BOX_RULES_ENV, str(tmp_path / "nowhere.json"))
+    with pytest.raises(SystemExit) as e:
+        hr.resolve_repo(str(repo), from_default_branch=False)
+    assert "does not exist" in str(e.value) and hr.BOX_RULES_ENV in str(e.value)
+
+
+def test_the_box_file_is_not_read_unattended_either(repo, tmp_path):
+    """It is no more reviewed than the repo's half, so the rule is the same one: the
+    unattended path reads NOTHING out of the box's own configuration. The cost is
+    named in the module docstring and it is the right price."""
+    write_sample(repo, {"reviewers": {"codex": {"model": "gpt-5.6-luna"}}})
+    write_box(tmp_path, {"reviewers": {"codex": {"model": "gpt-5.5"}}})
+    cfg = hr.resolve_repo(str(repo), from_default_branch=True)
+    assert cfg["reviewers"]["codex"]["model"] == "gpt-5.6-luna", (
+        "unattended takes the fleet pin off the protected branch, not this box's")
+
+
+def test_a_dropped_key_says_which_of_the_two_files_said_it(repo, tmp_path, capsys):
+    """With one file the sentence could leave the location implicit. With two, a reader
+    told `auto_merge` was ignored has to know WHICH file to go and edit."""
+    write_sample(repo, {"reviewers": {"codex": {"model": "gpt-5.6-luna"}}})
+    box = write_box(tmp_path, {"auto_merge": "all",
+                               "reviewers": {"codex": {"model": "gpt-5.5"}}})
+    hr.resolve_repo(str(repo), from_default_branch=False)
+    err = capsys.readouterr().err
+    assert "`auto_merge` is not a provider fact" in err
+    assert str(box) in err, f"the sentence must name the file. got:\n{err}"
 
 
 # ------------------------------------- a file the branch carries but cannot serve

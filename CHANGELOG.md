@@ -11,6 +11,56 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
+## v2.56 — what this machine serves is one file per box, not one per checkout
+
+`.harness-rules` answers "what will THIS MACHINE's providers actually serve?" — a fact about the
+box. It was read only from a repo root, and nothing propagated it: `create-worktree` does not copy
+it. So the fact was stored once per CHECKOUT, by hand, and a fresh worktree had no answer at all —
+it resolved a seat to the fleet pin, the provider refused it, and the seat fell back to a CLI
+default that the panel header then reported as `codex (CLI default; pinned gpt-5.6-luna unavailable,
+effort max unsupported)`. An unpinned seat makes the controlled two-vendor comparison the pin exists
+to guarantee unattributable, which is the whole reason it is pinned.
+
+What followed was not a crash. It was a **conversation**: the agent holding that worktree
+rediscovered the machine's own configuration and relayed the workaround to its peers in prose —
+five board posts, an independent confirmation from another session, and two live sessions whose
+titles were the workaround. Configuration arriving as chat, in the least reliable channel available
+and the one the tool that needs the answer cannot read.
+
+It also blocked the remedy for a worse problem. The fix for agents clobbering each other in a
+shared checkout is a worktree each; adopting that would have multiplied the rediscovery by the
+number of worktrees. **One file per box is what makes worktree-per-agent safe to turn on.**
+
+So the overlay is now read from two places, the repo's winning per key:
+
+| | Path | Scope |
+|---|---|---|
+| box | `$QUARTERBACK_HARNESS_RULES`, else `$XDG_CONFIG_HOME/quarterback/harness-rules.json` | every repo and every worktree on the machine |
+| repo | `<repo>/.harness-rules`, untracked, beside a `.sample` | this checkout only |
+
+Per KEY rather than per seat: a box that pins codex's model and a repo that pins only its effort end
+with both, rather than the narrower answer erasing the machine's.
+
+**The two are gated differently, deliberately.** The repo file still needs both its conditions —
+untracked, AND a `.sample` supplied the baseline — because untracked alone does not mean "overlay":
+a repo whose only config is an uncommitted `.harness-rules` would have its whole policy demoted to
+a seat toggle. The box file needs neither, because it cannot be the baseline nor be mistaken for
+one, and a legacy repo whose committed rules name a pin this machine cannot serve is exactly the
+case its own answer should still correct. A path named in `$QUARTERBACK_HARNESS_RULES` that does not
+exist is a hard exit rather than a fallback: somebody pointed at a file, and quietly running the
+fleet pin instead is the silent-policy failure this module exists to prevent.
+
+Unchanged: the narrowing to `enabled`/`model`/`effort`, the refusal to widen past what the protected
+sample agreed, every dropped key reported on stderr — now naming WHICH of the two files said it,
+because a reader told `auto_merge` was ignored has to know where to go and edit — and the rule that
+the unattended path reads nothing out of this box's own configuration, the box file included. It is
+no more reviewed than the repo's half.
+
+One test-hygiene note, because the feature made the hazard possible: `test_harness_rules.py`'s
+fixture now pins `XDG_CONFIG_HOME` at a tmpdir and clears `$QUARTERBACK_HARNESS_RULES`. Without it
+every test in the file would read the developer's own box file and pass or fail on whether that
+machine happens to pin a seat — which is #239, and not a defect worth shipping twice.
+
 ## v2.55 — a stub written at runtime cannot name `/usr/bin/env`, and now says so where it is written
 
 `nix build .#checks.x86_64-linux.worktree-tests` failed sixty-one assertions across two suites for a

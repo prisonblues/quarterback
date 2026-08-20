@@ -111,6 +111,22 @@ RULES_FILENAME = ".harness-rules"
 # that, and only the ref does: see the module docstring.
 SAMPLE_FILENAME = ".harness-rules.sample"
 
+#: Where this BOX records what its providers serve, OUTSIDE any checkout — and the
+#: reason it exists at all. `.harness-rules` answers "what will this MACHINE serve?",
+#: which is a fact about the box; storing it in the repo root stores it once per
+#: CHECKOUT, and nothing propagates it (`create-worktree` does not copy it). So every
+#: new worktree started with no overlay, resolved a seat to a fleet pin its provider
+#: does not deploy, and the agent holding it rediscovered the machine's own
+#: configuration and relayed it to its peers in prose. That is the least reliable
+#: channel available and the one the tool needing the answer cannot read.
+#:
+#: It also blocked the remedy for a worse problem: the fix for agents clobbering each
+#: other in one checkout is a worktree each, and adopting that multiplied the
+#: rediscovery by the number of worktrees. One file per box, read by all of them,
+#: is what makes worktree-per-agent safe to turn on. (#240)
+BOX_RULES_ENV = "QUARTERBACK_HARNESS_RULES"
+BOX_RULES_FILENAME = "harness-rules.json"
+
 # The reasoning levels each reviewer CLI accepts for the shared `effort` key.
 # codex spells it `model_reasoning_effort`, pi spells it `--thinking`, and the two
 # sets genuinely differ (pi has off/minimal, codex has ultra), so they are listed
@@ -844,93 +860,157 @@ def _overlay_problem(seat: str, key: str, val: Any) -> str:
     return ""
 
 
-def _local_overlay(root: Path, baseline: str) -> tuple[dict, str, list[str]]:
-    """This machine's untracked `.harness-rules`, narrowed to what a PROVIDER serves.
+def box_rules_path() -> Path:
+    """The per-BOX overlay's path. Never inside a checkout, so a fresh worktree is
+    correct the moment it exists rather than after someone remembers to copy a file.
 
-    Returns `(overlay, provenance, problems)`. `overlay` is shaped like the
-    `reviewers` block and holds nothing but `enabled`, `model` and `effort` — the
-    three provider facts, never merge policy; see the `_LOCAL_KEYS` comment for the
-    three further rules that narrowing rests on. An empty overlay is the answer
-    whenever the file is absent, or is tracked (the legacy layout, where it IS the
-    baseline `_read_rules` just read).
-
-    `problems` is a list of FINISHED SENTENCES, one per thing this file said that
-    was not applied — not a list of key names under one blanket message, which is
-    what it was. That blanket read "the untracked overlay may set only
-    reviewers.<seat>.enabled/model/effort", and it was printed over `reviewers:
-    "none"`, whose author had written that shape and was told it was forbidden, and
-    over `reviewers.gemini.enabled`, a well-formed key naming a seat that does not
-    exist — which is the exact confusion the diagnostic is there to prevent. A
-    problem that cannot say what is wrong with it is not a diagnostic.
-
-    NOT called at all on the unattended path. `resolve_repo` decides that, because
-    it is a property of the RUN and not of the file; see the module docstring.
+    `$QUARTERBACK_HARNESS_RULES` wins, for tests and for a host that keeps its config
+    somewhere else; otherwise XDG, which is where per-user machine config belongs and
+    is what a nix or home-manager generation can write. Returned whether or not it
+    exists — the caller decides, because "absent" and "named but missing" are
+    different answers and only one of them is a mistake.
     """
-    # BOTH conditions, and the first is the one a plausible-looking shortcut gets
-    # wrong. Untracked alone does not mean "overlay": a repo whose only config is
-    # an uncommitted `.harness-rules` — mid-migration, a fresh clone, a test
-    # fixture — would have its whole policy demoted to a seat toggle and silently
-    # dropped. The overlay exists only where a `.sample` supplied the baseline.
-    if baseline != SAMPLE_FILENAME:
-        return {}, "", []
-    f = root / RULES_FILENAME
-    if not f.is_file() or _is_tracked(root, RULES_FILENAME):
-        return {}, "", []
-    # Through the shared parser, so the two halves of the split answer a JSON array
-    # or a bare string in the same words. That used to be true only here.
-    raw = strip_comments(_baseline_json(f.read_text(), str(f)))
+    explicit = os.environ.get(BOX_RULES_ENV)
+    if explicit:
+        return Path(explicit).expanduser()
+    base = os.environ.get("XDG_CONFIG_HOME") or "~/.config"
+    return Path(base).expanduser() / "quarterback" / BOX_RULES_FILENAME
+
+
+def _overlay_keys(raw: dict, where: str) -> tuple[dict, list[str]]:
+    """Narrow one parsed overlay file to the provider facts, saying what it dropped.
+
+    Split out of `_local_overlay` when the per-box file arrived (#240): the narrowing
+    is a property of what an unreviewed file may SAY, not of where it sits, so both
+    sources get the identical treatment and neither can drift into being the lenient
+    one. `where` names the file in every sentence, which is the whole point once there
+    are two of them and a reader has to know which one to edit.
+    """
     overlay: dict = {}
     problems: list[str] = []
     for key, val in raw.items():
         if key != _LOCAL_BLOCK:
-            problems.append(f"`{key}` is not a provider fact — ignored; "
+            problems.append(f"{where}: `{key}` is not a provider fact — ignored; "
                             f"{_NOT_A_PROVIDER_FACT}")
             continue
         if not isinstance(val, dict):
-            # Its own sentence, because the blanket message told this author that
-            # `reviewers.<seat>.*` was the only allowed shape — which is what they
-            # thought they had written.
-            problems.append(f"`{_LOCAL_BLOCK}` must be an object of seats, not "
-                            f"{type(val).__name__} — the whole block was ignored. "
+            problems.append(f"{where}: `{_LOCAL_BLOCK}` must be an object of seats, "
+                            f"not {type(val).__name__} — the whole block was ignored. "
                             f'Shape: {{"{_LOCAL_BLOCK}": {{"codex": {{"model": '
                             f'"gpt-5.5"}}}}}}')
             continue
         for seat, cfg in val.items():
-            # The seat name is checked HERE rather than where the overlay is
-            # applied, so that `problems` can never be non-empty while `provenance`
-            # is unset — the print used to carry an `or root` fallback for exactly
-            # that case, which was unreachable and would have named a directory
-            # where a file path belongs. DEFAULTS is the authority on seat names: an
-            # unknown seat in the SAMPLE is dropped by `warn_unknown_keys` before
-            # this runs, so the resolved reviewers block holds exactly these.
             if seat not in DEFAULTS[_LOCAL_BLOCK]:
                 renamed = _RENAMED.get(_LOCAL_BLOCK, {}).get(seat)
                 problems.append(
-                    f"`{_LOCAL_BLOCK}.{seat}` is not a seat on this panel — ignored"
+                    f"{where}: `{_LOCAL_BLOCK}.{seat}` is not a seat on this panel "
+                    f"— ignored"
                     + (f"; it was renamed to {renamed!r}" if renamed else "")
                     + f". Seats: {', '.join(sorted(DEFAULTS[_LOCAL_BLOCK]))}")
                 continue
             if not isinstance(cfg, dict):
-                problems.append(f"`{_LOCAL_BLOCK}.{seat}` must be an object of "
-                                f"{{{', '.join(_LOCAL_KEYS)}}}, not "
+                problems.append(f"{where}: `{_LOCAL_BLOCK}.{seat}` must be an object "
+                                f"of {{{', '.join(_LOCAL_KEYS)}}}, not "
                                 f"{type(cfg).__name__} — ignored")
                 continue
             kept: dict = {}
             for k, v in sorted(cfg.items()):
                 if k not in _LOCAL_KEYS:
-                    problems.append(f"`{_LOCAL_BLOCK}.{seat}.{k}` is not a provider "
-                                    f"fact — ignored; {_NOT_A_PROVIDER_FACT}")
+                    problems.append(f"{where}: `{_LOCAL_BLOCK}.{seat}.{k}` is not a "
+                                    f"provider fact — ignored; "
+                                    f"{_NOT_A_PROVIDER_FACT}")
                     continue
-                # Name AND value. The name says which question this key answers; the
-                # value has to be an answer to it.
                 why = _overlay_problem(seat, k, v)
                 if why:
-                    problems.append(why)
+                    problems.append(f"{where}: {why}")
                     continue
                 kept[k] = v
             if kept:
                 overlay.setdefault(seat, {}).update(kept)
-    return overlay, str(f), problems
+    return overlay, problems
+
+
+def _local_overlay(root: Path, baseline: str) -> tuple[dict, str, list[str]]:
+    """What THIS MACHINE serves: the per-box file, then this repo's own untracked one.
+
+    Returns `(overlay, provenance, problems)`. `overlay` is shaped like the
+    `reviewers` block and holds nothing but `enabled`, `model` and `effort` — the
+    three provider facts, never merge policy; see the `_LOCAL_KEYS` comment for the
+    three further rules that narrowing rests on.
+
+    TWO SOURCES, and the repo's wins per key:
+
+        box   `$QUARTERBACK_HARNESS_RULES`, else XDG (`box_rules_path`)
+        repo  `<root>/.harness-rules`, untracked, beside a `.sample` baseline
+
+    The box file is where the answer BELONGS, because "what will this machine's
+    providers serve?" is true of the machine and not of one checkout of one repo. It
+    is read for every repo and every worktree on the box, which is what stops a fresh
+    worktree resolving a seat to a pin its provider does not deploy and its agent
+    rediscovering the machine's own configuration (#240). The repo file stays because
+    a box can legitimately answer differently per repo — a different gateway, a
+    different subscription — and where both name a key the more specific one is the
+    answer.
+
+    THE TWO ARE GATED DIFFERENTLY, deliberately. The repo file needs BOTH its
+    conditions: untracked, AND a `.sample` supplied the baseline. Untracked alone does
+    not mean "overlay" — a repo whose only config is an uncommitted `.harness-rules`
+    (mid-migration, a fresh clone, a test fixture) would have its whole policy demoted
+    to a seat toggle and silently dropped. The box file needs neither: it lives outside
+    every checkout, so it can never be the baseline nor be mistaken for it, and a
+    legacy repo whose committed rules name an unservable pin is exactly a case that
+    should still be corrected by the machine's own answer.
+
+    `problems` is a list of FINISHED SENTENCES, one per thing a file said that was not
+    applied, each naming the file it came from — not a list of key names under one
+    blanket message, which is what it was. That blanket read "the untracked overlay may
+    set only reviewers.<seat>.enabled/model/effort", and it was printed over
+    `reviewers: "none"`, whose author had written that shape and was told it was
+    forbidden, and over `reviewers.gemini.enabled`, a well-formed key naming a seat
+    that does not exist. A problem that cannot say what is wrong with it is not a
+    diagnostic, and with two possible files it now also has to say WHERE.
+
+    NOT called at all on the unattended path. `resolve_repo` decides that, because it
+    is a property of the RUN and not of the file; see the module docstring. That
+    applies to the box file too: it is no more reviewed than the repo's.
+    """
+    overlay: dict = {}
+    problems: list[str] = []
+    applied_from: list[str] = []
+
+    box = box_rules_path()
+    if box.is_file():
+        raw = strip_comments(_baseline_json(box.read_text(), str(box)))
+        got, said = _overlay_keys(raw, str(box))
+        problems += said
+        if got:
+            overlay.update(got)
+            applied_from.append(str(box))
+    elif os.environ.get(BOX_RULES_ENV):
+        # Named but missing is a mistake, and a loud one: somebody pointed at a file,
+        # so falling back to "this box has no answer" would be the silent-policy
+        # failure this module exists to prevent. An UNSET variable with no XDG file is
+        # the ordinary case and says nothing.
+        raise SystemExit(f"{BOX_RULES_ENV}={box} does not exist. Unset it to fall "
+                         f"back to {box_rules_path.__name__}'s default, or write the "
+                         f"file — it holds what this machine's providers serve, e.g. "
+                         f'{{"{_LOCAL_BLOCK}": {{"codex": {{"model": "gpt-5.5"}}}}}}')
+
+    f = root / RULES_FILENAME
+    if baseline == SAMPLE_FILENAME and f.is_file() \
+            and not _is_tracked(root, RULES_FILENAME):
+        raw = strip_comments(_baseline_json(f.read_text(), str(f)))
+        got, said = _overlay_keys(raw, str(f))
+        problems += said
+        for seat, cfg in got.items():
+            # Per KEY, not per seat: a box that pins codex's model and a repo that
+            # pins only its effort should end with both, rather than the repo's
+            # narrower answer erasing the machine's.
+            overlay.setdefault(seat, {}).update(cfg)
+        if got:
+            applied_from.append(str(f))
+
+    return overlay, " + ".join(applied_from), problems
 
 
 def strip_comments(obj: Any) -> Any:

@@ -41,6 +41,35 @@ deploying `gpt-5.5` and refuses the fleet's `gpt-5.6-luna` with a 404, then refu
 `max` effort separately. So the box says so in a file of its own, rather than in a
 committed one that would move the pin for every other box too.
 
+**Where the box says it, and why it is not in the repo.** The answer is read from two
+places, and the repo's wins per key:
+
+| | Path | Scope |
+|---|---|---|
+| box | `$QUARTERBACK_HARNESS_RULES`, else `$XDG_CONFIG_HOME/quarterback/harness-rules.json` (`~/.config/…`) | every repo and every worktree on this machine |
+| repo | `<repo>/.harness-rules`, untracked, beside a `.sample` | this checkout only |
+
+Prefer the box file. "What will this machine's providers serve" is true of the
+machine, so keeping it per-checkout kept it N times and propagated it none —
+`create-worktree` does not copy it — and a fresh worktree therefore resolved a seat to
+a pin its provider does not deploy. What followed was not a crash but a conversation:
+the agent holding that worktree rediscovered the machine's own configuration and
+relayed the workaround to its peers in prose, which is the least reliable channel
+available and the one the tool needing the answer cannot read. It also blocked the
+remedy for a worse problem — the fix for agents clobbering each other in one checkout
+is a worktree each, and adopting that multiplied the rediscovery by the number of
+worktrees. One file per box is what makes worktree-per-agent safe to turn on (#240).
+
+The two are gated differently on purpose. The repo file needs BOTH its conditions —
+untracked, and a `.sample` supplied the baseline — because untracked alone does not
+mean "overlay": a repo whose only config is an uncommitted `.harness-rules` would have
+its whole policy demoted to a seat toggle. The box file needs neither, because it
+cannot be the baseline nor be mistaken for it, and a legacy repo whose committed rules
+name an unservable pin is exactly what the machine's own answer should still correct.
+A path named in `$QUARTERBACK_HARNESS_RULES` that does not exist is a hard exit, not a
+fallback: somebody pointed at a file, and quietly running the fleet pin instead is the
+silent-policy failure this module exists to prevent.
+
 **The overlay may set three keys, and it may only NARROW.** All three answer one
 question — what will this machine serve — so `enabled` can take a seat OFF a box
 whose CLI is missing, and cannot turn one back ON that the sample deliberately
@@ -111,7 +140,7 @@ This is the one security-relevant choice in the design.
 
 | Mode | Rules come from | Used by |
 |---|---|---|
-| interactive | the working tree: `.harness-rules.sample`, plus this box's untracked `.harness-rules` overlay | `/panel`, `/epic`, `/lander` — anything you typed |
+| interactive | the working tree: `.harness-rules.sample`, plus this box's overlay — `~/.config/quarterback/harness-rules.json` and/or the untracked `.harness-rules` | `/panel`, `/epic`, `/lander` — anything you typed |
 | unattended | `git show origin/<default>:.harness-rules.sample` (falling back to `:.harness-rules` for an unmigrated repo), and **nothing** out of the working tree | the systemd timer (`HARNESS_UNATTENDED=1`) |
 
 An in-tree rules file means repo content influences the harness. For the flows a

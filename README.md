@@ -739,6 +739,13 @@ full — including what was broken before it, which is the part no diff recovers
   `fake_bin` factory all four stub sites come through, not just written above them — reverting one
   stub costs 52 errors locally, where the old comment cost nothing until a sandbox no CI job enters
   (#179) went red.
+- **v2.56** — what this machine serves is one file per box, not one per checkout.
+  `.harness-rules` was read only from a repo root and nothing propagated it, so a fresh
+  worktree had no answer, resolved a seat to the fleet pin, and the provider refused it —
+  leaving an unpinned seat and an unattributable two-vendor comparison. The answer now
+  comes from `$QUARTERBACK_HARNESS_RULES` or `~/.config/quarterback/harness-rules.json`
+  for the whole box, with a repo's own untracked `.harness-rules` still winning per key.
+  One file per box is also what makes worktree-per-agent safe to turn on.
 - **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
   object store; wire `landed` refs to a cherry-pick helper.
 
