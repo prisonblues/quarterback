@@ -99,6 +99,55 @@ class ClickTable(DataTable):
     so a handler on the App never runs — this has to be on the widget itself.
     """
 
+    def add_row(self, *cells, key: str | None = None, **kwargs):
+        """`DataTable.add_row`, except a key this table already holds is
+        suffixed rather than raised on.
+
+        DataTable answers a repeated key with DuplicateKey, which does not
+        degrade the row — it takes the whole dashboard down, and this is the
+        component a human looks at when something is ALREADY wrong. So it is
+        the one that must survive unexpected input rather than replace six
+        panels with a traceback (#209).
+
+        Every panel below computes a key it believes is unique, and after #208
+        and #209 those keys are right. This is the backstop for the next panel,
+        whose duplicates nobody has thought of yet: two rows that collide are
+        kept as two rows, the second under a `~2` key.
+
+        **Degrading is not the same as reporting, and this had to be said out
+        loud.** A row key is never rendered, so the `~2` is invisible; and in
+        the case the backstop was written for — two plan items arriving with no
+        `item_id` — two rows is also exactly what CORRECT data looks like. Left
+        at that, a keying bug this once crashed loudly would now produce nothing
+        at all. So the collision is written to the app log, which is the only
+        place it can be reported from.
+
+        Returns the key actually used. Callers must file their record under
+        THAT — `dispatch_row` looks a row up by key, so a suffixed row would
+        otherwise display fine and do nothing when clicked.
+        """
+        if key is not None:
+            # Compared on the string rather than by constructing a RowKey: the
+            # key type is Textual's private business and this survives it
+            # changing. The tables here are tens of rows, not thousands.
+            taken = {rk.value for rk in self.rows}
+            if key in taken:
+                n = 2
+                while f"{key}~{n}" in taken:
+                    n += 1
+                asked, key = key, f"{key}~{n}"
+                try:
+                    self.log.warning(
+                        f"{self.id or type(self).__name__}: duplicate row key "
+                        f"{asked!r} — kept as {key!r}. The panel's key is not "
+                        f"unique across every repo and screen it can show.")
+                except Exception:                   # noqa: BLE001
+                    # The backstop exists so this table cannot take the
+                    # dashboard down. A logger that is not there (no running
+                    # app) must not be the thing that finally does.
+                    pass
+        return super().add_row(*cells, key=key, **kwargs)
+
     def on_click(self, event: Click) -> None:
         if not self.row_count:
             return
@@ -323,7 +372,6 @@ class Dash(App):
             # rather than tolerating it — so the panel that exists to show the
             # second screen was the thing that could not survive one (#208).
             key = f"seat:{s['pane']}"
-            self.rows[key] = s
             live = s.get("command") not in ("bash", "sh", "zsh", "fish", "")
             # A pane can be running an agent and still be doing nothing you want
             # to know about, or be waiting on you and look identical. `running`
@@ -333,7 +381,7 @@ class Dash(App):
             scope = qd.pane_scope(s)
             label = f"{scope} {s['seat']}" if len(screens) > 1 and scope \
                 else f"seat {s['seat']}"
-            table.add_row(
+            key = table.add_row(
                 Text("●" if live else "·", style="green" if live else "grey50"),
                 Text("✕", style="bold red"),                 # click to close it
                 Text(qd.clip(label, 13), style="bold"),
@@ -343,15 +391,20 @@ class Dash(App):
                 Text(qd.clip(os.path.basename(s.get("path") or "") or "—", 22),
                      style="grey50"),
                 key=key,
-            )
+            ).value
+            self.rows[str(key)] = s
         # The ＋ is a ROW rather than a key, because the whole point of this
         # panel is that the mouse can do it. It carries a record of its own so
         # dispatch_row has something to look up — a row key with nothing behind
-        # it is dropped on the floor.
-        self.rows["seat:add"] = {"add": True}
-        table.add_row(Text(""), Text("＋", style="bold cyan"),
-                      Text("add seat", style="cyan"), Text(""), Text(""), Text(""),
-                      key="seat:add")
+        # it is dropped on the floor. Filed under the key add_row RETURNS like
+        # every other row here: `seat:add` cannot collide with a `seat:%12`
+        # today, but "this one call site is the exception" is how the rule
+        # above stops being a rule.
+        add_key = table.add_row(Text(""), Text("＋", style="bold cyan"),
+                                Text("add seat", style="cyan"),
+                                Text(""), Text(""), Text(""),
+                                key="seat:add").value
+        self.rows[str(add_key)] = {"add": True}
         title = f"SEATS · {len(seats)}" if seats else "SEATS · none on this screen"
         self.query_one("#t_seats", Static).update(title)
 
@@ -411,11 +464,10 @@ class Dash(App):
                         key=lambda a: (a.get("repo") or "", a.get("holder") or ""))
         for i, a in enumerate(agents):
             key = f"agent:{i}"
-            self.rows[key] = a
             seat = qd.seat_number(a.get("holder"))
             who = (a.get("holder") or "?").split("/", 1)[-1]
             word, style = qd.agent_state(a)
-            table.add_row(
+            key = table.add_row(
                 Text(qd.clip(who, 13), style="bold green" if seat else "bold"),
                 Text(word or "—", style=style),
                 Text(qd.clip(a.get("repo") or "—", 11),
@@ -424,7 +476,8 @@ class Dash(App):
                      style="white" if seat else "grey70"),
                 Text(qd.until(a.get("expires")), style="grey50"),
                 key=key,
-            )
+            ).value
+            self.rows[str(key)] = a
         self.query_one("#t_fleet", Static).update(f"FLEET · {len(agents)}")
         # Keep what the board said about each SEAT, keyed by seat number, so the
         # panel below can say what a pane is doing. The two panels answer
@@ -444,16 +497,16 @@ class Dash(App):
         ctable.clear()
         for i, c in enumerate(claims):
             key = f"claim:{i}"
-            self.rows[key] = c
             left = qd.minutes_left(c.get("expires"))
-            ctable.add_row(
+            key = ctable.add_row(
                 Text(qd.clip((c.get("holder") or "?").split("/", 1)[-1], 13), style="bold"),
                 Text(qd.clip(qd.claim_label(c.get("key") or "?", self.plan), 34),
                      style="yellow" if c.get("kind") == "issue" else "grey70"),
                 Text(qd.until(c.get("expires")),
                      style="red" if left is not None and left < 10 else "grey50"),
                 key=key,
-            )
+            ).value
+            self.rows[str(key)] = c
         self.query_one("#t_claims", Static).update(f"CLAIMED · {len(claims)}")
 
         # Who holds which issue comes off the same claims, and only the holder
@@ -489,7 +542,7 @@ class Dash(App):
             who, who_colour = qd.plan_who(item)
             takeable = qd.plan_issue(item, repos) is not None and not item.get("claim")
             repo = qd.short_repo(item.get("repo") or "fleet")
-            table.add_row(
+            key = table.add_row(
                 Text(glyph, style=colour),
                 Text("⚒", style="bold cyan" if takeable else "grey30"),
                 Text(qd.clip(repo, 11), style=qd.repo_colour(repo)),
@@ -498,8 +551,8 @@ class Dash(App):
                      style="grey50" if colour == "grey50" else "white"),
                 Text(qd.clip(who, 13), style=who_colour),
                 key=f"plan:{item.get('item_id')}",
-            )
-            self.rows[f"plan:{item.get('item_id')}"] = item
+            ).value
+            self.rows[str(key)] = item
         running, blocked = qd.plan_counts(items)
         title = f"PLANS · {len(items)} open"
         if running:
@@ -518,10 +571,11 @@ class Dash(App):
         for pr in sorted(prs, key=lambda p: -p.get("number", 0)):
             glyph, colour = qd.ci_state(pr)
             red += colour == "red"
-            key = f"pr:{pr.get('number')}"
-            self.rows[key] = pr
+            # By repo AND number. Two watched repos both reach #42 eventually,
+            # and the bare number handed this table the same row key twice (#209).
+            key = f"pr:{qd.repo_ref(pr)}"
             repo = qd.short_repo(pr.get("repo") or qd.REPO)
-            table.add_row(
+            key = table.add_row(
                 Text(glyph, style=colour),
                 Text("⚖", style="bold cyan"),          # click to panel-review
                 Text(qd.clip(repo, 11), style=qd.repo_colour(repo)),
@@ -530,7 +584,8 @@ class Dash(App):
                      style="grey50" if pr.get("isDraft") else "white"),
                 Text(qd.ago(pr.get("updatedAt")), style="grey50"),
                 key=key,
-            )
+            ).value
+            self.rows[str(key)] = pr
         title = f"OPEN PRs · {len(prs)}" + (f" · {red} red" if red else "")
         if err:
             title += f" · gh: {qd.clip(err, 24)}"
@@ -551,10 +606,9 @@ class Dash(App):
             claim = self.held.get(qd.issue_key(issue))
             holder = (claim.get("holder") or "?") if claim else None
             free += holder is None
-            key = f"issue:{number}"
-            self.rows[key] = issue
+            key = f"issue:{qd.repo_ref(issue)}"     # repo AND number (#209)
             repo = qd.short_repo(issue.get("repo") or qd.REPO)
-            table.add_row(
+            key = table.add_row(
                 Text("·" if holder else "○", style="grey50" if holder else "green"),
                 Text("⚒", style="grey50" if holder else "bold cyan"),
                 Text(qd.clip(repo, 11), style=qd.repo_colour(repo)),
@@ -565,7 +619,8 @@ class Dash(App):
                      else qd.ago(issue.get("updatedAt")),
                      style="yellow" if holder else "grey50"),
                 key=key,
-            )
+            ).value
+            self.rows[str(key)] = issue
         title = f"ISSUES · {len(issues)}" + (f" · {free} free" if issues else "")
         if err:
             title += f" · gh: {qd.clip(err, 24)}"
@@ -751,6 +806,19 @@ class Dash(App):
         qb-seat does: the brief positionally, after `--`.
         """
         number = pr.get("number")
+        # The same refusal the ⚒ on an issue row makes, for the same reason and
+        # with more at stake. /panel-review-pr takes a bare number and resolves
+        # the repository from the checkout it runs in, so a PR from a repo this
+        # dashboard only WATCHES would review whatever wears that number HERE —
+        # and this one spends money, comments on a public PR and pushes a fix
+        # commit to it. Until #209 that click was unreachable, because a second
+        # repo sharing a number crashed the panel before anything rendered; now
+        # both rows are there, so the guard has to be too.
+        repo = pr.get("repo")
+        if repo and self.repo_slug and repo != self.repo_slug:
+            self.say(f"PR #{number} is in {repo}; this dashboard runs in "
+                     f"{self.repo_slug} — review it from that checkout")
+            return
         command = f"{shlex.quote(self.agent_bin)} -- {shlex.quote(f'/panel-review-pr {number}')}"
         if self.confirm:
             self.push_screen(

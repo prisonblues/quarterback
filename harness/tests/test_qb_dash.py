@@ -26,6 +26,7 @@ import importlib.util
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 
@@ -350,6 +351,13 @@ async def _drive_panel() -> list[str]:
         prs = app.query_one("#prs")
         _need_rows(prs, "PRs", app.pr_err)
 
+        # This test is about the ⚖ MECHANICS — confirm, cancel, pane not window
+        # — on whatever PR happens to be newest. The cross-repo refusal has its
+        # own test below; left live here it would make this one pass or fail on
+        # which of QB_DASH_REPOS holds the highest-numbered PR today. An unknown
+        # repo is exactly how the guard already stands aside.
+        app.repo_slug = None
+
         # The ⚖ column asks first and starts nothing by itself.
         await pilot.click(prs, offset=(app_module.Dash.PANEL_COLUMN + 2, 1))
         await pilot.pause(0.3)
@@ -662,7 +670,15 @@ class _Sink:
 
     def update(self, *a, **k): pass
     def clear(self, *a, **k): pass
-    def add_row(self, *a, **k): pass
+
+    def add_row(self, *a, key=None, **k):
+        """Hands back a key like the real one does.
+
+        `DataTable.add_row` returns the RowKey it used, and since #209 the
+        panels file their record under that rather than under the key they
+        asked for — so a stub returning None models a widget that does not
+        exist, and would have hidden the caller getting it wrong."""
+        return SimpleNamespace(value=key)
 
 
 def test_a_fleet_click_jumps_to_the_pane_in_the_same_project(monkeypatch):
@@ -721,3 +737,264 @@ def test_a_repository_path_with_a_space_in_it_still_finds_its_pane(monkeypatch):
     monkeypatch.setattr(module.subprocess, "run", fake_run)
     assert app.jump_to_seat(2, "lexray") is True
     assert selected == ["%4"]
+
+
+# ---- one number, two repos (#209) --------------------------------------------
+#
+# `add_row` raises DuplicateKey rather than tolerating a repeated key, so a row
+# key that is not unique does not degrade the panel — it takes the whole
+# dashboard down, which is the worst thing this particular component can do:
+# it is what you look at when something is already wrong.
+#
+# #208 fixed the reported instance by keying SEATS on the pane id. It did not
+# fix the class. PRS and ISSUES are multi-repo — `_gh_list_many` concatenates
+# `gh` output across every repo in QB_DASH_REPOS and tags each row with its
+# origin — and both keyed their rows by the bare number, which two repos share
+# as soon as they have both reached it.
+#
+# `qbdata.issue_key` already states the rule these panels were breaking: "The
+# identity of an issue is the repo AND the number. Once the panels show more
+# than one repo, a bare number stops being unique."
+#
+# The crash is only the louder half. `self.rows` is keyed the same way, so a
+# collision that did NOT raise would silently point one row's click at the
+# other repo's record — the ⚖ starting a paid panel review on the wrong PR.
+# Both halves are asserted here.
+
+#: Two repos, each with a #42 and a #7. The numbers match; nothing else does.
+_TWO_REPOS_PRS = [
+    {"number": 42, "title": "the quarterback one", "repo": "prisonblues/quarterback",
+     "updatedAt": "2026-08-20T10:00:00Z"},
+    {"number": 42, "title": "the lexray one", "repo": "prisonblues/lexray",
+     "updatedAt": "2026-08-20T11:00:00Z"},
+]
+_TWO_REPOS_ISSUES = [
+    {"number": 7, "title": "the quarterback one", "repo": "prisonblues/quarterback",
+     "updatedAt": "2026-08-20T10:00:00Z"},
+    {"number": 7, "title": "the lexray one", "repo": "prisonblues/lexray",
+     "updatedAt": "2026-08-20T11:00:00Z"},
+]
+
+
+async def _drive_two_repos() -> list[str]:
+    """Render both multi-repo panels with a colliding number, then click each row.
+
+    The render is wrapped rather than left to propagate: a test that dies of
+    DuplicateKey reports an ERROR and names no assertion, and this suite's own
+    convention — every `_drive_*` returns the failures it found — is what turns
+    the crash into a statement about the defect.
+    """
+    app_module = _load_app()
+    app = app_module.Dash(interval=3600, gh_interval=3600)
+    # Every background fetch off: these panels are being driven by hand, and a
+    # live `gh` tick landing mid-test would rewrite the rows under the clicks.
+    app.refresh_limits = lambda: None
+    app.refresh_seats = lambda: None
+    app.refresh_board = lambda: None
+    app.refresh_plan = lambda: None
+    app.refresh_prs = lambda: None
+    app.refresh_issues = lambda: None
+
+    opened: list[str] = []
+    app.open_pr = lambda pr: opened.append(f"{pr.get('repo')}#{pr.get('number')}")
+    app.open_issue = lambda issue: opened.append(f"{issue.get('repo')}#{issue.get('number')}")
+
+    failures: list[str] = []
+    async with app.run_test(size=(100, 44)):
+        for label, render, rows, table_id, prefix in (
+            ("PRS", app.render_prs, _TWO_REPOS_PRS, "#prs", "pr:"),
+            ("ISSUES", app.render_issues, _TWO_REPOS_ISSUES, "#issues", "issue:"),
+        ):
+            try:
+                render(rows, None)
+            except Exception as exc:               # noqa: BLE001 — the defect itself
+                failures.append(
+                    f"{label}: two repos sharing a number took the dashboard down with "
+                    f"{type(exc).__name__} — a duplicate row must degrade, not crash")
+                continue
+
+            table = app.query_one(table_id)
+            if table.row_count != len(rows):
+                failures.append(
+                    f"{label}: {len(rows)} rows from two repos rendered as "
+                    f"{table.row_count} — one repo's row was dropped")
+                continue
+
+            # The PANEL's own key, not the one it was rescued into. Asserted
+            # exactly, and this is the assertion that makes the test about the
+            # defect: ClickTable.add_row suffixes a repeat rather than raising,
+            # so with the bare-number keys restored these rows STILL render as
+            # two, still carry distinct keys (`pr:42` and `pr:42~2`) and still
+            # click through to their own records — everything below passes and
+            # the bug is untouched. Only the key itself tells the two fixes
+            # apart, so only the key can pin the one this test is named for.
+            keys = [rk.value for rk in table.rows]
+            want_keys = sorted(f"{prefix}{r['repo']}#{r['number']}" for r in rows)
+            if sorted(keys) != want_keys:
+                failures.append(
+                    f"{label}: row keys are {sorted(keys)}, not {want_keys} — the "
+                    "panel is not keying on the repo, whatever the backstop did after")
+
+            # The click half. Each row must reach the record it displays; a
+            # shared key means the second write wins and both rows open it.
+            opened.clear()
+            if len(set(keys)) != len(keys):
+                failures.append(f"{label}: two rows share the row key {keys!r}")
+            for key in keys:
+                app.dispatch_row(key, column=None)
+            want = sorted(f"{r['repo']}#{r['number']}" for r in rows)
+            if sorted(opened) != want:
+                failures.append(
+                    f"{label}: clicking each row opened {sorted(opened)}, not {want} — "
+                    "a row is pointing at the other repo's record")
+    return failures
+
+
+def test_two_repos_sharing_a_number_render_and_click_independently():
+    """#209: a bare number is not an identity once the dashboard watches two repos.
+
+    Asserted on both panels because they broke the same way for the same reason,
+    and fixing one is exactly the shape of fix that leaves the other.
+    """
+    assert asyncio.run(_drive_two_repos()) == []
+
+
+class _CapturedLog:
+    """A widget's Textual logger, with `warning` kept where a test can read it.
+
+    Everything else is swallowed rather than left to the real logger: this
+    stands in for the whole `log` property while an app is running, and Textual
+    reaches for `self.log(...)` and `self.log.debug(...)` on its own account.
+    """
+
+    def __init__(self, sink: list[str]) -> None:
+        self._sink = sink
+
+    def __call__(self, *a, **k) -> None: pass
+    def __getattr__(self, name): return lambda *a, **k: None
+
+    def warning(self, *a, **k) -> None:
+        self._sink.append(" ".join(str(x) for x in a))
+
+
+async def _drive_duplicate_keys() -> list[str]:
+    """The backstop, through a real panel: two plan items with no item_id.
+
+    PLAN keys on the board's `item_id`, which is not something this end can
+    guarantee — two items arriving without one keyed every such row `plan:None`.
+    That is the shape of duplicate nobody predicts, which is the shape the
+    dashboard has to survive, so it is asserted on the panel rather than on the
+    widget in isolation.
+    """
+    app_module = _load_app()
+    app = app_module.Dash(interval=3600, gh_interval=3600)
+    app.refresh_limits = lambda: None
+    app.refresh_seats = lambda: None
+    app.refresh_board = lambda: None
+    app.refresh_plan = lambda: None
+    app.refresh_prs = lambda: None
+    app.refresh_issues = lambda: None
+
+    nameless = [
+        {"title": "first with no id", "repo": "prisonblues/quarterback"},
+        {"title": "second with no id", "repo": "prisonblues/quarterback"},
+    ]
+    failures: list[str] = []
+    logged: list[str] = []
+    with mock.patch.object(app_module.ClickTable, "log", _CapturedLog(logged)):
+        async with app.run_test(size=(100, 44)):
+            try:
+                app.render_plan(nameless, None)
+            except Exception as exc:               # noqa: BLE001 — the defect itself
+                return [f"PLAN: two items with no item_id took the dashboard down with "
+                        f"{type(exc).__name__} — an unforeseen duplicate must degrade"]
+            table = app.query_one("#plan")
+            if table.row_count != 2:
+                failures.append(
+                    f"PLAN: two rows rendered as {table.row_count} — one was swallowed "
+                    "rather than kept under a distinct key")
+            keys = [rk.value for rk in table.rows]
+            if len(set(keys)) != len(keys):
+                failures.append(f"PLAN: the duplicate survived into the table as {keys!r}")
+            # Degrading is only useful if the row still reaches its own record.
+            seen = [app.rows.get(k, {}).get("title") for k in keys]
+            if sorted(x for x in seen if x) != ["first with no id", "second with no id"]:
+                failures.append(
+                    f"PLAN: the rows point at {seen} — a suffixed row lost its record, "
+                    "so it would render fine and do nothing when clicked")
+    # And it has to be REPORTED, which is a separate claim from degrading. A row
+    # key is never rendered, so the `~2` is invisible; and two plan rows is also
+    # what correct data looks like. Absorb the collision without a word and a
+    # keying bug that used to crash the dashboard now produces nothing at all.
+    if not any("plan:None" in line for line in logged):
+        failures.append(
+            f"PLAN: the duplicate was absorbed in silence — the log holds {logged}, "
+            "so nothing about this row would ever reach anybody")
+    return failures
+
+
+def test_an_unforeseen_duplicate_degrades_instead_of_taking_the_dash_down():
+    """#209's general half: DataTable raises on a repeated key, and this is the
+    component you look at when something is already wrong."""
+    assert asyncio.run(_drive_duplicate_keys()) == []
+
+
+async def _drive_a_watched_repos_pr() -> list[str]:
+    """⚖ on a PR belonging to a repo this dashboard only WATCHES.
+
+    The ⚒ on an issue row has refused this since the panels went multi-repo:
+    `/fix-issue` takes a bare number and resolves the repository from the
+    checkout it runs in, so starting one from the wrong pane lands that number
+    on whatever issue wears it here. `/panel-review-pr` reads its repo the same
+    way and does more with it — it spends money, comments on a public PR and
+    pushes a fix commit — and the ⚖ was not making the same check.
+
+    Reachable only since #209. Two repos sharing a PR number used to crash the
+    panel before either row rendered, so the wrong-repo ⚖ was a click nobody
+    could make; keying on the repo is what puts both rows on the screen.
+    """
+    app_module = _load_app()
+    app = app_module.Dash(interval=3600, gh_interval=3600)
+    app.refresh_limits = lambda: None
+    app.refresh_seats = lambda: None
+    app.refresh_board = lambda: None
+    app.refresh_plan = lambda: None
+    app.refresh_prs = lambda: None
+    app.refresh_issues = lambda: None
+    # No dialog in the way: the refusal has to come BEFORE the confirmation,
+    # since a confirmation naming the right number and the wrong repo is a
+    # human being asked to approve the mistake.
+    app.confirm = False
+    app.repo_slug = "prisonblues/quarterback"
+
+    started: list[tuple[str, str]] = []
+    app.run_in_pane = lambda name, command: started.append((name, command))
+    app.run_in_window = lambda name, command: started.append((name, command))
+
+    failures: list[str] = []
+    async with app.run_test(size=(100, 44)):
+        app.render_prs(_TWO_REPOS_PRS, None)
+        for rk in list(app.query_one("#prs").rows):
+            pr = app.rows[str(rk.value)]
+            started.clear()
+            app.detail_text = ""
+            app.dispatch_row(str(rk.value), column=app_module.Dash.PANEL_COLUMN)
+            if pr["repo"] == app.repo_slug:
+                if not started:
+                    failures.append(
+                        "⚖ on this dashboard's OWN PR started nothing — the guard "
+                        f"is refusing everything, not just another repo's ({app.detail_text})")
+            elif started:
+                failures.append(
+                    f"⚖ on {pr['repo']}#{pr['number']} launched {started[0][1]!r} — a paid "
+                    f"review, in {app.repo_slug}, of whatever wears that number there")
+            elif pr["repo"] not in app.detail_text:
+                failures.append(
+                    f"⚖ on {pr['repo']}#{pr['number']} refused but said {app.detail_text!r} — "
+                    "a dim icon that swallows the click is indistinguishable from a broken one")
+    return failures
+
+
+def test_the_scales_refuse_a_pr_from_a_repo_this_dashboard_only_watches():
+    """The ⚖ makes the same check the ⚒ does, and #209 is what makes it reachable."""
+    assert asyncio.run(_drive_a_watched_repos_pr()) == []
