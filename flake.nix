@@ -86,6 +86,15 @@
           # that is gone is an error, and the person renaming it has to look at
           # both checks.
           rm harness/tests/test_release_numbers.py
+          # Nor is test_fixer_escalation.py, for the same reason and by the same
+          # mechanism (#251): it reads ten repo-root files across app/ and
+          # harness/commands/, none of which this check contains, so all ten errored
+          # here. It is a prose-consistency suite, not a worktree-scripts one — this
+          # check exists for the layout the bash scripts assume and the curl/jq they
+          # shell out to — so it gets its own check below rather than dragging the
+          # application tree into this sandbox. `rm`, not --ignore, for the reason
+          # above.
+          rm harness/tests/test_fixer_escalation.py
           # Same treatment the package gets: there is no /usr/bin/env in the
           # sandbox, so an unpatched `#!/usr/bin/env bash` fails to exec at all
           # — and every test then fails for a reason that has nothing to do with
@@ -180,6 +189,72 @@
             echo "stopped reporting — both are the failure this check exists to catch." >&2
             exit 1
           }
+          touch $out
+        '';
+
+        # The fixer-escalation suite, which like the release-metadata one above is not
+        # a harness suite at all: it asserts that the escalation rules stated in the
+        # command briefs, the loops README and the app's review API still agree with
+        # each other. It reads ten repo-root files across four trees and needs nothing
+        # else — no git, no tmux, no network — and it lived in `worktree-tests`, whose
+        # sandbox holds `harness/bin` and `harness/tests`, where every one of those ten
+        # reads errored on a missing file instead of being asserted (#251). Third
+        # instance of #163's mechanism, found the same way: by finally running the flake.
+        #
+        # Copied one by one rather than the repo root wholesale, for the reason
+        # release-metadata-tests gives: `./.` would drag a developer's `mcp/.venv` and
+        # every `__pycache__` into the store. The enumeration is what goes stale, so
+        # nothing relies on somebody remembering it — the suite declares its reads in
+        # `READS`, `doc()` refuses any path absent from it, and
+        # `test_the_check_supplies_every_file_this_suite_reads` compares that set
+        # against the `install` lines here in both directions. flake.nix is copied in
+        # so that guard runs HERE and not only in a checkout.
+        fixer-escalation-tests = pkgs.runCommand "quarterback-fixer-escalation-tests"
+          {
+            nativeBuildInputs = [ (pkgs.python3.withPackages (ps: [ ps.pytest ])) ];
+          } ''
+          # The layout matters as much as the file set: the suite computes its repo root
+          # as the test file's parent.parent.parent, so the test has to sit two
+          # directories below the files it reads. `install -D` rather than `cp` so a
+          # file under a directory this sandbox has never held brings its own parent
+          # with it, and following the guard's "add an install line" advice cannot
+          # produce a second, unrelated "No such file or directory".
+          install -Dm644 ${./harness/tests/test_fixer_escalation.py} repo/harness/tests/test_fixer_escalation.py
+          install -Dm644 ${./harness/commands/review-pr.md}       repo/harness/commands/review-pr.md
+          install -Dm644 ${./harness/commands/panel-review-pr.md} repo/harness/commands/panel-review-pr.md
+          install -Dm644 ${./harness/commands/fix-and-land.md}    repo/harness/commands/fix-and-land.md
+          install -Dm644 ${./harness/commands/fix-issue.md}       repo/harness/commands/fix-issue.md
+          install -Dm644 ${./harness/commands/epic.md}            repo/harness/commands/epic.md
+          install -Dm644 ${./harness/README.md}                   repo/harness/README.md
+          install -Dm644 ${./harness/loops/README.md}             repo/harness/loops/README.md
+          install -Dm644 ${./harness/loops/panel.py}              repo/harness/loops/panel.py
+          install -Dm644 ${./app/api/reviews.py}                  repo/app/api/reviews.py
+          install -Dm644 ${./app/models/review.py}                repo/app/models/review.py
+          install -Dm644 ${./flake.nix}                           repo/flake.nix
+          cd repo/harness
+          # An empty inifile, and `-c` to pin it: the same reasoning as
+          # release-metadata-tests, minus the part about pyproject.toml, which this
+          # sandbox does not hold. It pins the rootdir here so `tests` below resolves
+          # against this directory.
+          printf '[pytest]\n' > pytest.ini
+          pytest -q -rs -p no:cacheprovider -c pytest.ini tests > report.txt 2>&1 || {
+            cat report.txt >&2
+            exit 1
+          }
+          cat report.txt
+          # NO skip is expected. pytest exits 0 with any number of skips, and a skip
+          # nobody reads is exactly what #163, #246 and #251 each looked like from the
+          # outside. The one test here that can skip is the coupling guard, when
+          # flake.nix is not beside the suite — it is installed above precisely so that
+          # it is, so a skip from it means that line went away and took this sandbox's
+          # only staleness check with it.
+          if grep -q '^SKIPPED' report.txt; then
+            echo "a test skipped in the fixer-escalation sandbox, and none is expected." >&2
+            echo "If it is the coupling guard, flake.nix stopped being installed and" >&2
+            echo "nothing is checking this file list any more:" >&2
+            grep '^SKIPPED' report.txt >&2
+            exit 1
+          fi
           touch $out
         '';
 

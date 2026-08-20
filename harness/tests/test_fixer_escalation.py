@@ -189,6 +189,28 @@ _STEP_REFERENCE = re.compile(
 _PREMISE_CHECK_SECTION = "The premise check (`--ask`)"
 
 
+#: Every repo-root path this suite reads, declared in one place.
+#:
+#: It is a *declaration* rather than a summary because `doc` refuses anything absent from it
+#: (below), so a new read cannot be added without adding it here. That is what the sandbox
+#: needs: this suite lives two directories below the files it reads, and
+#: `nix build .#checks.<system>.fixer-escalation-tests` runs it against a sandbox holding only
+#: what that check copies in. A read nobody copied in does not FAIL there, it ERRORS on a
+#: missing file — which is how #163 sat unnoticed for a day, and #246 after it, and how this
+#: suite's own ten reads sat erroring inside `worktree-tests` (#251).
+#:
+#: Derived from `FIX_LOOPS` and `ANCHOR_DOCS` rather than relisting their entries, so a rename
+#: there still fails in one place with one message.
+READS = frozenset({
+    *FIX_LOOPS,
+    *ANCHOR_DOCS,
+    PANEL_PY,
+    "harness/loops/README.md",
+    "app/api/reviews.py",
+    "app/models/review.py",
+})
+
+
 @functools.lru_cache(maxsize=None)
 def doc(relpath: str) -> str:
     # Encoding spelled out: these files are prose full of em dashes, and `read_text()` takes the
@@ -198,6 +220,17 @@ def doc(relpath: str) -> str:
     #
     # Cached because the parametrised tests read the same handful of files several times each.
     # A plain speed-up: the module-scoped fixtures below still exist, for the slices they name.
+    # Refused rather than read, if it is not in `READS`. One accessor is the whole reason this
+    # works: every read in this suite comes through here, so this single assertion is what makes
+    # `READS` a complete enumeration rather than a list somebody has to remember to update. The
+    # alternative — parsing this file for its reads, as #182 and #246 must, since theirs are
+    # built inline — cannot chase every way of naming a path and fails silently at the first
+    # idiom it misses. Here there is nothing to chase.
+    assert relpath in READS, (
+        f"{relpath!r} is read here but is not in READS, so flake.nix's fixer-escalation-tests "
+        f"check does not know to copy it into its sandbox — where this read would error as a "
+        f"FileNotFoundError rather than be asserted. Add it to READS and add an `install` line "
+        f"for it to that check.")
     return (REPO_ROOT / relpath).read_text(encoding="utf-8")
 
 
@@ -679,3 +712,136 @@ def test_an_escalation_is_recorded_as_deferred(name: str, outcomes: set[str]):
         f"{name} discusses recording an escalation without naming `deferred` in the same "
         f"paragraph or bullet; the four values it could be naming instead are {sorted(outcomes)}, "
         "and three of them would be wrong")
+
+
+# ---- the sandbox holds what this suite reads (#251) --------------------------
+#
+# This suite reads ten repo-root files while living two directories below that root, and
+# `nix build .#checks.<system>.fixer-escalation-tests` runs it against a sandbox holding
+# only what that check installs. It used to be collected by `worktree-tests` instead,
+# whose sandbox holds neither `app/` nor `harness/commands/`, and all ten reads errored
+# there as FileNotFoundError — not failures, ERROR lines, in a check no workflow ran.
+#
+# `READS` and `doc`'s refusal are one half of stopping that recurring: a read this suite
+# has not declared cannot happen. This is the other half: what it declares and what the
+# check installs have to be the same set.
+
+#: An `install`/`cp` of a repo-root path into the sandbox. Anchored at line start and on the
+#: command, so a `${./x}` inside a comment or passed as an argument is not read as supplying
+#: a file — interpolating a store path is not the same as the sandbox having it.
+_FLAKE_INSTALL = re.compile(
+    r'^\s*(?:install|cp)(?:\s+-\S+)*\s+\$\{\s*\./([^}\s]+?)\s*\}', re.MULTILINE)
+
+#: Installed deliberately without being read: the guard below reads `flake.nix` to compare
+#: against, so the check has to hold it, but it is not part of what the SUITE is about. Named
+#: here rather than subtracted inline, so a second entry has to be argued for in a diff.
+_INSTALLED_BUT_NOT_READ = frozenset({"flake.nix", "harness/tests/test_fixer_escalation.py"})
+
+_CHECK_NAME = "fixer-escalation-tests"
+
+
+def _check_region(flake_text: str) -> str:
+    """The `fixer-escalation-tests` block of `flake.nix`, and only it.
+
+    Anchored on the attribute definition at line start, because `flake.nix` discusses this
+    check in the prose above it: a first-occurrence search for the bare name would slice from
+    a comment and compare this suite against whatever block followed — indistinguishable,
+    from the outside, from a correct comparison. Exactly one definition is required, so a
+    rename is an error here rather than a silently empty region that reports every file as
+    missing, or every file as supplied."""
+    starts = [m.start() for m in
+              re.finditer(rf"^\s*{re.escape(_CHECK_NAME)} = ", flake_text, re.MULTILINE)]
+    assert len(starts) == 1, (
+        f"expected exactly one line defining {_CHECK_NAME} in flake.nix, found {len(starts)}")
+    end = flake_text.find("\n        '';", starts[0])
+    assert end != -1, (
+        f"the {_CHECK_NAME} block is not terminated by a closing ''; at its own indentation")
+    return flake_text[starts[0]:end]
+
+
+@pytest.fixture(scope="module")
+def installed() -> frozenset[str]:
+    """What the check puts in its sandbox, out of `flake.nix`.
+
+    Skipped rather than failed when `flake.nix` is absent: this suite is itself collected from
+    a sandbox, and one that cannot see the expression cannot judge it. The check installs
+    `flake.nix` so that this does not skip there — and requires that it does not, since a skip
+    would mean this guard had quietly stopped running in the build it protects."""
+    flake = REPO_ROOT / "flake.nix"
+    if not flake.is_file():
+        pytest.skip("no flake.nix beside this checkout, so there is no check to compare against")
+    return frozenset(_FLAKE_INSTALL.findall(_check_region(flake.read_text(encoding="utf-8"))))
+
+
+def test_the_check_supplies_every_file_this_suite_reads(installed):
+    """The enumeration in `flake.nix` is what goes stale, so nothing relies on somebody
+    remembering it. Add a read to `READS` without an `install` line and this fails in the
+    ordinary `pytest harness/tests` before a push — and in CI's `harness suites` job, which
+    discovers every `harness/**/tests` — rather than erroring in a nix build nobody runs."""
+    missing = sorted(READS - installed)
+    assert not missing, (
+        f"this suite reads files that flake.nix's {_CHECK_NAME} check does not install into "
+        "its sandbox, so they will error there as FileNotFoundError rather than be asserted: "
+        + ", ".join(missing) + ". Add an `install -Dm644 ${./<path>}` for each")
+
+
+def test_the_check_installs_nothing_this_suite_does_not_read(installed):
+    """The other direction, and not symmetry for its own sake. A file the check carries and
+    nothing reads is a read that was deleted or renamed while the sandbox went on supplying
+    the old path — so the next person to add a read finds an install line already there,
+    for a file this suite no longer looks at, and trusts it."""
+    unread = sorted(installed - READS - _INSTALLED_BUT_NOT_READ)
+    assert not unread, (
+        f"flake.nix's {_CHECK_NAME} check installs files this suite does not read: "
+        + ", ".join(unread) + ". Either a read was removed and the install line outlived it, "
+        "or the file belongs in _INSTALLED_BUT_NOT_READ with a reason")
+
+
+def test_the_reads_are_declared_rather_than_summarised():
+    """`READS` is only worth comparing if it is what the suite actually reads, and `doc`'s
+    refusal is what makes that true. Asserted rather than trusted: this is the mechanism the
+    two guards above rest on, and it is one `assert` away from being decoration."""
+    with pytest.raises(AssertionError, match="not in READS"):
+        doc("docs/DEPLOY.md")
+    # And the refusal names what to do about it, in both places that need changing.
+    with pytest.raises(AssertionError, match="install"):
+        doc("app/api/nothing_here.py")
+
+
+def test_the_region_reader_stops_at_the_end_of_its_own_check():
+    """`'';` is two characters a shell script may legitimately contain — this check's own
+    script prints Nix-quoted advice — and a slice running past the block's end would credit
+    it with a neighbouring check's installs, reporting a file as supplied that this sandbox
+    never receives."""
+    text = (f"        {_CHECK_NAME} = pkgs.runCommand \"a\" {{ }} ''\n"
+            "          install -Dm644 ${./app/api/reviews.py} repo/app/api/reviews.py\n"
+            "        '';\n"
+            "        worktree-tests = pkgs.runCommand \"b\" { } ''\n"
+            "          cp -r ${./harness/bin} harness/bin\n"
+            "        '';\n")
+    assert set(_FLAKE_INSTALL.findall(_check_region(text))) == {"app/api/reviews.py"}
+
+
+def test_the_region_reader_refuses_an_absent_or_doubled_check():
+    """A renamed check, which is the whole reason the name is written out in `_CHECK_NAME`.
+    `nix flake check` on a flake whose check was renamed says nothing at all about this
+    suite, and a region reader that quietly returned "" would report either every read as
+    uncopied or — after the subtraction above — nothing wrong at all."""
+    with pytest.raises(AssertionError, match="found 0"):
+        _check_region("        mcp-tests = pkgs.runCommand \"a\" { } ''\n        '';\n")
+    with pytest.raises(AssertionError, match="found 2"):
+        _check_region(f"        {_CHECK_NAME} = pkgs.runCommand \"a\" {{ }} ''\n"
+                      "        '';\n"
+                      f"        {_CHECK_NAME} = pkgs.runCommand \"b\" {{ }} ''\n"
+                      "        '';\n")
+
+
+def test_only_an_install_counts_as_supplying_a_file():
+    """`${./x}` is Nix putting a path in the store, which is not the same as the sandbox
+    having that file where this suite reads it. A commented-out line and a script named as an
+    argument both interpolate a store path, and neither is an install."""
+    block = ("          # install -Dm644 ${./app/models/review.py} repo/app/models/review.py\n"
+             "          bash ${./scripts/release_stamp.py} check\n"
+             "          install -Dm644 ${./harness/README.md} repo/harness/README.md\n"
+             "          cp -r ${./harness/commands} repo/harness/commands\n")
+    assert set(_FLAKE_INSTALL.findall(block)) == {"harness/README.md", "harness/commands"}
