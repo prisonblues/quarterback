@@ -11,6 +11,65 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
+## vNEXT — an item can be wrong and fresh at the same time
+
+`plan_read` computes one answer, `next`, and every agent that starts cold acts on it.
+Nothing checked it against reality.
+
+**On 2026-08-20 the plan's ranks 2 and 4 pointed at PRs #182 and #211, both merged ninety
+minutes earlier, and `next` returned rank 2.** Finished work, offered as the thing to do,
+by the one call the plan exists to answer. Beside it: `idle_days: 0.0, stale: false` —
+because staleness measures time-since-touched and not agreement-with-reality, so an item can
+be wrong and fresh at the same time and nothing on the board could tell. Three live
+workstreams (PRs #247, #249, issue #209) were outside the plan entirely, and rank 1's note
+said `free: MERGEABLE/CLEAN` while the board's own `/review/findings?pr=216` said
+`stopped: false, "22 finding(s) no earlier round raised"`. The item and the board
+contradicted each other and nothing noticed.
+
+Every input needed to catch all four was already on the board or one `gh` call away. Plan
+items carry `ref: {kind: pr, value: "182"}`; `GET /reviews` carries `pr_state`, `head_sha`,
+`ci_status` and `stop_reason` across 37 recorded runs. **Nothing joined them.** Detecting
+"this item's PR is merged" is a mechanical comparison, not a judgement.
+
+So `qb-reconcile` walks the plan's refs against GitHub and the board's own review record and
+reports five disagreements: `done_candidate`, `dropped_candidate`, `stale_claim`,
+`note_contradicted`, `untracked_pr`. No agent, no claims, no hook wiring, and **no
+`--execute` to graduate to** — it never edits the plan, because "this item looks done" is a
+candidate for a human or a `plan_done` call, and `dropped` in particular is a *decision* the
+plan's model deliberately keeps apart from `done`. `--json` is the deterministic input #232's
+orderer needs: an orderer cannot order a plan that does not describe the present.
+
+**A claim is checked by its session, not by its holder, and that is a defect class passive
+expiry cannot reach.** Expiry covers a holder that died — it stops renewing and the row
+lapses with nobody reaping it. It does not cover the holder still being there while the
+conversation that took the claim is gone: a `/new` resets the conversation, the seat identity
+and its claims are pinned to the pane, and the lifecycle hook renews the lease on every
+prompt whatever the new conversation is now about. The claim then looks maximally fresh
+*because* the agent is busy, with something else, and it cannot lapse while the pane lives.
+This was found by the pass reporting it about **its own author's claim on #255** while that
+claim was being held. A claim naming no session — one taken by hand — can only be checked by
+holder name, and names are recycled when an agent finishes, so that is reported as unchecked
+rather than as healthy.
+
+**An unmade check never reads as a clean one**, which is #244's shape and the half of #255
+that decided the file's structure. Every condition has a third answer, `unknowns` is never
+folded into `findings`, `complete: false` says so in the JSON, and the exit code separates
+"ran clean" (0) from "ran, some check unavailable" (1) from "could not run" (2). Not
+hypothetical: the deployed board is v2.48, its `/review/findings` returns no `cycles` field,
+so its `stopped` cannot be attributed to one cycle — and the pass says that instead of
+reading the field anyway.
+
+**The one judgement in it is a closed vocabulary, and running it found the vocabulary
+wrong.** `note_contradicted` has to decide whether a note asserts readiness, which is the
+only non-mechanical step here. The first draft included bare `green`; on this repo's own plan
+it matched "this PR is what makes it green", "should go green on its own" and "all checks
+were green at its last push" — three for three, none of them an assertion that anything is
+ready. The word belongs to CI, and CI is not the review record, so pairing a note about
+checks with a denial from `/review/findings` manufactures a contradiction out of two
+statements that never disagreed. Those three notes are now the regression tests.
+
+`BoardClient` grew a `post` — the alternative was a fourth client for one board, which
+`qb-board`'s own header already argues against.
 ## v2.62 — a dashboard for one project
 
 The dash was built to answer "who is alive, what do they hold, what is next" for a

@@ -1012,6 +1012,80 @@ PATH's if it answers the flag, otherwise the one that is running, and otherwise 
 all plus a line on stderr naming what it tried. A screen that does not re-fit is honest; a
 hook that fails invisibly is not.
 
+### `qb-reconcile` — does the plan still describe the present?
+
+`plan_read` computes one answer, `next`, and every agent that starts cold acts on it.
+Nothing checked it against reality. On 2026-08-20 ranks 2 and 4 of this repo's plan pointed
+at PRs #182 and #211 — **both merged ninety minutes earlier** — and `next` returned rank 2:
+finished work, offered as the thing to do. Beside it sat `idle_days: 0.0, stale: false`,
+because staleness measures time-since-touched and not agreement-with-reality. **An item can
+be wrong and fresh at the same time**, and nothing on the board could tell.
+
+Every input needed to catch that was already there. Plan items carry
+`ref: {kind: pr, value: "182"}`; `GET /reviews` carries `pr_state`, `head_sha`, `ci_status`
+and `stop_reason` across every recorded run. Nothing joined them. So:
+
+```bash
+qb-reconcile                     # every repo the board's plan names
+qb-reconcile --repo owner/name   # just that one
+qb-reconcile --json              # the whole report, unknowns beside the findings
+qb-reconcile --post              # also put the report on the board as a `finding`
+qb-reconcile --quiet             # say nothing when there is nothing to say
+```
+
+It walks the plan's refs against GitHub and the board's own review record and reports five
+disagreements:
+
+| condition | what it means |
+|---|---|
+| `done_candidate` | item open, its work merged or closed-as-completed |
+| `dropped_candidate` | item open, its work closed unmerged or not-planned |
+| `stale_claim` | item claimed, but the claim does not describe the present |
+| `note_contradicted` | the item's note asserts a readiness `/review/findings` denies |
+| `untracked_pr` | an open PR no open plan item accounts for |
+
+**No agent, no claims, no hooks.** It resolves refs, compares, prints and exits. It never
+edits the plan: "this item looks done" is a candidate for a human or a `plan_done` call, not
+a state transition to make behind their back — and `dropped` in particular is a *decision*,
+which is why the plan's model keeps it apart from `done`. The only write it can make is one
+board post, and only when asked.
+
+**Ref kind is not one of the conditions.** The first two are "the item outlived its work"
+and "the work was abandoned"; whether that work is spelled as a PR or an issue is only how
+it is looked up. Nine of the fourteen items on this plan carry `issue` refs, so a pass that
+read PR refs alone would be silent on two thirds of it while reporting that it had checked
+the plan.
+
+**A claim is checked by its session, not by its holder.** Passive expiry covers a holder
+that *died* — it stops renewing and the row lapses with nobody reaping it. It does not cover
+the holder still being there while the conversation that took the claim is gone: a `/new`
+resets the conversation, the seat identity and its claims are pinned to the pane, and the
+lifecycle hook renews the lease on every prompt whatever the new conversation is about. The
+claim then looks maximally fresh *because* the agent is busy — with something else — and it
+cannot lapse while the pane lives. A claim naming no session (one taken by hand) can only be
+checked by holder name, and names are recycled when an agent finishes, so that case is
+reported as **unchecked** rather than as healthy.
+
+**An unmade check never reads as a clean one**, which is the half of #255 that shapes the
+whole file. Every condition has a third answer, `unknowns` is never folded into `findings`,
+and `complete: false` says so in the JSON. This is not hypothetical: the deployed board is
+v2.48 and its `/review/findings` returns no `cycles` field, so its `stopped` cannot be
+attributed to one cycle — and the pass says exactly that instead of reading the field
+anyway. The exit code carries the same distinction:
+
+```
+0   ran, every check completed (a disagreement is the report, not an error)
+1   ran, but at least one check could not be made
+2   could not run at all: no board, no `gh`, or bad arguments
+```
+
+Run it on a timer with
+[`loops/systemd/qb-reconcile.{service,timer}`](loops/systemd/) — reference units, like the
+lander's. There is no `--execute` to graduate to, because there is nothing for it to do.
+
+`--json` is what #232's orderer reads: an orderer cannot order a plan that does not describe
+the present, which is why this is the deterministic half of that issue in its cheapest form.
+
 ## How it works
 
 - **Layout.** A worktree is a *sibling* of the main checkout: `../<project>-<branch>`, with

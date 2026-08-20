@@ -1,0 +1,37 @@
+[Unit]
+Description=Reconcile the board's plan against GitHub and /reviews (#255)
+Documentation=file:///home/%u/.claude/loops/README.md
+# gh and the board are both network calls; without this the first tick after boot
+# reports every ref as unresolvable and every claim as unchecked.
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# REPORT-ONLY, and unlike the lander there is no --execute to graduate to. This
+# pass never edits the plan: "this item looks done" is a candidate for a human or
+# a plan_done call, not a state transition to make behind their back. The only
+# write it can make is the board post below.
+#
+# --post puts the report on the board as a `finding`, which is the point of
+# running it on a timer at all — a report that only reaches ~/reconcile-logs is
+# invisible to the agents whose plan it is about, and #255 is a complaint about
+# consumers that cannot read the board. Drop the flag to log and stay silent.
+#
+# --quiet so a tick with nothing to say writes nothing: this fires every 15
+# minutes and a plan that agrees with reality is the normal case.
+#
+# It lives in bin/ rather than loops/, so this names it on PATH rather than by
+# path — %h/.nix-profile/bin/qb-reconcile if you would rather not depend on the
+# unit's PATH.
+ExecStart=qb-reconcile --post --quiet
+# Exit 1 is "ran, but some check could not be made" and exit 2 is "could not run
+# at all". Both are worth seeing in `systemctl --user status`, neither is worth
+# restarting for — the next tick retries. SuccessExitStatus keeps a partial run
+# (the common one: a rate-limited gh, a board mid-deploy) out of the failed state,
+# while a genuine 2 still goes red.
+SuccessExitStatus=0 1
+Nice=10
+
+[Install]
+WantedBy=default.target

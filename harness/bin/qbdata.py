@@ -674,7 +674,8 @@ class BoardClient:
         if self.cfg.token:
             req.add_header("Authorization", f"Bearer {self.cfg.token}")
         with urllib.request.urlopen(req, timeout=30, context=_ssl_context()) as resp:
-            return json.loads(resp.read().decode())
+            body = resp.read().decode()
+        return json.loads(body) if body.strip() else {}
 
     def get(self, path: str, params: dict | None = None) -> dict:
         query = urllib.parse.urlencode(

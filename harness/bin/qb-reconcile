@@ -1,0 +1,918 @@
+#!/usr/bin/env python3
+"""qb-reconcile — does the plan still describe the present?
+
+`plan_read` computes one answer, `next`, and every agent that starts cold acts on
+it. Nothing checked it against reality. On 2026-08-20 the plan's ranks 2 and 4
+pointed at PRs #182 and #211, both merged ninety minutes earlier, and `next`
+returned rank 2 — finished work, offered as the thing to do. `idle_days: 0.0,
+stale: false` sat beside it, because staleness measures time-since-touched and
+not agreement-with-reality: an item can be wrong and fresh at the same time.
+
+This walks the plan's refs against GitHub and the board's own review record and
+reports every disagreement it can establish. It is the deterministic half of
+#232 in its cheapest possible form, and #232 needs it regardless — an orderer
+cannot order a plan that does not describe the present.
+
+WHAT IT IS NOT. No agent, no claims, no hook wiring. It resolves refs, compares,
+prints, and exits; the only write it can make is one board post, and only when
+asked (`--post`). It NEVER edits the plan: "this item looks done" is a candidate
+for a human or a `plan_done` call, not a state transition to make behind their
+back. `dropped` in particular is a decision — the plan's own model says so — and
+a tool that inferred it would erase the distinction the model exists to keep.
+
+THE FIVE CONDITIONS (#255's table):
+
+    done_candidate      item open, its work merged or closed-as-completed
+    dropped_candidate   item open, its work closed unmerged / not-planned
+    stale_claim         item claimed, but the claim does not describe the present
+    note_contradicted   item's note asserts a readiness /review/findings denies
+    untracked_pr        open PR no open plan item accounts for
+
+REF KIND IS NOT ONE OF THEM. The first two conditions are "the item outlived its
+work" and "the work was abandoned"; whether that work is spelled as a PR or an
+issue is only how it is looked up. Nine of the fourteen items on this plan carry
+`issue` refs, so a pass that read PR refs alone would be silent on two thirds of
+it — while reporting, in the same breath, that it had checked the plan.
+
+ABSENCE IS NOT INABILITY (#244, and the reason this file is shaped as it is).
+Every condition has a third answer. A ref GitHub would not resolve, a claim
+naming no session, a stop summary the board cannot attribute to one cycle — none
+of those is "no disagreement", and each is reported in its own section with the
+reason it could not be settled. The exit code says which happened: a run that
+could not make a check does not get to look like a run that made it and found
+nothing. This matters in practice today, not hypothetically — the deployed board
+is v2.48 and `/review/findings` there returns no `cycles` field at all, so its
+`stopped` cannot be attributed and this says so rather than guessing.
+
+Exit codes:
+    0   ran, every check completed (findings or not — a disagreement is the
+        report, not an error)
+    1   ran, but at least one check could not be made
+    2   could not run at all: no board, no `gh`, or bad arguments
+
+Usage:
+    qb-reconcile                     every repo the board's plan names
+    qb-reconcile --repo owner/name   just that one
+    qb-reconcile --json              the whole report as JSON (what #232 reads)
+    qb-reconcile --post              also post one `finding` to the board
+    qb-reconcile --quiet             say nothing when there is nothing to say
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from qbdata import board_client, clip, short_repo  # noqa: E402
+
+#: How many open PRs to ask each repo for. Higher than the dashboard's 30
+#: because a truncated list here does not degrade a panel, it silently drops
+#: `untracked_pr` findings — so the cap is generous AND reported when reached
+#: (:func:`untracked_prs` raises it as an unknown rather than trimming quietly).
+PR_FETCH_LIMIT = 100
+
+#: Seconds for one `gh` call. Generous: a cron tick that takes a minute is fine,
+#: one that hangs until the next tick is not.
+GH_TIMEOUT = 45
+
+#: How many plan items to ask for. The board's own cap is 200 and a plan is tens of
+#: rows by design, so this is a backstop — but it is a cap all the same, and
+#: `GET /plan` says whether it bit (`truncated`). That flag is READ rather than
+#: assumed false: a reconcile pass that silently skipped the tail of the plan while
+#: printing a report headed "every repo the board's plan names" would be committing
+#: the exact error it exists to find.
+PLAN_LIMIT = 200
+
+CONDITIONS = (
+    "done_candidate",
+    "dropped_candidate",
+    "stale_claim",
+    "note_contradicted",
+    "untracked_pr",
+)
+
+#: What a note has to say for :func:`note_asserts_ready` to read it as a claim
+#: that a PR is ready to land. Deliberately a closed vocabulary rather than a
+#: sentiment judgement: this half of `note_contradicted` is the half that CANNOT
+#: be mechanical, so it is kept small, literal, and quoted back in the finding so
+#: a reader can dismiss a bad match in one glance.
+#:
+#: `clean` carries a negative lookahead for "clean up" and its spellings. Without
+#: it, a note saying "clean up the error handling" on a PR with open findings
+#: reads as an assertion that the PR is clean — the one false positive this
+#: vocabulary was always going to have, and the only one worth a special case.
+#:
+#: **Bare `green` is deliberately NOT here, and three live plan rows are why.**
+#: It was, and on this repo's own plan it matched "this PR is what makes it
+#: green", "should go green on its own" and "all checks were green at its last
+#: push" — three for three, none of them an assertion that anything is ready. The
+#: word belongs to CI, and CI is not the review record: a note about checks and a
+#: denial from `/review/findings` are claims about different things, so pairing
+#: them manufactures a contradiction out of two statements that never disagreed.
+#: `panel is green` stays, because it names what it is talking about.
+_READY_PHRASES = (
+    # `\b` on both ends, so **un**mergeable is not a claim that a PR is mergeable.
+    # The negation guard below cannot catch that one: the negator is inside the word.
+    r"\bmergeable\b",
+    r"clean(?!\s*[-\s]?ups?\b)(?!ing\b)",
+    r"landable",
+    r"ready to (?:land|merge|go)",
+    r"ready for (?:merge|landing|land)",
+    r"no (?:open |outstanding )?findings",
+    r"nothing (?:left )?to fix",
+    r"(?:all )?findings (?:all )?(?:fixed|resolved|addressed|cleared)",
+    r"review(?:ed)? clean",
+    r"panel (?:is )?(?:clean|done|green)",
+)
+_READY = re.compile("|".join(f"(?:{p})" for p in _READY_PHRASES), re.I)
+
+#: Words that turn a readiness phrase into its opposite, looked for in the run of
+#: text immediately before a match. "not ready to land" and "no longer clean" both
+#: contain a phrase from the vocabulary and both say the reverse of it, so a
+#: matcher without this reports the note as contradicted when the note and the
+#: board agree — the false positive that costs the most, because it makes the pass
+#: wrong about the one condition it cannot check mechanically.
+_NEGATORS = re.compile(
+    r"\b(?:not|never|no|nor|isn't|isnt|aren't|arent|wasn't|wasnt|won't|wont|can't|cant|"
+    r"cannot|hasn't|hasnt|haven't|havent|don't|dont|doesn't|doesnt|without|far from|"
+    r"nowhere near|less than|other than|anything but|nothing but)\b", re.I)
+
+#: Where a negator's reach ENDS, looking backwards from a matched phrase. A
+#: sentence boundary is the obvious one; a contrastive conjunction is the one that
+#: matters, and it was found by this pass's own test suite. "not ready to land last
+#: week, **but** the panel is clean now" makes a readiness claim in its second
+#: clause, and a guard that let `not` cross the comma silenced it — a false
+#: NEGATIVE, which is worse here than the false positive the guard was added for,
+#: because a disagreement this pass fails to report is one nobody else is looking
+#: for. So only the clause the phrase actually sits in is searched.
+#: `but` is the load-bearing entry and the one with an exception: in "anything but
+#: clean" it is part of the negation rather than a break in front of one, so those
+#: two spellings do not end a negator's reach. Fixed-width lookbehinds, which is
+#: all Python allows, and all this needs.
+_CLAUSE_BREAK = re.compile(
+    r"[.;!?]|(?<!anything )(?<!nothing )\b(?:but|however|although|though|whereas|yet)\b",
+    re.I)
+
+#: How far back to look at all — a backstop against a very long clause dragging in
+#: a `not` from thirty words away, applied before the clause split.
+_NEGATION_REACH = 60
+
+
+def _negated(before: str) -> bool:
+    """Is a readiness phrase preceded, in its OWN clause, by something reversing it?"""
+    return bool(_NEGATORS.search(_CLAUSE_BREAK.split(before)[-1]))
+
+#: "PR #216" and nothing looser. An item whose ref is an issue can still be
+#: ABOUT a pull request — "Merge PR #216 — the panel found 22" is a real plan
+#: row — and that PR is what its note's readiness claim is about. A bare `#216`
+#: is not enough: on this board most of them are issues, and resolving one as a
+#: PR would check the wrong thing and report the answer with a straight face.
+_PR_IN_TEXT = re.compile(r"\bPRs?\s*#\s*(\d+)", re.I)
+
+#: An outcome somebody recorded that CLEARS a finding still being raised. A note
+#: saying "clean" is defensible when every open chain has been refuted by the
+#: person who went and looked, so those do not contradict it. `deferred` and
+#: `superseded` are not here: both leave the defect standing.
+_CLEARING_OUTCOMES = ("fixed", "refuted")
+
+
+def _utcnow() -> datetime:
+    return datetime.now(UTC)
+
+
+@dataclass(frozen=True)
+class Finding:
+    """One disagreement, with the facts it was drawn from.
+
+    ``evidence`` is not decoration. Every condition here is a comparison between
+    two sources, and a report that states the conclusion without the pair leaves
+    a reader to re-run the query to find out whether to believe it.
+    """
+
+    condition: str
+    subject: str
+    summary: str
+    repo: str | None = None
+    ref: str | None = None
+    item_id: str | None = None
+    rank: int | None = None
+    evidence: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class Unknown:
+    """A check that could not be made, and why.
+
+    Never folded in with the findings. "I looked and found nothing" and "I could
+    not look" are different answers, and the whole complaint behind #255 is
+    consumers that report the second as the first.
+    """
+
+    condition: str
+    subject: str
+    reason: str
+    repo: str | None = None
+    ref: str | None = None
+
+
+@dataclass
+class Report:
+    generated: str
+    repos: list[str] = field(default_factory=list)
+    items_checked: int = 0
+    prs_checked: int = 0
+    findings: list[Finding] = field(default_factory=list)
+    unknowns: list[Unknown] = field(default_factory=list)
+
+    @property
+    def exit_code(self) -> int:
+        """0 clean, 1 partial. Findings do not raise it — they are the output."""
+        return 1 if self.unknowns else 0
+
+    def as_dict(self) -> dict:
+        return {
+            "generated": self.generated,
+            "repos": self.repos,
+            "items_checked": self.items_checked,
+            "prs_checked": self.prs_checked,
+            "counts": {c: sum(1 for f in self.findings if f.condition == c) for c in CONDITIONS},
+            "findings": [asdict(f) for f in self.findings],
+            # Beside the findings and never merged into them; a consumer that
+            # reads only `findings` and calls the plan reconciled is the bug.
+            "unknowns": [asdict(u) for u in self.unknowns],
+            "complete": not self.unknowns,
+        }
+
+
+# ---- the plan's own shape ----------------------------------------------------
+
+
+def item_ref(item: dict) -> tuple[str | None, str | None]:
+    """``("pr", "182")`` for an item that points at something, ``(None, None)`` else."""
+    ref = item.get("ref") or {}
+    kind, value = ref.get("kind"), ref.get("value")
+    if not kind or value in (None, ""):
+        return None, None
+    return str(kind), str(value).strip().lstrip("#").strip() or None
+
+
+def item_label(item: dict) -> str:
+    """How a finding names an item: its rank and its ref, which is what a reader
+    then types. The title is in the summary; the handle belongs here."""
+    kind, value = item_ref(item)
+    ref = f" {kind}#{value}" if kind and value else ""
+    return f"rank {item.get('rank')}{ref}"
+
+
+def pr_in_text(*texts: str | None) -> str | None:
+    """The first ``PR #<n>`` in any of ``texts`` — see :data:`_PR_IN_TEXT`."""
+    for text in texts:
+        if not text:
+            continue
+        match = _PR_IN_TEXT.search(text)
+        if match:
+            return match.group(1)
+    return None
+
+
+def item_pr(item: dict) -> str | None:
+    """The pull request this item's note would be making a claim about.
+
+    Its own ref when that is a PR; otherwise a ``PR #n`` named in the title or
+    the note. An issue-backed item saying "Merge PR #216" is making a claim about
+    216 and nothing else, and that is the claim /review/findings can answer.
+    """
+    kind, value = item_ref(item)
+    if kind == "pr" and value:
+        return value
+    return pr_in_text(item.get("title"), item.get("note"))
+
+
+# ---- condition 1 and 2: the item outlived its work --------------------------
+
+
+def ref_verdict(kind: str, state: dict) -> tuple[str | None, str, bool]:
+    """``(condition_or_None, how_it_reads, was_it_readable)`` for one resolved ref.
+
+    The third element is what keeps "GitHub says this item is fine" apart from
+    "GitHub said something this pass does not understand". It is returned as a
+    flag rather than left to be recovered from the prose, because the caller used
+    to sniff `how_it_reads` for a prefix — so rewording a message silently turned
+    an unknown into a clean bill, which is the exact class of bug this file exists
+    to report on.
+
+    ``state`` is what GitHub said: ``{"state": "MERGED", "state_reason": None}``.
+    A ``condition`` of None means the ref agrees with an open item.
+
+    A closed issue that names no ``stateReason`` still says the item outlived its
+    work — the ONE thing an open plan row claims is false — so it is reported as
+    a ``done_candidate`` whose evidence records that GitHub did not say which
+    kind of closed it was. Withholding the finding over the second question would
+    let the first go unreported, and the second is the human's to answer anyway.
+    """
+    raw = (state.get("state") or "").strip().upper()
+    reason = (state.get("state_reason") or "").strip().upper() or None
+
+    if kind == "pr":
+        if raw == "MERGED":
+            return "done_candidate", "merged", True
+        if raw == "CLOSED":
+            return "dropped_candidate", "closed without merging", True
+        if raw == "OPEN":
+            return None, "open", True
+        return None, f"an unrecognised state ({raw or 'none'})", False
+
+    if kind == "issue":
+        if raw == "CLOSED":
+            if reason == "NOT_PLANNED":
+                return "dropped_candidate", "closed as not planned", True
+            if reason == "COMPLETED":
+                return "done_candidate", "closed as completed", True
+            return "done_candidate", "closed (GitHub stated no reason)", True
+        if raw == "OPEN":
+            return None, "open", True
+        return None, f"an unrecognised state ({raw or 'none'})", False
+
+    return None, f"a ref kind this pass cannot resolve ({kind})", False
+
+
+# ---- condition 3: the claim does not describe the present -------------------
+
+
+def claim_verdict(claim: dict, live_sessions: set[str],
+                  live_holders: set[str]) -> tuple[bool, str]:
+    """``(is_stale, why)`` for a live claim on an open item.
+
+    The board expires a claim passively: a dead holder stops renewing and the row
+    lapses with nobody reaping it. That covers the holder DYING. It does not
+    cover the holder still being there while the conversation that took the claim
+    is gone — a `/new` or a `/clear` resets the conversation, the seat identity
+    and its claims are pinned to the pane, and the lifecycle hook renews the
+    lease on every prompt regardless of what the new conversation is about. The
+    claim then looks maximally fresh precisely because the agent is busy, with
+    something else, and it cannot expire while the pane lives.
+
+    So the session is checked first and the holder second: a claim's ``session``
+    and a lease's ``session`` are the same identifier, verified against a live
+    board (a healthy claim's session is among the live ones; the orphan's is
+    not). A claim naming NO session — one taken by hand through the CLI — can
+    only be checked by holder name, and holder names are recycled when an agent
+    finishes, so a live name is not proof the holder is the one that claimed it.
+    That case is an unknown, not a clean bill, and the caller reports it as one.
+    """
+    session = (claim.get("session") or "").strip() or None
+    holder = (claim.get("holder") or "").strip() or None
+
+    if session:
+        if session in live_sessions:
+            return False, "held by a live session"
+        if holder and holder in live_holders:
+            return True, (f"{holder} is live, but the session that took this claim "
+                          f"({clip(session, 8)}) is not — a reset conversation still "
+                          "holding it, which cannot expire while the pane lives")
+        return True, (f"neither the holder ({holder or 'unnamed'}) nor the session that "
+                      f"took this claim ({clip(session, 8)}) is live")
+
+    if holder and holder in live_holders:
+        return False, "the claim names no session"          # unknown; see caller
+    return True, f"holder {holder or 'unnamed'} has no live lease"
+
+
+# ---- condition 4: the note is fiction ---------------------------------------
+
+
+def note_asserts_ready(note: str | None) -> str | None:
+    """The phrase by which a note claims its PR is ready, or None.
+
+    Every match is checked for a negator in front of it, and a negated one is
+    skipped rather than ending the search: "not ready to land, but the panel is
+    clean" makes a readiness claim in its second clause, and stopping at the first
+    match would miss it while stopping at the first *un-negated* one finds it.
+    """
+    if not note:
+        return None
+    for match in _READY.finditer(note):
+        before = note[max(0, match.start() - _NEGATION_REACH):match.start()]
+        if not _negated(before):
+            return match.group(0)
+    return None
+
+
+def _clears(finding: dict) -> bool:
+    """Did somebody go and look, and settle this finding?"""
+    outcome = finding.get("outcome") or {}
+    return (outcome.get("outcome") or "") in _CLEARING_OUTCOMES
+
+
+def findings_denial(history: dict) -> tuple[str | None, str | None, dict]:
+    """``(denial, unknown_reason, evidence)`` — does the review record deny readiness?
+
+    Two independent signals, in this order:
+
+    **Findings still raised.** A chain with ``status: "open"`` was raised in the
+    PR's most recent round. That is window-independent for the newest run, so a
+    ``truncated`` history does not weaken it. Chains whose recorded outcome is
+    ``fixed`` or ``refuted`` are excluded: somebody went and looked.
+
+    **The cycle has not stopped.** Only when it can be attributed, and this is
+    where the board's own three-state discipline has to be honoured rather than
+    read for truthiness. ``stopped`` is null when no attributable cycle said,
+    which is not false; and the summary only speaks for the PR when ``cycles <=
+    1 and not truncated``. A board too old to report ``cycles`` at all cannot
+    have its summary attributed — the deployed v2.48 is exactly that — so this
+    returns an unknown instead of reading the field anyway.
+    """
+    findings = history.get("findings") or []
+    open_chains = [f for f in findings if f.get("status") == "open"]
+    standing = [f for f in open_chains if not _clears(f)]
+    cleared = len(open_chains) - len(standing)
+    truncated = bool(history.get("truncated"))
+    evidence = {
+        "rounds": history.get("rounds"),
+        "open_findings": len(standing),
+        "open_findings_cleared_by_outcome": cleared,
+        "stopped": history.get("stopped"),
+        "stop_reason": history.get("stop_reason"),
+        "cycles": history.get("cycles"),
+        "truncated": truncated,
+    }
+
+    if standing:
+        worst = sorted(f.get("severity") or "P9" for f in standing)[0]
+        return (f"{len(standing)} finding(s) still raised in the latest round "
+                f"(worst {worst})", None, evidence)
+
+    if "cycles" not in history:
+        return None, ("the board reported no `cycles`, so its stop summary cannot be "
+                      "attributed to one cycle (a board older than v2.54)"), evidence
+
+    cycles = history.get("cycles")
+    if not isinstance(cycles, int) or cycles > 1 or truncated:
+        return None, (f"the stop summary does not speak for this PR "
+                      f"(cycles={cycles}, truncated={truncated})"), evidence
+
+    stopped = history.get("stopped")
+    if stopped is None:
+        return None, "no attributable cycle said whether it stopped", evidence
+    if stopped is False:
+        reason = history.get("stop_reason") or "no reason given"
+        return f"the review cycle has not stopped: {reason}", None, evidence
+    return None, None, evidence
+
+
+# ---- condition 5: work the plan does not account for ------------------------
+
+
+def untracked_prs(open_prs: list[dict], items: list[dict]) -> tuple[list[dict], list[Unknown]]:
+    """Open PRs no open plan item accounts for, and the ones that could not be told.
+
+    A PR is accounted for three ways, and all three are needed: an item whose ref
+    IS it, an item whose issue ref is one this PR closes, or an item naming it as
+    ``PR #n``. Only the first is a bare number match — the second is what stops
+    "Rebase and land PR #182 (#163)" and its issue-backed sibling from both
+    reading as untracked work.
+
+    A PR whose ``closingIssuesReferences`` GitHub did not return cannot have the
+    second leg checked, so it comes back as an unknown rather than a finding: the
+    whole point of this pass is not to report an unmade check as a clean one.
+    """
+    # Keyed by (repo, number), never by number alone. Two repos both have a #12,
+    # and a plan item tracking one repo's #12 would otherwise account for the
+    # other's — hiding real untracked work behind a coincidence of numbering. The
+    # same rule `issue_key` in qbdata.py states for claims, for the same reason.
+    tracked_prs: set[tuple[str, str]] = set()
+    tracked_issues: set[tuple[str, str]] = set()
+    for item in items:
+        repo = item.get("repo")
+        if not repo:
+            # A fleet-scoped item names no repo, so it cannot be said to track a
+            # PR in one. Attributing it to every repo is how the bug above gets in.
+            continue
+        kind, value = item_ref(item)
+        if kind == "pr" and value:
+            tracked_prs.add((repo, value))
+        elif kind == "issue" and value:
+            tracked_issues.add((repo, value))
+        named = pr_in_text(item.get("title"), item.get("note"))
+        if named:
+            tracked_prs.add((repo, named))
+
+    findings: list[dict] = []
+    unknowns: list[Unknown] = []
+    for pr in open_prs:
+        number = str(pr.get("number"))
+        repo = pr.get("repo") or ""
+        if (repo, number) in tracked_prs:
+            continue
+        closes = pr.get("closingIssuesReferences")
+        if closes is None:
+            unknowns.append(Unknown(
+                condition="untracked_pr",
+                subject=f"PR #{number}",
+                repo=pr.get("repo"),
+                ref=f"pr#{number}",
+                reason="`gh` returned no closingIssuesReferences, so whether a plan "
+                       "item tracks this PR through its issue could not be checked",
+            ))
+            continue
+        if any((repo, str(i.get("number"))) in tracked_issues for i in closes):
+            continue
+        findings.append(pr)
+    return findings, unknowns
+
+
+# ---- the pass ---------------------------------------------------------------
+
+
+def reconcile(items: list[dict], ref_states: dict[tuple[str, str, str], dict | None],
+              live_sessions: set[str], live_holders: set[str],
+              histories: dict[tuple[str, str], dict | None],
+              open_prs: list[dict], repos: list[str],
+              now: datetime | None = None) -> Report:
+    """Every condition over already-fetched data. No I/O, so it is all testable.
+
+    ``ref_states`` is keyed ``(repo, kind, value)`` and ``histories`` ``(repo,
+    pr)``; a key present with a ``None`` value means the lookup was attempted and
+    failed, which is reported. A key ABSENT means it was never needed.
+    """
+    report = Report(generated=(now or _utcnow()).isoformat(), repos=sorted(repos),
+                    items_checked=len(items), prs_checked=len(open_prs))
+
+    for item in items:
+        repo = item.get("repo")
+        kind, value = item_ref(item)
+        label = item_label(item)
+        title = clip(item.get("title"), 70)
+
+        # 1 + 2 — the item against its work.
+        if kind and value:
+            ref = f"{kind}#{value}"
+            state = ref_states.get((repo or "", kind, value), "missing")
+            if not repo:
+                # A fleet-scoped item names no repo, so there is no repository to
+                # ask about its ref. Said plainly rather than reported as a failed
+                # lookup: nothing went wrong, the item is simply not answerable.
+                report.unknowns.append(Unknown(
+                    condition="done_candidate", subject=label, repo=repo, ref=ref,
+                    reason=f"the item names no repo, so {ref} cannot be resolved "
+                           "against any GitHub project"))
+            elif state == "missing" or state is None:
+                report.unknowns.append(Unknown(
+                    condition="done_candidate", subject=label, repo=repo, ref=ref,
+                    reason=f"{ref} could not be resolved against GitHub, so whether "
+                           "this item has outlived its work is unknown"))
+            else:
+                condition, reads, readable = ref_verdict(kind, state)
+                if condition:
+                    report.findings.append(Finding(
+                        condition=condition, subject=label, repo=repo, ref=ref,
+                        item_id=item.get("item_id"), rank=item.get("rank"),
+                        summary=f"open item, but {ref} is {reads} — {title}",
+                        evidence={"item_state": item.get("state"),
+                                  "github_state": state.get("state"),
+                                  "github_state_reason": state.get("state_reason"),
+                                  "url": state.get("url"),
+                                  "idle_days": item.get("idle_days"),
+                                  "stale": item.get("stale")}))
+                elif not readable:
+                    report.unknowns.append(Unknown(
+                        condition="done_candidate", subject=label, repo=repo, ref=ref,
+                        reason=f"GitHub reported {reads} for {ref}"))
+
+        # 3 — the claim against who is actually here.
+        claim = item.get("claim")
+        if claim:
+            stale, why = claim_verdict(claim, live_sessions, live_holders)
+            if stale:
+                report.findings.append(Finding(
+                    condition="stale_claim", subject=label, repo=repo,
+                    ref=f"{kind}#{value}" if kind and value else None,
+                    item_id=item.get("item_id"), rank=item.get("rank"),
+                    summary=f"claimed, but the claim is stale: {why} — {title}",
+                    evidence={"holder": claim.get("holder"),
+                              "session": claim.get("session"),
+                              "claim_id": claim.get("claim_id"),
+                              "acquired": claim.get("acquired"),
+                              "expires": claim.get("expires"),
+                              "note": clip(claim.get("note"), 120)}))
+            elif not (claim.get("session") or "").strip():
+                report.unknowns.append(Unknown(
+                    condition="stale_claim", subject=label, repo=repo,
+                    reason=f"the claim held by {claim.get('holder')} names no session, so "
+                           "it can only be checked by holder name — and names are "
+                           "recycled when an agent finishes"))
+
+        # 4 — the note against the review record.
+        pr = item_pr(item)
+        phrase = note_asserts_ready(item.get("note"))
+        if pr and phrase:
+            history = histories.get((repo or "", pr), "missing")
+            if history == "missing" or history is None:
+                report.unknowns.append(Unknown(
+                    condition="note_contradicted", subject=label, repo=repo, ref=f"pr#{pr}",
+                    reason=f"the note claims {phrase!r} but /review/findings for PR #{pr} "
+                           "could not be read, so the claim is unchecked"))
+            else:
+                denial, unknown, evidence = findings_denial(history)
+                if denial:
+                    report.findings.append(Finding(
+                        condition="note_contradicted", subject=label, repo=repo,
+                        ref=f"pr#{pr}", item_id=item.get("item_id"), rank=item.get("rank"),
+                        summary=f"the note says {phrase!r}, the board says {denial}",
+                        evidence={"phrase": phrase, "note": clip(item.get("note"), 200),
+                                  **evidence}))
+                elif unknown:
+                    report.unknowns.append(Unknown(
+                        condition="note_contradicted", subject=label, repo=repo,
+                        ref=f"pr#{pr}",
+                        reason=f"the note claims {phrase!r}; {unknown}"))
+
+    # 5 — work nothing on the plan accounts for.
+    untracked, pr_unknowns = untracked_prs(open_prs, items)
+    report.unknowns.extend(pr_unknowns)
+    for pr in untracked:
+        number = pr.get("number")
+        report.findings.append(Finding(
+            condition="untracked_pr", subject=f"PR #{number}", repo=pr.get("repo"),
+            ref=f"pr#{number}",
+            summary=f"open PR no plan item accounts for — {clip(pr.get('title'), 70)}",
+            evidence={"draft": bool(pr.get("isDraft")), "url": pr.get("url"),
+                      "updated": pr.get("updatedAt"),
+                      "closes": [i.get("number") for i in (pr.get("closingIssuesReferences") or [])]}))
+    return report
+
+
+# ---- fetching ---------------------------------------------------------------
+
+
+class Unavailable(RuntimeError):
+    """The pass cannot run at all — reported as exit 2, never as a traceback."""
+
+
+def _gh_json(args: list[str]) -> object | None:
+    """One `gh` call returning parsed JSON, or None if it could not be made.
+
+    None is "could not ask", and every caller turns it into an unknown rather
+    than into an absence of findings.
+    """
+    try:
+        out = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=GH_TIMEOUT)
+    except FileNotFoundError as exc:
+        raise Unavailable("`gh` is not on PATH — every GitHub-side check would be "
+                          "an unknown, which is not a report worth printing") from exc
+    except Exception:                                       # noqa: BLE001
+        return None
+    if out.returncode != 0:
+        return None
+    try:
+        return json.loads(out.stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+def fetch_ref_state(repo: str, kind: str, value: str) -> dict | None:
+    """What GitHub says about one ref. None = it could not be asked."""
+    if kind == "pr":
+        fields = "number,state,isDraft,mergedAt,closedAt,title,url"
+    elif kind == "issue":
+        fields = "number,state,stateReason,title,url"
+    else:
+        return None
+    got = _gh_json([kind, "view", value, "--repo", repo, "--json", fields])
+    if not isinstance(got, dict):
+        return None
+    return {"state": got.get("state"), "state_reason": got.get("stateReason"),
+            "url": got.get("url"), "title": got.get("title")}
+
+
+def fetch_open_prs(repo: str) -> tuple[list[dict], Unknown | None]:
+    """Open PRs with the linked issues condition 5 needs, and what went wrong.
+
+    A list that hit :data:`PR_FETCH_LIMIT` is reported rather than trimmed
+    quietly — a silent cap here reads as "the plan accounts for everything".
+    """
+    got = _gh_json(["pr", "list", "--repo", repo, "--state", "open",
+                    "--limit", str(PR_FETCH_LIMIT), "--json",
+                    "number,title,isDraft,updatedAt,url,closingIssuesReferences"])
+    if not isinstance(got, list):
+        return [], Unknown(condition="untracked_pr", subject=short_repo(repo), repo=repo,
+                           reason="`gh pr list` failed, so this repo's open PRs were "
+                                  "not compared against the plan at all")
+    for pr in got:
+        pr["repo"] = repo
+    if len(got) >= PR_FETCH_LIMIT:
+        return got, Unknown(condition="untracked_pr", subject=short_repo(repo), repo=repo,
+                            reason=f"the open-PR list hit the {PR_FETCH_LIMIT}-row fetch "
+                                   "limit, so there may be untracked PRs beyond it")
+    return got, None
+
+
+def fetch_history(client, repo: str, pr: str) -> dict | None:
+    try:
+        return client.get(f"/review/findings?repo={repo}&pr={pr}")
+    except Exception:                                       # noqa: BLE001
+        return None
+
+
+def fetch_live(client) -> tuple[set[str], set[str]]:
+    """(live session ids, live holder identities) from /active."""
+    agents = (client.get("/active") or {}).get("agents") or []
+    return ({(a.get("session") or "").strip() for a in agents if a.get("session")},
+            {(a.get("holder") or "").strip() for a in agents if a.get("holder")})
+
+
+def run(repo_filter: str | None = None) -> Report:
+    """Fetch everything the conditions need, then reconcile."""
+    try:
+        client, _cfg = board_client()
+    except Exception as exc:                                # noqa: BLE001
+        raise Unavailable(f"no board to reconcile against: {exc}") from exc
+
+    try:
+        plan = client.get(f"/plan?limit={PLAN_LIMIT}")
+    except Exception as exc:                                # noqa: BLE001
+        raise Unavailable(f"the board's plan could not be read: {exc}") from exc
+
+    items = [i for i in (plan.get("items") or []) if i.get("state") == "open"]
+    truncated = bool(plan.get("truncated"))
+    if repo_filter:
+        items = [i for i in items if (i.get("repo") or "") == repo_filter]
+
+    try:
+        live_sessions, live_holders = fetch_live(client)
+    except Exception as exc:                                # noqa: BLE001
+        raise Unavailable(f"/active could not be read, so no claim could be checked "
+                          f"against who is here: {exc}") from exc
+
+    repos = sorted({i["repo"] for i in items if i.get("repo")})
+    if repo_filter:
+        repos = [repo_filter]
+
+    ref_states: dict[tuple[str, str, str], dict | None] = {}
+    for item in items:
+        repo = item.get("repo")
+        kind, value = item_ref(item)
+        if not (repo and kind and value):
+            continue
+        key = (repo, kind, value)
+        if key not in ref_states:
+            ref_states[key] = fetch_ref_state(repo, kind, value)
+
+    histories: dict[tuple[str, str], dict | None] = {}
+    for item in items:
+        repo = item.get("repo")
+        pr = item_pr(item)
+        if not (repo and pr and note_asserts_ready(item.get("note"))):
+            continue
+        if (repo, pr) not in histories:
+            histories[(repo, pr)] = fetch_history(client, repo, pr)
+
+    open_prs: list[dict] = []
+    pr_unknowns: list[Unknown] = []
+    for repo in repos:
+        rows, problem = fetch_open_prs(repo)
+        open_prs.extend(rows)
+        if problem:
+            pr_unknowns.append(problem)
+
+    report = reconcile(items, ref_states, live_sessions, live_holders,
+                       histories, open_prs, repos)
+    report.unknowns.extend(pr_unknowns)
+    if truncated:
+        # Reported once, for the plan as a whole: the items past the cap were never
+        # read, so there is no subject to attach a per-item unknown to. It also
+        # makes every `untracked_pr` above provisional — a PR the unread tail
+        # tracks would have looked untracked from here.
+        report.unknowns.append(Unknown(
+            condition="done_candidate", subject="the plan",
+            reason=f"`GET /plan` reported the list truncated at {PLAN_LIMIT} items, so "
+                   "items past the cap were not reconciled and an `untracked_pr` above "
+                   "may be tracked by one of them"))
+    return report
+
+
+# ---- reporting --------------------------------------------------------------
+
+_HEADINGS = {
+    "done_candidate": "DONE CANDIDATES — the item outlived its work",
+    "dropped_candidate": "DROPPED CANDIDATES — the work was abandoned",
+    "stale_claim": "STALE CLAIMS — the claim does not describe the present",
+    "note_contradicted": "NOTES THE BOARD DENIES",
+    "untracked_pr": "UNTRACKED — open PRs the plan does not account for",
+}
+
+
+def render(report: Report) -> str:
+    """The report a cron log carries. Findings, then what could not be checked."""
+    lines = [f"qb-reconcile {report.generated}",
+             f"  {report.items_checked} open plan item(s), {report.prs_checked} open PR(s), "
+             f"repos: {', '.join(short_repo(r) for r in report.repos) or 'none'}"]
+
+    for condition in CONDITIONS:
+        hits = [f for f in report.findings if f.condition == condition]
+        if not hits:
+            continue
+        lines += ["", _HEADINGS[condition]]
+        for f in hits:
+            where = f" [{short_repo(f.repo)}]" if f.repo else ""
+            lines.append(f"  {f.subject}{where}: {f.summary}")
+
+    if report.unknowns:
+        lines += ["", f"COULD NOT CHECK ({len(report.unknowns)}) — "
+                      "not the same as nothing to report"]
+        for u in report.unknowns:
+            where = f" [{short_repo(u.repo)}]" if u.repo else ""
+            lines.append(f"  {u.subject}{where} ({u.condition}): {u.reason}")
+
+    if not report.findings:
+        lines += ["", "The plan agrees with GitHub and the board on everything checked."
+                      + ("" if not report.unknowns else
+                         " What could not be checked is above.")]
+    return "\n".join(lines)
+
+
+#: Most `refs` one post carries. The board renders them as links, and a plan with
+#: forty disagreements would otherwise turn one post into a ref dump — the same
+#: trade `GET /reviews` makes when it publishes `changed_files_total` and not the
+#: paths. Trimming loses nothing a reader needs: the post's `detail` is the whole
+#: rendered report, so every finding is named there whether or not it got a link.
+MAX_POST_REFS = 10
+
+
+def post_refs(report: Report) -> list[dict]:
+    """Dev-context links for the board post: the repos, then the findings' own refs.
+
+    Repos first and unconditionally, so a post about a repo is filed under it even
+    when the findings themselves are trimmed away.
+    """
+    refs: list[dict] = [{"kind": "repo", "value": short_repo(r)} for r in report.repos]
+    for finding in report.findings[:MAX_POST_REFS]:
+        if not finding.ref or not finding.repo:
+            continue
+        kind, _, value = finding.ref.partition("#")
+        if kind in ("pr", "issue") and value:
+            refs.append({"kind": kind, "value": value, "repo": finding.repo})
+    return refs
+
+
+def post_summary(report: Report) -> tuple[str, str]:
+    """``(summary, detail)`` for the one board post ``--post`` makes."""
+    counts = {c: sum(1 for f in report.findings if f.condition == c) for c in CONDITIONS}
+    parts = [f"{n} {c.replace('_', ' ')}" for c, n in counts.items() if n]
+    head = ", ".join(parts) if parts else "no disagreement"
+    if report.unknowns:
+        head += f"; {len(report.unknowns)} could not be checked"
+    return f"plan reconcile: {head}", render(report)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="qb-reconcile",
+        description="Report where the board's plan disagrees with GitHub and /reviews.")
+    parser.add_argument("--repo", metavar="OWNER/NAME",
+                        help="only this repo's plan items (default: every repo the plan names)")
+    parser.add_argument("--json", action="store_true", dest="as_json",
+                        help="the whole report as JSON, unknowns beside the findings")
+    parser.add_argument("--post", action="store_true",
+                        help="also post one `finding` to the board (off by default: "
+                             "this pass reports, it does not write)")
+    parser.add_argument("--quiet", action="store_true",
+                        help="print nothing when there is nothing to report")
+    args = parser.parse_args(argv)
+
+    try:
+        report = run(args.repo)
+    except Unavailable as exc:
+        print(f"qb-reconcile: {exc}", file=sys.stderr)
+        return 2
+
+    if args.as_json:
+        print(json.dumps(report.as_dict(), indent=2))
+    elif not (args.quiet and not report.findings and not report.unknowns):
+        print(render(report))
+
+    if args.post and (report.findings or report.unknowns):
+        summary, detail = post_summary(report)
+        try:
+            client, _cfg = board_client()
+            client.post("/post", {"type": "finding", "summary": summary,
+                                  "detail": detail, "refs": post_refs(report)})
+        except Exception as exc:                            # noqa: BLE001
+            # Best-effort, like the panel's board recording: a pass whose report
+            # reached the log has done its job, and telemetry that can fail the
+            # thing it reports on is worse than none.
+            print(f"qb-reconcile: report stands, but the board post failed: {exc}",
+                  file=sys.stderr)
+
+    return report.exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
