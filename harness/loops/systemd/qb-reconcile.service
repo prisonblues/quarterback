@@ -1,8 +1,14 @@
 [Unit]
 Description=Reconcile the board's plan against GitHub and /reviews (#255)
-Documentation=file:///home/%u/.claude/loops/README.md
-# gh and the board are both network calls; without this the first tick after boot
-# reports every ref as unresolvable and every claim as unchecked.
+Documentation=file://%h/.claude/loops/README.md
+# gh and the board are both network calls, and the first tick after boot wants a
+# route. `network-online.target` is a SYSTEM unit, so ordering a --user service
+# against it is inert — there is no such unit in a user manager to wait for. The
+# timer's OnBootSec=5min is what actually buys the delay; this pair is kept only
+# because a copy of this file dropped into a system manager would then mean it,
+# and because the sibling lander unit carries the same two lines. If you want the
+# ordering to hold for real, define the service in the host config
+# (`systemd.user.services.*`), which is where the lander's live unit lives anyway.
 Wants=network-online.target
 After=network-online.target
 
@@ -16,15 +22,20 @@ Type=oneshot
 # --post puts the report on the board as a `finding`, which is the point of
 # running it on a timer at all — a report that only reaches ~/reconcile-logs is
 # invisible to the agents whose plan it is about, and #255 is a complaint about
-# consumers that cannot read the board. Drop the flag to log and stay silent.
+# consumers that cannot read the board. It posts only when the report's CONTENT
+# has changed since the last post (a digest under $XDG_STATE_HOME), so an
+# unchanged disagreement is one post rather than ~96 a day. Drop the flag to log
+# and stay silent.
 #
 # --quiet so a tick with nothing to say writes nothing: this fires every 15
 # minutes and a plan that agrees with reality is the normal case.
 #
-# It lives in bin/ rather than loops/, so this names it on PATH rather than by
-# path — %h/.nix-profile/bin/qb-reconcile if you would rather not depend on the
-# unit's PATH.
-ExecStart=qb-reconcile --post --quiet
+# ABSOLUTE PATH, like the lander's %h/.claude/loops/run-loop.sh. A bare
+# executable name in ExecStart= is resolved against the MANAGER's $PATH (and only
+# on systemd >= 246), and a home-manager profile's bin is on a login shell's PATH
+# without being reliably on the user manager's. If your qb-reconcile lives
+# somewhere else, name it — the point is that it is named.
+ExecStart=%h/.nix-profile/bin/qb-reconcile --post --quiet
 # Exit 1 is "ran, but some check could not be made" and exit 2 is "could not run
 # at all". Both are worth seeing in `systemctl --user status`, neither is worth
 # restarting for — the next tick retries. SuccessExitStatus keeps a partial run
@@ -33,5 +44,9 @@ ExecStart=qb-reconcile --post --quiet
 SuccessExitStatus=0 1
 Nice=10
 
-[Install]
-WantedBy=default.target
+# No [Install] section, deliberately, exactly as loops-lander.service has none:
+# the TIMER is what starts this. `systemctl --user enable qb-reconcile.service`
+# would wire a oneshot into default.target, so it would also run at every login
+# beside the timer's own OnBootSec — and an operator who enabled the service but
+# not the timer would get a once-per-login pass that looks like it is on a
+# schedule. Enable qb-reconcile.timer.

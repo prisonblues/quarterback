@@ -16,9 +16,10 @@ board reconnects them.**
 - `bin/` — the bash the worktree commands drive (`create-worktree`, `remove-worktree`,
   `prune-worktrees`, `worktree-holder`), plus `qb-stage`, which records the workflow
   stage a session is in for the statusline, `qb-seat`, which turns one pane of a
-  multiplexer into a fleet seat with its own board identity, and `qb-board`, which
+  multiplexer into a fleet seat with its own board identity, `qb-board`, which
   launches the terminal board client (`qb-board --follow` tails the board to stdout
-  on any host with ssh; see the repo README)
+  on any host with ssh; see the repo README), and `qb-reconcile`, the read-only pass
+  that asks whether the board's plan still describes the present
 - `worktree.example.json` — per-repo config, annotated with quarterback's own values
 
 Neither half needs the other. The loops run with no board configured (recording is
@@ -1029,9 +1030,28 @@ and `stop_reason` across every recorded run. Nothing joined them. So:
 qb-reconcile                     # every repo the board's plan names
 qb-reconcile --repo owner/name   # just that one
 qb-reconcile --json              # the whole report, unknowns beside the findings
-qb-reconcile --post              # also put the report on the board as a `finding`
+qb-reconcile --post              # put the report on the board — only when it CHANGED
+qb-reconcile --include-drafts    # count draft PRs as untracked work too
 qb-reconcile --quiet             # say nothing when there is nothing to say
 ```
+
+**`--post` posts only what is new.** It hashes what the report *says* — the
+conditions, subjects and sentences, not `idle_days` or GitHub's `updatedAt`, which
+move on their own — and keeps that digest under `$XDG_STATE_HOME/qb-reconcile`. On a
+15-minute timer with no such check, one unchanged disagreement is ~96 identical
+`finding` posts a day, each carrying the whole rendered report in `detail`; `finding`
+is not in the board's `MUTED_TYPES`, so every one of them lands in every agent's
+orient read — the volume problem that list exists to solve. An unreadable digest
+posts rather than staying quiet: silencing a disagreement because a cache could not
+be read is the wrong way round.
+
+**Bot PRs and drafts are not untracked work.** The harness ships a whole loop for
+dependabot's PRs (`loops/lander.py`), and those are deliberately never on the plan —
+so counting them would make every repo with dependabot enabled a page of findings
+that are already owned. Drafts are opt-in for the same reason: a draft is not yet
+work the plan owes an item. Neither is dropped silently: the report says how many it
+did not compare and why, because "no untracked PRs" and "no untracked PRs among the
+ones I looked at" are different sentences.
 
 It walks the plan's refs against GitHub and the board's own review record and reports five
 disagreements:
@@ -1065,6 +1085,18 @@ claim then looks maximally fresh *because* the agent is busy — with something 
 cannot lapse while the pane lives. A claim naming no session (one taken by hand) can only be
 checked by holder name, and names are recycled when an agent finishes, so that case is
 reported as **unchecked** rather than as healthy.
+
+**And an absent lease is not evidence that a claim is dead, because the two TTLs are not the
+same length.** A plan claim runs an hour; a lease runs 30 minutes on this board (300s by API
+default) and is renewed by the lifecycle hook per *prompt*, and `/active` lists only leases
+that have not expired. So an agent in a single long autonomous turn — the normal shape of the
+loops this harness drives — drops out of `/active` for up to half an hour with its claim
+perfectly live, and nothing in the payload tells "quiet" from "gone". Only one case is a
+finding: the holder is demonstrably live and the session that took the claim is not, which is
+the case passive expiry can never reach. When *nothing* the claim names is in `/active`, the
+claim's own `expires` is what can still be read, and while it holds this is reported as
+**unchecked** — the board's own passive expiry settles it at the claim's TTL, and a finding
+accusing a working agent of holding a dead claim every fifteen minutes settles nothing.
 
 **An unmade check never reads as a clean one**, which is the half of #255 that shapes the
 whole file. Every condition has a third answer, `unknowns` is never folded into `findings`,
@@ -1356,6 +1388,10 @@ environment — but read it directly rather than through `qb`, so the occupancy 
 the board client work whether or not that CLI is installed. There is deliberately **no
 default board URL**: unset means this machine has not been told which board it belongs to,
 and guessing would point the query at somebody else's.
+
+`qb-reconcile` is the one piece here that cannot run at all without a board — the plan it
+reconciles *is* the board — so unlike `worktree-holder`, which degrades to "no occupancy
+information", it exits **2** and says which read it could not make.
 
 ## Caveats
 

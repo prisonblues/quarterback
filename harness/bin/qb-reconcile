@@ -54,13 +54,15 @@ Usage:
     qb-reconcile                     every repo the board's plan names
     qb-reconcile --repo owner/name   just that one
     qb-reconcile --json              the whole report as JSON (what #232 reads)
-    qb-reconcile --post              also post one `finding` to the board
+    qb-reconcile --post              post one `finding` — only when it CHANGED
+    qb-reconcile --include-drafts    count draft PRs as untracked work too
     qb-reconcile --quiet             say nothing when there is nothing to say
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -68,6 +70,7 @@ import subprocess
 import sys
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
+from urllib.parse import urlencode
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from qbdata import board_client, clip, short_repo  # noqa: E402
@@ -88,14 +91,37 @@ GH_TIMEOUT = 45
 #: assumed false: a reconcile pass that silently skipped the tail of the plan while
 #: printing a report headed "every repo the board's plan names" would be committing
 #: the exact error it exists to find.
-PLAN_LIMIT = 200
+#:
+#: The plan is fetched with `include_done=true`, which is why this is 500 rather
+#: than the board's own default of 200: the **repo set** this pass asks GitHub about
+#: comes from every row the plan has, not only its open ones. A repo whose plan rows
+#: are all done or dropped is still a repo the plan names, and it is the most likely
+#: place for untracked work to be — dropping it from the scope means its open PRs
+#: cannot be reported at all, in silence, under a report headed "every repo the
+#: board's plan names". So history is in scope, history is what grows, and the cap
+#: has to cover both while staying a cap (the board's own maximum is 1000).
+PLAN_LIMIT = 500
 
+#: The conditions a FINDING can carry, and the closed vocabulary `--json`
+#: consumers group by. Deliberately not shared with the unknowns: a check that
+#: could not be made is not always one condition's, and filing "the plan was
+#: truncated" under `done_candidate` told a consumer grouping by condition that a
+#: truncation was a done-candidate problem while the text underneath said it
+#: invalidated `untracked_pr`.
 CONDITIONS = (
     "done_candidate",
     "dropped_candidate",
     "stale_claim",
     "note_contradicted",
     "untracked_pr",
+)
+
+#: Conditions only an :class:`Unknown` carries — a check that is not any single
+#: finding condition's. `ref_unresolved` is the ref lookup that answers conditions
+#: 1 AND 2 at once; `plan_incomplete` is about the report, not about an item.
+UNKNOWN_CONDITIONS = (
+    "ref_unresolved",
+    "plan_incomplete",
 )
 
 #: What a note has to say for :func:`note_asserts_ready` to read it as a claim
@@ -117,19 +143,28 @@ CONDITIONS = (
 #: denial from `/review/findings` are claims about different things, so pairing
 #: them manufactures a contradiction out of two statements that never disagreed.
 #: `panel is green` stays, because it names what it is talking about.
+#:
+#: **Every readiness word carries `\b` on both ends, and the reason is the same
+#: three times over.** The negation guard below cannot catch a negator that is
+#: INSIDE the word: "unclean after the rebase" matches a boundary-less `clean` at
+#: offset 2 with `before == "un"`, no negator fires, and this reads a note saying
+#: the reverse of the vocabulary as an assertion of readiness — the costliest false
+#: positive available, because it manufactures a contradiction on the one condition
+#: that cannot be checked mechanically. `unmergeable` was caught and fixed; `un`
+#: clean and `un`landable shipped in the same tuple without it. The trailing
+#: boundary earns its keep too: without it `clean` matched "cleaned up the tests"
+#: and `review(?:ed)? clean` matched "reviewed cleanup pass".
 _READY_PHRASES = (
-    # `\b` on both ends, so **un**mergeable is not a claim that a PR is mergeable.
-    # The negation guard below cannot catch that one: the negator is inside the word.
     r"\bmergeable\b",
-    r"clean(?!\s*[-\s]?ups?\b)(?!ing\b)",
-    r"landable",
+    r"\bclean(?!\s*[-\s]?ups?\b)(?!ing\b)\b",
+    r"\blandable\b",
     r"ready to (?:land|merge|go)",
     r"ready for (?:merge|landing|land)",
     r"no (?:open |outstanding )?findings",
     r"nothing (?:left )?to fix",
     r"(?:all )?findings (?:all )?(?:fixed|resolved|addressed|cleared)",
-    r"review(?:ed)? clean",
-    r"panel (?:is )?(?:clean|done|green)",
+    r"\breview(?:ed)? clean\b",
+    r"panel (?:is )?(?:clean|done|green)\b",
 )
 _READY = re.compile("|".join(f"(?:{p})" for p in _READY_PHRASES), re.I)
 
@@ -230,6 +265,11 @@ class Report:
     prs_checked: int = 0
     findings: list[Finding] = field(default_factory=list)
     unknowns: list[Unknown] = field(default_factory=list)
+    #: Open PRs deliberately not compared against the plan, each with its reason.
+    #: Neither a finding nor an unknown — nothing went unchecked and nothing
+    #: disagrees — but never silent either: "no untracked PRs" and "no untracked
+    #: PRs among the ones I looked at" are different sentences.
+    prs_skipped: list[dict] = field(default_factory=list)
 
     @property
     def exit_code(self) -> int:
@@ -247,6 +287,7 @@ class Report:
             # Beside the findings and never merged into them; a consumer that
             # reads only `findings` and calls the plan reconciled is the bug.
             "unknowns": [asdict(u) for u in self.unknowns],
+            "prs_skipped": list(self.prs_skipped),
             "complete": not self.unknowns,
         }
 
@@ -272,7 +313,12 @@ def item_label(item: dict) -> str:
 
 
 def pr_in_text(*texts: str | None) -> str | None:
-    """The first ``PR #<n>`` in any of ``texts`` — see :data:`_PR_IN_TEXT`."""
+    """The first ``PR #<n>`` in any of ``texts`` — see :data:`_PR_IN_TEXT`.
+
+    First-wins is right for the question :func:`item_pr` asks ("which PR is this
+    note making a claim about"); it is wrong for the question condition 5 asks, and
+    :func:`prs_in_text` is that one.
+    """
     for text in texts:
         if not text:
             continue
@@ -280,6 +326,23 @@ def pr_in_text(*texts: str | None) -> str | None:
         if match:
             return match.group(1)
     return None
+
+
+def prs_in_text(*texts: str | None) -> list[str]:
+    """EVERY ``PR #<n>`` in ``texts``, in the order they appear.
+
+    Which PRs an item accounts for is not the same question as which one its note
+    is about, and first-wins answers it wrongly in the one direction that costs:
+    an item titled "Land PR #190 and PR #191" tracks both, and reading only #190
+    leaves #191 reported as work the plan does not account for — on a board post,
+    every tick, forever.
+    """
+    found: list[str] = []
+    for text in texts:
+        for number in _PR_IN_TEXT.findall(text or ""):
+            if number not in found:
+                found.append(number)
+    return found
 
 
 def item_pr(item: dict) -> str | None:
@@ -346,9 +409,45 @@ def ref_verdict(kind: str, state: dict) -> tuple[str | None, str, bool]:
 # ---- condition 3: the claim does not describe the present -------------------
 
 
-def claim_verdict(claim: dict, live_sessions: set[str],
-                  live_holders: set[str]) -> tuple[bool, str]:
-    """``(is_stale, why)`` for a live claim on an open item.
+#: What :func:`claim_verdict` can conclude. `unknown` is the one this had to grow.
+CLAIM_HELD, CLAIM_STALE, CLAIM_UNKNOWN = "held", "stale", "unknown"
+
+#: **An absent lease is not evidence that a claim is dead, and the two TTLs are
+#: why.** A plan claim's default TTL is 3600s (`app/api/claims.py`); a lease's is
+#: 300s by API default and every live lease on this board runs 1800s, renewed by
+#: the lifecycle hook per PROMPT. `/active` lists only leases with `expires_at >
+#: now` (`app/api/subagents.py`), so an agent in a single long autonomous turn —
+#: the normal shape of the loops this harness drives — drops out of `/active` for
+#: up to half an hour while its claim is perfectly live, and there is nothing in
+#: the payload to tell "quiet" from "gone". Reported as stale, that is a finding
+#: accusing a working agent of holding a dead claim, re-posted every fifteen
+#: minutes. What CAN be read is the claim's own `expires`, and while that holds the
+#: board's own passive expiry is what will settle the question — an hour at the
+#: outside — so this says so instead of guessing.
+_LEASE_ASYMMETRY = ("a lease is renewed per prompt and runs 30 minutes against a claim's "
+                    "hour, so a single long autonomous turn drops a working agent out of "
+                    "/active; the board's own passive expiry settles this at the claim's "
+                    "own TTL")
+
+
+def _claim_live(claim: dict, now: datetime) -> bool | None:
+    """Is the claim inside its own TTL? ``None`` = the board did not say."""
+    raw = (claim.get("expires") or "").strip()
+    if not raw:
+        return None
+    try:
+        expires = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=UTC)
+    return expires > now
+
+
+def claim_verdict(claim: dict, live_sessions: set[str], live_holders: set[str],
+                  now: datetime | None = None) -> tuple[str, str]:
+    """``(verdict, why)`` for a live claim on an open item — one of :data:`CLAIM_HELD`,
+    :data:`CLAIM_STALE`, :data:`CLAIM_UNKNOWN`.
 
     The board expires a claim passively: a dead holder stops renewing and the row
     lapses with nobody reaping it. That covers the holder DYING. It does not
@@ -365,24 +464,44 @@ def claim_verdict(claim: dict, live_sessions: set[str],
     not). A claim naming NO session — one taken by hand through the CLI — can
     only be checked by holder name, and holder names are recycled when an agent
     finishes, so a live name is not proof the holder is the one that claimed it.
-    That case is an unknown, not a clean bill, and the caller reports it as one.
+
+    The verdict is three-valued rather than a boolean because the case where
+    NOTHING the claim names is in `/active` is the one this pass cannot settle: see
+    :data:`_LEASE_ASYMMETRY`. Only one case is a finding, and it is the one passive
+    expiry can never reach — the holder is demonstrably live, so its lease is being
+    renewed and its absence explains nothing.
     """
     session = (claim.get("session") or "").strip() or None
     holder = (claim.get("holder") or "").strip() or None
+    at = now or _utcnow()
 
-    if session:
-        if session in live_sessions:
-            return False, "held by a live session"
-        if holder and holder in live_holders:
-            return True, (f"{holder} is live, but the session that took this claim "
-                          f"({clip(session, 8)}) is not — a reset conversation still "
-                          "holding it, which cannot expire while the pane lives")
-        return True, (f"neither the holder ({holder or 'unnamed'}) nor the session that "
-                      f"took this claim ({clip(session, 8)}) is live")
+    # The session that took the claim is here. Nothing to report.
+    if session and session in live_sessions:
+        return CLAIM_HELD, "held by a live session"
 
-    if holder and holder in live_holders:
-        return False, "the claim names no session"          # unknown; see caller
-    return True, f"holder {holder or 'unnamed'} has no live lease"
+    # The holder is here and the session that took the claim is not — the reset
+    # conversation. The only case where an absence proves something.
+    if session and holder and holder in live_holders:
+        return CLAIM_STALE, (f"{holder} is live, but the session that took this claim "
+                             f"({clip(session, 8)}) is not — a reset conversation still "
+                             "holding it, which cannot expire while the pane lives")
+
+    if not session and holder and holder in live_holders:
+        return CLAIM_UNKNOWN, ("the claim names no session, so it can only be checked by "
+                               "holder name — and names are recycled when an agent "
+                               "finishes, so a live name is not proof this holder is the "
+                               "one that claimed it")
+
+    # Nothing the claim names is in /active at all.
+    if _claim_live(claim, at):
+        return CLAIM_UNKNOWN, (
+            f"nothing in /active names the holder ({holder or 'unnamed'})"
+            + (f" or the session that took this claim ({clip(session, 8)})" if session else "")
+            + f", but the claim itself is live until {claim.get('expires')} — "
+            + _LEASE_ASYMMETRY)
+    return CLAIM_STALE, (f"neither the holder ({holder or 'unnamed'}) nor the session that "
+                         f"took this claim ({clip(session, 8) if session else 'none named'}) "
+                         "is live, and the claim is past its own expiry")
 
 
 # ---- condition 4: the note is fiction ---------------------------------------
@@ -411,6 +530,26 @@ def _clears(finding: dict) -> bool:
     return (outcome.get("outcome") or "") in _CLEARING_OUTCOMES
 
 
+#: Verdicts a master judge never actually pronounced. `unjudged` is what the panel
+#: writes when the judge crashed or never ran (`app/api/reviews.py`), and `sonar` is
+#: the hard gate's own issues, which no judge rules on either.
+_UNADJUDICATED = ("unjudged", "sonar")
+
+
+def _unadjudicated(chain: dict) -> bool:
+    """Was this chain's latest observation never ruled on by a judge?
+
+    `GET /review/findings` sets `status: "dismissed"` only when EVERY verdict in the
+    chain is `dismissed`, so a chain whose latest observation is `unjudged` or
+    `sonar` comes back `open` — and counting it as "still raised in the latest
+    round" is defensible, but reporting it without saying so is not. The endpoint's
+    own scoring excludes these from both sides of its measurement; a denial that
+    rests entirely on findings nobody confirmed has to say how many.
+    """
+    observations = chain.get("observations") or []
+    return bool(observations) and observations[-1].get("verdict") in _UNADJUDICATED
+
+
 def findings_denial(history: dict) -> tuple[str | None, str | None, dict]:
     """``(denial, unknown_reason, evidence)`` — does the review record deny readiness?
 
@@ -433,11 +572,13 @@ def findings_denial(history: dict) -> tuple[str | None, str | None, dict]:
     open_chains = [f for f in findings if f.get("status") == "open"]
     standing = [f for f in open_chains if not _clears(f)]
     cleared = len(open_chains) - len(standing)
+    unadjudicated = sum(1 for f in standing if _unadjudicated(f))
     truncated = bool(history.get("truncated"))
     evidence = {
         "rounds": history.get("rounds"),
         "open_findings": len(standing),
         "open_findings_cleared_by_outcome": cleared,
+        "open_findings_unadjudicated": unadjudicated,
         "stopped": history.get("stopped"),
         "stop_reason": history.get("stop_reason"),
         "cycles": history.get("cycles"),
@@ -446,8 +587,12 @@ def findings_denial(history: dict) -> tuple[str | None, str | None, dict]:
 
     if standing:
         worst = sorted(f.get("severity") or "P9" for f in standing)[0]
+        # The count is in the denial and not only in the evidence, because a
+        # denial nobody can weigh is a denial a reader has to go and re-derive.
+        unruled = (f", {unadjudicated} of them never adjudicated"
+                   if unadjudicated else "")
         return (f"{len(standing)} finding(s) still raised in the latest round "
-                f"(worst {worst})", None, evidence)
+                f"(worst {worst}{unruled})", None, evidence)
 
     if "cycles" not in history:
         return None, ("the board reported no `cycles`, so its stop summary cannot be "
@@ -470,18 +615,44 @@ def findings_denial(history: dict) -> tuple[str | None, str | None, dict]:
 # ---- condition 5: work the plan does not account for ------------------------
 
 
-def untracked_prs(open_prs: list[dict], items: list[dict]) -> tuple[list[dict], list[Unknown]]:
-    """Open PRs no open plan item accounts for, and the ones that could not be told.
+#: Logins whose pull requests are already somebody else's job. The harness ships a
+#: whole loop for dependabot's (`harness/loops/lander.py`, `DEPENDABOT_LOGIN`), and
+#: those PRs are deliberately never on the plan — so on any repo with dependabot
+#: enabled every one of them is an `untracked_pr`, permanently, in a post made every
+#: fifteen minutes, drowning the findings a reader is here for. `gh` reports
+#: `author.is_bot`, which catches renovate and the rest without a list; this list is
+#: the fallback for a `gh` that does not say.
+BOT_LOGINS = ("dependabot[bot]", "renovate[bot]", "github-actions[bot]")
+
+
+def pr_author(pr: dict) -> str:
+    return ((pr.get("author") or {}).get("login") or "").strip()
+
+
+def is_bot_pr(pr: dict) -> bool:
+    return bool((pr.get("author") or {}).get("is_bot")) or pr_author(pr) in BOT_LOGINS
+
+
+def untracked_prs(open_prs: list[dict], items: list[dict],
+                  include_drafts: bool = False) -> tuple[list[dict], list[Unknown], list[dict]]:
+    """``(untracked, could-not-tell, deliberately-skipped)`` over one repo's open PRs.
 
     A PR is accounted for three ways, and all three are needed: an item whose ref
     IS it, an item whose issue ref is one this PR closes, or an item naming it as
     ``PR #n``. Only the first is a bare number match — the second is what stops
     "Rebase and land PR #182 (#163)" and its issue-backed sibling from both
-    reading as untracked work.
+    reading as untracked work. ALL the ``PR #n``s an item names count, not the
+    first: "Land PR #190 and PR #191" tracks two.
 
     A PR whose ``closingIssuesReferences`` GitHub did not return cannot have the
     second leg checked, so it comes back as an unknown rather than a finding: the
     whole point of this pass is not to report an unmade check as a clean one.
+
+    The third list is what was not compared and why — bot PRs (see
+    :data:`BOT_LOGINS`) and, unless asked for, drafts. It is returned rather than
+    dropped because this file's rule is that no cap and no filter is silent: the
+    report says what it left out, so a reader can tell "nothing untracked" from
+    "nothing untracked among the PRs I looked at".
     """
     # Keyed by (repo, number), never by number alone. Two repos both have a #12,
     # and a plan item tracking one repo's #12 would otherwise account for the
@@ -500,16 +671,26 @@ def untracked_prs(open_prs: list[dict], items: list[dict]) -> tuple[list[dict], 
             tracked_prs.add((repo, value))
         elif kind == "issue" and value:
             tracked_issues.add((repo, value))
-        named = pr_in_text(item.get("title"), item.get("note"))
-        if named:
+        for named in prs_in_text(item.get("title"), item.get("note")):
             tracked_prs.add((repo, named))
 
     findings: list[dict] = []
     unknowns: list[Unknown] = []
+    skipped: list[dict] = []
     for pr in open_prs:
         number = str(pr.get("number"))
         repo = pr.get("repo") or ""
         if (repo, number) in tracked_prs:
+            continue
+        if is_bot_pr(pr):
+            skipped.append({"number": pr.get("number"), "repo": pr.get("repo"),
+                            "reason": f"authored by {pr_author(pr) or 'a bot'}, which the "
+                                      "plan is not expected to track"})
+            continue
+        if pr.get("isDraft") and not include_drafts:
+            skipped.append({"number": pr.get("number"), "repo": pr.get("repo"),
+                            "reason": "a draft, which is not yet work the plan owes an "
+                                      "item (--include-drafts to compare them too)"})
             continue
         closes = pr.get("closingIssuesReferences")
         if closes is None:
@@ -525,7 +706,7 @@ def untracked_prs(open_prs: list[dict], items: list[dict]) -> tuple[list[dict], 
         if any((repo, str(i.get("number"))) in tracked_issues for i in closes):
             continue
         findings.append(pr)
-    return findings, unknowns
+    return findings, unknowns, skipped
 
 
 # ---- the pass ---------------------------------------------------------------
@@ -535,14 +716,21 @@ def reconcile(items: list[dict], ref_states: dict[tuple[str, str, str], dict | N
               live_sessions: set[str], live_holders: set[str],
               histories: dict[tuple[str, str], dict | None],
               open_prs: list[dict], repos: list[str],
-              now: datetime | None = None) -> Report:
+              now: datetime | None = None,
+              ref_errors: dict[tuple[str, str, str], str] | None = None,
+              include_drafts: bool = False) -> Report:
     """Every condition over already-fetched data. No I/O, so it is all testable.
 
     ``ref_states`` is keyed ``(repo, kind, value)`` and ``histories`` ``(repo,
     pr)``; a key present with a ``None`` value means the lookup was attempted and
     failed, which is reported. A key ABSENT means it was never needed.
+    ``ref_errors`` carries WHY a lookup failed, under the same key: "no such pull
+    request" and "API rate limit exceeded" want opposite responses from a reader,
+    and without the reason both arrive as the same unknown.
     """
-    report = Report(generated=(now or _utcnow()).isoformat(), repos=sorted(repos),
+    at = now or _utcnow()
+    errors = ref_errors or {}
+    report = Report(generated=at.isoformat(), repos=sorted(repos),
                     items_checked=len(items), prs_checked=len(open_prs))
 
     for item in items:
@@ -560,14 +748,16 @@ def reconcile(items: list[dict], ref_states: dict[tuple[str, str, str], dict | N
                 # ask about its ref. Said plainly rather than reported as a failed
                 # lookup: nothing went wrong, the item is simply not answerable.
                 report.unknowns.append(Unknown(
-                    condition="done_candidate", subject=label, repo=repo, ref=ref,
+                    condition="ref_unresolved", subject=label, repo=repo, ref=ref,
                     reason=f"the item names no repo, so {ref} cannot be resolved "
                            "against any GitHub project"))
             elif state == "missing" or state is None:
+                why = errors.get((repo, kind, value))
                 report.unknowns.append(Unknown(
-                    condition="done_candidate", subject=label, repo=repo, ref=ref,
+                    condition="ref_unresolved", subject=label, repo=repo, ref=ref,
                     reason=f"{ref} could not be resolved against GitHub, so whether "
-                           "this item has outlived its work is unknown"))
+                           "this item has outlived its work is unknown"
+                           + (f" — {why}" if why else "")))
             else:
                 condition, reads, readable = ref_verdict(kind, state)
                 if condition:
@@ -583,14 +773,14 @@ def reconcile(items: list[dict], ref_states: dict[tuple[str, str, str], dict | N
                                   "stale": item.get("stale")}))
                 elif not readable:
                     report.unknowns.append(Unknown(
-                        condition="done_candidate", subject=label, repo=repo, ref=ref,
+                        condition="ref_unresolved", subject=label, repo=repo, ref=ref,
                         reason=f"GitHub reported {reads} for {ref}"))
 
         # 3 — the claim against who is actually here.
         claim = item.get("claim")
         if claim:
-            stale, why = claim_verdict(claim, live_sessions, live_holders)
-            if stale:
+            verdict, why = claim_verdict(claim, live_sessions, live_holders, now=at)
+            if verdict == CLAIM_STALE:
                 report.findings.append(Finding(
                     condition="stale_claim", subject=label, repo=repo,
                     ref=f"{kind}#{value}" if kind and value else None,
@@ -602,12 +792,12 @@ def reconcile(items: list[dict], ref_states: dict[tuple[str, str, str], dict | N
                               "acquired": claim.get("acquired"),
                               "expires": claim.get("expires"),
                               "note": clip(claim.get("note"), 120)}))
-            elif not (claim.get("session") or "").strip():
+            elif verdict == CLAIM_UNKNOWN:
                 report.unknowns.append(Unknown(
                     condition="stale_claim", subject=label, repo=repo,
-                    reason=f"the claim held by {claim.get('holder')} names no session, so "
-                           "it can only be checked by holder name — and names are "
-                           "recycled when an agent finishes"))
+                    ref=f"{kind}#{value}" if kind and value else None,
+                    reason=f"the claim held by {claim.get('holder')} could not be "
+                           f"checked: {why}"))
 
         # 4 — the note against the review record.
         pr = item_pr(item)
@@ -635,8 +825,9 @@ def reconcile(items: list[dict], ref_states: dict[tuple[str, str, str], dict | N
                         reason=f"the note claims {phrase!r}; {unknown}"))
 
     # 5 — work nothing on the plan accounts for.
-    untracked, pr_unknowns = untracked_prs(open_prs, items)
+    untracked, pr_unknowns, skipped = untracked_prs(open_prs, items, include_drafts)
     report.unknowns.extend(pr_unknowns)
+    report.prs_skipped.extend(skipped)
     for pr in untracked:
         number = pr.get("number")
         report.findings.append(Finding(
@@ -656,40 +847,61 @@ class Unavailable(RuntimeError):
     """The pass cannot run at all — reported as exit 2, never as a traceback."""
 
 
-def _gh_json(args: list[str]) -> object | None:
-    """One `gh` call returning parsed JSON, or None if it could not be made.
+def _gh_json(args: list[str]) -> tuple[object | None, str | None]:
+    """``(parsed JSON, why not)`` for one `gh` call.
 
-    None is "could not ask", and every caller turns it into an unknown rather
-    than into an absence of findings.
+    The reason is half the answer, and throwing it away made every failure the same
+    unhelpful unknown. "no such pull request" is a plan item pointing at a ref that
+    does not exist — a real, permanent disagreement somebody should go and fix —
+    while "API rate limit exceeded" is this tick's weather; they want opposite
+    responses from a reader, and the whole thesis of this pass is that the reason a
+    check could not be made is part of the report.
     """
     try:
         out = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=GH_TIMEOUT)
     except FileNotFoundError as exc:
         raise Unavailable("`gh` is not on PATH — every GitHub-side check would be "
                           "an unknown, which is not a report worth printing") from exc
-    except Exception:                                       # noqa: BLE001
-        return None
+    except Exception as exc:                                # noqa: BLE001
+        return None, f"the `gh` call did not complete ({type(exc).__name__}: {clip(str(exc), 60)})"
     if out.returncode != 0:
-        return None
+        return None, (clip(out.stderr, 120) or f"`gh` exited {out.returncode} and said nothing")
     try:
-        return json.loads(out.stdout)
+        return json.loads(out.stdout), None
     except json.JSONDecodeError:
-        return None
+        return None, "`gh` returned something that is not JSON"
 
 
-def fetch_ref_state(repo: str, kind: str, value: str) -> dict | None:
-    """What GitHub says about one ref. None = it could not be asked."""
+#: A repository name `gh --repo` will take and this pass will put in a URL. Board
+#: text is free — `ItemIn.repo` is 256 characters of anything and `ItemIn.ref_value`
+#: 64, normalised only by stripping a leading `#` — and `gh` reads an argument
+#: beginning with `-` as a FLAG, not as a value. A ref spelled `--repo=someone/else`
+#: would silently answer the question about a different repository, and the verdict
+#: would then be reported as a checked fact, which is the one thing this pass
+#: promises never to do. So both halves are validated before either reaches a
+#: subprocess or a query string, and a value that fails is reported as the unknown
+#: it is.
+_REPO_OK = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+
+
+def fetch_ref_state(repo: str, kind: str, value: str) -> tuple[dict | None, str | None]:
+    """``(what GitHub says about one ref, why it could not be asked)``."""
     if kind == "pr":
         fields = "number,state,isDraft,mergedAt,closedAt,title,url"
     elif kind == "issue":
         fields = "number,state,stateReason,title,url"
     else:
-        return None
-    got = _gh_json([kind, "view", value, "--repo", repo, "--json", fields])
+        return None, f"`gh` has no view command for a {kind!r} ref"
+    if not value.isdigit():
+        return None, (f"the ref value {clip(value, 40)!r} is not a number, so it does not "
+                      "name a pull request or an issue `gh` could be asked about")
+    if not _REPO_OK.match(repo):
+        return None, f"{clip(repo, 40)!r} is not a repository name `gh` can be asked about"
+    got, problem = _gh_json([kind, "view", value, "--repo", repo, "--json", fields])
     if not isinstance(got, dict):
-        return None
+        return None, problem or "`gh` did not return an object"
     return {"state": got.get("state"), "state_reason": got.get("stateReason"),
-            "url": got.get("url"), "title": got.get("title")}
+            "url": got.get("url"), "title": got.get("title")}, None
 
 
 def fetch_open_prs(repo: str) -> tuple[list[dict], Unknown | None]:
@@ -698,13 +910,20 @@ def fetch_open_prs(repo: str) -> tuple[list[dict], Unknown | None]:
     A list that hit :data:`PR_FETCH_LIMIT` is reported rather than trimmed
     quietly — a silent cap here reads as "the plan accounts for everything".
     """
-    got = _gh_json(["pr", "list", "--repo", repo, "--state", "open",
-                    "--limit", str(PR_FETCH_LIMIT), "--json",
-                    "number,title,isDraft,updatedAt,url,closingIssuesReferences"])
+    if not _REPO_OK.match(repo):
+        return [], Unknown(condition="untracked_pr", subject=clip(repo, 40), repo=repo,
+                           reason=f"{clip(repo, 40)!r} is not a repository name `gh` can be "
+                                  "asked about, so its open PRs were not compared against "
+                                  "the plan at all")
+    got, problem = _gh_json(["pr", "list", "--repo", repo, "--state", "open",
+                             "--limit", str(PR_FETCH_LIMIT), "--json",
+                             "number,title,isDraft,updatedAt,url,author,"
+                             "closingIssuesReferences"])
     if not isinstance(got, list):
         return [], Unknown(condition="untracked_pr", subject=short_repo(repo), repo=repo,
-                           reason="`gh pr list` failed, so this repo's open PRs were "
-                                  "not compared against the plan at all")
+                           reason=f"`gh pr list` failed ({problem or 'no reason given'}), so "
+                                  "this repo's open PRs were not compared against the plan "
+                                  "at all")
     for pr in got:
         pr["repo"] = repo
     if len(got) >= PR_FETCH_LIMIT:
@@ -715,8 +934,12 @@ def fetch_open_prs(repo: str) -> tuple[list[dict], Unknown | None]:
 
 
 def fetch_history(client, repo: str, pr: str) -> dict | None:
+    """The board's review record for one PR. Built with `urlencode`, not `f"…{repo}…"`:
+    a repo or ref carrying `&` or `=` would otherwise inject extra query parameters
+    into the board's own path — the same free board text `_REPO_OK` guards `gh`
+    against, arriving at the other source this pass compares."""
     try:
-        return client.get(f"/review/findings?repo={repo}&pr={pr}")
+        return client.get("/review/findings?" + urlencode({"repo": repo, "pr": pr}))
     except Exception:                                       # noqa: BLE001
         return None
 
@@ -728,20 +951,58 @@ def fetch_live(client) -> tuple[set[str], set[str]]:
             {(a.get("holder") or "").strip() for a in agents if a.get("holder")})
 
 
-def run(repo_filter: str | None = None) -> Report:
+#: The one board client this process builds, and the reason there is a function for
+#: it. `resolve_config` sources the site config in a subshell and can run
+#: `QUARTERBACK_TOKEN_CMD` (qbdata.py), so a second call is a second secret-fetch
+#: subprocess per tick — and a token command that succeeded for the three reads can
+#: fail for the write, producing "report stands, but the board post failed" against
+#: a board that answered a second ago.
+_CLIENT: tuple | None = None
+
+
+def client_once():
+    """``(client, cfg)``, built at most once per process."""
+    global _CLIENT
+    if _CLIENT is None:
+        _CLIENT = board_client()
+    return _CLIENT
+
+
+def run(repo_filter: str | None = None, include_drafts: bool = False) -> Report:
     """Fetch everything the conditions need, then reconcile."""
     try:
-        client, _cfg = board_client()
+        client, _cfg = client_once()
     except Exception as exc:                                # noqa: BLE001
         raise Unavailable(f"no board to reconcile against: {exc}") from exc
 
     try:
-        plan = client.get(f"/plan?limit={PLAN_LIMIT}")
+        # `include_done` because the REPO SET below comes from every row the plan
+        # has: see :data:`PLAN_LIMIT`. The item checks still run on open rows only.
+        plan = client.get(f"/plan?include_done=true&limit={PLAN_LIMIT}")
     except Exception as exc:                                # noqa: BLE001
         raise Unavailable(f"the board's plan could not be read: {exc}") from exc
 
-    items = [i for i in (plan.get("items") or []) if i.get("state") == "open"]
+    if not isinstance(plan, dict) or "items" not in plan:
+        # An answer with no `items` key is not a plan with no items. A proxy page,
+        # a 204 from a board mid-deploy, a body that is not an object — read as an
+        # empty plan, every one of them yields zero items, zero unknowns, exit 0
+        # and the line "The plan agrees with GitHub and the board on everything
+        # checked": a clean bill from a check that never ran, which is the exact
+        # collapse this pass exists to report on.
+        raise Unavailable("the board's plan came back with no `items` key, which is not "
+                          "the same as a plan with no items")
+
+    all_items = plan.get("items") or []
+    items = [i for i in all_items if i.get("state") == "open"]
+    # WHAT the cap cut decides what the truncation unknown may claim. The board
+    # orders open work ahead of history (`_scope_items`) and publishes `counts.open`
+    # for the whole scope, so the page can say whether any OPEN row was lost — and a
+    # report that said "items past the cap were not reconciled" when only finished
+    # rows were cut would be overstating its own blindness, which is the same error
+    # in the other direction.
     truncated = bool(plan.get("truncated"))
+    plan_open = (plan.get("counts") or {}).get("open")
+    open_cut = not isinstance(plan_open, int) or len(items) < plan_open
     if repo_filter:
         items = [i for i in items if (i.get("repo") or "") == repo_filter]
 
@@ -751,11 +1012,17 @@ def run(repo_filter: str | None = None) -> Report:
         raise Unavailable(f"/active could not be read, so no claim could be checked "
                           f"against who is here: {exc}") from exc
 
-    repos = sorted({i["repo"] for i in items if i.get("repo")})
+    # From ALL the plan's rows, not just its open ones. A repo whose items are all
+    # done or dropped is still a repo the plan names — and it is the most likely
+    # place for untracked work to be, so dropping it from the scope means its open
+    # PRs cannot be reported at all, silently, under a report headed "every repo
+    # the board's plan names".
+    repos = sorted({i["repo"] for i in all_items if i.get("repo")})
     if repo_filter:
         repos = [repo_filter]
 
     ref_states: dict[tuple[str, str, str], dict | None] = {}
+    ref_errors: dict[tuple[str, str, str], str] = {}
     for item in items:
         repo = item.get("repo")
         kind, value = item_ref(item)
@@ -763,7 +1030,9 @@ def run(repo_filter: str | None = None) -> Report:
             continue
         key = (repo, kind, value)
         if key not in ref_states:
-            ref_states[key] = fetch_ref_state(repo, kind, value)
+            ref_states[key], problem = fetch_ref_state(repo, kind, value)
+            if problem:
+                ref_errors[key] = problem
 
     histories: dict[tuple[str, str], dict | None] = {}
     for item in items:
@@ -783,18 +1052,24 @@ def run(repo_filter: str | None = None) -> Report:
             pr_unknowns.append(problem)
 
     report = reconcile(items, ref_states, live_sessions, live_holders,
-                       histories, open_prs, repos)
+                       histories, open_prs, repos, ref_errors=ref_errors,
+                       include_drafts=include_drafts)
     report.unknowns.extend(pr_unknowns)
     if truncated:
-        # Reported once, for the plan as a whole: the items past the cap were never
-        # read, so there is no subject to attach a per-item unknown to. It also
-        # makes every `untracked_pr` above provisional — a PR the unread tail
-        # tracks would have looked untracked from here.
+        # Reported once, for the plan as a whole: the rows past the cap were never
+        # read, so there is no subject to attach a per-item unknown to — and no
+        # finding condition either, which is why it carries `plan_incomplete`
+        # rather than being filed under `done_candidate` while its own text says it
+        # invalidates `untracked_pr`.
         report.unknowns.append(Unknown(
-            condition="done_candidate", subject="the plan",
-            reason=f"`GET /plan` reported the list truncated at {PLAN_LIMIT} items, so "
-                   "items past the cap were not reconciled and an `untracked_pr` above "
-                   "may be tracked by one of them"))
+            condition="plan_incomplete", subject="the plan",
+            reason=f"`GET /plan` reported the list truncated at {PLAN_LIMIT} rows, so "
+                   + ("open items past the cap were not reconciled and an "
+                      "`untracked_pr` above may be tracked by one of them"
+                      if open_cut else
+                      "the plan's finished rows past the cap were not read — every open "
+                      "item was reconciled, but a repo whose only rows are past the cap "
+                      "was never asked for its open PRs")))
     return report
 
 
@@ -814,6 +1089,18 @@ def render(report: Report) -> str:
     lines = [f"qb-reconcile {report.generated}",
              f"  {report.items_checked} open plan item(s), {report.prs_checked} open PR(s), "
              f"repos: {', '.join(short_repo(r) for r in report.repos) or 'none'}"]
+    if report.prs_skipped:
+        # No silent filters, the same rule the fetch cap follows: "no untracked PRs"
+        # and "no untracked PRs among the ones I compared" are different sentences.
+        # Grouped by reason rather than one entry per PR: a repo with thirty
+        # dependabot PRs open would otherwise put all thirty on one unreadable line,
+        # which is the same volume problem in a different place.
+        by_reason: dict[str, list[str]] = {}
+        for skip in report.prs_skipped:
+            by_reason.setdefault(str(skip.get("reason")), []).append(f"#{skip.get('number')}")
+        lines.append(f"  {len(report.prs_skipped)} open PR(s) not compared: "
+                     + "; ".join(f"{', '.join(numbers)} — {reason}"
+                                 for reason, numbers in by_reason.items()))
 
     for condition in CONDITIONS:
         hits = [f for f in report.findings if f.condition == condition]
@@ -872,6 +1159,64 @@ def post_summary(report: Report) -> tuple[str, str]:
     return f"plan reconcile: {head}", render(report)
 
 
+def state_path() -> str:
+    """Where the digest of the last posted report lives.
+
+    **`--post` on a 15-minute timer with no change detection is ~96 identical
+    `finding` posts a day**, each carrying the whole rendered report in `detail`.
+    And `finding` is not in the board's `MUTED_TYPES` (app/schemas.py), so every one
+    of them lands in every agent's orient read — the volume problem that list exists
+    to solve. "Post only when there is something to say" is not enough on its own,
+    because unknowns are the steady state rather than the exception: a board too old
+    for `cycles`, a fleet-scoped item with a ref, a hand-taken claim. So what has to
+    be new is the CONTENT, and this file is how a one-shot process with no memory of
+    the last tick can tell.
+    """
+    base = (os.environ.get("XDG_STATE_HOME")
+            or os.path.join(os.path.expanduser("~"), ".local", "state"))
+    return os.path.join(base, "qb-reconcile", "last-post")
+
+
+def post_digest(report: Report) -> str:
+    """A hash of what the report SAYS, with everything that moves on its own left out.
+
+    Not `as_dict()`: `evidence` carries `idle_days` and GitHub's `updatedAt`, which
+    change between ticks on a disagreement that has not changed at all, so hashing
+    them would make every report new and buy nothing. What a reader would call "the
+    same report" is the conditions, the subjects and the sentences.
+    """
+    body = sorted([f.condition, f.repo or "", f.ref or "", f.subject, f.summary]
+                  for f in report.findings)
+    body += sorted([u.condition, u.repo or "", u.ref or "", u.subject, u.reason]
+                   for u in report.unknowns)
+    return hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
+
+
+def read_digest() -> str | None:
+    """The digest of the last report posted, or None if there is not one to read.
+
+    An unreadable state file returns None and so posts: silencing a disagreement
+    because a cache could not be read is the wrong way round.
+    """
+    try:
+        with open(state_path(), encoding="utf-8") as fh:
+            return fh.read().strip() or None
+    except OSError:
+        return None
+
+
+def write_digest(digest: str) -> str | None:
+    """Record what was just posted. Returns the reason it could not be recorded."""
+    path = state_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(digest + "\n")
+    except OSError as exc:
+        return str(exc)
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="qb-reconcile",
@@ -881,14 +1226,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true", dest="as_json",
                         help="the whole report as JSON, unknowns beside the findings")
     parser.add_argument("--post", action="store_true",
-                        help="also post one `finding` to the board (off by default: "
+                        help="also post one `finding` to the board, and only when this "
+                             "report differs from the last one posted (off by default: "
                              "this pass reports, it does not write)")
+    parser.add_argument("--include-drafts", action="store_true", dest="include_drafts",
+                        help="compare draft PRs against the plan too (off by default: a "
+                             "draft is not yet work the plan owes an item)")
     parser.add_argument("--quiet", action="store_true",
                         help="print nothing when there is nothing to report")
     args = parser.parse_args(argv)
 
     try:
-        report = run(args.repo)
+        report = run(args.repo, include_drafts=args.include_drafts)
     except Unavailable as exc:
         print(f"qb-reconcile: {exc}", file=sys.stderr)
         return 2
@@ -899,17 +1248,31 @@ def main(argv: list[str] | None = None) -> int:
         print(render(report))
 
     if args.post and (report.findings or report.unknowns):
-        summary, detail = post_summary(report)
-        try:
-            client, _cfg = board_client()
-            client.post("/post", {"type": "finding", "summary": summary,
-                                  "detail": detail, "refs": post_refs(report)})
-        except Exception as exc:                            # noqa: BLE001
-            # Best-effort, like the panel's board recording: a pass whose report
-            # reached the log has done its job, and telemetry that can fail the
-            # thing it reports on is worse than none.
-            print(f"qb-reconcile: report stands, but the board post failed: {exc}",
-                  file=sys.stderr)
+        digest = post_digest(report)
+        if digest == read_digest():
+            if not args.quiet:
+                # stderr, because stdout under `--json` is a payload #232's orderer
+                # parses and a line of prose after it would not be JSON any more.
+                print("qb-reconcile: unchanged since the last post, so nothing was "
+                      "posted — the report above is the current one.", file=sys.stderr)
+        else:
+            summary, detail = post_summary(report)
+            try:
+                client, _cfg = client_once()
+                client.post("/post", {"type": "finding", "summary": summary,
+                                      "detail": detail, "refs": post_refs(report)})
+            except Exception as exc:                        # noqa: BLE001
+                # Best-effort, like the panel's board recording: a pass whose report
+                # reached the log has done its job, and telemetry that can fail the
+                # thing it reports on is worse than none.
+                print(f"qb-reconcile: report stands, but the board post failed: {exc}",
+                      file=sys.stderr)
+            else:
+                problem = write_digest(digest)
+                if problem:
+                    print("qb-reconcile: posted, but the digest could not be recorded, "
+                          f"so the next tick will post the same report again: {problem}",
+                          file=sys.stderr)
 
     return report.exit_code
 

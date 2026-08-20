@@ -670,12 +670,29 @@ class BoardClient:
     def __init__(self, cfg: BoardConfig) -> None:
         self.cfg = cfg
 
-    def _request(self, req: urllib.request.Request) -> dict:
+    def _request(self, req: urllib.request.Request, *, allow_empty: bool = False) -> dict:
+        """One authenticated request. ``allow_empty`` belongs to the WRITE path only.
+
+        An empty body is not ``{}``. A proxy's contentless 502, a 204 from a board
+        mid-deploy, a truncated response — read as an empty object, every one of
+        those arrives at a caller as "the board says there is nothing there", which
+        is the absence-vs-inability collapse this client's consumers exist to
+        report on rather than commit. Two of them are one line away from it:
+        `qb-reconcile` turns `GET /plan` into `plan.get("items") or []` and would
+        print "the plan agrees with GitHub and the board on everything checked"
+        over a plan it never received, and :func:`fetch_board` sets ``error`` from
+        an exception it would no longer get, rendering an empty fleet as a healthy
+        one. So ``get`` lets `json` raise, exactly as it did before ``post``
+        existed; only ``post``, whose 200 legitimately carries no body, tolerates
+        an empty one.
+        """
         if self.cfg.token:
             req.add_header("Authorization", f"Bearer {self.cfg.token}")
         with urllib.request.urlopen(req, timeout=30, context=_ssl_context()) as resp:
             body = resp.read().decode()
-        return json.loads(body) if body.strip() else {}
+        if allow_empty and not body.strip():
+            return {}
+        return json.loads(body)
 
     def get(self, path: str, params: dict | None = None) -> dict:
         query = urllib.parse.urlencode(
@@ -689,7 +706,7 @@ class BoardClient:
             data=json.dumps(body).encode(),
             headers={"Content-Type": "application/json"},
             method="POST")
-        return self._request(req)
+        return self._request(req, allow_empty=True)
 
     def active(self) -> dict:
         return self.get("/active")

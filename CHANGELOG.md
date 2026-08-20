@@ -51,6 +51,26 @@ claim was being held. A claim naming no session — one taken by hand — can on
 holder name, and names are recycled when an agent finishes, so that is reported as unchecked
 rather than as healthy.
 
+**And an absent lease is not evidence that a claim is dead, because the two TTLs are not the
+same length.** A plan claim runs an hour; a lease runs 30 minutes here (300s by API default)
+and is renewed per *prompt*, and `/active` lists only leases that have not expired. So an
+agent in one long autonomous turn — the normal shape of the loops this harness drives —
+drops out of `/active` for up to half an hour with its claim perfectly live, and nothing in
+the payload tells "quiet" from "gone". Only the case above is a finding. When *nothing* the
+claim names is in `/active`, the claim's own `expires` is what can still be read, and while
+it holds this is reported as unchecked: the board's own passive expiry settles it at the
+claim's TTL, and a finding accusing a working agent of holding a dead claim every fifteen
+minutes settles nothing.
+
+**`--post` posts only what changed**, hashing what the report *says* rather than
+`as_dict()` — `idle_days` and GitHub's `updatedAt` move on their own — into a digest under
+`$XDG_STATE_HOME`. On a 15-minute timer without it, one unchanged disagreement is ~96
+identical `finding` posts a day, each carrying the whole rendered report, and `finding` is
+not in `MUTED_TYPES`: every one of them would land in every agent's orient read. Bot PRs and
+drafts are not counted as untracked work for the same reason — the harness ships a whole loop
+for dependabot's, so counting them would bury the findings a reader is here for — and neither
+is dropped silently: the report says how many it did not compare and why.
+
 **An unmade check never reads as a clean one**, which is #244's shape and the half of #255
 that decided the file's structure. Every condition has a third answer, `unknowns` is never
 folded into `findings`, `complete: false` says so in the JSON, and the exit code separates

@@ -1386,7 +1386,10 @@ is itself one of the checks `ci` reads, and would otherwise gate on its own pend
   this directory: the program it runs is `qb-reconcile` from `bin/`, not a loop. It is here
   because this is where the harness's reference units live and one place for them beats two.
   Report-only with **no `--execute` to graduate to** — the pass never edits the plan — so the
-  only cutover decision is whether to keep `--post`. `OnUnitActiveSec=15min`,
+  only cutover decision is whether to keep `--post`, which posts only when the report's
+  content has changed since the last post. Like the lander's, the service carries no
+  `[Install]`: the timer is what starts it, and enabling the oneshot would also run it at
+  every login. `OnUnitActiveSec=15min`,
   `SuccessExitStatus=0 1` so a partial run (rate-limited `gh`, a board mid-deploy) stays out
   of the failed state while a genuine "could not run" still goes red. See
   [../README.md](../README.md#qb-reconcile--does-the-plan-still-describe-the-present).
