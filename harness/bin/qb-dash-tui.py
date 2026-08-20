@@ -582,7 +582,9 @@ class Dash(App):
         for item in ordered:
             glyph, colour = qd.plan_state(item)
             who, who_colour = qd.plan_who(item)
-            takeable = qd.plan_issue(item, repos) is not None and not item.get("claim")
+            issue = qd.plan_issue(item, repos)
+            takeable = (issue is not None and not item.get("claim")
+                        and self.wrong_repo(issue.get("repo"), "") is None)
             table.add_row(
                 Text(glyph, style=colour),
                 Text("⚒", style="bold cyan" if takeable else "grey30"),
@@ -618,9 +620,13 @@ class Dash(App):
             red += colour == "red"
             key = f"pr:{pr.get('number')}"
             self.rows[key] = pr
+            # Dimmed where the guard would refuse it: an icon that looks clickable
+            # and then explains itself is the "drawn takeable, refused one by one"
+            # this scope work exists to end, one panel over.
+            reachable = self.wrong_repo(pr.get("repo"), "") is None
             table.add_row(
                 Text(glyph, style=colour),
-                Text("⚖", style="bold cyan"),          # click to panel-review
+                Text("⚖", style="bold cyan" if reachable else "grey30"),
                 *self.repo_cell(qd.short_repo(pr.get("repo") or qd.REPO)),
                 Text(f"#{pr.get('number')}", style="bold grey70"),
                 Text(qd.clip(pr.get("title"), 44 if self.scope.column else 56),
@@ -650,9 +656,10 @@ class Dash(App):
             free += holder is None
             key = f"issue:{number}"
             self.rows[key] = issue
+            reachable = self.wrong_repo(issue.get("repo"), "") is None
             table.add_row(
                 Text("·" if holder else "○", style="grey50" if holder else "green"),
-                Text("⚒", style="grey50" if holder else "bold cyan"),
+                Text("⚒", style="bold cyan" if reachable and not holder else "grey30"),
                 *self.repo_cell(qd.short_repo(issue.get("repo") or qd.REPO)),
                 Text(f"#{number}", style="bold grey70"),
                 Text(qd.clip(issue.get("title"), 44 if self.scope.column else 56),
@@ -846,8 +853,27 @@ class Dash(App):
         on a stranger's pull request, which is the one click on this pane that
         cannot be taken back; `--repo <checkout>` is how a screen gets to start
         that project's work, because it moves the directory too.
+
+        **A guard that cannot tell refuses.** `self.repo_slug` is None whenever
+        `git remote get-url origin` came back empty — a checkout whose remote is
+        `upstream` (the fork case this feature's own slug comparison was written
+        for), no `git` on PATH, a timeout — and reading that as "nothing to check"
+        made this return None for EVERY row, silently. `gh` and `git push` resolve
+        a default remote without consulting `origin`, so the review would have gone
+        out anyway, against whatever that remote points at. The cost of failing
+        closed is a message on a click; the cost of failing open is a comment and a
+        commit on a stranger's PR.
         """
-        if not repo or not self.repo_slug or repo == self.repo_slug:
+        if not repo:
+            return None
+        if not self.repo_slug:
+            return (f"cannot tell which repo {self.repo} is — no origin remote, so "
+                    f"{what} cannot be aimed from here. Set QB_DASH_REPO, or start "
+                    "it from that checkout")
+        # Case-folded, like every other repo comparison this feature added: `repo`
+        # arrives in GitHub's canonical casing and `repo_slug` in whatever the origin
+        # URL was typed as, and `PrisonBlues/quarterback` is a working remote.
+        if repo.strip().lower() == self.repo_slug.strip().lower():
             return None
         return (f"{what} is in {repo}; this dashboard runs in {self.repo_slug} "
                 "— start it from that checkout")
@@ -1152,7 +1178,9 @@ def main(argv: list[str] | None = None) -> int:
                                  description="the fleet dashboard, clickable")
     ap.add_argument("--scope", choices=("repo", "all"), default=None,
                     help="repo (default): only this screen's repos, and no repo column; "
-                         "all: every repo on the board. `s` toggles it live")
+                         "all: every repo the board knows, in FLEET/CLAIMED/PLANS — "
+                         "PRs and issues stay the watched repos' either way. "
+                         "`s` toggles it live; QB_DASH_SCOPE sets the opening view")
     ap.add_argument("--repo", action="append", metavar="PATH|OWNER/NAME",
                     help="the project this screen is for — a checkout, which also "
                          "becomes where the ⚒ and ⚖ start work, or an owner/name "

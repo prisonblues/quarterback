@@ -307,7 +307,25 @@ def test_two_owners_of_one_name_are_two_repositories():
     both = qd.Scope(["myuser/quarterback", "prisonblues/quarterback"])
     assert both.column is True, "no cell left to tell a fork from its upstream"
     assert both.label() == "myuser/quarterback, prisonblues/quarterback"
-    assert qd.claim_label("myuser/quarterback#3", [], both) == "quarterback#3"
+    # CLAIMED has no repo column for the scope to restore, so the OWNER is what
+    # tells two claims apart — dropping it here would put the ambiguity back one
+    # panel further on.
+    assert qd.claim_label("myuser/quarterback#3", [], both) == "myuser/quarterback#3"
+    assert qd.claim_label("prisonblues/quarterback#3", [], both) \
+        == "prisonblues/quarterback#3"
+
+
+def test_one_repository_named_twice_is_still_one_repository():
+    """`QB_DASH_REPOS=quarterback,prisonblues/quarterback` is one project.
+
+    `keeps` has always read it that way; counting the two spellings separately put
+    the eleven-column cell back on a single-project pane, which is the waste the
+    scope removes.
+    """
+    twice = qd.Scope(["quarterback", f"{qd.REPO}"])
+    assert twice.column is False
+    assert twice.label() == "quarterback"
+    assert qd.claim_label(f"{qd.REPO}#209", [], twice) == "#209"
 
 
 def test_an_unattributable_row_is_marked_where_the_column_is_gone():
@@ -449,6 +467,34 @@ def test_a_checkout_is_asked_which_repo_it_is():
     assert slug.count("/") == 1 and slug.endswith("/quarterback")
 
 
+def test_a_checkout_is_returned_absolute_because_tmux_resolves_it_elsewhere():
+    """The path is handed to tmux as a `-c` start directory, and tmux resolves a
+    relative one against the SERVER's cwd — where it was started, not where the
+    dashboard is. `self.repo` was `os.getcwd()` and absolute by construction; a
+    relative `--repo` would have launched work somewhere else entirely, while the
+    guard beside it resolved the same path correctly in-process and hid it."""
+    root = Path(__file__).resolve().parent.parent.parent
+    for spelling in (".", "./"):
+        slug, path = qd.repo_target(spelling if spelling == "." else str(root) + "/")
+        assert os.path.isabs(path), f"{spelling} came back relative: {path}"
+    slug, path = qd.repo_target("harness/../")
+    assert os.path.isabs(path) and slug.endswith("/quarterback")
+
+
+def test_a_bare_name_that_is_a_directory_is_that_directory(tmp_path, monkeypatch):
+    """`--repo nix-fleet` beside a checkout of that name is not a guess about an
+    owner, and it worked before the shape rule arrived."""
+    # Asserted on the PATH, not on the slug: this suite runs in a worktree as
+    # readily as in the main checkout, and a worktree's directory name is not its
+    # repository's name — which is the whole reason a directory is asked for its
+    # origin rather than read as one.
+    root = Path(__file__).resolve().parent.parent.parent
+    monkeypatch.chdir(root.parent)
+    slug, path = qd.repo_target(root.name)
+    assert path == str(root)
+    assert slug.count("/") == 1 and " " not in slug
+
+
 def test_a_checkout_argument_says_where_work_should_run_too():
     """`--repo <checkout>` moves the ⚒'s cwd, not only the rows the panels draw.
 
@@ -496,9 +542,19 @@ def test_a_malformed_slug_is_refused_rather_than_handed_to_gh():
     the alternative is `gh` being asked about `na@me` and answering about nothing.
     """
     assert qd.repo_target("owner/ repo") == ("owner/repo", None)
-    for bad in ("owner/name with space", "owner/na@me", " /name", "owner/"):
-        with pytest.raises(ValueError):
+    for bad in ("owner/name with space", "owner/na@me", "owner/repo/extra"):
+        # THE MESSAGE, not just the raise: a malformed slug used to fall through to
+        # the checkout branch, spend a `git -C` subprocess on it and come back "not
+        # a git checkout with an origin remote", which diagnoses the wrong thing.
+        with pytest.raises(ValueError, match="not an owner/name slug"):
             qd.repo_target(bad)
+    # `owner/..` is a path, not a repository whose name happens to be dots.
+    with pytest.raises(ValueError):
+        qd.repo_target("owner/..")
+    # A trailing slash is stripped before anything looks at the shape, so this is
+    # the bare name `owner` and gets the bare name's message.
+    with pytest.raises(ValueError, match="needs its owner"):
+        qd.repo_target("owner/")
 
 
 def test_a_bare_name_is_refused_rather_than_given_an_owner():

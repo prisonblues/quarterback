@@ -741,12 +741,23 @@ becomes `#209`. The repos are the ones the dashboard already resolved for its `g
 `--repo` (a checkout or an `owner/name` slug, repeatable), else `QB_DASH_REPOS`, else the
 origin of `QB_DASH_REPO`, else of the directory it was started in.
 
+`--repo` reads `owner/name` as a **repository** and anything else as a **checkout**: a
+leading `./` or `/`, a third segment, or a single name that is a directory here. So a
+two-segment relative path needs its `./` — `--repo src/nix-fleet` is the repository
+`src/nix-fleet`, which is probably not what was meant, and `--repo ./src/nix-fleet` is the
+directory. Deciding on the shape is what stops the answer depending on which directory the
+pane happened to open in.
+
 **`--repo <checkout>` moves where work runs, `--repo <owner/name>` does not**, and the
 difference is the point rather than an inconsistency. `/fix-issue` and `/panel-review-pr`
 take a bare number and resolve the repository from the checkout their pane opens in, so a
 slug — which names a repo this machine may have no checkout of — can only filter rows; a
 checkout also becomes the cwd the ⚒ and the ⚖ launch into. Where a row's repo is not the
-one this dashboard runs in, both icons say so and start nothing. The ⚖ had no such guard
+one this dashboard runs in, both icons are dimmed and a click on one says why rather than
+starting it. **A guard that cannot tell refuses**: a checkout whose remote is `upstream`
+rather than `origin` — or a missing `git` — leaves the dashboard unable to name its own
+repo, and since `gh` and `git push` resolve a default remote without consulting `origin`,
+treating that as "nothing to check" would have let the review go out anyway. The ⚖ had no such guard
 before the scope existed: a review off another repo's PR row would have commented on, and
 pushed a fix commit to, whatever pull request wore that number here.
 
@@ -755,8 +766,7 @@ Two repos keep the column — there it still tells rows apart, and two owners of
 bare name they share — and so does the wide view, which is the whole reason to widen. `s`
 toggles between them in the TUI, redrawing from what the client already has rather than
 re-fetching; the plain renderer has no keyboard, so it takes `--scope all` or
-`QB_DASH_SCOPE=all`. Widening reaches the three board-derived panels only: OPEN PRs and
-ISSUES stay the watched repos' either way, because `gh` was never asked about any other. **A narrowed panel always says what it
+`QB_DASH_SCOPE=all`. **A narrowed panel always says what it
 hid** — `FLEET · 3 · 2 elsewhere` — because a filtered pane that reads like the whole fleet
 is worse than an unfiltered one: it is the same picture with fewer facts, and "nothing
 claimed" and "nothing claimed *here*" are different claims about the world.
@@ -834,8 +844,8 @@ to warn about, not to forbid.
 The confirmation is deliberate: a panel review costs money, comments on a public PR and
 pushes a fix commit, and `/fix-issue` writes a branch and opens a PR — so a stray click in a
 78-column pane should not be able to start either. `QB_DASH_CONFIRM=0` for anyone who wants
-the single click and means it. `QB_DASH_REPO` says where launched work runs, defaulting to
-the dashboard's own cwd.
+the single click and means it. `QB_DASH_REPO` says where launched work runs, behind
+`--repo <checkout>` and ahead of the dashboard's own cwd.
 
 Adding another verb is three things: an entry in `BINDINGS`, an `action_*` method, and — if
 it wants an icon — a column, since a click carries the column it landed in and that is how

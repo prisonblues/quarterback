@@ -16,9 +16,12 @@ for a `--repo` that names nothing. That order is not a style point — `resolve_
 caches, so reversing it aims the scope filter at the cwd's repo while the `gh`
 calls watch the pinned one, which is the shape of the P1 this same review found.
 
-Needs `rich` and nothing else — no textual, no board, no `gh`. That is deliberate:
-the plain renderer is the one that must keep working on an interpreter carrying
-only rich, so its test must not drag textual in to prove it.
+The printed half needs `rich` and nothing else — no textual, no board, no `gh`.
+That is deliberate: the plain renderer is the one that must keep working on an
+interpreter carrying only rich (`usable()` in `harness/bin/qb-dash` will pick such
+a one), so its test must not drag textual in to prove it. The handful of tests that
+drive the CLICKABLE renderer's `main` do import it, and are skipped without it
+rather than erroring — `needs_textual` below.
 
 Run: pytest harness/tests/test_qb_dash_plain.py
 """
@@ -36,6 +39,14 @@ BIN = Path(__file__).resolve().parent.parent / "bin"
 sys.path.insert(0, str(BIN))
 
 pytest.importorskip("rich", reason="the printed renderer needs rich")
+
+#: The clickable renderer imports textual at module scope, so `_tui()` cannot even
+#: be loaded without it. A bare ImportError here would be an ERROR rather than a
+#: skip on exactly the rich-only interpreter this file's own docstring says is
+#: legitimate — the sibling suite guards the same way, via `_why_no_tui`.
+needs_textual = pytest.mark.skipif(
+    importlib.util.find_spec("textual") is None,
+    reason="qb-dash-tui.py imports textual at module scope")
 
 import qbdata as qd                                       # noqa: E402
 
@@ -210,6 +221,7 @@ class Recorder:
         Recorder.seen["ran"] = True
 
 
+@needs_textual
 @pytest.mark.parametrize("argv,narrow", [
     ([], True),                              # the default, which is the point of it
     (["--scope", "repo"], True),
@@ -225,6 +237,7 @@ def test_the_tui_maps_scope_to_the_view_it_names(argv, narrow, watched, monkeypa
     assert Recorder.seen["scope"].on is narrow
 
 
+@needs_textual
 def test_the_tui_pins_the_repos_before_it_resolves_the_scope(watched, monkeypatch):
     """The order is load-bearing: `resolve_repos` caches, so resolving the scope
     first would filter on the cwd's repo while `gh` and the plan watch the pinned
@@ -237,6 +250,7 @@ def test_the_tui_pins_the_repos_before_it_resolves_the_scope(watched, monkeypatc
     assert Recorder.seen["scope"].names == {"other"}, "the scope resolved before the pin"
 
 
+@needs_textual
 def test_a_checkout_argument_also_moves_where_the_tui_launches_work(watched, monkeypatch):
     """The P1 this closes: `--repo` used to redirect only what the panels DRAW, so
     the named repo's ⚒ rows were drawn takeable and then refused one by one."""
@@ -250,12 +264,16 @@ def test_a_checkout_argument_also_moves_where_the_tui_launches_work(watched, mon
     assert Recorder.seen["repo"] is None
 
 
-def test_both_renderers_refuse_a_repo_that_names_nothing(dash, watched, monkeypatch):
+def test_the_printed_renderer_refuses_a_repo_that_names_nothing(dash, watched):
     """Exit 2 rather than a dashboard quietly watching the cwd instead."""
+    assert dash.main(["--repo", "no-such-name"]) == 2
+
+
+@needs_textual
+def test_the_clickable_renderer_refuses_one_too(watched, monkeypatch):
     tui = _tui()
     monkeypatch.setattr(tui, "Dash", Recorder)
-    assert tui.main(["--repo", "quarterback"]) == 2
-    assert dash.main(["--repo", "quarterback"]) == 2
+    assert tui.main(["--repo", "no-such-name"]) == 2
 
 
 def test_the_printed_renderer_maps_scope_and_pins_repos_too(dash, watched, monkeypatch):

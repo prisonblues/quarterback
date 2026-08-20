@@ -93,7 +93,9 @@ def set_repos(repos: list[str]) -> None:
 #: An owner or a repository name, as GitHub spells one. Anything else in an
 #: ``owner/name`` argument — a space, a quote, a shell metacharacter — is a
 #: malformed slug rather than a repository, and it would reach `gh` as one.
-_SLUG_PART = re.compile(r"[A-Za-z0-9._-]+")
+#: At least one character that is not a dot, so ``owner/..`` is not a repository
+#: name that merely looks odd: it is a path, and `gh` would be asked about it.
+_SLUG_PART = re.compile(r"(?=[^.])[A-Za-z0-9._-]+")
 
 
 def repo_target(value: str) -> tuple[str, str | None]:
@@ -106,17 +108,29 @@ def repo_target(value: str) -> tuple[str, str | None]:
     only the rows the panels draw. A slug names a repository this process may have
     no checkout of, which is why the second half of the answer can be None.
 
-    SHAPE FIRST, the filesystem second. ``--repo prisonblues/quarterback`` run
-    from a ``~/src/<owner>/<repo>`` tree matched ``os.path.isdir`` on a directory
-    that is not itself a checkout, and the plainly valid slug died as "not a git
-    checkout"; deciding on the shape also stops the answer depending on the cwd.
-    The cost is that a two-segment relative path needs its ``./`` — ``owner/name``
-    is a slug, always, because that is what the flag means everywhere else.
+    SHAPE FIRST, the filesystem second, and the whole rule in three lines:
+    ``owner/name`` is a **slug**; anything with another separator, a leading ``.``
+    or ``/``, or a single segment naming a directory is a **checkout**; anything
+    else is refused. Deciding on the shape is what stops the answer depending on
+    the cwd — ``--repo prisonblues/quarterback`` run from a ``~/src/<owner>/<repo>``
+    tree used to match ``os.path.isdir`` and die as "not a git checkout" — and the
+    cost is one keystroke: a two-segment relative path needs its ``./``, because
+    ``owner/name`` means a repository everywhere else in the fleet.
 
     A bare name is REFUSED rather than completed: `gh` needs an owner, the fleet
     works in repos whose owner is not this one's, and inventing one aims the PR
     panel — and the ⚒ that starts work off it — at somebody else's repository of
-    the same name.
+    the same name. Unless it names a directory, which is not a guess about an
+    owner: ``--repo nix-fleet`` beside a checkout of that name is unambiguous, and
+    that spelling worked before the shape rule arrived.
+
+    THE PATH COMES BACK ABSOLUTE. It is handed to tmux as a ``-c`` start directory
+    for the pane the ⚒ and ⚖ open, and tmux resolves a relative ``-c`` against the
+    tmux SERVER's cwd — where the server was first started, months ago — not this
+    process's. `self.repo` used to be `os.getcwd()` and so absolute by
+    construction; ``--repo ./nix-fleet`` would have quietly launched work in
+    whatever that name means to the server, while the guard beside it resolved the
+    same relative path correctly in-process and reported the right repo, hiding it.
     """
     raw = (value or "").strip() or "."
     # `~` is expanded here because the help text and the README advertise
@@ -124,17 +138,26 @@ def repo_target(value: str) -> tuple[str, str | None]:
     # built into a QB_SEATS_DASH command string or sent through `tmux send-keys`,
     # the tilde arrives intact and used to be reported as a bad slug.
     path = os.path.expanduser(raw).rstrip("/") or "/"
-    parts = path.split("/")
-    if (len(parts) == 2 and not path.startswith(".")
-            and all(_SLUG_PART.fullmatch(part.strip()) for part in parts)):
-        return "/".join(part.strip() for part in parts), None
-    if path.startswith((".", "/")) or "/" in path:
+    parts = [part.strip() for part in path.split("/")]
+    if len(parts) == 2 and not path.startswith(".") and all(
+            _SLUG_PART.fullmatch(part) for part in parts):
+        return "/".join(parts), None
+    # A single segment is a checkout only if it IS one — and a value with a `/`
+    # that reached here is not slug-shaped, so it is a path or it is nothing. Said
+    # from the shape rather than by asking git: `git -C 'owner/na@me'` costs a
+    # subprocess and answers "not a git checkout with an origin remote", which
+    # misdiagnoses a bad slug as a missing remote.
+    if path.startswith((".", "/")) or os.path.isdir(path):
         slug = repo_slug(path)
         if not slug:
             raise ValueError(f"{path}: not a git checkout with an origin remote")
-        return slug, path
+        return slug, os.path.abspath(path)
+    if "/" in path:
+        raise ValueError(f"{raw!r}: not an owner/name slug — a repository name may "
+                         "hold only letters, digits, dots, hyphens and underscores; "
+                         "write ./" + raw.lstrip("/") + " if you meant the directory")
     raise ValueError(f"{raw!r}: neither a checkout nor an owner/name slug — a bare "
-                     "name needs its owner, a relative path its ./")
+                     "name needs its owner, or a directory of that name here")
 
 
 def repo_arg(value: str) -> str:
@@ -232,8 +255,14 @@ class Scope:
         #: The full slugs of the watched repos that name an owner, and the bare
         #: names of the ones that do not.
         self.slugs = {r.strip().lower() for r in self.repos if "/" in r.strip()}
+        #: ...and the bare names of the ones that do not, MINUS any that a slug
+        #: already accounts for. `QB_DASH_REPOS=quarterback,prisonblues/quarterback`
+        #: is one repository named twice — which `keeps` has always treated as one —
+        #: and counting both spellings put the eleven-column cell back on a
+        #: single-project pane, which is the waste this whole thing removes.
+        named = {short_repo(slug) for slug in self.slugs}
         self.bare = {n for n in (repo_name(r) for r in self.repos
-                                 if "/" not in r.strip()) if n}
+                                 if "/" not in r.strip()) if n and n not in named}
         #: ONE ENTRY PER REPOSITORY, in the strongest form each was named in. The
         #: bare names alone folded a fork and its upstream into one — `column` then
         #: dropped the only cell that told them apart and `keeps` accepted both
@@ -935,6 +964,12 @@ def claim_label(key: str, plan: list[dict] | None = None,
     their repo column (#261): on a pane showing one project, ``quarterback#209``
     spends twelve columns to say ``#209``. Only when the scope is that one project
     — the wide view keeps the repo, because there it is what tells two claims apart.
+
+    And the OWNER survives where two watched repos share a name. CLAIMED has no
+    repo column for the scope to restore — its three are who/key/left — so if the
+    owner goes too, a fork's claim and its upstream's both read ``quarterback#3``,
+    which is the ambiguity the slug comparison exists to remove, reintroduced one
+    panel further on.
     """
     key = key or "?"
     wanted = key.split(":", 1)[1] if key.startswith("plan:") else None
@@ -942,6 +977,8 @@ def claim_label(key: str, plan: list[dict] | None = None,
         if wanted and item.get("item_id") == wanted:
             head = " ".join(x for x in ("plan", plan_ref(item)) if x)
             return f"{head} {item.get('title') or '?'}"
+    if scope is not None and len(scope.names) != len(scope.keys):
+        return key
     return _unprefixed(short_key(key), scope)
 
 

@@ -39,10 +39,13 @@ walks into it), and the SEATS panel's state column, which reads every seat pane 
 tmux server and is not the FLEET panel. A row nothing could attribute wears a `?`
 where the repo cell used to be its only sign.
 
-`--repo` also moves where the ⚒ and ⚖ start work when it names a checkout, and both
-launchers now refuse a row from a repo this checkout is not. The ⚖ had no such guard
-at all: a review started off another repo's PR row would have commented on, and pushed
-a fix commit to, whatever pull request wore that number here.
+`--repo` also moves where the ⚒ and ⚖ start work when it names a checkout — absolutely,
+because tmux resolves a relative start directory against its own server's cwd and not the
+dashboard's — and both launchers now dim, and refuse, a row from a repo this checkout is
+not. The ⚖ had no such guard at all: a review started off another repo's PR row would have
+commented on, and pushed a fix commit to, whatever pull request wore that number here. The
+guard fails closed where it cannot name this checkout's repo, since `gh` and `git push`
+find a default remote whether or not `origin` is the one that answers.
 
 ## v2.58 — a regression test has to fail first
 

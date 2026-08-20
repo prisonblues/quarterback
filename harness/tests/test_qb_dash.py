@@ -634,6 +634,78 @@ def test_the_scope_narrows_the_rows_and_drops_the_column_together():
     assert asyncio.run(_drive_scope()) == []
 
 
+def test_a_guard_that_cannot_tell_which_repo_it_is_in_refuses(monkeypatch):
+    """The one click on this pane that cannot be taken back, and the guard on it.
+
+    `repo_slug` returns None for any checkout whose remote is not `origin` — the
+    fork case this feature's slug comparison was written for — and reading that as
+    "nothing to check" turned the guard off for EVERY row while `gh` and
+    `git push` went on resolving a default remote of their own. A review would
+    still have commented on, and pushed a fix commit to, whatever PR wore that
+    number there.
+    """
+    app_module = _load_app()
+    app = app_module.Dash.__new__(app_module.Dash)          # no screen, no board
+    app.repo, app.repo_slug = "/somewhere", None
+    assert app.wrong_repo("prisonblues/quarterback", "PR #1") is not None
+    assert app.wrong_repo(None, "PR #1") is None, "a row naming no repo is not a mismatch"
+
+    app.repo_slug = "PrisonBlues/quarterback"
+    # Case-folded, like every other repo comparison here: `gh` reports GitHub's
+    # canonical casing and the origin URL carries whatever was typed.
+    assert app.wrong_repo("prisonblues/quarterback", "PR #1") is None
+    assert app.wrong_repo("someone/else", "PR #1") is not None
+
+
+async def _drive_icons() -> list[str]:
+    """The ⚖ and the ⚒ on a row this dashboard cannot act on."""
+    app_module = _load_app()
+    qd = app_module.qd
+    app = app_module.Dash(interval=3600, gh_interval=3600, plan_interval=3600,
+                          scope=qd.Scope([qd.REPO, "someone/else"]))
+    for name in ("refresh_limits", "refresh_seats", "refresh_board",
+                 "refresh_plan", "refresh_prs", "refresh_issues"):
+        setattr(app, name, lambda: None)
+
+    failures: list[str] = []
+    async with app.run_test(size=(90, 44)) as pilot:
+        app.cfg = app.cfg or SimpleNamespace(base_url="http://board.invalid", agent="host")
+        app.repo_slug = qd.REPO                            # what this checkout is
+        app.render_prs([{"number": 1, "title": "ours", "repo": qd.REPO,
+                         "isDraft": False, "statusCheckRollup": []},
+                        {"number": 2, "title": "theirs", "repo": "someone/else",
+                         "isDraft": False, "statusCheckRollup": []}], None)
+        app.render_issues([{"number": 3, "title": "ours", "repo": qd.REPO},
+                           {"number": 4, "title": "theirs", "repo": "someone/else"}], None)
+        await pilot.pause()
+
+        for table_id, column in (("#prs", app.PANEL_COLUMN), ("#issues", app.FIX_COLUMN)):
+            table = app.query_one(table_id)
+            styles = {}
+            for row in range(table.row_count):
+                cells = table.get_row_at(row)
+                number = next(str(c).lstrip("#") for c in cells
+                              if str(c).startswith("#"))
+                styles[number] = str(getattr(cells[column], "style", ""))
+            ours, theirs = ("1", "2") if table_id == "#prs" else ("3", "4")
+            if "cyan" not in styles.get(ours, ""):
+                failures.append(f"{table_id}: this repo's icon is not live ({styles})")
+            if "cyan" in styles.get(theirs, ""):
+                failures.append(f"{table_id}: another repo's icon still looks "
+                                f"clickable ({styles})")
+    return failures
+
+
+def test_an_icon_this_dashboard_cannot_act_on_says_so_before_the_click():
+    """Dimmed, not merely refused afterwards.
+
+    A bright ⚖ on a row from a repo this checkout is not is the same "drawn
+    takeable, refused one by one" the scope work exists to end — and the README
+    promises the icon itself says so.
+    """
+    assert asyncio.run(_drive_icons()) == []
+
+
 async def _drive_review_pane(seats: list[dict]) -> tuple[list[list[str]], list[str]]:
     """run_in_pane against a recorder, so the tmux argv itself is the assertion.
 
