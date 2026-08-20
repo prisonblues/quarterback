@@ -616,9 +616,8 @@ _COPIED_BUT_NOT_READ = frozenset({"harness/tests/test_release_numbers.py",
 #: Reading a check's block out of flake.nix, parsing its copy lines and checking they land
 #: where this suite looks, is the same job for every suite with this problem — and it was
 #: written out twice, here and in `_prose_sandbox` (#257). Two hand-rolled readers of one file
-#: agree only until somebody edits one of them. The names below are kept as thin aliases so
-#: this file's call sites and tests read as they did; the logic has one home.
-_FLAKE_COPY = _flake_sandbox.COPY_RE
+#: agree only until somebody edits one of them. `_SANDBOX_PREFIX` is kept as a thin alias
+#: because this file's assertions read it directly; the logic has one home.
 _SANDBOX_PREFIX = _flake_sandbox.SANDBOX_PREFIX
 
 
@@ -932,59 +931,10 @@ def test_every_use_of_repo_root_is_one_the_reader_can_follow():
         f"{_FLAKE_CHECK} check")
 
 
-#: A flake region with everything the copy reader has to get right: a commented-out copy, a
-#: `${./x}` in prose, one in an argument that is not a copy at all, the two copy commands, and
-#: the spacing a Nix formatter leaves behind.
-_FLAKE_REGION_SAMPLE = """        release-metadata-tests = pkgs.runCommand "x" { } ''
-          # cp ${./commented-out.md} repo/commented-out.md
-          # mentions ${./prose.md} in passing
-          install -Dm644 ${./CHANGELOG.md} repo/CHANGELOG.md
-          cp ${ ./app/main.py }  repo/app/main.py
-          pytest -q --ignore=${./not-a-copy.py} tests
-          touch $out
-        '';
-"""
+# The reader itself is exercised in `test_flake_sandbox.py`, beside the module that implements
+# it — five tests here duplicated its cases after the extraction, with a fixture that had
+# already drifted from the shared one (this copy had no `cp -r` of a directory, so the shape
+# most likely to regress was covered in one place and not the other). The coupling test above
+# still runs the reader against the real flake.nix, which is what this suite needs from it.
 
 
-def test_only_real_copy_lines_count_as_copies():
-    """The guard's fail-safe direction depends on this. A `${./x}` in a comment or an argument
-    counted as a copy is a file the sandbox does not have and the comparison says it does —
-    which is the sandbox erroring on a missing file with the guard green, i.e. #163."""
-    assert _flake_copies(_FLAKE_REGION_SAMPLE) == {
-        "CHANGELOG.md": "repo/CHANGELOG.md",
-        "app/main.py": "repo/app/main.py",
-    }
-
-
-def test_the_region_reader_takes_the_whole_check_and_stops_at_its_end():
-    """`release-metadata-tests` occurs in prose and `'';` ends every indented string in
-    flake.nix, so neither end can be found by taking the first occurrence of a substring."""
-    text = ("        loops-tests = pkgs.runCommand \"a\" { } ''\n"
-            "          cp ${./decoy.md} repo/decoy.md\n"
-            "        '';\n"
-            + _FLAKE_REGION_SAMPLE
-            + "        mcp-tests = pkgs.runCommand \"b\" { } ''\n"
-              "          cp ${./later.md} repo/later.md\n"
-              "        '';\n")
-    assert set(_flake_copies(_flake_check_region(text))) == {"CHANGELOG.md", "app/main.py"}
-
-
-def test_the_region_reader_says_so_when_the_check_is_not_there():
-    """A renamed check, which is the whole reason the name is a constant here."""
-    with pytest.raises(AssertionError, match="0 lines defining"):
-        _flake_check_region("        loops-tests = pkgs.runCommand \"a\" { } ''\n        '';\n")
-
-
-def test_the_region_reader_refuses_an_ambiguous_check_name():
-    """Two definitions and there is no telling which sandbox feeds this suite."""
-    doubled = _FLAKE_REGION_SAMPLE + _FLAKE_REGION_SAMPLE
-    with pytest.raises(AssertionError, match="2 lines defining"):
-        _flake_check_region(doubled)
-
-
-def test_the_region_reader_says_what_it_saw_when_the_check_is_unterminated():
-    """Not "the parser is wrong" — the far likelier cause is a restructured check, and a
-    message that blames the wrong thing sends whoever hits it to the wrong file."""
-    with pytest.raises(AssertionError, match="no line closing an indented string"):
-        _flake_check_region("        release-metadata-tests = pkgs.runCommand \"x\" { } ''\n"
-                            "          cp ${./CHANGELOG.md} repo/CHANGELOG.md\n")

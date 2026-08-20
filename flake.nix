@@ -270,11 +270,11 @@
         # A check for the CATEGORY rather than one per suite, deliberately. Every one of
         # these lived in `worktree-tests`, whose sandbox holds `harness/bin` and
         # `harness/tests`, so their repo-root reads errored on missing files instead of
-        # being asserted — #163's mechanism, and by the time it was counted there were
-        # four instances of it across three checks (#163, #246, #251, #257). A fourth
-        # near-identical check was the alternative; one place to add the fifth suite is
-        # worth more than per-suite precision here, since these sandboxes want the same
-        # thing.
+        # being asserted — #163's mechanism, five times over across four checks (#163,
+        # #246, #251, #257, and test_commands_wired.py, which had been erroring at
+        # COLLECTION since it landed). A fifth near-identical check was the alternative;
+        # one place to add the sixth suite is worth more than per-suite precision here,
+        # since these sandboxes want the same thing.
         #
         # Members are listed in `_prose_sandbox.MEMBERS`, not here: that list is what the
         # guard iterates, and it is held against the suites installed below in both
@@ -292,12 +292,9 @@
         #
         # Copied one by one rather than the repo root wholesale, for the reason
         # release-metadata-tests gives: `./.` would drag a developer's `mcp/.venv` and
-        # every `__pycache__` into the store. The enumeration is what goes stale, so
-        # nothing relies on somebody remembering it — the suite declares its reads in
-        # `READS`, `doc()` refuses any path absent from it, and
-        # `test_the_check_supplies_every_file_this_suite_reads` compares that set
-        # against the `install` lines here in both directions. flake.nix is copied in
-        # so that guard runs HERE and not only in a checkout.
+        # every `__pycache__` into the store. flake.nix is copied in so the comparison
+        # named above runs HERE and not only in a checkout — a guard that is inert in the
+        # sandbox it protects is no guard.
         prose-consistency-tests = pkgs.runCommand "quarterback-prose-consistency-tests"
           {
             nativeBuildInputs = [ (pkgs.python3.withPackages (ps: [ ps.pytest ])) ];
@@ -347,12 +344,9 @@
             exit 1
           }
           cat report.txt
-          # NO skip is expected. pytest exits 0 with any number of skips, and a skip
-          # nobody reads is exactly what #163, #246 and #251 each looked like from the
-          # outside. The one test here that can skip is the coupling guard, when
-          # flake.nix is not beside the suite — it is installed above precisely so that
-          # it is, so a skip from it means that line went away and took this sandbox's
-          # only staleness check with it.
+          # pytest exits 0 with any number of skips, and a skip nobody reads is exactly what
+          # every instance of this mechanism looked like from the outside.
+          #
           # The one skip this check expects is none at all, and the reason is specific: the
           # only test here that can skip is test_prose_sandbox.py's flake_text fixture, when
           # flake.nix is not beside the suites. It is installed above precisely so that it is,

@@ -59,19 +59,26 @@ MEMBERS = (
     "test_commands_wired",
 )
 
-#: MEMBERS is not the whole category, and the gap is structural rather than an oversight.
-#:
-#: `harness/loops/tests/test_panel_dials.py` reads two briefs at the repo root and has exactly
-#: this problem, but it cannot join this check: it exercises the `harness/loops` package as the
-#: code under test, so it has to run inside `loops-tests` where that package is the subject
-#: rather than a dependency. It is guarded there instead, by its own copy of this comparison
-#: against the `loops-tests` block — which is why `_flake_sandbox` is a shared module and not a
-#: private detail of this one.
-#:
-#: So a suite outside `harness/tests` is invisible to everything here: nothing in this module
-#: can enumerate the category, only the part of it that shares this sandbox. A sixth instance
-#: living somewhere else would go unnoticed by these guards exactly as the first five did. What
-#: closes that is a workflow running the flake at all (#179), not another assertion in here.
+# MEMBERS is not the whole category, and the gap is structural rather than an oversight.
+#
+# `harness/loops/tests/test_panel_dials.py` reads two briefs at the repo root and has exactly
+# this problem: it computes its root as `parents[3]`, while `loops-tests` copies the package in
+# and runs from inside it, so that root resolves above the build directory entirely. It cannot
+# join this check — it exercises `harness/loops` as the code under test, so it has to run in
+# `loops-tests` where that package is the subject rather than a dependency.
+#
+# It is NOT guarded here and, on this branch, not guarded anywhere: PR #249 fixes it and adds
+# the comparison on the `loops-tests` side, and that PR is not merged. Said plainly because the
+# first draft of this paragraph claimed the guard already existed, which was true only in that
+# other branch — a comment asserting a state that does not exist in the tree it ships in, which
+# is the exact failure this whole check is about.
+#
+# `_flake_sandbox` is shared with `release-metadata-tests`, not with anything on the loops side.
+# When #249 lands, that guard becomes its third importer.
+#
+# So a suite outside `harness/tests` is invisible to everything here: nothing in this module can
+# enumerate the category, only the part of it that shares this sandbox. What closes that is a
+# workflow running the flake at all (#179), not another assertion in here.
 
 #: Installed as whole directories rather than file by file, with the reason each is not
 #: enumerable. A directory supplies anything beneath it, so it weakens the staleness guard for
@@ -108,6 +115,51 @@ INSTALLED_BUT_NOT_READ = frozenset({
 #: as a directory rather than a list.
 SUITE_DIR = "harness/tests/"
 
+#: The check that would otherwise collect these suites, and the reason this module has to know
+#: about a check it is not part of.
+#:
+#: `worktree-tests` copies `harness/tests` in wholesale, so it picks up every file in this
+#: directory — including these suites, whose reads it cannot satisfy. Each one is removed from
+#: it by an explicit `rm`. Nothing tied that `rm` list to `MEMBERS`, which made the cost of
+#: joining this category one step longer than it looked: declare READS, add to MEMBERS, add an
+#: install — and if you stop there, the new suite is still collected by `worktree-tests`, still
+#: reads files that sandbox does not hold, and still ERRORS there, with every guard in this
+#: module reporting green. That is #163's mechanism arriving through the fix for it.
+#:
+#: So `test_every_member_is_removed_from_the_check_that_would_collect_it` holds the two lists
+#: against each other. `test_commands_wired.py` is the evidence that this was not hypothetical:
+#: it had been erroring in `worktree-tests` since it landed, and what fixed it was somebody
+#: noticing and hand-writing the `rm`.
+COLLECTING_CHECK = "worktree-tests"
+
+#: The checks that adopt a suite removed from `COLLECTING_CHECK`. A suite deleted from that
+#: sandbox has to run SOMEWHERE, and this category is not the only home: `test_release_numbers.py`
+#: was the first suite with this problem and has its own check (#182, #163).
+#:
+#: Listed so the converse guard can ask the question that matters — is this removal accounted
+#: for by a check that runs the file — rather than the narrower one it asked first, which
+#: reported `release-metadata-tests`' suite as homeless.
+ADOPTING_CHECKS = (CHECK_NAME, "release-metadata-tests")
+
+#: One `rm` of a file under `SUITE_DIR` in a check's script.
+REMOVAL_RE = __import__("re").compile(
+    rf"^[ \t]*rm[ \t]+(?P<path>{SUITE_DIR}\S+)[ \t]*$", __import__("re").MULTILINE)
+
+
+def removed_from_collecting_check(flake_text: str) -> frozenset[str]:
+    """The suite files `COLLECTING_CHECK` explicitly deletes before running."""
+    region = flake.check_region(flake_text, COLLECTING_CHECK)
+    return frozenset(m.group("path") for m in REMOVAL_RE.finditer(region))
+
+
+def adopted_suites(flake_text: str) -> frozenset[str]:
+    """Every file under `SUITE_DIR` that some adopting check installs."""
+    out: set[str] = set()
+    for check in ADOPTING_CHECKS:
+        out |= {p for p in flake.copies(flake.check_region(flake_text, check))
+                if p.startswith(SUITE_DIR)}
+    return frozenset(out)
+
 
 def declared_reads() -> dict[str, frozenset[str]]:
     """Each member's own declaration of what it reads, keyed by module name.
@@ -133,6 +185,34 @@ def declared_reads() -> dict[str, frozenset[str]]:
             f"outside its own directory, it does not belong in MEMBERS.")
         out[name] = frozenset(reads)
     return out
+
+
+#: Each member's read gate: the callable every read in it goes through, and a path outside its
+#: declaration that the gate must refuse. Named here rather than left to a per-member test,
+#: because what stood in for this was three near-identical hand-written tests that a new member
+#: had to remember to copy — the "list somebody has to remember to update" this whole design
+#: exists to remove, reintroduced one level up.
+#:
+#: Without it, `declared_reads` only proves a member has a READS attribute. A member could
+#: declare one, pass every guard here, and read `REPO_ROOT / "anything"` directly — which makes
+#: the declaration exactly the unenforced summary this module's docstring says it is not.
+GATES = {
+    "test_fixer_escalation": ("doc", "docs/DEPLOY.md"),
+    "test_regression_test_redgreen": ("brief", "loops.md"),
+    "test_commands_wired": ("_at", "harness/package.nix"),
+}
+
+
+def gate_of(member: str):
+    """The named member's read gate, as a callable, with the path it must refuse."""
+    module = importlib.import_module(member)
+    name, forbidden = GATES[member]
+    gate = getattr(module, name, None)
+    assert callable(gate), (
+        f"{member} is expected to route its reads through `{name}`, which is missing or not "
+        f"callable. Either it was renamed — update GATES — or the member stopped gating its "
+        f"reads, in which case READS is a comment and the comparisons here prove nothing.")
+    return gate, forbidden
 
 
 def installed(flake_text: str) -> dict[str, str]:

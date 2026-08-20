@@ -156,3 +156,71 @@ def test_a_member_that_declares_nothing_is_an_error_not_an_exemption(monkeypatch
     monkeypatch.setattr("test_commands_wired.READS", frozenset())
     with pytest.raises(AssertionError, match="empty"):
         contract.declared_reads()
+
+
+def test_every_member_is_removed_from_the_check_that_would_collect_it(flake_text):
+    """Joining this category costs four steps, not three, and nothing used to check the fourth.
+
+    `worktree-tests` copies `harness/tests` in wholesale, so a new member is collected there too
+    — in a sandbox that holds none of what it reads. Every guard above would report green while
+    the suite errored in that build, which is #163's mechanism arriving through the fix for it.
+
+    `test_commands_wired.py` is why this is not hypothetical: it sat erroring in `worktree-tests`
+    from the day it landed until somebody happened to run the flake and hand-write the `rm`."""
+    removed = contract.removed_from_collecting_check(flake_text)
+    installed_here = {p for p in contract.installed(flake_text)
+                      if p.startswith(contract.SUITE_DIR)}
+    still_collected = sorted(installed_here - removed)
+    assert not still_collected, (
+        f"these files are installed into {contract.CHECK_NAME} but are not removed from "
+        f"{contract.COLLECTING_CHECK}, which copies {contract.SUITE_DIR} in wholesale — so they "
+        f"run there too, in a sandbox that does not hold what they read, and error rather than "
+        f"fail: " + ", ".join(still_collected) + f". Add an `rm <path>` to {contract.COLLECTING_CHECK}")
+
+
+def test_the_collecting_check_removes_nothing_that_is_not_ours(flake_text):
+    """The converse, and the sharper question: a removal is fine if SOME check adopts the file,
+    and wrong only if none does. Asked the narrow way first — is it in this check — it reported
+    `release-metadata-tests`' own suite as homeless, which is how the list of adopting checks
+    came to be written down.
+
+    What it catches is a suite renamed on one side of the pair, or dropped from an adopting
+    check while its `rm` stayed: the file then runs in no sandbox at all, and every guard that
+    only looks at installs is satisfied because there is nothing left to look at."""
+    orphaned = sorted(contract.removed_from_collecting_check(flake_text)
+                      - contract.adopted_suites(flake_text))
+    assert not orphaned, (
+        f"{contract.COLLECTING_CHECK} removes files that no adopting check installs "
+        f"({', '.join(contract.ADOPTING_CHECKS)}), so they now run in NO check at all: "
+        + ", ".join(orphaned) + ". Either install them in the check that should run them, or "
+        "drop the `rm` so worktree-tests keeps collecting them")
+
+
+@pytest.mark.parametrize("member", contract.MEMBERS)
+def test_every_member_actually_enforces_its_declaration(member):
+    """`declared_reads` proves a member HAS a READS set. This proves the set is enforced.
+
+    Without it a member could declare its reads, pass every comparison in this module, and go on
+    reading `REPO_ROOT / "anything"` directly — leaving the declaration the unenforced summary
+    the docstring promises it is not, and every guard here reporting the suite as covered.
+
+    Parametrised over `MEMBERS` rather than written once per member: three near-identical
+    hand-copied tests were what stood in for this, and a fourth member joining had to remember
+    to write the fourth — which is the class of thing this design exists to stop relying on."""
+    gate, forbidden = contract.gate_of(member)
+    with pytest.raises(AssertionError):
+        gate(forbidden)
+
+
+@pytest.mark.parametrize("member", contract.MEMBERS)
+def test_every_member_gates_the_reads_it_does_declare(member):
+    """The other half: a gate that refuses everything is as useless as one that refuses nothing,
+    and would pass the test above. Each member's own declared reads must get through it."""
+    gate, _ = contract.gate_of(member)
+    reads = contract.declared_reads()[member]
+    # The gates take what their own suite naturally passes — a repo-relative path, a bare brief
+    # filename — so this asks each one for something it must accept rather than a uniform shape.
+    accepted = {"test_fixer_escalation": lambda: gate(sorted(reads)[0]),
+                "test_regression_test_redgreen": lambda: gate("review-pr.md"),
+                "test_commands_wired": lambda: gate("harness/hm-module.nix")}[member]
+    assert accepted() is not None

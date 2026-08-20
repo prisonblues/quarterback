@@ -91,11 +91,21 @@ def misdirected(pairs: dict[str, str], prefix: str = SANDBOX_PREFIX) -> list[str
                   if dest != prefix + src)
 
 
-def supplied_by(path: str, sources: set[str] | frozenset[str]) -> bool:
-    """Whether `path` is in the sandbox, directly or under a copied directory.
+def under(path: str, directory: str) -> bool:
+    """Whether `path` is genuinely inside `directory`, by path components.
 
-    Component-wise, not by string prefix: `harness/loops` is a string prefix of
-    `harness/loops_old/x.py` and a directory prefix of nothing but `harness/loops/…`, and a
-    `startswith` would report a file the sandbox does not hold as supplied.
+    Two ways a string check gets this wrong, and both would report a file the sandbox does not
+    hold as supplied. `harness/loops` is a string *prefix* of `harness/loops_old/x.py` and a
+    directory prefix of nothing but `harness/loops/…`. And `harness/commands/../hm-module.nix`
+    starts with `harness/commands/` while resolving outside it — so a `..` anywhere is refused
+    rather than reasoned about: every declaration in this repo is a static literal, so a
+    traversal segment is a mistake or a bypass, and normalising one would only decide which.
     """
-    return path in sources or any(path.startswith(src + "/") for src in sources)
+    if ".." in path.split("/") or ".." in directory.split("/"):
+        return False
+    return path.split("/")[:len(directory.split("/"))] == directory.split("/")
+
+
+def supplied_by(path: str, sources: set[str] | frozenset[str]) -> bool:
+    """Whether `path` is in the sandbox, directly or under a copied directory."""
+    return path in sources or any(under(path, src) for src in sources)

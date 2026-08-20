@@ -25,6 +25,8 @@ from pathlib import Path
 
 import pytest
 
+import _flake_sandbox
+
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 # No module-level `COMMANDS`/`HM_MODULE` paths: they were a route straight past `_at` below,
 # and an unused one is worse than none — the next read reaches for the constant that already
@@ -52,9 +54,12 @@ def _at(rel: str) -> Path:
 
     The check is by containment rather than equality, because one of this suite's two reads is a
     DIRECTORY it globs: `harness/commands/epic.md` is a declared read by virtue of
-    `harness/commands` being one.
+    `harness/commands` being one. Containment is `_flake_sandbox.under`, shared with the guard
+    that compares this suite against the sandbox — a second hand-written prefix check is how the
+    two come to disagree about what "inside" means, and a raw `startswith` lets
+    `harness/commands/../hm-module.nix` through a gate whose whole job is to refuse it.
     """
-    assert any(rel == d or rel.startswith(d + "/") for d in READS), (
+    assert any(rel == d or _flake_sandbox.under(rel, d) for d in READS), (
         f"{rel!r} is read here but is not covered by READS, so flake.nix's "
         f"prose-consistency-tests check does not know to install it — where this read would "
         f"error as a FileNotFoundError rather than be asserted. Add it to READS and install it "

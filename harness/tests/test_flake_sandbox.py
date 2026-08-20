@@ -106,3 +106,44 @@ def test_a_directory_supplies_what_is_under_it_and_only_that():
     assert not flake.supplied_by("harness/loops_old/panel.py", sources)
     assert not flake.supplied_by("harness/commands/review-pr.md", sources)
     assert not flake.supplied_by("harness/loopsfoo", sources)
+
+
+#: Copy shapes `COPY_RE` does not match, one snippet each. Every one is a genuine copy, so the
+#: reader misses a file the sandbox really does hold.
+#:
+#: The failure direction is the safe one — the read is reported UNSUPPLIED, so the guard goes red
+#: rather than green — but it is still a false failure on a correct flake.nix, and the message it
+#: prints tells the reader to add an install line that is already there. That is the
+#: confusing-false-failure outcome these suites argue gets a guard switched off rather than
+#: fixed, so the shapes are recorded here: this is what the reader does NOT accept, and anyone
+#: who writes one of them and gets an impossible failure has a test naming it.
+#:
+#: Not widened to accept them instead, deliberately. Each shape needs its destination understood
+#: to be checked at all (`misdirected` is the point of capturing it), and `cp ${./x} "$out/x" ||
+#: true` has no single destination token to check. A reader that matched loosely and then guessed
+#: at the destination would trade a loud false failure for a quiet false pass.
+UNMATCHED_SHAPES = {
+    "quoted destination with a trailing clause": '          cp ${./a.md} "$out/a.md" || true\n',
+    "trailing slash after the interpolation": "          cp -r ${./harness/commands}/ repo/x\n",
+    "a second command on the line": "          cp ${./a.md} repo/a.md && echo done\n",
+}
+
+
+@pytest.mark.parametrize("shape", sorted(UNMATCHED_SHAPES))
+def test_the_reader_does_not_see_these_copy_shapes(shape):
+    """Recorded rather than fixed, with the reasoning in the constant above. A reader whose
+    blind spots are written down is one somebody can trust the failures of."""
+    assert flake.copies(UNMATCHED_SHAPES[shape]) == {}
+
+
+def test_a_backslash_continued_copy_is_caught_by_the_destination_check():
+    """The one shape that is neither accepted nor silently missed, and it is worth pinning
+    because it was reported as invisible to both halves of the reader and is not.
+
+    `cp ${./a.md} \\` + a continued line matches, with the backslash captured AS the
+    destination — so `copies` sees the source and `misdirected` immediately reports it, because
+    `\\` is not `repo/a.md`. A loud failure with a slightly odd message beats a quiet pass, and
+    this records which of the two it is."""
+    pairs = flake.copies("          cp ${./a.md} \\\n            repo/a.md\n")
+    assert pairs == {"a.md": "\\"}
+    assert flake.misdirected(pairs) == ["a.md -> \\"]

@@ -43,7 +43,9 @@ from pathlib import Path
 import pytest
 
 HARNESS = Path(__file__).resolve().parents[1]
-COMMANDS = HARNESS / "commands"
+# No module-level `COMMANDS`: it was a route straight past `brief()` below, and the last round
+# removed exactly this constant from test_commands_wired.py for that reason while leaving it
+# here — the next read reaches for the constant that already exists rather than the accessor.
 
 sys.path.insert(0, str(HARNESS / "loops"))
 
@@ -87,7 +89,7 @@ def brief(name: str) -> Path:
         f"{rel!r} is read here but is not in READS, so flake.nix's prose-consistency-tests "
         f"check does not know to install it — where this read would error as a FileNotFoundError "
         f"rather than be asserted. Add it to READS and install it in that check.")
-    return COMMANDS / name
+    return HARNESS / "commands" / name
 
 
 @pytest.fixture(scope="module")
