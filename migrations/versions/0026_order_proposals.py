@@ -48,8 +48,8 @@ it (`rules_version`) or what they read (`inputs_digest`) is a row no later
 analysis can interpret. `repo` is nullable because NULL is the fleet-wide scope,
 exactly as in `plan_items`.
 
-Revision ID: 0025
-Revises: 0024
+Revision ID: 0026
+Revises: 0025
 """
 
 import sqlalchemy as sa
