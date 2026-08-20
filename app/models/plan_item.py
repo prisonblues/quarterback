@@ -3,7 +3,16 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import BigInteger, CheckConstraint, DateTime, Index, Text, func, text
+from sqlalchemy import (
+    BigInteger,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    Text,
+    func,
+    text,
+)
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -34,7 +43,7 @@ class PlanItem(Base):
     ``ref_value`` are the link; the *what* and the *why* stay in GitHub, and
     ``ix_plan_items_open_ref`` makes "one open item per issue" a database fact
     rather than a convention. What lives here is the half an issue cannot hold:
-    the order, the reasoning behind it (``note``), the phase, and the
+    the order, the reasoning behind it (``note``), the plan it belongs to, and the
     dependencies.
 
     **There is no holder column, deliberately.** An item is claimed when a live
@@ -60,7 +69,11 @@ class PlanItem(Base):
     #: collide with another kind's. Permissive storage, decided intake.
     ref_kind: Mapped[str | None] = mapped_column(Text)
     ref_value: Mapped[str | None] = mapped_column(Text)
-    phase: Mapped[str | None] = mapped_column(Text)
+    #: The plan this item belongs to, or NULL for a loose one. Replaced the
+    #: free-text ``phase`` (#172): a phase was a string two agents could
+    #: spell two ways, owned by nothing, claimable by nobody and finishable never.
+    plan_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("plans.id", ondelete="RESTRICT"), index=True)
     #: Position in the list. Rewritten wholesale by a reorder; see the migration
     #: on why this is an integer and not a fraction.
     rank: Mapped[int] = mapped_column(BigInteger, nullable=False)
@@ -75,9 +88,11 @@ class PlanItem(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
-    #: Last touched. Surfaced on every read so a phase nobody has moved in a
+    #: Last touched. Surfaced on every read so a plan nobody has moved in a
     #: fortnight is visibly stale — a plan that is believed and wrong is worse
-    #: than no plan.
+    #: than no plan. It is also half of the enclosing PLAN's staleness: work
+    #: happens to items, so the freshest item in a plan is what says the plan is
+    #: alive (see :class:`~app.models.plan.Plan.updated_at`).
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

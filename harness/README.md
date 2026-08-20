@@ -433,6 +433,88 @@ hand in one branch can be committed unread in another. That is not closed here: 
 either explicit staging in those two loops or rerere scoped away from loop-driven
 worktrees, and it is filed rather than guessed at.
 
+### `qb-claim` and `qb-claimed` — what you are working on, before you start
+
+Two scripts, one primitive, and they exist because the board's claim table had never once
+been written to by anything automatic. Thirteen agents worked three shared checkouts and
+`claims()` returned `[]` fleet-wide; the single row that ever appeared was written by hand
+because a human told an agent to (#172).
+
+```bash
+qb-claim issue 172 --note "worktree feat/issue-172"   # 0 taken / 1 held / 2 unknown
+qb-claim pr 207 --ttl 7200
+qb-claimed                                            # 0 held  / 1 free  / 2 unknown
+qb-claimed --json --quiet
+```
+
+**Neither composes a key.** They name the *resource* — kind and value — and the board
+derives the key from it, reading the repo off the checkout's origin remote. That is the
+whole of #172: the plan wrote `work/<repo>#163` while an agent wrote `issue/<repo>#163`,
+and because `(kind, key)` is the unique index those were two resources. A shell tool
+spelling a third would be the same defect with a new party.
+
+**Three exit codes, not two.** `1` names a holder. `2` is everything else that is not "it
+is yours": no board configured, no origin remote, a board that cannot be reached — and also
+a *definite* refusal (a 401 on a rotated token, a 422 on a ref the board does not key) and a
+contention that ended with nobody holding the key. It is deliberately not `1`, because a
+gate that reads "cannot tell" as "nothing held" fails open on every unconfigured host, which
+is a gate that stops nothing on exactly the hosts nobody checked. `preland.py` states the
+same rule about itself: *"a merge gate that fails open wherever it cannot see is not a
+gate."* The policy is the caller's; these two just answer honestly.
+
+And it is not `1` for the opposite reason too: `create-worktree` turns `1` into a hard
+refusal telling the operator to go and talk to the holder, so a rotated token or a lost
+insert race reported as a hold sends somebody looking for a peer that does not exist. Since
+the exit code cannot say which of the two happened, the *text* does — a refusal reads "the
+board REFUSED this claim and will refuse it again", with the remedy, because retrying is the
+answer to an outage and no answer at all to a misconfiguration.
+
+`qb-claim` prints the claim id on **stdout** and everything else on stderr, so a caller can
+capture the id for `claim/renew` and `claim/release` without parsing prose.
+
+**`create-worktree` takes the claim for you.** It derives the issue number from the branch
+it is about to make (`feat/issue-172`, `fix/issue-114`, `feat/issue-135-qb-next`) and
+claims it *before* the tree exists, so a refusal costs nothing to unwind:
+
+| flag | what it does |
+| --- | --- |
+| *(default)* | Claim the issue the branch names. Held by somebody else → **refuse**. Cannot tell → warn loudly and carry on |
+| `--no-claim` | Skip it entirely, silently |
+| `--require-claim` | Refuse on *any* uncertainty too — no board, no token, or a branch that names no issue |
+| `--claim-ttl <secs>` | How long to hold it (default 28800 = 8h; a worktree outlives an hour, and a lapsed claim reads as free to the next agent) |
+
+The asymmetry between the two failure modes is the one decision worth arguing with. A 409
+is the board saying something definite and two agents on one issue is exactly what this
+prevents, so it refuses. A board outage is not, and failing closed there would make the
+board a single point of failure for every worktree on the fleet — `--require-claim` is how
+you ask for the strict reading instead.
+
+A branch that names no issue is **warned about** rather than skipped quietly: an unclaimed
+checkout is one where the next agent has nothing to collide against, and silence is what
+let `claims()` stay empty for four months.
+
+**The checkout claim names no session, and it is handed back if the tree never appears.**
+Both follow from *who* the claim is for. `qb-claim` defaults `--session` to
+`$CLAUDE_CODE_SESSION_ID`, which during a checkout is the session of whoever ran
+`create-worktree` — a parent agent's, or nothing at all from a human shell — while the
+agent that will work in the tree has a different session and does not exist yet. Stamping
+the creating session hid the claim from the gate it exists to feed (`/claim/held` narrows
+on the session) and made it unmutable by its own worktree (`may_mutate` requires a recorded
+session to match, so the new agent got a 403 renewing or releasing its own claim). So the
+claim records none and belongs to the machine until somebody picks it up.
+
+And because the claim is taken *before* `git worktree add`, the run that dies in between —
+branch already checked out elsewhere, disk full, a bad base ref, a failing `.env` step —
+would otherwise leave the issue held for the full `--claim-ttl` by an agent that does not
+exist, refusing the next agent for a working day over a checkout that never happened. An
+EXIT trap hands it back, best-effort, through `qbdata`'s own client, and says what is left
+held when it cannot. Two guards on it: past the point the worktree directory exists the
+claim belongs to a tree somebody can work in or remove, so the trap stands down; and a
+claim the board reports as `renewed` was this machine's *before* the run, so it is left
+alone rather than destroyed by somebody else's failed checkout. That second one is why the
+checkout claims with `--json` — the flag exists so a caller can read `renewed` without
+grepping the prose on stderr.
+
 ### `worktree-holder` — is somebody else in there?
 
 The fourth script answers one question: **which live agent is working in this
@@ -764,9 +846,11 @@ ordered list, plus the fleet-wide one — with the items somebody is running at 
 the ones that are free, then the blocked ones, which are the band a reader can do nothing
 about. Inside each band the board's own order is kept, because the order is the point of a
 plan, and the repos this dashboard watches come before the ones it only overhears. A row
-shows `▶` running with its holder, `○` free with how long it has sat, or `⊘` blocked with
-what it waits on. Clicking one puts its phase, its claim note, its blockers and its own note
-on the detail line: that reasoning lives on the board and nowhere else — a plan item never
+shows `▶` running with its holder, `▷` inside a plan somebody else holds, `○` free with how
+long it has sat, or `⊘` blocked with what it waits on — the `▷` because an item covered by
+another agent's plan claim is not free work, and showing it as free is the outcome
+`covered_by` exists to prevent. Clicking one puts its plan, its claim note, its blockers and
+its own note on the detail line: that reasoning lives on the board and nowhere else — a plan item never
 restates its issue — and it does not fit in a title cell.
 
 A plan item that points at an issue carries a `⚒` like an issue row, so the shortest path
@@ -778,8 +862,9 @@ that number on whatever issue wears it there. **The `⚖` on a PR row refuses fo
 reason**, and it is the one with more at stake — a panel review spends money, comments on a
 public PR and pushes a fix commit to it. That click only became reachable with #209: two
 repos sharing a PR number used to crash the panel before either row rendered. A plan claim
-is keyed `plan:<uuid>`, which is right for a lock and unreadable on a pane, so CLAIMED
-resolves it against the plan and shows the item's title instead.
+is keyed `plan:<uuid>` and an item claim `item:<uuid>`, which is right for a lock and
+unreadable on a pane, so CLAIMED resolves each against the board and shows the plan's label
+or the item's title instead.
 
 **The issues panel is the one that feeds the fleet.** A seat picks unclaimed work off the
 board, so what matters is which issues nobody holds: the free ones sort to the top, and a

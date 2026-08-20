@@ -253,25 +253,50 @@ class QuarterbackClient:
         resp.raise_for_status()
         return resp.json()
 
-    def claim_release(self, body: dict) -> dict:
-        resp = self._http.post(self._url("/release/claim"), json=body)
+    def claim_held(self, params: dict) -> dict:
+        resp = self._http.get(self._url("/claim/held"),
+                              params={k: v for k, v in params.items() if v is not None})
         resp.raise_for_status()
         return resp.json()
 
-    def reclaim_release(self, body: dict) -> dict:
-        resp = self._http.post(self._url("/release/reclaim"), json=body)
+    # -- the plan (v2.39; a plan became a row of its own in #172) ------
+
+    def plans(self, params: dict) -> dict:
+        return self._plan_read("/plans", params)
+
+    def plan_submit(self, body: dict) -> dict:
+        if self._session and not body.get("session"):
+            body = {**body, "session": self._session}
+        resp = self._http.post(self._url("/plan/submit"), json=body)
         resp.raise_for_status()
         return resp.json()
 
-    def releases(self, repo: str) -> dict:
-        resp = self._http.get(self._url("/releases"), params={"repo": repo})
+    def plan_verb(self, path: str, body: dict) -> dict:
+        """One of the whole-PLAN verbs (claim / release / done).
+
+        The session is stamped here for the reason :meth:`plan_item` gives: a
+        claim whose holder cannot be reached is half a claim.
+        """
+        if self._session and not body.get("session"):
+            body = {**body, "session": self._session}
+        resp = self._http.post(self._url(f"/plan/{path}"), json=body)
         resp.raise_for_status()
         return resp.json()
-
-    # -- the plan (v2.39) ----------------------------------------------
 
     def plan(self, params: dict) -> dict:
-        resp = self._http.get(self._url("/plan"),
+        return self._plan_read("/plan", params)
+
+    def _plan_read(self, path: str, params: dict) -> dict:
+        """A plan read, carrying this session so `covered_by` can be exact.
+
+        Stamped here for the reason :meth:`plan_item` stamps it on a write: a plan
+        claim is owned by the session, so a read that names no session can only be
+        answered by MACHINE — and on a box running several agents that tells a
+        co-tenant its neighbour's held plan is free.
+        """
+        if self._session and not params.get("session"):
+            params = {**params, "session": self._session}
+        resp = self._http.get(self._url(path),
                               params={k: v for k, v in params.items() if v is not None})
         resp.raise_for_status()
         return resp.json()

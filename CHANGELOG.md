@@ -11,7 +11,300 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
+<<<<<<< HEAD
 ## vNEXT — an order the rules derive, and a record of what they claimed
+=======
+## vNEXT — a claim nobody takes: derive the key, make the plan a row, block on pickup
+
+`claims()` returned `[]`. Not filtered — empty, fleet-wide, across every repo and every
+machine, for four months. The atomic claim shipped in v2.31 to stop agents colliding and
+was hardened in v2.36 so a co-tenant could not renew someone else's. It had never had a
+row in it worth reading.
+
+Two reasons, and this release fixes both.
+
+### 1. Nothing automatic ever wrote one
+
+The lifecycle hook touches `/lease`, `/post`, `/presence` and `/sync`. It has never
+touched `/claim` — what it takes is a session *lease*, a different table with different
+semantics. `preland.py`'s `check_merge_claim` runs on every `/fix-and-land` and its own
+docstring says the rest: *"`kind=merge, key=<repo>:<branch>` shipped in #131 and nothing
+has ever read it — on the same day two agents merged at once. This is the read half."* So
+#131 built a write surface with no reader, `preland` built a reader with no writer, and
+the check had never been capable of firing. It ran on nine PRs in one day.
+
+And the documented workflow defined the word away: *"A `status` as you pick something up
+is the only post that can prevent duplicated work."* In the whole of
+`quarterback-workflow.md` the `claim()` tool is never named. The cleanest data point is an
+agent that read that and complied — sixteen posts in a day while landing ten PRs, and zero
+claims. Not carelessness. It did what the doc said.
+
+**So the write has to hang off an action that already happens.** Prompt-sniffing does not
+work: that session was driven by "152", "next", "yes", none of which a hook can read as
+task pickup. The checkout is the action. `create-worktree` now derives the issue number
+from the branch it is making and claims it *before the tree exists*, so a refusal costs
+nothing to unwind and there is nothing to opt into. `qb-claim` and `qb-claimed` are the
+write and read halves as CLIs, so the enforcement half can live in a hook without that
+hook re-implementing anything.
+
+Three exit codes on both, and that is the load-bearing decision: `0` held, `1` free, `2`
+cannot tell. A gate that reads "cannot tell" as "nothing held" fails open on every
+unconfigured or unreachable host — which is a gate that stops nothing on exactly the hosts
+nobody checked. `preland.py` already states the rule about itself: *"a merge gate that
+fails open wherever it cannot see is not a gate."*
+
+`GET /claim/held` is the board's own answer to that question, as **one boolean**. Not a
+list a caller re-derives it from: three callers re-deriving the repo a key belongs to is
+three chances to get it wrong, and the fleet has already spent an evening on exactly that.
+
+### 2. The claims that DID exist could not be joined to anything
+
+Recorded on the issue at 22:59 on 2026-08-17:
+
+> `claims()` showed `zeus/lantern-fennel` holding `kind=issue
+> key=prisonblues/quarterback#163`, acquired 22:31, live and unexpired. The plan item
+> referencing issue 163 read `"claim": null`, and the plan's own `counts` reported
+> `"claimed": 0`. Same issue, same repo, same second, two answers.
+
+Both subsystems were correct about their own string. `(kind, key)` is the unique index, so
+`issue/<repo>#163` and `work/<repo>#163` are two resources by construction — and nothing
+checked that the two agreed, because **agreeing by convention is not a thing that can be
+checked**.
+
+`app/claimkey.py` is the fix, and it is #148's fix one level up: stop asking for a name.
+A caller says *which resource* — an issue, a PR, a branch, a plan, an item — and the key is
+read off it in one place. `POST /claim` takes a `ref`; a composed `kind`/`key` pair is
+still accepted, canonicalised onto the same row, and the response says so, because an
+agent that believes it holds `issue/X` while the row reads `work/X` is the same defect with
+the parties swapped. `GET /claims` canonicalises its filters and takes a ref of its own.
+`ClaimRequest` canonicalises inside the primitive rather than at the endpoint, so the plan
+router, the endpoint and the fourth and fifth caller cannot be the one that forgot — which
+is the same mistake the deleted `RESERVED_KINDS` guard made by sitting in front of one
+caller.
+
+Two things it deliberately does **not** do. A key it does not recognise passes through
+untouched: a real claim on this board reads `prisonblues/lexray:serving-row:32022R2554`,
+which is a database row, and canonicalisation that guessed at an open domain is what PR
+#152 was closed for. And a PR does not share a key with the issue numbered the same —
+`#` was already the issue's, in the plan, in the dashboards' `issue_claims` join and in
+every claim taken by hand, so the PR takes `!`, which cannot occur in a GitHub owner,
+repository or branch name.
+
+### A plan is a row
+
+`plan_items.phase` was free text on an item, owned by nothing and bounded by nothing. It
+was the plan's own copy of the same defect — a name composed by whoever typed it — with
+four consequences, all observed:
+
+* "stage 1" and "Stage 1" were two phases and nothing could tell.
+* A phase had no state, so nothing could say it was finished.
+* A phase could not be **claimed**, and the one genuinely fuzzy race left on this board is
+  two agents surveying the same vague problem at once — before any item exists to be exact
+  about. There was no object at that grain to hold.
+* A plan arrived one `POST /plan/item` at a time, so an eight-item plan landed
+  incrementally and a second agent could claim from a half-written one. The raider is not
+  even wrong: what it read really was the plan at that moment.
+
+`plans` is a table (migration 0025). `ix_plans_open_label` makes "one open plan per label
+per scope" a database fact, case-folded because that is the whole point. `state` lets a plan
+finish. The id gives it a derived claim key (`work`/`plan:<uuid>`) through the one claim
+table — no fourth implementation of "who has this right now". `POST /plan/submit` writes
+the plan, every item and every dependency in a single transaction, and `depends_on` accepts
+`"@2"` for the second item of the same submission, so a plan carries its own graph without
+being written twice. It claims the plan on the way out by default, because the surveying
+agent wrote it and the gap between writing and holding is the gap.
+
+A plan claim is coarse and it is the **only** coarse grain: an item inside a plan somebody
+else holds reports `covered_by` and is skipped by `next`, while your own plan claim covers
+nothing from you — which is what lets the holder work through its own list item by item.
+Everything downstream is exact item keys, so the fuzzy intake converges into the structured
+one rather than staying a permanently softer path.
+
+`phase` migrates to a plan per distinct (repo, phase), folded for case, keeping the
+first-ranked item's own spelling and author — and in the state its items are already in, so a
+phase that was finished years ago does not arrive holding its label slot open for ever. The
+downgrade writes each label back onto its items, and says plainly what a rollback cannot
+carry: a plan's note, state and identity.
+
+### The release allocator is deleted
+
+`kind='release'` shipped in #46 to stop two branches picking one version. What actually
+stopped it was `scripts/release_stamp.py` (v2.34), which takes `max+1` at land from the ref
+being merged into — nine releases landed that way in a day with no collisions, while the
+allocator's own rows went stale for every PR still open. So `POST /release/claim`,
+`POST /release/reclaim`, `GET /releases`, `RESERVED_KINDS`, the version grammar and the
+`claim_release_number` / `reclaim_release_number` / `releases` tools are gone.
+
+A namespace nobody claims in does not need an allocator, and a stale record of one is worse
+than none: it is a second answer to a question that has one, which is the defect this whole
+release is about.
+
+Its tests went with it, with two exceptions, because a deletion must not take coverage it
+does not own. `test_a_renewed_claim_really_has_its_ttl_extended` and
+`test_an_empty_session_is_not_a_session` were round-1 findings about the **primitive** that
+happened to be exercised through the allocator; both were rewritten against `POST /claim`.
+And `test_release_repo_identity.py` became `test_repo_identity.py`: the repo shape rule
+outlived the allocator that first needed it, because a repo name is now half of every
+derived key, so the same adversarial spellings are asserted against claiming by ref, asking
+what you hold, and adding a plan item. Strictly more paths than before.
+
+### An unclaimed repo is warned about, not passed
+
+`preland`'s merge-claim check used to report an empty answer as `passed: unclaimed`. That
+reads identically to "nobody is landing this branch", and the first was the state this whole
+issue is about. It now warns when the repo holds no claims at all — a warning rather than a
+HOLD, because nothing is wrong with the PR and a gate that held every merge in every
+unenrolled repo is a gate people switch off.
+
+### What the review round changed, because two of them were the same defect again
+
+An independent pass over the diff found six, and the two worth naming here are the
+ones this release is *about*, committed by the release itself:
+
+* **A plan claim was reported and not honoured.** `plan_read` showed `covered_by` and
+  `next` skipped the item — and `POST /plan/item/claim` took it anyway. A record
+  everybody can see and nothing enforces is precisely the state the issue opens on. It
+  refuses now, naming the plan's holder and their session, with `force` for the case
+  where the holder really is sharing the work.
+* **Coverage was decided by machine, not by session.** `_covered_by` used
+  `same_machine`, so a co-tenant was told its neighbour's held plan was free — #142's
+  rule undone on the read path. `GET /plan` and `GET /plans` take a `session` now (the
+  MCP client stamps it, as it already did on writes) and fall back to the machine when
+  none is sent: coarser, and honest rather than wrong.
+
+The rest: a plan named by **id** skipped the state and scope filters the label lookup
+makes, so an item could be moved into a closed plan or another repo's; `qb-claim`
+printed the claim id *and* the JSON, so `--json` was unparseable and `--quiet` was not
+quiet; and `app/static/plan.html` still read `it.phase`, so the browser page showed no
+plan label at all.
+
+A second pass over the fixes found three more, two of them in the fix for the first
+finding — which is the argument for the round rather than against it:
+
+* **The covering check and the item claim are two statements.** `acquire` commits, which
+  is where its atomicity comes from, so nothing can lock across it — and a plan claim
+  landing in that window left both claims live, which is two agents each correctly
+  believing the work is theirs. The check is made again afterwards and the item claim
+  handed straight back, exactly as the already-dropped-item case does.
+* **The read is coarser than the write, and the refusal is where that has to be
+  explained.** `GET /plan` authorises with `reader`, which resolves a bearer token to a
+  machine and knows nothing finer, so a caller that sends no `session` is answered by
+  machine and a co-tenant's hold looks like its own — it then sees free work and is
+  refused when it claims it. Making the read strict instead would tell the holder its
+  own plan was covered, which is worse. So the refusal names the cause and the remedy,
+  because that 409 is the only place a caller meets the asymmetry.
+* `--quiet --json` printed JSON. Two flags making conflicting promises about stdout, and
+  which one wins had been left to statement order; `--quiet` does, being the stronger.
+
+### And a second round, whose theme was the same one a level down
+
+Thirty findings at or above P3. The judge crashed on that round, so every one was
+re-derived from the code before it was touched — one was a false positive and is recorded as
+refuted with its evidence, and the rest were real. Three deserve naming here, because all
+three are this release's own thesis applied to a path the release itself had not applied it
+to.
+
+* **The gate could not see the claims the write half took.** `GET /claim/held` compared the
+  holder with `==`. Every other ownership test on `resource_leases` goes through
+  `same_machine`, precisely because the name half of an identity is board-allocated per
+  `X-Agent-Key` and is recycled — and the two clients that make up this feature do not send
+  the same headers. The MCP server sends a key, so an agent claiming through the `claim`
+  tool is written down as `zeus/amber-otter`; `qbdata.py` sends only `Authorization`, so
+  `qb-claim` — and therefore `create-worktree` — writes under the bare `zeus`. Each half was
+  invisible to the other: the pickup gate reported `free` for an agent that had just claimed,
+  and the tool reported `free` for the claim the checkout took on its behalf. Two subsystems
+  each correct about their own string, which is the sentence this whole release is about. The
+  holder filter is `address_clause` now — the machine-scoped, alias-aware clause `/active`
+  already uses on `Lease.holder` — and the session, not the name, is what separates
+  co-tenants, exactly as it does for a mutation.
+
+  The same mis-attribution had a write half: `create-worktree` invoked `qb-claim` without
+  `--session`, so the claim was stamped with the session of whoever ran the checkout. The
+  agent that will work in the tree has a different session and does not exist yet, so that
+  claim was hidden from the gate *and* unmutable by its own worktree — a 403 renewing or
+  releasing its own checkout claim. It records no session now and belongs to the machine
+  until somebody picks it up, and `/claim/held` counts a session-less claim as the machine's,
+  which is what `may_mutate` already said in as many words.
+
+* **A plan claim was work in a repo that the repo question could not see.** `repo_of` answers
+  None for `plan:<uuid>` and is right to — an id says nothing about a repository — so a claim
+  on the plan for *this* repo landed in `unattributed` and `held` came back false. #172's
+  whole design routes the fuzzy intake through a plan claim, so a gate blind to plan claims
+  was blind to the intake the issue added. The join is finished against the row, which knows
+  its scope; a fleet-scoped plan stays unattributed, because it genuinely does not say where.
+
+* **The deletion left one door open.** `kind='release'` had no endpoints, no tools and no
+  allocator, and `POST /claim {kind: 'release'}` still wrote the rows — because
+  canonicalisation passes an unrecognised kind through and the `RESERVED_KINDS` guard went
+  with the allocator. So `release` is a *retired* kind now rather than an unknown one, refused
+  in the primitive that every caller goes through, naming `release_stamp.py`. A deletion that
+  leaves one path able to write the rows is not a deletion.
+
+The rest, by the property each restores:
+
+**Ordering.** `POST /plan/submit` committed the plan and *then* took its claim, reopening the
+window the endpoint exists to close; it mints the id and claims first now, and rolls the
+claim back if the write fails. A whole-plan claim could be taken over items another agent
+truthfully held — the reverse direction was already guarded — so it refuses, naming the item
+and its holder, with `force` for a holder who really is sharing. And a post-`acquire` re-check
+released the caller's claim unconditionally, destroying one it had held *before* the request;
+only a claim the request itself created is handed back.
+
+**Answering about the resource rather than the string.** A kind-only filter on `GET /claims`
+was not folded, so `?kind=issue` — what the pre-#172 vocabulary trained every agent and skill
+to send — matched nothing while the rows sat there; it folds now and *says* it folded, because
+a kind can no longer tell an issue from a PR. `GET /claims` also silently preferred `ref_kind`
+over a `kind`/`key` sent alongside, where `POST /claim` refuses the pair outright: one rule,
+both directions, and the MCP tools now refuse it too instead of being the softer door.
+`GET /plan?plan=<label>` could resolve to a *closed* plan of that name and report its live
+namesake as empty; a plan named by id no longer needs its repo spelled in an unscoped read;
+and `phase` is refused rather than ignored, so a caller still sending it is told what replaced
+it instead of quietly getting a loose item.
+
+**Totality on a read.** The key regexes are looser than the validators `derive` applies, so
+`canonical` could raise out of `GET /claims` and out of `repo_of` — one legacy row of the
+shape `_norm_scope` used to be able to write (`acme/foo.git#12`) turned `/claim/held` into a
+500 for every row. A key this board cannot key is left exactly as it arrived, which was
+already the rule; it is now the rule on the failure path too. `_branch` also rejected
+whitespace alone while claiming to reject git-reserved characters, so a merge key could name
+a ref that cannot exist — and a `:` in a branch round-trips to a *different* branch, because
+`_MERGE_KEY` splits on the first colon.
+
+**Saying the true thing to whoever is looking.** The migration turned every historical phase
+into an *open* plan, so a repo that had ever finished a "stage 1" could never open one again;
+a phase arrives in the state its items are already in. The dashboard's four presentation
+functions still called an item covered by somebody else's plan claim free work — the exact
+outcome `covered_by` exists to prevent — including the click that starts `/fix-issue` and
+spends money. Freshness is derived from the plan's items rather than bumped by eight write
+paths, so a plan being worked through daily stops reporting itself stale. `qb-claim` mapped a
+401 and a 422 onto "the board is down" and a contended 409 — a lost race with no holder — onto
+"held", which `create-worktree` turned into a refusal naming a phantom peer. `preland`'s
+enrollment warning could not see plan or item claims at all, because their keys name no repo.
+The browser page's header omitted `covered` and contradicted the panel below it. And the
+`resource_leases` docstring still documented `release` as a kind of the table it had just
+stopped being.
+
+**Handing back what you took.** `create-worktree` claims before `git worktree add` on purpose —
+a refusal has then cost nothing — and the inverse was unhandled: the claim succeeds, the tree
+does not, and the issue stays held for eight hours by an agent that does not exist. Worse than
+not claiming, because the record reads as authoritative and there is nobody to talk to. An
+EXIT trap hands it back through `qbdata`'s own client, stands down once the tree exists, and
+leaves a *renewed* claim alone — one this machine held before the run is not the failed
+checkout's to destroy.
+
+### What is not here
+
+**Working-tree contention** — an uncommitted file, someone else's in-flight edit — is #185,
+and deliberately not this. It has the *inverted* worktree rule: two agents in separate trees
+editing "the same file" are not colliding at all, so a path must never enter this key
+namespace, where the fleet-wide unique index would block an agent that is entirely free.
+
+**The hook itself.** `qb-hook` lives in nix-fleet, so the enforcement half — no live claim
+in this repo and about to do substantive work → stopped — is one `qb-claimed` call away but
+not in this repo to write. What is here is the primitive it needs, with the exit codes that
+make failing closed possible.
+## v2.59 — a row key the dashboard can actually tell apart
+>>>>>>> origin/main
 
 The plan has had an order since v2.39 and one writer for it: a human. That is the right
 rule — "if any agent may reorder it, the plan thrashes and stops being the shared intent it

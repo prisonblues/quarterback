@@ -43,7 +43,8 @@
   .chip.hold { color:#9fddc7; border-color:#2e5c48; }
   .chip.block { color:#f0b429; border-color:#5c4a1e; }
   .chip.stale { color:#e5484d; border-color:#5c2626; }
-  .chip.phase { color:#c9b6f5; border-color:#3a2f56; }
+  .chip.plan { color:#c9b6f5; border-color:#3a2f56; }
+  .chip.covered { color:#e0c890; border-color:#4a3b1e; }
   .chip.fleet { color:#8fb4e8; border-color:#31435c; }
   .refless { color:var(--muted); }
   .acts { display:flex; gap:4px; }
@@ -154,15 +155,17 @@ function row(it, s){
         ${refHtml(it)}
         <span class="title">${esc(it.title)}</span>
         ${it.repo===null&&s!==null?`<span class="chip fleet">fleet</span>`:""}
-        ${it.phase?`<span class="chip phase">${esc(it.phase)}</span>`:""}
+        ${it.plan?`<span class="chip plan">${esc(it.plan.label)}</span>`:""}
         ${held?`<span class="chip hold">held by ${who(held.holder)} · expires ${until(held.expires)}</span>`:""}
+        ${!held&&it.covered_by?`<span class="chip covered">in ${esc((it.plan&&it.plan.label)||"a plan")} held by ${who(it.covered_by.holder)}</span>`:""}
         ${blocked?`<span class="chip block">waiting on ${it.blocked_by.map(b=>esc(b.ref?("#"+b.ref):b.title)).join(", ")}</span>`:""}
         ${it.stale?`<span class="chip stale">stale ${it.idle_days}d</span>`:""}
         ${it.state!=="open"?`<span class="chip">${esc(it.state)}</span>`:""}
       </div>
       ${it.note?`<div class="note">${esc(it.note)}</div>`:""}
       <div class="meta">${esc(it.repo||"fleet")} · added by ${who(it.added_by)} · touched ${ago(it.updated)} ago${
-        held&&held.note?` · “${esc(held.note)}”`:""}</div>
+        held&&held.note?` · “${esc(held.note)}”`:""}${
+        !held&&it.covered_by&&it.covered_by.note?` · “${esc(it.covered_by.note)}”`:""}</div>
     </div>
     <div class="acts">
       <button data-move="up" data-id="${esc(it.item_id)}" ${canMove?"":"disabled"}
@@ -188,15 +191,26 @@ function render(){
 
   listEl.innerHTML = "";
   for(const it of shown) listEl.appendChild(row(it, s));
+  // `covered` is in the header for the same reason it is in `counts` at all: an item
+  // inside a plan somebody ELSE holds is why `next` skipped it, and a header that
+  // named only claims and blockers said "2 open · 0 held · 0 waiting" directly above
+  // a panel saying everything open was claimed or waiting. Held item-by-item and held
+  // by the plan over it are two different things to go and ask about, so they are two
+  // counts — and the per-row chip explains one row, not the two places a reader looks
+  // first.
   countsEl.textContent = `${counts.open||0} open · ${counts.claimed||0} held · ` +
-    `${counts.blocked||0} waiting · ${counts.stale||0} stale`;
+    `${counts.covered||0} in a held plan · ${counts.blocked||0} waiting · ` +
+    `${counts.stale||0} stale`;
   nextEl.innerHTML = next
     ? `<div class="next"><div class="lbl">next</div><div>${refHtml(next)} ${
         esc(next.title)}</div>${next.note?`<div class="note">${esc(next.note)}</div>`:""}</div>`
     // Keyed off the same counts as the header: "everything open is spoken for" is only
-    // true if something is open at all — a page of history alone gets no panel.
+    // true if something is open at all — a page of history alone gets no panel. And it
+    // names all three reasons `next` skips an item, because a reader whose whole plan
+    // is covered by one claim would otherwise be told it is "claimed or waiting" with
+    // nothing on the page claimed and nothing waiting.
     : (counts.open ? `<div class="next" style="border-color:#5c4a1e"><div class="lbl" style="color:#f0b429">next</div>
-        <div>nothing is free — everything open is claimed or waiting</div></div>` : "");
+        <div>nothing is free — everything open is claimed, waiting, or inside a plan somebody else holds</div></div>` : "");
   emptyEl.style.display = shown.length ? "none" : "block";
 }
 

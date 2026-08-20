@@ -1954,24 +1954,47 @@ def test_a_round_past_the_cap_is_rejected_rather_than_recorded(monkeypatch):
         panel.main()
 
 
+def _resolved_cap() -> int:
+    """The cap `run()` will actually apply with no `--max-rounds`.
+
+    Derived, not written down. These two tests used to hard-code 2 on the
+    coincidence that this repo's `review_panel.max_rounds` matched the shipped
+    default — the old docstring said so in as many words. When the repo moved its
+    own dial to 1 (P1/P2-only policy, 2026-08-20) the coincidence broke and a test
+    named for the DEFAULT failed on a change to this repo's POLICY, which is not
+    what it is for. The guard is what is under test; the number is configuration.
+    """
+    import harness_rules
+    import panel_seats
+    cfg = harness_rules.resolve_repo(str(Path(__file__).resolve().parents[3]))
+    return panel_seats.resolve_dials(cfg.get("review_panel") or {}, None, []).max_rounds
+
+
 def test_a_round_past_the_DEFAULT_cap_is_rejected_too(monkeypatch):
     """The guard used to fire only when --max-rounds was spelled out, and the cap
-    `run()` applies is the default when it is not. So `--round 3` alone passed
-    validation and took the cap branch on the spot, writing "round cap (2)
-    reached — …, unreviewed" into a round 3 and printing "round 3 of at most 2" —
-    the exact corrupted metadata the guard exists to prevent. On this repo the
-    default and `review_panel.max_rounds` are both 2, so the message names the
-    setting; either way the cap is 2 and round 3 is past it."""
-    monkeypatch.setattr(sys, "argv", ["panel.py", "--pr", "1", "--round", "3"])
-    with pytest.raises(SystemExit, match="past the cap of 2"):
+    `run()` applies is the resolved one when it is not. So `--round <cap+1>` alone
+    passed validation and took the cap branch on the spot, writing "round cap (N)
+    reached — …, unreviewed" into a round past the cap and printing "round N+1 of at
+    most N" — the exact corrupted metadata the guard exists to prevent."""
+    cap = _resolved_cap()
+    monkeypatch.setattr(sys, "argv",
+                        ["panel.py", "--pr", "1", "--round", str(cap + 1)])
+    with pytest.raises(SystemExit, match=f"past the cap of {cap}"):
         panel.main()
 
 
 def test_the_round_the_default_cap_allows_is_still_accepted(monkeypatch):
-    """Round 2 with no --max-rounds is the ordinary re-review, and the tighter
-    guard must not refuse it. It gets past validation and dies on the repo instead,
-    which is as far as this test can go without a checkout."""
-    monkeypatch.setattr(sys, "argv", ["panel.py", "--pr", "1", "--round", "2"])
+    """The last round the cap allows, with no --max-rounds, is the ordinary
+    re-review and the tighter guard must not refuse it. It gets past validation and
+    dies on the repo instead, which is as far as this test can go without a
+    checkout.
+
+    The round is the resolved cap rather than a literal 2, for the reason
+    `_resolved_cap` gives. At a cap of 1 this asserts that round 1 — every ordinary
+    single-round review — is still accepted, which is the property that actually
+    matters once a repo turns the second round off."""
+    cap = _resolved_cap()
+    monkeypatch.setattr(sys, "argv", ["panel.py", "--pr", "1", "--round", str(cap)])
     monkeypatch.setattr(panel, "run", lambda *a, **k: 0)
     assert panel.main() == 0
 
