@@ -11,7 +11,9 @@ waiting to land. State, not events.
 
 Board data comes from the same client the MCP server uses; PRs and issues come
 from `gh`, on a slower clock because that is a network call per refresh and
-neither moves every three seconds.
+neither moves every three seconds. The line across the top is Claude Code's own
+usage caps — the ceiling every seat below it is working towards, on a slower
+clock again.
 """
 
 from __future__ import annotations
@@ -31,9 +33,10 @@ from rich.text import Text
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from qbdata import (  # noqa: E402
-    ago, board_client, ci_state, claim_label, clip, fetch_board, fetch_issues, fetch_plan,
-    fetch_prs, claims_by_issue, issue_key, plan_counts, plan_ref, plan_state, plan_who,
-    repo_colour, short_repo, sort_issues, sort_plan, until,
+    LIMITS_EVERY, agent_state, ago, board_client, ci_state, claim_label, clip, fetch_board,
+    fetch_issues, fetch_limits, fetch_plan, fetch_prs, claims_by_issue, issue_key, limit_cells,
+    plan_counts, plan_ref, plan_state, plan_who, repo_colour, short_repo, sort_issues, sort_plan,
+    until,
 )
 
 BOARD_EVERY = 4.0       # seconds; presence changes on this order
@@ -50,24 +53,27 @@ def panel_agents(data: dict, width: int) -> Panel:
 
     t = Table.grid(padding=(0, 1), expand=True)
     t.add_column(width=13, no_wrap=True)          # who
+    t.add_column(width=7, no_wrap=True)           # state
     t.add_column(width=11, no_wrap=True)          # repo
     t.add_column(ratio=1, no_wrap=True)           # what
     t.add_column(width=5, justify="right", no_wrap=True)   # ttl
 
-    body = max(18, width - 37)
+    body = max(18, width - 45)
     for a in agents:
         who = (a.get("holder") or "?").split("/", 1)[-1]
         repo = a.get("repo") or "—"
         title = a.get("title") or a.get("branch") or "—"
         is_seat = "/seat-" in (a.get("holder") or "")
+        word, style = agent_state(a)
         t.add_row(
             Text(clip(who, 13), style="bold white on dark_green" if is_seat else "bold"),
+            Text(word or "—", style=style),
             Text(clip(repo, 11), style=repo_colour(repo)),
             Text(clip(title, body), style="white" if is_seat else "grey70"),
             Text(until(a.get("expires")), style="grey50"),
         )
     if not agents:
-        t.add_row(Text("nobody home", style="grey50"), "", "", "")
+        t.add_row(Text("nobody home", style="grey50"), "", "", "", "")
 
     subs = len(data.get("subagents") or [])
     head = f"[bold]FLEET[/] [grey50]{len(agents)} live"
@@ -234,7 +240,34 @@ def panel_issues(issues: list[dict], held: dict[int, dict], err: str | None,
                  padding=(0, 1))
 
 
-def header(cfg, data: dict, width: int) -> Panel:
+def limits_line(limits: list[dict], width: int, stale: bool = False) -> Text:
+    """The shared subscription's caps, as bars: `5h ████░░ 64% 3h57m  7d ██░ 41% 5d8h`.
+
+    At the top because it is the one number that governs every pane below it —
+    the seats spend one subscription between them, and a window they are about
+    to exhaust is worth knowing before an agent stops mid-issue rather than
+    after.
+    """
+    out = Text()
+    for i, (label, bar, pct, reset, colour) in enumerate(limit_cells(limits, width)):
+        if i:
+            out.append("  ")
+        out.append(label, style="bold grey70")
+        if bar:
+            out.append(f" {bar}", style=colour)
+        out.append(f" {pct}", style=f"bold {colour}")
+        if reset:
+            out.append(f" {reset}", style="grey50")
+    # A failed call keeps the last figures rather than blanking the line — they
+    # are minutes old and still roughly true — but says so, because a bar frozen
+    # at 64% while six seats work is the one reading that would mislead.
+    if out.plain and stale:
+        out.append(" ?", style="grey50")
+    return out
+
+
+def header(cfg, data: dict, width: int, limits: list[dict] | None = None,
+           stale: bool = False) -> Panel:
     host = (cfg.agent or "?").split("/", 1)[0]
     now = datetime.now().strftime("%H:%M:%S")
     state = Text("● board up", style="green")
@@ -245,7 +278,11 @@ def header(cfg, data: dict, width: int) -> Panel:
     line.add_column(justify="right")
     line.add_row(Text(f"quarterback · {host}", style="bold"), state)
     sub = Text(f"{cfg.base_url}   {now}", style="grey50")
-    return Panel(Group(line, Align.left(sub)), border_style="grey35", padding=(0, 1))
+    parts = [line, Align.left(sub)]
+    caps = limits_line(limits or [], width - 4, stale)
+    if caps.plain:
+        parts.insert(0, Align.left(caps))
+    return Panel(Group(*parts), border_style="grey35", padding=(0, 1))
 
 
 def fetch_state(client) -> dict:
@@ -261,6 +298,22 @@ def fetch_state(client) -> dict:
     return data
 
 
+def refresh_limits(caps: dict) -> dict:
+    """Update `caps` in place from the usage endpoint, keeping the last good figures.
+
+    A failed call must not blank the line. The caps move on the scale of hours,
+    so figures a few minutes old are still the right ones to act on, and a line
+    that vanished every time the network hiccuped would be read as "no limits" —
+    the opposite of what it means. qbdata keeps the last answer too, across
+    processes; this is the same rule inside one.
+    """
+    limits, err = fetch_limits()
+    if limits:
+        caps["limits"] = limits
+    caps["error"] = err
+    return caps
+
+
 def fetch_gh() -> dict:
     """The two `gh` calls, together: they share a clock and a failure mode."""
     prs, pr_err = fetch_prs()
@@ -268,9 +321,11 @@ def fetch_gh() -> dict:
     return {"prs": prs, "pr_err": pr_err, "issues": issues, "issue_err": issue_err}
 
 
-def frame(cfg, data: dict, gh: dict, width: int) -> Group:
+def frame(cfg, data: dict, gh: dict, width: int, caps: dict | None = None) -> Group:
+    caps = caps or {}
     held = claims_by_issue(data.get("claims", []))
-    parts = [header(cfg, data, width), panel_agents(data, width),
+    parts = [header(cfg, data, width, caps.get("limits"), bool(caps.get("error"))),
+             panel_agents(data, width),
              panel_claims(data, width),
              panel_plan(data.get("plan") or [], data.get("plan_err"), width),
              panel_prs(gh["prs"], gh["pr_err"], width),
@@ -301,13 +356,14 @@ def main() -> int:
 
     data = fetch_state(client)
     gh = fetch_gh()
+    caps = refresh_limits({"limits": [], "error": None})
 
     if args.once:
-        console.print(frame(cfg, data, gh, width))
+        console.print(frame(cfg, data, gh, width, caps))
         return 0
 
-    last_gh = time.monotonic()
-    with Live(frame(cfg, data, gh, width), console=console,
+    last_gh = last_caps = time.monotonic()
+    with Live(frame(cfg, data, gh, width, caps), console=console,
               screen=True, refresh_per_second=4) as live:
         while True:
             time.sleep(args.interval)
@@ -315,8 +371,11 @@ def main() -> int:
             if time.monotonic() - last_gh >= GH_EVERY:
                 gh = fetch_gh()
                 last_gh = time.monotonic()
+            if time.monotonic() - last_caps >= LIMITS_EVERY:
+                refresh_limits(caps)
+                last_caps = time.monotonic()
             width = console.width          # the pane can be resized under us
-            live.update(frame(cfg, data, gh, width))
+            live.update(frame(cfg, data, gh, width, caps))
 
 
 if __name__ == "__main__":

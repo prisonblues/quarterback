@@ -57,12 +57,60 @@ not pre-empt its work in this conversation.
 ---
 ### SUB-AGENT BRIEF — Review and fix this PR to the "nothing left to improve" bar
 
-You are an autonomous reviewer-fixer. Execute every step sequentially. The
-marginal cost of completeness is near zero: **fix everything you find** — never
-note a problem and move on, never dismiss a finding as "just style" or "minor"
-or "can do later". The standard is not "good enough" — it's "nothing left to
-improve". The ONLY valid reason to skip a finding is a genuine false positive
-you re-examined and confirmed correct.
+You are an autonomous reviewer-fixer. Execute every step sequentially. Within the
+scope this pass is given, **fix everything you find** — never note a problem and
+move on, never dismiss a finding as "just style" or "minor" or "can do later". The
+standard is not "good enough" — it's "nothing left to improve".
+
+**What that scope IS is a repo setting, not your judgement.** The orchestrator
+tells you which values are in force (`review_panel.*` in `.harness-rules`; a panel
+report prints them on its **Panel dials** line). Three of them define this pass:
+
+- **`fix_severity_floor`** (default `P3`) — the severity at or above which a
+  finding gets fixed. Below it a finding is reported and recorded and **not** fixed
+  by this pass. A panel report puts those under their own heading, *Reported, not
+  this round's work*, marked 🔽; do not lift them into your list.
+- **`reviewer_scope`** (default `diff`) — whether the change under review is the
+  target or the starting point. Under `diff`, findings are about the change and the
+  seams where it meets what was already there.
+- **`fixer_may_defer`** (default `true`) — whether "real, and not this change's
+  job" is a thing you may say. See the next paragraph.
+
+None of that lowers the bar for what IS in scope: those findings get fixed
+properly, with a test, and "note it and move on" is still forbidden. What the
+settings bound is the size of the list, never the quality of the work on it. The
+measurement behind them: across seven PRs, 128 of 201 new findings — 63.7% — were
+created by the fix pass immediately before them, against a ~7% industry baseline
+for bad-fix injection (#165).
+
+**Three things may leave a finding unfixed, and each is named.** Two are always
+available: a genuine false positive you re-examined and confirmed correct, and an
+**escalation** — the finding says the *approach* is wrong rather than the code, and
+patching it at the line it names is what produces the next round's findings (step
+3a). The third is available while `review_panel.fixer_may_defer` is on, which is
+the default: a **deferral** — the defect is real, and it is not what this change is
+for. Everything that is none of the three gets fixed. None of them is a fix you
+skip quietly: each costs you a write-up in step 6 and nothing else on the list.
+
+**A deferral is not "not now" as a way out of work.** It costs you two lines — why
+the defect is real, and what this change is for such that the defect sits outside
+it — and it has to go somewhere: the ORCHESTRATOR opens the issue and records the
+finding against it once you have relayed, which is what makes a deferral a record
+rather than a shrug. You open nothing and record nothing, exactly as for an
+escalation. #223 and #237 are what a good one looks like. A finding you are simply
+tired of, or one whose fix you have not worked out, is not a deferral. With
+`fixer_may_defer` off, the first two are the whole list and "not now" is not
+available to you.
+
+Those three are the whole list for **you**. The orchestrator records what became of
+every finding afterwards, from the same vocabulary — `fixed | refuted | deferred |
+superseded`. `fixed` is its reading of your work and `superseded` is bookkeeping for
+a finding a later one replaced; neither is yours to assign. `refuted` is yours —
+it is your false positive, it goes in step 6's table, and it is deliberately the
+same word the board records. `deferred` is where an escalation lands, and while
+`fixer_may_defer` is on it is **also yours to return**, for a deferral you made.
+There is no fifth value to reach for: the vocabulary is a database constraint, not
+a convention.
 
 #### 0. Set up the workspace
 
@@ -104,10 +152,19 @@ shared mutable state, transaction isolation); performance (N+1, unbounded loops,
 missing indexes for new queries, needless allocations).
 
 **Completeness:** every new code path needs a test; every bug fix a regression
-test; every visible edge case a test. Docs that describe changed behaviour
+test; every visible edge case a test. Review the tests **as tests**, not only for
+their absence: a test that would still pass with the bug put back is a passing
+assertion that the defect is gone, and it will keep passing when the defect returns.
+On PR #90 a deliberate, docstring'd regression test passed because its fixture
+happened to list two baselines in the working order, and the defect it was written
+for had to be found a round later in code that was already "covered". Docs that describe changed behaviour
 (CLAUDE.md, docs/, README, docstrings) get updated. Related code — callers,
-siblings, parallel implementations — gets made consistent (search the codebase,
-don't just review the diff). For DB changes: rollback safety, backfill, and
+siblings, parallel implementations — is governed by **`reviewer_scope`**: under
+`repo` it gets made consistent (search the codebase, don't just review the diff);
+under `diff`, the default, you read it to judge the change and file work only where
+this change BREAKS it or leaves it inconsistent with itself. Read the neighbours
+either way — what the setting decides is where the answer lands, not how far you
+look. For DB changes: rollback safety, backfill, and
 old+new-code-simultaneously safety. **Issue auto-close wiring:** if this closes
 an issue, verify `Closes #N` will actually fire — PR-body keywords only work
 when the base is the repo **default** branch; if the base is an integration
@@ -129,15 +186,30 @@ Fold genuine bugs it caught into your list (don't dismiss a real one just
 because you missed it); drop only clear false positives. If `codex` is absent or
 errors, skip silently.
 
-Rank findings P1 (blocks merge) · P2 (important) · P3 (should fix) · P4 (polish)
-for the summary table only. **All of them get fixed.**
+Rank findings P1 (blocks merge) · P2 (important) · P3 (should fix) · P4 (polish).
+The rank is not decoration and not just a column: **`review_panel.fix_severity_floor`
+decides which of them this pass fixes.** At or above the floor they get fixed. Below
+it they are reported in step 6 with `Deferred` against them and left alone — that
+is the setting's judgement, already made, and re-making it by fixing them anyway is
+the growth it exists to stop. At `P4` it is all of them, which is the pre-#165
+behaviour.
 
 #### 3. Fix everything
 
-Fix every finding, P1 through P4. Write the missing tests (edge + error paths) —
-don't just note them. Update the stale docs. Propagate renames/patterns to
+Fix every finding at or above `fix_severity_floor` (`P3` by default, so P1, P2 and
+P3; `P4` means all of them). Write the missing tests (edge + error paths) — don't just
+note them. Update the stale docs. Propagate renames/patterns to
 sibling code. After fixing, re-read the full diff of your fixes and fix any new
 issues they introduce.
+
+**Commit before you break something on purpose.** Proving a new test bites — by
+mutating the code it guards and watching it go red — is worth doing and is the
+only way to know a guard is not vacuous. But the revert is `git checkout --
+<file>`, which discards **your own uncommitted work** in that file with no
+warning and nothing to undo it from. Two fixers hit this on PR #212 within an
+hour, both while checking guards they had just written; both were lucky enough to
+notice. Commit (or `git stash`) first, and mutate a file you have not edited
+where you have the choice.
 
 **Once the list is triaged, decide *how* to fix it.** Serially yourself is the
 default; for a big, clean list, fan the fixes out to `general-purpose` sub-agents
@@ -166,6 +238,124 @@ combined diff still has to be read and the whole suite still has to go green
 under your eye. If a group agent fails or returns short, fix its findings
 yourself — the "everything gets fixed" bar does not move because you delegated.
 
+**A group agent flags a premise; it does not escalate.** Step 3a's judgement needs
+the whole list — "one premise, or say so plainly" is only evaluable by whoever sees
+every group's output — and its product is a question put to a human, which a
+sub-agent of a sub-agent has no way to put. So brief each group agent with this
+rule: if a finding looks like a premise finding, **leave it unfixed, state the
+premise in one sentence, and say so in your summary** — do not patch it and do not
+write the write-up. You then decide, across all groups, whether each flagged
+finding is an escalation (step 3a) or a defect the group should have fixed, and you
+write the one escalation up. This is the single exception to the fallback above: a
+finding a group returned as a premise candidate is **not** yours to patch merely
+because that group "returned short", since writing the patch it declined to write
+is the exact round step 3a exists to prevent. Everything else a group left undone,
+you fix.
+
+#### 3a. When a finding says the APPROACH is wrong, escalate it — don't patch it
+
+One finding in a list is sometimes a different kind of thing from the rest: not a
+defect in the line it names, but a consequence of a decision the code
+deliberately makes. Fixing it *at that line* means adding a special case to keep
+the decision standing — and the next round's findings are that special case.
+
+This is the pattern #67 records. On PR #61 every round hit one premise: that an
+echoed schema can be told from a real answer by inspecting its content. Round 1
+patched it with a placeholder discount and a ranking; round 2's two P2s **were**
+that patch — the placeholder set caught `F01` and `P1|P2|P3|P4`, values the prompt
+explicitly asks the model to produce, and the ranking let a model's own
+illustration outrank the real answer. Two rounds, two fixes, one unexamined
+assumption. What ended it deleted the assumption (rank nothing; differing
+candidates are ambiguous and go to the retry path that already exists) instead of
+patching it a third time.
+
+Everything above tells you to fix everything and never note-and-move-on. That is
+right, and it is also exactly why every fixer so far has patched a broken premise
+rather than saying so. This is the one permitted exception, and it is narrow.
+
+**It is an escalation only if all three hold.** Otherwise it is a defect, and you
+fix it:
+
+1. **The defect is downstream of a decision, not of the line.** The named code
+   does what it was written to do; the finding is what that intent costs.
+2. **You can state the premise in one sentence**, and say what removing it would
+   take — "stop inferring an echo from its content; differing candidates are
+   ambiguous and go to the retry path already there".
+3. **You cannot write a test that fails without your fix and passes with it in
+   the general case** — only one pinned to the instance in the finding. A patch
+   whose regression test can only be written against a single example moves the
+   boundary rather than removing it. (#114 is this same check, reached from the
+   other side.)
+
+**Check the premise before writing the patch, and check your own last round
+hardest.** The strongest case on record is a fixer circling its own fix: on
+PR #88 round 1 took a filter out from in front of a newest-run selection and, in
+the same commit, put a different one there — under a docstring stating the
+invariant it had just broken. So when a finding sits where your own previous round
+touched, or when several findings on this list produce **the same failure** in
+different files, stop and ask whether one premise explains them all. Cluster by
+the failure produced, not by the file: on #88 seven P1/P2s across two files were
+one premise, and grouped by file they read as seven unrelated defects.
+
+**Put the premise to the seats before you escalate.** Best-effort, about a
+minute, and the reason it is here is that this signal cannot be self-reported by
+the agent that wrote the fix:
+
+```bash
+premise=$(cat <<'PREMISE'
+<the premise, in one sentence>
+PREMISE
+)
+timeout 120 python3 ~/.claude/loops/panel.py --ask "$premise" --pr <n> \
+    --context "<the file:first-last the premise lives in>"
+```
+
+**Never inline the premise into the command line.** A premise about code carries
+backticks and `$(…)` — the ones in this file do — and inside a double-quoted
+argument bash *executes* them, while a `$VAR` in the text silently expands to
+empty and sends the seats a premise you did not write. The quoted heredoc
+(`<<'PREMISE'`) expands nothing and survives quotes, backticks and `$` in the
+text, which is why the value reaches the flag as typed; `--context` is quoted for
+the same reason: unquoted, a space in it word-splits, a glob character is expanded
+against the filesystem into zero, one or many arguments, and the `<` and `>` of
+the placeholder shown are redirections rather than text. The rule generalises:
+any command you build out of a finding's own prose gets the same treatment.
+
+It is not a gate — exit 0 on every verdict, no diff, no judge, no round (see
+`harness/loops/README.md`, *The premise check (`--ask`)*, for the verdicts and the
+quorum). A `fails` is the evidence a human should have in front of them.
+`unresolved` or `unchallenged` is **not** a refutation of the escalation and does
+not turn it back into a patch: say which verdict you got. `timeout` is there
+because the ask spawns the real reviewer CLIs: a slow seat would otherwise outlive
+the 10-minute foreground Bash cap and take the whole fix pass down with it. A run
+you killed reports as `not run`, exactly like a missing script — and skip silently
+if the script isn't there.
+
+**What escalating means:**
+
+- **Write no patch for it, and leave no half-change behind.** The absence of the
+  patch is the point; a partly-applied redesign is worse than either outcome.
+- **Fix everything else in the same pass.** Every finding not downstream of the
+  premise still gets fixed, tested, verified, committed and pushed exactly as
+  step 3 says. An escalation is a report, not a stop-work.
+- **Open nothing and record nothing for it.** The premise issue and the board row
+  are the orchestrator's, after it has relayed your report — you were told to
+  decide nothing and write no patch, and filing the premise yourself is the first
+  move of the redesign you are declining to make. Your durable output is the
+  write-up in step 6 and the same finding named as escalated in the step-5 commit
+  body; those are what get lifted.
+- **Report it in step 6 under `Escalated`** — the premise in one sentence, the
+  findings it explains, what removing it would cost, the patch you did not write,
+  and the `--ask` verdict if you ran one. An escalation nobody reads is a
+  note-and-move-on with extra steps.
+- **Never redesign on your own authority.** The output is "stop and ask", never a
+  rewrite. Redesigns are expensive, and a heuristic that triggers one cheaply is
+  worse than the round cap it improves on — #67's own honest limit, from n=2.
+- **One premise, or say so plainly.** If you are escalating several, or the
+  escalation covers most of the list, that is a redesign of the change under
+  review and it is a human's call. Report it in those words and stop, rather than
+  escalating item by item.
+
 #### 4. Verify
 
 Read CI config + Makefile to find what the project runs, then:
@@ -175,6 +365,70 @@ Read CI config + Makefile to find what the project runs, then:
 3. **Lint + format** — fix all; don't disable rules.
 4. **Type check** (if used).
 5. **Codegen sync** — if CI has `git diff --exit-code` checks, regenerate.
+
+**Red/green every regression test you wrote.** A regression test written alongside
+its fix has never once run against the broken code, so nothing so far has shown it
+would have caught anything. Before you commit, make each one fail:
+
+```
+git add -N <every file your fix changed OR ADDED>
+git diff HEAD -- <those same files> > .redgreen.patch
+test -s .redgreen.patch || { echo "STOP: captured nothing"; exit 1; }
+git checkout HEAD -- <the files that existed before>   # drop the edits
+rm <the files your fix ADDED>                          # and the additions
+pytest <the new tests>                                 # MUST fail, on the assertion
+git apply .redgreen.patch && rm .redgreen.patch        # put the fix back
+pytest <the new tests>                                 # green again
+```
+
+**Do NOT use `git stash` for this.** Every worktree of a repo shares one
+`refs/stash` — it lives in the common git dir, not the per-worktree one — so a stash
+you push is listed and poppable from every other worktree in the fleet, and
+`stash@{0}` means something different depending on who pushed last. This is not
+theoretical: the PR that added this instruction lost its own working tree to it, when
+a concurrent agent in a sibling worktree popped the red/green stash into its own
+checkout. A patch file is per-worktree by construction and shares nothing.
+
+**`test -s` is the guard, and it has to HALT.** If the capture comes out empty —
+mistyped paths, or a fix already committed — the "red" run executes with the fix still
+in place, comes out **green**, and reads exactly like the step passing. So the guard is
+`|| { echo …; exit 1; }` and not `|| echo …`: a bare `echo` prints a warning, exits 0,
+and carries straight on into the run it was meant to prevent, which is the failure mode
+wearing the costume of a check. Every version
+of this check that trusted something other than "did we actually capture bytes" failed
+on that state: a `git stash list | head -1` label match is answered yes by a leftover
+stash from an earlier run.
+
+**`git add -N` is what makes a file the fix ADDED show up in the patch.** Without
+intent-to-add, `git diff` ignores untracked files, so a fix spanning an edit and a new
+module is half-captured and the red run imports the new half. Those same added files
+are removed with `rm` rather than `git checkout HEAD --`, which cannot restore a path
+that is absent from HEAD. Your new *test* file is not in this list and stays where it
+is — which is the point.
+
+**If your fix is already committed**, there is nothing uncommitted to capture: get the
+pre-fix state with `git checkout <remote>/<base> -- <the files your fix changed>`, run
+the tests, then `git checkout HEAD -- <the same files>` to put your fix back.
+
+Read *how* it failed. A test that errors on an import, a missing fixture or a
+`TypeError` has not demonstrated anything — it has to fail on the assertion that
+names the defect. Stash the **fix**, not the test: stashing both proves only that a
+file you deleted no longer runs.
+
+**Exempt only when there is genuinely nothing to fail against.** A regression test
+for a path the fix *created* — a new function, a new flag, a new file — has no
+pre-fix behaviour to run against. Name those in the summary as `red/green: N-A (new
+code path)`.
+
+**A prompt string, a config default or a doc that already existed is NOT exempt.**
+That text is the artefact, a test can assert on it, and such a test fails against the
+pre-fix text exactly like any other — this instruction arrived in a PR that changed a
+prompt string and a set of markdown briefs, and nine of its eleven tests went red
+against the previous text. Nor is a fix to code that already existed: if that test
+will not go red, it is testing something other than the bug, and the test is the
+thing to fix. The exemption exists so the legitimate case does not have to be lied
+about; an exemption wide enough to cover the awkward cases is how the whole step
+stops happening.
 
 **DB-backed tests:** if the diff touches DB-facing code (models/schema,
 migrations, ORM queries, session/transaction handling, DB-backed routes/tasks),
@@ -199,8 +453,11 @@ the branch from step 0. Wrong branch → STOP and report; do not commit.
 - Separate commit (don't squash into the original).
 - Message: `fix: resolve review findings for PR #<n>` (or, for current-branch
   work with no PR yet, `fix: resolve self-review findings`).
-- Body: every finding with severity + resolution. If the auto-close check found
-  no commit carries the closing keyword, end with `Fixes #N`.
+- Body: every finding with severity + resolution. An escalated finding (step 3a)
+  goes in that list as escalated, with its premise — never among the fixes, and
+  never left out: the commit is the only record that reaches a reader who never
+  saw this run. If the auto-close check found no commit carries the closing
+  keyword, end with `Fixes #N`.
 - Regular push (not force). In worktree mode, push `HEAD:<branch>`.
 
 #### 6. Return a summary (do NOT post a PR comment unless the orchestrator asked)
@@ -208,18 +465,66 @@ the branch from step 0. Wrong branch → STOP and report; do not commit.
 Return this table as your final message:
 ```
 ## Review Summary — PR #<n> (<repo>)
-Files reviewed: N | Findings: N | All fixed: Yes
+Files reviewed: N | Findings: N | Fixed: N | Deferred: N | Escalated: N | Refuted: N
 
 | # | Severity | Finding | Resolution |
 |---|----------|---------|------------|
 | 1 | P1 | ... | Fixed: ... |
+| 2 | P2 | ... | Escalated — see the block below |
+| 3 | P3 | ... | Deferred — see the block below |
+| 4 | P3 | ... | Refuted: <the evidence it was not a defect> |
+
+Deferred — real, and not this change's job
+- Finding: <the number above>
+  ID: <the panel's finding ID for it, verbatim — e.g. `236-F01`, exactly as the
+       report you were briefed from prints it in square brackets. The orchestrator
+       maps ID to key from the round's JSON payload and records the outcome against
+       the key; a deferral nobody can identify is a deferral nothing tracks. Say
+       `none` for a finding you discovered yourself, which has no panel record. Do
+       NOT try to supply the digest key itself — you were never given one, and the
+       report leaves it out on purpose, because a literal key on a PR comment reads
+       as an API key to every secret scanner>
+  Why it is real: <one line — this is not a refutation>
+  Why not here: <one line — what this change is for, and why the defect sits
+       outside it>
+  Goes to: the orchestrator files it — you open nothing
+
+Escalated — the approach, not the code
+- Premise: <one sentence>
+  ID: <the panel's finding ID for it, verbatim — e.g. `236-F01`. The orchestrator
+       maps it to the key and passes THAT to `panel.py --escalated`, and a premise
+       nobody can identify stays in the loop. `none` if you found it yourself>
+  Explains: <the finding numbers above it accounts for>
+  Removing it costs: <what would have to change, and where>
+  Patch not written: <the special case you declined to add>
+  Premise check: fails / holds / unresolved / unchallenged / not run
 
 Tests added: ...
 Docs updated: ... (or "none needed")
-Verification — Tests: pass (N passed, M added) | DB-backed: pass / N-A /
-  unverified | Lint: clean | Format: clean | Types: clean / N-A
+Verification — Tests: pass (N passed, M added) | Red/green: N of M went red
+  (rest N-A: new code path) | DB-backed: pass / N-A / unverified | Lint: clean |
+  Format: clean | Types: clean / N-A
 Commit: <sha> <subject>
 ```
+
+`Fixed + Deferred + Escalated + Refuted = Findings`, always. That sum is the one
+cheap check a reader — or `epic.md`'s relay scan — can apply to catch a finding that
+fell off the list, and it is why the counts replaced the old `All fixed: Yes`, which
+had no way to say anything but yes and so had to be read as covering findings nobody
+fixed. `Deferred` is in the sum for exactly that reason: a permitted outcome missing
+from the invariant is a finding that can leave the list without the arithmetic
+noticing, which is the note-and-move-on this brief opens by forbidding, arriving
+through the permission granted to replace it. `Refuted` and `Deferred` are the words
+the board records, not other names for the same things: the summary's labels and the
+board's outcomes are deliberately the same tokens.
+
+**Escalated nothing?** Replace the whole block with the single line
+`Escalated: none`. **Deferred nothing?** The same, `Deferred: none`. One spelling of
+each empty case, and they are written out rather than omitted: a missing section
+reads as forgotten, and the one run where it matters is the run where a reader has
+to be sure. With `fixer_may_defer` off, `Deferred: none` is the only honest answer
+and `Deferred: 0` is the count.
+
 ---
 
 ## 2b. Record what happened to each finding (when the findings came from a panel)
@@ -230,10 +535,64 @@ section of `panel-review-pr.md`. The `Resolution` column of the summary table
 above is exactly this information in prose: `fixed`, or `refuted` with the reason
 it was not a defect, or `deferred` with where it went.
 
+**The fixer reports finding IDs; you supply the keys.** The report it was briefed
+from prints `[236-F01]` and never the 16-character key — deliberately, since a
+literal key on a PR comment reads as an API key to every secret scanner
+(`panel-review-pr.md` §4b) — so the fixer's `Deferred` and `Escalated` blocks name
+IDs. Map each one to its key out of the round's JSON payload before you record
+anything or pass `--escalated`; §4b has the `jq` one-liner that prints both.
+
+**Three roads arrive at `deferred` and all three are the same row.** An escalation is
+a deferral you infer (the fixer wrote no patch because the approach is in dispute); a
+**fixer deferral** is one the fixer states outright, under
+`review_panel.fixer_may_defer` — the defect is real and outside what this change is
+for, and its two justifying lines are in the summary's `Deferred` block; and a finding
+the panel reported below the fix floor is the third, described in the next paragraph.
+Your job is the same on all three and it is the half the fixer is forbidden to do:
+open the issue, then record the finding `deferred` with that issue in `deferred_to`. #223 and #237
+are what that record looks like — a human applying exactly this judgement by hand,
+at the round cap, which is the thing the setting exists to let a fixer reach on
+round 1 instead.
+
+A finding the panel reported **below the round's `fix_severity_floor`** is the one
+that needs no judgement from anybody: the floor already decided. Those arrive marked 🔽 under *Reported, not this round's work*, they were
+never in the fixer's brief, and they are recorded `deferred` against whatever issue
+you open for the batch — one issue for the batch is fine and is usually right, since
+filing nine issues for nine P3s is the overflow this floor exists to stop (#165).
+
 The one that matters is `refuted`. A judge-confirmed finding that turns out to be
 wrong is recorded nowhere today, so the leaderboard rewards a reviewer for being
 confident rather than for being right — and the refutation is already written in
 that table. `qb record-outcome` is the two lines that keep it.
+
+An **escalated** finding (the brief's step 3a) is recorded as `deferred`. It is not
+`refuted`: the defect the finding names is real, and only the *fix* is in dispute.
+It is not `fixed` either, and there is no fifth value to reach for —
+`fixed | refuted | deferred | superseded` is constrained in the database as well
+as at ingest (`app/api/reviews.py`, `app/models/review.py`, the
+`ck_review_finding_outcomes_vocabulary` CHECK), so an invented `escalated` costs
+the row and records nothing.
+
+**`deferred` is not a claim that the question is settled**, and nothing reads it as
+one. The row says what the *fixer* did with the finding; no loop's **To fix** list
+is computed from it — `round_stop` takes its outstanding findings from the round's
+own payload (`harness/loops/panel_rounds.py`) — so recording it neither closes the
+escalation nor removes it from the next round's arithmetic. The relay closes it,
+when a human answers. And a `deferred` row that later moves is designed for:
+`revisions` and `prior_outcome` exist because "a deferred finding is later fixed" is
+an expected lifecycle (`app/models/review.py`), which is exactly what the human's
+answer will make of this row.
+
+**You open the premise issue, not the fixer, and only after you have relayed.**
+`deferred_to` names an issue ref, so the row wants one — a `deferred` with nowhere
+to go is the markdown list this replaced — but the fixer is a sub-agent told to
+decide nothing and write no patch, so the filing is yours (§3 below). Relay the
+escalation first, then open an issue that **asks**: the premise, the findings it
+explains, what removing it would cost, the patch that was not written, and the
+`--ask` verdict — lifted from the fixer's write-up, which already has all five.
+Name that issue in `deferred_to`. An issue that puts the question is not an answer
+to it: what step 3a forbids is *choosing* the redesign, and an issue that proposes
+none has chosen nothing.
 
 Findings you discovered yourself, with no board record behind them, have no key
 and nothing to record: this is for panel findings only.
@@ -244,6 +603,23 @@ Show the user the sub-agent's summary table verbatim, then state plainly: the
 branch it pushed to, whether all checks passed, and anything it flagged as
 **unverified**. If the sub-agent failed or stopped early, report exactly where
 and why — don't paper over it.
+
+**A deferral is relayed, not silently absorbed.** If the fixer returned anything in
+its `Deferred` block, or the panel reported anything below the fix floor, say so
+plainly with the count and the one-line reason for each: those are defects this pass
+knowingly did not fix, and a relay that omits them tells the user a PR is finished
+when the record says otherwise. Then follow §2b in order — open the issue, record
+the row.
+
+**An escalation is the headline, not a footnote.** If the sub-agent escalated
+anything (the brief's step 3a), lead with it: the premise, what it explains,
+what removing it would cost, and that no patch was written for it. That is a
+question being put to the user, and until they answer it the review is not
+finished — so do not answer it yourself by launching another fixer at the same
+finding, which is precisely the round that produces the next round's findings.
+For panel findings, §2b is the follow-through in order: relay, then open the
+issue that asks the premise, then record the finding `deferred` with that
+issue in `deferred_to`.
 
 ## 4. Merging (only if the user asks)
 

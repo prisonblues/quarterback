@@ -134,6 +134,32 @@ def resolve(env: dict[str, str] | None = None) -> BoardConfig:
     what is set is not one.
     """
     env = dict(os.environ if env is None else env)
+
+    # FIRST, and into `env`, which is what every child this function starts inherits —
+    # the sourced config file and the token command both. The contract permits
+    # `QUARTERBACK_TOKEN_CMD` to reference `$QUARTERBACK_AGENT`, and the fleet's
+    # generated config does: it picks this host's line out of a shared token file with
+    # `sed -n s/^$QUARTERBACK_AGENT://p`. Resolved at the END of this function — where
+    # it used to be — the variable was simply unset in the child's environment, that
+    # selector became `s/^://p`, and every Python client on the host reported "no
+    # token" against a token file that was present and valid the whole time (#201).
+    #
+    # Environment, else this machine's short hostname, matching `qb-env`'s
+    # `${QUARTERBACK_AGENT:-$(hostname -s)}`.
+    #
+    # NOT the config file, and that is a deliberate divergence: `qb-env` sources the
+    # file into its own shell, so a plain `QUARTERBACK_AGENT=name` line there wins,
+    # while `_VARS` excludes the name here so a file that sets it cannot change
+    # `cfg.agent`. The file is still sourced with the resolved name exported, so a
+    # file that BOTH pins a name and expands it into a double-quoted value of its own
+    # mints a token for the pinned name while this reports the resolved one. Nothing
+    # detects that: the value the file computed is indistinguishable, after the fact,
+    # from one it was always going to compute. Single-quote the command — as the
+    # generated config does — and the reference is expanded when it runs, against
+    # this name. A test pins the no-honouring half.
+    agent = env.get("QUARTERBACK_AGENT") or _hostname()
+    env["QUARTERBACK_AGENT"] = agent
+
     path = config_path(env)
     from_file = _read_config_file(path, env)
 
@@ -172,7 +198,6 @@ def resolve(env: dict[str, str] | None = None) -> BoardConfig:
         except OSError:
             token = None
 
-    agent = env.get("QUARTERBACK_AGENT") or _hostname()
     return BoardConfig(
         base_url=base_url.rstrip("/"), token=token or None, agent=agent, config_path=path
     )

@@ -50,9 +50,66 @@ comments; `/panel-review-pr` takes the confirmed findings, has a sub-agent fix e
 them, and then **panels the fix commit** — one round leaves the fixer's own work read by
 nobody, and a structural fix creates interactions no earlier round could have seen.
 
+**A pinned model that this host's provider cannot serve no longer costs the seat.** Model
+slugs are pinned in `.harness-rules.sample` so that "codex found 9 issues" still means something
+six weeks later — but a pin is one value for the whole fleet and a *deployment* is per-host,
+so a slug that is right everywhere else can be unservable on one box. On daedalus, codex
+routes through an employer Azure gateway deploying `gpt-5.5` while the rules pin
+`gpt-5.6-luna`: the seat 404s ten times and the panel loses a whole vendor, which on PR #207
+left 25 findings all attributed to `claude` — reviewing a PR `claude` had written. There are
+**two** such pins and this
+gateway refuses both independently — `gpt-5.6-luna+max` 404s, `gpt-5.5+max` is an
+`unsupported_value` on `reasoning.effort`, `gpt-5.5+high` works — so dropping only the model
+loses the seat on the next knob, which is how PR #217 got a round where *no* reviewer ran at
+all. Each pin is now lowered on its own, only when the error names it, at most once each, and
+the report says what happened: `codex (CLI default; pinned gpt-5.6-luna unavailable, effort max
+unsupported)`. The substitution is recorded as
+state (`model_unavailable` / `effort_unsupported`) in the payload as well as the header,
+because the board is where
+"is the expensive tier worth it" gets answered from accumulated runs, and a run whose model
+was swapped must not be averaged in as the pinned one. Deliberately narrow: only for a pin
+that was set,
+only for those two causes, at most once each — a general "retry with fewer constraints" would
+quietly review on a weaker seat for reasons nobody chose. **codex only**, because lowering a pin
+means rebuilding the argv without it and only its argv can express "use your default":
+`claude` takes `--model` unconditionally and `agy` builds its argv before any failure exists.
+
+Two things about that failure were wrong before it could be fixed, and both were about
+reading the wrong stream. codex under `--json` puts its event stream on **stdout** —
+including `{"type":"error","message":"... 404 ... deployment ... does not exist"}` — while
+stderr holds one line, `Reading prompt from stdin...`, printed before the request was made.
+The panel diagnosed from stderr alone, so it reported `exited 1 (Reading prompt from
+stdin...)` for a config mismatch and sent two people to debug stdin plumbing. Worse, the
+same stderr-only view fed the retry decision: `is_rejection` keys on 4xx invalid-request
+markers and an explicit `"status":400`, so a gateway **404** read as a flake worth another
+go — and each attempt spent the seat's full budget, ten minutes at a time, to reach the
+identical answer. Both now read stdout's error envelopes too (`error_events`).
+
 Each reviewer also declares what it could *not* assess, and the panel records which of them
 saw only a prefix of the diff. A finding count reports "clean" and "I could not tell" as the
 same zero; those two columns are what tell them apart, on the PR comment and on the board.
+
+Before any of that, the panel **rules on whether the round is worth running**. It used to
+dispatch every configured seat at full effort whatever the diff, and on PR #137 that meant
+four seats against 763,375 chars — 6.4× the argv ceiling of the one seat whose prompt travels
+in argv — on a change that was a *pure move*, `panel.py` split into six modules with nothing
+retyped. Every relocated line appears twice in a diff, so the bulk of that was code nobody
+changed, and a finding about it is a finding about the base branch. The token cost was the
+second problem; the first is that a truncated read which produces findings is worse than no
+review, because the next step briefs a fixer to resolve every one of them.
+
+So the panel now measures the diff's **shape** as well as its size — a move is mechanically
+identifiable, because its added lines are a near-permutation of its deleted ones — and does
+one of three things. A diff that fits runs as it always did. A move-shaped diff that does not
+fit is reviewed as a **manifest**: what moved where, what did *not* survive, what changed
+besides moving, and which definitions the change *adds* in more than one place. A diff far over
+every seat's ceiling with no smaller honest question to ask is **refused**, loudly — printed,
+recorded on the board, and posted to the PR under `--post`, because "no review" must never read
+as "clean". A refused round still reads the CI gate, which is size-independent and costs one API
+call, and says that the Sonar gate was not evaluated rather than leaving its default to read as a
+pass. `--force` overrides it on the record. None of it fires on a repo that declared no
+ceiling: this decides *whether to start*, never *what to send*, and the deliberate absence of
+a default diff budget stands. `loops/README.md` has the whole rule.
 
 This is the piece with the tightest board coupling, and the reason the two halves ship
 together. A panel run is a controlled comparison — one diff, several models, one judge —
@@ -76,6 +133,80 @@ where it stops being prose nothing can count. Do not mark your own findings refu
 the board records who set it (from your token) and who you SAY signed it off — `attested_by` is a
 claim you are making, not a signature the board checked — and `/panel` shows the split.
 
+**How hard the panel looks, and how long it keeps looking, are now repo settings.** They
+were constants, and the measurement says those constants do not converge: across the seven
+PRs panelled on 2026-08-16, the last round of each raised 201 findings no earlier round had
+and **128 of them — 63.7% — were created by the fix pass immediately before it**, against a
+~7% industry baseline for bad-fix injection. Every one of those panels ended on the round
+cap, each saying so in its own output — *"a stop, not convergence"* — and nine of this
+repo's open issues are the panel's own deferred-finding overflow. The severity split, P1
+4.1% / P2 28.6% / P3 36.1% / P4 31.3%, says the signal is calibrated at about 1.2 P1s per
+PR and the 67.3% tail beside it is not.
+
+So `.harness-rules.sample` now carries seven `review_panel` dials (#165), and what they
+bound is the tail rather than the signal: `fix_severity_floor` (**P3**) is what a fix round
+is asked to clear, and below it a finding is reported, marked and recorded rather than
+fixed — P4 is 31.3% of findings and the tier that actually ballooned #236;
+`round_trigger_floor` (**P2**) is what a NEW finding needs to buy another round, which is
+the rule that mattered most, because from round 2 the thing under review IS the previous
+round's fix and a termination test fed by its own output can only end on the cap — the
+two floors differ on purpose, since fixing a P3 in a pass that is already open costs one
+edit while letting a P3 buy another round costs a whole panel plus another fix pass;
+`max_fix_growth` (**3.0**) stops a cycle whose fix pass has multiplied the change instead of
+fixing it; `reviewer_scope` (**diff**) asks reviewers for defects in the change rather than
+in everything it touches; `fixer_may_defer` (**true**) gives the fixer the third exit it did
+not have; `max_rounds` (**2**) surfaces the existing cap; and `require_failing_test`
+(**false**) reserves the name for #165's evidence contract and reports that it is not built,
+because the reviewer-emitted failing test it needs does not exist yet (#92, #114).
+
+None of that lowers the bar for what a fix round does take on — in scope, everything still
+gets fixed properly, with a test, and note-and-move-on is still forbidden — and every value
+is validated: a malformed value of one of these keys is a hard exit naming the key, the
+value and what is accepted, because a repo that typed `p-4` meaning "fix everything" must
+not silently get the default instead. An unknown key is the other case and keeps its old
+answer — warned about and dropped, so a rules file shared across a fleet that upgrades at
+different times is not a version pin. What the round actually applied is in the
+artifact, on a **Panel dials** line and in the payload's `review_panel`, because the
+orchestrator that briefs the fixer builds that brief out of the report. #165 proposes about
+fifteen dials; these are the seven whose enforcement point already exists, and the rest stay
+in the issue.
+
+The fixer has one more permitted outcome than "fixed" and "false positive", and it exists
+because of what the other two cost. A fix that patches a wrong assumption produces the next
+round's findings; a fix that removes the assumption does not — PR #61 spent two rounds and two
+fixes on one unexamined premise, and PR #88 had a fixer circle its own previous fix inside a
+single commit. So `review-pr.md`'s brief (step 3a) lets a fixer report that a finding says the
+**approach** is wrong rather than the code, and write no patch for it: stated, with the premise
+in one sentence and what removing it would cost, rather than answered with a special case. It is
+narrow on purpose — three conditions that must all hold — and it never authorises a redesign,
+because the output is "stop and ask" and the evidence behind it is still two PRs (#67). The
+premise can be put to the seats first with `panel.py --ask`, which is exactly the shape of
+question that path exists for. An escalated finding is recorded as `deferred` by the
+orchestrator, which relays it, opens an issue that **asks** the premise, and names that issue in
+`deferred_to`. Under `review_panel.fixer_may_defer` a fixer may now also return `deferred`
+itself — "the defect is real, and it is not what this change is for" — which is a different
+judgement from an escalation ("the defect is real and the FIX is in dispute") arriving at the
+same row; the fixer owes two justifying lines and the orchestrator still owns the filing.
+`harness/tests/test_fixer_escalation.py` guards the wiring rather than the
+judgement: that the permission and its report ship together, that the cross-file references to
+step 3a resolve, and that `deferred` is a value the database accepts.
+
+The loop knows about it, which took a second change (#221). An escalated finding is outstanding
+and no fixer may touch it, so under the original stopping rule it earned another round every time
+until the cap ran out — the mechanism built to stop a cycle circling a premise guaranteed it ran
+to the cap. `panel.py --escalated <key>` subtracts the key from the work a fix round can clear,
+so the cycle goes again for everything else and stops as soon as only escalations remain. The
+rule and the exact scope of what it guarantees are kept in `round_stop`'s docstring
+(`harness/loops/panel_rounds.py`), and what a caller must do about it in
+`harness/commands/panel-review-pr.md`; they are not restated here.
+
+What is NOT here is measuring recurrence — asking mechanically whether a round is circling the
+last round's fix — which is #67's other half and needs the provenance work in #48. Nor is
+premise identity: the register holds a finding KEY, and a fresh panel that re-words the same
+premise mints a new one, so the caller re-escalates it. Until those exist, an escalation is a
+caller's declaration read out of a fixer's own report: the loop takes it on trust, records the
+round it was first made in so it can be audited afterwards, and keeps the cap as the backstop.
+
 The same rule shapes how a run's **cost** is measured. Each member is timed, and each one that
 can be is also asked what it spent in tokens — but never by switching its CLI to a JSON output
 mode. Those modes all move the reply inside an envelope (`.result`, `.response`,
@@ -94,6 +225,78 @@ codex has no session id to pin for a new run, so it uses `--json` for the usage 
 uninstrumented rather than half-converted. A cost in dollars is recorded **only where the vendor
 states one** (pi does) and never derived from a price table, and anything unread stays null —
 which the board renders as "not recorded", never as a reviewer that cost nothing.
+
+### Red/green — a regression test that never failed proves nothing
+
+Every fix command in here tells the fixer to write a regression test. None of them used to
+ask whether that test would have **caught the defect it was written for**, and a test that
+would not is worse than no test: it is a passing assertion that the bug is gone, and it will
+keep passing after the bug comes back.
+
+PR #90 is the demonstration. Round 1 found that `load_baseline`'s anchor selection was
+order-dependent — the same two baselines gave the sha or `None` depending on `--baseline`
+argument order. A test for exactly that behaviour already existed, with a docstring
+explaining the intent, and it passed: its fixture happened to list the two baselines in the
+working order. The panel had to find the defect a round later, in code that was already
+"covered". The assertion was right; nobody had ever run it against the broken code, because
+the test was written alongside the fix and the broken code no longer existed by then.
+
+So `review-pr.md`'s brief (inherited by `/panel-review-pr`), `fix-issue.md` and
+`fix-issue-here.md` now all say the same thing: before committing, capture the **fix** as a
+patch and remove it — not the test — run each new regression test, and confirm it fails **on
+the assertion that names the defect**. An import error or a missing fixture demonstrates nothing. Then restore and
+confirm green. Red, then green, in the order that means something. The fixer reports the
+count, so a summary that skipped the step reads as skipped rather than as passed.
+
+The mechanism is a **patch file, not `git stash`**, and that is a fleet property rather
+than a preference. `refs/stash` lives in the common git dir, not the per-worktree one, so
+every worktree of a repo shares one stash stack: a stash pushed in one is listed and
+poppable from all the others, and `stash@{0}` resolves to whatever the last pusher meant.
+This harness runs many concurrent worktrees off one `.git` by design. The PR that added
+this instruction proved the hazard by losing its own working tree to it — a concurrent
+agent in a sibling worktree popped the red/green stash into its own checkout and pushed it
+back. Two earlier drafts tried to make stash safe (a label check, then an entry count);
+the count caught the loss, but nothing local can stop another worktree popping the entry.
+So: `git add -N` the fix's paths, `git diff HEAD` them to a patch, check `test -s`, remove
+them, run red, `git apply` the patch back. See #210 for giving the harness a per-worktree
+stash of its own.
+
+Three details in that sequence exist because the obvious spelling is wrong. **`test -s` is
+the check that matters**: an empty capture — mistyped paths, or a fix already committed —
+leaves the red run executing with the fix still in place, coming out green, reading exactly
+like the step passing. **`git add -N`** is what puts a file the fix *added* into the patch,
+since `git diff` ignores untracked files and a half-captured fix means the red run imports
+the new half; those same files come back out with `rm`, because `git checkout HEAD --`
+cannot restore a path absent from HEAD. **And the new test file stays put** — remove it
+along with the fix and the red run collects nothing, which exits non-zero without any
+assertion having failed.
+
+**The exemption is stated, deliberately — and it is narrow.** A regression test for a path
+the fix *created* has no pre-fix behaviour to fail against; those report `red/green: N-A (new
+code path)`. An instruction with no exemption for the legitimate case gets worked around
+rather than followed, and a worked-around instruction is worse than an honest `N-A` — it
+removes the signal that says which tests were actually proved.
+
+What is **not** exempt is a prompt string, a config default or a doc that already existed.
+Shipped text is an artefact a test can assert on, and the PR that added this instruction
+proved it in the act of being written: it changed `REVIEW_PROMPT` and three markdown briefs,
+and thirteen of `test_regression_test_redgreen.py`'s fifteen tests went red against the
+previous text. The first draft of the instruction *did* exempt that case — Codex flagged it in review —
+and an exemption that wide would have excused most of this harness from its own check, which
+is the failure mode #114 predicted.
+
+The panel carries the cheaper half of the same lever. `REVIEW_PROMPT` used to ask only about
+test **absence** ("new code paths … that lack a test"), which is a question #90's fixture
+answered correctly. It now also asks about tests that are present and not load-bearing — a
+fixture whose ordering or inputs happen to avoid the bug, an assertion that cannot fail, a
+mock that satisfies itself. That is a reviewer reading the tests as tests, and it is far
+cheaper than mutation testing on a diff for most of the same catch.
+
+Why this matters more here than in most repos: the standing rule at the round cap is *"fix
+P1/P2 correctness only, defer the rest"*, explicitly because **the last fix pass is never
+itself reviewed**. Its regression tests are the only thing standing behind it. A fix pass
+whose tests pass vacuously has no backstop at all — and that is precisely the pass this
+repo has decided not to review.
 
 ### `/fix-and-review` and `/fix-and-land` — an issue, end to end
 
@@ -143,7 +346,8 @@ act on the verdict.
 Guardrails are capability-detected, so a repo without `scripts/migration_reconcile.py`
 skips that check and says it skipped it. The board is the one exception — an unreadable
 review state is a HOLD, not a skip, because "nobody reviewed it" and "nobody could tell"
-are the same thing to a merge. `.harness-rules` is where a repo turns that off deliberately.
+are the same thing to a merge. `.harness-rules.sample` is where a repo turns that off
+deliberately.
 
 It reads; it does not act. It reports commands rather than running them and reads merge
 claims rather than taking them, which is what lets it be re-run to check its own advice —
@@ -318,12 +522,35 @@ turns the fleet into a drain, and nothing yet bounds how much work a fleet may t
 cursor on `QUARTERBACK_INSTANCE` (`qb-asks-<agent>-<instance>`), so one value exported for
 the whole box gives n seats *one* cursor between them: whichever seat polls first advances
 it past everyone else's mail and the other n−1 never see an ask addressed to them. Set per
-seat it is the opposite — a stable, typeable `zeus/seat-3` instead of `zeus/a4f81c2e`,
-which survives the seat restarting in the same pane because the board hands a returning
-key its old name back.
+seat it is the opposite — a stable, typeable `zeus/seat-lexray-3` instead of
+`zeus/a4f81c2e`, which survives the seat restarting in the same pane because the board
+hands a returning key its old name back.
+
+**Why the name carries the project as well as the number.** `seat-3` on its own makes the
+*namespace* the machine while the *numbering* is per screen — and `qb-seats` numbers from 1
+every time it builds one. So the second screen on a box asked for seat 1, found the first
+screen's seat 1 holding the pane marker, and refused: not an edge case reached by an unlucky
+choice of number but the guaranteed outcome of starting a second screen, which made one
+screen per project the one thing this could not do (#208).
+
+The guard was right and its key was too coarse, so the key grew a scope. A seat is
+`seat-<project>-<n>`, so `seat-lexray-1` and `seat-nix-fleet-1` are two seats while
+`seat-lexray-1` started twice is still one — every property the refusal names survives.
+The scope defaults to the basename of the seat's own repository, because a screen is per
+repository; `QB_SEAT_SCOPE` overrides it for the two cases that default cannot read, which
+are two screens on *one* repository and anyone who wants the old machine-wide numbering
+back (`QB_SEAT_SCOPE=`, empty and meaning it).
+
+The scope is **slugged**, and that is not cosmetic: an `X-Agent-Name` that does not match
+`^[a-z0-9]+(?:-[a-z0-9]+)*$` within 40 characters is refused with a 400, so a repository
+called `Foo.Bar_2` would otherwise make every seat in it fail registration. The basename is
+folded to lower case, every run of anything else becomes one hyphen, the ends are trimmed
+and the middle is capped at 32. A scope that slugs away to nothing — a directory named
+`___` — leaves the bare `seat-3` and says so on stderr, rather than inventing a project
+name nobody could type.
 
 **Why it registers that name itself, before starting anything.** Since v2.12 the board
-*designates* the name half of an identity, and `QUARTERBACK_INSTANCE=seat-3` is only a
+*designates* the name half of an identity, and `QUARTERBACK_INSTANCE=seat-lexray-3` is only a
 **request** (`X-Agent-Name`) — one the MCP server makes and the lifecycle hook does not.
 Allocation is first-contact-wins, and the hook fires on `SessionStart`, so it usually wins.
 Measured against a live board:
@@ -331,33 +558,36 @@ Measured against a live board:
 | First contact | Later request | Board says |
 |---|---|---|
 | key only, no name (the hook) | — | `zeus/meadow-russet` |
-| key only, no name (the hook) | `seat-9` (the MCP server) | `zeus/meadow-russet` — **the request is ignored** |
-| key **and** `seat-9` together | — | `zeus/seat-9` |
+| key only, no name (the hook) | `seat-lexray-9` (the MCP server) | `zeus/meadow-russet` — **the request is ignored** |
+| key **and** `seat-lexray-9` together | — | `zeus/seat-lexray-9` |
 
 So a seat that does not ask up front comes up as two random words about as often as not,
 losing the one property the numbering was for. `qb-seat` makes a single `GET /whoami`
 carrying both headers before it execs, which settles the row; every process that follows
-resolves to it. It reads back what the board actually said and warns if that is not
-`seat-N`, which happens when the key was bound to a designated name on some earlier run —
-allocation hands a returning key the name it already had, and a request cannot displace one
-that exists.
+resolves to it. It reads back what the board actually said and warns if that is not the name
+it asked for, which happens when the key was bound to a designated name on some earlier run
+— allocation hands a returning key the name it already had, and a request cannot displace
+one that exists.
 
 *Addressing was never at risk either way*, and that is worth knowing before someone
 re-derives the worry: the board resolves `machine/key` as a permanent alias, so an ask sent
-to `zeus/meadow-russet` is returned by a poll that asks for `to=zeus/seat-3`. This is about
-the name a human types and reads on a status bar.
+to `zeus/meadow-russet` is returned by a poll that asks for `to=zeus/seat-lexray-3`. This is
+about the name a human types and reads on a status bar.
 
-**Two panes on one seat number is refused, and the board cannot be the one to refuse it.**
+**Two panes on one seat is refused, and the board cannot be the one to refuse it.**
 They export the same instance, so they send the same key, so the board hands them *one*
 identity — from its side they are indistinguishable by construction. They then share the
 ask-poll cursor, and whichever polls first swallows the other's mail: the exact bug the
 per-seat instance exists to prevent, one level down, and invisible because both seats
 otherwise work. So the check is local, where the panes actually are. `qb-seat` records its
-pid in `$XDG_RUNTIME_DIR/qb-seat-<n>.pid` — or, on a machine with no `XDG_RUNTIME_DIR`
+pid in `$XDG_RUNTIME_DIR/qb-<seat name>.pid` — or, on a machine with no `XDG_RUNTIME_DIR`
 (macOS, most containers, ssh onto a box with no systemd user session), in
-`${TMPDIR:-/tmp}/qb-seat-<uid>-<n>.pid`, where the uid is in the name because `/tmp` is
-shared and a marker there is not. It exits **3** if a live process already holds that
-number. A marker left by a seat that died is taken over rather than honoured, and
+`${TMPDIR:-/tmp}/qb-<uid>-<seat name>.pid`, where the uid is in the name because `/tmp` is
+shared and a marker there is not. The marker is keyed on the **whole name** and not on the
+bare number, because the two have to agree or the guard is protecting something other than
+the identity it describes — a marker on the number alone refused the second screen's seat 1
+while the board would happily have given it its own identity. It exits **3** if a live
+process already holds that seat. A marker left by a seat that died is taken over rather than honoured, and
 `QB_SEAT_FORCE=1` overrides the refusal for a pid that has since been reused by something
 unrelated — noisily, on stderr, because being wrong about that is the shared-inbox bug
 with nothing on screen.
@@ -390,6 +620,7 @@ per-branch database), assign work, or drive the agent past starting it.
 | `QB_SEAT_REPO` | the pane's cwd | Where the seat works; the layout normally sets the cwd instead |
 | `QB_SEAT_BRIEF` | the built-in brief | Replaces it wholesale; empty means no brief at all |
 | `QB_SEAT_AGENT` | `claude` | The agent to start |
+| `QB_SEAT_SCOPE` | the repository directory's name | The project half of `seat-<scope>-<n>`, which is what lets two screens each hold a seat 1. Slugged to what the board will take as a name; set it when two screens share one repository, or set it **empty** for the machine-wide numbering this had before #208 |
 | `QB_SEAT_FORCE` | unset | Start anyway when this seat number looks already taken. Truthy values only (`1`, `yes`, `true`, `on`) — `QB_SEAT_FORCE=0` leaves the guard on |
 | `QB_SEAT_YOLO` | **on** | Permission prompts. A seat starts with them off (`--dangerously-skip-permissions`) because nobody is watching the pane to answer one; `QB_SEAT_YOLO=0` (or any of `no`, `false`, `off`) gives them back. The flag is claude's spelling: point `QB_SEAT_AGENT` at a wrapper for anything else |
 | `QUARTERBACK_BASE_URL`, `QUARTERBACK_TOKEN` / `QUARTERBACK_TOKEN_CMD` | from the config file | The board to register the name with |
@@ -417,7 +648,29 @@ qb-seats --staged     # built, each seat waiting on Enter
 qb-seats --no-yolo    # seats that stop and ask, as agents normally do
 qb-seats --add        # add a seat to a running screen
 ssh box -t qb-seats   # reattach from anywhere
+qb-b list             # the screens that are up, numbered
+qb-b resume 2         # reattach to the second of them, from any directory
 ```
+
+`qb-seats` on its own reattaches to the screen for **the repo you are standing in**, which
+is the one thing the shell after a dropped ssh link cannot be relied on to be. `list` and
+`resume` are for that shell: neither needs a repo or a `-C`, because a screen already knows
+the directory it was built in. `resume` takes the number from the list or the screen's name,
+and with exactly one screen up it takes no argument at all.
+
+A screen is recognised by a pane carrying `@qb_seat`, never by its name — `-s` takes
+anything, the fleet's own screen is `qbseats` rather than `seats-nix-fleet`, and tmux
+silently renames what it will not take verbatim. So the list is read back from tmux and can
+only print names that really exist, which also makes it the way to reattach to a screen tmux
+renamed under you.
+
+A screen also records **what its seats are called**: `@qb_repo` is the repository it was
+built in, and `@qb_scope` is the explicit `QB_SEAT_SCOPE` if it was given one. Both are set
+on the session — `--add` puts `@qb_scope` on the pane it creates instead, so it does not
+rewrite the session under seats already working in it — and together they are how anything
+reading the screen from outside turns a pane into a board identity. `list-panes -a` is the
+whole tmux server, so since #208 the seat number alone no longer says which seat a pane is;
+the dashboard's SEATS panel and its FLEET-row jump both go through this.
 
 One tmux session: N panes each running `qb-seat <n>`, and one full-width pane along the
 bottom running `qb-board --follow`. Every seat gets the **same** brief — read the board,
@@ -477,6 +730,26 @@ the tmux cursor to that seat's pane, a claim shows its note, a plan item explain
 where it is, a PR or an issue opens on GitHub. `qb-dash` is the same five views rendered
 without interaction, for a terminal that will not forward mouse events.
 
+**The top line is the ceiling every pane below it works towards.** The seats spend one
+Claude subscription between them, so the five-hour and weekly caps are a fleet-wide number
+that none of the tables can show — and six seats working a plan in parallel is exactly the
+way to spend a five-hour window in forty minutes. It reads `5h ██████░░░░ 64% 3h57m  7d
+███░░░░░░ 41% 5d8h`: the share spent, and when it comes back. Green to yellow at 70% and
+red at 90%, or sooner if the endpoint's own severity says so. A weekly cap scoped to one
+model appears under that model's name once it has been spent against; at zero it would be
+noise, so it is left out.
+
+The figures come from the same endpoint `/usage` reads, so a seat and the dash cannot
+disagree, and an install authenticating with an API key has no subscription caps to report —
+that is a missing line, not an error. **The endpoint rate-limits harder than a dashboard's
+instincts suggest**: five calls inside ten minutes earned a 429 while this was being built.
+So the interval is 3 minutes and it is enforced in `~/.cache/quarterback/limits.json` rather
+than in each process's timer — three seat screens are three dash processes, and a per-process
+clock cannot hold a machine-wide budget. A failed call keeps showing the last figures, which
+are minutes old and still roughly true; past ten minutes the line appends a dim `?` rather
+than pretending. A 429 backs off for ten minutes, because the failing call is itself the
+thing being rate limited.
+
 **Clicking starts work, not just navigation.** Each PR row carries a `⚖` and each issue row
 a `⚒`; clicking one opens a confirmation showing the exact command, and confirming runs
 `/panel-review-pr <n>` or `/fix-issue <n>` in a detached tmux window of its own — the same
@@ -523,20 +796,61 @@ Adding another verb is three things: an entry in `BINDINGS`, an `action_*` metho
 it wants an icon — a column, since a click carries the column it landed in and that is how
 one row offers more than one verb.
 
-Not wired into `qb-seats` yet. `qb-dash` is a **launcher**, not the dashboard: the dashboard
-is Python needing `rich`, `textual` and `mcp_server`, none of which a plain `python3` has, so
-a shebang would be rewritten by `patchShebangs` to an interpreter that dies on the first
-import. It hunts for one that can, the way `qb-board` does — `QB_DASH_PYTHON` names one
-outright, `QUARTERBACK_REPO` points at a checkout whose `mcp/.venv` is built. Until
-`mcp_server` is packaged, that venv is the only thing that satisfies it. Bring one
-up beside a running screen with `harness/dev/seats-extras.sh <session> <width>`, which also
-relabels the board pane — that script hardcodes local checkout paths behind
-`QB_MCP_CHECKOUT` and is developer scaffolding, not something to ship.
+`qb-seats` builds it. A screen is seats across the top, the dash down the right, and the
+tape full width along the bottom — the dash reports what is true now, the tape what just
+happened, and a screen wants both. `QB_SEATS_DASH` names the command; **set it to the
+empty string for a screen with no dash**. The default is the plain `qb-dash` rather than
+the nicer clickable `qb-dash-tui`, because the TUI crashes with `DuplicateKey` once a
+second screen exists (#209, underlying cause #208) — `QB_SEATS_DASH=qb-dash-tui` opts in,
+and it should become the default once that is fixed. Nothing falls back to the TUI on its
+own, not even when `qb-dash` is the one that is missing: with neither installed the pane
+holds a shell and a line saying which command to set, rather than the screen quietly
+being one pane short.
 
-Adding the dash also needs a wider `pane-border-format` than `qb-seats` sets: its own
-prints `board` for any pane with no seat number, so a second unlabelled pane claims that
-name. The dev script widens it to fall through to a `@qb_label` option; that belongs in
-`qb-seats` proper once this settles.
+`QB_SEATS_DASH_SIZE` is its width in columns, default 78 — what the dashboard's own table
+wants before it wraps — **and never more than a third of the window**. That ceiling is
+the interesting half: a client attaching resizes the window and rescales every pane in the
+dash's row, so the width has to be reasserted afterwards rather than at build time, and 78
+columns reasserted on a 100-column terminal leaves the two seats 19 columns and one. A
+narrow terminal therefore costs dash, not seats, and `qb-seats` says so on stderr when the
+clamp bites. This is also the first release where **a screen loses columns by default**:
+existing callers get seats a third narrower than before, and `QB_SEATS_DASH=` is how to
+have the old screen back.
+
+The width is per-screen state, read from the environment once when the screen is built and
+recorded on the pane. So `--add` and the seat bar's ✕ put the dash back to the width *that
+screen* asked for — including one set by dragging the border, which a reflow will not
+undo — rather than to whatever `QB_SEATS_DASH_SIZE` says in the shell that happened to run
+them. `--add` never *creates* a dash: a screen built with `QB_SEATS_DASH=` stays a screen
+with no dash until it is rebuilt.
+
+`qb-dash` is a **launcher**, not the dashboard: the dashboard is Python needing `rich`,
+`textual` and `mcp_server`, none of which a plain `python3` has, so a shebang would be
+rewritten by `patchShebangs` to an interpreter that dies on the first import. It hunts for
+one that can, the way `qb-board` does — `QB_DASH_PYTHON` names one outright,
+`QUARTERBACK_REPO` points at a checkout whose `mcp/.venv` is built.
+
+Prefer the INSTALLED dash over a checkout, which is why `qb-seats` resolves it that way: a
+uv-standalone python has no CA bundle, and a dash running under one reports "board
+unreachable" against a board that is up, beside a shell where the same URL works.
+
+This used to be `harness/dev/seats-extras.sh`, which stapled two unlanded worktrees
+together for a smoke test and hardcoded both paths. It is gone; the lessons it paid for —
+place the dash AFTER `select-layout` and never spread the window afterwards, reassert the
+width because attaching redistributes the row — are comments in `qb-seats` and assertions
+in `harness/tests/test_qb_seats.py`. The dev script only ever produced the right width
+because a human ran it by hand *after* attaching; the reassert is a `window-resized` hook
+precisely so that nobody has to.
+
+That hook has to name a `qb-seats` by absolute path, because a `run-shell` in a hook
+inherits the tmux *server's* PATH and the server usually predates anything that put this
+harness on one. Which copy is not obvious, and getting it wrong is silent: PATH's `qb-seats`
+is preferred everywhere else, so mid-rollout the working tree installed a hook pointing at
+an *installed* copy with no `--dash-fit` — which exits 2 into a `run-shell -b` that discards
+both streams, on every resize, saying nothing. So the copy is asked before the hook goes in:
+PATH's if it answers the flag, otherwise the one that is running, and otherwise no hook at
+all plus a line on stderr naming what it tried. A screen that does not re-fit is honest; a
+hook that fails invisibly is not.
 
 ## How it works
 
@@ -611,10 +925,10 @@ Keys the script reads: `project`, `framework`, `base_port`, `app_port`,
 `server.{workers_env,workers_default}`, `env.copy_from`, `workspace.{enabled,editor_cli}`,
 and the arrays `symlinks`, `copies`, `reserved_names`, `gitignore_additions`.
 
-### Two prerequisites for database isolation
+### Three prerequisites for database isolation
 
-Both are easy to miss, and missing either gets you a worktree that *looks* isolated while
-running against shared data.
+All three are easy to miss, and missing any of them gets you a worktree that *looks*
+isolated while running against shared data — or, for the third, no usable worktree at all.
 
 **1. The main checkout needs a `.env`.** It is the file `create-worktree` copies into the
 worktree and then rewrites the database name in. There is nothing else for it to derive
@@ -622,7 +936,24 @@ credentials from, so with no `.env` the DB step has nothing to copy and says so 
 `cp .env.example .env` is part of setting a repo up, not an optional nicety. (A repo that
 keeps its env elsewhere can point `env.copy_from` at that file instead.)
 
-**2. Your test suite must honour that `.env`.** This is the one that bites hardest, because
+**2. That `.env` must actually name the database.** `create-worktree` has to know which
+database to copy, and it looks in two places: `database.url_env` (default unset) and
+`database.name_env` (default `POSTGRES_DB`). Declaring the first no longer disables the
+second — it *cascades*, so a repo whose URL is assembled at runtime, or that keeps the name
+in `docker-compose.yml` and only the password in `.env`, resolves through `POSTGRES_DB`.
+quarterback itself is that shape: its `.env` carries `POSTGRES_PASSWORD` and nothing else,
+so isolated mode cannot work here until `POSTGRES_DB=quarterback` is added to it.
+
+When neither variable is set the run stops at the database step and names both variables and
+the file it read. It stops *after* the git worktree exists, so it also says the worktree is
+incomplete and gives the two commands out — a directory with a checkout but no `.venv`
+symlink, no port and no `CLAUDE.local.md` looks provisioned enough to `cd` into and then
+fails later for reasons that have nothing to do with the database. Before this was fixed the
+run died on `MAIN_DB_NAME: unbound variable` instead: the guard written to explain the case
+was the first thing to dereference the unset variable, so `set -u` killed the script at the
+exact line that existed to say what was wrong.
+
+**3. Your test suite must honour that `.env`.** This is the one that bites hardest, because
 provisioning succeeds and the damage happens later. A suite that decides its own database
 URL — the near-universal
 

@@ -67,7 +67,11 @@ GET   /stream            (SSE; ?since=<id> to replay backlog then go live)
 PUT   /blob/{sha}        (body = bytes; sha256 verified)  -> {sha, size, created}
 GET   /blob/{sha}                                          -> bytes | 404
 POST  /lease             { session, device, ttl=300, cwd?, repo?, branch?, title?, recap?,
-                           model? }                     -> {lease_id, expires, renewed}
+                           model?, state? }             -> {lease_id, expires, renewed}
+                         (state = working|waiting|input — what the holder is DOING.
+                          Returned by /active and /overlap with a `state_at`, and the
+                          two are read together: `stalled` is what a reader concludes
+                          from an old `working`, never something a holder reports.)
 POST  /lease/renew       { lease_id }
 POST  /lease/release     { lease_id }
 POST  /handoff           { session, blob, cwd?, title?, recap?, model? }
@@ -147,6 +151,17 @@ GET   /review/findings   ?repo=&pr=&limit=                       (one PR's findi
                                                                   was borne out, and each
                                                                   defect's outcome beside
                                                                   its status)
+                          the top-level `stopped`/`stop_reason`/`stop_confident`/`stop_veto`
+                          summarise ONE cycle: null unless the window holds no more
+                          than one, which `cycles` counts (a run carrying no cycle is
+                          skipped, not counted) (#44). Read all four with an identity
+                          test, never for truthiness — null is "no attributable cycle
+                          said", which is neither `false` nor `[]`. `cycles <= 1 and
+                          not truncated` is the only pair that speaks for the PR's
+                          whole history; `runs[]` carries each round's own four
+                          unaltered at any `limit` and is usually the better answer.
+                          The handler's docstring is the full contract — this is the
+                          summary of it, not a second copy
 GET   /panel             (browser view — the leaderboard)
 
 # the plan: what is next, in what order, and who has it (v2.39)
@@ -577,6 +592,51 @@ full — including what was broken before it, which is the part no diff recovers
   a repo name, and treat the string itself as untrusted input on the way back in: the board bounds
   its length at `PATH_MAX` and normalises nothing else, so quote it, and do not hand a value
   beginning with `-` to `git` as anything but an operand.
+- **v2.51** — reviewers can read the code, per repo, on by default (#113's second half).
+  `review_panel.reviewer_code_access` runs each seat that can take it in a checkout of the
+  PR at its head — fetched from GitHub's tarball endpoint, never from the main checkout,
+  whose branch is not the PR's. It buys ONE seat: only `claude` can be told "read but do
+  not execute" (`--allowedTools Read Grep Glob`, no `Bash`), while codex's only read path
+  is its shell, pi's `--no-tools` is all-or-nothing and antigravity has no tools at all —
+  so the other three keep the empty sandbox. The judge reads too, and is the party that
+  most needed to: the wrong findings #113 was filed over were *confirmed*, not merely
+  raised. Vendor convention files are stripped at every depth before any CLI starts
+  (symlinks unlinked, never followed), which is a denylist and says so. Every failure
+  degrades to reviewing from the diff, recorded per seat — and the board now stores that
+  rather than dropping it at ingest (migration `0023`). Measured at roughly 6x the cost in
+  money for one seat, so `reviewer_code_budget_usd` can cap it; uncapped by default,
+  because reaching a cap is a lost seat rather than a cheap one. `--no-code-access` opts
+  out for one run; `false` is what a repo taking untrusted contributions sets.
+- **v2.50** — the coverage veto stops reporting a constant. `confident` is `not veto`, so a
+  veto line that fires every round makes a confident stop unreachable rather than rare. Two
+  did: a seat that cannot read the code (every seat — an empty sandbox and no tools) declaring
+  gaps about code outside the diff, and antigravity's argv ceiling, which the kernel sets at
+  120,000 bytes. On PR #160's round 1 that was 16 of 19 veto lines, nine of them asking about
+  a file in this repo that `grep` answered in four minutes. Both are now recorded state
+  (`ReviewerRun.code_blind`, `argv_clamp`) rather than matched on message wording, both are
+  still reported, and both have a floor so exempting seats one at a time cannot empty the veto
+  on a round nothing read. Truncation by a `max_diff_chars` somebody typed still vetoes. First
+  half of #113; code access as a per-repo setting is the second and lands separately.
+- **v2.49** — the guard that could not fire. `create-worktree`'s isolated-DB step had a
+  `die` whose whole job was to explain a missing database name, and `set -u` killed the
+  script at that guard's own dereference instead — `MAIN_DB_NAME: unbound variable`, at the
+  exact line written to say what was wrong. One initialisation makes the message reachable.
+  `database.url_env` and `database.name_env` now cascade rather than excluding each other,
+  so a repo that assembles its URL at runtime (or keeps the name in docker-compose) can use
+  an isolated database. And because the step is 3 of 10, a failure there left a checkout
+  with no `.venv`, port or context file: it now says the worktree is incomplete and gives
+  the two commands out, naming the branch rather than the directory.
+- **v2.48** — a lease says what its holder is doing, not just where. `POST /lease` takes
+  `state` (`working | waiting | input`) and `/active` and `/overlap` return it with `state_at`,
+  because a state is only as good as its age: `working` last reported twenty minutes ago
+  describes a pane that looks busy and has not moved — the failure v2.46 named when it took the
+  permission prompts away. Neither timestamp already on the row can date it (`acquired_at` is
+  fixed at first claim, `expires_at` moves on every heartbeat), so the pair travels together and
+  each reader picks its own threshold. `stalled` is deliberately unreportable: it is a conclusion
+  drawn from a state and its age, and a holder cannot know it is in the state where it has
+  stopped talking. Both dashboards grow a `state` column and a seat cell on the tmux bar takes
+  its colour from `@qb_state`, set by the lifecycle hook — which is also the only thing that
+  knows a turn ended, so nothing here infers it.
 - **v2.47** — the dashboard grows hands, and its tests start running. The SEATS panel
   closes a seat and adds one, and tmux grows a clickable bar of the same widgets above the
   seat row — both through `qb-seat-click`, which `qb-dash-tui` had been calling since the
@@ -586,6 +646,19 @@ full — including what was broken before it, which is the part no diff recovers
   trap that made the ＋ do nothing in silence: a mouse binding gets no `$TMUX_PANE` and the
   tmux server's PATH usually predates the harness. And the dashboard's seven tests, which had
   skipped every CI run since they were written, now execute.
+- **v2.53** — a pinned reviewer model no host can serve stops costing the whole seat. A model
+  pin is one value for the fleet and a *deployment* is per-host: codex on the work box routes
+  through an employer gateway deploying `gpt-5.5` while `.harness-rules` pins `gpt-5.6-luna`,
+  so the seat 404s and a four-vendor panel silently became one — on PR #207, 25 findings all
+  from `claude`, reviewing a PR `claude` wrote, and on #217 a round where nobody ran at all.
+  Both codex pins are refused here independently (the `max` effort as well as the model), so
+  each is now lowered on its own, at most once, and the header says which
+  (`codex (CLI default; pinned gpt-5.6-luna unavailable, effort max unsupported)`), with
+  the substitution recorded as state in the payload so the board never averages a swapped run
+  in as the pinned one. Both halves of the old failure were the wrong stream: codex writes its
+  errors to stdout under `--json` while stderr holds a progress banner, so the diagnosis said
+  `exited 1 (Reading prompt from stdin...)` about a 404 — and the retry decision read the same
+  empty stream, retrying a settled failure at ten minutes a go.
 - **v2.46** — a screen you ask for by number, and seats that do not stop to ask. `qb-b 3`
   is the seat count, the default is 3 and the ceiling is 10; past five, seats are five across
   and two down, built rather than left to `select-layout tiled`, which picks the wrong axis
@@ -610,6 +683,96 @@ full — including what was broken before it, which is the part no diff recovers
   this machine's checkout, cherry-pick a located SHA, resume a session — and the refusals those
   inherit, where "could not tell" counts as a no. Not a third client: it consumes the same
   `mcp/mcp_server/client.py` the MCP server does, which is also how that package finally got CI.
+- **v2.52** — the panel decides whether the round is worth running. It used to dispatch every
+  configured seat at full effort whatever the diff: on PR #137 that was four seats against
+  763,375 chars, 6.4× the argv ceiling of the one seat whose prompt travels in argv, on a change
+  that was a *pure move* — `panel.py` split into six modules with nothing retyped. Every
+  relocated line appears twice in a diff, so the bulk of it was code already in `main` and
+  already reviewed, and a finding about it is a finding about the base branch. The token cost was
+  the second problem; the first is that a truncated read which produces findings is worse than no
+  review, because the next step briefs a fixer to resolve every one of them. The panel now
+  measures **shape** as well as size — a move's added lines are a near-permutation of its deleted
+  ones — and either reads the diff, reads a **manifest** of a move (what moved where, what did not
+  survive, what changed besides moving, which definitions the change adds in more than one
+  place), or **refuses** the round loudly: printed, `reviewed: false`, recorded on the board, and
+  posted to the PR under `--post`, because "no review" must never read as "clean". A refusal still
+  reads the CI gate, which no diff size can defeat. `--force` overrides it and is recorded doing
+  so. None of it fires where no ceiling was declared: this decides *whether to start*, never *what
+  to send*, and v2.16's refusal of a default diff budget stands.
+  It also stops the panel asking seats that are not here: a seat this box cannot run stops declaring things about the round. The panel
+  already knew an absent reviewer CLI is a fact about the *host* and must not veto a confident
+  stop, but `budgets` was still built from the *configured* set — so a seat with no CLI
+  acquired a diff budget, an argv clamp, a `config_notes` line saying how much diff it "gets",
+  and a `truncated: true` record. That last one was inherited: `load_baseline` banked the round
+  as truncated and the next round reported code as "read by no round of this cycle" when nothing
+  had been cut, which is a `confident` veto — so every multi-round cycle on such a box was
+  non-confident from round 2 onward, permanently. `seat_installed` now lives in `panel_core`
+  beside `CLI_BIN`, is read once per round, and `budgets`, `run_seat` and the judge's own
+  `adjudicate` all share it rather than keeping their own copies. The absent seat is still
+  dispatched and still records itself absent; it just gets no budget — and with no budget, no
+  rendered prompt it was never going to read. In the payload it records a `null` budget rather
+  than losing its `diff_budgets` key, so nothing downstream starts raising `KeyError` on the
+  unattended hosts this is for. `load_baseline` banks a round as truncated on
+  `truncated and not argv_capped and not absent` — two exemptions, each keyed on its own
+  recorded field, and neither subsuming the other: `argv_capped` (v2.50) covers only what the
+  kernel bounded, so an absent `pi` or `codex` with a configured budget under the target would
+  still bank a phantom round under it alone. A seat that was installed, read a real prefix and
+  then crashed still counts, under both. The sibling `truncated_any`, which decides whether a
+  round CLOSES earlier gaps, exempts `absent` but not `argv_capped`: a capped seat ran and saw
+  a prefix, so the round did not read its target whole; an absent one is no evidence either
+  way.
+- **v2.54** — one cycle's ending stops describing another's. `GET /review/findings` took its
+  `stopped`/`stop_reason`/`stop_confident`/`stop_veto` summary from the newest run in the window
+  whatever cycle that run belonged to, so a second loop — or one review-only `/panel` read — made
+  an older cycle read as complete, unfinished or unconfident on somebody else's evidence. All four
+  are null now unless the traced runs hold no more than one cycle, which `cycles` counts — a run
+  carrying no cycle ended none, so it is skipped rather than counted against the loop it sat
+  beside. They are three-state: null is "no attributable cycle said", which is neither `false`
+  nor `[]`, so read them with an identity test.
+- **v2.55** — a stub a test writes at runtime cannot name `/usr/bin/env`. There is none inside a nix
+  build sandbox, and `patchShebangs` reaches the scripts in `harness/bin` at build time but never a
+  file written while a test runs — so 43 assertions in `test_qb_seat.py` failed `assert 126 == 0`,
+  and `create_worktree_nginx.test.sh` failed *silently*: `command -v docker` passes on a stub that
+  exists and is `+x`, the exec fails, and `create-worktree` then skips nginx exactly as designed,
+  leaving 18 assertions blaming innocent nginx code and a 7/25 score made entirely of negative
+  assertions that are trivially true when the suite does nothing. The rule is now asserted in the
+  `fake_bin` factory all four stub sites come through, not just written above them — reverting one
+  stub costs 52 errors locally, where the old comment cost nothing until a sandbox no CI job enters
+  (#179) went red.
+- **v2.56** — what this machine serves is one file per box, not one per checkout.
+  `.harness-rules` was read only from a repo root and nothing propagated it, so a fresh
+  worktree had no answer, resolved a seat to the fleet pin, and the provider refused it —
+  leaving an unpinned seat and an unattributable two-vendor comparison. The answer now
+  comes from `$QUARTERBACK_HARNESS_RULES` or `~/.config/quarterback/harness-rules.json`
+  for the whole box, with a repo's own untracked `.harness-rules` still winning per key.
+  One file per box is also what makes worktree-per-agent safe to turn on.
+- **v2.57** — a seat is its number *and* its project, so a second screen can start. `seat-<n>` made
+  the namespace the machine while `qb-seats` numbers every screen's seats from 1, so the second
+  screen on a box could not start a single seat — one screen per project, the obvious way to work a
+  fleet, was the one thing it could not do (#208). The guard was right (two panes on one seat share
+  a board identity *and* an ask cursor) and its key was too coarse, so the key grew a scope:
+  `seat-lexray-1` and `seat-nix-fleet-1` are two seats, `seat-lexray-1` twice is still one. The
+  scope defaults to the repository's directory name, slugged to what the board will take as a name;
+  `QB_SEAT_SCOPE` names it for two screens on one repo, and empty asks for the old machine-wide
+  numbering. The pane marker moved with it, because a marker on the bare number would refuse the
+  second screen's seat 1 while the board gave it its own identity — and the dashboard now tells two
+  screens apart instead of showing one screen's agent against the other's pane.
+- **v2.58** — a regression test has to fail first. Every fix command told the fixer to write
+  one; none asked whether it would have caught the defect it was written for. PR #90 is the
+  demonstration: a deliberate, docstring'd regression test passed because its fixture happened
+  to list two baselines in the working order, and the order-dependence it was written for had
+  to be found a round later in code that was already "covered". So `review-pr.md` (inherited by
+  `/panel-review-pr`), `fix-issue.md` and `fix-issue-here.md` now say to capture the **fix**
+  as a patch — not the test — remove it, and confirm each new test fails **on the assertion
+  that names the defect** before restoring and confirming green; `/review-pr` reports the
+  count. A patch rather than `git stash` because every worktree of a repo shares one
+  `refs/stash`, which this change discovered by losing its own working tree to a concurrent
+  agent in a sibling worktree (#210). A test for a path the
+  fix *created* is exempt and reports `red/green: N-A`, stated explicitly because an
+  instruction with no exemption for the legitimate case gets worked around rather than
+  followed — but shipped text that already existed is **not** exempt, since a test can assert
+  on it, as this change did to its own prompt and briefs. The panel's `REVIEW_PROMPT` also stops asking only whether a test is **absent** —
+  #90's fixture answered that correctly — and now asks whether a present test is load-bearing.
 - **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
   object store; wire `landed` refs to a cherry-pick helper.
 

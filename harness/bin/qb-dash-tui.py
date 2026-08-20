@@ -125,6 +125,10 @@ class Dash(App):
 
     CSS = """
     Screen { background: $surface; }
+    /* Hidden until the first fetch says there is something to show: an install
+       with no subscription token gets no blank row. */
+    #limits { height: 1; padding: 0 1; background: $panel; color: $text;
+              display: none; }
     #head { height: 1; padding: 0 1; background: $panel; color: $text; }
     #detail { height: auto; min-height: 1; padding: 0 1; background: $panel;
               color: $text-muted; }
@@ -174,10 +178,22 @@ class Dash(App):
         # or an agent claims an item — neither of which happens every four
         # seconds.
         self.plan_interval = plan_interval
+        # Slower again: a five-hour window does not move in four seconds, and
+        # this one is a call to Anthropic rather than to the board.
+        self.limits_interval = qd.LIMITS_EVERY
+        self.limits: list[dict] = []
+        self.limits_err: str | None = None
         self.client = None
         self.cfg = None
         self.rows: dict[str, dict] = {}       # row key → the record behind it
         self.seats: list[dict] = []           # the seat PANES, off tmux
+        # (machine, scope, seat number) -> the board's live agent. All three,
+        # because neither of the first two is enough on its own: `list-panes -a` is
+        # the whole tmux server and since #208 two screens can each hold a seat 1,
+        # and the BOARD is the whole fleet, where two machines can each hold a
+        # `seat-lexray-1`. Keyed on the number alone, one of those overwrites the
+        # other and a pane is shown a state that belongs to something else.
+        self.seat_states: dict[tuple[str | None, str | None, int], dict] = {}
         self.prs: list[dict] = []
         self.issues: list[dict] = []
         self.issue_err: str | None = None
@@ -200,6 +216,10 @@ class Dash(App):
     # ---- layout ---------------------------------------------------------
 
     def compose(self) -> ComposeResult:
+        # Above the board line, because it governs every pane below it: the seats
+        # spend one subscription between them, and the window they are working
+        # towards is the one number none of the tables can show.
+        yield Static("", id="limits")
         yield Static("quarterback — connecting…", id="head")
         with Vertical():
             yield Static("SEATS", classes="title", id="t_seats")
@@ -220,8 +240,8 @@ class Dash(App):
         yield Footer()
 
     def on_mount(self) -> None:
-        self.query_one("#seats", DataTable).add_columns("", "✕", "seat", "running", "where")
-        self.query_one("#fleet", DataTable).add_columns("who", "repo", "what", "ttl")
+        self.query_one("#seats", DataTable).add_columns("", "✕", "seat", "state", "running", "where")
+        self.query_one("#fleet", DataTable).add_columns("who", "state", "repo", "what", "ttl")
         self.query_one("#claims", DataTable).add_columns("who", "key", "left")
         self.query_one("#plan", DataTable).add_columns(
             "", "⚒", "repo", "ref", "title", "who")
@@ -234,10 +254,12 @@ class Dash(App):
                 Text(f"no board configured: {type(exc).__name__}", style="bold red"))
             return
         self.refresh_seats()
+        self.refresh_limits()
         self.refresh_board()
         self.refresh_plan()
         self.refresh_prs()
         self.refresh_issues()
+        self.set_interval(self.limits_interval, self.refresh_limits)
         self.set_interval(self.interval, self.refresh_seats)
         self.set_interval(self.interval, self.refresh_board)
         self.set_interval(self.plan_interval, self.refresh_plan)
@@ -250,6 +272,11 @@ class Dash(App):
     def refresh_seats(self) -> None:
         seats = qd.tmux_seats()
         self.call_from_thread(self.render_seats, seats)
+
+    @work(thread=True, exclusive=True, group="limits")
+    def refresh_limits(self) -> None:
+        limits, err = qd.fetch_limits()
+        self.call_from_thread(self.render_limits, limits, err)
 
     @work(thread=True, exclusive=True, group="board")
     def refresh_board(self) -> None:
@@ -285,14 +312,32 @@ class Dash(App):
         self.seats = seats
         table = self.query_one("#seats", DataTable)
         table.clear()
+        # More than one screen on this server means more than one seat 1, so the
+        # number stops being a name. Said only when it is true: on the ordinary
+        # single-screen box "seat 1" is what the pane border and the seat bar both
+        # call it, and renaming it here would be three spellings for one thing.
+        screens = {s.get("session") for s in seats}
         for s in seats:
-            key = f"seat:{s['seat']}"
+            # By PANE ID, not by seat number. Two screens each with a seat 1 gave
+            # this table the same row key twice, and a DataTable raises DuplicateKey
+            # rather than tolerating it — so the panel that exists to show the
+            # second screen was the thing that could not survive one (#208).
+            key = f"seat:{s['pane']}"
             self.rows[key] = s
             live = s.get("command") not in ("bash", "sh", "zsh", "fish", "")
+            # A pane can be running an agent and still be doing nothing you want
+            # to know about, or be waiting on you and look identical. `running`
+            # is tmux's answer (is a process there); `state` is the agent's own.
+            agent = self.seat_state(s)
+            word, style = qd.agent_state(agent)
+            scope = qd.pane_scope(s)
+            label = f"{scope} {s['seat']}" if len(screens) > 1 and scope \
+                else f"seat {s['seat']}"
             table.add_row(
                 Text("●" if live else "·", style="green" if live else "grey50"),
                 Text("✕", style="bold red"),                 # click to close it
-                Text(f"seat {s['seat']}", style="bold"),
+                Text(qd.clip(label, 13), style="bold"),
+                Text(word or "—", style=style),
                 Text(qd.clip(s.get("command") or "—", 12),
                      style="white" if live else "grey50"),
                 Text(qd.clip(os.path.basename(s.get("path") or "") or "—", 22),
@@ -305,10 +350,49 @@ class Dash(App):
         # it is dropped on the floor.
         self.rows["seat:add"] = {"add": True}
         table.add_row(Text(""), Text("＋", style="bold cyan"),
-                      Text("add seat", style="cyan"), Text(""), Text(""),
+                      Text("add seat", style="cyan"), Text(""), Text(""), Text(""),
                       key="seat:add")
         title = f"SEATS · {len(seats)}" if seats else "SEATS · none on this screen"
         self.query_one("#t_seats", Static).update(title)
+
+    def render_limits(self, limits: list[dict], err: str | None) -> None:
+        """Claude Code's own caps, as bars — `5h ████░░ 64% 3h57m  7d ██░ 41% 5d8h`.
+
+        A failed call keeps the last figures rather than blanking the line: they
+        are minutes old and still roughly true, and a line that vanished on every
+        hiccup would read as "no limits", which is the opposite of what it means.
+        An install with no subscription token has nothing here to show, and the
+        row is hidden outright rather than left blank.
+        """
+        if limits:
+            self.limits = limits
+        self.limits_err = err
+        try:
+            bar = self.query_one("#limits", Static)
+        except Exception:                         # noqa: BLE001 — a resize before mount
+            return
+        cells = qd.limit_cells(self.limits, max(20, self.size.width - 2))
+        bar.display = bool(cells)
+        if not cells:
+            return
+        text = Text()
+        for i, (label, glyphs, pct, reset, colour) in enumerate(cells):
+            if i:
+                text.append("  ")
+            text.append(label, style="bold grey70")
+            if glyphs:
+                text.append(f" {glyphs}", style=colour)
+            text.append(f" {pct}", style=f"bold {colour}")
+            if reset:
+                text.append(f" {reset}", style="grey50")
+        if err:
+            text.append(" ?", style="grey50")
+        bar.update(text)
+
+    def on_resize(self) -> None:
+        """Re-lay the bars to the new width — they are sized to the pane, and the
+        dash pane is resized every time the screen is."""
+        self.render_limits(self.limits, self.limits_err)
 
     def render_board(self, data: dict) -> None:
         head = self.query_one("#head", Static)
@@ -330,8 +414,10 @@ class Dash(App):
             self.rows[key] = a
             seat = qd.seat_number(a.get("holder"))
             who = (a.get("holder") or "?").split("/", 1)[-1]
+            word, style = qd.agent_state(a)
             table.add_row(
                 Text(qd.clip(who, 13), style="bold green" if seat else "bold"),
+                Text(word or "—", style=style),
                 Text(qd.clip(a.get("repo") or "—", 11),
                      style=qd.repo_colour(a.get("repo") or "—")),
                 Text(qd.clip(a.get("title") or a.get("branch") or "—", 40),
@@ -340,6 +426,18 @@ class Dash(App):
                 key=key,
             )
         self.query_one("#t_fleet", Static).update(f"FLEET · {len(agents)}")
+        # Keep what the board said about each SEAT, keyed by seat number, so the
+        # panel below can say what a pane is doing. The two panels answer
+        # different questions from different sources — tmux knows which panes
+        # exist, only the board knows what the agent in one is doing — and this
+        # is the single point where they meet.
+        # Stashed, not rendered: SEATS has its own refresh worker and re-entering
+        # its table from this one raises DuplicateKey mid-rebuild. The state
+        # appears on the next seats tick, which is seconds, and it is a state a
+        # human is reading rather than a countdown.
+        self.seat_states = {
+            (qd.seat_machine(a.get("holder")), qd.seat_scope(a.get("holder")), n): a
+            for a in agents if (n := qd.seat_number(a.get("holder"))) is not None}
 
         claims = sorted(data.get("claims", []), key=lambda c: c.get("expires") or "")
         ctable = self.query_one("#claims", DataTable)
@@ -560,6 +658,39 @@ class Dash(App):
             self.say(f"{tag} — done")
         self.refresh_seats()
 
+    def seat_state(self, seat: dict) -> dict:
+        """What the board says about the agent in this pane, or {}.
+
+        NARROW, THEN NARROW AGAIN, AND NEVER GUESS. Start from every agent with
+        this seat number; keep the ones in this pane's project, then the ones on
+        this machine; take the survivor only if there is exactly one. Each step is
+        skipped when it would leave nothing, which is what lets a pane that cannot
+        say which project it is in — a screen built before `@qb_repo` — still match
+        the only agent answering to its number.
+
+        Both narrowings earn their place, and one of them is why this is not just a
+        dict lookup. `list-panes -a` is the whole tmux server, so since #208 one box
+        holds `zeus/seat-lexray-1` and `zeus/seat-nix-fleet-1` at once; and the
+        BOARD is the whole fleet, so `zeus/seat-lexray-1` and `laptop/seat-lexray-1`
+        are both on it. Either collision, resolved by taking the first, is a wrong
+        answer that looks exactly like a right one.
+
+        The machine is this host's name as the harness reads it, which is a GUESS —
+        the board's machine name comes from the token map and need not be the
+        hostname. It can only ever narrow a set that was already ambiguous, so a
+        wrong guess costs the state cell and never fills it in with the wrong agent.
+        """
+        try:
+            number = int(seat["seat"])
+        except (KeyError, TypeError, ValueError):
+            return {}
+        here = getattr(self.cfg, "agent", None)
+        found = [(k, a) for k, a in self.seat_states.items() if k[2] == number]
+        scope = qd.pane_scope(seat)
+        found = [c for c in found if c[0][1] == scope] or found
+        found = [c for c in found if c[0][0] == here] or found
+        return found[0][1] if len(found) == 1 else {}
+
     def seat_session(self) -> str | None:
         """Which screen to act on: the one the seats are in, not the cursor's.
 
@@ -722,9 +853,9 @@ class Dash(App):
         The pane gets @qb_label and NOT @qb_seat, which is what keeps it out of
         the way of everything else: qb-seats' --add, qb-seat-click's reflow and
         the seat bar all select on @qb_seat, so none of them counts a review as
-        a seat or offers to start an agent in it. @qb_label rather than a name
-        of its own because dev/seats-extras.sh already labels the dash and the
-        tape that way, and the pane border should read one option, not two.
+        a seat or offers to start an agent in it. @qb_label rather than a name of
+        its own because qb-seats already labels the dash and the tape that way,
+        and the pane border should read one option, not two.
 
         With no seat row to join — the dashboard run from a bare terminal, or a
         screen whose seats have all been closed — it falls back to a window
@@ -760,7 +891,7 @@ class Dash(App):
 
     def click_agent(self, agent: dict) -> None:
         seat = qd.seat_number(agent.get("holder"))
-        if seat is not None and self.jump_to_seat(seat):
+        if seat is not None and self.jump_to_seat(seat, qd.seat_scope(agent.get("holder"))):
             self.say(f"jumped to seat {seat} — {agent.get('holder')}")
             return
         self.say(
@@ -769,23 +900,45 @@ class Dash(App):
             f"{agent.get('cwd') or '?'}"
         )
 
-    def jump_to_seat(self, seat: int) -> bool:
-        """Move the tmux cursor to the pane wearing @qb_seat = seat."""
+    def jump_to_seat(self, seat: int, scope: str | None = None) -> bool:
+        """Move the tmux cursor to the pane wearing @qb_seat = seat.
+
+        `scope` says which screen, and it has to: a FLEET row carries a board
+        identity, two screens can each have a seat 1 (#208), and jumping to
+        whichever tmux listed first is a jump to the wrong project half the time.
+        Narrowed and never guessed, exactly as seat_state does it — a screen too
+        old to carry `@qb_repo` still gets a working click when it is the only
+        candidate, and two panes that cannot be told apart get none.
+
+        No machine to narrow on here, and none wanted: every pane tmux lists is on
+        this box by definition.
+
+        Tab-separated, not space: `@qb_repo` is a filesystem path and a directory
+        with a space in it made the previous split return four fields, which matched
+        no seat at all.
+        """
         if not os.environ.get("TMUX"):
             return False
         try:
             out = subprocess.run(
-                ["tmux", "list-panes", "-a", "-F", "#{pane_id} #{@qb_seat}"],
+                ["tmux", "list-panes", "-a", "-F",
+                 "#{pane_id}\t#{@qb_seat}\t#{@qb_repo}\t#{@qb_scope}"],
                 capture_output=True, text=True, timeout=5,
             ).stdout
-            for line in out.splitlines():
-                parts = line.split()
-                if len(parts) == 2 and parts[1] == str(seat):
-                    subprocess.run(["tmux", "select-pane", "-t", parts[0]], timeout=5)
-                    return True
         except Exception:                          # noqa: BLE001
             return False
-        return False
+        found = [p for p in (line.split("\t") for line in out.splitlines())
+                 if len(p) == 4 and p[1] == str(seat)]
+        found = [p for p in found
+                 if qd.pane_scope({"repo": p[2], "scope": p[3]}) == scope] or found
+        pane = found[0][0] if len(found) == 1 else None
+        if pane is None:
+            return False
+        try:
+            subprocess.run(["tmux", "select-pane", "-t", pane], timeout=5)
+        except Exception:                          # noqa: BLE001
+            return False
+        return True
 
     def open_pr(self, pr: dict) -> None:
         self.open_url(f"https://github.com/{pr.get('repo') or qd.REPO}/pull/{pr.get('number')}")

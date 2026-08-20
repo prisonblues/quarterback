@@ -30,6 +30,21 @@ class Lease(Base):
     title: Mapped[str | None] = mapped_column(Text)            # CC ai-title
     recap: Mapped[str | None] = mapped_column(Text)            # compact-summary head / last prompt
     model: Mapped[str | None] = mapped_column(Text)            # model id from last assistant msg
+    #: What the holder is doing right now: working | waiting | input. Reported by
+    #: the lifecycle hook, never inferred here.
+    #:
+    #: ``state_at`` is not decoration and not ``updated_at``. A state is only as
+    #: good as its age — "working" said twenty minutes ago describes a pane that
+    #: looks busy and has not moved — so the pair travels together and every
+    #: consumer decides staleness for itself. It cannot be recovered from the
+    #: lease's own timestamps: ``acquired_at`` is fixed at first claim and
+    #: ``expires_at`` moves on every heartbeat whether or not the state changed.
+    #:
+    #: ``stalled`` is deliberately NOT one of the values. It is what a reader
+    #: concludes from a state and its age, and a board that stored it would be
+    #: asserting something about a holder that stopped talking to it.
+    state: Mapped[str | None] = mapped_column(Text)
+    state_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     ttl_seconds: Mapped[int] = mapped_column(BigInteger, nullable=False)
     acquired_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

@@ -533,6 +533,49 @@ def detected_asker() -> str:
     return next((seat for var, seat in ASKER_ENV.items() if os.environ.get(var)), "")
 
 
+def _ask_payload_defaults() -> dict:
+    """Every key an ask payload carries, valued as "this ask never got that far".
+
+    The review path's `_payload_defaults` exists for a reason this path had not yet
+    learned: the REFUSAL is the payload a consumer is least likely to have tested
+    against, and it was the one hand-written short — thirteen keys against the
+    nineteen a real ask emits, so `context`, `context_problems`, `quorum`,
+    `threshold`, `answered`, `counts` and `seats_override` raised KeyError on exactly
+    the exit where the consumer has least else to go on. Spread into BOTH payloads,
+    so parity holds by construction rather than by two literals being remembered
+    together, which is what `test_the_ask_payload_has_the_same_shape_on_both_exits`
+    pins.
+    """
+    return {
+        "kind": "ask",
+        "repo": None,
+        "github": None,
+        "pr": None,
+        "premise": None,
+        "context": [],
+        "context_problems": [],
+        "asker": None,
+        # `reviewed` is about whether SEATS WERE CALLED, not whether they agreed. The
+        # refusal is the only exit where it is false.
+        "reviewed": False,
+        "skip_reason": None,
+        # Null rather than one of the four verdicts: nothing was asked, so there is
+        # nothing for `unchallenged` ("they answered and it did not resolve") to be
+        # true of.
+        "verdict": None,
+        "verdict_reason": None,
+        "quorum": None,
+        "threshold": None,
+        "answered": 0,
+        "counts": {},
+        "answers": {},
+        "seats_selected": [],
+        "seats_override": None,
+        "config_notes": [],
+        "run_key": None,
+    }
+
+
 def ask(repo_name: str | None, premise: str, contexts: list[str] | None = None,
         reviewers: str | None = None, pr_number: int | None = None,
         json_out: bool = False, json_file: str = "", record: bool = True,
@@ -558,10 +601,37 @@ def ask(repo_name: str | None, premise: str, contexts: list[str] | None = None,
     cfg = load_repo_cfg(repo_name)
     repo_name = cfg.get("name") or repo_name
     rev, panel = cfg["reviewers"], cfg["review_panel"]
-    selected, override_note = select_reviewers(rev, reviewers)
     # Progress and warnings go to stderr under --json, so stdout is the payload
     # and only the payload — the same rule the review path follows.
     chatter = sys.stderr if json_out else sys.stdout
+
+    # Same gate as the review path, for the same reason and through the same
+    # predicate. An ask is cheaper than a round and it is not less configured: which
+    # seats answer, on which models, at which effort, and how many of them make a
+    # verdict (`ask_quorum`/`ask_threshold`) all come out of the rules file — so a
+    # repo that has none gets a tally struck by a panel nobody chose, and the whole
+    # standing of an ask is that it is evidence about a premise. `reviewed: false`
+    # and a `skip_reason`, not recorded, exit 0: the round's shape, because a
+    # consumer must be able to tell "asked and unresolved" from "never asked".
+    refusal = review_refusal(cfg)
+    if refusal:
+        print(f"[{repo_name}] {refusal} — refusing to ask. No seat was called.",
+              file=chatter)
+        payload = {
+            **_ask_payload_defaults(),
+            "repo": repo_name, "github": cfg["github"],
+            "pr": pr_number, "premise": premise,
+            "reviewed": False, "skip_reason": refusal,
+            "verdict_reason": refusal,
+            "config_notes": [refusal],
+            "run_key": run_key,
+        }
+        write_failed = write_payload(json_file, payload)
+        if json_out:
+            print(json.dumps(payload, indent=2))
+        return finish(write_failed)
+
+    selected, override_note = select_reviewers(rev, reviewers)
 
     notes: list[str] = []
     if "sonarqube" in selected and reviewers:
@@ -707,7 +777,11 @@ def ask(repo_name: str | None, premise: str, contexts: list[str] | None = None,
 
     tally = ask_tally(answers, quorum, threshold, asker)
     payload = {
-        "kind": "ask",
+        **_ask_payload_defaults(),
+        # Seats were called, whatever they concluded. The refusal above is the only
+        # exit where this is false, and a consumer telling "asked and unresolved"
+        # from "never asked" reads this rather than guessing from an empty tally.
+        "reviewed": True,
         "repo": repo_name, "github": cfg["github"],
         # The PR this premise is being asked ON BEHALF of, when there is one.
         # Nothing is fetched for it: an ask reads the context it was handed, and
@@ -742,6 +816,12 @@ def ask(repo_name: str | None, premise: str, contexts: list[str] | None = None,
                         "verdict": a.verdict, "reason": a.reason, "gist": a.gist or None,
                         "skip": a.skip, "unreadable": a.unreadable, "absent": a.absent,
                         "model": models[n] or None, "effort": efforts.get(n) or None,
+                        # Beside `model`, and for the reason the round records it
+                        # too (#215): `model` is the pin, and these two say whether
+                        # it was the pin that answered. A board row carrying only
+                        # the pin averages a swapped seat in as the pinned one.
+                        "model_unavailable": a.model_unavailable or None,
+                        "effort_unsupported": a.effort_unsupported or None,
                         "duration_ms": a.duration_ms}
                     for n, a in sorted(answers.items())},
         "config_notes": notes,
@@ -770,8 +850,15 @@ def ask(repo_name: str | None, premise: str, contexts: list[str] | None = None,
             f"`{c.path}:{c.first}-{c.last}`" if c.first else f"`{c.path}`" for c in read))
     else:
         lines.append("**Context:** none given — the seats answered from the premise alone")
-    lines.append("**Seats:** " + (", ".join(reviewer_label(n, models[n], efforts.get(n, ""))
-                                            for n in seats) or "none"))
+    # `seat_label`, not `reviewer_label`: a seat that could not use its pins
+    # answered on something else, and the Seats line is where a reader learns which
+    # brain settled the premise (#215). It is also the line that must NOT name a
+    # substitute for a seat that answered nothing at all — `seat_label` owns that
+    # distinction, and owns it in one place because the round's header asks the
+    # identical question and the copy written out here got it wrong.
+    lines.append("**Seats:** " + (", ".join(
+        seat_label(n, models[n], efforts.get(n, ""), answers.get(n)) for n in seats)
+        or "none"))
     if asker:
         # Only the seats on THIS ask have a vote to be the only one, so
         # `--reviewers codex --asker claude` gets the other sentence: the first

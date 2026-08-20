@@ -904,7 +904,11 @@ def cfg(monkeypatch, repo):
     """The repo's resolved config, pointed at the fixture tree — so these tests
     exercise `ask()` and not `git remote get-url`."""
     conf = copy.deepcopy(harness_rules.DEFAULTS)
-    conf |= {"name": "demo", "github": "me/demo", "path": str(repo)}
+    # `_rules_baseline` because `ask()` refuses a repo whose rules nobody wrote
+    # (#238-user): the field is `resolve_repo`'s statement of WHICH file supplied the
+    # baseline, and a double of that function owes its consumers the same statement.
+    conf |= {"name": "demo", "github": "me/demo", "path": str(repo),
+             "_rules_baseline": harness_rules.SAMPLE_FILENAME}
     monkeypatch.setattr(panel_ask, "load_repo_cfg", lambda name: conf)
     return conf
 
@@ -1338,3 +1342,70 @@ def test_the_asker_reaches_the_tally(monkeypatch, cfg):
     monkeypatch.setattr(sys, "argv", ["panel.py", "--repo", cfg["path"], "--ask", "p",
                                       "--reviewers", "claude", "--no-record"])
     assert panel.main() == 0 and seen["asker"] == "claude"
+
+
+# --------------------------------- a repo nobody configured is not asked either
+
+def test_an_unconfigured_repo_is_REFUSED_rather_than_asked(monkeypatch, capsys,
+                                                           tmp_path, repo):
+    """The same gate as the review path, through the same predicate.
+
+    An ask is cheaper than a round and it is not less configured: which seats answer,
+    on which models, at which effort, and how many of them make a verdict
+    (`ask_quorum`/`ask_threshold`) all come out of the rules file. A repo with none
+    gets a tally struck by a panel nobody chose — and the whole standing of an ask is
+    that it is evidence about a premise."""
+    conf = copy.deepcopy(harness_rules.DEFAULTS)
+    conf |= {"name": "stranger", "github": "me/demo", "path": str(repo),
+             "_rules_baseline": "", "_rules_from": "none (defaults)"}
+    monkeypatch.setattr(panel_ask, "load_repo_cfg", lambda name: conf)
+    monkeypatch.setattr(panel_ask, "record_ask",
+                        lambda payload: pytest.fail("a refused ask is not recorded"))
+    monkeypatch.setattr(panel_ask, "ask_llm", lambda *a, **k: pytest.fail(
+        "no seat may be called for a repo whose rules nobody wrote"))
+    out = tmp_path / "ask.json"
+    assert panel.ask(str(repo), "the premise", json_file=str(out)) == 0
+    payload = json.loads(out.read_text())
+    assert payload["reviewed"] is False and payload["answers"] == {}
+    # Null rather than one of the four verdicts: `unchallenged` means the seats
+    # answered and it did not resolve, and nothing here was asked.
+    assert payload["verdict"] is None
+    assert harness_rules.SAMPLE_FILENAME in payload["skip_reason"]
+    assert "refusing to ask" in capsys.readouterr().out
+
+
+def test_the_ask_payload_has_the_same_shape_on_both_exits(monkeypatch, cfg, repo,
+                                                          tmp_path, capsys):
+    """#238-F07. The review path spreads `_payload_defaults()` into its refusal so a
+    consumer reading any key need not know which exit produced the payload; the ask
+    path hand-built thirteen keys against the nineteen a real ask emits, so
+    `context`, `context_problems`, `quorum`, `threshold`, `answered`, `counts` and
+    `seats_override` raised KeyError on exactly the exit with least else to go on.
+    And there was no test, so nothing caught it drifting further — which is the half
+    of the finding that matters most."""
+    monkeypatch.setattr(panel_ask, "record_ask", lambda payload: None)
+    monkeypatch.setattr(panel_ask, "ask_llm",
+                        lambda *a, **k: panel.SeatAnswer("holds", "r"))
+    ok_file = tmp_path / "ok.json"
+    panel.ask(cfg["path"], "p", [], reviewers="claude", json_file=str(ok_file))
+    answered = json.loads(ok_file.read_text())
+
+    conf = copy.deepcopy(harness_rules.DEFAULTS)
+    conf |= {"name": "stranger", "github": "me/demo", "path": str(repo),
+             "_rules_baseline": "", "_rules_from": "none (defaults)"}
+    monkeypatch.setattr(panel_ask, "load_repo_cfg", lambda name: conf)
+    monkeypatch.setattr(panel_ask, "record_ask",
+                        lambda payload: pytest.fail("a refused ask is not recorded"))
+    refused_file = tmp_path / "refused.json"
+    assert panel.ask(str(repo), "p", json_file=str(refused_file)) == 0
+    refused = json.loads(refused_file.read_text())
+
+    assert set(refused) == set(answered), (
+        "one shape on both exits, or the refusal is the payload nobody tested: "
+        f"only when answered={sorted(set(answered) - set(refused))}, "
+        f"only when refused={sorted(set(refused) - set(answered))}"
+    )
+    # `reviewed` is the one key that MUST differ in value — it is what tells
+    # "asked and unresolved" from "never asked".
+    assert answered["reviewed"] is True and refused["reviewed"] is False
+    assert refused["run_key"] and refused["verdict"] is None

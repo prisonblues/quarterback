@@ -77,6 +77,47 @@ Every fix needs tests — not optional.
 
 Match the existing test style. Name tests by scenario + expected outcome.
 
+**Red/green each regression test before you commit.** A test written alongside its
+fix has never run against the broken code, so nothing has shown it would catch
+anything — and a test that would not keeps passing when the bug returns. Capture the
+fix as a patch, remove it, watch the tests go red, put it back:
+
+```bash
+git add -N <every file your fix changed OR ADDED>
+git diff HEAD -- <those files> > .redgreen.patch
+test -s .redgreen.patch || { echo "STOP: captured nothing"; exit 1; }
+git checkout HEAD -- <the files that existed before>; rm <the files it ADDED>
+pytest <the new tests>            # MUST fail, on the assertion
+git apply .redgreen.patch && rm .redgreen.patch
+pytest <the new tests>            # green again
+```
+
+**Not `git stash`.** Every worktree of a repo shares one `refs/stash`, so a stash
+pushed here is poppable from every sibling worktree — the PR that added this
+instruction lost its working tree that way, to a concurrent agent in another worktree.
+A patch file shares nothing. `test -s` is the guard and it must **halt** — `|| { echo …;
+exit 1; }`, never a bare `|| echo …`, which warns and carries on: an empty capture (wrong
+paths, or a fix already committed) leaves the red run executing with the fix in place,
+coming out **green**, reading exactly like the step passing. `git add -N` is what puts a file the
+fix ADDED into the patch — without it `git diff` ignores untracked files and the red
+run imports the new half; those come back out with `rm`, not `git checkout HEAD --`.
+Your new *test* file is not in the list and stays put, which is the point: remove it
+too and the red run collects nothing, which is not a red test.
+If the fix is already committed: `git checkout <remote>/<base> -- <the files your fix
+changed>`, test, then `git checkout HEAD -- <the same files>`.
+
+Read *how* it failed. An import error, a missing fixture or a `TypeError` proves
+nothing — the failure has to be the assertion that names the defect. A removed fix
+routinely takes a symbol the new test imports with it, so this is the usual outcome
+rather than an unlikely one.
+
+**Exempt only where there is nothing to fail against:** a test for a path the fix
+*created* — a new function, flag or file. Report those as `red/green: N-A (new code
+path)`. A prompt string, a config default or a doc that already existed is **not**
+exempt — that text is the artefact and a test can assert on it — and neither is a fix
+to code that already existed: a test that will not go red is testing something other
+than the bug.
+
 ## 5. Update documentation
 
 If the change affects behaviour described in CLAUDE.md, docs/, README, or

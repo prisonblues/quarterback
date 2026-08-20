@@ -824,6 +824,22 @@ class ReviewerIn(BaseModel):
     #: it is a coverage failure in its own right — the panel already vetoes a stop
     #: over it, so the board must be able to see it too. None = the panel didn't say.
     unstructured: bool | None = None
+    #: This box does not carry the reviewer's CLI. The panel has sent this since
+    #: v2.32 and ingest dropped it, because this model declares
+    #: ``populate_by_name=True`` with no ``extra=`` and pydantic's default is
+    #: ``extra="ignore"`` — the exact silent-drop this file's v2.26 note is about
+    #: (#93). Landed now with the two below it.
+    absent: bool | None = None
+    #: This member reviewed from the diff alone — it could not read the code under
+    #: review (#113). The most important confound in the reviewer table: a seat that
+    #: could open the caller and one that could not are not comparable on findings
+    #: or on ``could_not_assess``, and a leaderboard that ranks them together is
+    #: measuring two different jobs.
+    code_blind: bool | None = None
+    #: This member's ``truncated`` was the kernel's doing rather than a budget's
+    #: (#113) — its prompt travels in argv and one element is capped. Kept apart
+    #: from ``truncated`` because the two have opposite remedies.
+    argv_capped: bool | None = None
 
     #: EVERY prompt-side token, cache hits included. Vendors disagree about this
     #: — Claude's own `input_tokens` is the uncached remainder and pi reports
@@ -1050,6 +1066,31 @@ class ChangedFileIn(BaseModel):
         if isinstance(v, float) and n != v:
             return None
         return n if n >= 0 else None
+
+
+class CodeAccessIn(BaseModel):
+    """Whether this round's seats could read the code under review (#113).
+
+    A nested object rather than three flat fields because the panel sends it as
+    one, and because the three answer one question at different grains: what was
+    ASKED for (`setting`), who actually got it (`seats`), and what had to be taken
+    out of the tree first (`convention_files_removed`).
+
+    ``seats`` is accepted and deliberately NOT stored: it is exactly the set of
+    reviewers whose ``code_blind`` is False, so a column would be a second copy of
+    a fact already on those rows — free to disagree with them, and the reviewer
+    rows are the ones a stats query joins. Accepting it keeps the payload
+    round-trippable without inventing a second source of truth."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    #: What the repo (or `--no-code-access`) asked for. None = the panel didn't say.
+    setting: bool | None = None
+    #: Who actually got it. Recorded on the reviewer rows, not here — see above.
+    seats: list[str] | None = None
+    #: Vendor instruction files removed before any CLI started. ``[]`` = a tree was
+    #: built and carried none; None = no tree was built.
+    convention_files_removed: list[str] | None = None
 
 
 class ReviewIn(BaseModel):
@@ -1370,6 +1411,9 @@ class ReviewIn(BaseModel):
     #: none and the members are inferred from finding attribution, with no model
     #: recorded — a run that can still be counted, just not tiered.
     reviewers: dict[str, ReviewerIn] = Field(default_factory=dict)
+    #: Whether the seats could read the code (#113). Optional: a panel that predates
+    #: the setting sends none, and every field inside it is independently nullable.
+    code_access: CodeAccessIn | None = None
 
     to_fix: list[FindingIn] = Field(default_factory=list)
     dismissed: list[FindingIn] = Field(default_factory=list)
@@ -1633,6 +1677,9 @@ def _scorecards(
             duration_ms=c.duration_ms if c else None,
             could_not_assess=c.could_not_assess if c else None,
             unstructured=c.unstructured if c else None,
+            absent=c.absent if c else None,
+            code_blind=c.code_blind if c else None,
+            argv_capped=c.argv_capped if c else None,
             input_tokens=c.input_tokens if c else None,
             output_tokens=c.output_tokens if c else None,
             cached_input_tokens=c.cached_input_tokens if c else None,
@@ -1709,6 +1756,11 @@ async def record_review(
         judge_model=body.judge_model or None,
         judge_skip=body.judge_skip,
         coverage_note=body.coverage_note or None,
+        # Flattened onto the run from the nested object, minus `seats` — that one
+        # lives on the reviewer rows it describes (see CodeAccessIn).
+        code_access=body.code_access.setting if body.code_access else None,
+        convention_files_removed=(body.code_access.convention_files_removed
+                                  if body.code_access else None),
         round=body.round,
         cycle=body.cycle or None,
         new_findings=body.new_findings,
@@ -2657,6 +2709,12 @@ def _card_view(c: ReviewReviewer, run: ReviewRun) -> dict:
         "duration_ms": c.duration_ms,
         "could_not_assess": c.could_not_assess,
         "unstructured": c.unstructured,
+        # #113. Read back out as well as stored: a column nothing exposes is a
+        # column nothing can be measured with, which is the same half-built shape
+        # v2.26 records for the four fields it landed (#93) — stored is not shipped.
+        "absent": c.absent,
+        "code_blind": c.code_blind,
+        "argv_capped": c.argv_capped,
         "rereview_flagged": c.rereview_flagged,
         "input_tokens": c.input_tokens,
         "output_tokens": c.output_tokens,
@@ -3555,6 +3613,57 @@ async def pr_finding_history(
     with ``stop_reason`` for the words and ``stop_veto`` for the reasons a stop was
     not convergence. It is not the reason string: that states a reason to go again
     just as often, so naming the ending after it called a running cycle finished.
+
+    Those four describe **one** cycle, so this endpoint reports them only when the
+    traced runs hold no more than one, and nulls all four otherwise (#44).
+    ``cycles`` says how many the window held, and it counts what its name says.
+
+    A run carrying no cycle at all — a standalone ``/panel`` read, or anything
+    recorded before the cycle column existed — is **skipped, not counted**. It
+    never ended the cycle running around it, so it has no ending to offer; by the
+    same token it has no standing to withhold one. One loop plus a one-shot read is
+    ``cycles: 1`` and summarises, from that loop's own last round. Where a
+    cycle-less run is the newest in the window, the ending still comes from the
+    cycle's last round rather than from the run that happened to land after it.
+
+    ``cycles: 0`` is a real answer, not an absent one: every traced run predates the
+    column or was a one-shot read, there is nothing to misattribute between, and the
+    window summarises — which is what keeps the pre-cycle archive reading as it
+    always did.
+
+    The four are therefore three-state, and must be read with ``is None`` rather
+    than for truthiness: ``stopped: null`` is "no attributable cycle said", which
+    is a different answer from ``false`` ("a round ran and said go again") — read
+    for truthiness it calls a finished cycle unfinished. Same for ``stop_veto``,
+    where ``[]`` is "the stopping rule ran and vetoed nothing" and null is "nobody
+    attributable said" — the distinction ``GET /review/{id}`` already draws.
+    ``cycles`` answers "is the summary attributable **within this window**?": 0 or
+    1 means yes. It is NOT on its own the answer to "does this describe the PR",
+    and this docstring used to say it was. ``cycles`` is computed over the traced
+    window like everything else here, so a PR with more rounds than ``limit`` can
+    show one cycle while an older one sits outside it — the summary is then a
+    true statement about the window and not about the PR. ``truncated`` is the
+    other half and must be read with it: ``cycles <= 1 and not truncated`` is the
+    only combination that speaks for the PR's whole recorded history. That is not
+    a defect to be nulled away, because narrowing ``limit`` to recover a summary
+    deliberately truncates — it is a claim whose scope the caller has to keep
+    hold of, and the two fields together are what state that scope.
+
+    Narrowing ``limit`` can bring a summary back, but it is a trade, not a clean
+    escape hatch, and both halves belong here. ``limit`` trims from the OLD end
+    only, so the sole summary it can recover is the NEWEST bucket's — no value of
+    ``limit`` reaches an older cycle's ending. And ``limit`` is the same window
+    that decides ``first_run``, the ``gone`` status and new-vs-old detection, so
+    narrowing it to recover a summary degrades the finding history in the same
+    response and sets ``truncated``. The per-run rows in ``runs[]`` carry each
+    round's own ``stopped``/``stop_reason``/``stop_confident``/``stop_veto``
+    unaltered at any window size, and reading those is usually the better answer.
+
+    The alternative — which this endpoint used to do — is to report ``runs[-1]``
+    regardless and let the newest loop decide how an older one reads; the
+    per-finding join beside it has refused that inference since cycles became a
+    stored fact, and a summary that contradicts the rows underneath it is worse
+    than an absent one.
     """
     # One over the window, so "there is older history" is a fact rather than the
     # guess "we returned exactly as many as we asked for".
@@ -3573,8 +3682,13 @@ async def pr_finding_history(
     fetched = [r for r, _ in fetched_rows]
     unread_counts = {r.id: n for r, n in fetched_rows}
     if not fetched:
-        return {"repo": repo, "pr": pr, "rounds": 0, "stopped": None,
-                "stop_reason": None, "stop_confident": None, "stop_veto": [],
+        # All four null, `stop_veto` included. An unreviewed PR is the clearest
+        # case of "the stopping rule never ran", and [] is reserved for "it ran and
+        # vetoed nothing" — the three-state contract the rest of this handler
+        # keeps, which this branch used to be the one exception to. `cycles: 0`:
+        # no runs, so no buckets.
+        return {"repo": repo, "pr": pr, "rounds": 0, "cycles": 0, "stopped": None,
+                "stop_reason": None, "stop_confident": None, "stop_veto": None,
                 "truncated": False, "runs": [], "findings": []}
 
     truncated = len(fetched) > limit
@@ -3746,10 +3860,48 @@ async def pr_finding_history(
         })
     out.sort(key=lambda c: (c["severity"] or "P9", order[c["first_run"]], c["key"]))
 
+    # Whether this PR's stop state is one thing to report. The question is how many
+    # CYCLES the window holds, and a run carrying no cycle is not one: a review-only
+    # `/panel`, or anything recorded before cycles were stored, never ended the cycle
+    # running around it — so it has no ending to contribute and cannot contradict
+    # one either. It is skipped, not counted.
+    #
+    # This is narrower than the rule that shipped first, which bucketed by cycle id
+    # with null as its own bucket and so nulled the summary whenever a single
+    # standalone read shared a window with a loop. That premise — a cycle-less run
+    # never ended the cycle around it — is right, and it argues for IGNORING that
+    # run rather than for letting it veto an attribution it is no part of. Three
+    # panel rounds said so before this changed.
+    #
+    # The narrower rule that IS the bug, and is not this one: "summarise when the
+    # newest cycle forms a contiguous tail of the window". A-r1 followed by B-r1 has
+    # B as a contiguous tail, and reporting B's confident stop as this PR's ending is
+    # exactly what #44 was filed about. That rule keys off ADJACENCY; this one counts
+    # distinct real cycles and never consults position.
+    cycles_present = {r.cycle for r in runs if r.cycle is not None}
+    summarisable = len(cycles_present) <= 1
+    # NOT `runs[-1]`. With cycle-less runs skipped rather than counted, the newest
+    # run in the window may be one of them — and a run that ended no cycle must not
+    # supply the ending. Take the newest run that belongs to the one cycle; where
+    # there is no cycle at all (the pre-cycle archive), every run qualifies and this
+    # is `runs[-1]` again, which is what that archive has always reported.
+    last = next(r for r in reversed(runs)
+                if not cycles_present or r.cycle in cycles_present)
+
     return {
         "repo": repo,
         "pr": pr,
         "rounds": len(runs),
+        # How many distinct CYCLES the traced runs belong to, which is what makes
+        # the four fields below readable: 0 or 1 summarises, more does not.
+        #
+        # It counts what its name says. Runs carrying no cycle are not counted,
+        # because they are in no cycle — so a PR read once by a standalone `/panel`
+        # beside one loop reports 1, which is the number of loops that ran. Zero is
+        # a real answer and means every traced run predates the cycle column (or was
+        # a one-shot read): there is nothing to misattribute between, so it
+        # summarises, and the pre-cycle archive reads as it always did.
+        "cycles": len(cycles_present),
         # What ended the cycle, from the last round that ran — and whether that
         # was convergence or merely a stop. A PR whose panel gave up at the round
         # cap, or stopped while a reviewer was reading half the diff, must not
@@ -3760,13 +3912,56 @@ async def pr_finding_history(
         # reason to go again just as often ("N finding(s) no earlier round
         # raised") — so a cycle that explicitly must continue was labelled
         # finished by the field that names the ending.
-        "stopped": runs[-1].stopped,
-        "stop_reason": runs[-1].stop_reason,
-        "stop_confident": runs[-1].stop_confident,
+        #
+        # NULL when the window holds more than one bucket (#44). These four came
+        # from `runs[-1]` whatever cycle it belonged to, so cycle B's last round
+        # decided how cycle A read — complete, unfinished, or unconfident — in the
+        # same response whose per-finding join refuses that exact inference:
+        # `followed_by` requires matching cycle ids rather than guessing from
+        # adjacency. A summary is a claim about one loop, and with two buckets in
+        # the window there is no one loop to claim it about. `cycles` above says
+        # so, which is the honest answer.
+        #
+        # Who a nullable bool/str breaks, audited rather than asserted — and the
+        # audit covers all four, not just the list one, because `stopped` and
+        # `stop_confident` are the fields most likely to be read for truthiness,
+        # where null silently reads as False: "the cycle is still going" and "the
+        # stop was not earned", both wrong.
+        #
+        # `app/static/reviews.html` is the ONLY consumer of this endpoint in the
+        # repo — grep for `/review/findings` over *.py, *.html, *.js and harness/
+        # — and it now tests `cycles` before anything else, so it never reaches a
+        # truthiness test on a null. `harness/loops/preland.py` is NOT a consumer
+        # of this response despite reading identically-named keys null-safely: its
+        # `_judge_round` rules on per-round rows from `GET /reviews`, and those
+        # four stay per-run facts that this change does not touch (the same is
+        # true of the `runs[]` rows below). So the exposure is future callers, and
+        # the docstring states the three-state contract for them.
+        "stopped": last.stopped if summarisable else None,
+        "stop_reason": last.stop_reason if summarisable else None,
+        "stop_confident": last.stop_confident if summarisable else None,
         # WHY the stop was unearned, in the panel's words. "not convergence" with
         # no reasons attached is the question this feature exists to answer left
         # unanswered.
-        "stop_veto": runs[-1].stop_veto or [],
+        #
+        # NULL rather than [] when the buckets are mixed, the same distinction
+        # `GET /review/{id}` already draws: [] is "the stopping rule ran and
+        # vetoed nothing", null is "nobody attributable said". The zero-runs branch
+        # at the top of this handler returns null for the same reason.
+        #
+        # The one consumer guards every read of it — `(h.stop_veto || []).length`
+        # in reviews.html — and that is now PINNED rather than left as prose:
+        # `test_the_page_never_reads_the_summary_stop_veto_unguarded` counts the
+        # mentions in the file that ships, so a future `for (const v of
+        # h.stop_veto)` fails a test instead of throwing in a browser.
+        #
+        # `last.stop_veto` RAW, never `or []`. The attributable case is exactly
+        # where the three-state contract has to hold: a stored NULL on the one run
+        # this summary speaks for means "that round recorded no veto answer", and
+        # coercing it to [] reports the opposite — "the stopping rule ran and
+        # vetoed nothing" — about the run whose evidence the whole summary rests
+        # on. `GET /review/{id}` returns it raw for this reason; so does this.
+        "stop_veto": last.stop_veto if summarisable else None,
         # More runs exist than the window traced, so `first_run` and a `gone`
         # status describe the window, not the PR's whole history.
         "truncated": truncated,
@@ -3798,7 +3993,23 @@ async def pr_finding_history(
              "unjudged": r.n_unjudged, "sonar": r.n_sonar,
              "round": r.round, "cycle": r.cycle, "new_findings": r.new_findings,
              "stopped": r.stopped, "stop_reason": r.stop_reason,
-             "stop_confident": r.stop_confident, "stop_veto": r.stop_veto or [],
+             # RAW, for the same reason as the summary above and with one more on
+             # top: the docstring, the README and the CHANGELOG all promise these
+             # four ride here UNALTERED at any window size, and point callers at
+             # them as the better answer precisely because the summary can be
+             # unattributable. An `or []` here made that promise false for a run
+             # with no recorded veto, and made the same run read differently
+             # through this endpoint than through `GET /review/{id}`.
+             #
+             # This is a SECOND nullable field under a different name, and the
+             # audit above covers only the summary's. Checked separately rather
+             # than assumed to follow: reviews.html reads a per-run veto in three
+             # places and each opens `(r.stop_veto || [])`, short-circuiting on
+             # `.length` before any `.join`/`.map`, so a null row renders as no
+             # vetoes. `test_the_page_never_reads_a_PER_RUN_stop_veto_unguarded`
+             # is that field's own pin, because the summary's test counts
+             # `h.stop_veto` and can never see a read of this one.
+             "stop_confident": r.stop_confident, "stop_veto": r.stop_veto,
              # Findings this round declared worth re-reading, and whether the
              # round that followed found anything where it pointed — file-grain,
              # over confirmed findings only. None = no round followed it in this
@@ -3872,6 +4083,15 @@ async def get_review(
         # was cut, and folding one into the other on read would hand every
         # consumer the collapse the storage side is built to prevent.
         "unread_files": run.unread_files,
+        # #113: what this round ASKED for, kept apart from the per-seat answer in
+        # `reviewers[].code_blind`. A round with the setting on and every seat
+        # blind is a configuration doing nothing, and only the difference shows it.
+        "code_access": run.code_access,
+        # Unmasked for the reason `unread_files` above is: [] means a tree was
+        # built and carried no instruction files, NULL means no tree was built at
+        # all, and folding them together loses which PRs tried to instruct their
+        # own reviewer.
+        "convention_files_removed": run.convention_files_removed,
         # Read `changed_files_total` against `len(changed_files)` before building
         # anything on this list: they are allowed to disagree, and when they do
         # the list is a PREFIX of what the PR touches.

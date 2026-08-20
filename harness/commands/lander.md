@@ -17,5 +17,5 @@ Run the dependabot lander for a repo.
    python3 ~/.claude/loops/lander.py --execute
    ```
 
-Policy lives in the repo's own `.harness-rules` (`auto_merge`): only dependabot patch/minor auto-merge on green;
+Policy lives in the repo's own `.harness-rules.sample` (`auto_merge`): only dependabot patch/minor auto-merge on green;
 security bumps escalate; red CI opens an edit-only fix in a worktree. Never merges anything else.

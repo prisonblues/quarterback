@@ -13,6 +13,8 @@ import shlex
 import socket
 import ssl
 import subprocess
+import time
+import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 
@@ -132,6 +134,45 @@ def minutes_left(stamp: str | None) -> int | None:
     return int((then - datetime.now(timezone.utc)).total_seconds() // 60)
 
 
+#: How long a `working` may stand before a reader calls it stalled. Tool calls
+#: refresh it, so the gap this has to clear is the longest a session legitimately
+#: goes without one — a long think, a slow build, a big edit in a single pass.
+#:
+#: It MUST agree with the same constant in the footer (nix-fleet's
+#: home/claude/scripts/statusline.sh, STALL_AFTER). Two readers of one beacon
+#: disagreeing about when it goes stale is worse than either threshold being
+#: wrong: the dashboard and the pane's own bar would describe the same seat
+#: differently, and there is no way to tell from the outside which one to believe.
+STALL_AFTER = 480
+
+
+def agent_state(agent: dict) -> tuple[str, str]:
+    """(word, style) for what a live agent is doing — '' when it never said.
+
+    The board stores what the holder reported; `stalled` is concluded HERE, from
+    the age of that report, and is the reason `state_at` travels with `state`.
+    A pane that said `working` and then went quiet is the failure this whole
+    field exists to surface: it looks identical to a busy one from the outside.
+
+    `waiting` and `input` do not go stale. A pane that has been waiting on a
+    human since lunch is still waiting on that human — ageing it into `stalled`
+    would hide the one state somebody is actually scanning for.
+    """
+    state = agent.get("state") or ""
+    if not state:
+        return "", "grey50"
+    if state == "working":
+        try:
+            then = datetime.fromisoformat((agent.get("state_at") or "").replace("Z", "+00:00"))
+        except ValueError:
+            return "working", "grey50"
+        if (datetime.now(timezone.utc) - then).total_seconds() >= STALL_AFTER:
+            return "stalled", "bold red"
+        return "working", "grey50"
+    return {"waiting": ("waiting", "bold yellow"),
+            "input": ("input", "bold magenta")}.get(state, (state, "grey50"))
+
+
 def short_key(key: str) -> str:
     """'prisonblues/quarterback:2.40' → 'quarterback:2.40'.
 
@@ -146,12 +187,104 @@ def clip(s: str | None, n: int) -> str:
     return s if len(s) <= n else s[: max(0, n - 1)] + "…"
 
 
-def seat_number(holder: str | None) -> int | None:
-    """1 for 'zeus/seat-1'. None for anything that is not a seat."""
-    if not holder or "/seat-" not in holder:
+#: How a seat spells itself on the board: `seat-<scope>-<n>`, where the scope is
+#: the project the seat sits in and is what stops two screens on one machine both
+#: wanting seat 1 (#208). The scope is optional because a seat whose scope slugged
+#: away to nothing — or that was deliberately started with an empty QB_SEAT_SCOPE —
+#: keeps the bare `seat-<n>` this had before, and the dashboard must go on
+#: recognising those.
+#:
+#: The NUMBER is the last hyphenated field, not the first: a scope may contain
+#: hyphens of its own, and `seat-nix-fleet-3` is seat 3 of nix-fleet rather than
+#: anything about `nix`. The bound is qb-seat's own 1-99.
+SEAT_RE = re.compile(r"^seat-(?:(.+)-)?([1-9][0-9]?)$")
+
+#: The most of `seat-<scope>-<n>` a scope may take, mirroring SEAT_SCOPE_MAX in
+#: qb-seat: the board allows 40 characters and `seat-`, a hyphen and two digits
+#: account for the other eight.
+SCOPE_MAX = 32
+
+
+def _seat(holder: str | None) -> "re.Match[str] | None":
+    """The seat match for a board identity, on the name half of `machine/name`."""
+    if not holder:
         return None
-    tail = holder.split("/seat-", 1)[1]
-    return int(tail) if tail.isdigit() else None
+    return SEAT_RE.match(holder.rsplit("/", 1)[-1])
+
+
+def seat_number(holder: str | None) -> int | None:
+    """1 for 'zeus/seat-lexray-1' and for 'zeus/seat-1'.
+
+    None for anything that is not a seat.
+    """
+    match = _seat(holder)
+    return int(match.group(2)) if match else None
+
+
+def seat_machine(holder: str | None) -> str | None:
+    """'zeus' for 'zeus/seat-lexray-1'. None for anything that is not a seat.
+
+    The board is the FLEET's, not this box's: two machines can each hold a
+    `seat-lexray-1`, so the machine half is part of what identifies a seat and
+    leaving it out shows a remote agent's state against a local pane.
+    """
+    if _seat(holder) is None:
+        return None
+    machine, sep, _ = (holder or "").partition("/")
+    return machine if sep else None
+
+
+def seat_scope(holder: str | None) -> str | None:
+    """'lexray' for 'zeus/seat-lexray-1'.
+
+    None for 'zeus/seat-1', which is a seat numbered across the whole machine,
+    and None for anything that is not a seat at all. The two cases are told
+    apart by :func:`seat_number`, which answers for the first and not the second.
+    """
+    match = _seat(holder)
+    return match.group(1) if match else None
+
+
+def slug_scope(text: str | None) -> str | None:
+    """Turn a requested scope into the one a seat will actually carry.
+
+    MIRRORS `seat_scope_slug` in qb-seat, and is pinned to it by
+    test_the_scope_rule_is_the_one_qb_seat_actually_applies — two implementations
+    of one rule is exactly how a dashboard ends up showing one seat's state
+    against another seat's pane. Case folding is ASCII-only for the same reason:
+    qb-seat folds with `tr '[:upper:]' '[:lower:]'`, which is bytes, where
+    str.lower() is Unicode.
+    """
+    if not text:
+        return None
+    lowered = "".join(chr(ord(c) + 32) if "A" <= c <= "Z" else c for c in text)
+    slug = re.sub(r"[^a-z0-9]+", "-", lowered).strip("-")[:SCOPE_MAX].rstrip("-")
+    return slug or None
+
+
+def scope_of(repo_path: str | None) -> str | None:
+    """The scope qb-seat gives a seat working in ``repo_path`` and told nothing else.
+
+    The default half of the rule: a seat is named after its repository's own
+    directory.
+    """
+    return slug_scope(os.path.basename((repo_path or "").rstrip("/")))
+
+
+def pane_scope(seat: dict) -> str | None:
+    """The scope of the seat in a tmux pane, or None when the pane cannot say.
+
+    `@qb_scope` first, because a screen given an explicit QB_SEAT_SCOPE is the one
+    case the repository cannot answer for: two screens on ONE repository, which is
+    precisely what that knob exists for. `@qb_repo` otherwise, which is the default
+    the seat itself computed from its cwd.
+
+    An explicitly EMPTY scope reads here as "the pane cannot say", and that is the
+    right answer rather than a gap: an empty scope asks for the machine-wide seat
+    numbering, in which a second screen cannot hold the same number at all — so
+    there is never a second candidate for the caller to confuse it with.
+    """
+    return slug_scope(seat.get("scope")) or scope_of(seat.get("repo"))
 
 
 class BoardConfig:
@@ -572,7 +705,7 @@ def plan_detail(item: dict) -> str:
 # ones whose agent has exited and left a shell behind. Only the second can be
 # closed with a click.
 
-SEAT_FIELDS = ("pane", "seat", "session", "window", "command", "path")
+SEAT_FIELDS = ("pane", "seat", "session", "window", "command", "path", "repo", "scope")
 
 
 def tmux_seats() -> list[dict]:
@@ -581,6 +714,15 @@ def tmux_seats() -> list[dict]:
     A seat is a pane carrying the @qb_seat option, which is how qb-seats marks
     them and the only handle that survives a pane being added or closed — the
     index shifts and the agent rewrites the title.
+
+    `@qb_repo` and `@qb_scope` come back with it because `list-panes -a` is the
+    whole SERVER and not this screen: since #208 two screens can each have a seat
+    1, so the number alone no longer says which board identity a pane is. Both are
+    set on the SESSION (or, for `--add`, on the pane) and formats resolve a user
+    option up through the hierarchy, so every pane of a screen answers for its own
+    screen. Either can be empty — `@qb_scope` whenever the screen was not given an
+    explicit one, `@qb_repo` on a screen built by a qb-seats old enough not to set
+    it — which is why the dashboard falls back to matching on the number.
 
     Returns [] rather than raising when there is no tmux, no server, or no
     screen: the dashboard runs inside the screen most of the time and in a bare
@@ -591,7 +733,8 @@ def tmux_seats() -> list[dict]:
         return []
     fmt = "\t".join("#{%s}" % f for f in
                     ("pane_id", "@qb_seat", "session_name", "window_index",
-                     "pane_current_command", "pane_current_path"))
+                     "pane_current_command", "pane_current_path", "@qb_repo",
+                     "@qb_scope"))
     try:
         got = subprocess.run(["tmux", "list-panes", "-a", "-F", fmt],
                              capture_output=True, text=True, timeout=5)
@@ -606,5 +749,248 @@ def tmux_seats() -> list[dict]:
             continue
         seats.append(dict(zip(SEAT_FIELDS, parts)))
     # By seat NUMBER, not by pane order: --add splits off the leftmost pane, so
-    # pane order runs 1, 3, 2 on a screen that has had a seat added to it.
-    return sorted(seats, key=lambda s: int(s["seat"]) if s["seat"].isdigit() else 0)
+    # pane order runs 1, 3, 2 on a screen that has had a seat added to it. By
+    # SCREEN first, because this lists the whole server and two screens now
+    # interleave their 1, 2, 3 otherwise — which reads as one screen with every
+    # seat number twice.
+    return sorted(seats, key=lambda s: (s["session"],
+                                        int(s["seat"]) if s["seat"].isdigit() else 0))
+
+
+# ---- claude code's own limits ------------------------------------------------
+#
+# The seats all bill to ONE subscription, so the ceiling every one of them is
+# working towards is a single fleet-wide number — and it is the one fact this
+# dashboard could not previously show. Six seats making a plan happen in
+# parallel is exactly the way to spend a five-hour window in forty minutes, and
+# the human at the screen finds out by watching an agent stop.
+#
+# The figures come from the same endpoint `/usage` reads, so what this shows and
+# what a seat says about itself cannot disagree. It is the subscription's usage,
+# not this session's: there is no per-session budget to report.
+#
+# NO TOKEN, NO LINE. An API-key install has no subscription limits to report and
+# a missing credentials file is that case, not a failure — it returns nothing to
+# show and no error, and the header simply has one line fewer.
+
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+# THREE MINUTES, AND THAT IS ALREADY GENEROUS. The endpoint rate-limits harder
+# than a dashboard's instincts suggest — five calls inside ten minutes was enough
+# to get a 429 while this was being written. A five-hour window moves about a
+# percent in three minutes, so nothing legible is being given up.
+LIMITS_EVERY = 180.0    # seconds between calls, across every pane on the machine
+BACKOFF = 600.0         # …and this long once the endpoint has said slow down
+STALE_AFTER = 600.0     # past this the line admits its figures are old
+
+
+def _oauth_token() -> str | None:
+    """Claude Code's own OAuth access token, or None if this install has none.
+
+    Read fresh every time rather than cached: Claude Code refreshes the token in
+    place, and a dashboard that cached one at startup would start 401ing after
+    an hour with nothing to say about why.
+    """
+    env = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+    if env:
+        return env
+    home = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+    try:
+        with open(os.path.join(home, ".credentials.json"), encoding="utf-8") as fh:
+            return (json.load(fh).get("claudeAiOauth") or {}).get("accessToken") or None
+    except Exception:                             # noqa: BLE001 — absent, or not ours to read
+        return None
+
+
+def _limit_label(row: dict) -> str:
+    """What to call a limit in two or three columns.
+
+    The kinds are the endpoint's, and the scoped one names its own model: a
+    weekly cap that applies to Opus alone reads 'Opus', because 'weekly_scoped'
+    is not a thing anybody is watching for.
+    """
+    kind = row.get("kind") or ""
+    if kind == "session":
+        return "5h"
+    if kind == "weekly_all":
+        return "7d"
+    if kind == "weekly_scoped":
+        scope = (row.get("scope") or {}).get("model") or {}
+        return scope.get("display_name") or "7d*"
+    return kind[:6] or "?"
+
+
+# THE CACHE IS ON DISK BECAUSE THE POLLERS ARE SEPARATE PROCESSES. A developer
+# running three seat screens has three dash panes, each its own process, each
+# with its own timer — and the endpoint rate-limits, which is not a guess: it
+# answered 429 while this was being built. A per-process interval cannot fix
+# that, so the interval is enforced where they can all see it. One file, last
+# answer plus the time the next call is allowed.
+
+def _cache_path() -> str:
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    return os.path.join(base, "quarterback", "limits.json")
+
+
+def _read_cache() -> dict:
+    try:
+        with open(_cache_path(), encoding="utf-8") as fh:
+            got = json.load(fh)
+        return got if isinstance(got, dict) else {}
+    except Exception:                             # noqa: BLE001 — no cache is a cold start
+        return {}
+
+
+def _write_cache(cache: dict) -> None:
+    """Atomically, because the other dash panes are reading it as this one writes."""
+    path = _cache_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.{os.getpid()}"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(cache, fh)
+        os.replace(tmp, path)
+    except Exception:                             # noqa: BLE001 — a cache is an optimisation
+        pass
+
+
+def _get_usage(token: str) -> tuple[list[dict], str | None]:
+    req = urllib.request.Request(USAGE_URL, headers={
+        "Authorization": f"Bearer {token}",
+        "anthropic-beta": "oauth-2025-04-20",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=15, context=_ssl_context()) as resp:
+            return parse_limits(json.loads(resp.read().decode())), None
+    except urllib.error.HTTPError as exc:
+        return [], f"HTTP {exc.code}"             # the code, or 429 is invisible
+    except Exception as exc:                      # noqa: BLE001
+        return [], type(exc).__name__
+
+
+def _cached(cache: dict, now: float, err: str | None = None) -> tuple[list[dict], str | None]:
+    limits = cache.get("limits") or []
+    if now - float(cache.get("at") or 0) > STALE_AFTER:
+        return limits, err or "stale"
+    return limits, (None if limits else err)
+
+
+def fetch_limits() -> tuple[list[dict], str | None]:
+    """[{label, percent, resets, severity}, …] — the caps the whole fleet shares.
+
+    Never raises, and never blanks a good answer. Returns ([], None) when there
+    is nothing to report at all (no token, so no subscription caps), and the
+    LAST figures with an error beside them when a call fails — they are minutes
+    old and still roughly true, which is more use than an empty line.
+    """
+    token = _oauth_token()
+    if not token:
+        return [], None
+    cache = _read_cache()
+    now = time.time()
+    if now < float(cache.get("next") or 0):
+        return _cached(cache, now)                # somebody else asked recently enough
+    limits, err = _get_usage(token)
+    if err is None:
+        _write_cache({"at": now, "limits": limits, "next": now + LIMITS_EVERY})
+        return limits, None
+    # A 429 means back further off, not try again in a minute: the failing call
+    # is itself the thing being rate limited, and three panes retrying on the
+    # short clock is how a warning becomes a wall.
+    cache["next"] = now + (BACKOFF if err == "HTTP 429" else LIMITS_EVERY)
+    _write_cache(cache)
+    return _cached(cache, now, err)
+
+
+def parse_limits(data: dict) -> list[dict]:
+    """The endpoint's answer, reduced to what fits on one line.
+
+    Split out from the fetch so the shaping is testable without a network, and
+    because the endpoint carries a dozen fields per cap of which this shows
+    three.
+    """
+    out = []
+    for row in data.get("limits") or []:
+        percent = row.get("percent")
+        if percent is None:
+            continue
+        percent = int(round(percent))
+        # A scoped cap nobody has touched is noise; the two headline caps stay
+        # even at zero, because "0%" at the start of a window is information.
+        if percent <= 0 and row.get("kind") not in ("session", "weekly_all"):
+            continue
+        out.append({
+            "label": _limit_label(row),
+            "percent": percent,
+            "resets": row.get("resets_at"),
+            "severity": row.get("severity") or "normal",
+        })
+    return out
+
+
+def limit_reset(stamp: str | None) -> str:
+    """'44m', '3h58m', '5d' — when a cap comes back, in five columns.
+
+    until() is right for a lease measured in minutes and wrong here: a weekly
+    window reads '128h48m', which is both too wide for the line and not how
+    anybody thinks about next Monday.
+    """
+    if not stamp:
+        return ""
+    try:
+        then = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    secs = int((then - datetime.now(timezone.utc)).total_seconds())
+    if secs <= 0:
+        return "now"
+    if secs < 3600:
+        return f"{secs // 60}m"
+    if secs < 48 * 3600:
+        return f"{secs // 3600}h{(secs % 3600) // 60:02d}m"
+    return f"{secs // 86400}d{(secs % 86400) // 3600}h"
+
+
+def limit_colour(percent: int, severity: str = "normal") -> str:
+    """Green, yellow, red — and the endpoint's own severity can only escalate it.
+
+    Thresholds here rather than trusting severity alone: severity says 'normal'
+    at 62% of a window that six seats will finish inside the hour, and the point
+    of the line is to see that coming.
+    """
+    if severity in ("critical", "exceeded", "blocked") or percent >= 90:
+        return "red"
+    if severity == "warning" or percent >= 70:
+        return "yellow"
+    return "green"
+
+
+def limit_bar(percent: int, width: int) -> str:
+    """A bar `width` cells wide. Full blocks for what is spent, light for the rest."""
+    width = max(1, width)
+    filled = max(0, min(width, int(round(percent / 100 * width))))
+    # Anything spent shows at least one cell: a bar that reads empty at 3% and
+    # empty at 0% has thrown away the only distinction that matters early on.
+    if percent > 0 and filled == 0:
+        filled = 1
+    return "█" * filled + "░" * (width - filled)
+
+
+def limit_cells(limits: list[dict], width: int) -> list[tuple[str, str, str, str, str]]:
+    """[(label, bar, '62%', '3h50m', colour), …], sized to fit `width` columns.
+
+    The layout lives here so the two dashboards cannot drift on it, and the
+    styling does not, so each stays in charge of how it draws a colour.
+    """
+    if not limits or width < 20:
+        return []
+    gap = 2                                       # between segments
+    # label + space + … + space + '100%' + space + reset, per segment.
+    fixed = sum(len(l["label"]) for l in limits) + len(limits) * (1 + 1 + 4 + 1 + 5) + \
+        gap * (len(limits) - 1)
+    bar = (width - fixed) // len(limits)
+    if bar < 4:                                   # too narrow for bars: drop them
+        bar = 0
+    bar = min(bar, 16)
+    return [(l["label"], limit_bar(l["percent"], bar) if bar else "",
+             f"{l['percent']}%", limit_reset(l["resets"]),
+             limit_colour(l["percent"], l["severity"])) for l in limits]

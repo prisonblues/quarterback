@@ -31,6 +31,7 @@ import panel  # noqa: E402
 import panel_scope  # noqa: E402  — scope/range readers moved here in #129
 import panel_core  # noqa: E402  — `sh` is defined here since #129
 import panel_seats  # noqa: E402  — these seats moved here in #129
+import panel_preflight as pf  # noqa: E402  — the pre-flight verdict (#138)
 
 
 def chunk(path: str, body: str) -> str:
@@ -328,6 +329,29 @@ def test_an_empty_tier_gets_neither_a_header_nor_a_cut_note():
     assert got.far == ""
     text = got.material(None)[0]
     assert "[cut:" not in text and "the rest of the PR" not in text
+
+
+def test_a_custom_header_is_REFUSED_under_increment_scope_rather_than_ignored():
+    """`_compose` interpolates `self.header` only in the whole-target branch; the
+    increment branch renders a brief and three labelled tiers and has nowhere to put a
+    single header that would be true of all of them.
+
+    Today's only caller that sets one — #138's move manifest — also sets `scope="pr"`,
+    because a manifest IS a whole target by construction, so nothing was wrong. But a
+    future caller passing both got no error and no header, which is the class of quiet
+    mismatch every other field on this class is written to prevent: a scoped prompt
+    silently missing a header it was told to carry reads as fine until somebody
+    compares two rounds."""
+    with pytest.raises(ValueError, match="only meaningful for a whole-target"):
+        panel.ReviewScope(scope="increment", diff=PR, increment=INCREMENT,
+                          prior_diff=PRIOR, since=ANCHOR, round_no=2,
+                          header="--- MOVE MANIFEST (NOT A DIFF) ---")
+    # The default header with increment scope is the ordinary case and must stay silent.
+    assert panel.ReviewScope(scope="increment", diff=PR, increment=INCREMENT,
+                             prior_diff=PRIOR, since=ANCHOR, round_no=2).near
+    # And a custom header under "pr" scope is what the manifest does, and it lands.
+    whole = panel.ReviewScope(diff=PR, header="--- NOT A DIFF ---")
+    assert whole.material(None)[0].startswith("--- NOT A DIFF ---\n")
 
 
 def test_the_brief_names_the_round_that_supplied_the_anchor():
@@ -801,6 +825,43 @@ def test_an_earlier_rounds_truncation_is_carried_forward(tmp_path):
     assert load([write(tmp_path, "clean.json", clean)]).truncated_rounds == set()
 
 
+def test_a_kernel_capped_truncation_is_not_carried_forward(tmp_path):
+    """The exemption has to hold HERE too, and missing it undid the whole change
+    for the cycles that matter.
+
+    An earlier round's truncation is carried because increment scope makes it
+    permanent — a later round reads only the fix commit and never returns to what
+    round 1 was cut off from. But a seat cut by the KERNEL was never going to be
+    closed by a later round either, on this box at this diff size, so carrying it
+    forward is not "a gap the cheap round failed to re-read": it is the same
+    constant arriving one round later and then standing for the rest of the cycle.
+    `/panel-review-pr` drives several rounds, so the loop would have gone straight
+    back to never stopping confidently while round 1's veto list looked fixed —
+    the change would have measured as working and not worked.
+
+    Truncation by a BUDGET still carries, which is what telling them apart buys:
+    raise the number and the next round really does read what this one could not."""
+    kernel = payload(1, head_sha="1111111111",
+                     reviewers={"antigravity": {"ran": True, "truncated": True,
+                                                "argv_capped": True},
+                                "claude": {"ran": True, "truncated": False}})
+    assert load([write(tmp_path, "kernel.json", kernel)]).truncated_rounds == set()
+
+    budget = payload(1, head_sha="1111111111",
+                     reviewers={"antigravity": {"ran": True, "truncated": True,
+                                                "argv_capped": False},
+                                "claude": {"ran": True, "truncated": False}})
+    assert load([write(tmp_path, "budget.json", budget)]).truncated_rounds == {1}
+
+    # An older payload that records no `argv_capped` at all still carries, which is
+    # the conservative direction this loader takes everywhere: "nobody said" is not
+    # "nothing happened", and an inherited veto left standing costs a round its
+    # confidence where clearing one wrongly claims coverage nothing had.
+    silent = payload(1, head_sha="1111111111",
+                     reviewers={"antigravity": {"ran": True, "truncated": True}})
+    assert load([write(tmp_path, "silent.json", silent)]).truncated_rounds == {1}
+
+
 def test_a_later_whole_pr_round_closes_an_earlier_rounds_gap(tmp_path):
     """The set was accumulate-only, so a round 3 still vetoed on round 1's
     truncation even when round 2 had re-read the whole PR untruncated in between —
@@ -933,7 +994,46 @@ def test_rounds_are_named_in_the_plural_when_there_are_several():
 
 # --------------------------------------------------------------- the whole round
 
+#: Every test below that forces truncation does it with a budget far under the
+#: diff, which is also what #138's pre-flight check refuses a round for — a
+#: 30-char cap on a 1,559-char diff is 52x over, and the panel now declines to
+#: dispatch rather than review 2% of a PR. That refusal is deliberate and has its
+#: own suite; here it would replace the truncation these tests exist to pin, so it
+#: is switched off explicitly rather than worked around with a bigger diff. `0`
+#: means "never refuse on size", and it leaves every other part of the round
+#: (including the truncation report) exactly as it was.
+#:
+#: **`manifest_moves` goes with it, and leaving it out was the sharper hole.** The
+#: refusal is not the only thing #138 does to a tiny-budget round: a diff that is
+#: move-shaped at 0.9 has its material REPLACED by a manifest, which is the very
+#: truncation these tests exist to pin. None of the fixtures here is move-shaped
+#: today, so nothing was wrong — but that made the suite a fixture edit away from a
+#: false green, in a file whose whole subject is what a budget does to a prompt.
+NO_REFUSAL = {"refuse_over_cap_multiple": 0, "manifest_moves": False}
+
+
+@pytest.fixture(autouse=True)
+def every_seat_is_on_this_box(monkeypatch):
+    """Pin the HOST out of every round in this file.
+
+    #138's `seat_ceilings` skips a seat whose CLI is not on PATH — an uninstalled
+    `agy` must not hold a ceiling on a round it cannot read — so a test that leaves
+    the real predicate in place is asserting on which vendor CLIs the machine
+    running the suite happens to carry. Locally that passes quietly; on a CI runner,
+    which has none of them, every ceiling here collapses to `cap is None` and the
+    pre-flight verdict stops engaging at all. That is the same host-dependence
+    `test_panel_preflight.ALL_HERE` documents at length, and it applies to any file
+    that runs a whole round with a budget in it — which this one does throughout.
+
+    Autouse rather than per-test, because the property wanted is "no round in this
+    file depends on the host", and a fixture a new test has to remember to ask for
+    is one a new test will not ask for.
+    """
+    monkeypatch.setattr(pf, "seat_installed", lambda name: True)
+
+
 CFG = {"github": "acme/board", "path": "/tmp/acme-board", "name": "board",
+       "_rules_baseline": ".harness-rules.sample",
        "reviewers": {"claude": {"enabled": True, "model": "sonnet"}},
        "review_panel": {}}
 HEAD = "b" * 40
@@ -961,7 +1061,7 @@ def budget_for_partial_context() -> int:
 
 
 def _judge(seen):
-    def fake(clusters, diff, model, pr, budget=None, coverage=None, ci=""):
+    def fake(clusters, diff, model, pr, budget=None, coverage=None, ci="", **_kw):
         seen["diff"], seen["budget"] = diff, budget
         return [], None, ""
     return fake
@@ -1001,7 +1101,7 @@ def _stub_run(monkeypatch, seen, *, cfg=None, findings=(), increment=INCREMENT,
     said = dict(FACTS, files=len([f for f in panel._diff_by_file(increment) if f]))
     said.update(facts or {})
     monkeypatch.setattr(panel_scope, "compare_facts", lambda *a: said)
-    def reviewer(name, model, prompt, effort=""):
+    def reviewer(name, model, prompt, effort="", **_kw):  # **_kw: code_tree since #113
         seen.setdefault("prompts", {})[name] = prompt
         return panel.ReviewerRun(list(findings), None, 10, [])
     monkeypatch.setattr(panel, "review_llm", reviewer)
@@ -1116,7 +1216,7 @@ def test_a_budget_under_the_target_is_truncation(monkeypatch, tmp_path):
     """The one thing that must never pass silently: a reviewer handed a prefix of
     the thing it is reviewing cannot see what it was not given."""
     seen = {}
-    cfg = dict(CFG, review_panel={"max_diff_chars": 30})
+    cfg = dict(CFG, review_panel={"max_diff_chars": 30, **NO_REFUSAL})
     got = _round(monkeypatch, tmp_path, seen, cfg=cfg, baselines=[_baseline(tmp_path)])
     assert got["diff_truncated"] is True
     assert got["reviewers"]["claude"]["truncated"] is True
@@ -1124,6 +1224,30 @@ def test_a_budget_under_the_target_is_truncation(monkeypatch, tmp_path):
     # off from the increment, which is what it was asked to read.
     assert any(f"of {len(INCREMENT):,} diff chars" in v
                for v in got["round_stop"]["veto"])
+
+
+def test_a_MOVE_SHAPED_increment_on_a_tiny_budget_is_still_truncation_here(monkeypatch,
+                                                                           tmp_path):
+    """`NO_REFUSAL` had to grow `manifest_moves: False`, and this is why.
+
+    Switching the refusal off is not enough to keep a tiny-budget round in this file
+    being about truncation: #138 also REPLACES the material of a move-shaped
+    over-ceiling round with a manifest, which fits, so `diff_truncated` goes false and
+    the very thing these tests pin disappears. None of the fixtures here is move-shaped
+    by accident today; this one is move-shaped on purpose, so the guard is pinned
+    rather than depending on every future fixture staying content-shaped."""
+    seen = {}
+    moved = "\n".join(f"-line {i}" for i in range(40))
+    arrived = "\n".join(f"+line {i}" for i in range(40))
+    increment = chunk("from.py", moved) + chunk("to.py", arrived)
+    assert pf.diff_shape(increment).is_move(), "fixture is not move-shaped"
+    cfg = dict(CFG, review_panel={"max_diff_chars": 30, **NO_REFUSAL})
+    got = _round(monkeypatch, tmp_path, seen, cfg=cfg, increment=increment,
+                 baselines=[_baseline(tmp_path)])
+    assert got["preflight"]["verdict"] == "run", "not substituted"
+    assert got["diff_truncated"] is True
+    assert got["reviewers"]["claude"]["truncated"] is True
+    assert "WHAT MOVED WHERE" not in seen["prompts"]["claude"]
 
 
 def test_a_budget_that_cannot_pay_for_the_frame_says_the_prompt_ran_over(monkeypatch,
@@ -1135,7 +1259,7 @@ def test_a_budget_that_cannot_pay_for_the_frame_says_the_prompt_ran_over(monkeyp
     window. Silent, the one contract a caller sets this number for ("the budget
     buys the whole prompt") would fail where it matters most."""
     seen = {}
-    cfg = dict(CFG, review_panel={"max_diff_chars": 30})
+    cfg = dict(CFG, review_panel={"max_diff_chars": 30, **NO_REFUSAL})
     got = _round(monkeypatch, tmp_path, seen, cfg=cfg, baselines=[_baseline(tmp_path)])
     assert len(seen["prompts"]["claude"]) > 30
     assert any("does not fit the budget it was given for claude" in n
@@ -1209,3 +1333,36 @@ def test_a_round_one_run_reviews_the_whole_pr_and_says_nothing_about_it(monkeypa
     assert got["scope"] == "pr" and got["diff_chars"] == len(PR)
     assert got["context_chars"] == 0 and got["config_notes"] == []
     assert seen["prompts"]["claude"].count(panel.PR_SCOPE_HEADER) == 1
+
+
+def test_an_argv_capped_round_does_not_clear_an_earlier_rounds_gap(tmp_path):
+    """The fail-open half of the argv exemption, found by a second model.
+
+    `cut` answers two different questions, and the exemption is only correct for
+    one of them. It decides whether this round leaves an inherited veto (the cap IS
+    exempt — no later round on this box could close a kernel gap either), and it
+    used to also decide `reread`, which ERASES every earlier round's recorded gap.
+
+    Under the exemption an argv-capped round has `cut == False`, so it qualified as
+    "a whole-PR round with nothing truncated" and wiped truncations that were
+    genuinely still open. Exempting the cap says "this gap will never close, stop
+    vetoing on it"; it must not also say "this round closed everyone else's"."""
+    r1 = payload(1, head_sha="1111111111",
+                 reviewers={"claude": {"ran": True, "truncated": True}})
+    # Round 2 read the whole PR, but its kernel-capped seat saw a prefix of it.
+    r2 = payload(2, head_sha="2222222222", scope="pr",
+                 reviewers={"antigravity": {"ran": True, "truncated": True,
+                                            "argv_capped": True},
+                            "claude": {"ran": True, "truncated": False}})
+    base = load([write(tmp_path, "r1.json", r1), write(tmp_path, "r2.json", r2)])
+
+    assert base.truncated_rounds == {1}, (
+        "round 2 was treated as having re-read the PR and cleared round 1's "
+        "truncation, but its argv-capped seat never saw the whole thing")
+
+    # ...and a round with genuinely nothing truncated still clears it, which is the
+    # behaviour this must not break.
+    clean2 = payload(2, head_sha="2222222222", scope="pr",
+                     reviewers={"claude": {"ran": True, "truncated": False}})
+    base = load([write(tmp_path, "r1.json", r1), write(tmp_path, "c2.json", clean2)])
+    assert base.truncated_rounds == set()

@@ -183,6 +183,76 @@ Every fix needs tests. Not optional. Not "if time permits".
 Look at the existing test style and follow it. Name tests
 descriptively: what scenario, what expected outcome.
 
+### Red/green — prove each regression test would have caught the bug
+
+A test written alongside its fix has never run against the broken
+code. Nothing so far has shown it would catch anything, and a test
+that would not is worse than no test: it is a passing assertion
+that the bug is gone, and it keeps passing when the bug comes back.
+
+Before you commit, make each new regression test fail:
+
+```bash
+cd "$WT_DIR" && git add -N <every file your fix changed OR ADDED>
+cd "$WT_DIR" && git diff HEAD -- <those same files> > .redgreen.patch
+cd "$WT_DIR" && { test -s .redgreen.patch || { echo "STOP: captured nothing"; exit 1; }; }
+cd "$WT_DIR" && git checkout HEAD -- <the files that existed before>
+cd "$WT_DIR" && rm <the files your fix ADDED>
+cd "$WT_DIR" && pytest <the new tests>    # MUST fail, on the assertion
+cd "$WT_DIR" && git apply .redgreen.patch && rm .redgreen.patch
+cd "$WT_DIR" && pytest <the new tests>    # green again
+```
+
+**Do NOT use `git stash` for this.** Every worktree of a repo shares
+one `refs/stash` — it is in the common git dir, not the per-worktree
+one — so a stash pushed here is listed and poppable from every other
+worktree this skill has ever created, and `stash@{0}` means whatever
+the last pusher meant. The PR that added this instruction lost its
+own working tree exactly that way: a concurrent agent in a sibling
+worktree popped the red/green stash into its own checkout. A patch
+file shares nothing.
+
+**`test -s` is the guard, and it has to HALT.** An empty capture —
+mistyped paths, or a fix already committed — means the red run
+executes with the fix still in place, comes out **green**, and reads
+precisely like the step passing. Hence `|| { echo …; exit 1; }`
+rather than `|| echo …`, which warns, exits 0, and proceeds into the
+run the check existed to prevent.
+
+**`git add -N` is what puts a file the fix ADDED into the patch.**
+Without intent-to-add, `git diff` ignores untracked files, so a fix
+spanning an edit and a new module is half-captured and the red run
+imports the new half. Added files come back out with `rm`, not `git
+checkout HEAD --`, which cannot restore a path absent from HEAD.
+Your new *test* file is not in the list and stays put — the point.
+
+**If the fix is already committed** there is nothing uncommitted to
+capture: use `git checkout <remote>/<base> -- <the files your fix
+changed>`, run the tests, then `git checkout HEAD -- <the same
+files>`.
+
+Read *how* it failed. An import error, a missing fixture or a
+`TypeError` demonstrates nothing — the failure has to be the
+assertion that names the defect. Stash the **fix**, not the test:
+stash both and all you have proved is that a file you removed no
+longer runs.
+
+**Exempt only where there is genuinely nothing to fail against:** a
+regression test for a path the fix *created* — a new function, flag
+or file — has no pre-fix behaviour to run against. Report those as
+`red/green: N-A (new code path)`.
+
+**A prompt string, a config default or a doc that already existed is
+NOT exempt.** That text is the artefact and a test can assert on it,
+so such a test goes red against the pre-fix text like any other —
+this very instruction arrived in a PR that changed a prompt string
+and a set of markdown briefs, and nine of its eleven tests failed
+against the previous text. Nor is a fix to code that already
+existed: a test that will not go red is testing something other than
+the bug, and the test is what needs fixing. The exemption exists so
+the legitimate case need not be lied about; one wide enough to cover
+the awkward cases is how the step stops happening at all.
+
 ## 6. Update documentation
 
 If the change affects behaviour described in CLAUDE.md, docs/,
@@ -262,6 +332,48 @@ Rank findings P1-P4 for the summary. Fix all of them. The only
 valid skip is a genuine false positive where re-examination
 confirms the code is correct. "Not worth the churn" is not valid.
 "Can do later" is not valid.
+
+One finding can be neither: it says the *approach* you chose is
+wrong rather than the code, and fixing it where it points means
+adding a special case to keep that approach standing (`/review-pr`'s
+step 3a has the test and why it matters — #67). Step 3a tells a
+fixer never to redesign on its own authority; here the opposite
+applies, and **authorship is the whole difference**. A fixer is
+changing somebody else's shipped decision on a PR under review, so
+its output is a question. You are the author, nothing is merged and
+no PR exists yet, so the decision is still yours to make and this is
+the cheapest moment in the cycle to make it: change the approach,
+and say in the PR body which finding made you.
+
+If you judge the redesign too big for this issue, do not bury it in
+a patch — write it up in the PR body with step 3a's five fields, so
+a reviewer inherits exactly what a fixer's escalation would have
+given them:
+
+- the premise, in one sentence;
+- the findings it explains;
+- what removing it would cost, and where;
+- the patch you did not write (the special case you declined to add);
+- the `--ask` verdict, if you put the premise to the seats
+  (`fails` / `holds` / `unresolved` / `unchallenged` / `not run`).
+
+Step 3a's invocation with its `--pr` dropped — that flag only links
+the ask to a PR for the board to render, and there is no PR yet; an
+`--ask` carrying no `--pr` is accepted, and it is the only form
+available here:
+
+```bash
+premise=$(cat <<'PREMISE'
+<the premise, in one sentence>
+PREMISE
+)
+timeout 120 python3 ~/.claude/loops/panel.py --ask "$premise" \
+    --context "<the file:first-last the premise lives in>"
+```
+
+Keep the quoted heredoc — step 3a says why, and the short version is
+that a premise about code carries backticks and `$(…)`, which bash
+executes inside a double-quoted argument.
 
 After fixing, re-run the quality pipeline. Iterate until clean.
 

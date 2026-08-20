@@ -30,14 +30,15 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
 import panel_scope  # noqa: E402  — scope/range readers moved here in #129
 import panel_seats  # noqa: E402
 import panel_core  # noqa: E402  — `sh` is defined here since #129
+import panel_preflight as pf  # noqa: E402  — the pre-flight verdict (#138)
 from conftest import gh_stub  # noqa: E402
-
-
 
 
 
@@ -584,19 +585,56 @@ FIX_COMPARE = _compare()
 CFG = {
     "github": "acme/e2e",
     "path": "/tmp/acme-e2e",
+    "_rules_baseline": ".harness-rules.sample",
     "reviewers": {"claude": {"enabled": True, "model": "sonnet"}},
     "review_panel": {},
 }
+
+
+@pytest.fixture(autouse=True)
+def every_seat_is_on_this_box(monkeypatch):
+    """Pin the HOST out of every round in this file.
+
+    #138's `seat_ceilings` skips a seat whose CLI is not on PATH — an uninstalled
+    `agy` must not hold a ceiling on a round it cannot read — so a test that leaves
+    the real predicate in place is asserting on which vendor CLIs the machine
+    running the suite happens to carry. Locally that passes quietly; on a CI runner,
+    which has none of them, every ceiling here collapses to `cap is None` and the
+    pre-flight verdict stops engaging at all. That is the same host-dependence
+    `test_panel_preflight.ALL_HERE` documents at length, and it applies to any file
+    that runs a whole round with a budget in it — which this one does throughout.
+
+    Autouse rather than per-test, because the property wanted is "no round in this
+    file depends on the host", and a fixture a new test has to remember to ask for
+    is one a new test will not ask for.
+    """
+    monkeypatch.setattr(pf, "seat_installed", lambda name: True)
 
 
 def _cfg(**budgets) -> dict:
     """A panel of one seat per named reviewer, each with its own diff budget (None
     for the whole diff). The multi-seat shapes are what pin the intersection rule
     the README makes a load-bearing claim about."""
-    return {**CFG, "reviewers": {
-        name: {"enabled": True, "model": "sonnet",
-               **({} if budget is None else {"max_diff_chars": budget})}
-        for name, budget in budgets.items()}}
+    return {**CFG,
+            # These budgets are truncation devices — `codex=20` cuts a seat out of
+            # both files on purpose — and a budget that far under the diff is also
+            # what #138's pre-flight check refuses a round for. The refusal has its
+            # own suite; here it would replace the coverage arithmetic these tests
+            # pin, so it is switched off for every seat shape this helper builds.
+            #
+            # `manifest_moves` goes off with it, and for the stronger reason: the
+            # refusal declines to run a round, but the MANIFEST substitutes its
+            # material, so a fixture that happened to be move-shaped at 0.9 would
+            # have the per-seat cut arithmetic here measured against a manifest
+            # instead of against the diff. `PR_DIFF` is not move-shaped today; this
+            # is what keeps that from being a property of the fixture.
+            "review_panel": {**CFG.get("review_panel", {}),
+                             "refuse_over_cap_multiple": 0,
+                             "manifest_moves": False},
+            "reviewers": {
+                name: {"enabled": True, "model": "sonnet",
+                       **({} if budget is None else {"max_diff_chars": budget})}
+                for name, budget in budgets.items()}}
 
 
 def _panel_round(monkeypatch, tmp_path, round_no, findings, head, baseline=(),
@@ -613,7 +651,7 @@ def _panel_round(monkeypatch, tmp_path, round_no, findings, head, baseline=(),
         compare=FIX_COMPARE if compare is None else compare,
         diff=PR_DIFF)
 
-    def fake_review(name, model, prompt, effort=""):
+    def fake_review(name, model, prompt, effort="", **_kw):  # **_kw: code_tree since #113
         # Only the first seat files, so two seats do not produce two canonical
         # records of one defect. What the extra seats are here for is the diff
         # budget they carry.
@@ -621,7 +659,7 @@ def _panel_round(monkeypatch, tmp_path, round_no, findings, head, baseline=(),
             [panel.Finding("claude", "P2", f, ln, t, "detail")
              for f, ln, t in findings] if name == "claude" else [], None, 800, None)
 
-    def fake_adjudicate(clusters, diff, model, pr, budget=None, coverage=None, ci=""):
+    def fake_adjudicate(clusters, diff, model, pr, budget=None, coverage=None, ci="", **_kw):  # **_kw: code_tree/budget_usd since #113
         return ([panel.Canonical(id=panel._finding_id(pr, i + 1), severity="P2",
                                  file=f.file, line=f.line, synthesis=f.title,
                                  verdict="confirmed", detail="detail",

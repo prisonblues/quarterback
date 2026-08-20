@@ -64,11 +64,20 @@ import ast
 import re
 import subprocess
 import tomllib
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+
+#: The repo root as a string, for the one use of it that is not a file read: the directory
+#: handed to `git ls-files`. Bound to its own name rather than spelled `str(REPO_ROOT)` at
+#: the call site so that `_repo_root_uses_the_reader_cannot_follow` below has one shape to
+#: recognise instead of an exemption for every `str(REPO_ROOT)` anywhere in the file — which
+#: would have waved through `Path(str(REPO_ROOT), "x")` and `os.path.join(str(REPO_ROOT), "x")`,
+#: reads the flake enumeration never hears about.
+_GIT_CWD = str(REPO_ROOT)
 
 #: Releases are named with two components (`v2.20`); the packaged and served versions carry
 #: three (`2.20.0`). So they are compared at the grain the CHANGELOG actually uses, which
@@ -172,13 +181,6 @@ def _without_fenced_blocks(text: str) -> str:
     return "".join(out)
 
 
-# Every `read_text` below spells its encoding out. The files this suite reads are prose — em
-# dashes, ellipses, the occasional accented name — and `read_text()` with no encoding takes the
-# platform default, which under a C/POSIX locale is ASCII. That is not a hypothetical shell: a
-# nix build, a minimal CI image and a cron job all commonly run without a UTF-8 locale, and the
-# failure there is a `UnicodeDecodeError` at collection time rather than anything about releases.
-
-
 @pytest.fixture(scope="module")
 def changelog_text() -> str:
     return (REPO_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
@@ -223,8 +225,8 @@ def packaged_version() -> str:
     """The RAW string, not a (major, minor): `pyproject.toml` and `app/main.py` are the
     two places carrying a full three-component version, and truncating them to the
     CHANGELOG's grain is what would hide a patch-level disagreement (see below)."""
-    text = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    return str(tomllib.loads(text)["project"]["version"])
+    raw = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    return str(tomllib.loads(raw)["project"]["version"])
 
 
 @pytest.fixture(scope="module")
@@ -347,6 +349,7 @@ def test_an_unstamped_entry_is_at_the_top(changelog_prose, changelog_releases):
     would then fail on the release AFTER the mistake, pointing at the wrong commit."""
     placeholder = re.search(rf"^## {PLACEHOLDER}\b", changelog_prose, flags=re.MULTILINE)
     if not placeholder:
+        # Named in flake.nix's allowed-skip list; see the note in the git test above.
         pytest.skip("nothing unstamped — this branch is not writing a release")
     first_numbered = re.search(rf"^## {_V}", changelog_prose, flags=re.MULTILINE)
     assert first_numbered and placeholder.start() < first_numbered.start(), (
@@ -392,9 +395,12 @@ def test_no_test_file_is_named_after_a_release():
     it committed here" is the question that was actually being asked, and git answers it without
     a list that grows every time somebody's setup differs."""
     try:
-        proc = subprocess.run(["git", "-C", str(REPO_ROOT), "ls-files", "-z"],
+        proc = subprocess.run(["git", "-C", _GIT_CWD, "ls-files", "-z"],
                               capture_output=True, text=True, check=False)
     except OSError:
+        # Both skip reasons are matched by name in flake.nix's release-metadata check, which
+        # allows exactly these two and fails the build on any other skip. Reword one and the
+        # build says so; it does not go quietly green.
         pytest.skip("git is not on PATH, so there is no set of tracked files to check")
     if proc.returncode != 0:
         pytest.skip("not a git checkout (an export or a tarball), so nothing here is tracked")
@@ -403,6 +409,53 @@ def test_no_test_file_is_named_after_a_release():
     assert not named, (
         "test files are named after their subject, not the release that shipped them: "
         + ", ".join(named))
+
+
+def _git_answers(stdout: str = "",
+                 returncode: int = 0) -> Callable[..., subprocess.CompletedProcess]:
+    """A stand-in for `subprocess.run` returning one of git's answers.
+
+    Monkeypatched in rather than a real repository being built, because what is under test is
+    what this file does with each answer — absent, refused, and a listing — not what git says
+    about a checkout. The three tests below are the only things exercising this test's three
+    paths at all: in a normal run it takes the listing path against the real repo and neither
+    skip is ever reached, and in the nix sandbox it takes a skip and asserts nothing.
+    """
+    def run(*_args, **_kwargs):
+        return subprocess.CompletedProcess([], returncode, stdout, "")
+    return run
+
+
+def test_the_tracked_filenames_check_skips_when_git_is_absent(monkeypatch):
+    """The release-metadata sandbox has no git in it on purpose, and flake.nix says in a
+    comment that this test skips there rather than failing. That claim held up only as prose
+    until here; it is also the reason string the flake check allows by name, so a reword that
+    silently turned the skip into something the build refuses is caught in the same breath."""
+    def no_git(*_args, **_kwargs):
+        raise OSError(2, "No such file or directory: 'git'")
+    monkeypatch.setattr(subprocess, "run", no_git)
+    with pytest.raises(pytest.skip.Exception, match="git is not on PATH"):
+        test_no_test_file_is_named_after_a_release()
+
+
+def test_the_tracked_filenames_check_skips_outside_a_checkout(monkeypatch):
+    """The other skip: git is there and the directory is an export or a tarball. Also allowed
+    by name in the flake check, for the sandbox where git happens to be present."""
+    monkeypatch.setattr(subprocess, "run", _git_answers(returncode=128))
+    with pytest.raises(pytest.skip.Exception, match="not a git checkout"):
+        test_no_test_file_is_named_after_a_release()
+
+
+def test_the_tracked_filenames_check_names_the_files_it_refuses(monkeypatch):
+    """And the rule itself, on a listing written here: a release-named test file in any suite
+    fails, and the ordinary ones beside it do not. Without this the two skips above are the
+    only paths through the test that anything exercises."""
+    monkeypatch.setattr(subprocess, "run", _git_answers(
+        "tests/test_v234.py\0harness/tests/test_v2_release.py\0tests/test_reviews.py\0"
+        "app/main.py\0tests/test_versioning.py\0"))
+    with pytest.raises(AssertionError,
+                       match=r"harness/tests/test_v2_release\.py, tests/test_v234\.py"):
+        test_no_test_file_is_named_after_a_release()
 
 
 def _readme_bullet(release_name: str) -> re.Pattern[str]:
@@ -534,265 +587,427 @@ def test_an_unclosed_fence_says_which_line_opened_it():
         _without_fenced_blocks("intro\n\n```md\n## vNEXT — a sample entry\n")
 
 
-#: A `cp ${./some/path}` inside the flake's release-metadata check, anchored to the `cp` that
-#: makes it a copy. The anchor is the whole point: `${./x}` on its own is Nix's "put this path
-#: in the store and interpolate where it landed", which a script may do to RUN a file
-#: (`bash ${./scripts/foo.sh}`) or to pass one as an argument — neither of which puts the file
-#: in the sandbox at the path this suite reads. Unanchored, any such reference would answer
-#: "yes, that file is supplied" for a file nothing copies. Flags are allowed between the two
-#: because `cp -r` and `cp --no-preserve=mode` are both things that script may grow.
-_FLAKE_COPY = re.compile(r"\bcp\b(?:[ \t]+-\S+)*[ \t]+\$\{\./([^}]+)\}")
+# ----------------------------------------------- the sandbox this suite is run in
+#
+# This suite reads files at the repo ROOT while living two directories below it, and
+# `nix build .#checks.<system>.release-metadata-tests` runs it in a sandbox holding only the
+# files that check copies in by name. Enumeration is what goes stale: a read whose file
+# nobody copied does not FAIL there, it errors on a missing file, and an ERROR line in a
+# check somebody has to go and read is how #163 sat unnoticed. So the two lists are compared
+# below, in both directions, where they fail in the ordinary `pytest harness/tests` a
+# developer runs before pushing rather than in a nix build they may not run at all.
+#
+# The comparison needs the suite's own reads as data, which is what the two AST readers
+# further down produce. Both take a source string, so the shapes they exist to catch are
+# written out as three-line snippets in the tests rather than having to be smuggled into
+# this file's real source.
 
-#: The line that DEFINES the check, as opposed to any of the sentences that mention it by name.
-#: `flake.nix` already discusses `release-metadata-tests` in prose around the attribute, and a
-#: search for the bare name takes whichever mention comes first in the file — so a comment added
-#: above the definition would silently move the slice below to a block that is not this check.
-#: Line-start indentation plus `= pkgs.runCommand` is the shape only a definition has.
-_FLAKE_CHECK_HEAD = re.compile(r"^[ \t]*release-metadata-tests = pkgs\.runCommand\b", re.MULTILINE)
+#: One copy line in the flake check's script: `cp ${./a/b} repo/a/b`, or the `install -D`
+#: form that brings its own parent directory. Anchored at line start AND on the command,
+#: because the region is bash inside a Nix indented string where `${./x}` also occurs in
+#: comments, in a commented-out copy line and in `--ignore` arguments — counting one of those
+#: as a copy is how this guard passes while the sandbox errors on the file it exists to catch.
+#: `\s*` inside the braces is for the Nix formatters that write `${ ./x }`, which would
+#: otherwise be reported as a missing copy on a repo where nothing is wrong.
+_FLAKE_COPY = re.compile(
+    r"^[ \t]*(?:cp|install)\b[^\n]*?\$\{\s*\./(?P<src>[^}\s]+)\s*\}[ \t]+(?P<dest>\S+)[ \t]*$",
+    re.MULTILINE)
 
-#: The end of that attribute's script, anchored to the indentation the block closes at. The
-#: previous version took the first bare `'';` after the head, which the script's own text can
-#: contain — an `echo "… '';"`, a comment quoting Nix syntax — and a slice truncated there
-#: compares the guard below against half a cp list while looking entirely healthy.
-_FLAKE_CHECK_END = re.compile(r"\n {8}'';")
+#: The flake attribute whose sandbox runs this suite, spelled as flake.nix spells it.
+_FLAKE_CHECK = "release-metadata-tests"
+
+#: The prefix every copy lands under: the sandbox builds a `repo/` tree and this suite's
+#: REPO_ROOT resolves to it. A destination that does not follow the rule puts the file
+#: somewhere the suite will not look, which comparing source paths alone cannot see.
+_SANDBOX_PREFIX = "repo/"
+
+#: Copied in without being read through `REPO_ROOT`, so the copies-with-no-read half of the
+#: comparison does not report it: pytest opens the suite's own file by path.
+_COPIED_BUT_NOT_READ = frozenset({"harness/tests/test_release_numbers.py"})
 
 
-def _flake_check_block(text: str) -> str:
-    """The `release-metadata-tests` runCommand script, sliced out of `flake.nix`'s source.
+def _flake_check_region(text: str) -> str:
+    """The `release-metadata-tests` check's own text, sliced out of flake.nix.
 
-    Both ends assert, and both say the parser broke rather than the flake did. This is a hand
-    parser over another language's syntax, so the day it stops matching is a day somebody
-    reshaped that attribute — and "this suite reads files the check does not copy" would be a
-    confusing way to be told about it."""
-    heads = list(_FLAKE_CHECK_HEAD.finditer(text))
-    assert len(heads) == 1, (
-        f"flake.nix has {len(heads)} lines defining `release-metadata-tests = pkgs.runCommand`, "
-        "and this parser needs exactly one. If the check was renamed, moved or reshaped, update "
-        "this pattern to match — the slice it takes is the only thing tying this suite to the "
+    Both ends are anchored at line start on shapes Nix actually writes, rather than found
+    with a bare substring search. `release-metadata-tests` appears in comments, in prose and
+    in a future `checks.${system}` assembly entry; `'';` ends every indented string in the
+    file. The first occurrence of either is not necessarily this check's, and a wrong slice
+    silently compares the suite's reads against some other derivation's copies.
+    """
+    opens = list(re.finditer(rf"^[ \t]*{re.escape(_FLAKE_CHECK)}\s*=", text, flags=re.MULTILINE))
+    assert len(opens) == 1, (
+        f"flake.nix has {len(opens)} lines defining `{_FLAKE_CHECK} =`, and this comparison "
+        "needs exactly one to know which sandbox feeds this suite. If the check was renamed, "
+        "rename `_FLAKE_CHECK` here too — this is the only thing tying the suite to the "
         "sandbox that feeds it")
-    end = _FLAKE_CHECK_END.search(text, heads[0].end())
+    start = opens[0].start()
+    end = re.compile(r"^[ \t]*'';[ \t]*$", re.MULTILINE).search(text, start)
     assert end, (
-        "the release-metadata-tests check has no closing `'';` on a line of its own at the "
-        "block's indentation, so this parser cannot tell where the script ends — the parser "
-        "broke, not the flake. Update the delimiter pattern to however the block now closes")
-    return text[heads[0].start():end.start()]
+        f"no line closing an indented string (`'';`) appears after the `{_FLAKE_CHECK}` "
+        f"definition at offset {start} of flake.nix, so this comparison cannot tell where "
+        "the check ends. The check's script was restructured, or the file is truncated")
+    return text[start:end.start()]
 
 
-def _unreadable_join(origin: str, node: ast.AST, shape: str) -> AssertionError:
-    """The refusal `_repo_root_paths_in` raises, phrased so the author can act on it."""
-    return AssertionError(
-        f"{origin} line {node.lineno} builds a repo-root path as {shape}, and the reader in "
-        "test_release_numbers.py only understands a literal join — `REPO_ROOT / \"app\" / "
-        "\"main.py\"`. It refuses rather than skipping the expression, because a read it "
-        "cannot see is a file the flake's sandbox will not be given, and the test that does "
-        "the reading then ERRORS there with FileNotFoundError instead of failing here, which "
-        "is the #163 failure moved one level up. Write the join with string literals, or teach "
-        "`_repo_root_paths_in` the shape you need")
+def _flake_copies(region: str) -> dict[str, str]:
+    """Source path -> destination, for every copy line in a check's script."""
+    return {m.group("src"): m.group("dest") for m in _FLAKE_COPY.finditer(region)}
 
 
-def _joined_components(node: ast.BinOp, origin: str) -> tuple[str, ...] | None:
-    """The components of a `REPO_ROOT / … / …` chain, or None if the chain is rooted elsewhere.
+#: This file's own syntax tree, parsed once. Both readers below want it, and parsing the
+#: source twice per run to hand them each their own copy bought nothing.
+_OWN_TREE: ast.Module | None = None
 
-    `/` is division far more often than it is a path join, so a chain whose base is anything but
-    `REPO_ROOT` is not this reader's business and yields nothing. One that IS rooted there and
-    carries a segment which is not a string literal raises: see `_unreadable_join`."""
-    operands: list[ast.expr] = []
-    cur: ast.expr = node
+
+def _source_tree(source: str | None = None) -> ast.Module:
+    """This file's tree, or a snippet's when one is given."""
+    global _OWN_TREE
+    if source is not None:
+        return ast.parse(source)
+    if _OWN_TREE is None:
+        _OWN_TREE = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    return _OWN_TREE
+
+
+def _repo_root_chain(node: ast.AST) -> list[str] | None:
+    """The literal segments joined onto `REPO_ROOT` with `/`, or None if this expression is
+    not rooted at `REPO_ROOT` through string literals alone.
+
+    A bare `REPO_ROOT` yields `[]` — rooted, but naming no file. One implementation of this
+    rule rather than two, because both readers below have to agree about what a followable
+    chain is and two hand-rolled versions of that only have to agree until someone edits one.
+    """
+    parts: list[str] = []
+    cur: ast.AST = node
     while isinstance(cur, ast.BinOp) and isinstance(cur.op, ast.Div):
-        operands.append(cur.right)
+        if not isinstance(cur.right, ast.Constant) or not isinstance(cur.right.value, str):
+            return None
+        parts.append(cur.right.value)
         cur = cur.left
     if not (isinstance(cur, ast.Name) and cur.id == "REPO_ROOT"):
         return None
-    components: list[str] = []
-    for operand in reversed(operands):
-        if isinstance(operand, ast.Constant) and isinstance(operand.value, str):
-            components.append(operand.value)
-        else:
-            raise _unreadable_join(origin, operand, "a segment that is not a string literal")
-    return tuple(components)
+    return list(reversed(parts))
 
 
-def _refuse_unreadable_call(node: ast.Call, origin: str) -> None:
-    """The two other ways to build a repo-root path that this reader cannot follow.
-
-    `str(REPO_ROOT)` — the directory handed to `git ls-files` — is deliberately not one of them,
-    and neither is `Path(__file__)`: the first is a call ON the name rather than a join, and the
-    second does not mention `REPO_ROOT` at all."""
-    func = node.func
-    if (isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name)
-            and func.value.id == "REPO_ROOT"):
-        raise _unreadable_join(origin, node, f"`REPO_ROOT.{func.attr}(…)`")
-    if (isinstance(func, ast.Name) and func.id == "Path"
-            and any(isinstance(a, ast.Name) and a.id == "REPO_ROOT" for a in node.args)):
-        raise _unreadable_join(origin, node, "`Path(REPO_ROOT, …)`")
-
-
-def _repo_root_paths_in(source: str, origin: str) -> set[str]:
-    """Every repo-root path `source` joins onto `REPO_ROOT`, read out of its syntax tree.
+def _paths_this_suite_reads(source: str | None = None) -> set[str]:
+    """Every repo-root path joined onto `REPO_ROOT`, read out of the syntax tree.
 
     Parsed rather than grepped, and the first version of this was grepped. A pattern over the
     raw source cannot tell an expression from a sentence, and it read the path out of the
     comment that documented it — so the guard failed on a repo where nothing was wrong, which
-    is the one failure this whole suite argues gets a check switched off. The tree has only
-    the expressions.
+    is the one failure this whole suite argues gets a check switched off.
 
-    A bare `REPO_ROOT` with nothing joined onto it is not a file read: it is the directory
-    handed to `git ls-files`, and it yields no chain here.
+    A bare `REPO_ROOT` with nothing joined onto it names no file and yields no path.
 
-    Takes source text rather than reading the file itself so that the refusals above can be
-    exercised on a snippet — a reader that fails loudly is only worth having if something
-    checks that it does.
-
-    `ast.walk` offers a two-component join twice, once whole and once as its own left operand,
-    so the DIRECTORY `app` arrives here alongside the file `app/main.py`. Rather than tracking
-    which nodes were somebody's left operand, every chain is collected and then any path that
-    is a component-wise prefix of another is dropped. Component-wise, not string-wise: `app` is
-    a string prefix of `appendix.md` and a directory prefix of nothing but `app/…`."""
-    tree = ast.parse(source)
-    found: set[tuple[str, ...]] = set()
+    Deliberately an over-approximation in one direction: a chain built to assert a file's
+    ABSENCE (`assert not (REPO_ROOT / "gone").exists()`) is indistinguishable from a read
+    here, and would be reported as a path the flake must copy — which for a path that does
+    not exist fails Nix evaluation outright. No such chain exists today. Write that assertion
+    against a path outside `REPO_ROOT` if one is ever needed.
+    """
+    tree = _source_tree(source)
+    # `ast.walk` yields every node, so a two-component join offers itself twice: once whole,
+    # and once as its own left operand. Taking both would register the DIRECTORY `app` as a
+    # file to copy alongside `app/main.py`. Only maximal chains are reads.
+    inner = {id(n.left) for n in ast.walk(tree)
+             if isinstance(n, ast.BinOp) and isinstance(n.op, ast.Div)}
+    paths: set[str] = set()
     for node in ast.walk(tree):
-        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
-            components = _joined_components(node, origin)
-            if components is not None:
-                found.add(components)
-        elif isinstance(node, ast.Call):
-            _refuse_unreadable_call(node, origin)
-    return {"/".join(path) for path in found
-            if not any(other[:len(path)] == path for other in found - {path})}
+        if not isinstance(node, ast.BinOp) or not isinstance(node.op, ast.Div):
+            continue
+        if id(node) in inner:
+            continue
+        parts = _repo_root_chain(node)
+        if parts:
+            paths.add("/".join(parts))
+    return paths
 
 
-def _paths_this_suite_reads() -> set[str]:
-    """The repo-root paths THIS file reads — what the flake's sandbox has to contain."""
-    return _repo_root_paths_in(Path(__file__).read_text(encoding="utf-8"),
-                               Path(__file__).name)
+#: Callees that build a path out of their ARGUMENTS. `REPO_ROOT` reaching one of these at any
+#: depth of wrapping — `Path(str(REPO_ROOT), "x")`, `os.path.join(str(REPO_ROOT), "x")` — is a
+#: read the chain reader cannot see, which is why the wrapping is walked through rather than
+#: only the immediate parent being looked at.
+_PATH_BUILDERS = frozenset({"Path", "PurePath", "PosixPath", "WindowsPath", "join", "joinpath"})
+
+#: Attribute access on `REPO_ROOT` that CONTINUES a path rather than asking a question about
+#: one. `.is_dir()`, `.exists()`, `.name`, `.relative_to()` and the rest are not reads and are
+#: none of this guard's business.
+_JOINING_ATTRS = frozenset({"joinpath"})
+
+
+def _builds_a_path(func: ast.expr) -> bool:
+    """Whether a call's callee is one of the path constructors above."""
+    if isinstance(func, ast.Name):
+        return func.id in _PATH_BUILDERS
+    return isinstance(func, ast.Attribute) and func.attr in _PATH_BUILDERS
+
+
+def _repo_root_uses_the_reader_cannot_follow(source: str | None = None) -> list[int]:
+    """The lines where `REPO_ROOT` builds a path in a shape `_paths_this_suite_reads` skips.
+
+    That reader only understands `REPO_ROOT / "a" / "b"` with string literals throughout,
+    which is every read in this file today and no guarantee about tomorrow's. A read written
+    any other way leaves it with nothing to report, so the flake enumeration goes stale and
+    the sandbox errors on a missing file — #163 again.
+
+    What is reported is the shapes that BUILD a path and cannot be followed: a non-literal
+    segment (including a loop variable), `.joinpath`, `Path(...)`/`os.path.join(...)` at any
+    depth of wrapping, and a name bound to a `REPO_ROOT` chain that is later joined onto —
+    `app_dir = REPO_ROOT / "app"` followed by `app_dir / "main.py"`, where the reader
+    registers the directory and never hears about the file.
+
+    What is NOT reported is every use that is not a path being built: `path.relative_to(
+    REPO_ROOT)`, `REPO_ROOT.is_dir()`, `subprocess.run(..., cwd=REPO_ROOT)`, an f-string, or
+    `REPO_ROOT` handed to a helper. Reporting those was the earlier rule here — refuse
+    anything unrecognised — and it fires on correct code with remediation advice ("write it
+    as `REPO_ROOT / \\"literal\\"`") that makes no sense for a non-path use. This suite's own
+    argument is that a check which fires on a correct repo gets switched off, so the shapes
+    are enumerated rather than the exemptions. The cost is a blind spot: a helper handed
+    `REPO_ROOT` can read whatever it likes unseen. Nothing here can chase that, and the
+    honest version of this guard says so rather than firing at everything.
+    """
+    tree = _source_tree(source)
+    parents = {id(child): node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+
+    # Names bound to a REPO_ROOT chain, so that a later join onto one can be spotted. The
+    # binding itself is fine — `flake = REPO_ROOT / "flake.nix"` is a read the reader sees.
+    aliases: set[str] = set()
+    for node in ast.walk(tree):
+        targets: list[ast.expr] = []
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+        elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)):
+            targets = [node.target]
+        if targets and node.value is not None and _repo_root_chain(node.value) is not None:
+            aliases.update(t.id for t in targets
+                           if isinstance(t, ast.Name) and t.id != "REPO_ROOT")
+
+    def joined_onto(node: ast.AST) -> bool:
+        parent = parents.get(id(node))
+        if isinstance(parent, ast.BinOp) and isinstance(parent.op, ast.Div) and parent.left is node:
+            return True
+        return isinstance(parent, ast.Attribute) and parent.attr in _JOINING_ATTRS
+
+    def inside_a_path_builder(node: ast.AST) -> bool:
+        cur: ast.AST | None = node
+        while cur is not None and not isinstance(cur, ast.stmt):
+            parent = parents.get(id(cur))
+            if isinstance(parent, ast.Call) and cur is not parent.func \
+                    and _builds_a_path(parent.func):
+                return True
+            cur = parent
+        return False
+
+    unreadable: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Name) or not isinstance(node.ctx, ast.Load):
+            continue
+        if node.id in aliases and joined_onto(node):
+            unreadable.add(node.lineno)
+            continue
+        if node.id != "REPO_ROOT":
+            continue
+        parent = parents.get(id(node))
+        if isinstance(parent, ast.BinOp) and isinstance(parent.op, ast.Div) and parent.left is node:
+            # Follow the chain to its top: a non-literal anywhere along it makes the whole
+            # chain unreadable, and it is the `REPO_ROOT` line that names the read.
+            top: ast.AST = node
+            while True:
+                above = parents.get(id(top))
+                if isinstance(above, ast.BinOp) and isinstance(above.op, ast.Div) \
+                        and above.left is top:
+                    top = above
+                else:
+                    break
+            if _repo_root_chain(top) is None:
+                unreadable.add(node.lineno)
+        elif joined_onto(node) or inside_a_path_builder(node):
+            unreadable.add(node.lineno)
+    # Sorted and de-duplicated: two unfollowable uses on one line (a comparison of two, a
+    # multi-argument call) would otherwise name that line twice in the failure message.
+    return sorted(unreadable)
 
 
 def test_the_flake_check_supplies_every_repo_root_file_this_suite_reads():
-    """The enumeration in `flake.nix` is the thing that goes stale, so nothing relies on
-    somebody remembering it.
+    """The enumeration in flake.nix against the reads in this file, both directions.
 
-    This suite reads files at the repo ROOT while living two directories below it, and
-    `nix build .#checks.<system>.release-metadata-tests` runs it in a sandbox containing
-    only the files that check names one by one. Add another file to the ones it copies and
-    the sandbox does not have it: the new assertion does not fail there, it ERRORS on a
-    missing file — and an ERROR line in a check somebody has to go and read is exactly how
-    #163 sat unnoticed for a day with every assertion in this suite inert.
-
-    So the coupling is asserted here, where it fails in the ordinary `pytest harness/tests`
-    a developer runs before pushing, rather than in a nix build they may not run at all.
-
-    Skipped rather than failed when `flake.nix` is absent: this file is also collected from
-    a sandbox, and a check that cannot see the expression cannot judge it."""
+    Skipped rather than failed when flake.nix is absent, because this file is also collected
+    from sandboxes that do not contain it. That skip is itself a hole — this is the release
+    check's only staleness guard, and a guard that can vanish silently is the thing this suite
+    argues against — so the flake check allows exactly two skip reasons and neither is this
+    one: drop the flake.nix copy line there and the build goes red rather than green.
+    """
     flake = REPO_ROOT / "flake.nix"
     if not flake.is_file():
         pytest.skip("no flake.nix beside this checkout, so there is no check to compare against")
-    copied = set(_FLAKE_COPY.findall(_flake_check_block(flake.read_text(encoding="utf-8"))))
+    copies = _flake_copies(_flake_check_region(flake.read_text(encoding="utf-8")))
+    read = _paths_this_suite_reads()
 
-    missing = sorted(_paths_this_suite_reads() - copied)
+    missing = sorted(read - set(copies))
     assert not missing, (
-        "this suite reads repo-root files that flake.nix's release-metadata-tests check does "
-        "not copy into its sandbox, so they will error there as FileNotFoundError rather than "
-        "be asserted: " + ", ".join(missing) + ". Add a `cp ${./<path>}` for each")
+        f"this suite reads repo-root files that flake.nix's {_FLAKE_CHECK} check does not "
+        "copy into its sandbox, so they will error there as FileNotFoundError rather than be "
+        "asserted: " + ", ".join(missing) + ". Add an `install -Dm644 ${./<path>} "
+        f"{_SANDBOX_PREFIX}<path>` line for each")
+
+    unread = sorted(set(copies) - read - _COPIED_BUT_NOT_READ)
+    assert not unread, (
+        f"flake.nix's {_FLAKE_CHECK} check copies files this suite no longer reads, so the "
+        "sandbox carries a store dependency for nothing and its file list has quietly stopped "
+        "describing the suite: " + ", ".join(unread) + ". Drop the copy line, or add the path "
+        "to `_COPIED_BUT_NOT_READ` with the reason it is there")
+
+    misplaced = sorted(f"{src} -> {dest}" for src, dest in copies.items()
+                       if dest != _SANDBOX_PREFIX + src)
+    assert not misplaced, (
+        f"flake.nix's {_FLAKE_CHECK} check copies files to destinations that do not mirror "
+        f"their repo paths under `{_SANDBOX_PREFIX}`, so the suite will not find them where "
+        "it looks and the source-path comparison above cannot see it: " + ", ".join(misplaced))
 
 
-def test_the_reader_finds_the_paths_it_is_meant_to_find():
-    """The guard above is only worth having if its parser works, and a parser that silently
-    finds NOTHING would make it pass on any flake at all.
+def test_the_reader_finds_every_literal_chain_and_only_those():
+    """The comparison above is only worth having if its reader works.
 
-    `app` is the other half of the same worry, from the opposite direction: the file is read as
-    `REPO_ROOT / "app" / "main.py"`, whose left operand is a perfectly good chain of its own, so
-    a reader that took every chain would demand the flake copy a DIRECTORY as if it were a file
-    and fail on a check that is doing exactly the right thing."""
-    found = _paths_this_suite_reads()
-    assert {"CHANGELOG.md", "README.md", "pyproject.toml", "app/main.py"} <= found
-    assert "app" not in found
-
-
-#: Every way of building a repo-root path that the reader is meant to refuse rather than skip.
-#: Each is a shape somebody could reasonably reach for — a loop over filenames, an f-string, a
-#: constant named at the top of the file, the `joinpath` spelling — and each was silently
-#: dropped by the version of the reader that broke out of its loop and moved on.
-_UNREADABLE_JOINS = [
-    "REPO_ROOT / name",
-    'REPO_ROOT / f"{name}.md"',
-    "REPO_ROOT / CHANGELOG",
-    'REPO_ROOT / "app" / name',
-    'REPO_ROOT.joinpath("app", "main.py")',
-    'Path(REPO_ROOT, "app", "main.py")',
-]
+    Asserted against a snippet rather than against this file's own reads. Writing those out
+    would be a third copy of the enumeration — the flake's, this file's, and a hand-kept list
+    of what the reader ought to see — and the third one is the one that goes stale unnoticed,
+    since a subset check never fails when a read DISAPPEARS. What guards this file's reads is
+    the two-directional comparison above."""
+    source = (
+        '(REPO_ROOT / "CHANGELOG.md").read_text()\n'
+        'text = (REPO_ROOT / "app" / "main.py").read_text()\n'
+        'flake = REPO_ROOT / "flake.nix"\n'
+        'subprocess.run(["git", "-C", str(REPO_ROOT)])\n'
+        'REPO_ROOT.joinpath("invisible.md")\n'
+        '(REPO_ROOT / name).read_text()\n'
+        '(OTHER_ROOT / "not-this-root.md").read_text()\n'
+    )
+    assert _paths_this_suite_reads(source) == {"CHANGELOG.md", "app/main.py", "flake.nix"}
 
 
-@pytest.mark.parametrize("expression", _UNREADABLE_JOINS)
-def test_the_reader_refuses_a_repo_root_path_it_cannot_resolve(expression):
-    """Loudly, and naming the line — the alternative is what this whole guard exists against.
-
-    A dropped read leaves the flake assertion green while the sandbox is missing a file, so the
-    suite errors in the nix build with a FileNotFoundError about a path nothing here mentions.
-    Refusing costs the author who wrote the dynamic join one clear message on the line they
-    wrote it; skipping costs whoever is next to run `nix build` an afternoon."""
-    source = f"import os\n\n{expression}\n"
-    with pytest.raises(AssertionError, match="line 3"):
-        _repo_root_paths_in(source, "a snippet")
+def test_the_reader_is_not_silently_finding_nothing():
+    """On this file, where a reader returning an empty set would make the comparison above
+    pass against any flake at all."""
+    assert _paths_this_suite_reads()
 
 
-def test_the_reader_accepts_the_shapes_this_file_already_uses():
-    """The refusals above are narrow on purpose. `str(REPO_ROOT)` is the directory handed to
-    `git ls-files` and `Path(__file__)` is how REPO_ROOT itself is computed — both are calls
-    near the name rather than joins onto it, and a guard that tripped on either would fail this
-    suite on its own unmodified source."""
-    source = ('REPO_ROOT = Path(__file__).resolve().parent.parent.parent\n'
-              'proc = subprocess.run(["git", "-C", str(REPO_ROOT), "ls-files", "-z"])\n'
-              'text = (REPO_ROOT / "app" / "main.py").read_text(encoding="utf-8")\n')
-    assert _repo_root_paths_in(source, "a snippet") == {"app/main.py"}
+#: The shapes the shape guard exists to refuse, one snippet each. Measured rather than
+#: supposed: every one of them reads a repo-root file while leaving `_paths_this_suite_reads`
+#: with nothing to report, so the flake enumeration never hears about the file.
+_SHAPES_THE_READER_CANNOT_FOLLOW = {
+    "joinpath": 'REPO_ROOT.joinpath("CHANGELOG.md").read_text()',
+    "Path(REPO_ROOT, ...)": 'Path(REPO_ROOT, "CHANGELOG.md").read_text()',
+    "a str()-wrapped root in a Path()": 'Path(str(REPO_ROOT), "CHANGELOG.md").read_text()',
+    "os.path.join on the root": 'os.path.join(str(REPO_ROOT), "CHANGELOG.md")',
+    "a variable segment": 'name = "CHANGELOG.md"\n(REPO_ROOT / name).read_text()\n',
+    "a loop over filenames": 'for name in NAMES:\n    (REPO_ROOT / name).read_text()\n',
+    "an intermediate directory": 'app_dir = REPO_ROOT / "app"\n(app_dir / "main.py").read_text()\n',
+    "an alias": 'root = REPO_ROOT\n(root / "app" / "main.py").read_text()\n',
+}
+
+#: Uses of `REPO_ROOT` that are not a path being built. The guard must stay quiet about these:
+#: it fires with advice to rewrite the expression as `REPO_ROOT / "literal"`, which is not
+#: something a `cwd=` argument or an `is_dir()` call can be rewritten as.
+_SHAPES_THAT_ARE_NOT_READS = {
+    "a literal chain": '(REPO_ROOT / "app" / "main.py").read_text()',
+    "a chain bound to a name and then read": 'flake = REPO_ROOT / "flake.nix"\nflake.read_text()\n',
+    "the git cwd string": '_GIT_CWD = str(REPO_ROOT)',
+    "a subprocess cwd": 'subprocess.run(["git", "status"], cwd=REPO_ROOT)',
+    "a question about the root": 'if REPO_ROOT.is_dir():\n    pass\n',
+    "a relative_to argument": 'p.relative_to(REPO_ROOT)',
+    "a comparison": 'assert Path.cwd() != REPO_ROOT',
+    "a message naming the root": 'raise SystemExit(f"no repo at {REPO_ROOT}")',
+}
 
 
-def test_the_reader_drops_a_directory_and_keeps_a_name_that_merely_starts_the_same():
-    """The prefix rule is component-wise, and `appendix.md` is why.
-
-    As string prefixes, `app` starts both `app/main.py` and `appendix.md`, so a `startswith`
-    would drop a file the sandbox genuinely has to be given — a missing copy that the guard
-    would then report as satisfied."""
-    source = ('a = REPO_ROOT / "app" / "main.py"\n'
-              'b = REPO_ROOT / "app"\n'
-              'c = REPO_ROOT / "appendix.md"\n')
-    assert _repo_root_paths_in(source, "a snippet") == {"app/main.py", "appendix.md"}
+@pytest.mark.parametrize("shape", sorted(_SHAPES_THE_READER_CANNOT_FOLLOW))
+def test_the_shape_guard_refuses_reads_the_reader_cannot_follow(shape):
+    """Each of these passes `_paths_this_suite_reads` in silence and then errors in the
+    sandbox on a file nobody copied in. The guard is what stands between the two, and a
+    refactor that made it return nothing unconditionally would leave this suite green
+    without them."""
+    source = _SHAPES_THE_READER_CANNOT_FOLLOW[shape]
+    assert _repo_root_uses_the_reader_cannot_follow(source), source
 
 
-def test_the_flake_block_is_found_past_a_mention_of_its_own_name():
-    """`flake.nix` talks about this check in prose beside it, and prose gets added over time.
-    A first-occurrence search for the bare attribute name would slice from the comment and take
-    whatever block happened to follow — comparing the guard against a different check's copies
-    while looking, from the outside, exactly as healthy as a correct one."""
-    text = ("{\n"
-            "  # The release-metadata-tests = check is described here, in the prose that sits\n"
-            "  # above it, because that is where this file explains its checks.\n"
-            "  checks = {\n"
-            "        release-metadata-tests = pkgs.runCommand \"release-metadata-tests\"\n"
-            "          { } ''\n"
-            "          cp ${./CHANGELOG.md}  repo/CHANGELOG.md\n"
+@pytest.mark.parametrize("shape", sorted(_SHAPES_THAT_ARE_NOT_READS))
+def test_the_shape_guard_is_quiet_about_uses_that_are_not_reads(shape):
+    source = _SHAPES_THAT_ARE_NOT_READS[shape]
+    assert _repo_root_uses_the_reader_cannot_follow(source) == [], source
+
+
+def test_the_shape_guard_names_a_line_once():
+    """Two unfollowable uses on one line is one line to go and look at, not two."""
+    assert _repo_root_uses_the_reader_cannot_follow(
+        'shutil.copy(Path(REPO_ROOT, "a"), Path(REPO_ROOT, "b"))') == [1]
+
+
+def test_every_use_of_repo_root_is_one_the_reader_can_follow():
+    """On this file. The coupling is not "the reader sees every read" — it cannot be — but
+    "every read here is written in a shape the reader sees"."""
+    unreadable = _repo_root_uses_the_reader_cannot_follow()
+    assert not unreadable, (
+        "REPO_ROOT builds a path at line(s) " + ", ".join(str(n) for n in unreadable)
+        + " in a shape `_paths_this_suite_reads` cannot follow, so the file being read there "
+        "will not reach the list checked against flake.nix. Write it as `REPO_ROOT / "
+        "\"literal\"`, or teach the reader the new shape and add the file to the "
+        f"{_FLAKE_CHECK} check")
+
+
+#: A flake region with everything the copy reader has to get right: a commented-out copy, a
+#: `${./x}` in prose, one in an argument that is not a copy at all, the two copy commands, and
+#: the spacing a Nix formatter leaves behind.
+_FLAKE_REGION_SAMPLE = """        release-metadata-tests = pkgs.runCommand "x" { } ''
+          # cp ${./commented-out.md} repo/commented-out.md
+          # mentions ${./prose.md} in passing
+          install -Dm644 ${./CHANGELOG.md} repo/CHANGELOG.md
+          cp ${ ./app/main.py }  repo/app/main.py
+          pytest -q --ignore=${./not-a-copy.py} tests
+          touch $out
+        '';
+"""
+
+
+def test_only_real_copy_lines_count_as_copies():
+    """The guard's fail-safe direction depends on this. A `${./x}` in a comment or an argument
+    counted as a copy is a file the sandbox does not have and the comparison says it does —
+    which is the sandbox erroring on a missing file with the guard green, i.e. #163."""
+    assert _flake_copies(_FLAKE_REGION_SAMPLE) == {
+        "CHANGELOG.md": "repo/CHANGELOG.md",
+        "app/main.py": "repo/app/main.py",
+    }
+
+
+def test_the_region_reader_takes_the_whole_check_and_stops_at_its_end():
+    """`release-metadata-tests` occurs in prose and `'';` ends every indented string in
+    flake.nix, so neither end can be found by taking the first occurrence of a substring."""
+    text = ("        loops-tests = pkgs.runCommand \"a\" { } ''\n"
+            "          cp ${./decoy.md} repo/decoy.md\n"
             "        '';\n"
-            "  };\n"
-            "}\n")
-    assert set(_FLAKE_COPY.findall(_flake_check_block(text))) == {"CHANGELOG.md"}
+            + _FLAKE_REGION_SAMPLE
+            + "        mcp-tests = pkgs.runCommand \"b\" { } ''\n"
+              "          cp ${./later.md} repo/later.md\n"
+              "        '';\n")
+    assert set(_flake_copies(_flake_check_region(text))) == {"CHANGELOG.md", "app/main.py"}
 
 
-def test_a_closing_delimiter_inside_the_script_does_not_truncate_the_block():
-    """`'';` is two characters a shell script may legitimately contain — this file's own check
-    prints and comments on Nix syntax — and a slice that ended at the first one would compare
-    against half the cp list and report the rest of the files as never copied."""
-    text = ("        release-metadata-tests = pkgs.runCommand \"release-metadata-tests\"\n"
-            "          { } ''\n"
-            "          echo \"a nix string is closed with '';\" > /dev/null\n"
-            "          cp ${./README.md}  repo/README.md\n"
-            "        '';\n")
-    assert set(_FLAKE_COPY.findall(_flake_check_block(text))) == {"README.md"}
+def test_the_region_reader_says_so_when_the_check_is_not_there():
+    """A renamed check, which is the whole reason the name is a constant here."""
+    with pytest.raises(AssertionError, match="0 lines defining"):
+        _flake_check_region("        loops-tests = pkgs.runCommand \"a\" { } ''\n        '';\n")
 
 
-def test_only_a_copy_counts_as_supplying_a_file():
-    """`${./x}` is Nix putting a path in the store, which is not the same as the sandbox having
-    that file at the path this suite reads. Running a script or passing a file as an argument
-    both interpolate one, and neither is a `cp`."""
-    block = ("          bash ${./scripts/release_stamp.py} check\n"
-             "          cp   ${./CHANGELOG.md}  repo/CHANGELOG.md\n"
-             "          cp -r ${./app} repo/app\n")
-    assert set(_FLAKE_COPY.findall(block)) == {"CHANGELOG.md", "app"}
+def test_the_region_reader_refuses_an_ambiguous_check_name():
+    """Two definitions and there is no telling which sandbox feeds this suite."""
+    doubled = _FLAKE_REGION_SAMPLE + _FLAKE_REGION_SAMPLE
+    with pytest.raises(AssertionError, match="2 lines defining"):
+        _flake_check_region(doubled)
+
+
+def test_the_region_reader_says_what_it_saw_when_the_check_is_unterminated():
+    """Not "the parser is wrong" — the far likelier cause is a restructured check, and a
+    message that blames the wrong thing sends whoever hits it to the wrong file."""
+    with pytest.raises(AssertionError, match="no line closing an indented string"):
+        _flake_check_region("        release-metadata-tests = pkgs.runCommand \"x\" { } ''\n"
+                            "          cp ${./CHANGELOG.md} repo/CHANGELOG.md\n")

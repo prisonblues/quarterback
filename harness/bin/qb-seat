@@ -14,9 +14,15 @@ set -uo pipefail
 # them without starting anything is what it is for:
 #   0  --help, or a dry run with nothing to refuse
 #   2  a seat number that is not 1-99, or a directory that is not a git worktree
-#   3  this seat number is already running in another pane on this machine
+#   3  this seat is already running in another pane on this machine
 #   *  otherwise this process is REPLACED by the agent and exits as it does
 #:end-usage
+#
+# A SEAT IS ITS NUMBER AND ITS PROJECT — `seat-lexray-3`, not `seat-3`. That is
+# what lets one screen per project be the ordinary way to work: two screens both
+# numbering their seats from 1 do not collide, and a seat number started twice in
+# the SAME project still does. QB_SEAT_SCOPE renames the middle part, or empties
+# it for the machine-wide numbering this had before.
 #
 # WHAT THIS IS FOR. Five agents on one machine is five terminals, five `cd`s and
 # a human reading the plan out loud to each of them — and that human is the part
@@ -49,6 +55,32 @@ set -uo pipefail
 # seat being restarted in the same pane, because the board hands a returning key
 # its old name back.
 #
+# WHY THE NAME CARRIES THE PROJECT AS WELL AS THE NUMBER. `seat-3` on its own makes
+# the NAMESPACE the machine while the NUMBERING is per screen — and `qb-seats`
+# numbers from 1 every time it builds one. So the second screen on a box asks for
+# seat 1, finds the first screen's seat 1 holding the marker, and refuses. Not an
+# edge case reached by an unlucky choice of number: the guaranteed outcome of
+# starting a second screen, which made one screen per project — the obvious way to
+# use this — the one thing it could not do (#208).
+#
+# The guard was right and its key was too coarse, so the key grew a scope. The
+# identity is `seat-<project>-<n>`, so `seat-lexray-1` and `seat-nix-fleet-1` are
+# two seats while `seat-lexray-1` started twice is still one, and every property
+# the refusal names survives: one identity per pane, one ask cursor per identity.
+# The default scope is the basename of the seat's own repository, because a screen
+# is per repository; QB_SEAT_SCOPE overrides it for the two cases that default
+# cannot read — two screens on ONE repository, and anyone who wants the old
+# machine-wide numbering back, which is QB_SEAT_SCOPE= , empty and meaning it.
+#
+# THE SLUG IS NOT COSMETIC. The scope is interpolated into a name the board has to
+# accept: an `X-Agent-Name` that does not match ^[a-z0-9]+(?:-[a-z0-9]+)*$ within
+# 40 characters is refused with a 400, and the key header's alphabet is no wider.
+# A repository called `Foo.Bar_2` would therefore make every seat in it fail
+# registration — so the basename is folded to lower case, every run of anything
+# else becomes one hyphen, the ends are trimmed and the middle is capped. A scope
+# that slugs away to nothing (a directory named `___`) leaves the bare `seat-3`
+# and says so, rather than inventing a project name nobody could type.
+#
 # WHY IT REGISTERS THE NAME ITSELF, BEFORE STARTING ANYTHING. Since v2.12 the
 # board DESIGNATES the name half of an identity: a client sends an opaque key and
 # is allocated two words. `QUARTERBACK_INSTANCE=seat-3` is honoured as a *request*
@@ -74,6 +106,13 @@ set -uo pipefail
 # beside it, and the panel's board recording before that.
 
 SEAT_NAME_PREFIX="seat-"
+
+# How much of `seat-<scope>-<n>` the scope may take. The board allows 40 characters
+# for both the key and the name, and the fixed parts are `seat-` plus a hyphen plus
+# at most two digits — so 32 is what is left, and a repository whose name is longer
+# than that is truncated rather than refused.
+SEAT_SCOPE_MAX=32
+
 AGENT_BIN="${QB_SEAT_AGENT:-claude}"
 
 # QB_SEAT_YOLO — permission prompts. ON unless this says otherwise, which is the
@@ -217,8 +256,6 @@ if [[ ! "$SEAT" =~ ^[1-9][0-9]?$ ]]; then
     exit 2
 fi
 
-SEAT_NAME="$SEAT_NAME_PREFIX$SEAT"
-
 # Where the seat works. The layout that declares the panes is the natural place
 # for this (zellij and tmux both set a per-pane cwd), so the default is simply
 # "here"; QB_SEAT_REPO is for a caller that has no such control.
@@ -248,6 +285,63 @@ if [[ "$(git -C "$REPO" rev-parse --is-bare-repository 2>/dev/null)" == "true" ]
     exit 2
 fi
 
+# ---- the seat's name --------------------------------------------------------
+
+# The scope — which project this seat sits in, and the half of the name that makes
+# seat 1 on one screen a different seat from seat 1 on the next. See the header for
+# why it exists and why it is slugged rather than used as found.
+seat_scope_slug() {
+    local slug
+    # `tr`, rather than ${x,,} and a [!a-z0-9] glob. ${x,,} is bash 4 and macOS
+    # ships 3.2 — the same machine that has no XDG_RUNTIME_DIR — and a bracket
+    # range is collation-dependent under a UTF-8 locale in a way tr's byte classes
+    # are not. Fold the case, everything else to a hyphen, squeeze the runs.
+    slug=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-' | tr -s '-')
+    slug="${slug#-}"
+    slug="${slug%-}"
+    # Capped to keep `seat-<scope>-<n>` inside the board's 40 characters, and
+    # trimmed AGAIN afterwards because the cut can land on a hyphen — and a name
+    # ending in one is a name the board rejects outright.
+    slug="${slug:0:$SEAT_SCOPE_MAX}"
+    slug="${slug%-}"
+    printf '%s' "$slug"
+}
+
+# ${VAR+set}, not ${VAR:-…}: an EMPTY QB_SEAT_SCOPE is an answer and not a missing
+# one — it is the only way to ask for the machine-wide numbering this had before
+# #208 — and it is the same spelling QB_SEAT_BRIEF uses beside it, for the same
+# reason.
+#
+# The default is the repository directory's own name, taken from the PHYSICAL path
+# rather than from $PWD's spelling of it: a seat reached through a symlink is the
+# same seat as one reached by the real path, and one that quietly got a second
+# identity out of the difference would be this bug again with a longer story.
+if [[ -n "${QB_SEAT_SCOPE+set}" ]]; then
+    SEAT_SCOPE_SOURCE="$QB_SEAT_SCOPE"
+else
+    SEAT_SCOPE_SOURCE=$(cd -P "$REPO" 2>/dev/null && pwd) || SEAT_SCOPE_SOURCE="$REPO"
+    SEAT_SCOPE_SOURCE="${SEAT_SCOPE_SOURCE##*/}"
+fi
+SEAT_SCOPE=$(seat_scope_slug "$SEAT_SCOPE_SOURCE")
+
+if [[ -n "$SEAT_SCOPE" ]]; then
+    SEAT_NAME="$SEAT_NAME_PREFIX$SEAT_SCOPE-$SEAT"
+else
+    SEAT_NAME="$SEAT_NAME_PREFIX$SEAT"
+fi
+
+# Said out loud, because the quiet version of this is the bug the scope exists to
+# fix: a scope that slugs away to nothing puts the seat back in the machine-wide
+# namespace, where the next screen's seat of the same number cannot start. Only for
+# a source that had something in it — an explicitly empty QB_SEAT_SCOPE asked for
+# exactly this and does not need telling.
+if [[ -z "$SEAT_SCOPE" && -n "$SEAT_SCOPE_SOURCE" ]]; then
+    printf 'qb-seat: there is no letter or digit in %s, so this seat is %s and is\n' \
+        "$SEAT_SCOPE_SOURCE" "$SEAT_NAME" >&2
+    printf '         numbered across the whole machine — set QB_SEAT_SCOPE if another\n' >&2
+    printf '         screen needs this number too.\n' >&2
+fi
+
 # ---- one pane per seat -------------------------------------------------------
 
 # Two panes started as the same seat is the failure this script exists to prevent,
@@ -262,17 +356,23 @@ fi
 # the pid of the process that becomes the agent (we exec, so it stays this pid),
 # in the per-user runtime directory that is already scoped to one login.
 #
+# KEYED ON THE WHOLE NAME, not on the bare number, and the two have to agree or
+# the guard is protecting something other than the identity it describes: a marker
+# named for the number alone would still refuse the second screen's seat 1 while
+# the board happily gave it its own identity (#208).
+#
 # XDG_RUNTIME_DIR is not everywhere, though: macOS has none, and neither do most
 # containers or an ssh session onto a box with no systemd user session. The
 # fallback carries the uid in the NAME, because /tmp is shared and a marker there
-# is not. Without it the first user to start seat 3 owns /tmp/qb-seat-3.pid for
-# everybody, and the second user's seat cannot write it (tee fails, silently),
+# is not. Without it the first user to start seat 3 in a repo owns that repo's
+# /tmp/qb-seat-<repo>-3.pid for everybody, and the second user's seat cannot write
+# it (tee fails, silently),
 # cannot remove it, and reads `kill -0` refusing on someone else's live pid as
 # proof that the seat has ended.
 if [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
-    SEAT_MARKER="$XDG_RUNTIME_DIR/qb-seat-$SEAT.pid"
+    SEAT_MARKER="$XDG_RUNTIME_DIR/qb-$SEAT_NAME.pid"
 else
-    SEAT_MARKER="${TMPDIR:-/tmp}/qb-seat-$UID-$SEAT.pid"
+    SEAT_MARKER="${TMPDIR:-/tmp}/qb-$UID-$SEAT_NAME.pid"
 fi
 
 # Is that pid still there? `kill -0` fails for "no such process" and for "not
@@ -312,11 +412,11 @@ seat_force_requested() {
 # and the cost of being wrong is a seat that quietly shares an inbox for hours.
 # Renumbering the pane is the fix.
 seat_taken_note() {
-    printf 'qb-seat: seat %s is already running here (pid %s).\n' "$SEAT" "$1" >&2
-    printf '         Two panes on one seat number share a board identity AND an ask\n' >&2
-    printf '         cursor, so one of them silently eats the other'\''s mail. Give this\n' >&2
-    printf '         pane a different number, or set QB_SEAT_FORCE=1 if that pid is not\n' >&2
-    printf '         really a seat.\n' >&2
+    printf 'qb-seat: %s is already running here (pid %s).\n' "$SEAT_NAME" "$1" >&2
+    printf '         Two panes on one seat share a board identity AND an ask cursor,\n' >&2
+    printf '         so one of them silently eats the other'\''s mail. Give this pane a\n' >&2
+    printf '         different number, or set QB_SEAT_FORCE=1 if that pid is not really\n' >&2
+    printf '         a seat.\n' >&2
 }
 
 # The override is not silent. It is an assertion, not a check — the operator is
@@ -324,8 +424,8 @@ seat_taken_note() {
 # the shared-inbox bug above with nothing on screen to say so. One line is the
 # only trace a forced start leaves anywhere.
 seat_force_note() {
-    printf 'qb-seat: seat %s looks taken (pid %s); QB_SEAT_FORCE is set, starting anyway\n' \
-        "$SEAT" "$1" >&2
+    printf 'qb-seat: %s looks taken (pid %s); QB_SEAT_FORCE is set, starting anyway\n' \
+        "$SEAT_NAME" "$1" >&2
     printf '         — if that pid IS a seat, the two now share one identity and one\n' >&2
     printf '         ask cursor.\n' >&2
 }
@@ -582,14 +682,14 @@ register_seat_name() {
     # an earlier run — a seat started by hand before this script existed, say.
     # Allocation hands a returning key the name it had, and a request cannot
     # override one that exists, so the seat keeps the two words it was given.
-    # Not fatal, and not an addressing problem: `<machine>/seat-N` is the key,
+    # Not fatal, and not an addressing problem: `<machine>/seat-<scope>-<n>` is the key,
     # which the board resolves as a permanent alias for as long as the row lives.
     #
     # It does NOT catch two panes started as the same seat — they send the same
     # key, so the board hands them the same identity and cannot tell them apart.
     # That one is only visible locally, which is what the pane marker is for.
     #
-    # Compared on the last segment rather than as `!= */seat-N`, which requires a
+    # Compared on the last segment rather than as `!= */seat-…`, which requires a
     # slash to be there at all: the day the board answers with a bare name, that
     # pattern makes every seat print these three lines on every start, and three
     # lines nobody needs on every start is how an operator learns to skip the one

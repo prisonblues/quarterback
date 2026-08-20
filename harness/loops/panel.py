@@ -121,6 +121,13 @@ import panel_scope               # noqa: F401
 from panel_rounds import *       # noqa: F401,F403
 import panel_rounds              # noqa: F401
 
+# The pre-flight verdict (#138) — whether a round is worth running at all, and
+# whether it should read the diff or a manifest of it. Its own module for the
+# reason the four above are: this file is what #129 split because one of its
+# sections was over the cap of the seat that has to read it.
+from panel_preflight import *     # noqa: F401,F403
+import panel_preflight            # noqa: F401
+
 # ----------------------------------------------------------------------------- run
 
 def _changed_files(meta: dict) -> tuple[list[dict], int | None, int]:
@@ -221,6 +228,11 @@ def _payload_defaults() -> dict:
         "is_draft": None,
         "reviewed": False,
         "skip_reason": None,
+        # The pre-flight verdict (#138) and the shape it was read off. None means
+        # this run never reached the verdict — the title-pattern skip returns
+        # above it — which is a different statement from a `run` verdict, and the
+        # difference matters to anything asking "was this PR ever weighed?"
+        "preflight": None,
         # The commit this round reviewed. NOTHING else in the payload identifies
         # one — `base` holds a branch NAME — and two later readers need it: the
         # next round diffs against it to get the fix commit (an increment is
@@ -295,6 +307,10 @@ def _payload_defaults() -> dict:
         "diff_chars": 0,
         "diff_budgets": {},
         "config_notes": [],
+        # Present on every payload, empty by default: a consumer that reads it —
+        # the next round, through --baseline — must not have to tell "no
+        # escalations" from "a payload that predates the field".
+        "escalated": {},
         "sonar_gate": "skipped",
         "ci_status": "unknown",
         "ci_failing": [],
@@ -303,6 +319,22 @@ def _payload_defaults() -> dict:
         "judge_skip": None,
         "reviewers_ran": [],
         "reviewers": {},
+        # Nulls rather than `{"setting": true, "seats": []}`, for the reason the
+        # file-count key above gives: a run that never got as far as asking cannot
+        # claim the setting was on and bought nothing. `seats: []` on a skipped
+        # round would read as "code access was available and no seat used it",
+        # which is a finding about the panel rather than about a round that never
+        # ran one.
+        "code_access": {"setting": None, "seats": None,
+                        "convention_files_removed": None},
+        # #165's dials as this round applied them. Null on the paths that reviewed
+        # nothing, for the reason `code_access` is: a round that never dispatched a
+        # seat, never briefed a fixer and never computed a stop did not apply a
+        # review policy, and recording the resolved values there would read as
+        # "these governed a round" about a round that did not happen. A bad VALUE
+        # in the rules file is still reported on those paths — it lands in
+        # `config_notes`, which the skip payloads carry.
+        "review_panel": None,
         "reviewers_selected": [],
         "reviewers_override": None,
         "to_fix": [],
@@ -372,18 +404,64 @@ def fit_comment(report: str, limit: int = COMMENT_CHARS) -> str:
     return head[:room - len(tail)] + cut + tail
 
 
+POST_TIMEOUT_S = 120
+
+
+def post_summary(gh_repo: str, pr_number: int, report: str) -> bool:
+    """Comment `report` on the PR. True when GitHub took it.
+
+    Bounded, and NOT check=True. This is the last step of a run that has already
+    succeeded and already printed its report: a hung network call here would
+    block after every expensive thing is done, and raising would throw away a
+    completed review over a failed comment. The comment is how the fix loop finds
+    the findings, so a failure has to be LOUD — but it degrades the run, it
+    doesn't void it.
+
+    A function rather than the inline block it was, because #138 gave it a second
+    caller with a stronger claim on it than the first. A REFUSED round posts too,
+    and posting is most of what makes the refusal loud: the terminal copy is read
+    by whoever is watching, and under the epic (#52) nobody is. A refusal that
+    exists only in a payload is the silent skip the refusal was built to replace.
+    """
+    try:
+        proc = subprocess.run(["gh", "pr", "comment", str(pr_number), "--repo",
+                               gh_repo, "--body", fit_comment(report)],
+                              capture_output=True,
+                              text=True, stdin=subprocess.DEVNULL,
+                              timeout=POST_TIMEOUT_S)
+        if proc.returncode == 0:
+            print(f"\n(posted panel summary to {gh_repo}#{pr_number})")
+            return True
+        why = stderr_gist(proc.stderr or "") or f"exited {proc.returncode}"
+    except (subprocess.TimeoutExpired, OSError) as e:
+        why = (f"timed out after {POST_TIMEOUT_S}s"
+               if isinstance(e, subprocess.TimeoutExpired) else e.__class__.__name__)
+    print(f"\n! panel summary NOT posted to {gh_repo}#{pr_number} ({why})"
+          f" — the report above is the only copy", file=sys.stderr)
+    return False
+
+
 def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = False,
         reviewers: str | None = None, json_file: str = "", record: bool = True,
         round_no: int = 1, baseline: list[str] | None = None,
         max_rounds: int | None = None, scope: str = "auto",
-        since: str = "") -> int:
+        since: str = "", force: bool = False,
+        no_code_access: bool = False,
+        escalated: list[str] | None = None) -> int:
     # A cycle is something the CALLER drives, and only /panel-review-pr does:
     # naming a cap (or a round, or a baseline) is what says this run is part of
     # one. A review-only /panel run left to the default is a single pass, and
     # must not report itself as "round 1 of at most 2 — go again", promising a
     # re-review nothing will run.
+    # `--escalated` is deliberately NOT one of them, and `main` refuses the flag
+    # unless one of the three is given. It names work a LATER round must not count,
+    # and it is read out of a fix pass that by construction followed a review
+    # round — so `--escalated` with no round, cap or baseline is a caller error,
+    # and the loud refusal at the edge is the whole of the answer. Treating the
+    # flag as evidence of a cycle (the shape this had for one round) produced
+    # exactly what the comment above forbids: "round 1 of at most 2 — go again",
+    # promising a re-review nothing will run.
     in_cycle = max_rounds is not None or round_no > 1 or bool(baseline)
-    cap = DEFAULT_MAX_ROUNDS if max_rounds is None else max_rounds
     # Idempotency key for the board record, minted once per process so a retry of
     # the POST cannot double-count the run into the stats. A fresh panel run is a
     # genuinely new observation and gets a new key — re-reviewing a PR after a fix
@@ -401,6 +479,72 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     gh_repo = cfg["github"]
     rev = cfg["reviewers"]
     panel = cfg["review_panel"]
+    # Every config diagnostic this run will report. Initialised HERE, not beside the
+    # file-list warnings below it, because #165's dials are resolved before the PR is
+    # fetched: a rules file with a bad `fix_severity_floor` has to say so whether or
+    # not the PR read succeeds, and the round cap the verdict is computed against
+    # comes out of the same resolution. Everything downstream still just appends.
+    notes: list[str] = []
+    # The seven `review_panel` settings that trade thoroughness against convergence,
+    # resolved once (`panel_seats.resolve_dials`) so the prompt, the report, the stop
+    # rule and the payload cannot disagree about which policy this round ran under.
+    dials = resolve_dials(panel, max_rounds, notes)
+    cap = dials.max_rounds
+
+    # A repo that configured no review does not get one. Before `gh pr view`, and
+    # before the --reviewers check below it, because this refusal is about the repo
+    # and not about the run: there is nothing to spend an API call finding out.
+    #
+    # Shaped exactly like the title-pattern skip forty lines down — a loud line, a
+    # payload with `reviewed: false` and a `skip_reason`, exit 0, and NOT recorded on
+    # the board, because no review happened. That shape is load-bearing on the epic's
+    # merge gate, which reads `reviewed`/`skip_reason` off the payload precisely
+    # because a zero exit, a push and the existence of a payload have each been
+    # mistaken for a review in turn (see `epic.sub_pr_merge` in the sample).
+    refusal = review_refusal(cfg)
+    if refusal:
+        # Its own stream selection rather than `chatter`, which is assigned below the
+        # PR fetch this refusal exists to skip.
+        print(f"[{repo_name}#{pr_number}] {refusal} — refusing to review. No panel ran.",
+              file=sys.stderr if json_out else sys.stdout)
+        unconfigured_payload = {
+            **_payload_defaults(),
+            "repo": repo_name, "github": gh_repo, "pr": pr_number,
+            # Nothing was fetched, so nothing about the PR is known: `title` and
+            # `base` are null here where the title-pattern skip has them, and that
+            # is the honest difference between "we read the PR and declined it" and
+            # "we declined before reading it".
+            "title": None, "base": None,
+            "round": round_no,
+            "skip_reason": refusal,
+            "config_notes": [refusal],
+            "run_key": run_key,
+        }
+        # No `load_baseline` and no cycle bookkeeping, unlike the title skip. That
+        # one is per-PR and the cycle around it goes on; this is per-REPO and
+        # terminal — every round of every cycle here refuses identically until a
+        # rules file is committed, so there is no next round for a baseline to
+        # anchor and nothing an inherited escalation register could be carried by.
+        failed = write_payload(json_file, unconfigured_payload)
+        if json_out:
+            print(json.dumps(unconfigured_payload, indent=2))
+        return finish(failed)
+
+    # `--round 4` against a cap of 2 is a caller error, and it used to be checked in
+    # `main` against the CLI flag and the built-in constant alone — so a repo setting
+    # `review_panel.max_rounds: 3` had `--round 3` refused on the strength of a cap it
+    # had raised. Checked HERE instead, against the cap this run will actually apply,
+    # and still before anything is fetched. Without it the round runs and hits the cap
+    # branch on the spot, writing "round cap (2) reached — …, unreviewed" into a round
+    # 3 whose caller believed it had asked for more.
+    if round_no > cap:
+        blame = ("--max-rounds" if max_rounds is not None
+                 else f"`review_panel.max_rounds` ({panel.get('max_rounds')})"
+                 if panel.get("max_rounds") not in (None, "") else
+                 f"the default cap of {DEFAULT_MAX_ROUNDS}")
+        sys.exit(f"panel: --round {round_no} is past the cap of {cap}, from {blame}: "
+                 "raise the cap, or pass the round this run actually is")
+
     # Resolved before anything is fetched, so a typo'd --reviewers fails on the
     # spot rather than after a PR read and a diff download.
     selected, override_note = select_reviewers(rev, reviewers)
@@ -443,12 +587,11 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     changed_files, changed_files_total, dropped_files = _changed_files(meta)
     pr_state, is_draft = meta.get("state"), meta.get("isDraft")
 
-    # Built BEFORE the skip branch, because the skip branch returns. It used to
-    # sit with the diff budgets forty lines below, so a skipped PR carrying two
-    # paths and a total of 3,000 said nothing at all — and the skip path is the
-    # one this release argues is most likely to be merged unattended, which makes
-    # it the worst possible place for the warning to go missing.
-    notes: list[str] = []
+    # These are built BEFORE the skip branch, because the skip branch returns. They
+    # used to sit with the diff budgets forty lines below, so a skipped PR carrying
+    # two paths and a total of 3,000 said nothing at all — and the skip path is the
+    # one this release argues is most likely to be merged unattended, which makes it
+    # the worst possible place for the warning to go missing.
     # `dropped` is excluded on purpose: a discarded malformed row is not GitHub
     # paging us short, and one note covering both would send a reader looking for
     # a truncation that never happened.
@@ -460,6 +603,46 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     if dropped_files:
         notes.append(f"{dropped_files:,} file entr{'y' if dropped_files == 1 else 'ies'} "
                      "had no usable path and were dropped")
+    # Checked at the door, and before the skip branch returns. `--escalated` is
+    # the one input here read out of a fixer's PROSE report rather than produced
+    # by a machine, and its value is both written into every later round's
+    # baseline and interpolated into a `config_notes` line that `--post` puts in a
+    # public PR comment. Rejected rather than passed on, reported rather than
+    # dropped: the note names a flattened, truncated excerpt, which says which
+    # value was wrong without putting a caller's arbitrary markdown on the PR.
+    #
+    # Deduplicated, because `panel-review-pr.md` documents re-passing a key you
+    # inherited as harmless and it has to actually be: this loop and the skip
+    # branch's below both iterate the values, so `--escalated K --escalated K`
+    # wrote the same note twice — into the payload, and with `--post` into a public
+    # PR comment. On the value as WRITTEN (a `str()` of it), not on the value
+    # itself: one duplicate note per spelling the caller used, and nothing here
+    # assumes the caller passed something hashable.
+    declared: list[str] = []
+    reported: set[str] = set()
+    for raw in (escalated or []):
+        if str(raw) in reported:
+            continue
+        reported.add(str(raw))
+        if _is_key(raw):
+            # The NORMALISED key: a value transcribed out of prose arrives
+            # upper-cased or newline-padded often enough, and the register has to
+            # hold the spelling a finding's own key equals.
+            key = _key_norm(raw)
+            if key not in declared:
+                declared.append(key)
+        else:
+            # EVERY value that is not a key, the EMPTY one included. The
+            # `elif str(raw or "")` this replaces let `--escalated ""` take neither
+            # branch — no key recorded and no note, which is the one outcome this
+            # flag's design rules out — and the empty value is the likeliest of all
+            # to arrive: `--escalated "$KEY"` with an unset shell variable, or an
+            # orchestrator interpolating a `Key:` line the fixer's report never
+            # carried. `_key_gist` renders it `(empty)`, which is what that
+            # fallback was written for.
+            notes.append(f"--escalated `{_key_gist(raw)}` is not the shape of a finding "
+                         "key (8-64 hex characters) — it was ignored, so the finding it "
+                         "meant still counts as work a fix round can clear")
 
     # Progress goes to stderr in --json mode, so stdout is the payload and only
     # the payload: it is a machine-readable artifact, and a consumer that has to
@@ -487,6 +670,16 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             skip_prior = load_baseline(baseline or [],
                                        {"repo": repo_name, "github": gh_repo,
                                         "pr": pr_number, "round": round_no})
+            # A key this round was handed that the register does not already hold
+            # is LOST here, and said so. The alternative — recording it — dates
+            # the declaration to a round that reviewed nothing and writes it in
+            # unchecked, since the typo check needs findings this round does not
+            # have. Silence is the one option ruled out: the caller would believe
+            # the finding was excluded while every later round counted it.
+            for key in sorted(k for k in declared if k not in skip_prior.escalated):
+                notes.append(f"--escalated {key} was passed to a round that reviewed "
+                             "nothing, so it was NOT recorded — pass it again on the "
+                             "next round that runs")
             skipped_payload = {
                 **_payload_defaults(),
                 "repo": repo_name, "github": gh_repo, "pr": pr_number,
@@ -523,6 +716,15 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 # read is a fact about the cycle, not about the review it skipped,
                 # so it travels rather than being dropped on the floor.
                 "config_notes": notes + skip_prior.problems,
+                # A skipped round carries the cycle's open escalations forward
+                # and adds nothing to them. It is the baseline the NEXT round
+                # inherits, and a register that emptied whenever a title matched
+                # /^Merge / would lose the question on the quietest round of the
+                # cycle — but it reviewed nothing, so it cannot date a declaration
+                # to a round that read no code, and the typo check below the skip
+                # branch (which needs this round's findings) never ran on this
+                # path. A key passed here is reported instead, above.
+                "escalated": dict(skip_prior.escalated),
                 "round": round_no,
                 "cycle": skip_prior.cycle,
                 "prior_rounds": len(skip_prior.rounds),
@@ -670,9 +872,225 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # Only for the reviewers actually running: a budget warning about a model
     # this run never asked for is noise, and a "truncated for antigravity" footnote
     # under a claude-only panel is a lie.
+    #
+    # "Actually running" means SELECTED *and* INSTALLED (#222): a seat whose CLI is
+    # not on this box cannot be handed a diff, so a budget for it is the root of
+    # four statements about a reviewer that never read a byte — the last of which,
+    # a `truncated: True` record, `load_baseline` banked as a coverage gap the next
+    # round inherited. `seat_installed`'s docstring in panel_core carries the whole
+    # reasoning; it is filtered HERE rather than at each consumer so that a fifth
+    # consumer added later inherits the fix instead of needing its own.
+    #
+    # Read ONCE per round rather than per consumer. `run_seat` asks the same
+    # predicate again when the seat is dispatched, and two independently-timed PATH
+    # reads can disagree; a snapshot is what makes the consumers below — the
+    # budget, the argv clamp, the prompt, the payload — describe one host.
+    #
+    # This set is now the round's ONE answer to "which seats are here": a seat it
+    # excludes is never dispatched, so `run_seat`'s own PATH read cannot contradict
+    # it (see the dispatch loop). `adjudicate` still asks independently for
+    # `claude`, which is a separate seat with a separate record, and its own gate
+    # refuses it the same way.
+    installed = {name for name in LLM_REVIEWERS if seat_installed(name)}
     budgets = {name: diff_budget(rev.get(name, {}), "max_diff_chars", panel_budget, notes)
-               for name in LLM_REVIEWERS if name in selected}
-    judge_budget = diff_budget(panel, "judge_max_diff_chars", panel_budget, notes)
+               for name in LLM_REVIEWERS if name in selected and name in installed}
+    # The judge is a seat on this box too: `adjudicate` runs it through the
+    # `claude` CLI and refuses when that is absent, asking this same predicate. So
+    # it gets no budget and no `config_notes` line there either — a "the judge saw
+    # 60,000 of 177,872 chars" note about an adjudication that never happened is
+    # the same lie as the reviewer footnote above.
+    #
+    # It is also NOT in `budgets`, and so is not weighed by the pre-flight verdict
+    # below (#138). That is a boundary rather than an oversight, and `seat_ceilings`
+    # states the argument: the verdict decides whether to dispatch the SEATS and
+    # what to hand them, while `judge_max_diff_chars` says what adjudication is
+    # worth. Counted there, that knob could refuse a round every reviewer could
+    # read whole.
+    judge_budget = (diff_budget(panel, "judge_max_diff_chars", panel_budget, notes)
+                    if "claude" in installed else None)
+
+    # ---- the pre-flight verdict (#138): is this round worth running, and read as
+    # WHAT. Here and not earlier because it is measured against the seats' own
+    # caps, which is what keeps it from being the default diff budget #49 refused;
+    # here and not later because a refusal must cost nothing, and everything below
+    # this — the CI read, the four seats, the judge — costs.
+    #
+    # Measured on `review.target`, NOT on `diff`, and under "pr" scope those are
+    # the same string so round 1 is unaffected either way. Under increment scope
+    # they are not: the target is the fix commit and `diff` is the whole PR, so
+    # measuring the PR would refuse — or hand a manifest to — a round whose actual
+    # material is a 3 KB increment, because of a size that round was never going to
+    # send. Both questions this asks are about the thing being reviewed: "would a
+    # seat read a useless fraction of it" and "is IT a move". A round 2 fix commit
+    # is neither large nor move-shaped just because the PR it lands in is.
+    #
+    # It also means `preflight.shape.chars` is scope-dependent exactly as
+    # `diff_chars` is — read `scope` beside it.
+    #
+    # **The CONTEXT tiers are deliberately not weighed with it, and this is where to
+    # say why.** Under increment scope a seat's prompt also carries `review.near` and
+    # `review.far`, so a round with a small increment and large context tiers is
+    # handed more than the target measured here. Neither question this asks is about
+    # that total. "Is IT a move" is plainly about the target. "Would a seat read a
+    # useless fraction of it" is too, because the target is the tier that is never
+    # cut while anything else is present (`ReviewScope.material`'s priority order):
+    # losing context under a tight budget is the DESIGN of increment scope, is
+    # labelled in the prompt, is reported in `config_notes`, and already vetoes a
+    # confident stop through the `short_context` sentence below. Refusing a round
+    # because the optional tiers behind its target are large would refuse the case
+    # scoping exists to make cheap. The one place the total genuinely binds — argv,
+    # which cannot carry an oversized prompt at all — is clamped separately against
+    # `sendable` a few dozen lines down, and says so per seat.
+    #
+    # `notes` is passed so a junk threshold in `.harness-rules` is reported the way
+    # every other bad config value is. The VERDICT itself is deliberately not a
+    # config note: it rides in `payload["preflight"]`, which reaches the board,
+    # where `config_notes` does not — and it gets its own warning above the
+    # findings, which is a better place for it than a "⚠️ config:" line. Written
+    # into both, one report carried the same three sentences twice.
+    #
+    # What this round set out to review, captured BEFORE the manifest can replace
+    # the material: a manifest travels as a whole-target ("pr") scope by
+    # construction — there are no tiers to compose — so substituting it flips
+    # `review.scope`, and the inherited coverage vetoes are gated on that flag. A
+    # move-shaped round 2 would therefore have skipped them and been free to stop
+    # `confident: True` over gaps earlier rounds left, because its material stopped
+    # looking scoped. The round's SCOPE and the shape of its material are two
+    # different facts, and only the second one changed. Captured here rather than
+    # after the refusal branch so that branch can record it too.
+    target_scope = review.scope
+    pre = preflight(review.target, budgets, panel, notes, forced=force)
+    if pre.refused:
+        # The CI gate, read on a round that dispatches nobody. It is one API call,
+        # is not defeated by diff size, and costs no seat's budget — and a refusal
+        # that lost it told `/panel-review-pr` to stop the cycle with nothing said
+        # about a red build. "A refusal must cost nothing" is about the seats and
+        # the judge, which is where the minutes and the tokens are. Sonar is NOT
+        # read: it is a selected panel MEMBER with a `ran: false` row below, and
+        # dispatching a member while telling the board none ran is the exact
+        # inconsistency this path is built to avoid. `refusal_report` states that
+        # gate was not evaluated so its absence cannot read as a pass.
+        ci_status, ci_failing, ci_skip = review_ci(gh_repo, pr_number)
+        # `review_ci` returns its skip reason ALREADY LABELLED — `ci: TimeoutExpired`
+        # — because the ordinary path puts that string straight into
+        # `result.skipped`, which is parsed board-side as "<reviewer>: <reason>".
+        # Neither consumer on this path parses it that way, and both were adding a
+        # second label to the first: `config_notes` renders "⚠️ config: ci:
+        # TimeoutExpired", filing a CI outage as a config key called `ci`, and
+        # `_ci_line` renders "could NOT be read (ci: timed out)". So the bare reason
+        # is what travels here and each renderer says what it is for itself.
+        ci_why = (ci_skip or "").removeprefix("ci: ")
+        if ci_skip:
+            # `config_notes` and not `skipped`, unlike the ordinary path's
+            # `result.skipped`: there is no `PanelResult` here, and a `ci:` entry
+            # in `skipped` would be filed as a reviewer named "ci" that failed to
+            # run, in the table that answers which reviewer finds the real issues.
+            notes.append(f"CI could not be read — {ci_why}")
+        report = refusal_report(repo_name, pr_number, title, base, pre,
+                                ci_status, tuple(ci_failing), ci_why)
+        # One short sentence per seat: the per-seat answer to "why is this row
+        # empty". The whole reason is in `skip_reason` and `preflight.reason`.
+        #
+        # `pre.measured`/`pre.cap_unit` rather than `pre.shape.chars` and the word
+        # "chars": the ceiling that refused this round may be antigravity's argv
+        # limit, which is in bytes, and a per-seat skip reason that states a
+        # character count against a byte ceiling disagrees with `skip_reason` in the
+        # same payload. See `panel_preflight.Ceiling`.
+        refused_by = (f"not dispatched — the panel refused this round "
+                      f"({pre.measured:,} {pre.cap_unit} against {pre.cap:,})")
+        print(report, file=chatter)
+        refuse_payload = {
+            **_payload_defaults(),
+            "repo": repo_name, "github": gh_repo, "pr": pr_number,
+            "title": title, "base": base,
+            # Same three ends the skip path records, and for the same reasons: a
+            # refused round still moved the head, and round r+1 has to be able to
+            # anchor its increment and its fix range somewhere.
+            "head_sha": head_sha, "merge_base": merge_base, "base_sha": base_sha,
+            # What the round was GOING to review, recorded for the same reason
+            # `preflight.shape` records what it measured: a refusal under
+            # `--scope increment --since <sha>` otherwise publishes the field
+            # defaults, so nothing distinguishes it from a refused whole-PR round.
+            # `load_baseline` reads `payload.get("scope") or "pr"`, which is
+            # harmless here only because `reviewers_ran == []` routes a refused
+            # round to `unread_rounds` before scope matters — a coupling nothing
+            # states and nothing enforces.
+            "scope": target_scope,
+            "since_sha": review.since or None,
+            # The one HARD gate a refusal can still report. `sonar_gate` stays at
+            # its default: Sonar is a member and no member ran, which the notice
+            # says out loud rather than leaving the default to be read as a pass.
+            "ci_status": ci_status,
+            "ci_failing": ci_failing,
+            "changed_lines": changed,
+            "changed_files": changed_files,
+            "changed_files_total": changed_files_total,
+            "pr_state": pr_state, "is_draft": is_draft,
+            "config_notes": notes + prior.problems,
+            "round": round_no,
+            "cycle": prior.cycle,
+            "prior_rounds": len(prior.rounds),
+            "prior_findings": len(prior.keys),
+            "provenance_counts": ({b: 0 for b in PROVENANCE} if prior.rounds else {}),
+            "reviewers_selected": sorted(selected),
+            "reviewers_override": override_note,
+            # NOT optional, and the reason is this whole feature's own failure mode
+            # arriving in the board's statistics. `_scorecards` builds a row for
+            # every name in `reviewers_selected`, and with no `reviewers` block "a
+            # member is assumed to have run unless it appears in `skipped`" —
+            # deliberately, so that a quiet reviewer is not filed as broken. A
+            # refusal sending `reviewers_selected` and nothing else would therefore
+            # record every configured seat as having run and found nothing: a
+            # refusal read as a clean review, per reviewer, in the very table that
+            # answers "which reviewer finds the real issues". The title-pattern
+            # skip dodges this by never being recorded; this path is recorded on
+            # purpose, so it has to tell the truth per seat.
+            #
+            # Both shapes, because there are two consumers reading two keys:
+            # `reviewers` is the structured one, `skipped` is parsed as
+            # "<name>: <reason>".
+            "reviewers": {n: {"ran": False, "skip": f"{n}: {refused_by}"}
+                          for n in sorted(selected)},
+            "skipped": [f"{n}: {refused_by}" for n in sorted(selected)],
+            # The budgets the verdict was measured against, so the refusal can be
+            # checked rather than taken on trust — the reason names one seat's cap
+            # and this is every seat's.
+            "diff_budgets": {**budgets, "judge": judge_budget},
+            # `diff_chars` stays 0: nothing was reviewed, and the PR's own size is
+            # in `preflight.shape.chars` where it is a measurement rather than a
+            # claim about coverage.
+            "skip_reason": pre.reason,
+            "preflight": pre.as_dict(),
+            "run_key": run_key,
+        }
+        failed = write_payload(json_file, refuse_payload)
+        # RECORDED, unlike the title-pattern skip, and that is the difference
+        # between the two paths rather than an inconsistency. A title skip says
+        # "this PR was never worth a panel"; a refusal says "a panel was wanted
+        # and this diff defeated it", which is exactly the observation the board
+        # exists to accumulate — and the issue's own requirement, so that "no
+        # review" can never be read later as "clean".
+        if record:
+            record_run(refuse_payload)
+        if json_out:
+            print(json.dumps(refuse_payload, indent=2))
+        elif post:
+            post_summary(gh_repo, pr_number, report)
+        return finish(failed)
+    if pre.verdict == "manifest":
+        # The manifest REPLACES the material rather than adding a review mode:
+        # everything downstream works on `review`, so the budgets, the truncation
+        # measurement, the judge and the board record all keep working and all
+        # measure the manifest — which is the thing that was actually sent. See
+        # `ReviewScope.header`.
+        #
+        # `since`/`since_round` ride across. They are what `since_sha` is recorded
+        # from and what the report quotes as the anchor; dropped, a scoped round
+        # that read a manifest would publish `since_sha: null` and lose the record
+        # of which commit its target was measured from.
+        review = ReviewScope(scope="pr", diff=pre.manifest, round_no=round_no,
+                             since=review.since, since_round=review.since_round,
+                             header=MOVE_MANIFEST_HEADER)
 
     # Read BEFORE the seats are dispatched, because its result now travels in
     # their prompt (#91). It used to run concurrently with them and be collected
@@ -685,9 +1103,28 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         result.skipped.append(ci_skip)
     ci_text = ci_brief(ci_status, ci_failing, ci_skip)
 
-    def prompt_for(budget: int | None) -> str:
-        return REVIEW_PROMPT.format(n=pr_number, repo=gh_repo, base=base,
-                                    ci=ci_text, diff=review.material(budget)[0])
+    # A manifest round asks a different question, so it sends a different brief —
+    # and only the brief differs. Both templates take the same `.format` keys and
+    # end with the same reply contract (`_FINDINGS_ENVELOPE`), which is what lets
+    # one closure serve both and what keeps `SCHEMA_ECHOES` able to recognise
+    # either prompt's own example rather than filing it as a finding. `{code}`
+    # lives in that shared tail too (v2.51), so a slot added to one template can
+    # never be missing from the other.
+    # `reviewer_brief` fills the scope slot from `review_panel.reviewer_scope` (#165):
+    # `diff` asks for defects in the change and routes anything outside it to an
+    # observation, `repo` is the pre-#165 wording verbatim. The manifest brief takes
+    # no scope — it is already the narrowest question this panel asks, and its whole
+    # instruction is "do not review the moved code".
+    brief = (MOVE_MANIFEST_PROMPT if pre.verdict == "manifest"
+             else reviewer_brief(dials.reviewer_scope))
+
+    def prompt_for(budget: int | None, reads_code: bool = False) -> str:
+        # `reads_code` defaults False so the one-argument callers keep working —
+        # `fit_argv_budget` takes this as a single-arg render, and antigravity is
+        # never a code-reading seat, so that path is unaffected by construction.
+        return brief.format(n=pr_number, repo=gh_repo, base=base,
+                            ci=ci_text, diff=review.material(budget)[0],
+                            code=CODE_ACCESS_BRIEF if reads_code else "")
 
     # `agy` is the only reviewer whose prompt must travel in argv, so it is the
     # only one the kernel can veto. Clamp it to what execve will carry and say
@@ -706,16 +1143,25 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # length. Starting from the PR's would tell antigravity it had been cut on a
     # round whose material fits whole.
     sendable = len(review.target) + len(review.near) + len(review.far)
+    #: Seats whose budget the KERNEL cut, rather than a number somebody typed.
+    #: Half of the coverage exemption; the other half is whether the cut actually
+    #: cost the seat any of the target, which only `truncated_for` below can
+    #: measure — see `argv_clamp` for why a comparison against the target's length
+    #: is not the same question under increment scope.
+    kernel_cut: set[str] = set()
     if "antigravity" in budgets:
         asked = budgets["antigravity"]
-        fitted = fit_argv_budget(prompt_for, sendable if asked is None else asked)
-        if fitted < (sendable if asked is None else asked):
+        want = sendable if asked is None else asked
+        fitted, cut_by_kernel = argv_clamp(prompt_for, sendable, asked)
+        if fitted < want:
             notes.append(
                 f"antigravity gets {fitted:,} of {sendable:,} diff chars — its prompt "
                 f"travels in argv and the kernel caps one element at "
                 f"{ARGV_PROMPT_MAX_BYTES:,} bytes. It is the only reviewer with no way "
                 "to read a prompt off stdin.")
             budgets["antigravity"] = fitted
+        if cut_by_kernel:
+            kernel_cut.add("antigravity")
 
     # Truncation is measured against the review TARGET, not against everything
     # sent. Under increment scope losing context is the design — that is what the
@@ -736,6 +1182,12 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     truncated_for = {n: b for n, b in budgets.items()
                      if sent[n][0] < len(review.target)}
     truncated = bool(truncated_for)
+    # The coverage exemption, assembled from both halves: truncated by MEASUREMENT
+    # (composed above, so the brief and headers are accounted for) and cut by the
+    # kernel rather than by a config budget. A subset of `truncated_for` by
+    # construction, which is what keeps the report footnote and the veto agreeing
+    # about the same seats.
+    argv_capped = {n for n in truncated_for if n in kernel_cut}
     # A budget below the scoped frame's OWN size cannot be honoured. The brief and
     # the section headers are over a kilobyte and they are what makes the target
     # legible as the target; cutting them to fit would hand the reviewer an
@@ -794,7 +1246,68 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     models = {n: rev.get(n, {}).get("model", SEAT_MODEL_DEFAULTS.get(n, ""))
               for n in LLM_REVIEWERS}
     efforts = {n: rev.get(n, {}).get("effort", "") for n in EFFORTS}
-    labels = {n: reviewer_label(n, models[n], efforts.get(n, "")) for n in LLM_REVIEWERS}
+    # No precomputed `labels` map: the label is not a property of the CONFIG any
+    # more. A seat that could not use its pins reviewed on something else (#215),
+    # so the only place the label can be built is where the run that earned it is
+    # in hand — `seat_label(…, got)`, below. The map that used to be here was left
+    # behind by that change with nothing reading it, which is a copy of the report's
+    # header free to drift out of agreement with the header.
+
+    # May the seats read the PR's code (#113)? A per-repo setting, ON by default,
+    # and the seats that can actually use it are `SEAT_READS_CODE` — three of the
+    # four vendors cannot express "read but do not execute", which is recorded
+    # there rather than here. `--no-code-access` turns it off for one run, the
+    # same shape as `--reviewers`: a switch this file honours over the config.
+    want_code = code_access_wanted(panel, no_code_access, notes)
+    # Read even when code access is off, so a misconfigured value is reported on
+    # the round that carries it rather than staying silent until someone turns
+    # access on months later and wonders why the cap is not applying.
+    budget_usd = code_budget(panel, notes)
+    #: The seats that both were ASKED for and could use it. Computed before the
+    #: fetch so a repo whose only enabled seats are code-blind ones pays no
+    #: download at all — the tree would be built and then handed to nobody.
+    code_seats = sorted(n for n in selected if n in SEAT_READS_CODE)
+    code_tree: Path | None = None
+    stripped: list[str] = []
+    #: Where the round's single copy of the tree lives, or None when nothing needed
+    #: one. Removed after the seats have finished copying out of it — see the
+    #: cleanup below the executor, which is why this is a plain mkdtemp rather than
+    #: a `with`: the tree has to outlive the dispatch and die before the report.
+    code_dir: Path | None = None
+    if want_code and code_seats:
+        # One fetch and one strip for the whole round, copied per seat by
+        # `seat_checkout`. Doing it per seat would download the same tarball up to
+        # four times and give the strip four chances to differ.
+        code_dir = Path(tempfile.mkdtemp(prefix="panel-tree-"))
+        code_tree, problem = fetch_pr_tree(gh_repo, meta["headRefOid"], code_dir)
+        if problem:
+            # A note, not a failure: a round that reviews from the diff is the OFF
+            # posture, which works, and every seat records itself as blind so the
+            # coverage veto reads the round correctly without being told twice.
+            notes.append(f"{problem} — the seats review from the diff alone this round")
+            code_tree = None
+        else:
+            try:
+                stripped = strip_convention_files(code_tree)
+            except OSError as e:
+                # The strip is not optional. A tree that keeps its instruction
+                # files is the injection channel this whole design turns off to,
+                # so a strip that cannot finish means no seat gets the tree.
+                notes.append(f"a vendor instruction file in the PR's tree could not be "
+                             f"removed ({e}) — no seat was given the code, because a "
+                             "checkout that keeps them can instruct its own reviewer")
+                code_tree = None
+    elif want_code and not code_seats:
+        notes.append("`reviewer_code_access` is on, but no seat on this panel can use "
+                     "it — see SEAT_READS_CODE; only claude can be given read tools "
+                     "without also being given a shell")
+    if stripped:
+        # Said out loud, per round. A silent strip makes a PR that shipped an
+        # `AGENTS.md` indistinguishable from one that did not, on the single axis
+        # where the difference is worth knowing.
+        notes.append(f"removed {len(stripped)} vendor instruction file(s) from the "
+                     f"reviewers' checkout: {', '.join(stripped[:8])}"
+                     + (f" and {len(stripped) - 8} more" if len(stripped) > 8 else ""))
 
     tasks = {}
     with ThreadPoolExecutor(max_workers=len(ALL_REVIEWERS) + 1) as ex:
@@ -802,8 +1315,25 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # the panel, we want each vendor's eyes regardless of diff size.
         for name in LLM_REVIEWERS:
             if name in selected:
-                tasks[name] = ex.submit(review_llm, name, models[name],
-                                        prompt_for(budgets[name]), efforts.get(name, ""))
+                # The prompt differs per seat now: a seat with the tree is TOLD so,
+                # because the default frame is "here is a diff" and a reviewer
+                # following it faithfully declares gaps it could have opened a file
+                # to close. See CODE_ACCESS_BRIEF.
+                reads = code_tree is not None and name in SEAT_READS_CODE
+                # A seat this box cannot run gets NO prompt (#222). Every SELECTED
+                # seat is still dispatched, because `run_seat` is the single
+                # authority on absence and is not only a PATH check — it answers a
+                # typo'd reasoning effort as the config error it is, before looking
+                # for the binary. But `budgets` has no entry for an absent seat, and
+                # `prompt_for(None, …)` means "uncapped", so rendering one would
+                # compose the entire diff — per absent seat, per round — for
+                # `run_seat` to discard a moment later.
+                prompt = (prompt_for(budgets[name], reads) if name in budgets
+                          else "")
+                tasks[name] = ex.submit(review_llm, name, models[name], prompt,
+                                        efforts.get(name, ""),
+                                        code_tree=code_tree,
+                                        budget_usd=budget_usd if reads else None)
         sonar_future = None
         sonar_filed = False
         if "sonarqube" in selected:
@@ -834,11 +1364,37 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 "effort": efforts.get(name) or None,
                 "ran": not got.skip,
                 "skip": got.skip,
-                "max_diff_chars": budgets[name],
+                # Reconciled against `got.absent`, not read straight off `budgets`
+                # (225-R3-F05). `budgets` is decided before dispatch and `run_seat`
+                # decides absence after it, so on the one round where those two
+                # disagree the payload would otherwise carry a real budget beside
+                # `absent: true` — the contradictory pairing #222 exists to remove,
+                # written by the fix meant to have removed it. Whatever happened,
+                # happened: a seat the run found absent had no budget and read no
+                # prefix, and both fields say so.
+                #
+                # None for a seat this box cannot run (#222) — it had no budget,
+                # rather than a budget it failed to spend. `truncated` below is
+                # keyed off `truncated_for`, which is built from the same dict, so
+                # what the pair now guarantees is that a null budget can NEVER sit
+                # beside a `truncated: True` — the pairing that made a round look
+                # cut when nothing that ran was.
+                #
+                # That is the whole of it, and deliberately less than it looks: an
+                # INSTALLED seat with no `max_diff_chars` configured records the
+                # same null beside the same false, so the pair does not tell an
+                # absent seat from an uncapped one. `absent` below is the field
+                # that carries that distinction, and it is the one `coverage_veto`
+                # and `load_baseline` read for exactly this reason.
+                "max_diff_chars": None if got.absent else budgets.get(name),
                 # The mechanical half of "did this reviewer see the whole thing":
                 # checked against the budget rather than asked for, because the
                 # one thing a truncated reviewer cannot notice is the truncation.
-                "truncated": name in truncated_for,
+                "truncated": not got.absent and name in truncated_for,
+                # WHY it was truncated, where the answer is the kernel rather than
+                # a number in a config file. Same shape of fact as `absent` and
+                # treated the same way by coverage_veto.
+                "argv_capped": name in argv_capped,
                 "duration_ms": got.duration_ms,
                 "could_not_assess": got.could_not_assess,
                 "unstructured": got.unstructured,
@@ -846,6 +1402,18 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 # coverage_veto, which is the one consumer that treats it
                 # differently from every other way of not running.
                 "absent": got.absent,
+                # Which pin this host could not serve, when the seat reviewed on
+                # the CLI default instead (#215). In the payload as well as the
+                # header because the board is where "is the expensive tier worth
+                # it" gets answered from accumulated runs, and a run whose model
+                # was substituted must not be averaged in as the pinned one.
+                "model_unavailable": got.model_unavailable or None,
+                "effort_unsupported": got.effort_unsupported or None,
+                # A fact about the panel's DESIGN rather than about the round: an
+                # empty sandbox and no file tools, so this seat's declarations
+                # about code outside the diff are constants. coverage_veto is
+                # again the consumer that cares.
+                "code_blind": got.code_blind,
                 # Spread, not nested: a member whose usage could not be read
                 # contributes no keys at all, so the board stores nulls and
                 # renders "not recorded" — rather than a zero it would average in
@@ -856,7 +1424,14 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 result.skipped.append(got.skip)
                 llm_skipped.append(got.skip)
             else:
-                ran_llm.append(labels[name])
+                # The label the seat EARNED, not the one it was configured with. A
+                # seat that fell back to the CLI default (#215) reviewed on a
+                # different model than `.harness-rules` names, and printing the pin
+                # here would put a model in the record that never ran — the exact
+                # attributability the pins exist to protect, broken in the
+                # direction that looks correct.
+                ran_llm.append(seat_label(name, models[name],
+                                          efforts.get(name, ""), got))
                 ran_names.append(name)
                 llm_findings.extend(got.findings)
         if sonar_future:
@@ -881,6 +1456,21 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 # anything into the population the judge clusters, and only this
                 # branch can. See `filers`.
                 sonar_filed = bool(soft)
+
+    # The executor has joined, so every seat has finished copying out of the tree
+    # and nothing reads it again. Removed HERE rather than at the end of `run`
+    # because a PR's checkout is the largest thing this process holds and the
+    # report, the judge and the board write-up all still have to run; and rather
+    # than in a `with`, because the reviewers are dispatched inside another block
+    # and nesting a third would re-indent the whole panel. `ignore_errors`, since a
+    # tree that will not delete is a disk problem and not a reason to lose a review
+    # that has already happened — the directory is under the system temp root and
+    # the next reboot takes it.
+    #: Whether a tree was actually built and handed out, recorded BEFORE the
+    #: directory goes away. `code_tree` stays a valid Path object after the rmtree,
+    #: pointing at nothing, so a later reader of it would be asking a question the
+    #: variable can no longer answer honestly.
+    code_tree_used = code_tree is not None
 
     # Pre-cluster as a hint, then let the master MERGE the duplicates and rule on
     # each issue in one step (no consensus gate). Dedup cannot happen upstream of
@@ -917,12 +1507,44 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             f"offered (its budget is {judge_budget:,}) — it ruled on findings about code "
             "it was shown less of than the reviewers were")
     notes.extend(judge_gaps)
+    # The judge is a claude seat, so it takes code access on the same terms the
+    # reviewer seats do — and it is the party best placed to use it, because the
+    # wrong findings #113 was filed over were CONFIRMED, not merely raised.
+    #
+    # The tree has to still exist at this line, which is what decides where the
+    # cleanup below it goes. Removing it when the reviewer executor joined — the
+    # obvious place, and where it was first written — left the judge holding a path
+    # to a deleted directory: `seat_checkout` would fail its copy, fall back to an
+    # empty sandbox, and the judge would silently review blind with the setting on
+    # and nothing reporting it. Degrading correctly is exactly what made it silent.
     findings, judge_skip, coverage_note = adjudicate(
         clusters, judge_text, panel.get("judge_model", ""), pr_number, None, coverage,
-        ci=ci_text)
+        ci=ci_text, code_tree=code_tree, budget_usd=budget_usd)
+    # Now nothing reads the tree again: the reviewers copied out of it inside the
+    # executor and the judge has just finished with it. Removed here rather than at
+    # the end of `run` because a PR's checkout is the largest thing this process
+    # holds and the report and board write-up still have to run.
+    if code_dir is not None:
+        shutil.rmtree(code_dir, ignore_errors=True)
     judged = judge_skip is None and bool(findings)
     to_fix = sorted((c for c in findings if c.verdict != "dismissed"),
                     key=lambda c: c.severity)
+    # Which of them a fix round is actually asked to clear (#165). Below the floor a
+    # finding is still master-confirmed, still recorded and still in the payload — it
+    # is reported under its own heading with its own mark, exactly as an escalated
+    # finding is marked ⛔, so a brief built from this report cannot pick it up by
+    # accident. At the pre-#165 floor (`P4`) `under_floor` is empty and every list
+    # below renders as it always did.
+    # A PREDICATE, and every one of the four readers below goes through it. Splitting
+    # into two lists and then asking `c in under_floor` looked equivalent and is not:
+    # `Canonical` compares by value, so two genuinely distinct findings with the same
+    # severity, file, line and synthesis are equal to each other, and one of them
+    # would be marked on the strength of the other's membership.
+    def below_floor(c: Canonical) -> bool:
+        return not severity_at_least(c.severity, dials.fix_severity_floor)
+
+    for_fix = [c for c in to_fix if not below_floor(c)]
+    under_floor = [c for c in to_fix if below_floor(c)]
     dismissed = [c for c in findings if c.verdict == "dismissed"]
     # Sonar's hard-gate issues never reach the judge, so each is a canonical
     # record of its own single account — numbered after the judged ones, since
@@ -958,6 +1580,13 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # whose only outstanding item is a new or still-open gate issue is not a dry
     # round. Leaving them out classified exactly that as convergence and ended the
     # cycle without another fixer.
+    #
+    # #165's floors do not reach them, and `round_stop` is where that is enforced —
+    # it exempts every key whose `verdict` is `sonar` from BOTH floors at every rule,
+    # because Sonar's own severities are routinely P3/P4 and filtering by them put
+    # this exact bug back: a new P3 gate issue fell out of `triggering`, landed in
+    # `quiet_new`, and the cycle stopped `confident` on a PR that cannot merge. A
+    # third floor has to go through the same exemption.
     outstanding = to_fix + sonar
     new_keys = sorted({c.key for c in outstanding if is_new(c)})
     flagged = sum(1 for c in to_fix if c.needs_rereview)
@@ -979,12 +1608,26 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # words — so the context is not decoration, it is the only part of the PR this
     # round can find a pre-existing defect in. Cut it and that becomes
     # unreachable, and the round would report the resulting quiet as convergence.
+    #
+    # `review.scope`, and NOT `target_scope` like the three below it — the one
+    # exception in this block, so it is worth saying why rather than leaving it to
+    # look like the conversion that was missed. This veto is about `short_context`,
+    # which measures what the seats were sent AGAINST the context tiers of the
+    # material they were sent it from. A manifest substitution replaces that
+    # material with a whole-target composition whose `near` and `far` are both ""
+    # (they are `init=False` on `ReviewScope` and only filled under increment
+    # scope), so `short_context` on a manifest round is `sent < 0` for every seat —
+    # empty by construction, whichever flag guards it. Converting the guard would
+    # change nothing and would imply this veto can fire on a manifest round, which
+    # it cannot: the gap a manifest round leaves is not "part of the context did
+    # not fit", it is "nobody read the moved code", and `manifest_veto` below is
+    # the sentence for that.
     if review.scope == "increment" and short_context:
         inherited.append(
             f"{', '.join(short_context)} saw only part of the PR behind the increment — a "
             "defect earlier rounds misjudged, in the part that did not fit, could not have "
             "been raised this round")
-    if review.scope == "increment" and prior.truncated_rounds:
+    if target_scope == "increment" and prior.truncated_rounds:
         cut = sorted(prior.truncated_rounds)
         inherited.append(
             f"{_rounds_phrase(cut)} had a truncated reviewer and this round reviewed only "
@@ -997,16 +1640,178 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # increment therefore starts AFTER code the cycle has no read of, and the
     # payload cannot show that: `scope` and `since_sha` say what was reviewed, not
     # what was stepped over.
-    if review.scope == "increment" and prior.unread_rounds:
+    if target_scope == "increment" and prior.unread_rounds:
         skipped = sorted(prior.unread_rounds)
         inherited.append(
             f"{_rounds_phrase(skipped)} recorded a head but no reviewer read it, and this "
             f"round's increment starts after it — that code has been read by no round of "
             "this cycle")
+    # The same shape of gap from a different cause (#138), and it needs its own
+    # sentence because "no reviewer read it" is false of a manifest round: every
+    # seat ran, on a description of a move rather than on the move. This round's
+    # increment starts after that code, so nothing in the cycle will read it now.
+    if target_scope == "increment" and prior.manifest_rounds:
+        described = sorted(prior.manifest_rounds)
+        inherited.append(
+            f"{_rounds_phrase(described)} read a MANIFEST of a move rather than its code, "
+            f"and this round's increment starts after it — the relocated code has been "
+            "read by no round of this cycle")
+    # A manifest round's quiet is the least trustworthy quiet the panel produces,
+    # and it is the one nothing else catches. Every other coverage veto keys off a
+    # seat being short of what it was sent — and a manifest round's seats were sent
+    # the whole manifest, so `truncated` is false for all of them and the round can
+    # stop `confident: True` having had nobody read a line of the moved code.
+    #
+    # Mechanical, not asked for. The brief does tell each seat to declare the facts
+    # a manifest cannot carry, and a seat that does produces a `could_not_assess`
+    # veto through the ordinary path — but "was the moved code read" is something
+    # the panel KNOWS, from the material it composed, and this file's standing rule
+    # is that what can be measured is never left to a model to volunteer.
+    #
+    # Not alert fatigue, unlike the absent-CLI case this deliberately does not
+    # imitate: it fires only on a move-shaped diff over a seat's ceiling, not on
+    # every round of every repo that configured something.
+    manifest_veto = ([f"this round read a MANIFEST of a move, not the code — "
+                      f"{pre.shape.moved:,} relocated lines went unread by every seat"]
+                     if pre.verdict == "manifest" else [])
     veto = (coverage_veto(reviewer_meta, judge_skip, flagged, len(review.target))
-            + judge_gaps + inherited + prior.problems)
+            + manifest_veto + judge_gaps + inherited + prior.problems)
+    # Declared this round, plus every key an earlier round declared. The earliest
+    # round that said so owns the answer, so `prior` wins a collision — a caller
+    # re-passing a key it inherited must not re-date the claim to now.
+    #
+    # Sorted, for the same reason `round_stop`'s `escalated_outstanding` is: this
+    # dict is serialised straight into the payload, so the order of the
+    # `--escalated` flags and of the baseline reads must not change the artifact's
+    # bytes. A diff between two payloads has to mean something changed.
+    held = dict(sorted({**{k: round_no for k in declared}, **prior.escalated}.items()))
+    # A key naming no finding this cycle has ever seen is almost always a typo,
+    # and a typo here is silent by construction: the loop would simply carry on
+    # counting a finding the caller believes it excluded. Said out loud rather
+    # than corrected, because the other reading — a key from a cycle whose payload
+    # was lost — is legitimate and this cannot tell them apart.
+    #
+    # `prior.escalated` counts as seen, and that is not redundant with
+    # `prior.keys`: the register is inherited TRANSITIVELY (every payload carries
+    # the whole register forward, and the skip path copies it) while the finding
+    # RECORD is not. So passing only the latest baseline — which the docs allow —
+    # inherits a key whose finding no bucket carries any more, and a premise
+    # re-worded under a new key (`panel-review-pr.md` §5 says that happens very
+    # often) drops out of every later round's buckets too. Without this the note
+    # then fired every round for the rest of the cycle on a key that was never
+    # mistyped, which is exactly the false positive that teaches a reader to skip
+    # it. A key an earlier payload's register carries is by construction a key an
+    # earlier round knew.
+    seen = ({c.key for c in (*to_fix, *sonar, *dismissed)}
+            | prior.keys | set(prior.escalated))
+    for key in sorted(k for k in held if k not in seen):
+        notes.append(f"--escalated {key} names no finding this round raised and no "
+                     "earlier round's payload carries — check the key, or the "
+                     "baseline it should have come in on")
+    # Not a typo and not work either: the master ruled this finding not real, so
+    # there is nothing for a fix round to clear and nothing for a human to answer.
+    # Said rather than left implicit, because the escalation of a dismissed finding
+    # is otherwise invisible — the key passes the typo check above (`seen` includes
+    # `dismissed`), it is not in `outstanding` so no stop rule ever consults it, and
+    # neither the record nor the report marks the row (see the `escalated` field on
+    # the `dismissed` bucket below).
+    ruled_out = sorted(({c.key for c in dismissed} & set(held))
+                       - {c.key for c in outstanding})
+    for key in ruled_out:
+        notes.append(f"--escalated {key} names a finding this round's master DISMISSED "
+                     "as not real, so it changes nothing about THIS round's stop — but "
+                     "the key is still recorded and inherited, and a later round that "
+                     "rules the same defect real will hold it there. Withdraw it from "
+                     "the next round's --escalated if that is not what you meant")
+    # The repeat KEYS, not a count of them: `round_stop` subtracts the escalated
+    # ones itself, so the rule lives in one place instead of depending on every
+    # caller to filter first. It takes keys and nothing else — the count overload
+    # it used to accept could not obey the escalation rule, and a caller passing
+    # one put the #221 jam straight back with nothing said.
     stop = round_stop(round_no, cap, new_keys, outstanding, veto, not prior.problems,
-                      repeated=len({c.key for c in outstanding if not is_new(c)}))
+                      repeated={c.key for c in outstanding if not is_new(c)},
+                      escalated=held,
+                      # #165. The trigger floor bounds which NEW findings buy a round;
+                      # the fix floor bounds rules 2 and 3, because a finding no fix
+                      # round was asked to clear is outstanding every round by
+                      # construction and would otherwise run the cycle to the cap on
+                      # its own. `round_stop`'s docstring has the whole argument.
+                      trigger_floor=dials.round_trigger_floor,
+                      fix_floor=dials.fix_severity_floor)
+    # An escalated SonarCloud issue is still a RED GATE, and "the approach is wrong,
+    # a human must answer the premise" does not turn it green. `round_stop` counts
+    # it like any other escalation — correctly, since it is work no fix round may
+    # do — so a cycle whose only remaining item is an escalated `python:S2259`
+    # stops with "nothing left that a fix round can clear", which is true of the
+    # ROUND and reads as a clean finish on a PR that cannot merge.
+    #
+    # Named here rather than fixed by keeping gate issues out of the register:
+    # `outstanding` is `to_fix + sonar` and the stop rule already acted on the key,
+    # so a record that showed the issue as ordinary work would contradict the rule
+    # that stopped the cycle. `preland.py` HOLDs on `sonar_gate == "ERROR"`
+    # independently, so nothing lands on this silently — but that is a different
+    # script, and this panel's own verdict has to say it too: in `reason`, which a
+    # loop reads, and in `veto`, which a human reads. `confident` is already false
+    # (holding an escalation takes a veto line of its own), so this adds no verdict
+    # it has not already earned.
+    held_gate = sorted({c.key for c in sonar} & set(stop["escalated_outstanding"]))
+    if stop["stop"] and held_gate and result.sonar_gate == "ERROR":
+        stop["reason"] += " — and the SonarCloud quality gate is still FAILING"
+        stop["veto"] = [*stop["veto"],
+                        f"{len(held_gate)} escalated finding(s) are SonarCloud gate "
+                        "issues and the gate reads ERROR — a premise answer does not "
+                        "clear an external merge gate, so this PR cannot land until "
+                        "the issue is resolved or excluded in SonarCloud"]
+    # ---- the growth ceiling (#165). A fix pass that MULTIPLIES the diff has written
+    # a second change, not a fix: on PR #236 the fix passes took a 359-insertion bug
+    # fix to 2,313 while none of the 67 findings was in the fix, and the last of them
+    # introduced an unbounded FIFO read. So a round whose material is more than
+    # `max_fix_growth` times what the cycle's FIRST round reviewed stops and says the
+    # change wants splitting, rather than buying another panel over a bigger change.
+    #
+    # Computable with no new plumbing: the size is `len(review.target)`, the same
+    # number `diff_chars` records, and `Baseline.first_reviewed` reads the earliest
+    # baseline's own `diff_chars` off the payloads round 2+ already receives via
+    # `--baseline`. Both are scope-dependent, which is why the scope of each end
+    # travels with it and is printed — under the default `increment` scope this is
+    # "the fix commit is Nx the change round 1 read", under `pr` scope it is "the PR
+    # has grown Nx", and they are different sentences about the same ceiling.
+    #
+    # **NOT dressed up as convergence.** It takes a veto line naming itself and
+    # `confident` is forced false, the same discipline the round cap and a held
+    # escalation get: the cycle is ending because something went wrong, and a reader
+    # who cannot tell that from a clean finish has been told the opposite of the truth.
+    # Set AFTER the SonarCloud sentence above so the reason reads outermost-first.
+    growth = None
+    if dials.max_fix_growth is not None and prior.first_reviewed:
+        first_round, first_chars, first_scope = prior.first_reviewed
+        ratio = len(review.target) / first_chars
+        over = ratio > dials.max_fix_growth
+        growth = {"limit": dials.max_fix_growth, "ratio": round(ratio, 3),
+                  "over": over, "chars": len(review.target), "scope": review.scope,
+                  "first_round": first_round, "first_chars": first_chars,
+                  "first_scope": first_scope}
+        if over:
+            stop["stop"] = True
+            stop["reason"] = (
+                f"the change this round reviewed is {ratio:.1f}x what round "
+                f"{first_round} reviewed, past the {dials.max_fix_growth:g}x "
+                f"`max_fix_growth` ceiling — {stop['reason']}, and what this needs is "
+                "splitting, not another round")
+            stop["veto"] = [*stop["veto"],
+                            f"this round's {len(review.target):,} chars ({review.scope}) "
+                            f"against round {first_round}'s {first_chars:,} "
+                            f"({first_scope}) is {ratio:.1f}x, past the "
+                            f"{dials.max_fix_growth:g}x `max_fix_growth` ceiling — a fix "
+                            "pass that multiplies the change has written a second "
+                            "change, and this stop is that measurement, not convergence"]
+            # Explicit rather than inferred from the veto line: `confident` was already
+            # computed inside `round_stop`, so appending to `veto` here changes nothing
+            # about it — and a verdict this file forces to `stop` must never be able to
+            # carry the flag that means "nothing left to find".
+            stop["confident"] = False
+    stop["fix_growth"] = growth
+
     # Whether a CYCLE exists at all, and the one predicate that decides it — for
     # the report's Rounds block and for the payload alike. They used to disagree:
     # the report suppressed the block for a review-only run while the payload sent
@@ -1029,10 +1834,13 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # therefore empty on every run this ever made — the `missed-unread` bucket
     # unreachable in production while 487 unit tests, which call the helpers
     # directly with correct inputs, stayed green over it.
-    # Defensive rather than expected: `budgets` is built over the same selected
-    # seats `tasks` is, so a seat that ran normally has an entry (possibly None,
-    # meaning uncapped). It survives so a future change to how `budgets` is built
-    # cannot quietly turn "no budget recorded" into "read nothing".
+    # Defensive rather than expected: `budgets` covers the seats that are both
+    # selected and installed (#222), and `run_seat` refuses an absent seat before
+    # it can run — so a seat in `ran_names` has an entry (possibly None, meaning
+    # uncapped). It survives so a future change to how `budgets` is built cannot
+    # quietly turn "no budget recorded" into "read nothing", and it is the note a
+    # test double that replaces `review_llm` wholesale would trip, since such a
+    # double never reaches that refusal.
     no_budget = [n for n in ran_names if n not in budgets]
     if no_budget:
         notes.append("no diff budget is recorded for " + ", ".join(sorted(no_budget))
@@ -1149,7 +1957,11 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # `since_sha` is null: a consumer must be able to tell a round that chose
         # whole-PR scope from one written before scope existed, and the second one
         # sends no key at all.
-        "scope": review.scope,
+        # `target_scope`, not `review.scope`: a manifest round's material is a
+        # whole-target "pr" composition of an increment, and what this field means
+        # is what the round REVIEWED. Read `preflight.verdict` beside it to know
+        # whether the round read that target or a description of it.
+        "scope": target_scope,
         "since_sha": review.since or None,
         "prior_rounds": prior_rounds,
         "prior_findings": len(prior_keys),
@@ -1183,7 +1995,27 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # front of an uncapped reviewer, and the pair is the measurement issue #41
         # exists to produce.
         "context_chars": len(review.near) + len(review.far),
-        "diff_budgets": {**budgets, "judge": judge_budget},
+        # What the round was weighed against before it ran, on EVERY reviewed run
+        # and not only on a refused one. A `run` verdict recorded beside the
+        # findings is what makes the refused ones countable: "the panel weighed
+        # this and proceeded" and "the panel never weighed it" are otherwise the
+        # same silence, which is the failure this whole feature is about. It also
+        # carries the review target's pre-substitution size under a manifest round,
+        # where `diff_chars` measures the manifest.
+        "preflight": pre.as_dict(),
+        # Every SELECTED seat still has a key here, as it always has — a seat this
+        # box cannot run records `null` rather than vanishing (#222). The internal
+        # `budgets` dict genuinely OMITS it, and has to: everything that iterates
+        # that dict (`composed`, `truncated_for`, the argv clamp) reads a null as
+        # "uncapped" and would compose the whole diff for a seat that never ran.
+        # The payload has no such reader and one shape to keep — a board or
+        # dashboard doing `payload["diff_budgets"][name]` for a configured seat
+        # must not start raising KeyError on exactly the unattended hosts this fix
+        # is for. `null` is the same answer `reviewers.<name>.max_diff_chars`
+        # already gives for that seat, and `reviewers.<name>.absent` is what says
+        # which kind of null it is.
+        "diff_budgets": {**{n: None for n in LLM_REVIEWERS if n in selected},
+                         **budgets, "judge": judge_budget},
         "config_notes": notes,
         "sonar_gate": result.sonar_gate,
         "ci_status": ci_status,
@@ -1193,6 +2025,26 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         "judge_skip": judge_skip,
         "reviewers_ran": ran_llm,
         "reviewers": reviewer_meta,
+        # Whether the seats could read the code, at the grain a later comparison
+        # needs (#113). `setting` is what the repo (or --no-code-access) asked for;
+        # `seats` is who actually got it, read back from what each seat RECORDED
+        # rather than from the intent — a fetch or a copy that failed leaves the
+        # setting on and the seat blind, and only the second is true of the round.
+        #
+        # Both, because they answer different questions. Comparing rounds across
+        # the change needs the setting; reading one round's coverage needs the
+        # seats. And a repo that turned it on while every seat it enables is
+        # code-blind is a configuration doing nothing, which is visible in the
+        # difference and invisible in either half alone.
+        "code_access": {
+            "setting": want_code,
+            "seats": sorted(n for n, m in reviewer_meta.items()
+                            if m.get("ran") and m.get("code_blind") is False),
+            # What the strip took out of the reviewers' checkout. `[]` is "the PR
+            # carried none", which is a different fact from the null a round that
+            # never fetched a tree records.
+            "convention_files_removed": stripped if code_tree_used else None,
+        },
         "reviewers_selected": sorted(selected),
         "reviewers_override": override_note,
         # `new_this_round` is added HERE rather than on the record: it is a fact
@@ -1203,12 +2055,55 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # are facts about this run's comparison against a baseline rather than
         # properties of the defect, and a Canonical that carried either would have
         # to be told about a baseline to know its own shape.
+        # key -> the round it was first declared escalated in. The next round
+        # inherits it through `--baseline`, so a cycle cannot lose an open premise
+        # question by forgetting to re-pass a flag.
+        "escalated": held,
+        # On the finding, not only in the register beside it: this is what a
+        # fixer's brief is built from, and §5's rule is that an escalated finding
+        # is never handed to another fixer. On EVERY bucket, not just `to_fix`:
+        # `outstanding` is `to_fix + sonar`, so a Sonar gate issue whose key is in
+        # the register is already subtracted from the work `round_stop` counts,
+        # and a record that showed it as ordinary work would contradict the stop
+        # rule that acted on it. `dismissed` is not work at all, but it is keyed
+        # the same way — same fields, in the same ORDER, so a consumer reading one
+        # bucket's shape does not find a different one in the next and a payload
+        # diff does not move three keys around.
+        #
+        # `escalated` is always FALSE on a dismissed finding, and that is not an
+        # oversight: the master ruled it not real, so "escalated — awaiting a human"
+        # says the opposite about the same row. Nothing else treats it as escalated
+        # either — it is not in `outstanding`, so no stop rule consults it, and the
+        # report renders ⛔ only in the two lists a fixer's brief can be built from.
+        # A caller who does escalate a dismissed key gets a `config_notes` line
+        # saying so, rather than a record that contradicts the report.
+        # `below_fix_floor` rides beside `escalated` and for the same reason: it is
+        # the other way a confirmed, outstanding finding is deliberately NOT this
+        # round's work, and a programmatic consumer building a fixer's brief has to
+        # be able to see it without re-deriving the floor. On every bucket, in the
+        # same position, on the same rule the comment above states — except
+        # `dismissed`, where it is always False for the reason `escalated` is: the
+        # master ruled it not real, so "below the fix floor" would describe work that
+        # does not exist. `review_panel` below records the floor it was computed
+        # against.
         "to_fix": [{**c.as_dict(), "new_this_round": is_new(c),
-                    "provenance": provenance_of(c)} for c in to_fix],
+                    "provenance": provenance_of(c),
+                    "escalated": c.key in held,
+                    "below_fix_floor": below_floor(c)} for c in to_fix],
         "sonar_findings": [{**c.as_dict(), "new_this_round": is_new(c),
-                            "provenance": provenance_of(c)} for c in sonar],
+                            "provenance": provenance_of(c),
+                            "escalated": c.key in held,
+                            "below_fix_floor": below_floor(c)} for c in sonar],
         "dismissed": [{**c.as_dict(), "new_this_round": is_new(c),
-                       "provenance": provenance_of(c)} for c in dismissed],
+                       "provenance": provenance_of(c),
+                       "escalated": False,
+                       "below_fix_floor": False} for c in dismissed],
+        # The seven #165 dials AS APPLIED, not as written: a repo whose
+        # `fix_severity_floor` was rejected reads the floor that actually ran here
+        # and the reason it was rejected in `config_notes`. Every key present on
+        # every reviewed round, so a consumer never has to tell "the default applied"
+        # from "a payload written before the field".
+        "review_panel": dials.as_dict(),
         "provenance_counts": provenance_counts,
         "skipped": result.skipped,
         "run_key": run_key,
@@ -1281,6 +2176,18 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # reader is looking at when they decide how much a finding is worth.
         sole = " — sole reviewer, no second opinion" if not consensus_possible else ""
         return f" _(via {', '.join(revs)}{sole})_"
+
+    def escalation(c: Canonical) -> str:
+        """The ⛔ mark, in every list a fixer's brief can be built from.
+
+        The finding is still outstanding and still shown — hiding it would lose
+        the question — but it is not this round's work, and §5's rule is that it
+        is never handed to another fixer. Both the judged findings and the Sonar
+        gate issues get it, because `outstanding` is the two of them together and
+        a mark on only one would say the stop rule counted something the report
+        presents as ordinary work."""
+        return (f" ⛔ _escalated in round {held[c.key]} — awaiting a human, "
+                "not a fix pass_" if c.key in held else "")
 
     def accounts(c: Canonical) -> list[str]:
         """What each reviewer actually said, under a MERGED finding.
@@ -1372,6 +2279,30 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                      f"configured reviewer{'s' if len(seats_asked) != 1 else ''} did not "
                      "run. Read what follows as a weaker review, not a cleaner one: "
                      "an empty seat cannot report what it would have found.")
+    # Above the findings for the same reason the line before it is: a reader who
+    # takes a manifest round's findings for a content review reads "no correctness
+    # findings" as "the moved code is correct". Nobody read the moved code.
+    if pre.verdict == "manifest":
+        lines.append(f"  - ⚠️ **reviewed as a MOVE MANIFEST, not as a diff** — "
+                     f"{pre.shape.moved:,} of "
+                     f"{max(pre.shape.added, pre.shape.removed):,} changed lines "
+                     f"({pre.shape.move_ratio * 100:.1f}%) are relocated text, and the "
+                     f"diff is {pre.measured:,} {pre.cap_unit} against "
+                     f"{pre.cap_seat}'s "
+                     f"{pre.cap:,}. The seats were asked what MOVED, what did not "
+                     "survive, and what changed besides moving. **The moved code "
+                     "itself was not read by anybody** — treat its correctness as "
+                     "carried over from when it landed on the base branch, not as "
+                     "reviewed here.")
+    if pre.forced:
+        lines.append(f"  - ⚠️ **`--force` overrode a pre-flight `{pre.would_have}` "
+                     f"verdict** — the panel judged this round "
+                     f"{'not worth running' if pre.would_have == 'refuse' else 'unreadable as content'}"
+                     " and was overruled. What follows is a content review of a "
+                     f"{pre.measured:,}-{pre.cap_unit_adj} diff against a "
+                     f"{pre.cap:,}-{pre.cap_unit_adj} "
+                     "ceiling: most of each seat's budget went somewhere, and it was "
+                     "not necessarily where the change is.")
     if seats_absent:
         # Quieter, and separate, for the reason above: this one is about the box,
         # is true every run on it, and is nobody's fault.
@@ -1408,19 +2339,62 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     else:
         judge_txt = f"⚠️ {judge_skip} — all findings KEPT unjudged (re-run to get a verdict)"
     lines.append(f"**Master judge:** {judge_txt}")
+    # Which seats could read the code, stated on the PR comment (#113). It belongs
+    # next to the reviewer list because it is a property OF that list, and it has to
+    # be visible: a reader weighing "codex could not assess the caller" against
+    # "claude read it and disagreed" is comparing two seats that were given
+    # different evidence, and that is a bigger confound than an unpinned model. It
+    # is also the line that explains why some declarations cost the round its
+    # confidence and others did not.
+    read_code = sorted(n for n, m in reviewer_meta.items()
+                       if m.get("ran") and m.get("code_blind") is False)
+    diff_only = sorted(n for n, m in reviewer_meta.items()
+                       if m.get("ran") and m.get("code_blind"))
+    if read_code:
+        lines.append(f"**Code access:** {', '.join(read_code)} read the PR's tree at "
+                     f"{(meta.get('headRefOid') or '')[:8]}"
+                     + (f"; {', '.join(diff_only)} reviewed the diff alone"
+                        if diff_only else "")
+                     + " — a seat's own `could_not_assess` counts against the round "
+                       "only where it could have opened the file")
+    elif want_code and diff_only:
+        # The configured-but-unusable case, said once rather than left to be
+        # inferred from an absence. A repo that switched this on and sees nothing
+        # about it in the report would reasonably conclude it is working.
+        lines.append("**Code access:** on, but no seat on this panel can take it — "
+                     f"{', '.join(diff_only)} reviewed the diff alone")
+    # On EVERY round, at the defaults or not (#165). The orchestrator that briefs the
+    # fixer builds that brief out of THIS report, so "which findings is the fixer being
+    # asked to clear, and what buys another round" has to be readable from the
+    # artifact rather than from whoever remembers the repo's config — and a reader
+    # weighing a quiet round needs to know whether the quiet was measured or
+    # configured. Beside the reviewer list and the code-access line because it is the
+    # same kind of fact: the terms this round ran under.
+    lines.append(f"**Panel dials** (`review_panel`): {dials.gist()}")
     for note in notes:
         lines.append(f"  - ⚠️ config: {note}")
     if truncated:
         # Named per reviewer, since the budgets can now differ: "truncated" alone
         # would hide that one model saw the whole diff and another saw a third of
         # it, which is exactly what you need to know when they disagree.
-        cut = ", ".join(f"{n} ({b:,})" for n, b in sorted(truncated_for.items()))
-        what = "increment" if review.scope == "increment" else "diff"
+        # The kernel-capped seat is marked, because the footnote is now the only
+        # place its truncation appears at all: it no longer files a veto line, and
+        # a reader comparing "truncated for antigravity" against a confident stop
+        # needs to see, right there, that the cap was the machine's and not a
+        # budget somebody could raise.
+        cut = ", ".join(f"{n} ({b:,}{', argv ceiling' if n in argv_capped else ''})"
+                        for n, b in sorted(truncated_for.items()))
+        # `target_scope`, not `review.scope`: a manifest round's material is a
+        # whole-target "pr" composition of whatever the round targeted (#138).
+        what = ("manifest" if pre.verdict == "manifest"
+                else "increment" if target_scope == "increment" else "diff")
         lines.append(f"\n_{what} is {len(review.target):,} chars — truncated for {cut}_")
 
-    lines.append(f"\n### To fix ({len(to_fix)}) — master-confirmed, any reviewer count")
-    if to_fix:
-        for c in to_fix:
+    lines.append(f"\n### To fix ({len(for_fix)}) — master-confirmed, any reviewer count"
+                 + (f", {dials.fix_severity_floor} and above"
+                    if under_floor else ""))
+    if for_fix:
+        for c in for_fix:
             tail = f" — {c.rationale}" if c.rationale and c.rationale != "unjudged" else ""
             rel = f" _(same decision as {', '.join(c.related)})_" if c.related else ""
             # Said per finding, not only in the header: the rationale is blank
@@ -1434,10 +2408,30 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             again = (" ↻ _fix needs re-reading (" + ", ".join(c.rereview_by) + ")_"
                      if c.needs_rereview else "")
             lines.append(f"- **{c.severity}**{fresh} `{loc(c)}` [{c.id}] — {c.synthesis}"
-                         f"{conf(c)}{unruled}{tail}{rel}{again}")
+                         f"{conf(c)}{unruled}{tail}{rel}{again}{escalation(c)}")
             lines += accounts(c)
     else:
         lines.append("- none")
+
+    # The other half of the fix floor (#165), and it has to be a section of its own
+    # rather than a mark inside **To fix**: the two lists are read by different
+    # readers for different purposes — one is a fixer's work list, the other is a
+    # record for a human — and an orchestrator that pastes "the To fix list" into a
+    # brief must not be able to sweep these up with it. Absent entirely at the
+    # pre-#165 floor, where nothing is below it.
+    if under_floor:
+        lines.append(f"\n### Reported, not this round's work ({len(under_floor)}) — "
+                     f"below the `{dials.fix_severity_floor}` fix floor")
+        lines.append("_Master-confirmed, recorded, and deliberately NOT for the fixer: "
+                     f"`review_panel.fix_severity_floor` is "
+                     f"`{dials.fix_severity_floor}`. Do not build a fix brief from "
+                     "this list — a fix pass that takes them on is the growth this "
+                     "floor exists to stop (#165). They stay in the payload "
+                     "(`below_fix_floor`) and on the board._")
+        for c in under_floor:
+            fresh = " 🆕" if prior_rounds and is_new(c) else ""
+            lines.append(f"- 🔽 **{c.severity}**{fresh} `{loc(c)}` [{c.id}] — "
+                         f"{c.synthesis}{conf(c)}{escalation(c)}")
 
     if sonar:
         lines.append(f"\n### SonarCloud issues ({len(sonar)}) — part of the gate")
@@ -1445,7 +2439,8 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             # Same 🆕 rule as the judged findings: these count towards the round
             # diff too, because the gate has to end up clear either way.
             fresh = " 🆕" if prior_rounds and is_new(c) else ""
-            lines.append(f"- {c.severity}{fresh} `{loc(c)}` — {c.synthesis}")
+            lines.append(f"- {c.severity}{fresh} `{loc(c)}` — {c.synthesis}"
+                         f"{escalation(c)}")
 
     if dismissed:
         lines.append(f"\n### Dismissed by master ({len(dismissed)})")
@@ -1469,6 +2464,18 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         lines.append("\n### Coverage declared by the reviewers")
         for name, gaps in declared.items():
             lines.append(f"- **{name}** could not assess: " + "; ".join(gaps))
+        # Said once, under the declarations themselves, because the report has to
+        # answer the question a reader asks HERE: five declared gaps and a
+        # confident stop used to be a contradiction, and now it is the design.
+        # Without this the change reads as the panel having quietly stopped caring
+        # what its reviewers could not see.
+        if declared and all(reviewer_meta.get(n, {}).get("code_blind")
+                            for n in declared):
+            lines.append(
+                "- _these did not cost the round its confidence: every seat above "
+                "reviews from the diff alone, so a gap outside the diff is a fact "
+                "about the panel and not about this PR. Whoever reads this can "
+                "close one with `grep`, and it is worth doing._")
         if coverage_note:
             lines.append(f"- _master:_ {coverage_note}")
 
@@ -1522,28 +2529,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     print(report)
 
     if post:
-        # Bounded, and NOT check=True. This is the last step of a run that has
-        # already succeeded and already printed its report above: a hung network
-        # call here would block after every expensive thing is done, and raising
-        # would throw away a completed review over a failed comment. The comment
-        # is how the fix loop finds the findings, so a failure has to be LOUD —
-        # but it degrades the run, it doesn't void it.
-        try:
-            proc = subprocess.run(["gh", "pr", "comment", str(pr_number), "--repo",
-                                   gh_repo, "--body", fit_comment(report)],
-                                  capture_output=True,
-                                  text=True, stdin=subprocess.DEVNULL, timeout=120)
-            if proc.returncode == 0:
-                print(f"\n(posted panel summary to {gh_repo}#{pr_number})")
-            else:
-                why = stderr_gist(proc.stderr or "") or f"exited {proc.returncode}"
-                print(f"\n! panel summary NOT posted to {gh_repo}#{pr_number} ({why})"
-                      f" — the report above is the only copy", file=sys.stderr)
-        except (subprocess.TimeoutExpired, OSError) as e:
-            why = "timed out after 120s" if isinstance(e, subprocess.TimeoutExpired) \
-                else e.__class__.__name__
-            print(f"\n! panel summary NOT posted to {gh_repo}#{pr_number} ({why})"
-                  f" — the report above is the only copy", file=sys.stderr)
+        post_summary(gh_repo, pr_number, report)
     else:
         print("\n(report only — pass --post to comment on the PR)")
     return finish(write_failed)
@@ -1586,11 +2572,23 @@ def main() -> int:
                          f"configured set ({', '.join(ALL_REVIEWERS)}); e.g. "
                          "--reviewers codex for a single-vendor read. "
                          "Default: whatever .harness-rules enables")
+    ap.add_argument("--no-code-access", action="store_true", dest="no_code_access",
+                    help="review from the diff alone, even where .harness-rules sets "
+                         "`review_panel.reviewer_code_access: true`. One run's override "
+                         "of the repo's setting, the same shape as --reviewers; there is "
+                         "deliberately no flag the other way, because turning code "
+                         "access ON for a repo that switched it off is a decision about "
+                         "trusting that repo's contributors and belongs in its config")
     ap.add_argument("--json-file", metavar="PATH", default="", dest="json_file",
                     help="also write the JSON payload here, keeping the report "
                          "(and --post) — unlike --json, which replaces them")
     ap.add_argument("--no-record", action="store_false", dest="record",
                     help="don't record this run on the quarterback board")
+    ap.add_argument("--force", action="store_true",
+                    help="review the diff as content even when the pre-flight check "
+                         "refuses the round or rules the change move-shaped. The "
+                         "verdict it overrode is recorded and printed — an override "
+                         "is a decision, not a way of not making one")
     # Defaulted to None rather than 1, so "not passed" and "passed as 1" stay
     # distinguishable. They are the same round to `run()` — resolved to 1 a few
     # lines below — but not to the `--ask` guard: comparing against the default
@@ -1602,6 +2600,16 @@ def main() -> int:
     ap.add_argument("--baseline", action="append", default=[], metavar="PATH",
                     help="a previous round's --json-file payload, so this run can say "
                          "which findings no earlier round raised. Repeatable")
+    ap.add_argument("--escalated", action="append", default=[], metavar="KEY",
+                    help="a finding key (as sent with the finding: 8-64 hex chars) "
+                         "whose fixer reported that the APPROACH is wrong rather than "
+                         "the code, and wrote no patch (review-pr.md step 3a). It "
+                         "stays outstanding and stays in the report, but no longer "
+                         "counts as work a fix round can clear — otherwise the cycle "
+                         "runs to its cap on a finding only a human can close. "
+                         "Repeatable; needs a cycle (--round/--max-rounds/--baseline) "
+                         "to mean anything, and is inherited by later rounds through "
+                         "--baseline")
     ap.add_argument("--scope", choices=ROUND_SCOPES, default="auto",
                     help="what a round past the first REVIEWS. increment: the "
                          "commits since the last round's head, with the rest of the "
@@ -1640,12 +2648,14 @@ def main() -> int:
         wrong = [f for f, used in (("--post", args.post),
                                    ("--round", args.round_no is not None),
                                    ("--baseline", bool(args.baseline)),
+                                   ("--force", args.force),
+                                   ("--escalated", bool(args.escalated)),
                                    ("--max-rounds", args.max_rounds is not None)) if used]
         if wrong:
             raise SystemExit(f"--ask does not take {', '.join(wrong)}: an ask is one "
                              "question to the seats, not a round — there is no diff to "
-                             "post about, no judge, and no cycle for a baseline to be "
-                             "part of")
+                             "post about, no judge, no pre-flight verdict to override, "
+                             "and no cycle for a baseline to be part of")
         asker = asking_seat(args.asker)
         if asker and asker not in LLM_REVIEWERS:
             raise SystemExit(f"--asker: unknown seat {asker!r} — expected one of "
@@ -1672,23 +2682,43 @@ def main() -> int:
         raise SystemExit("--round: rounds are numbered from 1")
     if args.max_rounds is not None and args.max_rounds < 1:
         raise SystemExit("--max-rounds: at least one round has to run")
-    # Checked against the EFFECTIVE cap, not only against an explicit one. The
-    # default is the cap `run()` actually applies, so `--round 3` with no
-    # --max-rounds used to pass this guard and then hit the cap branch on the
-    # spot — writing "round cap (2) reached … unreviewed" into a round 3 and
-    # printing "round 3 of at most 2". That is precisely the corrupted cycle
-    # metadata this guard exists to prevent, leaking through the one spelling it
-    # did not cover.
-    cap = DEFAULT_MAX_ROUNDS if args.max_rounds is None else args.max_rounds
-    if round_no > cap:
-        default_note = "" if args.max_rounds is not None else \
-            " (the default, since --max-rounds was not passed)"
-        raise SystemExit(f"--round {round_no} is past --max-rounds "
-                         f"{cap}{default_note}: raise the cap, or pass the round "
-                         "this run actually is")
+    # The round-against-the-cap check MOVED into `run()` (#165). It has to be made
+    # against the EFFECTIVE cap — otherwise `--round 3` with no --max-rounds passes
+    # here and then hits the cap branch on the spot, writing "round cap (2) reached …
+    # unreviewed" into a round 3 and printing "round 3 of at most 2" — and the
+    # effective cap is now `review_panel.max_rounds` where a repo sets one, which
+    # nothing here has read: the rules file is resolved inside `run()`. Checked there,
+    # still before any PR is fetched, and it names which of the three answers supplied
+    # the cap. Resolving the repo twice to keep the check here would print every rules
+    # diagnostic twice for it.
+    # `--escalated` only means something ACROSS rounds: it names work a later round
+    # must not count. A run that is not part of a cycle has no later round, so
+    # accepting the flag there leaves two options and both are worse than refusing
+    # it — drop the declaration silently, or invent a cycle to hold it and print
+    # "round 1 of at most 2 — go again" for a re-review nobody will run. And an
+    # escalation is by construction read out of a fix pass that followed a review
+    # round, so arriving without one of these three is a caller error: it is much
+    # more likely a forgotten --round than a considered single-pass declaration.
+    #
+    # The condition is `round_no > 1`, NOT "was --round passed", because that is
+    # what `run()`'s `in_cycle` tests. Asking a different question here let
+    # `--round 1 --escalated <key>` past both doors — the guard saw a --round and
+    # allowed it, `in_cycle` saw round 1 with no cap or baseline and built a
+    # single-pass run — so the flag was accepted outside a cycle, which is exactly
+    # the case this refusal exists for. Two conditions for one predicate is how
+    # that happened, so they are spelled the same way and `in_cycle`'s own terms
+    # are the ones used.
+    if args.escalated and not (round_no > 1 or args.max_rounds is not None
+                               or args.baseline):
+        raise SystemExit("--escalated needs a cycle to mean anything: pass --round (2 or "
+                         "more) and --max-rounds, plus the earlier rounds' --baseline. "
+                         "It names work a LATER round must not count, and a single-pass "
+                         "review — which `--round 1` on its own still is — has no later "
+                         "round")
     return run(args.repo, args.pr, args.post, args.json_out, args.reviewers,
                args.json_file, args.record, round_no, args.baseline,
-               args.max_rounds, args.scope, args.since)
+               args.max_rounds, args.scope, args.since, args.force,
+               args.no_code_access, args.escalated)
 
 
 if __name__ == "__main__":
