@@ -99,6 +99,38 @@ class ClickTable(DataTable):
     so a handler on the App never runs — this has to be on the widget itself.
     """
 
+    def add_row(self, *cells, key: str | None = None, **kwargs):
+        """`DataTable.add_row`, except a key this table already holds is
+        suffixed rather than raised on.
+
+        DataTable answers a repeated key with DuplicateKey, which does not
+        degrade the row — it takes the whole dashboard down, and this is the
+        component a human looks at when something is ALREADY wrong. So it is
+        the one that must survive unexpected input rather than replace six
+        panels with a traceback (#209).
+
+        Every panel below computes a key it believes is unique, and after #208
+        and #209 those keys are right. This is the backstop for the next panel,
+        whose duplicates nobody has thought of yet: two rows that collide show
+        up as two rows, one of them under a `~2` key, which is visible and
+        wrong in a way somebody can report.
+
+        Returns the key actually used. Callers must file their record under
+        THAT — `dispatch_row` looks a row up by key, so a suffixed row would
+        otherwise display fine and do nothing when clicked.
+        """
+        if key is not None:
+            # Compared on the string rather than by constructing a RowKey: the
+            # key type is Textual's private business and this survives it
+            # changing. The tables here are tens of rows, not thousands.
+            taken = {rk.value for rk in self.rows}
+            if key in taken:
+                n = 2
+                while f"{key}~{n}" in taken:
+                    n += 1
+                key = f"{key}~{n}"
+        return super().add_row(*cells, key=key, **kwargs)
+
     def on_click(self, event: Click) -> None:
         if not self.row_count:
             return
@@ -323,7 +355,6 @@ class Dash(App):
             # rather than tolerating it — so the panel that exists to show the
             # second screen was the thing that could not survive one (#208).
             key = f"seat:{s['pane']}"
-            self.rows[key] = s
             live = s.get("command") not in ("bash", "sh", "zsh", "fish", "")
             # A pane can be running an agent and still be doing nothing you want
             # to know about, or be waiting on you and look identical. `running`
@@ -333,7 +364,7 @@ class Dash(App):
             scope = qd.pane_scope(s)
             label = f"{scope} {s['seat']}" if len(screens) > 1 and scope \
                 else f"seat {s['seat']}"
-            table.add_row(
+            key = table.add_row(
                 Text("●" if live else "·", style="green" if live else "grey50"),
                 Text("✕", style="bold red"),                 # click to close it
                 Text(qd.clip(label, 13), style="bold"),
@@ -343,7 +374,8 @@ class Dash(App):
                 Text(qd.clip(os.path.basename(s.get("path") or "") or "—", 22),
                      style="grey50"),
                 key=key,
-            )
+            ).value
+            self.rows[str(key)] = s
         # The ＋ is a ROW rather than a key, because the whole point of this
         # panel is that the mouse can do it. It carries a record of its own so
         # dispatch_row has something to look up — a row key with nothing behind
@@ -411,11 +443,10 @@ class Dash(App):
                         key=lambda a: (a.get("repo") or "", a.get("holder") or ""))
         for i, a in enumerate(agents):
             key = f"agent:{i}"
-            self.rows[key] = a
             seat = qd.seat_number(a.get("holder"))
             who = (a.get("holder") or "?").split("/", 1)[-1]
             word, style = qd.agent_state(a)
-            table.add_row(
+            key = table.add_row(
                 Text(qd.clip(who, 13), style="bold green" if seat else "bold"),
                 Text(word or "—", style=style),
                 Text(qd.clip(a.get("repo") or "—", 11),
@@ -424,7 +455,8 @@ class Dash(App):
                      style="white" if seat else "grey70"),
                 Text(qd.until(a.get("expires")), style="grey50"),
                 key=key,
-            )
+            ).value
+            self.rows[str(key)] = a
         self.query_one("#t_fleet", Static).update(f"FLEET · {len(agents)}")
         # Keep what the board said about each SEAT, keyed by seat number, so the
         # panel below can say what a pane is doing. The two panels answer
@@ -444,16 +476,16 @@ class Dash(App):
         ctable.clear()
         for i, c in enumerate(claims):
             key = f"claim:{i}"
-            self.rows[key] = c
             left = qd.minutes_left(c.get("expires"))
-            ctable.add_row(
+            key = ctable.add_row(
                 Text(qd.clip((c.get("holder") or "?").split("/", 1)[-1], 13), style="bold"),
                 Text(qd.clip(qd.claim_label(c.get("key") or "?", self.plan), 34),
                      style="yellow" if c.get("kind") == "issue" else "grey70"),
                 Text(qd.until(c.get("expires")),
                      style="red" if left is not None and left < 10 else "grey50"),
                 key=key,
-            )
+            ).value
+            self.rows[str(key)] = c
         self.query_one("#t_claims", Static).update(f"CLAIMED · {len(claims)}")
 
         # Who holds which issue comes off the same claims, and only the holder
@@ -489,7 +521,7 @@ class Dash(App):
             who, who_colour = qd.plan_who(item)
             takeable = qd.plan_issue(item, repos) is not None and not item.get("claim")
             repo = qd.short_repo(item.get("repo") or "fleet")
-            table.add_row(
+            key = table.add_row(
                 Text(glyph, style=colour),
                 Text("⚒", style="bold cyan" if takeable else "grey30"),
                 Text(qd.clip(repo, 11), style=qd.repo_colour(repo)),
@@ -498,8 +530,8 @@ class Dash(App):
                      style="grey50" if colour == "grey50" else "white"),
                 Text(qd.clip(who, 13), style=who_colour),
                 key=f"plan:{item.get('item_id')}",
-            )
-            self.rows[f"plan:{item.get('item_id')}"] = item
+            ).value
+            self.rows[str(key)] = item
         running, blocked = qd.plan_counts(items)
         title = f"PLANS · {len(items)} open"
         if running:
@@ -518,10 +550,11 @@ class Dash(App):
         for pr in sorted(prs, key=lambda p: -p.get("number", 0)):
             glyph, colour = qd.ci_state(pr)
             red += colour == "red"
-            key = f"pr:{pr.get('number')}"
-            self.rows[key] = pr
+            # By repo AND number. Two watched repos both reach #42 eventually,
+            # and the bare number handed this table the same row key twice (#209).
+            key = f"pr:{qd.repo_ref(pr)}"
             repo = qd.short_repo(pr.get("repo") or qd.REPO)
-            table.add_row(
+            key = table.add_row(
                 Text(glyph, style=colour),
                 Text("⚖", style="bold cyan"),          # click to panel-review
                 Text(qd.clip(repo, 11), style=qd.repo_colour(repo)),
@@ -530,7 +563,8 @@ class Dash(App):
                      style="grey50" if pr.get("isDraft") else "white"),
                 Text(qd.ago(pr.get("updatedAt")), style="grey50"),
                 key=key,
-            )
+            ).value
+            self.rows[str(key)] = pr
         title = f"OPEN PRs · {len(prs)}" + (f" · {red} red" if red else "")
         if err:
             title += f" · gh: {qd.clip(err, 24)}"
@@ -551,10 +585,9 @@ class Dash(App):
             claim = self.held.get(qd.issue_key(issue))
             holder = (claim.get("holder") or "?") if claim else None
             free += holder is None
-            key = f"issue:{number}"
-            self.rows[key] = issue
+            key = f"issue:{qd.repo_ref(issue)}"     # repo AND number (#209)
             repo = qd.short_repo(issue.get("repo") or qd.REPO)
-            table.add_row(
+            key = table.add_row(
                 Text("·" if holder else "○", style="grey50" if holder else "green"),
                 Text("⚒", style="grey50" if holder else "bold cyan"),
                 Text(qd.clip(repo, 11), style=qd.repo_colour(repo)),
@@ -565,7 +598,8 @@ class Dash(App):
                      else qd.ago(issue.get("updatedAt")),
                      style="yellow" if holder else "grey50"),
                 key=key,
-            )
+            ).value
+            self.rows[str(key)] = issue
         title = f"ISSUES · {len(issues)}" + (f" · {free} free" if issues else "")
         if err:
             title += f" · gh: {qd.clip(err, 24)}"

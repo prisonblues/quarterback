@@ -11,6 +11,54 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
+## vNEXT — a row key the dashboard can actually tell apart
+
+`qb-dash-tui` dies with `DuplicateKey` when two rows want the same key, and a `DataTable`
+raises rather than tolerating one — so the failure is not an odd-looking row, it is the
+whole dashboard replaced by a traceback. That is the worst component in the harness to lose
+on unexpected input: it is what you look at when something is already wrong.
+
+**#208 fixed the reported instance and not the class.** Two seat screens each numbering from
+1 gave the SEATS panel the same key twice; v2.57 re-keyed that panel on the pane id and the
+reproduction in #209 stopped crashing. The other two multi-repo panels were still keyed on a
+bare number. `_gh_list_many` concatenates `gh` output across every repo in `QB_DASH_REPOS`
+and tags each row with where it came from, so OPEN PRs and ISSUES show several repos at
+once — and two repos both reach #42 eventually. Pointing one screen at two active
+repositories, which is the entire purpose of `QB_DASH_REPOS`, was enough.
+
+The same file already knew. `qbdata.issue_key` exists because the *claim* join hit this and
+says so: "The identity of an issue is the repo AND the number. Once the panels show more
+than one repo, a bare number stops being unique." The lesson had been written down for one
+caller and not applied to the panels three functions away. It is now one helper,
+`qbdata.repo_ref`, with `issue_key` delegating to it under the name the board's claim keys
+use.
+
+**The crash was the louder half.** `self.rows` — what a click looks a row up in — was keyed
+the same way, so a collision that somehow did not raise would have pointed one row's click
+at the other repo's record: the ⚖ starting a paid panel review on a PR nobody was looking
+at. Every panel now files its record under the key `add_row` returns rather than the key it
+passed, which is also what makes the backstop below safe.
+
+**And the class is closed rather than the instance, this time.** `ClickTable.add_row`
+suffixes a key the table already holds instead of raising. Every panel's key is believed
+unique and after #208 and #209 they are; this is for the panel nobody has written yet, and
+for the case this end cannot guarantee — PLAN keys on the board's `item_id`, and two items
+arriving without one keyed every such row `plan:None`. A collision now shows up as two rows,
+one under a `~2` key, which is visible and reportable rather than fatal.
+
+Both halves are pinned by tests that were confirmed to fail against the previous code, each
+on its own assertion: two repos sharing a number render and click independently, and an
+unforeseen duplicate degrades instead of taking the dash down. The `_Sink` double in that
+suite grew a real return value from `add_row` — it had been returning `None`, modelling a
+widget that does not exist, and would have hidden the callers getting this wrong.
+
+Not changed: `QB_SEATS_DASH` still defaults to the plain `qb-dash`. The crash was the
+correctness reason for that default and it is gone, but `textual` and `rich` are
+deliberately outside the ordinary dev install, so flipping it is a packaging decision and
+not this fix's to make.
+
+Fixes #209.
+
 ## v2.58 — a regression test has to fail first
 
 Every fix command in the harness told the fixer to write a regression test. None of

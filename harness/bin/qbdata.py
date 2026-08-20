@@ -474,15 +474,25 @@ def issue_claims(claims: list[dict], repo: str = REPO) -> dict[int, dict]:
     return held
 
 
+def repo_ref(row: dict) -> str:
+    """'prisonblues/quarterback#176' — a numbered row's identity, across repos.
+
+    The number alone is not one. Once a panel shows more than one repo two rows
+    both called #12 are two different things, and anything that keys on the bare
+    number silently conflates them — a claim join marking ours held because
+    theirs is, or a DataTable handed the same row key twice (#209).
+    """
+    return f"{row.get('repo') or REPO}#{row.get('number')}"
+
+
 def issue_key(row: dict) -> str:
     """'prisonblues/quarterback#176' — how the board namespaces a claim.
 
-    The identity of an issue is the repo AND the number. Once the panels show
-    more than one repo, a bare number stops being unique: two repos both have a
-    #12, and marking ours held because theirs is would send the next seat past
-    the one issue it should have taken.
+    The same identity :func:`repo_ref` builds, under the name the board's claim
+    keys use, so a reader following a claim is not sent to a function about
+    table rows.
     """
-    return f"{row.get('repo') or REPO}#{row.get('number')}"
+    return repo_ref(row)
 
 
 def claims_by_issue(claims: list[dict]) -> dict[str, dict]:
