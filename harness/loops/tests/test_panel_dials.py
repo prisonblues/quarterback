@@ -34,7 +34,9 @@ code path that can stop a fixer patching something), so a test suite for it that
 reads no markdown is testing nothing at all.
 """
 
+import ast
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -913,3 +915,152 @@ def test_the_fixer_is_asked_for_the_id_it_was_given_and_never_for_a_key():
     panel_md = " ".join(PANEL_REVIEW_PR.read_text(encoding="utf-8").split())
     assert "Map the fixer's finding IDs to keys first" in panel_md
     assert '"\\(.id)\\t\\(.key)' in panel_md
+
+
+# ------------------------------------------------- the sandbox holds what this file reads
+#
+# #246: this file reads the briefs at `REPO_ROOT / "harness/commands/…"` while living
+# three directories below that root, and `nix build .#checks.<system>.loops-tests` runs
+# it in a sandbox containing only what that check copies in. The check used to copy the
+# suite in flat, so `parents[3]` resolved to `/` and every brief read errored as a
+# FileNotFoundError — not a failure, an ERROR line, in a build no workflow runs. That is
+# #163's mechanism exactly, and it is the reason the enumeration is asserted here rather
+# than left to whoever adds the next read.
+
+#: A `cp`/`install` of a repo-root path into the sandbox, anchored on the command so that
+#: a `${./x}` in a comment or passed as an argument is not mistaken for a copy.
+_FLAKE_COPY = re.compile(r'^\s*(?:cp|install)(?:\s+-\S+)*\s+\$\{\s*\./([^}\s]+?)\s*\}',
+                         re.MULTILINE)
+
+
+def _loops_check_region(flake_text: str) -> str:
+    """The `loops-tests` block of `flake.nix`, and only it.
+
+    Anchored on the attribute at line start, because `flake.nix` names this check in the
+    prose beside it: a first-occurrence search for the bare name would slice from a comment
+    and compare this suite against whatever block happened to follow — looking, from the
+    outside, exactly as healthy as a correct one."""
+    starts = [m.start() for m in re.finditer(r"^\s*loops-tests = ", flake_text, re.MULTILINE)]
+    assert len(starts) == 1, (
+        f"expected exactly one line defining loops-tests in flake.nix, found {len(starts)}")
+    end = flake_text.find("\n        '';", starts[0])
+    assert end != -1, "the loops-tests block is not terminated by a closing ''; at its level"
+    return flake_text[starts[0]:end]
+
+
+def _repo_root_reads() -> set[str]:
+    """The repo-root paths this file joins onto `REPO_ROOT`, out of its own syntax tree.
+
+    Parsed rather than grepped: a pattern over the raw source cannot tell an expression
+    from a sentence, and this file's prose mentions the brief paths repeatedly.
+
+    Refuses what it cannot resolve rather than passing over it. A reader that silently
+    skipped `REPO_ROOT.joinpath(...)`, a variable segment or a second name bound to
+    `REPO_ROOT` would leave the guard below with nothing to report and the sandbox
+    erroring on a file nobody copied in — the failure this guard exists to prevent,
+    wearing the guard's own clothes. The refusal costs whoever writes a dynamic join one
+    message on their line; the alternative costs the next person an afternoon."""
+    source = Path(__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    parents = {id(c): n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
+    found, unreadable = set(), []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Name) and node.id == "REPO_ROOT"
+                and isinstance(node.ctx, ast.Load)):
+            continue
+        segments, cur, parent = [], node, parents.get(id(node))
+        while isinstance(parent, ast.BinOp) and isinstance(parent.op, ast.Div) \
+                and parent.left is cur:
+            if not (isinstance(parent.right, ast.Constant)
+                    and isinstance(parent.right.value, str)):
+                segments = None
+                break
+            segments.append(parent.right.value)
+            cur, parent = parent, parents.get(id(parent))
+        if segments:
+            found.add("/".join(segments))
+        else:
+            unreadable.append(node.lineno)
+    assert not unreadable, (
+        "REPO_ROOT is used at line(s) " + ", ".join(str(n) for n in unreadable) + " in a "
+        "shape this reader cannot follow, so the file read there would not reach the list "
+        "checked against flake.nix. Write it as `REPO_ROOT / \"literal\"`, or teach the "
+        "reader the new shape and add the file to the loops-tests check")
+    return found
+
+
+#: The one repo-root read the sandbox is NOT required to supply: the guard below reads
+#: `flake.nix` to compare against, behind an `is_file()` that skips when it is absent. It is
+#: named here rather than special-cased inside the comparison so that it cannot quietly grow
+#: — anything else added to this set is a read somebody has decided to stop guarding, which
+#: is a decision that should be visible in a diff.
+_READ_BUT_NOT_COPIED = {"flake.nix"}
+
+
+def test_the_reader_finds_the_briefs_it_is_meant_to_find():
+    """The guard below is only worth having if its reader works, and a reader that silently
+    found NOTHING would make it pass against any flake at all."""
+    assert _repo_root_reads() == {"harness/commands/review-pr.md",
+                                 "harness/commands/panel-review-pr.md",
+                                 "flake.nix"}
+
+
+def test_the_loops_check_supplies_every_repo_root_file_this_file_reads():
+    """The enumeration in `flake.nix` is the thing that goes stale, so nothing relies on
+    somebody remembering it. Add a third brief read here and this fails in the ordinary
+    `pytest harness/loops/tests` before a push, rather than erroring in a nix build that
+    no workflow runs.
+
+    Skipped rather than failed when `flake.nix` is absent: this file is itself collected
+    from a sandbox that does not hold the flake, and a check that cannot see the
+    expression cannot judge it."""
+    flake = REPO_ROOT / "flake.nix"
+    if not flake.is_file():
+        pytest.skip("no flake.nix beside this checkout, so there is no check to compare against")
+    copied = set(_FLAKE_COPY.findall(_loops_check_region(flake.read_text(encoding="utf-8"))))
+    # A copy of `harness/commands` supplies every file beneath it.
+    missing = sorted(p for p in _repo_root_reads() - _READ_BUT_NOT_COPIED
+                     if p not in copied
+                     and not any(p.startswith(c + "/") for c in copied))
+    assert not missing, (
+        "this file reads repo-root paths that flake.nix's loops-tests check does not copy "
+        "into its sandbox, so they will error there as FileNotFoundError rather than be "
+        "asserted: " + ", ".join(missing) + ". Add a `cp ${./<path>}` for each")
+
+
+def test_the_region_reader_stops_at_the_end_of_its_own_check():
+    """`'';` is two characters a shell script may legitimately contain, and a slice that ran
+    past the block's end would credit this check with a neighbour's copies — reporting a file
+    as supplied that this sandbox never receives."""
+    text = ("        loops-tests = pkgs.runCommand \"a\" { } ''\n"
+            "          cp -r ${./harness/loops} repo/harness/loops\n"
+            "        '';\n"
+            "        worktree-tests = pkgs.runCommand \"b\" { } ''\n"
+            "          cp -r ${./harness/bin} harness/bin\n"
+            "        '';\n")
+    assert set(_FLAKE_COPY.findall(_loops_check_region(text))) == {"harness/loops"}
+
+
+def test_the_region_reader_refuses_an_ambiguous_or_absent_check():
+    """A renamed check, which is the whole reason the name is written out here. `nix flake
+    check` on a flake whose check has been renamed says nothing about this suite, so a
+    region reader that quietly returned "" would report every read as uncopied — or, worse,
+    every read as satisfied."""
+    with pytest.raises(AssertionError, match="found 0"):
+        _loops_check_region("        mcp-tests = pkgs.runCommand \"a\" { } ''\n        '';\n")
+    with pytest.raises(AssertionError, match="found 2"):
+        _loops_check_region("        loops-tests = pkgs.runCommand \"a\" { } ''\n"
+                            "        '';\n"
+                            "        loops-tests = pkgs.runCommand \"b\" { } ''\n"
+                            "        '';\n")
+
+
+def test_only_a_copy_counts_as_supplying_a_file():
+    """`${./x}` is Nix putting a path in the store, which is not the same as the sandbox
+    having that file where this suite reads it. Running a script or naming one in a comment
+    both interpolate a path, and neither is a copy."""
+    block = ("          # cp ${./harness/README.md} repo/harness/README.md\n"
+             "          bash ${./scripts/release_stamp.py} check\n"
+             "          cp -r ${./harness/commands} repo/harness/commands\n"
+             "          install -Dm644 ${./.harness-rules.sample} repo/.harness-rules.sample\n")
+    assert set(_FLAKE_COPY.findall(block)) == {"harness/commands", ".harness-rules.sample"}

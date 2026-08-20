@@ -42,12 +42,60 @@
               pkgs.git
             ];
           } ''
-          cp -r ${./harness/loops} loops
-          chmod -R u+w loops
-          cd loops
+          # The suite is laid out as repo/harness/loops, not as a bare loops/,
+          # because test_panel_dials.py reads the two review briefs at
+          # `Path(__file__).parents[3] / "harness/commands"`. Copied flat, that
+          # resolves to / and the reads error as FileNotFoundError rather than
+          # being asserted — the same way #163's did, in a different check.
+          mkdir -p repo/harness
+          cp -r ${./harness/loops} repo/harness/loops
+          cp -r ${./harness/commands} repo/harness/commands
+          # The rules baseline, because the panel refuses to review a repo that
+          # configured nothing — so without it the cap guard's two tests get that
+          # refusal instead of the cap they are asserting.
+          cp ${./.harness-rules.sample} repo/.harness-rules.sample
+          # flake.nix itself, so the brief-coupling guard runs HERE rather than
+          # skipping — it compares this check's copy list against the paths the suite
+          # reads, and a guard that is inert in the sandbox it protects is no guard.
+          # Same reason release-metadata-tests copies it in.
+          cp ${./flake.nix} repo/flake.nix
+          chmod -R u+w repo
+          # A real repository, because `panel.main()` resolves the round cap
+          # through harness_rules, which shells out to git and refuses a
+          # directory that is not a checkout. Without this the cap guard's two
+          # tests fail on "is not a git repository" instead of asserting the cap
+          # — a check that reports the sandbox rather than the code.
+          export HOME=$TMPDIR
+          git -C repo init -q -b main
+          # …and an origin, because the harness addresses repos as
+          # `gh --repo owner/name` and derives that slug from this remote.
+          git -C repo remote add origin https://github.com/prisonblues/quarterback.git
+          git -C repo -c user.email=b@build -c user.name=build \
+              -c commit.gpgsign=false commit -q --allow-empty -m "sandbox"
+          cd repo/harness/loops
           # -p no:cacheprovider: the store is read-only and pytest would otherwise
           # try to write .pytest_cache beside the tests.
-          pytest -q -p no:cacheprovider
+          pytest -q -rs -p no:cacheprovider > report.txt 2>&1 || {
+            cat report.txt >&2
+            exit 1
+          }
+          cat report.txt
+          # -rs prints the reason for every skip, and the check below turns those lines
+          # into a build result. pytest exits 0 with any number of skips, and a skip
+          # nobody reads is what #163 and #246 both looked like — an assertion that
+          # reported nothing, in a check wearing a green badge.
+          #
+          # NO skip is expected here. The one test that can skip is the brief-coupling
+          # guard, when flake.nix is not beside the suite; it is copied in above
+          # precisely so that it is, so a skip from it means the copy line went away
+          # and took this sandbox's only staleness check out of the build with it.
+          if grep -q '^SKIPPED' report.txt; then
+            echo "a test skipped in the loops sandbox, and none is expected here. If it" >&2
+            echo "is the brief-coupling guard, flake.nix stopped being copied in and" >&2
+            echo "nothing is checking this copy list any more:" >&2
+            grep '^SKIPPED' report.txt >&2
+            exit 1
+          fi
           touch $out
         '';
 
