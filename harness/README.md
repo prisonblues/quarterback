@@ -241,9 +241,9 @@ working order. The panel had to find the defect a round later, in code that was 
 the test was written alongside the fix and the broken code no longer existed by then.
 
 So `review-pr.md`'s brief (inherited by `/panel-review-pr`), `fix-issue.md` and
-`fix-issue-here.md` now all say the same thing: before committing, stash the **fix** — not
-the test — run each new regression test, and confirm it fails **on the assertion that names
-the defect**. An import error or a missing fixture demonstrates nothing. Then restore and
+`fix-issue-here.md` now all say the same thing: before committing, capture the **fix** as a
+patch and remove it — not the test — run each new regression test, and confirm it fails **on
+the assertion that names the defect**. An import error or a missing fixture demonstrates nothing. Then restore and
 confirm green. Red, then green, in the order that means something. The fixer reports the
 count, so a summary that skipped the step reads as skipped rather than as passed.
 
@@ -279,8 +279,8 @@ removes the signal that says which tests were actually proved.
 What is **not** exempt is a prompt string, a config default or a doc that already existed.
 Shipped text is an artefact a test can assert on, and the PR that added this instruction
 proved it in the act of being written: it changed `REVIEW_PROMPT` and three markdown briefs,
-and nine of `test_regression_test_redgreen.py`'s eleven tests went red against the previous
-text. The first draft of the instruction *did* exempt that case — Codex flagged it in review —
+and thirteen of `test_regression_test_redgreen.py`'s fifteen tests went red against the
+previous text. The first draft of the instruction *did* exempt that case — Codex flagged it in review —
 and an exemption that wide would have excused most of this harness from its own check, which
 is the failure mode #114 predicted.
 

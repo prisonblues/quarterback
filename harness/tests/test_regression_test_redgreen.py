@@ -7,7 +7,7 @@ its fixture happened to list the two baselines in the working order. The asserti
 was right and the defect was found a round later in code that was already
 "covered", because nobody had ever run the test against the bug.
 
-The fix for that is an instruction, not a mechanism (#114): stash the fix, watch the
+The fix for that is an instruction, not a mechanism (#114): remove the fix, watch the
 new test go red on its assertion, restore, watch it go green. Instructions rot in a
 way code does not — the paragraph gets rewritten, the file gets reorganised, one of
 the three briefs gets updated and the others do not — so what is pinned here is that

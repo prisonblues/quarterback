@@ -11,7 +11,7 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
-## vNEXT — a regression test has to fail first
+## v2.58 — a regression test has to fail first
 
 Every fix command in the harness told the fixer to write a regression test. None of
 them asked whether that test would have **caught the defect it was written for**, and
@@ -38,10 +38,10 @@ above. `review-pr.md`'s brief said "every bug fix a regression test" and
 `panel-review-pr.md` inherited it; neither said the test must first fail.
 
 So `review-pr.md` (inherited by `/panel-review-pr`), `fix-issue.md` and
-`fix-issue-here.md` now all say the same thing: before committing, stash the **fix** —
-not the test — run each new regression test, and confirm it fails **on the assertion
-that names the defect**. Then restore and confirm green. Stashing both proves only that
-a file you removed no longer runs, and a test that errors on an import or a missing
+`fix-issue-here.md` now all say the same thing: before committing, capture the **fix**
+as a patch and remove it — not the test — run each new regression test, and confirm it
+fails **on the assertion that names the defect**. Then restore and confirm green.
+Removing both proves only that a file you removed no longer runs, and a test that errors on an import or a missing
 fixture has demonstrated nothing. `/review-pr`'s summary table reports the count, so a
 fixer that skipped the step no longer reads like one that did it.
 
@@ -53,7 +53,7 @@ because it destroys the signal saying which tests were actually proved.
 
 A prompt string, a config default or a doc that **already existed** is not exempt.
 Shipped text is an artefact a test can assert on, and this change proved it while being
-written: it edits `REVIEW_PROMPT` and three markdown briefs, and nine of its eleven new
+written: it edits `REVIEW_PROMPT` and three markdown briefs, and thirteen of its fifteen new
 tests were confirmed red against the previous text. The first draft of the instruction
 exempted exactly that case, Codex flagged it in review, and the exemption as drafted
 would have excused most of this harness from its own check — which is the failure #114
@@ -89,10 +89,10 @@ exit status.
 
 `harness/tests/test_regression_test_redgreen.py` pins all of it: that every
 fix-writing brief carries the instruction, that it names the red half and how to get
-the broken code back, that it says to stash the fix rather than the test, that it
+the broken code back, that it says to remove the fix rather than the test, that it
 requires the failure to be the assertion, that the exemption is stated with a
 reportable form, and that the prompt gained the load-bearing dimension without losing
-the absence one. Nine of its eleven tests were confirmed to fail against the pre-#114
+the absence one. Thirteen of its fifteen tests were confirmed to fail against the pre-#114
 files; the other two are premises that are supposed to hold either way.
 
 ## v2.57 — a seat is its number *and* its project, so a second screen can start

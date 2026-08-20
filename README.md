@@ -757,7 +757,7 @@ full — including what was broken before it, which is the part no diff recovers
   numbering. The pane marker moved with it, because a marker on the bare number would refuse the
   second screen's seat 1 while the board gave it its own identity — and the dashboard now tells two
   screens apart instead of showing one screen's agent against the other's pane.
-- **vNEXT** — a regression test has to fail first. Every fix command told the fixer to write
+- **v2.58** — a regression test has to fail first. Every fix command told the fixer to write
   one; none asked whether it would have caught the defect it was written for. PR #90 is the
   demonstration: a deliberate, docstring'd regression test passed because its fixture happened
   to list two baselines in the working order, and the order-dependence it was written for had
