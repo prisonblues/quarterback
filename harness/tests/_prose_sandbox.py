@@ -218,3 +218,22 @@ def gate_of(member: str):
 def installed(flake_text: str) -> dict[str, str]:
     """Source path -> destination, for everything this check puts in its sandbox."""
     return flake.copies(flake.check_region(flake_text, CHECK_NAME))
+
+
+def collectible(path: str) -> bool:
+    """Whether pytest would COLLECT this file if it found it in a sandbox.
+
+    The `rm` rule below is about collection and nothing else: `worktree-tests` copies
+    `harness/tests` in wholesale, so a *suite* installed for this check would be collected
+    there as well, in a sandbox holding none of what it reads, and would error rather than
+    fail. A helper module is never collected — pytest looks for `test_*.py` — so its presence
+    in another sandbox is inert, and requiring its removal forbids a configuration that is
+    correct.
+
+    That stopped being hypothetical with #230: `test_claude_wiring.py` runs in
+    `worktree-tests`, because two thirds of it drives bash and jq that this check deliberately
+    does not have, and it declares its reads through `_flake_sandbox` like the members here
+    do. So that helper has to exist in both sandboxes. The alternative was a second copy of a
+    parser whose whole reason for being factored out was that one copy was enough.
+    """
+    return path.startswith(SUITE_DIR) and Path(path).name.startswith("test_")

@@ -1,0 +1,313 @@
+#!/usr/bin/env bash
+# Wire quarterback into Claude Code's LOOSE user configs — the half of the install that
+# is not a file nix can own.
+#
+# WHY THIS IS A SCRIPT AND NOT `home.file`. ~/.claude/settings.json has several writers:
+# the user edits it, Claude Code writes to it, and a nix module wants to declare parts of
+# it. A store symlink would make it read-only and break the app, so the only workable
+# shape is a surgical, idempotent, fail-soft merge — which is what this is. Same for
+# ~/.claude.json (Claude Code's own state file) and ~/.claude/CLAUDE.md (the user's prose).
+#
+# WHY IT LIVES IN THE HARNESS. It used to live in the consumer's personal config, one pin
+# away from the qb-hook it wires (#230). A hook script versioned separately from the board
+# it posts to is skew nothing can see: the file is not in the tree `qb-doctor` checks, so
+# "this host is running a qb-hook that predates the route it is calling" had no observer.
+# Shipping it here puts the wiring, the hook and the board client on ONE pin.
+#
+#   qb-claude-setup                  wire it (the home-manager activation's entry point)
+#   qb-claude-setup --check          is it wired, and to THIS install?  (see exit codes)
+#   qb-claude-setup --print-fragment the settings.json hooks fragment, paths resolved
+#
+# Options:
+#   --mcp auto|always|never   register the stdio MCP server in ~/.claude.json.
+#                             `auto` (default) registers it only when the shim can
+#                             actually start — see the venv check below.
+#   --hook PATH               the qb-hook to wire (default: the sibling of this script)
+#   --fragment PATH           the hooks fragment (default: the one this install ships)
+#
+# Exit codes — a contract, because #204's `qb-doctor` reads them:
+#   0  everything this mode checked is wired, and wired to THIS install
+#   1  something is missing (or unreadable): the board is partly or wholly deaf
+#   2  everything is wired, but to a DIFFERENT qb-hook than this install's — the
+#      version skew #230 exists to end. Not an error on a host mid-migration; it is
+#      exactly the state a doctor should name.
+# The default (wiring) mode always exits 0. It runs inside a home-manager activation and
+# a coordination board must never be the reason a switch fails.
+set -uo pipefail
+
+MODE=wire
+MCP_MODE=auto
+HOOK="${QB_HOOK:-}"
+FRAG="${QB_CLAUDE_FRAGMENT:-}"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --check)          MODE=check ;;
+    --print-fragment) MODE=fragment ;;
+    --mcp)            MCP_MODE="${2:-auto}"; shift ;;
+    --hook)           HOOK="${2:-}"; shift ;;
+    --fragment)       FRAG="${2:-}"; shift ;;
+    -h|--help)        sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "qb-claude-setup: unknown argument: $1" >&2; exit 64 ;;
+  esac
+  shift
+done
+case "$MCP_MODE" in auto|always|never) ;; *)
+  echo "qb-claude-setup: --mcp takes auto, always or never (got: $MCP_MODE)" >&2; exit 64 ;;
+esac
+
+CDIR="$HOME/.claude"
+S="$CDIR/settings.json"
+J="$HOME/.claude.json"
+C="$CDIR/CLAUDE.md"
+DOC="quarterback-workflow.md"
+
+# ---- finding our own install ------------------------------------------------
+# NOT `readlink -f`: home-manager installs a file as its own flat
+# /nix/store/…-hm_qbclaudesetup path, so full resolution walks past the bin/ directory
+# and dirname yields /nix/store. Walk the symlink chain one link at a time and take the
+# first directory that holds the sibling being looked for — the same walk qb-hook,
+# qb-mcp, qb-board and qb-b all do, and for the same reason.
+self_dir_with() {   # self_dir_with <sibling name>: echo the dir, or fail
+  local p="$0" d
+  for _ in 1 2 3 4 5 6 7 8; do
+    d="$(cd -P "$(dirname "$p")" 2>/dev/null && pwd)" || return 1
+    [ -e "$d/$1" ] && { printf '%s\n' "$d"; return 0; }
+    [ -L "$p" ] || return 1
+    p="$(readlink "$p")"
+    case "$p" in /*) ;; *) p="$d/$p" ;; esac
+  done
+  return 1
+}
+
+# Canonicalised, and that is not tidiness. The activation invokes this by store path
+# (${cfg.package}/bin/qb-claude-setup) while a human types it off PATH, where the sibling walk
+# lands on ~/.nix-profile/bin — two spellings of one file, written into settings.json by
+# whichever ran last, and --check calling the difference SKEW. `readlink -f` HERE, unlike the
+# walk above: that one has to STOP at the bin/ directory to find a sibling, this one is
+# answering "which file is that, really". An explicit --hook is left exactly as given: a
+# caller naming a path means that path.
+if [ -z "$HOOK" ]; then
+  _bin="$(self_dir_with qb-hook)" \
+    || { echo "qb-claude-setup: no qb-hook beside $0 — broken install" >&2; exit 1; }
+  HOOK="$(readlink -f -- "$_bin/qb-hook" 2>/dev/null || printf '%s' "$_bin/qb-hook")"
+fi
+
+# The fragment sits in two different places depending on how the harness was installed, and
+# both are legitimate: `share/quarterback-harness/claude/` in the nix package (bin/ holds
+# entry points, share/ holds data), and `../claude/` in a source checkout, which is what the
+# test suite and a `git clone` user have. Try both rather than making one of them the "real"
+# one — a data file the tests cannot reach is a data file nothing asserts about.
+#
+# Searched from the FULLY RESOLVED script path first, and this is the one place in these
+# scripts where full resolution is right. The sibling walk deliberately stops at the first
+# directory holding a qb-hook, which for an invocation through ~/.nix-profile/bin or a
+# symlink farm is that directory — and no data lives there, only links. Resolving says where
+# the install actually is, so the layout beside it is the install's own. The walked directory
+# stays as a fallback for the reverse case: a checkout whose bin/ is reached through a link
+# but whose data sits beside the link rather than beside the file.
+if [ -z "$FRAG" ]; then
+  _real="$(readlink -f -- "$0" 2>/dev/null || printf '%s' "$0")"
+  _realdir="$(dirname "$_real")"
+  _walked="$(self_dir_with qb-hook)" || _walked=""
+  for _c in "$_realdir/../share/quarterback-harness/claude" "$_realdir/../claude" \
+            "$_walked/../share/quarterback-harness/claude" "$_walked/../claude"; do
+    [ -r "$_c/settings-fragment.json" ] && { FRAG="$_c/settings-fragment.json"; break; }
+  done
+fi
+[ -n "$FRAG" ] && [ -r "$FRAG" ] || {
+  echo "qb-claude-setup: cannot find settings-fragment.json (looked beside $HOOK)" >&2
+  # Wiring mode must not fail an activation; the other modes are being ASKED a question
+  # and have to answer honestly rather than exit 0 having done nothing.
+  [ "$MODE" = wire ] && exit 0 || exit 1
+}
+
+command -v jq >/dev/null 2>&1 || {
+  echo "qb-claude-setup: jq is not on PATH — nothing wired" >&2
+  [ "$MODE" = wire ] && exit 0 || exit 1
+}
+
+# The fragment with @QB_HOOK@ resolved: the exact JSON that gets merged, and the exact
+# JSON a consumer who declares settings.json themselves should merge (`--print-fragment`).
+# One expression serves both, so the documented manual path cannot drift from the wired one.
+resolved_fragment() {
+  jq --arg hook "$HOOK" '
+    def resolve: walk(if type == "string" then gsub("@QB_HOOK@"; $hook) else . end);
+    resolve' "$FRAG"
+}
+
+case "$MODE" in fragment) resolved_fragment; exit $?; esac
+
+# `mine`: an entry this script owns. Matched on the COMMAND naming qb-hook rather than on an
+# exact path, which is what makes the merge idempotent across installs — a host moving from a
+# hand-rolled ~/.local/bin/qb-hook to a flake pin has its old entries replaced rather than
+# doubled, and a doubled PostToolUse hook fires the courier twice per tool call.
+#
+# Loose about the path, strict about the word. `qb-hook` must not be followed by another
+# identifier character, so `/nix/store/…/bin/qb-hook Stop` matches, a quoted
+# `"…/qb-hook" Stop` matches (the class is negated, so it covers either quote without
+# naming one), and a consumer's own `my-qb-hooks.sh` does not — which the bare substring
+# claimed, and stripping somebody else's guard is a worse failure than either.
+QB_HOOK_RE='qb-hook($|[^A-Za-z0-9_])'
+JQ_MINE="def mine: any(.hooks[]?; (.command // \"\") | test(\"$QB_HOOK_RE\"));"
+
+# ---- --check ----------------------------------------------------------------
+if [ "$MODE" = check ]; then
+  [ -r "$S" ] || { echo "qb-claude-setup: no $S — nothing is wired"; exit 1; }
+  jq -e . "$S" >/dev/null 2>&1 || { echo "qb-claude-setup: $S is not valid JSON"; exit 1; }
+  # The rows FIRST, with jq's exit status kept. Read straight into the loop through a
+  # process substitution and that status is unrecoverable: a settings.json whose `hooks` is
+  # not the shape Claude Code writes (`"hooks": "bad"` — syntactically valid JSON, so the
+  # check above passes it) makes jq error, the loop sees no lines, and every counter stays
+  # zero. Which is exit 0. A doctor blessing a host with no board is the one answer this
+  # mode must never give, so no rows is a failure, not a clean bill.
+  rows=$(
+    jq -r --slurpfile frag <(resolved_fragment) "
+      $JQ_MINE
+      . as \$live
+      | \$frag[0].hooks
+      | keys_unsorted[] as \$e
+      | ((\$live.hooks[\$e] // []) | map(select(mine)) | first) as \$hit
+      | [ \$e,
+          ( if \$hit == null then \"\"
+            else ( [ \$hit.hooks[]? | .command? // \"\" | select(test(\"$QB_HOOK_RE\")) ] | first // \"\" )
+            end ) ]
+      | @tsv" "$S" 2>/dev/null
+  ) || rows=""
+  want=$(resolved_fragment | jq -r '.hooks | keys_unsorted | length')
+  if [ "$(printf '%s\n' "$rows" | grep -c .)" != "$want" ]; then
+    echo "qb-claude-setup: could not read $want hook events out of $S."
+    echo "       It is valid JSON, but its \`hooks\` is not the shape Claude Code writes —"
+    echo "       so nothing here can say whether this host is wired. Fix the file by hand."
+    exit 1
+  fi
+  missing=0; other=0
+  while IFS=$'\t' read -r ev cmd; do
+    [ -n "$ev" ] || continue
+    if [ -z "$cmd" ]; then
+      printf 'MISSING  %-17s no qb-hook entry — this host is deaf on that event\n' "$ev"
+      missing=1
+    elif [ "$cmd" = "$HOOK $ev" ]; then
+      printf 'ok       %-17s %s\n' "$ev" "$cmd"
+    else
+      printf 'SKEW     %-17s %s\n' "$ev" "$cmd"
+      printf '         %-17s (this install is %s)\n' "" "$HOOK"
+      other=1
+    fi
+  done <<< "$rows"
+  [ "$missing" = 1 ] && exit 1
+  [ "$other" = 1 ] && exit 2
+  exit 0
+fi
+
+# ---- wire: ~/.claude/settings.json -----------------------------------------
+# The merge is additive BY IDENTITY, not by array replacement: foreign entries in the same
+# event (a consumer's own PreToolUse guards, say) are kept, ours are replaced. That is what
+# lets this compose with a consumer who also merges into this file — see hm-module.nix's
+# `claude.activationAfter` for the ordering half of that story, which a jq expression
+# cannot solve on its own.
+mkdir -p "$CDIR" 2>/dev/null
+if [ -f "$S" ] && ! jq -e . "$S" >/dev/null 2>&1; then
+  echo "qb-claude-setup: $S is not valid JSON — left it alone rather than guessing" >&2
+else
+  tmp=$(mktemp) || tmp=""
+  if [ -n "$tmp" ] && jq -n --slurpfile live <([ -f "$S" ] && cat "$S" || echo '{}') \
+        --slurpfile frag <(resolved_fragment) "
+        $JQ_MINE
+        \$frag[0] as \$f
+        | (\$live[0] // {})
+        | .hooks = (.hooks // {})
+        | reduce (\$f.hooks | keys_unsorted[]) as \$e (.;
+            .hooks[\$e] = (((.hooks[\$e] // []) | map(select(mine | not))) + \$f.hooks[\$e]))
+      " > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+    if [ -f "$S" ] && cmp -s "$tmp" "$S"; then
+      :   # already wired, byte for byte. Say nothing: this runs on every switch, and a
+          # line per rebuild is how activation output stops being read.
+    else
+      install -m 600 "$tmp" "$S" && echo "qb-claude-setup: wired 7 hook events → $S"
+    fi
+  else
+    echo "qb-claude-setup: settings.json merge failed — left unchanged" >&2
+  fi
+  rm -f "$tmp" 2>/dev/null
+fi
+
+# ---- wire: the CLAUDE.md import --------------------------------------------
+# Conditional on the DOC BEING THERE, which is the bug the fleet's copy carried: it
+# appended `@quarterback-workflow.md` whether or not anything had installed that file, and
+# an @import of a missing file is a line in every session's context that resolves to
+# nothing. The module installs the doc (`claude.workflowDoc`); if it was turned off, there
+# is nothing to import and this correctly does nothing.
+if [ -f "$C" ] && [ -e "$CDIR/$DOC" ] && ! grep -q "$DOC" "$C" 2>/dev/null; then
+  printf '\n@%s\n' "$DOC" >> "$C" && echo "qb-claude-setup: @$DOC imported into $C"
+fi
+
+# ---- wire: the stdio MCP server -------------------------------------------
+# `auto` is the default and it is not timidity. qb-mcp execs a python out of a CHECKOUT's
+# venv (mcp/.venv) because the MCP server has real dependencies and lives beside the HTTP
+# client it shares; a consumer who has only the flake has no such checkout. Registering a
+# server that cannot start means every session opens with a failed MCP connection, so
+# `auto` registers it when it would work and says what is missing when it would not —
+# and self-heals on the next switch after the venv exists. `always` is for a consumer who
+# builds the venv after activation and does not want to switch twice.
+if [ "$MCP_MODE" != never ]; then
+  # Canonicalised for the same reason as the hook above: ~/.claude.json is rewritten by
+  # whichever invocation ran last, and two spellings of one shim would churn the file.
+  if _mcp_bin="$(self_dir_with qb-mcp)"; then
+    _mcp="$(readlink -f -- "$_mcp_bin/qb-mcp" 2>/dev/null || printf '%s' "$_mcp_bin/qb-mcp")"
+  else
+    _mcp_bin=""; _mcp=""
+  fi
+  if [ -z "$_mcp_bin" ]; then
+    echo "qb-claude-setup: no qb-mcp beside $0 — MCP not registered" >&2
+  else
+    # Resolve the repo the same way qb-mcp does, and from the same place: the site config.
+    _repo="${QUARTERBACK_REPO:-}"
+    if [ -z "$_repo" ]; then
+      _cfg="${QUARTERBACK_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/quarterback/config}"
+      [ -r "$_cfg" ] && _repo=$(
+        # A subshell, and only the one variable out: this file is site configuration with
+        # a token COMMAND in it, and sourcing it into this script's scope would put that
+        # on every later expansion's doorstep for no reason.
+        # shellcheck disable=SC1090   # a per-host path by definition; nothing to follow
+        . "$_cfg" >/dev/null 2>&1; printf '%s' "${QUARTERBACK_REPO:-}")
+    fi
+    _repo="${_repo:-$HOME/source/quarterback}"
+    if [ "$MCP_MODE" = always ] || [ -x "$_repo/mcp/.venv/bin/python" ]; then
+      # An ABSENT ~/.claude.json is created, not skipped. This used to be gated on the file
+      # existing, which quietly meant a host got the MCP server only if Claude Code had
+      # already run there once and written its state file — so the first switch on a fresh
+      # machine registered nothing, `board_read` was unavailable, and the activation said
+      # nothing about it. Exactly the bug the settings.json branch above had.
+      #
+      # Safe to create: the keys Claude Code keeps in here are absent in a fresh install
+      # too, so a file holding only `mcpServers` is indistinguishable from one that has not
+      # been onboarded yet, which is what a fresh host is.
+      if [ -f "$J" ] && ! jq -e . "$J" >/dev/null 2>&1; then
+        echo "qb-claude-setup: $J is not valid JSON — left it alone rather than guessing" >&2
+      else
+        tmp=$(mktemp) || tmp=""
+        if [ -n "$tmp" ] && jq -n --slurpfile live <([ -f "$J" ] && cat "$J" || echo '{}') \
+              --arg cmd "$_mcp" '
+              ($live[0] // {})
+              | .mcpServers = (.mcpServers // {})
+              | .mcpServers.quarterback = {type:"stdio", command:$cmd, args:[], env:{}}
+            ' > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+          # 600 on create as well as update: this file can hold per-server env, and the one
+          # this script writes is the shape a token would arrive in if anything ever put one there.
+          cmp -s "$tmp" "$J" 2>/dev/null \
+            || { install -m 600 "$tmp" "$J" \
+                 && echo "qb-claude-setup: quarterback MCP → $_mcp in $J"; }
+        else
+          echo "qb-claude-setup: .claude.json jq failed — left unchanged" >&2
+        fi
+        rm -f "$tmp" 2>/dev/null
+      fi
+    else
+      echo "qb-claude-setup: MCP not registered — no interpreter at $_repo/mcp/.venv/bin/python." >&2
+      echo "       Build it with: cd $_repo/mcp && uv venv --python 3.12 .venv && uv pip install -e ." >&2
+      echo "       Then rebuild, or pass --mcp always to register it ahead of the venv." >&2
+    fi
+  fi
+fi
+exit 0

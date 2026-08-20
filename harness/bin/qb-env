@@ -1,0 +1,91 @@
+# shellcheck shell=bash
+# quarterback site configuration — SOURCED by qb, qb-mcp and qb-hook. Not executable.
+#
+# WHY THIS EXISTS. The three wrappers used to bake one deployment into themselves:
+# `${QUARTERBACK_BASE_URL:-https://qb.fo.ls}` for the URL and a hardwired 1Password
+# read for the token. That is fine while there is one board, and actively dangerous
+# once there are two. The fleet now has a second, deliberately disjoint board on the
+# work island (daedalus), and `qb.fo.ls` is NOT unreachable from there — it resolves
+# on public DNS and answers over the internet. So an unset variable on an employer's
+# machine meant "quietly talk to the personal board", which is precisely the thing
+# hosts/sisyphus/default.nix forbids.
+#
+# The published MCP server already got this right; mcp/mcp_server/server.py says of
+# its own base URL: "No default: the board is self-hosted, so there is no sensible
+# URL to fall back to. Guessing one would silently point an agent at someone else's
+# board." These wrappers now agree with it. Unset is an ERROR, never a guess.
+#
+# THE CONTRACT. A per-host config file, rendered by home-manager (see home/scripts.nix):
+#
+#   QUARTERBACK_BASE_URL   the board this machine talks to. Required; no default.
+#   QUARTERBACK_TOKEN_CMD  a command printing this machine's bearer on stdout. This
+#                          is what makes the token source per-site: a cached file on
+#                          the personal fleet, the token file on daedalus, an ssh
+#                          fetch on sisyphus. Kept cheap — it runs on every call.
+#   QUARTERBACK_TOKEN_REFRESH_CMD
+#                          optional; used INSTEAD of TOKEN_CMD after a confirmed 401.
+#                          It exists because the two are not always the same command:
+#                          where TOKEN_CMD reads a cache, re-running it after a
+#                          rotation just returns the same stale bearer, so the refresh
+#                          has to go past the cache to the source of truth. Defaults
+#                          to TOKEN_CMD, which is right wherever that already reads
+#                          the authoritative copy.
+#   QUARTERBACK_REPO       checkout holding mcp/ (for qb-mcp's venv).
+#   QUARTERBACK_AGENT      this machine's name in the token file. Defaults to hostname.
+#
+# Environment beats the config file throughout, so a single invocation can override
+# any of it without editing anything.
+
+QB_CONFIG="${QUARTERBACK_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/quarterback/config}"
+
+qb_load_config() {
+  # shellcheck disable=SC1090
+  [ -r "$QB_CONFIG" ] && . "$QB_CONFIG"
+  QUARTERBACK_AGENT="${QUARTERBACK_AGENT:-$(hostname -s 2>/dev/null || hostname)}"
+  return 0
+}
+
+# Hard-fail rather than guess. Callers that must never break a session (qb-hook)
+# check the variable themselves and no-op instead of calling this.
+qb_require_base_url() {
+  [ -n "${QUARTERBACK_BASE_URL:-}" ] && return 0
+  cat >&2 <<EOF
+${0##*/}: QUARTERBACK_BASE_URL is not set and there is no default.
+
+  This machine has not been told which quarterback board it belongs to. There is
+  deliberately no fallback: guessing would point this agent at another island's
+  board. Set it in $QB_CONFIG (rendered per-host by home-manager).
+EOF
+  return 1
+}
+
+# Token resolution, in precedence order. QUARTERBACK_TOKEN_CMD is the per-site hook;
+# the /run/op-secrets path is the pre-config fleet layout, kept so a host that has
+# not been rebuilt yet still works.
+qb_resolve_token() {
+  [ -n "${QUARTERBACK_TOKEN:-}" ] && return 0
+  if [ -n "${QUARTERBACK_TOKEN_CMD:-}" ]; then
+    QUARTERBACK_TOKEN="$(eval "$QUARTERBACK_TOKEN_CMD" 2>/dev/null)" || QUARTERBACK_TOKEN=""
+    QUARTERBACK_TOKEN="${QUARTERBACK_TOKEN%%$'\n'*}"
+    [ -n "$QUARTERBACK_TOKEN" ] && { export QUARTERBACK_TOKEN; return 0; }
+  fi
+  if [ -r /run/op-secrets/quarterback-token ]; then
+    QUARTERBACK_TOKEN="$(cat /run/op-secrets/quarterback-token 2>/dev/null)"
+    [ -n "$QUARTERBACK_TOKEN" ] && { export QUARTERBACK_TOKEN; return 0; }
+  fi
+  return 1
+}
+
+# Re-mint after a confirmed 401 — the generic form of what used to be an inline
+# `op read`. A site whose tokens cannot be re-fetched simply leaves TOKEN_CMD unset
+# and this is a no-op, which is the honest outcome rather than a fake success.
+qb_refresh_token() {
+  local cmd="${QUARTERBACK_TOKEN_REFRESH_CMD:-${QUARTERBACK_TOKEN_CMD:-}}"
+  [ -n "$cmd" ] || return 1
+  local fresh
+  fresh="$(eval "$cmd" 2>/dev/null)" || return 1
+  fresh="${fresh%%$'\n'*}"
+  [ -n "$fresh" ] && [ "$fresh" != "${QUARTERBACK_TOKEN:-}" ] || return 1
+  QUARTERBACK_TOKEN="$fresh"; export QUARTERBACK_TOKEN
+  return 0
+}

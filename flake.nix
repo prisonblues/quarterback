@@ -18,8 +18,19 @@
         default = harness;
       });
 
-      # Wires the harness into ~/.claude and ~/.local/bin. This is what a
-      # home-manager consumer imports instead of hand-listing every command file.
+      # Wires the harness into ~/.claude: the loops engine, the slash commands, and —
+      # since #230 — the board itself. Enabling it and naming a board gives a host the
+      # seven Claude Code lifecycle hooks, the stdio MCP registration and the site
+      # config that qb-hook, qb and qb-mcp all read, so presence, leases, the ask
+      # courier, overlap detection and sync advice work without the consumer
+      # reassembling any of it by hand. This is what a home-manager consumer imports
+      # instead of hand-listing every command file and hand-writing the wiring.
+      #
+      # That sentence used to name a second directory this module has never written to,
+      # and to deliver no board at all: it installed the package, ~/.claude/loops and the
+      # command files, while every mechanism that makes the harness a board CLIENT lived
+      # in whatever personal config the consumer happened to keep — on a different pin
+      # from this flake, which is skew nothing could see. It does not any more (#230).
       homeManagerModules = rec {
         quarterback-harness = import ./harness/hm-module.nix;
         default = quarterback-harness;
@@ -135,6 +146,29 @@
           # built out of. Same shape as that check's own copy of this tree: input
           # to a guard, not a suite to run.
           cp -r ${./harness/loops} harness/loops
+          # test_claude_wiring.py's reads (#230). It stays in THIS check rather than
+          # joining prose-consistency-tests, and the split is the same one that check's
+          # comment draws: two thirds of it drives `qb-claude-setup` and `qb-hook` as
+          # subprocesses against a temporary $HOME, so it needs the jq and bash above,
+          # which that sandbox deliberately does not have. Its assertions ON this repo's
+          # own text — the module's options, what the package ships, this very list —
+          # ride along, because the subject is one mechanism and splitting the file by
+          # which tool each assertion needs would put the coupling guard (the hook's
+          # dispatch switch against the fragment) in neither half.
+          #
+          # harness/claude as a TREE: the fragment is read, and so is the workflow doc's
+          # presence, and a wiring that grows a second data file should not need a line here.
+          cp -r ${./harness/claude} harness/claude
+          # -D so a file whose parent this sandbox has never held brings the parent with
+          # it, and 644 because the chmod below only reaches what `cp -r` made read-only.
+          install -Dm644 ${./harness/hm-module.nix} harness/hm-module.nix
+          install -Dm644 ${./harness/package.nix} harness/package.nix
+          # At the top, not under harness/: the suite computes the repo root as its own
+          # parent.parent, so this is where a repo-root file has to sit. It is here so the
+          # sandbox guard runs HERE — it compares this list against the paths the suite
+          # reads, and a guard inert in the sandbox it protects is no guard, which is the
+          # point Codex made on #264's earlier cut and it holds identically for this one.
+          install -Dm644 ${./flake.nix} flake.nix
           chmod -R u+w harness
           # test_release_numbers.py is not a harness test and cannot run in this
           # sandbox: it reads CHANGELOG.md, README.md, pyproject.toml, app/main.py
@@ -174,7 +208,16 @@
           rm harness/tests/test_prose_sandbox.py
           rm harness/tests/_prose_sandbox.py
           rm harness/tests/test_flake_sandbox.py
-          rm harness/tests/_flake_sandbox.py
+          # _flake_sandbox.py STAYS, and it is the one member of that group that does.
+          # It is a helper rather than a guard — parsing a check's copy lines, which #264
+          # factored out precisely because the job is identical for every suite with this
+          # problem — and since #230 this check has a member that uses it:
+          # test_claude_wiring.py compares this list against the four paths it reads. Remove
+          # it here and those assertions do not fail, they SKIP; and this check allowlists no
+          # skips (it has legitimate ones), so they would go quiet in the sandbox they exist
+          # to protect. That is the point Codex made on #264's earlier cut, one check along.
+          # `test_flake_sandbox.py` above is the guard ON this helper and still belongs to
+          # the prose check, which is where the helper's own behaviour is asserted.
           # Same treatment the package gets: there is no /usr/bin/env in the
           # sandbox, so an unpatched `#!/usr/bin/env bash` fails to exec at all
           # — and every test then fails for a reason that has nothing to do with
@@ -377,6 +420,127 @@
           fi
           touch $out
         '';
+
+        # The home-manager module, EVALUATED. Until #230 nothing in this repo evaluated it
+        # at all: `nix flake check` prints "unknown flake output 'homeManagerModules'" and
+        # walks past, the GitHub jobs run pytest, and the only thing that ever forced this
+        # file was a consumer's own rebuild. So the module — the artifact a consumer
+        # actually imports — was the least-checked file in the tree, and a syntax error or a
+        # bad option type in it would ship and break every consumer's switch rather than
+        # anything here.
+        #
+        # The suite in harness/tests asserts on the module's TEXT, deliberately, so it runs
+        # in CI with no nix. This asserts on what the module PRODUCES, which text cannot
+        # reach: that the activation entry exists with the right dependencies, that the site
+        # config renders, and that each opt-out actually removes something.
+        #
+        # It is not a home-manager integration test and does not pretend to be. The stub
+        # below declares the four options the module writes to, and `lib.hm.dag` is stubbed
+        # faithfully enough for `entryAfter` to be inspected. If the module grows a write to
+        # an option this stub does not declare, THIS check fails with "The option `x' does
+        # not exist" — loudly, locally, with the fix being one line here. That is the right
+        # failure; a stub that accepted anything would make this check an expensive way of
+        # confirming the file parses.
+        hm-module-eval =
+          let
+            # home-manager extends nixpkgs' lib with `hm`; the module uses exactly one thing
+            # out of it. Injected through specialArgs, which is how home-manager itself
+            # hands its extended lib to modules.
+            hmLib = pkgs.lib.extend (final: prev: {
+              hm.dag = {
+                entryAfter = after: data: { inherit after data; before = [ ]; };
+                entryBefore = before: data: { inherit before data; after = [ ]; };
+                entryAnywhere = data: { inherit data; after = [ ]; before = [ ]; };
+              };
+            });
+            stub = { lib, ... }: {
+              options = {
+                home.packages = lib.mkOption { type = lib.types.listOf lib.types.package; default = [ ]; };
+                home.file = lib.mkOption { type = lib.types.attrsOf (lib.types.attrsOf lib.types.anything); default = { }; };
+                home.activation = lib.mkOption { type = lib.types.attrsOf lib.types.anything; default = { }; };
+                xdg.configFile = lib.mkOption { type = lib.types.attrsOf lib.types.anything; default = { }; };
+                # home-manager's own, via modules/misc/assertions.nix.
+                assertions = lib.mkOption { type = lib.types.listOf lib.types.unspecified; default = [ ]; };
+                warnings = lib.mkOption { type = lib.types.listOf lib.types.str; default = [ ]; };
+              };
+            };
+            with' = settings: (pkgs.lib.evalModules {
+              specialArgs = { lib = hmLib; inherit pkgs; };
+              modules = [ stub ./harness/hm-module.nix { programs.quarterback-harness = settings; } ];
+            }).config;
+
+            # `throw` and not `assert`: an assert prints the expression, and the expression
+            # here is a set membership nobody can read a diagnosis out of.
+            expect = cond: msg: if cond then true else throw "hm-module-eval: ${msg}";
+            has = set: name: builtins.hasAttr name set;
+
+            wired = with' {
+              enable = true;
+              board.url = "https://board.example";
+              board.tokenCommand = "cat /run/secrets/tok";
+            };
+            noBoard = with' { enable = true; };
+            noWiring = with' { enable = true; claude.enable = false; };
+            ordered = with' { enable = true; claude.activationAfter = [ "theirMerge" ]; };
+            noMcp = with' { enable = true; claude.registerMcp = "never"; };
+            disabled = with' { enable = false; };
+            badQuote = with' { enable = true; board.url = "x"; board.tokenCommand = "op read op://a/b's/c"; };
+
+            act = c: c.home.activation.quarterbackClaudeWiring;
+          in
+          pkgs.writeText "quarterback-hm-module-eval" (builtins.toJSON {
+            # AC: enabling the module and naming a board gives a host the wiring.
+            activationExists = expect (has wired.home.activation "quarterbackClaudeWiring")
+              "enabling the module does not add the wiring activation entry";
+            activationRunsTheScript = expect
+              (pkgs.lib.hasInfix "/bin/qb-claude-setup" (act wired).data)
+              "the activation does not run qb-claude-setup out of the package";
+            activationAfterWriteBoundary = expect
+              ((act wired).after == [ "writeBoundary" ])
+              "the wiring no longer waits for writeBoundary, so it can run before the files land";
+            # AC: it composes with a consumer that also merges into settings.json.
+            activationAfterIsExtensible = expect
+              ((act ordered).after == [ "writeBoundary" "theirMerge" ])
+              "claude.activationAfter does not reach the DAG entry, so a consumer cannot order us";
+            # AC: a host that names a board gets the site config every wrapper reads.
+            configRendered = expect
+              (pkgs.lib.hasInfix "QUARTERBACK_BASE_URL=https://board.example"
+                wired.xdg.configFile."quarterback/config".text)
+              "the site config does not carry the board URL";
+            configQuotesTheTokenCommand = expect
+              (pkgs.lib.hasInfix "QUARTERBACK_TOKEN_CMD='cat /run/secrets/tok'"
+                wired.xdg.configFile."quarterback/config".text)
+              "the token command is not single-quoted, so it is expanded before it is evaluated";
+            # ...and a host that names none collides with nobody: `null` means "I own that file".
+            noConfigWithoutABoard = expect (!(has noBoard.xdg.configFile "quarterback/config"))
+              "the module renders quarterback/config with no board named, which collides with every consumer who renders it themselves";
+            warnsAboutAUselessBoard = expect (builtins.length noMcp.warnings == 0
+              && builtins.length (with' { enable = true; board.url = "x"; }).warnings == 1)
+              "a board URL with no token command no longer warns, and the failure it causes is silent";
+            # AC: opting out is possible.
+            optOutRemovesTheActivation = expect (!(has noWiring.home.activation "quarterbackClaudeWiring"))
+              "claude.enable = false still installs the activation";
+            optOutRemovesTheWorkflowDoc = expect
+              (!(has noWiring.home.file ".claude/quarterback-workflow.md"))
+              "claude.enable = false still links the workflow doc, whose @import the wiring adds";
+            mcpModeReachesTheScript = expect (pkgs.lib.hasInfix "--mcp never" (act noMcp).data)
+              "claude.registerMcp does not reach the wiring invocation";
+            # The eval-time guard on a value that would fail at runtime as "no token".
+            singleQuoteIsRefused = expect
+              (builtins.any (a: !a.assertion) badQuote.assertions)
+              "a tokenCommand containing a single quote is accepted, and it breaks token resolution on every call";
+            quotelessIsAccepted = expect (builtins.all (a: a.assertion) wired.assertions)
+              "an ordinary tokenCommand trips an assertion";
+            # And the module is inert when it is off.
+            disabledInstallsNothing = expect
+              (disabled.home.file == { } && disabled.home.activation == { }
+                && disabled.home.packages == [ ])
+              "the module writes something with enable = false";
+            # The commands still land, which is what the module did before it did anything else.
+            commandsStillLand = expect
+              (has wired.home.file ".claude/loops" && has wired.home.file ".claude/commands/fix-issue.md")
+              "the loops or the slash commands stopped being linked";
+          });
 
         # The board client (#110) and the HTTP client it shares with the MCP
         # server. A check rather than only a GitHub job for the same reason the
