@@ -43,8 +43,18 @@ passed, which is also what makes the backstop below safe.
 suffixes a key the table already holds instead of raising. Every panel's key is believed
 unique and after #208 and #209 they are; this is for the panel nobody has written yet, and
 for the case this end cannot guarantee — PLAN keys on the board's `item_id`, and two items
-arriving without one keyed every such row `plan:None`. A collision now shows up as two rows,
-one under a `~2` key, which is visible and reportable rather than fatal.
+arriving without one keyed every such row `plan:None`. A collision is kept as two rows, the
+second under a `~2` key, rather than being fatal — **and it is written to the app log**,
+because degrading is not the same as reporting. A row key is never rendered, so the `~2` is
+invisible, and two plan rows is also what correct data looks like; left silent, a keying bug
+that used to crash the dashboard would now produce nothing at all.
+
+**The ⚖ now refuses another repo's PR**, which is the click #209 made reachable. Two repos
+sharing a number used to take the panel down before either row rendered; both are on the
+screen now, and `/panel-review-pr` takes a bare number and resolves the repository from the
+checkout it runs in — so clicking the watched repo's #42 would have started a paid review of
+*this* repo's #42, commented on it and pushed a fix commit. The ⚒ on an issue row has made
+that check since the panels went multi-repo. The ⚖, which does more, was not making it.
 
 Both halves are pinned by tests that were confirmed to fail against the previous code, each
 on its own assertion: two repos sharing a number render and click independently, and an

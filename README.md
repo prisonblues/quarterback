@@ -782,8 +782,10 @@ full — including what was broken before it, which is the part no diff recovers
   under `issue_key` and the panels did not. The click half went with it: `self.rows` was
   keyed the same way, so a collision would have pointed one row's ⚖ at another repo's PR.
   And the class is closed rather than the instance — `ClickTable.add_row` suffixes a
-  duplicate instead of raising, so the panel nobody has written yet degrades to a visible
-  odd row rather than taking the other five down with it.
+  duplicate instead of raising and logs that it did, so the panel nobody has written yet
+  degrades to an extra row and a line in the log rather than taking the other five down
+  with it. Both rows rendering is also what makes the ⚖ on a watched repo's PR clickable
+  for the first time, so it now refuses one, exactly as the ⚒ on an issue row already did.
 - **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
   object store; wire `landed` refs to a cherry-pick helper.
 

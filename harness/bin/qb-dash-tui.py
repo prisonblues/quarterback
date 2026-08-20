@@ -111,9 +111,16 @@ class ClickTable(DataTable):
 
         Every panel below computes a key it believes is unique, and after #208
         and #209 those keys are right. This is the backstop for the next panel,
-        whose duplicates nobody has thought of yet: two rows that collide show
-        up as two rows, one of them under a `~2` key, which is visible and
-        wrong in a way somebody can report.
+        whose duplicates nobody has thought of yet: two rows that collide are
+        kept as two rows, the second under a `~2` key.
+
+        **Degrading is not the same as reporting, and this had to be said out
+        loud.** A row key is never rendered, so the `~2` is invisible; and in
+        the case the backstop was written for — two plan items arriving with no
+        `item_id` — two rows is also exactly what CORRECT data looks like. Left
+        at that, a keying bug this once crashed loudly would now produce nothing
+        at all. So the collision is written to the app log, which is the only
+        place it can be reported from.
 
         Returns the key actually used. Callers must file their record under
         THAT — `dispatch_row` looks a row up by key, so a suffixed row would
@@ -128,7 +135,17 @@ class ClickTable(DataTable):
                 n = 2
                 while f"{key}~{n}" in taken:
                     n += 1
-                key = f"{key}~{n}"
+                asked, key = key, f"{key}~{n}"
+                try:
+                    self.log.warning(
+                        f"{self.id or type(self).__name__}: duplicate row key "
+                        f"{asked!r} — kept as {key!r}. The panel's key is not "
+                        f"unique across every repo and screen it can show.")
+                except Exception:                   # noqa: BLE001
+                    # The backstop exists so this table cannot take the
+                    # dashboard down. A logger that is not there (no running
+                    # app) must not be the thing that finally does.
+                    pass
         return super().add_row(*cells, key=key, **kwargs)
 
     def on_click(self, event: Click) -> None:
@@ -379,11 +396,15 @@ class Dash(App):
         # The ＋ is a ROW rather than a key, because the whole point of this
         # panel is that the mouse can do it. It carries a record of its own so
         # dispatch_row has something to look up — a row key with nothing behind
-        # it is dropped on the floor.
-        self.rows["seat:add"] = {"add": True}
-        table.add_row(Text(""), Text("＋", style="bold cyan"),
-                      Text("add seat", style="cyan"), Text(""), Text(""), Text(""),
-                      key="seat:add")
+        # it is dropped on the floor. Filed under the key add_row RETURNS like
+        # every other row here: `seat:add` cannot collide with a `seat:%12`
+        # today, but "this one call site is the exception" is how the rule
+        # above stops being a rule.
+        add_key = table.add_row(Text(""), Text("＋", style="bold cyan"),
+                                Text("add seat", style="cyan"),
+                                Text(""), Text(""), Text(""),
+                                key="seat:add").value
+        self.rows[str(add_key)] = {"add": True}
         title = f"SEATS · {len(seats)}" if seats else "SEATS · none on this screen"
         self.query_one("#t_seats", Static).update(title)
 
@@ -785,6 +806,19 @@ class Dash(App):
         qb-seat does: the brief positionally, after `--`.
         """
         number = pr.get("number")
+        # The same refusal the ⚒ on an issue row makes, for the same reason and
+        # with more at stake. /panel-review-pr takes a bare number and resolves
+        # the repository from the checkout it runs in, so a PR from a repo this
+        # dashboard only WATCHES would review whatever wears that number HERE —
+        # and this one spends money, comments on a public PR and pushes a fix
+        # commit to it. Until #209 that click was unreachable, because a second
+        # repo sharing a number crashed the panel before anything rendered; now
+        # both rows are there, so the guard has to be too.
+        repo = pr.get("repo")
+        if repo and self.repo_slug and repo != self.repo_slug:
+            self.say(f"PR #{number} is in {repo}; this dashboard runs in "
+                     f"{self.repo_slug} — review it from that checkout")
+            return
         command = f"{shlex.quote(self.agent_bin)} -- {shlex.quote(f'/panel-review-pr {number}')}"
         if self.confirm:
             self.push_screen(

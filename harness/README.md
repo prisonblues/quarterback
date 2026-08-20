@@ -752,9 +752,12 @@ from "what is next" to somebody doing it is one click. An item pointing at nothi
 somebody already holds, says so rather than swallowing the click. The `⚒` refuses an issue
 belonging to a repo this dashboard only watches: `/fix-issue` takes a bare number and reads
 the repository off the checkout it runs in, so starting one from the wrong pane would land
-that number on whatever issue wears it there. A plan claim is keyed `plan:<uuid>`, which is
-right for a lock and unreadable on a pane, so CLAIMED resolves it against the plan and shows
-the item's title instead.
+that number on whatever issue wears it there. **The `⚖` on a PR row refuses for the same
+reason**, and it is the one with more at stake — a panel review spends money, comments on a
+public PR and pushes a fix commit to it. That click only became reachable with #209: two
+repos sharing a PR number used to crash the panel before either row rendered. A plan claim
+is keyed `plan:<uuid>`, which is right for a lock and unreadable on a pane, so CLAIMED
+resolves it against the plan and shows the item's title instead.
 
 **The issues panel is the one that feeds the fleet.** A seat picks unclaimed work off the
 board, so what matters is which issues nobody holds: the free ones sort to the top, and a
@@ -782,6 +785,12 @@ builds the `owner/repo#n` that is), and neither is a seat number once a second s
 exists (the pane id is). File the record under the key `add_row` RETURNS rather than the
 one you passed: `ClickTable.add_row` suffixes a collision it was not expecting instead of
 raising, and a row filed under the wrong key renders fine and does nothing when clicked.
+
+That backstop **degrades; it does not report**, and the two are not the same thing. A row
+key is never rendered, so the `~2` is invisible, and in the case it was written for — two
+plan items arriving with no `item_id` — two rows is also what correct data looks like. So
+the collision is written to the app log (`textual console`, or `self.log` in a test), which
+is the only place it can surface at all. Do not read a quiet dashboard as a unique key.
 
 `qb-seats` builds it. A screen is seats across the top, the dash down the right, and the
 tape full width along the bottom — the dash reports what is true now, the tape what just
