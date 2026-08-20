@@ -132,6 +132,44 @@ where it stops being prose nothing can count. Do not mark your own findings refu
 the board records who set it (from your token) and who you SAY signed it off — `attested_by` is a
 claim you are making, not a signature the board checked — and `/panel` shows the split.
 
+**How hard the panel looks, and how long it keeps looking, are now repo settings.** They
+were constants, and the measurement says those constants do not converge: across the seven
+PRs panelled on 2026-08-16, the last round of each raised 201 findings no earlier round had
+and **128 of them — 63.7% — were created by the fix pass immediately before it**, against a
+~7% industry baseline for bad-fix injection. Every one of those panels ended on the round
+cap, each saying so in its own output — *"a stop, not convergence"* — and nine of this
+repo's open issues are the panel's own deferred-finding overflow. The severity split, P1
+4.1% / P2 28.6% / P3 36.1% / P4 31.3%, says the signal is calibrated at about 1.2 P1s per
+PR and the 67.3% tail beside it is not.
+
+So `.harness-rules.sample` now carries seven `review_panel` dials (#165), and what they
+bound is the tail rather than the signal: `fix_severity_floor` (**P3**) is what a fix round
+is asked to clear, and below it a finding is reported, marked and recorded rather than
+fixed — P4 is 31.3% of findings and the tier that actually ballooned #236;
+`round_trigger_floor` (**P2**) is what a NEW finding needs to buy another round, which is
+the rule that mattered most, because from round 2 the thing under review IS the previous
+round's fix and a termination test fed by its own output can only end on the cap — the
+two floors differ on purpose, since fixing a P3 in a pass that is already open costs one
+edit while letting a P3 buy another round costs a whole panel plus another fix pass;
+`max_fix_growth` (**3.0**) stops a cycle whose fix pass has multiplied the change instead of
+fixing it; `reviewer_scope` (**diff**) asks reviewers for defects in the change rather than
+in everything it touches; `fixer_may_defer` (**true**) gives the fixer the third exit it did
+not have; `max_rounds` (**2**) surfaces the existing cap; and `require_failing_test`
+(**false**) reserves the name for #165's evidence contract and reports that it is not built,
+because the reviewer-emitted failing test it needs does not exist yet (#92, #114).
+
+None of that lowers the bar for what a fix round does take on — in scope, everything still
+gets fixed properly, with a test, and note-and-move-on is still forbidden — and every value
+is validated: a malformed value of one of these keys is a hard exit naming the key, the
+value and what is accepted, because a repo that typed `p-4` meaning "fix everything" must
+not silently get the default instead. An unknown key is the other case and keeps its old
+answer — warned about and dropped, so a rules file shared across a fleet that upgrades at
+different times is not a version pin. What the round actually applied is in the
+artifact, on a **Panel dials** line and in the payload's `review_panel`, because the
+orchestrator that briefs the fixer builds that brief out of the report. #165 proposes about
+fifteen dials; these are the seven whose enforcement point already exists, and the rest stay
+in the issue.
+
 The fixer has one more permitted outcome than "fixed" and "false positive", and it exists
 because of what the other two cost. A fix that patches a wrong assumption produces the next
 round's findings; a fix that removes the assumption does not — PR #61 spent two rounds and two
@@ -144,7 +182,11 @@ because the output is "stop and ask" and the evidence behind it is still two PRs
 premise can be put to the seats first with `panel.py --ask`, which is exactly the shape of
 question that path exists for. An escalated finding is recorded as `deferred` by the
 orchestrator, which relays it, opens an issue that **asks** the premise, and names that issue in
-`deferred_to`. `harness/tests/test_fixer_escalation.py` guards the wiring rather than the
+`deferred_to`. Under `review_panel.fixer_may_defer` a fixer may now also return `deferred`
+itself — "the defect is real, and it is not what this change is for" — which is a different
+judgement from an escalation ("the defect is real and the FIX is in dispute") arriving at the
+same row; the fixer owes two justifying lines and the orchestrator still owns the filing.
+`harness/tests/test_fixer_escalation.py` guards the wiring rather than the
 judgement: that the permission and its report ship together, that the cross-file references to
 step 3a resolve, and that `deferred` is a value the database accepts.
 

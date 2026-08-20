@@ -193,7 +193,17 @@ the fixer — surface that in §6 rather than letting a one-vendor review read
 like a full panel.
 
 From its output collect:
-- **To fix** — the master-confirmed findings (any reviewer count, P1–P4).
+- **Panel dials** — the line the report prints under that name, naming `review_panel`.
+  It says which severity floor the fixer is being briefed to, what buys another round,
+  whether the fixer may defer, and the fix-growth ceiling. Read it BEFORE §4: the brief you build
+  depends on it, and it is the only place the round's policy is written down where
+  you can see it (#165).
+- **To fix** — the master-confirmed findings the fix round is asked to clear (any
+  reviewer count, at or above the round's `fix_severity_floor`).
+- **Reported, not this round's work** — the master-confirmed findings BELOW that
+  floor, marked 🔽. Present only where the floor left something under it. These are
+  recorded and relayed and **never pasted into the fixer's brief**; §4b says what
+  becomes of them.
 - **SonarCloud** — the hard-gate issues (these MUST end up resolved).
 - **Skipped reviewers** — note them; a skipped Codex/Sonar means thinner
   coverage, surface it.
@@ -237,10 +247,29 @@ with these overrides:
   findings.** They are already exhaustively reviewed and judged — the sub-agent
   does NOT re-derive them. Paste the full **To fix** list and the **SonarCloud**
   issues into the brief as the findings to resolve.
-- The sub-agent may still surface *additional* obvious defects it trips over
-  while fixing, and must fix those too — but its job is to resolve **every**
-  panel-confirmed finding (P1–P4) plus every SonarCloud issue, to the
-  "nothing left to improve" standard.
+- Its job is to resolve **every panel-confirmed finding the round asked it to
+  clear** — the **To fix** list, which is already filtered to the round's
+  `fix_severity_floor` — plus every SonarCloud issue, to the "nothing left to
+  improve" standard. Paste the **To fix** list and the SonarCloud issues, and
+  **not** the 🔽 *Reported, not this round's work* list: a fix pass that takes those
+  on is the growth the floor exists to stop, and the floor has already made that
+  judgement (#165).
+- **An additional defect the sub-agent trips over while fixing is subject to the same
+  floor and the same scope as a panel finding.** At or above the round's
+  `fix_severity_floor` *and* inside the change under review, it gets fixed — a P1 the
+  panel missed and the fixer walks straight into is still a P1, and leaving it because
+  no reviewer happened to name it is the worst outcome on offer. Below the floor, or
+  outside the change under review, it is **reported in the summary and not fixed**,
+  exactly like a below-floor panel finding. What this replaced granted a blanket
+  permission to fix whatever the pass noticed, three lines from the instruction that
+  establishes the floor — an open route back to fixing everything, and it bit hardest
+  for precisely the P3/P4 items the floor exists to hold back.
+- **Relay the dials into the brief.** The sub-agent cannot read `.harness-rules` for
+  itself in worktree mode and must not guess: state `fix_severity_floor`,
+  `reviewer_scope` and `fixer_may_defer` from the panel report's **Panel dials**
+  line, in the brief, as the values in force. The brief's own opening asks for them
+  by name, and a fixer left to guess reverts to "fix everything you find, anywhere",
+  which is the behaviour these settings exist to bound.
 - **Parallel fixes apply here too.** A panel list is typically longer than a
   single reviewer's, so the brief's step 3 fan-out (split a 6+ finding list into
   disjoint-file groups across fix sub-agents) is often the right call — the
@@ -280,9 +309,17 @@ a usage line; record the outcomes once it lands rather than dropping them, and
 say in the relay that they are outstanding — an outcome nobody records is the
 gap this whole feature exists to close.
 
+**Map the fixer's finding IDs to keys first — this is a step, not an aside.** The
+fixer reports the ID it was given (`236-F01`, exactly as the report prints it in
+square brackets) in its `Deferred` and `Escalated` blocks, because the ID is the only
+identifier it ever saw: the report carries no keys, on purpose (see below). You hold
+the payload, so the ID → key mapping is yours, and every `key` in the JSON below and
+every `--escalated` argument in §5 comes out of it. The one-liner prints both columns:
+
 ```bash
-# the keys, beside what each finding actually was
-jq -r '.to_fix[] | "\(.key)\t\(.severity)\t\(.synthesis)"' r<r>.json
+# id, key, and what each finding actually was — the left column is what the fixer
+# quotes back at you, the second is what the board and --escalated take
+jq -r '.to_fix[] | "\(.id)\t\(.key)\t\(.severity)\t\(.synthesis)"' r<r>.json
 
 cat <<'JSON' | qb record-outcome
 {"repo": "<owner/name>", "pr": <pr>, "outcomes": [
@@ -299,7 +336,10 @@ A key is a 16-character hex digest, and it is the same identity the board chains
 observations by — so an outcome recorded now attaches to every round that raised
 the defect, including the ones still to come. (Substituted rather than shown
 inline because a literal one reads as an API key to every secret scanner,
-`gitleaks` on this repo's pre-commit hook included.)
+`gitleaks` on this repo's pre-commit hook included. That is also why the **report**
+renders only finding IDs and why the fixer is asked for one rather than a key: the
+report is posted as a PR comment, and rendering keys into it would trade a mapping
+step you can do with `jq` for a secret-scanner hit on every panelled PR.)
 
 One of four per finding:
 
@@ -308,8 +348,14 @@ One of four per finding:
   point**: you are already writing the refutation into the PR comment and the fix
   commit, in prose nothing can count. A bare `refuted` is the same
   confident-assertion-with-nothing-behind-it the release exists to measure.
-- **`deferred`** — real, not now. Put where it went in `deferred_to`. This is
-  also where an **escalated** finding goes (the brief's step 3a): the defect is
+- **`deferred`** — real, not now. Put where it went in `deferred_to`. **Three roads
+  arrive here and all three are the same row.** (1) The fixer said so itself, under
+  `review_panel.fixer_may_defer` — the defect is real and outside what this change is
+  for, with the two justifying lines in its summary's `Deferred` block. (2) The
+  panel reported it BELOW the round's `fix_severity_floor`, so it was never in the
+  fixer's brief at all; one issue for the batch is fine and usually right, since
+  filing nine issues for nine P3s is the overflow the floor exists to stop. (3) An
+  **escalated** finding (the brief's step 3a): the defect is
   real and the fix is what is in dispute, so `refuted` would be a lie about the
   finding and `fixed` a lie about the code, and there is no fifth outcome to
   invent — the vocabulary is a database constraint, not a convention. Recording it
@@ -411,11 +457,13 @@ no with complete confidence):
   never as "clean".
 
 **An escalation ends the fix half of the cycle for that finding — tell the loop,
-with `--escalated`.** Pass the key on the round you learn of it:
+with `--escalated`.** Pass the key on the round you learn of it — the fixer gave you
+a finding ID, so map it through §4b's `jq` first; this flag takes keys and nothing
+else:
 
 ```
 python3 ~/.claude/loops/panel.py --pr <pr> --post --round <r> --max-rounds <N> \
-    --escalated <the key the fixer escalated> \
+    --escalated <the key the fixer's escalated ID maps to> \
     --baseline /tmp/tmp.AbC123/r1.json [--baseline …] \
     --json-file /tmp/tmp.AbC123/r<r>.json
 ```

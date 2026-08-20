@@ -327,6 +327,14 @@ def _payload_defaults() -> dict:
         # ran one.
         "code_access": {"setting": None, "seats": None,
                         "convention_files_removed": None},
+        # #165's dials as this round applied them. Null on the paths that reviewed
+        # nothing, for the reason `code_access` is: a round that never dispatched a
+        # seat, never briefed a fixer and never computed a stop did not apply a
+        # review policy, and recording the resolved values there would read as
+        # "these governed a round" about a round that did not happen. A bad VALUE
+        # in the rules file is still reported on those paths — it lands in
+        # `config_notes`, which the skip payloads carry.
+        "review_panel": None,
         "reviewers_selected": [],
         "reviewers_override": None,
         "to_fix": [],
@@ -454,7 +462,6 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # exactly what the comment above forbids: "round 1 of at most 2 — go again",
     # promising a re-review nothing will run.
     in_cycle = max_rounds is not None or round_no > 1 or bool(baseline)
-    cap = DEFAULT_MAX_ROUNDS if max_rounds is None else max_rounds
     # Idempotency key for the board record, minted once per process so a retry of
     # the POST cannot double-count the run into the stats. A fresh panel run is a
     # genuinely new observation and gets a new key — re-reviewing a PR after a fix
@@ -472,6 +479,17 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     gh_repo = cfg["github"]
     rev = cfg["reviewers"]
     panel = cfg["review_panel"]
+    # Every config diagnostic this run will report. Initialised HERE, not beside the
+    # file-list warnings below it, because #165's dials are resolved before the PR is
+    # fetched: a rules file with a bad `fix_severity_floor` has to say so whether or
+    # not the PR read succeeds, and the round cap the verdict is computed against
+    # comes out of the same resolution. Everything downstream still just appends.
+    notes: list[str] = []
+    # The seven `review_panel` settings that trade thoroughness against convergence,
+    # resolved once (`panel_seats.resolve_dials`) so the prompt, the report, the stop
+    # rule and the payload cannot disagree about which policy this round ran under.
+    dials = resolve_dials(panel, max_rounds, notes)
+    cap = dials.max_rounds
 
     # A repo that configured no review does not get one. Before `gh pr view`, and
     # before the --reviewers check below it, because this refusal is about the repo
@@ -511,6 +529,21 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         if json_out:
             print(json.dumps(unconfigured_payload, indent=2))
         return finish(failed)
+
+    # `--round 4` against a cap of 2 is a caller error, and it used to be checked in
+    # `main` against the CLI flag and the built-in constant alone — so a repo setting
+    # `review_panel.max_rounds: 3` had `--round 3` refused on the strength of a cap it
+    # had raised. Checked HERE instead, against the cap this run will actually apply,
+    # and still before anything is fetched. Without it the round runs and hits the cap
+    # branch on the spot, writing "round cap (2) reached — …, unreviewed" into a round
+    # 3 whose caller believed it had asked for more.
+    if round_no > cap:
+        blame = ("--max-rounds" if max_rounds is not None
+                 else f"`review_panel.max_rounds` ({panel.get('max_rounds')})"
+                 if panel.get("max_rounds") not in (None, "") else
+                 f"the default cap of {DEFAULT_MAX_ROUNDS}")
+        sys.exit(f"panel: --round {round_no} is past the cap of {cap}, from {blame}: "
+                 "raise the cap, or pass the round this run actually is")
 
     # Resolved before anything is fetched, so a typo'd --reviewers fails on the
     # spot rather than after a PR read and a diff download.
@@ -554,12 +587,11 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     changed_files, changed_files_total, dropped_files = _changed_files(meta)
     pr_state, is_draft = meta.get("state"), meta.get("isDraft")
 
-    # Built BEFORE the skip branch, because the skip branch returns. It used to
-    # sit with the diff budgets forty lines below, so a skipped PR carrying two
-    # paths and a total of 3,000 said nothing at all — and the skip path is the
-    # one this release argues is most likely to be merged unattended, which makes
-    # it the worst possible place for the warning to go missing.
-    notes: list[str] = []
+    # These are built BEFORE the skip branch, because the skip branch returns. They
+    # used to sit with the diff budgets forty lines below, so a skipped PR carrying
+    # two paths and a total of 3,000 said nothing at all — and the skip path is the
+    # one this release argues is most likely to be merged unattended, which makes it
+    # the worst possible place for the warning to go missing.
     # `dropped` is excluded on purpose: a discarded malformed row is not GitHub
     # paging us short, and one note covering both would send a reader looking for
     # a truncation that never happened.
@@ -1078,7 +1110,13 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # either prompt's own example rather than filing it as a finding. `{code}`
     # lives in that shared tail too (v2.51), so a slot added to one template can
     # never be missing from the other.
-    brief = MOVE_MANIFEST_PROMPT if pre.verdict == "manifest" else REVIEW_PROMPT
+    # `reviewer_brief` fills the scope slot from `review_panel.reviewer_scope` (#165):
+    # `diff` asks for defects in the change and routes anything outside it to an
+    # observation, `repo` is the pre-#165 wording verbatim. The manifest brief takes
+    # no scope — it is already the narrowest question this panel asks, and its whole
+    # instruction is "do not review the moved code".
+    brief = (MOVE_MANIFEST_PROMPT if pre.verdict == "manifest"
+             else reviewer_brief(dials.reviewer_scope))
 
     def prompt_for(budget: int | None, reads_code: bool = False) -> str:
         # `reads_code` defaults False so the one-argument callers keep working —
@@ -1491,6 +1529,22 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     judged = judge_skip is None and bool(findings)
     to_fix = sorted((c for c in findings if c.verdict != "dismissed"),
                     key=lambda c: c.severity)
+    # Which of them a fix round is actually asked to clear (#165). Below the floor a
+    # finding is still master-confirmed, still recorded and still in the payload — it
+    # is reported under its own heading with its own mark, exactly as an escalated
+    # finding is marked ⛔, so a brief built from this report cannot pick it up by
+    # accident. At the pre-#165 floor (`P4`) `under_floor` is empty and every list
+    # below renders as it always did.
+    # A PREDICATE, and every one of the four readers below goes through it. Splitting
+    # into two lists and then asking `c in under_floor` looked equivalent and is not:
+    # `Canonical` compares by value, so two genuinely distinct findings with the same
+    # severity, file, line and synthesis are equal to each other, and one of them
+    # would be marked on the strength of the other's membership.
+    def below_floor(c: Canonical) -> bool:
+        return not severity_at_least(c.severity, dials.fix_severity_floor)
+
+    for_fix = [c for c in to_fix if not below_floor(c)]
+    under_floor = [c for c in to_fix if below_floor(c)]
     dismissed = [c for c in findings if c.verdict == "dismissed"]
     # Sonar's hard-gate issues never reach the judge, so each is a canonical
     # record of its own single account — numbered after the judged ones, since
@@ -1526,6 +1580,13 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # whose only outstanding item is a new or still-open gate issue is not a dry
     # round. Leaving them out classified exactly that as convergence and ended the
     # cycle without another fixer.
+    #
+    # #165's floors do not reach them, and `round_stop` is where that is enforced —
+    # it exempts every key whose `verdict` is `sonar` from BOTH floors at every rule,
+    # because Sonar's own severities are routinely P3/P4 and filtering by them put
+    # this exact bug back: a new P3 gate issue fell out of `triggering`, landed in
+    # `quiet_new`, and the cycle stopped `confident` on a PR that cannot merge. A
+    # third floor has to go through the same exemption.
     outstanding = to_fix + sonar
     new_keys = sorted({c.key for c in outstanding if is_new(c)})
     flagged = sum(1 for c in to_fix if c.needs_rereview)
@@ -1669,7 +1730,14 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # one put the #221 jam straight back with nothing said.
     stop = round_stop(round_no, cap, new_keys, outstanding, veto, not prior.problems,
                       repeated={c.key for c in outstanding if not is_new(c)},
-                      escalated=held)
+                      escalated=held,
+                      # #165. The trigger floor bounds which NEW findings buy a round;
+                      # the fix floor bounds rules 2 and 3, because a finding no fix
+                      # round was asked to clear is outstanding every round by
+                      # construction and would otherwise run the cycle to the cap on
+                      # its own. `round_stop`'s docstring has the whole argument.
+                      trigger_floor=dials.round_trigger_floor,
+                      fix_floor=dials.fix_severity_floor)
     # An escalated SonarCloud issue is still a RED GATE, and "the approach is wrong,
     # a human must answer the premise" does not turn it green. `round_stop` counts
     # it like any other escalation — correctly, since it is work no fix round may
@@ -1694,6 +1762,56 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                         "issues and the gate reads ERROR — a premise answer does not "
                         "clear an external merge gate, so this PR cannot land until "
                         "the issue is resolved or excluded in SonarCloud"]
+    # ---- the growth ceiling (#165). A fix pass that MULTIPLIES the diff has written
+    # a second change, not a fix: on PR #236 the fix passes took a 359-insertion bug
+    # fix to 2,313 while none of the 67 findings was in the fix, and the last of them
+    # introduced an unbounded FIFO read. So a round whose material is more than
+    # `max_fix_growth` times what the cycle's FIRST round reviewed stops and says the
+    # change wants splitting, rather than buying another panel over a bigger change.
+    #
+    # Computable with no new plumbing: the size is `len(review.target)`, the same
+    # number `diff_chars` records, and `Baseline.first_reviewed` reads the earliest
+    # baseline's own `diff_chars` off the payloads round 2+ already receives via
+    # `--baseline`. Both are scope-dependent, which is why the scope of each end
+    # travels with it and is printed — under the default `increment` scope this is
+    # "the fix commit is Nx the change round 1 read", under `pr` scope it is "the PR
+    # has grown Nx", and they are different sentences about the same ceiling.
+    #
+    # **NOT dressed up as convergence.** It takes a veto line naming itself and
+    # `confident` is forced false, the same discipline the round cap and a held
+    # escalation get: the cycle is ending because something went wrong, and a reader
+    # who cannot tell that from a clean finish has been told the opposite of the truth.
+    # Set AFTER the SonarCloud sentence above so the reason reads outermost-first.
+    growth = None
+    if dials.max_fix_growth is not None and prior.first_reviewed:
+        first_round, first_chars, first_scope = prior.first_reviewed
+        ratio = len(review.target) / first_chars
+        over = ratio > dials.max_fix_growth
+        growth = {"limit": dials.max_fix_growth, "ratio": round(ratio, 3),
+                  "over": over, "chars": len(review.target), "scope": review.scope,
+                  "first_round": first_round, "first_chars": first_chars,
+                  "first_scope": first_scope}
+        if over:
+            stop["stop"] = True
+            stop["reason"] = (
+                f"the change this round reviewed is {ratio:.1f}x what round "
+                f"{first_round} reviewed, past the {dials.max_fix_growth:g}x "
+                f"`max_fix_growth` ceiling — {stop['reason']}, and what this needs is "
+                "splitting, not another round")
+            stop["veto"] = [*stop["veto"],
+                            f"this round's {len(review.target):,} chars ({review.scope}) "
+                            f"against round {first_round}'s {first_chars:,} "
+                            f"({first_scope}) is {ratio:.1f}x, past the "
+                            f"{dials.max_fix_growth:g}x `max_fix_growth` ceiling — a fix "
+                            "pass that multiplies the change has written a second "
+                            "change, and this stop is that measurement, not convergence"]
+            # Explicit rather than inferred from the veto line: `confident` was already
+            # computed inside `round_stop`, so appending to `veto` here changes nothing
+            # about it — and a verdict this file forces to `stop` must never be able to
+            # carry the flag that means "nothing left to find".
+            stop["confident"] = False
+    stop["fix_growth"] = growth
+
     # Whether a CYCLE exists at all, and the one predicate that decides it — for
     # the report's Rounds block and for the payload alike. They used to disagree:
     # the report suppressed the block for a review-only run while the payload sent
@@ -1959,15 +2077,33 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # report renders ⛔ only in the two lists a fixer's brief can be built from.
         # A caller who does escalate a dismissed key gets a `config_notes` line
         # saying so, rather than a record that contradicts the report.
+        # `below_fix_floor` rides beside `escalated` and for the same reason: it is
+        # the other way a confirmed, outstanding finding is deliberately NOT this
+        # round's work, and a programmatic consumer building a fixer's brief has to
+        # be able to see it without re-deriving the floor. On every bucket, in the
+        # same position, on the same rule the comment above states — except
+        # `dismissed`, where it is always False for the reason `escalated` is: the
+        # master ruled it not real, so "below the fix floor" would describe work that
+        # does not exist. `review_panel` below records the floor it was computed
+        # against.
         "to_fix": [{**c.as_dict(), "new_this_round": is_new(c),
                     "provenance": provenance_of(c),
-                    "escalated": c.key in held} for c in to_fix],
+                    "escalated": c.key in held,
+                    "below_fix_floor": below_floor(c)} for c in to_fix],
         "sonar_findings": [{**c.as_dict(), "new_this_round": is_new(c),
                             "provenance": provenance_of(c),
-                            "escalated": c.key in held} for c in sonar],
+                            "escalated": c.key in held,
+                            "below_fix_floor": below_floor(c)} for c in sonar],
         "dismissed": [{**c.as_dict(), "new_this_round": is_new(c),
                        "provenance": provenance_of(c),
-                       "escalated": False} for c in dismissed],
+                       "escalated": False,
+                       "below_fix_floor": False} for c in dismissed],
+        # The seven #165 dials AS APPLIED, not as written: a repo whose
+        # `fix_severity_floor` was rejected reads the floor that actually ran here
+        # and the reason it was rejected in `config_notes`. Every key present on
+        # every reviewed round, so a consumer never has to tell "the default applied"
+        # from "a payload written before the field".
+        "review_panel": dials.as_dict(),
         "provenance_counts": provenance_counts,
         "skipped": result.skipped,
         "run_key": run_key,
@@ -2227,6 +2363,14 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # about it in the report would reasonably conclude it is working.
         lines.append("**Code access:** on, but no seat on this panel can take it — "
                      f"{', '.join(diff_only)} reviewed the diff alone")
+    # On EVERY round, at the defaults or not (#165). The orchestrator that briefs the
+    # fixer builds that brief out of THIS report, so "which findings is the fixer being
+    # asked to clear, and what buys another round" has to be readable from the
+    # artifact rather than from whoever remembers the repo's config — and a reader
+    # weighing a quiet round needs to know whether the quiet was measured or
+    # configured. Beside the reviewer list and the code-access line because it is the
+    # same kind of fact: the terms this round ran under.
+    lines.append(f"**Panel dials** (`review_panel`): {dials.gist()}")
     for note in notes:
         lines.append(f"  - ⚠️ config: {note}")
     if truncated:
@@ -2246,9 +2390,11 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 else "increment" if target_scope == "increment" else "diff")
         lines.append(f"\n_{what} is {len(review.target):,} chars — truncated for {cut}_")
 
-    lines.append(f"\n### To fix ({len(to_fix)}) — master-confirmed, any reviewer count")
-    if to_fix:
-        for c in to_fix:
+    lines.append(f"\n### To fix ({len(for_fix)}) — master-confirmed, any reviewer count"
+                 + (f", {dials.fix_severity_floor} and above"
+                    if under_floor else ""))
+    if for_fix:
+        for c in for_fix:
             tail = f" — {c.rationale}" if c.rationale and c.rationale != "unjudged" else ""
             rel = f" _(same decision as {', '.join(c.related)})_" if c.related else ""
             # Said per finding, not only in the header: the rationale is blank
@@ -2266,6 +2412,26 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             lines += accounts(c)
     else:
         lines.append("- none")
+
+    # The other half of the fix floor (#165), and it has to be a section of its own
+    # rather than a mark inside **To fix**: the two lists are read by different
+    # readers for different purposes — one is a fixer's work list, the other is a
+    # record for a human — and an orchestrator that pastes "the To fix list" into a
+    # brief must not be able to sweep these up with it. Absent entirely at the
+    # pre-#165 floor, where nothing is below it.
+    if under_floor:
+        lines.append(f"\n### Reported, not this round's work ({len(under_floor)}) — "
+                     f"below the `{dials.fix_severity_floor}` fix floor")
+        lines.append("_Master-confirmed, recorded, and deliberately NOT for the fixer: "
+                     f"`review_panel.fix_severity_floor` is "
+                     f"`{dials.fix_severity_floor}`. Do not build a fix brief from "
+                     "this list — a fix pass that takes them on is the growth this "
+                     "floor exists to stop (#165). They stay in the payload "
+                     "(`below_fix_floor`) and on the board._")
+        for c in under_floor:
+            fresh = " 🆕" if prior_rounds and is_new(c) else ""
+            lines.append(f"- 🔽 **{c.severity}**{fresh} `{loc(c)}` [{c.id}] — "
+                         f"{c.synthesis}{conf(c)}{escalation(c)}")
 
     if sonar:
         lines.append(f"\n### SonarCloud issues ({len(sonar)}) — part of the gate")
@@ -2516,20 +2682,15 @@ def main() -> int:
         raise SystemExit("--round: rounds are numbered from 1")
     if args.max_rounds is not None and args.max_rounds < 1:
         raise SystemExit("--max-rounds: at least one round has to run")
-    # Checked against the EFFECTIVE cap, not only against an explicit one. The
-    # default is the cap `run()` actually applies, so `--round 3` with no
-    # --max-rounds used to pass this guard and then hit the cap branch on the
-    # spot — writing "round cap (2) reached … unreviewed" into a round 3 and
-    # printing "round 3 of at most 2". That is precisely the corrupted cycle
-    # metadata this guard exists to prevent, leaking through the one spelling it
-    # did not cover.
-    cap = DEFAULT_MAX_ROUNDS if args.max_rounds is None else args.max_rounds
-    if round_no > cap:
-        default_note = "" if args.max_rounds is not None else \
-            " (the default, since --max-rounds was not passed)"
-        raise SystemExit(f"--round {round_no} is past --max-rounds "
-                         f"{cap}{default_note}: raise the cap, or pass the round "
-                         "this run actually is")
+    # The round-against-the-cap check MOVED into `run()` (#165). It has to be made
+    # against the EFFECTIVE cap — otherwise `--round 3` with no --max-rounds passes
+    # here and then hits the cap branch on the spot, writing "round cap (2) reached …
+    # unreviewed" into a round 3 and printing "round 3 of at most 2" — and the
+    # effective cap is now `review_panel.max_rounds` where a repo sets one, which
+    # nothing here has read: the rules file is resolved inside `run()`. Checked there,
+    # still before any PR is fetched, and it names which of the three answers supplied
+    # the cap. Resolving the repo twice to keep the check here would print every rules
+    # diagnostic twice for it.
     # `--escalated` only means something ACROSS rounds: it names work a later round
     # must not count. A run that is not part of a cycle has no later round, so
     # accepting the flag there leaves two options and both are worse than refusing

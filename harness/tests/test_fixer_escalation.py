@@ -340,11 +340,20 @@ def test_the_summary_counts_use_the_recorded_vocabulary_and_state_their_invarian
     assert not re.search(r"\bnot a defect\b", counts, re.IGNORECASE), (
         f"the counts line ({counts.strip()!r}) says 'not a defect', a third name for what this "
         "file already calls a false positive and records as `refuted`; one outcome, one word")
-    assert "Fixed + Escalated + Refuted = Findings" in flat, (
-        "the counts state no invariant, so nothing tells a reader that the three must sum to "
-        "Findings — the one cheap check that catches a finding that fell off the table")
-    assert "Escalated: none" in flat, (
-        "step 6 no longer spells the empty case; a missing Escalated block reads as forgotten")
+    assert "Deferred: N" in counts, (
+        f"the counts line ({counts.strip()!r}) no longer says `Deferred: N` — `deferred` is a "
+        "permitted fixer outcome under `review_panel.fixer_may_defer` (#165), and a permitted "
+        "outcome missing from the counts is a finding that can leave the table without the "
+        "arithmetic below noticing")
+    assert "Fixed + Deferred + Escalated + Refuted = Findings" in flat, (
+        "the counts state no invariant, so nothing tells a reader that the four must sum to "
+        "Findings — the one cheap check that catches a finding that fell off the table. Every "
+        "permitted outcome has to be a term in it: one left out is exactly the note-and-move-on "
+        "the permission was granted to replace")
+    for empty in ("Escalated: none", "Deferred: none"):
+        assert empty in flat, (
+            f"step 6 no longer spells the empty case {empty!r}; a missing block reads as "
+            "forgotten, and the run where that matters is the run where a reader has to be sure")
 
 
 # ------------------------------------------------------------- 2. the cross-file anchor

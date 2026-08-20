@@ -1624,6 +1624,15 @@ def _stub_panel(monkeypatch, findings=None, title="feat: x", cfg=PANEL_CFG):
     monkeypatch.setattr(panel, "adjudicate", _fake_adjudicate)
 
 
+#: A finding at or above the default `round_trigger_floor`/`fix_severity_floor` (#165).
+#: `_stub_panel`'s own default is a P3, which is BELOW both floors — correctly, since
+#: most tests here are about how a finding is rendered and recorded and a P3 exercises
+#: the below-floor path — so any test whose subject is the loop GOING AGAIN has to
+#: raise something that buys a round, or it is asserting the floors rather than the
+#: rule it names.
+BLOCKING = [panel.Finding("claude", "P2", "a.py", 3, "unvalidated input")]
+
+
 def _report(monkeypatch, capsys, tmp_path, round_no, baseline=(), max_rounds=None,
             findings=None, title="feat: x", cfg=PANEL_CFG):
     """One whole panel run, so what is under test is the report it writes on the
@@ -1672,14 +1681,16 @@ def test_a_first_round_inside_a_cycle_still_reports_where_the_loop_stands(monkey
     """Naming the cap is what says this run belongs to a cycle — /panel-review-pr
     passes it on round 1, and that round's `go again` is a promise something will
     keep."""
-    report, _ = _report(monkeypatch, capsys, tmp_path, 1, max_rounds=2)
+    report, _ = _report(monkeypatch, capsys, tmp_path, 1, max_rounds=2,
+                        findings=BLOCKING)
     assert "**Rounds:** round 1 of at most 2 — **go again**" in report
 
 
 def test_a_re_review_says_which_round_it_is_and_where_the_loop_stands(monkeypatch, capsys,
                                                                       tmp_path):
-    _, r1 = _report(monkeypatch, capsys, tmp_path, 1, max_rounds=2)
-    report, out = _report(monkeypatch, capsys, tmp_path, 2, baseline=[r1], max_rounds=2)
+    _, r1 = _report(monkeypatch, capsys, tmp_path, 1, max_rounds=2, findings=BLOCKING)
+    report, out = _report(monkeypatch, capsys, tmp_path, 2, baseline=[r1], max_rounds=2,
+                          findings=BLOCKING)
     assert "**Rounds:** round 2 of at most 2" in report
     # The same finding again is not fresh damage, and the ↻/🆕 marker stays off.
     assert "🆕" not in report
@@ -1931,10 +1942,15 @@ def test_the_repo_a_payload_names_is_the_one_it_resolved(monkeypatch, capsys, tm
 
 def test_a_round_past_the_cap_is_rejected_rather_than_recorded(monkeypatch):
     """`--round 5 --max-rounds 2` records an impossible position and hits the cap
-    branch on the spot, writing "round cap (2) reached" into a round 5."""
+    branch on the spot, writing "round cap (2) reached" into a round 5.
+
+    The guard lives in `run()` since #165 rather than in `main`, because the cap it
+    has to be checked against can now come from `review_panel.max_rounds` and only
+    `run()` has read the rules file. Still before anything is fetched, and it names
+    which of the three answers supplied the cap — which is what these two assert."""
     monkeypatch.setattr(sys, "argv",
                         ["panel.py", "--pr", "1", "--round", "5", "--max-rounds", "2"])
-    with pytest.raises(SystemExit, match="past --max-rounds"):
+    with pytest.raises(SystemExit, match="past the cap of 2, from --max-rounds"):
         panel.main()
 
 
@@ -1943,9 +1959,11 @@ def test_a_round_past_the_DEFAULT_cap_is_rejected_too(monkeypatch):
     `run()` applies is the default when it is not. So `--round 3` alone passed
     validation and took the cap branch on the spot, writing "round cap (2)
     reached — …, unreviewed" into a round 3 and printing "round 3 of at most 2" —
-    the exact corrupted metadata the guard exists to prevent."""
+    the exact corrupted metadata the guard exists to prevent. On this repo the
+    default and `review_panel.max_rounds` are both 2, so the message names the
+    setting; either way the cap is 2 and round 3 is past it."""
     monkeypatch.setattr(sys, "argv", ["panel.py", "--pr", "1", "--round", "3"])
-    with pytest.raises(SystemExit, match="past --max-rounds 2"):
+    with pytest.raises(SystemExit, match="past the cap of 2"):
         panel.main()
 
 

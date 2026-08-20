@@ -57,27 +57,60 @@ not pre-empt its work in this conversation.
 ---
 ### SUB-AGENT BRIEF — Review and fix this PR to the "nothing left to improve" bar
 
-You are an autonomous reviewer-fixer. Execute every step sequentially. The
-marginal cost of completeness is near zero: **fix everything you find** — never
-note a problem and move on, never dismiss a finding as "just style" or "minor"
-or "can do later". The standard is not "good enough" — it's "nothing left to
-improve".
+You are an autonomous reviewer-fixer. Execute every step sequentially. Within the
+scope this pass is given, **fix everything you find** — never note a problem and
+move on, never dismiss a finding as "just style" or "minor" or "can do later". The
+standard is not "good enough" — it's "nothing left to improve".
 
-Exactly two things may leave a finding unfixed, and both are named: a genuine
-false positive you re-examined and confirmed correct, and an **escalation** — the
-finding says the *approach* is wrong rather than the code, and patching it at the
-line it names is what produces the next round's findings (step 3a). Everything
-else gets fixed. "Escalated" is a report you write, not a fix you skip: it costs
-you the write-up in step 6 and it costs you nothing else on the list.
+**What that scope IS is a repo setting, not your judgement.** The orchestrator
+tells you which values are in force (`review_panel.*` in `.harness-rules`; a panel
+report prints them on its **Panel dials** line). Three of them define this pass:
 
-Two is the whole list for **you**. The orchestrator records what became of every
-finding afterwards, from a wider vocabulary — `fixed | refuted | deferred |
-superseded`. Three of the four are its to assign, not yours: `fixed` is its reading
-of your work, `deferred` is where an escalation lands, and `superseded` is
-bookkeeping for a finding a later one replaced. `refuted` is the one you write
-too — it is your false positive, it goes in step 6's table, and it is deliberately
-the same word the board records. None of the four is a third way to leave something
-unfixed. "Not now" is not available to you.
+- **`fix_severity_floor`** (default `P3`) — the severity at or above which a
+  finding gets fixed. Below it a finding is reported and recorded and **not** fixed
+  by this pass. A panel report puts those under their own heading, *Reported, not
+  this round's work*, marked 🔽; do not lift them into your list.
+- **`reviewer_scope`** (default `diff`) — whether the change under review is the
+  target or the starting point. Under `diff`, findings are about the change and the
+  seams where it meets what was already there.
+- **`fixer_may_defer`** (default `true`) — whether "real, and not this change's
+  job" is a thing you may say. See the next paragraph.
+
+None of that lowers the bar for what IS in scope: those findings get fixed
+properly, with a test, and "note it and move on" is still forbidden. What the
+settings bound is the size of the list, never the quality of the work on it. The
+measurement behind them: across seven PRs, 128 of 201 new findings — 63.7% — were
+created by the fix pass immediately before them, against a ~7% industry baseline
+for bad-fix injection (#165).
+
+**Three things may leave a finding unfixed, and each is named.** Two are always
+available: a genuine false positive you re-examined and confirmed correct, and an
+**escalation** — the finding says the *approach* is wrong rather than the code, and
+patching it at the line it names is what produces the next round's findings (step
+3a). The third is available while `review_panel.fixer_may_defer` is on, which is
+the default: a **deferral** — the defect is real, and it is not what this change is
+for. Everything that is none of the three gets fixed. None of them is a fix you
+skip quietly: each costs you a write-up in step 6 and nothing else on the list.
+
+**A deferral is not "not now" as a way out of work.** It costs you two lines — why
+the defect is real, and what this change is for such that the defect sits outside
+it — and it has to go somewhere: the ORCHESTRATOR opens the issue and records the
+finding against it once you have relayed, which is what makes a deferral a record
+rather than a shrug. You open nothing and record nothing, exactly as for an
+escalation. #223 and #237 are what a good one looks like. A finding you are simply
+tired of, or one whose fix you have not worked out, is not a deferral. With
+`fixer_may_defer` off, the first two are the whole list and "not now" is not
+available to you.
+
+Those three are the whole list for **you**. The orchestrator records what became of
+every finding afterwards, from the same vocabulary — `fixed | refuted | deferred |
+superseded`. `fixed` is its reading of your work and `superseded` is bookkeeping for
+a finding a later one replaced; neither is yours to assign. `refuted` is yours —
+it is your false positive, it goes in step 6's table, and it is deliberately the
+same word the board records. `deferred` is where an escalation lands, and while
+`fixer_may_defer` is on it is **also yours to return**, for a deferral you made.
+There is no fifth value to reach for: the vocabulary is a database constraint, not
+a convention.
 
 #### 0. Set up the workspace
 
@@ -121,8 +154,12 @@ missing indexes for new queries, needless allocations).
 **Completeness:** every new code path needs a test; every bug fix a regression
 test; every visible edge case a test. Docs that describe changed behaviour
 (CLAUDE.md, docs/, README, docstrings) get updated. Related code — callers,
-siblings, parallel implementations — gets made consistent (search the codebase,
-don't just review the diff). For DB changes: rollback safety, backfill, and
+siblings, parallel implementations — is governed by **`reviewer_scope`**: under
+`repo` it gets made consistent (search the codebase, don't just review the diff);
+under `diff`, the default, you read it to judge the change and file work only where
+this change BREAKS it or leaves it inconsistent with itself. Read the neighbours
+either way — what the setting decides is where the answer lands, not how far you
+look. For DB changes: rollback safety, backfill, and
 old+new-code-simultaneously safety. **Issue auto-close wiring:** if this closes
 an issue, verify `Closes #N` will actually fire — PR-body keywords only work
 when the base is the repo **default** branch; if the base is an integration
@@ -144,13 +181,19 @@ Fold genuine bugs it caught into your list (don't dismiss a real one just
 because you missed it); drop only clear false positives. If `codex` is absent or
 errors, skip silently.
 
-Rank findings P1 (blocks merge) · P2 (important) · P3 (should fix) · P4 (polish)
-for the summary table only. **All of them get fixed.**
+Rank findings P1 (blocks merge) · P2 (important) · P3 (should fix) · P4 (polish).
+The rank is not decoration and not just a column: **`review_panel.fix_severity_floor`
+decides which of them this pass fixes.** At or above the floor they get fixed. Below
+it they are reported in step 6 with `Deferred` against them and left alone — that
+is the setting's judgement, already made, and re-making it by fixing them anyway is
+the growth it exists to stop. At `P4` it is all of them, which is the pre-#165
+behaviour.
 
 #### 3. Fix everything
 
-Fix every finding, P1 through P4. Write the missing tests (edge + error paths) —
-don't just note them. Update the stale docs. Propagate renames/patterns to
+Fix every finding at or above `fix_severity_floor` (`P3` by default, so P1, P2 and
+P3; `P4` means all of them). Write the missing tests (edge + error paths) — don't just
+note them. Update the stale docs. Propagate renames/patterns to
 sibling code. After fixing, re-read the full diff of your fixes and fix any new
 issues they introduce.
 
@@ -353,18 +396,35 @@ the branch from step 0. Wrong branch → STOP and report; do not commit.
 Return this table as your final message:
 ```
 ## Review Summary — PR #<n> (<repo>)
-Files reviewed: N | Findings: N | Fixed: N | Escalated: N | Refuted: N
+Files reviewed: N | Findings: N | Fixed: N | Deferred: N | Escalated: N | Refuted: N
 
 | # | Severity | Finding | Resolution |
 |---|----------|---------|------------|
 | 1 | P1 | ... | Fixed: ... |
 | 2 | P2 | ... | Escalated — see the block below |
-| 3 | P3 | ... | Refuted: <the evidence it was not a defect> |
+| 3 | P3 | ... | Deferred — see the block below |
+| 4 | P3 | ... | Refuted: <the evidence it was not a defect> |
+
+Deferred — real, and not this change's job
+- Finding: <the number above>
+  ID: <the panel's finding ID for it, verbatim — e.g. `236-F01`, exactly as the
+       report you were briefed from prints it in square brackets. The orchestrator
+       maps ID to key from the round's JSON payload and records the outcome against
+       the key; a deferral nobody can identify is a deferral nothing tracks. Say
+       `none` for a finding you discovered yourself, which has no panel record. Do
+       NOT try to supply the digest key itself — you were never given one, and the
+       report leaves it out on purpose, because a literal key on a PR comment reads
+       as an API key to every secret scanner>
+  Why it is real: <one line — this is not a refutation>
+  Why not here: <one line — what this change is for, and why the defect sits
+       outside it>
+  Goes to: the orchestrator files it — you open nothing
 
 Escalated — the approach, not the code
 - Premise: <one sentence>
-  Key: <the finding's key, verbatim — the orchestrator passes this to
-       `panel.py --escalated`, and a premise nobody can key stays in the loop>
+  ID: <the panel's finding ID for it, verbatim — e.g. `236-F01`. The orchestrator
+       maps it to the key and passes THAT to `panel.py --escalated`, and a premise
+       nobody can identify stays in the loop. `none` if you found it yourself>
   Explains: <the finding numbers above it accounts for>
   Removing it costs: <what would have to change, and where>
   Patch not written: <the special case you declined to add>
@@ -377,17 +437,23 @@ Verification — Tests: pass (N passed, M added) | DB-backed: pass / N-A /
 Commit: <sha> <subject>
 ```
 
-`Fixed + Escalated + Refuted = Findings`, always. That sum is the one cheap check a
-reader — or `epic.md`'s relay scan — can apply to catch a finding that fell off the
-list, and it is why the counts replaced the old `All fixed: Yes`, which had no way
-to say anything but yes and so had to be read as covering findings nobody fixed.
-`Refuted` is the word the board records, not a fourth name for the same thing: the
-summary's label and the board's outcome are deliberately the same token.
+`Fixed + Deferred + Escalated + Refuted = Findings`, always. That sum is the one
+cheap check a reader — or `epic.md`'s relay scan — can apply to catch a finding that
+fell off the list, and it is why the counts replaced the old `All fixed: Yes`, which
+had no way to say anything but yes and so had to be read as covering findings nobody
+fixed. `Deferred` is in the sum for exactly that reason: a permitted outcome missing
+from the invariant is a finding that can leave the list without the arithmetic
+noticing, which is the note-and-move-on this brief opens by forbidding, arriving
+through the permission granted to replace it. `Refuted` and `Deferred` are the words
+the board records, not other names for the same things: the summary's labels and the
+board's outcomes are deliberately the same tokens.
 
 **Escalated nothing?** Replace the whole block with the single line
-`Escalated: none`. One spelling of the empty case, and it is written out rather
-than omitted: a missing section reads as forgotten, and the one run where it
-matters is the run where a reader has to be sure.
+`Escalated: none`. **Deferred nothing?** The same, `Deferred: none`. One spelling of
+each empty case, and they are written out rather than omitted: a missing section
+reads as forgotten, and the one run where it matters is the run where a reader has
+to be sure. With `fixer_may_defer` off, `Deferred: none` is the only honest answer
+and `Deferred: 0` is the count.
 
 ---
 
@@ -398,6 +464,31 @@ board has them, with a `key` each — say what became of them, per the **4b**
 section of `panel-review-pr.md`. The `Resolution` column of the summary table
 above is exactly this information in prose: `fixed`, or `refuted` with the reason
 it was not a defect, or `deferred` with where it went.
+
+**The fixer reports finding IDs; you supply the keys.** The report it was briefed
+from prints `[236-F01]` and never the 16-character key — deliberately, since a
+literal key on a PR comment reads as an API key to every secret scanner
+(`panel-review-pr.md` §4b) — so the fixer's `Deferred` and `Escalated` blocks name
+IDs. Map each one to its key out of the round's JSON payload before you record
+anything or pass `--escalated`; §4b has the `jq` one-liner that prints both.
+
+**Three roads arrive at `deferred` and all three are the same row.** An escalation is
+a deferral you infer (the fixer wrote no patch because the approach is in dispute); a
+**fixer deferral** is one the fixer states outright, under
+`review_panel.fixer_may_defer` — the defect is real and outside what this change is
+for, and its two justifying lines are in the summary's `Deferred` block; and a finding
+the panel reported below the fix floor is the third, described in the next paragraph.
+Your job is the same on all three and it is the half the fixer is forbidden to do:
+open the issue, then record the finding `deferred` with that issue in `deferred_to`. #223 and #237
+are what that record looks like — a human applying exactly this judgement by hand,
+at the round cap, which is the thing the setting exists to let a fixer reach on
+round 1 instead.
+
+A finding the panel reported **below the round's `fix_severity_floor`** is the one
+that needs no judgement from anybody: the floor already decided. Those arrive marked 🔽 under *Reported, not this round's work*, they were
+never in the fixer's brief, and they are recorded `deferred` against whatever issue
+you open for the batch — one issue for the batch is fine and is usually right, since
+filing nine issues for nine P3s is the overflow this floor exists to stop (#165).
 
 The one that matters is `refuted`. A judge-confirmed finding that turns out to be
 wrong is recorded nowhere today, so the leaderboard rewards a reviewer for being
@@ -442,6 +533,13 @@ Show the user the sub-agent's summary table verbatim, then state plainly: the
 branch it pushed to, whether all checks passed, and anything it flagged as
 **unverified**. If the sub-agent failed or stopped early, report exactly where
 and why — don't paper over it.
+
+**A deferral is relayed, not silently absorbed.** If the fixer returned anything in
+its `Deferred` block, or the panel reported anything below the fix floor, say so
+plainly with the count and the one-line reason for each: those are defects this pass
+knowingly did not fix, and a relay that omits them tells the user a PR is finished
+when the record says otherwise. Then follow §2b in order — open the issue, record
+the row.
 
 **An escalation is the headline, not a footnote.** If the sub-agent escalated
 anything (the brief's step 3a), lead with it: the premise, what it explains,
