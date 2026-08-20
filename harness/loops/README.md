@@ -173,6 +173,13 @@ Detected from the checkout, **not settable** here: `path`, `github`, `default_br
 | `review_panel.ask_max_context_chars` | Total `--context` material one ask may hand its seats, across every spec. **60,000** (~15k tokens). Over budget is clamped and SAID, per spec — an ask's whole claim is that it is the cheap check, and unbounded context is the #117 cost shape on the path advertised as costing a minute. |
 | `review_panel.reviewer_code_access` | May a seat READ the code under review? **true**. `false` is the old posture — every seat in an empty repo, the diff its only evidence — and is what a repo taking UNTRUSTED contributions selects. On does not mean every seat gets it: only a CLI that can express "read but do not execute" is handed the tree (today just `claude`), and which seats did is recorded per seat. `--no-code-access` turns it off for one run. See below. |
 | `review_panel.reviewer_code_budget_usd` | Dollars the code-reading seat may spend per invocation (`claude --max-budget-usd`). **`null`** — uncapped — for the reason `max_diff_chars` is: reaching the cap is a LOST seat (a skip, which vetoes), not a cheaper review. Measured for calibration: ~$4 for one seat on a 75,628-char diff against ~$0.70 diff-only. Applies only to a seat that got the tree; the cap is per invocation and a reparse retry can spend it twice. |
+| `review_panel.fixer_may_defer` | May a fixer answer "real, and not this change's job"? **true**. Its two exits were a refuted false positive and an escalation about the *approach*, and the brief then said "'Not now' is not available to you" — so a correct third judgement had no legal way out and the only move left was the patch. Maps to the existing `deferred` outcome; the fixer owes a justification and the orchestrator opens the issue. `false` is the old two-exit behaviour. |
+| `review_panel.fix_severity_floor` | Severity a fix round is asked to clear, at or above. **`P2`**. Below it a finding is reported, marked 🔽 under its own heading, recorded (`below_fix_floor` in the payload) and **not fixed**. Measured: the cut discards 67.3% of findings and loses zero P1s. `P4` fixes everything, the pre-#165 behaviour. |
+| `review_panel.round_trigger_floor` | Severity a NEW finding needs to buy another round. **`P2`**. Below-floor new findings are still reported and recorded; `round_stop`'s reason names the floor and the count. `P4` is the pre-#165 behaviour. |
+| `review_panel.max_fix_growth` | Multiple of the cycle's FIRST round's reviewed size that a later round may review before the cycle stops and says the change wants splitting. **3.0**; `null` switches the check off (the one key here where `null` is not "inherit"). Not dressed up as convergence — it takes a veto line and `confident` is false. |
+| `review_panel.reviewer_scope` | What a reviewer is asked to look for: **`diff`** (defects in the change and its seams; anything outside it is an observation) or `repo` (the pre-#165 wording — "search the codebase, don't just review the diff"). Not how hard anyone looks: every dimension stays in the prompt and a code-reading seat still reads the callers. |
+| `review_panel.require_failing_test` | A finding must carry a reproducible failing test to block. **false, and read-only**: the reviewer-emitted test artefact it needs is not built (#92 — a reviewer emits a test and never runs one; #114 — it must be shown RED pre-fix). Setting it `true` is recorded, reported, and enforces nothing, and the round says so in `config_notes`. |
+| `review_panel.max_rounds` | The round cap, as a repo setting. **2**. `panel.py --max-rounds` still wins; this wins over the built-in constant. #165 proposes 1 and this keeps 2 deliberately — round 2 is what caught a defect *created* by round 1's fix on #236 — because the three keys above attack the fix pass's growth instead. |
 | `loops` | `dependabot_lander` / `stacked_driver` / `issue_executor` — which loops may run. |
 | `epic` | Epic-driver settings — see below. |
 | `preland.disabled_checks` | Checks `preland.py` must not run, by name. Empty by default — every guardrail it can detect, it runs. A name nothing answers to is a **hard error**, not a warning; see below. |
@@ -288,6 +295,56 @@ switches the refusal off, while `move_shape_ratio` is a threshold with no off at
 ratio of `0` turns the feature all the way *on* — every diff with one relocated line
 becomes a move), so its note points at `manifest_moves` instead. All three are the
 pre-flight verdict, below.
+
+### Thoroughness against convergence — #165's seven dials
+
+The panel had one behaviour and no dials, and the measurement says that behaviour does
+not converge. Across seven PRs panelled on 2026-08-16, the last round of each raised
+201 findings no earlier round had, and **128 of them — 63.7% — were created by the fix
+pass immediately before it**, against a ~7% industry baseline for bad-fix injection.
+Every one of those panels terminated on the round cap, each saying so in its own
+output: *"a stop, not convergence."* Nine of this repo's open issues are the panel's own
+deferred-finding overflow.
+
+The severity split of that queue is P1 4.1% / P2 28.6% / P3 36.1% / P4 31.3% — about
+1.2 P1s per PR, roughly what a production generator-verifier loop reports. **The signal
+is calibrated; the 67.3% tail beside it is not.** These seven settings bound the tail.
+None of them makes the panel look less carefully, and none lowers the bar for what a fix
+round takes on: in scope, everything still gets fixed properly, with a test, and "note
+it and move on" stays forbidden.
+
+The diagnosis they act on, in three parts:
+
+1. **The panel computed a calibrated severity and the prompts threw it away.**
+   `review-pr.md` ranked findings "for the summary table only. All of them get fixed."
+   → `fix_severity_floor`, which is the rule #223 and #237 already apply by hand — but
+   only *at the cap*, after three fix passes have grown the change.
+2. **The fixer was forbidden to scope.** Two exits, and "'Not now' is not available to
+   you" → `fixer_may_defer`, plus `reviewer_scope`, which stops the review round handing
+   the fixer work outside the change in the first place.
+3. **The loop's termination test was fed by its own output.** `round_stop`'s rule 1 went
+   again on a new finding at any severity, and from round 2 the thing under review IS the
+   previous round's fix → `round_trigger_floor`, with `max_fix_growth` as the backstop for
+   the case where the fix pass has already written a second change.
+
+`max_rounds` and `require_failing_test` are the two that change nothing on their own:
+the first surfaces an existing constant so a repo can move it, the second reserves the
+name for the evidence contract #165 argues is the real termination condition, and reports
+that it is not built rather than pretending to enforce it.
+
+**Every one of the seven is validated, and a bad value is never silent.** It falls back
+to the default and lands a `config_notes` line naming the value and the set that is
+accepted — printed above the findings as "⚠️ config:", carried in the payload, and on the
+PR comment under `--post`. That is `resolve_round_scope`'s and `diff_budget`'s manners; a
+hard exit stays reserved for a rules file that cannot mean what it says at all, because a
+file shared across a fleet of boxes that upgrade at different times must not become a
+version pin on every one of them.
+
+**What the round applied is in the artifact.** The report carries a
+**Panel dials** line on every round, at the defaults or not, and the
+payload carries `review_panel` with all seven as applied. The orchestrator that briefs
+the fixer builds that brief out of the report, so the policy has to be readable there
+rather than from whoever remembers the repo's config.
 
 ### The SonarQube token
 

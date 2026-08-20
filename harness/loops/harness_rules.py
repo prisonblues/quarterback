@@ -408,6 +408,167 @@ DEFAULTS: dict = {
         # the seat and buys nothing. Note the cap is per INVOCATION and `run_cli`
         # may make a reparse retry, so one seat can spend up to twice this.
         "reviewer_code_budget_usd": None,
+        # ------------------------------------------------------------------ #165
+        # THOROUGHNESS AGAINST CONVERGENCE. Seven settings, one measurement.
+        #
+        # Across the seven PRs panelled on 2026-08-16, the last round of each
+        # raised 201 findings no earlier round had — and 128 of them, 63.7%, were
+        # created by the fix pass immediately before it. The industry baseline for
+        # bad-fix injection is ~7% (Capers Jones), passing 25% only for novices in
+        # high-complexity code, so the fix pass is the largest single source of
+        # defects in this loop's own queue. Every one of those panels terminated on
+        # the round cap, each saying so in its own words: "a stop, not
+        # convergence". Nine of this repo's open issues are the panel's own
+        # deferred-finding overflow.
+        #
+        # The severity split of that queue — P1 4.1%, P2 28.6%, P3 36.1%,
+        # P4 31.3% — is about 1.2 P1s per PR, roughly the yield a production
+        # generator-verifier loop reports. **The signal is calibrated; the 67.3%
+        # tail shipped beside it is not.** These settings bound the tail. None of
+        # them makes the panel find less carefully, and none of them lowers the bar
+        # for what a fix round DOES take on: inside scope, everything still gets
+        # fixed properly, with a test, and "note it and move on" stays forbidden.
+        #
+        # A fresh panel on PR #236 is the run that prompted them: three rounds went
+        # 18 -> 25 -> 24 findings, 19 of round 3's 24 attributed by the panel itself
+        # to the preceding fix pass (79%), and the PR grew from 359 to 2,313
+        # insertions while none of the 67 findings was in the bug fix the PR
+        # existed for. It landed at 62 insertions.
+        #
+        # #165 proposes about fifteen dials. These seven are the ones whose
+        # enforcement point already exists; the rest stay in the issue rather than
+        # becoming keys nothing reads.
+        #
+        # The fixer's THIRD exit. Today the brief allows exactly two ways to leave
+        # a finding unfixed — a false positive it re-examined and refuted, and an
+        # escalation about the approach (`review-pr.md` step 3a) — and then says in
+        # as many words: "'Not now' is not available to you." So a fixer that
+        # correctly judges "this is real, and it is not what this change is for"
+        # has no legal way to say it, and the only remaining move is the patch.
+        # That is the incentive behind the 63.7%.
+        #
+        # The OUTCOME already exists. `deferred` is in the recorded vocabulary
+        # (`fixed|refuted|deferred|superseded`, constrained at ingest in
+        # `app/api/reviews.py` and again by the `ck_review_finding_outcomes_vocabulary`
+        # CHECK), and issues #223 and #237 are humans applying exactly this
+        # judgement by hand at the round cap. The judgement was being made and the
+        # workflow forbade reaching it; this is the permission, not a new word.
+        # `deferred` is what a deferral maps to — do NOT invent a fifth value, it
+        # costs the row and records nothing.
+        #
+        # NOT a way out of work, and the briefs say so: a deferral takes a
+        # one-line justification, names where it went (`deferred_to`), and the
+        # ORCHESTRATOR opens the issue — #223 and #237 are what a good deferral
+        # record looks like. False restores today's two exits.
+        "fixer_may_defer": True,
+        # What a fix round is asked to CLEAR. At or above this severity a finding
+        # gets fixed; below it, it is reported and recorded and not fixed. The
+        # panel already computes a calibrated severity and the prompts then throw
+        # it away — `review-pr.md` ranks findings "for the summary table only. All
+        # of them get fixed."
+        #
+        # P2 because the cut was measured, not guessed: applied to the seven PRs
+        # above it discards 99 of 147 findings (67.3%) and loses ZERO P1s — all six
+        # sit in the kept tier. #223 and #237 already apply this exact rule by hand
+        # ("fix P1/P2 correctness only, defer the rest"), but only AT the cap, after
+        # three rounds of fix passes have already grown the change. This applies it
+        # from round 1, which is the difference between a policy and a post-mortem.
+        #
+        # Below-floor findings are not discarded: the report gives them their own
+        # heading and their own mark so a brief built from it cannot pick them up by
+        # accident, and the payload marks each one, the same way an escalated
+        # finding is marked ⛔. `"P4"` restores today's behaviour — everything gets
+        # fixed.
+        "fix_severity_floor": "P2",
+        # What buys another ROUND. Only findings no earlier round raised AND at or
+        # above this severity make the cycle go again. A new finding below the floor
+        # is still reported and still recorded; it just does not by itself purchase
+        # a panel, a fix pass and another panel.
+        #
+        # This is the half that makes the loop terminable. `round_stop`'s rule 1
+        # goes again on a new finding at ANY severity, and from round 2 the thing
+        # being reviewed IS the previous round's fix — so the termination test is
+        # fed by the loop's own output and can only end on the cap. That is not a
+        # theory about the code; it is what all seven panels did.
+        #
+        # P2 for the same measured reason as `fix_severity_floor`, and the two are
+        # separate keys on purpose: "worth fixing while we are in here" and "worth
+        # another round of everything" are different questions, and a repo may want
+        # to fix P3s in the pass it is already running without letting one buy a
+        # fourth round. `"P4"` restores today's behaviour.
+        "round_trigger_floor": "P2",
+        # A fix pass that MULTIPLIES the diff has written a second change, not a
+        # fix. If what a round reviews has grown by more than this multiple of what
+        # the FIRST round of the cycle reviewed, the cycle stops and says the change
+        # wants splitting rather than another round.
+        #
+        # 3.0 is deliberately loose — a genuine fix that adds the tests the review
+        # asked for can easily double a small diff, and the failure this catches is
+        # not that shape. On #236 the last fix pass added ~900 lines to a 359-line
+        # PR and introduced an unbounded hang (`read_bytes()` on a FIFO, with the
+        # guard against exactly that dropped) plus a detector wrong in both
+        # directions. Round 2 is not the problem there; a 900-line round-1 fix is.
+        #
+        # Not dressed up as convergence: it is a stop, it takes a veto line naming
+        # itself, and `confident` is false — the same discipline the round cap and a
+        # held escalation already get. `null` disables the check. Read `scope`
+        # beside any ratio it reports: under increment scope (the default) a later
+        # round's measurement is the fix commit, and under `pr` scope it is the
+        # whole grown PR, so the same number means "the fix is 3x the change" in one
+        # and "the PR tripled" in the other. Both are the thing worth stopping for.
+        "max_fix_growth": 3.0,
+        # What a reviewer is asked to look FOR. `diff` asks for defects in the
+        # change under review, and surfaces anything outside it as an observation
+        # rather than as a finding a fix round must clear. `repo` is today's
+        # posture and is a licence to expand the change: `review-pr.md` currently
+        # says "Related code — callers, siblings, parallel implementations — gets
+        # made consistent (search the codebase, don't just review the diff)", which
+        # on #236 is how a bug fix became 2,313 insertions with none of its 67
+        # findings in the fix.
+        #
+        # `diff` is NOT "review less carefully". Every dimension stays in the
+        # prompt and a reviewer that reads the tree (`reviewer_code_access`) still
+        # reads the callers — it is where the answer LANDS that changes, an
+        # observation for a human instead of an item on a fixer's list. A repo
+        # whose review round is the only pass that ever looks at the neighbours
+        # sets `repo` and gets today's behaviour.
+        "reviewer_scope": "diff",
+        # The evidence contract, and #165 calls it the most important dial here: a
+        # finding must carry a reproducible failing test to be blocking, and the
+        # rest become observations. It inverts the exit condition from "stop when no
+        # reviewer finds anything" — unbounded, since a reviewer asked to find
+        # problems always can and P4s have no bottom — to "stop when the specified
+        # behaviours pass", which terminates by construction.
+        #
+        # **Default False, because the artefact it needs does not exist.** Nothing
+        # emits a reviewer test today: #92's standing decision is that a reviewer
+        # never gains an execution capability (it EMITS a test; CI or the fixer runs
+        # it), and #114 requires the test be shown RED against the unfixed code,
+        # because a regression test that never failed proves nothing. Defaulting it
+        # True would silently stop findings from blocking on the strength of an
+        # artefact nobody produces — the loudest possible way to make a review look
+        # clean.
+        #
+        # So it is read, validated and REPORTED and it changes nothing else. The key
+        # exists so the work has a home and a repo can opt in the day it is built,
+        # and so that a repo setting it True is told, in `config_notes`, that the
+        # contract behind it is not implemented rather than believing it is.
+        "require_failing_test": False,
+        # The existing `panel_core.DEFAULT_MAX_ROUNDS`, surfaced as a repo setting.
+        # `panel.py --max-rounds` still wins — it is the CALLER's cap and only
+        # `/panel-review-pr` drives a loop — and this wins over the constant, the
+        # same order `round_scope` resolves in.
+        #
+        # #165 proposes 1 and this deliberately keeps 2. Round 2 is the round that
+        # caught a serious defect CREATED by round 1's fix on #236 — the unbounded
+        # FIFO read — so the problem is not that round 2 exists, it is that round
+        # 1's fix was allowed to be 900 lines. `fix_severity_floor`,
+        # `round_trigger_floor` and `max_fix_growth` attack the growth instead,
+        # which makes round 2 cheap: a re-read of a small fix rather than a damage
+        # survey of a change that tripled. Set 1 for a repo that would rather not
+        # have the fix commit read at all, and remember what that buys — round 2 is
+        # the only pass that ever reads the fixer's own work (#24).
+        "max_rounds": 2,
     },
     "loops": {
         "dependabot_lander": False,

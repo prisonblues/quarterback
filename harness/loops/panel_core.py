@@ -196,6 +196,39 @@ ARGV_PROMPT_MAX_BYTES = 120_000
 # downstream comparison has to defend itself.
 SEVERITIES = ("P1", "P2", "P3", "P4")
 
+# ----------------------------------------------------------------- #165's dials
+#
+# The built-in half of `review_panel.{fixer_may_defer, fix_severity_floor,
+# round_trigger_floor, max_fix_growth, reviewer_scope, require_failing_test,
+# max_rounds}`. WHY each number is this number lives beside the key in
+# `harness_rules.DEFAULTS`, which is the file an operator reads; these are what
+# the resolvers in `panel_seats` fall back to when a rules file (or a test's
+# hand-written `panel` literal) does not carry the key. The two are asserted equal
+# by `tests/test_panel_dials.py` — a drift between them would leave the documented
+# default and the applied default disagreeing, silently, in the direction nobody
+# checks.
+
+#: Findings at or above this severity are what a fix round is asked to clear.
+DEFAULT_FIX_SEVERITY_FLOOR = "P2"
+#: New findings at or above this severity are what buys another round.
+DEFAULT_ROUND_TRIGGER_FLOOR = "P2"
+#: The floor value that means "no floor" — the least severe severity there is, so
+#: everything is at or above it. Both floors default to this INSIDE `round_stop`,
+#: which is what keeps every caller that has not heard of them on the old
+#: behaviour rather than on the new default.
+NO_SEVERITY_FLOOR = SEVERITIES[-1]
+#: How many times the first round's reviewed size a later round may review before
+#: the cycle stops and says the change wants splitting. None disables it.
+DEFAULT_MAX_FIX_GROWTH = 3.0
+#: What a reviewer is asked to look for: defects in the change (`diff`), or in the
+#: change and everything it touches (`repo` — the pre-#165 posture).
+DEFAULT_REVIEWER_SCOPE = "diff"
+REVIEWER_SCOPES = ("diff", "repo")
+#: May a fixer answer "real, and not this change's job"? See `harness_rules`.
+DEFAULT_FIXER_MAY_DEFER = True
+#: Off, because the artefact it needs is not built (#92, #114). See `harness_rules`.
+DEFAULT_REQUIRE_FAILING_TEST = False
+
 # The judge's prompt holds the one component that grows with the review itself —
 # one line per reviewer account, each up to RAW_DETAIL_CHARS — so the listing
 # gets a budget of its own. It is no longer a share of anything: the diff's
@@ -317,11 +350,27 @@ PR #{n} ({repo}), base={base}:
 {diff}
 """
 
+#: Where `reviewer_scope` lands in the reviewer's brief. Literal tokens swapped with
+#: `str.replace`, for the reason :data:`JUDGE_CODE_SLOT` gives for being one: this
+#: template is rendered by `.format()` in `panel.py`, so a `{}` field would have to
+#: be passed by every caller of both templates and would make every stray brace in
+#: the substituted prose a KeyError. A token nothing else can produce is inert
+#: until it is deliberately swapped — which is also what lets `SCHEMA_ECHOES` keep
+#: reading the raw template.
+REVIEWER_SCOPE_SLOT = "<<<REVIEWER_SCOPE>>>"
+#: The same setting, in the one review DIMENSION whose wording it changes. Two slots
+#: rather than one, because the paragraph and the bullet are read at different
+#: moments and a bullet that still says "should change to stay consistent" under a
+#: paragraph saying the opposite is the contradiction a model resolves whichever way
+#: it likes.
+RELATED_CODE_SLOT = "<<<RELATED_CODE>>>"
+
 REVIEW_PROMPT = """You are reviewing a pull request diff to the same exhaustive standard as a
-senior reviewer whose bar is "nothing left to improve". The marginal cost of completeness is
-near zero: report EVERYTHING you spot, across every dimension below — do NOT self-censor a
-finding because it seems "minor" or "just style". A later master judge filters false positives;
-your job is breadth, not triage.
+senior reviewer whose bar is "nothing left to improve". Report EVERYTHING you spot, across every
+dimension below — do NOT self-censor a finding because it seems "minor" or "just style". A later
+master judge filters false positives; your job is breadth, not triage.
+
+<<<REVIEWER_SCOPE>>>
 
 Review for:
 - Correctness: logic bugs, off-by-ones, race conditions, boundary conditions, null/None handling
@@ -331,7 +380,7 @@ Review for:
 - Performance: N+1 queries, unbounded iterations, missing indexes, unnecessary allocations
 - Test coverage: new code paths, bug fixes, or edge cases visible in the diff that lack a test
 - Documentation: behaviour changes that leave CLAUDE.md, docs, README, or docstrings stale
-- Related code: callers, siblings, or parallel implementations that should change to stay consistent
+- Related code: <<<RELATED_CODE>>>
 - Craft: naming, complexity, dead code, redundant conditions, project-convention/style breaks, DRY
 
 Severity: P1 blocks merge (correctness/security) · P2 important (error handling, test gaps,
@@ -339,6 +388,59 @@ logic flaws) · P3 should fix (style, naming, simplifications) · P4 polish (min
 Report all of them.
 
 """ + _FINDINGS_ENVELOPE
+
+#: `reviewer_scope` -> (the scope paragraph, the Related-code bullet's tail).
+#:
+#: `repo` is the pre-#165 text, kept verbatim rather than paraphrased so that
+#: switching the setting back really does restore the prompt this panel was measured
+#: on. `diff` is the default, and what it changes is where an out-of-scope
+#: observation LANDS, not how hard anyone looks: every dimension below stays in the
+#: prompt and a seat holding the tree (`reviewer_code_access`) still reads the
+#: callers to judge the change.
+#:
+#: One honest cost, recorded because nothing else will say it: the `diff` text routes
+#: a serious out-of-scope observation into `could_not_assess`, which is a coverage
+#: channel, and for a seat that CAN read the code a declared gap costs the round its
+#: confidence (`coverage_veto`). It is bounded to "serious enough that somebody
+#: should know", so it is rare by construction, and it errs towards a round that
+#: does not claim convergence — the safe direction. Giving observations a channel of
+#: their own means a new key in the reply envelope, the parser, the judge listing and
+#: the payload, and that is #165's work and not this dial's.
+_SCOPE_BRIEF = {
+    "diff": ("""WHAT COUNTS AS A FINDING HERE. A finding is a defect in THE CHANGE UNDER
+REVIEW — the lines this diff adds, removes or touches, and the seams where they meet the
+code that was already there. Read as widely as you need to in order to judge those lines;
+file findings only about them. A defect elsewhere that this change neither caused nor made
+worse is real, and it is not this review's answer: if it is serious enough that somebody
+should know, say it in ONE `could_not_assess` phrase beginning "outside the change:", and
+otherwise leave it.
+
+A fix round is briefed from your findings, so a finding outside the change is an instruction
+to GROW the change — and the fix pass is where 63.7% of this loop's next-round findings came
+from (#165). Breadth across the dimensions below is still the job; breadth across the
+repository is not.""",
+             "callers, siblings, or parallel implementations this change BREAKS or leaves "
+             "inconsistent with itself"),
+    "repo": ("""WHAT COUNTS AS A FINDING HERE. Anything you can see. The marginal cost of
+completeness is near zero, so related code — callers, siblings, parallel implementations —
+is in scope and gets made consistent: search the codebase, don't just review the diff.""",
+             "callers, siblings, or parallel implementations that should change to stay "
+             "consistent"),
+}
+
+
+def reviewer_brief(scope: str = DEFAULT_REVIEWER_SCOPE) -> str:
+    """:data:`REVIEW_PROMPT` with `review_panel.reviewer_scope` filled in.
+
+    A function rather than two constants because everything else about the two
+    briefs is identical, and a second full template is a second place to forget an
+    edit. An unknown scope reads as the default — the value is validated where it is
+    read (:func:`panel_seats.reviewer_scope`), and this is the last line of defence
+    rather than the one that reports."""
+    para, related = _SCOPE_BRIEF.get(scope) or _SCOPE_BRIEF[DEFAULT_REVIEWER_SCOPE]
+    return (REVIEW_PROMPT.replace(REVIEWER_SCOPE_SLOT, para)
+            .replace(RELATED_CODE_SLOT, related))
+
 
 MOVE_MANIFEST_PROMPT = """You are reviewing a MOVE, and you are deliberately NOT being given its
 diff. Read the brief below before the manifest — the question you are being asked is not the one
@@ -1120,6 +1222,26 @@ def _severity(raw, fallback: str) -> str:
     ``min(accounts, ...)``, head the fix list and count in no bucket at all."""
     sev = str(raw or "").strip().upper()
     return sev if sev in SEVERITIES else fallback
+
+
+def severity_at_least(sev, floor) -> bool:
+    """Is ``sev`` at least as severe as ``floor``? P1 is the most severe.
+
+    One predicate for both of #165's floors and for the report's below-floor mark,
+    so "which side of the line is this finding on" cannot be answered two ways in
+    the same round. Both arguments go through :func:`_severity`, which strips and
+    upper-cases — so a rules file saying ``p2`` and a reviewer saying ``" p2 "``
+    are the same floor, matching what every other severity in this panel is
+    normalised to at parse time.
+
+    An unreadable SEVERITY reads as P1 and an unreadable FLOOR as no floor at all,
+    and the asymmetry is deliberate: both errors resolve towards *fixing it
+    anyway*. A finding whose severity nothing could parse is not a finding to drop
+    on the strength of the parse failure, and a floor nobody could read must not
+    silently start filtering. The floor is separately validated where it is read
+    (:func:`panel_seats.severity_floor`), which is where an operator gets told."""
+    return (SEVERITIES.index(_severity(sev, SEVERITIES[0]))
+            <= SEVERITIES.index(_severity(floor, NO_SEVERITY_FLOOR)))
 
 
 #: Spellings of "yes" a model reaches for when the contract asked for `true`.
@@ -1907,6 +2029,11 @@ __all__ = [
     "describe", "resolve_repo", "stderr_gist", "DEFAULT_DIFF_BUDGET",
     "RAW_DETAIL_CHARS", "CLUSTER_WINDOW", "ACCOUNT_CHARS", "DEFAULT_MAX_ROUNDS",
     "DEFAULT_ROUND_SCOPE", "ROUND_SCOPES", "CLI_TIMEOUT", "BLANK_RETRY_MAX_S",
+    "DEFAULT_FIX_SEVERITY_FLOOR", "DEFAULT_ROUND_TRIGGER_FLOOR", "NO_SEVERITY_FLOOR",
+    "DEFAULT_MAX_FIX_GROWTH", "DEFAULT_REVIEWER_SCOPE", "REVIEWER_SCOPES",
+    "DEFAULT_FIXER_MAY_DEFER", "DEFAULT_REQUIRE_FAILING_TEST",
+    "severity_at_least", "REVIEWER_SCOPE_SLOT", "RELATED_CODE_SLOT",
+    "_SCOPE_BRIEF", "reviewer_brief",
     "CLI_ABSENT", "ARGV_PROMPT_MAX_BYTES", "SEVERITIES", "MAX_LISTING_CHARS",
     "LISTING_ACCOUNT_CHARS", "COMMENT_CHARS", "ROUNDS_HEADING", "LLM_REVIEWERS",
     "BUDGET_MARKER", "BUDGET_EXHAUSTED", "JUDGE_CODE_SLOT",

@@ -806,6 +806,26 @@ class Baseline:
     #: the loop is trusting a report by the same agent whose fix pass produced
     #: it. Earliest wins on a merge, for the same reason the cycle id does.
     escalated: dict[str, int] = field(default_factory=dict)
+    #: ``(round, chars, scope)`` of the EARLIEST accepted baseline — the denominator
+    #: `review_panel.max_fix_growth` measures this round against (#165).
+    #:
+    #: The earliest, not the latest, and the round number travels with it because the
+    #: question the ceiling asks is "how much bigger is what we are reviewing now than
+    #: what this cycle STARTED from". Measured against the previous round instead, a
+    #: fix pass could triple the change three rounds running and clear the check every
+    #: time.
+    #:
+    #: The scope travels too, and it is not decoration: ``diff_chars`` is
+    #: scope-dependent (see the payload's own comment on it), so under the default
+    #: `increment` scope this is round 1's whole-PR size against a later round's fix
+    #: commit, and under ``pr`` scope it is two whole-PR sizes. Both readings are worth
+    #: stopping for and they are different sentences, so whatever reports a ratio has
+    #: to be able to say which one it computed.
+    #:
+    #: None where no baseline was usable, or where the earliest one records no size —
+    #: a payload written before `diff_chars` existed, or a round that reviewed nothing.
+    #: The check then does not run, and says so rather than inventing a denominator.
+    first_reviewed: tuple[int, int, str] | None = None
     problems: list[str] = field(default_factory=list)
 
     def raised_before(self, finding: Canonical) -> bool:
@@ -1287,6 +1307,18 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
             unread = []
         b.unread_files = {f for f in unread if f and isinstance(f, str)}
         b.read_nothing = not latest.get("reviewed")
+        # The growth denominator, off the EARLIEST accepted round — `ordered` is
+        # sorted by round, so its head. Read defensively and dropped rather than
+        # coerced, on this function's standing rule that a bad payload costs a
+        # `problems` entry and never the review: a size that is not a positive int
+        # cannot be a denominator (0 divides, a bool is an int in Python, a float
+        # arrives from a hand-edited file), and a missing one is the ordinary case for
+        # a round that reviewed nothing or a payload older than the field.
+        first_round, _first_path, first = ordered[0]
+        chars = first.get("diff_chars")
+        if (isinstance(chars, int) and not isinstance(chars, bool) and chars > 0
+                and first.get("reviewed")):
+            b.first_reviewed = (first_round, chars, str(first.get("scope") or "pr"))
     return b
 
 
@@ -1415,7 +1447,9 @@ def coverage_veto(reviewer_meta: dict[str, dict], judge_skip: str | None,
 def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
                outstanding: list[Canonical], veto: list[str],
                baseline_ok: bool = True, repeated: Iterable[str] = (),
-               escalated: Iterable[str] = ()) -> dict:
+               escalated: Iterable[str] = (), *,
+               trigger_floor: str = NO_SEVERITY_FLOOR,
+               fix_floor: str = NO_SEVERITY_FLOOR) -> dict:
     """Whether the panel/fix cycle should go again, and what decided it.
 
     ``outstanding`` is every finding the cycle still has to clear, which is wider
@@ -1433,8 +1467,10 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     and the vote only re-encodes a finding count already known. So the loop turns
     on what actually happened:
 
-    1. findings this round that no earlier round raised -> go again;
-    2. a P1/P2 still outstanding -> go again, whatever anyone declared (a blocker
+    1. findings this round that no earlier round raised, **at or above**
+       ``trigger_floor`` -> go again;
+    2. a P1/P2 still outstanding **at or above** ``fix_floor`` -> go again, whatever
+       anyone declared (a blocker
        raised again is a blocker that was not fixed) — **except one in**
        ``escalated``, which the filter below has already subtracted. Said here
        rather than left to the filter's own paragraph because it is the largest
@@ -1446,7 +1482,8 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
        veto line, ``confident`` is false, and ``reason`` says a human is owed an
        answer;
     3. ``repeated`` — the KEYS of findings an earlier round already raised that
-       are STILL outstanding, at any severity -> go again. The fixer was told
+       are STILL outstanding, at any severity **at or above** ``fix_floor``
+       -> go again. The fixer was told
        about them and they are still there, and ``/panel-review-pr``'s bar is
        every finding fixed, not every P1/P2. This used to only cost the stop its
        confidence, which ended the cycle with a judge-confirmed defect present and
@@ -1460,6 +1497,40 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     The cap is what stops rule 3 running forever when two reviewers disagree
     about a P4 — the cycle ends either way, and a cap reached with work
     outstanding is recorded as such rather than as convergence.
+
+    **THE TWO FLOORS (#165), and why there are two.** Both default to
+    :data:`NO_SEVERITY_FLOOR`, so a caller that has not heard of them gets exactly
+    the behaviour above; `panel.py` passes the repo's
+    ``review_panel.round_trigger_floor`` and ``fix_severity_floor``.
+
+    ``trigger_floor`` bounds rule 1 alone: a new finding below it is still counted,
+    still reported and still in the payload, it simply does not by itself buy a
+    panel, a fix pass and another panel. That rule is the one the measurement
+    indicts. From round 2 the thing under review IS the previous round's fix, so
+    rule 1's input is the loop's own output — 128 of 201 new findings across seven
+    PRs were created by the fix pass immediately before them — and a termination
+    test fed by its own output can only end on the cap, which is what all seven
+    panels did.
+
+    ``fix_floor`` bounds rules 2 and 3, and it has to or the other dial does
+    nothing. A finding below the fix floor is one the fix round was never asked to
+    clear, so it is outstanding every round by construction: rule 3's own
+    justification — "the fixer was told about them and they are still there" — is
+    simply false of it, and left unbounded it would go again until the cap on a P3
+    nobody ever intended to fix. Rule 2 takes the same bound for the same reason,
+    which matters only where the fix floor is ``P1``: at ``P2`` every P1/P2 is
+    already at or above it and the filter is a no-op.
+
+    **A stop under either floor is reported as what it is, and is NOT vetoed.** The
+    ``reason`` names the floor and counts what was left under it, so nothing reads as
+    "dry" that was not dry. But it is a POLICY stop, not a cap: the repo said which
+    findings are worth a round, the round obeyed, and the findings it did not act on
+    are in the report and in the payload. Calling that unearned would make every
+    configured convergence non-confident and hand the cap back its monopoly on
+    ending the loop, which is the failure this whole change exists to remove. The
+    growth ceiling (``max_fix_growth``, applied by the caller) is the opposite case
+    and is vetoed, because there the round is stopping over something that WENT
+    WRONG.
 
     ``escalated`` is not a fifth rule but a FILTER in front of all four (#221), and
     it is the exception none of them can express. A finding whose fixer reported
@@ -1565,15 +1636,39 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     # the cycle still has to clear, escalations and all" can still say so.
     clearable_new = [k for k in new_keys if k not in held]
     clearable = [c for c in outstanding if c.key not in held]
-    repeats = len({k for k in repeated if k and k not in held})
-    blockers = [c for c in clearable if c.severity in ("P1", "P2")]
-    if clearable_new:
-        stop, reason = False, (f"{len(clearable_new)} finding(s) no earlier round raised")
+    # Severity by key, off `outstanding` — which carries it for the same findings
+    # `new_keys` and `repeated` name. Deriving it here rather than widening either
+    # parameter keeps every existing caller's contract: they pass bare keys today,
+    # and a key whose severity this cannot find is treated as ABOVE the floor (the
+    # `SEVERITIES[0]` fallback), so an unrecognised key costs a round rather than
+    # silently dropping a finding out of the loop.
+    severity = {c.key: c.severity for c in outstanding}
+
+    def above(key: str, floor: str) -> bool:
+        return severity_at_least(severity.get(key, SEVERITIES[0]), floor)
+
+    #: New findings that buy a round, and the ones that were raised and do not.
+    triggering = [k for k in clearable_new if above(k, trigger_floor)]
+    quiet_new = [k for k in clearable_new if not above(k, trigger_floor)]
+    repeats = len({k for k in repeated
+                   if k and k not in held and above(k, fix_floor)})
+    blockers = [c for c in clearable if c.severity in ("P1", "P2")
+                and severity_at_least(c.severity, fix_floor)]
+    if triggering:
+        stop, reason = False, (f"{len(triggering)} finding(s) no earlier round raised")
     elif blockers:
         stop, reason = False, f"{len(blockers)} P1/P2 still outstanding after the fix"
     elif repeats:
         stop, reason = False, (f"{repeats} finding(s) an earlier round already raised "
                                "are still outstanding")
+    elif quiet_new:
+        # Checked AFTER the three go-again rules and BEFORE the escalation stop, so
+        # the reason names the most specific true thing: a round with a below-floor
+        # new finding and an outstanding P1 goes again for the P1, and a round whose
+        # only news is below the floor stops saying exactly that rather than "dry".
+        stop, reason = True, (
+            f"{len(quiet_new)} new finding(s), none at or above the "
+            f"{trigger_floor} round trigger floor — reported, not fixed here")
     elif blocking:
         # Not "dry": something WAS raised and is unanswered. A reader reconciling
         # "dry" against a PR carrying an open premise question would be told
@@ -1618,6 +1713,15 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
         "veto": veto,
         "round": round_no,
         "max_rounds": max_rounds,
+        # The floors this verdict was reached under, and what they held back. A
+        # consumer comparing two rounds' `stop` has to be able to see that the
+        # answer changed because the policy did — and `new_below_trigger_floor`
+        # is the count that would otherwise be invisible: those findings ARE in
+        # the payload's buckets, and nothing else says they were new and did not
+        # buy a round.
+        "trigger_floor": trigger_floor,
+        "fix_floor": fix_floor,
+        "new_below_trigger_floor": sorted(quiet_new),
     }
 
 

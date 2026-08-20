@@ -193,7 +193,17 @@ the fixer — surface that in §6 rather than letting a one-vendor review read
 like a full panel.
 
 From its output collect:
-- **To fix** — the master-confirmed findings (any reviewer count, P1–P4).
+- **Panel dials** — the line the report prints under that name, naming `review_panel`.
+  It says which severity floor the fixer is being briefed to, what buys another round,
+  whether the fixer may defer, and the fix-growth ceiling. Read it BEFORE §4: the brief you build
+  depends on it, and it is the only place the round's policy is written down where
+  you can see it (#165).
+- **To fix** — the master-confirmed findings the fix round is asked to clear (any
+  reviewer count, at or above the round's `fix_severity_floor`).
+- **Reported, not this round's work** — the master-confirmed findings BELOW that
+  floor, marked 🔽. Present only where the floor left something under it. These are
+  recorded and relayed and **never pasted into the fixer's brief**; §4b says what
+  becomes of them.
 - **SonarCloud** — the hard-gate issues (these MUST end up resolved).
 - **Skipped reviewers** — note them; a skipped Codex/Sonar means thinner
   coverage, surface it.
@@ -238,9 +248,19 @@ with these overrides:
   does NOT re-derive them. Paste the full **To fix** list and the **SonarCloud**
   issues into the brief as the findings to resolve.
 - The sub-agent may still surface *additional* obvious defects it trips over
-  while fixing, and must fix those too — but its job is to resolve **every**
-  panel-confirmed finding (P1–P4) plus every SonarCloud issue, to the
-  "nothing left to improve" standard.
+  while fixing, and must fix those too — but its job is to resolve **every
+  panel-confirmed finding the round asked it to clear** — the **To fix** list, which
+  is already filtered to the round's `fix_severity_floor` — plus every SonarCloud
+  issue, to the "nothing left to improve" standard. Paste the **To fix** list and
+  the SonarCloud issues, and **not** the 🔽 *Reported, not this round's work* list: a
+  fix pass that takes those on is the growth the floor exists to stop, and the floor
+  has already made that judgement (#165).
+- **Relay the dials into the brief.** The sub-agent cannot read `.harness-rules` for
+  itself in worktree mode and must not guess: state `fix_severity_floor`,
+  `reviewer_scope` and `fixer_may_defer` from the panel report's **Panel dials**
+  line, in the brief, as the values in force. The brief's own opening asks for them
+  by name, and a fixer left to guess reverts to "fix everything you find, anywhere",
+  which is the behaviour these settings exist to bound.
 - **Parallel fixes apply here too.** A panel list is typically longer than a
   single reviewer's, so the brief's step 3 fan-out (split a 6+ finding list into
   disjoint-file groups across fix sub-agents) is often the right call — the
@@ -308,8 +328,14 @@ One of four per finding:
   point**: you are already writing the refutation into the PR comment and the fix
   commit, in prose nothing can count. A bare `refuted` is the same
   confident-assertion-with-nothing-behind-it the release exists to measure.
-- **`deferred`** — real, not now. Put where it went in `deferred_to`. This is
-  also where an **escalated** finding goes (the brief's step 3a): the defect is
+- **`deferred`** — real, not now. Put where it went in `deferred_to`. **Three roads
+  arrive here and all three are the same row.** (1) The fixer said so itself, under
+  `review_panel.fixer_may_defer` — the defect is real and outside what this change is
+  for, with the two justifying lines in its summary's `Deferred` block. (2) The
+  panel reported it BELOW the round's `fix_severity_floor`, so it was never in the
+  fixer's brief at all; one issue for the batch is fine and usually right, since
+  filing nine issues for nine P3s is the overflow the floor exists to stop. (3) An
+  **escalated** finding (the brief's step 3a): the defect is
   real and the fix is what is in dispute, so `refuted` would be a lie about the
   finding and `fixed` a lie about the code, and there is no fifth outcome to
   invent — the vocabulary is a database constraint, not a convention. Recording it

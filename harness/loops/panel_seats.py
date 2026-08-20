@@ -1242,6 +1242,271 @@ def resolve_round_scope(asked: str, panel: dict, notes: list[str]) -> str:
     return DEFAULT_ROUND_SCOPE if want == "auto" else want
 
 
+# --------------------------------------------------------------- #165's dials
+#
+# Seven `review_panel.*` settings that trade thoroughness against convergence, read
+# in one place so a round's applied policy is one object rather than seven lookups
+# scattered through `run()`. Each key's number and the measurement behind it are
+# documented beside it in `harness_rules.DEFAULTS`; what lives here is how a WRITTEN
+# value is turned into an applied one.
+#
+# **What a bad value does, and why it is not a hard exit.** Every reader below falls
+# back to the default and appends a `config_notes` sentence naming the value that was
+# wrong and the set that is accepted. That is the manners :func:`resolve_round_scope`,
+# :func:`diff_budget` and `panel_preflight._rule`/`_flag` already have, and the notes
+# are not a quiet channel: they print above the findings as "⚠️ config:", they travel
+# in the payload, and under `--post` they land in a public PR comment. What is ruled
+# out is SILENCE — a repo that typed a setting wrong and got default behaviour with
+# nothing said, which is exactly what `warn_unknown_keys` exists to prevent one level
+# up. A hard exit is reserved, here as there, for a file that cannot mean what it says
+# at all (`_check_block_shape`); a rules file shared across a fleet of boxes that
+# upgrade at different times must not become a version pin on every one of them.
+
+
+#: Spellings of "no" a hand writes in a JSON rules file, mirroring `panel_core._TRUTHY`
+#: for the other half. Both are needed: a value that is neither is REPORTED rather
+#: than read as truthy, which is the whole point of not using `bool(raw)` — the empty
+#: string aside, every non-empty string is truthy in Python, `"false"` included.
+_FALSEY = frozenset({"false", "no", "n", "0", "off"})
+
+#: "No value was written" — distinct from a written `null`, for the one setting where
+#: the two mean different things (:func:`fix_growth_limit`). A private object rather
+#: than a string or None, because every one of those is a value a JSON rules file can
+#: legitimately hold.
+_ABSENT = object()
+
+
+def severity_floor(panel: dict, key: str, fallback: str, notes: list[str]) -> str:
+    """One of ``SEVERITIES``, for `fix_severity_floor` and `round_trigger_floor`.
+
+    Case-insensitive, because `_severity` normalises every severity that enters the
+    panel the same way (strip and upper-case) and a floor that did not would make
+    ``"p2"`` in a hand-written rules file mean something different from ``"P2"`` in a
+    reviewer's reply. Unset — missing, null or ``""`` — is not a mistake and is
+    silent, the same reading :func:`diff_budget` gives an absent budget.
+
+    ``P4`` is a legitimate value and is how a repo asks for the pre-#165 behaviour,
+    so it is accepted like any other rather than warned about: the report says which
+    floor was in force on every round, which is where a reader learns it is off."""
+    want = panel.get(key)
+    if want is None or want == "":
+        return fallback
+    got = _severity(want, "") if isinstance(want, str) else ""
+    if not got:
+        notes.append(f"`{key}`={want!r} is not a severity — accepted values are "
+                     f"{', '.join(SEVERITIES)} (case-insensitive); using {fallback}")
+        return fallback
+    return got
+
+
+def reviewer_scope(panel: dict, notes: list[str]) -> str:
+    """``diff`` or ``repo`` — what a reviewer is asked to look for.
+
+    Shaped like :func:`resolve_round_scope` minus the CLI half, which this
+    deliberately does not have: there is no `--reviewer-scope`. A per-run override of
+    what counts as a finding would make two rounds of one cycle answer different
+    questions, and the round diff — which finding is NEW — is computed across
+    rounds."""
+    want = panel.get("reviewer_scope")
+    if want is None or want == "":
+        return DEFAULT_REVIEWER_SCOPE
+    if not isinstance(want, str) or want.strip().lower() not in REVIEWER_SCOPES:
+        notes.append(f"`reviewer_scope`={want!r} is not one of "
+                     f"{', '.join(REVIEWER_SCOPES)} — using {DEFAULT_REVIEWER_SCOPE}")
+        return DEFAULT_REVIEWER_SCOPE
+    return want.strip().lower()
+
+
+def fix_growth_limit(panel: dict, notes: list[str]) -> float | None:
+    """`max_fix_growth` — a positive multiple, or ``None`` for "do not check".
+
+    **An explicit ``null`` switches the check off; an ABSENT key inherits the
+    default.** The two are the same thing to almost every setting in this harness and
+    they cannot be here, because the default is a number and this is a check whose
+    only job is to stop a cycle — read the two as one and there is no way to opt out
+    at all. `panel_preflight._rule` reaches the opposite conclusion for
+    `refuse_over_cap_multiple` and both are right: there, `0` is a value the ratio can
+    meaningfully take, so `null` had to keep meaning inherit; here a multiple of 0 is
+    not a threshold anything can be under, so `null` is the only spelling left for
+    "off". A key that is absent is not an opt-out — nobody wrote anything — which is
+    why the sentinel below tells them apart rather than `.get()` collapsing both to
+    None.
+
+    A bool is rejected before the numeric read for the reason `_rule` gives:
+    ``isinstance(True, int)`` is True, so `max_fix_growth: false` — the other way an
+    operator writes "off" — would otherwise become the threshold 1.0 and stop every
+    cycle whose fix commit is bigger than its first round. Non-finite is rejected too:
+    ``inf`` is the check silently off behind a value that reads like a number, and
+    ``nan`` compares false against everything, which is the same thing."""
+    raw = panel.get("max_fix_growth", _ABSENT)
+    if raw is _ABSENT:
+        return DEFAULT_MAX_FIX_GROWTH
+    if raw is None or raw == "":
+        return None
+
+    def refuse(why: str) -> float | None:
+        notes.append(f"`max_fix_growth`={raw!r} {why} — a positive multiple of the "
+                     "first round's reviewed size, or null to switch the check off; "
+                     f"using {DEFAULT_MAX_FIX_GROWTH}")
+        return DEFAULT_MAX_FIX_GROWTH
+
+    if isinstance(raw, bool) or not isinstance(raw, (int, float, str)):
+        return refuse("is not a number")
+    try:
+        n = float(raw)
+    except (TypeError, ValueError):
+        return refuse("is not a number")
+    if n != n or n in (float("inf"), float("-inf")):
+        return refuse("is not a finite number")
+    if n <= 0:
+        return refuse("is not above zero")
+    return n
+
+
+def panel_flag(panel: dict, key: str, fallback: bool, notes: list[str]) -> bool:
+    """One boolean `review_panel` setting, with `panel_preflight._flag`'s manners —
+    the string spellings a hand writes (``"false"``, ``"off"``) and the bare ``0``/``1``
+    a generator writes are accepted, and anything else falls back and says so.
+
+    Not a call INTO that function, deliberately. `_flag`'s note says "using
+    <fallback>" and nothing else, which is right for a pre-flight threshold and wrong
+    for a policy switch: `fixer_may_defer` decides what a fixer is permitted to do
+    and `require_failing_test` decides what blocks, so the note has to name the two
+    values that are accepted or a reader cannot tell a rejected value from an honoured
+    one."""
+    raw = panel.get(key)
+    if raw is None or raw == "":
+        return fallback
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, (int, float)) and raw in (0, 1):
+        return bool(raw)
+    if isinstance(raw, str):
+        word = raw.strip().lower()
+        if word in _TRUTHY:
+            return True
+        if word in _FALSEY:
+            return False
+    notes.append(f"`{key}`={raw!r} is not true or false — accepted are true/false "
+                 f"(and the spellings `yes`/`no`, `on`/`off`, `1`/`0`); "
+                 f"using {fallback}")
+    return fallback
+
+
+def resolve_max_rounds(asked: int | None, panel: dict, notes: list[str]) -> int:
+    """The round cap: the CLI's answer if it gave one, else the repo's
+    ``review_panel.max_rounds``, else :data:`DEFAULT_MAX_ROUNDS`.
+
+    :func:`resolve_round_scope`'s order, for the same reason — ``--max-rounds`` is
+    the CALLER's cap and only `/panel-review-pr` drives a loop, so a caller that
+    named one has said something more specific than the repo's policy. `main`
+    already refuses a CLI cap below 1 before `run()` is reached; this is the other
+    half, for the value nothing else checks.
+
+    An integer, and a float that is one (``2.0`` from a generator) is accepted with
+    it; ``2.5`` is not, because a cap is a round number and rounding it silently
+    would run a round the file did not ask for. A bool is rejected before the
+    integer read: ``max_rounds: true`` is ``1`` to Python, which would cap every
+    cycle at one round on a value that says nothing about rounds."""
+    if asked is not None:
+        return asked
+    raw = panel.get("max_rounds")
+    if raw is None or raw == "":
+        return DEFAULT_MAX_ROUNDS
+    n = None
+    if isinstance(raw, bool):
+        n = None
+    elif isinstance(raw, int):
+        n = raw
+    elif isinstance(raw, float) and raw.is_integer():
+        n = int(raw)
+    elif isinstance(raw, str):
+        try:
+            n = int(raw.strip())
+        except ValueError:
+            n = None
+    if n is None or n < 1:
+        notes.append(f"`max_rounds`={raw!r} is not a whole number of rounds >= 1 — "
+                     f"using {DEFAULT_MAX_ROUNDS}")
+        return DEFAULT_MAX_ROUNDS
+    return n
+
+
+@dataclass(frozen=True)
+class Dials:
+    """The seven #165 settings as this round applied them.
+
+    One object, resolved once, for the four consumers that would otherwise each read
+    the rules dict: the reviewer prompt, the report, the stop rule and the payload. A
+    round's policy has to be ONE answer — a report saying `fix floor P2` while the
+    stop rule used P4 is the failure this exists to make impossible — and it also
+    means the payload records what was applied rather than what was written."""
+
+    fixer_may_defer: bool = DEFAULT_FIXER_MAY_DEFER
+    fix_severity_floor: str = DEFAULT_FIX_SEVERITY_FLOOR
+    round_trigger_floor: str = DEFAULT_ROUND_TRIGGER_FLOOR
+    max_fix_growth: float | None = DEFAULT_MAX_FIX_GROWTH
+    reviewer_scope: str = DEFAULT_REVIEWER_SCOPE
+    require_failing_test: bool = DEFAULT_REQUIRE_FAILING_TEST
+    max_rounds: int = DEFAULT_MAX_ROUNDS
+
+    def as_dict(self) -> dict:
+        """For the payload. Every key present on every round, so a consumer never has
+        to tell "the default applied" from "a payload written before the field"."""
+        return {"fixer_may_defer": self.fixer_may_defer,
+                "fix_severity_floor": self.fix_severity_floor,
+                "round_trigger_floor": self.round_trigger_floor,
+                "max_fix_growth": self.max_fix_growth,
+                "reviewer_scope": self.reviewer_scope,
+                "require_failing_test": self.require_failing_test,
+                "max_rounds": self.max_rounds}
+
+    def gist(self) -> str:
+        """The one report line. Printed on EVERY round, at the default or not: the
+        orchestrator builds the fixer's brief out of this report, so "which findings
+        is the fixer being asked to clear" has to be readable from the artifact rather
+        than from whoever remembers the repo's config. `max_rounds` is left out — the
+        Rounds block already prints the cap it actually used."""
+        growth = ("off" if self.max_fix_growth is None
+                  else f"{self.max_fix_growth:g}x")
+        return (f"fix at/above {self.fix_severity_floor} · another round at/above "
+                f"{self.round_trigger_floor} · reviewer scope {self.reviewer_scope} · "
+                f"fix growth cap {growth} · fixer may defer "
+                f"{'yes' if self.fixer_may_defer else 'no'} · failing test required "
+                f"{'yes' if self.require_failing_test else 'no'}")
+
+
+def resolve_dials(panel: dict, asked_max_rounds: int | None,
+                  notes: list[str]) -> Dials:
+    """Read, validate and report all seven at once.
+
+    `require_failing_test` gets a note of its own when it is ON, and that note is the
+    whole of its behaviour: the contract it describes needs a reviewer-emitted test
+    artefact that does not exist yet (#92 — a reviewer never gains an execution
+    capability, it emits a test and CI or the fixer runs it — and #114 — the test must
+    be shown RED against the unfixed code). A repo that switched it on and saw nothing
+    in the report would reasonably conclude findings were being filtered on evidence.
+    They are not, and the round says so."""
+    dials = Dials(
+        fixer_may_defer=panel_flag(panel, "fixer_may_defer",
+                                   DEFAULT_FIXER_MAY_DEFER, notes),
+        fix_severity_floor=severity_floor(panel, "fix_severity_floor",
+                                          DEFAULT_FIX_SEVERITY_FLOOR, notes),
+        round_trigger_floor=severity_floor(panel, "round_trigger_floor",
+                                           DEFAULT_ROUND_TRIGGER_FLOOR, notes),
+        max_fix_growth=fix_growth_limit(panel, notes),
+        reviewer_scope=reviewer_scope(panel, notes),
+        require_failing_test=panel_flag(panel, "require_failing_test",
+                                        DEFAULT_REQUIRE_FAILING_TEST, notes),
+        max_rounds=resolve_max_rounds(asked_max_rounds, panel, notes),
+    )
+    if dials.require_failing_test:
+        notes.append("`require_failing_test: true` is recorded and NOT enforced — the "
+                     "reviewer-emitted failing test it needs is not built (#92, #114), "
+                     "so every finding still blocks exactly as it did")
+    return dials
+
+
 def fit_argv_budget(render, budget: int) -> int:
     """The largest diff budget <= `budget` whose rendered prompt still fits in one
     argv element, for the seat whose prompt has nowhere else to go.
@@ -2573,6 +2838,8 @@ __all__ = [
     "code_access_wanted", "_fetch_tarball", "TREE_RETRY_STATUSES", "code_budget",
     "READ_ONLY_TOOLS", "claude_args",
     "QB_NO_SUBCOMMAND", "record_ask", "diff_budget", "resolve_round_scope",
+    "severity_floor", "reviewer_scope", "fix_growth_limit", "panel_flag",
+    "resolve_max_rounds", "Dials", "resolve_dials", "_FALSEY", "_ABSENT",
     "fit_argv_budget", "argv_clamp", "reviewer_label", "fallback_label",
     "seat_label", "error_events", "error_text",
     "is_model_unavailable", "is_effort_unsupported", "codex_args",
