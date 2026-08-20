@@ -22,16 +22,38 @@ claim key (`work`/`plan:<uuid>`) through the one claim table; and
 
 ## The data migration
 
-Every distinct (repo, phase) becomes one open plan, and the items that named it
-point at it. `added_by` is taken from the item that carried the phase and ranks
-first — the plan's author is whoever started the phase, which is the truest thing
-this schema can know about a string.
+Every distinct (repo, phase) becomes one plan, and the items that named it point
+at it. `added_by` is taken from the item that carried the phase and ranks first —
+the plan's author is whoever started the phase, which is the truest thing this
+schema can know about a string.
 
 Case is folded when GROUPING, because that is the whole point: "stage 1" and
 "Stage 1" collapse into one plan rather than two. The label KEPT is the
 first-ranked item's spelling, not a lower-cased one — a plan's label is read by
 people, and `min()` over the group would have picked by byte order rather than by
 who named it.
+
+**A finished phase arrives finished.** The first version of this backfill inserted
+every group as `open`, and that made `ix_plans_open_label` — the index this whole
+table exists for — permanently occupy a label slot on behalf of work that was over
+before the migration ran. A repo that had ever finished a phase called "stage 1"
+could never open a plan called "stage 1" again: `POST /plan/submit` answered 409
+naming a plan with zero open items, which nothing would ever close because nothing
+prompts anyone to. `test_a_finished_label_is_free_for_the_next_plan` asserts that
+reusing a label after finishing is the intended workflow, and an `open` backfill
+denied it for every label the board had ever used.
+
+So the state is READ off the items rather than assumed, by the same arithmetic
+`POST /plan/done` applies to a plan with items left: a group with an open item is
+open; a group with none but at least one `done` is `done`, with `done_at` taken
+from the last item that finished, because that is when the phase actually ended;
+a group whose every item was `dropped` is `dropped`, because
+`app.models.plan.STATES` is explicit that abandoned and finished are different
+facts and a fortnight later the difference is what makes the history readable.
+
+`done_by` stays NULL on a backfilled plan, deliberately. Nobody closed these
+plans — they did not exist to be closed — and naming the agent that happened to
+finish the last item would be inventing a decision that was never taken.
 
 ## Reversible, and lossy in one direction only
 
@@ -83,16 +105,43 @@ def upgrade() -> None:
     op.create_foreign_key("fk_plan_items_plan", "plan_items", "plans",
                           ["plan_id"], ["id"], ondelete="RESTRICT")
 
-    # One plan per (scope, folded label). DISTINCT ON picks the row the ORDER BY
+    # One plan per (scope, folded label), in the state its items are already in.
+    # Two reads of the same grouping, because they answer different questions:
+    # `lead_item` is who named the phase (DISTINCT ON picks the row the ORDER BY
     # puts first inside each group, which is how the first-ranked item's own
-    # spelling and author reach the plan rather than an alphabetical accident.
+    # spelling and author reach the plan rather than an alphabetical accident),
+    # and `by_group` is what became of the work. Inserting every group `open`
+    # would have handed a finished phase's label slot to `ix_plans_open_label`
+    # for good — see the module docstring.
     op.execute("""
-        INSERT INTO plans (repo, label, added_by, state, created_at, updated_at)
-        SELECT DISTINCT ON (COALESCE(repo, ''), lower(btrim(phase)))
-               repo, btrim(phase), added_by, 'open', created_at, now()
-          FROM plan_items
-         WHERE phase IS NOT NULL AND btrim(phase) <> ''
-         ORDER BY COALESCE(repo, ''), lower(btrim(phase)), rank, created_at
+        WITH by_group AS (
+            SELECT COALESCE(repo, '') AS scope, lower(btrim(phase)) AS folded,
+                   bool_or(state = 'open') AS any_open,
+                   bool_or(state = 'done') AS any_done,
+                   max(done_at) FILTER (WHERE state = 'done') AS last_done
+              FROM plan_items
+             WHERE phase IS NOT NULL AND btrim(phase) <> ''
+             GROUP BY 1, 2
+        ), lead_item AS (
+            SELECT DISTINCT ON (COALESCE(repo, ''), lower(btrim(phase)))
+                   COALESCE(repo, '') AS scope, lower(btrim(phase)) AS folded,
+                   repo, btrim(phase) AS label, added_by, created_at
+              FROM plan_items
+             WHERE phase IS NOT NULL AND btrim(phase) <> ''
+             ORDER BY COALESCE(repo, ''), lower(btrim(phase)), rank, created_at
+        )
+        INSERT INTO plans (repo, label, added_by, state, created_at, updated_at, done_at)
+        SELECT i.repo, i.label, i.added_by,
+               CASE WHEN g.any_open THEN 'open'
+                    WHEN g.any_done THEN 'done'
+                    ELSE 'dropped' END,
+               i.created_at, now(),
+               -- Only a `done` plan carries a completion time, exactly as dropping
+               -- an item clears its own. COALESCE covers a done item that never
+               -- recorded when.
+               CASE WHEN g.any_done AND NOT g.any_open
+                    THEN COALESCE(g.last_done, now()) END
+          FROM lead_item i JOIN by_group g USING (scope, folded)
     """)
     op.execute("""
         UPDATE plan_items i

@@ -118,8 +118,10 @@ Everything downstream is exact item keys, so the fuzzy intake converges into the
 one rather than staying a permanently softer path.
 
 `phase` migrates to a plan per distinct (repo, phase), folded for case, keeping the
-first-ranked item's own spelling and author. The downgrade writes each label back onto its
-items, and says plainly what a rollback cannot carry: a plan's note, state and identity.
+first-ranked item's own spelling and author — and in the state its items are already in, so a
+phase that was finished years ago does not arrive holding its label slot open for ever. The
+downgrade writes each label back onto its items, and says plainly what a rollback cannot
+carry: a plan's note, state and identity.
 
 ### The release allocator is deleted
 
@@ -190,6 +192,102 @@ finding — which is the argument for the round rather than against it:
   because that 409 is the only place a caller meets the asymmetry.
 * `--quiet --json` printed JSON. Two flags making conflicting promises about stdout, and
   which one wins had been left to statement order; `--quiet` does, being the stronger.
+
+### And a second round, whose theme was the same one a level down
+
+Thirty findings at or above P3. The judge crashed on that round, so every one was
+re-derived from the code before it was touched — one was a false positive and is recorded as
+refuted with its evidence, and the rest were real. Three deserve naming here, because all
+three are this release's own thesis applied to a path the release itself had not applied it
+to.
+
+* **The gate could not see the claims the write half took.** `GET /claim/held` compared the
+  holder with `==`. Every other ownership test on `resource_leases` goes through
+  `same_machine`, precisely because the name half of an identity is board-allocated per
+  `X-Agent-Key` and is recycled — and the two clients that make up this feature do not send
+  the same headers. The MCP server sends a key, so an agent claiming through the `claim`
+  tool is written down as `zeus/amber-otter`; `qbdata.py` sends only `Authorization`, so
+  `qb-claim` — and therefore `create-worktree` — writes under the bare `zeus`. Each half was
+  invisible to the other: the pickup gate reported `free` for an agent that had just claimed,
+  and the tool reported `free` for the claim the checkout took on its behalf. Two subsystems
+  each correct about their own string, which is the sentence this whole release is about. The
+  holder filter is `address_clause` now — the machine-scoped, alias-aware clause `/active`
+  already uses on `Lease.holder` — and the session, not the name, is what separates
+  co-tenants, exactly as it does for a mutation.
+
+  The same mis-attribution had a write half: `create-worktree` invoked `qb-claim` without
+  `--session`, so the claim was stamped with the session of whoever ran the checkout. The
+  agent that will work in the tree has a different session and does not exist yet, so that
+  claim was hidden from the gate *and* unmutable by its own worktree — a 403 renewing or
+  releasing its own checkout claim. It records no session now and belongs to the machine
+  until somebody picks it up, and `/claim/held` counts a session-less claim as the machine's,
+  which is what `may_mutate` already said in as many words.
+
+* **A plan claim was work in a repo that the repo question could not see.** `repo_of` answers
+  None for `plan:<uuid>` and is right to — an id says nothing about a repository — so a claim
+  on the plan for *this* repo landed in `unattributed` and `held` came back false. #172's
+  whole design routes the fuzzy intake through a plan claim, so a gate blind to plan claims
+  was blind to the intake the issue added. The join is finished against the row, which knows
+  its scope; a fleet-scoped plan stays unattributed, because it genuinely does not say where.
+
+* **The deletion left one door open.** `kind='release'` had no endpoints, no tools and no
+  allocator, and `POST /claim {kind: 'release'}` still wrote the rows — because
+  canonicalisation passes an unrecognised kind through and the `RESERVED_KINDS` guard went
+  with the allocator. So `release` is a *retired* kind now rather than an unknown one, refused
+  in the primitive that every caller goes through, naming `release_stamp.py`. A deletion that
+  leaves one path able to write the rows is not a deletion.
+
+The rest, by the property each restores:
+
+**Ordering.** `POST /plan/submit` committed the plan and *then* took its claim, reopening the
+window the endpoint exists to close; it mints the id and claims first now, and rolls the
+claim back if the write fails. A whole-plan claim could be taken over items another agent
+truthfully held — the reverse direction was already guarded — so it refuses, naming the item
+and its holder, with `force` for a holder who really is sharing. And a post-`acquire` re-check
+released the caller's claim unconditionally, destroying one it had held *before* the request;
+only a claim the request itself created is handed back.
+
+**Answering about the resource rather than the string.** A kind-only filter on `GET /claims`
+was not folded, so `?kind=issue` — what the pre-#172 vocabulary trained every agent and skill
+to send — matched nothing while the rows sat there; it folds now and *says* it folded, because
+a kind can no longer tell an issue from a PR. `GET /claims` also silently preferred `ref_kind`
+over a `kind`/`key` sent alongside, where `POST /claim` refuses the pair outright: one rule,
+both directions, and the MCP tools now refuse it too instead of being the softer door.
+`GET /plan?plan=<label>` could resolve to a *closed* plan of that name and report its live
+namesake as empty; a plan named by id no longer needs its repo spelled in an unscoped read;
+and `phase` is refused rather than ignored, so a caller still sending it is told what replaced
+it instead of quietly getting a loose item.
+
+**Totality on a read.** The key regexes are looser than the validators `derive` applies, so
+`canonical` could raise out of `GET /claims` and out of `repo_of` — one legacy row of the
+shape `_norm_scope` used to be able to write (`acme/foo.git#12`) turned `/claim/held` into a
+500 for every row. A key this board cannot key is left exactly as it arrived, which was
+already the rule; it is now the rule on the failure path too. `_branch` also rejected
+whitespace alone while claiming to reject git-reserved characters, so a merge key could name
+a ref that cannot exist — and a `:` in a branch round-trips to a *different* branch, because
+`_MERGE_KEY` splits on the first colon.
+
+**Saying the true thing to whoever is looking.** The migration turned every historical phase
+into an *open* plan, so a repo that had ever finished a "stage 1" could never open one again;
+a phase arrives in the state its items are already in. The dashboard's four presentation
+functions still called an item covered by somebody else's plan claim free work — the exact
+outcome `covered_by` exists to prevent — including the click that starts `/fix-issue` and
+spends money. Freshness is derived from the plan's items rather than bumped by eight write
+paths, so a plan being worked through daily stops reporting itself stale. `qb-claim` mapped a
+401 and a 422 onto "the board is down" and a contended 409 — a lost race with no holder — onto
+"held", which `create-worktree` turned into a refusal naming a phantom peer. `preland`'s
+enrollment warning could not see plan or item claims at all, because their keys name no repo.
+The browser page's header omitted `covered` and contradicted the panel below it. And the
+`resource_leases` docstring still documented `release` as a kind of the table it had just
+stopped being.
+
+**Handing back what you took.** `create-worktree` claims before `git worktree add` on purpose —
+a refusal has then cost nothing — and the inverse was unhandled: the claim succeeds, the tree
+does not, and the issue stays held for eight hours by an agent that does not exist. Worse than
+not claiming, because the record reads as authoritative and there is nobody to talk to. An
+EXIT trap hands it back through `qbdata`'s own client, stands down once the tree exists, and
+leaves a *renewed* claim alone — one this machine held before the run is not the failed
+checkout's to destroy.
 
 ### What is not here
 

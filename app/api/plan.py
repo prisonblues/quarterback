@@ -43,7 +43,7 @@ from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import func, or_, select, text
+from sqlalchemy import func, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -241,6 +241,25 @@ def _dep_refused(token: str, problem: str, hint: str) -> HTTPException:
         "error": f"depends_on {token!r}: {problem}", "token": token, "hint": hint})
 
 
+def _too_many_deps(position: int | None = None) -> HTTPException:
+    """The cap on how much one item may wait on, refused in ONE shape.
+
+    ``POST /plan/item/depends`` refused anything over :data:`MAX_DEPS` and a
+    submission did not: only the ``outside`` tokens went through
+    :func:`_resolve_deps`, and the ``@n`` edges were merged in afterwards, so one
+    submitted row could land holding 32 + 63 of them — through the endpoint whose
+    whole point is that a plan arrives as a unit, and against the same row the
+    other endpoint would have refused. Counted on the tokens as ASKED FOR, which
+    is where :func:`_resolve_deps` counts them too: before de-duplication, so the
+    answer does not depend on how many of them were the same edge written twice.
+    """
+    return HTTPException(422, detail={
+        "error": f"{f'item {position}: ' if position is not None else ''}"
+                 f"at most {MAX_DEPS} dependencies per item",
+        **({"item": position} if position is not None else {}),
+        "hint": "an item waiting on thirty others is a plan, not an item"})
+
+
 async def _resolve_dep(session: AsyncSession, token: str, repo: str | None) -> PlanItem:
     """One dependency, given as an item id or as ``#60`` / ``60``.
 
@@ -295,9 +314,7 @@ async def _resolve_deps(session: AsyncSession, raw: list[str] | None, repo: str 
     if not raw:
         return []
     if len(raw) > MAX_DEPS:
-        raise HTTPException(422, detail={
-            "error": f"at most {MAX_DEPS} dependencies per item",
-            "hint": "an item waiting on thirty others is a plan, not an item"})
+        raise _too_many_deps()
     if item_id is not None:
         # Held from here to the commit, so the graph this validates against is
         # the graph the write lands on. NOT taken on the add path: nothing can
@@ -317,6 +334,24 @@ async def _resolve_deps(session: AsyncSession, raw: list[str] | None, repo: str 
     if item_id is not None:
         await _refuse_cycle(session, item_id, resolved)
     return resolved
+
+
+def _hand_back(claim: ResourceLease, renewed: bool, now: datetime) -> bool:
+    """Give up the claim THIS request took — and only this request's. Returns kept.
+
+    The re-checks after :func:`acquire` exist to undo a claim that lost a race
+    while it was being taken. But ``acquire`` may have RENEWED a claim the caller
+    already held before the request ever arrived, and releasing that one is
+    confiscating a legitimate claim as collateral: the caller held the item,
+    somebody else took the enclosing plan, and it now holds neither — which is
+    strictly worse than the state the re-check is there to prevent, because the
+    work really was this agent's. So a renew is left standing and reported back in
+    ``claim_kept``, and only a claim this request created is handed in.
+    """
+    if renewed:
+        return True
+    claim.released_at = now
+    return False
 
 
 async def _lock_deps(session: AsyncSession) -> None:
@@ -398,9 +433,49 @@ async def _claims_for(session: AsyncSession, keys: set[str],
     return {r.key: r for r in rows}
 
 
+async def _plan_activity(session: AsyncSession,
+                         plans: list[Plan]) -> dict[uuid.UUID, datetime]:
+    """When each plan's ITEMS last moved — the other half of "is this plan alive?".
+
+    ``stale`` is derived from ``plans.updated_at``, and a plan is worked through
+    its items: appending one, claiming one, releasing one, recording a dependency,
+    finishing one and moving one in from another plan all leave the plan row
+    untouched. Only ``plan/claim``, ``plan/release`` and ``plan/done`` ever
+    touched it — so a plan whose items were being worked through daily reported
+    ``stale: true`` after a fortnight, which is the exact opposite of what the
+    flag is for. "A plan that is believed and wrong is worse than no plan" cuts
+    both ways: a live plan called stale is as misleading as a dead one called
+    fresh.
+
+    **Derived on the read rather than bumped on every item write**, deliberately,
+    and it is one mechanism rather than two. There are eight item-write paths that
+    would each have to remember (``reorder`` touches items in several plans at
+    once), an opt-out set is a second place to forget — and every item claim would
+    then take a row lock on the plan it belongs to, serialising the agents the
+    plan exists to keep apart. One query, and it cannot drift from the writes
+    because it reads them.
+    """
+    ids = [p.id for p in plans]
+    if not ids:
+        return {}
+    rows = await session.execute(
+        select(PlanItem.plan_id, func.max(PlanItem.updated_at))
+        .where(PlanItem.plan_id.in_(ids)).group_by(PlanItem.plan_id))
+    return {plan_id: latest for plan_id, latest in rows if latest is not None}
+
+
 def _plan_view(plan: Plan, claim: ResourceLease | None, now: datetime,
-               items: dict[str, int] | None = None) -> dict:
-    idle = (now - plan.updated_at).total_seconds() / 86400
+               items: dict[str, int] | None = None,
+               active_at: datetime | None = None) -> dict:
+    """One plan as it reads, given when anything inside it last moved.
+
+    ``active_at`` is what keeps ``stale`` honest — see :func:`_plan_activity`. It
+    is folded into ``updated`` as well as into ``idle_days``, because two fields
+    of one response disagreeing about when a plan last changed is this release's
+    own defect in miniature: one question, two answers.
+    """
+    latest = plan.updated_at if active_at is None else max(plan.updated_at, active_at)
+    idle = (now - latest).total_seconds() / 86400
     return {
         "plan_id": str(plan.id),
         "repo": plan.repo,
@@ -410,13 +485,27 @@ def _plan_view(plan: Plan, claim: ResourceLease | None, now: datetime,
         "claim": claim_view(claim) if claim is not None else None,
         "added_by": plan.added_by,
         "created": plan.created_at.isoformat(),
-        "updated": plan.updated_at.isoformat(),
+        "updated": latest.isoformat(),
         "idle_days": round(idle, 1),
         "stale": plan.state == "open" and idle >= STALE_DAYS,
         "done": plan.done_at.isoformat() if plan.done_at else None,
         "done_by": plan.done_by,
         **({"items": items} if items is not None else {}),
     }
+
+
+async def _view_plan(session: AsyncSession, plan: Plan, claim: ResourceLease | None,
+                     now: datetime, items: dict[str, int] | None = None) -> dict:
+    """One plan, with its items' freshness looked up. The async half of
+    :func:`_plan_view`, as :func:`_view_items` is of :func:`_item_view`.
+
+    Every path that renders a single plan goes through here rather than calling
+    :func:`_plan_view` itself, so "when did this plan last move" has one answer on
+    the write paths and the read paths alike. :func:`_plans_view` does the same
+    lookup for a whole list in one query.
+    """
+    activity = await _plan_activity(session, [plan])
+    return _plan_view(plan, claim, now, items=items, active_at=activity.get(plan.id))
 
 
 def _covered_by(claim: ResourceLease | None, mine: str | None,
@@ -518,6 +607,7 @@ async def _plans_view(session: AsyncSession, repo: str | None, exact: bool,
                       Plan.created_at, Plan.id)))
     if not plans:
         return []
+    activity = await _plan_activity(session, plans)
     claims = await _claims_for(
         session, {plan_claim_key(p) for p in plans if p.state == "open"}, now)
     counts = {plan_id: n for plan_id, n in await session.execute(
@@ -526,7 +616,7 @@ async def _plans_view(session: AsyncSession, repo: str | None, exact: bool,
         .group_by(PlanItem.plan_id))}
     return [
         _plan_view(p, claims.get(plan_claim_key(p)) if p.state == "open" else None, now,
-                   items={"open": counts.get(p.id, 0)})
+                   items={"open": counts.get(p.id, 0)}, active_at=activity.get(p.id))
         | {"covered_by": _covered_by(
             claims.get(plan_claim_key(p)) if p.state == "open" else None, mine,
             session_id)}
@@ -670,7 +760,7 @@ def _in_scope(plan: Plan, repo: str | None) -> bool:
 
 
 async def _find_plan(session: AsyncSession, token: str | None, repo: str | None,
-                     *, open_only: bool) -> Plan | None:
+                     *, open_only: bool, any_repo: bool = False) -> Plan | None:
     """The plan a caller named, by id or by label. None if it named none, or none matched.
 
     Case-folded on the label, which is the whole reason a plan is a row: "stage
@@ -683,6 +773,24 @@ async def _find_plan(session: AsyncSession, token: str | None, repo: str | None,
     *another repo's*, so ``plan_item/update`` would move an item into a finished
     list, or into one nobody reading that repo can see. An id is not an
     authorisation to skip the rules the name has to pass.
+
+    ``any_repo`` is the one exception, and only for the id path: an unscoped
+    ``GET /plan`` reads EVERY scope, so ``?plan=<id>`` answering 422 unless the
+    caller also names the repo made a globally unique id less nameable than the
+    read it narrows — the id was the thing that needed no scope. The label path
+    keeps its exact scope regardless, because a label is unique per scope and
+    widening it would make which "stage 1" you got depend on insertion order.
+
+    **The OPEN plan wins when both exist.** With ``open_only`` off the state
+    filter goes, and ``ix_plans_open_label`` is partial on ``state = 'open'`` —
+    so one scope may legitimately hold a finished "stage 1" and a live one at
+    once, and the finished one was created first. Ordering by ``created_at``
+    alone therefore answered ``GET /plan?plan=stage 1`` with the closed plan:
+    no items, ``counts.open`` 0, ``next`` null — "nothing to do in stage 1"
+    while the live stage 1 was full of work, which is the failure
+    :func:`_scope_items` says a filter must never produce. Open first, then most
+    recent, because the last "stage 1" is the one somebody naming "stage 1"
+    means.
     """
     token = _norm_text(token)
     if not token:
@@ -690,7 +798,7 @@ async def _find_plan(session: AsyncSession, token: str | None, repo: str | None,
     as_uuid = _as_uuid(token)
     if as_uuid is not None:
         plan = await session.get(Plan, as_uuid)
-        if plan is None or not _in_scope(plan, repo):
+        if plan is None or not (any_repo or _in_scope(plan, repo)):
             return None
         return None if open_only and plan.state != "open" else plan
     stmt = select(Plan).where(func.lower(Plan.label) == token.lower())
@@ -700,14 +808,17 @@ async def _find_plan(session: AsyncSession, token: str | None, repo: str | None,
     # open "stage 1" (the unique index is per scope), so widening would make which
     # one you got depend on insertion order.
     stmt = stmt.where(Plan.repo.is_(None) if repo is None else Plan.repo == repo)
-    return await session.scalar(stmt.order_by(Plan.created_at).limit(1))
+    return await session.scalar(
+        stmt.order_by(Plan.state != "open", Plan.created_at.desc()).limit(1))
 
 
 async def _plan_or_422(session: AsyncSession, token: str | None, repo: str | None,
-                       *, open_only: bool = True) -> Plan | None:
+                       *, open_only: bool = True,
+                       any_repo: bool = False) -> Plan | None:
     if token is None:
         return None
-    plan = await _find_plan(session, token, repo, open_only=open_only)
+    plan = await _find_plan(session, token, repo, open_only=open_only,
+                            any_repo=any_repo)
     if plan is None:
         raise HTTPException(422, detail={
             "error": f"no {'open ' if open_only else ''}plan called {token!r} "
@@ -753,6 +864,26 @@ async def _ensure_plan(session: AsyncSession, label: str | None, repo: str | Non
     return plan
 
 
+#: What ``plan`` replaced (#172), and why it is REFUSED rather than ignored.
+#: Pydantic drops an unknown body field and FastAPI drops an unknown query
+#: parameter, so the old spelling failed three different silent ways: ``POST
+#: /plan/item {phase: "stage 1"}`` made a loose item belonging to nothing,
+#: ``plan/item/update {phase: ...}`` did nothing at all and answered 200, and
+#: ``GET /plan?phase=...`` answered about the whole scope — a broader list than
+#: was asked for, which is exactly the shape of "nothing to do here" being wrong.
+#: A migration that fails loudly is the cheap kind.
+_PHASE_GONE = {
+    "error": "`phase` is gone: a plan is a row now, not a string on an item (#172)",
+    "hint": "say `plan` instead — the same field on the wire with a row behind it. "
+            "An unknown label creates the plan; GET /plans lists them.",
+}
+
+
+def _refuse_phase(value: str | None) -> None:
+    if value is not None:
+        raise HTTPException(422, detail=_PHASE_GONE)
+
+
 class ItemIn(BaseModel):
     title: str = Field(min_length=1, max_length=MAX_TITLE)
     repo: str | None = Field(default=None, max_length=256)
@@ -764,6 +895,8 @@ class ItemIn(BaseModel):
     #: it. An unknown label creates the plan — see :func:`_ensure_plan` for why
     #: that is not the laxness it looks like.
     plan: str | None = Field(default=None, max_length=MAX_LABEL)
+    #: Accepted only so it can be refused — see :data:`_PHASE_GONE`.
+    phase: str | None = Field(default=None, max_length=MAX_LABEL)
     #: WHY it sits here. The sentence a human would otherwise repeat to each
     #: agent that asks, which is the half an issue has no field for.
     note: str | None = Field(default=None, max_length=MAX_NOTE)
@@ -806,6 +939,8 @@ class UpdateIn(ItemRefIn):
     #: it — a loose item is a real state (it is what every item was before v2.39
     #: gave them phases), so there has to be a way back to it.
     plan: str | None = Field(default=None, max_length=MAX_LABEL)
+    #: Accepted only so it can be refused — see :data:`_PHASE_GONE`.
+    phase: str | None = Field(default=None, max_length=MAX_LABEL)
     note: str | None = Field(default=None, max_length=MAX_NOTE)
     state: Literal["open", "dropped"] | None = None
 
@@ -848,6 +983,11 @@ class ClaimPlanIn(PlanRefIn):
     ttl: int = Field(default=DEFAULT_TTL, ge=1, le=MAX_TTL)
     session: str | None = Field(default=None, max_length=MAX_SESSION)
     note: str | None = Field(default=None, max_length=500)
+    #: Claim the plan over items somebody else is already holding. Refused by
+    #: default and said out loud when used, exactly as ``force`` on an item claim
+    #: is: they may genuinely be sharing the work, but then "I know they hold part
+    #: of this" is on the record rather than assumed.
+    force: bool = False
 
 
 class ReleasePlanIn(PlanRefIn):
@@ -878,6 +1018,9 @@ async def read_plan(
     include_done: bool = Query(default=False, description="include done and dropped items"),
     plan: str | None = Query(default=None,
                             description="only this plan, by label or id"),
+    phase: str | None = Query(default=None,
+                              description="gone (#172): a plan is a row now — "
+                                          "narrow with `plan` instead"),
     exact: bool = Query(default=False,
                         description="this scope ONLY — do not widen a repo read to the "
                                     "fleet-wide items (and, with no repo, the fleet list "
@@ -899,9 +1042,13 @@ async def read_plan(
     list sees why the items above it were skipped (held, blocked, or covered by
     another agent's plan claim).
     """
+    _refuse_phase(phase)
     now = _utcnow()
     repo = _norm_scope(repo)
-    scoped = await _plan_or_422(session, plan, repo, open_only=False)
+    # An id needs no scope, and only here: an unscoped read covers every scope, so
+    # narrowing it by plan id must not be the one thing that cannot reach one.
+    scoped = await _plan_or_422(session, plan, repo, open_only=False,
+                                any_repo=repo is None and not exact)
     plan_id = scoped.id if scoped is not None else None
     # `next` and `counts` are answers about the PLAN; `items` is a page of it.
     # Deriving all three from one truncated query made the first two describe the
@@ -934,11 +1081,14 @@ async def read_plan(
     # The narrowed plan comes OUT of that list rather than being rendered again, so
     # `plan` and the matching row of `plans` cannot disagree about who holds it —
     # rendering it separately gave it `claim: null` while the list showed the claim.
-    # A plan narrowed to but out of scope (a closed one, or another repo's) still
-    # answers with its own view; it is just claimless, which it is.
     scoped_view = next((row for row in plans
                         if scoped is not None and row["plan_id"] == str(scoped.id)),
-                       _plan_view(scoped, None, now) if scoped is not None else None)
+                       None)
+    if scoped_view is None and scoped is not None:
+        # Narrowed to a plan the list does not carry (a closed one, or — read
+        # unscoped by id — another repo's). It still answers with its own view; it
+        # is just claimless, which it is.
+        scoped_view = await _view_plan(session, scoped, None, now)
     return {
         "repo": repo,
         "exact": exact,
@@ -977,6 +1127,7 @@ async def add_item(
     one that is already there — the plan holding two rows about #60 is precisely
     the drift it exists to remove.
     """
+    _refuse_phase(body.phase)
     if (body.ref_kind is None) != (_norm_ref(body.ref_value) is None):
         raise HTTPException(422, "a ref needs both kind and value, or neither")
     title = _norm_text(body.title)
@@ -1021,7 +1172,10 @@ async def add_item(
                     "item per issue — reorder or update that one instead",
         }) from None
     await session.refresh(item)
-    return (await _view_items(session, [item], _utcnow()))[0]
+    # `mine` on a write path too: without it the author's OWN plan claim came back
+    # as `covered_by`, so an agent adding to the plan it holds was told the plan
+    # was somebody else's — the page renders that verbatim.
+    return (await _view_items(session, [item], _utcnow(), mine=author))[0]
 
 
 @router.post("/plan/item/claim")
@@ -1086,28 +1240,35 @@ async def claim_item(
     # two agents each correctly believing the work is theirs. That is the exact
     # outcome the plan claim exists to prevent, so losing it here costs the item
     # claim rather than being reported as a warning nobody reads.
+    #
+    # What the re-check hands back is THIS request's claim and not a moment more:
+    # `acquire` may have renewed one the caller already held, and taking that away
+    # would leave an agent that legitimately had the item holding nothing at all —
+    # see :func:`_hand_back`, and `claim_kept` in the refusals below.
     await session.refresh(item)
     if item.state != "open":
-        claim.released_at = now
+        kept = _hand_back(claim, renewed, now)
         await session.commit()
         raise HTTPException(409, detail={
             "error": f"that item became {item.state} while you were claiming it",
-            "item_id": str(item.id), "hint": "re-read the plan: it moved under you"})
+            "item_id": str(item.id), "claim_kept": kept,
+            "hint": "re-read the plan: it moved under you"})
     if not body.force:
         raced = await _covering_claim(session, item, holder, body.session, now)
         if raced is not None:
-            claim.released_at = now
+            kept = _hand_back(claim, renewed, now)
             await session.commit()
             raise HTTPException(409, detail={
                 "error": "somebody took the whole plan while you were claiming this item",
-                "item_id": str(item.id), "covered_by": raced,
+                "item_id": str(item.id), "covered_by": raced, "claim_kept": kept,
                 "hint": "re-read the plan: it moved under you. Talk to them, or pass "
                         "force=true to take one item out of it deliberately"})
     # One instant per request: `now` stamps the claim, the row and the view it
     # renders, so a single logical moment is not three slightly different ones.
     item.updated_at = now
     await session.commit()
-    view = (await _view_items(session, [item], now))[0]
+    view = (await _view_items(session, [item], now, mine=holder,
+                              session_id=body.session))[0]
     return {**view, "claimed": True, "renewed": renewed, "claim_id": str(claim.id),
             "forced": bool(blockers)}
 
@@ -1177,7 +1338,8 @@ async def release_item(
         # exactly the item the staleness flag exists to surface.
         item.updated_at = now
         await session.commit()
-    return {**(await _view_items(session, [item], now))[0], "released": released}
+    return {**(await _view_items(session, [item], now, mine=holder,
+                                 session_id=body.session))[0], "released": released}
 
 
 def _is_mine(claim: ResourceLease, holder: str, session_id: str | None) -> bool:
@@ -1258,7 +1420,8 @@ async def complete_item(
     item.note = _completion_note(item.note, body.note)
     item.updated_at = now
     await session.commit()
-    view = (await _view_items(session, [item], now))[0]
+    view = (await _view_items(session, [item], now, mine=holder,
+                              session_id=body.session))[0]
     # The claim itself, not a bool: `done` no longer renders a claim on the item
     # (it is history), so "somebody else was holding this when it was recorded
     # finished" would otherwise be a fact with nowhere left to read it.
@@ -1284,7 +1447,7 @@ def _completion_note(existing: str | None, said: str | None) -> str | None:
 @router.post("/plan/item/depends")
 async def set_depends(
     body: DependsIn,
-    _: str = Depends(identify),
+    holder: str = Depends(identify),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     """Record what an item is waiting on. An agent may: a dependency is a FACT.
@@ -1305,7 +1468,10 @@ async def set_depends(
     item.depends_on = await _resolve_deps(session, body.depends_on, item.repo, item.id)
     item.updated_at = now
     await session.commit()
-    return (await _view_items(session, [item], now))[0]
+    # No `session` on this body, so coverage is answered by machine — the coarser
+    # honest answer `_covered_by` documents, rather than reporting the caller's own
+    # plan claim as somebody else's.
+    return (await _view_items(session, [item], now, mine=holder))[0]
 
 
 @router.post("/plan/item/update")
@@ -1324,6 +1490,7 @@ async def update_item(
     so the drop control on a history row was one click from destroying the record
     that the issue ever closed — and the page offered it on every row.
     """
+    _refuse_phase(body.phase)
     item = await _get(session, body.item_id)
     if body.state is not None and item.state == "done" and body.state != "done":
         raise HTTPException(409, detail={
@@ -1371,7 +1538,8 @@ async def update_item(
         if not is_unique_violation(e):
             raise
         raise await _ref_taken(session, *ref) from None
-    return {**(await _view_items(session, [item], now))[0], "edited_by": editor}
+    return {**(await _view_items(session, [item], now, mine=editor))[0],
+            "edited_by": editor}
 
 
 async def _ref_taken(session: AsyncSession, repo: str | None, ref_kind: str | None,
@@ -1437,8 +1605,13 @@ async def reorder(
     return {
         "repo": repo, "reordered": len(ordered), "by": editor,
         "appended": [str(i.id) for i in rest],
+        # Says who is asking, as every write path now does. A human is never a claim
+        # holder, so here it changes nothing — the uniformity is the point: the
+        # defect was the one call site that did not say, and rendered the caller's
+        # own plan claim as somebody else's cover.
         "items": await _view_items(
-            session, await _scope_items(session, repo, exact=True, include_done=False), now),
+            session, await _scope_items(session, repo, exact=True, include_done=False),
+            now, mine=editor),
     }
 
 
@@ -1548,8 +1721,16 @@ async def submit_plan(
 
     So the unit of submission is the unit of intent: the plan row, every item, and
     every dependency between them commit together or not at all. ``claim=true``
-    (the default) then takes the plan in the same call, because the surveying
-    agent wrote it and the gap between writing and holding is the gap.
+    (the default) takes the plan in the same call, because the surveying agent
+    wrote it and the gap between writing and holding is the gap.
+
+    **The claim is taken BEFORE the write, not after.** ``acquire`` commits, so it
+    cannot be part of this transaction either way — and taking it afterwards
+    reopens the same window one notch later: the plan and its items are committed
+    and readable, and for as long as the second transaction takes there is nothing
+    holding them. Taking it first cannot collide (the key is this request's own
+    fresh id) and cannot fail the caller after persisting anything; if the write
+    then fails, the claim is handed straight back.
 
     The plan's label must be free in its scope. An existing open plan is a 409
     naming it rather than an append — "add to that one" and "submit a plan" are
@@ -1586,85 +1767,163 @@ async def submit_plan(
                 "hint": "one open item per issue: the plan links to issues and never "
                         "restates them"})
 
+    # The cap applies to the MERGED list, and it is cheapest to say so here: only
+    # the `outside` tokens reach `_resolve_deps`, so without this a submitted row
+    # could carry 32 external edges plus 63 `@n` ones — refused on the same row by
+    # `POST /plan/item/depends`. Before anything is written, because a submission
+    # is all-or-nothing and "refuse it" is only available while nothing is.
+    for position, item in enumerate(body.items, start=1):
+        if len(item.depends_on) > MAX_DEPS:
+            raise _too_many_deps(position)
+
     batch = _batch_deps(body.items)
 
     existing = await _find_plan(session, label, repo, open_only=True)
     if existing is not None:
-        raise HTTPException(409, detail={
-            "error": f"a plan called {existing.label!r} is already open here",
-            "plan_id": str(existing.id), "repo": existing.repo,
-            "hint": "add to it with POST /plan/item (plan=<label>), or finish it "
-                    "first — submitting over it would be two plans with one name"})
+        raise _label_taken(existing)
 
-    # Held to the commit: every item's rank comes off `_next_rank`, and a
-    # submission is the case where that read-then-insert happens `len(items)`
-    # times in a row.
-    await _lock_scope(session, repo)
-    plan = Plan(repo=repo, label=label, note=_norm_text(body.note), added_by=author)
-    session.add(plan)
-    rank = await _next_rank(session, repo)
-    plan_items: list[PlanItem] = []
-    for position, (item, title, ref) in enumerate(
-            zip(body.items, titles, refs, strict=True)):
-        plan_items.append(PlanItem(
-            repo=repo, title=title, ref_kind=item.ref_kind, ref_value=ref,
-            note=_norm_text(item.note), added_by=author, rank=rank + position,
-            depends_on=[]))
-    for row in plan_items:
-        session.add(row)
-    try:
-        # Ids first: an `@2` edge needs the id of a row that has not been assigned
-        # one yet, and a plan whose edges are written in a second transaction is
-        # the incremental plan this endpoint replaces.
-        await session.flush()
-    except IntegrityError as e:
-        await session.rollback()
-        if not is_unique_violation(e):
-            raise
-        raise await _submit_conflict(session, repo, body.items, refs) from None
-    for row in plan_items:
-        row.plan_id = plan.id
-    # External edges resolve against the database, batch edges against this
-    # submission, and the two merge in the order the caller wrote them.
-    for position, (row, item) in enumerate(zip(plan_items, body.items, strict=True)):
-        outside = [t for t in item.depends_on if not str(t).startswith(_BATCH_REF)]
-        resolved = await _resolve_deps(session, outside, repo, item_id=row.id)
-        inside = [str(plan_items[i].id) for i in batch[position]]
-        row.depends_on = list(dict.fromkeys([*resolved, *inside]))
-    try:
-        await session.commit()
-    except IntegrityError as e:
-        await session.rollback()
-        if not is_unique_violation(e):
-            raise
-        raise await _submit_conflict(session, repo, body.items, refs) from None
-
-    claimed = None
+    # The plan's id is minted HERE rather than at flush, because the claim below has
+    # to be taken before the plan is readable.
+    plan = Plan(id=uuid.uuid4(), repo=repo, label=label, note=_norm_text(body.note),
+                added_by=author)
+    claimed, claim_id = None, None
     if body.claim:
-        # After the commit, never inside it: `acquire` commits (that is where its
-        # atomicity comes from) and refuses a session with pending work.
+        # **Before the write, not after.** `acquire` commits — that is where its
+        # atomicity comes from — so a claim taken afterwards is a second
+        # transaction, and the gap between the two is a plan that is readable and
+        # unheld: precisely the window this endpoint exists to close, moved from
+        # between two items to between the plan and its claim. It also meant a
+        # failing claim answered with an error *after* the plan and every item had
+        # been persisted. Nobody can be holding `plan:<a fresh uuid>`, so this
+        # cannot conflict; what it buys is the ordering.
         claim, _ = await acquire(session, ClaimRequest(
             kind=CLAIM_KIND, key=plan_claim_key(plan), holder=author, ttl=body.ttl,
             sess=body.session,
-            note=_norm_text(body.note_on_claim) or f"planning: {plan.label}",
+            note=_norm_text(body.note_on_claim) or f"planning: {label}",
             now=now, session_owned=True))
-        claimed = claim_view(claim)
+        claimed, claim_id = claim_view(claim), claim.id
+
+    try:
+        # Held to the commit: every item's rank comes off `_next_rank`, and a
+        # submission is the case where that read-then-insert happens `len(items)`
+        # times in a row.
+        await _lock_scope(session, repo)
+        session.add(plan)
+        rank = await _next_rank(session, repo)
+        plan_items: list[PlanItem] = []
+        for position, (item, title, ref) in enumerate(
+                zip(body.items, titles, refs, strict=True)):
+            plan_items.append(PlanItem(
+                repo=repo, title=title, ref_kind=item.ref_kind, ref_value=ref,
+                note=_norm_text(item.note), added_by=author, rank=rank + position,
+                depends_on=[]))
+        for row in plan_items:
+            session.add(row)
+        # Ids first: an `@2` edge needs the id of a row that has not been assigned
+        # one yet, and a plan whose edges are written in a second transaction is the
+        # incremental plan this endpoint replaces.
+        await session.flush()
+        for row in plan_items:
+            row.plan_id = plan.id
+        # External edges resolve against the database, batch edges against this
+        # submission, and the two merge in the order the caller wrote them.
+        for position, (row, item) in enumerate(zip(plan_items, body.items, strict=True)):
+            outside = [t for t in item.depends_on if not str(t).startswith(_BATCH_REF)]
+            resolved = await _resolve_deps(session, outside, repo, item_id=row.id)
+            inside = [str(plan_items[i].id) for i in batch[position]]
+            row.depends_on = list(dict.fromkeys([*resolved, *inside]))
+        await session.commit()
+    except IntegrityError as e:
+        # ONE handler for the whole write, because the flush that trips an index is
+        # not always the explicit one: `_next_rank` is a SELECT, so autoflush inserts
+        # the plan row *there*, and a label race therefore failed before the flush
+        # this used to guard — arriving as a 500 rather than as any answer about the
+        # plan at all.
+        await session.rollback()
+        await _undo_claim(session, claim_id, now)
+        if not is_unique_violation(e):
+            raise
+        raise await _submit_conflict(session, repo, label, body.items, refs) from None
+    except Exception:
+        # The claim above is ordering, not a record. A claim left standing over a
+        # plan that was never written is a key nobody can release, held by an agent
+        # that was told its submission failed — so it goes back before the refusal
+        # the caller actually sees.
+        await _undo_claim(session, claim_id, now)
+        raise
+
     await session.refresh(plan)
     return {
-        **_plan_view(plan, None, now, items={"open": len(plan_items)}),
+        **await _view_plan(session, plan, None, now, items={"open": len(plan_items)}),
         "claim": claimed,
-        "items": await _view_items(session, list(plan_items), now, mine=author),
+        "items": await _view_items(session, list(plan_items), now, mine=author,
+                                   session_id=body.session),
     }
 
 
-async def _submit_conflict(session: AsyncSession, repo: str | None,
+def _label_taken(plan: Plan) -> HTTPException:
+    """409: a plan by that name is already open in this scope.
+
+    Named once because two paths arrive at it. The pre-check reads the label
+    before the write; the LOSER of a race between two submissions of one label
+    meets ``ix_plans_open_label`` on the flush instead — `_lock_scope` is taken
+    after the pre-check, so both pass it — and used to be answered by
+    :func:`_submit_conflict`, which looks only for colliding item refs, found
+    none, and said "that submission collided with an existing row" with
+    ``clashes: []`` and advice to drop lines that were fine. The caller was told
+    to edit its plan and never told the name was taken. One refusal, so the timing
+    cannot change the answer.
+    """
+    return HTTPException(409, detail={
+        "error": f"a plan called {plan.label!r} is already open here",
+        "plan_id": str(plan.id), "repo": plan.repo,
+        "hint": "add to it with POST /plan/item (plan=<label>), or finish it "
+                "first — submitting over it would be two plans with one name"})
+
+
+async def _undo_claim(session: AsyncSession, claim_id: uuid.UUID | None,
+                      now: datetime) -> None:
+    """Hand back a claim taken for a write that then failed.
+
+    **It rolls the session back first, and that is load-bearing**: handing the
+    claim back is itself a COMMIT, and this is called on the failure paths — so a
+    session still carrying the refused submission would land exactly the rows the
+    422 says were not written. A refused ring of dependencies committed half a plan
+    the first time this was written without the rollback.
+
+    An UPDATE by id rather than a touch on the instance, because after that
+    rollback the ORM object is expired and reading it would re-emit the statement
+    that just failed — the same reason :func:`_ref_taken` takes plain values.
+    """
+    await session.rollback()
+    if claim_id is None:
+        return
+    await session.execute(
+        update(ResourceLease)
+        .where(ResourceLease.id == claim_id, ResourceLease.released_at.is_(None))
+        .values(released_at=now))
+    await session.commit()
+
+
+async def _submit_conflict(session: AsyncSession, repo: str | None, label: str,
                            asked: list[SubmitItemIn], refs: list[str | None],
                            ) -> HTTPException:
-    """409 naming which of the submitted refs is already open in the plan.
+    """409 naming what the submission collided with: the label, or which ref.
 
     A submission is all-or-nothing, so the caller needs to know *which* line to
     change — "something in there collides" would make it bisect its own plan.
+
+    The LABEL is looked for first, and is why this takes one: the plan row and the
+    items go in on the same flush, so the unique index that fired may have been
+    ``ix_plans_open_label`` rather than ``ix_plan_items_open_ref``, and a caller
+    whose only problem is the name must not be sent to edit lines that are
+    correct. Re-read rather than decided from the constraint name, because the
+    answer wanted is the same 409 the pre-check gives and that is a row, not a
+    string.
     """
+    taken = await _find_plan(session, label, repo, open_only=True)
+    if taken is not None:
+        return _label_taken(taken)
     clashes = []
     for item, ref in zip(asked, refs, strict=True):
         if ref is None:
@@ -1684,6 +1943,39 @@ async def _submit_conflict(session: AsyncSession, repo: str | None,
         "hint": "one open item per issue — nothing was written, so drop those lines "
                 "and submit again",
     })
+
+
+async def _held_items(session: AsyncSession, plan: Plan, holder: str,
+                      session_id: str | None, now: datetime) -> list[dict]:
+    """The open items of this plan somebody ELSE is holding, with who and until when.
+
+    The other direction of the coverage rule, and it was missing. ``claim_item``
+    refuses an item inside a plan another agent holds; nothing refused the plan to
+    an agent when another already truthfully held items inside it — so "all of
+    this is mine" could be said over work that demonstrably was not, and both
+    claims stayed live. That is overlapping ownership, which is the one outcome
+    both grains exist to prevent, and it does not matter which of the two arrived
+    first.
+
+    Ownership is :func:`_is_mine`, as everywhere else on this router: the items you
+    are holding yourself are no obstacle to claiming the plan they are in — that is
+    the ordinary way a plan is worked through.
+    """
+    items = list(await session.scalars(
+        select(PlanItem).where(PlanItem.plan_id == plan.id, PlanItem.state == "open")))
+    if not items:
+        return []
+    claims = await _claims_for(session, {claim_key(i) for i in items}, now)
+    held = []
+    for item in items:
+        claim = claims.get(claim_key(item))
+        if claim is None or _is_mine(claim, holder, session_id):
+            continue
+        held.append({"item_id": str(item.id), "title": item.title,
+                     "ref": item.ref_value, "holder": claim.holder,
+                     "session": claim.session, "note": claim.note,
+                     "expires": claim.expires_at.isoformat()})
+    return held
 
 
 async def _get_plan(session: AsyncSession, plan_id: uuid.UUID) -> Plan:
@@ -1709,12 +2001,28 @@ async def claim_plan(
     Session-owned, like an item claim and for the same reason: a machine runs
     several agents on one token, and "two agents on one box both hold the plan" is
     the failure it exists to prevent.
+
+    **Coarse does not mean it wins.** An item another agent already holds is
+    refused (see :func:`_held_items`): a plan claim taken over it would leave two
+    live claims on one piece of work, each of whose holders is right — the exact
+    outcome the plan grain exists to prevent, in the direction ``claim_item``
+    already guarded and this one did not. ``force`` is the way to say it anyway,
+    and then it is in the record.
     """
     now = _utcnow()
     plan = await _get_plan(session, body.plan_id)
     if plan.state != "open":
         raise HTTPException(409, detail={
             "error": f"that plan is {plan.state}", "plan_id": str(plan.id)})
+    held = await _held_items(session, plan, holder, body.session, now)
+    if held and not body.force:
+        raise HTTPException(409, detail={
+            "error": "items in that plan are held by somebody else",
+            "plan_id": str(plan.id), "held_items": held,
+            "hint": "claiming the plan says all of it is yours, and they truthfully "
+                    "hold part of it — talk to them (their sessions are above), take "
+                    "the items you need one at a time, or pass force=true to claim "
+                    "the plan over theirs deliberately"})
     claim, renewed = await acquire(session, ClaimRequest(
         kind=CLAIM_KIND, key=plan_claim_key(plan), holder=holder, ttl=body.ttl,
         sess=body.session, note=_norm_text(body.note) or f"planning: {plan.label}",
@@ -1725,15 +2033,30 @@ async def claim_plan(
     # reason — `acquire` cannot be held inside a lock.
     await session.refresh(plan)
     if plan.state != "open":
-        claim.released_at = now
+        kept = _hand_back(claim, renewed, now)
         await session.commit()
         raise HTTPException(409, detail={
             "error": f"that plan became {plan.state} while you were claiming it",
-            "plan_id": str(plan.id), "hint": "re-read the plans: it moved under you"})
+            "plan_id": str(plan.id), "claim_kept": kept,
+            "hint": "re-read the plans: it moved under you"})
+    if not body.force:
+        # And the same window on the other check: an item claim landing between
+        # `_held_items` and here leaves both grains live, which is the state this
+        # endpoint's own refusal is about.
+        raced = await _held_items(session, plan, holder, body.session, now)
+        if raced:
+            kept = _hand_back(claim, renewed, now)
+            await session.commit()
+            raise HTTPException(409, detail={
+                "error": "somebody claimed an item inside that plan while you were "
+                         "claiming the plan",
+                "plan_id": str(plan.id), "held_items": raced, "claim_kept": kept,
+                "hint": "re-read the plan: it moved under you. Talk to them, or pass "
+                        "force=true to claim the plan over their items deliberately"})
     plan.updated_at = now
     await session.commit()
-    return {**_plan_view(plan, claim, now), "claimed": True, "renewed": renewed,
-            "claim_id": str(claim.id)}
+    return {**await _view_plan(session, plan, claim, now), "claimed": True,
+            "renewed": renewed, "claim_id": str(claim.id), "forced": bool(held)}
 
 
 @router.post("/plan/release")
@@ -1761,7 +2084,7 @@ async def release_plan(
         # looking fresh by releasing a claim it never held.
         plan.updated_at = now
         await session.commit()
-    return {**_plan_view(plan, None, now), "released": released}
+    return {**await _view_plan(session, plan, None, now), "released": released}
 
 
 @router.post("/plan/done")
@@ -1811,6 +2134,6 @@ async def complete_plan(
     plan.note = _completion_note(plan.note, body.note)
     plan.updated_at = now
     await session.commit()
-    return {**_plan_view(plan, None, now),
+    return {**await _view_plan(session, plan, None, now),
             "claim_left": None if mine or claim is None else claim_view(claim),
             "items_left": [str(i.id) for i in left]}

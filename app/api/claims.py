@@ -31,6 +31,13 @@ being merged into — nine releases landed that way in a day with no collisions,
 while the allocator's own rows went stale for every PR still open. A namespace
 nobody claims in does not need an allocator, and a stale record of it is worse
 than none: it is the second spelling this module is now built to prevent.
+
+The endpoints went; the KIND could still be written, because canonicalisation
+passes an unrecognised kind through and the ``RESERVED_KINDS`` guard was deleted
+with the allocator. So ``release`` is now a *retired* kind rather than an unknown
+one (:data:`app.claimkey.RETIRED_KINDS`) and ``POST /claim`` refuses it with 422,
+naming ``release_stamp.py``. A deletion that leaves one path able to write the
+rows is not a deletion.
 """
 
 from __future__ import annotations
@@ -41,22 +48,34 @@ from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, model_validator
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import identify, reader
-from app.claimkey import REF_KINDS, BadRef, canonical, canonical_repo, derive, repo_of
+from app.claimkey import (
+    REF_KINDS,
+    BadRef,
+    board_object,
+    canonical,
+    canonical_kind,
+    canonical_repo,
+    derive,
+    repo_of,
+)
 from app.db import async_session, get_session
-from app.identity import same_machine
+from app.identity import address_clause, resolve_alias, same_machine
+from app.models.plan import Plan
+from app.models.plan_item import PlanItem
 from app.models.resource_lease import ResourceLease
 
 router = APIRouter(tags=["claim"])
 
-#: Default hold, in seconds. A land takes minutes and a release number is held
-#: from "I am writing the CHANGELOG" to "it merged", which on this repo has run
-#: to hours. Long enough not to lapse mid-work, short enough that a crashed
-#: holder frees it within one coffee.
+#: Default hold, in seconds. A land takes minutes and a unit of work is held from
+#: "I have picked this up" to "the PR merged", which on this repo has run to
+#: hours. Long enough not to lapse mid-work, short enough that a crashed holder
+#: frees it within one coffee. (The release number used to be the long case; the
+#: allocator that held it is deleted, and the land is the remaining reason.)
 DEFAULT_TTL = 3600
 MAX_TTL = 86_400
 
@@ -159,8 +178,11 @@ async def _sweep_lapsed(session: AsyncSession, kind: str, key: str,
     Passive: it runs only when somebody asks for this exact key, so there is no
     reaper and a quiet key costs nothing. ``lapsed`` is set rather than only
     ``released_at`` because "the holder let go" and "the holder vanished" are
-    different facts — and for a release number that is the difference between
-    shipped and abandoned, which :func:`allocate_release` must not have to guess.
+    different facts: the first is work that finished, the second is a session
+    that stopped answering, and a dashboard that showed them the same way would
+    report an abandoned land as a completed one. ``qbdata`` filters on this column
+    to tell them apart. (The allocator that first needed the distinction is
+    deleted — the distinction outlived it, which is why it is still here.)
     """
     await session.execute(
         update(ResourceLease)
@@ -561,9 +583,9 @@ async def release_claim(
     holder: str = Depends(identify),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
-    """Let go. Idempotent, and never deletes: the row is the history an allocator
-    reads, so a released claim stays on the table as a number that was handed
-    out."""
+    """Let go. Idempotent, and never deletes: the row is the history, so a
+    released claim stays on the table as a record that this agent held this
+    resource between these two times."""
     claim = await session.get(ResourceLease, body.claim_id)
     if claim is None:
         raise HTTPException(404, "claim not found")
@@ -600,14 +622,25 @@ async def list_claims(
     """
     now = _utcnow()
     stmt = select(ResourceLease)
+    asked = {"kind": kind, "key": key}
     # Derived here rather than by the caller, for the reason the write path is:
     # the MCP layer is a separate package with no import of this one, so a client
     # that composed the lookup key would be a SECOND implementation of the rule —
     # which is the defect #172 is about, moved into the read path.
-    if ref_kind:
-        if not ref_value:
-            raise HTTPException(422, "ref_kind needs ref_value: which issue, PR, "
-                                     "branch or id?")
+    if ref_kind or ref_value:
+        if not (ref_kind and ref_value):
+            raise HTTPException(422, "ref_kind and ref_value go together: which "
+                                     "issue, PR, branch or id?")
+        if kind or key:
+            # Refused, not silently preferred — the same rule `ClaimIn` applies to
+            # the write, and for the same reason. That validator's argument is
+            # that "a request carrying both is a caller with two ideas about what
+            # it is claiming"; a *read* carrying both is a caller with two ideas
+            # about what it is asking, and answering about one of them without
+            # saying which is how a lookup reports "nobody holds that" about a
+            # row that is right there. One rule, both directions.
+            raise HTTPException(422, "ask by `ref_kind`/`ref_value` (the board "
+                                     "derives the key) OR by `kind`/`key`, not both")
         try:
             kind, key = derive(ref_kind, repo=repo, value=ref_value)
         except BadRef as e:
@@ -617,7 +650,24 @@ async def list_claims(
         # looking up `kind=issue&key=<repo>#163` is asking about a resource, not
         # about a string, and answering "no claims" about a row that is right
         # there is how #172's plan-versus-claims disagreement read from outside.
-        kind, key = canonical(kind, key)
+        try:
+            kind, key = canonical(kind, key)
+        except BadRef as e:
+            raise HTTPException(422, str(e)) from None
+    elif kind:
+        # A kind with no key. This branch did not exist, so `?kind=issue` filtered
+        # on the literal string `issue` and matched nothing — every claim on a
+        # unit of work is stored under `work` now, and `kind` alone is what the
+        # pre-#172 vocabulary trained every agent, skill and dashboard to send.
+        # An empty answer about held resources is the defect this module's own
+        # docstring names, so the alias is folded here and the fold is REPORTED:
+        # `pr` and `issue` share one kind by design, so this filter is coarser
+        # than the caller asked for and saying nothing about that would trade one
+        # silent wrong answer for another.
+        try:
+            kind = canonical_kind(kind)
+        except BadRef as e:
+            raise HTTPException(422, str(e)) from None
     if kind:
         stmt = stmt.where(ResourceLease.kind == kind)
     if key:
@@ -629,11 +679,77 @@ async def list_claims(
                           ResourceLease.expires_at > now)
     stmt = stmt.order_by(ResourceLease.acquired_at.desc()).limit(limit)
     rows = list(await session.scalars(stmt))
-    return {"claims": [
+    out: dict = {"claims": [
         {**claim_view(c),
          "released": c.released_at.isoformat() if c.released_at else None,
          "lapsed": c.lapsed}
         for c in rows]}
+    if (asked["kind"], asked["key"]) not in ((None, None), (kind, key)):
+        # Said out loud, exactly as `POST /claim` says it: a caller that believes
+        # it asked about `issue/<repo>#163` while the filter read `work/…` is the
+        # #172 defect with the parties swapped.
+        out["filtered_on"] = {"kind": kind, "key": key}
+        out["asked_for"] = asked
+        note = (f"you asked about {asked['kind']}/{asked['key'] or '(any key)'}; the "
+                f"board keys that as {kind}/{key or '(any key)'}")
+        if asked["key"] is None:
+            note += (" — a kind alone can no longer tell an issue from a PR, because "
+                     "the key's shape carries that now. Send `ref_kind`/`ref_value` "
+                     "for one resource, or `kind` and `key` together.")
+        out["note_on_kind"] = note
+    return out
+
+
+async def _board_scopes(
+    session: AsyncSession, rows: list[ResourceLease]
+) -> dict[tuple[str, str], str]:
+    """The repo each ``plan:``/``item:`` claim among ``rows`` is against (#172).
+
+    ``repo_of`` answers None for a board object and is right to: the key is an id,
+    and an id says nothing about a repository. But the *row* does — a plan carries
+    its scope and an item carries its own — so a claim on the plan for
+    ``prisonblues/quarterback`` **is** a claim in that repo, and reporting it as
+    ``unattributed`` made ``held`` false for an agent holding the plan for the
+    very repo it was asking about. Which is the one thing this endpoint exists to
+    get right: #172's whole design routes the fuzzy case through a plan claim, so
+    a gate blind to plan claims is blind to the intake the issue added.
+
+    A NULL scope stays unattributed, because a fleet-scoped plan genuinely does
+    not say which repo — that is the open question #172 closes on, and this
+    answers it the way the schema does rather than guessing from the items.
+
+    One statement per table, keyed on the ids actually present, so the endpoint
+    stays two queries whatever the row count.
+    """
+    wanted: set[tuple[str, str]] = set()
+    for c in rows:
+        obj = board_object(c.kind, c.key)
+        if obj is not None:
+            wanted.add(obj)
+    if not wanted:
+        return {}
+    out: dict[tuple[str, str], str] = {}
+    for prefix, model in (("plan", Plan), ("item", PlanItem)):
+        ids = [i for kind, i in wanted if kind == prefix]
+        if not ids:
+            continue
+        for row_id, scope in await session.execute(
+            select(model.id, model.repo).where(model.id.in_(ids))
+        ):
+            if not scope:
+                continue
+            try:
+                # `_norm_scope` lower-cases on the way in, so this normally
+                # changes nothing; it runs anyway because a row written before it
+                # did must not silently compare unequal to the `repo` query
+                # parameter, which IS canonicalised.
+                out[(prefix, str(row_id))] = canonical_repo(scope)
+            except BadRef:
+                # A scope that is not a repo shape this board keys. Left out, so
+                # the claim reads as unattributed rather than attributed to a
+                # repo no caller can name in a query.
+                continue
+    return out
 
 
 @router.get("/claim/held")
@@ -641,8 +757,10 @@ async def held_claims(
     repo: str | None = Query(default=None, description="`owner/name`; omit for every repo"),
     holder_q: str | None = Query(default=None, alias="holder",
                                  description="whose claims; defaults to yours"),
-    session_q: str | None = Query(default=None, alias="session",
-                                  description="narrow to one session's claims"),
+    session_q: str | None = Query(
+        default=None, alias="session",
+        description="narrow to one session's claims — plus any claim that named "
+                    "no session, which belongs to the machine"),
     caller: str = Depends(identify),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
@@ -658,11 +776,45 @@ async def held_claims(
 
     The repo attribution is :func:`app.claimkey.repo_of`, so it is read off the
     key rather than from a column a caller fills in — the same rule that makes the
-    key itself derived. A key whose repo cannot be read (a plan id, or the open
-    free-text namespace) is reported under ``unattributed`` rather than dropped:
-    "I am holding something, and it does not say which repo" is a different answer
-    from "I am holding nothing", and a gate that collapsed them would stop an
-    agent that is demonstrably working.
+    key itself derived. A plan or item key names a board object rather than a
+    repo, so the join is finished against the row (:func:`_board_scopes`); a key
+    that still names no repo after that is reported under ``unattributed`` rather
+    than dropped, because "I am holding something, and it does not say which
+    repo" is a different answer from "I am holding nothing", and a gate that
+    collapsed them would stop an agent that is demonstrably working.
+
+    **Whose claims, and the rule is this module's own.** This asked for
+    ``holder == whose`` — plain equality, and the only ownership test on this
+    table that did. Every other one goes through :func:`same_machine`
+    (:func:`may_mutate`, ``_may_renew``, the plan router's ``_is_mine``), because
+    the name half of an identity is *board-allocated per* ``X-Agent-Key`` and is
+    recycled. The two clients that make up this feature do not send the same
+    headers: the MCP server sends ``X-Agent-Key``, so an agent claiming through
+    the ``claim`` tool writes under ``zeus/amber-otter``, while the harness CLIs
+    send only ``Authorization``, so ``qb-claim`` — and therefore
+    ``create-worktree`` — writes under the bare ``zeus``. Under plain equality
+    each was invisible to the other: the pickup gate reported ``held: false`` for
+    an agent that had just claimed through the tool, and the tool reported
+    ``held: false`` for the claim the checkout took on its behalf. The suite could
+    not see it because ``tests/conftest.py`` sends no key, so writer and reader
+    were always the same bare string.
+
+    So the holder filter is :func:`app.identity.address_clause`, the same
+    machine-scoped, alias-aware clause ``GET /active`` already uses on
+    ``Lease.holder``: it matches the machine root, this agent's name and its
+    permanent key form — and *not* a co-tenant's name. An agent that comes back
+    under a different name therefore still sees everything the machine holds and
+    everything its key answers to; a claim written under a name it has since lost
+    is the one case the widening does not recover, and it is the same gap
+    :func:`app.identity.resolve_alias` documents for a retired agent's mail.
+
+    **And the session is what separates co-tenants**, exactly as it does for a
+    mutation: a claim that named a session belongs to that session, and a claim
+    that named none falls back to the machine because there is nothing finer to
+    compare. ``may_mutate``'s rule, read as a filter. That is what lets the
+    checkout claim work: ``create-worktree`` records no session — the agent that
+    will use the tree does not exist yet — so the claim belongs to the box until
+    somebody picks it up, and the session that picks it up can see it.
     """
     if repo is not None:
         try:
@@ -674,20 +826,25 @@ async def held_claims(
     # have to name itself — that is the client-supplied-identity mistake
     # `identify` exists to avoid, and it is how a co-tenant's claim would come
     # back as your own.
-    whose = holder_q or caller
+    whose, aliases = await resolve_alias(session, holder_q or caller)
     stmt = select(ResourceLease).where(
-        ResourceLease.holder == whose,
+        address_clause(ResourceLease.holder, whose, aliases),
         ResourceLease.released_at.is_(None),
         ResourceLease.expires_at > now,
     )
     wanted_session = clean_session(session_q)
     if wanted_session:
-        stmt = stmt.where(ResourceLease.session == wanted_session)
+        stmt = stmt.where(or_(ResourceLease.session == wanted_session,
+                             ResourceLease.session.is_(None)))
     rows = list(await session.scalars(stmt.order_by(ResourceLease.acquired_at.desc())))
+    scopes = await _board_scopes(session, rows)
 
     in_repo, unattributed = [], []
     for c in rows:
         where = repo_of(c.kind, c.key)
+        if where is None:
+            obj = board_object(c.kind, c.key)
+            where = scopes.get(obj) if obj is not None else None
         if where is None:
             unattributed.append(claim_view(c))
         elif repo is None or where == repo:

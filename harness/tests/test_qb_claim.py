@@ -37,7 +37,8 @@ CLAIM, CLAIMED = BIN / "qb-claim", BIN / "qb-claimed"
 
 
 def run(script: Path, *args, board: str | None = None, repo: str = "acme/widget",
-        answer: dict | None = None, status: int = 200, tmp_path: Path = None):
+        answer: dict | None = None, status: int = 200,
+        replies: list | None = None, tmp_path: Path = None):
     """Run one of the CLIs against a stubbed board and a stubbed repo lookup.
 
     Both are stubbed by running a COPY of the script beside a stub `qbdata.py`.
@@ -47,6 +48,13 @@ def run(script: Path, *args, board: str | None = None, repo: str = "acme/widget"
     Doubling the module rather than standing up a board keeps this suite in the
     harness job, which has no database and no services: the same reason every
     other test here doubles `sh`.
+
+    `replies` scripts CONSECUTIVE answers — `[(status, body), …]` — for the one
+    path that asks twice: a contended 409 is a lost race with no holder, which a
+    second POST normally wins, so "the retry takes it" and "still contended" are
+    different outcomes and both have to be reachable. The last reply repeats, so a
+    single `status`/`answer` still describes a board that keeps saying the same
+    thing however often it is asked.
     """
     stub = tmp_path / "stub"
     stub.mkdir(exist_ok=True)
@@ -57,8 +65,8 @@ import json, urllib.error, io
 
 REPO = {repo!r}
 BOARD = {board!r}
-ANSWER = {json.dumps(answer)!r}
-STATUS = {status}
+REPLIES = json.loads({json.dumps(replies or [(status, answer)])!r})
+CALLS = []
 
 
 def repo_slug(path="."):
@@ -74,10 +82,13 @@ class _Client:
 
 
 def _answer():
-    if STATUS != 200:
+    status, body = REPLIES[min(len(CALLS), len(REPLIES) - 1)]
+    CALLS.append(status)
+    if status != 200:
         raise urllib.error.HTTPError(
-            "http://board/x", STATUS, "nope", {{}}, io.BytesIO(ANSWER.encode()))
-    return json.loads(ANSWER)
+            "http://board/x", status, "nope", {{}},
+            io.BytesIO(json.dumps(body).encode()))
+    return body
 
 
 def board_client():
@@ -192,6 +203,67 @@ def test_any_other_http_answer_is_unknown_not_a_conflict(tmp_path):
         got = run(CLAIM, "issue", "1", board="http://b", status=status,
                   answer={"detail": "nope"}, tmp_path=tmp_path)
         assert got.returncode == 2, f"HTTP {status} was not 'unknown'"
+
+
+@pytest.mark.parametrize("status", [401, 403, 422])
+def test_a_definite_refusal_exits_two_but_is_not_reported_as_an_outage(status, tmp_path):
+    """The exit code cannot tell these apart from a dead board — there are three
+    codes and 1 names a holder — so the TEXT has to. It said "the board refused the
+    claim", `create-worktree` printed "a board outage must not stop a checkout" over
+    it, and a rotated token then read as something to wait out."""
+    got = run(CLAIM, "issue", "1", board="http://b", status=status,
+              answer={"detail": "no"}, tmp_path=tmp_path)
+    assert got.returncode == 2
+    assert "not an outage" in got.stderr
+    assert "will refuse it again" in got.stderr
+
+
+def test_a_definite_refusal_prints_the_boards_sentence_not_a_dict_repr(tmp_path):
+    """A 422 carries the reason a ref could not be keyed, which is the whole of what
+    the operator needs; printing the envelope round it hides it in a python repr."""
+    got = run(CLAIM, "issue", "1", board="http://b", status=422,
+              answer={"detail": {"error": "repo must be `owner/name`"}},
+              tmp_path=tmp_path)
+    assert got.returncode == 2
+    assert "repo must be `owner/name`" in got.stderr
+    assert "{'error'" not in got.stderr
+
+
+def test_a_contended_409_is_retried_rather_than_reported_as_held(tmp_path):
+    """`acquire` answers 409 twice, and only one of them has a holder in it. The
+    contended one is the losing half of an insert race whose winner had already
+    gone — nobody holds the key, so the race is over and asking again wins it."""
+    taken = {"claim_id": "abc", "kind": "work", "key": "acme/widget#1",
+             "expires": "t", "renewed": False}
+    got = run(CLAIM, "issue", "1", board="http://b", tmp_path=tmp_path, replies=[
+        (409, {"detail": {"error": "claim contended; try again",
+                          "kind": "work", "key": "acme/widget#1"}}),
+        (200, taken)])
+    assert got.returncode == 0, got.stderr
+    assert got.stdout.strip() == "abc"
+
+
+def test_a_contention_that_survives_the_retry_is_unknown_not_held(tmp_path):
+    """Read as HELD it became a `create-worktree` `die` telling the operator to go
+    and talk to a holder that does not exist. It is not 0 either — nobody holds it
+    and neither do we — so `--require-claim` still refuses."""
+    got = run(CLAIM, "issue", "1", board="http://b", status=409,
+              answer={"detail": {"error": "claim contended; try again",
+                                 "kind": "work", "key": "acme/widget#1"}},
+              tmp_path=tmp_path)
+    assert got.returncode == 2, "a 409 with nobody in it was read as a holder"
+    assert "contended" in got.stderr
+    assert "held:" not in got.stderr, "a phantom holder is worse than an unknown"
+
+
+def test_a_409_the_tool_cannot_parse_invents_no_holder(tmp_path):
+    """The holder is what makes a refusal actionable, and a body that carries none —
+    a proxy's HTML, a reason string — used to print "somebody else has it" anyway,
+    which is a peer to go and find that was never there."""
+    got = run(CLAIM, "issue", "1", board="http://b", status=409,
+              answer="503 from something in front of the board", tmp_path=tmp_path)
+    assert got.returncode == 2
+    assert "somebody else" not in got.stderr
 
 
 def test_a_repoless_kind_needs_no_remote(tmp_path):

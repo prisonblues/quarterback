@@ -23,6 +23,17 @@ The repo comes from the checkout's origin remote and the answer comes from the
 board's own `/claim/held`. Neither is worked out here: the repo a key belongs to
 is derived from the key server-side, and a fourth re-implementation of that join
 is what #172 is about.
+
+**`--session` defaults to the environment on purpose, and it is not a narrowing
+that can hide your own work.** This file sends only `Authorization`, so the board
+sees the bare machine — which on a box running several agents is every one of
+them. The session is the only thing that tells them apart, so defaulting to
+`$CLAUDE_CODE_SESSION_ID` is what stops a co-tenant's claim reading as yours.
+What it must not do is hide a claim taken *for* you: `/claim/held` therefore
+matches this session **plus every claim that named none**, because a claim with no
+session belongs to the machine (`may_mutate` says so in as many words) and the
+checkout claim `create-worktree` takes before the tree exists is exactly one of
+those. Pass `--session ''` to see everything the machine holds.
 """
 
 from __future__ import annotations

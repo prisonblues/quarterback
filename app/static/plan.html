@@ -191,15 +191,26 @@ function render(){
 
   listEl.innerHTML = "";
   for(const it of shown) listEl.appendChild(row(it, s));
+  // `covered` is in the header for the same reason it is in `counts` at all: an item
+  // inside a plan somebody ELSE holds is why `next` skipped it, and a header that
+  // named only claims and blockers said "2 open · 0 held · 0 waiting" directly above
+  // a panel saying everything open was claimed or waiting. Held item-by-item and held
+  // by the plan over it are two different things to go and ask about, so they are two
+  // counts — and the per-row chip explains one row, not the two places a reader looks
+  // first.
   countsEl.textContent = `${counts.open||0} open · ${counts.claimed||0} held · ` +
-    `${counts.blocked||0} waiting · ${counts.stale||0} stale`;
+    `${counts.covered||0} in a held plan · ${counts.blocked||0} waiting · ` +
+    `${counts.stale||0} stale`;
   nextEl.innerHTML = next
     ? `<div class="next"><div class="lbl">next</div><div>${refHtml(next)} ${
         esc(next.title)}</div>${next.note?`<div class="note">${esc(next.note)}</div>`:""}</div>`
     // Keyed off the same counts as the header: "everything open is spoken for" is only
-    // true if something is open at all — a page of history alone gets no panel.
+    // true if something is open at all — a page of history alone gets no panel. And it
+    // names all three reasons `next` skips an item, because a reader whose whole plan
+    // is covered by one claim would otherwise be told it is "claimed or waiting" with
+    // nothing on the page claimed and nothing waiting.
     : (counts.open ? `<div class="next" style="border-color:#5c4a1e"><div class="lbl" style="color:#f0b429">next</div>
-        <div>nothing is free — everything open is claimed or waiting</div></div>` : "");
+        <div>nothing is free — everything open is claimed, waiting, or inside a plan somebody else holds</div></div>` : "");
   emptyEl.style.display = shown.length ? "none" : "block";
 }
 

@@ -199,13 +199,23 @@ POST  /claim/renew       { claim_id, session? }        (never revives a lapsed c
 POST  /claim/release     { claim_id, session? }        (idempotent; the row is history)
 GET   /claims            ?kind=&key=&holder=&include_released=&limit=
                           or ?ref_kind=&ref_value=&repo= to have the key derived, which
-                          is the only way a lookup cannot miss a claim by spelling it
+                          is the only way a lookup cannot miss a claim by spelling it.
+                          The two spellings are exclusive, as they are on POST /claim.
+                          A kind on its own is folded too (`issue`->`work`), and the
+                          fold is reported: kinds no longer tell an issue from a PR
 GET   /claim/held        ?repo=&holder=&session=   -> {held: bool, claims, unattributed}
                           the deterministic yes/no a pickup gate reads. `held` is one
                           boolean rather than a list three callers each re-derive the
-                          repo from; a key that names no repo (a plan, the free-text
-                          namespace) lands in `unattributed`, because "working, and the
-                          key does not say where" is not "idle"
+                          repo from; a plan or item claim is attributed by the row's own
+                          scope, and a key that still names no repo (a fleet plan, the
+                          free-text namespace) lands in `unattributed`, because
+                          "working, and the key does not say where" is not "idle".
+                          Whose claims is the machine-scoped, alias-aware rule the rest
+                          of the table already authorises with — the MCP client sends
+                          X-Agent-Key and the harness CLIs do not, so an exact holder
+                          match made each half invisible to the other. `session=`
+                          narrows to one session plus the claims that named none, which
+                          belong to the machine
 
 # the plan: what is next, in what order, and who has it (v2.39; plans are rows in #172)
 GET   /plan              ?repo=&plan=&include_done=&exact=&limit=200&session=

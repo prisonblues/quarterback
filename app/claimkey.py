@@ -25,6 +25,13 @@ nothing here should pretend to understand it. Canonicalisation that guessed at a
 open domain is the mistake #148's own fix was reverted for; this recognises a
 closed set of shapes and leaves the rest alone.
 
+What is deliberately **refused** rather than passed through: a kind this board
+used to key and no longer does (:data:`RETIRED_KINDS`). Passing an unrecognised
+kind through is right for a namespace nobody here owns, and wrong for one that
+was deleted on purpose — ``kind='release'`` went on being writable after its
+allocator, its endpoints and its tools were removed, which left the one path
+still able to create the stale rows the deletion existed to stop.
+
 ## Worktree blindness is the point
 
 Every key here names a **repo-global** resource: an issue, a PR, a branch, a plan.
@@ -128,6 +135,30 @@ _UUID_KEY = re.compile(r"\A(?P<prefix>plan|item):(?P<id>[0-9a-fA-F-]{32,36})\Z")
 #: this is a closed set and adding to it is a code change, not a caller's choice.
 REF_KINDS = ("issue", "pr", "branch", "plan", "item")
 
+#: Kinds this board used to key and deliberately no longer does, with what to do
+#: instead. **Not the same thing as a kind it does not recognise.** The open
+#: namespace above passes through untouched because the board has no business
+#: guessing at ``prisonblues/lexray:serving-row:32022R2554``; a retired kind is
+#: one the board *did* own, whose writer was deleted on purpose, and whose rows
+#: are the thing the deletion was for.
+#:
+#: ``release`` is the one. #172 deleted the allocator because ``release_stamp.py``
+#: has taken ``max+1`` at land since v2.34 — nine releases in a day, no
+#: collisions — while the allocator's own rows went stale for every open PR. The
+#: argument is that *a stale record is worse than none: it is a second answer to
+#: a question that has one.* A path that still writes new ones concedes the
+#: argument. The endpoints went; ``POST /claim {kind: 'release'}`` did not, and
+#: canonicalising an unrecognised kind by passing it through was what carried it.
+RETIRED_KINDS: dict[str, str] = {
+    "release": (
+        "`release` is not a kind this board keys any more (#172). The allocator "
+        "was deleted because release_stamp.py takes max+1 from the ref being "
+        "merged into at land, and the allocator's records went stale for every "
+        "PR that stayed open — a stale record is a second answer to a question "
+        "that has one. Stamp the version at land instead; nothing needs claiming."
+    ),
+}
+
 
 class BadRef(ValueError):
     """A ref that cannot be turned into a key. Callers render this as a 422."""
@@ -176,18 +207,63 @@ def _uuid(value: object) -> str:
         raise BadRef(f"{value!r} is not an id") from e
 
 
+#: The characters ``git check-ref-format`` refuses outright in a ref name: ASCII
+#: control characters, space, and ``~ ^ : ? * [ \`` and DEL. Enumerated rather
+#: than guessed at, and safe to enumerate because — unlike the repo-spelling
+#: domain #148 deleted a parser for — this set is *closed by git*: a published
+#: rule about a handful of characters, not an open space of remote spellings.
+_BRANCH_BAD_CHARS = frozenset(" ~^:?*[\\\x7f") | {chr(c) for c in range(0x20)}
+
+#: The sequence rules from the same page, as (test, why) pairs.
+_BRANCH_BAD_SEQUENCES = (
+    ("..", "`..` is git's range operator"),
+    ("@{", "`@{` is git's reflog syntax"),
+    ("//", "an empty path component"),
+)
+
+
 def _branch(value: object) -> str:
-    """A branch name, as git would accept it — no whitespace, and not empty.
+    """A branch name, as git would accept it — :manpage:`git-check-ref-format`.
 
     Case is NOT folded. Repository names are case-insensitive on GitHub and
     branch names are not: ``main`` and ``Main`` are two refs, and folding them
     would let an agent landing one hold the claim on the other.
+
+    **The shape rule is git's, and it has to be more than "no whitespace."** This
+    used to reject whitespace alone while its own docstring claimed to reject
+    git-reserved characters, so ``prisonblues/quarterback:feat~1`` and
+    ``…:refs/heads:x`` were claimable merge keys naming branches that cannot
+    exist. A coordination key for a nonexistent ref is the #172 defect in its
+    purest form: a claim two agents can never contend over, sitting in the table
+    that exists to make contention visible. And the ``:`` case is worse than
+    merely useless — ``_MERGE_KEY`` splits on the first colon after the repo, so
+    a branch spelled with one round-trips to a *different* branch name.
+
+    This is a rejection, never a repair: a value that is not a branch name is
+    refused rather than mangled into one, for the reason :data:`REPO_RE` gives.
     """
     if not isinstance(value, str):
         raise BadRef("a branch is a string")
     branch = value.strip()
-    if not branch or any(c.isspace() for c in branch):
-        raise BadRef("a branch name cannot be blank or contain whitespace")
+    if not branch:
+        raise BadRef("a branch name cannot be blank")
+    bad = sorted(c for c in set(branch) if c in _BRANCH_BAD_CHARS)
+    if bad:
+        raise BadRef(
+            f"{branch!r} is not a branch name git would accept: it contains "
+            f"{', '.join(repr(c) for c in bad)}, which `git check-ref-format` "
+            f"refuses. A claim on a ref that cannot exist is a key nobody can "
+            f"contend over.")
+    for sequence, why in _BRANCH_BAD_SEQUENCES:
+        if sequence in branch:
+            raise BadRef(f"{branch!r} is not a branch name git would accept: {why}")
+    if branch == "@" or branch.startswith("/") or branch.endswith(("/", ".", ".lock")):
+        raise BadRef(f"{branch!r} is not a branch name git would accept")
+    for part in branch.split("/"):
+        if part.startswith(".") or part.endswith(".lock"):
+            raise BadRef(
+                f"{branch!r} is not a branch name git would accept: no component "
+                f"may start with `.` or end with `.lock`")
     return branch
 
 
@@ -221,6 +297,59 @@ def derive(ref_kind: str, *, repo: str | None = None, value: object = None) -> t
     raise BadRef(f"{ref_kind!r} is not a resource this board keys: {', '.join(REF_KINDS)}")
 
 
+def _fold(kind: str, key: str) -> tuple[str, str]:
+    """:func:`canonical` without the retired-kind refusal. **Never raises.**
+
+    Split out because the read paths need a total function. ``repo_of`` is called
+    once per row of ``GET /claim/held``, over rows that are *already stored* — so
+    it has to have an answer for every one of them, including a legacy ``release``
+    row and including a key whose shape matched but whose parts do not validate.
+    """
+    kind = (kind or "").strip()
+    key = (key or "").strip()
+    lowered = kind.lower()
+
+    try:
+        if lowered in PR_KINDS:
+            # A PR spelled with the issue sigil is still a PR: the kind is the only
+            # thing that can tell them apart in a composed key, so it decides.
+            m = _ISSUE_KEY.match(key) or _PR_KEY.match(key)
+            if m:
+                return derive("pr", repo=m.group("repo"), value=m.group("number"))
+        if lowered in WORK_KINDS:
+            m = _PR_KEY.match(key)
+            if m:
+                return derive("pr", repo=m.group("repo"), value=m.group("number"))
+            m = _ISSUE_KEY.match(key)
+            if m:
+                return derive("issue", repo=m.group("repo"), value=m.group("number"))
+            m = _UUID_KEY.match(key)
+            if m:
+                return derive(m.group("prefix"), value=m.group("id"))
+        if lowered in MERGE_KINDS:
+            m = _MERGE_KEY.match(key)
+            if m:
+                return derive("branch", repo=m.group("repo"), value=m.group("branch"))
+    except BadRef:
+        # **Matching a shape is not being one.** The regexes above are
+        # deliberately looser than the validators :func:`derive` then applies:
+        # ``_REPO_GROUP`` admits ``acme/foo.git`` where ``REPO_RE`` refuses the
+        # ``.git`` suffix, ``_ISSUE_KEY`` admits ``#0`` where ``_number`` starts
+        # at 1, and ``_UUID_KEY`` admits 32-36 characters of hex-and-dashes that
+        # are not a uuid. Rows of exactly that shape are already on the board —
+        # ``_norm_scope`` used only to lower-case a repo, so a plan item scoped
+        # ``acme/foo.git`` stored the key ``acme/foo.git#12``.
+        #
+        # So the fallthrough is the module's own rule, not a new one: a key this
+        # board cannot key is left exactly as it arrived. The alternative was a
+        # ValueError out of a read, which turned one legacy row into a 500 for
+        # the whole of ``GET /claim/held`` and for ``GET /claims?kind=work&key=…``.
+        return kind, key
+    # Not a shape this board keys. Left exactly as it arrived — see the module
+    # docstring on why an open domain is not canonicalised.
+    return kind, key
+
+
 def canonical(kind: str, key: str) -> tuple[str, str]:
     """Fold a caller-COMPOSED pair onto the derived one. Unrecognised pairs pass through.
 
@@ -239,34 +368,61 @@ def canonical(kind: str, key: str) -> tuple[str, str]:
     the real board claim on a database row would have been rewritten into a claim
     on a branch called ``serving-row:32022R2554``. Only :data:`MERGE_KINDS` fold
     onto :data:`MERGE`.
-    """
-    kind = (kind or "").strip()
-    key = (key or "").strip()
-    lowered = kind.lower()
 
-    if lowered in PR_KINDS:
-        # A PR spelled with the issue sigil is still a PR: the kind is the only
-        # thing that can tell them apart in a composed key, so it decides.
-        m = _ISSUE_KEY.match(key) or _PR_KEY.match(key)
-        if m:
-            return derive("pr", repo=m.group("repo"), value=m.group("number"))
-    if lowered in WORK_KINDS:
-        m = _PR_KEY.match(key)
-        if m:
-            return derive("pr", repo=m.group("repo"), value=m.group("number"))
-        m = _ISSUE_KEY.match(key)
-        if m:
-            return derive("issue", repo=m.group("repo"), value=m.group("number"))
-        m = _UUID_KEY.match(key)
-        if m:
-            return derive(m.group("prefix"), value=m.group("id"))
+    Raises :class:`BadRef` for a kind in :data:`RETIRED_KINDS`. This is the one
+    place a *write* can be refused for its kind, and it is here rather than in
+    front of ``POST /claim`` for the reason ``ClaimRequest`` canonicalises here:
+    a guard in front of one caller is a guard the fourth caller does not have,
+    which is exactly what the deleted ``RESERVED_KINDS`` was.
+    """
+    lowered = (kind or "").strip().lower()
+    if lowered in RETIRED_KINDS:
+        raise BadRef(RETIRED_KINDS[lowered])
+    return _fold(kind, key)
+
+
+def canonical_kind(kind: str) -> str:
+    """The kind a resource of this sort is STORED under — for a kind-only filter.
+
+    ``canonical`` needs a key to work with, because the key's shape is what
+    carries the issue/PR/plan distinction now. A caller narrowing by kind alone
+    has no key to offer, and every spelling the old vocabulary trained agents to
+    use (``issue``, ``task``, ``item``, ``epic``, ``pr``, ``branch``) is now
+    *stored* as ``work`` or ``merge`` — so an un-folded kind filter answered
+    ``{"claims": []}`` about resources that were held. That is #172's own defect
+    reproduced in the read path: a lookup missing a row that is right there.
+
+    >>> canonical_kind("issue"), canonical_kind("pr"), canonical_kind("branch")
+    ('work', 'work', 'merge')
+
+    Coarser than a key lookup on purpose, and it cannot be otherwise: ``pr`` and
+    ``issue`` share one kind by design, so a kind-only filter can no longer tell
+    them apart. Callers say so to whoever asked (``note_on_kind``) rather than
+    quietly returning either too much or nothing at all.
+    """
+    lowered = (kind or "").strip().lower()
+    if lowered in RETIRED_KINDS:
+        raise BadRef(RETIRED_KINDS[lowered])
+    if lowered in WORK_KINDS or lowered in PR_KINDS:
+        return WORK
     if lowered in MERGE_KINDS:
-        m = _MERGE_KEY.match(key)
-        if m:
-            return derive("branch", repo=m.group("repo"), value=m.group("branch"))
-    # Not a shape this board keys. Left exactly as it arrived — see the module
-    # docstring on why an open domain is not canonicalised.
-    return kind, key
+        return MERGE
+    return (kind or "").strip()
+
+
+def board_object(kind: str, key: str) -> tuple[str, str] | None:
+    """``("plan"|"item", id)`` for a board-object key, else None. Never raises.
+
+    :func:`repo_of` cannot attribute these and is right not to — the key is a
+    board id and says nothing about a repository. The *row* does, though, so a
+    caller that can reach the table can finish the join; this is how it asks
+    which row. See ``GET /claim/held``.
+    """
+    canon_kind, canon_key = _fold(kind, key)
+    if canon_kind != WORK:
+        return None
+    m = _UUID_KEY.match(canon_key)
+    return (m.group("prefix"), m.group("id")) if m else None
 
 
 def repo_of(kind: str, key: str) -> str | None:
@@ -279,15 +435,27 @@ def repo_of(kind: str, key: str) -> str | None:
 
     A plan or item key returns None — those are board objects and may span repos
     (the open question at the end of #172). A caller asking "am I holding
-    anything here" therefore gets a truthful "not via this key", and the plan
-    router answers the plan-scoped question itself.
+    anything here" therefore gets a truthful "not via this key", and finishes the
+    join against the row itself via :func:`board_object`.
+
+    **Total, and it has to be**: it runs once per row over rows that already
+    exist, so a legacy or malformed key is an answer of None rather than an
+    exception out of a read.
     """
-    canon_kind, canon_key = canonical(kind, key)
+    canon_kind, canon_key = _fold(kind, key)
     patterns = ((_ISSUE_KEY, _PR_KEY) if canon_kind == WORK
                 else (_MERGE_KEY,) if canon_kind == MERGE
                 else ())
     for pattern in patterns:
         m = pattern.match(canon_key)
         if m:
-            return m.group("repo").lower()
+            try:
+                return canonical_repo(m.group("repo"))
+            except BadRef:
+                # The key names something in the repo position that is not a repo
+                # this board keys (``acme/foo.git#12``). "The key does not say
+                # where" is the truthful answer, and it is the one `unattributed`
+                # exists for — better than attributing a claim to a repo no
+                # caller can ever name in a query.
+                return None
     return None

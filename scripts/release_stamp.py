@@ -51,13 +51,19 @@ was ever written in terms of the number — that is what "cheap to redo" actuall
 it is worth more than an unstamp command that would have to guess which of two identical
 headings belongs to you.
 
-**This is not an allocator and deliberately does not become one.** #46/#99's
-`POST /release/claim` records that a caller INTENDS to take a number; it is an
-announcement, not a reservation, and this tool neither reads it nor honours it. A branch
-holding a claim for v2.34 gets no protection here: the next `apply` on any branch stamps
-v2.34 too, because a stamped number is only ever "the next one free at the ref I merged
-into", which is a question a git ref answers on its own. Announce a claim if it helps a
-human coordinate; do not rely on it to keep a number free.
+**This is not an allocator, and since #172 there is no other one.** #46/#99's
+`POST /release/claim` recorded that a caller INTENDED to take a number: an announcement,
+not a reservation, which this tool never read and never honoured. A branch holding a
+claim for v2.34 got no protection here — the next `apply` on any branch stamped v2.34
+too, because a stamped number is only ever "the next one free at the ref I merged into",
+which is a question a git ref answers on its own.
+
+So the allocator is deleted: `POST /release/claim`, `POST /release/reclaim`,
+`GET /releases`, their MCP tools and the `kind='release'` claim underneath them are all
+gone, and this file is the whole mechanism. A namespace nobody claims in does not need
+an allocator, and the rows it did have — one going stale for every PR still open — were
+a second answer to a question that has one. There is nothing to announce and nothing to
+opt into: write the placeholder, and `apply` at land.
 
 ## What counts as a placeholder
 

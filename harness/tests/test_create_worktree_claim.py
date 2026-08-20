@@ -31,6 +31,7 @@ nobody runs — the rule `test_create_worktree_rerere.py` and
 Run: pytest harness/tests
 """
 
+import json
 import os
 import shutil
 import subprocess
@@ -69,24 +70,34 @@ die() { echo "Error: $1" >&2; exit 1; }
 
 
 def run_stanza(branch: str, *, claim="true", require="false", ttl="60",
-              stub: str | None = None, tmp_path: Path) -> subprocess.CompletedProcess:
+              stub: str | None = None, py: str | None = None, after: str = "",
+              tmp_path: Path) -> subprocess.CompletedProcess:
     """Run `claim_the_branch` with a stub `qb-claim` of the caller's choosing.
 
     `stub=None` means no qb-claim on PATH at all, which is a real deployment
     state (a host with the board tooling absent) and one of the "cannot tell"
     cases the policy is about.
+
+    `py` stubs the `python3` the rollback releases THROUGH, and `after` is script
+    run once the claim has been taken — which is where the rest of the checkout
+    would be, and therefore where its failure has to be simulated. The EXIT trap
+    fires either way, so a test that passes neither is asserting that nothing was
+    released, which is also a thing worth asserting.
     """
     bindir = tmp_path / "bin"
     bindir.mkdir(exist_ok=True)
-    if stub is not None:
-        fake = bindir / "qb-claim"
-        fake.write_text("#!/usr/bin/env bash\n" + stub + "\n")
+    for name, body in (("qb-claim", stub), ("python3", py)):
+        if body is None:
+            continue
+        fake = bindir / name
+        fake.write_text("#!/usr/bin/env bash\n" + body + "\n")
         fake.chmod(0o755)
     script = (PRELUDE
               + f'CLAIM={claim}\nREQUIRE_CLAIM={require}\nCLAIM_TTL={ttl}\n'
               + f'MAIN_REPO={tmp_path}\n'
               + claim_block()
-              + f'\nclaim_the_branch {branch!r}\n')
+              + f'\nclaim_the_branch {branch!r}\n'
+              + after + "\n")
     # PATH is the stub directory plus bash's OWN directory and nothing else. Not
     # the inherited PATH: the `stub=None` case has to mean "no qb-claim anywhere",
     # and on a machine where the harness is installed the real one is on PATH —
@@ -210,3 +221,226 @@ def test_the_flags_are_documented_in_the_usage_header(flag):
     src = SCRIPT.read_text()
     header = src.split("# ============================================", 1)[0]
     assert flag in header, f"{flag} is not in the usage header"
+
+
+# --------------------------------------- the session the claim is stamped with
+
+def test_the_checkout_claim_records_NO_session(tmp_path):
+    """Round 2's F04. `qb-claim` defaults `--session` to $CLAUDE_CODE_SESSION_ID,
+    which here is the session of whoever RAN create-worktree — a parent agent's,
+    or nothing at all from a human shell. The agent that will work in this tree
+    has a different session and does not exist yet, so stamping the creating one
+    mis-attributes the claim twice over: `/claim/held` narrows on the session, so
+    the pickup gate this exists to feed read the claim as somebody else's and
+    reported the new worktree free; and `may_mutate` requires a recorded session
+    to match, so the worktree's own agent got a 403 renewing or releasing its own
+    checkout claim.
+
+    A claim that names no session falls back to the machine, which is what a
+    checkout claim is: it belongs to the tree until somebody picks it up.
+    """
+    argv = tmp_path / "argv"
+    got = run_stanza("feat/issue-172", tmp_path=tmp_path,
+                     stub=f'printf "%s\\n" "$@" >{argv}; echo cid; exit 0',
+                     after="CLAIM_KEPT=true")
+    assert got.returncode == 0, got.stderr
+    lines = argv.read_text().split("\n")
+    assert "--session" in lines, f"the session was left to the environment: {lines}"
+    assert lines[lines.index("--session") + 1] == "", (
+        "the checkout stamped a session on a claim it does not own")
+    assert "--json" in lines, (
+        "the rollback reads `renewed` off the board's answer, so the claim has to be "
+        "taken with --json — otherwise stdout is a bare id and a renew looks like a take")
+
+
+def test_the_environments_session_is_not_inherited(tmp_path):
+    """The same property from the other side: even with a session id in the
+    environment — which is the normal state of every agent shell — the claim is
+    taken without one."""
+    argv = tmp_path / "argv"
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    fake = bindir / "qb-claim"
+    # A stub that behaves like the real default: fall back to the environment.
+    # argparse's own semantics: the environment supplies the DEFAULT, and any
+    # `--session` on the command line replaces it — including an empty one. A stub
+    # that fell back on empty would be testing itself rather than the stanza.
+    fake.write_text(
+        '#!/usr/bin/env bash\n'
+        'sess="${CLAUDE_CODE_SESSION_ID:-}"\n'
+        'while [[ $# -gt 0 ]]; do\n'
+        '  if [[ "$1" == "--session" ]]; then sess="$2"; shift 2; else shift; fi\n'
+        'done\n'
+        f'printf "%s" "$sess" >{argv}\n'
+        'echo \'{"claim_id":"cid"}\'\n')
+    fake.chmod(0o755)
+    script = (PRELUDE
+              + 'CLAIM=true\nREQUIRE_CLAIM=false\nCLAIM_TTL=60\n'
+              + f'MAIN_REPO={tmp_path}\n'
+              + claim_block()
+              + "\nclaim_the_branch 'feat/issue-172'\nCLAIM_KEPT=true\n")
+    got = subprocess.run(
+        [BASH, "-c", script], capture_output=True, text=True,
+        env={"PATH": f"{bindir}:{os.path.dirname(BASH)}", "HOME": str(tmp_path),
+             "CLAUDE_CODE_SESSION_ID": "the-parents-session"})
+    assert got.returncode == 0, got.stderr
+    assert argv.read_text() == "", (
+        "the parent's session id reached the claim, which is the F04 defect")
+
+
+# ------------------------------- and it is handed back if the tree never exists
+
+def test_a_failed_checkout_hands_the_claim_back(tmp_path):
+    """Round 2's F17. The claim is taken before `git worktree add` on purpose — a
+    refusal has then cost nothing. The inverse was not handled: the claim
+    succeeds, the tree does not (branch checked out elsewhere, disk full, a bad
+    base ref, a failing .env step), the script dies under `set -euo pipefail`, and
+    the issue stays held for CLAIM_TTL — 8h by default — by an agent that does not
+    exist. Worse than not claiming: the record reads as authoritative and there is
+    nobody to talk to."""
+    released = tmp_path / "released"
+    got = run_stanza("feat/issue-9", tmp_path=tmp_path,
+                     stub=f'echo \'{{"claim_id":"claim-abc"}}\'; exit 0',
+                     py=f'printf "%s" "$QB_CLAIM_ANSWER" >{released}; echo released; exit 0',
+                     after="false")
+    assert got.returncode != 0
+    assert released.exists(), "the claim was left held by a checkout that never happened"
+    assert "claim-abc" in released.read_text(), (
+        "the board's own answer is what the rollback acts on — capturing stdout is "
+        "the whole reason it is captured")
+    assert "claim released" in got.stderr
+
+
+def test_the_rollback_does_not_change_the_exit_status(tmp_path):
+    """A cleanup that rewrote the exit code would hide the real failure behind its
+    own success."""
+    got = run_stanza("feat/issue-9", tmp_path=tmp_path,
+                     stub=f'echo \'{{"claim_id":"claim-abc"}}\'; exit 0',
+                     py='echo released; exit 0', after="exit 7")
+    assert got.returncode == 7
+
+
+def test_a_completed_checkout_KEEPS_the_claim(tmp_path):
+    """Past the point the tree exists the claim belongs to something somebody can
+    work in or remove, and releasing it would be the opposite error."""
+    released = tmp_path / "released"
+    got = run_stanza("feat/issue-9", tmp_path=tmp_path,
+                     stub=f'echo \'{{"claim_id":"claim-abc"}}\'; exit 0',
+                     py=f'touch {released}; echo released; exit 0', after="CLAIM_KEPT=true")
+    assert got.returncode == 0, got.stderr
+    assert not released.exists(), "a successful checkout released its own claim"
+
+
+def test_a_refusal_releases_nothing(tmp_path):
+    """There is nothing to hand back: the 409 means somebody else holds it, and a
+    release attempt would be an attempt on their claim."""
+    released = tmp_path / "released"
+    got = run_stanza("feat/issue-9", tmp_path=tmp_path,
+                     stub='echo "held: zeus/thorn-spruce has it" >&2; exit 1',
+                     py=f'touch {released}; echo released; exit 0')
+    assert got.returncode != 0 and "already claimed" in got.stderr
+    assert not released.exists()
+
+
+def test_a_release_that_fails_says_what_to_release_by_hand(tmp_path):
+    """An unreachable board is the likeliest reason the checkout failed at all, so
+    the rollback is best-effort — and when it cannot run, the id it could not use
+    is the one thing the operator needs."""
+    got = run_stanza("feat/issue-9", tmp_path=tmp_path,
+                     stub=f'echo \'{{"claim_id":"claim-abc"}}\'; exit 0',
+                     py='exit 1', after="false")
+    assert got.returncode != 0
+    assert "claim NOT released" in got.stderr
+    assert "claim-abc" in got.stderr, (
+        "the board's answer was not printed, so nobody can act on it")
+
+
+def test_no_python3_is_not_a_crash(tmp_path):
+    """The release goes through qbdata's own client, so it needs an interpreter.
+    A host without one must still get its real error, not a second one from the
+    cleanup."""
+    got = run_stanza("feat/issue-9", tmp_path=tmp_path,
+                     stub=f'echo \'{{"claim_id":"claim-abc"}}\'; exit 0', after="false")
+    assert got.returncode != 0
+    assert "claim NOT released" in got.stderr
+
+
+def test_a_RENEWED_claim_is_not_handed_back(tmp_path):
+    """`qb-claim` exits 0 both for a claim it took and for one this machine already
+    held. Releasing the second would destroy a claim that existed before the run —
+    an agent that had #9 by hand, ran a checkout for it, and lost its claim to the
+    checkout's failure. The board's own `renewed` flag decides, which is why the
+    claim is taken with `--json`: grepping qb-claim's prose is the thing its
+    docstring says a caller should not have to do."""
+    released = tmp_path / "released"
+    got = run_stanza("feat/issue-9", tmp_path=tmp_path,
+                     stub='echo \'{"claim_id":"claim-abc","renewed":true}\'; exit 0',
+                     py=(f'if [[ "$QB_CLAIM_ANSWER" == *renewed* ]]; then '
+                         f'echo "left alone: already ours"; exit 0; fi; '
+                         f'touch {released}; echo released; exit 0'),
+                     after="false")
+    assert got.returncode != 0
+    assert not released.exists(), (
+        "a claim this machine already held was released by a failed checkout")
+    assert "left alone" in got.stderr
+
+
+def test_the_real_rollback_leaves_a_renewed_claim_alone(tmp_path):
+    """The same property through the REAL python the trap runs, not a stub of it:
+    a `renewed: true` answer must not reach `POST /claim/release` at all. The stub
+    here is a fake `qbdata` module, so importing it at all is the failure."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    (bindir / "qbdata.py").write_text(
+        "def board_client():\n"
+        f"    open({str(tmp_path / 'touched')!r}, 'w').close()\n"
+        "    raise AssertionError('the rollback tried to release a renewed claim')\n")
+    stub = bindir / "qb-claim"
+    stub.write_text('#!/usr/bin/env bash\necho \'{"claim_id":"c1","renewed":true}\'\n')
+    stub.chmod(0o755)
+    script = (PRELUDE
+              + 'CLAIM=true\nREQUIRE_CLAIM=false\nCLAIM_TTL=60\n'
+              + f'MAIN_REPO={tmp_path}\n'
+              + claim_block()
+              + "\nclaim_the_branch 'feat/issue-9'\nfalse\n")
+    got = subprocess.run([BASH, "-c", script], capture_output=True, text=True,
+                         env={"PATH": f"{bindir}:{os.path.dirname(BASH)}:/usr/bin:/bin",
+                              "HOME": str(tmp_path)})
+    assert got.returncode != 0
+    assert not (tmp_path / "touched").exists(), got.stderr
+    assert "left alone" in got.stderr, got.stderr
+
+
+def test_the_real_rollback_posts_the_release_through_qbdata(tmp_path):
+    """The release path of the same trap, through the real python: the claim_id off
+    the board's answer, posted to `/claim/release` via **qbdata's own client**. Not
+    a curl — the base URL, the token and its config precedence live in that module,
+    and a second implementation of "where is the board" is the class of defect #172
+    is about."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    (bindir / "qbdata.py").write_text(
+        "import json\n"
+        "class _C:\n"
+        "    def post(self, path, body):\n"
+        f"        open({str(tmp_path / 'posted')!r}, 'w').write(json.dumps([path, body]))\n"
+        "        return {}\n"
+        "def board_client():\n"
+        "    return _C(), None\n")
+    stub = bindir / "qb-claim"
+    stub.write_text('#!/usr/bin/env bash\necho \'{"claim_id":"c9"}\'\n')
+    stub.chmod(0o755)
+    script = (PRELUDE
+              + 'CLAIM=true\nREQUIRE_CLAIM=false\nCLAIM_TTL=60\n'
+              + f'MAIN_REPO={tmp_path}\n'
+              + claim_block()
+              + "\nclaim_the_branch 'feat/issue-9'\nfalse\n")
+    got = subprocess.run([BASH, "-c", script], capture_output=True, text=True,
+                         env={"PATH": f"{bindir}:{os.path.dirname(BASH)}:/usr/bin:/bin",
+                              "HOME": str(tmp_path)})
+    assert got.returncode != 0
+    assert (tmp_path / "posted").exists(), got.stderr
+    path, body = json.loads((tmp_path / "posted").read_text())
+    assert path == "/claim/release"
+    assert body == {"claim_id": "c9"}
+    assert "released" in got.stderr

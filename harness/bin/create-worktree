@@ -428,13 +428,81 @@ branch_issue() {
     [[ "$b" =~ (^|/)issue-([0-9]+)(-|$) ]] && printf '%s\n' "${BASH_REMATCH[2]}"
 }
 
+# What `claim_the_branch` took, so `claim_rollback` can hand it back.
+CLAIM_ANSWER=""      # the board's whole answer as JSON, empty if nothing was taken
+CLAIM_ISSUE=""       # which issue it was, for the message
+CLAIM_BIN=""         # the harness bin/ that holds qbdata.py, for the release
+CLAIM_KEPT=false     # true once the tree exists and the claim belongs to it
+
+# Give the claim back if the checkout never happened.
+#
+# `claim_the_branch` runs BEFORE `git worktree add` on purpose, and that is
+# right: a refusal has then cost nothing. The inverse was not handled. The claim
+# succeeds and then the tree does not — the branch is already checked out in
+# another worktree, the disk is full, `BASE_REF` is bad, one of the .env or
+# symlink steps fails — the script dies under `set -euo pipefail`, and issue #N
+# stays held for CLAIM_TTL (8h by default) by an agent that does not exist. The
+# next agent is refused for a working day over a checkout that never happened,
+# which is worse than not claiming at all: the record reads as authoritative and
+# there is nobody to go and talk to.
+#
+# The guard is `CLAIM_KEPT`, set once the worktree directory exists. Past that
+# point the claim belongs to a tree somebody can either work in or remove, and
+# releasing it would be the opposite error.
+#
+# **A RENEW is not released.** `qb-claim` exits 0 both for a claim it took and for
+# one this machine already held, and handing back the second would destroy a claim
+# that existed before this run — an agent that had #N by hand, ran a checkout for
+# it, and lost the claim to the checkout's failure. So the board's `renewed` flag
+# decides, which is why the claim is taken with `--json`: the alternative is
+# grepping qb-claim's prose, and its own docstring is that a caller should not
+# have to. This is the same rule the plan router applies after `acquire`.
+#
+# Released through qbdata's own client rather than a curl: the base URL, the
+# token and its config precedence live there, and a second implementation of
+# "where is the board" is the class of defect #172 is about. Best-effort by
+# construction — an unreachable board is the likeliest reason a checkout failed
+# at all, so this stays quiet, never changes the exit status, and says what is
+# left held when it cannot do the release itself.
+claim_rollback() {
+    local status=$?
+    [[ -n "$CLAIM_ANSWER" && "$CLAIM_KEPT" != true ]] || return "$status"
+    local answer="$CLAIM_ANSWER" said
+    CLAIM_ANSWER=""
+    if said=$(QB_CLAIM_ANSWER="$answer" QB_BIN_DIR="$CLAIM_BIN" python3 - <<'ROLLBACK'
+import json
+import os
+import sys
+
+sys.path.insert(0, os.environ["QB_BIN_DIR"])
+answer = json.loads(os.environ["QB_CLAIM_ANSWER"])
+if answer.get("renewed"):
+    # Ours before this run began. Releasing it would be the collateral damage
+    # this branch exists to avoid.
+    print("left alone: this machine already held it before the checkout ran")
+    raise SystemExit(0)
+import qbdata                                                     # noqa: E402
+client, _cfg = qbdata.board_client()
+client.post("/claim/release", {"claim_id": answer["claim_id"]})
+print("released: free again for the next agent")
+ROLLBACK
+    ); then
+        echo -e "  ${YELLOW}claim $said${NC} (issue #$CLAIM_ISSUE — the checkout failed)" >&2
+    else
+        echo -e "  ${YELLOW}claim NOT released:${NC} the checkout failed and issue #$CLAIM_ISSUE" >&2
+        echo -e "  stays held until it lapses. The board's answer was: $answer" >&2
+    fi
+    return "$status"
+}
+trap claim_rollback EXIT
+
 # Take the claim on the issue this branch names, before the tree exists.
 #
 # The structured-pickup half of #172: the unit of work exists before the agent
 # does, so the claim is taken BY THE CHECKOUT and there is nothing to opt into.
 # It runs before `git worktree add` on purpose — a refusal has then cost nothing,
 # and the loser has a directory-free repo rather than a half-built worktree it
-# has to clean up.
+# has to clean up. `claim_rollback` above covers the other direction.
 #
 # Three outcomes, and they are deliberately not two:
 #   * taken/renewed -> proceed
@@ -444,8 +512,21 @@ branch_issue() {
 #     warn loudly and proceed, unless --require-claim. Failing closed here would
 #     make the board a single point of failure for every worktree on the fleet,
 #     which is a worse outcome than an unclaimed checkout that says so.
+#
+# **The claim records NO session, and that is not an oversight.** `qb-claim`
+# defaults `--session` to $CLAUDE_CODE_SESSION_ID, which here is the session of
+# whoever ran create-worktree — a parent agent's, or nothing at all from a human
+# shell. The agent that will work in this tree has a different session and does
+# not exist yet, so stamping the creating one mis-attributes the claim twice
+# over: `GET /claim/held` narrows on the session, so the pickup gate this exists
+# to feed read the claim as somebody else's and reported the new worktree free;
+# and `may_mutate` requires a recorded session to match, so the worktree's own
+# agent got a 403 renewing or releasing its own checkout claim and could neither
+# extend it past the TTL nor hand it back. A claim that names no session falls
+# back to the machine, which is exactly what a checkout claim is — it belongs to
+# the tree until an agent picks it up.
 claim_the_branch() {
-    local branch="$1" issue qc rc
+    local branch="$1" issue qc rc bindir
     [[ "$CLAIM" = true ]] || return 0
 
     issue=$(branch_issue "$branch") || true
@@ -469,18 +550,42 @@ claim_the_branch() {
         return 0
     fi
 
+    CLAIM_ISSUE="$issue"
+    # Where qbdata.py sits, next to qb-claim. Parameter expansion and the two
+    # builtins rather than `dirname`: this has to work on the same bare PATH the
+    # rest of the stanza already survives on. Made absolute here because the trap
+    # can fire after the script has changed directory, and LOGICALLY absolute
+    # (plain `cd`, not `cd -P`) because that is what qb-claim itself does with
+    # os.path.dirname(os.path.abspath(__file__)) — resolving symlinks instead
+    # walks past the bin/ directory on a home-manager install, which is the trap
+    # qb-b already carries a comment about.
+    bindir="${qc%/*}"
+    [[ "$bindir" != "$qc" ]] || bindir="."
+    CLAIM_BIN="$(cd "$bindir" && pwd)"
     set +e
-    "$qc" issue "$issue" --repo-path "$MAIN_REPO" --ttl "$CLAIM_TTL" \
-        --note "worktree $branch on $(hostname -s 2>/dev/null || echo host)" >/dev/null
+    # stdout is CAPTURED rather than discarded: without the board's answer there
+    # is nothing to hand back when the checkout then fails, which is what left
+    # issues held for eight hours by worktrees that were never created. `--json`
+    # rather than the bare id because the rollback needs `renewed` too — see
+    # `claim_rollback`. The commentary a human reads is on stderr either way, so
+    # it still goes straight to the terminal.
+    CLAIM_ANSWER=$("$qc" issue "$issue" --repo-path "$MAIN_REPO" --ttl "$CLAIM_TTL" \
+        --session "" --json \
+        --note "worktree $branch on $(hostname -s 2>/dev/null || echo host)")
     rc=$?
     set -e
+    [[ "$rc" -eq 0 ]] || CLAIM_ANSWER=""
     case "$rc" in
         0) echo -e "  ${GREEN}claimed${NC} issue #$issue for '$branch'" ;;
         1) die "issue #$issue is already claimed (see above). Two agents on one issue is
   what the claim exists to prevent — talk to the holder, take something else, or
   pass --no-claim if you genuinely mean to work it in parallel." ;;
-        *) echo -e "  ${YELLOW}unclaimed:${NC} the board could not be asked about issue #$issue" >&2
-           echo -e "  (see above). Proceeding — a board outage must not stop a checkout." >&2
+        *) echo -e "  ${YELLOW}unclaimed:${NC} issue #$issue was not claimed — qb-claim's own" >&2
+           echo -e "  reason is above, and it matters which one it is: an outage is a thing to" >&2
+           echo -e "  wait out, while a refused token or a resource the board does not key is a" >&2
+           echo -e "  thing to fix and will read the same way on every checkout from now on." >&2
+           echo -e "  Proceeding either way, because a board outage must not stop a checkout;" >&2
+           echo -e "  --require-claim if you would rather it did." >&2
            [[ "$REQUIRE_CLAIM" = true ]] && die "--require-claim: the claim on #$issue could not be taken"
            ;;
     esac
@@ -1049,6 +1154,11 @@ else
         git worktree add "$WORKTREE_DIR" -b "$BRANCH_NAME"
     fi
 fi
+
+# The tree exists, so the claim now belongs to something. Everything after this
+# is setup a caller can retry or unwind by hand; the claim stays either way, and
+# `claim_rollback` stands down. See it for why the guard is here and not later.
+CLAIM_KEPT=true
 
 # ============================================
 # STEP: Copy and customize .env

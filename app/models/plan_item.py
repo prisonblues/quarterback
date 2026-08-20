@@ -90,7 +90,9 @@ class PlanItem(Base):
     )
     #: Last touched. Surfaced on every read so a plan nobody has moved in a
     #: fortnight is visibly stale — a plan that is believed and wrong is worse
-    #: than no plan.
+    #: than no plan. It is also half of the enclosing PLAN's staleness: work
+    #: happens to items, so the freshest item in a plan is what says the plan is
+    #: alive (see :class:`~app.models.plan.Plan.updated_at`).
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

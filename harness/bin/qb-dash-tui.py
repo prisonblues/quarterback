@@ -529,7 +529,12 @@ class Dash(App):
         self.plan, self.plan_err = items, err
         repos = qd.resolve_repos()
         ordered = qd.sort_plan(items, repos)
+        # The covering holder is in the signature as well as the item's own: a
+        # plan claim landing changes the glyph, the band and the whole right-hand
+        # column of every item in that plan, and a signature blind to it would
+        # leave those rows advertising free work until something else moved.
         sig = tuple((i.get("item_id"), (i.get("claim") or {}).get("holder"),
+                     (i.get("covered_by") or {}).get("holder"),
                      len(i.get("blocked_by") or []), i.get("updated")) for i in ordered)
         if sig == self.plan_sig and not err:
             return
@@ -540,7 +545,8 @@ class Dash(App):
         for item in ordered:
             glyph, colour = qd.plan_state(item)
             who, who_colour = qd.plan_who(item)
-            takeable = qd.plan_issue(item, repos) is not None and not item.get("claim")
+            takeable = (qd.plan_issue(item, repos) is not None
+                        and not qd.plan_holder(item))
             repo = qd.short_repo(item.get("repo") or "fleet")
             key = table.add_row(
                 Text(glyph, style=colour),
@@ -841,10 +847,18 @@ class Dash(App):
         if issue is None:
             self.say(f"no issue behind this item — {qd.clip(item.get('title'), 60)}")
             return
-        claim = item.get("claim")
-        if claim:
-            self.say(f"#{issue['number']} is already being worked by "
-                     f"{claim.get('holder') or '?'}")
+        # An item inside somebody else's HELD PLAN is taken too, and this is the
+        # click that spends money on it. `claim` alone let the ⚒ start /fix-issue
+        # on a line of a plan another agent had reserved as a unit — the exact
+        # duplicated work the plan claim exists to prevent, from the panel that
+        # exists to show who is on what.
+        holder = qd.plan_holder(item)
+        if holder:
+            who = holder.get("holder") or "?"
+            self.say(f"#{issue['number']} is already being worked by {who}"
+                     if item.get("claim") else
+                     f"#{issue['number']} is inside a plan {who} holds — talk to "
+                     f"them rather than taking one line out of it")
             return
         self.fix_issue(issue)
 

@@ -633,6 +633,11 @@ def _unclaimed_repo_warning(repo: str) -> list[str]:
     that means "the table is empty" reads identically to one that means "nobody is
     landing this", and the first is the state #172 was filed about.
 
+    Two questions, because a claim key does not always name a repo: the claims
+    list answers it for issues, PRs and branches, and :func:`_plan_claims_here`
+    answers it for the plan, whose keys are board ids with no repo in them at all.
+    Either one is enough to say this repo claims things.
+
     Never raises and never blocks on a slow board: a failed read here simply says
     nothing extra, because the caller already has its own answer about the key.
     """
@@ -642,16 +647,25 @@ def _unclaimed_repo_warning(repo: str) -> list[str]:
     claims = body.get("claims")
     if not isinstance(claims, list):
         return []
-    # Keys are `<owner>/<name>` followed by a SEPARATOR, whatever the kind — the
-    # board derives them all from the repo (`app/claimkey.py`), so one prefix test
-    # covers issues, PRs and branches without this file re-deriving the rule. The
-    # separator is required: `o/r` is a prefix of `o/rx#1`, and reading a
-    # neighbour's claim as this repo's would silence the warning in the one case it
-    # is for.
+    # A key on a REPO object is `<owner>/<name>` followed by a SEPARATOR, whatever
+    # the kind — the board derives them all from the repo (`app/claimkey.py`), so
+    # one prefix test covers issues, PRs and branches without this file
+    # re-deriving the rule. The separator is required: `o/r` is a prefix of
+    # `o/rx#1`, and reading a neighbour's claim as this repo's would silence the
+    # warning in the one case it is for.
     heads = tuple(f"{repo.lower()}{sep}" for sep in "#!:")
     here = [c for c in claims
             if str(c.get("key") or "").lower().startswith(heads)]
     if here:
+        return []
+    # A key on a BOARD object says no repo at all, by design: a plan and an item
+    # are keyed `plan:<uuid>` / `item:<uuid>` because a plan may span several
+    # repos, so `repo_of` returns None for them and no prefix test can ever see
+    # one. The plan-level claim is the *new* half of #172 — the agile intake, the
+    # one coarse grain — so a repo whose agents claim their work that way was the
+    # repo most likely to be told it claims nothing at all. The plan itself is
+    # asked instead.
+    if _plan_claims_here(repo):
         return []
     live = len(claims)
     return [
@@ -663,6 +677,49 @@ def _unclaimed_repo_warning(repo: str) -> list[str]:
         "collide in silence: enrol it (create-worktree takes the claim, "
         "`qb-claim issue <n>` by hand) or read this check as uninformative."
     ]
+
+
+def _plan_claims_here(repo: str) -> int:
+    """How much of THIS repo's plan is held right now. 0 if it cannot be read.
+
+    The claims list cannot answer this. A plan claim is keyed `plan:<uuid>` and a
+    ref-less item `item:<uuid>`, with no repo in either — that is deliberate
+    (`app/claimkey.py`: a board object may span repos), and it means "is this repo
+    enrolled" cannot be decided by looking at keys. Asking the plan is not a second
+    implementation of the rule: the board does the attribution, off its own rows,
+    the same way `GET /claim/held` does it for the keys that do carry a repo.
+
+    `counts` rather than the item page, because `counts` is computed over the whole
+    open set while `items` is a page of it — reading the page would make this
+    answer "nothing is claimed" about the rows it did not fetch. And `exact`,
+    because widening a repo read to the fleet-wide list would let another repo's
+    plan silence this repo's warning, which is the mistake the separator test above
+    exists to prevent, one scope up.
+
+    Best-effort like its caller: a failed read returns 0 and the warning is printed
+    on the safe side. A gate that turned an outage into "this repo is fine" would
+    be the fail-open this whole check exists to close.
+    """
+    body, err = board_get("plan", {"repo": repo, "exact": "true", "limit": "1"})
+    if err or not isinstance(body, dict):
+        return 0
+    held = 0
+    counts = body.get("counts")
+    if isinstance(counts, dict):
+        # `claimed` is item by item; `covered` is inside a plan somebody holds as a
+        # unit. Both are agents saying "this is mine" in this repo, which is the
+        # only question here.
+        for name in ("claimed", "covered"):
+            value = counts.get(name)
+            if isinstance(value, int) and value > 0:
+                held += value
+    plans = body.get("plans")
+    if isinstance(plans, list):
+        # A plan claimed while it is still being written has no claimed items yet,
+        # and that is the moment the claim exists FOR: the surveying agent holds
+        # the list before there is anything exact in it to hold.
+        held += sum(1 for p in plans if isinstance(p, dict) and p.get("claim"))
+    return held
 
 
 def check_migrations(root: str, base: BaseRef, versions: str = "") -> Check:

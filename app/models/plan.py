@@ -67,6 +67,16 @@ class Plan(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+    #: When the PLAN ROW last changed — claimed, released, finished. Activity in
+    #: the plan's ITEMS deliberately does not touch it, and the endpoint does not
+    #: read this column alone because of that: ``stale`` is the later of this and
+    #: the freshest item in the plan (``app.api.plan._plan_activity``). A plan is
+    #: worked through its items — appending, claiming, finishing and moving them
+    #: all left this timestamp alone — so a plan whose items were being worked
+    #: daily reported ``stale: true`` after a fortnight, which is the opposite of
+    #: what the flag is for. Bumping this row from each of those eight writes was
+    #: the alternative, and it is eight places to forget plus a row lock on the
+    #: plan for every item claim.
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

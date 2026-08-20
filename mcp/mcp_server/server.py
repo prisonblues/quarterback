@@ -487,7 +487,9 @@ def claim(ctx: Context, ref_kind: str | None = None, ref_value: str | None = Non
             issue / pr / branch refs; ignored for plan and item ids, which are
             already globally unique.
         kind: the OLD way — a kind you compose yourself. Still accepted and
-            canonicalised onto the derived key, and the answer says so.
+            canonicalised onto the derived key, and the answer says so. Never
+            together with `ref_kind`: a request describing two resources is
+            refused rather than guessed at, which is what `POST /claim` does too.
         key: the composed key, with `kind`.
         ttl: Seconds until the claim lapses without a renew (default 3600).
         session: Your session id. Not just so a peer can reach you — it is what
@@ -499,6 +501,17 @@ def claim(ctx: Context, ref_kind: str | None = None, ref_value: str | None = Non
     Returns the claim incl. claim_id; remember it to renew or release.
     """
     body: dict = {"ttl": ttl, "session": session, "note": note}
+    if ref_kind and (kind or key):
+        # The same refusal `ClaimIn` makes, made here so the tool cannot be the
+        # softer door onto it. Preferring the ref silently was worse than either
+        # answer: a request describing two resources is a caller with two ideas
+        # about what it is claiming, and the one that gets dropped is the one it
+        # will believe it holds — #172 with the parties swapped again.
+        raise ToolError(
+            "say it once: ref_kind + ref_value (the board derives the key), or "
+            f"kind + key if you already have a composed one — not both. You sent "
+            f"ref_kind={ref_kind!r} and kind/key={(kind, key)!r}; guessing which "
+            "one you meant is how a claim lands on the wrong resource.")
     if ref_kind:
         if not ref_value:
             raise ToolError("ref_kind needs ref_value: which issue, PR, branch or id?")
@@ -569,10 +582,23 @@ def claims(ctx: Context, ref_kind: str | None = None, ref_value: str | None = No
         ref_value: the number, branch name or board id.
         repo_path: the checkout whose origin remote names the repo.
         kind: a composed kind, if you already have one. Canonicalised with `key`.
+            Not together with `ref_kind` — the answer could only be about one of
+            them, and the refusal is the same one `claim` makes.
         key: the composed key.
         holder: only this agent's claims.
     """
     params: dict = {"holder": holder}
+    if ref_kind and (kind or key):
+        # Refused rather than resolved, exactly as `claim` refuses it. A lookup is
+        # where the two-spellings defect actually bites: the answer comes back
+        # empty or full for ONE of the resources described, the caller reads it as
+        # the answer about the other, and "nobody holds it" about a row that is
+        # right there is how #172 looked from outside.
+        raise ToolError(
+            "ask about one resource: ref_kind + ref_value (the board derives the "
+            f"key), or kind/key — not both. You sent ref_kind={ref_kind!r} and "
+            f"kind/key={(kind, key)!r}, and the answer would be about only one "
+            "of them.")
     if ref_kind:
         if not ref_value:
             raise ToolError("ref_kind needs ref_value: which issue, PR, branch or id?")
@@ -849,7 +875,7 @@ def plan_submit(ctx: Context, label: str, items: list[dict], repo: str | None = 
 
 @mcp.tool()
 def plan_hold(ctx: Context, plan_id: str, ttl: int | None = None,
-              note: str | None = None) -> dict:
+              note: str | None = None, force: bool = False) -> dict:
     """Take a WHOLE plan — "all of this is mine", including the planning pass itself.
 
     Not the same as `plan_claim`, which takes one item. Hold a plan when you are
@@ -860,10 +886,23 @@ def plan_hold(ctx: Context, plan_id: str, ttl: int | None = None,
     Everyone else's `plan_read` shows the items as `covered_by` you, `next` skips
     them, and `plan_claim` on one of them is refused — so this is how you stop four
     agents converging on one problem without holding twenty item claims.
+
+    Args:
+        plan_id: the plan's board id.
+        ttl: seconds to hold it.
+        note: what the plan is for — it is what a refused agent is shown.
+        force: an item somebody ELSE holds refuses the whole plan, because "all of
+            this is mine" over a truthful item claim is two agents each correctly
+            believing the work is theirs. `force` says it anyway and is recorded in
+            the note, for the case where the item's holder really is sharing the
+            plan with you. The refusal names the item, its holder and their session
+            first — it is somebody to talk to, not a wall.
     """
     body: dict = {"plan_id": plan_id, "note": note}
     if ttl is not None:
         body["ttl"] = ttl
+    if force:
+        body["force"] = True
     try:
         return _get_client(ctx).plan_verb("claim", body)
     except httpx.HTTPStatusError as e:

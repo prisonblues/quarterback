@@ -21,9 +21,14 @@ already had and must keep: a claim is never reimplemented (it is a
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime, timedelta
 
+from sqlalchemy import update
+
+from app.api.plan import MAX_DEPS, STALE_DAYS
 from app.db import async_session
 from app.models.plan import Plan
+from app.models.plan_item import PlanItem
 
 from .conftest import DESKTOP, LAPTOP
 
@@ -81,7 +86,7 @@ async def test_nothing_is_written_when_one_line_collides(client):
     assert r.status_code == 409, r.text
     assert [c["ref"] for c in r.json()["detail"]["clashes"]] == ["issue 10"]
 
-    plan = await read(client, repo)
+    plan = await read(client, repo, exact=True)
     assert [i["ref"]["value"] for i in plan["items"]] == ["10"], \
         "part of the refused submission landed anyway"
     assert [p["label"] for p in plan["plans"]] == ["wave 1"]
@@ -152,7 +157,7 @@ async def test_two_spellings_of_one_label_are_one_plan(client):
         "title": "#71", "repo": repo, "ref_kind": "issue", "ref_value": "71",
         "plan": "STAGE 1"}, headers=LAPTOP)
     assert added.status_code == 200, added.text
-    plan = await read(client, repo)
+    plan = await read(client, repo, exact=True)
     assert len(plan["plans"]) == 1
     assert plan["plans"][0]["items"] == {"open": 2}
     assert {i["plan"]["plan_id"] for i in plan["items"]} == {plan["plans"][0]["plan_id"]}
@@ -226,10 +231,12 @@ async def test_a_plan_claim_is_an_ordinary_claim_on_the_one_table(client):
     key = out["claim"]["key"]
     listed = await client.get("/claims", params={"key": key}, headers=LAPTOP)
     assert [c["claim_id"] for c in listed.json()["claims"]] == [out["claim"]["claim_id"]]
-    # And it answers the pickup question — under `unattributed`, because a plan
-    # may span repos and attributing it to one would be a guess.
-    held = await client.get("/claim/held", headers=LAPTOP)
-    assert any(c["key"] == key for c in held.json()["unattributed"])
+    # And it answers the pickup question, attributed to the plan's own scope: the
+    # key names a board object and says nothing about a repo, but the ROW does, so
+    # holding the plan for this repo is holding something in this repo.
+    held = await client.get("/claim/held", params={"repo": repo}, headers=LAPTOP)
+    assert held.json()["held"] is True
+    assert any(c["key"] == key for c in held.json()["claims"])
 
 
 async def test_a_co_tenant_cannot_hold_a_plan_another_agent_holds(client):
@@ -355,7 +362,8 @@ async def test_plans_are_listed_with_who_holds_them_and_how_much_is_left(client)
     repo = "acme/planslist"
     out = await submitted(client, repo, "surveyed", [item(210), item(211)],
                           session="s-s", note_on_claim="working out the order")
-    r = await client.get("/plans", params={"repo": repo}, headers=DESKTOP)
+    r = await client.get("/plans", params={"repo": repo, "exact": True},
+                         headers=DESKTOP)
     assert r.status_code == 200, r.text
     row = r.json()["plans"][0]
     assert row["label"] == "surveyed"
@@ -363,8 +371,9 @@ async def test_plans_are_listed_with_who_holds_them_and_how_much_is_left(client)
     assert row["claim"]["note"] == "working out the order"
     assert row["covered_by"]["holder"] == out["claim"]["holder"]
 
-    closed = await client.get("/plans", params={"repo": repo, "include_closed": True},
-                              headers=DESKTOP)
+    closed = await client.get(
+        "/plans", params={"repo": repo, "exact": True, "include_closed": True},
+        headers=DESKTOP)
     assert len(closed.json()["plans"]) == 1
 
 
@@ -595,3 +604,424 @@ async def test_the_refusal_says_why_your_plan_read_disagreed(client):
                                 "session": "s-second"}, headers=LAPTOP)
     assert r.status_code == 409, r.text
     assert "did not send `session` on GET /plan" in r.json()["detail"]["hint"]
+
+
+# ------------------------------- what the second review round found (round 2)
+
+
+async def plan_claim_keys(client, headers=LAPTOP) -> set[str]:
+    """Every live plan-level claim on the board, by key."""
+    r = await client.get("/claims", params={"limit": 1000}, headers=headers)
+    assert r.status_code == 200, r.text
+    return {c["key"] for c in r.json()["claims"] if c["key"].startswith("plan:")}
+
+
+async def age_plan(plan_id: str, items: bool = False) -> None:
+    """Put a plan — and optionally everything in it — a fortnight in the past."""
+    long_ago = datetime.now(UTC) - timedelta(days=STALE_DAYS + 3)
+    async with async_session() as s:
+        row = await s.get(Plan, uuid.UUID(plan_id))
+        row.updated_at = long_ago
+        if items:
+            await s.execute(update(PlanItem).where(PlanItem.plan_id == row.id)
+                            .values(updated_at=long_ago))
+        await s.commit()
+
+
+async def test_a_submitted_plan_is_claimed_before_it_can_be_read(client):
+    """The claim goes first, and the order is the whole point.
+
+    `acquire` commits — that is where its atomicity comes from — so the claim can
+    never be part of the plan's transaction. Taken AFTER it, the plan and every item
+    are committed and readable while nothing holds them: the raid window this
+    endpoint exists to close, moved from between two items to between the plan and
+    its claim. Observed from inside the submission, at the moment the rows exist in
+    an uncommitted transaction and nobody else can see them yet."""
+    repo = "acme/planclaimfirst"
+    import app.api.plan as plan_api
+    real = plan_api._next_rank
+    seen: dict = {}
+
+    async def peek(session, scope):
+        if "claims" not in seen:
+            seen["claims"] = await plan_claim_keys(client, DESKTOP)
+            listed = await client.get("/plans",
+                                      params={"repo": repo, "exact": True},
+                                      headers=DESKTOP)
+            seen["plans"] = listed.json()["plans"]
+        return await real(session, scope)
+
+    plan_api._next_rank = peek
+    try:
+        out = await submitted(client, repo, "held first", [item(300)],
+                              session="s-first")
+    finally:
+        plan_api._next_rank = real
+    assert out["claim"]["key"] in seen["claims"], \
+        "the plan was written before it was claimed — that window is the defect"
+    assert seen["plans"] == [], "the plan was readable before it was held"
+
+
+async def test_a_refused_submission_leaves_no_claim_standing(client):
+    """The other end of taking it first: a claim over a plan that was never written
+    is a key nobody can release, held by an agent that was told its submission
+    failed."""
+    repo = "acme/planclaimundo"
+    await submitted(client, repo, "wave 1", [item(301)], claim=False)
+    before = await plan_claim_keys(client)
+    r = await submit(client, repo, "wave 2", [item(302), item(301)],
+                     session="s-undone")
+    assert r.status_code == 409, r.text
+    assert await plan_claim_keys(client) == before, \
+        "a claim outlived the submission it was taken for"
+    plans = await read(client, repo, exact=True)
+    assert [p["label"] for p in plans["plans"]] == ["wave 1"]
+
+
+async def test_a_plan_cannot_be_claimed_over_an_item_somebody_else_holds(client):
+    """The reverse of the coverage rule, and it had no guard. `claim_item` refuses an
+    item inside somebody else's plan; nothing refused the PLAN to an agent when
+    another already truthfully held items in it — so "all of this is mine" could be
+    said over work that demonstrably was not, with both claims live. Overlapping
+    ownership is the one outcome both grains exist to prevent, whichever arrived
+    first."""
+    repo = "acme/planoveritem"
+    out = await submitted(client, repo, "contested", [item(303), item(304)],
+                          claim=False)
+    theirs = await client.post("/plan/item/claim",
+                               json={"item_id": out["items"][0]["item_id"],
+                                     "session": "s-worker"}, headers=DESKTOP)
+    assert theirs.status_code == 200, theirs.text
+
+    r = await client.post("/plan/claim",
+                          json={"plan_id": out["plan_id"], "session": "s-surveyor"},
+                          headers=LAPTOP)
+    assert r.status_code == 409, r.text
+    held = r.json()["detail"]["held_items"]
+    assert [h["ref"] for h in held] == ["303"]
+    assert held[0]["session"] == "s-worker"
+    # Refused up front rather than taken and handed back: `claim_kept` is the
+    # post-`acquire` re-check's field, and nothing should have been acquired.
+    assert "claim_kept" not in r.json()["detail"]
+    assert f"plan:{out['plan_id']}" not in await plan_claim_keys(client)
+
+    # `force` is how it is said anyway, and then it is in the record.
+    forced = await client.post("/plan/claim",
+                               json={"plan_id": out["plan_id"],
+                                     "session": "s-surveyor", "force": True},
+                               headers=LAPTOP)
+    assert forced.status_code == 200, forced.text
+    assert forced.json()["claimed"] is True and forced.json()["forced"] is True
+
+
+async def test_the_items_you_hold_yourself_are_no_obstacle_to_the_plan(client):
+    """Working through your own plan item by item is the ordinary way to use it, so
+    ownership here is `_is_mine`, exactly as it is everywhere else on this router."""
+    repo = "acme/planoverown"
+    out = await submitted(client, repo, "mine", [item(305)], claim=False)
+    mine = await client.post("/plan/item/claim",
+                             json={"item_id": out["items"][0]["item_id"],
+                                   "session": "s-me"}, headers=LAPTOP)
+    assert mine.status_code == 200, mine.text
+    r = await client.post("/plan/claim",
+                          json={"plan_id": out["plan_id"], "session": "s-me"},
+                          headers=LAPTOP)
+    assert r.status_code == 200, r.text
+    assert r.json()["forced"] is False
+
+
+async def test_an_item_claimed_DURING_a_plan_claim_takes_the_plan_claim_back(client):
+    """The check and the claim are two statements and nothing can lock across
+    `acquire`, so the check is made again afterwards — the same correction
+    `claim_item` makes in the other direction, for the same reason: "both claims
+    live" is two agents each correctly believing the work is theirs."""
+    repo = "acme/planitemrace"
+    out = await submitted(client, repo, "raced", [item(306)], claim=False)
+    import app.api.plan as plan_api
+    real = plan_api._held_items
+    seen = {"n": 0}
+
+    async def once_free(*a, **kw):
+        seen["n"] += 1
+        if seen["n"] == 1:
+            r = await client.post("/plan/item/claim",
+                                  json={"item_id": out["items"][0]["item_id"],
+                                        "session": "s-winner"}, headers=DESKTOP)
+            assert r.status_code == 200, r.text
+            return []
+        return await real(*a, **kw)
+
+    plan_api._held_items = once_free
+    try:
+        r = await client.post("/plan/claim",
+                              json={"plan_id": out["plan_id"], "session": "s-loser"},
+                              headers=LAPTOP)
+    finally:
+        plan_api._held_items = real
+    assert seen["n"] == 2, "the check was not made again after the claim"
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["claim_kept"] is False
+    listed = await client.get("/claims", params={"key": f"plan:{out['plan_id']}"},
+                              headers=LAPTOP)
+    assert listed.json()["claims"] == [], "the plan claim it lost was left standing"
+
+
+async def test_losing_the_plan_race_does_not_take_a_claim_you_already_held(client):
+    """`acquire` may RENEW a claim the caller held before the request ever arrived,
+    and the re-check released it regardless — so an agent that legitimately had the
+    item came out of a lost race holding neither the item nor the plan. What is
+    handed back is what this request took, and no more."""
+    repo = "acme/planracekeep"
+    out = await submitted(client, repo, "keepmine", [item(307)], claim=False)
+    item_id = out["items"][0]["item_id"]
+    first = await client.post("/plan/item/claim",
+                              json={"item_id": item_id, "session": "s-holder"},
+                              headers=LAPTOP)
+    assert first.status_code == 200, first.text
+
+    import app.api.plan as plan_api
+    real = plan_api._covering_claim
+    seen = {"n": 0}
+
+    async def once_free(*a, **kw):
+        seen["n"] += 1
+        if seen["n"] == 1:
+            # Somebody takes the plan in the window — over an item they know is
+            # held, which is why this one has to say `force`.
+            r = await client.post("/plan/claim",
+                                  json={"plan_id": out["plan_id"],
+                                        "session": "s-winner", "force": True},
+                                  headers=DESKTOP)
+            assert r.status_code == 200, r.text
+            return None
+        return await real(*a, **kw)
+
+    plan_api._covering_claim = once_free
+    try:
+        again = await client.post("/plan/item/claim",
+                                  json={"item_id": item_id, "session": "s-holder"},
+                                  headers=LAPTOP)
+    finally:
+        plan_api._covering_claim = real
+    assert again.status_code == 409, again.text
+    assert again.json()["detail"]["claim_kept"] is True
+    mine = await read(client, repo, session="s-holder")
+    assert mine["items"][0]["claim"]["session"] == "s-holder", \
+        "the claim the caller already held was confiscated as collateral"
+
+
+async def test_a_write_never_reports_your_own_plan_claim_as_cover(client):
+    """`covered_by` is somebody ELSE's plan claim, and the item-write paths rendered
+    their responses without saying who was asking — so the plan holder's own
+    successful claim came back `covered_by: {holder: <itself>}`, which the page
+    renders as "in mine, held by you" over the item you just took."""
+    repo = "acme/planowncover"
+    out = await submitted(client, repo, "mine", [item(308), item(309)],
+                          session="s-owner")
+    first, second = (i["item_id"] for i in out["items"])
+    took = await client.post("/plan/item/claim",
+                             json={"item_id": first, "session": "s-owner"},
+                             headers=LAPTOP)
+    assert took.status_code == 200, took.text
+    assert took.json()["covered_by"] is None, \
+        "the claim succeeded because the plan was yours, and said it was not"
+    let_go = await client.post("/plan/item/release",
+                               json={"item_id": first, "session": "s-owner"},
+                               headers=LAPTOP)
+    assert let_go.json()["covered_by"] is None
+    added = await client.post("/plan/item", json={
+        "title": "one more", "repo": repo, "plan": "mine", "ref_kind": "issue",
+        "ref_value": "310"}, headers=LAPTOP)
+    assert added.status_code == 200, added.text
+    assert added.json()["covered_by"] is None
+    # ...and a co-tenant's write still meets the cover, which is the half that must
+    # not be traded away for the other.
+    raider = await client.post("/plan/item/claim",
+                               json={"item_id": second, "session": "s-raider",
+                                     "force": True}, headers=LAPTOP)
+    assert raider.status_code == 200, raider.text
+    assert raider.json()["covered_by"]["holder"] == out["claim"]["holder"]
+
+
+async def test_a_finished_plan_does_not_shadow_the_live_one_of_the_same_name(client):
+    """`ix_plans_open_label` is partial on `state = 'open'`, so one scope may hold a
+    finished "stage 1" and a live one at once — and the finished one was created
+    first. Ordering by `created_at` alone therefore answered `GET /plan?plan=stage 1`
+    with the closed plan: no items, `counts.open` 0, `next` null. "Nothing to do in
+    stage 1" while the live stage 1 was full of work."""
+    repo = "acme/planshadow"
+    first = await submitted(client, repo, "stage 1", [item(314)], claim=False)
+    await client.post("/plan/done", json={"plan_id": first["plan_id"], "force": True},
+                      headers=LAPTOP)
+    second = await submitted(client, repo, "stage 1", [item(315)], claim=False)
+
+    narrowed = await read(client, repo, plan="stage 1")
+    assert narrowed["plan"]["plan_id"] == second["plan_id"]
+    assert narrowed["plan"]["state"] == "open"
+    assert [i["ref"]["value"] for i in narrowed["items"]] == ["315"]
+    assert narrowed["counts"]["open"] == 1
+    assert narrowed["next"] is not None
+    # History is not lost by it: the finished plan still answers to its id.
+    by_id = await client.get(
+        "/plan", params={"repo": repo, "plan": first["plan_id"], "include_done": True},
+        headers=LAPTOP)
+    assert by_id.json()["plan"]["state"] == "done"
+
+
+async def test_a_plan_id_needs_no_repo_in_an_unscoped_read(client):
+    """An unscoped `GET /plan` reads every scope, so `?plan=<id>` answering 422
+    unless the caller ALSO named the repo made a globally unique id the one thing the
+    broad read could not narrow to."""
+    repo = "acme/planbyid"
+    out = await submitted(client, repo, "byid", [item(316)], claim=False)
+    r = await client.get("/plan", params={"plan": out["plan_id"]}, headers=LAPTOP)
+    assert r.status_code == 200, r.text
+    assert r.json()["plan"]["label"] == "byid"
+    assert [i["ref"]["value"] for i in r.json()["items"]] == ["316"]
+    # `exact` with no repo is the fleet list by itself, and a repo's plan is not in
+    # it — the id is nameable in the broad read, not in a narrower one.
+    narrow = await client.get("/plan", params={"plan": out["plan_id"], "exact": True},
+                              headers=LAPTOP)
+    assert narrow.status_code == 422, narrow.text
+    # And a LABEL stays scope-exact: two scopes may each hold "byid", so widening
+    # would make which one you got depend on insertion order.
+    by_label = await client.get("/plan", params={"plan": "byid"}, headers=LAPTOP)
+    assert by_label.status_code == 422, by_label.text
+
+
+async def test_a_plan_worked_through_its_items_does_not_go_stale(client):
+    """`stale` was read off the plan row alone, and a plan is worked through its
+    ITEMS: appending one, claiming one, finishing one and moving one in all left the
+    row untouched. So a plan whose items were being worked daily reported
+    `stale: true` after a fortnight — the opposite of what the flag is for."""
+    repo = "acme/planstale"
+    out = await submitted(client, repo, "worked", [item(317)], claim=False)
+    await age_plan(out["plan_id"], items=True)
+    added = await client.post("/plan/item", json={
+        "title": "fresh", "repo": repo, "plan": "worked", "ref_kind": "issue",
+        "ref_value": "318"}, headers=LAPTOP)
+    assert added.status_code == 200, added.text
+
+    narrowed = await read(client, repo, plan="worked")
+    assert narrowed["plan"]["stale"] is False, "a plan being worked read as stale"
+    assert narrowed["plan"]["idle_days"] < 1
+    listed = await client.get("/plans", params={"repo": repo, "exact": True},
+                              headers=LAPTOP)
+    assert [p["stale"] for p in listed.json()["plans"]] == [False]
+    # Every path that renders one plan agrees, not only the lists: releasing nothing
+    # changes nothing, and must not answer differently about how old the plan is.
+    idle = await client.post("/plan/release", json={"plan_id": out["plan_id"]},
+                             headers=LAPTOP)
+    assert idle.json()["released"] is False
+    assert idle.json()["stale"] is False
+
+
+async def test_moving_an_item_into_an_old_plan_makes_it_fresh_again(client):
+    """The other instance of the same rule: `update_item` moves items between plans,
+    and a plan somebody is moving work into is demonstrably being maintained. The
+    only timestamp it was judged on was the one nobody had touched."""
+    repo = "acme/planstalemove"
+    old = await submitted(client, repo, "dormant", [item(325)], claim=False)
+    live = await submitted(client, repo, "current", [item(326)], claim=False)
+    await age_plan(old["plan_id"], items=True)
+    assert (await read(client, repo, plan="dormant"))["plan"]["stale"] is True
+    moved = await client.post("/plan/item/update", json={
+        "item_id": live["items"][0]["item_id"], "plan": "dormant"}, headers=EDGE)
+    assert moved.status_code == 200, moved.text
+    assert (await read(client, repo, plan="dormant"))["plan"]["stale"] is False
+
+
+async def test_a_plan_nothing_has_happened_in_is_still_stale(client):
+    """The other half: the flag has to keep firing, or "believed and wrong" is just
+    inverted."""
+    repo = "acme/planreallystale"
+    out = await submitted(client, repo, "abandoned", [item(319)], claim=False)
+    await age_plan(out["plan_id"], items=True)
+    narrowed = await read(client, repo, plan="abandoned")
+    assert narrowed["plan"]["stale"] is True
+    assert narrowed["plan"]["idle_days"] >= STALE_DAYS
+    assert narrowed["items"][0]["stale"] is True
+
+
+async def test_a_label_race_says_the_name_is_taken_not_that_a_ref_collided(client):
+    """`_lock_scope` is taken after the label pre-check, so two submissions of one
+    label both pass it and the loser meets `ix_plans_open_label` instead. That used
+    to be answered by the ref-collision handler, which found no colliding refs and
+    said "that submission collided with an existing row" with `clashes: []` and
+    advice to drop lines that were fine — the caller was never told the plan name
+    was taken."""
+    repo = "acme/planlabelrace"
+    first = await submitted(client, repo, "stage 1", [item(320)], claim=False)
+    import app.api.plan as plan_api
+    real = plan_api._find_plan
+    seen = {"n": 0}
+
+    async def blind_once(*a, **kw):
+        seen["n"] += 1
+        if seen["n"] == 1:
+            return None      # the window both submissions pass through
+        return await real(*a, **kw)
+
+    plan_api._find_plan = blind_once
+    try:
+        r = await submit(client, repo, "stage 1", [item(321)], session="s-loser")
+    finally:
+        plan_api._find_plan = real
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert detail["plan_id"] == first["plan_id"]
+    assert "already open here" in detail["error"]
+    assert "clashes" not in detail, "the loser was sent to edit lines that were fine"
+    # Nothing landed, and the claim the loser took for it went back.
+    landed = await read(client, repo, exact=True)
+    assert [i["ref"]["value"] for i in landed["items"]] == ["320"]
+    assert f"plan:{detail['plan_id']}" not in await plan_claim_keys(client)
+
+
+async def test_a_submission_cannot_carry_more_dependencies_than_the_cap(client):
+    """`POST /plan/item/depends` refuses more than `MAX_DEPS` on a row and a
+    submission did not: only the external tokens went through `_resolve_deps`, and
+    the `@n` edges were merged in afterwards — so one row could land holding 32 + 63
+    of them, through the endpoint whose whole point is that the plan arrives as a
+    unit."""
+    repo = "acme/plandepcap"
+    # Every edge here is an `@n` one, which is the half that never reached
+    # `_resolve_deps` — so before the merged list was capped this landed a 200 with
+    # 33 dependencies on one row.
+    rows = [item(9400 + n) for n in range(MAX_DEPS + 2)]
+    rows[-1] = item(9400 + MAX_DEPS + 1,
+                    depends_on=[f"@{n + 1}" for n in range(MAX_DEPS + 1)])
+    r = await submit(client, repo, "greedy", rows, claim=False)
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"]["item"] == len(rows)
+    assert f"at most {MAX_DEPS}" in r.json()["detail"]["error"]
+    assert (await read(client, repo, exact=True))["items"] == [], \
+        "a refused submission wrote"
+    # A cap and not a ban: exactly MAX_DEPS lands, and the row really carries them.
+    fine = [*rows[:-1], item(9500, depends_on=[f"@{n + 1}" for n in range(MAX_DEPS)])]
+    landed = await submitted(client, repo, "fine", fine, claim=False)
+    assert len(landed["items"][-1]["depends_on"]) == MAX_DEPS
+
+
+async def test_the_old_phase_field_is_refused_rather_than_ignored(client):
+    """A plan is a row now and `phase` is gone. Pydantic drops an unknown body field
+    and FastAPI drops an unknown query parameter, so the old spelling failed three
+    silent ways: a loose item belonging to nothing, an update that did nothing and
+    answered 200, and a read answering about the whole scope instead of one plan."""
+    repo = "acme/planphase"
+    out = await submitted(client, repo, "stage 1", [item(324)], claim=False)
+    loose = await client.post("/plan/item", json={
+        "title": "smuggled", "repo": repo, "phase": "stage 1"}, headers=LAPTOP)
+    assert loose.status_code == 422, loose.text
+    assert "`phase` is gone" in loose.json()["detail"]["error"]
+
+    moved = await client.post("/plan/item/update", json={
+        "item_id": out["items"][0]["item_id"], "phase": "stage 1"}, headers=EDGE)
+    assert moved.status_code == 422, moved.text
+
+    narrowed = await client.get("/plan", params={"repo": repo, "phase": "stage 1"},
+                                headers=LAPTOP)
+    assert narrowed.status_code == 422, narrowed.text
+    assert "`plan`" in narrowed.json()["detail"]["hint"]
+    # ...and the refused add wrote nothing, so `phase` cannot make a loose item.
+    assert len((await read(client, repo, exact=True))["items"]) == 1

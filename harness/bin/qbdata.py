@@ -603,10 +603,41 @@ def fetch_plan(client) -> tuple[list[dict], str | None]:
     return data.get("items") or [], None
 
 
+def plan_holder(item: dict) -> dict | None:
+    """The claim standing over this item — its own, or the plan's. None if free.
+
+    **The one place "is anybody on this?" is decided, because it was decided four
+    ways.** A plan claim is coarse and deliberate: an agent that claimed a whole
+    plan said "all of this is mine", so `GET /plan` reports the item's
+    `covered_by` and `next` skips it (#172). Every presentation function here read
+    `claim` alone, so the panel and the TUI drew the cyan ○ "free to take" on the
+    items of somebody else's held plan, sorted them into the free band, counted
+    them as neither running nor blocked, and showed an idle age where the holder
+    goes — advertising as free the exact work the plan claim exists to reserve.
+    The truth was in the detail line, which a reader has to ask for.
+
+    `covered_by` is already somebody ELSE's: the board resolves "mine" before it
+    answers, and your own plan claim covers nothing from you — that is what lets
+    the holder work through its own list item by item. Note that
+    :func:`fetch_plan` sends no session, so on a multi-agent box the board answers
+    by machine and a co-tenant's hold reads as nobody's. That is the documented
+    coarse fallback and not this function's to fix; it means the dashboard
+    understates coverage there, never overstates it.
+    """
+    return item.get("claim") or item.get("covered_by") or None
+
+
 def plan_state(item: dict) -> tuple[str, str]:
-    """(glyph, colour) for a plan row: running, blocked, or free to take."""
+    """(glyph, colour) for a plan row: running, held via its plan, blocked, or free.
+
+    ▷ rather than ▶ for a covered item, because the remedy is different: ▶ is an
+    agent on this line, ▷ is an agent on the whole list this line is in, and what
+    a reader does about it is talk to them rather than take one item out of it.
+    """
     if item.get("claim"):
         return "▶", "green"
+    if item.get("covered_by"):
+        return "▷", "yellow"
     if item.get("blocked_by"):
         return "⊘", "grey50"
     return "○", "cyan"
@@ -658,17 +689,22 @@ def plan_issue(item: dict, repos: list[str] | None = None) -> dict | None:
 
 
 def sort_plan(items: list[dict], repos: list[str] | None = None) -> list[dict]:
-    """Running first, then what is free to take, then what is blocked.
+    """Taken first, then what is free to take, then what is blocked.
 
     Inside each band the board's own order is kept — the plan is an ordered list
     and the order is the point — with the repos this dashboard watches ahead of
     the ones it only overhears. Blocked items sink because they are the one band
     a reader can do nothing about.
+
+    The top band is :func:`plan_holder`, not `claim`: an item inside somebody
+    else's held plan is taken, and sorting it into the free band put it in the run
+    of rows a seat reads to find work nobody has. The free band has one job, and
+    an item that is not free is the list failing at it.
     """
     watched = {short_repo(r) for r in (repos if repos is not None else resolve_repos())}
 
     def band(item: dict) -> int:
-        if item.get("claim"):
+        if plan_holder(item):
             return 0
         return 2 if item.get("blocked_by") else 1
 
@@ -680,9 +716,16 @@ def sort_plan(items: list[dict], repos: list[str] | None = None) -> list[dict]:
 
 
 def plan_counts(items: list[dict]) -> tuple[int, int]:
-    """(running, blocked) — the two numbers both panel titles report."""
-    running = sum(1 for i in items if i.get("claim"))
-    blocked = sum(1 for i in items if not i.get("claim") and i.get("blocked_by"))
+    """(running, blocked) — the two numbers both panel titles report.
+
+    An item covered by somebody else's plan claim counts as running. The title's
+    question is "how much of this list is already somebody's", and a plan claim
+    makes it somebody's — the glyph is what says whether the agent is on the line
+    or on the whole list. Counted as neither, it read as free work in the only
+    number a reader takes in without looking at the rows.
+    """
+    running = sum(1 for i in items if plan_holder(i))
+    blocked = sum(1 for i in items if not plan_holder(i) and i.get("blocked_by"))
     return running, blocked
 
 
@@ -690,12 +733,17 @@ def plan_who(item: dict) -> tuple[str, str]:
     """(text, colour) for the right-hand column: who has it, or what it waits on.
 
     Three different facts share one column because only one of them is ever true
-    of a row: a claimed item has a holder, a blocked one has something to wait
-    for, and a free one has only how long it has been sitting there.
+    of a row: a taken item has a holder, a blocked one has something to wait for,
+    and a free one has only how long it has been sitting there.
+
+    "Taken" includes an item inside somebody else's held plan, and the holder is
+    the whole point of showing it: the column read as an idle age — "4d", the
+    strongest possible invitation to pick something up — over work another agent
+    had reserved.
     """
-    claim = item.get("claim")
-    if claim:
-        return (claim.get("holder") or "?").split("/", 1)[-1], "yellow"
+    holder = plan_holder(item)
+    if holder:
+        return (holder.get("holder") or "?").split("/", 1)[-1], "yellow"
     blockers = item.get("blocked_by") or []
     if blockers:
         first = blockers[0].get("ref")
@@ -706,17 +754,34 @@ def plan_who(item: dict) -> tuple[str, str]:
 def claim_label(key: str, plan: list[dict] | None = None) -> str:
     """What a claim is ON, in words a human can read off a pane.
 
-    A claim on a plan item is keyed ``plan:<uuid>``: right for a lock, useless on
-    a screen — 36 hex characters that say only "something on the plan". Given the
-    plan, the item's title goes in instead. Without it the raw key stays, because
-    a key nobody can resolve still beats a blank.
+    A claim on a board object is keyed by uuid — ``item:<id>`` for one line of the
+    plan, ``plan:<id>`` for a whole one: right for a lock, useless on a screen,
+    where 36 hex characters say only "something on the plan". Given the plan, the
+    item's title or the plan's label goes in instead. Without it the raw key
+    stays, because a key nobody can resolve still beats a blank.
+
+    **Both prefixes, because #172 moved them.** An ITEM claim used to be keyed
+    ``plan:<uuid>`` and is now ``item:<uuid>``, while ``plan:`` became the
+    whole-plan claim that release added — so the old test matched a plan id
+    against item ids, which cannot ever be equal, and the CLAIMED pane showed a
+    bare uuid for every claim the new plan takes.
     """
     key = key or "?"
-    wanted = key.split(":", 1)[1] if key.startswith("plan:") else None
+    prefix, _, wanted = key.partition(":")
+    if not wanted or prefix not in ("item", "plan"):
+        # `acme/widget:feat/x` is a branch and `acme/widget#5` an issue: both are
+        # already readable, and neither is a uuid to look up.
+        return short_key(key)
     for item in (plan or []):
-        if wanted and item.get("item_id") == wanted:
+        if prefix == "item" and item.get("item_id") == wanted:
             head = " ".join(x for x in ("plan", plan_ref(item)) if x)
             return f"{head} {item.get('title') or '?'}"
+        row = item.get("plan") or {}
+        if prefix == "plan" and row.get("plan_id") == wanted and row.get("label"):
+            # The plan's own claim, over every item under that label. Named as the
+            # plan rather than as one of its items: it is not the first row's
+            # work, it is all of it.
+            return f"plan {row['label']}"
     return short_key(key)
 
 
