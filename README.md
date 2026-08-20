@@ -773,7 +773,7 @@ full — including what was broken before it, which is the part no diff recovers
   followed — but shipped text that already existed is **not** exempt, since a test can assert
   on it, as this change did to its own prompt and briefs. The panel's `REVIEW_PROMPT` also stops asking only whether a test is **absent** —
   #90's fixture answered that correctly — and now asks whether a present test is load-bearing.
-- **vNEXT** — a row key the dashboard can actually tell apart. `qb-dash-tui` dies with
+- **v2.59** — a row key the dashboard can actually tell apart. `qb-dash-tui` dies with
   `DuplicateKey` when two rows want the same key, and that is not a bad-looking row — a
   `DataTable` raises, so the whole dashboard becomes a traceback. #208 fixed the reported
   instance by re-keying SEATS on the pane id; OPEN PRs and ISSUES were still keyed on a bare

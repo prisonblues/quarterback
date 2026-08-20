@@ -11,7 +11,7 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
-## vNEXT — a row key the dashboard can actually tell apart
+## v2.59 — a row key the dashboard can actually tell apart
 
 `qb-dash-tui` dies with `DuplicateKey` when two rows want the same key, and a `DataTable`
 raises rather than tolerating one — so the failure is not an odd-looking row, it is the
