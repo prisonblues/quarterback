@@ -255,6 +255,170 @@ def test_an_ordinary_claim_key_is_still_shortened():
     assert qd.claim_label(f"{qd.REPO}#142", []) == "quarterback#142"
 
 
+# ---- the scope: which project's rows a dashboard is about (#261) -------------
+#
+# Two decisions, and they have to agree: which rows are kept, and whether the
+# repo cell is worth eleven columns of a 78-column pane. Tested together for that
+# reason — a column dropped from rows that were not narrowed shows nothing, and
+# rows narrowed with the column still there is the waste the scope exists to end.
+
+ONE = qd.Scope([qd.REPO])
+TWO = qd.Scope([qd.REPO, "prisonblues/nix-fleet"])
+
+
+def test_one_repo_spends_no_column_saying_which_one():
+    assert ONE.column is False
+    assert ONE.label() == "quarterback"
+
+
+def test_two_watched_repos_keep_the_cell_that_tells_them_apart():
+    assert TWO.column is True
+
+
+def test_the_wide_view_always_names_the_repo_because_that_is_why_it_is_wide():
+    wide = ONE.widened()
+    assert wide.on is False
+    assert wide.column is True
+    assert wide.label() == "all repos"
+    assert wide.keeps("someone/else") is True
+
+
+def test_the_three_spellings_of_one_repository_are_one_repository():
+    """A lease reports the checkout's directory; the plan and `gh` report a slug.
+
+    Comparing the spellings would put a seat's own FLEET row outside its own
+    scope — the board says `quarterback`, the plan says `prisonblues/quarterback`,
+    and neither is wrong.
+    """
+    assert ONE.keeps("quarterback")
+    assert ONE.keeps("prisonblues/quarterback")
+    assert ONE.keeps("Quarterback")
+    assert not ONE.keeps("prisonblues/nix-fleet")
+
+
+def test_a_row_the_board_cannot_attribute_stays_on_the_pane():
+    """No repo is not evidence of ANOTHER repo.
+
+    An agent working outside a checkout reports no repo, and hiding it would drop
+    a live peer on the strength of a missing field. The narrow view is a way to
+    read the fleet, not a claim to have accounted for all of it.
+    """
+    assert ONE.keeps(None)
+    assert ONE.keeps("")
+
+
+def test_a_narrowed_panel_can_say_how_many_rows_it_hid():
+    """The count is the whole reason in_scope returns two things.
+
+    A panel that filtered silently is a panel lying about the fleet: "nothing
+    claimed" and "nothing claimed here" are different facts.
+    """
+    rows = [{"repo": "quarterback"}, {"repo": "prisonblues/nix-fleet"},
+            {"repo": None}, {"repo": "someone/other"}]
+    kept, hidden = qd.in_scope(rows, ONE)
+    assert [r["repo"] for r in kept] == ["quarterback", None]
+    assert hidden == 2
+
+
+def test_no_scope_at_all_hides_nothing():
+    rows = [{"repo": "a/one"}, {"repo": "b/two"}]
+    assert qd.in_scope(rows, None) == (rows, 0)
+
+
+def test_a_claim_names_its_repo_in_its_key_or_not_at_all():
+    """The three key shapes in use, of which two carry a repo."""
+    assert qd.claim_repo("prisonblues/quarterback#209") == "prisonblues/quarterback"
+    assert qd.claim_repo("prisonblues/quarterback:2.40") == "prisonblues/quarterback"
+    assert qd.claim_repo("merge-queue") is None
+    assert qd.claim_repo("") is None
+    assert qd.claim_repo(None) is None
+
+
+def test_a_plan_claim_gets_its_repo_from_the_plan_or_stays_unattributed():
+    """`plan:<uuid>` names an ITEM, not a repo, so the plan is what resolves it.
+
+    Unattributed when the plan has not been fetched — and that keeps the claim on
+    the pane, which is right: hiding it would drop the one row saying somebody
+    already holds the work you were about to pick up.
+    """
+    plan = [item("roof", repo="65lowther")]
+    plan[0]["item_id"] = "ea9e1623"
+    assert qd.claim_repo("plan:ea9e1623", plan) == "65lowther"
+    assert qd.claim_repo("plan:ea9e1623", []) is None
+    assert qd.claim_repo("plan:ea9e1623") is None
+
+
+def test_the_claim_key_drops_the_repo_only_when_the_header_states_it():
+    """`quarterback#209` is twelve columns to say `#209` — on a pane showing one
+    project. On a pane showing several, the repo is what tells two claims apart."""
+    assert qd.claim_label(f"{qd.REPO}#209", [], ONE) == "#209"
+    assert qd.claim_label(f"{qd.REPO}:2.40", [], ONE) == "2.40"
+    assert qd.claim_label(f"{qd.REPO}#209", [], ONE.widened()) == "quarterback#209"
+    assert qd.claim_label(f"{qd.REPO}#209", [], TWO) == "quarterback#209"
+    assert qd.claim_label("prisonblues/nix-fleet#3", [], ONE) == "nix-fleet#3"
+    assert qd.claim_label(f"{qd.REPO}#209", []) == "quarterback#209"
+
+
+def test_the_scope_opens_narrow_and_the_env_is_how_a_pane_opens_wide(monkeypatch):
+    """Narrow by default, because that is what a screen is FOR."""
+    monkeypatch.delenv(qd.SCOPE_ENV, raising=False)
+    assert qd.resolve_scope([qd.REPO]).on is True
+    monkeypatch.setenv(qd.SCOPE_ENV, "all")
+    assert qd.resolve_scope([qd.REPO]).on is False
+    monkeypatch.setenv(qd.SCOPE_ENV, "ALL")
+    assert qd.resolve_scope([qd.REPO]).on is False
+    # Anything unrecognised is the default rather than an error: a typo in a
+    # tmux env should cost a wide pane, not a dashboard that will not start.
+    monkeypatch.setenv(qd.SCOPE_ENV, "quarterback")
+    assert qd.resolve_scope([qd.REPO]).on is True
+
+
+# ---- pointing a dashboard at a project --------------------------------------
+
+@pytest.fixture
+def watched():
+    """Restore the process-wide repo cache, whatever a test does to it."""
+    before = qd._repos
+    yield
+    qd._repos = before
+
+
+def test_repo_reaches_what_reads_resolve_repos_for_itself(watched):
+    """--repo has to land in the CACHE, not be passed around.
+
+    The plan's ordering, the `gh` calls and the ⚒ that needs a slug to start work
+    all reach resolve_repos() directly. Threading a list through the callers that
+    do take one would leave whichever was missed silently watching the cwd, which
+    is #176 again.
+    """
+    qd.set_repos(["prisonblues/nix-fleet", " ", "me/app"])
+    assert qd.resolve_repos() == ["prisonblues/nix-fleet", "me/app"]
+
+
+def test_clearing_the_pin_falls_back_to_the_environment(watched, monkeypatch):
+    qd.set_repos([])
+    monkeypatch.setenv("QB_DASH_REPOS", "me/app")
+    assert qd.resolve_repos() == ["me/app"]
+
+
+def test_a_checkout_is_asked_which_repo_it_is():
+    slug = qd.repo_arg(str(Path(__file__).resolve().parent.parent.parent))
+    assert slug.count("/") == 1 and slug.endswith("/quarterback")
+
+
+def test_a_bare_name_is_refused_rather_than_given_an_owner():
+    """`gh` needs an owner, and the fleet works in repos whose owner is not ours.
+
+    Inventing one aims the PR panel — and the ⚒ that starts work off it — at
+    somebody else's repository of the same name.
+    """
+    with pytest.raises(ValueError):
+        qd.repo_arg("quarterback")
+    with pytest.raises(ValueError):
+        qd.repo_arg("/nowhere/at/all/really")
+    assert qd.repo_arg("prisonblues/nix-fleet") == "prisonblues/nix-fleet"
+
+
 # ---- the tmux screen ---------------------------------------------------------
 
 def test_no_tmux_means_no_seats_rather_than_an_exception(monkeypatch):

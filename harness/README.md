@@ -730,6 +730,33 @@ the tmux cursor to that seat's pane, a claim shows its note, a plan item explain
 where it is, a PR or an issue opens on GitHub. `qb-dash` is the same five views rendered
 without interaction, for a terminal that will not forward mouse events.
 
+**It opens on ONE project, and that is the interesting default.** Every panel here is
+fleet-wide by construction — FLEET is every live agent on the board, CLAIMED every claim,
+PLANS every repo's list — while a screen is built for one repository. So most rows were
+somebody else's, and the repo cell was then the same word, eleven columns wide, on every
+line of a 78-column pane (#261). The scope narrows the three board-derived panels to the
+repos this screen watches and drops the column outright; the eleven columns go back to
+`what` an agent is doing and to a plan item's title, and `quarterback#209` in CLAIMED
+becomes `#209`. The repos are the ones the dashboard already resolved for its `gh` calls:
+`--repo` (a checkout or an `owner/name` slug, repeatable), else `QB_DASH_REPOS`, else the
+origin of the directory it was started in.
+
+Two repos keep the column — there it still tells rows apart — and so does the wide view,
+which is the whole reason to widen. `s` toggles between them in the TUI, redrawing from
+what the client already has rather than re-fetching; the plain renderer has no keyboard, so
+it takes `--scope all` or `QB_DASH_SCOPE=all`. **A narrowed panel always says what it
+hid** — `FLEET · 3 · 2 elsewhere` — because a filtered pane that reads like the whole fleet
+is worse than an unfiltered one: it is the same picture with fewer facts, and "nothing
+claimed" and "nothing claimed *here*" are different claims about the world.
+
+Three things stay fleet-wide on purpose. A row whose repo the board cannot name — an agent
+outside a checkout, a `plan:<uuid>` claim this process has not resolved — is kept, because
+no repo is not evidence of another repo and hiding it drops a live peer. The held-issue
+markers come from *every* claim, so an issue held by an agent working out of another repo's
+checkout is still shown as held rather than offered to the next seat. And OPEN PRs and
+ISSUES cannot narrow at all: `gh` was only ever asked about the watched repos, so there is
+no other repo's row there to hide — only their column answers to the scope.
+
 **The top line is the ceiling every pane below it works towards.** The seats spend one
 Claude subscription between them, so the five-hour and weekly caps are a fleet-wide number
 that none of the tables can show — and six seats working a plan in parallel is exactly the
@@ -755,8 +782,8 @@ a `⚒`; clicking one opens a confirmation showing the exact command, and confir
 `/panel-review-pr <n>` or `/fix-issue <n>` in a detached tmux window of its own — the same
 way `qb-seat` starts an agent, so what it starts is a real session you can attach to, read
 and interrupt. Clicking anywhere else on the row still opens the thing on GitHub. The keys
-are `o` open, `p` panel-review, `f` fix the selected issue or plan item, `r` refresh, `?`
-the list, `q` quit.
+are `o` open, `p` panel-review, `f` fix the selected issue or plan item, `s` this project's
+rows or the whole fleet's, `r` refresh, `?` the list, `q` quit.
 
 **The plans panel is the one that says what the work is FOR.** FLEET says who is here and
 CLAIMED says what they hold; neither answers why. `PLANS` is the board's plan — every repo's

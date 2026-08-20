@@ -75,6 +75,41 @@ def short_repo(repo: str) -> str:
     return repo.split("/", 1)[-1]
 
 
+def set_repos(repos: list[str]) -> None:
+    """Pin which repositories this process watches, overriding the environment.
+
+    The dashboards take ``--repo`` now, and half of what reads the answer reaches
+    :func:`resolve_repos` for itself — ``plan_repo``, ``sort_plan``, ``fetch_prs``
+    — rather than taking a list as an argument. Priming the cache is what makes
+    one flag reach all of them; threading it through every call site would leave
+    whichever one was missed silently watching the cwd, which is the shape of
+    #176 all over again.
+    """
+    global _repos
+    cleaned = [r.strip() for r in repos if r and r.strip()]
+    _repos = cleaned or None
+
+
+def repo_arg(value: str) -> str:
+    """A ``--repo`` argument — a checkout or an ``owner/name`` slug — as a slug.
+
+    A directory is asked for its origin, which is how "the project this screen is
+    set up for" is spelled when you are standing in it. A bare name is REFUSED
+    rather than completed: `gh` needs an owner, the fleet works in repos whose
+    owner is not this one's, and inventing one aims the PR panel — and the ⚒ that
+    starts work off it — at somebody else's repository of the same name.
+    """
+    value = (value or "").strip().rstrip("/") or "."
+    if value in (".", "..") or os.path.isdir(value):
+        slug = repo_slug(value)
+        if not slug:
+            raise ValueError(f"{value}: not a git checkout with an origin remote")
+        return slug
+    if value.count("/") == 1 and all(part.strip() for part in value.split("/")):
+        return value
+    raise ValueError(f"{value!r}: neither a checkout nor an owner/name slug")
+
+
 _REPO_COLOURS = ["cyan", "magenta", "green", "yellow", "blue", "red"]
 _repo_colour: dict[str, str] = {}
 
@@ -89,6 +124,140 @@ def repo_colour(name: str) -> str:
     if key not in _repo_colour:
         _repo_colour[key] = _REPO_COLOURS[len(_repo_colour) % len(_REPO_COLOURS)]
     return _repo_colour[key]
+
+
+# ---- scope: which project's rows this dashboard is about ---------------------
+#
+# Every board-derived panel is fleet-wide by construction — FLEET is every live
+# agent, CLAIMED every claim, PLANS every repo's list — and a screen is built for
+# ONE project. So most rows are somebody else's, and the repo cell is then the
+# same word, eleven columns wide, on every line: a 78-column pane spending its
+# scarcest thing on a fact the header can state once (#261).
+#
+# One object holds both halves of the decision because they have to agree. What is
+# kept, and whether the column is worth keeping, are the same question asked twice:
+# a column dropped from a table whose rows were NOT narrowed shows nothing anywhere,
+# and rows narrowed with the column left in place is the waste this exists to end.
+
+#: Opens the dashboard wide instead of on the screen's own repos. Any other value
+#: — including nothing — is the narrow default, which is what a seat screen wants
+#: every time but the one time it is looking for a peer somewhere else.
+SCOPE_ENV = "QB_DASH_SCOPE"
+SCOPE_WIDE = ("all", "fleet", "wide")
+
+
+def repo_name(value: str | None) -> str | None:
+    """A repo in the one form these panels can be compared in, or None.
+
+    THREE spellings reach this dashboard for one repository. A lease reports a
+    bare ``quarterback``, because what it saw was the checkout's directory; the
+    plan and `gh` both report ``prisonblues/quarterback``; and a hand-written plan
+    item reports whichever the human typed. Folded to the bare name, lowercased,
+    so what gets compared is repositories rather than spellings — comparing the
+    slugs would put a seat's own FLEET row out of its own scope.
+    """
+    return short_repo((value or "").strip()).lower() or None
+
+
+def claim_repo(key: str | None, plan: list[dict] | None = None) -> str | None:
+    """Which repo a claim is against, or None when its key cannot say.
+
+    Three key shapes are in use and only two of them carry a repo: ``owner/repo#12``
+    (an issue), ``owner/repo:2.40`` (a release number), and ``plan:<uuid>`` — which
+    names an item and not a repo, so the plan is consulted when the caller has it
+    and the claim is left unattributed when it does not.
+
+    None means "cannot say", and every caller treats that as in scope. A claim
+    whose repo is unknown is not evidence that it belongs to another project, and
+    hiding it drops the one row that says somebody already holds the work you were
+    about to pick up.
+    """
+    key = (key or "").strip()
+    if not key:
+        return None
+    if key.startswith("plan:"):
+        wanted = key.split(":", 1)[1]
+        for item in plan or []:
+            if item.get("item_id") == wanted:
+                return item.get("repo") or None
+        return None
+    head = key.split("#", 1)[0].split(":", 1)[0]
+    # A head with no owner is not a repo we can name. `gh` and the plan both spell
+    # a claim key with its owner, so a bare word here is some other namespace's
+    # key, and reading it as a repo would scope rows against a word that is not one.
+    return head if "/" in head else None
+
+
+class Scope:
+    """Which rows a dashboard is about, and whether to spend a column saying so."""
+
+    def __init__(self, repos: list[str], on: bool = True) -> None:
+        self.repos = list(repos)
+        self.on = bool(on)
+        self.names = {n for n in (repo_name(r) for r in self.repos) if n}
+
+    @property
+    def column(self) -> bool:
+        """Is the repo cell worth its eleven columns?
+
+        Not when the rows have been narrowed to ONE repository: every cell then
+        carries the same word, and the header says it once for the whole pane. Yes
+        for the wide view — telling repos apart is the entire reason to widen — and
+        yes for a screen watching two, where the cell still distinguishes rows.
+        """
+        return not self.on or len(self.names) != 1
+
+    def keeps(self, repo: str | None) -> bool:
+        """Does a row in ``repo`` belong on this pane?
+
+        A row whose repo nothing could name STAYS. No repo is not evidence of
+        another repo, and dropping it hides a live agent working outside a checkout
+        — or a claim whose plan item this process has not fetched — on the strength
+        of a missing field. The narrow view is a way to read the fleet, not a claim
+        to have accounted for all of it.
+        """
+        if not self.on or not self.names:
+            return True
+        name = repo_name(repo)
+        return name is None or name in self.names
+
+    def label(self) -> str:
+        """What the header says this pane is showing, in one phrase."""
+        return ", ".join(sorted(self.names)) if self.on and self.names else "all repos"
+
+    def widened(self) -> Scope:
+        """The same watch list, the other way round — what the toggle switches to."""
+        return Scope(self.repos, not self.on)
+
+
+def resolve_scope(repos: list[str] | None = None, on: bool | None = None) -> Scope:
+    """The scope a dashboard starts in: narrow, unless told otherwise.
+
+    Narrow by default because that is what a screen is for. ``QB_DASH_SCOPE=all``
+    opens wide for a session that is watching the fleet rather than working in it;
+    the repos are the ones :func:`resolve_repos` already worked out, so one
+    ``--repo`` or ``QB_DASH_REPOS`` aims the filter and the `gh` calls together.
+    """
+    if on is None:
+        on = os.environ.get(SCOPE_ENV, "").strip().lower() not in SCOPE_WIDE
+    return Scope(resolve_repos() if repos is None else repos, on)
+
+
+def in_scope(rows: list[dict], scope: Scope | None,
+             repo_of=None) -> tuple[list[dict], int]:
+    """The rows a scope keeps, and HOW MANY IT HID.
+
+    The count comes back rather than being dropped because a filtered panel that
+    does not say it filtered is a panel quietly lying about the fleet — the same
+    defect as a hardcoded repo (#176) one level up. Every caller puts it in the
+    panel title, so "nobody else is working" and "nobody else is working *here*"
+    can never read the same.
+    """
+    if scope is None:
+        return list(rows), 0
+    getter = repo_of or (lambda row: row.get("repo"))
+    kept = [row for row in rows if scope.keeps(getter(row))]
+    return kept, len(rows) - len(kept)
 
 
 def ago(stamp: str | None) -> str:
@@ -654,13 +823,19 @@ def plan_who(item: dict) -> tuple[str, str]:
     return ago(item.get("updated")), "grey50"
 
 
-def claim_label(key: str, plan: list[dict] | None = None) -> str:
+def claim_label(key: str, plan: list[dict] | None = None,
+                scope: Scope | None = None) -> str:
     """What a claim is ON, in words a human can read off a pane.
 
     A claim on a plan item is keyed ``plan:<uuid>``: right for a lock, useless on
     a screen — 36 hex characters that say only "something on the plan". Given the
     plan, the item's title goes in instead. Without it the raw key stays, because
     a key nobody can resolve still beats a blank.
+
+    The scope trims the repo off the front for the same reason the panels drop
+    their repo column (#261): on a pane showing one project, ``quarterback#209``
+    spends twelve columns to say ``#209``. Only when the scope is that one project
+    — the wide view keeps the repo, because there it is what tells two claims apart.
     """
     key = key or "?"
     wanted = key.split(":", 1)[1] if key.startswith("plan:") else None
@@ -668,7 +843,25 @@ def claim_label(key: str, plan: list[dict] | None = None) -> str:
         if wanted and item.get("item_id") == wanted:
             head = " ".join(x for x in ("plan", plan_ref(item)) if x)
             return f"{head} {item.get('title') or '?'}"
-    return short_key(key)
+    return _unprefixed(short_key(key), scope)
+
+
+def _unprefixed(label: str, scope: Scope | None) -> str:
+    """``quarterback#209`` → ``#209``, and ``quarterback:2.40`` → ``2.40``.
+
+    Only against the repo the pane is scoped to, and only when that is a single
+    repo: trimming a name the header does not state would leave a bare ``#209``
+    with nothing anywhere saying whose #209 it is.
+    """
+    if scope is None or scope.column or len(scope.names) != 1:
+        return label
+    name = next(iter(scope.names))
+    lowered = label.lower()
+    if lowered.startswith(f"{name}#"):
+        return label[len(name):]                  # the '#' stays: it reads as an issue
+    if lowered.startswith(f"{name}:"):
+        return label[len(name) + 1:]              # the ':' does not: it read as a namespace
+    return label
 
 
 def plan_detail(item: dict) -> str:
