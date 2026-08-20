@@ -21,14 +21,32 @@ If you find yourself wanting this one to merge, that is not a missing flag — i
    repo (default: the cwd's repo). `--rounds N` / `--loop` pass straight through to
    `/panel-review-pr` (default: its default, 2). Consume every `--flag` **with its value** before
    reading the integers, or `--rounds 3` reviews issue 3 — `panel-review-pr.md` §1 has the parsing
-   rule and the reason it is written that way.
+   rule and the reason it is written that way, **including the one exception**: `--loop` takes no
+   value and is consumed alone (`--loop 42` is `--loop` and issue #42, not a flag whose value is
+   `42`). Applying the general rule to `--loop` eats the issue number and leaves you with none,
+   which is the bug class the rule exists to prevent, one flag over. A `--flag` this command does
+   not know is **not** silently swallowed: say which flag you did not recognise and stop, rather
+   than running a narrower command than the caller asked for.
 
-   Then resolve the repo's own answers — do not assume this repo's:
+   Then resolve the repo's own answers — do not assume this repo's — and say which repo you asked
+   about, because the default is the cwd and the cwd is the thing being overridden:
    ```bash
-   python3 ~/.claude/loops/harness_rules.py --json
+   python3 ~/.claude/loops/harness_rules.py --repo <repo> --json    # omit --repo only when no repo argument was given
    ```
+   `harness_rules.py --repo` takes "path or name (default: cwd)", so a bare invocation reads *this*
+   checkout's answers and uses them for a PR in another repo — exactly what the sentence above
+   forbids. (`fix-and-land.md`:19 carries the identical defect; fix them together or they drift.)
+
    `$BASE` = `executor_pr_base` (`test` for lexray, `main`/`master` elsewhere), unless `--base`
    overrode it. `headless_permission_mode` is what the sub-agents run under.
+
+   **Then check the repo argument is one you can actually honour.** `/fix-issue` has **no repo
+   parameter** — its `@arguments` is `<issue-number> [--base <branch>] [--shared-db | --isolated-db]`
+   and it operates on the canonical remote of whatever checkout it runs in. So a repo argument
+   naming anything other than the cwd's repo cannot be carried into step 2: it would resolve
+   *that* repo's rules and then implement the issue *here*, silently. If `<repo>` was given and
+   does not match the cwd's repo (`gh repo view --json nameWithOwner`), **stop and say so** — the
+   fix is to run the command from that repo's checkout, not to proceed.
 
 2. **Implement:** run `/fix-issue <issue> --base $BASE`. It plans, implements, tests, opens a PR
    against the right base, and leaves its worktree in place.
@@ -54,8 +72,17 @@ If you find yourself wanting this one to merge, that is not a missing flag — i
    work is grading itself, and the board cannot tell a fixer from a reviewer, so it records the
    verdict either way.
 
-   The sub-agent's brief is `panel-review-pr.md` §§3–6 for this PR — it owns the whole cycle,
-   including the re-review rounds, which are not yours to run afterwards — plus:
+   **Write the brief out in full — the sub-agent cannot see this file, or any command file you
+   name.** Read `~/.claude/commands/panel-review-pr.md` once and paste its §§3–6 into the brief
+   verbatim; do not hand over the *reference* "`panel-review-pr.md` §§3–6" and assume the sub-agent
+   will resolve it. This is `panel-review-pr.md` §2's own rule for its own fan-out ("Write the brief
+   out in full — a sub-agent cannot see this file"), and it applies here for the same reason plus
+   one more: `~/.claude/commands` is a nix store symlink, so a sub-agent asked to resolve a slash
+   command may be reading a different version of it than you are, or none at all. If the paste
+   fails — the file is not where you looked — stop and say so rather than sending a reference.
+
+   The pasted brief covers the whole cycle for this PR, including the re-review rounds, which are
+   not yours to run afterwards. Add to it:
    - the resolved context: repo `nameWithOwner`, remote, **`WT_DIR`**, PR number, base and head
      branch, and the round cap;
    - `--repo <WT_DIR>` on every `panel.py` invocation, since its cwd is not guaranteed to be the
@@ -84,15 +111,34 @@ If you find yourself wanting this one to merge, that is not a missing flag — i
 
 4. **Merge prep — everything that is stable, and nothing that is not.**
 
+   **First, re-sync `$WT_DIR` to the PR's head — step 3 almost certainly moved it and did not
+   touch your copy.** Per `panel-review-pr.md` §4, the review sub-agent fixes in place only if the
+   PR's head branch is already its own checkout's branch; otherwise it works in a throwaway
+   `git worktree`, pushes `HEAD:<branch>`, and deletes it. That is the documented default whenever
+   the fixer's cwd is not the PR branch — which is the sub-agent's situation every time. So after
+   any round that produced a fix, the branch has moved on the remote and `$WT_DIR` is still at the
+   commit `/fix-issue` left there:
+   ```bash
+   git -C "$WT_DIR" fetch origin && git -C "$WT_DIR" merge --ff-only @{u}
+   ```
+   This is not housekeeping — it is load-bearing for the very next command. `preland.py`'s
+   `checkout` check compares `git -C $WT_DIR rev-parse HEAD` against the PR's `headRefOid` and
+   fails on any mismatch; HOLD dominates the verdict and the HOLD bullet below forbids clearing it
+   with `--skip`. Skip the re-sync and **every PR whose review actually produced a fix dead-ends at
+   a HOLD that misreports your stale local checkout as a merge blocker** — the command's happy path
+   broken for the case it exists to serve. If the fast-forward is refused, `$WT_DIR` has commits the
+   remote does not: **stop and say so**, do not force anything.
+
    ```bash
    python3 ~/.claude/loops/preland.py --pr <pr> --repo "$WT_DIR" --json
    ```
    `--repo` explicitly, never "run it from the worktree": the shell cwd resets between tool calls,
    so a `cd` does not stick and a defaulted `--repo` reads whichever checkout you were launched in —
    which is the one whose branch is not under review. **If that path does not exist, run it out of
-   the checkout** — `python3 harness/loops/preland.py --pr <pr> --repo "$WT_DIR" --json` — and do
-   not read a missing file as permission to skip the step. `~/.claude/loops` is a nix store symlink,
-   so it is exactly as current as the last home-manager rebuild and nothing announces the gap.
+   the checkout** — `python3 "$WT_DIR/harness/loops/preland.py" --pr <pr> --repo "$WT_DIR" --json` —
+   and do not read a missing file as permission to skip the step. `~/.claude/loops` is a nix store
+   symlink, so it is exactly as current as the last home-manager rebuild and nothing announces the
+   gap.
 
    **The verdict is the decision.** Act on it; never substitute your own reading of the same facts.
    - **RECONCILE (exit 3)** → run every command in `actions`, in order, verbatim. Commit what they
@@ -104,25 +150,51 @@ If you find yourself wanting this one to merge, that is not a missing flag — i
    - **HOLD (exit 2)** → stop here and report `reasons` as they are written. Do not clear a HOLD by
      re-running with the check turned off: `--skip` and `.harness-rules` are for repos that
      genuinely lack a guardrail, not for a verdict you dislike.
-   - **READY (exit 0)** → prep is done. Go to step 5.
+   - **READY (exit 0)** → preland is satisfied, but **prep is not done**. Do 4a and 4b below, in
+     that order, and only then go to step 5. They are part of this step, not optional trailing
+     prose: step 5 asks you to report what `preflight` said, and the closing-keyword check is the
+     one piece of prep that is load-bearing on a non-default `$BASE`.
 
-   **Do NOT stamp the release number.** `release_stamp.py apply` resolves `vNEXT` against `$BASE`
-   **as it stands now**, and this command hands the PR to a human who merges later — by which time
-   another branch may have taken that number, leaving `apply` refusing with nothing left to rewrite
-   and a hand-edit as the repair (`fix-and-land.md` step 4 documents it). A number is only knowable
-   at the moment of the merge, so ask the cheaper question and leave the number alone:
+   **4a. Ask the release-number question without spending the answer.** `release_stamp.py apply`
+   resolves `vNEXT` against `$BASE` **as it stands now**, and this command hands the PR to a human
+   who merges later — by which time another branch may have taken that number, leaving `apply`
+   refusing with nothing left to rewrite and a hand-edit as the repair (`fix-and-land.md` step 4
+   documents it). A number is only knowable at the moment of the merge, so ask the cheaper question
+   and leave the number alone:
    ```bash
-   python3 scripts/release_stamp.py preflight --repo "$WT_DIR" --onto origin/$BASE
+   python3 "$WT_DIR/scripts/release_stamp.py" preflight --repo "$WT_DIR" --onto origin/$BASE
    ```
-   Report what it said. Exit 2 is a refusal carrying the sentence that repairs it — quote that
-   sentence rather than paraphrasing it, because it is the whole value of running this early. On a
-   branch that ships no release it is a noop, so run it unconditionally rather than guessing.
-   Whoever merges runs `apply` then (a human, or `/fix-and-land`).
+   **The script path is `$WT_DIR`-relative, not cwd-relative** — `--repo` only chooses which repo
+   the plan is built *against*, not where the script is loaded *from*, so a bare
+   `python3 scripts/release_stamp.py` pairs one checkout's tool with another checkout's files, which
+   is the same defect the `preland.py` paragraph above spends five lines refusing.
 
-   **Check the closing keyword while you are here.** If `$BASE` is not the repo's default branch, a
-   `Closes #N` in the PR body fires on nothing: the keyword has to be in a commit message that
-   lands on the default branch. `/fix-issue` puts `Fixes #N` in its commit body for exactly this
-   reason — confirm it is there, and add a commit that carries it if it is not.
+   **This script is per-repo, so detect it rather than assuming it.** `scripts/release_stamp.py`
+   does not exist in every repo this command runs against (lexray has no such file). If it is
+   absent, **skip 4a with a stated reason** and say so in step 5 — this is `preland.py`'s own
+   `_detected()` discipline, which skips a guardrail that is not on the branch instead of failing
+   on it. A bare `python3: No such file or directory` at exit 2 is **not** "a refusal carrying the
+   sentence that repairs it"; reading it as one reports a missing tool as a release-number problem.
+
+   Where the script *is* present: report what it said. Exit 2 is a genuine refusal carrying the
+   sentence that repairs it — quote that sentence rather than paraphrasing it, because it is the
+   whole value of running this early. On a branch that ships no release it is a noop, so run it
+   unconditionally once you know the file is there. Whoever merges runs `apply` then (a human, or
+   `/fix-and-land`).
+
+   **4b. Check the closing keyword.** If `$BASE` is not the repo's default branch, a `Closes #N` in
+   the PR body fires on nothing: the keyword has to be in a commit message that lands on the default
+   branch. `/fix-issue` puts `Fixes #N` in its commit body for exactly this reason — confirm it is
+   there, and add a commit that carries it if it is not.
+
+   **If you added that commit, push it and run preland again**, for the reason the RECONCILE bullet
+   already states: a push restarts CI, so the green preland just reported describes a commit that is
+   no longer the head, its `checkout` check is now at a stale sha, and its `review` check finds the
+   newest recorded round read the previous head. Quoting the earlier READY to the human after
+   pushing describes code the PR no longer contains. Flag it as what it is, too — a commit riding
+   out unreviewed, which `panel-review-pr.md` §5 otherwise forbids; it is allowed here only because
+   it is a message-only commit with no code in it, and if yours has code in it, it is not this
+   commit and needs a round.
 
 5. **Report, and hand over the merge.** One block, in this order, because it is read top-down by
    someone deciding whether to press the button:
@@ -137,7 +209,9 @@ If you find yourself wanting this one to merge, that is not a missing flag — i
      disagreement between them, which is more informative than either verdict alone.
    - **preland:** the verdict, quoted, plus anything a RECONCILE did and the fact that preland was
      re-run after it.
-   - **Release number:** what `preflight` said, and that `apply` is deliberately left to the merge.
+   - **Release number:** what `preflight` said, and that `apply` is deliberately left to the merge —
+     or that 4a was skipped because this repo ships no `scripts/release_stamp.py`, which is a fact
+     about the repo and not a step that failed.
    - **The PR, the issue, and `WT_DIR`** — the worktree stays up so review findings can be
      addressed on the same branch and DB (`/drop-worktree` when the PR merges).
    - **One sentence: the merge is yours.** Say what it would be — `gh pr merge <pr> --merge` for a

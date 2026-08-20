@@ -128,9 +128,14 @@ def test_fix_and_review_does_not_stamp_the_release_number():
     nothing."""
     runnable = _fenced(command("fix-and-review"))
     assert runnable.strip(), "no code blocks were read out of the file — the fence pattern is wrong"
-    assert "release_stamp.py preflight" in runnable, (
+    # Matched by regex, not substring: the script is invoked by a `$WT_DIR`-relative path that has
+    # to be quoted (`"$WT_DIR/scripts/release_stamp.py" preflight`), because `--repo` chooses which
+    # repo the plan is built against and NOT where the script is loaded from. Asserting the bare
+    # unquoted spelling pinned the invocation to a form that pairs one checkout's tool with another
+    # checkout's files.
+    assert re.search(r'release_stamp\.py"?\s+preflight', runnable), (
         "the merge-prep step no longer asks whether the release could be stamped")
-    assert "release_stamp.py apply" not in runnable, (
+    assert not re.search(r'release_stamp\.py"?\s+apply', runnable), (
         "prep must not stamp the number — that belongs to whoever merges. The paragraph explaining "
         "why may name `apply`; a code block may not.")
 
@@ -140,3 +145,67 @@ def test_the_two_end_to_end_commands_point_at_each_other():
     one-way reference means the mistake is only recoverable from the file they did not open."""
     assert "/fix-and-review" in command("fix-and-land")
     assert "/fix-and-land" in command("fix-and-review")
+
+
+def test_fix_and_review_resyncs_the_worktree_before_preland():
+    """216-F01, the P1. The review sub-agent fixes in a throwaway `git worktree` and pushes
+    `HEAD:<branch>` (`panel-review-pr.md` §4), so `$WT_DIR` is left at the commit `/fix-issue` made
+    and the branch has moved without it. `preland.py`'s `checkout` check compares
+    `git -C $WT_DIR rev-parse HEAD` against the PR's `headRefOid` and fails on mismatch; HOLD
+    dominates and the step forbids `--skip`. Without a re-sync, every PR whose review actually
+    produced a fix dead-ends at a HOLD describing a stale local checkout — the happy path broken
+    for the case the command exists to serve.
+
+    Asserted as an ORDERING over the runnable blocks, not as the presence of a sentence: a
+    fast-forward written after preland has already returned its verdict fixes nothing."""
+    runnable = _fenced(command("fix-and-review"))
+    ff = re.search(r'merge --ff-only', runnable)
+    preland = re.search(r'preland\.py', runnable)
+    assert ff, "merge prep never fast-forwards $WT_DIR onto the pushed head"
+    assert preland, "merge prep never runs preland — the fence pattern or the step is gone"
+    assert ff.start() < preland.start(), (
+        "the re-sync must come BEFORE preland, or preland still reads the stale checkout it was "
+        "the whole point of refreshing")
+
+
+def test_fix_and_review_asks_harness_rules_about_the_repo_it_was_given():
+    """216-F12. `harness_rules.py --repo` is "path or name (default: cwd)", so a bare invocation
+    reads THIS checkout's `executor_pr_base` and applies it to a PR in another repo — which is the
+    thing the sentence directly above it forbids. The flag is what makes the sentence true."""
+    runnable = _fenced(command("fix-and-review"))
+    rules = [ln for ln in runnable.splitlines() if "harness_rules.py" in ln]
+    assert rules, "step 1 no longer resolves the repo's own answers at all"
+    assert any("--repo" in ln for ln in rules), (
+        "harness_rules.py is invoked without --repo, so it answers about the cwd while the command "
+        "claims to answer about the named repo")
+
+
+def test_fix_and_review_loads_release_stamp_from_the_worktree_it_asks_about():
+    """216-F06. `--repo` chooses which repo the plan is built AGAINST; it does not change where the
+    script is loaded FROM. A cwd-relative `python3 scripts/release_stamp.py` therefore pairs one
+    checkout's tool with another checkout's files — the exact failure the `preland.py` paragraph
+    above it spends five lines refusing."""
+    runnable = _fenced(command("fix-and-review"))
+    stamp = [ln for ln in runnable.splitlines() if "release_stamp.py" in ln]
+    assert stamp, "the release-number question is no longer asked"
+    for ln in stamp:
+        assert "$WT_DIR/scripts/release_stamp.py" in ln, (
+            f"release_stamp.py is loaded from a cwd-relative path: {ln.strip()!r}")
+
+
+def test_fix_and_reviews_escalation_citation_resolves():
+    """216-F14 was a PHANTOM — and this test is the reason it is worth keeping a test here at all.
+
+    The panel reviewed this PR against a base 114 commits behind main and reported that
+    `review-pr.md` had no step 3a and that nothing invoked `panel.py --ask`. Both were true of
+    THAT base and false of main: `review-pr.md` now carries `#### 3a. When a finding says the
+    APPROACH is wrong, escalate it` and invokes `--ask` directly. That is #241 — a round scoped to
+    a stale base reporting confidently about code that had already moved.
+
+    So the citation stands, and what needs guarding is the thing the phantom finding was right
+    to care about: that it keeps resolving. A cross-file reference is only as good as the target."""
+    assert "step 3a" in command("fix-and-review"), (
+        "the escalation route lost its citation — a reader cannot find the mechanism")
+    assert re.search(r"^#### 3a\.", command("review-pr"), re.MULTILINE), (
+        "review-pr.md no longer has a step 3a, so fix-and-review.md now cites nothing — either "
+        "restore it there or stop citing it here")
