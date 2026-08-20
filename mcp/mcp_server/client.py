@@ -295,6 +295,12 @@ class QuarterbackClient:
         resp.raise_for_status()
         return resp.json()
 
+    def plan_order(self, params: dict) -> dict:
+        resp = self._http.get(self._url("/plan/order"),
+                              params={k: v for k, v in params.items() if v is not None})
+        resp.raise_for_status()
+        return resp.json()
+
     def handoff(self, session: str, blob: str) -> dict:
         resp = self._http.post(self._url("/handoff"), json={"session": session, "blob": blob})
         resp.raise_for_status()

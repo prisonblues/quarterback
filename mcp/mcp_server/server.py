@@ -182,7 +182,11 @@ mcp = FastMCP(
         "record it. The claim expires by itself, so a session that dies frees its "
         "item with nobody intervening. plan_done(item_id) when the issue closes.\n"
         "A human orders the plan; you add items, claim them, record what they wait "
-        "on (plan_depends) and complete them.\n\n"
+        "on (plan_depends) and complete them.\n"
+        "**Is that order still right?** plan_order(repo=...) — the order the "
+        "deterministic rules imply (dependency edges, blockers, merged PRs, red CI, "
+        "unanswered findings, staleness) beside the live one, with every placement "
+        "labelled derived or ambiguous. Advisory: only a human can apply it.\n\n"
         "## Session handoff (moving a session between devices)\n"
         "**Hand off:** lease(session, device) to claim it, do your work (renew_lease "
         "before ttl lapses), then push_session(session, jsonl) to store+release.\n"
@@ -689,6 +693,52 @@ def plan_read(ctx: Context, repo: str | None = None, phase: str | None = None,
              "limit": limit})
     except httpx.HTTPStatusError as e:
         _raise(e, "plan_read")
+
+
+@mcp.tool()
+def plan_order(ctx: Context, repo: str | None = None) -> dict:
+    """What order the deterministic rules would put the plan in, and why (#232).
+
+    `plan_read` gives you the order that is IN FORCE, which is a human's. This
+    gives you the order the *facts* imply — dependency edges, open blockers, a
+    merged PR, red CI, findings nobody has answered, an item nobody has touched in
+    a fortnight — beside the live one, and it never changes anything.
+
+    Read `counts.derived` against `counts.ambiguous` and `counts.interchangeable`
+    before the order itself: they say how much of it is a fact. Every entry
+    carries a `basis`:
+
+    * `constraint` — a dependency edge or an open blocker put it there. Facts the
+      board owns; nothing to argue with.
+    * `preference` — a graded rule did, mostly read off the last panel run for the
+      item's PR, so it is a snapshot and can be out of date.
+    * `ambiguous` — no rule separated it from a peer. Ties keep the order already
+      in force, so if no rule fires anywhere the suggestion is the order you have.
+      A crossing no rule ordered is labelled: both items carry a `displaced` reason
+      naming what went past them, because applying a rule to a pair with something
+      between them has to shift that something.
+    * `unopposed` / `unresolved` — nothing to compare it against, and a dependency
+      cycle the rules will not repair.
+
+    `unknown` names what the rules could not read — an item with no PR, a PR the
+    board has never panelled, evidence a week old, and changed-file overlap, whose
+    query is #101 and not written yet. Absent evidence is never good news, and it
+    is listed rather than left to be inferred.
+
+    **You cannot apply this.** `apply` in the response names the one call that
+    puts an order into force (`POST /plan/reorder`) and it is human-only. If you
+    disagree with a placement, say so on the board addressed to whoever is
+    deciding — the ordering is advisory in both directions.
+
+    Args:
+        repo: the scope, EXACTLY — omit for the fleet-wide list. Unlike
+            `plan_read` this never widens: ranks are per scope, so a widened read
+            would be two sequences interleaved rather than one order.
+    """
+    try:
+        return _get_client(ctx).plan_order({"repo": repo})
+    except httpx.HTTPStatusError as e:
+        _raise(e, "plan_order")
 
 
 @mcp.tool()
