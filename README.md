@@ -453,18 +453,43 @@ redeploys, with no diff to catch it — which is why the sentence that used to n
 own version has gone too. It was a fourth copy of a number that already lives in
 `pyproject.toml` and `app/main.py`, and it drifted exactly like the others.
 
-### A branch never picks its own number
+### A branch never writes in CHANGELOG.md
 
-Write `## vNEXT — <title>` at the top of [CHANGELOG.md](CHANGELOG.md) and `- **vNEXT** — …` at
-the end of the list below. Name no number, in either file. Whoever lands first gets the next one:
+Write a fragment instead — one file, named after your issue, that no other branch will ever
+open ([changelog.d/README.md](changelog.d/README.md) has the format):
+
+```
+changelog.d/296.feat.md
+```
+
+Every branch that shipped anything used to edit the same lines at the top of
+[CHANGELOG.md](CHANGELOG.md), so every pair of concurrent branches conflicted there — over
+nothing, since both entries are right and both belong, and git cannot know that two insertions
+at one offset are independent. Under fragments that conflict has nowhere to occur. A fragment
+names **no version at all**, not even the placeholder, which is what takes the branch out of the
+race for a number entirely rather than deferring it.
+
+At land time the fragments become one release entry, and then that entry gets its number:
 
 ```bash
 git fetch origin
+scripts/changelog_fragments.py check                    # do the fragments parse?
+scripts/changelog_fragments.py assemble --title "…"     # -> `## vNEXT — …` + the README bullet
 scripts/release_stamp.py preflight        # what it would take, read-only
 scripts/release_stamp.py apply            # rewrites the placeholder; commits nothing
 scripts/release_stamp.py apply --major    # …as v3 rather than v2.34
 scripts/release_stamp.py check            # nothing unstamped, no number used twice
 ```
+
+`assemble` needs `--title` only past one fragment; a lone fragment lends the release its own
+title. A fragment that lands unassembled is not lost — the next `assemble` sweeps it into that
+release, which is what a release IS: everything since the last one.
+
+### A branch never picks its own number
+
+Hand-writing `## vNEXT — <title>` at the top of [CHANGELOG.md](CHANGELOG.md) and
+`- **vNEXT** — …` at the end of the list below still works, and is what `assemble` writes for
+you. Name no number, in either file. Whoever lands first gets the next one.
 
 `apply` reads the highest `## vX.Y` heading in the CHANGELOG **at the ref you are merging into**,
 adds one, and writes it into every heading and bold run carrying the placeholder — across all
