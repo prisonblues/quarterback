@@ -122,6 +122,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shlex
 import subprocess
 import sys
 import tomllib
@@ -284,6 +285,11 @@ class Plan:
     served_to: str = ""
     onto_newest: Release | None = None
     major: bool = False
+    #: Things a caller should know that are not this branch's to fix, and must not
+    #: stop it. A broken base is the one that matters (#168): it is a refusal for a
+    #: branch that needs a number and noise for one that does not, and refusing both
+    #: is how one skipped stamp took out every branch in the repo at once.
+    warnings: list[str] = field(default_factory=list)
 
     @property
     def stamping(self) -> bool:
@@ -302,6 +308,7 @@ class Plan:
             ],
             "symlinked": self.symlinked,
             "unreadable": self.unreadable,
+            "warnings": self.warnings,
             "serves": self.serves,
             "serves_reason": self.serves_reason,
             "served_from": self.served_from or None,
@@ -872,6 +879,198 @@ def placeholder_at_ref(repo: Path, ref: str) -> list[str]:
     return sorted(found)
 
 
+#: How far back the repair walk looks for a tree with no placeholder in it, counting the ref
+#: it starts from. Bounded because of the case it is actually for: an unstamped entry that
+#: landed a long time ago and was never repaired leaves a RUN of consecutive ancestors all
+#: carrying it, and each one costs a `git grep` to rule out. A history that predates the
+#: placeholder scheme is the cheap case, not the expensive one — the first commit the walk
+#: looks at has no placeholder and it stops there.
+_REPAIR_WALK_MAX = 50
+
+
+def _cmd(repo: Path, sub: str, *rest: str) -> str:
+    """One invocation of this tool, spelled so it can be pasted into any shell.
+
+    Absolute on BOTH halves — the interpreter's argument and `--repo` — because nothing here
+    knows the cwd of the shell that will run it. `harness/commands/fix-and-review.md` runs
+    this tool as `python3 "$WT_DIR/scripts/release_stamp.py" preflight --repo "$WT_DIR"`
+    precisely so it operates on the worktree under review rather than on the caller's cwd,
+    and a repair command that dropped both halves would run against whatever that shell
+    happens to be sitting in: silently the wrong checkout, or a bare filesystem error where
+    it is not a repository at all. A cwd-relative `scripts/release_stamp.py` is also on
+    nobody's PATH, and a resolved ref is only worth resolving if the whole line can be pasted.
+
+    `--repo` goes straight after the subcommand because that is where argparse accepts it:
+    it is declared on each subparser, so `… --repo DIR apply` is a usage error rather than a
+    repair. Both paths go through `shlex.quote`, since a checkout under a directory with a
+    space in it is otherwise a command that parses as two arguments.
+    """
+    script = shlex.quote(str(Path(__file__).resolve()))
+    return " ".join(["python3", script, sub, "--repo", shlex.quote(str(repo)), *rest])
+
+
+def _releases_at(repo: Path, ref: str) -> set[Release] | None:
+    """CHANGELOG.md's release numbers at `ref`, or None when they cannot be read there.
+
+    None is "cannot tell" and never "none": no CHANGELOG.md at that commit, or one this tool
+    will not parse. Every caller is composing advice or excusing a number rather than
+    deciding a release, so a ref it cannot read is a question it declines rather than a stop.
+    """
+    if not _git_ok(repo, "cat-file", "-e", f"{ref}:CHANGELOG.md"):
+        return None
+    try:
+        return set(releases_in(_git(repo, "show", f"{ref}:CHANGELOG.md"),
+                               f"{ref}:CHANGELOG.md"))
+    except StampError:
+        return None
+
+
+def _clean_ancestor(repo: Path, onto_sha: str) -> tuple[str | None, int]:
+    """The newest first-parent commit at or before `onto_sha` with no placeholder in its tree.
+
+    Returns `(sha, in_reach)` — the second being how many commits of first-parent history the
+    walk could see at all, which is not decoration: with nothing found, "the walk ran out of
+    BUDGET" and "the walk ran out of HISTORY" want opposite advice, and a bare `None` cannot
+    tell them apart. Out of budget means an unstamped entry that landed more
+    than `_REPAIR_WALK_MAX` commits ago and there is an older clean commit to point at. Out of
+    history means there is not — a placeholder in the root commit, or, far more often, a
+    shallow clone: `.github/workflows/tests.yml` runs `check` from a bare `actions/checkout@v4`,
+    which is a depth-1 clone, where this `git log` returns exactly one grafted SHA no matter
+    what the real history holds. Telling that caller the entry "has been there longer than
+    fifty commits" is a statement about a history it does not have.
+
+    A history exactly `_REPAIR_WALK_MAX` long with nothing clean in it reads as "out of
+    budget", which is one `git log` cheaper than distinguishing it and is not wrong by much:
+    "the entry has been there longer than fifty commits" is true of a fifty-commit history
+    whose root already carries it.
+
+    First parent, because that is the side a merge came FROM: on `main` the first parent is
+    the previous `main`, so the walk crosses releases rather than descending into the branch
+    that made one. `onto_sha` ITSELF is a candidate — `check` calls this with a HEAD whose
+    placeholder is still uncommitted, and the ref to stamp against there is HEAD, not HEAD^.
+
+    One `git log` for the candidates rather than a `rev-parse` per step. The walk is bounded
+    at `_REPAIR_WALK_MAX`, and spending fifty subprocesses to enumerate what a single call
+    already knows is fifty too many on a path whose only output is one line of advice.
+    """
+    log = _git(repo, "log", "--first-parent", "--format=%H", f"-n{_REPAIR_WALK_MAX}", onto_sha)
+    shas = log.split()
+    for sha in shas:
+        if not placeholder_at_ref(repo, sha):
+            return sha, len(shas)
+    return None, len(shas)
+
+
+def _is_shallow(repo: Path) -> bool:
+    """Whether this checkout is a shallow clone, for advice that would otherwise be a lie.
+
+    Best-effort, like everything else the advice path calls: a git too old to know the
+    question is answered "no" rather than allowed to turn a message into an exit 2.
+    """
+    try:
+        return _git(repo, "rev-parse", "--is-shallow-repository").strip() == "true"
+    except StampError:
+        return False
+
+
+def _repair_advice(repo: Path, onto: str, onto_sha: str | None = None) -> str:
+    """How to repair an `onto` carrying an unstamped placeholder, as a sentence to print.
+
+    The message this replaces described how to find the ref — *"a ref that predates the
+    unstamped entry — the commit it merged into, e.g. HEAD^ on the merge that brought it in"*
+    — which is correct and is the opposite of every other invocation of this tool, where
+    `--onto` is `origin/main` and `origin/main` is the thing that is broken. #168's reading is
+    that somebody hitting this under time pressure reaches for the usual command, gets the
+    same refusal, and concludes the tool is stuck. So the ref is resolved and the command
+    printed ready to run.
+
+    NEVER RAISES, and never returns a command-shaped string it could not resolve. Both
+    matter, and for the same reason: this composes ADVICE, on a path that includes the one
+    branch that must not be stopped — the one shipping no release, which is warned and
+    carries on. A `git grep` against a shallow clone, an object missing from an old ancestor,
+    a `git log` that fails for any reason at all: none of that is this branch's problem, so
+    the walk degrades to the prose it replaces rather than turning a noop into an exit 2.
+    And a `<placeholder>` inside a printed command is worse than prose, not better — pasted
+    into a shell, `<a ref…>` redirects input from a file named `a` and the promised
+    ready-to-run repair fails with a filesystem error.
+
+    An empty walk is THREE outcomes wearing one sentence, and two of them were being told
+    something false: out of BUDGET (an older clean commit exists, the bound just did not reach
+    it), out of the history THIS CLONE HAS (a shallow checkout — which is what
+    `actions/checkout@v4` hands the only automated caller of `check` — where the repair is a
+    fetch and no local ref can be named), and out of history full stop (the root commit
+    carries it, and there has never been a clean tree here to stamp against).
+    """
+    try:
+        sha = onto_sha or resolve(repo, onto)
+        ref, in_reach = _clean_ancestor(repo, sha)
+        if ref is None and in_reach >= _REPAIR_WALK_MAX:
+            return (
+                f"No commit within {_REPAIR_WALK_MAX} first-parent commits of {onto} has a "
+                f"tree without a `{PLACEHOLDER}` in it, so there is no ref to name here — the "
+                f"unstamped entry has been there longer than that. Stamp it by hand, or point "
+                f"`{_cmd(repo, 'apply', '--onto')}` at an older commit whose tree is clean."
+            )
+        if ref is None and _is_shallow(repo):
+            # The one automated caller of `check` is this case. `.github/workflows/tests.yml`
+            # checks out with a bare `actions/checkout@v4`, which is depth 1, so the walk sees
+            # a single grafted commit and finds a placeholder in it — measured, not inferred.
+            # "It has been there longer than fifty commits" is then a claim about a history
+            # this clone does not have, and "point apply at an older commit" names refs it
+            # cannot resolve. What it can act on is the fetch.
+            return (
+                f"Every commit this clone has of {onto}'s first-parent history — {in_reach} "
+                f"of them — carries a `{PLACEHOLDER}`, and this is a shallow clone, so the "
+                "commit that would repair it is almost certainly one that was never fetched. "
+                "Deepen the checkout (`git fetch --unshallow`, or `fetch-depth: 0` on "
+                "`actions/checkout`) and run this again; there is no ref to name until then."
+            )
+        if ref is None:
+            return (
+                f"{onto}'s first-parent history is {in_reach} commit(s) long and every one of "
+                f"them carries a `{PLACEHOLDER}`, back to the root commit — so there is no ref "
+                "to name here, and never was one. Stamp the entry by hand: this history has "
+                "no commit with a clean tree to resolve a number against."
+            )
+        advice = f"To repair {onto}, run:\n    {_cmd(repo, 'apply', '--onto', ref)}"
+        # What to expect from that command, when it is not simply going to work. A release
+        # that landed AFTER the skipped stamp is above the clean ancestor's newest, so the
+        # branch being repaired holds a number that ref has never issued — and with a
+        # placeholder still present that is refused, differently worded, by the command
+        # handed over to fix the first refusal. Said here rather than discovered there.
+        #
+        # And said WITHOUT the repair it used to suggest. "Put those entries back to
+        # `## vNEXT` first" was reachable only because `onto` already carries one, so
+        # following it leaves two placeholders in one CHANGELOG — which `build_plan` refuses
+        # in a third differently-worded way ("two placeholders cannot both become one
+        # number"). The advice written to stop somebody concluding the tool is stuck has to
+        # end at an edit that works, and here that edit is a hand-stamp: the entry needs a
+        # number nothing else has taken, and the newest at `onto` plus one is free by
+        # construction.
+        at_onto = _releases_at(repo, sha) or set()
+        gained = sorted(at_onto - (_releases_at(repo, ref) or set()))
+        if gained:
+            named = ", ".join(fmt(r) for r in gained)
+            free = (max(at_onto)[0], max(at_onto)[1] + 1)
+            advice += (
+                f"\n{onto} has gained {named} since that commit, so that run stops on those "
+                f"instead: they are numbers {ref[:12]} never issued, which is the same "
+                f"refusal one step along. Putting them back to `## {PLACEHOLDER}` is not the "
+                f"way round it — {onto} already carries one, and two placeholders in one "
+                "CHANGELOG cannot both become one number. Stamp the unstamped entry by hand "
+                f"instead; {fmt(free)} is free at {onto}."
+            )
+        return advice
+    except StampError:
+        # Not resolvable, not walkable: the prose this replaces, which needs no git at all.
+        return (
+            f"To repair {onto}, run `{_cmd(repo, 'apply', '--onto')}` against a ref that "
+            f"predates the unstamped entry — the commit it merged into, e.g. `HEAD^` on the "
+            f"merge that brought it in, NOT the default `origin/main`, which is the ref "
+            "carrying it."
+        )
+
+
 def _collision(repo: Path, branch_text: str, onto: str, onto_text: str) -> None:
     """Refuse when this branch's release number is one somebody else has already used.
 
@@ -1012,6 +1211,14 @@ def build_plan(repo: Path, onto: str, serve: bool | None, major: bool = False) -
     loose_here = [s for s in plan.loose if s.path == "CHANGELOG.md"]
     nothing_to_do = not plan.sites and not loose_here and not headings
 
+    def _noop() -> Plan:
+        """Return with nothing to stamp. Reached from more than one place now: a base this
+        tool cannot read a number at is not a stop for a branch that needs no number, and it
+        is not a licence to skip the one refusal that still applies either."""
+        if loose_here:
+            _refuse_loose(loose_here)
+        return plan
+
     # The ref is resolved to a SHA once, here, and every later question is asked of the SHA.
     # `git merge-base origin/main HEAD` and `git show origin/main:CHANGELOG.md` re-resolve
     # the NAME, so a push landing mid-run would have the number computed against one base
@@ -1036,10 +1243,198 @@ def build_plan(repo: Path, onto: str, serve: bool | None, major: bool = False) -
     # state with no placeholder left and the one this check exists for.
     _collision(repo, branch_text, onto, onto_text)
 
+    # THE NUMBERS COME FIRST, into LOCALS. Both checks below are about the base and about
+    # numbers already written down — neither is a question about this branch's placeholder,
+    # and both used to sit under the `not plan.sites` early return where a branch that had
+    # hard-coded its number could not reach them (#167). They stay locals until the early
+    # return has been passed, because `plan.version` is what `plan.stamping` reads: setting
+    # it here would make every docs-only branch report `stamped vX` and break the noop that
+    # `fix-and-land` runs unconditionally.
+    #
+    # `next_release` before `max()` for the reason it always was: it refuses an unparseable
+    # file with a sentence, where `max(())` on a CHANGELOG with no headings exits 1 on a
+    # ValueError — which a caller reading the documented 0/2 scheme reads as "unknown", the
+    # one outcome this tool promises never to give.
+    #
+    # In a `try` BECAUSE they are hoisted. That refusal used to sit below the early return,
+    # so a base whose CHANGELOG has no parseable headings — a repo that just adopted the
+    # file, an `--onto` pointing at a stub, one whose only headings are inside fenced
+    # examples — never reached a branch that ships no release. Hoisted and unguarded it exits
+    # 2 for that branch instead, and `fix-and-land` wires exit 2 straight to a HOLD: the
+    # blast radius #168 is about, reintroduced one line above the fix for it. A branch that
+    # DOES need a number still gets the refusal, because there is no number to hand it.
+    #
+    # Both bumps come out of one pair of calls and `next_version` is chosen from them, rather
+    # than a third parse asking a question these two have already answered between them: the
+    # flag picks one of two answers, it does not produce a third.
+    try:
+        minor_next = next_release(onto_text, False, f"{onto}:CHANGELOG.md")
+        major_next = next_release(onto_text, True, f"{onto}:CHANGELOG.md")
+        onto_newest = max(releases_in(onto_text, f"{onto}:CHANGELOG.md"))
+    except StampError as e:
+        if plan.sites:
+            raise
+        plan.warnings.append(
+            f"no release number could be read at {onto} ({e}), so nothing on this branch "
+            "could be checked against one. Not this branch's problem, since it ships no "
+            "release and needs no number"
+        )
+        return _noop()
+    next_version = major_next if major else minor_next
+    could_have_issued = {minor_next, major_next}
+
+    # A number above the base's newest is one nobody at `onto` has issued, and whether that
+    # is a refusal turns on WHETHER THIS BRANCH STILL HAS A PLACEHOLDER.
+    #
+    #   * With one, every such number is refused, the next one included. The branch has
+    #     something to stamp AND has already written a number down: stamping would put a
+    #     number in twice, which is the case the old check was written for.
+    #   * Without one, the next number is the single legitimate reading. Re-running `apply`
+    #     on a branch it already stamped has to stay a noop — `fix-and-land` runs it
+    #     unconditionally — and once `apply` has run there is no placeholder left, so that
+    #     branch is byte-identical to one that hard-coded the same number. Nothing in the
+    #     tree tells those two apart, so the number is judged and not its author.
+    #
+    # The second bullet is the whole of #167, and it is what hoisting buys: `## v2.40` on a
+    # branch whose base is at v2.33 is not a collision today and is one the week v2.40 comes
+    # round. Under the old placement it was invisible, because a branch that names its own
+    # release has no placeholder to trip the check — measured across an eight-PR queue in
+    # #167, where all eight hard-coded a number, none carried a `vNEXT`, and the guard fired
+    # for none of them.
+    #
+    # What it CANNOT catch, and the README and CHANGELOG say so rather than implying
+    # otherwise: a hand-written `max+1`. That is byte-identical to `apply`'s own output, and
+    # `max+1` read off the top of `main` is exactly what a person hard-coding by hand picks.
+    # What is left is the number that skips ahead of the next free one, the number already
+    # taken at the base (`_collision`, above), and more than one new number at once.
+    #
+    # At or BELOW the base's newest is not this check's business: the branch either inherited
+    # the number (fine — it is editing a shipped entry) or somebody else has since taken it,
+    # which is `_collision`'s third shape and is refused above.
+    #
+    # BOTH bumps are admissible, not just the one this invocation was asked for. `--major` is
+    # a flag and never an inference, so a branch stamped `v3` re-meets this check the next
+    # time `apply` runs WITHOUT it — and `fix-and-land` runs `apply` unconditionally and
+    # without the flag. Allowing only the minor bump would refuse every major release branch
+    # on the second run, which is the noop that caller depends on. ONE of the two, though,
+    # never both at once: a blanket difference against the pair let a branch carrying `##
+    # v2.34` AND `## v3` straight through — two releases on one branch, which the convention
+    # says cannot happen and which nothing else here can see, since `_collision` looks for a
+    # number that already exists at `onto` or twice in this file and neither is true of two
+    # different numbers nobody has issued yet.
+    #
+    # WHERE THE NUMBER CAME FROM IS NOT ASKED, and three rounds of review are the reason.
+    # Hoisting this check above the early return means it also runs for branches with nothing
+    # to stamp — including one sitting on top of a ref FRESHER than a stale `--onto`, whose
+    # CHANGELOG carries numbers that shipped elsewhere. Refusing those as "a branch does not
+    # pick its own number" is nonsense about an entry the branch only inherited, so two
+    # attempts were made to tell the two apart from the local repository: the second-and-later
+    # parents of merge commits, and then any ref sharing `onto`'s branch name. Both were
+    # simultaneously too wide and too narrow, and each hole was the same one:
+    #
+    #   * merge parents excused a number found in ANY merged snapshot, so a branch that
+    #     hand-wrote `## v2.40` and was refused for it had the refusal laundered by a second
+    #     branch merging it — and missed rebase and fast-forward, which carry no merge commit;
+    #   * same-named refs excused a purely local `refs/heads/main`, never pushed and never
+    #     reviewed, which is what `git checkout main && git commit && git checkout -b feat`
+    #     leaves behind — and refused any checkout that holds the commits but not the ref
+    #     (`clone --single-branch`, `pull <url> main`, a pruned remote).
+    #
+    # The premise both share is that a local repository can say where a number LANDED. It
+    # cannot: a ref proves somebody wrote a number down, never that it was issued. So this
+    # asks the one question it can answer — is this number above the newest at the ref I was
+    # given — and the message names BOTH repairs rather than guessing which applies. A stale
+    # base is a real thing to be told about, and "fetch and try again" costs a reader nothing
+    # when it was not the problem.
+    issued = releases_in(branch_text, "CHANGELOG.md")
+    claimed = {r for r in issued if r > onto_newest}
+    allowed = (claimed if not plan.sites and len(claimed) == 1 and claimed <= could_have_issued
+               else set())
+    ahead = sorted(claimed - allowed)
+    if ahead:
+        named = ", ".join(fmt(r) for r in ahead)
+        # "Put it back to the placeholder" is only a repair when there is not already one
+        # here. With a placeholder present, following it literally writes a SECOND, and
+        # `build_plan` then refuses with "two placeholders cannot both become one number" —
+        # a different message about a state the advice created, which is the advice loop
+        # `_repair_advice` was rewritten to stop. That branch is told to delete instead.
+        own = (f"delete it — this branch already carries a `## {PLACEHOLDER}`, and that is "
+               "the entry that becomes a number" if plan.sites else
+               f"put the entry back to `## {PLACEHOLDER} — …` (and its README bullet with "
+               "it) and run `apply` again")
+        raise StampError(
+            f"this branch's CHANGELOG already has an entry for {named}, which does not exist at "
+            f"{onto} (newest there is {fmt(onto_newest)}, so the next free number is "
+            f"{fmt(next_version)}). Either this branch named its own number — {own} — or "
+            f"{onto} is behind and the entry was inherited from a later one, in which case "
+            "fetch and re-run against the updated ref. This tool cannot tell which from "
+            "here: a ref proves somebody wrote a number down, never that it was issued."
+        )
+
+    # DOES THIS BRANCH SHIP A RELEASE? Only a branch with somewhere to stamp does, and the
+    # numbers are deliberately not consulted — the third and last place this file tried to
+    # read intent off a release number, and the third to get it wrong.
+    #
+    # It used to be `bool(plan.sites) or bool(claimed & could_have_issued)`, to keep a branch
+    # already stamped `v3` and one already stamped `v2.34` on the same side of the #168
+    # refusal. But `claimed` cannot tell an already-stamped number from an INHERITED one — a
+    # docs-only branch that pulled a `main` which had since issued v2.34 has `claimed ==
+    # {v2.34}`, which is also exactly `could_have_issued` against the stale base. So that
+    # branch read as shipping a release and was refused over a broken base it does not touch:
+    # #168's blast radius, arriving through the flag rather than through the check.
+    #
+    # Consistency between the two already-stamped branches was the wrong thing to want. The
+    # refusal exists to stop `apply` handing out `max+1` while the base holds an entry that is
+    # going to want a number — and a branch with no placeholder stamps NOTHING, so there is no
+    # number for a broken base to make wrong. It is told, and it carries on. Having something
+    # to stamp is the whole of the question.
+    ships_release = bool(plan.sites)
+
+    # An unstamped placeholder at the base is a real refusal for a branch that needs a number
+    # and NOISE for one that does not. Refusing both is how one skipped stamp took out every
+    # branch in the repo at once (#168): `fix-and-land` wires exit 2 straight to a HOLD, so a
+    # branch shipping no release would be held over somebody else's mistake, in a file it
+    # does not touch. It is told instead, and carries on.
+    #
+    # A branch that has already MERGED the broken base carries the placeholder in its own
+    # worktree, so it is refused here through `plan.sites` — correctly, since `apply` would
+    # otherwise stamp somebody else's entry. The relief is for branches that have not taken
+    # that merge, and the docs say so rather than claiming the refusal is gone.
+    try:
+        unstamped_at_base = placeholder_at_ref(repo, onto_sha)
+    except StampError as e:
+        # Same reasoning one level along: reading the base must not be able to stop a branch
+        # that needs nothing from it. A shallow clone, an object missing from the ref, a
+        # `git grep` that fails for any reason — for a branch that ships a release this stays
+        # a refusal, because the check is load-bearing for it; for one that does not, it is a
+        # line on stderr and the branch carries on.
+        if ships_release:
+            raise
+        plan.warnings.append(f"could not check {onto} for an unstamped `{PLACEHOLDER}`: {e}")
+        unstamped_at_base = []
+    if unstamped_at_base:
+        where = ", ".join(unstamped_at_base)
+        if ships_release:
+            raise StampError(
+                f"{onto} itself carries an unstamped `{PLACEHOLDER}` ({where}) — the previous "
+                "release landed without being stamped. Numbering on top of it would hand this "
+                "branch a number the unstamped one is going to want.\n"
+                f"{_repair_advice(repo, onto, onto_sha)}"
+            )
+        plan.warnings.append(
+            f"{onto} carries an unstamped `{PLACEHOLDER}` ({where}) — the previous release "
+            "landed without being stamped. Not this branch's problem, since it ships no "
+            f"release and needs no number. {_repair_advice(repo, onto, onto_sha)}"
+        )
+
     if not plan.sites:
-        if loose_here:
-            _refuse_loose(loose_here)
-        return plan
+        return _noop()
+
+    # Past the early return, so this branch really is stamping: `plan.version` is what
+    # `plan.stamping` reads and what `_report` prints.
+    plan.version = next_version
+    plan.onto_newest = onto_newest
+    plan.major = major
 
     if plan.loose:
         _refuse_loose(plan.loose)
@@ -1059,41 +1454,6 @@ def build_plan(repo: Path, onto: str, serve: bool | None, major: bool = False) -
             f"`{fmt(release(first.group(1), first.group(2)))}` in CHANGELOG.md. The file is "
             "newest first, so an unreleased entry belongs at the top — stamped where it is, "
             "it would break the ordering the whole file is read by"
-        )
-
-    unstamped_at_base = placeholder_at_ref(repo, onto_sha)
-    if unstamped_at_base:
-        where = ", ".join(unstamped_at_base)
-        raise StampError(
-            f"{onto} itself carries an unstamped `{PLACEHOLDER}` ({where}) — the previous "
-            "release landed without being stamped. Fix that first; numbering on top of it "
-            "would hand this branch a number the unstamped one is going to want. To repair "
-            f"{onto} itself, run `apply --onto` against a ref that predates the unstamped "
-            "entry — the commit it merged into, e.g. HEAD^ on the merge that brought it in"
-        )
-    # `next_release` first, because it is the one that refuses an unparseable file with a
-    # sentence. Taking `max()` of the same list first would reach `max(())` on a CHANGELOG
-    # with no headings and exit 1 on a ValueError — which a caller reading the documented
-    # 0/2 scheme reads as "unknown", i.e. the one outcome this tool promises never to give.
-    plan.version = next_release(onto_text, major, f"{onto}:CHANGELOG.md")
-    plan.onto_newest = max(releases_in(onto_text, f"{onto}:CHANGELOG.md"))
-    plan.major = major
-
-    # Any number ABOVE the base's newest is one this branch picked for itself, whether it
-    # happens to equal the number about to be handed out or not. `## v2.40` on a branch whose
-    # base is at v2.33 is not a collision today and is one the week v2.40 comes round; more
-    # to the point it is a branch naming its own release, which is the practice this file
-    # exists to end. Only checked when there is something to stamp: a branch that has ALREADY
-    # been stamped legitimately carries a number above the base, and saying so would make
-    # `apply` refuse its own output.
-    ahead = sorted({r for r in releases_in(branch_text, "CHANGELOG.md") if r > plan.onto_newest})
-    if ahead:
-        named = ", ".join(fmt(r) for r in ahead)
-        raise StampError(
-            f"this branch's CHANGELOG already has an entry for {named}, which does not exist "
-            f"at {onto} (newest there is {fmt(plan.onto_newest)}). A branch does not pick its "
-            f"own number — write `## {PLACEHOLDER}` and let this tool resolve it against the "
-            "ref you are actually merging into"
         )
 
     changed = changed_paths(repo, onto_sha)
@@ -1368,11 +1728,14 @@ def cmd_check(args: argparse.Namespace) -> int:
         print(f"STOP: {len(bad)} unstamped `{PLACEHOLDER}` placeholder(s):", file=sys.stderr)
         for s in bad:
             print(f"  {s.path}:{s.line}  {s.text}", file=sys.stderr)
-        print("\nA release landed without being stamped. Re-run `release_stamp.py apply "
-              "--onto <a ref that predates this entry>` — on main after a merge that is the "
-              "commit the release merged into, e.g. `HEAD^`, NOT the default `origin/main`, "
-              "which is the ref carrying the unstamped entry — then push the result. Until "
-              "then this ref documents a version that does not exist.", file=sys.stderr)
+        # The same resolved command `preflight` and `apply` hand out, for the same reason and
+        # on the harder case: this is the guard that fires ON main, so the ref to stamp
+        # against is never the `origin/main` every other invocation passes. Describing how to
+        # find one and resolving one are the same sentence said two ways, and leaving the
+        # description here would have left it on the path that hits it most.
+        print("\nA release landed without being stamped, so this ref documents a version that "
+              f"does not exist. {_repair_advice(repo, 'HEAD')}\nThen push the result.",
+              file=sys.stderr)
     if dupes:
         for path, rels in dupes.items():
             print(f"STOP: release number(s) declared twice in {path}: "
@@ -1385,6 +1748,8 @@ def cmd_check(args: argparse.Namespace) -> int:
 
 
 def _warn_skipped(plan: Plan) -> None:
+    for line in plan.warnings:
+        print(f"warning: {line}", file=sys.stderr)
     if plan.untracked:
         print(f"warning: {PLACEHOLDER} in untracked markdown, which is never stamped:",
               file=sys.stderr)

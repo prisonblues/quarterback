@@ -11,6 +11,92 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
+## v2.66 — the two guards that only fired when they were not needed
+
+`release_stamp.py` has two checks that exist for the same failure — a branch naming its own
+release number — and both sat below an early return that a branch naming its own release number
+always takes.
+
+`build_plan` returns as soon as there is no `vNEXT` left to rewrite, because `apply` has to be a
+noop on a branch shipping no release: `fix-and-land` runs it unconditionally and wires exit 2
+straight to a HOLD. The bug is that **"no placeholder" was standing in for "ships no release"**,
+and those are different states. A branch that hard-codes `## v2.40` ships a release *and* has no
+placeholder. It returned early, so neither the "a branch does not pick its own number" refusal nor
+the "the base carries an unstamped entry" refusal ever ran. Measured across an eight-PR queue in
+#167: all eight hard-coded a number, none carried a placeholder, and the guard fired for none of
+them — inert across the whole queue it was written for.
+
+Both checks are above the early return now, which needed the question they turn on to be answered
+differently. **The number is judged, not its author.** After `apply` runs there is no placeholder
+left either, so a branch it stamped is byte-identical to one that hard-coded the same number and
+nothing in the tree tells them apart — refusing every number above the base would make `apply`
+refuse its own output. So a branch with nothing left to stamp may carry ONE newly-issued number,
+the next minor or the next major and not both, and a branch that still holds a placeholder may
+carry none at all, since stamping would write the number in twice.
+
+**That scopes the claim, and the scope is worth saying rather than implying.** What the guard
+sees is the branch that overshoots — `## v2.40` against a base at v2.33 — and the branch carrying
+two unissued numbers at once. What it cannot see is a hand-written `max+1`: that is the same bytes
+`apply` writes, and `max+1` read off the top of `main` is precisely what somebody numbering by hand
+picks. So of that eight-PR queue it refuses the ones whose number sits above the next free one at
+land time, and lets through any that happens to equal it. (A number somebody else has since taken
+is `_collision`'s, and was already caught.) The placeholder is still the only thing here that makes
+the number unguessable — this closes the door on branches that skipped it and guessed high, not on
+skipping it.
+
+**And one skipped stamp no longer takes out every branch that has not merged it** (#168). An
+unstamped placeholder on `main` is a real refusal for a branch that needs a number — you cannot
+hand out `max+1` while the base holds an entry that is going to want one — and it is noise for a
+branch that ships no release, which was being held over somebody else's mistake in a file it does
+not touch. That one is warned, and carries on. A branch that has already pulled `main` since the
+bad commit landed is a different case and is still refused: it carries the unstamped entry in its
+own worktree, so it has something to stamp, and stamping it would put this branch's number on
+somebody else's release. In a repo where agents pull `main` routinely that is a lot of live
+branches, so the relief is real but it is not universal — repairing `main` is still the fix.
+
+The refusal that remains **names the ref to repair from**, walking back to the last commit whose
+tree is clean, instead of describing how to find it: every other invocation of this tool passes
+`--onto origin/main`, this is the one case where `origin/main` is the broken thing, and somebody
+reaching for the usual command under time pressure got the same refusal and concluded the tool was
+stuck. `check` — the guard that fires ON `main`, and so the command's hardest case — prints the
+same resolved line. When the walk finds nothing clean within its bound it says so in prose rather
+than printing a command with a `<placeholder>` in it, because a shell reads `<` as a redirect and
+a repair command that fails with a filesystem error is worse than a sentence.
+
+Hoisting also put that refusal in front of a branch that **inherited** a number rather than
+picking one: `--onto main` while `origin/main` has since issued v2.34 and v2.35, which every branch
+that pulled since carries. Those sit above the stale base's newest, and "a branch does not pick its
+own number" is nonsense about an entry that shipped last week.
+
+**Two attempts were made to tell those apart from the local repository, and both were abandoned.**
+Reading the second-and-later parents of merge commits excused *any* number in *any* merged
+snapshot, so a branch that hand-wrote `## v2.40` and was refused for it had that refusal laundered
+by a second branch merging it — and missed rebase and fast-forward, which carry no merge commit at
+all. Reading refs that share `--onto`'s branch name then excused a purely local `refs/heads/main`,
+never pushed and never reviewed, which is what `git checkout main && git commit && git checkout -b
+feat` leaves behind — and refused any checkout holding the commits but not the ref
+(`clone --single-branch`, `pull <url> main`, a pruned remote). Each was simultaneously too wide and
+too narrow, and both holes were the same hole.
+
+The premise they share is that a local repository can say where a number LANDED. It cannot: a ref
+proves somebody wrote a number down, never that it was issued. So the check asks the one question
+it can answer — is this number above the newest at the ref I was given — and **the message names
+both repairs instead of guessing**: put the entry back to `## vNEXT`, or fetch, because the base is
+behind and the entry came from a later one. What that costs is a docs-only branch on a stale base
+being refused where it used to be a noop, and `fetch` is the whole of the remedy.
+
+The repair line is **pasteable from anywhere**: an absolute path to the script and an explicit
+`--repo`, because `fix-and-review` runs this tool against a worktree that is not the caller's cwd,
+and a bare `scripts/release_stamp.py` with no `--repo` repairs whatever checkout the reader's shell
+happens to be sitting in. When the walk comes back empty it now says which of the two ways that
+happened, because they want opposite advice. A depth-1 clone — what `actions/checkout@v4` produces,
+and what the one automated caller of `check` runs in — sees exactly one commit however long the
+real history is, so "the unstamped entry has been there longer than fifty commits" was a claim
+about a history that clone does not have and "point `--onto` at an older commit" named a ref it
+cannot resolve. It is told to deepen the checkout instead.
+
+Two of the last three releases landed unstamped and needed their own repair PRs.
+
 ## v2.65 — the hm-module wires the board in, not just the commands
 
 `homeManagerModules.quarterback-harness` said it "wires the harness into `~/.claude` and
