@@ -270,6 +270,13 @@
           install -Dm644 ${./harness/tests/_flake_sandbox.py} repo/harness/tests/_flake_sandbox.py
           install -Dm644 ${./CHANGELOG.md}   repo/CHANGELOG.md
           install -Dm644 ${./README.md}      repo/README.md
+          # The README's release list is RENDERED from the CHANGELOG's order (#296), and the
+          # suite asserts the file matches the render — so the renderer is part of the
+          # question, not a tool beside it. It imports the stamper by path for the one
+          # definition of a release heading, which is why both are here; the suite records
+          # the stamper in `_COPIED_BUT_NOT_READ` because it reaches it through an import.
+          install -Dm644 ${./scripts/readme_releases.py} repo/scripts/readme_releases.py
+          install -Dm644 ${./scripts/release_stamp.py}   repo/scripts/release_stamp.py
           install -Dm644 ${./pyproject.toml} repo/pyproject.toml
           install -Dm644 ${./app/main.py}    repo/app/main.py
           install -Dm644 ${./flake.nix}      repo/flake.nix

@@ -501,6 +501,25 @@ def releases_in(text: str, where: str = "") -> list[Release]:
     return [r for r, _ in release_headings(text, where)]
 
 
+def entry_names(text: str, where: str = "") -> list[str]:
+    """Every release ENTRY heading in file order, spelled the way the file spells it.
+
+    Numbered entries and the unstamped one in the same list, because a reader that wants the
+    CHANGELOG's order — `scripts/readme_releases.py`, which renders the README's release list
+    from it — wants the in-flight entry in its place at the top rather than as a separate
+    question asked of a second scan. Merging two scans at the call site would put the answer
+    to "which entry comes first" in the caller, and there are now two callers.
+
+    Exported for that caller rather than used here: everything in this file numbers releases,
+    and a placeholder has no number. Kept beside `releases_in` all the same, so the answer to
+    "what is a release heading" stays in one place — the reason this repo keeps repeating.
+    """
+    masked = mask_code(text, where)
+    found = [(m.start(), fmt(release(m.group(1), m.group(2)))) for m in _HEADING.finditer(masked)]
+    found += [(m.start(), PLACEHOLDER) for m in _HEADING_PLACEHOLDER.finditer(masked)]
+    return [name for _, name in sorted(found)]
+
+
 def duplicates_in(text: str, where: str = "") -> list[Release]:
     """Release numbers this file declares more than once, sorted.
 

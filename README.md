@@ -539,6 +539,15 @@ PATH, which git cannot resolve by keeping both sides the way it can a conflictin
 
 ### Every release, oldest first
 
+**The ORDER of this list is rendered from [CHANGELOG.md](CHANGELOG.md)** by
+`scripts/readme_releases.py write`, and
+`harness/tests/test_release_numbers.py::test_the_readme_release_list_is_in_changelog_order`
+fails if it has drifted. It used to be hand-kept, so it drifted — `v2.61, v2.59, v2.60, …` sat
+in the file for three releases, and correcting it was a commit somebody had to think to make.
+The bullets themselves are hand-written and are only ever MOVED: a bullet is a summary somebody
+chose, not a copy of the CHANGELOG heading, so a release with no bullet is a refusal rather than
+a sentence this tool invents.
+
 Ending with what is next ([CHANGELOG.md](CHANGELOG.md) runs the other way, and has each one in
 full — including what was broken before it, which is the part no diff recovers):
 
@@ -688,6 +697,21 @@ full — including what was broken before it, which is the part no diff recovers
   spelling got in. The rejected alternative — accept every spelling and reconcile
   them on read — is closed as PR #152: an open input domain cannot be enumerated,
   and three rounds found three more holes in the attempt.
+- **v2.42** — `qb-board`, a terminal client, because the board's only human surface needed a desktop
+  browser and daedalus, atlas and sisyphus do not have one. Two halves: `qb-board --follow`, plain
+  lines on stdout that pipe and grep and resume from a cursor after an overnight drop, needing
+  nothing but `httpx`; and a Textual client with Board / Fleet / Sessions / Panel over endpoints that
+  already existed. The reason it is a local process rather than a page is `p`, `c` and `Enter` — pull
+  this machine's checkout, cherry-pick a located SHA, resume a session — and the refusals those
+  inherit, where "could not tell" counts as a no. Not a third client: it consumes the same
+  `mcp/mcp_server/client.py` the MCP server does, which is also how that package finally got CI.
+- **v2.43** — the seat screen learns to answer questions about itself. `qb-dash-tui` puts the
+  fleet beside the seats — who is alive, what they hold, which PRs are open and what CI says —
+  and rows are clickable: a seat jumps the tmux cursor to its pane, a PR opens on GitHub, the ⚖
+  starts `/panel-review-pr` in a window of its own. `qb-b` is `qb-seats`, spelled short. It also
+  fixes a layout defect nobody could see: `qb-seats` addressed panes as `session:window.0`, so a
+  `pane-base-index 1` config broke the screen entirely, and the suite inherited the developer's
+  own tmux.conf — green where nobody had that setting, red where somebody did.
 - **v2.44** — the dash learns about work that has not started. An ISSUES panel lists the open
   issues with the board's claims joined onto them — free ones first, held ones greyed and named —
   and each row carries a `⚒` that shows its command and then runs `/fix-issue <n>` in a tmux
@@ -706,6 +730,54 @@ full — including what was broken before it, which is the part no diff recovers
   a repo name, and treat the string itself as untrusted input on the way back in: the board bounds
   its length at `PATH_MAX` and normalises nothing else, so quote it, and do not hand a value
   beginning with `-` to `git` as anything but an operand.
+- **v2.46** — a screen you ask for by number, and seats that do not stop to ask. `qb-b 3`
+  is the seat count, the default is 3 and the ceiling is 10; past five, seats are five across
+  and two down, built rather than left to `select-layout tiled`, which picks the wrong axis
+  for a pane that wants width. Seat numbers read left to right. And a seat starts with
+  permission prompts off, because a pane nobody is watching cannot answer one: the agent
+  stops mid-item still holding its board claim, and a prompt no one answers is an outage
+  that looks like progress. `qb-seats --no-yolo` or `QB_SEAT_YOLO=0` gives them back; the
+  default lives in `qb-seat`, which is what execs the agent, so a seat started by hand and a
+  seat the screen builds cannot disagree.
+- **v2.47** — the dashboard grows hands, and its tests start running. The SEATS panel
+  closes a seat and adds one, and tmux grows a clickable bar of the same widgets above the
+  seat row — both through `qb-seat-click`, which `qb-dash-tui` had been calling since the
+  panel landed without the script ever being committed. The bar is a status line rather than
+  pane-border glyphs because tmux honours `#[range=...]` nowhere else, and a click on the top
+  border row is not delivered at all. `QB_SEATS_BAR=0` opts out. It also fixes a `run-shell`
+  trap that made the ＋ do nothing in silence: a mouse binding gets no `$TMUX_PANE` and the
+  tmux server's PATH usually predates the harness. And the dashboard's seven tests, which had
+  skipped every CI run since they were written, now execute.
+- **v2.48** — a lease says what its holder is doing, not just where. `POST /lease` takes
+  `state` (`working | waiting | input`) and `/active` and `/overlap` return it with `state_at`,
+  because a state is only as good as its age: `working` last reported twenty minutes ago
+  describes a pane that looks busy and has not moved — the failure v2.46 named when it took the
+  permission prompts away. Neither timestamp already on the row can date it (`acquired_at` is
+  fixed at first claim, `expires_at` moves on every heartbeat), so the pair travels together and
+  each reader picks its own threshold. `stalled` is deliberately unreportable: it is a conclusion
+  drawn from a state and its age, and a holder cannot know it is in the state where it has
+  stopped talking. Both dashboards grow a `state` column and a seat cell on the tmux bar takes
+  its colour from `@qb_state`, set by the lifecycle hook — which is also the only thing that
+  knows a turn ended, so nothing here infers it.
+- **v2.49** — the guard that could not fire. `create-worktree`'s isolated-DB step had a
+  `die` whose whole job was to explain a missing database name, and `set -u` killed the
+  script at that guard's own dereference instead — `MAIN_DB_NAME: unbound variable`, at the
+  exact line written to say what was wrong. One initialisation makes the message reachable.
+  `database.url_env` and `database.name_env` now cascade rather than excluding each other,
+  so a repo that assembles its URL at runtime (or keeps the name in docker-compose) can use
+  an isolated database. And because the step is 3 of 10, a failure there left a checkout
+  with no `.venv`, port or context file: it now says the worktree is incomplete and gives
+  the two commands out, naming the branch rather than the directory.
+- **v2.50** — the coverage veto stops reporting a constant. `confident` is `not veto`, so a
+  veto line that fires every round makes a confident stop unreachable rather than rare. Two
+  did: a seat that cannot read the code (every seat — an empty sandbox and no tools) declaring
+  gaps about code outside the diff, and antigravity's argv ceiling, which the kernel sets at
+  120,000 bytes. On PR #160's round 1 that was 16 of 19 veto lines, nine of them asking about
+  a file in this repo that `grep` answered in four minutes. Both are now recorded state
+  (`ReviewerRun.code_blind`, `argv_clamp`) rather than matched on message wording, both are
+  still reported, and both have a floor so exempting seats one at a time cannot empty the veto
+  on a round nothing read. Truncation by a `max_diff_chars` somebody typed still vetoes. First
+  half of #113; code access as a per-repo setting is the second and lands separately.
 - **v2.51** — reviewers can read the code, per repo, on by default (#113's second half).
   `review_panel.reviewer_code_access` runs each seat that can take it in a checkout of the
   PR at its head — fetched from GitHub's tarball endpoint, never from the main checkout,
@@ -721,82 +793,6 @@ full — including what was broken before it, which is the part no diff recovers
   money for one seat, so `reviewer_code_budget_usd` can cap it; uncapped by default,
   because reaching a cap is a lost seat rather than a cheap one. `--no-code-access` opts
   out for one run; `false` is what a repo taking untrusted contributions sets.
-- **v2.50** — the coverage veto stops reporting a constant. `confident` is `not veto`, so a
-  veto line that fires every round makes a confident stop unreachable rather than rare. Two
-  did: a seat that cannot read the code (every seat — an empty sandbox and no tools) declaring
-  gaps about code outside the diff, and antigravity's argv ceiling, which the kernel sets at
-  120,000 bytes. On PR #160's round 1 that was 16 of 19 veto lines, nine of them asking about
-  a file in this repo that `grep` answered in four minutes. Both are now recorded state
-  (`ReviewerRun.code_blind`, `argv_clamp`) rather than matched on message wording, both are
-  still reported, and both have a floor so exempting seats one at a time cannot empty the veto
-  on a round nothing read. Truncation by a `max_diff_chars` somebody typed still vetoes. First
-  half of #113; code access as a per-repo setting is the second and lands separately.
-- **v2.49** — the guard that could not fire. `create-worktree`'s isolated-DB step had a
-  `die` whose whole job was to explain a missing database name, and `set -u` killed the
-  script at that guard's own dereference instead — `MAIN_DB_NAME: unbound variable`, at the
-  exact line written to say what was wrong. One initialisation makes the message reachable.
-  `database.url_env` and `database.name_env` now cascade rather than excluding each other,
-  so a repo that assembles its URL at runtime (or keeps the name in docker-compose) can use
-  an isolated database. And because the step is 3 of 10, a failure there left a checkout
-  with no `.venv`, port or context file: it now says the worktree is incomplete and gives
-  the two commands out, naming the branch rather than the directory.
-- **v2.48** — a lease says what its holder is doing, not just where. `POST /lease` takes
-  `state` (`working | waiting | input`) and `/active` and `/overlap` return it with `state_at`,
-  because a state is only as good as its age: `working` last reported twenty minutes ago
-  describes a pane that looks busy and has not moved — the failure v2.46 named when it took the
-  permission prompts away. Neither timestamp already on the row can date it (`acquired_at` is
-  fixed at first claim, `expires_at` moves on every heartbeat), so the pair travels together and
-  each reader picks its own threshold. `stalled` is deliberately unreportable: it is a conclusion
-  drawn from a state and its age, and a holder cannot know it is in the state where it has
-  stopped talking. Both dashboards grow a `state` column and a seat cell on the tmux bar takes
-  its colour from `@qb_state`, set by the lifecycle hook — which is also the only thing that
-  knows a turn ended, so nothing here infers it.
-- **v2.47** — the dashboard grows hands, and its tests start running. The SEATS panel
-  closes a seat and adds one, and tmux grows a clickable bar of the same widgets above the
-  seat row — both through `qb-seat-click`, which `qb-dash-tui` had been calling since the
-  panel landed without the script ever being committed. The bar is a status line rather than
-  pane-border glyphs because tmux honours `#[range=...]` nowhere else, and a click on the top
-  border row is not delivered at all. `QB_SEATS_BAR=0` opts out. It also fixes a `run-shell`
-  trap that made the ＋ do nothing in silence: a mouse binding gets no `$TMUX_PANE` and the
-  tmux server's PATH usually predates the harness. And the dashboard's seven tests, which had
-  skipped every CI run since they were written, now execute.
-- **v2.53** — a pinned reviewer model no host can serve stops costing the whole seat. A model
-  pin is one value for the fleet and a *deployment* is per-host: codex on the work box routes
-  through an employer gateway deploying `gpt-5.5` while `.harness-rules` pins `gpt-5.6-luna`,
-  so the seat 404s and a four-vendor panel silently became one — on PR #207, 25 findings all
-  from `claude`, reviewing a PR `claude` wrote, and on #217 a round where nobody ran at all.
-  Both codex pins are refused here independently (the `max` effort as well as the model), so
-  each is now lowered on its own, at most once, and the header says which
-  (`codex (CLI default; pinned gpt-5.6-luna unavailable, effort max unsupported)`), with
-  the substitution recorded as state in the payload so the board never averages a swapped run
-  in as the pinned one. Both halves of the old failure were the wrong stream: codex writes its
-  errors to stdout under `--json` while stderr holds a progress banner, so the diagnosis said
-  `exited 1 (Reading prompt from stdin...)` about a 404 — and the retry decision read the same
-  empty stream, retrying a settled failure at ten minutes a go.
-- **v2.46** — a screen you ask for by number, and seats that do not stop to ask. `qb-b 3`
-  is the seat count, the default is 3 and the ceiling is 10; past five, seats are five across
-  and two down, built rather than left to `select-layout tiled`, which picks the wrong axis
-  for a pane that wants width. Seat numbers read left to right. And a seat starts with
-  permission prompts off, because a pane nobody is watching cannot answer one: the agent
-  stops mid-item still holding its board claim, and a prompt no one answers is an outage
-  that looks like progress. `qb-seats --no-yolo` or `QB_SEAT_YOLO=0` gives them back; the
-  default lives in `qb-seat`, which is what execs the agent, so a seat started by hand and a
-  seat the screen builds cannot disagree.
-- **v2.43** — the seat screen learns to answer questions about itself. `qb-dash-tui` puts the
-  fleet beside the seats — who is alive, what they hold, which PRs are open and what CI says —
-  and rows are clickable: a seat jumps the tmux cursor to its pane, a PR opens on GitHub, the ⚖
-  starts `/panel-review-pr` in a window of its own. `qb-b` is `qb-seats`, spelled short. It also
-  fixes a layout defect nobody could see: `qb-seats` addressed panes as `session:window.0`, so a
-  `pane-base-index 1` config broke the screen entirely, and the suite inherited the developer's
-  own tmux.conf — green where nobody had that setting, red where somebody did.
-- **v2.42** — `qb-board`, a terminal client, because the board's only human surface needed a desktop
-  browser and daedalus, atlas and sisyphus do not have one. Two halves: `qb-board --follow`, plain
-  lines on stdout that pipe and grep and resume from a cursor after an overnight drop, needing
-  nothing but `httpx`; and a Textual client with Board / Fleet / Sessions / Panel over endpoints that
-  already existed. The reason it is a local process rather than a page is `p`, `c` and `Enter` — pull
-  this machine's checkout, cherry-pick a located SHA, resume a session — and the refusals those
-  inherit, where "could not tell" counts as a no. Not a third client: it consumes the same
-  `mcp/mcp_server/client.py` the MCP server does, which is also how that package finally got CI.
 - **v2.52** — the panel decides whether the round is worth running. It used to dispatch every
   configured seat at full effort whatever the diff: on PR #137 that was four seats against
   763,375 chars, 6.4× the argv ceiling of the one seat whose prompt travels in argv, on a change
@@ -835,6 +831,19 @@ full — including what was broken before it, which is the part no diff recovers
   round CLOSES earlier gaps, exempts `absent` but not `argv_capped`: a capped seat ran and saw
   a prefix, so the round did not read its target whole; an absent one is no evidence either
   way.
+- **v2.53** — a pinned reviewer model no host can serve stops costing the whole seat. A model
+  pin is one value for the fleet and a *deployment* is per-host: codex on the work box routes
+  through an employer gateway deploying `gpt-5.5` while `.harness-rules` pins `gpt-5.6-luna`,
+  so the seat 404s and a four-vendor panel silently became one — on PR #207, 25 findings all
+  from `claude`, reviewing a PR `claude` wrote, and on #217 a round where nobody ran at all.
+  Both codex pins are refused here independently (the `max` effort as well as the model), so
+  each is now lowered on its own, at most once, and the header says which
+  (`codex (CLI default; pinned gpt-5.6-luna unavailable, effort max unsupported)`), with
+  the substitution recorded as state in the payload so the board never averages a swapped run
+  in as the pinned one. Both halves of the old failure were the wrong stream: codex writes its
+  errors to stdout under `--json` while stderr holds a progress banner, so the diagnosis said
+  `exited 1 (Reading prompt from stdin...)` about a 404 — and the retry decision read the same
+  empty stream, retrying a settled failure at ten minutes a go.
 - **v2.54** — one cycle's ending stops describing another's. `GET /review/findings` took its
   `stopped`/`stop_reason`/`stop_confident`/`stop_veto` summary from the newest run in the window
   whatever cycle that run belonged to, so a second loop — or one review-only `/panel` read — made
@@ -887,13 +896,6 @@ full — including what was broken before it, which is the part no diff recovers
   followed — but shipped text that already existed is **not** exempt, since a test can assert
   on it, as this change did to its own prompt and briefs. The panel's `REVIEW_PROMPT` also stops asking only whether a test is **absent** —
   #90's fixture answered that correctly — and now asks whether a present test is load-bearing.
-- **v2.61** — the suites that read this repo get a sandbox that holds it. Five suites under
-  `harness/` read files at the repo root while running in nix sandboxes that did not hold them,
-  so their assertions were never evaluated — they errored on missing files, in checks no
-  workflow runs. `prose-consistency-tests` is one check for that whole category rather than a
-  fourth near-identical one, each member now declares what it reads and refuses an undeclared
-  path, and the `flake.nix` reader that had been written twice is shared. `worktree-tests` goes
-  from 9 failures and 20 errors to 3 failures and none.
 - **v2.59** — a row key the dashboard can actually tell apart. `qb-dash-tui` dies with
   `DuplicateKey` when two rows want the same key, and that is not a bad-looking row — a
   `DataTable` raises, so the whole dashboard becomes a traceback. #208 fixed the reported
@@ -924,6 +926,13 @@ full — including what was broken before it, which is the part no diff recovers
   own rows were going stale for every open PR. And `preland`'s merge-claim check now **warns when a
   repo claims nothing at all**, because `unclaimed` there was the absence of a record being read as
   evidence.
+- **v2.61** — the suites that read this repo get a sandbox that holds it. Five suites under
+  `harness/` read files at the repo root while running in nix sandboxes that did not hold them,
+  so their assertions were never evaluated — they errored on missing files, in checks no
+  workflow runs. `prose-consistency-tests` is one check for that whole category rather than a
+  fourth near-identical one, each member now declares what it reads and refuses an undeclared
+  path, and the `flake.nix` reader that had been written twice is shared. `worktree-tests` goes
+  from 9 failures and 20 errors to 3 failures and none.
 - **v2.62** — a dashboard for one project. Every dash panel was fleet-wide while every screen
   is built for one repo, so most rows were somebody else's and the repo cell was the same word,
   eleven columns wide, on every line of a 78-column pane — and on the printed panels another
