@@ -188,7 +188,8 @@ just the slow seat. Poll the background task instead.
 
 **Panel members** default to the repo's `.harness-rules.sample`; pass no `--reviewers`
 unless the user named who should review ("just codex", "codex and antigravity"), then
-add `--reviewers <comma-list>` from `claude`, `codex`, `antigravity`, `sonarqube`. It
+add `--reviewers <comma-list>` from `claude`, `codex`, `antigravity`, `pi`, `grok`,
+`sonarqube`. It
 replaces the configured set rather than filtering it, so a named reviewer runs
 even where the rules disable it. Fewer reviewers means thinner coverage feeding
 the fixer — surface that in §6 rather than letting a one-vendor review read

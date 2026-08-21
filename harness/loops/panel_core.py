@@ -273,7 +273,7 @@ ROUNDS_HEADING = "**Rounds:**"
 # The panel's possible members. LLM reviewers are interchangeable in everything
 # except how their CLI is invoked; sonarqube is a different shape (an API, and a
 # hard gate), so it is selectable but not iterable with the others.
-LLM_REVIEWERS = ("claude", "codex", "antigravity", "pi")
+LLM_REVIEWERS = ("claude", "codex", "antigravity", "pi", "grok")
 ALL_REVIEWERS = LLM_REVIEWERS + ("sonarqube",)
 
 # Reviewer name -> the executable to look for on PATH, where the two differ.
