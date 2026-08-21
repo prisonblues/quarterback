@@ -742,10 +742,18 @@ the directory it was built in. `resume` takes the number from the list or the sc
 and with exactly one screen up it takes no argument at all.
 
 A screen is recognised by a pane carrying `@qb_seat`, never by its name — `-s` takes
-anything, the fleet's own screen is `qbseats` rather than `seats-nix-fleet`, and tmux
-silently renames what it will not take verbatim. So the list is read back from tmux and can
-only print names that really exist, which also makes it the way to reattach to a screen tmux
-renamed under you.
+anything, the fleet's own screen is `qbseats` rather than `seats-nix-fleet`, and **what
+tmux does with a name it will not take verbatim depends on which tmux you have**: up to
+3.6a it silently renamed one (`my.screen` → `my_screen`), and 3.7b keeps it as typed. So
+the list is read back from tmux and can only print names that really exist, which is also
+the way to reattach to a screen an older tmux renamed under you.
+
+**Inside the script a session is addressed by `#{session_id}`, never by its name**, and
+that is not tidiness: `.` and `:` are a tmux target's own separators, so on 3.7b
+`-t "=my.screen"` parses as pane `screen` of session `my` and every seat command failed
+against a screen that plainly existed. `qb-seat-click` — the bar's ✕ and ＋ — does the same.
+Names are for the messages a human reads; ids do the addressing, and
+`test_every_session_target_is_an_id_and_not_a_name` reads both scripts to keep it that way.
 
 A screen also records **what its seats are called**: `@qb_repo` is the repository it was
 built in, and `@qb_scope` is the explicit `QB_SEAT_SCOPE` if it was given one. Both are set

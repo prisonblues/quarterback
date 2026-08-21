@@ -150,7 +150,6 @@ def screen(tmp_path):
         # A test may not need the network to be up to pass.
         "QB_SEATS_BOARD": "printf tape-stub",
     }
-    sessions = []
 
     def _run(*args, name="t", exe=None):
         """`exe` starts the script as something else — a command list, in place of
@@ -162,7 +161,6 @@ def screen(tmp_path):
         which copy of itself it means. A test about that decision cannot be run
         through one fixed entry point.
         """
-        sessions.append(name)
         done = subprocess.run(
             [*(exe or [str(QB_SEATS)]), "-C", str(repo), "-s", name, *args],
             env=env,
@@ -196,13 +194,26 @@ def screen(tmp_path):
     _run.env = env
     yield _run
 
-    # Only the sessions this fixture made, addressed exactly (`=name`), and NEVER
-    # `tmux kill-server`: a server that loses its last session exits on its own,
-    # so the blunt instrument bought nothing and could reach a server that is not
-    # ours. Whatever else is running on this machine is none of a test's business.
-    for name in sessions:
-        subprocess.run(["tmux", "kill-session", "-t", f"={name}"], env=env,
-                       capture_output=True)
+    # BY ID, AND ONLY ON OUR OWN SOCKET. Never `tmux kill-server`: a server that
+    # loses its last session exits on its own, so the blunt instrument bought
+    # nothing and could reach a server that is not ours. Whatever else is running
+    # on this machine is none of a test's business — which is what the socket
+    # check below is for, and it is the same check `_run` makes: if tmux ignored
+    # TMUX_TMPDIR then this is somebody else's server and nothing gets killed.
+    #
+    # This used to address `=name`, using the name each call ASKED for, and leaked
+    # a server per test whenever the two differed: tmux renames a name it will not
+    # take (3.6a turns `my.screen` into `my_screen`) and tmux 3.7b keeps the dot,
+    # which makes `-t "=my.screen"` parse as pane `screen` of session `my`. Either
+    # way the kill missed, the session stayed up holding a `sleep 300`, and the
+    # socket directory was removed out from under a server still running in it.
+    # Listing the ids is both simpler and exact.
+    if (Path(socket_dir) / f"tmux-{os.getuid()}").exists():
+        live = subprocess.run(["tmux", "list-sessions", "-F", "#{session_id}"],
+                              env=env, capture_output=True, text=True)
+        for sid in live.stdout.split():
+            subprocess.run(["tmux", "kill-session", "-t", sid], env=env,
+                           capture_output=True)
     shutil.rmtree(socket_dir, ignore_errors=True)
 
 
@@ -792,7 +803,29 @@ def test_the_bar_is_a_second_status_line_and_says_which_one_it_is(screen):
         "nested if-shell would lose its arguments and the click would be silent")
 
 
-def test_every_session_target_is_an_id_and_not_a_name():
+#: A `-t` target built from a shell variable that holds a session NAME, in either
+#: of the two spellings this screen ever used: `-t "=$SESSION"`, and
+#: `-t "$SESSION:window"`. The second survives a `.` by luck — tmux splits a target
+#: on `:` first, so the dot stays inside the session part and an exact-name match
+#: still wins — but not a `:`, which turns `has:colon:seats` into "can't find
+#: window: colon:seats". One rule for both is easier to hold than "ids here, names
+#: there because that spelling happens to be safe".
+#:
+#: The brace form is matched too (`${SESSION}`), because a pattern that a pair of
+#: braces walks past is a tripwire with a documented way around it. `$SESSION_ID`
+#: and `$sid` do not match: `\b` will not fire between `N` and `_`, nor inside
+#: `sid`.
+_TARGET_BY_NAME = re.compile(r'-t\s+"?=?\$\{?(?:SESSION|session|s)\}?\b')
+
+#: An `=`-anchored target of any kind. `=` means "match this NAME exactly", so its
+#: presence is proof the target is a name — whatever variable, or literal, follows
+#: it. This is the half of the rule that does not need to know the variable names a
+#: future author will pick.
+_EXACT_NAME_TARGET = re.compile(r'-t\s+"=')
+
+
+@pytest.mark.parametrize("script", ["qb-seats", "qb-seat-click"])
+def test_every_session_target_is_an_id_and_not_a_name(script):
     """A `-t` may not address a session by NAME, whatever the name looks like.
 
     `.` and `:` are a target's own separators. tmux used to rewrite them out of a
@@ -802,30 +835,58 @@ def test_every_session_target_is_an_id_and_not_a_name():
     exists. Every seat command failed, `list` showed nothing and `resume` could not
     reach it (#259).
 
+    BOTH SCRIPTS, because the bar's buttons are in the other one. `qb-seat-click`
+    carried six of these targets after the first pass converted `qb-seats`, and it
+    is the worse place for them: it is reached through `run-shell -b`, which
+    discards both streams, so the ✕, the ＋ and the seat cells would have gone on
+    doing nothing at all with no error anywhere.
+
     Asserted on the SOURCE rather than by driving tmux, because the bug is
     invisible on the tmux a developer has: 3.6a renames the dot away, so no test
     using a session name can exercise it there. This holds under either version,
     which is the point — the next `-t "=$SESSION"` someone adds fails here and now
     rather than on whichever box happens to carry the newer tmux.
     """
-    src = (Path(__file__).resolve().parents[1] / "bin" / "qb-seats").read_text()
+    src = (Path(__file__).resolve().parents[1] / "bin" / script).read_text()
     offenders = [
-        f"{n}: {line.strip()}"
+        f"{script}:{n}: {line.strip()}"
         for n, line in enumerate(src.splitlines(), 1)
-        # `=$s`/`=$SESSION` and friends: an `=`-anchored target built from a shell
-        # variable holding a name. `session_id`'s own list-sessions lookup is not
-        # a `-t` and does not match.
-        # `=$s`/`=$SESSION` and `$SESSION:window` alike: any `-t` built from a
-        # shell variable holding a NAME. The second form survives a `.` by luck —
-        # tmux splits on `:` first, so the dot stays inside the session part — but
-        # not a `:`, which `has:colon:seats` turns into "can't find window:
-        # colon:seats". One rule for both is easier to hold than two.
-        if re.search(r'-t\s+"=?\$(SESSION|s)\b(?!_ID)', line)
+        # COMMENTS ARE NOT CODE. Both files describe the broken spelling in prose
+        # — that is how the next reader learns why the ids are there — and a guard
+        # that could not tell the two apart would make the explanation unwritable.
+        if not line.lstrip().startswith("#")
+        and (_TARGET_BY_NAME.search(line) or _EXACT_NAME_TARGET.search(line))
     ]
     assert not offenders, (
         "these address a tmux session by name, which breaks the moment the name "
-        "carries a `.` or a `:` — use the session id (SESSION_ID, or the id read "
-        "beside the name in screens()):\n  " + "\n  ".join(offenders))
+        "carries a `.` or a `:` — use the session id (SESSION_ID/sid, or the id "
+        "read beside the name in screens()):\n  " + "\n  ".join(offenders))
+
+
+def test_the_name_target_pattern_catches_the_forms_that_actually_shipped():
+    """The guard's own red: a pattern matching nothing passes everything."""
+    for shipped in (
+        'tmux has-session -t "=$SESSION" 2>/dev/null',
+        'tmux list-panes -t "$SESSION:seats" -F \'#{pane_id}\'',
+        'tmux list-panes -s -t "=$s" -F \'#{@qb_seat}\'',
+        'tmux list-panes -s -t "=$session" -F \'#{pane_id} #{@qb_seat}\'',
+        'tmux show-options -v -t "=$session:" @qb_repo',
+        # The two ways past a pattern anchored on `"$NAME`: braces, and a
+        # variable this guard has never heard of behind an `=`.
+        'tmux kill-session -t "${SESSION}"',
+        'tmux kill-session -t "=$screen_name"',
+    ):
+        assert (_TARGET_BY_NAME.search(shipped)
+                or _EXACT_NAME_TARGET.search(shipped)), shipped
+    for fixed in (
+        'tmux list-panes -t "$SESSION_ID:seats" -F \'#{pane_id}\'',
+        'tmux list-panes -s -t "$sid" -F \'#{@qb_seat}\'',
+        'tmux kill-session -t "$SESSION_ID"',
+        'tmux resize-pane -t "$p" -x "$want"',
+        "  'switch-client -t ='",
+    ):
+        assert not _TARGET_BY_NAME.search(fixed), fixed
+        assert not _EXACT_NAME_TARGET.search(fixed), fixed
 
 
 def test_the_bar_can_be_turned_off(screen):
@@ -901,6 +962,58 @@ def test_the_seat_name_jumps_to_that_pane(screen):
     assert click(screen, "seat3", "t").returncode == 0
     active = screen.tmux("display-message", "-p", "-t", "t:seats", "#{@qb_seat}")
     assert active.stdout.strip() == "3"
+
+
+def test_the_bar_works_on_a_screen_whose_name_tmux_keeps_verbatim(screen):
+    """Every widget on the bar, against a session called `my.screen`.
+
+    The three buttons are the reason `qb-seat-click` had to convert too: it looked
+    its session up with `-t "=$session"`, and on tmux 3.7b — which keeps the dot
+    rather than renaming it — that parses as pane `screen` of session `my` and
+    comes back "can't find pane: screen". The ✕ then closed nothing, the ＋ added
+    nothing and a seat cell jumped nowhere, all three in silence, because the bar
+    reaches the script through `run-shell -b` and that discards both streams.
+
+    Driven by the name tmux ACTUALLY gave the screen, not by `my.screen`: 3.6a
+    renames the dot to an underscore and there is nothing to exercise there, so
+    hardcoding either spelling would pin a tmux version rather than this script's
+    promise. On 3.6a this is a second pass over the ordinary case; on 3.7b it is
+    the regression.
+    """
+    screen("-n", "3", name="my.screen")
+    wait_for_log(screen.log, 3)
+    names = [n for _, n in listing(screen)]
+    assert len(names) == 1, f"expected exactly one screen, got {names}"
+    real = names[0]
+
+    done = click(screen, "seat3", real, name=real)
+    assert done.returncode == 0, done.stderr
+    active = screen.tmux("display-message", "-p", "-t", f"{real}:seats", "#{@qb_seat}")
+    assert active.stdout.strip() == "3", done.stderr
+
+    done = click(screen, "kill2", real, name=real)
+    assert done.returncode == 0, done.stderr
+    assert sorted(n for _, n in panes(screen, real) if n) == ["1", "3"], done.stderr
+
+    done = click(screen, "add", real, name=real)
+    assert done.returncode == 0, done.stderr
+    assert sorted(int(n) for _, n in panes(screen, real) if n) == [1, 3, 4], done.stderr
+
+
+def test_a_click_naming_a_screen_that_is_gone_says_so(screen):
+    """It used to present as "seat 1 has no pane", which names the wrong thing.
+
+    @qb_click_session is a SERVER option and outlives the screen that set it, so a
+    stale one is the ordinary way this arrives — and the answer a user needs is
+    that the screen is gone, not that one of its seats is.
+    """
+    screen("-n", "2")
+    done = click(screen, "seat1", "no-such-screen")
+    assert done.returncode == 1
+    # The script's own words, not tmux's. Before the id conversion this reached
+    # tmux with `-t "=no-such-screen"` and reported whatever came back, which is
+    # how a missing SCREEN came to be described as a missing seat.
+    assert "no screen named 'no-such-screen' is up" in done.stderr, done.stderr
 
 
 def test_the_dispatcher_reads_what_the_click_stashed(screen):

@@ -558,12 +558,15 @@ seat_bar() {
 #     the ✕ is three columns from the cell that merely jumps to the pane.
 install_bar() {
   local click=$1 run stash confirm inner
-  # `-t "$SESSION_ID:"`, with the colon, throughout. set-option rejects the bare
-  # `=name` exact-match form that every other command here takes — it reports
-  # "no such session" for a session that plainly exists. The colon makes it a
-  # window target of that session, which resolves, and keeps `=` doing its job:
-  # dropping it would let a session named `seats-quarterback-old` be matched by
-  # a prefix and configured instead of this one.
+  # `-t "$SESSION_ID:"` — the id, then the colon that says "that session's current
+  # window". These lines used to read `-t "=$SESSION:"`, and both halves of that
+  # spelling were about the NAME: set-option would not take the bare `=name`
+  # exact-match form at all ("no such session" for a session that plainly exists),
+  # and the `=` was there to stop `seats-quarterback-old` being matched by prefix.
+  # An id needs neither — it is exact by construction and set-option takes it with
+  # or without the colon (measured on 3.6a and 3.7b alike). The colon stays because
+  # every other session target in this script carries it and one spelling is easier
+  # to hold than two, not because anything here still depends on it.
   tmux set-option -t "$SESSION_ID:" mouse on
   tmux set-option -t "$SESSION_ID:" status 2
   tmux set-option -t "$SESSION_ID:" status-position top
@@ -648,7 +651,16 @@ attach() {
   else
     # No terminal to attach to (a script, a unit, a CI check). The screen is up
     # regardless — say how to reach it rather than failing.
-    printf '%s: %s is up — tmux attach -t %s\n' "$PROG" "$SESSION" "$SESSION"
+    #
+    # `$PROG resume` and not `tmux attach -t $SESSION`, which is what this said
+    # and which does not work for the names this script now supports: a target
+    # session is parsed for `.` and `:` like any other, so `tmux attach -t
+    # my.screen` comes back "can't find pane: screen" on 3.7b (measured). Handing
+    # a human a command that fails against exactly the screens the id conversion
+    # exists for is worse than saying nothing. `resume` takes the name because it
+    # resolves it the way session_id does, and it is the spelling `list` already
+    # advertises.
+    printf '%s: %s is up — %s resume %s\n' "$PROG" "$SESSION" "$PROG" "$SESSION"
   fi
 }
 
@@ -690,11 +702,13 @@ screens() {
     n=$(tmux list-panes -s -t "$sid" -F '#{@qb_seat}' 2>/dev/null \
           | awk 'NF { n++ } END { print n + 0 }')
     [ "$n" -gt 0 ] || continue
-    # `=$s:` WITH THE COLON, exactly as the set-option calls further down use it
-    # and for the same reason: display-message takes a target-PANE, and a bare
-    # session name is not one. It does not fail loudly either — it prints an
-    # empty line, which is how the first cut of this listed every screen with no
-    # path and every one of them "(attached)".
+    # `$sid:` WITH THE COLON, exactly as the set-option calls further down use it.
+    # These read `=$s:` before the id conversion, and the colon was load-bearing
+    # then: display-message takes a target-PANE and a bare session NAME is not
+    # one, and it does not fail loudly either — it prints an empty line, which is
+    # how the first cut of this listed every screen with no path and every one of
+    # them "(attached)". See install_bar for why the colon is kept now that the
+    # target is an id and no longer needs it.
     att=$(tmux display-message -p -t "$sid:" '#{session_attached}' 2>/dev/null) || att=
     path=$(tmux display-message -p -t "$sid:" '#{session_path}' 2>/dev/null) || path=
     # NO FIELD MAY BE EMPTY. A tab is IFS whitespace, so a reader splitting on one
@@ -1170,10 +1184,18 @@ SESSION_ASKED=$SESSION
 _created=$(tmux new-session -d -P -F '#{session_id} #{session_name}' -s "$SESSION" \
   -n seats -c "$REPO" -x "$WINDOW_COLS" -y "$WINDOW_ROWS" \
   -e QB_SEATS=1 -e FLEET_NO_MOTD=1 ${seat_env[@]+"${seat_env[@]}"})
+# CHECKED ON THE SHAPE, not by comparing the two halves. `${_created%% *}` and
+# `${_created#* }` both return the whole string when there is no space in it, so
+# "they came back different" reads as "there were two fields" — except for a
+# session actually named `$3`, where the two fields are genuinely equal and a
+# perfectly good screen would die here as a tmux malfunction. `$` and digits is
+# what a session id is, and a name has to be there after the space.
+case "$_created" in
+  '$'[0-9]*' '?*) ;;
+  *) die "tmux did not report the new session's id and name ('$_created')" ;;
+esac
 SESSION_ID=${_created%% *}
 SESSION=${_created#* }
-[ -n "$SESSION_ID" ] && [ "$SESSION_ID" != "$SESSION" ] \
-  || die "tmux did not report the new session's id and name ('$_created')"
 [ "$SESSION" = "$SESSION_ASKED" ] \
   || warn "tmux would not take '$SESSION_ASKED' as a session name and called this
        screen '$SESSION' instead — that is the name to reattach to, and the name

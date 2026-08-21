@@ -574,8 +574,16 @@ def checkout(tmp_path):
     A checkout the test makes is one every environment has, so these assert in the
     sandbox instead of only on a laptop. It is also the more honest fixture: what
     is under test is `repo_target`'s reading of *a* checkout, never this one.
+
+    THE DIRECTORY IS NOT NAMED AFTER THE REPOSITORY, and that is the fixture's one
+    piece of deliberate awkwardness. `repo_target` asks a directory for its ORIGIN
+    rather than reading its name — which is the whole reason it shells out to git
+    at all, and what makes `--repo <a worktree>` report the repository instead of
+    the branch the worktree is named for. A fixture whose directory and origin both
+    said `quarterback` could not tell the two implementations apart, so it says
+    `wt-review` on disk and `prisonblues/quarterback` at the remote.
     """
-    root = tmp_path / "quarterback"
+    root = tmp_path / "wt-review"
     (root / "sub").mkdir(parents=True)
 
     def git(*args):
@@ -613,7 +621,12 @@ def test_a_bare_name_that_is_a_directory_is_that_directory(checkout, monkeypatch
     monkeypatch.chdir(checkout.parent)
     slug, path = qd.repo_target(checkout.name)
     assert path == str(checkout)
-    assert slug.count("/") == 1 and " " not in slug
+    # BOTH halves, and the slug is the half a directory name cannot supply. The
+    # fixture's directory is `wt-review` and its origin is `prisonblues/quarterback`
+    # — this suite runs in a worktree as readily as in the main checkout, and a
+    # worktree's directory name is not its repository's name.
+    assert slug == "prisonblues/quarterback", (
+        f"{checkout.name!r} was read as a name rather than asked for its origin")
 
 
 def test_a_checkout_argument_says_where_work_should_run_too(checkout):
