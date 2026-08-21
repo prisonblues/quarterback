@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Where this script lives, so its siblings (qb-hooks) are findable however it
+# was invoked — via PATH, a symlink, or an absolute path.
+WORKTREE_SCRIPT_DIR=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
+
 # Generic Worktree Setup Script
 # Usage: create-worktree [options] <branch-name>
 #
@@ -1079,6 +1083,35 @@ if [[ "$rerere_is_ours" = true ]]; then
     echo -e "  committing it: it is git's last answer, not necessarily this one's."
 fi
 # <<< rerere
+
+# Every worktree of a repo shares ONE `refs/stash`: it lives in the common git
+# dir, not the per-worktree one. So a stash pushed in `foo-fix-issue-114` is
+# listed by `git stash list` in `foo-fix-issue-113`, and `stash@{0}` there
+# resolves to whatever the last pusher meant. This script is the thing that
+# creates that configuration, so this script is where the guard belongs — and it
+# has already cost two working trees (#210), once with the recovery note parked
+# in the same shared stash that ate it.
+#
+# The guard is a `reference-transaction` hook, because nothing else can see a
+# `git stash` typed by hand: stash is a C built-in, so `alias.stash` is ignored
+# and a `git-stash` on PATH is never consulted, and there is no `pre-stash` hook.
+# Repo-level, so it covers the main checkout as well as the worktrees — the
+# near-miss that prompted this was an orchestrator stashing in MAIN while agents
+# ran in siblings.
+#
+# `qb-hooks install` re-exports whatever the machine's managed hooks dir provides
+# (here: a gitleaks `pre-commit`), because `core.hooksPath` replaces the hooks
+# directory rather than stacking with it. Best-effort: a repo whose config will
+# not take the key still gets its worktree.
+# >>> stash-guard (extracted verbatim by harness/tests/test_stash_guard.py)
+if [[ -x "$WORKTREE_SCRIPT_DIR/qb-hooks" ]]; then
+    if ! "$WORKTREE_SCRIPT_DIR/qb-hooks" install --repo "$MAIN_REPO"; then
+        echo -e "  ${YELLOW}stash guard not installed${NC} — 'git stash' in this repo writes a" >&2
+        echo -e "  refs/stash shared with every worktree, and a sibling can pop it. Use" >&2
+        echo -e "  'qb-stash' (per-worktree) rather than 'git stash' here." >&2
+    fi
+fi
+# <<< stash-guard
 
 # Before the tree, so a refusal costs nothing to unwind.
 claim_the_branch "$BRANCH_NAME"

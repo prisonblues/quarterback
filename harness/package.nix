@@ -64,7 +64,10 @@ stdenvNoCC.mkDerivation {
     # templates/ ships alongside them: create-worktree does nothing for a repo
     # until that repo has a .worktree.json, so an installed harness that omits
     # the starting points makes the user go back to the source tree for them.
-    cp -r loops commands templates claude $out/share/quarterback-harness/
+    # githooks/ is data too: `qb-hooks` copies reference-transaction and
+    # qb-hook-forward out of it into a repo's common git dir. Omit it and an
+    # installed harness creates worktrees with no stash guard at all.
+    cp -r loops commands templates claude githooks $out/share/quarterback-harness/
     install -m 0644 worktree.example.json README.md $out/share/quarterback-harness/
 
     runHook postInstall
@@ -79,7 +82,8 @@ stdenvNoCC.mkDerivation {
   # Rewrites `#!/usr/bin/env bash|python3` to store paths, so an installed
   # harness does not depend on what happens to be on the user's PATH.
   postFixup = ''
-    patchShebangs $out/bin $out/share/quarterback-harness/loops
+    patchShebangs $out/bin $out/share/quarterback-harness/loops \
+                  $out/share/quarterback-harness/githooks
   '';
 
   nativeBuildInputs = [ makeWrapper ];

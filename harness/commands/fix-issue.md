@@ -210,7 +210,11 @@ worktree this skill has ever created, and `stash@{0}` means whatever
 the last pusher meant. The PR that added this instruction lost its
 own working tree exactly that way: a concurrent agent in a sibling
 worktree popped the red/green stash into its own checkout. A patch
-file shares nothing.
+file shares nothing. `create-worktree` now installs a hook
+that REFUSES the shared stash, so a plain `git stash` here stops with
+a `REFUSED:` message; `qb-stash push` is the per-worktree
+replacement. It takes no pathspec, which is why this step still wants
+a patch file.
 
 **`test -s` is the guard, and it has to HALT.** An empty capture —
 mistyped paths, or a fix already committed — means the red run

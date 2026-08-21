@@ -1,0 +1,243 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+# qb-stash — a stash that belongs to ONE worktree.
+#
+# WHY. `refs/stash` lives in the COMMON git dir, so every worktree of a repo
+# shares one stash stack. `git stash push` in `foo-fix-issue-114` is listed by
+# `git stash list` in `foo-fix-issue-113`, and `stash@{0}` there resolves to
+# whatever the last pusher meant. This harness runs many concurrent worktrees off
+# one `.git` by design, so that is the normal configuration, and it has already
+# taken two working trees (issue #210). Nothing in git warns either party: a
+# stash entry has no author, no worktree and no session.
+#
+# `refs/worktree/*` is the one ref namespace git keeps PER WORKTREE, and
+# `git stash create` mints a stash commit without touching the shared stack. This
+# script is those two facts joined up.
+#
+#   qb-stash push [-m <msg>]   snapshot tracked changes, then revert the tree
+#   qb-stash list              this worktree's entries, newest first
+#   qb-stash show [<n>] [...]  diff of entry <n> (default 0)
+#   qb-stash apply [<n>]       restore entry <n>, keep it
+#   qb-stash pop [<n>]         restore entry <n>, then drop it
+#   qb-stash drop [<n>]        delete entry <n>
+#   qb-stash clear             delete every entry in this worktree
+#
+# apply/pop take --index to restore the staged/unstaged split as well as the
+# content — the asymmetry that made hand-recovery of the lost trees lossy.
+#
+# TWO LIMITS, MEASURED RATHER THAN GUESSED, because half-implementing them would
+# be worse than naming them:
+#
+#   * NO PATHSPEC. `git stash create` takes none, so `push` snapshots tracked
+#     changes across the whole worktree. For path-scoped work (removing a fix to
+#     prove a regression test goes red) use a patch file instead — `git add -N`,
+#     `git diff HEAD -- <paths> > x.patch`, `test -s`, `git apply`. A patch file
+#     is per-worktree by construction too, and it takes a pathspec.
+#   * NO UNTRACKED FILES. `git stash create` has no `-u` and ignores them
+#     (verified: an untracked file is absent from the stash commit's diffstat and
+#     from `rev-list --parents`). `push` therefore LEAVES untracked files in the
+#     tree rather than pretending to have saved them, and says so.
+#
+# Entries die with the worktree: `git worktree remove` takes `refs/worktree/*`
+# with it. `remove-worktree` checks for entries before it tears anything down.
+
+PREFIX="refs/worktree/qb-stash"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+die() { echo -e "${RED}qb-stash: $*${NC}" >&2; exit 1; }
+
+usage() {
+    sed -n '3,40p' "$0" | sed 's/^# \{0,1\}//'
+    exit "${1:-0}"
+}
+
+git rev-parse --git-dir >/dev/null 2>&1 || die "not inside a git repository"
+
+# Resolve entry <n> (0 = newest) to its full ref name. Entries are named after a
+# fixed-width nanosecond timestamp, so a plain descending refname sort IS
+# newest-first and no renumbering dance is needed on push. `creatordate` is the
+# obvious alternative and is wrong: three pushes inside one second tie, and
+# for-each-ref then falls back to ASCENDING refname, silently reversing the list.
+entry_refs() {
+    git for-each-ref --sort=-refname --format='%(refname)' "$PREFIX/"
+}
+
+# Nanoseconds where the platform has them (GNU date), a second plus a random
+# suffix where it does not — two pushes in the same second must not land on the
+# same ref name, which would overwrite the earlier entry outright.
+new_entry_id() {
+    local now
+    now=$(date +%s%N 2>/dev/null)
+    if [[ ! "$now" =~ ^[0-9]{19}$ ]]; then
+        now="$(date +%s)$(printf '%09d' $((RANDOM * 30518 % 1000000000)))"
+    fi
+    printf '%s-%s' "$now" "$$"
+}
+
+nth_ref() {
+    local n="$1" i=0 r
+    while IFS= read -r r; do
+        [[ -n "$r" ]] || continue
+        if [[ "$i" == "$n" ]]; then printf '%s' "$r"; return 0; fi
+        i=$((i + 1))
+    done < <(entry_refs)
+    return 1
+}
+
+# Accept `2`, `qb-stash@{2}` or a full ref, mirroring what people type at git.
+parse_index() {
+    local arg="${1:-0}"
+    case "$arg" in
+        refs/worktree/qb-stash/*) printf '%s' "$arg"; return 0 ;;
+        qb-stash@\{*\}) arg="${arg#qb-stash@\{}"; arg="${arg%\}}" ;;
+        stash@\{*\}) arg="${arg#stash@\{}"; arg="${arg%\}}" ;;
+    esac
+    [[ "$arg" =~ ^[0-9]+$ ]] || die "not an entry index: $1"
+    nth_ref "$arg" || die "no qb-stash entry $arg in this worktree (see: qb-stash list)"
+}
+
+cmd_push() {
+    local msg=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -m|--message) msg="${2:-}"; shift 2 ;;
+            -m*) msg="${1#-m}"; shift ;;
+            -h|--help) usage ;;
+            -u|--include-untracked|-a|--all)
+                die "$1 is not supported: 'git stash create' has no untracked
+       mode, so qb-stash cannot save untracked files. They are left in the tree." ;;
+            --) shift; break ;;
+            -*) die "unknown option: $1" ;;
+            *) break ;;
+        esac
+    done
+    [[ $# -eq 0 ]] || die "qb-stash push takes no pathspec ('git stash create' has none).
+       For path-scoped work use a patch file: git add -N <paths> &&
+       git diff HEAD -- <paths> > x.patch"
+
+    # `git stash create` will happily snapshot mid-merge, and the `reset --hard`
+    # below would then throw the merge state away along with the conflict
+    # resolution in progress. Plain `git stash` has the same hole; this one
+    # refuses instead.
+    local gd
+    gd=$(git rev-parse --absolute-git-dir)
+    if [[ -e "$gd/MERGE_HEAD" || -e "$gd/CHERRY_PICK_HEAD" || -e "$gd/REVERT_HEAD" \
+          || -d "$gd/rebase-merge" || -d "$gd/rebase-apply" ]]; then
+        die "a merge, rebase, cherry-pick or revert is in progress — finish or abort it
+       first. Snapshotting now would take the tree but not the operation, and the
+       revert that follows would discard the state you are resolving."
+    fi
+
+    local branch sha
+    branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
+    [[ -n "$msg" ]] || msg="WIP on $branch"
+
+    sha=$(git stash create "$msg") || die "git stash create failed"
+    if [[ -z "$sha" ]]; then
+        echo "No local changes to save"
+        return 0
+    fi
+
+    local ref="$PREFIX/$(new_entry_id)"
+    git update-ref "$ref" "$sha" -m "$msg" || die "could not write $ref"
+
+    # `stash create` snapshots but does NOT revert; doing that is ours. --hard
+    # discards exactly the tracked changes just captured and leaves untracked and
+    # ignored files alone, which is also what plain `git stash` does.
+    git reset -q --hard HEAD || die "snapshot saved at $ref, but reverting the tree failed"
+
+    echo -e "${GREEN}Saved working directory and index state${NC} $msg"
+    echo "  $ref"
+
+    local untracked
+    untracked=$(git ls-files --others --exclude-standard | head -5)
+    if [[ -n "$untracked" ]]; then
+        echo -e "${YELLOW}  Untracked files were NOT saved and are still in the tree:${NC}" >&2
+        echo "$untracked" | sed 's/^/    /' >&2
+    fi
+}
+
+cmd_list() {
+    local i=0 r
+    while IFS= read -r r; do
+        [[ -n "$r" ]] || continue
+        printf 'qb-stash@{%d}: %s\n' "$i" "$(git log -1 --format=%s "$r")"
+        i=$((i + 1))
+    done < <(entry_refs)
+    [[ "$i" -gt 0 ]] || return 0
+}
+
+cmd_show() {
+    local ref; ref=$(parse_index "${1:-0}") || exit 1
+    shift || true
+    git stash show -p "$@" "$ref"
+}
+
+cmd_apply() {
+    local args=() idx=""
+    for a in "$@"; do
+        case "$a" in
+            --index|-q|--quiet) args+=("$a") ;;
+            -h|--help) usage ;;
+            *) idx="$a" ;;
+        esac
+    done
+    local ref; ref=$(parse_index "${idx:-0}") || exit 1
+    git stash apply "${args[@]+"${args[@]}"}" "$ref"
+}
+
+cmd_pop() {
+    local args=() idx=""
+    for a in "$@"; do
+        case "$a" in
+            --index|-q|--quiet) args+=("$a") ;;
+            -h|--help) usage ;;
+            *) idx="$a" ;;
+        esac
+    done
+    local ref; ref=$(parse_index "${idx:-0}") || exit 1
+    # Drop ONLY after a clean apply. A conflicted pop that also deleted the entry
+    # is how a recoverable mess becomes an unrecoverable one.
+    git stash apply "${args[@]+"${args[@]}"}" "$ref" || {
+        echo -e "${YELLOW}qb-stash: entry kept at $ref${NC}" >&2
+        exit 1
+    }
+    git update-ref -d "$ref"
+    echo "Dropped $ref"
+}
+
+cmd_drop() {
+    local ref short
+    ref=$(parse_index "${1:-0}") || exit 1
+    short=$(git rev-parse --short "$ref" 2>/dev/null || echo "?")
+    git update-ref -d "$ref" || die "could not delete $ref"
+    echo "Dropped $ref ($short)"
+}
+
+cmd_clear() {
+    local r n=0
+    while IFS= read -r r; do
+        [[ -n "$r" ]] || continue
+        git update-ref -d "$r" && n=$((n + 1))
+    done < <(entry_refs)
+    echo "Dropped $n qb-stash entr$([[ $n -eq 1 ]] && echo y || echo ies)"
+}
+
+sub="${1:-list}"
+shift || true
+case "$sub" in
+    push|save) cmd_push "$@" ;;
+    list) cmd_list "$@" ;;
+    show) cmd_show "$@" ;;
+    apply) cmd_apply "$@" ;;
+    pop) cmd_pop "$@" ;;
+    drop) cmd_drop "$@" ;;
+    clear) cmd_clear "$@" ;;
+    -h|--help|help) usage ;;
+    *) echo -e "${RED}qb-stash: unknown subcommand '$sub'${NC}" >&2; usage 1 ;;
+esac
