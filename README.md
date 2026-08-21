@@ -985,7 +985,11 @@ full — including what was broken before it, which is the part no diff recovers
   output is byte-identical to a hard-coded one — which is also the limit of it: a hand-written
   `max+1` cannot be told from a stamped one and is not refused. A broken base no longer holds
   branches that ship no release and have not merged it (#168) — those are warned — and the
-  refusal that remains names the ref to repair from instead of describing how to find it.
+  refusal that remains names the ref to repair from instead of describing how to find it, as a
+  line that can be pasted from any directory. A number this branch INHERITED from a base that has
+  moved on is not one it picked, and the test for that is where the number landed rather than
+  which refs got merged: a feature branch's say-so is not provenance however many merges it
+  travels through.
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
   roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps

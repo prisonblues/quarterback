@@ -63,6 +63,27 @@ same resolved line. When the walk finds nothing clean within its bound it says s
 than printing a command with a `<placeholder>` in it, because a shell reads `<` as a redirect and
 a repair command that fails with a filesystem error is worse than a sentence.
 
+Hoisting also put that refusal in front of a branch that **inherited** a number rather than picking
+one: `--onto main` while `origin/main` has since issued v2.34 and v2.35, which every branch that
+pulled since carries. Those sit above the stale base's newest, and "a branch does not pick its own
+number" is nonsense about an entry that shipped last week. What excuses them is where the number
+LANDED — a ref naming the same branch `--onto` does, carried forward from it, and already contained
+by this branch. Asking instead which refs the branch had MERGED was wrong in both directions at
+once: a branch that inherited the same numbers by rebase or fast-forward has no merge commit to
+inspect and was refused anyway, and *any* number in *any* merged snapshot was excused, so a branch
+that hand-wrote `## v2.40` and was refused for it could have that refusal laundered by a second
+branch merging it. That is #167 back, through a merge.
+
+The repair line is **pasteable from anywhere**: an absolute path to the script and an explicit
+`--repo`, because `fix-and-review` runs this tool against a worktree that is not the caller's cwd,
+and a bare `scripts/release_stamp.py` with no `--repo` repairs whatever checkout the reader's shell
+happens to be sitting in. When the walk comes back empty it now says which of the two ways that
+happened, because they want opposite advice. A depth-1 clone — what `actions/checkout@v4` produces,
+and what the one automated caller of `check` runs in — sees exactly one commit however long the
+real history is, so "the unstamped entry has been there longer than fifty commits" was a claim
+about a history that clone does not have and "point `--onto` at an older commit" named a ref it
+cannot resolve. It is told to deepen the checkout instead.
+
 Two of the last three releases landed unstamped and needed their own repair PRs.
 
 ## v2.65 — the hm-module wires the board in, not just the commands

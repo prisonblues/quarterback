@@ -122,6 +122,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shlex
 import subprocess
 import sys
 import tomllib
@@ -886,9 +887,26 @@ def placeholder_at_ref(repo: Path, ref: str) -> list[str]:
 #: looks at has no placeholder and it stops there.
 _REPAIR_WALK_MAX = 50
 
-#: How the README and `fix-and-land` spell this tool. A bare `release_stamp.py` is on nobody's
-#: PATH, and a resolved ref is only worth resolving if the whole line can be pasted.
-_INVOCATION = "python3 scripts/release_stamp.py"
+
+def _cmd(repo: Path, sub: str, *rest: str) -> str:
+    """One invocation of this tool, spelled so it can be pasted into any shell.
+
+    Absolute on BOTH halves — the interpreter's argument and `--repo` — because nothing here
+    knows the cwd of the shell that will run it. `harness/commands/fix-and-review.md` runs
+    this tool as `python3 "$WT_DIR/scripts/release_stamp.py" preflight --repo "$WT_DIR"`
+    precisely so it operates on the worktree under review rather than on the caller's cwd,
+    and a repair command that dropped both halves would run against whatever that shell
+    happens to be sitting in: silently the wrong checkout, or a bare filesystem error where
+    it is not a repository at all. A cwd-relative `scripts/release_stamp.py` is also on
+    nobody's PATH, and a resolved ref is only worth resolving if the whole line can be pasted.
+
+    `--repo` goes straight after the subcommand because that is where argparse accepts it:
+    it is declared on each subparser, so `… --repo DIR apply` is a usage error rather than a
+    repair. Both paths go through `shlex.quote`, since a checkout under a directory with a
+    space in it is otherwise a command that parses as two arguments.
+    """
+    script = shlex.quote(str(Path(__file__).resolve()))
+    return " ".join(["python3", script, sub, "--repo", shlex.quote(str(repo)), *rest])
 
 
 def _releases_at(repo: Path, ref: str) -> set[Release] | None:
@@ -907,31 +925,102 @@ def _releases_at(repo: Path, ref: str) -> set[Release] | None:
         return None
 
 
-def _merged_in(repo: Path, onto_sha: str) -> set[Release]:
-    """Release numbers this branch MERGED IN rather than wrote.
+def _fresher_bases(repo: Path, onto: str, onto_sha: str) -> list[str]:
+    """Commits that are a LATER `onto` than `onto_sha` and that this branch already contains.
+
+    The one thing that makes a release number real is that it landed on the integration
+    branch, and `--onto` is the name of that branch. So a ref is consulted here only when all
+    three hold:
+
+      * it names the same BRANCH `onto` does, under any remote or none — `--onto main` also
+        looks at `origin/main` and `upstream/main`, and `--onto origin/main` also looks at
+        `main`. A ref with a different short name is somebody's feature branch, and a number
+        written on a feature branch has not been issued by anybody;
+      * `onto_sha` is an ancestor of it, so it is the same line of development carried
+        FORWARD rather than a divergent one — "fresher", not merely "different";
+      * it is an ancestor of HEAD, so this branch actually contains it. A number that appears
+        at a ref this branch has not taken is a number this branch wrote down on its own,
+        whoever else may also have written it.
+
+    `--onto` given as a SHA or as `HEAD~3` names no branch, so nothing matches and the caller
+    falls back to refusing — which is the safe direction, since the question "has this landed
+    anywhere" then has no ref that can answer it.
+    """
+    branch = onto.rsplit("/", 1)[-1]
+    if not branch or branch.startswith("-"):
+        return []
+    try:
+        out = _git(repo, "for-each-ref", "--format=%(objectname)",
+                   f"refs/heads/{branch}", f"refs/remotes/*/{branch}")
+    except StampError:
+        return []
+    tips = []
+    for sha in out.split():
+        if sha == onto_sha or sha in tips:
+            continue
+        if not _git_ok(repo, "merge-base", "--is-ancestor", onto_sha, sha):
+            continue
+        if not _git_ok(repo, "merge-base", "--is-ancestor", sha, "HEAD"):
+            continue
+        tips.append(sha)
+    return tips
+
+
+def _inherited(repo: Path, onto: str, onto_sha: str) -> set[Release]:
+    """Release numbers this branch INHERITED from a later `onto` rather than picked itself.
 
     `_collision` asks "did THIS BRANCH add the number" and answers it from the merge base,
     because a branch that merely inherited an entry is editing history and not claiming a
     number. The ahead check below has to ask the same question, and the merge base cannot
-    answer it there: a branch that merged a ref FRESHER than `--onto` — a stale local `main`
-    against a branch that pulled `origin/main` — carries numbers that were issued elsewhere
-    and are above `onto`'s newest, and refusing those tells somebody that an entry which
-    shipped last week is a number they picked.
+    answer it there: a branch sitting on top of a ref FRESHER than `--onto` — a stale local
+    `main` against a branch that has pulled `origin/main` — carries numbers that were issued
+    elsewhere and are above `onto`'s newest, and refusing those tells somebody that an entry
+    which shipped last week is a number they picked.
 
-    So: the second and later parents of every merge on this branch. Those are the refs it
-    merged IN, and a number already present in one of their CHANGELOGs was not written here.
-    Only called when the check is otherwise about to refuse — it is a `git show` per merged
-    ref, and the common answer is that nothing on the branch is above the base at all.
+    The question is WHERE THE NUMBER LANDED, not how it arrived. Asking instead which refs
+    this branch has MERGED — the second-and-later parents of its merge commits — got it wrong
+    in both directions at once. Too narrow: a branch that inherited the same numbers by
+    rebase or by fast-forward has no merge commit to inspect and was refused anyway. And far
+    too wide: it excused any number present in any merged snapshot, so a branch that
+    hand-wrote `## v2.40` and was refused for it could have that refusal laundered by a
+    second branch merging it — `ahead` empty, `_collision` blind because v2.40 exists neither
+    at `onto` nor twice in the file, and v2.40 lands six numbers early. That is #167 back,
+    through a merge. Provenance has to be about the ref the number landed on.
+
+    Only called when the check is otherwise about to refuse: one `git for-each-ref`, then two
+    `merge-base --is-ancestor` and a `git show` per ref that shares the name. The common
+    answer is that nothing on the branch is above the base at all, and it costs nothing.
+
+    NEVER RAISES, like the advice below and for a related reason: a git failure here would
+    otherwise leave a `StampError` carrying a raw git message on the hoisted path, where the
+    documented refusal is a sentence about release numbers. It degrades to "nothing was
+    inherited", which refuses rather than excuses — the safe direction when provenance cannot
+    be established.
     """
-    merged: set[Release] = set()
-    for line in _git(repo, "log", "--merges", "--format=%P", f"{onto_sha}..HEAD").split("\n"):
-        for parent in line.split()[1:]:
-            merged |= _releases_at(repo, parent) or set()
-    return merged
+    inherited: set[Release] = set()
+    for tip in _fresher_bases(repo, onto, onto_sha):
+        inherited |= _releases_at(repo, tip) or set()
+    return inherited
 
 
-def _clean_ancestor(repo: Path, onto_sha: str) -> str | None:
-    """The newest first-parent commit at or before `onto_sha` whose tree has no placeholder.
+def _clean_ancestor(repo: Path, onto_sha: str) -> tuple[str | None, int]:
+    """The newest first-parent commit at or before `onto_sha` with no placeholder in its tree.
+
+    Returns `(sha, in_reach)` — the second being how many commits of first-parent history the
+    walk could see at all, which is not decoration: with nothing found, "the walk ran out of
+    BUDGET" and "the walk ran out of HISTORY" want opposite advice, and a bare `None` cannot
+    tell them apart. Out of budget means an unstamped entry that landed more
+    than `_REPAIR_WALK_MAX` commits ago and there is an older clean commit to point at. Out of
+    history means there is not — a placeholder in the root commit, or, far more often, a
+    shallow clone: `.github/workflows/tests.yml` runs `check` from a bare `actions/checkout@v4`,
+    which is a depth-1 clone, where this `git log` returns exactly one grafted SHA no matter
+    what the real history holds. Telling that caller the entry "has been there longer than
+    fifty commits" is a statement about a history it does not have.
+
+    A history exactly `_REPAIR_WALK_MAX` long with nothing clean in it reads as "out of
+    budget", which is one `git log` cheaper than distinguishing it and is not wrong by much:
+    "the entry has been there longer than fifty commits" is true of a fifty-commit history
+    whose root already carries it.
 
     First parent, because that is the side a merge came FROM: on `main` the first parent is
     the previous `main`, so the walk crosses releases rather than descending into the branch
@@ -943,10 +1032,23 @@ def _clean_ancestor(repo: Path, onto_sha: str) -> str | None:
     already knows is fifty too many on a path whose only output is one line of advice.
     """
     log = _git(repo, "log", "--first-parent", "--format=%H", f"-n{_REPAIR_WALK_MAX}", onto_sha)
-    for sha in log.split():
+    shas = log.split()
+    for sha in shas:
         if not placeholder_at_ref(repo, sha):
-            return sha
-    return None
+            return sha, len(shas)
+    return None, len(shas)
+
+
+def _is_shallow(repo: Path) -> bool:
+    """Whether this checkout is a shallow clone, for advice that would otherwise be a lie.
+
+    Best-effort, like everything else the advice path calls: a git too old to know the
+    question is answered "no" rather than allowed to turn a message into an exit 2.
+    """
+    try:
+        return _git(repo, "rev-parse", "--is-shallow-repository").strip() == "true"
+    except StampError:
+        return False
 
 
 def _repair_advice(repo: Path, onto: str, onto_sha: str | None = None) -> str:
@@ -969,38 +1071,81 @@ def _repair_advice(repo: Path, onto: str, onto_sha: str | None = None) -> str:
     And a `<placeholder>` inside a printed command is worse than prose, not better — pasted
     into a shell, `<a ref…>` redirects input from a file named `a` and the promised
     ready-to-run repair fails with a filesystem error.
+
+    An empty walk is THREE outcomes wearing one sentence, and two of them were being told
+    something false: out of BUDGET (an older clean commit exists, the bound just did not reach
+    it), out of the history THIS CLONE HAS (a shallow checkout — which is what
+    `actions/checkout@v4` hands the only automated caller of `check` — where the repair is a
+    fetch and no local ref can be named), and out of history full stop (the root commit
+    carries it, and there has never been a clean tree here to stamp against).
     """
     try:
         sha = onto_sha or resolve(repo, onto)
-        ref = _clean_ancestor(repo, sha)
-        if ref is None:
+        ref, in_reach = _clean_ancestor(repo, sha)
+        if ref is None and in_reach >= _REPAIR_WALK_MAX:
             return (
                 f"No commit within {_REPAIR_WALK_MAX} first-parent commits of {onto} has a "
                 f"tree without a `{PLACEHOLDER}` in it, so there is no ref to name here — the "
                 f"unstamped entry has been there longer than that. Stamp it by hand, or point "
-                f"`{_INVOCATION} apply --onto` at an older commit whose tree is clean."
+                f"`{_cmd(repo, 'apply', '--onto')}` at an older commit whose tree is clean."
             )
-        advice = f"To repair {onto}, run:\n    {_INVOCATION} apply --onto {ref}"
+        if ref is None and _is_shallow(repo):
+            # The one automated caller of `check` is this case. `.github/workflows/tests.yml`
+            # checks out with a bare `actions/checkout@v4`, which is depth 1, so the walk sees
+            # a single grafted commit and finds a placeholder in it — measured, not inferred.
+            # "It has been there longer than fifty commits" is then a claim about a history
+            # this clone does not have, and "point apply at an older commit" names refs it
+            # cannot resolve. What it can act on is the fetch.
+            return (
+                f"Every commit this clone has of {onto}'s first-parent history — {in_reach} "
+                f"of them — carries a `{PLACEHOLDER}`, and this is a shallow clone, so the "
+                "commit that would repair it is almost certainly one that was never fetched. "
+                "Deepen the checkout (`git fetch --unshallow`, or `fetch-depth: 0` on "
+                "`actions/checkout`) and run this again; there is no ref to name until then."
+            )
+        if ref is None:
+            return (
+                f"{onto}'s first-parent history is {in_reach} commit(s) long and every one of "
+                f"them carries a `{PLACEHOLDER}`, back to the root commit — so there is no ref "
+                "to name here, and never was one. Stamp the entry by hand: this history has "
+                "no commit with a clean tree to resolve a number against."
+            )
+        advice = f"To repair {onto}, run:\n    {_cmd(repo, 'apply', '--onto', ref)}"
         # What to expect from that command, when it is not simply going to work. A release
         # that landed AFTER the skipped stamp is above the clean ancestor's newest, so the
         # branch being repaired holds a number that ref has never issued — and with a
         # placeholder still present that is refused, differently worded, by the command
         # handed over to fix the first refusal. Said here rather than discovered there.
-        gained = sorted((_releases_at(repo, sha) or set()) - (_releases_at(repo, ref) or set()))
+        #
+        # And said WITHOUT the repair it used to suggest. "Put those entries back to
+        # `## vNEXT` first" was reachable only because `onto` already carries one, so
+        # following it leaves two placeholders in one CHANGELOG — which `build_plan` refuses
+        # in a third differently-worded way ("two placeholders cannot both become one
+        # number"). The advice written to stop somebody concluding the tool is stuck has to
+        # end at an edit that works, and here that edit is a hand-stamp: the entry needs a
+        # number nothing else has taken, and the newest at `onto` plus one is free by
+        # construction.
+        at_onto = _releases_at(repo, sha) or set()
+        gained = sorted(at_onto - (_releases_at(repo, ref) or set()))
         if gained:
             named = ", ".join(fmt(r) for r in gained)
+            free = (max(at_onto)[0], max(at_onto)[1] + 1)
             advice += (
-                f"\n{onto} has gained {named} since that commit. If those entries were "
-                f"written there by hand rather than merged in, put them back to "
-                f"`## {PLACEHOLDER}` first — otherwise that run stops on them instead."
+                f"\n{onto} has gained {named} since that commit, so that run stops on those "
+                f"instead: they are numbers {ref[:12]} never issued, which is the same "
+                f"refusal one step along. Putting them back to `## {PLACEHOLDER}` is not the "
+                f"way round it — {onto} already carries one, and two placeholders in one "
+                "CHANGELOG cannot both become one number. Stamp the unstamped entry by hand "
+                f"instead; {fmt(free)} is free at {onto}."
             )
         return advice
     except StampError:
         # Not resolvable, not walkable: the prose this replaces, which needs no git at all.
         return (
-            f"To repair {onto}, run `{_INVOCATION} apply --onto` against a ref that predates "
-            f"the unstamped entry — the commit it merged into, e.g. `HEAD^` on the merge that "
-            f"brought it in, NOT the default `origin/main`, which is the ref carrying it."
+            f"To repair {onto}, run `{_cmd(repo, 'apply', '--onto')}` against a ref that "
+            f"predates the unstamped entry — the commit it merged into, e.g. `HEAD^` on the "
+            f"merge that brought it in, NOT the default `origin/main`, which is the ref "
+            "carrying it."
         )
 
 
@@ -1258,15 +1403,15 @@ def build_plan(repo: Path, onto: str, serve: bool | None, major: bool = False) -
     #
     # And CLAIMED, not merely present. `_collision` asks whether this branch ADDED a number
     # and answers it from the merge base; hoisting this check above the early return means it
-    # now runs for branches with nothing to stamp, including one that has merged a ref
-    # FRESHER than a stale `--onto` and carries numbers that shipped elsewhere. Refusing
+    # now runs for branches with nothing to stamp, including one sitting on top of a ref
+    # FRESHER than a stale `--onto` that carries numbers which shipped elsewhere. Refusing
     # those with "a branch does not pick its own number" is nonsense about an entry the
-    # branch only merged, and used to be a clean noop — so what arrived by merge comes off
-    # first, and only on the path that is otherwise about to refuse.
+    # branch only inherited, and used to be a clean noop — so what a later `onto` had already
+    # issued comes off first, and only on the path that is otherwise about to refuse.
     issued = releases_in(branch_text, "CHANGELOG.md")
     claimed = {r for r in issued if r > onto_newest}
     if claimed:
-        claimed -= _merged_in(repo, onto_sha)
+        claimed -= _inherited(repo, onto, onto_sha)
     allowed = (claimed if not plan.sites and len(claimed) == 1 and claimed <= could_have_issued
                else set())
     ahead = sorted(claimed - allowed)

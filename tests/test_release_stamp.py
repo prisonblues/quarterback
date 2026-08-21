@@ -25,6 +25,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -170,6 +171,31 @@ def place(repo: Path, *, changelog: bool = True, bullet: bool = True) -> None:
 
 def run(repo: Path, *argv: str) -> int:
     return rs.main([*argv, "--repo", str(repo)])
+
+
+def stamp_cmd(repo: Path, *rest: str) -> str:
+    """The `apply` invocation the tool prints as a repair, spelled the way it spells it.
+
+    Absolute script path and an explicit `--repo`, because that is the whole property the
+    command has to have: `fix-and-review` runs this tool against a worktree that is not the
+    caller's cwd, and a repair line that names neither runs somewhere else entirely.
+    """
+    script = Path(__file__).resolve().parent.parent / "scripts" / "release_stamp.py"
+    return " ".join(["python3", shlex.quote(str(script)), "apply",
+                     "--repo", shlex.quote(str(repo)), *rest])
+
+
+def shallow_clone_of(repo: Path, into: Path, *, branch: str = "main") -> Path:
+    """A REAL depth-1 clone, which is what `actions/checkout@v4` produces with no options.
+
+    Built rather than simulated: the thing under test is what `git log --first-parent -n50`
+    returns across a graft, and a monkeypatched stand-in for that would only ever assert the
+    stand-in. `file://` and not a plain path — git treats a local path as an alternate-objects
+    clone and ignores `--depth` on it, so a "shallow" fixture built that way is a full one.
+    """
+    git(into.parent, "clone", "-q", "--depth", "1", "--branch", branch,
+        f"file://{repo}", str(into))
+    return into
 
 
 def plan_json(repo: Path, *argv: str, capsys) -> dict:
@@ -1669,7 +1695,7 @@ def test_the_broken_base_refusal_names_a_ref_instead_of_describing_one(repo, cap
     place(repo)
     assert run(repo, "apply", "--onto", "main") == 2
     err = capsys.readouterr().err
-    assert "apply --onto" in err
+    assert stamp_cmd(repo, "--onto", before) in err
     assert before[:12] in err, f"the resolved ref itself, not prose about finding it: {err}"
 
 
@@ -1773,28 +1799,146 @@ def test_a_hand_written_next_free_number_is_not_refused_and_cannot_be(repo, caps
     assert "noop" in capsys.readouterr().out
 
 
-def test_a_number_merged_in_from_a_fresher_ref_is_not_one_this_branch_picked(repo, capsys):
+def advance_the_integration_branch(repo: Path, *versions: str, name: str = "main") -> str:
+    """Land `versions` on a REMOTE-TRACKING copy of the integration branch, leaving the local
+    one stale. That is the shape the whole "inherited, not claimed" question is about: `--onto
+    main` while `origin/main` has moved on. `update-ref` rather than a second repo, because
+    what matters is the ref NAME and where it points, and a clone would add nothing else."""
+    here = git(repo, "rev-parse", "--abbrev-ref", "HEAD").strip()
+    git(repo, "checkout", "-q", "-b", "_advance", name)
+    text = (repo / "CHANGELOG.md").read_text()
+    added = "".join(entry(v) for v in versions)
+    write(repo, "CHANGELOG.md", text.replace("## v2.33", added + "## v2.33", 1))
+    commit(repo, f"{', '.join(versions)} landed on {name}")
+    sha = git(repo, "rev-parse", "HEAD").strip()
+    git(repo, "checkout", "-q", here)
+    git(repo, "branch", "-q", "-D", "_advance")
+    git(repo, "update-ref", f"refs/remotes/origin/{name}", sha)
+    return sha
+
+
+def test_a_number_inherited_from_a_fresher_base_is_not_one_this_branch_picked(repo, capsys):
     """`_collision` asks whether this branch ADDED a number. This check has to ask the same.
 
-    Local `main` is stale at v2.33, the branch merged a fresher ref that already carried
-    v2.34 and v2.35, and the branch itself is docs-only. Those numbers shipped elsewhere and
-    are above the stale base's newest — refusing them with "a branch does not pick its own
-    number" is nonsense about an entry the branch merely merged, and this was a clean noop
+    Local `main` is stale at v2.33, `origin/main` has since issued v2.34 and v2.35, this
+    docs-only branch has merged `origin/main`, and so its CHANGELOG carries both. They are
+    above the stale base's newest — refusing them with "a branch does not pick its own
+    number" is nonsense about entries that shipped last week, and this was a clean noop
     before the check was hoisted above the early return.
     """
-    git(repo, "checkout", "-q", "-b", "fresher", "main")
+    write(repo, "docs.md", "# how\n\nA branch that ships no release.\n")
+    commit(repo, "docs only")
+    advance_the_integration_branch(repo, "v2.35", "v2.34")
+    git(repo, "merge", "-q", "--no-ff", "-m", "pull origin/main", "origin/main")
+
+    assert run(repo, "apply", "--onto", "main") == 0
+    assert "noop" in capsys.readouterr().out
+
+
+def test_a_number_inherited_without_a_merge_commit_is_excused_too(repo, capsys):
+    """The same branch, rebased instead of merged. There is no merge commit to inspect.
+
+    Asking which refs a branch has MERGED — the second-and-later parents of its merge
+    commits — answers this one "none", so a branch created from, rebased onto or
+    fast-forwarded past a fresher `origin/main` carried its numbers in plain first-parent
+    history and was refused for them. The question is which ref ISSUED the number, and that
+    is a question about refs, not about the shape of the commits underneath.
+    """
+    write(repo, "docs.md", "# how\n\nA branch that ships no release.\n")
+    commit(repo, "docs only")
+    advance_the_integration_branch(repo, "v2.35", "v2.34")
+    git(repo, "rebase", "-q", "origin/main")
+    assert git(repo, "log", "--merges", "--format=%H", "main..HEAD").strip() == "", (
+        "no merge commit anywhere on this branch — that is the point of the fixture"
+    )
+
+    assert run(repo, "apply", "--onto", "main") == 0
+    assert "noop" in capsys.readouterr().out
+
+
+def test_a_number_merged_in_from_a_FEATURE_branch_is_still_this_branch_s_to_answer_for(
+        repo, capsys):
+    """#167 laundered through a merge, which is what "merged in" excused without meaning to.
+
+    Branch `rogue` hand-writes `## v2.40` and is refused for it. Nothing else changes — and
+    then a second branch merges `rogue`. Ask "is this number in some ref I merged" and the
+    answer is yes, so `ahead` empties out; `_collision` cannot see it either, since v2.40
+    exists neither at `main` nor twice in the file. v2.40 would land, six numbers early, on a
+    branch that never wrote it. A number is only issued by the ref releases LAND on, so a
+    feature branch's say-so is not provenance no matter how many merges it travels through.
+    """
+    git(repo, "checkout", "-q", "-b", "rogue", "main")
     text = (repo / "CHANGELOG.md").read_text()
     write(repo, "CHANGELOG.md",
-          text.replace("## v2.33", entry("v2.35") + entry("v2.34") + "## v2.33", 1))
-    commit(repo, "two releases that shipped elsewhere")
+          text.replace("## v2.33", entry("v2.40") + "## v2.33", 1))
+    commit(repo, "hand-wrote its own number")
+    assert run(repo, "preflight", "--onto", "main") == 2, "refused when asked directly"
+    capsys.readouterr()
 
     git(repo, "checkout", "-q", "work")
     write(repo, "docs.md", "# how\n\nA branch that ships no release.\n")
     commit(repo, "docs only")
-    git(repo, "merge", "-q", "--no-ff", "-m", "merge the fresher ref", "fresher")
+    git(repo, "merge", "-q", "--no-ff", "-m", "merge the rogue branch", "rogue")
 
-    assert run(repo, "apply", "--onto", "main") == 0
-    assert "noop" in capsys.readouterr().out
+    assert run(repo, "preflight", "--onto", "main") == 2
+    assert "already has an entry for v2.40" in capsys.readouterr().err
+
+
+def test_a_ref_of_the_same_name_that_is_not_the_base_carried_forward_is_not_consulted(repo):
+    """`origin/main` counts because it is `main` moved ON, not merely because it is `main`.
+
+    A ref sharing the short name but not descending from the base is a different line of
+    development — a fork's `main`, a force-push, a branch re-created from somewhere else —
+    and a number written there has not been issued by the ref this branch is merging into.
+    Both directions are required, so both are pinned: an ancestor of HEAD that `onto` does
+    not lead to is no more a base than one this branch has not taken.
+    """
+    behind = git(repo, "rev-parse", "main").strip()
+    advance_the_integration_branch(repo, "v2.34")
+    git(repo, "merge", "-q", "--ff-only", "origin/main")
+    ahead = git(repo, "rev-parse", "origin/main").strip()
+    assert rs._fresher_bases(repo, "main", behind) == [ahead], "the sanity check"
+
+    # Same ref name, pointed back at a commit the base has already passed: an ancestor of
+    # HEAD, but not `behind` carried forward, so there is nothing for it to have issued.
+    git(repo, "update-ref", "refs/remotes/origin/main", behind)
+    assert rs._fresher_bases(repo, "main", ahead) == []
+
+
+def test_a_number_the_branch_has_not_taken_the_merge_for_is_still_its_own(repo, capsys):
+    """Inheriting a number means CONTAINING the ref that issued it, not that some ref did.
+
+    `origin/main` has shipped v2.35 and this branch has not pulled it, so the entry it wrote
+    under that heading is not the one that shipped — it is a second release wearing the same
+    number, which is the collision the whole file exists to stop. Excusing it on the strength
+    of a ref the branch never took would land v2.35 twice.
+    """
+    text = (repo / "CHANGELOG.md").read_text()
+    write(repo, "CHANGELOG.md", text.replace("## v2.33", entry("v2.35") + "## v2.33", 1))
+    commit(repo, "hand-wrote a number that has since shipped elsewhere")
+    advance_the_integration_branch(repo, "v2.35", "v2.34")
+    assert subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor",
+                           "origin/main", "HEAD"], capture_output=True).returncode != 0, (
+        "the fixture's whole point: the ref that issued v2.35 is not on this branch"
+    )
+
+    assert run(repo, "preflight", "--onto", "main") == 2
+    assert "already has an entry for v2.35" in capsys.readouterr().err
+
+
+def test_the_provenance_lookup_cannot_turn_a_refusal_into_a_traceback(repo, capsys, monkeypatch):
+    """It runs on the hoisted path, so it has the same NEVER RAISES obligation as the advice.
+
+    Every other new git call here is guarded — `next_release`, `placeholder_at_ref`,
+    `_releases_at`, `_repair_advice` — and an unguarded one leaves a raw git message where
+    the documented refusal is a sentence about release numbers. Failing to establish
+    provenance means "not established", which refuses; it never excuses.
+    """
+    def broken(_repo, *_a):
+        raise rs.StampError("git for-each-ref failed: no output")
+
+    monkeypatch.setattr(rs, "_git", broken)
+    assert rs._inherited(repo, "main", "deadbeef") == set()
 
 
 def test_a_base_with_no_release_headings_does_not_hold_a_branch_that_ships_no_release(
@@ -1867,12 +2011,15 @@ def test_a_branch_that_has_merged_the_broken_base_is_refused_like_any_other(repo
 # the repair advice: a command, or prose, and never a command-shaped string that is neither
 
 
-def test_the_printed_repair_command_is_one_that_can_actually_be_run(repo, capsys):
-    """Spelled the way the docs and `fix-and-land` spell it, with the whole SHA.
+def test_the_printed_repair_command_is_one_that_can_actually_be_run(repo, capsys, tmp_path):
+    """Not "looks runnable" — RUN, from a cwd that is not the repo and is not a repo at all.
 
-    A bare `release_stamp.py` is on nobody's PATH and a 12-character abbreviation can go
-    ambiguous as a repo grows — either way the command handed over as ready to run is not,
-    which is the whole point of resolving the ref instead of describing it.
+    A bare `release_stamp.py` is on nobody's PATH, a 12-character abbreviation can go
+    ambiguous as a repo grows, and a cwd-relative `scripts/release_stamp.py` with no `--repo`
+    is worse than either: `fix-and-review.md` invokes this tool as
+    `python3 "$WT_DIR/scripts/release_stamp.py" preflight --repo "$WT_DIR"` precisely so it
+    operates on the worktree under review, and a repair line that drops both halves runs
+    against whatever shell the reader pastes it into. So the assertion is the paste.
     """
     git(repo, "checkout", "-q", "main")
     clean = git(repo, "rev-parse", "HEAD").strip()
@@ -1882,7 +2029,23 @@ def test_the_printed_repair_command_is_one_that_can_actually_be_run(repo, capsys
     place(repo)
 
     assert run(repo, "preflight", "--onto", "main") == 2
-    assert f"python3 scripts/release_stamp.py apply --onto {clean}" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert stamp_cmd(repo, "--onto", clean) in err
+
+    # The line as printed, pasted verbatim, from somewhere that is not a git repository at
+    # all. `python3` becomes this interpreter only because a venv may not expose that name;
+    # everything the message is actually asserting about — the script path and `--repo` — is
+    # taken from the printed line unchanged.
+    line = next(ln.strip() for ln in err.splitlines() if ln.strip().startswith("python3 "))
+    elsewhere = tmp_path / "not-a-repo"
+    elsewhere.mkdir()
+    argv = shlex.split(line)
+    proc = subprocess.run([sys.executable, *argv[1:]], cwd=elsewhere,
+                          capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    assert "## v2.34 — a release" in (repo / "CHANGELOG.md").read_text(), (
+        "the pasted line has to reach the repo it was composed for, not the pasting shell's"
+    )
 
 
 def test_the_repair_command_says_what_the_ref_it_names_will_still_refuse(repo, capsys):
@@ -1892,6 +2055,13 @@ def test_the_repair_command_says_what_the_ref_it_names_will_still_refuse(repo, c
     worded one — "this branch's CHANGELOG already has an entry for v2.34" — which is the
     "concludes the tool is stuck" outcome this advice replaced. It is said here instead of
     discovered there.
+
+    And the way out it names has to be one that WORKS, which is why this test follows it
+    rather than reading it. "Put those entries back to `## vNEXT` first" was only reachable
+    because `onto` already carries a `## vNEXT`, so doing as it said left two of them in one
+    CHANGELOG — a third refusal, differently worded again ("two placeholders cannot both
+    become one number"). The advice that ends the loop is a hand-stamp with a number nothing
+    has taken, and the tool knows which number that is.
     """
     git(repo, "checkout", "-q", "main")
     clean = git(repo, "rev-parse", "HEAD").strip()
@@ -1907,6 +2077,18 @@ def test_the_repair_command_says_what_the_ref_it_names_will_still_refuse(repo, c
     err = capsys.readouterr().err
     assert clean in err
     assert "has gained v2.34 since that commit" in err
+    assert "v2.35 is free at main" in err
+    assert "put them back to" not in err.lower(), (
+        f"a second placeholder on a ref that already has one is refused, not repaired: {err}"
+    )
+
+    # Now do what it said, on `main`, and check that the loop actually ends there.
+    git(repo, "checkout", "-q", "-f", "main")
+    for path in ("CHANGELOG.md", "README.md"):
+        write(repo, path, (repo / path).read_text().replace("vNEXT", "v2.35"))
+    commit(repo, "stamped by hand, as the advice said")
+    assert run(repo, "check") == 0
+    assert "clean:" in capsys.readouterr().out
 
 
 def test_a_history_with_no_clean_ancestor_says_so_rather_than_printing_a_broken_command(
@@ -1933,6 +2115,52 @@ def test_a_history_with_no_clean_ancestor_says_so_rather_than_printing_a_broken_
     err = capsys.readouterr().err
     assert "no ref to name here" in err
     assert "<" not in err, f"nothing command-shaped that a shell would mangle: {err}"
+    # And says WHICH of the two ways the walk can come back empty this was. Nothing has been
+    # there "longer than fifty commits" in a one-commit history, and pointing `--onto` at an
+    # older commit names a commit that does not exist.
+    assert "1 commit(s) long" in err
+    assert "back to the root commit" in err
+    assert str(rs._REPAIR_WALK_MAX) not in err, f"a bound this walk never reached: {err}"
+
+
+def test_a_shallow_clone_is_told_to_fetch_rather_than_that_the_entry_is_ancient(
+        tmp_path, capsys):
+    """The one automated caller of `check` is a depth-1 clone, and it got the wrong sentence.
+
+    `.github/workflows/tests.yml` runs `check` after a bare `actions/checkout@v4`, which
+    fetches one commit — so `git log --first-parent -n50 HEAD` returns exactly one grafted
+    SHA however long the real history is, the walk finds a placeholder in it, and the message
+    reported that the entry "has been there longer than that" and offered to stamp against
+    "an older commit whose tree is clean". In this clone there is no older commit at all. The
+    repair is a fetch, and it is the only thing the reader can act on.
+    """
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    git(origin, "init", "-q", "-b", "main")
+    git(origin, "config", "user.email", "t@example.com")
+    git(origin, "config", "user.name", "t")
+    write(origin, "CHANGELOG.md", CHANGELOG_HEAD + entry("v2.33"))
+    write(origin, "README.md", readme(["v2.33"]))
+    commit(origin, "v2.33, stamped and clean")
+    clean = git(origin, "rev-parse", "HEAD").strip()
+    place(origin)
+    commit(origin, "a release landed on main without being stamped")
+
+    clone = shallow_clone_of(origin, tmp_path / "clone")
+    assert git(clone, "rev-parse", "--is-shallow-repository").strip() == "true"
+    assert len(git(clone, "log", "--first-parent", "--format=%H", "-n50", "HEAD").split()) == 1
+
+    assert run(clone, "check") == 2
+    err = capsys.readouterr().err
+    assert "this is a shallow clone" in err
+    assert "git fetch --unshallow" in err
+    assert "longer than that" not in err
+    assert clean[:12] not in err, "no ref that this clone cannot resolve"
+
+    # And the same repo with its history is given the ref, which is what says the message
+    # above is about the CLONE and not about the history.
+    assert run(origin, "check") == 2
+    assert stamp_cmd(origin, "--onto", clean) in capsys.readouterr().err
 
 
 def test_the_repair_walk_is_bounded(repo, capsys, monkeypatch):
@@ -1971,7 +2199,7 @@ def test_the_repair_walk_enumerates_its_candidates_in_one_git_call(repo, monkeyp
     real = rs._git
     monkeypatch.setattr(rs, "_git", lambda r, *a: (seen.append(a[0]), real(r, *a))[1])
 
-    assert rs._clean_ancestor(repo, sha) == clean
+    assert rs._clean_ancestor(repo, sha) == (clean, 5)
     assert seen.count("log") == 1
     assert seen.count("rev-parse") == 0, "the candidates come from the log, not one call each"
 
@@ -2011,11 +2239,11 @@ def test_check_names_the_ref_to_stamp_against_instead_of_describing_one(repo, ca
     head = git(repo, "rev-parse", "HEAD").strip()
     place(repo)
     assert run(repo, "check") == 2
-    assert f"python3 scripts/release_stamp.py apply --onto {head}" in capsys.readouterr().err
+    assert stamp_cmd(repo, "--onto", head) in capsys.readouterr().err
 
     commit(repo, "the release landed unstamped")
     assert run(repo, "check") == 2
-    assert f"apply --onto {head}" in capsys.readouterr().err
+    assert stamp_cmd(repo, "--onto", head) in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------
