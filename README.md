@@ -988,6 +988,16 @@ full — including what was broken before it, which is the part no diff recovers
   is deliberately NOT asked: two attempts to establish it from the local repository each
   opened the laundering hole the other closed, so the refusal names both repairs — rewrite the
   entry, or fetch a base that is behind — rather than guessing which applies.
+- **vNEXT** — the growth guard was measuring the round, not the PR. `max_fix_growth` divided the
+  cycle's whole-PR starting size into *one round's increment*, because both ends read
+  `diff_chars` — the size of what a round reviewed, which under the default `increment` scope is
+  the fix commit. PR #188 went 185 → 593 → 721 churned lines, 3.90x under a 3.0x ceiling, and the
+  backstop against this repo's measured 63.7% bad-fix-injection rate never fired. Both ends are
+  whole-PR sizes now whatever `round_scope` is: that dial decides what reviewers are asked to look
+  at, this one asks how big the change has become. Every round records `pr_chars` beside
+  `diff_chars` so the denominator is a PR size too — a whole PR over a fix commit would have
+  inverted the same error. The ratio still names which measurement it is at both ends, and the
+  regression test, built from #188's own numbers, was confirmed red first (#298).
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
   roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps

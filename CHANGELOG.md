@@ -11,6 +11,46 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
+## vNEXT — the growth guard was measuring the round, not the PR
+
+`review_panel.max_fix_growth` is the backstop against a fix pass that writes a second change
+instead of a fix — the failure this repo measures at a **63.7% bad-fix-injection rate**, against
+a ~7% industry baseline. It was pointed slightly off-target, and the miss is the kind that leaves
+a check looking configured while it stops nothing.
+
+The ratio put the cycle's whole-PR starting size on the bottom and **one round's increment** on
+the top. Both ends came from `diff_chars`, which is the size of what a round REVIEWED — and under
+the default `increment` round scope that is the fix commit, not the PR. So PR #188 went from 185
+churned lines to 593 to 721 — **3.90x under a 3.0x ceiling** — and the guard never fired: its
+round-2 increment was 128 lines, which against 185 is 0.69x and nowhere near anything. The
+quantity being measured was real, it was simply not the one that runs away.
+
+Both ends are whole-PR sizes now, whatever `round_scope` is set to. The separation is the point
+and it is written down where the ratio is computed: **`round_scope` decides what the reviewers are
+asked to look at; this ceiling asks how big the change has become.** Two different questions, and
+the second must not silently change meaning because the first was configured. Under `pr` scope
+the numerator was already the whole PR, which is why the existing tests — all of them pinning
+`scope="pr"` — were green over the defect for the whole of its life.
+
+The denominator needed the same treatment, or the fix would have inverted the error: a cycle whose
+only baseline is a scoped round carries a `diff_chars` that is one fix commit, and a whole PR over
+a fix commit stops a cycle that has not grown at all. So every round now records **`pr_chars`**
+beside `diff_chars` — the PR's own size regardless of scope, the line that does not cliff at round
+2 — and the denominator is read from it. `diff_chars` still supplies it where the baseline's own
+`scope` says it IS the whole PR, which is round 1 of every cycle and keeps the ordinary case
+working across the upgrade. An increment-scoped payload written before `pr_chars` gets no
+denominator and the check does not run, rather than inventing one out of an increment.
+
+The reported ratio still names which measurement it is, at both ends, because two readings of a
+size exist in this payload and whatever reports a ratio has to be able to say which one it
+computed. `fix_growth.review_scope` rides alongside so a reader can see what the round reviewed
+without mistaking it for what was measured.
+
+The regression test drives all three of #188's rounds at their real sizes and was confirmed red
+against the pre-fix implementation: the ceiling read `2.196x` at round 2 and `0.694x` at round 3,
+on a PR that had grown from 3,170 to 12,282 chars. A backstop is exactly the thing whose test has
+to fail before the fix (#298).
+
 ## v2.66 — the two guards that only fired when they were not needed
 
 `release_stamp.py` has two checks that exist for the same failure — a branch naming its own
