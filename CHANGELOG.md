@@ -60,16 +60,37 @@ the payload tells "quiet" from "gone". Only the case above is a finding. When *n
 claim names is in `/active`, the claim's own `expires` is what can still be read, and while
 it holds this is reported as unchecked: the board's own passive expiry settles it at the
 claim's TTL, and a finding accusing a working agent of holding a dead claim every fifteen
-minutes settles nothing.
+minutes settles nothing. That read is **three-valued, and the third value is the point**: a
+claim carrying no `expires`, or one that will not parse, is reported as unchecked too. A
+bare `if` on it collapses "the board did not say when this expires" into "it expired" and
+files a finding whose sentence — "the claim is past its own expiry" — asserts a comparison
+the pass never made. That is this file's own subject inverted, and it shipped in it.
 
-**`--post` posts only what changed**, hashing what the report *says* rather than
-`as_dict()` — `idle_days` and GitHub's `updatedAt` move on their own — into a digest under
-`$XDG_STATE_HOME`. On a 15-minute timer without it, one unchanged disagreement is ~96
-identical `finding` posts a day, each carrying the whole rendered report, and `finding` is
-not in `MUTED_TYPES`: every one of them would land in every agent's orient read. Bot PRs and
-drafts are not counted as untracked work for the same reason — the harness ships a whole loop
-for dependabot's, so counting them would bury the findings a reader is here for — and neither
-is dropped silently: the report says how many it did not compare and why.
+**`--post` posts what changed, and what has gone unheard**, hashing what the report *says*
+rather than `as_dict()` — `idle_days` and GitHub's `updatedAt` move on their own — into a
+digest under `$XDG_STATE_HOME`. On a 15-minute timer without it, one unchanged disagreement
+is ~96 identical `finding` posts a day, each carrying the whole rendered report, and
+`finding` is not in `MUTED_TYPES`: every one of them would land in every agent's orient read.
+But change detection alone trades that for eventual silence — `GET /board` orients over a
+30-minute window, so half an hour after the single post a still-live disagreement is
+invisible to every cold orient, which is the reader `--post` is for. So the digest carries
+the time it was posted and an unchanged report goes out again once it is older than
+`REPOST_AFTER`. Which puts a rule on the report's own sentences, since they are what is
+hashed: **a summary or a reason must not interpolate a value that moves on its own.** The
+live-but-quiet claim message wrote the claim's `expires` into its text, and `/plan` re-issues
+that timestamp on every renewal — so the identical disagreement was re-posted every time the
+agent holding it renewed, through the one function written to prevent exactly that.
+
+Bot PRs and drafts are not counted as untracked work — the harness ships a whole loop for
+dependabot's, so counting them would bury the findings a reader is here for — and neither is
+dropped silently: the report says how many it did not compare and why, including on a tick
+where that is the *only* thing it has to say, which is the case the `--quiet` and `--post`
+gates originally missed and the shipped timer unit runs. **What accounts for a PR is an
+item's ref or its title, never its note**: notes say "follows PR #999" and "blocked until PR
+#247 lands" without owning either, and reading those as ownership silences `untracked_pr`
+about that PR forever. **Every row accounts, not only the open ones**, because the repo scope
+is drawn from the whole plan — a repo included for its finished rows would otherwise have
+every open PR it has reported as untracked, on every tick.
 
 **An unmade check never reads as a clean one**, which is #244's shape and the half of #255
 that decided the file's structure. Every condition has a third answer, `unknowns` is never

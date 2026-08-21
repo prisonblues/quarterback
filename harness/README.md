@@ -1030,20 +1030,34 @@ and `stop_reason` across every recorded run. Nothing joined them. So:
 qb-reconcile                     # every repo the board's plan names
 qb-reconcile --repo owner/name   # just that one
 qb-reconcile --json              # the whole report, unknowns beside the findings
-qb-reconcile --post              # put the report on the board — only when it CHANGED
+qb-reconcile --post              # put the report on the board — when it CHANGED, or aged out
 qb-reconcile --include-drafts    # count draft PRs as untracked work too
 qb-reconcile --quiet             # say nothing when there is nothing to say
 ```
 
-**`--post` posts only what is new.** It hashes what the report *says* — the
-conditions, subjects and sentences, not `idle_days` or GitHub's `updatedAt`, which
-move on their own — and keeps that digest under `$XDG_STATE_HOME/qb-reconcile`. On a
-15-minute timer with no such check, one unchanged disagreement is ~96 identical
-`finding` posts a day, each carrying the whole rendered report in `detail`; `finding`
-is not in the board's `MUTED_TYPES`, so every one of them lands in every agent's
-orient read — the volume problem that list exists to solve. An unreadable digest
-posts rather than staying quiet: silencing a disagreement because a cache could not
-be read is the wrong way round.
+**`--post` posts what is new, or what has gone unheard.** It hashes what the report
+*says* — the conditions, subjects and sentences, not `idle_days` or GitHub's
+`updatedAt`, which move on their own — and keeps that digest, with the time it was
+posted, under `$XDG_STATE_HOME/qb-reconcile`. On a 15-minute timer with no such check,
+one unchanged disagreement is ~96 identical `finding` posts a day, each carrying the
+whole rendered report in `detail`; `finding` is not in the board's `MUTED_TYPES`, so
+every one of them lands in every agent's orient read — the volume problem that list
+exists to solve.
+
+**But "changed" alone is not the test, because "posted once, ever" is not the same as
+"not spam".** `GET /board` orients over a 30-minute window by default, so half an hour
+after that single post the disagreement is invisible to every subsequent cold orient —
+which is exactly the reader `--post` exists for. So an unchanged report is re-posted
+once it is older than `REPOST_AFTER` (4 hours): 6 posts a day for a disagreement that
+never changes, and a bound on how long a live one can go unseen rather than the
+possibility removed. An unreadable digest, or one written before the timestamp existed,
+posts rather than staying quiet — silencing a disagreement because a cache could not be
+read is the wrong way round.
+
+Because those sentences are what is hashed, **a `summary` or a `reason` must not carry a
+value that moves on its own**: interpolating a claim's `expires` into one defeats the
+digest through the field it trusts, since `/plan` re-issues that timestamp every time
+the claim is renewed.
 
 **Bot PRs and drafts are not untracked work.** The harness ships a whole loop for
 dependabot's PRs (`loops/lander.py`), and those are deliberately never on the plan —
@@ -1051,7 +1065,21 @@ so counting them would make every repo with dependabot enabled a page of finding
 that are already owned. Drafts are opt-in for the same reason: a draft is not yet
 work the plan owes an item. Neither is dropped silently: the report says how many it
 did not compare and why, because "no untracked PRs" and "no untracked PRs among the
-ones I looked at" are different sentences.
+ones I looked at" are different sentences — and a tick whose *only* content is skipped
+PRs still prints under `--quiet` and still posts under `--post`, or that promise would
+not hold in the one configuration the shipped timer unit runs.
+
+**What accounts for a PR is an item's ref or its title, never its note.** A ref and a
+title say what an item IS; a note is prose about the work, and prose mentions a PR
+without owning it all the time — "follows PR #999", "blocked until PR #247 lands".
+Reading those as ownership marks a PR tracked forever and `untracked_pr` then goes
+permanently silent about work nothing on the plan is doing, which is a false negative
+on the one condition whose whole job is finding unaccounted-for work. A PR genuinely
+owned by an issue-backed item is reached through the issue leg instead. And **every row
+the plan has can account for a PR, not only its open ones**: the repo scope is drawn
+from the whole plan so a repo whose work is all finished still gets its open PRs read,
+and if only open rows could account for them, every PR in such a repo would be a
+standing finding.
 
 It walks the plan's refs against GitHub and the board's own review record and reports five
 disagreements:

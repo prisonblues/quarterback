@@ -22,10 +22,11 @@ Type=oneshot
 # --post puts the report on the board as a `finding`, which is the point of
 # running it on a timer at all — a report that only reaches ~/reconcile-logs is
 # invisible to the agents whose plan it is about, and #255 is a complaint about
-# consumers that cannot read the board. It posts only when the report's CONTENT
-# has changed since the last post (a digest under $XDG_STATE_HOME), so an
-# unchanged disagreement is one post rather than ~96 a day. Drop the flag to log
-# and stay silent.
+# consumers that cannot read the board. It posts when the report's CONTENT has
+# changed since the last post (a digest under $XDG_STATE_HOME), or when that post
+# has aged past qb-reconcile's REPOST_AFTER — so an unchanged disagreement is a
+# handful of posts a day rather than ~96, without going permanently quiet while it
+# is still true. Drop the flag to log and stay silent.
 #
 # --quiet so a tick with nothing to say writes nothing: this fires every 15
 # minutes and a plan that agrees with reality is the normal case.

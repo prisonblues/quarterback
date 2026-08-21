@@ -251,13 +251,22 @@ def test_a_live_holder_whose_session_is_gone_is_still_a_stale_claim():
     assert "daedalus/quill-marble is live" in why
 
 
-def test_a_claim_nothing_in_active_names_and_whose_own_ttl_ran_out_is_stale():
-    """Both halves have to fail before this reads as stale. `ORPHANED` carries no
-    `expires`, so the claim cannot vouch for itself either."""
+def test_a_claim_nothing_in_active_names_and_that_names_no_expiry_is_an_unknown():
+    """RED/GREEN: this returned CLAIM_STALE with the words "the claim is past its own
+    expiry" over a claim that never said when it expires.
+
+    `_claim_live` is three-valued on purpose — True, False, and `None` for "the board
+    did not say" — and its only caller tested it with a bare `if`, so Python's
+    truthiness put `None` and `False` down the same branch. The wording is what makes
+    it a defect rather than a lenience: a comparison the pass could not make was
+    reported in a sentence asserting it had been made and come out unfavourably,
+    which is the absence-vs-inability collapse this whole file exists to report on,
+    inverted into a finding whose justification is invented. `ORPHANED` carries no
+    `expires`, so there is nothing to be past."""
     verdict, why = qr.claim_verdict(ORPHANED, set(), set())
-    assert verdict == qr.CLAIM_STALE
-    assert "neither" in why
-    assert "past its own expiry" in why
+    assert verdict == qr.CLAIM_UNKNOWN
+    assert "no readable `expires`" in why
+    assert "past its own expiry" not in why
 
 
 def test_a_holder_with_no_live_lease_and_an_expired_claim_is_stale():
@@ -298,8 +307,12 @@ def test_a_naive_or_unreadable_expiry_does_not_take_the_tick_down():
             "expires": (qr._utcnow() + timedelta(minutes=20)).replace(
                 tzinfo=None).isoformat()}
     assert qr.claim_verdict(live, set(), set())[0] == qr.CLAIM_UNKNOWN
-    assert qr.claim_verdict({"holder": "x", "session": "y", "expires": "not a date"},
-                            set(), set())[0] == qr.CLAIM_STALE
+    # RED/GREEN: an expiry that will not parse used to come back STALE, i.e. as a
+    # finding, saying the claim was past a date the pass had just failed to read.
+    verdict, why = qr.claim_verdict(
+        {"holder": "x", "session": "y", "expires": "not a date"}, set(), set())
+    assert verdict == qr.CLAIM_UNKNOWN
+    assert "no readable `expires`" in why
 
 
 def test_a_claim_naming_no_session_is_not_asserted_to_be_healthy():
@@ -376,6 +389,40 @@ def test_a_note_saying_the_reverse_is_not_a_readiness_claim(note):
     condition that cannot be checked mechanically: the note and the board agree,
     and the pass reports them as contradicting each other."""
     assert qr.note_asserts_ready(note) is None
+
+
+@pytest.mark.parametrize("note", [
+    # RED/GREEN: confirmed red before `_PREFIX_NEGATOR`. The `\b` fix that closed
+    # "unmergeable" does not close this, and the reason is that it is the SAME
+    # boundary doing the work: a hyphen is a non-word character, so in
+    # "non-mergeable" the leading `\b` of `\bmergeable\b` is satisfied by the hyphen
+    # and the phrase matches at offset 4. `_NEGATORS` holds no `non`/`un`, so
+    # `_negated("non-")` was False and the note read as a readiness claim — on the
+    # exact three words the boundary fix was written for.
+    "non-mergeable until #182 lands",
+    "un-clean after the rebase",
+    "still non-landable",
+    "the tree is un-clean",
+])
+def test_a_hyphenated_negating_prefix_is_not_a_readiness_claim(note):
+    """A hyphen is a word boundary, which is why `\b` alone cannot see this one."""
+    assert qr.note_asserts_ready(note) is None
+
+
+@pytest.mark.parametrize("note,phrase", [
+    # The other side of the same guard, and why it is anchored to the end of the
+    # preceding text rather than dropped into `_NEGATORS`: that set is searched
+    # across the phrase's whole clause, so a bare `non` in it would silence every
+    # one of these. "non-blocking", "non-trivial" and "non-fatal" are ordinary words
+    # in these notes and none of them reverses a claim made six words later.
+    ("non-blocking review comments only; mergeable now", "mergeable"),
+    ("a non-trivial rebase, and the panel is clean", "panel is clean"),
+    ("non-fatal warnings remain but it is ready to land", "ready to land"),
+])
+def test_a_hyphenated_word_that_negates_nothing_does_not_silence_the_claim(note, phrase):
+    """A false NEGATIVE is the worse failure here: a disagreement this pass does not
+    report is one nobody else is looking for."""
+    assert qr.note_asserts_ready(note) == phrase
 
 
 def test_a_negated_clause_does_not_hide_a_real_claim_later_in_the_note():
@@ -566,6 +613,41 @@ def pr(number, closes=(), **over) -> dict:
             else [{"number": n} for n in closes]}
     base.update(over)
     return base
+
+
+def test_a_pr_a_note_merely_mentions_is_not_thereby_accounted_for():
+    """RED/GREEN: confirmed red before `untracked_prs` stopped reading notes.
+
+    Notes reference a PR in passing constantly — "follows PR #999", "rebase after PR
+    #182 lands", "blocked until PR #247 lands" — and none of those says the item is
+    the work on that PR. Reading them as ownership marked the PR tracked forever, so
+    condition 5 went permanently silent about work nothing on the plan is doing: a
+    false negative on the one condition whose entire job is finding unaccounted-for
+    work. An item's ref and title say what it IS; its note is prose about it."""
+    found, _, _ = qr.untracked_prs(
+        [pr(247)],
+        [item(ref={"kind": "issue", "value": "209"}, title="Ship the seat model",
+              note="blocked until PR #247 lands")])
+    assert [p["number"] for p in found] == [247]
+
+
+def test_a_pr_the_title_names_is_still_accounted_for():
+    """The other half: a title naming a PR is the item saying what it is landing,
+    and dropping the note must not cost that."""
+    found, _, _ = qr.untracked_prs(
+        [pr(190), pr(191)],
+        [item(ref=None, title="Land PR #190 and PR #191", note="follows PR #999")])
+    assert found == []
+
+
+def test_an_issue_backed_item_whose_pr_closes_it_still_accounts_for_that_pr():
+    """Why dropping the note costs nothing real: a PR genuinely owned by an
+    issue-backed item is reached through the issue leg, which is what it is for."""
+    found, _, _ = qr.untracked_prs(
+        [pr(268, closes=[213])],
+        [item(ref={"kind": "issue", "value": "213"}, title="the reconcile pass",
+              note="PR #268 is up")])
+    assert found == []
 
 
 def test_an_open_pr_no_item_names_is_untracked():
@@ -965,6 +1047,47 @@ def test_the_repo_scope_comes_from_the_whole_plan_not_only_its_open_rows(monkeyp
     assert report.repos == sorted([REPO, OTHER])
     assert sorted(asked) == sorted([REPO, OTHER])
     assert report.items_checked == 1
+
+
+def test_a_repo_on_the_plan_only_for_finished_rows_is_not_all_untracked(monkeypatch):
+    """RED/GREEN: confirmed red before `tracking_items`. The repo scope was widened to
+    every row the plan has so a repo whose work is all finished still gets its open
+    PRs read — but what could ACCOUNT for a PR stayed the open rows only, so nothing
+    in such a repo could account for anything and every one of its open PRs became an
+    `untracked_pr` finding, on every tick, forever. Three done rows from last month
+    and a dozen live PRs is a dozen standing findings: the drowning-in-noise the bot
+    and draft filters exist to prevent, let back in through the widened scope. A plan
+    row that named a PR still names it after it is marked done."""
+    board = FakeBoard({"items": [
+        item(rank=1, repo=REPO),
+        item(rank=2, repo=OTHER, state="done", item_id="b" * 8,
+             ref={"kind": "pr", "value": "300"}),
+        item(rank=3, repo=OTHER, state="dropped", item_id="c" * 8,
+             ref=None, title="Land PR #301"),
+    ]})
+    monkeypatch.setattr(qr, "board_client", lambda: (board, None))
+    monkeypatch.setattr(qr, "fetch_ref_state", lambda r, k, v: ({"state": "OPEN"}, None))
+
+    def listing(repo):
+        return ([pr(300, repo=OTHER), pr(301, repo=OTHER)] if repo == OTHER else []), None
+
+    monkeypatch.setattr(qr, "fetch_open_prs", listing)
+    report = qr.run()
+    assert [f.ref for f in report.findings if f.condition == "untracked_pr"] == []
+
+
+def test_an_open_pr_no_row_of_any_state_names_is_still_untracked(monkeypatch):
+    """The widened accounting must not become a mute button: a PR nothing on the
+    plan names in any state is exactly what condition 5 is for."""
+    board = FakeBoard({"items": [
+        item(rank=2, repo=OTHER, state="done", item_id="b" * 8,
+             ref={"kind": "pr", "value": "300"})]})
+    monkeypatch.setattr(qr, "board_client", lambda: (board, None))
+    monkeypatch.setattr(qr, "fetch_ref_state", lambda r, k, v: ({"state": "OPEN"}, None))
+    monkeypatch.setattr(qr, "fetch_open_prs",
+                        lambda repo: ([pr(300, repo=OTHER), pr(999, repo=OTHER)], None))
+    report = qr.run()
+    assert [f.ref for f in report.findings if f.condition == "untracked_pr"] == ["pr#999"]
 
 
 def test_the_plan_is_asked_for_its_finished_rows_too(wired):
@@ -1436,6 +1559,61 @@ def test_an_unchanged_report_is_not_posted_a_second_time(capsys):
         qr.run, qr.board_client = saved_run, saved_client
 
 
+def test_an_unchanged_report_is_posted_again_once_it_has_aged_out(capsys):
+    """RED/GREEN: confirmed red before `suppressed`/`REPOST_AFTER`. Change detection
+    alone is "post once, then never again while the disagreement persists", which is
+    not the same as "do not spam". `GET /board` orients over a 30-minute window by
+    default, so 31 minutes after the single post the still-live disagreement is
+    invisible to every subsequent cold orient — exactly the reader `--post` exists
+    for, per the timer unit's own comment that a report reaching only
+    ~/reconcile-logs is invisible to the agents whose plan it is about. The trade
+    went from ~96 posts a day to eventual zero visibility; it should have been a
+    re-post interval, which needs a timestamp beside the hash and not just the hash.
+    """
+    posts = []
+    saved_run, qr.run = qr.run, lambda _repo=None, **_k: full_report(
+        items=[item()], open_prs=[])
+    saved_client, qr.board_client = qr.board_client, lambda: (
+        type("C", (), {"post": lambda _s, p, b: posts.append((p, b))})(), None)
+    try:
+        qr.main(["--post"])
+        assert len(posts) == 1
+        # Age the recorded post past the interval, leaving the digest itself alone:
+        # the report has not changed, only the time since anyone was told about it.
+        digest, when = qr.read_digest()
+        qr.write_digest(digest, now=when - qr.REPOST_AFTER - timedelta(minutes=1))
+        qr.main(["--post"])
+        assert len(posts) == 2, "a standing disagreement must not go permanently quiet"
+    finally:
+        qr.run, qr.board_client = saved_run, saved_client
+    capsys.readouterr()
+
+
+def test_the_repost_interval_needs_both_halves():
+    """`suppressed` is unchanged AND recent, and each half alone is a different bug:
+    without the first a changed report is swallowed, without the second a standing
+    one is. An unreadable timestamp counts as long ago, because the failure that
+    costs is a live disagreement nobody can see."""
+    now = qr._utcnow()
+    fresh = now - qr.REPOST_AFTER + timedelta(minutes=1)
+    aged = now - qr.REPOST_AFTER - timedelta(minutes=1)
+    assert qr.suppressed("beef", "beef", fresh, now) is True
+    assert qr.suppressed("beef", "beef", aged, now) is False
+    assert qr.suppressed("beef", "cafe", fresh, now) is False
+    assert qr.suppressed("beef", "beef", None, now) is False
+
+
+def test_a_state_file_written_before_the_timestamp_existed_posts_once(monkeypatch,
+                                                                     tmp_path):
+    """The upgrade path: a file holding only a hash has no time to compare, which
+    reads as "old enough" rather than "posted just now"."""
+    path = tmp_path / "last-post"
+    path.write_text("beef\n", encoding="utf-8")
+    monkeypatch.setattr(qr, "state_path", lambda: str(path))
+    assert qr.read_digest() == ("beef", None)
+    assert qr.suppressed("beef", "beef", None) is False
+
+
 def test_a_report_that_changed_is_posted_again(capsys):
     """The guard must not be a mute button: a NEW disagreement is exactly what the
     timer is for."""
@@ -1472,8 +1650,56 @@ def test_an_unreadable_digest_posts_rather_than_silencing_the_report(monkeypatch
     """Fail open. Silencing a disagreement because a cache could not be read is the
     wrong way round, and this pass exists to stop exactly that trade."""
     monkeypatch.setattr(qr, "state_path", lambda: "/proc/self/nonexistent/dir/last-post")
-    assert qr.read_digest() is None
+    assert qr.read_digest() == (None, None)
+    assert qr.suppressed("beef", None, None) is False
     assert qr.write_digest("beef") is not None      # and says why, rather than raising
+
+
+def test_a_tick_whose_only_content_is_skipped_prs_still_prints_and_posts(capsys):
+    """RED/GREEN: confirmed red before `has_content`. Both gates keyed off findings
+    and unknowns only, and `prs_skipped` is neither — so a tick with thirty skipped
+    dependabot PRs and nothing else printed nothing under `--quiet` and posted
+    nothing under `--post`. The shipped systemd unit runs exactly `qb-reconcile
+    --post --quiet`, so in the deployed configuration the whole feature was invisible
+    whenever it was the only thing to say — against a README and a CHANGELOG that
+    both promise "neither is dropped silently"."""
+    posts = []
+    report = full_report(items=[item(ref={"kind": "pr", "value": "188"})],
+                         ref_states={(REPO, "pr", "188"): {"state": "OPEN"}},
+                         open_prs=[pr(400, author={"login": "dependabot[bot]", "is_bot": True})])
+    assert report.findings == [] and report.unknowns == []
+    assert len(report.prs_skipped) == 1
+
+    saved_run, qr.run = qr.run, lambda _repo=None, **_k: report
+    saved_client, qr.board_client = qr.board_client, lambda: (
+        type("C", (), {"post": lambda _s, p, b: posts.append((p, b))})(), None)
+    try:
+        assert qr.main(["--post", "--quiet"]) == 0
+        out = capsys.readouterr().out
+        assert "not compared" in out
+        assert len(posts) == 1
+    finally:
+        qr.run, qr.board_client = saved_run, saved_client
+
+
+def test_a_wholly_empty_tick_is_still_silent_under_quiet(capsys):
+    """The other side of the same gate: widening it to `prs_skipped` must not make
+    `--quiet` print on a tick with genuinely nothing to say."""
+    posts = []
+    report = full_report(items=[item(ref={"kind": "pr", "value": "188"})],
+                         ref_states={(REPO, "pr", "188"): {"state": "OPEN"}},
+                         open_prs=[])
+    assert not (report.findings or report.unknowns or report.prs_skipped)
+
+    saved_run, qr.run = qr.run, lambda _repo=None, **_k: report
+    saved_client, qr.board_client = qr.board_client, lambda: (
+        type("C", (), {"post": lambda _s, p, b: posts.append((p, b))})(), None)
+    try:
+        assert qr.main(["--post", "--quiet"]) == 0
+        assert capsys.readouterr().out == ""
+        assert posts == []
+    finally:
+        qr.run, qr.board_client = saved_run, saved_client
 
 
 def test_the_board_client_is_built_once_for_the_reads_and_the_write(capsys):

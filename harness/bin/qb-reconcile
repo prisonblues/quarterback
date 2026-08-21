@@ -69,7 +69,7 @@ import re
 import subprocess
 import sys
 from dataclasses import asdict, dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from urllib.parse import urlencode
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -195,6 +195,20 @@ _CLAUSE_BREAK = re.compile(
     r"[.;!?]|(?<!anything )(?<!nothing )\b(?:but|however|although|though|whereas|yet)\b",
     re.I)
 
+#: The negating prefix that survived the `\b` fix, because a HYPHEN is itself a word
+#: boundary. `\bmergeable\b` was given its boundaries to stop "unmergeable" matching
+#: at offset 2, and it does — but in "non-mergeable" the hyphen satisfies the leading
+#: `\b`, so the phrase matches anyway, and `_NEGATORS` holds no `non`/`un` to catch it.
+#: "non-mergeable until #182 lands" and "un-clean after the rebase" therefore read as
+#: assertions of readiness, on the exact words the boundary fix was written for.
+#:
+#: Anchored to the END of the preceding text rather than added to `_NEGATORS`, and
+#: that is the whole point: `_NEGATORS` is searched across the phrase's entire clause,
+#: so a bare `non` there would silence "non-blocking and mergeable" — "non-trivial",
+#: "non-fatal", "non-blocking" are ordinary words in these notes and none of them
+#: negates a readiness claim six words later. Only a prefix glued to the phrase does.
+_PREFIX_NEGATOR = re.compile(r"\b(?:non|un)-$", re.I)
+
 #: How far back to look at all — a backstop against a very long clause dragging in
 #: a `not` from thirty words away, applied before the clause split.
 _NEGATION_REACH = 60
@@ -202,6 +216,8 @@ _NEGATION_REACH = 60
 
 def _negated(before: str) -> bool:
     """Is a readiness phrase preceded, in its OWN clause, by something reversing it?"""
+    if _PREFIX_NEGATOR.search(before):
+        return True
     return bool(_NEGATORS.search(_CLAUSE_BREAK.split(before)[-1]))
 
 #: "PR #216" and nothing looser. An item whose ref is an issue can still be
@@ -335,7 +351,8 @@ def prs_in_text(*texts: str | None) -> list[str]:
     is about, and first-wins answers it wrongly in the one direction that costs:
     an item titled "Land PR #190 and PR #191" tracks both, and reading only #190
     leaves #191 reported as work the plan does not account for — on a board post,
-    every tick, forever.
+    every tick, forever. Its caller passes the title and not the note; see
+    :func:`untracked_prs` for why the two are not the same evidence.
     """
     found: list[str] = []
     for text in texts:
@@ -492,13 +509,26 @@ def claim_verdict(claim: dict, live_sessions: set[str], live_holders: set[str],
                                "finishes, so a live name is not proof this holder is the "
                                "one that claimed it")
 
-    # Nothing the claim names is in /active at all.
-    if _claim_live(claim, at):
+    # Nothing the claim names is in /active at all. `_claim_live` is three-valued
+    # here and every branch below is one of its three answers: a bare `if` would
+    # collapse "the board did not say when this expires" into "it expired", and
+    # report a comparison this pass never made under a sentence asserting it did.
+    absent = (f"nothing in /active names the holder ({holder or 'unnamed'})"
+              + (f" or the session that took this claim ({clip(session, 8)})"
+                 if session else ""))
+    live = _claim_live(claim, at)
+    if live:
         return CLAIM_UNKNOWN, (
-            f"nothing in /active names the holder ({holder or 'unnamed'})"
-            + (f" or the session that took this claim ({clip(session, 8)})" if session else "")
-            + f", but the claim itself is live until {claim.get('expires')} — "
+            f"{absent}, but the claim itself is still inside its own TTL — "
             + _LEASE_ASYMMETRY)
+    if live is None:
+        # No `expires`, or one that would not parse. The claim cannot vouch for
+        # itself and nothing else can either, so this is the second unknown rather
+        # than a finding: the pass has no fact that says the claim is dead.
+        return CLAIM_UNKNOWN, (
+            f"{absent}, and the claim carries no readable `expires` "
+            f"({claim.get('expires') or 'none'!r}), so whether it is still inside "
+            "its own TTL could not be checked either")
     return CLAIM_STALE, (f"neither the holder ({holder or 'unnamed'}) nor the session that "
                          f"took this claim ({clip(session, 8) if session else 'none named'}) "
                          "is live, and the claim is past its own expiry")
@@ -637,12 +667,28 @@ def untracked_prs(open_prs: list[dict], items: list[dict],
                   include_drafts: bool = False) -> tuple[list[dict], list[Unknown], list[dict]]:
     """``(untracked, could-not-tell, deliberately-skipped)`` over one repo's open PRs.
 
+    ``items`` here is every plan row, open or finished — see :func:`reconcile`'s
+    ``tracking_items``. A row that named a PR still names it after it is marked done.
+
     A PR is accounted for three ways, and all three are needed: an item whose ref
-    IS it, an item whose issue ref is one this PR closes, or an item naming it as
-    ``PR #n``. Only the first is a bare number match — the second is what stops
-    "Rebase and land PR #182 (#163)" and its issue-backed sibling from both
-    reading as untracked work. ALL the ``PR #n``s an item names count, not the
-    first: "Land PR #190 and PR #191" tracks two.
+    IS it, an item whose issue ref is one this PR closes, or an item whose TITLE
+    names it as ``PR #n``. Only the first is a bare number match — the second is
+    what stops "Rebase and land PR #182 (#163)" and its issue-backed sibling from
+    both reading as untracked work. ALL the ``PR #n``s a title names count, not
+    the first: "Land PR #190 and PR #191" tracks two.
+
+    **The note is deliberately not read for this, and the ref/title pair is why.**
+    An item's ref and its title say what the item IS; its note is prose about the
+    work, and prose mentions a PR without owning it all the time — "follows PR
+    #999", "rebase after PR #182 lands", "blocked until PR #247 lands" are the
+    shape of real notes on this board. Reading those as ownership marks a PR
+    tracked that nothing on the plan is doing, and condition 5 then goes silent
+    about it on every tick forever. That is a false negative on the one condition
+    whose entire job is finding unaccounted-for work, which is the direction this
+    file's own thesis says costs the most. A PR genuinely owned by an issue-backed
+    item is already reached by the issue leg, which is what that leg is for;
+    :func:`item_pr` still reads the note, because "which PR is this note making a
+    claim about" is a different question and prose answers it correctly.
 
     A PR whose ``closingIssuesReferences`` GitHub did not return cannot have the
     second leg checked, so it comes back as an unknown rather than a finding: the
@@ -671,7 +717,9 @@ def untracked_prs(open_prs: list[dict], items: list[dict],
             tracked_prs.add((repo, value))
         elif kind == "issue" and value:
             tracked_issues.add((repo, value))
-        for named in prs_in_text(item.get("title"), item.get("note")):
+        # Title only — see the docstring. A note naming a PR is talking about it,
+        # not accounting for it.
+        for named in prs_in_text(item.get("title")):
             tracked_prs.add((repo, named))
 
     findings: list[dict] = []
@@ -718,7 +766,8 @@ def reconcile(items: list[dict], ref_states: dict[tuple[str, str, str], dict | N
               open_prs: list[dict], repos: list[str],
               now: datetime | None = None,
               ref_errors: dict[tuple[str, str, str], str] | None = None,
-              include_drafts: bool = False) -> Report:
+              include_drafts: bool = False,
+              tracking_items: list[dict] | None = None) -> Report:
     """Every condition over already-fetched data. No I/O, so it is all testable.
 
     ``ref_states`` is keyed ``(repo, kind, value)`` and ``histories`` ``(repo,
@@ -727,9 +776,26 @@ def reconcile(items: list[dict], ref_states: dict[tuple[str, str, str], dict | N
     ``ref_errors`` carries WHY a lookup failed, under the same key: "no such pull
     request" and "API rate limit exceeded" want opposite responses from a reader,
     and without the reason both arrive as the same unknown.
+
+    ``items`` are the rows CHECKED — conditions 1-4 run on open work only, because
+    a finished row pointing at a merged PR is the record working. ``tracking_items``
+    are the rows that ACCOUNT for a PR in condition 5, and they are every row the
+    plan has, defaulting to ``items`` when a caller has no wider list.
+
+    **The two are different lists, and collapsing them is a bug in whichever
+    direction it is done.** The repo scope is drawn from the whole plan (see
+    :func:`run`) precisely so a repo whose rows are all finished still gets its open
+    PRs read — but if only the OPEN rows can account for a PR, nothing in such a
+    repo can account for anything, and every one of its open PRs becomes an
+    `untracked_pr` finding on every tick forever. A repo with three done rows from
+    last month and a dozen live PRs nobody put on the plan is then a dozen standing
+    findings: the drowning-in-noise problem the bot and draft filters exist to
+    prevent, let back in through the widened scope. A plan row that named a PR still
+    names it after it is marked done; "the plan accounts for this" does not expire.
     """
     at = now or _utcnow()
     errors = ref_errors or {}
+    accounting = items if tracking_items is None else tracking_items
     report = Report(generated=at.isoformat(), repos=sorted(repos),
                     items_checked=len(items), prs_checked=len(open_prs))
 
@@ -825,7 +891,7 @@ def reconcile(items: list[dict], ref_states: dict[tuple[str, str, str], dict | N
                         reason=f"the note claims {phrase!r}; {unknown}"))
 
     # 5 — work nothing on the plan accounts for.
-    untracked, pr_unknowns, skipped = untracked_prs(open_prs, items, include_drafts)
+    untracked, pr_unknowns, skipped = untracked_prs(open_prs, accounting, include_drafts)
     report.unknowns.extend(pr_unknowns)
     report.prs_skipped.extend(skipped)
     for pr in untracked:
@@ -1051,9 +1117,16 @@ def run(repo_filter: str | None = None, include_drafts: bool = False) -> Report:
         if problem:
             pr_unknowns.append(problem)
 
+    # Every row the plan has, under the same repo filter the checked items got.
+    # The repo scope came from this list, so what can account for a PR has to as
+    # well, or a repo included only for its finished rows reports all of them.
+    tracking = all_items
+    if repo_filter:
+        tracking = [i for i in tracking if (i.get("repo") or "") == repo_filter]
+
     report = reconcile(items, ref_states, live_sessions, live_holders,
                        histories, open_prs, repos, ref_errors=ref_errors,
-                       include_drafts=include_drafts)
+                       include_drafts=include_drafts, tracking_items=tracking)
     report.unknowns.extend(pr_unknowns)
     if truncated:
         # Reported once, for the plan as a whole: the rows past the cap were never
@@ -1184,6 +1257,16 @@ def post_digest(report: Report) -> str:
     change between ticks on a disagreement that has not changed at all, so hashing
     them would make every report new and buy nothing. What a reader would call "the
     same report" is the conditions, the subjects and the sentences.
+
+    **Which puts a rule on the sentences: a `summary` or a `reason` must not carry a
+    value that moves on its own.** They are hashed, so anything interpolated into one
+    that changes while the disagreement does not defeats this function through the
+    one field it trusts. `claim_verdict`'s live-but-quiet branch did exactly that —
+    it wrote the claim's own `expires` into its reason, and `/plan` re-issues that
+    timestamp on every renewal, which an agent holding an item across the claim's
+    3600s TTL is *expected* to do. So the identical disagreement re-posted every
+    renewal. It now says "still inside its own TTL" and leaves the timestamp to the
+    board, which is where a reader can read it anyway.
     """
     body = sorted([f.condition, f.repo or "", f.ref or "", f.subject, f.summary]
                   for f in report.findings)
@@ -1192,26 +1275,73 @@ def post_digest(report: Report) -> str:
     return hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
 
 
-def read_digest() -> str | None:
-    """The digest of the last report posted, or None if there is not one to read.
+#: How long an UNCHANGED report stays suppressed before it is posted again.
+#:
+#: Change detection alone is "post once, then never again while the disagreement
+#: persists", and that is not the same as "do not spam". `GET /board` orients over a
+#: 30-minute window by default (`window_min=30`, app/api/posts.py), so a post older
+#: than that is invisible to every subsequent cold orient — which is exactly the
+#: reader `--post` exists for, per the timer unit's own comment that a report only
+#: reaching ~/reconcile-logs is invisible to the agents whose plan it is about. A
+#: disagreement that has stood for a day is not less true than a new one, and under
+#: pure change detection it is the one nobody can see.
+#:
+#: Four hours is a compromise and worth naming as one. Matching the orient window
+#: would restore continuous visibility and put back the ~96 posts a day the digest
+#: was added to stop; this bounds how long a live disagreement can be invisible
+#: instead of removing the possibility, at 6 posts a day for one that never changes.
+REPOST_AFTER = timedelta(hours=4)
 
-    An unreadable state file returns None and so posts: silencing a disagreement
-    because a cache could not be read is the wrong way round.
+
+def read_digest() -> tuple[str | None, datetime | None]:
+    """``(digest, when_it_was_posted)`` for the last report posted.
+
+    ``(None, None)`` when there is nothing readable to compare against, and an
+    unreadable state file is deliberately that: silencing a disagreement because a
+    cache could not be read is the wrong way round. A file written before the
+    timestamp existed parses as a digest with no time, which reads as "old enough"
+    and posts once — the same way round.
     """
     try:
         with open(state_path(), encoding="utf-8") as fh:
-            return fh.read().strip() or None
+            lines = fh.read().splitlines()
     except OSError:
-        return None
+        return None, None
+    digest = (lines[0].strip() if lines else "") or None
+    when = None
+    if digest and len(lines) > 1:
+        try:
+            when = datetime.fromisoformat(lines[1].strip())
+        except ValueError:
+            when = None
+        if when is not None and when.tzinfo is None:
+            when = when.replace(tzinfo=UTC)
+    return digest, when
 
 
-def write_digest(digest: str) -> str | None:
-    """Record what was just posted. Returns the reason it could not be recorded."""
+def suppressed(digest: str, last: str | None, when: datetime | None,
+               now: datetime | None = None) -> bool:
+    """Should this report be held back — unchanged AND recently enough said?
+
+    Both halves, never just the first: see :data:`REPOST_AFTER`. A last-posted time
+    that could not be read is treated as long ago, because the failure that costs is
+    a standing disagreement nobody can see.
+    """
+    if digest != last:
+        return False
+    if when is None:
+        return False
+    return (now or _utcnow()) - when < REPOST_AFTER
+
+
+def write_digest(digest: str, now: datetime | None = None) -> str | None:
+    """Record what was just posted, and when. Returns the reason it could not be."""
     path = state_path()
+    at = (now or _utcnow()).isoformat()
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as fh:
-            fh.write(digest + "\n")
+            fh.write(f"{digest}\n{at}\n")
     except OSError as exc:
         return str(exc)
     return None
@@ -1227,8 +1357,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="the whole report as JSON, unknowns beside the findings")
     parser.add_argument("--post", action="store_true",
                         help="also post one `finding` to the board, and only when this "
-                             "report differs from the last one posted (off by default: "
-                             "this pass reports, it does not write)")
+                             "report differs from the last one posted or that post has "
+                             "aged past its re-post interval (off by default: this pass "
+                             "reports, it does not write)")
     parser.add_argument("--include-drafts", action="store_true", dest="include_drafts",
                         help="compare draft PRs against the plan too (off by default: a "
                              "draft is not yet work the plan owes an item)")
@@ -1242,14 +1373,24 @@ def main(argv: list[str] | None = None) -> int:
         print(f"qb-reconcile: {exc}", file=sys.stderr)
         return 2
 
+    # What counts as "something to report", for both gates below. `prs_skipped` is
+    # in it: it is neither a finding nor an unknown, but it is the report's answer
+    # to "what did you not compare, and why", and README and CHANGELOG both promise
+    # it is never dropped silently. Keyed off findings/unknowns alone, a tick whose
+    # only content was thirty skipped dependabot PRs printed nothing under `--quiet`
+    # and posted nothing under `--post` — which is the shipped systemd unit's exact
+    # invocation, so in the deployed configuration the feature did not exist.
+    has_content = bool(report.findings or report.unknowns or report.prs_skipped)
+
     if args.as_json:
         print(json.dumps(report.as_dict(), indent=2))
-    elif not (args.quiet and not report.findings and not report.unknowns):
+    elif not (args.quiet and not has_content):
         print(render(report))
 
-    if args.post and (report.findings or report.unknowns):
+    if args.post and has_content:
         digest = post_digest(report)
-        if digest == read_digest():
+        last, when = read_digest()
+        if suppressed(digest, last, when):
             if not args.quiet:
                 # stderr, because stdout under `--json` is a payload #232's orderer
                 # parses and a line of prose after it would not be JSON any more.
