@@ -1074,10 +1074,11 @@ of both for other repos.
 
 ## The terminal board (`qb-board`)
 
-> **The command is `qb-board`.** `qb board` is the spelling the fleet's CLI will use, and that CLI
-> lives in nix-fleet, not here — until it grows the one-line arm described under *Where it lives*
-> below, `qb board` is not a command on any host. Everything in this section works today under the
-> hyphenated name, which is what the harness package puts on PATH.
+> **The command is `qb-board`.** `qb board` is the spelling the fleet's CLI will use. That CLI is
+> now `harness/bin/qb` and lives here (#230), but it still has no `board` arm — until it grows the
+> one line described under *Where it lives* below, `qb board` is not a command on any host.
+> Everything in this section works today under the hyphenated name, which is what the harness
+> package puts on PATH.
 
 `GET /` is a browser view behind Authelia. That is the right surface on a desktop and no surface
 at all on **daedalus**, **atlas** or **sisyphus** — the headless machines where work runs
@@ -1141,11 +1142,12 @@ guess reaches another island's real board.
 `client.py` the MCP server uses — this repo already had two clients for one board (that one and the
 browser's JavaScript) and a third would be the thing to avoid. `harness/bin/qb-board` is a launcher
 that finds an interpreter which can import it, and ships in the harness package so home-manager puts
-it on PATH. `qb` itself still lives in nix-fleet ([#28](https://github.com/prisonblues/quarterback/issues/28)
-is what settles that split), so the `qb board` spelling wants a one-line arm there —
-`board) exec qb-board "$@" ;;` — and nothing else: `qb-board` already drops a leading literal
-`board` argument. That arm is not in this PR and cannot be, so until it is deployed the command
-is `qb-board`. Write it without a `shift`: the strip exists precisely so the verb can arrive, and
+it on PATH. `qb` itself is `harness/bin/qb` as of #230 — it used to live in a consumer's own repo,
+which is what made the `qb board` spelling somebody else's change to make
+([#28](https://github.com/prisonblues/quarterback/issues/28) is what settles that split). It still
+wants a one-line arm — `board) exec qb-board "$@" ;;` — and nothing else: `qb-board` already drops
+a leading literal `board` argument. That arm is not written yet, so until it is the command is
+`qb-board`. Write it without a `shift`: the strip exists precisely so the verb can arrive, and
 an arm that shifts it away silently disables the thing it is there for.
 
 ## Development

@@ -15,8 +15,13 @@
 # Shipping it here puts the wiring, the hook and the board client on ONE pin.
 #
 #   qb-claude-setup                  wire it (the home-manager activation's entry point)
-#   qb-claude-setup --check          is it wired, and to THIS install?  (see exit codes)
+#   qb-claude-setup --check          are the HOOKS wired, and to THIS install? (exit codes)
 #   qb-claude-setup --print-fragment the settings.json hooks fragment, paths resolved
+#
+# --check reads ~/.claude/settings.json and nothing else. It deliberately says nothing
+# about the MCP registration or the CLAUDE.md @import: those are wired from the same run
+# but they are not what the exit codes below mean, and a doctor that folded three answers
+# into one number could not tell a deaf host from one missing a doc.
 #
 # Options:
 #   --mcp auto|always|never   register the stdio MCP server in ~/.claude.json.
@@ -40,14 +45,39 @@ MCP_MODE=auto
 HOOK="${QB_HOOK:-}"
 FRAG="${QB_CLAUDE_FRAGMENT:-}"
 
+# The whole leading comment block, de-hashed. Not a line range: a range goes stale the
+# moment somebody adds a sentence to the header, and the way it goes stale is by printing
+# the exit-code contract cut off mid-word — which is what `sed -n '2,32p'` was doing.
+# Pure bash, so it needs nothing on PATH that the activation might not have supplied.
+usage() {
+  local line
+  while IFS= read -r line; do
+    case "$line" in
+      '#!'*) continue ;;
+      '#'*)  line="${line#\#}"; printf '%s\n' "${line# }" ;;
+      *)     break ;;
+    esac
+  done < "$0"
+}
+
+# A flag whose value is missing is refused, exactly like an unknown flag is. This is
+# invoked from an activation with arguments composed by nix, and `--mcp` swallowed by a
+# broken interpolation would silently wire `auto` where the module asked for `never` —
+# the same class of failure as a typo'd flag being ignored, and just as invisible.
+need_value() {   # need_value <count> <flag> <what>
+  [ "$1" -ge 2 ] && return 0
+  echo "qb-claude-setup: $2 needs $3" >&2
+  exit 64
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --check)          MODE=check ;;
     --print-fragment) MODE=fragment ;;
-    --mcp)            MCP_MODE="${2:-auto}"; shift ;;
-    --hook)           HOOK="${2:-}"; shift ;;
-    --fragment)       FRAG="${2:-}"; shift ;;
-    -h|--help)        sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --mcp)            need_value $# --mcp "a value (auto|always|never)"; MCP_MODE="$2"; shift ;;
+    --hook)           need_value $# --hook "a path"; HOOK="$2"; shift ;;
+    --fragment)       need_value $# --fragment "a path"; FRAG="$2"; shift ;;
+    -h|--help)        usage; exit 0 ;;
     *) echo "qb-claude-setup: unknown argument: $1" >&2; exit 64 ;;
   esac
   shift
@@ -138,6 +168,19 @@ resolved_fragment() {
 
 case "$MODE" in fragment) resolved_fragment; exit $?; esac
 
+# How many events this install wires, ASKED of the fragment rather than written down. The
+# fragment is the list (that is the point of it being data), so a hardcoded count is a
+# message that lies the first time the list changes — and the count is what both the
+# "wired N events" line and --check's short-rows guard compare against.
+# Zero is refused along with unreadable, because a fragment that wires nothing makes
+# --check pass vacuously — every counter stays at its initial value and the answer is
+# "all wired", on a host with no board. Same rule as the short-rows guard below.
+NEVENTS=$(resolved_fragment | jq -r '.hooks | keys_unsorted | length' 2>/dev/null)
+case "$NEVENTS" in ''|0|*[!0-9]*)
+  echo "qb-claude-setup: $FRAG wires no hook events — nothing to do" >&2
+  [ "$MODE" = wire ] && exit 0 || exit 1 ;;
+esac
+
 # `mine`: an entry this script owns. Matched on the COMMAND naming qb-hook rather than on an
 # exact path, which is what makes the merge idempotent across installs — a host moving from a
 # hand-rolled ~/.local/bin/qb-hook to a flake pin has its old entries replaced rather than
@@ -148,8 +191,17 @@ case "$MODE" in fragment) resolved_fragment; exit $?; esac
 # `"…/qb-hook" Stop` matches (the class is negated, so it covers either quote without
 # naming one), and a consumer's own `my-qb-hooks.sh` does not — which the bare substring
 # claimed, and stripping somebody else's guard is a worse failure than either.
+#
+# `(.hooks? // [])[]?` and not `.hooks[]?`: jq's `?` binds to the iteration, so `.hooks`
+# raising "cannot index string" on a malformed entry is NOT caught by it, and one piece of
+# junk in one array would abort the whole merge — leaving a host unwired over somebody
+# else's typo, with a single line on stderr. Guarding the index instead skips the entry
+# and keeps it, which is what "additive by identity" is supposed to mean.
 QB_HOOK_RE='qb-hook($|[^A-Za-z0-9_])'
-JQ_MINE="def mine: any(.hooks[]?; (.command // \"\") | test(\"$QB_HOOK_RE\"));"
+JQ_MINE="def mine: any((.hooks? // [])[]?; (.command? // \"\") | test(\"$QB_HOOK_RE\"));"
+# The command an entry contributes, or "" — used for both halves of --check, so the
+# expected string comes out of the fragment by the same rule the live one does.
+JQ_CMD="def qbcmd: [ (.hooks? // [])[]? | .command? // \"\" | select(test(\"$QB_HOOK_RE\")) ] | first // \"\";"
 
 # ---- --check ----------------------------------------------------------------
 if [ "$MODE" = check ]; then
@@ -161,37 +213,40 @@ if [ "$MODE" = check ]; then
   # check above passes it) makes jq error, the loop sees no lines, and every counter stays
   # zero. Which is exit 0. A doctor blessing a host with no board is the one answer this
   # mode must never give, so no rows is a failure, not a clean bill.
+  #
+  # The EXPECTED command comes out of the fragment, not out of `"$HOOK $ev"`. Rebuilding
+  # it here would hardcode this file's knowledge of the fragment's shape, so the day an
+  # entry carries anything but the bare event name every correctly wired host in the fleet
+  # reports SKEW — a doctor calling a healthy install broken, from a string it made up.
   rows=$(
     jq -r --slurpfile frag <(resolved_fragment) "
       $JQ_MINE
+      $JQ_CMD
       . as \$live
       | \$frag[0].hooks
       | keys_unsorted[] as \$e
+      | ( [ (.[\$e] // [])[] | qbcmd | select(. != \"\") ] | first // \"\" ) as \$want
       | ((\$live.hooks[\$e] // []) | map(select(mine)) | first) as \$hit
-      | [ \$e,
-          ( if \$hit == null then \"\"
-            else ( [ \$hit.hooks[]? | .command? // \"\" | select(test(\"$QB_HOOK_RE\")) ] | first // \"\" )
-            end ) ]
+      | [ \$e, \$want, (if \$hit == null then \"\" else (\$hit | qbcmd) end) ]
       | @tsv" "$S" 2>/dev/null
   ) || rows=""
-  want=$(resolved_fragment | jq -r '.hooks | keys_unsorted | length')
-  if [ "$(printf '%s\n' "$rows" | grep -c .)" != "$want" ]; then
-    echo "qb-claude-setup: could not read $want hook events out of $S."
+  if [ "$(printf '%s\n' "$rows" | grep -c .)" != "$NEVENTS" ]; then
+    echo "qb-claude-setup: could not read $NEVENTS hook events out of $S."
     echo "       It is valid JSON, but its \`hooks\` is not the shape Claude Code writes —"
     echo "       so nothing here can say whether this host is wired. Fix the file by hand."
     exit 1
   fi
   missing=0; other=0
-  while IFS=$'\t' read -r ev cmd; do
+  while IFS=$'\t' read -r ev want cmd; do
     [ -n "$ev" ] || continue
     if [ -z "$cmd" ]; then
       printf 'MISSING  %-17s no qb-hook entry — this host is deaf on that event\n' "$ev"
       missing=1
-    elif [ "$cmd" = "$HOOK $ev" ]; then
+    elif [ "$cmd" = "$want" ]; then
       printf 'ok       %-17s %s\n' "$ev" "$cmd"
     else
       printf 'SKEW     %-17s %s\n' "$ev" "$cmd"
-      printf '         %-17s (this install is %s)\n' "" "$HOOK"
+      printf '         %-17s (this install wires %s)\n' "" "$want"
       other=1
     fi
   done <<< "$rows"
@@ -224,7 +279,7 @@ else
       :   # already wired, byte for byte. Say nothing: this runs on every switch, and a
           # line per rebuild is how activation output stops being read.
     else
-      install -m 600 "$tmp" "$S" && echo "qb-claude-setup: wired 7 hook events → $S"
+      install -m 600 "$tmp" "$S" && echo "qb-claude-setup: wired $NEVENTS hook events → $S"
     fi
   else
     echo "qb-claude-setup: settings.json merge failed — left unchanged" >&2
@@ -238,8 +293,20 @@ fi
 # an @import of a missing file is a line in every session's context that resolves to
 # nothing. The module installs the doc (`claude.workflowDoc`); if it was turned off, there
 # is nothing to import and this correctly does nothing.
-if [ -f "$C" ] && [ -e "$CDIR/$DOC" ] && ! grep -q "$DOC" "$C" 2>/dev/null; then
-  printf '\n@%s\n' "$DOC" >> "$C" && echo "qb-claude-setup: @$DOC imported into $C"
+#
+# NOT conditional on ~/.claude/CLAUDE.md already existing, which was the same "only ever
+# edits a file somebody else made" bug the settings.json and ~/.claude.json branches both
+# had. Nothing else on a fresh host writes that file, so gating on it meant the module
+# installed the workflow doc and no session ever read it — silently, and for the whole
+# life of the host, since the gate never opens on its own. `>>` creates it; the leading
+# blank line is for an existing file that already has prose in it.
+if [ -e "$CDIR/$DOC" ] && ! grep -q "$DOC" "$C" 2>/dev/null; then
+  _pre=""; [ -s "$C" ] && _pre=$'\n'
+  if printf '%s@%s\n' "$_pre" "$DOC" >> "$C"; then
+    echo "qb-claude-setup: @$DOC imported into $C"
+  else
+    echo "qb-claude-setup: could not write $C — @$DOC not imported" >&2
+  fi
 fi
 
 # ---- wire: the stdio MCP server -------------------------------------------

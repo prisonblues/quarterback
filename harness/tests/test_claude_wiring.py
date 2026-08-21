@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -174,6 +175,9 @@ def commands(settings: Path, event: str) -> list[str]:
     data = json.loads(settings.read_text(encoding="utf-8"))
     return [h.get("command", "")
             for entry in data.get("hooks", {}).get(event, [])
+            # Entries this script does not understand are kept verbatim rather than
+            # dropped, so the reader has to survive one.
+            if isinstance(entry, dict)
             for h in entry.get("hooks", [])]
 
 
@@ -422,6 +426,24 @@ def test_the_workflow_doc_import_is_added_once(home):
 
 
 @jq_required
+def test_the_import_is_added_on_a_host_with_no_claude_md_at_all(home):
+    """The third instance of the bug Codex found twice. Wiring only ever EDITED
+    `~/.claude/CLAUDE.md`, so on a fresh host — the acceptance criterion's own case — the
+    module installed `quarterback-workflow.md` and nothing ever imported it. Nothing else
+    creates that file, so the gate never opens on its own: the doc would sit unread for
+    the life of the machine, silently, exactly as the settings.json and `~/.claude.json`
+    branches used to."""
+    assert not home.claude_md.exists()
+    (home.home / ".claude" / "quarterback-workflow.md").write_text("board norms\n")
+    assert home("--mcp", "never").returncode == 0
+    assert home.claude_md.read_text() == "@quarterback-workflow.md\n", (
+        "a file created from nothing must not open with a blank line")
+    # ...and it is still added exactly once on the next switch.
+    assert home("--mcp", "never").returncode == 0
+    assert home.claude_md.read_text().count("@quarterback-workflow.md") == 1
+
+
+@jq_required
 def test_no_import_is_added_for_a_doc_that_is_not_installed(home):
     """The fleet's copy appended the @import unconditionally. An @import of a missing file
     is a line in every session's context that resolves to nothing, on every host that
@@ -518,11 +540,93 @@ def test_check_refuses_to_bless_a_settings_file_whose_hooks_are_the_wrong_shape(
     assert "not the shape Claude Code writes" in result.stdout
 
 
+@jq_required
+def test_check_takes_the_expected_command_from_the_fragment_not_from_a_guess(tmp_path, home):
+    """`--check` used to compare the live entry against a `"$HOOK $event"` it rebuilt
+    itself, which hardcodes this script's belief about the fragment's shape. The day an
+    entry carries anything else — a flag, a different argument — every correctly wired host
+    in the fleet reports SKEW, and the report is a string the doctor made up rather than
+    one either file contains. Both halves have to come from the fragment."""
+    frag = json.loads(FRAGMENT.read_text(encoding="utf-8"))
+    frag["hooks"]["Stop"][0]["hooks"][0]["command"] = f"{PLACEHOLDER} Stop --quiet"
+    custom = tmp_path / "frag.json"
+    custom.write_text(json.dumps(frag))
+    assert home("--fragment", str(custom), "--mcp", "never").returncode == 0
+    assert commands(home.settings, "Stop") == [f"{HOOK} Stop --quiet"]
+    result = home("--fragment", str(custom), "--check")
+    assert result.returncode == 0, result.stdout
+    assert [ln.split()[0] for ln in result.stdout.splitlines()] == ["ok"] * 7
+
+
+@jq_required
+def test_the_count_it_reports_comes_from_the_fragment(tmp_path, home):
+    """"wired 7 hook events" was a literal 7 beside a list held in a data file. The first
+    time the two disagree the activation reports a number that is simply not what it did."""
+    frag = json.loads(FRAGMENT.read_text(encoding="utf-8"))
+    del frag["hooks"]["Notification"]
+    custom = tmp_path / "frag.json"
+    custom.write_text(json.dumps(frag))
+    result = home("--fragment", str(custom), "--mcp", "never")
+    assert result.returncode == 0, result.stderr
+    assert "wired 6 hook events" in result.stdout
+
+
+@jq_required
+def test_one_malformed_entry_does_not_cost_the_whole_wiring(home):
+    """jq's `?` binds to the iteration, not to the index, so `.hooks[]?` on an entry that
+    is not an object still raises — and one piece of junk in one array used to abort the
+    merge for all seven events. A host left with no board because somebody else's config
+    had a stray string in it is a worse outcome than skipping the string."""
+    home.settings.write_text(json.dumps({"hooks": {
+        "Stop": ["junk", {"hooks": [{"type": "command", "command": "my-guard.sh"}]}]}}))
+    result = home("--mcp", "never")
+    assert result.returncode == 0, result.stderr
+    assert commands(home.settings, "Stop") == ["my-guard.sh", f"{HOOK} Stop"]
+    assert json.loads(home.settings.read_text())["hooks"]["Stop"][0] == "junk", (
+        "the entry this script does not understand was dropped rather than left alone")
+    assert home("--check").returncode == 0
+
+
+@jq_required
+def test_a_fragment_that_wires_nothing_is_refused_rather_than_blessed(tmp_path, home):
+    """An empty fragment makes every counter in --check stay at its initial value, and the
+    answer that falls out of that is "all wired" — on a host with no board. The same
+    vacuous-pass shape as the short-rows guard, one level up."""
+    empty = tmp_path / "empty.json"
+    empty.write_text(json.dumps({"hooks": {}}))
+    assert home("--fragment", str(empty), "--check").returncode == 1
+    # ...and wiring mode still refuses to fail an activation over it.
+    result = home("--fragment", str(empty), "--mcp", "never")
+    assert result.returncode == 0
+    assert "wires no hook events" in result.stderr
+
+
 def test_an_unknown_argument_is_refused_rather_than_ignored(home):
     """It is invoked from an activation script with flags composed by nix. A typo'd flag
     that was ignored would wire something other than what the module asked for."""
     assert home("--mcp-mode", "never").returncode == 64
     assert home("--mcp", "sometimes").returncode == 64
+
+
+@pytest.mark.parametrize("flag", ["--mcp", "--hook", "--fragment"])
+def test_a_flag_with_no_value_is_refused_too(home, flag: str):
+    """Same reason as the unknown flag above, and the same activation. `--mcp` swallowed by
+    a broken nix interpolation used to fall back to `auto` — wiring something other than
+    what the module asked for, which is precisely what exit 64 exists to prevent."""
+    result = home(flag)
+    assert result.returncode == 64, result.stdout
+    assert flag in result.stderr
+
+
+def test_help_prints_the_whole_header_including_the_exit_code_contract(home):
+    """It was a line range (`sed -n '2,32p'`), and a line range goes stale by cutting the
+    contract off mid-word — which is what it was doing: "…mid-migration; it is"."""
+    result = home("--help")
+    assert result.returncode == 0
+    assert "exactly the state a doctor should name." in result.stdout
+    assert "The default (wiring) mode always exits 0." in result.stdout
+    assert not result.stdout.startswith("#"), "the comment markers were not stripped"
+    assert "set -uo pipefail" not in result.stdout, "it ran past the end of the header"
 
 
 # --------------------------------------------------- which qb-hook is this
@@ -550,6 +654,86 @@ def test_qb_hook_version_fails_loudly_when_its_library_is_missing(tmp_path):
     result = subprocess.run([str(lone), "--version"], capture_output=True, text=True)
     assert result.returncode == 1
     assert "not found" in result.stdout
+
+
+@pytest.fixture
+def hook_against_a_stub_board(tmp_path):
+    """Run one qb-hook event against a `curl` that answers with a status we choose.
+
+    A stub rather than a real server because the assertion is about what qb-hook makes of
+    an HTTP status, and a status is the one thing a stub can produce exactly.
+    """
+    stub_dir = tmp_path / "stub-bin"
+    stub_dir.mkdir()
+    curl = stub_dir / "curl"
+    # It has to honour `-w`, since that is how qb-hook asks for the status at all: a stub
+    # that always printed the code would pass even if the flag were dropped.
+    # An absolute interpreter, not `/usr/bin/env`: the nix sandbox this suite also runs in
+    # has no /usr/bin/env, so an env shebang leaves the stub unexecutable, qb-hook records
+    # the board as unreachable, and the 200 case fails while the 401 case passes for the
+    # wrong reason. That is the shape `patchShebangs` exists for, and a file written at
+    # test time never meets it.
+    curl.write_text(
+        f'#!{shutil.which("bash") or "/bin/sh"}\n'
+        'w=""\n'
+        'while [ $# -gt 0 ]; do case "$1" in -w) w="$2"; shift ;; esac; shift; done\n'
+        'printf \'%s\' "${STUB_BODY:-}"\n'
+        'case "$w" in\n'
+        '  "") : ;;\n'
+        '  *"%{http_code}"*) printf \'\\n%s\' "${STUB_CODE:-200}" ;;\n'
+        'esac\n')
+    curl.chmod(0o755)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    def run(event: str, code: str, body: str = "{}"):
+        env = {
+            **os.environ,
+            "PATH": f"{stub_dir}:{os.environ.get('PATH', '')}",
+            "HOME": str(tmp_path / "home"),
+            "XDG_RUNTIME_DIR": str(run_dir),
+            "QUARTERBACK_CONFIG": str(tmp_path / "no-config"),
+            "QUARTERBACK_BASE_URL": "https://board.invalid",
+            "QUARTERBACK_TOKEN": "t",
+            "QUARTERBACK_AGENT": "testbox",
+            "STUB_CODE": code,
+            "STUB_BODY": body,
+        }
+        env.pop("TMUX", None)
+        subprocess.run([str(HOOK), event], input='{"session_id":"abcdef123456"}',
+                       env=env, capture_output=True, text=True, check=False)
+        return (run_dir / "qb-health").read_text().strip()
+
+    run.run_dir = run_dir
+    return run
+
+
+@pytest.mark.skipif(
+    subprocess.run(["sh", "-c", "command -v jq"], capture_output=True).returncode != 0,
+    reason="qb-hook exits 0 without jq, so there would be no beacon to assert on")
+@pytest.mark.parametrize("code,verdict", [("200", "ok"), ("409", "ok"),
+                                          ("401", "down"), ("500", "down")])
+def test_the_health_beacon_reads_the_http_status_and_not_curls_exit_code(
+        hook_against_a_stub_board, code: str, verdict: str):
+    """`curl -sS` exits 0 on a 401 exactly as it does on a 200, so the beacon used to write
+    `ok` on every turn of a host whose token the board had stopped accepting: the status
+    line said quarterback was fine while every post it made was dropped. That is the
+    failure qb-mcp's own self-heal exists for, and a health beacon is the one thing that
+    must not have it. 409 stays `ok` on purpose — a lease conflict is news about the lease,
+    not about the board being reachable."""
+    assert hook_against_a_stub_board("Stop", code) == verdict
+
+
+@pytest.mark.skipif(
+    subprocess.run(["sh", "-c", "command -v jq"], capture_output=True).returncode != 0,
+    reason="qb-hook exits 0 without jq")
+def test_the_name_beacon_is_not_written_from_a_rejected_response(hook_against_a_stub_board):
+    """The name half of an identity is the board's to designate, so caching one out of a
+    401 body would put a name in the status line that no lease backs."""
+    hook_against_a_stub_board("Stop", "401", body='{"holder":"testbox/ghost"}')
+    assert not (hook_against_a_stub_board.run_dir / "qb-name-abcdef123456").exists()
+    hook_against_a_stub_board("Stop", "200", body='{"holder":"testbox/glacier"}')
+    assert (hook_against_a_stub_board.run_dir / "qb-name-abcdef123456").read_text() == "glacier"
 
 
 def test_a_hook_event_on_an_unconfigured_host_is_silent_success(tmp_path):
@@ -638,14 +822,29 @@ def test_the_site_config_is_only_rendered_when_a_board_is_named():
     assert re.search(r"lib\.mkIf wantConfig \{\s*\n\s*xdg\.configFile", text)
 
 
-def test_the_token_command_may_not_carry_a_single_quote():
-    """It is emitted single-quoted so it stays literal until the token is resolved, which
-    is what lets it reference $QUARTERBACK_AGENT. A quote inside it terminates the quoting
-    and the failure surfaces as "no token" on every board call, with nothing pointing back
-    at the option that caused it — so it is an assertion, at eval time, by name."""
-    text = module_text()
-    assert 'hasInfix "\'" board.tokenCommand' in text
-    assert 'hasInfix "\'" board.tokenRefreshCommand' in text
+@pytest.mark.parametrize("option", ["board.tokenCommand", "board.tokenRefreshCommand",
+                                    "board.url", "board.agent"])
+def test_a_single_quoted_value_may_not_carry_a_single_quote(option: str):
+    """Every value emitted single-quoted needs the guard, not just the token command. A
+    quote inside one terminates the quoting and the rest of the line becomes shell in a
+    file that is *sourced* — surfacing as "no token" or an unset URL on every board call,
+    with nothing pointing back at the option that caused it. So: an assertion, at eval
+    time, by name."""
+    assert f'(noSingleQuote "{option}" {option})' in module_text()
+
+
+@pytest.mark.parametrize("var,value", [
+    ("QUARTERBACK_BASE_URL", "board.url"),
+    ("QUARTERBACK_AGENT", "board.agent"),
+])
+def test_the_site_config_quotes_every_value_it_emits(var: str, value: str):
+    """`~/.config/quarterback/config` is sourced, so an unquoted assignment ends at the
+    first `&`, `;` or space and the remainder is executed. `https://board/x?a=1&b=2` is a
+    perfectly ordinary URL and, unquoted, it backgrounds `b=2` on every board call — in
+    every hook, on every tool call, with the only symptom being a host that never appears."""
+    assert re.search(rf"^\s*{var}='\$\{{{re.escape(value)}\}}'", module_text(), re.MULTILINE) \
+        or re.search(rf"^\s*{var}='\$\{{toString {re.escape(value)}\}}'", module_text(), re.MULTILINE), \
+        f"{var} is not emitted single-quoted in hm-module.nix"
 
 
 @pytest.mark.parametrize("name", ["qb-hook", "qb-env", "qb-mcp", "qb-claude-setup", "qb"])

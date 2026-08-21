@@ -1409,6 +1409,12 @@ of seven, which any single yes/no would have reported as "wired". Exit codes are
 than this install's. `2` is not a lesser `1`: it is the state a host is in for the whole of a
 migration, and it is the skew this section exists to end.
 
+It reads `~/.claude/settings.json` and nothing else. The MCP registration and the CLAUDE.md
+@import are wired by the same run and are deliberately **not** in those exit codes: folding
+three answers into one number would leave a doctor unable to tell a deaf host from one
+missing a doc. Check those two by looking — `jq .mcpServers.quarterback ~/.claude.json` and
+`grep quarterback-workflow ~/.claude/CLAUDE.md`.
+
 ### Wiring `~/.claude/settings.json` when you already write to it
 
 That file has several writers — you edit it, Claude Code writes to it, and nix wants to
@@ -1494,7 +1500,7 @@ quarterback-specific lines anywhere else in your config.
 | `board.repo` | `$HOME/source/quarterback` | a checkout, which `qb-mcp` needs for the MCP server's venv |
 | `claude.enable` | `true` | do the wiring at all. Off gives you the fragment to merge yourself |
 | `claude.activationAfter` | `[ ]` | activation entries the wiring must run after. Name yours if you also merge into `settings.json` |
-| `claude.workflowDoc` | `true` | install `~/.claude/quarterback-workflow.md` and @import it. The import is conditional on the file, so turning this off leaves no dangling @import |
+| `claude.workflowDoc` | `true` | install `~/.claude/quarterback-workflow.md` and @import it from `~/.claude/CLAUDE.md`, creating that file if you have none. The import is conditional on the doc, so turning this off leaves no dangling @import |
 | `claude.registerMcp` | `"auto"` | register `qb-mcp` in `~/.claude.json`. `auto` registers it only when the interpreter it execs exists, because a server that cannot start means every session opens on a failed connection; it self-heals on the next switch. `always` for a host that builds the venv afterwards |
 
 Outside home-manager, `nix build github:prisonblues/quarterback#harness` puts the scripts in

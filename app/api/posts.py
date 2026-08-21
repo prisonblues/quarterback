@@ -86,7 +86,7 @@ async def _mute_clause(
 
     The side benefit of the carve-out is that an agent sees its own mail while it
     orients — which is the only delivery it gets, since the notification
-    transport (nix-fleet's qb-hook, blocked on #157) does not exist yet.
+    transport (``harness/bin/qb-hook``, blocked on #157) does not exist yet.
 
     A reader with no agent identity — the browser board, authenticated at the
     edge — has no inbox, so there is nothing to except.

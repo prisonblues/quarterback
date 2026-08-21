@@ -485,6 +485,13 @@
             noMcp = with' { enable = true; claude.registerMcp = "never"; };
             disabled = with' { enable = false; };
             badQuote = with' { enable = true; board.url = "x"; board.tokenCommand = "op read op://a/b's/c"; };
+            # A URL that is entirely legal and, unquoted, ends the assignment at the `&`
+            # and runs the rest as a background command every time the config is sourced.
+            queryUrl = with' {
+              enable = true;
+              board.url = "https://board.example/x?a=1&b=2";
+              board.tokenCommand = "cat /run/secrets/tok";
+            };
 
             act = c: c.home.activation.quarterbackClaudeWiring;
           in
@@ -504,9 +511,20 @@
               "claude.activationAfter does not reach the DAG entry, so a consumer cannot order us";
             # AC: a host that names a board gets the site config every wrapper reads.
             configRendered = expect
-              (pkgs.lib.hasInfix "QUARTERBACK_BASE_URL=https://board.example"
+              (pkgs.lib.hasInfix "QUARTERBACK_BASE_URL='https://board.example'"
                 wired.xdg.configFile."quarterback/config".text)
-              "the site config does not carry the board URL";
+              "the site config does not carry the board URL, single-quoted";
+            # The config file is SOURCED. An unquoted value ends at the first `&`, `;` or
+            # space, and the rest of the line is executed — silently, on every board call.
+            configQuotesTheUrl = expect
+              (pkgs.lib.hasInfix "QUARTERBACK_BASE_URL='https://board.example/x?a=1&b=2'"
+                queryUrl.xdg.configFile."quarterback/config".text)
+              "a URL with a query string is emitted unquoted, so sourcing the config runs the half after the &";
+            configQuotesTheAgent = expect
+              (pkgs.lib.hasInfix "QUARTERBACK_AGENT='zeus box'"
+                (with' { enable = true; board.url = "x"; board.tokenCommand = "t"; board.agent = "zeus box"; })
+                  .xdg.configFile."quarterback/config".text)
+              "the agent name is emitted unquoted, so a value with a space becomes a command";
             configQuotesTheTokenCommand = expect
               (pkgs.lib.hasInfix "QUARTERBACK_TOKEN_CMD='cat /run/secrets/tok'"
                 wired.xdg.configFile."quarterback/config".text)
@@ -529,6 +547,14 @@
             singleQuoteIsRefused = expect
               (builtins.any (a: !a.assertion) badQuote.assertions)
               "a tokenCommand containing a single quote is accepted, and it breaks token resolution on every call";
+            singleQuoteIsRefusedInTheUrlToo = expect
+              (builtins.any (a: !a.assertion)
+                (with' { enable = true; board.url = "https://a'b"; }).assertions)
+              "a board.url containing a single quote is accepted, and it breaks the config file it is emitted into";
+            doubleQuoteIsRefusedInTheRepo = expect
+              (builtins.any (a: !a.assertion)
+                (with' { enable = true; board.url = "x"; board.tokenCommand = "t"; board.repo = "$HOME/a\"b"; }).assertions)
+              "a board.repo containing a double quote is accepted, and it is emitted double-quoted";
             quotelessIsAccepted = expect (builtins.all (a: a.assertion) wired.assertions)
               "an ordinary tokenCommand trips an assertion";
             # And the module is inert when it is off.

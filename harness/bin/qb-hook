@@ -320,13 +320,26 @@ _remember_name() {  # _remember_name <lease response body>
   fi
 }
 
+# The HTTP status, not curl's exit code. `curl -sS` exits 0 on a 401 as readily as on a
+# 200, so a token the board has stopped accepting used to write `ok` into the health
+# beacon on every turn: the status line said quarterback was fine while every post it
+# made was being dropped. That is the exact failure qb-mcp's own self-heal exists for,
+# and the one thing a health beacon must not get wrong. `-f` is deliberately not used —
+# it would also throw away the body, which _lease needs.
+_http_ok() {   # _http_ok <status> — is this a status the board answered normally with?
+  case "$1" in 2*) return 0 ;; *) return 1 ;; esac
+}
+
 _post() {   # _post <type> <summary>
-  if curl -sS --max-time 6 "${_auth[@]}" "${_json[@]}" -X POST "$BASE/post" \
+  local code
+  code=$(curl -sS --max-time 6 "${_auth[@]}" "${_json[@]}" -X POST "$BASE/post" \
        -d "$(jq -nc --arg t "$1" --arg s "$2" --arg sid "$sid" --argjson refs "$(_refs)" \
-             '{type:$t, summary:$s, session:$sid, refs:$refs}')" >/dev/null 2>&1
-  then _health ok; else _health down; fi
+             '{type:$t, summary:$s, session:$sid, refs:$refs}')" \
+       -o /dev/null -w '%{http_code}' 2>/dev/null) || code=""
+  if _http_ok "$code"; then _health ok; else _health down; fi
 }
 _opt() {  # jq expr: merge cwd/title/recap/model when set (shared by lease + record)
+  # shellcheck disable=SC2016  # a jq program, not a shell string: $c/$t/$r/$m are jq's
   printf '%s' '(if $c!="" then {cwd:$c} else {} end) + (if $t!="" then {title:$t} else {} end) + (if $r!="" then {recap:$r} else {} end) + (if $m!="" then {model:$m} else {} end)'
 }
 _lease() {  # claim OR renew (same device re-claim == renew, per the API), carrying context
@@ -338,13 +351,21 @@ _lease() {  # claim OR renew (same device re-claim == renew, per the API), carry
   # only overwrites when a state is actually sent (see LeaseIn.state), so the
   # heartbeat leases that know nothing leave the last report — and its age —
   # alone, which is what makes the age worth reading.
-  local out
-  if out=$(curl -sS --max-time 6 "${_auth[@]}" "${_json[@]}" -X POST "$BASE/lease" \
+  #
+  # `-w '\n%{http_code}'` appends the status on its own last line, so the body and the
+  # verdict both survive one call. A 409 is counted as the board answering — a lease
+  # conflict says somebody else holds it, which is news about the lease and not about
+  # quarterback being reachable — while a 401 or a 500 is not, and used to read `ok`.
+  local out code body
+  out=$(curl -sS --max-time 6 "${_auth[@]}" "${_json[@]}" -X POST "$BASE/lease" \
        -d "$(jq -nc --arg s "$sid" --arg d "$AGENT" --arg c "$cwd" --arg repo "$repo" --arg br "$branch" \
                  --arg t "$title" --arg r "$recap" --arg m "$model" --arg st "$STATE_NOW" \
              "{session:\$s, device:\$d, ttl:1800} + $(_opt) + (if \$repo!=\"\" then {repo:\$repo} else {} end) + (if \$br!=\"\" then {branch:\$br} else {} end) + (if \$st!=\"\" then {state:\$st} else {} end)")" \
-       2>/dev/null)
-  then _health ok; _remember_name "$out"; else _health down; fi
+       -w '\n%{http_code}' 2>/dev/null) || out=""
+  code="${out##*$'\n'}"; body="${out%$'\n'*}"
+  if _http_ok "$code" || [ "$code" = 409 ]; then _health ok; else _health down; fi
+  _http_ok "$code" && _remember_name "$body"
+  return 0
 }
 _put_blob() {   # PUT the transcript blob; echo its sha (empty on any failure)
   [ -n "$tp" ] && [ -r "$tp" ] && command -v sha256sum >/dev/null 2>&1 || return 0

@@ -2,6 +2,7 @@
 # qb — quarterback CLI. See Claude Code sessions across the fleet and revive one.
 #   qb sessions          list live + resumable sessions (id, who, repo, age, size)
 #   qb resume <session>  pull the latest transcript blob + `claude --resume`
+#   qb focus <session>   focus the niri window whose process tree holds that session
 #   qb record-review     record a panel run (POST /review); JSON payload on stdin
 #   qb record-outcome    record what HAPPENED to a panel's findings
 #                        (POST /review/outcomes); JSON payload on stdin

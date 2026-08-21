@@ -95,16 +95,29 @@ day: the merge matches the command *naming* `qb-hook` rather than an exact path,
 `~/.local/bin/qb-hook` entries are replaced rather than doubled — and a doubled `PostToolUse`
 entry would run the hot path twice per tool call.
 
-Three smaller fixes rode along, all of the same shape — a wiring step that quietly did nothing
+Four smaller fixes rode along, all of the same shape — a wiring step that quietly did nothing
 on a host that had not been set up by hand first. The CLAUDE.md `@import` is now conditional on
 the doc actually being installed (it was appended unconditionally, so a host without it carried a
-line in every session's context that resolved to nothing). The MCP server is registered only when
-the interpreter it execs exists, because a registered server that cannot start means every session
-opens on a failed connection — **and** it is now registered on a host where `~/.claude.json` does
-not exist yet, which the old gate skipped: a fresh machine got the MCP server only if Claude Code
-had already run there once, so the first switch left `board_read` unavailable and said nothing.
-`--check` also refuses to bless a `settings.json` whose `hooks` is valid JSON of the wrong shape;
-reading the entries out of one errored, and with the error swallowed that read as "all wired".
+line in every session's context that resolved to nothing) — and it now **creates**
+`~/.claude/CLAUDE.md` rather than only editing one, because nothing else on a fresh host writes
+that file, so waiting for it meant the workflow doc shipped and no session ever read it. The MCP
+server is registered only when the interpreter it execs exists, because a registered server that
+cannot start means every session opens on a failed connection — **and** it is now registered on a
+host where `~/.claude.json` does not exist yet, which the old gate skipped: a fresh machine got
+the MCP server only if Claude Code had already run there once, so the first switch left
+`board_read` unavailable and said nothing. `--check` also refuses to bless a `settings.json`
+whose `hooks` is valid JSON of the wrong shape; reading the entries out of one errored, and with
+the error swallowed that read as "all wired".
+
+Two things the move surfaced in the scripts themselves. `~/.config/quarterback/config` is
+**sourced**, so every value the module renders into it is quoted now: `https://board/x?a=1&b=2`
+is an ordinary URL, and unquoted it ends the assignment at the `&` and backgrounds the rest —
+on every board call, in every hook, with the only symptom a host that never appears. And
+`qb-hook`'s health beacon reads the HTTP status rather than curl's exit code: `curl -sS` exits 0
+on a 401 exactly as it does on a 200, so a host whose bearer the board had stopped accepting
+wrote `ok` on every turn while every post it made was dropped — the one thing a health beacon
+must not get wrong, and the failure `qb-mcp`'s own self-heal exists for. A 409 still counts as
+`ok`: a lease conflict is news about the lease, not about the board being reachable.
 
 ### Nothing was evaluating the module
 
