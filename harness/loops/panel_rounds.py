@@ -806,25 +806,38 @@ class Baseline:
     #: the loop is trusting a report by the same agent whose fix pass produced
     #: it. Earliest wins on a merge, for the same reason the cycle id does.
     escalated: dict[str, int] = field(default_factory=dict)
-    #: ``(round, chars, scope)`` of the EARLIEST accepted baseline — the denominator
-    #: `review_panel.max_fix_growth` measures this round against (#165).
+    #: ``(round, chars, measurement)`` of the EARLIEST accepted baseline — the
+    #: denominator `review_panel.max_fix_growth` measures this round against (#165).
     #:
     #: The earliest, not the latest, and the round number travels with it because the
-    #: question the ceiling asks is "how much bigger is what we are reviewing now than
-    #: what this cycle STARTED from". Measured against the previous round instead, a
-    #: fix pass could triple the change three rounds running and clear the check every
-    #: time.
+    #: question the ceiling asks is "how much bigger is the change now than what this
+    #: cycle STARTED from". Measured against the previous round instead, a fix pass
+    #: could triple the change three rounds running and clear the check every time.
     #:
-    #: The scope travels too, and it is not decoration: ``diff_chars`` is
-    #: scope-dependent (see the payload's own comment on it), so under the default
-    #: `increment` scope this is round 1's whole-PR size against a later round's fix
-    #: commit, and under ``pr`` scope it is two whole-PR sizes. Both readings are worth
-    #: stopping for and they are different sentences, so whatever reports a ratio has
-    #: to be able to say which one it computed.
+    #: **A WHOLE-PR size, whatever that round REVIEWED (#298).** ``round_scope``
+    #: decides what the reviewers are asked to LOOK AT; this ceiling asks how big the
+    #: change has BECOME, and the second must not silently change meaning because the
+    #: first was configured. So the size is read off the payload's ``pr_chars``, which
+    #: every round records regardless of its scope, and off ``diff_chars`` only where
+    #: the baseline's own ``scope`` is ``pr`` and the two are the same number
+    #: (:func:`_whole_pr_chars`). Taking ``diff_chars`` unconditionally — as this did
+    #: until #298 — put a whole PR on one end and, under the default `increment`
+    #: scope, one round's fix commit on the other. That is a real quantity and not the
+    #: one that runs away: PR #188 went 185 -> 593 -> 721 churned lines, 3.90x under a
+    #: 3.0x ceiling, while its round-2 increment was 128 lines and nowhere near it.
+    #: The guard never fired.
     #:
-    #: None where no baseline was usable, or where the earliest one records no size —
-    #: a payload written before `diff_chars` existed, or a round that reviewed nothing.
-    #: The check then does not run, and says so rather than inventing a denominator.
+    #: The measurement still travels with the number, because two readings of a size
+    #: exist in this payload and whatever reports a ratio has to be able to say which
+    #: one it computed. It is the whole-PR one on both ends now by construction rather
+    #: than by luck, and printing it is what makes that checkable from the report
+    #: instead of from this comment.
+    #:
+    #: None where no baseline was usable, or where the earliest one records no
+    #: whole-PR size — a payload written before `diff_chars` existed, a round that
+    #: reviewed nothing, or an increment-scoped round written before `pr_chars`, whose
+    #: `diff_chars` is a fix commit and cannot stand in for the PR. The check then
+    #: does not run, and says so rather than inventing a denominator.
     first_reviewed: tuple[int, int, str] | None = None
     problems: list[str] = field(default_factory=list)
 
@@ -891,6 +904,40 @@ def _mtime(path: str) -> float:
         return os.path.getmtime(path)
     except OSError:
         return 0.0
+
+
+def _positive_int(value: object) -> int | None:
+    """A size a payload can be believed about, or None.
+
+    Read defensively and dropped rather than coerced, on `load_baseline`'s standing
+    rule that a bad payload costs a `problems` entry and never the review: a size
+    that is not a positive int cannot be a denominator (0 divides, a bool is an int
+    in Python, a float arrives from a hand-edited file)."""
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
+def _whole_pr_chars(payload: dict) -> int | None:
+    """How big the PR was when an earlier round read it, or None where that round's
+    payload cannot say.
+
+    The growth ceiling's denominator (#298), and deliberately NOT ``diff_chars``
+    wherever the two differ. ``diff_chars`` is the size of what a round REVIEWED, so
+    under `increment` scope it is one fix commit — and a cycle whose starting size is
+    a fix commit is measuring the wrong thing at the wrong end. ``pr_chars`` is the
+    PR's own size on every round whatever its scope, which is the single question
+    `max_fix_growth` asks.
+
+    ``diff_chars`` is still read where the baseline's own ``scope`` says it IS the
+    whole PR, which is the fallback for payloads written before ``pr_chars`` existed
+    — round 1 of a cycle is `pr`-scoped by construction (there is nothing yet to be
+    an increment from), so the ordinary cycle keeps its denominator across the
+    upgrade. An increment-scoped payload from before then carries no whole-PR size at
+    all and gets None: inventing one out of its increment is the bug this closes."""
+    return _positive_int(payload.get("pr_chars")) or (
+        _positive_int(payload.get("diff_chars"))
+        if str(payload.get("scope") or "pr") == "pr" else None)
 
 
 def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
@@ -1308,17 +1355,18 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
         b.unread_files = {f for f in unread if f and isinstance(f, str)}
         b.read_nothing = not latest.get("reviewed")
         # The growth denominator, off the EARLIEST accepted round — `ordered` is
-        # sorted by round, so its head. Read defensively and dropped rather than
-        # coerced, on this function's standing rule that a bad payload costs a
-        # `problems` entry and never the review: a size that is not a positive int
-        # cannot be a denominator (0 divides, a bool is an int in Python, a float
-        # arrives from a hand-edited file), and a missing one is the ordinary case for
-        # a round that reviewed nothing or a payload older than the field.
+        # sorted by round, so its head. A WHOLE-PR size and never that round's review
+        # target (#298): see `first_reviewed`, and :func:`_whole_pr_chars` for which
+        # field supplies it. `None` is the ordinary case for a round that reviewed
+        # nothing or a payload older than the field, and the check simply does not run.
         first_round, _first_path, first = ordered[0]
-        chars = first.get("diff_chars")
-        if (isinstance(chars, int) and not isinstance(chars, bool) and chars > 0
-                and first.get("reviewed")):
-            b.first_reviewed = (first_round, chars, str(first.get("scope") or "pr"))
+        chars = _whole_pr_chars(first)
+        if chars is not None and first.get("reviewed"):
+            # `"pr"` because that is what was just read, not because the label is
+            # decorative: both ends of this ratio are whole-PR sizes now, and the
+            # report prints the measurement so a reader can check that rather than
+            # take it on trust.
+            b.first_reviewed = (first_round, chars, "pr")
     return b
 
 
@@ -1789,5 +1837,6 @@ __all__ = [
     "_unmerged", "_judge_listing", "_parse_verdicts", "adjudicate",
     "REWORD_RATIO", "_TITLE_NOISE", "_stem", "_same_words",
     "Baseline", "_baseline_title", "_SHA_RE", "_mtime",
+    "_positive_int", "_whole_pr_chars",
     "load_baseline", "coverage_veto", "round_stop",
 ]

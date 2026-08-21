@@ -436,7 +436,9 @@ Three consequences worth knowing when you read the result:
 
 - **`diff_chars` is the increment, not the PR.** It drops sharply at round 2 and
   that is the feature working, not the PR shrinking. `scope` in the payload says
-  which it is; `context_chars` is the context prepared alongside it.
+  which it is; `context_chars` is the context prepared alongside it, and `pr_chars`
+  is the whole PR's size on every round whatever its scope — that is the one to read
+  for "how big has this change become", and the one `max_fix_growth` measures (#298).
 - **The target shrinks; the bill mostly does not.** A round still sends its target
   plus its context, so do not read a small `diff_chars` as a cheap round. What the
   scoping buys is where the reviewer's attention goes, and — when a budget is set —

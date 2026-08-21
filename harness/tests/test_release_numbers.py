@@ -61,8 +61,10 @@ exists.
 from __future__ import annotations
 
 import ast
+import importlib.util
 import re
 import subprocess
+import sys
 import tomllib
 from collections.abc import Callable
 from pathlib import Path
@@ -493,6 +495,59 @@ def test_the_readme_release_list_has_an_entry_for_the_newest_release(changelog_r
         f"README.md's release list has no `- **{newest}**` entry")
 
 
+#: `scripts/readme_releases.py`, loaded once and by path: `scripts/` is a directory of
+#: standalone tools rather than an importable package, and there is no `sys.path` entry that
+#: would make `import readme_releases` mean this repo's file rather than somebody's.
+_RENDERER = None
+
+
+def _renderer():
+    """The README list renderer, imported lazily.
+
+    Lazily because this file is also collected in sandboxes: an import at module level would
+    turn a sandbox missing `scripts/` into a collection ERROR for the whole suite, taking the
+    other twenty-odd release-metadata assertions down with it. The flake comparison below is
+    what keeps the sandbox stocked, and it can only report a missing copy if the suite it
+    guards is still collectable.
+    """
+    global _RENDERER
+    if _RENDERER is None:
+        spec = importlib.util.spec_from_file_location(
+            "readme_releases", REPO_ROOT / "scripts" / "readme_releases.py")
+        assert spec and spec.loader
+        _RENDERER = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = _RENDERER
+        spec.loader.exec_module(_RENDERER)
+    return _RENDERER
+
+
+def test_the_readme_release_list_is_in_changelog_order(readme_text, changelog_text):
+    """The list is RENDERED from CHANGELOG.md's order, and this is where drift is a failure.
+
+    It drifted for three releases in a row — `v2.61, v2.59, v2.60, v2.62, …` — and by the time
+    #296 was written nine bullets were out of place, because the ordering convention
+    was written down nowhere and checked by nothing. `74a0453` is a human pushing
+    `docs(readme): put v2.62 at the end of the release list`, which is the same class being
+    corrected by whoever happened to notice.
+
+    The renderer only ever REORDERS whole bullets, so this test failing means one of two
+    things and the message says which: the list is out of order (run
+    `scripts/readme_releases.py write`), or a release has no bullet at all, which nothing can
+    write for you.
+
+    Asserted against the renderer rather than against a second hand-rolled ordering rule here.
+    A test that re-derived the order would be the third copy of the fact — CHANGELOG, README,
+    and this file — and the third copy is the one that goes stale unnoticed."""
+    renderer = _renderer()
+    try:
+        rendered = renderer.render(readme_text, changelog_text)
+    except renderer.ListError as e:
+        pytest.fail(str(e))
+    assert rendered == readme_text, (
+        "README.md's release list is not in CHANGELOG.md's order. It is rendered, not "
+        "hand-kept: run `scripts/readme_releases.py write`")
+
+
 #: A release bullet and only a release bullet: `- **v2.33** — …`. Anchoring the closing `**`
 #: right after the number is what keeps the list's deliberate range entries out of this — a
 #: `- **v1–v2.1** —` or a `- **v3 (next)** —` simply does not match, rather than matching as
@@ -610,8 +665,15 @@ _FLAKE_CHECK = "release-metadata-tests"
 #: Copied in without being read through `REPO_ROOT`, so the copies-with-no-read half of the
 #: comparison does not report it: pytest opens the suite's own file by path, and the shared
 #: reader below is imported rather than read.
+#:
+#: `scripts/release_stamp.py` is the third: this suite never opens it, but
+#: `scripts/readme_releases.py` — which it does open — imports it by path for the one
+#: definition of what a release heading is. A sandbox holding the renderer and not the
+#: stamper errors on the import rather than on a read, which the read-side comparison
+#: cannot see.
 _COPIED_BUT_NOT_READ = frozenset({"harness/tests/test_release_numbers.py",
-                                  "harness/tests/_flake_sandbox.py"})
+                                  "harness/tests/_flake_sandbox.py",
+                                  "scripts/release_stamp.py"})
 
 #: Reading a check's block out of flake.nix, parsing its copy lines and checking they land
 #: where this suite looks, is the same job for every suite with this problem — and it was

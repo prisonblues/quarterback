@@ -187,6 +187,29 @@ def test_fix_and_review_does_not_stamp_the_release_number():
         "why may name `apply`; a code block may not.")
 
 
+def test_fix_and_land_assembles_the_changelog_before_it_stamps():
+    """A fragment names no version, so there is nothing for `apply` to rewrite until `assemble`
+    has built the entry. In that order and no other: run the other way round, `apply` sees a
+    branch with no placeholder and no release, returns 0, and the fragments land unassembled
+    with the release silently unnumbered — a green landing that shipped no entry.
+
+    Both invocations asserted in a code BLOCK, not in prose. A step nobody runs is exactly what
+    this file's sibling assertions exist to catch, and a mechanism the landing loop does not
+    invoke is a mechanism this repo has documented rather than adopted."""
+    runnable = _fenced(command("fix-and-land"))
+    assert runnable.strip(), "no code blocks were read out of the file — the fence pattern is wrong"
+    assemble = runnable.find("changelog_fragments.py")
+    stamp = runnable.find("release_stamp.py")
+    assert assemble >= 0, (
+        "fix-and-land no longer assembles changelog fragments, so a branch that wrote one lands "
+        "with its release entry still sitting in changelog.d/")
+    assert stamp >= 0, "the release-number step is gone"
+    assert assemble < stamp, (
+        "`release_stamp.py apply` runs before `changelog_fragments.py assemble`, so it stamps a "
+        "tree whose release entry has not been written yet and reports success having done "
+        "nothing")
+
+
 def test_the_two_end_to_end_commands_point_at_each_other():
     """Whichever one a user reaches first has to be able to tell them it is the wrong one. A
     one-way reference means the mistake is only recoverable from the file they did not open."""

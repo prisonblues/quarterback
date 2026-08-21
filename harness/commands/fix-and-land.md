@@ -72,16 +72,27 @@ turns the merge off.
      loop must not make on its own.
    - **READY** → step 5.
 
-   **Once READY, before you push: the release number.** A branch that ships a release writes
-   `vNEXT` and names no number, so this is where the number is decided — against `$BASE` **as it
-   stands now**, which is the only moment the answer is knowable.
+   **Once READY, before you push: the release entry, then its number.** A branch that ships a
+   release writes a `changelog.d/<issue>.<kind>.md` fragment and names no version at all, so the
+   entry is BUILT here — and then numbered against `$BASE` **as it stands now**, which is the only
+   moment the answer is knowable.
 
    ```bash
    rc=0
+   python3 scripts/changelog_fragments.py assemble || rc=$?
+   [[ $rc -eq 0 ]] || { echo "HOLD: read the error above"; exit "$rc"; }
    python3 scripts/release_stamp.py apply --onto origin/$BASE || rc=$?
    [[ $rc -eq 2 ]] && echo "HOLD: read the STOP above"
    [[ $rc -eq 0 ]] || exit "$rc"
    ```
+
+   `assemble` folds every fragment present into one `## vNEXT — <title>` entry and adds the
+   matching README bullet, then deletes what it consumed. It is a noop with no fragments, so it
+   runs unconditionally like the stamp below it. Past ONE fragment it refuses without `--title`,
+   and that refusal is a HOLD rather than something to work around: the release heading is the
+   line a reader scans, several fragments have no shared title anywhere to derive one from, and
+   picking one is a judgement about what the release MEANS — the same class as `--major`, which
+   this loop also does not make on its own.
 
    The `|| rc=$?` is not decoration. Exit 2 is a refusal carrying the sentence that repairs it, and
    under a `set -e` wrapper a bare invocation terminates the surrounding script before anything

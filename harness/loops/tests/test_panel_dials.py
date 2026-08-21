@@ -46,6 +46,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
 import panel_core  # noqa: E402  — `sh` and the dial constants live here
+import panel_scope  # noqa: E402  — the two compare calls a scoped round makes
 import panel_seats  # noqa: E402  — the resolvers live here
 import harness_rules  # noqa: E402  — DEFAULTS, the documented half
 from conftest import gh_stub  # noqa: E402
@@ -92,12 +93,19 @@ def _adjudicate(clusters, diff, model, pr, budget=None, coverage=None, cwd=None,
              for i, f in enumerate(flat)], None, "")
 
 
-def stub(monkeypatch, findings, *, config=None, diff=None, prompts=None, sonar=()):
+def stub(monkeypatch, findings, *, config=None, diff=None, prompts=None, sonar=(),
+         head="abc", increment=None, prior_diff=""):
     """Every process a run would spawn, replaced. `prompts` collects what each seat
     was actually handed, which is the only way to test `reviewer_scope` — its whole
     enforcement is the text of the brief. `sonar` seats SonarCloud with a red gate and
     those issues as its hard ones, which is the only way to reach the floors' one
-    exemption through the real `run()`."""
+    exemption through the real `run()`.
+
+    `increment` puts the round under the DEFAULT `increment` round scope: `head` moves
+    away from the anchor the baseline recorded, and the two compare round trips
+    `ReviewScope.decide` makes are answered here rather than through `gh`. Both are
+    needed together — a round whose head has not moved falls back to whole-PR scope,
+    which is the case the growth ceiling was already right about (#298)."""
     resolved = config or PANEL_CFG
     if sonar:
         resolved = {**resolved,
@@ -108,8 +116,19 @@ def stub(monkeypatch, findings, *, config=None, diff=None, prompts=None, sonar=(
     monkeypatch.setattr(panel, "load_repo_cfg", lambda name: resolved)
     monkeypatch.setattr(panel_core, "sh", gh_stub(
         meta={"title": "fix: a real bug", "additions": 3, "deletions": 1,
-              "headRefName": "h", "headRefOid": "abc"},
-        diff=diff or "diff --git a/a.py b/a.py\n+x\n"))
+              "headRefName": "h", "headRefOid": head},
+        diff=diff or "diff --git a/a.py b/a.py\n+x\n",
+        compare='{"status": "ahead", "files": [{"filename": "a.py", "patch": "@@"}]}'))
+    if increment is not None:
+        # Two ranges, told apart by their right-hand end: `anchor...head` is the fix
+        # commit (the review target), `base...anchor` is the PR as the anchoring round
+        # read it (the near-context tier).
+        monkeypatch.setattr(panel_scope, "fetch_increment",
+                            lambda repo, a, b: ((increment, "") if b == head
+                                                else (prior_diff, "")))
+        monkeypatch.setattr(panel_scope, "compare_facts",
+                            lambda *a: {"status": "ahead", "files": 1, "commits": 1,
+                                        "total_commits": 1, "merges": 0})
 
     def review(cmd_name, model, prompt, *a, **k):
         if prompts is not None:
@@ -123,9 +142,10 @@ def stub(monkeypatch, findings, *, config=None, diff=None, prompts=None, sonar=(
 
 def run(monkeypatch, capsys, tmp_path, findings, *, round_no=1, baseline=(),
         max_rounds=2, config=None, diff=None, prompts=None, scope="auto",
-        name="r", sonar=()):
+        name="r", sonar=(), head="abc", increment=None, prior_diff=""):
     """One whole panel run: the report it prints and the payload it writes."""
-    stub(monkeypatch, findings, config=config, diff=diff, prompts=prompts, sonar=sonar)
+    stub(monkeypatch, findings, config=config, diff=diff, prompts=prompts, sonar=sonar,
+         head=head, increment=increment, prior_diff=prior_diff)
     out = tmp_path / f"{name}{round_no}.json"
     assert panel.run("board", 34, post=False, json_file=str(out), record=False,
                      round_no=round_no, baseline=list(baseline),
@@ -536,6 +556,105 @@ def test_a_fix_pass_that_multiplies_the_change_stops_the_cycle(monkeypatch, caps
     assert stop["confident"] is False
     assert any("max_fix_growth" in v for v in stop["veto"])
     assert "a stop, not convergence" in report
+
+
+#: PR #188's actual round sizes, in churned lines. The PR stood at 185 when round 1
+#: read it, 593 after the first fix pass and 721 after the second — 3.21x and then
+#: **3.90x**, under a ceiling of 3.0, and the guard fired at neither. Each round after
+#: the first reviews the fix commit, so the sizes the old measurement saw are the
+#: DIFFERENCES: 408 lines and then 128.
+LINE = "+one line of fix\n"
+PR_188 = {r: "diff --git a/a.py b/a.py\n" + LINE * n
+          for r, n in ((1, 185), (2, 593), (3, 721))}
+FIX_188 = {r: "diff --git a/a.py b/a.py\n" + LINE * n for r, n in ((2, 408), (3, 128))}
+
+
+def test_the_growth_ceiling_measures_the_pr_and_not_the_round(monkeypatch, capsys,
+                                                              tmp_path):
+    """#298, on PR #188's own three rounds: 185 -> 593 -> 721 churned lines, 3.90x
+    under a 3.0x ceiling, and no stop at either round that could have made one.
+
+    `round_scope` decides what the reviewers are asked to LOOK AT; the ceiling asks how
+    big the change has BECOME. Taken off the review target, the DEFAULT `increment`
+    scope put a fix commit over the cycle's whole-PR starting size — 2.20x at round 2
+    and **0.69x at round 3**, both comfortably under any ceiling, while the PR itself
+    had nearly quadrupled. The backstop against this repo's measured 63.7% bad-fix
+    injection rate was pointed at the wrong number, so it read as configured and
+    stopped nothing.
+
+    Run through `run()` rather than against the arithmetic, because the defect was
+    never in the arithmetic: it was in which string the numerator came from, and only
+    a round that really scopes its target can tell the two apart."""
+    # What the old measurement saw, stated as a property of the fixture: both fix
+    # commits are UNDER the ceiling against the cycle's starting size, so a test that
+    # did not scope its rounds would pass against the unfixed code.
+    assert all(len(FIX_188[r]) / len(PR_188[1]) < 3.0 for r in (2, 3))
+
+    _, r1_payload, r1 = run(monkeypatch, capsys, tmp_path, [finding("P2")],
+                            round_no=1, max_rounds=4, diff=PR_188[1])
+    _, r2_payload, r2 = run(monkeypatch, capsys, tmp_path, [finding("P2")], round_no=2,
+                            baseline=[r1], max_rounds=4, diff=PR_188[2],
+                            head="def", increment=FIX_188[2], prior_diff=PR_188[1])
+    _, r3_payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")], round_no=3,
+                           baseline=[r1, r2], max_rounds=4, diff=PR_188[3],
+                           head="fed", increment=FIX_188[3], prior_diff=PR_188[2])
+
+    for round_no, payload in ((2, r2_payload), (3, r3_payload)):
+        # The rounds really did scope, or this asserts nothing at all: with a whole-PR
+        # target the numerator was already right and the test passes unfixed.
+        assert payload["scope"] == "increment", f"round {round_no}"
+        assert payload["diff_chars"] == len(FIX_188[round_no])
+        growth = payload["round_stop"]["fix_growth"]
+        assert growth["over"] is True, (
+            f"round {round_no}: the PR went {len(PR_188[1]):,} -> "
+            f"{len(PR_188[round_no]):,} chars and the ceiling read {growth['ratio']}x "
+            "— it measured the fix commit, not the PR")
+        assert growth["chars"] == len(PR_188[round_no])
+        assert growth["first_chars"] == len(PR_188[1]) and growth["first_round"] == 1
+        assert payload["round_stop"]["stop"] is True
+        assert payload["round_stop"]["confident"] is False
+        # The reported ratio still names WHICH measurement it is — two whole-PR sizes,
+        # beside the scope the round reviewed under, which is a different fact.
+        assert growth["scope"] == "pr" and growth["first_scope"] == "pr"
+        assert growth["review_scope"] == "increment"
+        assert any("whole PR" in v and "max_fix_growth" in v
+                   for v in payload["round_stop"]["veto"])
+        # Where the denominator comes from: every round records the PR's own size
+        # beside the scope-dependent size of what it reviewed.
+        assert payload["pr_chars"] == len(PR_188[round_no])
+
+    assert r1_payload["pr_chars"] == len(PR_188[1])
+    # #188's two headline numbers, to one decimal place as the report prints them.
+    assert f"{r2_payload['round_stop']['fix_growth']['ratio']:.1f}" == "3.2"
+    assert f"{r3_payload['round_stop']['fix_growth']['ratio']:.1f}" == "3.9"
+
+
+def test_the_growth_denominator_is_a_whole_pr_size_not_an_increment(tmp_path):
+    """The other end of #298, and the reason `pr_chars` is recorded at all.
+
+    A cycle whose only baseline is a SCOPED round — which `--baseline` explicitly
+    allows, and which every round 3 of a cycle passed only its predecessor gets — has a
+    `diff_chars` that is one fix commit. Read as the cycle's starting size it would put
+    a whole PR over a fix commit and stop a cycle that has not grown at all, which is
+    the same wrong-numerator error pointing the other way."""
+    scoped = tmp_path / "scoped.json"
+    scoped.write_text(json.dumps({
+        "repo": "board", "github": "acme/board", "pr": 34, "round": 2, "cycle": "cyc",
+        "reviewed": True, "scope": "increment", "head_sha": "abc",
+        "diff_chars": len(FIX_188[3]), "pr_chars": len(PR_188[3]),
+        "reviewers_ran": ["claude"], "to_fix": [], "dismissed": [],
+        "sonar_findings": []}))
+    prior = panel.load_baseline([str(scoped)],
+                                {"github": "acme/board", "pr": 34, "round": 3})
+    assert prior.first_reviewed == (2, len(PR_188[3]), "pr")
+
+    # And a payload written before `pr_chars` existed: its increment cannot stand in
+    # for a PR, so the check does not run rather than inventing a denominator.
+    old = tmp_path / "old.json"
+    old.write_text(json.dumps({**json.loads(scoped.read_text()), "pr_chars": None}))
+    assert panel.load_baseline([str(old)],
+                               {"github": "acme/board", "pr": 34,
+                                "round": 3}).first_reviewed is None
 
 
 def test_a_fix_that_did_not_multiply_the_change_is_not_stopped(monkeypatch, capsys,
