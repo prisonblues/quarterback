@@ -1136,7 +1136,24 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # payload, `skip_reason`, the per-seat `ran: false` rows, the board record and
     # `--force` all already exist below, and a second refusal branch beside them is
     # how the checks in #96 came to disagree with each other.
-    pre = preflight(review.target, budgets, panel, notes, forced=force, gate=gate)
+    # `installed` is HANDED to the verdict rather than left to be re-derived, and
+    # it is the round's own snapshot from a few dozen lines up. `seat_ceilings`
+    # resolves the predicate in its body when it is given none, so the verdict was
+    # taking a SECOND, independently-timed PATH reading — the exact thing the
+    # snapshot's own comment above says it exists to prevent ("two independently
+    # timed PATH reads can disagree; a snapshot is what makes the consumers below
+    # describe one host"). The verdict was the one consumer still outside it.
+    #
+    # `.__contains__` and not the set, because the parameter is a PREDICATE that
+    # `seat_ceilings` calls per seat. Being a bound method it is also always truthy,
+    # which matters for the `installed or seat_installed` fallback there: an empty
+    # set is falsy and would hand a host carrying no seat at all straight back to
+    # the PATH read. That case cannot arise today — the predicate is only ever asked
+    # about names in `budgets`, which is a subset of this set, so an empty snapshot
+    # means an empty `budgets` and nothing to ask about — which is why there is no
+    # test for it. It is spelled the safe way because the cost is a dunder.
+    pre = preflight(review.target, budgets, panel, notes, forced=force, gate=gate,
+                    installed=installed.__contains__)
     if pre.refused:
         # The CI gate, read on a round that dispatches nobody. It is one API call,
         # is not defeated by diff size, and costs no seat's budget — and a refusal

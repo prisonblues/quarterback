@@ -30,6 +30,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
 import panel_core  # noqa: E402
+import panel_preflight  # noqa: E402  — the verdict resolves its own host predicate
 import panel_rounds  # noqa: E402  — `load_baseline` reads the finish back
 import panel_timing  # noqa: E402
 from conftest import DEFAULT_HEAD, gh_stub  # noqa: E402
@@ -527,6 +528,11 @@ def test_a_refused_round_times_the_work_it_still_does(monkeypatch, tmp_path):
         return ("PASS", [], None)
 
     monkeypatch.setattr(panel, "review_ci", slow_ci)
+    # A box carrying no vendor CLI at all — a CI runner. The round's OWN answer to
+    # "which seats are here" is the conftest fixture's pin on `panel.seat_installed`,
+    # and the pre-flight verdict must use that snapshot rather than taking a second
+    # reading of its own. See the test below, which is what this line is here for.
+    monkeypatch.setattr(panel_preflight, "seat_installed", lambda name: False)
     payload = _run(tmp_path, name="refused")
     assert payload["skip_reason"], "this round was meant to be refused"
     t = payload["timing"]
@@ -535,3 +541,45 @@ def test_a_refused_round_times_the_work_it_still_does(monkeypatch, tmp_path):
     assert t["round_ms"] >= 280
     # And no seat ran, so there is nothing to report as having held the round.
     assert t["slowest_seat"] is None and t["gated_ms"] == 0
+
+
+def test_the_preflight_verdict_reads_the_round_s_host_snapshot_not_path(monkeypatch,
+                                                                        tmp_path):
+    """The verdict must not take its own reading of which seats this box carries.
+
+    `panel.run` resolves that once — "read ONCE per round rather than per consumer
+    … two independently-timed PATH reads can disagree, and a snapshot is what makes
+    the consumers below describe one host" — and then hands the snapshot to the
+    budgets, the argv clamp, the prompt and the payload. `seat_ceilings` resolves
+    the predicate in its own body when it is given none, so the verdict was the one
+    consumer still outside that snapshot, reading PATH for itself.
+
+    The effect is a review tool whose ANSWER depends on the machine: the same PR at
+    the same size is refused on a workstation that carries `claude` and reviewed,
+    truncated to a fifth of its diff, on a runner that does not — with nothing
+    reporting the difference. It reached this suite as a test that passed locally
+    and failed in CI, which is the mildest way it could possibly have shown up.
+
+    Pinned FALSE, not True, because that is the direction that fails open: an empty
+    host is exactly where a missing ceiling turns a refusal into a truncated
+    review."""
+    _stub(monkeypatch, cfg={**CFG, "reviewers": {"claude": {"enabled": True,
+                                                            "model": "sonnet",
+                                                            "max_diff_chars": 20}},
+                              "review_panel": {"refuse_over_cap_multiple": 2}})
+    monkeypatch.setattr(panel_preflight, "seat_installed", lambda name: False)
+    refused = _run(tmp_path, name="bare-host")
+
+    # The same round on a box that carries everything: the verdict is the same,
+    # which is the whole claim. One direction alone passes against a verdict that
+    # simply ignores the predicate.
+    _stub(monkeypatch, cfg={**CFG, "reviewers": {"claude": {"enabled": True,
+                                                            "model": "sonnet",
+                                                            "max_diff_chars": 20}},
+                              "review_panel": {"refuse_over_cap_multiple": 2}})
+    monkeypatch.setattr(panel_preflight, "seat_installed", lambda name: True)
+    stocked = _run(tmp_path, name="full-host")
+
+    assert refused["skip_reason"] == stocked["skip_reason"]
+    assert refused["preflight"]["verdict"] == stocked["preflight"]["verdict"] == "refuse"
+    assert refused["reviewers_ran"] == stocked["reviewers_ran"] == []
