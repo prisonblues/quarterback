@@ -976,7 +976,7 @@ full — including what was broken before it, which is the part no diff recovers
   to carry them, and a host that ran only the script got none of those mechanisms and no error.
   `qb-hook --version` and `qb-claude-setup --check` make the pin and the wiring answerable
   per event (#230, the precondition for #232 and #253).
-- **vNEXT** — the two guards that only fired when they were not needed. `release_stamp.py`
+- **v2.66** — the two guards that only fired when they were not needed. `release_stamp.py`
   refuses a branch that names a release number above the next free one, and refuses to number
   on top of a base carrying an unstamped `vNEXT` — and both sat below an early return that a
   branch naming its own number always takes, because "no placeholder" was standing in for
