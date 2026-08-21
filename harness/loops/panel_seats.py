@@ -1486,6 +1486,70 @@ def low_severity_budget(panel: dict, notes: list[str]) -> int | None:
     return n
 
 
+def distant_merge_lines(panel: dict, notes: list[str]) -> int | None:
+    """`distant_merge_lines` — whole lines >= 0, or ``None`` for "never distant".
+
+    How much an integration merge may put into a PR's OWN files before the round that
+    ran before it stops being a review of this PR's change (#278). Three readings,
+    all of them meant:
+
+    * a **number** is the allowance: at or under it the merge is DISTANT and the
+      earlier round stands, past it the merge is INVOLVED and its resolution is
+      unreviewed work;
+    * **0** keeps the reading and admits only a resolution that is empty over this
+      PR's own files — the mechanically distant case, and the strictest setting that
+      still saves a round;
+    * an explicit **null** switches the reading off: every head move is a review of
+      earlier code, which is the behaviour before this key existed.
+
+    So an ABSENT key inherits the default and a written `null` does not, exactly as
+    :func:`low_severity_budget` and :func:`fix_growth_limit` have it, and for
+    :func:`low_severity_budget`'s sharper reason: `0` here is a perfectly good
+    allowance and means something DIFFERENT from off — only an empty resolution is
+    distant, versus none ever is — so collapsing the two would leave one of the two
+    readings unwritable.
+
+    A bool is rejected before the integer read for :func:`resolve_max_rounds`'s
+    reason: ``isinstance(True, int)`` is True, so `distant_merge_lines: false` — the
+    obvious way a hand writes "off" — would otherwise become a one-line allowance,
+    which is not off and is not anything else either. An integral float counts and a
+    fractional one does not: half a changed line is not a quantity any diff reports.
+    Negative is refused rather than clamped — a repo that wrote one meant something,
+    and nothing here can tell which — and clamping it to 0 would silently pick the
+    STRICTEST reading for a file that may have meant the loosest."""
+    raw = panel.get("distant_merge_lines", _ABSENT)
+    if raw is _ABSENT:
+        return DEFAULT_DISTANT_MERGE_LINES
+    if raw is None or raw == "":
+        return None
+
+    def refuse(what: str) -> int | None:
+        _refuse_value("distant_merge_lines", raw,
+                      f"{what} — a whole number of changed lines an integration may "
+                      "put into this PR's own files and still leave the earlier round "
+                      "standing, 0 to require an empty resolution, or null to read "
+                      "every head move as a review of earlier code")
+        return None            # unreachable; `_refuse_value` always raises
+
+    n = None
+    if isinstance(raw, bool):
+        n = None
+    elif isinstance(raw, int):
+        n = raw
+    elif isinstance(raw, float):
+        n = int(raw) if raw.is_integer() else None
+    elif isinstance(raw, str):
+        try:
+            n = int(raw.strip())
+        except ValueError:
+            n = None
+    if n is None:
+        return refuse("a whole number")
+    if n < 0:
+        return refuse("zero or more")
+    return n
+
+
 def fix_growth_limit(panel: dict, notes: list[str]) -> float | None:
     """`max_fix_growth` — a positive multiple, or ``None`` for "do not check".
 
@@ -3079,7 +3143,8 @@ __all__ = [
     "code_access_wanted", "_fetch_tarball", "TREE_RETRY_STATUSES", "code_budget",
     "READ_ONLY_TOOLS", "claude_args",
     "QB_NO_SUBCOMMAND", "record_ask", "diff_budget", "resolve_round_scope",
-    "severity_floor", "reviewer_scope", "low_severity_budget", "fix_growth_limit",
+    "severity_floor", "reviewer_scope", "low_severity_budget",
+    "distant_merge_lines", "fix_growth_limit",
     "panel_flag",
     "resolve_max_rounds", "Dials", "resolve_dials", "_FALSEY", "_ABSENT",
     "_refuse_value",

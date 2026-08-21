@@ -453,6 +453,38 @@ Three consequences worth knowing when you read the result:
   always used to. The same list carries the caveats on a round that WAS scoped: a
   rebase between the rounds, or a merge commit inside the range.
 
+### When the range between the rounds is an integration (#278)
+
+An integration moves the head, and a moved head used to invalidate the round that
+preceded it outright — so merging `origin/main` into a branch to clear a stale base
+cost a whole panel cycle across every seat, whatever the merge contained. It no
+longer does. **The order is not applied blindly: what decides it is how much of the
+merge is genuinely new material to this PR.** The measurement is `git diff` between
+the commit the round read and the merge result, restricted to the files this PR
+touches, counted in changed lines, against `review_panel.distant_merge_lines`
+(default **20**; `0` admits only an empty resolution, `null` restores the old flat
+behaviour where any head move is a review of earlier code).
+
+Whenever the range carries a merge commit, the round says which reading it took, in
+`config_notes`. Read it — the two are different claims about coverage and you must
+never have to infer which happened:
+
+- **`round N follows an integration and takes the DISTANT reading`** — the merge
+  touched nothing this PR touches and the resolution was trivial or absent, so
+  **the earlier round STANDS**. Nothing is being claimed as reviewed that was not:
+  the merged code is not this PR's change and is not what the findings are about.
+  A round was not required on that merge's account, and `preland`'s `review` check
+  says the same thing as a WARNING rather than a HOLD.
+- **`round N follows an integration and takes the INVOLVED reading`** — a real
+  resolution in code this PR also touches. That resolution is unreviewed work and
+  it gets reviewed — **only that part**, which is what the increment already is
+  when it is pointed at the range between the round and the merge. `preland` HOLDs
+  until a round has read it.
+
+A range with **no** merge commit in it is never distant, whatever its size: that is
+a push, not an integration, and unreviewed work of this PR's own kind holds at any
+size. So does a range that could not be measured at all.
+
 Read `round_stop` from the JSON (`jq .round_stop`). It is mechanical and it is
 the decision — do not substitute your own judgement, and do not ask a reviewer
 whether another round is needed (that asks a model to predict findings it has not

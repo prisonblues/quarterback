@@ -240,6 +240,16 @@ REVIEWER_SCOPES = ("diff", "repo")
 DEFAULT_FIXER_MAY_DEFER = True
 #: Off, because the artefact it needs is not built (#92, #114). See `harness_rules`.
 DEFAULT_REQUIRE_FAILING_TEST = False
+#: Lines an integration merge may put into a PR's OWN files and still leave the
+#: round that ran before it standing as a review of this PR's change (#278). The
+#: measurement is `diff(the commit the round read, the merge result)` restricted to
+#: the files the PR itself touches; at or under this many changed lines the merge is
+#: DISTANT and the earlier round stands, past it the merge is INVOLVED and its
+#: resolution is unreviewed work. `None` switches the reading off, which is the
+#: pre-#278 behaviour where any head move is a review of earlier code; `0` admits
+#: only a resolution that is empty over this PR's files. `harness_rules` carries the
+#: argument for the number.
+DEFAULT_DISTANT_MERGE_LINES = 20
 
 # The judge's prompt holds the one component that grows with the review itself —
 # one line per reviewer account, each up to RAW_DETAIL_CHARS — so the listing
@@ -2049,6 +2059,7 @@ __all__ = [
     "DEFAULT_LOW_SEVERITY_FIX_LINES",
     "DEFAULT_MAX_FIX_GROWTH", "DEFAULT_REVIEWER_SCOPE", "REVIEWER_SCOPES",
     "DEFAULT_FIXER_MAY_DEFER", "DEFAULT_REQUIRE_FAILING_TEST",
+    "DEFAULT_DISTANT_MERGE_LINES",
     "severity_at_least", "REVIEWER_SCOPE_SLOT", "RELATED_CODE_SLOT",
     "_SCOPE_BRIEF", "reviewer_brief",
     "CLI_ABSENT", "ARGV_PROMPT_MAX_BYTES", "SEVERITIES", "MAX_LISTING_CHARS",

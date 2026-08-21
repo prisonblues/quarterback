@@ -425,6 +425,55 @@ DEFAULTS: dict = {
         # a refusal, only a note: refusing on "we could not tell" would stop a
         # round on GitHub's scheduling.
         "require_mergeable": True,
+        # How much of an integration merge is genuinely NEW material to this PR
+        # before the round that ran before it stops being a review of this PR's
+        # change (#278). The measurement is `git diff` between the commit the round
+        # read and the merge result, RESTRICTED to the files this PR itself touches,
+        # counted in changed lines. At or under this many the merge is DISTANT — it
+        # moved nothing this PR is about, so the earlier round stands and nothing is
+        # claimed as reviewed that was not. Past it the merge is INVOLVED — that
+        # resolution is unreviewed work, and it gets reviewed, only it and not the
+        # whole PR again.
+        #
+        # This is the number that decides whether an integration costs a whole panel
+        # cycle. #80 measures integration cost as quadratic in open PRs — five
+        # concurrent PRs is about ten integration merges — and at a measured 283,795
+        # tokens per `claude` seat per round, throwing a round away per integration is
+        # the ceiling on running more than one thing at a time.
+        #
+        # LINES, not file overlap and not hunk overlap, and the choice is deliberate.
+        # File overlap is a hair-trigger: `main` touching one docstring in a file this
+        # PR also edits would force a full re-review, and the shipped answer would be
+        # "re-review everything", which is what this replaces. Hunk overlap is the
+        # sharpest predictor of a genuine conflict and is the one measurement that
+        # cannot be had from the compare API cheaply or read the same way from a local
+        # `git diff`, so the two ends of this feature would answer differently. Lines
+        # of resolution is continuous — which is what makes a DIAL mean something
+        # rather than rename a boolean — it is the same number computed locally and
+        # over the API, and 0 is exactly the mechanical distant case the decision
+        # names ("a merge whose resolution is empty over this PR's files").
+        #
+        # 20, and at the LOW end on purpose. The two ways of being wrong cost wildly
+        # different amounts: reading INVOLVED when the merge was distant buys one
+        # scoped round over a small range, while reading DISTANT when it was involved
+        # ships a hand-resolved merge nobody read — and #80's `stderr_gist` incident is
+        # what that costs, a landed fix silently reverted because a function that had
+        # MOVED on one side met a `main` that already had it, git conflicting on
+        # neither and the second definition winning. So the threshold sits at the low
+        # end of what could honestly be called trivial: an import block, one side of a
+        # signature change, a version string. Past that it is code, and code gets read.
+        #
+        # `null` switches the reading off: every head move is then a review of earlier
+        # code, which is the behaviour before this key existed and the safe end of the
+        # switch for a repo that would rather pay. `0` keeps the reading and admits
+        # only a resolution that is empty over this PR's own files. A range carrying
+        # no merge commit at all is never distant whatever its size — that is a push,
+        # not an integration, and unreviewed work of this PR's own kind holds at any
+        # size. Which reading a round took is written into `config_notes`, and
+        # `preland`'s review check reports it as the reason it did or did not HOLD:
+        # a round that stood on a distant merge and one that re-reviewed a resolution
+        # are different claims about coverage, and neither may have to be inferred.
+        "distant_merge_lines": 20,
         # Dollars one code-reading seat may spend per CLI invocation, via
         # `claude --max-budget-usd`. `null` — the default — means no cap, and that
         # default is chosen for the reason `max_diff_chars` gives for its own: a

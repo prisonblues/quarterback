@@ -539,6 +539,176 @@ def _range_notes(facts: dict, since: str, head: str, round_no: int) -> list[str]
     return out
 
 
+# ------------------------------------------------------------------ #278: after an
+# integration, how much of the merge is genuinely NEW material to this PR.
+#
+# The two orders this settles. "Review, then integrate" throws the round away,
+# because any integration moves the head and `preland` reads a moved head as a
+# review of earlier code. "Integrate, then review" pays for a fresh cycle whatever
+# the merge contained. Both spend the same amount however trivial the merge was,
+# and neither looks at what actually changed.
+#
+# So neither order is applied blindly. After an integration the question is how much
+# of the merge is new material TO THIS PR, and the answer decides which order was the
+# right one for that merge:
+#
+#   DISTANT   the merge touched nothing this PR touches, and the resolution was
+#             trivial or absent. The earlier round STANDS. Nothing is claimed as
+#             reviewed that was not, because the merged code is not this PR's change
+#             and is not what the findings are about.
+#   INVOLVED  real conflicts, resolved by hand, in code this PR also touches. That
+#             resolution is unreviewed work and gets reviewed — only that part, not
+#             the whole PR again, which is `--scope increment` pointed at the range
+#             between the round and the merge rather than a new mechanism.
+#
+# WHAT IT DOES NOT SEE, stated rather than hidden. The churn below is everything the
+# range put into this PR's own files: a hand resolution, `main`'s own edits to those
+# files, and anything a fixer pushed alongside. `_range_notes` already says in as many
+# words that the last two cannot be told apart from each other, and nothing here
+# improves on that. It does not need to — every one of them is material the earlier
+# round did not read, sitting in the code this PR is about, and the reading is "how
+# much unreviewed material is in this PR's own files", which is the honest question.
+# The one thing the count alone could get wrong is calling a small PUSH an
+# integration, and that is why a range with no merge commit in it is never distant.
+
+#: The three readings of a head that moved after the round that reviewed it.
+#: `unread` is a real answer and not a failure: a range this cannot measure is
+#: reported as unmeasured and treated as involved by every caller, because a
+#: precondition that could not be read is not a satisfied one.
+MERGE_DISTANT, MERGE_INVOLVED, MERGE_UNREAD = "distant", "involved", "unread"
+
+
+def _changed_lines(chunk: str) -> int:
+    """Added plus deleted lines in one file's slice of a unified diff.
+
+    Both sides counted, not just additions. A resolution that DELETES a landed fix
+    is the #80 incident this whole reading exists to catch — a function that had
+    moved on one side meeting a `main` that already had it, git conflicting on
+    neither and the second definition winning — and an added-lines measure scores
+    that at zero and calls the merge distant.
+
+    The `+++`/`---` file headers are skipped because they are not content and
+    every file would otherwise carry two lines of churn it did not have, which at
+    a low threshold is the difference between distant and involved on a merge
+    that changed nothing.
+    """
+    n = 0
+    for line in chunk.splitlines():
+        if line.startswith(("+++", "---")):
+            continue
+        if line[:1] in ("+", "-"):
+            n += 1
+    return n
+
+
+@dataclass(frozen=True)
+class Integration:
+    """What one commit range put into a PR, in the only terms the reading needs.
+
+    Deliberately two facts and not a diff. The two callers stand in different
+    places — the panel reads GitHub's compare API and never checks anything out
+    (:func:`fetch_increment` says why), `preland` runs in a checkout and has real
+    `git` — and a shape that carried the diff itself would force one of them to
+    fetch what the other already has. What they share is the JUDGEMENT, which is
+    the part that must not drift.
+
+    ``churn`` is this PR's OWN files that the range changed, mapped to changed
+    lines; ``None`` when the range could not be read at all, with ``problem``
+    saying why. ``merges`` is how many merge commits the range contains — only
+    ever tested for being nonzero, because "was there an integration in here" is
+    the whole question it answers.
+    """
+
+    churn: dict[str, int] | None = None
+    merges: int = 0
+    problem: str = ""
+
+    @classmethod
+    def from_diff(cls, range_diff: str, pr_files: set[str], merges: int) -> Integration:
+        """An ``Integration`` from the range's unified diff and the PR's own file
+        set — the shape the panel already holds, since
+        :meth:`ReviewScope.decide` has both by the time it asks."""
+        return cls(churn={f: _changed_lines(v)
+                          for f, v in _diff_by_file(range_diff).items()
+                          if f and f in pr_files},
+                   merges=merges)
+
+    @property
+    def lines(self) -> int:
+        return sum((self.churn or {}).values())
+
+
+@dataclass(frozen=True)
+class MergeReading:
+    """Which reading a moved head got, and the sentence that says so.
+
+    ``why`` is carried rather than rebuilt by each caller on purpose. The round
+    writes it into `config_notes` and `preland` writes it into the check's
+    reasons or warnings, and those are two claims about the same coverage: a
+    reader comparing a payload against a gate verdict must not have to work out
+    whether the two were talking about the same merge.
+    """
+
+    verdict: str = MERGE_UNREAD
+    lines: int = 0
+    files: tuple[str, ...] = ()
+    limit: int | None = DEFAULT_DISTANT_MERGE_LINES
+    why: str = ""
+
+    @property
+    def distant(self) -> bool:
+        """The one question every caller asks. `unread` is NOT distant, which is
+        what makes an unreadable range fail toward the expensive answer."""
+        return self.verdict == MERGE_DISTANT
+
+
+def merge_involvement(step: Integration, limit: int | None,
+                      span: tuple[str, str]) -> MergeReading:
+    """How involved was the merge — the whole of #278's judgement, in one place.
+
+    ``limit`` is `review_panel.distant_merge_lines`, resolved by
+    :func:`panel_seats.distant_merge_lines`. ``None`` is the reading switched
+    off, and it produces INVOLVED rather than UNREAD: nothing failed, the repo
+    asked for the pre-#278 behaviour where any head move is a review of earlier
+    code, and the sentence says which of the two happened.
+
+    Never raises and takes no I/O. Both callers build the :class:`Integration`
+    from something that already failed softly, so the failure has already been
+    turned into ``churn=None`` by the time it arrives here.
+    """
+    where = f"{(span[0] or '')[:8]}...{(span[1] or '')[:8]}"
+    if step.churn is None:
+        return MergeReading(MERGE_UNREAD, limit=limit, why=(
+            f"whether {where} is a distant integration could not be measured"
+            + (f" ({step.problem})" if step.problem else "")))
+    files = tuple(f for f, n in sorted(step.churn.items()) if n)
+    lines = step.lines
+    if limit is None:
+        return MergeReading(MERGE_INVOLVED, lines, files, None, why=(
+            "`distant_merge_lines` is null for this repo, so no head move is read as "
+            f"distant and the reading was not taken — {where} put {lines:,} line(s) "
+            "into this PR's own files"))
+    if not step.merges:
+        # Size is not consulted, and that is the point. A range with no merge in it
+        # is a PUSH, and a push into this PR's own files is unreviewed work of
+        # exactly the kind the round exists to read, however little of it there is.
+        # Reading a small push as distant is the one way this measurement could
+        # weaken a gate rather than sharpen it.
+        return MergeReading(MERGE_INVOLVED, lines, files, limit, why=(
+            f"{where} carries no merge commit, so it is a push and not an integration "
+            f"— {lines:,} line(s) across {len(files)} of this PR's own file(s) went "
+            "unreviewed, and size does not excuse a push"))
+    if lines > limit:
+        return MergeReading(MERGE_INVOLVED, lines, files, limit, why=(
+            f"the integration {where} changed {lines:,} line(s) across {len(files)} of "
+            f"this PR's own file(s), past the {limit}-line `distant_merge_lines` limit "
+            "— an INVOLVED merge, and that resolution is unreviewed work"))
+    return MergeReading(MERGE_DISTANT, lines, files, limit, why=(
+        f"the integration {where} changed {lines:,} line(s) of this PR's own files, at "
+        f"or under the {limit}-line `distant_merge_lines` limit — a DISTANT merge, so "
+        "the round that ran before it is still a review of this PR's change"))
+
+
 def _is_commitish(value: str) -> bool:
     """Does this look like a SHA — abbreviated or full? Used to decide whether two
     anchors can be compared by prefix, which is only meaningful for hex."""
@@ -742,7 +912,9 @@ class ReviewScope:
     @classmethod
     def decide(cls, want: str, round_no: int, diff: str,
                commits: tuple[str, str], gh_repo: str, base: str = "",
-               since_round: int | None = None) -> tuple[ReviewScope, list[str]]:
+               since_round: int | None = None,
+               distant_lines: int | None = DEFAULT_DISTANT_MERGE_LINES
+               ) -> tuple[ReviewScope, list[str]]:
         """Pick this round's scope and fetch what it needs, as ``(scope, notes)``.
 
         ``commits`` is (the anchor the previous round reviewed, this round's
@@ -750,7 +922,11 @@ class ReviewScope:
         the caller passed one, else the ``head_sha`` of the latest baseline, else
         "". ``since_round`` is the round that supplied it, when a baseline did;
         ``base`` is the PR's base branch, which the near context tier is taken
-        from.
+        from. ``distant_lines`` is `review_panel.distant_merge_lines` (#278) and
+        buys one sentence rather than a branch: when the range carries an
+        integration merge, the round SAYS which reading that merge got and why,
+        so a payload that stood on a distant merge and one that re-read a hand
+        resolution are not left to be told apart by inference.
 
         **Every fallback to whole-PR scope produces a note.** A round that says
         it reviewed the increment and in fact re-read the PR is wrong about the
@@ -838,6 +1014,26 @@ class ReviewScope:
         facts = compare_facts(gh_repo, anchor, head)
         said = _count(facts, "files")
         caveats.extend(_range_notes(facts, anchor, head, round_no))
+        # #278's reading, and it goes into `notes` rather than into `caveats`
+        # BECAUSE every guard below can still send this round back to the whole PR.
+        # A caveat describes the review target and is discarded with it; this is a
+        # fact about the MERGE, it stays true whichever way the fallbacks go, and it
+        # is the one thing a reader must not have to infer — a round that stood on a
+        # distant merge and one that re-read a hand resolution are different claims
+        # about coverage.
+        merges = _count(facts, "merges")
+        reading = merge_involvement(Integration.from_diff(raw, mine, merges),
+                                    distant_lines, (anchor, head))
+        if merges and reading.verdict != MERGE_UNREAD:
+            notes.append(
+                f"round {round_no} follows an integration and takes the "
+                f"{reading.verdict.upper()} reading: {reading.why}"
+                + (". No round was required on this merge's account — read `scope` "
+                   "for what this one looked at instead"
+                   if reading.distant else
+                   ". Read `scope` for whether this round's target was that "
+                   "resolution, or the whole PR again past one of the fallbacks "
+                   "below"))
         if said > len(raw_files) or said >= COMPARE_FILE_CAP:
             # The one class of degraded range that must not be reviewed anyway. A
             # truncated compare is a 200 with files missing from it: it is smaller
@@ -1350,7 +1546,9 @@ __all__ = [
     "_base_tip_now", "PROVENANCE", "_provenance",
     "DIFF_PREAMBLE", "_diff_by_file", "_diff_subset", "_fit_parts",
     "fetch_increment", "COMPARE_FILE_CAP", "_count", "compare_facts",
-    "_range_notes", "_is_commitish", "_is_ref", "_same_commit",
+    "_range_notes", "MERGE_DISTANT", "MERGE_INVOLVED", "MERGE_UNREAD",
+    "_changed_lines", "Integration", "MergeReading", "merge_involvement",
+    "_is_commitish", "_is_ref", "_same_commit",
     "_prior_round", "PR_SCOPE_HEADER", "INCREMENT_BRIEF", "JUDGE_INCREMENT_BRIEF",
     "ReviewScope", "_cut_note", "_cut_note_reserve", "_SONAR_SEV",
     "_sonar_findings", "_try", "review_sonarqube", "ci_brief",

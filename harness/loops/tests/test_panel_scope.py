@@ -532,8 +532,12 @@ def test_a_merge_in_the_range_is_reported_because_no_filter_can_remove_it(monkey
     files it DOES touch cannot be, and a reviewer reads them as the fixer's work.
     The code already knew that and said nothing — this is the saying."""
     _, notes = decide(monkeypatch, facts={"merges": 2})
-    assert "2 merge commit(s)" in notes[0]
-    assert "cannot be told apart from the fixer's" in notes[0]
+    # Not `notes[0]`: a range carrying a merge also carries #278's distant/involved
+    # reading, which is emitted first because it is a fact about the merge rather
+    # than a caveat about the target.
+    merged = [n for n in notes if "2 merge commit(s)" in n]
+    assert len(merged) == 1
+    assert "cannot be told apart from the fixer's" in merged[0]
 
 
 def test_a_non_ancestor_range_is_reported_rather_than_reviewed_as_a_delta(monkeypatch):
@@ -601,7 +605,14 @@ def test_no_caveat_about_the_increment_survives_a_fallback(monkeypatch):
     big = chunk("fix.py", "+x" * len(PR)) + chunk("gone.py", "-was here")
     got, notes = decide(monkeypatch, increment=big, facts={"merges": 2, "files": 2})
     assert got.scope == "pr"
-    assert len(notes) == 1 and "reviewed the whole PR" in notes[0]
+    assert sum("reviewed the whole PR" in n for n in notes) == 1
+    # No caveat about the discarded target survives. #278's reading does, and is
+    # deliberately not a caveat: it describes the MERGE, which is true whichever
+    # scope the round ended up with, and a reader must never have to infer whether
+    # a round stood on a distant merge or re-read a hand resolution.
+    assert not any("left out of the review target" in n for n in notes)
+    assert not any("2 merge commit(s)" in n for n in notes)
+    assert sum("follows an integration and takes the" in n for n in notes) == 1
     # Nothing was lost when the increment IS used: the same range, under the size
     # guard's ceiling, still carries both caveats.
     small = chunk("fix.py", "+the fix") + chunk("gone.py", "-was here")
