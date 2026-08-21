@@ -487,6 +487,22 @@ is no `origin/main` for it to compare against, and it reads CHANGELOG headings a
 for a repeated number. The repair is in the message: put *your* entry back to `## vNEXT` and its
 bullet back to `- **vNEXT** — …`, then run `apply` again.
 
+**A branch that hard-codes its number is refused too, and used to not be.** Both that check and
+the one below sat under an early return taken whenever the branch has no `vNEXT` left to rewrite —
+and "no placeholder" is not "ships no release": a branch that writes `## v2.40` by hand ships one
+and has no placeholder, so it met neither. It is judged on the number rather than on who typed it,
+because once `apply` has run there is no placeholder left either, and a branch it stamped is
+byte-identical to one that hard-coded the same number. So a branch with nothing left to stamp may
+carry the next number and no other; a branch that still has a placeholder may carry none at all,
+since stamping would then write the number in twice.
+
+**An unstamped `vNEXT` at the base stops the branches that need a number, and only those.** It is
+still a refusal when this branch ships a release — you cannot hand out `max+1` while the base holds
+an entry that is going to want a number — and it is a warning for a branch that ships none, which
+would otherwise be held over somebody else's skipped step in a file it does not touch. The refusal
+names the ref to repair from rather than describing how to find one: every other use of this tool
+passes `--onto origin/main`, and this is the one case where `origin/main` is the broken thing.
+
 "A number this branch added" is asked of the fork point, not of the heading text. Editing a
 released entry — fixing a typo, rewrapping a long title — is not a collision, and two branches
 that both wrote the same boilerplate title still are one. Two tokens, because nothing else on the branch was ever written in terms of the
@@ -947,6 +963,15 @@ full — including what was broken before it, which is the part no diff recovers
   to carry them, and a host that ran only the script got none of those mechanisms and no error.
   `qb-hook --version` and `qb-claude-setup --check` make the pin and the wiring answerable
   per event (#230, the precondition for #232 and #253).
+- **vNEXT** — the two guards that only fired when they were not needed. `release_stamp.py`
+  refuses a branch that names its own release number, and refuses to number on top of a base
+  carrying an unstamped `vNEXT` — and both sat below an early return that a branch naming its
+  own number always takes, because "no placeholder" was standing in for "ships no release".
+  Measured across an eight-PR queue in #167, the guard fired for none of them. Both are
+  hoisted, judging the NUMBER rather than its author, since `apply`'s own output is
+  byte-identical to a hard-coded one. A broken base no longer holds branches that ship no
+  release (#168) — those are warned — and the refusal that remains names the ref to repair
+  from instead of describing how to find it.
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
   roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps

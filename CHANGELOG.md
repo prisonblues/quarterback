@@ -11,6 +11,41 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
+## vNEXT — the two guards that only fired when they were not needed
+
+`release_stamp.py` has two checks that exist for the same failure — a branch naming its own
+release number — and both sat below an early return that a branch naming its own release number
+always takes.
+
+`build_plan` returns as soon as there is no `vNEXT` left to rewrite, because `apply` has to be a
+noop on a branch shipping no release: `fix-and-land` runs it unconditionally and wires exit 2
+straight to a HOLD. The bug is that **"no placeholder" was standing in for "ships no release"**,
+and those are different states. A branch that hard-codes `## v2.40` ships a release *and* has no
+placeholder. It returned early, so neither the "a branch does not pick its own number" refusal nor
+the "the base carries an unstamped entry" refusal ever ran. Measured across an eight-PR queue in
+#167: all eight hard-coded a number, none carried a placeholder, and the guard fired for none of
+them — inert across the whole queue it was written for.
+
+Both checks are above the early return now, which needed the question they turn on to be answered
+differently. **The number is judged, not its author.** After `apply` runs there is no placeholder
+left either, so a branch it stamped is byte-identical to one that hard-coded the same number and
+nothing in the tree tells them apart — refusing every number above the base would make `apply`
+refuse its own output. So a branch with nothing left to stamp may carry the next number and no
+other, and a branch that still holds a placeholder may carry none at all, since stamping would
+write the number in twice.
+
+**And one skipped stamp no longer takes out every branch at once** (#168). An unstamped
+placeholder on `main` is a real refusal for a branch that needs a number — you cannot hand out
+`max+1` while the base holds an entry that is going to want one — and it is noise for a branch
+that ships no release, which was being held over somebody else's mistake in a file it does not
+touch. That one is warned, and carries on. The refusal that remains **names the ref to repair
+from**, walking back to the last commit whose tree is clean, instead of describing how to find it:
+every other invocation of this tool passes `--onto origin/main`, this is the one case where
+`origin/main` is the broken thing, and somebody reaching for the usual command under time pressure
+got the same refusal and concluded the tool was stuck.
+
+Two of the last three releases landed unstamped and needed their own repair PRs.
+
 ## v2.65 — the hm-module wires the board in, not just the commands
 
 `homeManagerModules.quarterback-harness` said it "wires the harness into `~/.claude` and

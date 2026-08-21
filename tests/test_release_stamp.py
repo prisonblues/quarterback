@@ -1552,3 +1552,158 @@ def test_a_path_with_a_newline_in_it_does_not_break_the_base_scan(repo, capsys):
     place(repo)
     assert run(repo, "preflight", "--onto", "main") == 2
     assert "itself carries an unstamped" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# a branch that hard-codes its number reaches the checks written to catch it (#167, #168)
+#
+# Both checks used to sit below `if not plan.sites: return plan`, and "no placeholder" was
+# standing in for "ships no release". Those are different states: a branch that hard-coded
+# its number ships a release AND has no placeholder, so it returned early and met neither.
+
+
+def test_a_hand_written_number_is_refused_even_with_no_placeholder_to_stamp(repo, capsys):
+    """#167's own worked example: `## v<base+7>`, no `vNEXT` anywhere, must be refused.
+
+    This is the shape the check existed for and could not see. Measured across an eight-PR
+    queue in the issue: all eight hard-coded a number, none carried a placeholder, and the
+    guard fired for none of them — so it was inert exactly when it was needed.
+    """
+    text = (repo / "CHANGELOG.md").read_text()
+    write(repo, "CHANGELOG.md", text.replace("## v2.33", entry("v2.40") + "## v2.33", 1))
+    commit(repo, "a branch that named its own release")
+    assert run(repo, "preflight", "--onto", "main") == 2
+    err = capsys.readouterr().err
+    assert "already has an entry for v2.40" in err
+    assert "does not exist at main" in err
+    assert "next free number is v2.34" in err, "say what it should have been, not only what is wrong"
+
+
+def test_re_running_apply_on_a_branch_it_already_stamped_is_still_a_noop(repo, capsys):
+    """The reason the refusal above is about the NUMBER and not about who typed it.
+
+    After `apply` runs there is no placeholder left, so a branch it stamped is byte-identical
+    to one that hard-coded the same number — nothing in the tree tells them apart. Refusing
+    every number above the base would therefore make `apply` refuse its own output, and
+    `fix-and-land` runs it unconditionally. The next number is the one legitimate reading.
+    """
+    place(repo)
+    assert run(repo, "apply", "--onto", "main") == 0
+    assert "stamped v2.34" in capsys.readouterr().out
+    commit(repo, "work, stamped v2.34")
+
+    assert run(repo, "apply", "--onto", "main") == 0
+    assert "noop" in capsys.readouterr().out
+
+
+def test_a_placeholder_beside_a_hand_written_number_is_still_refused(repo, capsys):
+    """…and the leniency above is scoped to branches with nothing left to stamp.
+
+    With a placeholder still present the branch has something to stamp AND has already
+    written a number down, so stamping would put the number in twice. That holds for the
+    next number as much as for any other, which is what keeps the pre-existing refusal.
+    """
+    place(repo)
+    text = (repo / "CHANGELOG.md").read_text()
+    write(repo, "CHANGELOG.md", text.replace("## v2.33", entry("v2.34") + "## v2.33", 1))
+    assert run(repo, "preflight", "--onto", "main") == 2
+    assert "already has an entry for v2.34" in capsys.readouterr().err
+
+
+def test_a_hand_written_number_also_detects_a_broken_base(repo, capsys):
+    """#167's "second effect, same cause": the base check sat below the same early return.
+
+    A branch with no placeholder did not merely skip the ordering check — it also failed to
+    notice that `main` carries an unstamped entry, which is the one thing that makes its
+    number wrong.
+    """
+    git(repo, "checkout", "-q", "main")
+    place(repo)
+    commit(repo, "a release landed on main without being stamped")
+    git(repo, "checkout", "-q", "work")
+
+    text = (repo / "CHANGELOG.md").read_text()
+    write(repo, "CHANGELOG.md", text.replace("## v2.33", entry("v2.34") + "## v2.33", 1))
+    commit(repo, "a branch that named its own release")
+    assert run(repo, "preflight", "--onto", "main") == 2
+    assert "carries an unstamped" in capsys.readouterr().err
+
+
+def test_a_broken_base_does_not_hold_a_branch_that_ships_no_release(repo, capsys):
+    """#168's blast radius: one skipped stamp must not take out every branch at once.
+
+    The refusal is right for a branch that needs a number and noise for one that does not,
+    and `fix-and-land` wires exit 2 straight to a HOLD — so refusing both held every branch
+    in the repo over somebody else's mistake, in a file it does not touch. It is told, and
+    it carries on.
+    """
+    git(repo, "checkout", "-q", "main")
+    place(repo)
+    commit(repo, "a release landed on main without being stamped")
+    git(repo, "checkout", "-q", "work")
+
+    write(repo, "docs.md", "# how\n\nA branch that ships no release.\n")
+    commit(repo, "docs only")
+    assert run(repo, "apply", "--onto", "main") == 0
+    out = capsys.readouterr()
+    assert "noop" in out.out
+    assert "carries an unstamped" in out.err, "silence would leave main broken with nobody told"
+    assert "ships no release" in out.err
+
+
+def test_the_broken_base_refusal_names_a_ref_instead_of_describing_one(repo, capsys):
+    """#168: the repair is the opposite of every other invocation of this tool.
+
+    Every normal use passes `--onto origin/main`, and here `origin/main` is the broken thing;
+    the old message described how to find a ref that predates the unstamped entry. Someone
+    hitting this under time pressure reaches for the usual command, gets the same refusal and
+    concludes the tool is stuck — so the ref is resolved and the command printed ready to run.
+    """
+    git(repo, "checkout", "-q", "main")
+    before = git(repo, "rev-parse", "HEAD").strip()
+    place(repo)
+    commit(repo, "a release landed on main without being stamped")
+    git(repo, "checkout", "-q", "work")
+
+    place(repo)
+    assert run(repo, "apply", "--onto", "main") == 2
+    err = capsys.readouterr().err
+    assert "apply --onto" in err
+    assert before[:12] in err, f"the resolved ref itself, not prose about finding it: {err}"
+
+
+def test_the_repair_ref_is_the_last_commit_before_the_placeholder_arrived(repo, capsys):
+    """It walks back to a base that is actually clean, not merely to the first parent.
+
+    Two unstamped commits in a row is the realistic shape — a release lands unstamped, work
+    carries on top of it — and `HEAD^` there is still broken, so a command built from it
+    would fail with the same message it was handed out to fix.
+    """
+    git(repo, "checkout", "-q", "main")
+    clean = git(repo, "rev-parse", "HEAD").strip()
+    place(repo)
+    commit(repo, "a release landed on main without being stamped")
+    write(repo, "after.md", "# work carried on regardless\n")
+    commit(repo, "another commit on top of the broken one")
+    git(repo, "checkout", "-q", "work")
+
+    place(repo)
+    assert run(repo, "apply", "--onto", "main") == 2
+    assert clean[:12] in capsys.readouterr().err
+
+
+def test_a_branch_stamped_as_a_major_is_not_refused_by_a_plain_rerun(repo, capsys):
+    """`--major` is a flag and never an inference, and `fix-and-land` runs `apply` without it.
+
+    So a branch stamped `v3` meets the "did somebody pick their own number" check again on the
+    next plain run, with `next_release` answering v2.34. Allowing only the minor bump would
+    refuse every major release branch on its second run — turning the noop that caller depends
+    on into a HOLD.
+    """
+    place(repo)
+    assert run(repo, "apply", "--onto", "main", "--major") == 0
+    assert "stamped v3" in capsys.readouterr().out
+    commit(repo, "work, stamped v3")
+
+    assert run(repo, "apply", "--onto", "main") == 0
+    assert "noop" in capsys.readouterr().out
