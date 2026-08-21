@@ -201,6 +201,15 @@ jobs:
   flake:
     name: flake checks
     runs-on: ubuntu-latest
+    # Least privilege, and this job is the one in this file that most needs it: it
+    # evaluates and BUILDS nix code that arrives with the pull request, through a
+    # third-party action that runs before any code of ours. The SHA pin below covers
+    # the action being repointed; it says nothing about what the token that action
+    # holds can do. A repository whose default `GITHUB_TOKEN` is still read/write —
+    # the common default — hands that write scope to a `flake.nix` written by whoever
+    # opened the PR. Checkout is all this job needs.
+    permissions:
+      contents: read
     # The jobs above and this one do NOT run the same thing, and that is the
     # point rather than duplication (#179). They run `uv run pytest` against a
     # normal checkout; the flake runs the same suites inside a sandbox holding
@@ -245,6 +254,16 @@ jobs:
           # neither, and the job's failure names the config rather than the flake.
           extra_nix_config: |
             experimental-features = nix-command flakes
+          # Flake inputs are `github:` refs, and the installer fetches its own
+          # release metadata the same way. Unauthenticated, both share the runner
+          # IP's 60 requests/hour with every other job on that host, and the cost
+          # lands squarely here: the deliberate absence of a nix store cache
+          # (reasoned about above) means this job re-fetches on every single run.
+          # The symptom is an intermittent `HTTP 403: rate limit exceeded` that has
+          # nothing to do with the diff — and a required check that fails for
+          # reasons the PR did not cause is one reviewers learn to re-run without
+          # reading, which is worse than not having it.
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
 
       # DISCOVERED and not listed, and it FAILS when it finds nothing — the same
       # rule as the harness job above, for a sharper reason: `nix flake check` on
@@ -287,7 +306,16 @@ jobs:
             echo "::error::flake.nix declares no checks for $system — \`checks.$system\` could not be evaluated at all, so it was removed or renamed rather than emptied. nix said: $(tr '\n' ' ' <"$eval_err")"
             exit 1
           fi
-          count=$(jq 'length' <<<"$names")
+          # Caught, for the same reason the eval above is. `set -e` would end the
+          # step here on a bare jq message — no jq on the runner, or a `names` that
+          # is not a well-formed JSON array — and the annotation is the entire
+          # purpose of this step, so every way the names can fail to arrive has to
+          # produce one. A step that dies silently reports the same as a check set
+          # that vanished, which is the confusion this job exists to remove.
+          if ! count=$(jq 'length' <<<"$names" 2>/dev/null); then
+            echo "::error::the flake's check names could not be counted — \`nix eval\` returned something that is not a JSON array, or jq is missing from this runner. nix returned: $(tr -d '\r' <<<"$names" | tr '\n' ' ' | head -c 300)"
+            exit 1
+          fi
           if [[ "$count" -eq 0 ]]; then
             echo "::error::flake.nix declares no checks for $system — they were removed, or this job is now a no-op reporting green."
             exit 1
@@ -296,7 +324,20 @@ jobs:
           # jq that fails inside `$(...)` in printf's argument list still leaves
           # printf exiting 0, so `set -e` never sees it and the job carries on
           # reporting an empty set of names as though it had found none.
-          joined=$(jq -r 'join(", ")' <<<"$names")
+          #
+          # `map(@json)` and not a bare `join`, because these names are attribute
+          # names out of the pull request's own flake.nix and this line goes into a
+          # log that Actions PARSES: a line beginning `::` is a workflow command, so
+          # a check named with an embedded newline and `::error::` forges an
+          # annotation — or `::add-mask::`, or an `::error::` claiming the opposite
+          # of what happened. @json renders each name as a JSON string literal, so a
+          # newline arrives as the two characters `\n` and no name can ever start a
+          # line. The quotes are a readability gain as well: an empty or
+          # space-padded name is visible instead of invisible.
+          if ! joined=$(jq -r 'map(@json) | join(", ")' <<<"$names" 2>/dev/null); then
+            echo "::error::the flake's check names could not be rendered for the log, though $count of them were counted — jq failed on a document it had just parsed."
+            exit 1
+          fi
           printf 'running %d flake check(s) on %s: %s\n' "$count" "$system" "$joined"
 
       # -L so the pytest output of a failing suite is in this log. Without it a

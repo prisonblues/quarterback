@@ -346,6 +346,89 @@ def test_the_discovery_step_names_the_checks_it_found(tmp_path):
     assert re.search(r"\b2\b[^\n]*check", proc.stdout), proc.stdout
 
 
+def test_the_flake_job_asks_for_no_more_token_than_it_needs():
+    """The job builds nix code that arrived with the pull request, through a
+    third-party action that runs before any code of ours.
+
+    The SHA pin covers that action being repointed; it says nothing about what the
+    token the action holds is allowed to do. With no `permissions:` block the job
+    inherits the repository default, which is commonly read/write — so a `flake.nix`
+    written by whoever opened the PR gets built with a write-capable token in the
+    environment. The pin was the tested half of the defence and the scope was the
+    untested half, which is the wrong way round: this one costs a line.
+    """
+    permissions = _flake_job().get("permissions")
+    assert permissions is not None, (
+        "the flake job declares no `permissions:`, so it runs PR-controlled build "
+        "code with whatever the repository default grants")
+    if isinstance(permissions, str):                    # `permissions: read-all`
+        assert permissions in {"read-all", "{}"}, permissions
+        return
+    assert permissions.get("contents") == "read", (
+        f"the flake job asks for contents: {permissions.get('contents')!r}; it needs "
+        "no more than read to check out and build")
+    writes = {scope: level for scope, level in permissions.items() if level == "write"}
+    assert not writes, f"the flake job asks for write on {sorted(writes)}"
+
+
+def test_the_nix_installer_is_given_a_token_for_its_github_fetches():
+    """Flake inputs are `github:` refs and the installer fetches its own release
+    metadata the same way. Unauthenticated, those share the runner IP's 60
+    requests/hour with every other job on the host — and this job re-fetches on every
+    run, because it deliberately keeps no nix store cache. The symptom is an
+    intermittent 403 that has nothing to do with the diff, on a job the comment
+    invites branch protection to make required. A required check that fails for
+    reasons the PR did not cause is one reviewers learn to re-run without reading."""
+    with_block = _nix_install_step(_flake_job()).get("with") or {}
+    token = str(with_block.get("github_access_token", ""))
+    assert "secrets.GITHUB_TOKEN" in token, (
+        "install-nix-action is invoked with no github_access_token, so every flake "
+        f"input fetch is anonymous and rate-limited by runner IP: {with_block!r}")
+
+
+@needs_jq_and_bash
+def test_a_reply_that_is_not_a_json_array_is_annotated_rather_than_bare(tmp_path):
+    """RED/GREEN: `count=$(jq 'length' ...)` was unguarded, so `set -e` ended the step
+    on jq's own message before any `echo "::error::"` could run.
+
+    The step annotates two ways for the checks to disappear and explains at length why
+    `joined=` is assigned on its own line — but the count had the same exposure and no
+    cover. The job then goes red with a bare jq error, which reads as a broken runner
+    rather than as what it is. Producing an annotation for every way the names can fail
+    to arrive is the step's whole purpose."""
+    proc = _run_discovery(tmp_path, "not json at all")
+    assert proc.returncode != 0, "a reply jq cannot parse was treated as a check set"
+    assert "::error::" in proc.stdout, (
+        "the step died on jq's exit status with nothing annotated, so the job's log "
+        f"names jq instead of the flake: stdout={proc.stdout!r} stderr={proc.stderr!r}")
+
+
+@needs_jq_and_bash
+def test_a_check_name_cannot_forge_a_workflow_command(tmp_path):
+    """RED/GREEN: check names are attribute names out of the PULL REQUEST's own
+    flake.nix, and they were printed through a bare `jq -r join` into a log that
+    Actions parses.
+
+    A line beginning `::` is a workflow command, so a check named with an embedded
+    newline followed by `::error::` forges an annotation — or `::add-mask::` to blank
+    out later output, or an `::error::` asserting the opposite of what happened, on a
+    job whose entire job is to be believed about whether the checks ran. `@json`
+    renders each name as a JSON string literal, so a newline arrives as the two
+    characters `\n` and no name can begin a line."""
+    forged = r'["worktree-tests","evil\n::error::the checks all passed"]'
+    proc = _run_discovery(tmp_path, forged)
+    assert proc.returncode == 0, proc.stderr
+    # The real annotation-bearing lines are the step's own. Nothing the flake named
+    # may start one.
+    for line in proc.stdout.splitlines():
+        assert not line.lstrip().startswith("::"), (
+            f"a check name forged a workflow command line: {line!r}")
+    # And the name is still legible in the log rather than dropped — the point is to
+    # neutralise it, not to hide that it is there.
+    assert "evil" in proc.stdout, proc.stdout
+    assert "worktree-tests" in proc.stdout, proc.stdout
+
+
 @needs_jq_and_bash
 def test_the_discovery_step_derives_the_system_rather_than_naming_one(tmp_path):
     """The stub refuses any flakeref that does not name the system it reported, so this
