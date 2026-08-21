@@ -616,6 +616,17 @@ Then the part that is new, and is the point of running more than one round:
   than either verdict on its own.
 - **Flagged for re-review:** findings whose reporter said the FIX needs re-reading,
   and whether the following round did find something there.
+- **Wall clock:** each round's `timing` block, one line per round: the round's
+  total, how it split across `setup` / `seats` / `judge` / `wrapup`, which seat was
+  slowest, and `gated_ms` — how long the round sat on that one seat with every
+  other seat finished and its findings undelivered. Then the fix phase between the
+  rounds, from `timing.fix`. Say `source` with it: `payload` is measured end to
+  end, `commits` is a lower bound derived from the two rounds' head commit times,
+  and a `null` with a note is not a fast fix phase, it is an unmeasured one.
+  Report the numbers; do not act on them here. **This cycle is where the evidence
+  for or against "the fixer is the slow part" is produced** (#192), and until
+  several cycles have produced it the answer is a hunch — the panel's own hunch
+  had the judge and the gating wait folded into a phase nobody had measured.
 - **Escalated:** any finding a fixer reported as the approach being wrong rather
   than the code, with its premise, what it explains, what removing it would cost,
   and its `--ask` verdict if one was run. Say it even when the answer is none. This

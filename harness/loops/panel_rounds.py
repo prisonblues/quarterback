@@ -25,6 +25,9 @@ import panel_scope               # noqa: F401
 # have been a claim about another module's current contents rather than a property
 # of this file.
 from collections.abc import Iterable          # noqa: E402
+# Named here for the same reason, and used by exactly one check: a baseline's
+# recorded finish has to be a FINITE instant, and `json` parses a bare `Infinity`.
+import math                                   # noqa: E402
 
 # ----------------------------------------------------------------------------- synthesis
 
@@ -754,6 +757,29 @@ class Baseline:
     #: see above — and the briefs name that round to the reviewers, so it has to
     #: travel with the sha rather than being guessed from this run's round number.
     head_round: int | None = None
+    #: When the LATEST prior round that recorded one FINISHED, as epoch seconds
+    #: (#192). The left-hand end of the fix phase: this round's own start is the
+    #: right-hand end, and the span between them is the fixer, the verification
+    #: and the push together — the half of a cycle's wall clock that nothing
+    #: measured at all.
+    #:
+    #: Read with the same "latest round that SUPPLIED one" rule as ``head_sha``
+    #: directly above, and for the same reason: a newer round written by an older
+    #: panel names no finish, and taking the last payload alone would clear an
+    #: answer an earlier one gave. An older left-hand end over-states the fix
+    #: phase (it spans a round as well), which is why the payload also carries
+    #: ``finished_round`` — an over-stated span whose ends are named is checkable,
+    #: and a missing one is not.
+    #:
+    #: None for a payload written before the field existed, which is not an
+    #: error: :func:`panel_timing.fix_phase` falls back to deriving the span from
+    #: the two rounds' head commit times, and says which source it used.
+    finished_at: float | None = None
+    #: Which round supplied ``finished_at``. Travels with it for the reason
+    #: ``head_round`` travels with ``head_sha``: the pair is quoted in the report,
+    #: and a span whose earlier end came from round 1 while round 2 also ran is a
+    #: different measurement from one whose ends are adjacent.
+    finished_round: int | None = None
     #: Earlier rounds that recorded a head but produced no reviewer read at all —
     #: a title-skipped round, or one whose every seat failed. The anchor advances
     #: over them (a skipped round still moved the head), so a scoped round after
@@ -1339,6 +1365,35 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
                                   "rather than attributing against whatever that names")
                 continue
             b.head_sha, b.head_round = sha, was
+        # The fix phase's earlier end (#192), on its own pass rather than folded
+        # into the loop above: a round can record a head and no finish (a payload
+        # from before the field) or a finish and no head (a round whose PR read
+        # failed after the clock started), and pairing them would let either
+        # absence discard the other's answer. Same "latest that supplied one"
+        # rule; same reason.
+        for was, path, payload in ordered:
+            when = (payload.get("timing") or {}).get("finished_at")
+            if when is None:
+                continue
+            # Validated rather than trusted, like `head_sha` beside it. A string,
+            # a bool (an `int` subclass, so `True` would read as 1970) or a
+            # negative reading is not a wall-clock instant, and the span computed
+            # from one would be reported as a fix phase — a number that looks
+            # measured and is not, which is the failure #192 is about.
+            # `math.isfinite` as well as the range check: Python's `json`
+            # parses a bare `Infinity`, which passes `> 0` and then dates the
+            # previous round to the end of time — a fix phase computed from it is
+            # a negative infinity, and the skew branch is not where that belongs.
+            # NaN fails `> 0` already and needs no separate term.
+            ok = (isinstance(when, (int, float)) and not isinstance(when, bool)
+                  and math.isfinite(when) and when > 0)
+            if not ok:
+                b.problems.append(
+                    f"baseline {path} records a finish time of {when!r}, which is not a "
+                    "wall-clock instant — the fix phase before this round was NOT "
+                    "measured from it")
+                continue
+            b.finished_at, b.finished_round = float(when), was
         # Coverage, unlike the anchor, is a property of the LAST round alone: it is
         # what that round could not read, and an older round's list describes a
         # different diff at a different budget.
