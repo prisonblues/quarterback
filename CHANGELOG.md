@@ -11,7 +11,7 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
-## vNEXT — a claim nobody takes: derive the key, make the plan a row, block on pickup
+## v2.60 — a claim nobody takes: derive the key, make the plan a row, block on pickup
 
 `claims()` returned `[]`. Not filtered — empty, fleet-wide, across every repo and every
 machine, for four months. The atomic claim shipped in v2.31 to stop agents colliding and

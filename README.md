@@ -871,7 +871,7 @@ full — including what was broken before it, which is the part no diff recovers
   degrades to an extra row and a line in the log rather than taking the other five down
   with it. Both rows rendering is also what makes the ⚖ on a watched repo's PR clickable
   for the first time, so it now refuses one, exactly as the ⚒ on an issue row already did.
-- **vNEXT** — a claim nobody takes. `claims()` returned `[]` fleet-wide for four months while
+- **v2.60** — a claim nobody takes. `claims()` returned `[]` fleet-wide for four months while
   thirteen agents worked three shared checkouts, and both halves of why are fixed here. **The key
   is derived, never composed** (`app/claimkey.py`): the plan wrote `work/<repo>#163` while an agent
   wrote `issue/<repo>#163`, and since `(kind, key)` is the unique index those were two resources —
