@@ -1022,17 +1022,28 @@ full — including what was broken before it, which is the part no diff recovers
   is deliberately NOT asked: two attempts to establish it from the local repository each
   opened the laundering hole the other closed, so the refusal names both repairs — rewrite the
   entry, or fetch a base that is behind — rather than guessing which applies.
-- **vNEXT** — the release list is rendered, and a branch stops editing the file everyone edits.
-  This list was retyped from the CHANGELOG and fell out of order — `v2.61, v2.59, v2.60, …` for
-  three releases, eleven bullets adrift by the time #296 was opened — so its ORDER now comes
-  from `scripts/readme_releases.py` and a test fails when it drifts. Only the order: a bullet is
-  a summary somebody chose, so it is moved byte-for-byte and a release with no bullet is a
-  refusal, not an invented sentence. And a branch writes `changelog.d/<issue>.<kind>.md` rather
-  than editing the top of `CHANGELOG.md`, which every branch did and every pair of branches
-  conflicted over; `scripts/changelog_fragments.py assemble` folds the fragments into one
-  `vNEXT` entry at land time and adds this bullet through the same renderer. A fragment names no
-  version at all, so there is nothing to race for. Steps 3 and 4 of #296 — the git tag as the
-  atomic allocator, and deriving the served version from it — are still open.
+- **vNEXT** — the files two branches both had to edit, and the guard that measured the wrong
+  thing. **This list stopped being retyped.** It was a hand-kept copy of the CHANGELOG and fell
+  out of order — `v2.61, v2.59, v2.60, …` for three releases, eleven bullets adrift by the time
+  #296 was opened — so its ORDER now comes from `scripts/readme_releases.py` and a test fails when
+  it drifts. Only the order: a bullet is a summary somebody chose, so it is moved byte-for-byte
+  and a release with no bullet is a refusal rather than an invented sentence. **And a branch
+  writes `changelog.d/<issue>.<kind>.md`** instead of the top of `CHANGELOG.md`, which every
+  branch edited and every pair of branches conflicted over — this entry is itself two branches
+  folded by hand, which under fragments would not have been a conflict at all.
+  `scripts/changelog_fragments.py assemble` builds the `vNEXT` entry at land time and adds this
+  bullet through the same renderer; a fragment names no version, so there is nothing to race for.
+  Steps 3 and 4 of #296 — the git tag as the atomic allocator, and deriving the served version
+  from it — stay open. **The growth guard measures the PR, not the round.** `max_fix_growth`
+  divided the cycle's whole-PR starting size into *one round's increment*, because both ends read
+  `diff_chars` — the size of what a round reviewed, which under the default `increment` scope is
+  the fix commit. PR #188 went 185 → 593 → 721 churned lines, 3.90x under a 3.0x ceiling, and the
+  backstop against this repo's measured 63.7% bad-fix-injection rate never fired. Both ends are
+  whole-PR sizes now whatever `round_scope` is: that dial decides what reviewers are asked to look
+  at, this one asks how big the change has become. Every round records `pr_chars` beside
+  `diff_chars` so the denominator is a PR size too — a whole PR over a fix commit would have
+  inverted the same error. The ratio still names which measurement it is at both ends, and the
+  regression test, built from #188's own numbers, was confirmed red first (#298).
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
   roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps
