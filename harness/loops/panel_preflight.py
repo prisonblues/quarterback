@@ -861,6 +861,17 @@ class Preflight:
     forced: bool = False
     #: What the verdict WOULD have been without --force.
     would_have: str = ""
+    #: The PRECONDITION that refused this round, when a precondition did (#271) —
+    #: today only "the branch cannot merge". Empty on every size-driven verdict.
+    #:
+    #: It exists because a gate refusal and a size refusal are the same `refuse`
+    #: verdict with the same `reason` field and want different prose everywhere
+    #: they are rendered: `refusal_report`'s measurement table and its three
+    #: remedies are all about a diff that is too big, and printed over a branch
+    #: that simply cannot merge they tell an operator to split a PR whose size was
+    #: never the problem. `reason` says WHAT; this says which QUESTION was asked,
+    #: which is the part a renderer has to branch on.
+    gate: str = ""
     thresholds: dict = field(default_factory=dict)
     #: The manifest, on a ``manifest`` verdict and nowhere else. Carried rather
     #: than rebuilt by the caller because the verdict is made by MEASURING it —
@@ -937,8 +948,19 @@ class Preflight:
 
 def preflight(diff: str, budgets: dict[str, int | None], panel: dict,
               notes: list[str], forced: bool = False,
-              installed=None) -> Preflight:
+              installed=None, gate: str = "") -> Preflight:
     """Rule on a round before it is dispatched.
+
+    `gate` is a PRECONDITION that has already failed — a sentence saying why this
+    round should not happen at all, decided by the caller before any of the sizes
+    below are looked at (#271). Handed one, this refuses on it and says so, and
+    `--force` overrides it through exactly the same machinery that overrides a
+    size refusal. It arrives as a parameter rather than being asked here because
+    the question is not about the diff: `panel.run` reads the PR's mergeability off
+    metadata it has already fetched, and the ONLY reason to route the answer
+    through this function is that everything downstream of a refusal — the payload,
+    `skip_reason`, the per-seat `ran: false` rows, the board record, `--force` —
+    already exists here and must not be built a second time.
 
     The order of the tests is the argument. Fitting the cap settles it — a diff
     every seat can read is a diff to read, whatever its shape, because reading a
@@ -1024,10 +1046,18 @@ def preflight(diff: str, budgets: dict[str, int | None], panel: dict,
         if name != "run" and forced:
             return Preflight("run", f"--force: {forced_reason or reason}", shape,
                              ceiling, over, forced=True, would_have=name,
-                             thresholds=thresholds)
+                             gate=gate, thresholds=thresholds)
         return Preflight(name, reason, shape, ceiling, over,
-                         thresholds=thresholds, manifest=manifest)
+                         gate=gate, thresholds=thresholds, manifest=manifest)
 
+    # BEFORE any size question, because a precondition is not a budget: a branch
+    # that cannot merge is not reviewable at any ceiling, and refusing it for its
+    # size instead would print remedies ("split the PR") about the wrong problem.
+    # After the measurement above, though, and deliberately — `preflight.shape` is
+    # what a reader has instead of the round, and a gate refusal that recorded
+    # nothing about the diff it declined would be the silent target #241 is about.
+    if gate:
+        return verdict("refuse", gate)
     if ceiling is None:
         return verdict("run", "")
     if size <= cap:
@@ -1490,7 +1520,7 @@ def refusal_report(repo_name: str, pr_number: int, title: str,
     differ, so the multiple can be checked by hand from the numbers on the page
     rather than from an encoding the reader would have to guess.
     """
-    if not pre.refused or pre.cap is None:
+    if not pre.refused or (pre.cap is None and not pre.gate):
         raise ValueError(
             f"refusal_report on a {pre.verdict!r} verdict (cap={pre.cap!r}) — only a "
             "refusal has a reason to state, and a reasonless refusal notice is worse "
@@ -1522,6 +1552,32 @@ def refusal_report(repo_name: str, pr_number: int, title: str,
         f"  - diff: {s.chars:,} chars"
         + (f" / {s.nbytes:,} bytes" if s.nbytes != s.chars else "")
         + f", {s.files:,} file(s), +{s.added:,} / -{s.removed:,} non-blank lines",
+    ]
+    if pre.gate:
+        # A precondition refusal, and every line below the diff's own size would be
+        # about a budget question this round never reached. The size is still
+        # printed above — it is what a reader is owed about the thing that was NOT
+        # reviewed — but the ceiling, the move ratio and "split the PR" all describe
+        # a problem this refusal is not about, and `pre.cap` may legitimately be
+        # None here (a repo with no configured budget declares no ceiling at all,
+        # and this refusal does not need one).
+        lines += [
+            "  - the size was not the problem, and no ceiling was consulted: this "
+            "round was refused on a precondition, before any seat was dispatched.",
+            "",
+            "**What to do,** in the order they are worth doing:",
+            "  1. Rebase the branch onto its base and push, then re-run the panel. "
+            "A review of a branch that cannot merge is a review of a diff that is "
+            "about to change, and at `review_panel.max_rounds: 1` nothing re-reads "
+            "what the rebase does.",
+            "  2. `review_panel.require_mergeable: false` if this repo genuinely "
+            "wants conflicted branches reviewed — an architectural read where the "
+            "conflict is incidental is a real case.",
+            "  3. `--force` to review this one anyway. The findings will be about "
+            "code whose merged form does not exist yet; read them as provisional.",
+        ]
+        return "\n".join(lines)
+    lines += [
         f"  - relocated: {s.moved:,} of {widest:,} ({s.move_ratio * 100:.1f}%) — "
         f"the move threshold is {pre.thresholds.get('move_shape_ratio'):g}",
         f"  - tightest seat ceiling: {pre.cap:,} {pre.cap_unit} ({pre.cap_seat}), "

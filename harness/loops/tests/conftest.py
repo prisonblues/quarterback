@@ -20,18 +20,26 @@ panel.py means teaching :func:`gh_stub` about it once — and if you forget,
 `strict=True` (the default) raises on the unknown call instead of letting it rot
 into a plausible answer.
 
-**The six calls panel.py makes**, all through ``panel.sh``:
+**The seven calls panel.py makes**, all through ``panel.sh``:
 
-===========================================  ===========================
-call                                          answered by
-===========================================  ===========================
-``gh pr view … --json title,additions,…``    ``meta``
-``gh pr view … --json headRefOid``           ``head`` / ``head_moves_to``
-``gh pr view … --json baseRefOid``           ``merge_base`` / ``…_after``
-``gh api repos/…/git/ref/heads/…``           ``base_tip``
-``gh api repos/…/compare/a...b``             ``compare`` / ``compare_diff``
-``gh pr diff …``                             ``diff``
-===========================================  ===========================
+=============================================  ===========================
+call                                            answered by
+=============================================  ===========================
+``gh pr view … --json title,additions,…``      ``meta``
+``gh pr view … --json headRefOid``             ``head`` / ``head_moves_to``
+``gh pr view … --json mergeable``              ``mergeable_now``
+``gh api repos/…/compare/… --jq .merge_base…`` ``fork_point`` / ``…_after``
+``gh api repos/…/git/ref/heads/…``             ``base_tip``
+``gh api repos/…/compare/a...b --jq {status…`` ``compare`` / ``compare_diff``
+``gh pr diff …``                               ``diff``
+=============================================  ===========================
+
+Two of those are the SAME endpoint told apart by their ``--jq``, which is how
+panel.py itself tells them apart: one asks the compare API for a fork point
+(:func:`panel_scope._merge_base_now`, #241) and the other for a range of file
+patches (``_fix_range_diff``). There used to be a ``gh pr view --json baseRefOid``
+here instead of the first — that read is the defect #241 is about, because
+``baseRefOid`` is GitHub's stored base and not a merge base.
 
 This is deliberately a plain factory rather than a fixture: the modules here set
 ``panel.sh`` inside each test, often several times per test with different
@@ -202,16 +210,24 @@ def pr_tarball(files=None, prefix="acme-board-aaa1110"):
 def pr_meta(title="feat: a thing", *, additions=20, deletions=2,
             base_ref="main", head_ref="feat/x", head=DEFAULT_HEAD,
             merge_base=DEFAULT_MERGE_BASE, files=UNSET, changed_files=UNSET,
-            state="OPEN", draft=False, **extra):
+            state="OPEN", draft=False, mergeable="MERGEABLE", **extra):
     """The opening metadata read, as `gh pr view --json …` returns it.
 
     `merge_base=None` omits `baseRefOid` entirely rather than sending null —
     that is what a `gh` too old to know the field actually does, and the two are
     not the same thing to the code reading it.
+
+    `mergeable` defaults to the state that lets a round proceed. It is not a
+    convenience: the panel refuses a CONFLICTING branch before any seat runs
+    (#271) and records a `config_notes` line for anything that is not MERGEABLE,
+    so a default of "unset" would put a note on every run() test in this suite and
+    refuse the several that assert on a round that ran. A test about the gate says
+    `mergeable="CONFLICTING"` and means it.
     """
     meta = {"title": title, "additions": additions, "deletions": deletions,
             "baseRefName": base_ref, "headRefName": head_ref,
-            "headRefOid": head, "state": state, "isDraft": draft}
+            "headRefOid": head, "state": state, "isDraft": draft,
+            "mergeable": mergeable}
     if merge_base is not None:
         meta["baseRefOid"] = merge_base
     if files is not UNSET:
@@ -224,8 +240,9 @@ def pr_meta(title="feat: a thing", *, additions=20, deletions=2,
 
 def gh_stub(*, meta=UNSET, diff=PR_DIFF, base_tip=DEFAULT_BASE_TIP,
             head=UNSET, head_moves_to=None, merge_base=UNSET,
-            merge_base_after=UNSET, compare=UNSET, compare_diff="",
-            tree=UNSET, calls=None, strict=True):
+            fork_point=UNSET, merge_base_after=UNSET, compare=UNSET,
+            compare_diff="", mergeable_now=UNSET, tree=UNSET, calls=None,
+            strict=True):
     """A `panel.sh` double answering every `gh` call panel.py makes.
 
     Every answer takes a value, a `BaseException` to raise, or None meaning "the
@@ -241,8 +258,17 @@ def gh_stub(*, meta=UNSET, diff=PR_DIFF, base_tip=DEFAULT_BASE_TIP,
         for. It answers the single-field `headRefOid` read, which is
         `_head_sha_now`; the opening read has already given the original head, so
         this applies from the first such read rather than the second.
-      merge_base_after: what the `baseRefOid` re-read answers once the head has
-        moved. Defaults to the unchanged `merge_base` (the no-op path).
+      merge_base: GitHub's STORED base for the PR (`baseRefOid` on the opening
+        read). Not a merge base — see `fork_point`.
+      fork_point: what the compare API answers for the TRUE merge base
+        (`_merge_base_now`). Defaults to `merge_base`, i.e. the two agree and no
+        stale-base note fires — which is the state nearly every test in this suite
+        is implicitly about. Give it a different value to reproduce #241.
+      merge_base_after: what the fork-point read answers once the head has
+        moved. Defaults to the unchanged `fork_point` (the no-op path).
+      mergeable_now: what the mergeability RE-READ answers (#271). Only reached
+        when the opening read said UNKNOWN, which is what GitHub returns while it
+        computes the merge test. Defaults to the metadata's own state.
       calls: a list to append every argv to, for tests asserting on what was asked.
       strict: raise on a `gh` call this stub does not recognise. Leave it on. The
         whole point of this file is that an unanswered call must be loud.
@@ -270,7 +296,12 @@ def gh_stub(*, meta=UNSET, diff=PR_DIFF, base_tip=DEFAULT_BASE_TIP,
     # rather than the success path they are all implicitly on.
     tree = pr_tarball() if tree is UNSET else tree
     the_merge_base = (base.get("baseRefOid") if merge_base is UNSET else merge_base)
+    # The TRUE fork point, which agrees with the stored base unless a test says
+    # otherwise. `_commit_id` rejects a non-sha, so a `None` here has to come back
+    # as an empty body rather than the string "None".
+    the_fork = the_merge_base if fork_point is UNSET else fork_point
     head_reads = []
+    fork_reads = []
 
     def answer(value):
         if isinstance(value, BaseException):
@@ -298,9 +329,14 @@ def gh_stub(*, meta=UNSET, diff=PR_DIFF, base_tip=DEFAULT_BASE_TIP,
                 head_reads.append(args)
                 moved = head_moves_to if head_moves_to is not None else the_head
                 return json.dumps({} if moved is None else {"headRefOid": answer(moved)})
-            if field == "baseRefOid":
-                after = the_merge_base if merge_base_after is UNSET else merge_base_after
-                return json.dumps({} if after is None else {"baseRefOid": answer(after)})
+            if field == "mergeable":
+                # The re-read the #271 gate makes when the opening answer was
+                # UNKNOWN, which is what GitHub returns while it computes. It
+                # answers the metadata's own state unless a test separates them.
+                return json.dumps(
+                    {} if mergeable_now is None else
+                    {"mergeable": answer(base.get("mergeable")
+                                         if mergeable_now is UNSET else mergeable_now)})
             return json.dumps(base)
 
         if args[:3] == ["gh", "pr", "diff"]:
@@ -316,10 +352,24 @@ def gh_stub(*, meta=UNSET, diff=PR_DIFF, base_tip=DEFAULT_BASE_TIP,
                 return tip if isinstance(tip, str) and tip.lstrip().startswith("{") \
                     else json.dumps({"object": {"sha": tip, "type": "commit"}})
             if "/compare/" in path:
-                # Two callers, told apart by how they ask: the diff media type
-                # wants a raw diff, `--jq` wants a JSON body.
+                # THREE callers now, told apart by how they ask: the diff media
+                # type wants a raw diff, `.merge_base_commit.sha` wants the fork
+                # point (#241), and the remaining `--jq` wants the range body.
+                # Discriminated on the jq expression panel.py actually sends rather
+                # than on a copy of it here, so a change to that expression cannot
+                # leave this stub answering the wrong caller.
                 if "Accept: application/vnd.github.diff" in args:
                     return answer(compare_diff)
+                if panel._MERGE_BASE_JQ in args:
+                    # The first read is the round's own; any later one is the
+                    # re-read after the head moved, exactly as `head_moves_to`
+                    # applies from the first single-field head read.
+                    fork_reads.append(args)
+                    after = the_fork if merge_base_after is UNSET else merge_base_after
+                    got = the_fork if len(fork_reads) == 1 else after
+                    # `gh --jq` prints a JSON string RAW and a missing field as
+                    # `null`, which is what the caller's own guard is written for.
+                    return "" if got is None else f"{answer(got)}\n"
                 return answer("" if compare is UNSET else compare)
             if "/tarball/" in path:
                 # The PR's own tree (#113). Answered by DEFAULT, and that matters:
