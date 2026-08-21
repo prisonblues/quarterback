@@ -201,6 +201,7 @@ Detected from the checkout, **not settable** here: `path`, `github`, `default_br
 | `review_panel.ask_quorum` / `ask_threshold` | `--ask`'s tally rules: how many seats must have **answered** for the vote to mean anything, and how many must have said the same thing for it to be that answer. Both **2** — one seat agreeing with the agent that wrote the premise is not a challenge. A rule above the number of seats on the ask is warned about: it can never be met. |
 | `review_panel.ask_max_context_chars` | Total `--context` material one ask may hand its seats, across every spec. **60,000** (~15k tokens). Over budget is clamped and SAID, per spec — an ask's whole claim is that it is the cheap check, and unbounded context is the #117 cost shape on the path advertised as costing a minute. |
 | `review_panel.reviewer_code_access` | May a seat READ the code under review? **true**. `false` is the old posture — every seat in an empty repo, the diff its only evidence — and is what a repo taking UNTRUSTED contributions selects. On does not mean every seat gets it: only a CLI that can express "read but do not execute" is handed the tree (today just `claude`), and which seats did is recorded per seat. `--no-code-access` turns it off for one run. See below. |
+| `review_panel.require_mergeable` | Must the branch be able to MERGE before a round is worth running? **true**. GitHub reporting the branch `CONFLICTING` means the merged state the review is implicitly reasoning about does not exist, and the rebase that resolves it changes the diff every finding is about — so the round is refused before any seat is dispatched. It is nearly free: mergeability rides on the PR metadata the panel already fetches, and the same check used to run only at the merge gate (`preland.check_pr_state`), i.e. after a full multi-vendor round and a judge had been spent. `false` reviews conflicted branches and says so in `config_notes`; `--force` is the per-run override. GitHub computes mergeability lazily and answers `UNKNOWN` while it does, so the question is put a second time when the first answer is cold — measured here, three consecutive reads of an open PR gave `UNKNOWN`, `CONFLICTING`, `CONFLICTING`. An `UNKNOWN` that survives both reads is a note and never a refusal. |
 | `review_panel.reviewer_code_budget_usd` | Dollars the code-reading seat may spend per invocation (`claude --max-budget-usd`). **`null`** — uncapped — for the reason `max_diff_chars` is: reaching the cap is a LOST seat (a skip, which vetoes), not a cheaper review. Measured for calibration: ~$4 for one seat on a 75,628-char diff against ~$0.70 diff-only. Applies only to a seat that got the tree; the cap is per invocation and a reparse retry can spend it twice. |
 | `review_panel.fixer_may_defer` | May a fixer answer "real, and not this change's job"? **true**. Its two exits were a refuted false positive and an escalation about the *approach*, and the brief then said "'Not now' is not available to you" — so a correct third judgement had no legal way out and the only move left was the patch. Maps to the existing `deferred` outcome; the fixer owes a justification and the orchestrator opens the issue. `false` is the old two-exit behaviour. |
 | `review_panel.fix_severity_floor` | Severity a fix round is asked to clear, at or above. **`P3`**. Below it a finding is reported, marked 🔽 under its own heading, recorded (`below_fix_floor` in the payload) and **not fixed**. The measured cut is at P2 (67.3% of findings, zero P1s lost) and this deliberately sits a tier below it: severity is model-authored, and the class a P2 floor misses is correctness expressed as craft — a missing regression test on a parser or an auth boundary, a missing timeout or cleanup, a migration rollback gap. Fixing one in a pass already open is one edit; P4 (31.3%, the tier that ballooned #236) stays out. `P4` fixes everything, the pre-#165 behaviour — for `round_stop`'s rules 1 and 3; rule 2's bar is a hardcoded `("P1", "P2")` and only `P1` moves it. A Sonar hard-gate issue is exempt from both floors at every rule. |
@@ -818,7 +819,12 @@ rather than the caller's.
 |---|---|---|
 | `run` | the diff fits every seat's ceiling; or no seat declares one; or it is over but under the refusal multiple | exactly what every release before this one did, truncation report included |
 | `manifest` | over a ceiling **and** move-shaped **and** a manifest of it is smaller than *both* the diff and the ceiling | the seats are handed a *manifest* instead of the diff |
-| `refuse` | over a ceiling by `refuse_over_cap_multiple` with no smaller honest question to ask — not move-shaped, or move-shaped with no manifest to substitute | nobody is dispatched; the refusal is printed, recorded, and posted under `--post` |
+| `refuse` | over a ceiling by `refuse_over_cap_multiple` with no smaller honest question to ask — not move-shaped, or move-shaped with no manifest to substitute; **or** a precondition failed, which today means the branch cannot merge (`require_mergeable`) | nobody is dispatched; the refusal is printed, recorded, and posted under `--post` |
+
+A `refuse` on a **precondition** is the same verdict reached without measuring anything: the
+branch cannot merge, so no ceiling was consulted and none is quoted. It is decided before the seats, and `--force` overrides it through the
+same machinery that overrides a size refusal — leaving `preflight.would_have: refuse` behind, so
+"the tool chose to run" and "a caller overrode the tool" never look alike.
 
 A move-shaped diff over a ceiling therefore has three outcomes, not one. It gets the manifest
 whenever there IS one to substitute; when there is not — `manifest_moves` is off, or the
@@ -1190,6 +1196,30 @@ longer colliding because one stopped *re-reading* a file it still changes.
 > review happened — so a skipped PR's file list reaches `--json` and the next round's
 > `--baseline`, and never the board. Do not read "the skip payload carries it" as "the
 > board can answer collision queries about a skipped PR"; it cannot.
+
+### A round the board did not take says so (#284)
+
+Recording goes through `qb record-review` and stays **best-effort** — a board that is down
+must never fail a review that already ran. What it is not is silent. `record_run` used to
+open with `if not shutil.which("qb"): return`, and since `qb` ships in the fleet's own repo
+rather than this one, whether a round was recorded depended on a binary from elsewhere being
+on the PATH of whichever box ran the panel. 67 rounds across 30 PRs went missing that way,
+leaving the board holding 39% of this repo's review history with nothing anywhere saying so
+— and every measurement taken from it (the `/panel` leaderboard, per-reviewer precision, the
+dial calibration) computed off a three-day tail nobody knew was a tail.
+
+Three ways to miss, one sentence each: **no `qb` on this host**; **`qb` refused** (no board
+URL, no token, no such subcommand); **`qb` ran and the board did not answer** — that last one
+is invisible to an exit code, because `qb record-review` exits 0 either way and distinguishes
+them on its streams. What `qb` itself said is quoted, capped, so a wrong guess about a program
+in another repo corrects itself in front of the reader.
+
+The sentence lands in **`config_notes`** — which puts it in the payload a fixer is briefed
+from, in the report, and in the `--post` PR comment — and in the `--json-file` on disk,
+because the recording is attempted *before* that file is written. The refusal notice carries
+it too. And it names its own recovery: `--json-file` writes exactly the bytes piped to `qb`,
+so `qb record-review < PAYLOAD.json` from any host with one puts the round on the board
+later. `run_key` makes the replay a join rather than a double-count.
 
 Note that `gh pr view --json` **fails the whole command** on a field it does not recognise
 rather than omitting it, so there is no graceful degradation on an older `gh` — the run

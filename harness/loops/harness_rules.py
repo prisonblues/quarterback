@@ -405,6 +405,26 @@ DEFAULTS: dict = {
         # a seat that can read the tree while another cannot is a bigger confound
         # than an unpinned model.
         "reviewer_code_access": True,
+        # Must the branch be able to MERGE before a round is worth running? **On.**
+        # The merged state a review is implicitly reasoning about does not exist
+        # while GitHub reports the branch CONFLICTING, and the rebase that resolves
+        # it changes the diff every finding is about — so the round is refused
+        # before any seat is dispatched, which is the cheapest refusal in the
+        # system and used to be made LAST, by `preland.check_pr_state` at the merge
+        # gate, after a full multi-vendor round and a judge had been spent (#271).
+        # It is nearly free: mergeability rides on the PR metadata the panel
+        # already fetches, and costs one further read only when that comes back
+        # UNKNOWN — which GitHub answers while it computes the merge test, so
+        # asking once would refuse only the PRs somebody had looked at recently.
+        #
+        # A dial rather than a rule because there are real cases for reviewing a
+        # conflicted branch — an architectural read where the conflict is
+        # incidental, or a PR whose conflict IS the thing being discussed. `false`
+        # reviews them and says so in `config_notes`; `panel.py --force` is the
+        # per-run override for one PR. An UNKNOWN that survives both reads is never
+        # a refusal, only a note: refusing on "we could not tell" would stop a
+        # round on GitHub's scheduling.
+        "require_mergeable": True,
         # Dollars one code-reading seat may spend per CLI invocation, via
         # `claude --max-budget-usd`. `null` — the default — means no cap, and that
         # default is chosen for the reason `max_diff_chars` gives for its own: a

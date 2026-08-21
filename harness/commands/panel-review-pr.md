@@ -153,7 +153,9 @@ payload is marked `reviewed: false`), so exit 0 always means the file is there.
 - `refuse` — no seat was dispatched (`reviewed: false`, with `skip_reason`). **Stop
   the cycle here.** Do NOT go to §4: a fix pass briefed with zero findings from a
   round nobody ran is a fixer told the PR is clean. Relay the panel's reason and
-  the remedies it named — split the PR, raise the cap for a seat that can take it,
+  the remedies it named — for an oversized diff: split the PR, raise the cap for a
+  seat that can take it, or re-run with `--force`; for a branch that cannot merge
+  (`require_mergeable`, #271): rebase and re-run, turn the dial off for this repo,
   or re-run with `--force` — and let the user choose. Never add `--force` on your
   own initiative; the refusal is the panel's decision about a diff it measured, and
   overriding it unasked is exactly the failure the check was built to stop.

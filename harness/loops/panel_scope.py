@@ -109,6 +109,28 @@ def _commit_id(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def _mergeable_now(gh_repo: str, pr_number: int) -> str | None:
+    """GitHub's mergeability for the PR, asked AGAIN. None if it cannot be had.
+
+    Called only when the first answer was ``UNKNOWN``, and it is what makes the
+    #271 gate work at all. GitHub computes mergeability LAZILY: the first query
+    schedules the merge test and answers ``UNKNOWN`` while it runs, and the next
+    one has the result. Measured on this repo, three consecutive reads of an open
+    PR — ``UNKNOWN``, then ``CONFLICTING``, then ``CONFLICTING``. So a gate that
+    asks once refuses only the PRs somebody happened to have looked at recently,
+    which is a gate that appears to work and mostly does not.
+
+    One extra call, and only on the cold answer. Bounded and swallowed like its
+    siblings: a precondition this cannot read is reported as unread, never guessed
+    at, and never allowed to stall the round."""
+    try:
+        return (json.loads(panel_core.sh(["gh", "pr", "view", str(pr_number), "--repo", gh_repo,
+                               "--json", "mergeable"],
+                              timeout=FIX_RANGE_TIMEOUT_S)).get("mergeable")) or None
+    except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
+        return None
+
+
 def _head_sha_now(gh_repo: str, pr_number: int) -> str | None:
     """The PR's head commit, re-read. None if it cannot be had — the caller only
     uses it to notice that the head MOVED, and "could not tell" has to leave the
@@ -128,25 +150,62 @@ def _head_sha_now(gh_repo: str, pr_number: int) -> str | None:
         return None
 
 
-def _merge_base_now(gh_repo: str, pr_number: int) -> str | None:
-    """The PR's merge base, re-read. None if it cannot be had.
+#: The one field the compare read below wants. `--jq` rather than parsing the
+#: whole body here because the body is the entire comparison — up to 300 file
+#: patches — and this call wants forty hex characters out of it.
+_MERGE_BASE_JQ = ".merge_base_commit.sha"
 
-    Only called when the head has been seen to move mid-round. `baseRefOid` is
-    recomputed by GitHub on every push to the head branch, so a head that moved
-    may have taken the merge base with it — and on this repo the usual reason a
-    head moves is a merge of the base branch into the PR, which is precisely the
-    push that moves it. Pairing a re-stamped head with a merge base computed for
-    the commit before it yields a range nothing ever reviewed.
+#: What a commit id looks like coming back from `--jq`. `gh --jq` prints a JSON
+#: string RAW (no quotes), and prints a missing field as the four characters
+#: `null` — which is truthy, is not a commit, and would otherwise be recorded as
+#: one. Short forms are accepted because a caller may hand this an abbreviated
+#: sha; anything else is a None.
+_SHA_TEXT = re.compile(r"[0-9a-f]{7,64}")
 
-    Bounded like its siblings: an attribution nothing gates on must never be able
-    to stall a panel."""
+
+def _merge_base_now(gh_repo: str, base_ref: str, head_sha: str) -> str | None:
+    """The TRUE merge base of `base_ref` and `head_sha` — the commit the branch
+    actually forked from — or None if it cannot be had.
+
+    **This used to return `baseRefOid` and that is the defect in #241.** GitHub
+    maintains `baseRefOid` for its own purposes and recomputes it on a push to the
+    head branch; it is not the merge base, and it has been measured wrong in both
+    directions on this repo. On PR #187 it was OLDER than the fork point, because a
+    commit shared with another PR landed on `main` and nothing recomputed the
+    stored base — so `gh pr diff` returned code already on `main` and a full round
+    was spent confirming 15 findings about it. On PR #270 it was NEWER: `f34aa89`,
+    the tip of `main`, against a true fork point of `0819625` four commits back, so
+    the recorded base named a commit the branch had never contained. The invariant
+    to hold is the weak one — `baseRefOid` is not a merge base — and only asking
+    for a merge base satisfies it.
+
+    The compare endpoint's `merge_base_commit` IS `git merge-base <base> <head>`,
+    computed by GitHub against the base branch as it stands now. Read from the API
+    rather than from a local `git merge-base` because nothing else in this panel
+    needs a checkout: the whole tool reads GitHub, runs anywhere `gh` is
+    authenticated, and a local computation would be right only when the PR's head
+    happens to have been fetched into whatever directory the panel was started in
+    — silently falling back the rest of the time, which is the failure this exists
+    to end.
+
+    Bounded like its siblings, and None on every failure: a base commit is not
+    required for a round to proceed, and a panel must never stall on a fact
+    nothing gates on. The CALLER says in `config_notes` which base it ended up
+    using — a fallback nobody is told about is the silent mis-scoping #241 is
+    about."""
+    if not (gh_repo and base_ref and head_sha):
+        return None
     try:
-        return _commit_id(
-            json.loads(panel_core.sh(["gh", "pr", "view", str(pr_number), "--repo", gh_repo,
-                           "--json", "baseRefOid"],
-                          timeout=FIX_RANGE_TIMEOUT_S)).get("baseRefOid"))
+        # `per_page=1` trims the commit list, which is the part of this response
+        # that grows without bound on a long-lived branch. The file patches are
+        # capped by the API at 300 and are downloaded either way — the cost is one
+        # request on a path that then decides whether four seats and a judge run.
+        got = panel_core.sh(
+            ["gh", "api", f"repos/{gh_repo}/compare/{base_ref}...{head_sha}?per_page=1",
+             "--jq", _MERGE_BASE_JQ], timeout=FIX_RANGE_TIMEOUT_S).strip()
     except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
         return None
+    return _commit_id(got) if _SHA_TEXT.fullmatch(got) else None
 
 
 def _base_tip_now(gh_repo: str, base_ref: str) -> str | None:
@@ -1286,7 +1345,9 @@ def review_ci(gh_repo: str, pr_number: int) -> tuple[str, list[str], str | None]
 #: is exported without anyone remembering to list it.
 __all__ = [
     "panel_core", "_fix_range_diff", "_commit_id", "_head_sha_now",
-    "_merge_base_now", "_base_tip_now", "PROVENANCE", "_provenance",
+    "_mergeable_now",
+    "_merge_base_now", "_MERGE_BASE_JQ", "_SHA_TEXT",
+    "_base_tip_now", "PROVENANCE", "_provenance",
     "DIFF_PREAMBLE", "_diff_by_file", "_diff_subset", "_fit_parts",
     "fetch_increment", "COMPARE_FILE_CAP", "_count", "compare_facts",
     "_range_notes", "_is_commitish", "_is_ref", "_same_commit",

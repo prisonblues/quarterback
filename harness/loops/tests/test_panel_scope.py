@@ -1077,7 +1077,12 @@ def _stub_run(monkeypatch, seen, *, cfg=None, findings=(), increment=INCREMENT,
         if args[:3] == ["gh", "pr", "view"]:
             return json.dumps({"title": title, "additions": 3, "deletions": 1,
                                "baseRefName": "main", "baseRefOid": MERGE_BASE,
-                               "headRefName": "feat/x", "headRefOid": HEAD})
+                               "headRefName": "feat/x", "headRefOid": HEAD,
+                               # A branch that can merge. Unanswered it reads
+                               # UNKNOWN, which is a `config_notes` line (#271) —
+                               # and these tests read `config_notes` as a scope
+                               # note that never happened.
+                               "mergeable": "MERGEABLE"})
         # The base branch's tip, which v2.29 reads to stamp what this round would
         # be merged INTO. Answered here for the same reason the compare call
         # below is: unanswered it degrades to a `config_notes` entry, and these
@@ -1090,6 +1095,11 @@ def _stub_run(monkeypatch, seen, *, cfg=None, findings=(), increment=INCREMENT,
         # left — and left unanswered it degrades to a `config_notes` entry, which
         # these tests read as a scope note that never happened.
         if args[:2] == ["gh", "api"] and "/compare/" in args[2]:
+            # The fork-point read (#241) is the same endpoint with a different
+            # `--jq`, and it wants a bare sha rather than a body. Unanswered it
+            # comes back unparseable, which is another `config_notes` line.
+            if panel._MERGE_BASE_JQ in args:
+                return f"{MERGE_BASE}\n"
             return json.dumps({"status": "ahead", "files": [
                 {"filename": "fix.py", "patch": "@@ -1,1 +1,2 @@\n+the fix commit"}]})
         return PR
