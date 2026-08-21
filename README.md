@@ -858,6 +858,13 @@ full — including what was broken before it, which is the part no diff recovers
   followed — but shipped text that already existed is **not** exempt, since a test can assert
   on it, as this change did to its own prompt and briefs. The panel's `REVIEW_PROMPT` also stops asking only whether a test is **absent** —
   #90's fixture answered that correctly — and now asks whether a present test is load-bearing.
+- **vNEXT** — the suites that read this repo get a sandbox that holds it. Five suites under
+  `harness/` read files at the repo root while running in nix sandboxes that did not hold them,
+  so their assertions were never evaluated — they errored on missing files, in checks no
+  workflow runs. `prose-consistency-tests` is one check for that whole category rather than a
+  fourth near-identical one, each member now declares what it reads and refuses an undeclared
+  path, and the `flake.nix` reader that had been written twice is shared. `worktree-tests` goes
+  from 9 failures and 20 errors to 3 failures and none.
 - **v2.59** — a row key the dashboard can actually tell apart. `qb-dash-tui` dies with
   `DuplicateKey` when two rows want the same key, and that is not a bad-looking row — a
   `DataTable` raises, so the whole dashboard becomes a traceback. #208 fixed the reported

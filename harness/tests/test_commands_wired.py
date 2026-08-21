@@ -25,9 +25,56 @@ from pathlib import Path
 
 import pytest
 
+import _flake_sandbox
+
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-COMMANDS = REPO_ROOT / "harness" / "commands"
-HM_MODULE = REPO_ROOT / "harness" / "hm-module.nix"
+# No module-level `COMMANDS`/`HM_MODULE` paths: they were a route straight past `_at` below,
+# and an unused one is worse than none — the next read reaches for the constant that already
+# exists rather than the accessor.
+
+#: Every repo path this suite reads, declared for the sandbox that runs it.
+#:
+#: `harness/commands` is the DIRECTORY, not a list of files, because `_shipped` globs it — "which
+#: briefs exist" is the question, so the directory itself is the read and a file list could not
+#: express it. `_prose_sandbox` compares this set against what
+#: `nix build .#checks.<system>.prose-consistency-tests` installs; a read nobody installed does
+#: not FAIL there, it ERRORS on a missing file, which is #163's mechanism and how four suites
+#: before this one sat red in a check no workflow runs (#246, #251, #257).
+READS = frozenset({"harness/commands", "harness/hm-module.nix"})
+
+
+def _at(rel: str) -> Path:
+    """A repo-root path this suite has declared, or an error naming what to do about it.
+
+    Every filesystem access here goes through this. That is what makes `READS` a declaration
+    rather than a summary — without it the set is a comment, and `_prose_sandbox`'s stated
+    invariant ("each member routes every read through an accessor that refuses anything absent
+    from that declaration") would simply be false for this member, silently, while its guards
+    went on reporting the suite as covered.
+
+    The check is by containment rather than equality, because one of this suite's two reads is a
+    DIRECTORY it globs: `harness/commands/epic.md` is a declared read by virtue of
+    `harness/commands` being one. Containment is `_flake_sandbox.under`, shared with the guard
+    that compares this suite against the sandbox — a second hand-written prefix check is how the
+    two come to disagree about what "inside" means, and a raw `startswith` lets
+    `harness/commands/../hm-module.nix` through a gate whose whole job is to refuse it.
+    """
+    assert any(rel == d or _flake_sandbox.under(rel, d) for d in READS), (
+        f"{rel!r} is read here but is not covered by READS, so flake.nix's "
+        f"prose-consistency-tests check does not know to install it — where this read would "
+        f"error as a FileNotFoundError rather than be asserted. Add it to READS and install it "
+        f"in that check.")
+    return REPO_ROOT / rel
+
+
+def _hm_module() -> Path:
+    """`hm-module.nix`, through the gate."""
+    return _at("harness/hm-module.nix")
+
+
+def _brief(name: str) -> Path:
+    """One command brief, through the gate."""
+    return _at(f"harness/commands/{name}.md")
 
 #: The `commands` option's default: a nix list of bare quoted strings. Read out of the source text
 #: rather than by evaluating the module — the point is to be runnable in CI with no nix at all, and
@@ -36,14 +83,14 @@ _DEFAULT_LIST = re.compile(r"commands = lib\.mkOption \{.*?default = \[(.*?)\];"
 
 
 def _listed() -> set[str]:
-    text = HM_MODULE.read_text(encoding="utf-8")
+    text = _hm_module().read_text(encoding="utf-8")
     match = _DEFAULT_LIST.search(text)
     assert match, "hm-module.nix no longer declares a `commands` default as a literal list"
     return set(re.findall(r'"([^"]+)"', match.group(1)))
 
 
 def _shipped() -> set[str]:
-    return {p.stem for p in COMMANDS.glob("*.md")}
+    return {p.stem for p in _at("harness/commands").glob("*.md")}
 
 
 @pytest.fixture(scope="module")
@@ -85,7 +132,7 @@ def test_every_linked_command_has_a_file(name: str, shipped: set[str]):
 def test_every_command_declares_a_description(name: str):
     """`@description` is what Claude Code shows in the command list, and a command nobody can tell
     apart from its siblings is most of the way to not being installed."""
-    text = (COMMANDS / f"{name}.md").read_text(encoding="utf-8")
+    text = _brief(name).read_text(encoding="utf-8")
     assert re.search(r"^@description \S", text, re.MULTILINE), (
         f"harness/commands/{name}.md has no `@description` line")
 
@@ -94,7 +141,7 @@ def test_every_command_declares_a_description(name: str):
 
 
 def command(name: str) -> str:
-    return (COMMANDS / f"{name}.md").read_text(encoding="utf-8")
+    return _brief(name).read_text(encoding="utf-8")
 
 
 def test_fix_and_review_says_it_never_merges():
@@ -209,3 +256,24 @@ def test_fix_and_reviews_escalation_citation_resolves():
     assert re.search(r"^#### 3a\.", command("review-pr"), re.MULTILINE), (
         "review-pr.md no longer has a step 3a, so fix-and-review.md now cites nothing — either "
         "restore it there or stop citing it here")
+
+
+def test_the_reads_are_declared_rather_than_summarised():
+    """`READS` is only worth comparing against flake.nix if it is what this suite may actually
+    read, and `_at`'s refusal is what makes that true. Asserted rather than trusted: it is the
+    mechanism `_prose_sandbox`'s guards rest on, and one `assert` away from being decoration."""
+    with pytest.raises(AssertionError, match="not covered by READS"):
+        _at("harness/package.nix")
+    with pytest.raises(AssertionError, match="install it"):
+        _at("docs/DEPLOY.md")
+
+
+def test_a_path_under_a_declared_directory_is_allowed():
+    """The containment rule, which is not incidental: one of this suite's two reads is a
+    directory it globs, so every brief beneath it is a declared read and an equality check would
+    refuse the suite's own ordinary work."""
+    assert _at("harness/commands/epic.md").name == "epic.md"
+    assert _at("harness/commands").is_dir()
+    # But only genuinely beneath it — component-wise, not by string prefix.
+    with pytest.raises(AssertionError, match="not covered by READS"):
+        _at("harness/commands-old/epic.md")

@@ -43,7 +43,9 @@ from pathlib import Path
 import pytest
 
 HARNESS = Path(__file__).resolve().parents[1]
-COMMANDS = HARNESS / "commands"
+# No module-level `COMMANDS`: it was a route straight past `brief()` below, and the last round
+# removed exactly this constant from test_commands_wired.py for that reason while leaving it
+# here — the next read reaches for the constant that already exists rather than the accessor.
 
 sys.path.insert(0, str(HARNESS / "loops"))
 
@@ -55,13 +57,47 @@ sys.path.insert(0, str(HARNESS / "loops"))
 # `/fix-issue` and `/review-pr` rather than briefing a fixer itself.
 FIX_BRIEFS = ("review-pr.md", "fix-issue.md", "fix-issue-here.md")
 
+#: The one brief that is not a fix loop: `/panel` reviews and never fixes, so it is read to
+#: assert an ABSENCE rather than a behaviour.
+PANEL = "panel.md"
+
+#: Every repo-root path this suite reads, declared in one place.
+#:
+#: It is a declaration rather than a summary because `brief` refuses anything absent from it, so
+#: a new read cannot be added without adding it here. That is what the sandbox needs: this suite
+#: reads files outside its own directory, and `nix build .#checks.<system>.prose-consistency-tests`
+#: runs it against a sandbox holding only what that check installs. A read nobody installed does
+#: not FAIL there, it ERRORS on a missing file — which is how #163 sat unnoticed, and #246, and
+#: #251, and this suite (#257). `_prose_sandbox` compares this set against the check's installs.
+READS = frozenset(f"harness/commands/{name}" for name in (*FIX_BRIEFS, PANEL))
+
+
+def brief(name: str) -> Path:
+    """The path to a command brief, refused if this suite has not declared it.
+
+    One accessor is the whole reason `READS` can be trusted: every read here comes through it,
+    so this single assertion is what makes that set complete rather than a list somebody has to
+    remember to update."""
+    rel = f"harness/commands/{name}"
+    # Note the shape of this accessor, and its limit: it takes a bare filename and hard-codes
+    # the briefs directory onto it, so it can only ever express a read inside
+    # `harness/commands/`. That is every filesystem read this suite makes — but it is not every
+    # dependency: the module also does `sys.path.insert` on `harness/loops` and imports
+    # panel_core, which no path gate can see, and which is why `harness/loops` is declared as a
+    # TREE in `_prose_sandbox` rather than as a read here.
+    assert rel in READS, (
+        f"{rel!r} is read here but is not in READS, so flake.nix's prose-consistency-tests "
+        f"check does not know to install it — where this read would error as a FileNotFoundError "
+        f"rather than be asserted. Add it to READS and install it in that check.")
+    return HARNESS / "commands" / name
+
 
 @pytest.fixture(scope="module")
 def briefs():
     """Each fix-writing brief's text, keyed by filename."""
     out = {}
     for name in FIX_BRIEFS:
-        path = COMMANDS / name
+        path = brief(name)
         assert path.exists(), f"{name} has moved — this suite is now green about nothing"
         out[name] = path.read_text(encoding="utf-8")
     return out
@@ -367,7 +403,17 @@ def test_the_panel_command_describes_the_dimensions_it_actually_sends(briefs):
     It enumerates the review dimensions for a reader deciding whether to run the
     panel. A dimension in `REVIEW_PROMPT` and not in that list is a reviewer doing
     work the command says it does not do."""
-    text = (COMMANDS / "panel.md").read_text(encoding="utf-8")
+    text = brief(PANEL).read_text(encoding="utf-8")
     assert re.search(r"load-bearing", text, re.IGNORECASE), (
         "panel.md's dimension list does not mention load-bearing tests, which "
         "REVIEW_PROMPT now asks every reviewer for")
+
+
+def test_the_reads_are_declared_rather_than_summarised():
+    """`brief`'s refusal is the mechanism `_prose_sandbox`'s comparison rests on for this suite,
+    and it had no test — an identical mechanism in test_fixer_escalation got one, and a broken
+    refusal here would have gone unnoticed while the guards reported the suite as covered."""
+    with pytest.raises(AssertionError, match="not in READS"):
+        brief("no-such-brief.md")
+    with pytest.raises(AssertionError, match="install it"):
+        brief("loops.md")          # a real file, and still not one this suite declared

@@ -11,6 +11,30 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
+## vNEXT — the suites that read this repo get a sandbox that holds it
+
+Five test suites under `harness/` read files at the repo root while running in nix sandboxes
+that hold neither them nor, in one case, the Python package they import. A read nobody copied
+in does not fail there — it ERRORS on a missing file, so the assertions were never evaluated
+and the build said so only in `ERROR` lines inside a check that no workflow runs at all. One
+of them had been erroring at collection since the day it landed; another was found only
+because a human happened to type `nix build`.
+
+`test_release_numbers.py` was the first (#163) and got its own check. This adds
+`prose-consistency-tests` for the rest of the category — the suites whose subject is this
+repo's own text and the code it describes — rather than a fourth near-identical check: a fifth
+instance arrived while the change was being written, and joining it took a declaration, a line
+in a list and one install.
+
+Each member now declares what it reads and routes every read through an accessor that refuses
+an undeclared path, so a read the sandbox does not supply cannot be added silently. The
+comparison against `flake.nix` runs both ways and is asserted in ordinary `pytest`, before a
+push, rather than in a build nobody runs. The reader that parses `flake.nix` was written twice;
+it is now `harness/tests/_flake_sandbox.py`, shared with the check that came first.
+
+`worktree-tests` goes from 9 failures and 20 errors to 3 failures and no errors. The three that
+remain are a tmux version difference, tracked separately.
+
 ## v2.60 — a claim nobody takes: derive the key, make the plan a row, block on pickup
 
 `claims()` returned `[]`. Not filtered — empty, fleet-wide, across every repo and every
