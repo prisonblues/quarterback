@@ -169,6 +169,15 @@ def run(repo, fake_bin, tmp_path, runtime_dir):
         # default's argv as a side effect and would go red the day it changes.
         # The tests that are ABOUT the default set it themselves.
         environ["QB_SEAT_YOLO"] = "0"
+        # OFF for the fixture, and this one is not a convenience. Left alone,
+        # every test here would run the real `qb-pace` beside the script under
+        # test, which reads the DEVELOPER'S OWN subscription out of ~/.claude and
+        # calls the usage endpoint over the network — sixty times a run, on
+        # figures that decide nothing about the code under test and could turn a
+        # suite red because somebody spent a window that afternoon. A test that
+        # reaches the network is its own defect. The tests that are ABOUT the gate
+        # set the knob themselves and put a stub qb-pace on PATH ahead of it.
+        environ["QB_SEAT_PACE"] = "off"
         environ.update(env or {})
         for gone in unset:
             environ.pop(gone, None)
@@ -1231,3 +1240,109 @@ def test_forwarded_knobs_are_all_read():
         f"and says nothing: {sorted(unread)}. qb-seat reads {sorted(read)}."
     )
 
+
+
+# ---- the fleet's ceiling, before the seat spends it (#275) --------------------
+#
+# A seat is a pane nobody is watching, spending a subscription it shares with
+# every other seat and every other project on the fleet. These pin the gate that
+# lets it be told, and — only when asked — stopped.
+
+
+@pytest.fixture
+def pace(fake_bin, tmp_path):
+    """A stub `qb-pace` on PATH, answering whatever a test wants.
+
+    On PATH rather than beside the script, because that is the order qb-seat looks
+    in (an installed copy beats a checkout) — and because a stub the real command
+    would otherwise shadow is a stub that proves nothing.
+    """
+    log = tmp_path / "pace.log"
+
+    def _install(line: str, status: int) -> Path:
+        fake_bin("qb-pace", _SANDBOX_SAFE_SHEBANG
+                 + f'printf "%s\\n" "$*" >> {log}\n'
+                 + (f'printf "%s\\n" {line!r}\n' if line else "")
+                 + f"exit {status}\n")
+        return log
+
+    return _install
+
+
+def test_a_spent_window_stops_a_seat_that_was_told_to_obey(run, agent, pace):
+    """RED/GREEN. This is the one refusal in the harness that reads a ceiling
+    nobody here sets, and it is opt-in: a pane started by something with no human
+    in front of it can be told to wait rather than to fail three retries deep into
+    a round the fleet cannot pay for."""
+    pace("pace: HOLD — 5h at 96%; resets in 47m", 3)
+    result = run("1", env={"QB_SEAT_PACE": "obey"})
+    assert result.returncode == 4
+    assert not agent.exists(), "the agent was started anyway"
+    assert "5h at 96%" in result.stderr
+    assert "47m" in result.stderr, "a hold that does not say when is a stop"
+
+
+def test_a_spent_window_only_says_so_by_default(run, agent, pace):
+    """Being told beats being blocked. A human who wants to spend the last 4% of a
+    window on the thing they care about is making a decision, and a spawner is not
+    the place to overrule it — so the default warns and starts."""
+    pace("pace: HOLD — 5h at 96%; resets in 47m", 3)
+    # UNSET, not "warn": the fixture pins the knob off so the rest of the suite
+    # never reads a real subscription, and a test about the default that supplied
+    # one would be asserting its own argument.
+    result = run("1", unset=("QB_SEAT_PACE",))
+    assert result.returncode == 0
+    assert agent.exists(), "the default refused to start a seat"
+    assert "5h at 96%" in result.stderr
+
+
+def test_a_ceiling_that_could_not_be_read_does_not_stop_a_seat(run, agent, pace):
+    """`unknown` is qb-pace's 4, and it must not be treated as a spent window.
+    Refusing every seat on the fleet because a laptop dropped its network is a far
+    larger claim than the one this gate is making — but it is still SAID, because
+    the one thing an unreadable ceiling may not do is read as a clear one (#244)."""
+    pace("pace: UNKNOWN — the usage endpoint could not be read (HTTP 500)", 4)
+    result = run("1", env={"QB_SEAT_PACE": "obey"})
+    assert result.returncode == 0
+    assert agent.exists()
+    assert "could not be read" in result.stderr
+
+
+def test_a_pace_command_that_hangs_or_breaks_does_not_hold_up_the_pane(run, agent, pace):
+    """Any status that is not qb-pace's `hold` starts the seat. A gate that fails
+    closed on a broken install stops being a budget gate and becomes an outage."""
+    pace("", 127)
+    assert run("1", env={"QB_SEAT_PACE": "obey"}).returncode == 0
+    assert agent.exists()
+
+
+def test_off_does_not_consult_at_all(run, agent, pace):
+    """The knob a test needs, and a box that wants nothing to do with this."""
+    log = pace("pace: HOLD — 5h at 96%", 3)
+    assert run("1", env={"QB_SEAT_PACE": "off"}).returncode == 0
+    assert not log.exists(), "qb-pace was run despite QB_SEAT_PACE=off"
+
+
+def test_a_dry_run_reaches_the_refusal_like_every_other_one(run, agent, pace):
+    """The usage text promises it: a --dry-run reports every refusal without
+    starting anything, which is exactly when you want to be told about this one."""
+    pace("pace: HOLD — 5h at 96%; resets in 47m", 3)
+    result = run("1", "--dry-run", env={"QB_SEAT_PACE": "obey"})
+    assert result.returncode == 4
+    assert not agent.exists()
+
+
+def test_an_unreadable_value_is_read_as_warn_and_says_so(run, agent, pace):
+    """A typo must not silently disable the gate, and must not silently enable a
+    refusal either. It warns, which is the default, and names the value."""
+    pace("pace: HOLD — 5h at 96%", 3)
+    result = run("1", env={"QB_SEAT_PACE": "obeyy"})
+    assert result.returncode == 0
+    assert agent.exists()
+    assert "obeyy" in result.stderr
+
+
+def test_the_gate_is_a_documented_exit_code(run):
+    """4 is in the usage text's list, so `qb-seat --help` accounts for every
+    refusal it can make."""
+    assert "4  the shared subscription's window is spent" in run("--help").stdout

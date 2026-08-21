@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""qb-pace — how the shared subscription stands, for something other than a human.
+
+    qb-pace                 the verdict, one line
+    qb-pace --json          the same, for a caller that has to branch on it
+    qb-pace --estimate 4    …plus what a four-seat job costs and what is left
+    qb-pace --gate          say it AND carry it in the exit status
+
+`qb-dash` has drawn the five-hour and weekly caps since the seats started sharing
+one subscription, and until now nothing read them: the fleet's only hard ceiling
+was enforced by a human noticing a bar go red (#275). This is the same figures,
+in words, at the same three-minute floor and from the same machine-wide cache —
+it never asks the usage endpoint a question the dashboard has not already asked.
+
+EXIT STATUS, AND WHY IT IS OPT-IN. Plain `qb-pace` always exits 0 and always
+prints. Being told is the whole of the gap this closes, and a command that
+started failing in scripts because a window was warm would be a bigger claim than
+the one being made here.
+
+`--gate` is for the caller that has decided to obey, and it inverts both halves:
+the verdict goes in the exit status, and **nothing is printed at `go`**. A caller
+can then relay whatever came out without parsing it, and a line printed on every
+invocation is how an operator learns to skip the one that means something. With
+`--json` the document is printed either way — a parser wants the same shape every
+time, and its "nothing to say" is a field rather than an empty stream.
+
+The codes:
+
+    0  go, or slow — slow means spend less, not stop, and what to turn down is
+       #276's business rather than this command's
+    3  hold — the window is effectively spent. It comes back: the line says
+       when, and a caller that treats 3 as terminal has thrown that away
+    4  unknown — the caps could not be read at all. Deliberately NOT 0: a
+       governor that cannot read its input must not report clear (#244). It is
+       also not 3, because a dropped network is not a spent window, and the two
+       codes differ so a caller can decide which of them it is willing to run on
+    2  this command was used wrongly
+
+WHAT IT DOES NOT DO. It does not throttle, park, resume or choose work. It
+answers "how does the fleet stand" and leaves the rest with the caller — #276
+owns the dials, #55 owns the ceiling this repo sets for itself, #232/#227 own
+what runs next.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from qbdata import (  # noqa: E402
+    limit_reset_secs, pace, pace_estimate, pace_line, subscription_cost,
+)
+
+#: `--gate`'s codes. Named rather than spelled at the `return`, because the
+#: docstring above is the contract a caller reads and a literal is how the two
+#: come to disagree.
+GATE_HOLD = 3
+GATE_UNKNOWN = 4
+
+
+def estimate_lines(verdict: dict, seats: int, rounds: int) -> list[str]:
+    """The job beside the headroom — and a plain refusal to predict the fit.
+
+    The two halves are real and the multiplication between them is not: nothing
+    records how much of a five-hour window a seat-run actually spends (#275's own
+    first step), so the fit line says it cannot be answered rather than dressing
+    a guess in the same voice as the two measurements above it.
+    """
+    cost, why_not = subscription_cost()
+    est = pace_estimate(verdict, cost, seats, rounds)
+    lines = []
+    if est["tokens"] is None:
+        lines.append(f"estimate  unknown — {why_not}")
+    else:
+        # The models are named because the average is over them: a figure that
+        # mixes opus and sonnet runs reads very differently from one that does
+        # not, and "average of what" is not a question a reader should have to ask.
+        lines.append(
+            f"estimate  {seats} seat{'s' if seats != 1 else ''} x {rounds} "
+            f"round{'s' if rounds != 1 else ''} ~ {est['tokens']:,} tokens "
+            f"({est['per_run']:,}/run over {est['runs']} measured "
+            f"{'/'.join(cost.get('models') or ['?'])} runs, board /review/stats). "
+            f"Only seats billing to THIS subscription are counted."
+        )
+    if est["headroom_pct"] is None:
+        lines.append(f"headroom  unknown — {verdict['reason']}")
+    else:
+        left = f"{est['headroom_pct']}% of {verdict['cap']} left"
+        if est["resets_in_s"] is not None:
+            left += f", resets in {limit_reset_secs(est['resets_in_s'])}"
+        lines.append(f"headroom  {left}")
+    lines.append(f"fit       unknown — {est['why']}")
+    return lines
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="qb-pace",
+        description="The shared subscription's caps, as a verdict rather than a bar.",
+    )
+    parser.add_argument("--json", action="store_true",
+                        help="the verdict as an object, for a caller that branches on it")
+    parser.add_argument("--estimate", type=int, metavar="SEATS",
+                        help="what a job of this many seats costs, beside what is left")
+    parser.add_argument("--rounds", type=int, default=1, metavar="N",
+                        help="rounds per seat for --estimate (default 1)")
+    parser.add_argument("--gate", action="store_true",
+                        help="carry the verdict in the exit status: 3 hold, 4 unknown")
+    args = parser.parse_args(argv)
+    if args.estimate is not None and args.estimate < 1:
+        parser.error("--estimate takes a seat count of 1 or more")
+    if args.rounds < 1:
+        parser.error("--rounds takes 1 or more")
+
+    verdict = pace()
+    # `--gate` says nothing at `go`: see the docstring. The JSON path is exempt
+    # because a parser needs one shape every time.
+    quiet = args.gate and verdict["verdict"] == "go"
+    if args.json:
+        # The estimate rides INSIDE the object rather than beside it: a caller
+        # parsing this gets one document or none, never a line of prose glued to
+        # the top of some JSON.
+        if args.estimate is not None:
+            cost, why_not = subscription_cost()
+            verdict = dict(verdict, estimate=dict(
+                pace_estimate(verdict, cost, args.estimate, args.rounds),
+                unavailable=why_not))
+        print(json.dumps(verdict, indent=2))
+    elif not quiet:
+        print(pace_line(verdict))
+        if args.estimate is not None:
+            for line in estimate_lines(verdict, args.estimate, args.rounds):
+                print(line)
+    if not args.gate:
+        return 0
+    return {"hold": GATE_HOLD, "unknown": GATE_UNKNOWN}.get(verdict["verdict"], 0)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

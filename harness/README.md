@@ -19,7 +19,9 @@ board reconnects them.**
   multiplexer into a fleet seat with its own board identity, `qb-board`, which
   launches the terminal board client (`qb-board --follow` tails the board to stdout
   on any host with ssh; see the repo README), `qb-reconcile`, the read-only pass
-  that asks whether the board's plan still describes the present — **and the board
+  that asks whether the board's plan still describes the present, `qb-pace`, which
+  says how the shared subscription's five-hour and weekly windows stand and what a
+  job of N seats would cost against them — **and the board
   client proper**: `qb-hook` (the lifecycle reflexes Claude Code fires), `qb-mcp`
   (the per-session stdio MCP shim), `qb-claude-setup` (the wiring), `qb` (the human
   CLI), and `qb-env`, the site-config library the four of them source
@@ -716,6 +718,7 @@ per-branch database), assign work, or drive the agent past starting it.
 | `QB_SEAT_AGENT` | `claude` | The agent to start |
 | `QB_SEAT_SCOPE` | the repository directory's name | The project half of `seat-<scope>-<n>`, which is what lets two screens each hold a seat 1. Slugged to what the board will take as a name; set it when two screens share one repository, or set it **empty** for the machine-wide numbering this had before #208 |
 | `QB_SEAT_FORCE` | unset | Start anyway when this seat number looks already taken. Truthy values only (`1`, `yes`, `true`, `on`) — `QB_SEAT_FORCE=0` leaves the guard on |
+| `QB_SEAT_PACE` | `warn` | What to do about the shared subscription's window before starting. `warn` says it and starts anyway; `obey` refuses to start at `hold` and names when the window comes back (exit 4); `off` does not consult at all. See `qb-pace` below |
 | `QB_SEAT_YOLO` | **on** | Permission prompts. A seat starts with them off (`--dangerously-skip-permissions`) because nobody is watching the pane to answer one; `QB_SEAT_YOLO=0` (or any of `no`, `false`, `off`) gives them back. The flag is claude's spelling: point `QB_SEAT_AGENT` at a wrapper for anything else |
 | `QUARTERBACK_BASE_URL`, `QUARTERBACK_TOKEN` / `QUARTERBACK_TOKEN_CMD` | from the config file | The board to register the name with |
 | `QUARTERBACK_CONFIG` | `$XDG_CONFIG_HOME/quarterback/config`, else `~/.config/quarterback/config` | Where those three are read from when the environment does not supply them. Sourced in a subshell, and only those three are read back out of it, so nothing else the file sets can reach the seat or the agent |
@@ -907,6 +910,13 @@ are minutes old and still roughly true; past ten minutes the line appends a dim 
 than pretending. A 429 backs off for ten minutes, because the failing call is itself the
 thing being rate limited.
 
+**And the same figures are readable as a verdict, not only as a bar.** Drawing the ceiling
+left it enforced by a human noticing a bar go red, which is a poor arrangement for a fleet
+of panes nobody is watching; `qbdata.pace()` turns the cached figures into `go` / `slow` /
+`hold` / `unknown`, and `qb-pace` — its own section below — is what a script asks. It is the
+same cache and the same three-minute floor, so a verdict never costs a call and the word and
+the bar cannot come to disagree.
+
 **Clicking starts work, not just navigation.** Each PR row carries a `⚖` and each issue row
 a `⚒`; clicking one opens a confirmation showing the exact command, and confirming runs
 `/panel-review-pr <n>` or `/fix-issue <n>` in a detached tmux window of its own — the same
@@ -997,6 +1007,17 @@ clamp bites. This is also the first release where **a screen loses columns by de
 existing callers get seats a third narrower than before, and `QB_SEATS_DASH=` is how to
 have the old screen back.
 
+**A new screen says what its seats are about to spend.** N agents on one shared
+subscription is the largest single spending decision this fleet makes, and it is made here,
+at a prompt, by a human who is not looking at the dash the caps are drawn on — so
+`qb-seats` asks `qb-pace`
+for an estimate of *this* screen's seat count and prints it before the first pane exists.
+It warns and proceeds, always: the refusal lives one layer down in `qb-seat`, off by
+default, for panes with nobody in front of them. Printed here rather than in the panes
+because a seat execs its agent moments later and the agent paints over anything printed
+before it. `QB_SEATS_PACE=off` silences it, and a `qb-pace` that is missing, broken or slow
+costs the note and never the screen.
+
 The width is per-screen state, read from the environment once when the screen is built and
 recorded on the pane. So `--add` and the seat bar's ✕ put the dash back to the width *that
 screen* asked for — including one set by dragging the border, which a reflow will not
@@ -1031,6 +1052,81 @@ both streams, on every resize, saying nothing. So the copy is asked before the h
 PATH's if it answers the flag, otherwise the one that is running, and otherwise no hook at
 all plus a line on stderr naming what it tried. A screen that does not re-fit is honest; a
 hook that fails invisibly is not.
+
+### `qb-pace` — the shared ceiling, read by something other than a bar
+
+Every seat, every panel and every `/fix-issue` on the fleet bills to **one** Claude
+subscription, across every machine and every project. That subscription's five-hour and
+weekly windows are the only hard ceiling any of this has, and until #275 the dashboard drew
+them and nothing read them: the brake was a human watching a progress bar, on a fleet whose
+own documentation says a seat is *a pane nobody is watching*.
+
+```
+qb-pace                 the verdict, one line
+qb-pace --json          the same, for a caller that has to branch on it
+qb-pace --estimate 4    …plus what a four-seat job costs and what is left
+qb-pace --gate          say it AND carry it in the exit status
+```
+
+Four answers, and the fourth is the one that matters most:
+
+- **go** — room, or nothing to pace against. An install authenticating with an API key has
+  no subscription caps at all, so it gets `go` and says why — the same rule that makes the
+  dash's answer to that state one line fewer rather than an error.
+- **slow** / **hold** — the bar's own yellow and red, at 70% and 90%, or sooner when the
+  endpoint's `severity` says so. The thresholds are not restated here; the verdict is
+  derived from `limit_colour`, because a display and a decision disagreeing about what 88%
+  means is exactly the failure nobody can see. **`hold` is a wait, not a stop**: it carries
+  `resets_in_s`, and a caller that treats it as terminal has thrown away the only fact that
+  makes it survivable.
+- **unknown** — the figures could not be obtained at all. Deliberately not `go`, which would
+  be a governor reporting clear on an input it never read; and deliberately not `hold`,
+  which would let a dropped network park the fleet.
+
+Figures that are merely **old** are a third case and they are not discarded — caps move over
+hours, so minutes-old ones are still the right ones to act on. What staleness costs is the
+right to say `go`. It does not promote a `slow` into a `hold`: staleness is uncertainty
+about the number, and parking work over it would be a claim about the window made on the
+strength of the weather.
+
+**Where the number lives: nowhere new.** `pace()` keeps no store. The cap is the usage
+endpoint's fact, `fetch_limits()` already holds the only copy there is — one machine-wide
+cache behind a three-minute floor, shared by every dash pane — and the verdict reads that.
+No second file, no board row, no figure of its own to drift behind the endpoint's back. It
+is fleet-scoped because its **source** is, not because something here aggregates it.
+
+`--gate` inverts both halves for a caller that has decided to obey: the verdict goes in the
+exit status (**3** hold, **4** unknown, **0** go or slow) and nothing is printed at `go`, so
+a caller can relay whatever came out without parsing it. Plain `qb-pace` always exits 0 and
+always prints — being told is the whole of the gap this closes, and a command that started
+failing in scripts because a window was warm would be a bigger claim than the one being
+made. 3 and 4 are separate codes on purpose: a caller may reasonably decide to run on an
+unreadable ceiling and may not reasonably decide to run on a spent one.
+
+**`--estimate` states two measured halves and refuses to multiply them.** It prices the job
+from the board's own record — `GET /review/stats`, counting only the seats that bill to
+*this* subscription, since `codex`, `antigravity` and `pi` bill to OpenAI, a Google account
+and OpenRouter — and it prints what the window has left beside it. The third line says
+`fit unknown`, because nothing anywhere records how much of a five-hour window a seat-run
+actually spends: the board knows tokens, the endpoint knows percent, and no row pairs them.
+Sampling the caps either side of a run is what would close that, and it belongs to whatever
+drives the run. A fit predicted from a rate nobody measured would arrive in the same
+sentence as two real numbers and be believed.
+
+**Who reads it.** `qb-seats` prints the estimate when it builds a screen — N agents on one
+subscription is the largest single spending decision the fleet makes, and it is made at a
+prompt by a human who is not looking at the dash. It warns and proceeds, always. `qb-seat`
+carries the refusal, and it is **off by default**: `QB_SEAT_PACE=obey` is for panes with
+nobody in front of them, and at `hold` such a seat does not start, says when the window
+comes back, and exits 4. `unknown` never stops a seat under either mode — refusing every
+seat on the fleet because a laptop dropped its network is a far larger claim than this is
+making — but it is always said.
+
+**What it deliberately does not do.** It does not throttle, park, resume, or choose work.
+Turning a `slow` into thinner rounds needs dials that can be moved at runtime, which is
+#276; a ceiling this repo sets for *itself* is #55; what to run next is #232/#227. This
+answers "how does the fleet stand", and the value of having it as a function rather than a
+colour is that the answer stops needing somebody to be looking.
 
 ### `qb-reconcile` — does the plan still describe the present?
 

@@ -1137,3 +1137,185 @@ def test_an_empty_get_reaches_fetch_board_as_an_error_rather_than_an_empty_fleet
     out = qd.fetch_board(client)
     assert out["error"] is not None
     assert out["agents"] == []
+
+
+# ---- the pacing verdict (#275) -----------------------------------------------
+#
+# The caps were drawn and read by nothing. These pin the four answers, and in
+# particular the two that are easy to get wrong in the direction that costs
+# money: a ceiling nobody could read must not report as clear, and a window
+# nearly spent must say so before something spends the rest of it.
+
+def _cap(label="5h", percent=10, severity="normal", resets=None):
+    return {"label": label, "percent": percent, "severity": severity, "resets": resets}
+
+
+def test_a_ceiling_that_could_not_be_read_is_unknown_and_never_go():
+    """RED/GREEN: the whole of #244 applied to the budget. A governor that reports
+    `go` on figures it never obtained is worse than one that does not exist — it is
+    believed. `unknown` is also not `hold`, because a dropped network is not a spent
+    window and parking the fleet over one would be a claim about the wrong thing."""
+    got = qd.pace(([], "HTTP 500"))
+    assert got["verdict"] == "unknown"
+    assert got["source"] == "unreadable"
+    assert "HTTP 500" in got["reason"]
+
+
+def test_no_token_is_go_and_says_why():
+    """An API-key install has no subscription caps at all. That is a `go` with a
+    reason, exactly as the dash's answer to the same state is one line fewer rather
+    than an error — and it must not read as `unknown`, which means "there is a
+    ceiling and I could not see it"."""
+    got = qd.pace(([], None))
+    assert got["verdict"] == "go"
+    assert got["source"] == "absent"
+    assert "no OAuth token" in got["reason"]
+
+
+def test_a_cap_near_exhaustion_holds_and_carries_when_it_comes_back():
+    """`hold` is a WAIT, not a stop. The resumption time is the fact that makes it
+    survivable, so it travels with the verdict rather than being looked up again."""
+    soon = (datetime.now(timezone.utc) + timedelta(minutes=47)).isoformat()
+    got = qd.pace(([_cap(percent=96, resets=soon)], None))
+    assert got["verdict"] == "hold"
+    assert got["cap"] == "5h" and got["percent"] == 96
+    assert 2700 <= got["resets_in_s"] <= 2820
+
+
+def test_the_verdicts_are_the_bars_own_thresholds_and_its_severity_rule():
+    """Not restated with numbers of their own: the display and the decision
+    disagreeing about what 88% means is precisely the failure nobody can see."""
+    assert qd.pace(([_cap(percent=69)], None))["verdict"] == "go"
+    assert qd.pace(([_cap(percent=70)], None))["verdict"] == "slow"
+    assert qd.pace(([_cap(percent=89)], None))["verdict"] == "slow"
+    assert qd.pace(([_cap(percent=90)], None))["verdict"] == "hold"
+    # The endpoint's own severity knows about caps this fleet has not modelled, so
+    # it may escalate a percentage that looks comfortable.
+    assert qd.pace(([_cap(percent=4, severity="critical")], None))["verdict"] == "hold"
+    assert qd.pace(([_cap(percent=4, severity="warning")], None))["verdict"] == "slow"
+
+
+def test_the_binding_cap_is_the_worst_one_rather_than_the_first():
+    """A 7d window at 12% does not buy back a 5h window at 94%. The reported cap is
+    the one about to stop the work, whatever order the endpoint listed them in."""
+    got = qd.pace(([_cap("7d", 12), _cap("5h", 94)], None))
+    assert (got["verdict"], got["cap"]) == ("hold", "5h")
+    # Same verdict on both: the one nearer its ceiling is the one to name.
+    got = qd.pace(([_cap("7d", 72), _cap("5h", 81)], None))
+    assert (got["verdict"], got["cap"]) == ("slow", "5h")
+
+
+def test_figures_that_could_not_be_refreshed_lose_the_right_to_say_go():
+    """A `go` on figures nobody could refresh is the one verdict that can be
+    confidently wrong about a window that emptied while the network was down."""
+    got = qd.pace(([_cap(percent=8)], "stale"))
+    assert got["verdict"] == "slow"
+    assert got["source"] == "stale"
+    assert "could not be refreshed" in got["reason"]
+
+
+def test_stale_figures_do_not_promote_a_slow_into_a_hold():
+    """Staleness is uncertainty about the number. Parking work over a network
+    hiccup would be a claim about the window made on the strength of the weather."""
+    got = qd.pace(([_cap(percent=75)], "stale"))
+    assert got["verdict"] == "slow"
+    assert qd.pace(([_cap(percent=95)], "stale"))["verdict"] == "hold"
+
+
+def test_pacing_asks_the_endpoint_no_more_often_than_the_dashboard_does(alone, monkeypatch):
+    """The acceptance criterion in as many words: a verdict must never cost an extra
+    call. It comes off the same machine-wide cache behind the same three-minute
+    floor, so a fleet that consulted it before every unit of work would not be the
+    thing that gets the endpoint to answer 429."""
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-whatever")
+    calls = _serve(monkeypatch, USAGE)
+    first = qd.pace()
+    for _ in range(20):
+        qd.pace()
+    assert len(calls) == 1, "pacing asked the usage endpoint again"
+    assert first["cap"] == "5h" and first["percent"] == 62
+
+
+def test_the_line_names_the_verdict_and_the_reset_it_carries():
+    # Half a minute of slack: the countdown floors to whole minutes, so a bare 47
+    # renders as 46 the instant the clock has moved at all.
+    soon = (datetime.now(timezone.utc) + timedelta(minutes=47, seconds=30)).isoformat()
+    line = qd.pace_line(qd.pace(([_cap(percent=96, resets=soon)], None)))
+    assert line.startswith("pace: HOLD — 5h at 96%")
+    assert "resets in 47m" in line
+    # Nothing to wait for at `go`, so nothing about waiting.
+    assert "resets" not in qd.pace_line(qd.pace(([_cap(percent=4)], None)))
+
+
+# ---- what a job costs, and the fit this deliberately will not predict ---------
+
+def _stats(rows: list[dict]) -> bytes:
+    return json.dumps({"by_model": rows}).encode()
+
+
+def test_only_the_seats_billing_to_this_subscription_are_counted(monkeypatch):
+    """RED/GREEN: the five-hour and weekly caps are the ANTHROPIC subscription's.
+    `codex` bills to OpenAI, `antigravity` to a Google account and `pi` to
+    OpenRouter, so counting a four-seat panel as four seats of pressure on this
+    window overstates it by the three seats that are not on it."""
+    client, _ = _client(monkeypatch, _stats([
+        {"reviewer": "claude", "model": "opus", "total_tokens": 2_000_000,
+         "billable_runs": 5},
+        {"reviewer": "codex", "model": "gpt-5.6-luna", "total_tokens": 9_000_000,
+         "billable_runs": 5},
+    ]))
+    cost, err = qd.subscription_cost(client)
+    assert err is None
+    assert cost["tokens_per_run"] == 400_000, "a seat on another vendor was counted"
+    assert cost["runs"] == 5
+
+
+def test_the_average_is_over_runs_rather_than_over_groups(monkeypatch):
+    """The groups are (reviewer, model, effort) and they have wildly different run
+    counts, so a mean of the rows' own means weights one opus run like forty
+    sonnet ones."""
+    client, _ = _client(monkeypatch, _stats([
+        {"reviewer": "claude", "model": "opus", "total_tokens": 900_000, "billable_runs": 1},
+        {"reviewer": "claude", "model": "sonnet", "total_tokens": 900_000, "billable_runs": 9},
+    ]))
+    cost, _ = qd.subscription_cost(client)
+    assert cost["tokens_per_run"] == 180_000
+
+
+def test_a_board_with_no_token_history_says_so_rather_than_estimating_zero(monkeypatch):
+    client, _ = _client(monkeypatch, _stats([
+        {"reviewer": "claude", "model": "opus", "total_tokens": None, "billable_runs": 0},
+    ]))
+    cost, err = qd.subscription_cost(client)
+    assert cost is None
+    assert "no measured token history" in err
+
+
+def test_a_board_that_will_not_answer_is_reported_rather_than_raised(monkeypatch):
+    def boom(*a, **k):
+        raise OSError("no network")
+
+    monkeypatch.setattr(qd.urllib.request, "urlopen", boom)
+    client = qd.BoardClient(qd.BoardConfig("https://board.example", "t", "host"))
+    cost, err = qd.subscription_cost(client)
+    assert cost is None and "did not answer" in err
+
+
+def test_the_estimate_states_the_job_and_the_headroom_and_refuses_the_fit():
+    """The two halves are measured and the multiplication between them is not.
+    Nothing records how much of a five-hour window a seat-run actually spends —
+    that is #275's own first sequencing step, and it belongs to whatever drives the
+    run. A fit predicted from a rate nobody measured would arrive in the same
+    sentence as two real numbers and be believed."""
+    verdict = qd.pace(([_cap(percent=62)], None))
+    est = qd.pace_estimate(verdict, {"tokens_per_run": 283_795, "runs": 45}, seats=5, rounds=2)
+    assert est["tokens"] == 283_795 * 10
+    assert est["headroom_pct"] == 38
+    assert est["fits"] is None
+    assert "without guessing" in est["why"]
+
+
+def test_an_estimate_with_no_history_is_no_number_rather_than_a_guess():
+    est = qd.pace_estimate(qd.pace(([_cap(percent=62)], None)), None, seats=4)
+    assert est["tokens"] is None and est["per_run"] is None
+    assert est["headroom_pct"] == 38, "the half that IS known is still reported"

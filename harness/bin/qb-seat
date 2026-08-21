@@ -15,6 +15,7 @@ set -uo pipefail
 #   0  --help, or a dry run with nothing to refuse
 #   2  a seat number that is not 1-99, or a directory that is not a git worktree
 #   3  this seat is already running in another pane on this machine
+#   4  the shared subscription's window is spent and QB_SEAT_PACE=obey
 #   *  otherwise this process is REPLACED by the agent and exits as it does
 #:end-usage
 #
@@ -703,6 +704,92 @@ register_seat_name() {
     fi
     return 0
 }
+
+# ---- the fleet's ceiling, before a seat starts spending it -------------------
+#
+# The seats spend ONE subscription between them, so the five-hour and weekly caps
+# are a fleet-wide number no single pane can see — and until #275 nothing read
+# them: `qb-dash` drew a bar and a human watching it was the brake. A seat is the
+# worst place for that arrangement, because the note at the top of this file is
+# that a seat is a pane nobody is watching.
+#
+# BEING TOLD IS THE DEFAULT; BEING STOPPED IS OPT-IN. QB_SEAT_PACE:
+#
+#   warn  (default) say it, start anyway. A human who wants to spend the last 8%
+#         of a window on the thing they care about is making a decision, and a
+#         spawner is not the place to overrule it.
+#   obey  refuse to start at `hold` — the window is effectively spent — and name
+#         when it comes back. For a pane started by something with no human in it.
+#   off   do not consult at all. Also what a test wants: reading the developer's
+#         real subscription is not a thing a suite may do.
+#
+# `unknown` — the caps could not be read AT ALL — starts the seat under either
+# mode, and says so. Refusing every seat on the fleet because a laptop dropped its
+# network is a far larger claim than the one being made here; what it must not do
+# is call that `go` (#244), and it does not.
+#
+# NOTHING IS PRINTED AT `go`, because `qb-pace --gate` is silent when there is
+# nothing to act on — the same rule register_seat_name states above: a line
+# printed on every start is how an operator learns to skip the one that means
+# something.
+#
+# THE VERDICT IS NOT RECOMPUTED HERE. qb-pace reads the caps the dashboard has
+# already fetched, through the same machine-wide cache and the same three-minute
+# floor, so this costs a process and almost never a request — and a seat cannot
+# come to disagree with the bar a human is looking at while deciding whether to
+# start it.
+
+# PATH first, then beside $0 — beside_me's order in qb-seats, for its reasons: an
+# installed copy should beat a checkout, and the two install into one directory
+# together so a sibling is the answer when PATH has none.
+pace_cmd() {
+    local found
+    found=$(command -v qb-pace 2>/dev/null) && { printf '%s' "$found"; return 0; }
+    printf '%s/qb-pace' "$(cd -P "$(dirname "$0")" 2>/dev/null && pwd)"
+}
+
+consult_pace() {
+    local mode bin line status
+    mode="${QB_SEAT_PACE:-warn}"
+    case "$mode" in
+        off) return 0 ;;
+        warn|obey) ;;
+        *)  printf 'qb-seat: QB_SEAT_PACE=%s is not off, warn or obey — read as warn\n' \
+                "$mode" >&2
+            mode=warn ;;
+    esac
+    bin="$(pace_cmd)"
+    # No qb-pace beside us and none on PATH is an older or partial install, not a
+    # reason to refuse to work. The seat starts, unpaced, exactly as it did before.
+    [[ -x "$bin" ]] || return 0
+
+    # Bounded like the board call above, and for the same reason: the answer comes
+    # from a cache almost every time, but the one process that refreshes it is
+    # making an HTTPS request, and a pane that hangs on the network is worse than
+    # a pane that starts without knowing the window.
+    if command -v timeout >/dev/null 2>&1; then
+        line=$(timeout 20 "$bin" --gate 2>/dev/null)
+    else
+        line=$("$bin" --gate 2>/dev/null)
+    fi
+    status=$?
+    [[ -n "$line" ]] && printf 'qb-seat: %s\n' "$line" >&2
+
+    # 3 is qb-pace's `hold`, and only `hold`. A timeout (124), a broken install or
+    # an `unknown` all land elsewhere and start the seat, which is the difference
+    # between a governor that stops work when the window is spent and one that
+    # stops work when anything at all goes wrong.
+    if [[ "$status" == "3" && "$mode" == "obey" ]]; then
+        printf 'qb-seat: not starting seat %s — QB_SEAT_PACE=obey and the shared window\n' \
+            "$SEAT" >&2
+        printf '         is spent. It comes back: the line above says when. Start it then,\n' >&2
+        printf '         or QB_SEAT_PACE=warn to spend the rest of it on this seat now.\n' >&2
+        exit 4
+    fi
+    return 0
+}
+
+consult_pace
 
 # ---- start the seat ----------------------------------------------------------
 
