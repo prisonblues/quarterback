@@ -17,7 +17,7 @@ the top of this file conflict every time, over nothing — both entries are righ
 and a fragment is a path no other branch will ever open. `changelog.d/README.md` has the format.
 `vNEXT` means exactly what it meant before; assembly is just what writes it.
 
-## vNEXT — the files two branches both had to edit, and the guard that measured the wrong thing
+## v2.67 — the files two branches both had to edit, and the guard that measured the wrong thing
 
 ### the release list is rendered, and a branch stops editing the file everyone edits
 
