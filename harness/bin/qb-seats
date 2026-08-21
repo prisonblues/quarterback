@@ -283,7 +283,7 @@ dash_cmd() {
 # two would make this print two ids, `resize-pane -t` rejects a two-id target, and
 # the reassert below would then quietly do nothing at all.
 dash_pane() {
-  tmux list-panes -t "$SESSION:seats" -F '#{pane_id} #{@qb_label}' \
+  tmux list-panes -t "$SESSION_ID:seats" -F '#{pane_id} #{@qb_label}' \
     | awk '$2 == "dash" { print $1; exit }'
 }
 
@@ -483,7 +483,7 @@ dash_hooks() {
   for self in "${tried[@]}"; do
     understands_dash_fit "$self" || continue
     cmd="$(sh_quote "$self") --dash-fit -s $(sh_quote "$SESSION")"
-    tmux set-hook -w -t "$SESSION:seats" window-resized \
+    tmux set-hook -w -t "$SESSION_ID:seats" window-resized \
       "run-shell -b \"$(tmux_quote "$cmd")\""
     return 0
   done
@@ -621,10 +621,15 @@ SESSION_ID=""
 # name is the last field for the reason `screens()` gives — it may contain spaces,
 # and everything before it is one fixed field.
 session_id() {
-  local id nm
+  local line
+  # SPLIT BY HAND, not with `IFS=' ' read -r id nm`: read strips trailing IFS
+  # whitespace from the last field, so a session called `mine ` (tmux takes one)
+  # would come back as `mine` and never compare equal to what the caller asked
+  # for. `IFS=` keeps the line whole and the two expansions cut it at the first
+  # space, which is where the id ends.
   tmux list-sessions -F '#{session_id} #{session_name}' 2>/dev/null \
-    | while IFS=' ' read -r id nm; do
-        [ "$nm" = "$1" ] && printf '%s\n' "$id"
+    | while IFS= read -r line; do
+        [ "${line#* }" = "$1" ] && printf '%s\n' "${line%% *}"
       done
 }
 
@@ -667,7 +672,7 @@ attach() {
 # THE LAST FIELD of each record: everything before it is a fixed count of fields,
 # so a reader can take the rest of the line as the name and be right.
 screens() {
-  local s sid n att path all
+  local s sid n att path all line
   # READ THE SESSION LIST FIRST, and tolerate it failing. A server with no
   # sessions at all — which is `list` and `resume` on a box where nothing is up,
   # the commonest reason to run either — makes `tmux list-sessions` exit 1, and
@@ -680,7 +685,8 @@ screens() {
   # and is not what a reader is scanning. Each line is `<id> <name>`, and the id
   # is what the two lookups below address: a session called `my.screen` is real
   # and unreachable by its own name (see session_id).
-  printf '%s\n' "$all" | sort -k2 | while IFS=' ' read -r sid s; do
+  printf '%s\n' "$all" | sort -k2 | while IFS= read -r line; do
+    sid=${line%% *}; s=${line#* }
     n=$(tmux list-panes -s -t "$sid" -F '#{@qb_seat}' 2>/dev/null \
           | awk 'NF { n++ } END { print n + 0 }')
     [ "$n" -gt 0 ] || continue
@@ -785,7 +791,7 @@ EOF
 # Seats are identified by a pane option, not by index or title: the index shifts
 # when a pane is added, and the agent in the pane rewrites the title.
 seat_panes() {
-  tmux list-panes -t "$SESSION:seats" -F '#{pane_id} #{@qb_seat}' \
+  tmux list-panes -t "$SESSION_ID:seats" -F '#{pane_id} #{@qb_seat}' \
     | awk '$2 != "" { print $1, $2 }' | sort -k2 -n
 }
 
@@ -1179,12 +1185,12 @@ tmux set-environment -t "$SESSION_ID" -r QUARTERBACK_INSTANCE
 
 # Label the panes. Two seats are indistinguishable once both are printing, and
 # being able to address ONE of them is the whole point.
-tmux set-option -w -t "$SESSION:seats" pane-border-status top
+tmux set-option -w -t "$SESSION_ID:seats" pane-border-status top
 # @qb_label is how a pane that is NOT a seat says what it is: the option this script
 # labels the dash and the tape with, and the one the dashboard marks a review pane
 # with when it splits one into this row. Without the middle case every such pane is
 # labelled "board", which is the one thing on this screen they are definitely not.
-tmux set-option -w -t "$SESSION:seats" pane-border-format \
+tmux set-option -w -t "$SESSION_ID:seats" pane-border-format \
   ' #{?@qb_seat,seat #{@qb_seat},#{?@qb_label,#{@qb_label},board}} #{?pane_active,*,} '
 
 # What the screen is, recorded on the screen. The bar's ＋ has to run this same
@@ -1228,7 +1234,7 @@ row_of() {                      # how many seats go in the top row
 }
 TOP=$(row_of)
 
-first=$(tmux list-panes -t "$SESSION:seats" -F '#{pane_id}')
+first=$(tmux list-panes -t "$SESSION_ID:seats" -F '#{pane_id}')
 tmux set-option -p -t "$first" @qb_seat 1
 
 # Split off the pane just made, not off $first: a split lands to the RIGHT of
@@ -1258,7 +1264,7 @@ if [ "$SEATS" -gt "$TOP" ]; then
   done
   tmux select-layout -t "$second" -E 2>/dev/null || true
 fi
-[ "$SEATS" -le 5 ] && tmux select-layout -t "$SESSION:seats" even-horizontal
+[ "$SEATS" -le 5 ] && tmux select-layout -t "$SESSION_ID:seats" even-horizontal
 
 # The dash, down the right. AFTER the select-layout calls above and BEFORE the
 # tape below, and both halves of that matter:
@@ -1287,7 +1293,7 @@ if [ -n "$DASH_CMD" ]; then
   # line saying why beats dying half-built, on a tmux error, with a session name
   # that then makes the obvious rerun fail too.
   if ! dash=$(tmux split-window -h -f -l "$DASH_SIZE" -P -F '#{pane_id}' \
-                -t "$SESSION:seats" -c "$REPO"); then
+                -t "$SESSION_ID:seats" -c "$REPO"); then
     warn "no dash: the pane could not be split off at $DASH_SIZE columns"
     DASH_CMD=""
     dash=""

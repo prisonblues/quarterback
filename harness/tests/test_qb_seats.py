@@ -815,7 +815,12 @@ def test_every_session_target_is_an_id_and_not_a_name():
         # `=$s`/`=$SESSION` and friends: an `=`-anchored target built from a shell
         # variable holding a name. `session_id`'s own list-sessions lookup is not
         # a `-t` and does not match.
-        if re.search(r'-t\s+"=\$', line)
+        # `=$s`/`=$SESSION` and `$SESSION:window` alike: any `-t` built from a
+        # shell variable holding a NAME. The second form survives a `.` by luck —
+        # tmux splits on `:` first, so the dot stays inside the session part — but
+        # not a `:`, which `has:colon:seats` turns into "can't find window:
+        # colon:seats". One rule for both is easier to hold than two.
+        if re.search(r'-t\s+"=?\$(SESSION|s)\b(?!_ID)', line)
     ]
     assert not offenders, (
         "these address a tmux session by name, which breaks the moment the name "

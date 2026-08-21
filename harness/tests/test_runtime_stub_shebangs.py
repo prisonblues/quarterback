@@ -44,15 +44,24 @@ import pytest
 
 TESTS = Path(__file__).resolve().parent
 
-#: A shebang naming `env`, anywhere inside a quoted string.
-_ENV_SHEBANG = re.compile(r"""['"]#!\s*/usr/bin/env\b""")
+#: `/usr/bin/env` at the START of a string literal — which covers the shebang
+#: written whole (`"#!/usr/bin/env bash"`) and the two ways of assembling one
+#: that a `#!`-anchored pattern would miss: `"#!" + "/usr/bin/env bash"`, and a
+#: named constant (`SHEBANG = "/usr/bin/env bash"`) interpolated later. It cannot
+#: catch every possible assembly — a path built character by character defeats
+#: any pattern — so this is a tripwire for the forms people actually write, not
+#: a proof. The nix build is still what decides.
+_ENV_SHEBANG = re.compile(r"""['"](?:#!\s*)?/usr/bin/env\b""")
 
-#: Lines allowed to carry one, each for a stated reason rather than a shape.
-#: `(filename, substring that must also be on the line)`.
+#: Lines allowed to carry one, each for a stated reason rather than a shape:
+#: `(filename, substring that must also be on the line, how many matches it may
+#: carry)`. The COUNT is the
+#: point: exempting a LINE rather than an occurrence would let a second bad literal
+#: be appended to an allowed line and go unread.
 ALLOWED = {
     # A test whose SUBJECT is which shebangs work: it writes all three forms and
     # asserts on what each does. Rewriting it would delete the coverage.
-    ("test_qb_seat.py", 'for body in ('),
+    ("test_qb_seat.py", 'for body in (', 1),
 }
 
 
@@ -63,7 +72,11 @@ def _sources() -> list[Path]:
 
 
 def _allowed(path: Path, line: str) -> bool:
-    return any(path.name == name and needle in line for name, needle in ALLOWED)
+    """Exempt only if the line is named AND carries no more hits than it was granted."""
+    for name, needle, count in ALLOWED:
+        if path.name == name and needle in line:
+            return len(_ENV_SHEBANG.findall(line)) <= count
+    return False
 
 
 @pytest.mark.parametrize("path", _sources(), ids=lambda p: p.name)
@@ -90,7 +103,7 @@ def test_the_allowlist_still_matches_something():
     It would also hide the next real instance in that file the day the line it was
     written for is edited, so a stale entry is worse than an absent one.
     """
-    for name, needle in ALLOWED:
+    for name, needle, count in ALLOWED:
         path = TESTS / name
         assert path.exists(), f"ALLOWED names {name}, which is gone — drop the entry"
         matched = [
@@ -101,12 +114,19 @@ def test_the_allowlist_still_matches_something():
             f"ALLOWED exempts {name} lines containing {needle!r}, but no such line "
             "carries a /usr/bin/env shebang any more — the exemption is stale and "
             "should be deleted, not left to cover a future one")
+        for line in matched:
+            assert len(_ENV_SHEBANG.findall(line)) <= count, (
+                f"{name}: the exempt line carries more than the {count} literal(s) it "
+                "was granted — say why in ALLOWED rather than raising the number")
 
 
 def test_the_pattern_catches_the_form_that_actually_shipped():
     """The guard's own red, since a pattern that matches nothing passes everything."""
     assert _ENV_SHEBANG.search("""    fake.write_text('#!/usr/bin/env bash\\n' + body)""")
     assert _ENV_SHEBANG.search('''    stub.write_text("#!/usr/bin/env sh\\n")''')
+    # …the two ways of assembling one that a `#!`-anchored pattern would miss…
+    assert _ENV_SHEBANG.search('    stub.write_text("#!" + "/usr/bin/env bash")')
+    assert _ENV_SHEBANG.search('SHEBANG = "/usr/bin/env bash"')
     # …and does not fire on the two forms that are correct.
     assert not _ENV_SHEBANG.search("""    fake.write_text('#!/bin/sh\\n' + body)""")
     assert not _ENV_SHEBANG.search('''    fake.write_text(f"#!{BASH}\\n" + body)''')
