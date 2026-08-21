@@ -858,17 +858,6 @@ full — including what was broken before it, which is the part no diff recovers
   followed — but shipped text that already existed is **not** exempt, since a test can assert
   on it, as this change did to its own prompt and briefs. The panel's `REVIEW_PROMPT` also stops asking only whether a test is **absent** —
   #90's fixture answered that correctly — and now asks whether a present test is load-bearing.
-- **v2.62** — a dashboard for one project. Every dash panel was fleet-wide while every screen
-  is built for one repo, so most rows were somebody else's and the repo cell was the same word,
-  eleven columns wide, on every line of a 78-column pane — and on the printed panels another
-  repo's plan items pushed this one's into the "…and N more" line. FLEET, CLAIMED and PLANS now
-  narrow to the repos the screen already resolved for its `gh` calls, the repo column is dropped
-  where it would say one thing on every row, and `s` (or `--scope all`, `QB_DASH_SCOPE=all`)
-  widens. Every narrowed panel says what it hid; a row the board could not attribute is kept and
-  marked `?`; the SEATS state column and the held-issue markers stay fleet-wide, because a seat
-  on another screen and an issue held from another checkout are both still facts about this one.
-  `--repo <checkout|owner/name>` points a pane at another project — a checkout also moves where
-  the ⚒ and ⚖ launch, and both now refuse a row from a repo this checkout is not.
 - **v2.61** — the suites that read this repo get a sandbox that holds it. Five suites under
   `harness/` read files at the repo root while running in nix sandboxes that did not hold them,
   so their assertions were never evaluated — they errored on missing files, in checks no
@@ -906,6 +895,17 @@ full — including what was broken before it, which is the part no diff recovers
   own rows were going stale for every open PR. And `preland`'s merge-claim check now **warns when a
   repo claims nothing at all**, because `unclaimed` there was the absence of a record being read as
   evidence.
+- **v2.62** — a dashboard for one project. Every dash panel was fleet-wide while every screen
+  is built for one repo, so most rows were somebody else's and the repo cell was the same word,
+  eleven columns wide, on every line of a 78-column pane — and on the printed panels another
+  repo's plan items pushed this one's into the "…and N more" line. FLEET, CLAIMED and PLANS now
+  narrow to the repos the screen already resolved for its `gh` calls, the repo column is dropped
+  where it would say one thing on every row, and `s` (or `--scope all`, `QB_DASH_SCOPE=all`)
+  widens. Every narrowed panel says what it hid; a row the board could not attribute is kept and
+  marked `?`; the SEATS state column and the held-issue markers stay fleet-wide, because a seat
+  on another screen and an issue held from another checkout are both still facts about this one.
+  `--repo <checkout|owner/name>` points a pane at another project — a checkout also moves where
+  the ⚒ and ⚖ launch, and both now refuse a row from a repo this checkout is not.
 - **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
   object store; wire `landed` refs to a cherry-pick helper.
 
