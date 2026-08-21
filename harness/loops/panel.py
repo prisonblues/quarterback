@@ -305,6 +305,11 @@ def _payload_defaults() -> dict:
         "coverage_note": None,
         "diff_truncated": False,
         "diff_chars": 0,
+        # The PR's own size, which a skipped round never measured (#298). 0 rather
+        # than null for the same reason `diff_chars` beside it is 0: `reviewed` is
+        # what tells a reader this round measured nothing, and the growth ceiling
+        # already refuses a baseline whose `reviewed` is false.
+        "pr_chars": 0,
         "diff_budgets": {},
         "config_notes": [],
         # Present on every payload, empty by default: a consumer that reads it —
@@ -1765,17 +1770,37 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # ---- the growth ceiling (#165). A fix pass that MULTIPLIES the diff has written
     # a second change, not a fix: on PR #236 the fix passes took a 359-insertion bug
     # fix to 2,313 while none of the 67 findings was in the fix, and the last of them
-    # introduced an unbounded FIFO read. So a round whose material is more than
-    # `max_fix_growth` times what the cycle's FIRST round reviewed stops and says the
-    # change wants splitting, rather than buying another panel over a bigger change.
+    # introduced an unbounded FIFO read. So a round whose PR is more than
+    # `max_fix_growth` times the size the cycle's FIRST round found it at stops and
+    # says the change wants splitting, rather than buying another panel over a bigger
+    # change.
     #
-    # Computable with no new plumbing: the size is `len(review.target)`, the same
-    # number `diff_chars` records, and `Baseline.first_reviewed` reads the earliest
-    # baseline's own `diff_chars` off the payloads round 2+ already receives via
-    # `--baseline`. Both are scope-dependent, which is why the scope of each end
-    # travels with it and is printed — under the default `increment` scope this is
-    # "the fix commit is Nx the change round 1 read", under `pr` scope it is "the PR
-    # has grown Nx", and they are different sentences about the same ceiling.
+    # **BOTH ENDS ARE THE WHOLE PR, WHATEVER THIS ROUND REVIEWED (#298).**
+    # `round_scope` decides what the reviewers are asked to LOOK AT; this ceiling
+    # asks how big the change has BECOME. They are different questions, and the
+    # second must not silently change its meaning because the first was configured.
+    # Measured on `review.target` — as it was until #298 — the default `increment`
+    # scope put one round's fix commit over the cycle's whole-PR starting size, which
+    # is a real quantity and not the one that runs away: PR #188 went 185 -> 593 ->
+    # 721 churned lines, 3.90x under this 3.0x ceiling, while its round-2 increment
+    # was 128 lines and never came near it. The backstop against the 63.7% bad-fix
+    # injection this repo measures was pointed at the wrong number and never fired.
+    #
+    # Still no new plumbing on this end: `review.diff` is the PR as `gh pr diff`
+    # returned it under either scope, and `Baseline.first_reviewed` reads the
+    # earliest baseline's whole-PR size off the payloads round 2+ already receive via
+    # `--baseline` (`pr_chars`, recorded below).
+    #
+    # `review.diff` under a manifest round is the MANIFEST, exactly as
+    # `review.target` was: what that round put in front of the panel is a description
+    # of a move, and the target's pre-substitution size lives in `preflight.shape`.
+    # Named rather than left to be discovered, because it is the one case where this
+    # ratio is not two diff sizes.
+    #
+    # The measurement of each end still travels with it and is still printed, because
+    # two readings of a size exist in this payload and whatever reports a ratio has to
+    # be able to say which one it computed. `review_scope` rides alongside so a reader
+    # can see what the round reviewed without mistaking it for what was measured.
     #
     # **NOT dressed up as convergence.** It takes a veto line naming itself and
     # `confident` is forced false, the same discipline the round cap and a held
@@ -1785,21 +1810,23 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     growth = None
     if dials.max_fix_growth is not None and prior.first_reviewed:
         first_round, first_chars, first_scope = prior.first_reviewed
-        ratio = len(review.target) / first_chars
+        pr_chars = len(review.diff)
+        ratio = pr_chars / first_chars
         over = ratio > dials.max_fix_growth
         growth = {"limit": dials.max_fix_growth, "ratio": round(ratio, 3),
-                  "over": over, "chars": len(review.target), "scope": review.scope,
+                  "over": over, "chars": pr_chars, "scope": "pr",
+                  "review_scope": review.scope,
                   "first_round": first_round, "first_chars": first_chars,
                   "first_scope": first_scope}
         if over:
             stop["stop"] = True
             stop["reason"] = (
-                f"the change this round reviewed is {ratio:.1f}x what round "
-                f"{first_round} reviewed, past the {dials.max_fix_growth:g}x "
+                f"this PR is {ratio:.1f}x the size round {first_round} reviewed it at, "
+                f"past the {dials.max_fix_growth:g}x "
                 f"`max_fix_growth` ceiling — {stop['reason']}, and what this needs is "
                 "splitting, not another round")
             stop["veto"] = [*stop["veto"],
-                            f"this round's {len(review.target):,} chars ({review.scope}) "
+                            f"the PR's {pr_chars:,} chars (whole PR) "
                             f"against round {first_round}'s {first_chars:,} "
                             f"({first_scope}) is {ratio:.1f}x, past the "
                             f"{dials.max_fix_growth:g}x `max_fix_growth` ceiling — a fix "
@@ -1990,6 +2017,14 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # answer, and a seat that got the whole target and only part of the
         # context is named in `config_notes`.
         "diff_chars": len(review.target),
+        # The WHOLE PR's size, whatever this round reviewed — the growth ceiling's
+        # own measurement (#298) and the one number in this group that means the same
+        # thing on every round of a cycle. `diff_chars` above is scope-dependent by
+        # design, so a later round reading it as "how big is this PR now" is handed a
+        # fix commit; plotted across a cycle, this is the line that does not cliff at
+        # round 2. Equal to `diff_chars` under "pr" scope, and under a manifest round
+        # both measure the manifest, which is what was sent.
+        "pr_chars": len(review.diff),
         # Everything prepared ALONGSIDE the target: 0 under "pr" scope, where
         # there is no such thing. This plus `diff_chars` is what a round put in
         # front of an uncapped reviewer, and the pair is the measurement issue #41
