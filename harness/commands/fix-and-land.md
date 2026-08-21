@@ -206,13 +206,14 @@ turns the merge off.
    If both hold, **claim the base, re-verify, merge, then stand down** — in that order:
 
    ```bash
-   qb-claim branch "$BASE" --note "landing PR #<pr>" --json   # 0 = yours, 1 = held, 2 = cannot tell
+   claim_id=$(qb-claim branch "$BASE" --note "landing PR #<pr>" --json)  # 0 yours / 1 held / 2 unknown
    python3 ~/.claude/loops/preland.py --pr <pr> --json --claim-holder "<the holder it printed>"
    gh pr merge <pr> --squash --delete-branch
    ```
 
    ```
    merge_queue_leave(pr=<pr>, base="$BASE", entry_id="<the id 4a returned>", reason="merged")
+   release_claim(claim_id="<$claim_id>")
    ```
 
    - **Being at the head of the queue is not the claim.** The queue orders; `kind=merge` is the
@@ -232,8 +233,16 @@ turns the merge off.
    - **Re-run the gate after claiming**, because time passed: CI can have gone red and the head
      can have moved. `--claim-holder` takes the `holder` field out of `qb-claim --json` so your
      own claim is not read as somebody else's. Anything but READY here ends the sequence — report
-     the new verdict and say that you hold the claim and did not merge, so nobody reads a live
-     claim as a landing in progress. It carries a TTL and lapses on its own.
+     the new verdict, and **release the claim on the way out** (`release_claim(claim_id="$claim_id")`)
+     before you leave the queue and stop.
+   - **Once you have taken the claim, every exit releases it — the merge and the stop alike.**
+     `qb-claim` prints the claim id on stdout and everything else on stderr, which is what makes
+     `claim_id=$(…)` above the whole capture. A claim left behind by a loop that stopped is worse
+     than a queue entry left behind: it is `preland`'s `merge_claim` check answering "somebody is
+     landing onto `$BASE`" to **every other agent in the fleet**, for the rest of its TTL, about a
+     land that is not happening. Nobody merges onto that base in the meantime. Pass the same
+     `session` you claimed with if the release is refused — `qb-claim` defaults it to
+     `$CLAUDE_CODE_SESSION_ID`, and a claim that named a session is owned by that session.
    - **Leaving the queue is the last step and it is not optional.** The line advancing is the
      moment every PR behind this one may start spending CI, and until the entry goes they are all
      correctly waiting for a land that already happened. It expires on its own, but a lease

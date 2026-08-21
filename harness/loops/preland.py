@@ -1030,8 +1030,7 @@ def check_queue(repo: str, pr: dict) -> Check:
         QUEUE_PATH, {"repo": repo, "base": base, "pr": pr["number"],
                      "head": pr["headRefOid"]})
     if status == 404:
-        return Check("queue", "skipped-absent",
-                     f"this board has no landing queue (no /{QUEUE_PATH})")
+        return _queue_absent(base)
     if err:
         c = Check("queue", "error", "the queue is unreadable")
         c.reasons.append(
@@ -1052,6 +1051,36 @@ def check_queue(repo: str, pr: dict) -> Check:
     c = Check("queue", "passed",
               detail={"base": base, "active_order": order, "you": you})
     return _judge_place(c, you, order, pr, base)
+
+
+def _queue_absent(base: str) -> Check:
+    """A 404 on ``/merge-queue``: ruled on rather than believed.
+
+    404 is the board saying "no such route", and for THIS route that is usually a
+    capability answer — the endpoint landed in #317, and a board deployed before it
+    has no line to read. But 404 is also what a base URL pointed at the wrong host
+    returns, and what a proxy with no upstream returns, and reading either of those
+    as "this board has no queue" would fail the gate open on exactly the
+    misconfiguration it has no other way of noticing. A capability answer that
+    cannot be told apart from an outage is not a capability answer.
+
+    So the absence is corroborated, the way :func:`_detected` corroborates a
+    missing guardrail script against the base rather than taking the branch's word
+    for it: ask for a route that predates the queue by a long way. A board that
+    answers ``/claims`` is a real board that simply does not have the queue yet;
+    one that cannot answer that either is not a board this gate is talking to.
+    """
+    _, err, _status = board_request("claims", {"limit": "1"})
+    if not err:
+        return Check("queue", "skipped-absent",
+                     f"this board has no landing queue (no /{QUEUE_PATH})")
+    c = Check("queue", "error", "the queue is unreadable")
+    c.reasons.append(
+        f"the board answered 404 for /{QUEUE_PATH}, and /claims — which has existed "
+        f"far longer — came back with: {err}. So this is not a board that merely "
+        "predates the queue, and nothing here can tell whether another PR is ahead "
+        f"of this one in the line to land on {base!r}")
+    return c
 
 
 def _judge_place(c: Check, you: dict, order: list, pr: dict, base: str) -> Check:

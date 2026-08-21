@@ -1154,14 +1154,38 @@ def test_the_queue_is_asked_about_the_base_and_this_head(queue):
     assert queue["asked"] == [{"repo": "o/r", "base": "main", "pr": 7, "head": HEAD}]
 
 
-def test_a_board_with_no_queue_is_a_capability_answer_not_a_failure(queue):
+def test_a_board_with_no_queue_is_a_capability_answer_not_a_failure(board):
     """The endpoint landed in #317 and a board deployed before it answers 404 —
     the same fact as a repo with no `scripts/migration_reconcile.py`. Every host
     HOLDing until its board is redeployed would be a gate people turn off."""
-    queue["body"], queue["err"], queue["status"] = None, "board answered HTTP 404", 404
+    board["merge-queue"] = (None, "board answered HTTP 404", 404)
+    board["claims"] = ({"claims": []}, "")
     c = preland.check_queue("o/r", pr())
     assert c.status == "skipped-absent"
     assert preland.verdict_of([c]) == preland.READY
+
+
+def test_a_404_from_a_board_that_answers_nothing_else_is_not_a_capability_answer(board):
+    """Codex, round 1. 404 is also what a base URL pointed at the wrong host
+    returns, and what a proxy with no upstream returns — and reading either of
+    those as "this board has no queue" fails the gate open on exactly the
+    misconfiguration it has no other way of noticing. So the absence is
+    corroborated against a route that predates the queue by a long way."""
+    board["merge-queue"] = (None, "board answered HTTP 404", 404)
+    board["claims"] = (None, "board answered HTTP 404 for /claims", 404)
+    c = preland.check_queue("o/r", pr())
+    assert c.status == "error", (
+        "a board that cannot answer /claims either was read as one that merely "
+        "predates the queue, so a mis-pointed board URL reaches READY")
+    assert preland.verdict_of([c]) == preland.HOLD
+
+
+def test_a_404_corroborated_against_a_REFUSED_claims_read_is_not_absence(board):
+    """A 401 on /claims is a token problem, not a board without a queue. Anything
+    that is not a clean answer leaves the 404 uncorroborated."""
+    board["merge-queue"] = (None, "board answered HTTP 404", 404)
+    board["claims"] = (None, "board answered HTTP 401 — the token was refused", 401)
+    assert preland.check_queue("o/r", pr()).status == "error"
 
 
 def test_a_queue_that_cannot_be_read_holds_and_names_the_off_switch(queue):

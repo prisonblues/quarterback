@@ -582,3 +582,22 @@ def test_fix_and_land_claims_the_base_before_it_merges():
     assert "--claim-holder" in runnable, (
         "the re-verification after claiming does not pass `--claim-holder`, so the loop's own "
         "claim is read as somebody else's and it holds its own merge")
+
+
+def test_the_landing_claim_is_released_on_every_exit_after_it_is_taken():
+    """Codex, round 1. The claim is a worse thing to leak than a queue place: it is preland's
+    `merge_claim` check answering "somebody is landing onto $BASE" to every other agent in the
+    fleet, for the rest of its TTL, about a land that is not happening — so nobody merges onto that
+    base in the meantime. The post-claim re-verification can come back anything but READY, and that
+    exit has to release it too."""
+    text = command("fix-and-land")
+    runnable = _fenced(text)
+    assert "release_claim" in runnable, (
+        "fix-and-land takes `kind=merge` and never releases it, so a loop that stopped between the "
+        "claim and the merge blocks every other agent's landing until the TTL expires")
+    assert re.search(r"claim_id=\$\(", runnable), (
+        "nothing captures the claim id `qb-claim` prints on stdout, so there is no id to release "
+        "with — the release step above cannot actually be run")
+    assert re.search(r"every exit releases it", text), (
+        "the release reads as a step in the happy path only; the exit that matters is the one where "
+        "the re-verification did not come back READY")
