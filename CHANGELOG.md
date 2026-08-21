@@ -11,7 +11,7 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
-## vNEXT — the hm-module wires the board in, not just the commands
+## v2.65 — the hm-module wires the board in, not just the commands
 
 `homeManagerModules.quarterback-harness` said it "wires the harness into `~/.claude` and
 `~/.local/bin`". It wrote to neither of those in the way that sentence implies and installed

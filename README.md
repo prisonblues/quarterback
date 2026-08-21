@@ -932,7 +932,7 @@ full — including what was broken before it, which is the part no diff recovers
   `/usr/bin/env` (there is none in a nix sandbox, and this had shipped five times, so it is a
   guard now rather than a review comment), and five `test_qbdata.py` tests asked git about a
   checkout the sandbox does not hold and build their own.
-- **vNEXT** — the hm-module wires the board in, not just the commands. `homeManagerModules
+- **v2.65** — the hm-module wires the board in, not just the commands. `homeManagerModules
   .quarterback-harness` said it wired the harness into `~/.claude` and installed three things:
   the package, `~/.claude/loops`, and the command files. The seven Claude Code hook entries,
   the MCP registration and `qb-hook` itself all lived in whatever personal config a consumer
