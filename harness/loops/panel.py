@@ -1003,7 +1003,6 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # same payload. See `panel_preflight.Ceiling`.
         refused_by = (f"not dispatched — the panel refused this round "
                       f"({pre.measured:,} {pre.cap_unit} against {pre.cap:,})")
-        print(report, file=chatter)
         refuse_payload = {
             **_payload_defaults(),
             "repo": repo_name, "github": gh_repo, "pr": pr_number,
@@ -1068,15 +1067,25 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             "preflight": pre.as_dict(),
             "run_key": run_key,
         }
-        failed = write_payload(json_file, refuse_payload)
         # RECORDED, unlike the title-pattern skip, and that is the difference
         # between the two paths rather than an inconsistency. A title skip says
         # "this PR was never worth a panel"; a refusal says "a panel was wanted
         # and this diff defeated it", which is exactly the observation the board
         # exists to accumulate — and the issue's own requirement, so that "no
         # review" can never be read later as "clean".
+        #
+        # Ahead of the write and ahead of the print, because a refusal the board
+        # never saw has to say so in all three artefacts and not just in the one
+        # nobody keeps (#284). `refusal_report` takes no notes list — it is not
+        # the panel's report — so the line is appended to the notice in the same
+        # `⚠️ config:` shape the reviewed report renders `config_notes` in.
         if record:
-            record_run(refuse_payload)
+            missed = record_run(refuse_payload)
+            if missed:
+                refuse_payload["config_notes"].append(missed)
+                report += f"\n  - ⚠️ config: {missed}"
+        print(report, file=chatter)
+        failed = write_payload(json_file, refuse_payload)
         if json_out:
             print(json.dumps(refuse_payload, indent=2))
         elif post:
@@ -2173,14 +2182,24 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         "run_key": run_key,
     }
 
+    # Recorded BEFORE the file is written, which is the ordering the fix needs
+    # rather than a preference: `record_run` now answers whether the board took
+    # the run, and `notes` IS `payload["config_notes"]` — so appending here puts
+    # "this round was NOT recorded" into the payload on disk, into `--json`, and
+    # into the report and PR comment below, instead of into a stderr line in a
+    # subprocess nobody reads (#284). The board is sent the payload as it stood,
+    # which is right both ways round: if it answered, it has the run and the note
+    # is false; if it did not, there is nothing to have received the note.
+    if record:
+        missed = record_run(payload)
+        if missed:
+            notes.append(missed)
+
     # So a caller can have BOTH the PR comment and the machine-readable run.
     # Without --json-file, --json suppresses the report and the only way to get
     # both was to review the PR twice — several CLI invocations, for a copy. A
     # requested file that could not be written FAILS the run (see `finish`).
     write_failed = write_payload(json_file, payload)
-
-    if record:
-        record_run(payload)
 
     # ---- machine-readable mode: the whole run as JSON, no report/post. Same
     # shape as the skip-pattern exit's payload, so a consumer can read any key of

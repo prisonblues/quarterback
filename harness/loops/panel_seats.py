@@ -1069,7 +1069,34 @@ def run_cli(args: list[str] | Callable[[], list[str]], label: str, timeout: int 
     return None, last
 
 
-def record_run(payload: dict) -> None:
+#: How much of `qb`'s own output is quoted back into the one-line note. Long
+#: enough for a curl error or an HTTP status, short enough that a board returning
+#: an HTML error page cannot push a page of markup into a PR comment.
+QB_SAID_MAX = 200
+
+
+def _unrecorded(why: str) -> str:
+    """The one line a round that did not reach the board says about itself.
+
+    Printed on stderr AND returned, because those are two different readers and
+    #284 is what happens when only the first exists: the stderr line lives in a
+    subprocess nobody reads afterwards, while the returned line goes into
+    `config_notes` — the payload, the report, and the PR comment.
+
+    It names the recovery because the payload survives the failure: `--json-file`
+    writes exactly the bytes this function pipes to `qb`, so the run can be put on
+    the board later from any host that has one. That is the whole of #284's
+    backfill answer for runs from here on — no queue, no retry daemon, no state
+    to go stale; the artefact already exists and the note says what to do with it.
+    """
+    line = (f"this round was NOT recorded on the board — {why}. The review itself "
+            "is complete and unaffected; re-record it later with "
+            "`qb record-review < <the --json-file payload>`")
+    print(f"panel: {line}", file=sys.stderr)
+    return line
+
+
+def record_run(payload: dict) -> str:
     """Record this run on the quarterback board, best-effort.
 
     A panel run is a controlled comparison — one diff, several models, one judge
@@ -1095,21 +1122,50 @@ def record_run(payload: dict) -> None:
 
     Never raises and never blocks the review: telemetry that can fail a run that
     already succeeded is worse than no telemetry.
+
+    **Returns "" when the board has it, and one line saying so when it does not**
+    — for the caller to put in `config_notes`, which is the whole of #284. Not
+    failing the run was always right; being SILENT about it was not, and the two
+    had been fused into a bare `return`. `qb` lives in the fleet's own repo (#28),
+    so its absence is an ordinary property of a host rather than an anomaly, and
+    a round recorded nowhere was indistinguishable from one recorded everywhere:
+    67 rounds across 30 PRs went missing that way, leaving the board holding 39%
+    of this repo's review history and every measurement taken from it — the
+    /panel leaderboard, #165's dial calibration, #232's orderer — computed off a
+    three-day tail nobody knew was a tail.
+
+    Three ways to miss, one sentence each:
+
+    * no `qb` on this host — the early return that caused #284;
+    * `qb` refused (exit non-zero): no board URL, no token, no such subcommand;
+    * `qb` ran and the board did not answer. This is the quiet one. `qb
+      record-review` exits **0** whether or not the POST landed, deliberately —
+      a down board must never fail a review — and distinguishes the two on its
+      streams: the success branch prints the recorded id on STDOUT, the failure
+      branch prints "review not recorded (…)" on stderr and leaves stdout empty.
+      So an empty stdout under exit 0 is the tell, and what `qb` said is quoted
+      either way so a misread corrects itself in front of the reader rather than
+      becoming a confident wrong sentence about a program in another repo.
     """
     if not shutil.which("qb"):
-        return
+        return _unrecorded("there is no `qb` on this host (it lives in the fleet's "
+                          "own repo, not this one — #28)")
     try:
         proc = subprocess.run(["qb", "record-review"], input=json.dumps(payload),
                               capture_output=True, text=True, timeout=20)
     except (OSError, subprocess.SubprocessError) as e:
-        print(f"panel: run not recorded ({e.__class__.__name__})", file=sys.stderr)
-        return
-    # qb exits 0 whether or not the board answered, and says which on stderr; the
-    # note is worth surfacing (a board that has been down for a week is invisible
-    # otherwise) but is never an error here.
-    note = (proc.stdout or proc.stderr or "").strip().splitlines()
-    if note:
-        print(f"panel: {note[-1]}", file=sys.stderr)
+        return _unrecorded(f"`qb record-review` failed ({e.__class__.__name__})")
+    said = (proc.stderr or proc.stdout or "").strip().splitlines()
+    quoted = f" — `qb` said: {said[-1][:QB_SAID_MAX]}" if said else ""
+    if proc.returncode:
+        return _unrecorded(f"`qb record-review` exited {proc.returncode}{quoted}")
+    if not (proc.stdout or "").strip():
+        return _unrecorded(f"`qb` ran but the board did not answer{quoted}")
+    # Recorded. The id (and the board's "already recorded" for a replayed
+    # payload) is still worth a stderr line — it is how a human watching a run
+    # sees the record land.
+    print(f"panel: {proc.stdout.strip().splitlines()[-1]}", file=sys.stderr)
+    return ""
 
 
 #: `qb`'s exit code for a subcommand it does not have — and for several other
