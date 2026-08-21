@@ -85,9 +85,13 @@ turns the merge off.
    `mergeable` + CI-green over its own panel round, which had 8 P1s outstanding, by an agent who had
    written up that precise confusion an hour earlier and had itself recorded the PR as blocked.
 
-   - **HOLD, and `checks.queue` is the only check that failed** → you are in the line but not at
+   - **HOLD whose only unresolved check is your place in the line** — `checks.queue.status` is
+     `failed` and every other check reads `passed` or `skipped-*`. You are in the queue and not at
      the head. **Stand down**: report `checks.queue.reasons` — they name your position and the
-     agent holding the place ahead — and stop. Do **not** rebase, push or restart CI: you would
+     agent holding the place ahead — and stop. (`checks.queue.status` of `error` is a different
+     thing: the board could not be read, so take the branch below. And if the reason says you are
+     not in the line at all, 4a did not land — run it again rather than proceeding past a check
+     that cannot see you.) Do **not** rebase, push or restart CI: you would
      spend a run to learn what the board already told you, and invalidate the head's checks doing
      it. Do **not** post a PR comment; the position changes on its own, and a comment per attempt
      is noise on a PR whose only problem is its turn.
