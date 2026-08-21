@@ -1022,6 +1022,17 @@ full — including what was broken before it, which is the part no diff recovers
   is deliberately NOT asked: two attempts to establish it from the local repository each
   opened the laundering hole the other closed, so the refusal names both repairs — rewrite the
   entry, or fetch a base that is behind — rather than guessing which applies.
+- **vNEXT** — the release list is rendered, and a branch stops editing the file everyone edits.
+  This list was retyped from the CHANGELOG and fell out of order — `v2.61, v2.59, v2.60, …` for
+  three releases, eleven bullets adrift by the time #296 was opened — so its ORDER now comes
+  from `scripts/readme_releases.py` and a test fails when it drifts. Only the order: a bullet is
+  a summary somebody chose, so it is moved byte-for-byte and a release with no bullet is a
+  refusal, not an invented sentence. And a branch writes `changelog.d/<issue>.<kind>.md` rather
+  than editing the top of `CHANGELOG.md`, which every branch did and every pair of branches
+  conflicted over; `scripts/changelog_fragments.py assemble` folds the fragments into one
+  `vNEXT` entry at land time and adds this bullet through the same renderer. A fragment names no
+  version at all, so there is nothing to race for. Steps 3 and 4 of #296 — the git tag as the
+  atomic allocator, and deriving the served version from it — are still open.
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
   roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps

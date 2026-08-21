@@ -17,6 +17,52 @@ the top of this file conflict every time, over nothing — both entries are righ
 and a fragment is a path no other branch will ever open. `changelog.d/README.md` has the format.
 `vNEXT` means exactly what it meant before; assembly is just what writes it.
 
+## vNEXT — the release list is rendered, and a branch stops editing the file everyone edits
+
+Two of the four places a version lives were hand-kept copies, and both drifted the way a
+hand-kept copy does.
+
+**The README's release list was retyped from the CHANGELOG, so it fell out of order.** It read
+`v2.61, v2.59, v2.60, v2.62, …` for three releases, and by the time #296 was written eleven
+bullets were out of place. `74a0453` is a human pushing `docs(readme): put v2.62 at the end of
+the release list` — the same class corrected by whoever happened to notice, because the ordering
+convention was written down nowhere and checked by nothing. `scripts/readme_releases.py` renders
+the ORDER from `CHANGELOG.md` and
+`test_the_readme_release_list_is_in_changelog_order` fails when it drifts.
+
+Only the order. A bullet's prose is hand-written and is MOVED byte-for-byte, because it is not a
+copy of the heading — `## v2.19 — what each reviewer cost, not just what it found` is a bullet
+reading `per-reviewer token usage and vendor-stated cost, so the leaderboard ranks reviewers on
+what they cost as well as what they find`, and fifty-odd bullets are like that. Rendering the
+list *from* the headings would delete the summaries and call it generation, so a release with no
+bullet is a refusal naming the release rather than a sentence nobody wrote.
+
+**And every branch that shipped anything edited the same lines at the top of `CHANGELOG.md`.**
+So every pair of concurrent branches conflicted there, over nothing: both entries are right,
+both belong, and git cannot know that two insertions at one offset are independent. PR #268 hit
+it in a session where three PRs were open. A branch now writes `changelog.d/<issue>.<kind>.md` —
+a path no other branch will ever open, so the conflict has nowhere to occur — and
+`scripts/changelog_fragments.py assemble` folds every fragment present into one
+`## vNEXT — <title>` entry at land time, adds the matching README bullet through the renderer so
+the two cannot disagree, and deletes what it consumed.
+
+A fragment names **no version at all**, not even the placeholder, and that is refused rather
+than tolerated. It takes the branch out of the race for a number instead of deferring it.
+`vNEXT` itself is unchanged: still the unstamped entry, still the only thing `release_stamp.py
+apply` rewrites, still what `harness/tests/test_release_numbers.py` asserts about. What changed
+is when it appears — assembly writes it, at land, out of files that never named it.
+
+Not towncrier, judged rather than assumed. Towncrier renders an entry for a version it is TOLD,
+and here the number is not known until `apply` resolves the placeholder against the ref being
+merged into, which is *after* assembly — so it would have to be driven with a placeholder
+version, and this repo would own a second grammar for release entries beside the one
+`release_stamp.py` already parses. Two answers to "what is a release entry" is the defect this
+repo keeps writing changelog entries about. It also renders one file, and half of what drifts
+here is the README's list.
+
+Steps 3 and 4 of #296 — the git tag as the atomic allocator, and deriving `pyproject.toml` and
+`app/main.py` from it — are not in this. The issue stays open for them.
+
 ## v2.66 — the two guards that only fired when they were not needed
 
 `release_stamp.py` has two checks that exist for the same failure — a branch naming its own
