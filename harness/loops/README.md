@@ -1212,7 +1212,7 @@ The sentence lands in **`config_notes`** — which puts it in the payload a fixe
 from, in the report, and in the `--post` PR comment — and in the `--json-file` on disk,
 because the recording is attempted *before* that file is written. The refusal notice carries
 it too. And it names its own recovery: `--json-file` writes exactly the bytes piped to `qb`,
-so `qb record-review < <the payload>` from any host with one puts the round on the board
+so `qb record-review < PAYLOAD.json` from any host with one puts the round on the board
 later. `run_key` makes the replay a join rather than a double-count.
 
 Note that `gh pr view --json` **fails the whole command** on a field it does not recognise

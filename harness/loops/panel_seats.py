@@ -1090,8 +1090,9 @@ def _unrecorded(why: str) -> str:
     to go stale; the artefact already exists and the note says what to do with it.
     """
     line = (f"this round was NOT recorded on the board — {why}. The review itself "
-            "is complete and unaffected; re-record it later with "
-            "`qb record-review < <the --json-file payload>`")
+            "is complete and unaffected; re-record it later from any host with a "
+            "`qb`: `qb record-review < PAYLOAD.json`, where PAYLOAD.json is the "
+            "file `--json-file` wrote")
     print(f"panel: {line}", file=sys.stderr)
     return line
 
