@@ -1637,12 +1637,18 @@ def test_a_placeholder_beside_a_hand_written_number_is_still_refused(repo, capsy
     assert "already has an entry for v2.34" in capsys.readouterr().err
 
 
-def test_a_hand_written_number_also_detects_a_broken_base(repo, capsys):
+def test_a_hand_written_number_is_told_about_a_broken_base_but_not_held_by_it(repo, capsys):
     """#167's "second effect, same cause": the base check sat below the same early return.
 
     A branch with no placeholder did not merely skip the ordering check — it also failed to
-    notice that `main` carries an unstamped entry, which is the one thing that makes its
-    number wrong.
+    NOTICE that `main` carries an unstamped entry. It notices now, and noticing is a warning
+    rather than a refusal, because a branch with nothing to stamp cannot be harmed by the
+    broken base: `apply` returns before it writes anything, so there is no number for the
+    base's unnumbered entry to collide with. If one is written later and does collide,
+    `_collision` catches it then, which is the moment the collision actually exists.
+
+    Refusing here would be #168's blast radius wearing the other issue's clothes — a branch
+    held over somebody else's skipped step, in a file it does not touch.
     """
     git(repo, "checkout", "-q", "main")
     place(repo)
@@ -1652,9 +1658,10 @@ def test_a_hand_written_number_also_detects_a_broken_base(repo, capsys):
     text = (repo / "CHANGELOG.md").read_text()
     write(repo, "CHANGELOG.md", text.replace("## v2.33", entry("v2.34") + "## v2.33", 1))
     commit(repo, "a branch that named its own release")
-    assert run(repo, "preflight", "--onto", "main") == 2
-    assert "carries an unstamped" in capsys.readouterr().err
-
+    assert run(repo, "preflight", "--onto", "main") == 0
+    err = capsys.readouterr().err
+    assert "carries an unstamped" in err, "noticing is the point of #167's second effect"
+    assert "ships no release" in err
 
 def test_a_broken_base_does_not_hold_a_branch_that_ships_no_release(repo, capsys):
     """#168's blast radius: one skipped stamp must not take out every branch at once.
@@ -1744,14 +1751,22 @@ def test_a_branch_stamped_as_a_major_is_not_refused_by_a_plain_rerun(repo, capsy
 # branch that ships nothing at all.
 
 
-def test_a_major_stamped_branch_meets_a_broken_base_like_the_minor_one_does(repo, capsys):
-    """`--major` is a flag, so the same branch answers "do I ship a release" twice.
+def test_neither_already_stamped_branch_is_held_by_a_broken_base(repo, capsys):
+    """The two already-stamped branches agree — and it is the WARNING they agree on.
 
-    `apply --major` stamps v3; `fix-and-land` re-runs `apply` without the flag, and that run
-    computes v2.34. Asking whether the branch ships a release by looking for THIS run's
-    number missed it — a branch stamped v3 read as shipping nothing and was merely warned
-    about a broken base, while the byte-equivalent branch stamped v2.34 beside it was
-    refused. Both candidates are admissible, so both have to be asked about.
+    This reverses a P1 from round 1 of the panel, deliberately. That finding was right that
+    the two disagreed: asking "does this branch ship a release" by looking for THIS run's
+    number meant a branch stamped `v3` (re-run plainly, so the question was asked about
+    v2.34) read as shipping nothing and was warned, while the byte-equivalent branch stamped
+    v2.34 beside it was refused. Making them consistent was correct; making them consistent
+    by REFUSING both was not.
+
+    `claimed` cannot tell an already-stamped number from an inherited one — a docs-only
+    branch that pulled a `main` which had since issued v2.34 carries exactly the number
+    `could_have_issued` names — so that reading refused branches that ship nothing at all.
+    And the refusal was never protecting anything: with no placeholder there is nothing for
+    `apply` to stamp, so the base's unnumbered entry has no number of this branch's to spoil.
+    Having something to stamp is the whole of the question.
     """
     place(repo)
     assert run(repo, "apply", "--onto", "main", "--major") == 0
@@ -1763,9 +1778,10 @@ def test_a_major_stamped_branch_meets_a_broken_base_like_the_minor_one_does(repo
     commit(repo, "a release landed on main without being stamped")
     git(repo, "checkout", "-q", "work")
 
-    assert run(repo, "apply", "--onto", "main") == 2
-    assert "itself carries an unstamped" in capsys.readouterr().err
-
+    assert run(repo, "apply", "--onto", "main") == 0
+    out = capsys.readouterr()
+    assert "noop" in out.out
+    assert "carries an unstamped" in out.err and "ships no release" in out.err
 
 def test_two_new_numbers_on_one_branch_are_refused_even_though_each_is_admissible(repo, capsys):
     """A branch ships one release. Two numbers nobody has issued is not two admissible reads.

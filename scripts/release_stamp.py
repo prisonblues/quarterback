@@ -1353,29 +1353,42 @@ def build_plan(repo: Path, onto: str, serve: bool | None, major: bool = False) -
     ahead = sorted(claimed - allowed)
     if ahead:
         named = ", ".join(fmt(r) for r in ahead)
+        # "Put it back to the placeholder" is only a repair when there is not already one
+        # here. With a placeholder present, following it literally writes a SECOND, and
+        # `build_plan` then refuses with "two placeholders cannot both become one number" —
+        # a different message about a state the advice created, which is the advice loop
+        # `_repair_advice` was rewritten to stop. That branch is told to delete instead.
+        own = (f"delete it — this branch already carries a `## {PLACEHOLDER}`, and that is "
+               "the entry that becomes a number" if plan.sites else
+               f"put the entry back to `## {PLACEHOLDER} — …` (and its README bullet with "
+               "it) and run `apply` again")
         raise StampError(
             f"this branch's CHANGELOG already has an entry for {named}, which does not exist at "
             f"{onto} (newest there is {fmt(onto_newest)}, so the next free number is "
-            f"{fmt(next_version)}). Either this branch named its own number — put the entry "
-            f"back to `## {PLACEHOLDER} — …` (and its README bullet with it) and run `apply` "
-            f"again — or {onto} is behind and the entry was inherited from a later one, in "
-            f"which case fetch and re-run against the updated ref. This tool cannot tell "
-            "which from here: a ref proves somebody wrote a number down, never that it was "
-            "issued."
+            f"{fmt(next_version)}). Either this branch named its own number — {own} — or "
+            f"{onto} is behind and the entry was inherited from a later one, in which case "
+            "fetch and re-run against the updated ref. This tool cannot tell which from "
+            "here: a ref proves somebody wrote a number down, never that it was issued."
         )
 
-    # DOES THIS BRANCH SHIP A RELEASE? Not "does it carry a placeholder" — those two came
-    # apart the moment a branch could hard-code its number, and conflating them is the whole
-    # of #167. It ships one if it has somewhere to stamp, or if it already carries a number
-    # it could have been issued.
+    # DOES THIS BRANCH SHIP A RELEASE? Only a branch with somewhere to stamp does, and the
+    # numbers are deliberately not consulted — the third and last place this file tried to
+    # read intent off a release number, and the third to get it wrong.
     #
-    # `claimed & could_have_issued` and not `next_version in issued`, because `could_have_issued`
-    # deliberately holds BOTH candidates while `next_version` is only this invocation's. A
-    # branch stamped `v3` and re-run plainly has `next_version == v2.34`, which its CHANGELOG
-    # does not contain — so it read as shipping no release, and the byte-equivalent
-    # minor-stamped branch beside it read as shipping one. One of those two was told about a
-    # broken base and the other was refused over it, for no difference either could see.
-    ships_release = bool(plan.sites) or bool(claimed & could_have_issued)
+    # It used to be `bool(plan.sites) or bool(claimed & could_have_issued)`, to keep a branch
+    # already stamped `v3` and one already stamped `v2.34` on the same side of the #168
+    # refusal. But `claimed` cannot tell an already-stamped number from an INHERITED one — a
+    # docs-only branch that pulled a `main` which had since issued v2.34 has `claimed ==
+    # {v2.34}`, which is also exactly `could_have_issued` against the stale base. So that
+    # branch read as shipping a release and was refused over a broken base it does not touch:
+    # #168's blast radius, arriving through the flag rather than through the check.
+    #
+    # Consistency between the two already-stamped branches was the wrong thing to want. The
+    # refusal exists to stop `apply` handing out `max+1` while the base holds an entry that is
+    # going to want a number — and a branch with no placeholder stamps NOTHING, so there is no
+    # number for a broken base to make wrong. It is told, and it carries on. Having something
+    # to stamp is the whole of the question.
+    ships_release = bool(plan.sites)
 
     # An unstamped placeholder at the base is a real refusal for a branch that needs a number
     # and NOISE for one that does not. Refusing both is how one skipped stamp took out every
