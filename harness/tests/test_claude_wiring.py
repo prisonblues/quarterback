@@ -860,8 +860,9 @@ def test_the_package_ships_the_claude_data_directory():
     """The fragment and the workflow doc. `bin/*` is copied by glob and `claude/` is not,
     so this one is a hand-maintained list — the exact shape that goes stale."""
     text = PACKAGE_NIX.read_text(encoding="utf-8")
-    assert re.search(r"cp -r loops commands templates claude \$out/share/quarterback-harness/",
-                     text), "package.nix no longer installs harness/claude into share/"
+    assert re.search(
+        r"cp -r loops commands templates claude githooks \$out/share/quarterback-harness/",
+        text), "package.nix no longer installs harness/claude into share/"
 
 
 #: What this suite reads from outside its own directory — the declaration `_flake_sandbox`

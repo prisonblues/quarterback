@@ -146,6 +146,12 @@
           # built out of. Same shape as that check's own copy of this tree: input
           # to a guard, not a suite to run.
           cp -r ${./harness/loops} harness/loops
+          # harness/githooks holds the two scripts `qb-hooks` copies into a repo's
+          # common git dir — the shared-refs/stash guard and its delegating forwarder
+          # (#210). test_stash_guard.py installs them into real fixture repos and then
+          # runs git against them, so without this line every assertion about the guard
+          # errors on a missing file rather than being evaluated (#163).
+          cp -r ${./harness/githooks} harness/githooks
           # test_claude_wiring.py's reads (#230). It stays in THIS check rather than
           # joining prose-consistency-tests, and the split is the same one that check's
           # comment draws: two thirds of it drives `qb-claude-setup` and `qb-hook` as
@@ -222,7 +228,10 @@
           # sandbox, so an unpatched `#!/usr/bin/env bash` fails to exec at all
           # — and every test then fails for a reason that has nothing to do with
           # the code under test.
-          patchShebangs harness/bin
+          # githooks too: they are execed BY GIT as hooks, so an unpatched
+          # `#!/usr/bin/env bash` makes every ref transaction in the fixture
+          # repos fail to run the guard at all.
+          patchShebangs harness/bin harness/githooks
           cd harness
           export HOME=$TMPDIR
           git config --global init.defaultBranch main

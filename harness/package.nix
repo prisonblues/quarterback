@@ -82,7 +82,8 @@ stdenvNoCC.mkDerivation {
   # Rewrites `#!/usr/bin/env bash|python3` to store paths, so an installed
   # harness does not depend on what happens to be on the user's PATH.
   postFixup = ''
-    patchShebangs $out/bin $out/share/quarterback-harness/loops
+    patchShebangs $out/bin $out/share/quarterback-harness/loops \
+                  $out/share/quarterback-harness/githooks
   '';
 
   nativeBuildInputs = [ makeWrapper ];
