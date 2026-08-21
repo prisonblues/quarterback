@@ -30,19 +30,38 @@ Both checks are above the early return now, which needed the question they turn 
 differently. **The number is judged, not its author.** After `apply` runs there is no placeholder
 left either, so a branch it stamped is byte-identical to one that hard-coded the same number and
 nothing in the tree tells them apart — refusing every number above the base would make `apply`
-refuse its own output. So a branch with nothing left to stamp may carry the next number and no
-other, and a branch that still holds a placeholder may carry none at all, since stamping would
-write the number in twice.
+refuse its own output. So a branch with nothing left to stamp may carry ONE newly-issued number,
+the next minor or the next major and not both, and a branch that still holds a placeholder may
+carry none at all, since stamping would write the number in twice.
 
-**And one skipped stamp no longer takes out every branch at once** (#168). An unstamped
-placeholder on `main` is a real refusal for a branch that needs a number — you cannot hand out
-`max+1` while the base holds an entry that is going to want one — and it is noise for a branch
-that ships no release, which was being held over somebody else's mistake in a file it does not
-touch. That one is warned, and carries on. The refusal that remains **names the ref to repair
-from**, walking back to the last commit whose tree is clean, instead of describing how to find it:
-every other invocation of this tool passes `--onto origin/main`, this is the one case where
-`origin/main` is the broken thing, and somebody reaching for the usual command under time pressure
-got the same refusal and concluded the tool was stuck.
+**That scopes the claim, and the scope is worth saying rather than implying.** What the guard
+sees is the branch that overshoots — `## v2.40` against a base at v2.33 — and the branch carrying
+two unissued numbers at once. What it cannot see is a hand-written `max+1`: that is the same bytes
+`apply` writes, and `max+1` read off the top of `main` is precisely what somebody numbering by hand
+picks. So of that eight-PR queue it refuses the ones whose number sits above the next free one at
+land time, and lets through any that happens to equal it. (A number somebody else has since taken
+is `_collision`'s, and was already caught.) The placeholder is still the only thing here that makes
+the number unguessable — this closes the door on branches that skipped it and guessed high, not on
+skipping it.
+
+**And one skipped stamp no longer takes out every branch that has not merged it** (#168). An
+unstamped placeholder on `main` is a real refusal for a branch that needs a number — you cannot
+hand out `max+1` while the base holds an entry that is going to want one — and it is noise for a
+branch that ships no release, which was being held over somebody else's mistake in a file it does
+not touch. That one is warned, and carries on. A branch that has already pulled `main` since the
+bad commit landed is a different case and is still refused: it carries the unstamped entry in its
+own worktree, so it has something to stamp, and stamping it would put this branch's number on
+somebody else's release. In a repo where agents pull `main` routinely that is a lot of live
+branches, so the relief is real but it is not universal — repairing `main` is still the fix.
+
+The refusal that remains **names the ref to repair from**, walking back to the last commit whose
+tree is clean, instead of describing how to find it: every other invocation of this tool passes
+`--onto origin/main`, this is the one case where `origin/main` is the broken thing, and somebody
+reaching for the usual command under time pressure got the same refusal and concluded the tool was
+stuck. `check` — the guard that fires ON `main`, and so the command's hardest case — prints the
+same resolved line. When the walk finds nothing clean within its bound it says so in prose rather
+than printing a command with a `<placeholder>` in it, because a shell reads `<` as a redirect and
+a repair command that fails with a filesystem error is worse than a sentence.
 
 Two of the last three releases landed unstamped and needed their own repair PRs.
 

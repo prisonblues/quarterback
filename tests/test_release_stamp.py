@@ -1576,7 +1576,8 @@ def test_a_hand_written_number_is_refused_even_with_no_placeholder_to_stamp(repo
     err = capsys.readouterr().err
     assert "already has an entry for v2.40" in err
     assert "does not exist at main" in err
-    assert "next free number is v2.34" in err, "say what it should have been, not only what is wrong"
+    assert "next free number is v2.34" in err, \
+        "say what it should have been, not only what is wrong"
 
 
 def test_re_running_apply_on_a_branch_it_already_stamped_is_still_a_noop(repo, capsys):
@@ -1707,3 +1708,343 @@ def test_a_branch_stamped_as_a_major_is_not_refused_by_a_plain_rerun(repo, capsy
 
     assert run(repo, "apply", "--onto", "main") == 0
     assert "noop" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# what "ships a release" and "picked its own number" actually mean
+#
+# Both questions are asked ABOVE the early return now, which is what makes them reach a
+# branch that hard-coded its number — and what makes every way they can be wrong reach a
+# branch that ships nothing at all.
+
+
+def test_a_major_stamped_branch_meets_a_broken_base_like_the_minor_one_does(repo, capsys):
+    """`--major` is a flag, so the same branch answers "do I ship a release" twice.
+
+    `apply --major` stamps v3; `fix-and-land` re-runs `apply` without the flag, and that run
+    computes v2.34. Asking whether the branch ships a release by looking for THIS run's
+    number missed it — a branch stamped v3 read as shipping nothing and was merely warned
+    about a broken base, while the byte-equivalent branch stamped v2.34 beside it was
+    refused. Both candidates are admissible, so both have to be asked about.
+    """
+    place(repo)
+    assert run(repo, "apply", "--onto", "main", "--major") == 0
+    assert "stamped v3" in capsys.readouterr().out
+    commit(repo, "work, stamped v3")
+
+    git(repo, "checkout", "-q", "main")
+    place(repo)
+    commit(repo, "a release landed on main without being stamped")
+    git(repo, "checkout", "-q", "work")
+
+    assert run(repo, "apply", "--onto", "main") == 2
+    assert "itself carries an unstamped" in capsys.readouterr().err
+
+
+def test_two_new_numbers_on_one_branch_are_refused_even_though_each_is_admissible(repo, capsys):
+    """A branch ships one release. Two numbers nobody has issued is not two admissible reads.
+
+    v2.34 and v3 are both numbers this branch could legitimately have been stamped, and
+    excusing them as a set excuses them TOGETHER — a branch carrying both walked through,
+    with nothing else able to see it: `_collision` looks for a number that already exists at
+    the base or twice in this file, and neither is true of two different unissued numbers.
+    """
+    text = (repo / "CHANGELOG.md").read_text()
+    write(repo, "CHANGELOG.md",
+          text.replace("## v2.33", entry("v3") + entry("v2.34") + "## v2.33", 1))
+    commit(repo, "two releases on one branch")
+    assert run(repo, "preflight", "--onto", "main") == 2
+    err = capsys.readouterr().err
+    assert "already has an entry for v2.34, v3" in err
+
+
+def test_a_hand_written_next_free_number_is_not_refused_and_cannot_be(repo, capsys):
+    """The limit of the guard, pinned so the docs cannot drift back into claiming more.
+
+    `max+1` read off the top of `main` is exactly what somebody hard-coding by hand picks,
+    and it is byte-identical to what `apply` writes. Nothing in the tree tells the two apart,
+    so this branch is a noop — the guard catches the number that SKIPS AHEAD of the next free
+    one, the number already taken at the base (`_collision`), and more than one at once.
+    """
+    text = (repo / "CHANGELOG.md").read_text()
+    write(repo, "CHANGELOG.md", text.replace("## v2.33", entry("v2.34") + "## v2.33", 1))
+    commit(repo, "a branch that hand-wrote exactly the next free number")
+    assert run(repo, "apply", "--onto", "main") == 0
+    assert "noop" in capsys.readouterr().out
+
+
+def test_a_number_merged_in_from_a_fresher_ref_is_not_one_this_branch_picked(repo, capsys):
+    """`_collision` asks whether this branch ADDED a number. This check has to ask the same.
+
+    Local `main` is stale at v2.33, the branch merged a fresher ref that already carried
+    v2.34 and v2.35, and the branch itself is docs-only. Those numbers shipped elsewhere and
+    are above the stale base's newest — refusing them with "a branch does not pick its own
+    number" is nonsense about an entry the branch merely merged, and this was a clean noop
+    before the check was hoisted above the early return.
+    """
+    git(repo, "checkout", "-q", "-b", "fresher", "main")
+    text = (repo / "CHANGELOG.md").read_text()
+    write(repo, "CHANGELOG.md",
+          text.replace("## v2.33", entry("v2.35") + entry("v2.34") + "## v2.33", 1))
+    commit(repo, "two releases that shipped elsewhere")
+
+    git(repo, "checkout", "-q", "work")
+    write(repo, "docs.md", "# how\n\nA branch that ships no release.\n")
+    commit(repo, "docs only")
+    git(repo, "merge", "-q", "--no-ff", "-m", "merge the fresher ref", "fresher")
+
+    assert run(repo, "apply", "--onto", "main") == 0
+    assert "noop" in capsys.readouterr().out
+
+
+def test_a_base_with_no_release_headings_does_not_hold_a_branch_that_ships_no_release(
+        repo, capsys):
+    """#168's blast radius, arriving one line above the fix for it.
+
+    `next_release` refuses a base CHANGELOG it cannot read a number in — a repo that just
+    adopted the file, an `--onto` pointing at a stub — and hoisting it above the early return
+    put that refusal in front of every branch, including the ones that need no number. The
+    sibling test above still holds: a branch that DOES need one gets the STOP, because there
+    is no number to hand it.
+    """
+    git(repo, "checkout", "-q", "main")
+    write(repo, "CHANGELOG.md", "# Version history\n\nNothing here yet.\n")
+    commit(repo, "a base whose changelog has no release headings")
+    git(repo, "checkout", "-q", "work")
+    write(repo, "docs.md", "# how\n\nA branch that ships no release.\n")
+    commit(repo, "docs only")
+
+    assert run(repo, "apply", "--onto", "main") == 0
+    out = capsys.readouterr()
+    assert "noop" in out.out
+    assert "no release number could be read at main" in out.err
+
+
+def test_a_base_this_tool_cannot_scan_does_not_hold_a_branch_that_ships_no_release(
+        repo, capsys, monkeypatch):
+    """The same argument for the other read of the base. A shallow clone, an object missing
+    from an old ancestor, a `git grep` that fails for any reason at all: none of it is the
+    business of a branch that ships no release, and all of it used to sit below the early
+    return where such a branch never reached it. A branch that ships one still stops."""
+    def unreadable(_repo, ref):
+        raise rs.StampError(f"git grep at {ref} failed: shallow clone")
+
+    monkeypatch.setattr(rs, "placeholder_at_ref", unreadable)
+
+    write(repo, "docs.md", "# how\n\nA branch that ships no release.\n")
+    commit(repo, "docs only")
+    assert run(repo, "apply", "--onto", "main") == 0
+    out = capsys.readouterr()
+    assert "noop" in out.out
+    assert "could not check main for an unstamped" in out.err
+
+    place(repo)
+    assert run(repo, "apply", "--onto", "main") == 2
+    assert "git grep at" in capsys.readouterr().err
+
+
+def test_a_branch_that_has_merged_the_broken_base_is_refused_like_any_other(repo, capsys):
+    """The #168 relief is scoped, and the docs say so rather than reading as unconditional.
+
+    A branch that pulled `main` after the bad commit landed carries the unstamped entry in
+    its OWN worktree, so it has something to stamp and is refused — correctly, since `apply`
+    would otherwise stamp somebody else's release entry with this branch's number. In a repo
+    where agents pull `main` routinely that is a lot of live branches.
+    """
+    git(repo, "checkout", "-q", "main")
+    place(repo)
+    commit(repo, "a release landed on main without being stamped")
+    git(repo, "checkout", "-q", "work")
+    write(repo, "docs.md", "# how\n\nA branch that ships no release.\n")
+    commit(repo, "docs only")
+    git(repo, "merge", "-q", "--no-ff", "-m", "pull main", "main")
+
+    assert run(repo, "apply", "--onto", "main") == 2
+    assert "itself carries an unstamped" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# the repair advice: a command, or prose, and never a command-shaped string that is neither
+
+
+def test_the_printed_repair_command_is_one_that_can_actually_be_run(repo, capsys):
+    """Spelled the way the docs and `fix-and-land` spell it, with the whole SHA.
+
+    A bare `release_stamp.py` is on nobody's PATH and a 12-character abbreviation can go
+    ambiguous as a repo grows — either way the command handed over as ready to run is not,
+    which is the whole point of resolving the ref instead of describing it.
+    """
+    git(repo, "checkout", "-q", "main")
+    clean = git(repo, "rev-parse", "HEAD").strip()
+    place(repo)
+    commit(repo, "a release landed on main without being stamped")
+    git(repo, "checkout", "-q", "work")
+    place(repo)
+
+    assert run(repo, "preflight", "--onto", "main") == 2
+    assert f"python3 scripts/release_stamp.py apply --onto {clean}" in capsys.readouterr().err
+
+
+def test_the_repair_command_says_what_the_ref_it_names_will_still_refuse(repo, capsys):
+    """A release landed AFTER the skipped stamp, so the clean ancestor has never issued it.
+
+    The command handed over to fix the first refusal would then produce a second, differently
+    worded one — "this branch's CHANGELOG already has an entry for v2.34" — which is the
+    "concludes the tool is stuck" outcome this advice replaced. It is said here instead of
+    discovered there.
+    """
+    git(repo, "checkout", "-q", "main")
+    clean = git(repo, "rev-parse", "HEAD").strip()
+    place(repo)
+    commit(repo, "a release landed on main without being stamped")
+    text = (repo / "CHANGELOG.md").read_text()
+    write(repo, "CHANGELOG.md", text.replace("## v2.33", entry("v2.34") + "## v2.33", 1))
+    commit(repo, "and another landed by hand on top of it")
+    git(repo, "checkout", "-q", "work")
+    place(repo)
+
+    assert run(repo, "preflight", "--onto", "main") == 2
+    err = capsys.readouterr().err
+    assert clean in err
+    assert "has gained v2.34 since that commit" in err
+
+
+def test_a_history_with_no_clean_ancestor_says_so_rather_than_printing_a_broken_command(
+        tmp_path, capsys):
+    """The walk finds nothing, including at a root commit — the exhaustion branch.
+
+    The fallback used to be `apply --onto <a ref before the unstamped entry>`, which is not a
+    command: pasted into a shell, `<a` redirects input from a file named `a` and the promised
+    repair fails with a filesystem error. Prose is the honest answer when there is no ref.
+    """
+    root = tmp_path / "allbad"
+    root.mkdir()
+    git(root, "init", "-q", "-b", "main")
+    git(root, "config", "user.email", "t@example.com")
+    git(root, "config", "user.name", "t")
+    write(root, "CHANGELOG.md", CHANGELOG_HEAD + entry("vNEXT") + entry("v2.33"))
+    write(root, "README.md", readme(["v2.33"]) + "- **vNEXT** — a release.\n")
+    commit(root, "a root commit that already carries the placeholder")
+    git(root, "checkout", "-q", "-b", "work")
+    write(root, "docs.md", "# work on top of it\n")
+    commit(root, "work")
+
+    assert run(root, "preflight", "--onto", "main") == 2
+    err = capsys.readouterr().err
+    assert "no ref to name here" in err
+    assert "<" not in err, f"nothing command-shaped that a shell would mangle: {err}"
+
+
+def test_the_repair_walk_is_bounded(repo, capsys, monkeypatch):
+    """The bound is for a RUN of consecutive ancestors that all carry the entry — an
+    unstamped release that landed long ago and was never repaired — because each one costs a
+    `git grep` to rule out. (A history predating the placeholder scheme is the cheap case:
+    the first commit looked at is clean and the walk stops there.)"""
+    monkeypatch.setattr(rs, "_REPAIR_WALK_MAX", 1)
+    git(repo, "checkout", "-q", "main")
+    place(repo)
+    commit(repo, "a release landed on main without being stamped")
+    write(repo, "after.md", "# work carried on regardless\n")
+    commit(repo, "another commit on top of the broken one")
+    git(repo, "checkout", "-q", "work")
+    place(repo)
+
+    assert run(repo, "preflight", "--onto", "main") == 2
+    assert "within 1 first-parent commits of main" in capsys.readouterr().err
+
+
+def test_the_repair_walk_enumerates_its_candidates_in_one_git_call(repo, monkeypatch):
+    """One `git log`, not a `rev-parse` per step. The walk is bounded at 50 and its only
+    output is a line of advice, so fifty subprocesses to enumerate what a single call already
+    knows is fifty too many — and this now runs on the warning path too, where the branch is
+    not even being stopped."""
+    git(repo, "checkout", "-q", "main")
+    clean = git(repo, "rev-parse", "HEAD").strip()
+    place(repo)
+    commit(repo, "a release landed on main without being stamped")
+    for i in range(3):
+        write(repo, f"more{i}.md", "# more work on top\n")
+        commit(repo, f"more {i}")
+    sha = git(repo, "rev-parse", "HEAD").strip()
+
+    seen: list[str] = []
+    real = rs._git
+    monkeypatch.setattr(rs, "_git", lambda r, *a: (seen.append(a[0]), real(r, *a))[1])
+
+    assert rs._clean_ancestor(repo, sha) == clean
+    assert seen.count("log") == 1
+    assert seen.count("rev-parse") == 0, "the candidates come from the log, not one call each"
+
+
+def test_composing_the_repair_advice_cannot_stop_a_branch(repo, capsys, monkeypatch):
+    """The advice is best-effort, on a path that includes the branch that must NOT be stopped.
+
+    Every git call it makes can fail — a shallow clone, a missing object on an old ancestor —
+    and a message is not worth an exit 2. It degrades to the prose it replaced.
+    """
+    def unwalkable(_repo, _sha):
+        raise rs.StampError("git log failed: no such object")
+
+    monkeypatch.setattr(rs, "_clean_ancestor", unwalkable)
+    git(repo, "checkout", "-q", "main")
+    place(repo)
+    commit(repo, "a release landed on main without being stamped")
+    git(repo, "checkout", "-q", "work")
+    write(repo, "docs.md", "# how\n\nA branch that ships no release.\n")
+    commit(repo, "docs only")
+
+    assert run(repo, "apply", "--onto", "main") == 0
+    out = capsys.readouterr()
+    assert "noop" in out.out
+    assert "e.g. `HEAD^`" in out.err
+
+
+def test_check_names_the_ref_to_stamp_against_instead_of_describing_one(repo, capsys):
+    """`check` is the guard that fires ON main, which is the case the resolved command was
+    written for — every other invocation of this tool passes `--onto origin/main`, and here
+    `origin/main` is the ref carrying the unstamped entry. Leaving the description on this
+    path would have left it on the one that hits it most.
+
+    Uncommitted first, because that is what a half-finished merge looks like and the ref to
+    stamp against there is HEAD itself, not HEAD^.
+    """
+    head = git(repo, "rev-parse", "HEAD").strip()
+    place(repo)
+    assert run(repo, "check") == 2
+    assert f"python3 scripts/release_stamp.py apply --onto {head}" in capsys.readouterr().err
+
+    commit(repo, "the release landed unstamped")
+    assert run(repo, "check") == 2
+    assert f"apply --onto {head}" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# the warnings key, which a JSON consumer reads and stderr does not reach
+
+
+def test_the_warnings_key_is_present_on_a_clean_base(repo, capsys):
+    """Present and empty, for the reason `written` is: a schema with two shapes is one the
+    caller discovers the second of in production."""
+    place(repo)
+    assert plan_json(repo, "preflight", "--onto", "main", capsys=capsys)["warnings"] == []
+    assert plan_json(repo, "apply", "--onto", "main", capsys=capsys)["warnings"] == []
+
+
+def test_a_broken_base_warning_reaches_the_json_consumer(repo, capsys):
+    """`--json` prints nothing to stderr and the caller reading it never sees `_warn_skipped`.
+
+    A warning that only exists on the text path is one every automated consumer of this tool
+    is blind to — which is exactly the caller the #168 relief is for, since it is `fix-and-land`
+    that runs `apply` unconditionally.
+    """
+    git(repo, "checkout", "-q", "main")
+    place(repo)
+    commit(repo, "a release landed on main without being stamped")
+    git(repo, "checkout", "-q", "work")
+    write(repo, "docs.md", "# how\n\nA branch that ships no release.\n")
+    commit(repo, "docs only")
+
+    warnings = plan_json(repo, "apply", "--onto", "main", capsys=capsys)["warnings"]
+    assert len(warnings) == 1
+    assert "carries an unstamped" in warnings[0]
+    assert "ships no release" in warnings[0]
