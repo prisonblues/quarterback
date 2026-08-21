@@ -18,8 +18,13 @@ board reconnects them.**
   stage a session is in for the statusline, `qb-seat`, which turns one pane of a
   multiplexer into a fleet seat with its own board identity, `qb-board`, which
   launches the terminal board client (`qb-board --follow` tails the board to stdout
-  on any host with ssh; see the repo README), and `qb-reconcile`, the read-only pass
-  that asks whether the board's plan still describes the present
+  on any host with ssh; see the repo README), `qb-reconcile`, the read-only pass
+  that asks whether the board's plan still describes the present — **and the board
+  client proper**: `qb-hook` (the lifecycle reflexes Claude Code fires), `qb-mcp`
+  (the per-session stdio MCP shim), `qb-claude-setup` (the wiring), `qb` (the human
+  CLI), and `qb-env`, the site-config library the four of them source
+- `claude/` — the Claude Code configuration the harness owns: the hook `settings-fragment.json`
+  and `quarterback-workflow.md`. See [claude/README.md](claude/README.md)
 - `worktree.example.json` — per-repo config, annotated with quarterback's own values
 
 Neither half needs the other. The loops run with no board configured (recording is
@@ -1355,6 +1360,104 @@ Adopt the second when you can no longer tell what the others are doing.
 
 ---
 
+## The board client
+
+Everything above is the workflow half. This is the half that makes a machine *appear* on a
+board, and until #230 none of it was here: the hook script, the MCP registration and the
+seven `settings.json` entries all lived in whatever personal config a consumer happened to
+keep. So a host that imported the flake got the slash commands and the loops and **no
+board** — no lease, no presence, no ask courier, no overlap detection, no sync advice — while
+the flake's own description said otherwise. Worse, the hook was pinned by a different repo
+than the board it posts to, which is version skew that `qb-doctor` could not even look at,
+because the file was not in the tree it checks.
+
+Five files, one pin:
+
+| file | what it is |
+|---|---|
+| `bin/qb-hook` | the lifecycle reflexes — presence, lease, handoff, publish-on-push, the ask courier, sync advice, sub-agent records. Fired by Claude Code, never by the model: these must not depend on anybody remembering them. Fail-open by contract |
+| `bin/qb-env` | the site-config contract — which board, which token. Sourced, not run |
+| `bin/qb-mcp` | one stdio MCP server per session, so each agent carries its own identity |
+| `bin/qb-claude-setup` | the wiring: merges the hook fragment into `~/.claude/settings.json`, registers the MCP server in `~/.claude.json`, @imports the workflow doc |
+| `bin/qb` | what a human types — `qb sessions`, `qb resume <id>` |
+
+### Which qb-hook am I running?
+
+```bash
+qb-hook --version
+# qb-hook /nix/store/…-quarterback-harness-0.1.0/bin/qb-hook
+# qb-env  /nix/store/…-quarterback-harness-0.1.0/bin/qb-env
+```
+
+Paths, not a version string: on a nix install the store hash **is** the pin, uniquely, while a
+`version` field is something somebody has to remember to bump. The two lines matter together —
+a `qb-hook` and a `qb-env` from different store paths is a half-migrated install, and it is
+invisible from either line alone. This is the fourth layer #204 counts three of.
+
+### Is it actually wired?
+
+```bash
+qb-claude-setup --check
+# ok       PreToolUse        /nix/store/…/bin/qb-hook PreToolUse
+# MISSING  PostToolUse       no qb-hook entry — this host is deaf on that event
+# SKEW     Stop              /home/you/.local/bin/qb-hook Stop
+```
+
+Per event, because that is the resolution the failure has: the bug this replaced wired three
+of seven, which any single yes/no would have reported as "wired". Exit codes are a contract —
+**0** all wired here, **1** something missing, **2** all wired but to a different `qb-hook`
+than this install's. `2` is not a lesser `1`: it is the state a host is in for the whole of a
+migration, and it is the skew this section exists to end.
+
+It reads `~/.claude/settings.json` and nothing else. The MCP registration and the CLAUDE.md
+@import are wired by the same run and are deliberately **not** in those exit codes: folding
+three answers into one number would leave a doctor unable to tell a deaf host from one
+missing a doc. Check those two by looking — `jq .mcpServers.quarterback ~/.claude.json` and
+`grep quarterback-workflow ~/.claude/CLAUDE.md`.
+
+### Wiring `~/.claude/settings.json` when you already write to it
+
+That file has several writers — you edit it, Claude Code writes to it, and nix wants to
+declare parts of it — so `home.file` cannot own it: a store symlink is read-only and breaks
+the app. The wiring is therefore an activation script doing a surgical, idempotent merge, and
+it is **additive by identity**: quarterback's own entries are replaced, everybody else's in
+the same event are kept. Your `PreToolUse` Bash guard survives having a board installed.
+
+The half a jq expression cannot fix is ordering. The usual spelling of "declare part of
+settings.json from nix" is `jq -s '.[0] * .[1]'`, and `*` replaces **arrays** — so a canonical
+file of yours that declares `hooks.PreToolUse` will drop quarterback's entry from that one
+array if it lands last. Name your entry and the ordering is explicit:
+
+```nix
+programs.quarterback-harness.claude.activationAfter = [ "claudeBaseSettings" ];
+```
+
+Relying on the DAG's tie-breaking between two entries that merely both come after
+`writeBoundary` is not a fix; it is the same bug with a coincidence holding it up. If you
+would rather own the file outright, take the fragment instead:
+
+```bash
+qb-claude-setup --print-fragment      # the exact JSON the activation would have merged
+```
+
+with `claude.enable = false`. One expression produces both, so the manual route cannot drift
+from the wired one.
+
+### Migrating off a hand-rolled copy
+
+If you already carry your own `qb-hook`/`qb-claude-setup` (this is where they came from), the
+transition is safe in either direction and needs no flag day: the merge matches on the command
+*naming* `qb-hook` rather than on an exact path, so your old `~/.local/bin/qb-hook` entries are
+**replaced** rather than doubled. A doubled `PostToolUse` entry would run the hot path twice
+per tool call and poll the ask courier twice per window, which is the reason that is matched
+loosely on purpose. When you drop your copies, drop the `settings.json` hook entries with them
+and let the module write them; `qb-claude-setup --check` tells you which pin you are on
+meanwhile. One thing to check by hand: an activation attribute called `quarterbackClaude` in
+your own config does **not** collide with this module's (`quarterbackClaudeWiring`), but two
+definitions of one name would be an eval failure rather than a merge, so keep the names apart.
+
+---
+
 ## Installing
 
 Nothing here has a build step — it is bash and standard-library Python. There are two ways
@@ -1370,15 +1473,35 @@ The repo root is a flake. As a home-manager consumer:
 
   # …then in your home-manager configuration:
   imports = [ inputs.quarterback.homeManagerModules.default ];
-  programs.quarterback-harness.enable = true;
+
+  programs.quarterback-harness = {
+    enable = true;
+    board.url = "https://qb.example.org";
+    board.tokenCommand = "cat /run/secrets/quarterback-token";
+  };
 }
 ```
 
-That links `loops/` to `~/.claude/loops`, every slash command to `~/.claude/commands/`, and
-puts the worktree scripts on `PATH`. Narrow `programs.quarterback-harness.commands` if your
-host already defines a command of the same name — home-manager will collide rather than pick
-a winner silently, which is the behaviour you want. Set `installScripts = false` to take the
-loops and commands without the worktree tooling.
+That links `loops/` to `~/.claude/loops`, every slash command to `~/.claude/commands/`, puts
+the scripts on `PATH`, and — because a board was named — renders
+`~/.config/quarterback/config` and wires the seven lifecycle hooks and the MCP server at
+activation. Presence, leases, the courier and sync advice work from the next session, with no
+quarterback-specific lines anywhere else in your config.
+
+| option | default | what it decides |
+|---|---|---|
+| `commands` | all of them | which slash commands land in `~/.claude/commands`. Narrow it if your host already defines one of the names — home-manager collides rather than picking a winner silently, which is the behaviour you want |
+| `installScripts` | `true` | the package on `PATH`. Off takes the loops and commands without the worktree tooling. The board wiring does not depend on it: hooks are wired by store path, so a host can have a working client with nothing on `PATH` |
+| `seats.enable` | `false` | adds `tmux`, the one runtime dependency the harness cannot assume. Off because you enable this module on every host and want a seat screen on one |
+| `board.url` | `null` | the board this host talks to. **Null means "I render that config myself"**, not "use a default" — there is deliberately no fallback URL, because a self-hosted board has none and a guess points an agent at somebody else's |
+| `board.tokenCommand` | `null` | a command printing this machine's bearer. A command, not a path: the token source is what varies per site. Runs on every board call, so keep it cheap |
+| `board.tokenRefreshCommand` | `tokenCommand` | used *instead* after a confirmed 401, for the common case where `tokenCommand` reads a cache and re-running it returns the same stale bearer |
+| `board.agent` | short hostname | this machine's name on the board — the machine half of a `machine/name` identity |
+| `board.repo` | `$HOME/source/quarterback` | a checkout, which `qb-mcp` needs for the MCP server's venv |
+| `claude.enable` | `true` | do the wiring at all. Off gives you the fragment to merge yourself |
+| `claude.activationAfter` | `[ ]` | activation entries the wiring must run after. Name yours if you also merge into `settings.json` |
+| `claude.workflowDoc` | `true` | install `~/.claude/quarterback-workflow.md` and @import it from `~/.claude/CLAUDE.md`, creating that file if you have none. The import is conditional on the doc, so turning this off leaves no dangling @import |
+| `claude.registerMcp` | `"auto"` | register `qb-mcp` in `~/.claude.json`. `auto` registers it only when the interpreter it execs exists, because a server that cannot start means every session opens on a failed connection; it self-heals on the next switch. `always` for a host that builds the venv afterwards |
 
 Outside home-manager, `nix build github:prisonblues/quarterback#harness` puts the scripts in
 `result/bin` and the rest in `result/share/quarterback-harness`.
@@ -1395,8 +1518,11 @@ cp harness/commands/*.md ~/.claude/commands/
 
 `git`, `jq`, `bash`, and Python 3 (standard library only — the loops import nothing
 third-party). `gh` for anything that talks to GitHub, which is most of it. `curl` for
-`worktree-holder` (without it the check reports "could not tell" and the scripts carry
-on). `docker` and a database client only if your repo uses them.
+`worktree-holder` and for the board client (without it `worktree-holder` reports "could not
+tell" and `qb-hook` no-ops, both silently and on purpose — a coordination board must never be
+in the critical path of a tool call). `jq` and `curl` are hard requirements for `qb-hook`
+specifically, which checks for both and exits 0 without them. `docker` and a database client
+only if your repo uses them.
 
 `qb-board` is the one exception to the stdlib-only rule, and it is an exception in
 where the code lives rather than in this directory: the launcher here is bash, and what
@@ -1414,16 +1540,19 @@ reported as skipped, not fatal.
 ### Connecting it to a board (optional)
 
 The panel looks for a `qb` CLI to record runs. With none on `PATH`, it no-ops silently and
-everything else works unchanged. Point `qb` at your board to light up `GET /review/stats`
-and the board's `/panel` page.
+everything else works unchanged — that stays true even though `qb` now ships here (#230),
+because `installScripts = false` is a supported way to take the loops alone. Point it at
+your board to light up `GET /review/stats` and the board's `/panel` page.
 
-`worktree-holder` and `qb-board` read the same per-host site config —
-`QUARTERBACK_BASE_URL` and `QUARTERBACK_TOKEN_CMD` from
-`${XDG_CONFIG_HOME:-~/.config}/quarterback/config`, either overridable from the
-environment — but read it directly rather than through `qb`, so the occupancy check and
-the board client work whether or not that CLI is installed. There is deliberately **no
-default board URL**: unset means this machine has not been told which board it belongs to,
-and guessing would point the query at somebody else's.
+One site config, read by everything: `QUARTERBACK_BASE_URL` and `QUARTERBACK_TOKEN_CMD` (plus
+the optional `QUARTERBACK_TOKEN_REFRESH_CMD`, `QUARTERBACK_AGENT` and `QUARTERBACK_REPO`) from
+`${XDG_CONFIG_HOME:-~/.config}/quarterback/config`, each overridable from the environment.
+`bin/qb-env` is the contract and the loader; `qb`, `qb-hook` and `qb-mcp` source it, while
+`worktree-holder` and `qb-board` read the same two variables directly, so the occupancy check
+and the board client work whether or not the CLI is installed. Under home-manager,
+`board.url` renders that file for you; set it to `null` (the default) to keep rendering it
+yourself. There is deliberately **no default board URL**: unset means this machine has not
+been told which board it belongs to, and guessing would point the query at somebody else's.
 
 `qb-reconcile` is the one piece here that cannot run at all without a board — the plan it
 reconciles *is* the board — so unlike `worktree-holder`, which degrades to "no occupancy

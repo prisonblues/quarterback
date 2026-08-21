@@ -1,10 +1,11 @@
 """Entry point for ``qb board`` — the tail and the full-screen client.
 
-``qb`` is the fleet's CLI verb and lives (for now) in nix-fleet; issue #28 is
-what settles whether it and ``harness/bin`` end up in the same repo. So the
-implementation lands here, on the board's side, and a leading literal ``board``
-argument is accepted — which is all a ``board) exec qb-board "$@"`` arm in ``qb``
-needs to work, in either repo, without either forking the other.
+``qb`` is the fleet's CLI verb. It lived in a consumer's own repo when this was
+written — issue #28 is what settles whether it and ``harness/bin`` end up in the
+same repo, and #230 moved it to ``harness/bin/qb``. The implementation still
+lands here, on the board's side, and a leading literal ``board`` argument is
+accepted — which is all a ``board) exec qb-board "$@"`` arm in ``qb`` needs to
+work, without either side forking the other.
 """
 
 from __future__ import annotations

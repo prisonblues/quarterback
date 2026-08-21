@@ -11,6 +11,139 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
+## v2.65 — the hm-module wires the board in, not just the commands
+
+`homeManagerModules.quarterback-harness` said it "wires the harness into `~/.claude` and
+`~/.local/bin`". It wrote to neither of those in the way that sentence implies and installed
+exactly three things: the package on PATH, `~/.claude/loops`, and `~/.claude/commands/*.md`.
+
+Everything that makes the harness *function as a board client* lived in the consumer's personal
+config — on this fleet, a separate repo:
+
+| what | where it lived |
+|---|---|
+| the seven `qb-hook` entries in `settings.json` | a hand-maintained file in the consumer's repo |
+| the deep-merge that installed them | that repo's `home.activation` |
+| the CLAUDE.md import and the `.claude.json` MCP registration | that repo's `qb-claude-setup` |
+| `qb-hook`, `qb`, `qb-mcp`, `qb-claude-setup`, `qb-env` | that repo's `home/bin` |
+
+So importing the flake gave you slash commands and the loops engine, and **no board**: no lease,
+no presence, no courier, no overlap detection, no `/sync` advice. Every mechanism those hooks
+carry was absent, and the module's own description promised otherwise.
+
+**The skew was worse than the gap.** #204 names three independently versioned things that must
+agree — board image, harness flake pin, Python venv. There were four: `qb-hook` and friends were
+versioned by whatever repo the consumer kept them in, on a different pin from the flake. A
+`qb-hook` expecting a board route the pinned harness does not serve is skew `qb-doctor` cannot
+see, because the file is not in the tree it is checking. And #253 wants six lifecycle events
+emitted from `qb-hook`'s `PostToolUse` classifier — a ten-line change this repo could not make,
+could not test in its own suite, and could not ship.
+
+### The wiring was three-sevenths of a wiring
+
+Measured while moving it: the script wired `SessionStart`, `Stop` and `SessionEnd`, and nothing
+else. On a host with no `settings.json` at all it wired **nothing** — it only ever edited an
+existing file. The other four entries existed because the same consumer's canonical
+`settings.json` happened to carry them, so the script was not the wiring, it was half of it, and
+nothing compared the two halves. A host that ran only the script had:
+
+- no `PostToolUse` — so no ask courier (a peer's directed question reached a headless `/epic` or
+  `/lander` run never, since those have no next prompt) and no publish-on-push;
+- no `UserPromptSubmit` — so no claim-before-you-work, no same-problem discovery, no stale-checkout
+  advisory. Three agents once fixed the same red CI job in a morning and the third had *checked*;
+- no `PreToolUse` — so sub-agent fan-out was invisible to `/active`;
+- no `Notification` — so a pane waiting on a human looked identical to a pane thinking.
+
+And no error, on any of them.
+
+### What landed
+
+`qb-hook`, `qb`, `qb-mcp`, `qb-claude-setup` and `qb-env` are in `harness/bin`, on the same pin
+as the board client and the loops. `qb-env` comes not as an entry point but because it is the
+library the other four **source**, each finding it as a sibling of `$0`.
+
+The hook entries are now a **data file** — `harness/claude/settings-fragment.json`, naming
+`@QB_HOOK@` because a fragment inside a package cannot name that package's own store path.
+`harness/tests/test_claude_wiring.py` counts it against `qb-hook`'s own dispatch switch in both
+directions: an event the hook handles and the fragment does not wire is dead code that reads like
+a feature, and an event wired with no arm spawns a shell per occurrence to fall through a `case`.
+That comparison is the check that did not exist, and it is the one that would have caught this.
+
+`programs.quarterback-harness.board.url` and `board.tokenCommand` are all a host needs to appear
+on a board. `claude.enable = false` takes the fragment instead (`qb-claude-setup
+--print-fragment`, one expression shared with the wired path, so the manual route cannot drift).
+`claude.activationAfter` names the activation entries the wiring must follow, because `jq -s
+'.[0] * .[1]'` — the usual spelling of "declare part of `settings.json` from nix" — replaces
+**arrays**, and ordering between two repos' activation scripts is order-dependence (#166) rather
+than a detail. That hazard is pinned as a test: the merge is additive by identity, and the one
+thing a jq expression cannot fix from this side is who runs last.
+
+Two questions are answerable now that were not:
+
+    qb-hook --version        # this hook's path, and the qb-env it loaded
+    qb-claude-setup --check  # per event: ok / MISSING / SKEW  (exit 0 / 1 / 2)
+
+Paths rather than a version string, because on a nix install the store hash *is* the pin while a
+`version` field is something somebody has to remember to bump — and the two lines matter
+together, since a `qb-hook` and a `qb-env` from different store paths is a half-migrated install
+that is invisible from either line alone. `--check` is per event because the bug it replaces was
+six-of-seven, which any single yes/no reports as "wired"; exit **2** (wired, but to another pin)
+is deliberately not a lesser **1**, since it is the state every migrating host is in.
+
+Migration for a consumer carrying its own copies is safe in either direction and needs no flag
+day: the merge matches the command *naming* `qb-hook` rather than an exact path, so old
+`~/.local/bin/qb-hook` entries are replaced rather than doubled — and a doubled `PostToolUse`
+entry would run the hot path twice per tool call.
+
+Four smaller fixes rode along, all of the same shape — a wiring step that quietly did nothing
+on a host that had not been set up by hand first. The CLAUDE.md `@import` is now conditional on
+the doc actually being installed (it was appended unconditionally, so a host without it carried a
+line in every session's context that resolved to nothing) — and it now **creates**
+`~/.claude/CLAUDE.md` rather than only editing one, because nothing else on a fresh host writes
+that file, so waiting for it meant the workflow doc shipped and no session ever read it. The MCP
+server is registered only when the interpreter it execs exists, because a registered server that
+cannot start means every session opens on a failed connection — **and** it is now registered on a
+host where `~/.claude.json` does not exist yet, which the old gate skipped: a fresh machine got
+the MCP server only if Claude Code had already run there once, so the first switch left
+`board_read` unavailable and said nothing. `--check` also refuses to bless a `settings.json`
+whose `hooks` is valid JSON of the wrong shape; reading the entries out of one errored, and with
+the error swallowed that read as "all wired".
+
+Two things the move surfaced in the scripts themselves. `~/.config/quarterback/config` is
+**sourced**, so every value the module renders into it is quoted now: `https://board/x?a=1&b=2`
+is an ordinary URL, and unquoted it ends the assignment at the `&` and backgrounds the rest —
+on every board call, in every hook, with the only symptom a host that never appears. And
+`qb-hook`'s health beacon reads the HTTP status rather than curl's exit code: `curl -sS` exits 0
+on a 401 exactly as it does on a 200, so a host whose bearer the board had stopped accepting
+wrote `ok` on every turn while every post it made was dropped — the one thing a health beacon
+must not get wrong, and the failure `qb-mcp`'s own self-heal exists for. A 409 still counts as
+`ok`: a lease conflict is news about the lease, not about the board being reachable.
+
+### Nothing was evaluating the module
+
+`nix flake check` prints `unknown flake output 'homeManagerModules'` and walks past, the GitHub
+jobs run pytest, and the only thing that ever forced `hm-module.nix` was a consumer's own
+rebuild — so the file a consumer actually imports was the least-checked in the tree, and a bad
+option type in it would break every consumer's switch rather than anything here. `hm-module-eval`
+evaluates it against a stub declaring the four options it writes to, and asserts on what it
+produces rather than what it says: that the activation entry exists with the right dependencies,
+that `claude.activationAfter` reaches the DAG, that the site config renders and that `null`
+renders nothing, that each opt-out removes something, and that a `tokenCommand` carrying a single
+quote trips its assertion. It is not a home-manager integration test and does not pretend to be;
+if the module grows a write to an option the stub does not declare, the check fails there, with
+the fix one line away.
+
+The suite that drives the scripts stays in `worktree-tests`, which has the jq and bash it needs,
+and declares the four repo files it reads through v2.61's `_flake_sandbox` — the parser that
+release separated out for exactly this. One correction to v2.61 fell out of using it:
+`_flake_sandbox.py` was removed from that sandbox along with the guards it serves, so the new
+declaration compared against nothing and reported a skip rather than a failure. The helper stays
+now; its own guard still belongs to the prose check.
+
+Not fixed here, and worth saying: `qb-mcp` still needs a **checkout** for its venv, so the flake
+alone cannot give a consumer the MCP tools. That is the other packaging gap (#202), and `auto`
+declining with the exact command to run is the honest interim.
+
 ## v2.64 — a screen you can build and cannot reach
 
 `qb-seats` addressed every tmux session by NAME — `-t "=$SESSION"`, `-t "$SESSION:seats"`,
@@ -194,7 +327,6 @@ not. The ⚖ had no such guard at all: a review started off another repo's PR ro
 commented on, and pushed a fix commit to, whatever pull request wore that number here. The
 guard fails closed where it cannot name this checkout's repo, since `gh` and `git push`
 find a default remote whether or not `origin` is the one that answers.
-
 ## v2.61 — the suites that read this repo get a sandbox that holds it
 
 Five test suites under `harness/` read files at the repo root while running in nix sandboxes

@@ -303,11 +303,11 @@ judge-confirmed P2s were plainly wrong — the `installPhase` it said enumerated
 three scripts does `install -m 0755 bin/*` and globs — and they are still in the
 board as confirmed.
 
-**`qb record-outcome` ships in nix-fleet and is not in force until a
-home-manager rebuild** (it is nix-fleet PR #19). Until then the verb exits 2 with
-a usage line; record the outcomes once it lands rather than dropping them, and
-say in the relay that they are outstanding — an outcome nobody records is the
-gap this whole feature exists to close.
+**`qb record-outcome` ships in this repo** (`harness/bin/qb`, as of #230) and is on PATH
+wherever the harness is — but a host still running an older `qb` from somewhere else has a
+verb that exits 2 with a usage line. If that happens, record the outcomes after the rebuild
+rather than dropping them, and say in the relay that they are outstanding — an outcome nobody
+records is the gap this whole feature exists to close.
 
 **Map the fixer's finding IDs to keys first — this is a step, not an aside.** The
 fixer reports the ID it was given (`236-F01`, exactly as the report prints it in

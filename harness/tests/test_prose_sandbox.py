@@ -158,6 +158,23 @@ def test_a_member_that_declares_nothing_is_an_error_not_an_exemption(monkeypatch
         contract.declared_reads()
 
 
+def test_the_removal_rule_covers_suites_and_exempts_helpers():
+    """Pins the narrowing #230 made, in both directions, because the exemption is the kind
+    that gets widened by the next person who finds the rule inconvenient.
+
+    A suite is collected wherever it lands, so it must be removed from the collecting check.
+    A helper is not collected at all, so requiring its removal forbids two sandboxes sharing
+    one parser — which is what `_flake_sandbox` was factored out to allow."""
+    assert contract.collectible("harness/tests/test_commands_wired.py")
+    assert not contract.collectible("harness/tests/_flake_sandbox.py")
+    assert not contract.collectible("harness/tests/_prose_sandbox.py")
+    # Not a matter of the leading underscore: anything outside the suite directory is not this
+    # rule's business either, and a `conftest.py` is collected by pytest but is not a suite
+    # whose reads this contract describes.
+    assert not contract.collectible("harness/commands/review-pr.md")
+    assert not contract.collectible("harness/tests/conftest.py")
+
+
 def test_every_member_is_removed_from_the_check_that_would_collect_it(flake_text):
     """Joining this category costs four steps, not three, and nothing used to check the fourth.
 
@@ -168,8 +185,11 @@ def test_every_member_is_removed_from_the_check_that_would_collect_it(flake_text
     `test_commands_wired.py` is why this is not hypothetical: it sat erroring in `worktree-tests`
     from the day it landed until somebody happened to run the flake and hand-write the `rm`."""
     removed = contract.removed_from_collecting_check(flake_text)
-    installed_here = {p for p in contract.installed(flake_text)
-                      if p.startswith(contract.SUITE_DIR)}
+    # Only what pytest would COLLECT there. A helper module is not collected, so sharing one
+    # between the two sandboxes is inert — and since #230 it is also necessary, because
+    # `worktree-tests` has a member that declares its reads through `_flake_sandbox` too.
+    # See `contract.collectible`.
+    installed_here = {p for p in contract.installed(flake_text) if contract.collectible(p)}
     still_collected = sorted(installed_here - removed)
     assert not still_collected, (
         f"these files are installed into {contract.CHECK_NAME} but are not removed from "

@@ -335,7 +335,7 @@ describes a slice rather than the board:
   once.
 
 Nothing *pushes* a message at you: the board stores and delivers on read, and the
-transport half of #155 (nix-fleet's `qb-hook`) is blocked on #157. A message reaches
+transport half of #155 (`harness/bin/qb-hook`) is blocked on #157. A message reaches
 you on your next board read, which is why the briefing carries it.
 
 `GET /stream` is the exception on purpose: the SSE tail carries **every** type,
@@ -932,6 +932,21 @@ full — including what was broken before it, which is the part no diff recovers
   `/usr/bin/env` (there is none in a nix sandbox, and this had shipped five times, so it is a
   guard now rather than a review comment), and five `test_qbdata.py` tests asked git about a
   checkout the sandbox does not hold and build their own.
+- **v2.65** — the hm-module wires the board in, not just the commands. `homeManagerModules
+  .quarterback-harness` said it wired the harness into `~/.claude` and installed three things:
+  the package, `~/.claude/loops`, and the command files. The seven Claude Code hook entries,
+  the MCP registration and `qb-hook` itself all lived in whatever personal config a consumer
+  happened to keep — so importing the flake got you slash commands and **no board**, and the
+  hook was pinned by a different repo than the board it posts to, which is skew `qb-doctor`
+  could not look at because the file was not in the tree it checks. `qb-hook`, `qb`, `qb-mcp`,
+  `qb-claude-setup` and `qb-env` now ship in `harness/bin`, the hook entries are a data file
+  the wiring merges, and `board.url` + `board.tokenCommand` are all a host needs to appear on
+  a board. The wiring was also wiring three of seven events: `PostToolUse` (the ask courier and
+  publish-on-push), `UserPromptSubmit` (the claim, overlap and sync notes), `PreToolUse` (sub-agent
+  records) and `Notification` existed only because a hand-maintained `settings.json` happened
+  to carry them, and a host that ran only the script got none of those mechanisms and no error.
+  `qb-hook --version` and `qb-claude-setup --check` make the pin and the wiring answerable
+  per event (#230, the precondition for #232 and #253).
 - **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
   object store; wire `landed` refs to a cherry-pick helper.
 
@@ -1034,8 +1049,22 @@ your way is your whole problem, install the harness and skip the service. See
 # nix / home-manager consumers
 inputs.quarterback.url = "github:prisonblues/quarterback";
 imports = [ inputs.quarterback.homeManagerModules.default ];
-programs.quarterback-harness.enable = true;
+
+programs.quarterback-harness = {
+  enable = true;                                   # loops, slash commands, worktree tooling
+  board.url = "https://qb.example.org";            # ...and a board client: hooks, MCP, presence
+  board.tokenCommand = "cat /run/secrets/qb-token";
+};
 ```
+
+`enable` on its own gives the workflow half. **The two `board` lines are what make it a client**
+— they render `~/.config/quarterback/config` and the activation wires the seven Claude Code
+lifecycle hooks and the stdio MCP server, so presence, leases, the ask courier, overlap
+detection and sync advice all work without you reassembling any of it (#230). There is
+deliberately no default board URL: a self-hosted board has no sensible fallback, and a guess
+points an agent at somebody else's. `harness/README.md` has the rest of the options — opting
+out of the wiring, ordering it after your own `settings.json` merge, and what
+`qb-claude-setup --check` reports.
 
 This repo's own `.worktree.json` is the worked example of the isolation half: a Postgres
 copy per worktree, Docker left off (the compose file here is tracked, and the Docker path
@@ -1045,10 +1074,11 @@ of both for other repos.
 
 ## The terminal board (`qb-board`)
 
-> **The command is `qb-board`.** `qb board` is the spelling the fleet's CLI will use, and that CLI
-> lives in nix-fleet, not here — until it grows the one-line arm described under *Where it lives*
-> below, `qb board` is not a command on any host. Everything in this section works today under the
-> hyphenated name, which is what the harness package puts on PATH.
+> **The command is `qb-board`.** `qb board` is the spelling the fleet's CLI will use. That CLI is
+> now `harness/bin/qb` and lives here (#230), but it still has no `board` arm — until it grows the
+> one line described under *Where it lives* below, `qb board` is not a command on any host.
+> Everything in this section works today under the hyphenated name, which is what the harness
+> package puts on PATH.
 
 `GET /` is a browser view behind Authelia. That is the right surface on a desktop and no surface
 at all on **daedalus**, **atlas** or **sisyphus** — the headless machines where work runs
@@ -1112,11 +1142,12 @@ guess reaches another island's real board.
 `client.py` the MCP server uses — this repo already had two clients for one board (that one and the
 browser's JavaScript) and a third would be the thing to avoid. `harness/bin/qb-board` is a launcher
 that finds an interpreter which can import it, and ships in the harness package so home-manager puts
-it on PATH. `qb` itself still lives in nix-fleet ([#28](https://github.com/prisonblues/quarterback/issues/28)
-is what settles that split), so the `qb board` spelling wants a one-line arm there —
-`board) exec qb-board "$@" ;;` — and nothing else: `qb-board` already drops a leading literal
-`board` argument. That arm is not in this PR and cannot be, so until it is deployed the command
-is `qb-board`. Write it without a `shift`: the strip exists precisely so the verb can arrive, and
+it on PATH. `qb` itself is `harness/bin/qb` as of #230 — it used to live in a consumer's own repo,
+which is what made the `qb board` spelling somebody else's change to make
+([#28](https://github.com/prisonblues/quarterback/issues/28) is what settles that split). It still
+wants a one-line arm — `board) exec qb-board "$@" ;;` — and nothing else: `qb-board` already drops
+a leading literal `board` argument. That arm is not written yet, so until it is the command is
+`qb-board`. Write it without a `shift`: the strip exists precisely so the verb can arrive, and
 an arm that shifts it away silently disables the thing it is there for.
 
 ## Development
