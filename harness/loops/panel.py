@@ -128,6 +128,13 @@ import panel_rounds              # noqa: F401
 from panel_preflight import *     # noqa: F401,F403
 import panel_preflight            # noqa: F401
 
+# Where the round's wall clock went (#192). Its own module, and deliberately NOT
+# star-imported: nothing here calls it as a bare global, so an explicit import
+# keeps `panel_timing.` on every call site and makes the instrumentation greppable
+# as one thing — this file is edited by several changes at once and a timing call
+# that reads like a panel helper is the kind of line a merge loses.
+import panel_timing               # noqa: F401
+
 # The mergeability sentence, from the merge gate that already owns it (#271). One
 # import rather than a second copy: `preland.check_pr_state` refuses a CONFLICTING
 # branch at merge time, this refuses a round on the same branch hours earlier, and
@@ -218,6 +225,12 @@ def _payload_defaults() -> dict:
     literal of nine keys against this one's two dozen, so the skipped PR — the
     case that payload exists FOR — was the one that raised KeyError."""
     return {
+        # Where this round's wall clock went (#192). None means the run never got
+        # far enough to say — the same distinction every other key here draws, and
+        # it matters more than most: a fix phase is measured from the PREVIOUS
+        # round's `timing.finished_at`, so a payload that carries a zero rather
+        # than a null hands the next round a left-hand end that never happened.
+        "timing": None,
         "changed_lines": 0,
         # The PR's file list, not this round's. Under #41 a later round reviews
         # only the increment, so the round's files narrow while the PR's
@@ -478,6 +491,12 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # genuinely new observation and gets a new key — re-reviewing a PR after a fix
     # loop is data, not a duplicate.
     run_key = uuid.uuid4().hex
+    # The round's stopwatch, started HERE rather than beside the seats (#192).
+    # Half of a cycle's wall clock was unattributable, and the reason a
+    # measurement that starts where the interesting code starts cannot close that
+    # gap is that it can only ever report the part somebody already suspected.
+    # Everything from the config read down is inside a phase.
+    clock = panel_timing.RoundClock()
     cfg = load_repo_cfg(repo_name)
     # The name RESOLVED from the checkout, never the argument. `--repo` is
     # optional — `panel.py --pr N` in a repo is the documented single-PR form —
@@ -529,6 +548,13 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             "round": round_no,
             "skip_reason": refusal,
             "config_notes": [refusal],
+            # No baseline was read on this path, so there is no earlier end and no
+            # fix phase — but the payload still says when it started and stopped,
+            # because `_payload_defaults`' rule is that a consumer reading a key
+            # should not have to know which exit produced the payload.
+            "timing": panel_timing.timing_block(clock,
+                                                panel_timing.fix_phase(clock.started_at),
+                                                measured_to="unconfigured"),
             "run_key": run_key,
         }
         # No `load_baseline` and no cycle bookkeeping, unlike the title skip. That
@@ -755,6 +781,21 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 "prior_rounds": len(skip_prior.rounds),
                 "prior_findings": len(skip_prior.keys),
                 "skip_reason": f"title matches skip pattern /{pat}/",
+                # A finish, for the same reason `head_sha` is here (#192): this
+                # payload is the next round's `--baseline`, and its fix phase runs
+                # from where THIS round stopped. Left null, that round measures
+                # from whichever earlier round last recorded a finish and reports a
+                # span containing a whole skipped round as a fix phase.
+                "timing": panel_timing.timing_block(
+                    clock,
+                    panel_timing.fix_phase(clock.started_at,
+                                           prior_finished_at=skip_prior.finished_at,
+                                           prior_round=(skip_prior.finished_round
+                                                        or skip_prior.head_round),
+                                           prior_head_sha=skip_prior.head_sha,
+                                           head_sha=head_sha,
+                                           repo_path=cfg.get("path") or ""),
+                    measured_to="skip"),
                 "run_key": run_key,
             }
             # --json-file is honoured here too, and its failure fails the run the
@@ -1095,7 +1136,24 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # payload, `skip_reason`, the per-seat `ran: false` rows, the board record and
     # `--force` all already exist below, and a second refusal branch beside them is
     # how the checks in #96 came to disagree with each other.
-    pre = preflight(review.target, budgets, panel, notes, forced=force, gate=gate)
+    # `installed` is HANDED to the verdict rather than left to be re-derived, and
+    # it is the round's own snapshot from a few dozen lines up. `seat_ceilings`
+    # resolves the predicate in its body when it is given none, so the verdict was
+    # taking a SECOND, independently-timed PATH reading — the exact thing the
+    # snapshot's own comment above says it exists to prevent ("two independently
+    # timed PATH reads can disagree; a snapshot is what makes the consumers below
+    # describe one host"). The verdict was the one consumer still outside it.
+    #
+    # `.__contains__` and not the set, because the parameter is a PREDICATE that
+    # `seat_ceilings` calls per seat. Being a bound method it is also always truthy,
+    # which matters for the `installed or seat_installed` fallback there: an empty
+    # set is falsy and would hand a host carrying no seat at all straight back to
+    # the PATH read. That case cannot arise today — the predicate is only ever asked
+    # about names in `budgets`, which is a subset of this set, so an empty snapshot
+    # means an empty `budgets` and nothing to ask about — which is why there is no
+    # test for it. It is spelled the safe way because the cost is a dunder.
+    pre = preflight(review.target, budgets, panel, notes, forced=force, gate=gate,
+                    installed=installed.__contains__)
     if pre.refused:
         # The CI gate, read on a round that dispatches nobody. It is one API call,
         # is not defeated by diff size, and costs no seat's budget — and a refusal
@@ -1142,6 +1200,14 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                       "with" if pre.gate else
                       f"not dispatched — the panel refused this round "
                       f"({pre.measured:,} {pre.cap_unit} against {pre.cap:,})")
+        # The refusal's one phase, closed HERE rather than above the CI read. A
+        # refusal is the cheap path by design, and this is what checks that claim —
+        # so it has to contain the gh call the refusal still makes and the report
+        # it still builds. Closed before either, `round_ms` would sum to a phase
+        # that excluded the only two things this path does. It closes before the
+        # payload is assembled, since the payload carries the timing; the print and
+        # the board record now happen after that (#284), and are the cheap end.
+        clock.mark("setup")
         refuse_payload = {
             **_payload_defaults(),
             "repo": repo_name, "github": gh_repo, "pr": pr_number,
@@ -1204,6 +1270,21 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             # claim about coverage.
             "skip_reason": pre.reason,
             "preflight": pre.as_dict(),
+            # Timed like any other exit (#192). A refusal is the cheap path by
+            # design, and "cheap" is a claim this is the only thing that checks —
+            # but the load-bearing half is `finished_at`: this payload is fed to
+            # round r+1 as a `--baseline`, and without a finish here that round
+            # measures its fix phase from whichever earlier round last recorded
+            # one, silently spanning this one as well.
+            "timing": panel_timing.timing_block(
+                clock,
+                panel_timing.fix_phase(clock.started_at,
+                                       prior_finished_at=prior.finished_at,
+                                       prior_round=prior.finished_round or prior.head_round,
+                                       prior_head_sha=prior.head_sha,
+                                       head_sha=head_sha,
+                                       repo_path=cfg.get("path") or ""),
+                measured_to="refusal"),
             "run_key": run_key,
         }
         # RECORDED, unlike the title-pattern skip, and that is the difference
@@ -1462,6 +1543,12 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                      f"reviewers' checkout: {', '.join(stripped[:8])}"
                      + (f" and {len(stripped) - 8} more" if len(stripped) > 8 else ""))
 
+    # Everything above — the PR read, the diff fetch, the scope decision, the
+    # pre-flight verdict, the CI read and the code-tree download — closes here as
+    # one phase. It is the part of a round that costs no vendor call and was
+    # therefore assumed to cost no time; `setup` is what says whether that is true
+    # on this repo.
+    clock.mark("setup")
     tasks = {}
     with ThreadPoolExecutor(max_workers=len(ALL_REVIEWERS) + 1) as ex:
         # Every selected LLM reviewer runs — no de-minimis gate. If we asked for
@@ -1495,6 +1582,17 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 {"number": pr_number, "base": base,
                  "head": meta["headRefName"], "head_sha": meta["headRefOid"]},
                 changed_lines, cfg["path"])
+
+        # Observe the seats landing before collecting them in submission order
+        # (#192). Sonar is watched with the rest: it is dispatched into the same
+        # executor and its finish is part of the same join, so leaving it out
+        # would attribute a round Sonar held to whichever LLM seat was slowest.
+        # `watch` never reads a result, so the loop below still raises, skips and
+        # records exactly as it did — see its docstring.
+        panel_timing.watch(clock,
+                           {**tasks, **({"sonarqube": sonar_future} if sonar_future
+                                        else {})},
+                           echo=chatter)
 
         llm_findings: list[Finding] = []
         ran_llm: list[str] = []
@@ -1624,6 +1722,11 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     #: pointing at nothing, so a later reader of it would be asking a question the
     #: variable can no longer answer honestly.
     code_tree_used = code_tree is not None
+    # The seat phase: dispatch to join. Every seat's own finish offset was recorded
+    # inside it, so `seats` minus the second-slowest of those is the span the round
+    # spent on one process with every other seat finished — `gated_ms`, the number
+    # #192's "parallel but gated on its slowest seat" claim was missing.
+    clock.mark("seats")
 
     # Pre-cluster as a hint, then let the master MERGE the duplicates and rule on
     # each issue in one step (no consensus gate). Dedup cannot happen upstream of
@@ -1679,6 +1782,12 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # holds and the report and board write-up still have to run.
     if code_dir is not None:
         shutil.rmtree(code_dir, ignore_errors=True)
+    # The judge's own phase, and it is charged with the clustering and the material
+    # composition ahead of it because those exist only to feed it. Its size against
+    # `seats` is the argument for or against every proposal to overlap the two:
+    # the judge cannot start until the slowest seat lands, so it pays `gated_ms`
+    # before it begins and that cost is invisible in this number.
+    clock.mark("judge")
     judged = judge_skip is None and bool(findings)
     to_fix = sorted((c for c in findings if c.verdict != "dismissed"),
                     key=lambda c: c.severity)
@@ -2122,10 +2231,36 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # at different accounts of the same review — and one finding record per
     # defect, carrying every reviewer's own report, so a consumer reads the merge
     # instead of re-deriving it from an over-counted list.
+    # Everything between the judge returning and this line: provenance, the stop
+    # rule, the growth ceiling, the escalation register. Closed here so the four
+    # phases partition the round exactly rather than leaving a remainder nobody
+    # can name — `measured_to` says what is outside them.
+    clock.mark("wrapup")
+    # The fix phase that ran INTO this round (#192). Its earlier end comes from the
+    # previous round's own recorded finish where there is one, and is derived from
+    # the two rounds' head commit times where there is not — `fix_phase` records
+    # which, because the derivation is a lower bound and breaks in the two places
+    # it would matter most. `cfg["path"]` is the checkout the derivation reads; on
+    # a host that has no clone of this repo it simply reports that it could not.
+    timing = panel_timing.timing_block(
+        clock,
+        panel_timing.fix_phase(clock.started_at,
+                               prior_finished_at=prior.finished_at,
+                               prior_round=prior.finished_round or prior.head_round,
+                               prior_head_sha=prior.head_sha,
+                               head_sha=head_sha,
+                               repo_path=cfg.get("path") or ""))
     payload = {
         **_payload_defaults(),
         "repo": repo_name, "github": gh_repo, "pr": pr_number,
         "title": title, "base": base, "changed_lines": changed,
+        # Where the wall clock went, and what the round spent waiting on one thing
+        # (#192). Board ingest is `extra="ignore"`, so this key is dropped there
+        # until a column exists for it — it travels in `--json`/`--json-file`,
+        # which is what a cycle chains its rounds through, and `finished_at` is
+        # read straight back out of it by the NEXT round's `load_baseline` as the
+        # left-hand end of that round's fix phase.
+        "timing": timing,
         # The commit reviewed: the NEXT round anchors its increment on it, and
         # provenance measures its fix range to it. One key, because two would be
         # one fact with two chances to disagree.
@@ -2571,6 +2706,13 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     else:
         judge_txt = f"⚠️ {judge_skip} — all findings KEPT unjudged (re-run to get a verdict)"
     lines.append(f"**Master judge:** {judge_txt}")
+    # Where the round's wall clock went, on the PR comment and not only in the
+    # payload (#192). It sits directly under the reviewer list and the judge
+    # because it is a fact about exactly those two, and the operator deciding
+    # whether to spend another round is the reader it is for — the payload is not
+    # where they are looking. It reports the fix phase BEFORE this round, which is
+    # the half of a cycle's cost that had no number anywhere.
+    lines.append(panel_timing.timing_line(timing))
     # Which seats could read the code, stated on the PR comment (#113). It belongs
     # next to the reviewer list because it is a property OF that list, and it has to
     # be visible: a reader weighing "codex could not assess the caller" against
