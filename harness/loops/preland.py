@@ -109,6 +109,16 @@ sys.path.insert(0, str(Path(__file__).parent))
 from harness_rules import (  # noqa: E402
     RepoNotFound, check_status, describe, resolve_repo,
 )
+# #278's reading lives in `panel_scope` because that is where the review target is
+# decided, and the JUDGEMENT must not exist twice: this gate and the round it rules
+# on have to answer "how involved was that merge" the same way, or a payload and a
+# verdict can disagree about the same commit with nothing saying which is right.
+# Only the measurement differs by caller — the panel reads GitHub's compare API and
+# checks nothing out, this runs in a checkout and has real `git`.
+from panel_scope import (  # noqa: E402
+    DEFAULT_DISTANT_MERGE_LINES, Integration, merge_involvement,
+)
+from panel_seats import distant_merge_lines  # noqa: E402
 
 READY, RECONCILE, HOLD = "READY", "RECONCILE", "HOLD"
 
@@ -503,7 +513,151 @@ def check_ci(pr: dict) -> Check:
     return c
 
 
-def check_review(repo: str, pr: dict, earned_stop: bool = False) -> Check:
+@dataclass(frozen=True)
+class MergeGate:
+    """Where the #278 reading is measured and the dial it is measured against.
+
+    Two fields rather than two more arguments threaded through three functions:
+    the pair travels together, is read in one place, and a caller that has neither
+    (a test, or a call site that predates #278) gets the honest answer — an
+    unmeasurable head move, which HOLDs exactly as it did before. Frozen, so the
+    empty one is safe as a default argument: it is built once at definition time
+    and there is nothing in it a call could mutate for the next caller.
+    """
+
+    root: str = ""
+    limit: int | None = DEFAULT_DISTANT_MERGE_LINES
+
+
+def _paths(out: str | None) -> list[str] | None:
+    """The paths in a NUL-separated `git` listing, or None if it could not be read.
+
+    `-z` rather than the default: git QUOTES a path with a space or a non-ASCII
+    byte in it (`"src/a b.py"`), and a quoted name matches nothing in the file set
+    it is being intersected with — so a merge into a file whose name needed quoting
+    would count as zero changed lines and read DISTANT. `_git` strips whitespace and
+    NUL is not whitespace, so the trailing separator survives as an empty field and
+    is dropped here.
+    """
+    if out is None:
+        return None
+    return [f for f in out.split("\0") if f]
+
+
+def _integration_since(root: str, recorded: str, pr: dict) -> Integration:
+    """What landed on this PR between the commit a round read and the head it has
+    now, measured with real `git` in the checkout this gate is already standing in.
+
+    The measurement #278 names, taken literally: `git diff` between the pre-merge
+    head and the merge result, RESTRICTED to the files this PR itself touches. The
+    restriction is what makes it a statement about this PR rather than about
+    `main` — a base merge drags in every file main gained, which is not this PR's
+    change and is not what the earlier round's findings were about.
+
+    `--numstat` rather than a diff body: the count is all that is wanted, and a
+    range that merged a busy `main` can be megabytes of text that would be read into
+    memory only to be discarded. A binary file the PR also touches REFUSES the
+    reading rather than counting zero — numstat reports `-` for it, and a merge that
+    replaced an asset this PR also edits is real material that cannot be measured in
+    lines, so it must not be allowed to look like an empty resolution.
+
+    **"The files this PR touches" is a UNION of two moments, and it has to be.** Taken
+    from the head alone it is what the PR contributes AFTER the merge, and a
+    resolution that reverted one of the PR's files all the way back to base drops that
+    file out of the set — so the change the earlier round reviewed would have been
+    silently discarded by the merge and the measurement would score it zero and call
+    the merge distant. That is #80's `stderr_gist` incident exactly (a landed fix lost
+    because a branch that had MOVED a function met a `main` that already had it), and
+    it is the one defect this whole reading exists to catch. So the files the PR
+    touched AS THE ROUND READ IT — measured from its own fork point, before the
+    integration — are in the set too.
+
+    **A rewritten branch has no range and says so.** `git diff A B` will happily
+    compare two commits with no ancestry between them, and after a force-push or a
+    rebase the answer is not a delta from `A` at all: anything dropped in the rewrite
+    is in neither side, and a small diff plus any merge commit in the replacement
+    history would preserve a review of code that no longer exists. `_fix_range_diff`
+    refuses GitHub's `diverged` status for the same reason; this is the local half.
+
+    Every failure returns a stated `problem` and never raises. An unreadable range is
+    an unread precondition, and :func:`merge_involvement` turns that into the
+    expensive answer — the behaviour before #278, which is the safe direction.
+    """
+    head = pr["headRefOid"]
+    if not root:
+        return Integration(problem="no checkout was available to measure it in")
+    for sha in (recorded, head):
+        if _git(root, "rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}") is None:
+            return Integration(problem=f"{sha[:12]} is not in this checkout, so the "
+                                       "range cannot be read here — fetch it, or the "
+                                       "branch was rewritten and there is no range")
+    if _git(root, "merge-base", "--is-ancestor", recorded, head) is None:
+        return Integration(problem=f"{recorded[:12]} is not an ancestor of the head, so "
+                                   "there is no range between them — the branch was "
+                                   "rewritten since the round read it")
+    base = f"origin/{pr['baseRefName']}"
+    fork, was = _git(root, "merge-base", base, head), _git(root, "merge-base", base,
+                                                           recorded)
+    if not (fork and was):
+        return Integration(problem=f"this PR's fork point from {base} could not be "
+                                   "computed, so which files are the PR's own is "
+                                   "unknown")
+    own = _paths(_git(root, "diff", "--name-only", "-z", fork, head))
+    had = _paths(_git(root, "diff", "--name-only", "-z", was, recorded))
+    rows = _paths(_git(root, "diff", "--numstat", "-z", "--no-renames", recorded, head))
+    merges = _git(root, "rev-list", "--count", "--merges", f"{recorded}..{head}")
+    if own is None or had is None or rows is None or merges is None:
+        return Integration(problem="`git` could not read the range in this checkout")
+    mine, churn = set(own) | set(had), {}
+    for row in rows:
+        parts = row.split("\t", 2)
+        if len(parts) != 3 or parts[2] not in mine:
+            continue
+        if parts[0] == "-" or parts[1] == "-":
+            return Integration(problem=f"{parts[2]} is binary and this PR also touches "
+                                       "it, so what the range put there cannot be "
+                                       "counted in lines")
+        try:
+            churn[parts[2]] = int(parts[0]) + int(parts[1])
+        except ValueError:
+            return Integration(problem=f"`git diff --numstat` gave {row!r}, which is "
+                                       "not a line count")
+    try:
+        n_merges = int(merges)
+    except ValueError:
+        return Integration(problem=f"`git rev-list --count --merges` gave {merges!r}")
+    return Integration(churn=churn, merges=n_merges)
+
+
+def _head_moved(c: Check, recorded: str, pr: dict, gate: MergeGate) -> None:
+    """#278: a head that moved is not by itself a review of earlier code.
+
+    This clause used to be flat — recorded head != current head, therefore HOLD —
+    and under the decision that is right for an INVOLVED merge and too strong for a
+    DISTANT one. Too strong is not free: any integration moves the head, so the flat
+    reading made a base merge cost a whole panel cycle across every seat, and #80
+    measures integration cost as quadratic in the number of open PRs. Five
+    concurrent PRs is about ten integration merges, at a measured 283,795 tokens per
+    `claude` seat per round.
+
+    Distant is a WARNING and not silence. The head did move, a reader of the payload
+    has to be able to see that it moved and see why it was let through, and
+    `merge_reading` in the detail carries the numbers the sentence is built from.
+    """
+    reading = merge_involvement(_integration_since(gate.root, recorded, pr),
+                                gate.limit, (recorded, pr["headRefOid"]))
+    c.detail["merge_reading"] = {"verdict": reading.verdict, "lines": reading.lines,
+                                 "files": list(reading.files), "limit": reading.limit}
+    moved = (f"the round read {recorded[:12]}, the PR's head is now "
+             f"{pr['headRefOid'][:12]}")
+    if reading.distant:
+        c.warnings.append(f"{moved} — {reading.why}")
+    else:
+        c.reasons.append(f"{moved} — it is a review of earlier code: {reading.why}")
+
+
+def check_review(repo: str, pr: dict, earned_stop: bool = False,
+                 gate: MergeGate = MergeGate()) -> Check:
     """The panel's own statements about the round that read THIS commit.
 
     Every clause here is a field the round wrote about itself. None of them is a
@@ -512,6 +666,8 @@ def check_review(repo: str, pr: dict, earned_stop: bool = False) -> Check:
     opinion about the same diff.
 
     ``earned_stop`` is ``--require-earned-stop``: see :func:`_round_stop_earned`.
+    ``gate`` is where the #278 head-moved reading is measured: see
+    :func:`_head_moved`.
     """
     c = Check("review", "passed")
     rows, err = board_get("reviews", {"repo": repo, "pr": pr["number"], "limit": 20})
@@ -542,10 +698,11 @@ def check_review(repo: str, pr: dict, earned_stop: bool = False) -> Check:
     # findings a fix already cleared, or worse, blesses a stale head — and that is
     # too much to rest on another service's clause remaining what it is today.
     newest = max(rows, key=lambda r: (str(r.get("ts") or ""), r.get("id") or 0))
-    return _judge_round(c, newest, pr, earned_stop)
+    return _judge_round(c, newest, pr, earned_stop, gate)
 
 
-def _judge_round(c: Check, latest: dict, pr: dict, earned_stop: bool = False) -> Check:
+def _judge_round(c: Check, latest: dict, pr: dict, earned_stop: bool = False,
+                 gate: MergeGate = MergeGate()) -> Check:
     """The clause list, against the newest round the board holds for this PR."""
     c.detail = {k: latest.get(k) for k in
                 ("id", "ts", "round", "cycle", "head_sha", "stopped", "stop_reason",
@@ -562,8 +719,7 @@ def _judge_round(c: Check, latest: dict, pr: dict, earned_stop: bool = False) ->
         c.reasons.append("the round recorded no head_sha, so there is no way to tell "
                          "which commit it read — re-run the panel on this head")
     elif recorded != pr["headRefOid"]:
-        c.reasons.append(f"the round read {recorded[:12]}, the PR's head is now "
-                         f"{pr['headRefOid'][:12]} — it is a review of earlier code")
+        _head_moved(c, recorded, pr, gate)
     if latest.get("stopped") is not True:
         c.reasons.append("the round did not stop: " +
                          (latest.get("stop_reason") or "it recorded no stopping verdict"))
@@ -1048,11 +1204,16 @@ def gather(cfg: dict, pr: dict, base: BaseRef, off: dict[str, str],
     """
     repo, root = cfg["github"], cfg["path"]
     versions = (cfg.get("epic") or {}).get("migrations_dir") or ""
+    gate = MergeGate(root, distant_merge_lines(cfg.get("review_panel") or {}, []))
     how = {
         "pr_state": lambda: check_pr_state(pr),
         "checkout": lambda: check_checkout(root, pr),
         "ci": lambda: check_ci(pr),
-        "review": lambda: check_review(repo, pr, earned_stop),
+        # Resolved OUTSIDE the lambda: a malformed `distant_merge_lines` is a hard
+        # exit through `_refuse_value`, and it belongs where `disabled_checks`
+        # already puts a bad rules value — before any check runs, not inside one
+        # check's guard where it would read as that check failing.
+        "review": lambda: check_review(repo, pr, earned_stop, gate),
         "merge_claim": lambda: check_merge_claim(repo, pr, mine),
         "migrations": lambda: check_migrations(root, base, versions),
         "sw_version": lambda: check_sw_version(root, base),

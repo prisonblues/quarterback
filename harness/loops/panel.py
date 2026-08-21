@@ -959,9 +959,12 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         notes.append(f"--since {since!r} is not a commit or a ref — it was ignored")
         since = ""
     anchor = since or prior.head_sha or ""
+    # #278's dial, resolved here beside the scope it qualifies rather than inside
+    # `decide`: a malformed value is a hard exit through `_refuse_value`, and the one
+    # place a rules file may take a run down is where the run reads the rules file.
     review, scope_notes = ReviewScope.decide(
         want_scope, round_no, diff, (anchor, head_sha), gh_repo, base,
-        None if since else prior.head_round)
+        None if since else prior.head_round, distant_merge_lines(panel, notes))
     notes.extend(scope_notes)
 
     # Diff budgets: panel-wide value, then each model's own override. Every
