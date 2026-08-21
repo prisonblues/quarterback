@@ -215,7 +215,7 @@ turns the merge off.
    ```
 
    ```bash
-   claim_id=$(qb-claim branch "$BASE" --note "landing PR #<pr>" --json)  # 0 yours / 1 held / 2 unknown
+   claim_id=$(qb-claim branch "$BASE" --ttl 1800 --note "landing PR #<pr>" --json)  # 0/1/2
    python3 ~/.claude/loops/preland.py --pr <pr> --json --claim-holder "<the holder it printed>"
    gh pr merge <pr> --squash --delete-branch
    ```
@@ -249,6 +249,11 @@ turns the merge off.
      own claim is not read as somebody else's. Anything but READY here ends the sequence — report
      the new verdict, and **release the claim on the way out** (`release_claim(claim_id="$claim_id")`)
      before you leave the queue and stop.
+   - **`--ttl 1800`, not the board's hour.** Keying the claim on the base (#318) widened what a
+     leaked one costs: it now blocks every merge onto `$BASE`, not one branch's. The TTL is the
+     only backstop for a session that dies between the claim and the release, so it is set to the
+     same window a queue entry gets — a land that takes longer than half an hour has gone wrong,
+     and an hour of nobody landing is a jam bought for no margin anyone needs.
    - **Once you have taken the claim, every exit releases it — the merge and the stop alike.**
      `qb-claim` prints the claim id on stdout and everything else on stderr, which is what makes
      `claim_id=$(…)` above the whole capture. A claim left behind by a loop that stopped is worse

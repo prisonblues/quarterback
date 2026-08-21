@@ -615,3 +615,17 @@ def test_the_head_asserts_its_readiness_on_the_line_before_it_merges():
         "the head never tells the line it is ready, so `GET /merge-queue` reports the PR about to "
         "land as not-ready and preland's own advice to re-enqueue at this head goes nowhere")
     assert ready < merge, "readiness is asserted after the merge, which is a green light on a PR that has gone"
+
+
+@pytest.mark.parametrize("name", ("fix-and-land", "panel-review-pr"))
+def test_the_landing_claim_is_taken_on_a_bounded_ttl(name: str):
+    """Keying the claim on the base (#318) widened what a leaked one costs: it blocks every merge
+    onto that base rather than one branch's, and `preland`'s `merge_claim` check is what makes that
+    a hard stop for everybody. The TTL is the only backstop for a session that ends between the
+    claim and the release, and the board's default is an hour."""
+    runnable = _fenced(command(name))
+    claim = re.search(r"qb-claim branch \S+([^\n]*)", runnable)
+    assert claim, f"{name} no longer claims a branch before merging"
+    assert "--ttl" in claim.group(1), (
+        f"{name} takes the landing claim on the board's default hour, so a session that dies "
+        "between the claim and the merge blocks every land onto that base for an hour")

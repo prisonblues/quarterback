@@ -881,7 +881,7 @@ for a verdict you dislike.
 Claim the base, re-verify, stamp the release, merge. In that order:
 
 ```bash
-qb-claim branch <base> --note "landing PR #<pr>" --json            # exit 1 = held
+qb-claim branch <base> --ttl 1800 --note "landing PR #<pr>" --json  # exit 1 = held
 python3 ~/.claude/loops/preland.py --pr <pr> --require-earned-stop --json \
     --claim-holder "<the holder from that answer>"                 # must be READY
 python3 scripts/changelog_fragments.py assemble
@@ -892,6 +892,9 @@ git commit -m "chore(release): stamp vNEXT" && git push
 gh pr merge <pr> --merge --delete-branch
 ```
 
+- **`--ttl 1800`, not the board's hour.** Keying on the base widened what a leaked claim costs —
+  it blocks every merge onto that base rather than one branch's — and the TTL is the only backstop
+  if this session ends between the claim and the merge. Half an hour is well past any land.
 - **The branch claimed is `<base>`, not `<branch>`** — the branch being landed
   ONTO. #318: two agents landing two *different* PRs into `main` hold
   `<repo>:feat/a` and `<repo>:feat/b` under a head key, never see each other, and
