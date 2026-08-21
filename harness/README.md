@@ -149,7 +149,7 @@ repo's open issues are the panel's own deferred-finding overflow. The severity s
 4.1% / P2 28.6% / P3 36.1% / P4 31.3%, says the signal is calibrated at about 1.2 P1s per
 PR and the 67.3% tail beside it is not.
 
-So `.harness-rules.sample` now carries seven `review_panel` dials (#165), and what they
+So `.harness-rules.sample` now carries eight `review_panel` dials (#165, #297), and what they
 bound is the tail rather than the signal: `fix_severity_floor` (**P3**) is what a fix round
 is asked to clear, and below it a finding is reported, marked and recorded rather than
 fixed — P4 is 31.3% of findings and the tier that actually ballooned #236;
@@ -158,6 +158,12 @@ the rule that mattered most, because from round 2 the thing under review IS the 
 round's fix and a termination test fed by its own output can only end on the cap — the
 two floors differ on purpose, since fixing a P3 in a pass that is already open costs one
 edit while letting a P3 buy another round costs a whole panel plus another fix pass;
+`low_severity_fix_lines` (**40**) is the churned lines the whole round may spend on the band
+between the two floors, counted rather than estimated and spent cheapest-first — added after a
+second measurement on 2026-08-21, where PR #188's 185-line feature came out of two fix passes
+at 721 lines, 74% of the PR being review-response code, off a round-2 fix list that was 89%
+below P2; a budget rather than a per-fix cap because #188's round 1 was 408 lines of
+individually reasonable small fixes;
 `max_fix_growth` (**3.0**) stops a cycle whose fix pass has multiplied the change instead of
 fixing it; `reviewer_scope` (**diff**) asks reviewers for defects in the change rather than
 in everything it touches; `fixer_may_defer` (**true**) gives the fixer the third exit it did
@@ -174,8 +180,8 @@ answer — warned about and dropped, so a rules file shared across a fleet that 
 different times is not a version pin. What the round actually applied is in the
 artifact, on a **Panel dials** line and in the payload's `review_panel`, because the
 orchestrator that briefs the fixer builds that brief out of the report. #165 proposes about
-fifteen dials; these are the seven whose enforcement point already exists, and the rest stay
-in the issue.
+fifteen dials; these are the seven whose enforcement point already exists, plus #297's budget,
+and the rest stay in the issue.
 
 The fixer has one more permitted outcome than "fixed" and "false positive", and it exists
 because of what the other two cost. A fix that patches a wrong assumption produces the next

@@ -540,6 +540,40 @@ DEFAULTS: dict = {
         # is already running and refuses to let one buy a fourth. `"P4"` restores
         # today's behaviour.
         "round_trigger_floor": "P2",
+        # How many CHURNED LINES the whole round may spend on findings the fix floor
+        # admits and `round_trigger_floor` does not — the band between the two, which
+        # at the shipped defaults is exactly the P3s.
+        #
+        # The measurement this answers (#297, 2026-08-21). PR #188's feature was 185
+        # churned lines; two fix passes turned it into 721, so **74% of that PR was
+        # review-response code**, and round 2's "to fix" list was 89% below P2. On
+        # #268, 17 of the 20 round-2 findings were created by the round-1 fix pass —
+        # 85%, against this repo's own measured 63.7% and a ~7% industry baseline for
+        # bad-fix injection. The line a fix leaves is next round's review surface at
+        # that rate, so a fix pass that accumulates lines is buying the next round's
+        # findings.
+        #
+        # **A budget, not a per-fix cap, and not a higher floor.** #188's round 1 was
+        # not one balloon; it was 408 lines of individually reasonable small fixes,
+        # each of which any per-fix cap would have waved through. And the floor stays
+        # at P3 on purpose (`fix_severity_floor` carries that argument): a genuinely
+        # cheap correctness-adjacent fix is worth taking while the pass is open. What
+        # a budget stops is the ACCUMULATION, which is the thing that was measured.
+        #
+        # **Mechanical, not discretionary.** The spend is COUNTED — `git diff
+        # --numstat` after each fix, cheapest first, stop when the budget is gone —
+        # and never estimated, and the fixer is never asked "does this risk
+        # ballooning?". That question is a judgement by the actor whose judgement the
+        # 85% impugns. `max_fix_growth` verifies the total afterwards.
+        #
+        # 40 lines: enough for a handful of the genuinely cheap ones (a missing
+        # timeout, a guard, a stale docstring) and nowhere near 408. Unpaid findings
+        # are not dropped — they are reported and recorded exactly like a below-floor
+        # finding and are what the next round or an issue picks up. `null` is no
+        # budget at all, the pre-#297 behaviour where every finding at or above the
+        # fix floor is unconditional work; `0` fixes none of the band, which is
+        # `fix_severity_floor` raised to the cut without saying so twice.
+        "low_severity_fix_lines": 40,
         # A fix pass that MULTIPLIES the diff has written a second change, not a
         # fix. If what a round reviews has grown by more than this multiple of what
         # the FIRST round of the cycle reviewed, the cycle stops and says the change

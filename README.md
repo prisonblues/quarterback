@@ -988,6 +988,13 @@ full — including what was broken before it, which is the part no diff recovers
   is deliberately NOT asked: two attempts to establish it from the local repository each
   opened the laundering hole the other closed, so the refusal names both repairs — rewrite the
   entry, or fetch a base that is behind — rather than guessing which applies.
+- **vNEXT** — a line budget for the panel's low-severity fixes. `review_panel.low_severity_fix_lines`
+  (**40**) is the churned lines a round may spend on findings between `fix_severity_floor` and
+  `round_trigger_floor`, spent cheapest-first and counted rather than estimated. PR #188's
+  185-line feature came out of two fix passes at 721 lines — 74% of the PR was review-response
+  code — off a round-2 fix list that was 89% below P2. A budget rather than a per-fix cap, because
+  #188's round 1 was 408 lines of individually reasonable small fixes; and not a higher floor,
+  because a genuinely cheap correctness-adjacent fix is still worth taking while the pass is open.
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
   roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps

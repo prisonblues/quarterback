@@ -205,6 +205,7 @@ Detected from the checkout, **not settable** here: `path`, `github`, `default_br
 | `review_panel.fixer_may_defer` | May a fixer answer "real, and not this change's job"? **true**. Its two exits were a refuted false positive and an escalation about the *approach*, and the brief then said "'Not now' is not available to you" — so a correct third judgement had no legal way out and the only move left was the patch. Maps to the existing `deferred` outcome; the fixer owes a justification and the orchestrator opens the issue. `false` is the old two-exit behaviour. |
 | `review_panel.fix_severity_floor` | Severity a fix round is asked to clear, at or above. **`P3`**. Below it a finding is reported, marked 🔽 under its own heading, recorded (`below_fix_floor` in the payload) and **not fixed**. The measured cut is at P2 (67.3% of findings, zero P1s lost) and this deliberately sits a tier below it: severity is model-authored, and the class a P2 floor misses is correctness expressed as craft — a missing regression test on a parser or an auth boundary, a missing timeout or cleanup, a migration rollback gap. Fixing one in a pass already open is one edit; P4 (31.3%, the tier that ballooned #236) stays out. `P4` fixes everything, the pre-#165 behaviour — for `round_stop`'s rules 1 and 3; rule 2's bar is a hardcoded `("P1", "P2")` and only `P1` moves it. A Sonar hard-gate issue is exempt from both floors at every rule. |
 | `review_panel.round_trigger_floor` | Severity a NEW finding needs to buy another round. **`P2`** — a tier above `fix_severity_floor`, because letting a P3 buy a round costs a whole panel plus another fix pass where fixing it in the open pass costs one edit. Below-floor new findings are still reported and recorded; `round_stop`'s reason names the floor and the count. `P4` is the pre-#165 behaviour. |
+| `review_panel.low_severity_fix_lines` | Churned lines the WHOLE round may spend fixing findings below `round_trigger_floor` — at the shipped floors, the P3 band. **40**. Spent cheapest-first and COUNTED (`git diff --numstat` after each fix), never estimated; what it does not reach is reported and recorded exactly like a below-floor finding. The measurement: PR #188's feature was 185 churned lines and two fix passes made it 721 — **74% of the PR was review-response code** — with round 2's fix list 89% below P2, and on #268 85% of round-2 findings were created by the round-1 fix pass. A budget and not a per-fix cap, because #188's round 1 was 408 lines of individually reasonable small fixes that any per-fix cap waves through; and not a higher floor, because a genuinely cheap correctness-adjacent fix is still worth taking while the pass is open. `0` fixes none of the band (the applied floor becomes the cut, and the report says so); `null` is no budget at all, the pre-#297 unconditional behaviour. While a budget is in force, `round_stop`'s repeat rules are bounded at the cut rather than at the fix floor — an unpaid budgeted finding is outstanding by construction, exactly as a below-floor one is. |
 | `review_panel.max_fix_growth` | Multiple of the cycle's FIRST round's reviewed size that a later round may review before the cycle stops and says the change wants splitting. **3.0**; `null` switches the check off (the one key here where `null` is not "inherit"). Not dressed up as convergence — it takes a veto line and `confident` is false. |
 | `review_panel.reviewer_scope` | What a reviewer is asked to look for: **`diff`** (defects in the change and its seams; anything outside it is an observation) or `repo` (the pre-#165 wording — "search the codebase, don't just review the diff"). Not how hard anyone looks: every dimension stays in the prompt and a code-reading seat still reads the callers. |
 | `review_panel.require_failing_test` | A finding must carry a reproducible failing test to block. **false, and read-only**: the reviewer-emitted test artefact it needs is not built (#92 — a reviewer emits a test and never runs one; #114 — it must be shown RED pre-fix). Setting it `true` is recorded, reported, and enforces nothing, and the round says so in `config_notes`. |
@@ -325,7 +326,7 @@ ratio of `0` turns the feature all the way *on* — every diff with one relocate
 becomes a move), so its note points at `manifest_moves` instead. All three are the
 pre-flight verdict, below.
 
-### Thoroughness against convergence — #165's seven dials
+### Thoroughness against convergence — #165's seven dials, and #297's eighth
 
 The panel had one behaviour and no dials, and the measurement says that behaviour does
 not converge. Across seven PRs panelled on 2026-08-16, the last round of each raised
@@ -337,12 +338,13 @@ deferred-finding overflow.
 
 The severity split of that queue is P1 4.1% / P2 28.6% / P3 36.1% / P4 31.3% — about
 1.2 P1s per PR, roughly what a production generator-verifier loop reports. **The signal
-is calibrated; the 67.3% tail beside it is not.** These seven settings bound the tail.
+is calibrated; the 67.3% tail beside it is not.** These eight settings bound the tail.
 None of them makes the panel look less carefully, and none lowers the bar for what a fix
 round takes on: in scope, everything still gets fixed properly, with a test, and "note
 it and move on" stays forbidden.
 
-The diagnosis they act on, in three parts:
+The diagnosis they act on, in four parts — the fourth measured five days after the
+first three landed:
 
 1. **The panel computed a calibrated severity and the prompts threw it away.**
    `review-pr.md` ranked findings "for the summary table only. All of them get fixed."
@@ -355,13 +357,22 @@ The diagnosis they act on, in three parts:
    again on a new finding at any severity, and from round 2 the thing under review IS the
    previous round's fix → `round_trigger_floor`, with `max_fix_growth` as the backstop for
    the case where the fix pass has already written a second change.
+4. **The fix pass became most of the PR.** Measured again on 2026-08-21, five days after
+   the first three landed: PR #188's 185-line feature came out of two fix passes at 721
+   churned lines — **74% of the PR was review-response code** — and round 2's fix list
+   was 89% below P2. The floor above is a per-FINDING rule and cannot see that: #188's
+   round 1 was 408 lines of individually reasonable small fixes, each of which the floor
+   correctly admitted → `low_severity_fix_lines`, a combined line budget for the band
+   between the two floors, spent cheapest-first and counted rather than estimated. The
+   floor stays at P3 — the argument below for the extra tier is unchanged, and a budget
+   is what that argument was always missing.
 
 `max_rounds` and `require_failing_test` are the two that change nothing on their own:
 the first surfaces an existing constant so a repo can move it, the second reserves the
 name for the evidence contract #165 argues is the real termination condition, and reports
 that it is not built rather than pretending to enforce it.
 
-**Every one of the seven is validated, and a bad value is a hard exit** — the mechanism
+**Every one of the eight is validated, and a bad value is a hard exit** — the mechanism
 and the sentence shape `harness_rules._check_block_shape` already uses, naming the key,
 the value and the accepted set. The line is drawn between an unknown KEY and a malformed
 VALUE of a known one, and it is the line `_check_block_shape` already draws: an
@@ -371,13 +382,16 @@ upgrade at different times does not become a version pin; a value this harness c
 read is not version skew in any direction, it is a typo, and `fix_severity_floor: "p-4"`
 meaning "fix everything" must not quietly become the default and stop the pass fixing
 P3s. Unset — missing, `null`, `""` — is not a mistake and stays silent (and for
-`max_fix_growth` an explicit `null` is the off switch).
+`max_fix_growth` and `low_severity_fix_lines`, both of which distinguish an absent key
+from a written one, an explicit `null` is the off switch).
 
 **What the round applied is in the artifact.** The report carries a
 **Panel dials** line on every round, at the defaults or not, and the
-payload carries `review_panel` with all seven as applied. The orchestrator that briefs
-the fixer builds that brief out of the report, so the policy has to be readable there
-rather than from whoever remembers the repo's config.
+payload carries `review_panel` with all eight as applied, and each finding carries
+`budgeted_fix` beside `below_fix_floor` so a consumer can tell "not this round's work"
+from "this round's work while the budget lasts" without re-deriving either floor. The
+orchestrator that briefs the fixer builds that brief out of the report, so the policy
+has to be readable there rather than from whoever remembers the repo's config.
 
 ### The SonarQube token
 

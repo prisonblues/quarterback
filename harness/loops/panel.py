@@ -485,7 +485,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # not the PR read succeeds, and the round cap the verdict is computed against
     # comes out of the same resolution. Everything downstream still just appends.
     notes: list[str] = []
-    # The seven `review_panel` settings that trade thoroughness against convergence,
+    # The eight `review_panel` settings that trade thoroughness against convergence,
     # resolved once (`panel_seats.resolve_dials`) so the prompt, the report, the stop
     # rule and the payload cannot disagree about which policy this round ran under.
     dials = resolve_dials(panel, max_rounds, notes)
@@ -1540,8 +1540,22 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # `Canonical` compares by value, so two genuinely distinct findings with the same
     # severity, file, line and synthesis are equal to each other, and one of them
     # would be marked on the strength of the other's membership.
+    # `dials.fix_floor`, not `dials.fix_severity_floor`: the two differ only at
+    # `low_severity_fix_lines: 0`, where the band the fix floor admits below the
+    # trigger floor can buy nothing and so is not this round's work at all (#297).
+    # The property carries the argument; what matters here is that ONE floor answers
+    # "may this be fixed" for the report, the payload and the mark.
     def below_floor(c: Canonical) -> bool:
-        return not severity_at_least(c.severity, dials.fix_severity_floor)
+        return not severity_at_least(c.severity, dials.fix_floor)
+
+    # The other half of #297: findings the fix floor admits but the trigger floor does
+    # not, which the round pays for out of a shared line budget rather than
+    # unconditionally. They stay in the fixer's LIST — a genuinely cheap fix is worth
+    # taking while the pass is open, which is the argument `fix_severity_floor` is set
+    # a tier low for — and are marked so the budget travels with them into any brief
+    # built by pasting that list.
+    def budgeted(c: Canonical) -> bool:
+        return dials.budgeted(c.severity)
 
     for_fix = [c for c in to_fix if not below_floor(c)]
     under_floor = [c for c in to_fix if below_floor(c)]
@@ -1737,7 +1751,13 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                       # construction and would otherwise run the cycle to the cap on
                       # its own. `round_stop`'s docstring has the whole argument.
                       trigger_floor=dials.round_trigger_floor,
-                      fix_floor=dials.fix_severity_floor)
+                      # The floor the round was REQUIRED to clear, which is the fix
+                      # floor until a budget is in force and the cut afterwards
+                      # (#297) — an unpaid budgeted finding is outstanding for the
+                      # same reason a below-floor one is, and rule 3 would otherwise
+                      # run every budgeted cycle to the cap on it.
+                      # `Dials.cleared_floor` has the argument.
+                      fix_floor=dials.cleared_floor)
     # An escalated SonarCloud issue is still a RED GATE, and "the approach is wrong,
     # a human must answer the premise" does not turn it green. `round_stop` counts
     # it like any other escalation — correctly, since it is work no fix round may
@@ -2086,19 +2106,28 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # master ruled it not real, so "below the fix floor" would describe work that
         # does not exist. `review_panel` below records the floor it was computed
         # against.
+        # `budgeted_fix` is the third of that family and the one #297 adds: not "NOT
+        # this round's work" but "this round's work only while the line budget lasts",
+        # which is a third answer and cannot be spelled by the other two. Always
+        # False on a SONAR issue, where the other two flags are computed: neither
+        # floor applies to a hard-gate issue at any rule, so a budget that could
+        # decline to fix one would say the panel may leave a red quality gate red.
         "to_fix": [{**c.as_dict(), "new_this_round": is_new(c),
                     "provenance": provenance_of(c),
                     "escalated": c.key in held,
-                    "below_fix_floor": below_floor(c)} for c in to_fix],
+                    "below_fix_floor": below_floor(c),
+                    "budgeted_fix": budgeted(c)} for c in to_fix],
         "sonar_findings": [{**c.as_dict(), "new_this_round": is_new(c),
                             "provenance": provenance_of(c),
                             "escalated": c.key in held,
-                            "below_fix_floor": below_floor(c)} for c in sonar],
+                            "below_fix_floor": below_floor(c),
+                            "budgeted_fix": False} for c in sonar],
         "dismissed": [{**c.as_dict(), "new_this_round": is_new(c),
                        "provenance": provenance_of(c),
                        "escalated": False,
-                       "below_fix_floor": False} for c in dismissed],
-        # The seven #165 dials AS APPLIED, not as written: a repo whose
+                       "below_fix_floor": False,
+                       "budgeted_fix": False} for c in dismissed],
+        # The eight #165/#297 dials AS APPLIED, not as written: a repo whose
         # `fix_severity_floor` was rejected reads the floor that actually ran here
         # and the reason it was rejected in `config_notes`. Every key present on
         # every reviewed round, so a consumer never has to tell "the default applied"
@@ -2391,8 +2420,28 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         lines.append(f"\n_{what} is {len(review.target):,} chars — truncated for {cut}_")
 
     lines.append(f"\n### To fix ({len(for_fix)}) — master-confirmed, any reviewer count"
-                 + (f", {dials.fix_severity_floor} and above"
+                 + (f", {dials.fix_floor} and above"
                     if under_floor else ""))
+    # #297's budget, stated where the list it bounds is, not only on the dials line.
+    # A mark inside **To fix** rather than a section of its own, which is the opposite
+    # of the choice the below-floor findings get below — and for the same reason read
+    # the other way. These ARE the fixer's work; what is bounded is how much of them
+    # gets done. An orchestrator that pastes the To fix list into a brief has to
+    # sweep these up, so the budget has to come with them, which means the header.
+    on_budget = [c for c in for_fix if budgeted(c)]
+    if on_budget:
+        lines.append(
+            f"_💸 marks the {len(on_budget)} finding(s) below the "
+            f"`{dials.round_trigger_floor}` cut. They share a "
+            f"{dials.low_severity_fix_lines}-line budget for the WHOLE round: measure "
+            "each fix's churned lines (`git diff --numstat`) rather than estimating "
+            "them, spend cheapest first, and stop when the budget is spent. "
+            "Count, do not estimate, "
+            "and do not ask yourself whether a fix risks ballooning — the budget is "
+            "the answer to that question and it has already been given. What the "
+            "budget does not reach is reported and recorded exactly like a below-floor "
+            "finding: not dropped, and not this round's work (#297). Everything "
+            "unmarked is unconditional._")
     if for_fix:
         for c in for_fix:
             tail = f" — {c.rationale}" if c.rationale and c.rationale != "unjudged" else ""
@@ -2407,7 +2456,9 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             fresh = " 🆕" if prior_rounds and is_new(c) else ""
             again = (" ↻ _fix needs re-reading (" + ", ".join(c.rereview_by) + ")_"
                      if c.needs_rereview else "")
-            lines.append(f"- **{c.severity}**{fresh} `{loc(c)}` [{c.id}] — {c.synthesis}"
+            paid = "💸 " if budgeted(c) else ""
+            lines.append(f"- {paid}**{c.severity}**{fresh} `{loc(c)}` [{c.id}] — "
+                         f"{c.synthesis}"
                          f"{conf(c)}{unruled}{tail}{rel}{again}{escalation(c)}")
             lines += accounts(c)
     else:
@@ -2420,11 +2471,21 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # brief must not be able to sweep these up with it. Absent entirely at the
     # pre-#165 floor, where nothing is below it.
     if under_floor:
+        # The APPLIED floor in both lines, which is the written one except at a
+        # budget of 0 — where it is the cut, and saying `fix_severity_floor` would
+        # name a floor these findings are above while listing them as not this
+        # round's work. The `because` clause names whichever key actually decided it,
+        # so an operator reading the report knows which one to edit.
+        because = (f"`review_panel.fix_severity_floor` is "
+                   f"`{dials.fix_severity_floor}`"
+                   if dials.fix_floor == dials.fix_severity_floor else
+                   f"`review_panel.low_severity_fix_lines` is 0, so the round's "
+                   f"applied floor is the `{dials.round_trigger_floor}` cut rather "
+                   f"than the `{dials.fix_severity_floor}` fix floor")
         lines.append(f"\n### Reported, not this round's work ({len(under_floor)}) — "
-                     f"below the `{dials.fix_severity_floor}` fix floor")
+                     f"below the `{dials.fix_floor}` fix floor")
         lines.append("_Master-confirmed, recorded, and deliberately NOT for the fixer: "
-                     f"`review_panel.fix_severity_floor` is "
-                     f"`{dials.fix_severity_floor}`. Do not build a fix brief from "
+                     f"{because}. Do not build a fix brief from "
                      "this list — a fix pass that takes them on is the growth this "
                      "floor exists to stop (#165). They stay in the payload "
                      "(`below_fix_floor`) and on the board._")

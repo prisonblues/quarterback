@@ -11,6 +11,49 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
+## vNEXT — the fix pass stopped being most of the PR
+
+The panel's fix floor is a rule about one finding at a time, and the thing that went wrong is not
+one finding. Measured on 2026-08-21: PR #188's feature was **185 churned lines**, two fix passes
+turned it into **721**, and **74% of that PR was review-response code** — it stopped being a PR
+with fixes applied and became a PR that was mostly its own review. Round 2's fix list was **89%
+below P2**, the tier the measurement cuts at, and on #268 **17 of 20** round-2 findings were
+created by the round-1 fix pass — 85%, against this repo's own measured 63.7% and a ~7% industry
+baseline for bad-fix injection. The line a fix leaves is the next round's review surface at that
+rate, so an accumulating fix pass buys the next round's findings.
+
+`fix_severity_floor` sits a tier below the measured cut on purpose, and the argument for that is
+good: severity is model-authored, and the class a P2 floor misses is correctness expressed as
+craft — a missing timeout, a missing regression test on a parser, a migration rollback gap.
+"Fixing one in a pass already open is one edit" is true. But it counts the FIXER'S EFFORT and not
+the line, and #188's round 1 was 408 lines of individually reasonable small fixes with no single
+one of them looking expensive.
+
+So the floor does not move. The band it admits below the cut gets an eighth `review_panel` dial —
+**`low_severity_fix_lines`**, default **40** — a combined line budget for the whole round, spent
+cheapest-first and stopped when it runs out. A budget rather than a per-fix cap, because a per-fix
+cap cannot see 408 lines arriving twenty at a time. Mechanical rather than discretionary: the
+brief tells the fixer to COUNT (`git diff --numstat` after each fix, running total) and explicitly
+not to ask itself whether a fix risks ballooning — that question is a judgement by the actor whose
+judgement the 85% indicts. What the budget does not reach is reported and recorded exactly as a
+below-floor finding already is: not dropped, not the fixer's.
+
+Validated like its seven siblings — a malformed value is a hard exit naming the key, the value and
+what is accepted — and printed on the **Panel dials** line at the defaults or not, so the artifact
+says what the round applied. `null` is no budget at all, the behaviour before this release; `0`
+fixes none of the band, and the applied floor rises to the cut and the report says so. While a
+budget is in force, `round_stop`'s repeat rules are bounded at the cut rather than at the fix
+floor: an unpaid budgeted finding is outstanding by construction, exactly as a below-floor one is,
+and rule 3 would otherwise run every budgeted cycle to the cap on findings the round was never
+obliged to clear. Each finding now carries `budgeted_fix` beside `below_fix_floor`, because "not
+this round's work" and "this round's work while the budget lasts" are different answers.
+
+This repo's own `.harness-rules.sample` closes the gap between the floors (both P2 since
+2026-08-20), so the budget is inert here and is written out saying so. What it is for is the
+restoration that file leaves open: the P3 floor was given up because that tier was being filed
+into issues rather than fixed, and it could not simply be kept because fixing it accumulates. A
+budget is the missing half.
+
 ## v2.66 — the two guards that only fired when they were not needed
 
 `release_stamp.py` has two checks that exist for the same failure — a branch naming its own
