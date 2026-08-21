@@ -1320,6 +1320,7 @@ fixing anything.
 ```bash
 python3 ~/.claude/loops/preland.py --pr 131            # the report
 python3 ~/.claude/loops/preland.py --pr 131 --json     # the payload a loop reads
+python3 ~/.claude/loops/preland.py --pr 131 --require-earned-stop   # for the caller that ran the round
 ```
 
 **May this PR be merged, and if not, what is outstanding.** One answer, three values,
@@ -1364,10 +1365,20 @@ The `review` clauses are the round's **own statements** — `head_sha`, `stopped
 discovering that merge gates trust proxies (the exit code, then the push, then the
 existence of a payload file), and this must not become the fourth.
 
-`stop_confident: false` is a **warning, not a hold**, deliberately: two permanently-absent
-reviewer seats on a headless box would otherwise make a green verdict unreachable, which is
-the noise-for-signal trade this file already argues against for `coverage_veto`. The vetoes
-are printed with it.
+`stop_confident: false` is a **warning, not a hold** by default, deliberately: two
+permanently-absent reviewer seats on a headless box would otherwise make a green verdict
+unreachable, which is the noise-for-signal trade this file already argues against for
+`coverage_veto`. The vetoes are printed with it.
+
+`--require-earned-stop` makes it a HOLD, and is for the caller that **ran the round itself**
+and is about to offer to land on the strength of it — `/panel-review-pr` §7. There an
+unearned stop is not background noise about somebody else's box: it is this cycle reporting
+that nobody read the whole diff. Which of the two a run is doing is the caller's fact rather
+than something this script can see, so it is a flag rather than a rule, and `checks.review.detail.require_earned_stop`
+records which reading produced the verdict. Either way the vetoes are reported: the flag
+changes what the verdict IS, never what the reader is told. A `stop_confident` the board
+recorded as **null** is not an unearned stop under either reading — null is a question
+nobody answered, and the caller that ran the round has its own payload to answer it from.
 
 **Capability detection, and its two exceptions.** Repo-local guardrails are detected — a
 repo without `scripts/migration_reconcile.py` records `skipped-absent` and moves on, which

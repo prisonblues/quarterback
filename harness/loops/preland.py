@@ -68,10 +68,12 @@ WHAT IT MUST NOT BECOME
     the round's own statements: ``stopped``, ``confirmed``, ``head_sha``,
     ``sonar_gate``. #62 spent three rounds discovering that merge gates trust
     proxies, replacing the exit code with the push and the push with the payload
-    artefact. And ``stop_confident: false`` is a WARN, not a HOLD: two
+    artefact. And ``stop_confident: false`` is a WARN by default, not a HOLD: two
     permanently-absent reviewer seats on a headless box would otherwise make a
     green verdict unreachable, which is the noise-for-signal trade
-    ``.harness-rules`` already argues against for ``coverage_veto``.
+    ``.harness-rules`` already argues against for ``coverage_veto``. A caller
+    that ran the round itself and is about to offer to land on the strength of it
+    asks for the strict reading with ``--require-earned-stop`` (#100).
 
 ITS LIMIT, STATED PLAINLY
     This is advisory. The board cannot gate github.com and neither can a script
@@ -85,6 +87,7 @@ Usage:
     preland.py --pr 131                     # human-readable, in the cwd's repo
     preland.py --pr 131 --json              # the payload a loop reads
     preland.py --pr 131 --skip ci           # for a CI job (see above)
+    preland.py --pr 131 --require-earned-stop   # for the loop that ran the round
 """
 
 from __future__ import annotations
@@ -500,13 +503,15 @@ def check_ci(pr: dict) -> Check:
     return c
 
 
-def check_review(repo: str, pr: dict) -> Check:
+def check_review(repo: str, pr: dict, earned_stop: bool = False) -> Check:
     """The panel's own statements about the round that read THIS commit.
 
     Every clause here is a field the round wrote about itself. None of them is a
     proxy, and none of them is re-derived: the panel already decided whether it
     stopped and why, and this reads that decision rather than forming a second
     opinion about the same diff.
+
+    ``earned_stop`` is ``--require-earned-stop``: see :func:`_round_stop_earned`.
     """
     c = Check("review", "passed")
     rows, err = board_get("reviews", {"repo": repo, "pr": pr["number"], "limit": 20})
@@ -537,14 +542,18 @@ def check_review(repo: str, pr: dict) -> Check:
     # findings a fix already cleared, or worse, blesses a stale head — and that is
     # too much to rest on another service's clause remaining what it is today.
     newest = max(rows, key=lambda r: (str(r.get("ts") or ""), r.get("id") or 0))
-    return _judge_round(c, newest, pr)
+    return _judge_round(c, newest, pr, earned_stop)
 
 
-def _judge_round(c: Check, latest: dict, pr: dict) -> Check:
+def _judge_round(c: Check, latest: dict, pr: dict, earned_stop: bool = False) -> Check:
     """The clause list, against the newest round the board holds for this PR."""
     c.detail = {k: latest.get(k) for k in
                 ("id", "ts", "round", "cycle", "head_sha", "stopped", "stop_reason",
                  "stop_confident", "confirmed", "unjudged", "sonar_gate", "judge_skip")}
+    # Which mode ran, in the audit trail. A payload that reads READY has to say
+    # whether the strict clause was even asked, or a caller cannot tell a stop
+    # that was earned from one nobody put the question to.
+    c.detail["require_earned_stop"] = earned_stop
     c.summary = (f"round {latest.get('round')} of cycle "
                  f"{(latest.get('cycle') or '?')[:8]} at "
                  f"{(latest.get('ts') or '?')[:19]}")
@@ -573,23 +582,38 @@ def _judge_round(c: Check, latest: dict, pr: dict) -> Check:
     elif gate not in ("", "OK", "SKIPPED", "NO-ANALYSIS", "NO-PR-ANALYSIS", "NONE"):
         c.warnings.append(f"the SonarCloud gate reads {latest['sonar_gate']!r}, which "
                           "is not a status this check knows how to rule on")
+    _round_stop_earned(c, latest, earned_stop)
     _round_warnings(c, latest)
     c.status = "failed" if c.reasons else "passed"
     return c
 
 
-def _round_warnings(c: Check, latest: dict) -> None:
-    """What the round said that is worth reading but must not block.
+def _round_stop_earned(c: Check, latest: dict, earned_stop: bool) -> None:
+    """`stop_confident: false` — a warning by default, a HOLD when asked for.
 
-    `stop_confident: false` is the deliberate one. It means the stop was not
-    earned — a reviewer was truncated, or absent, or the judge was skipped — and
+    The default is deliberate and unchanged. An unearned stop means a reviewer
+    was truncated, or absent, or the judge was skipped, or the cap ran out — and
     holding on it would make a green verdict unreachable on exactly the headless
-    boxes that run unattended, where two seats are permanently missing. So the
-    vetoes are printed and the merge is not blocked.
+    boxes that run unattended, where two seats are permanently missing.
+
+    `--require-earned-stop` is for the caller that just RAN the round and is
+    about to offer to land on the strength of it (`/panel-review-pr` §7, #100).
+    There, an unearned stop is not background noise about somebody else's box: it
+    is this cycle reporting that nobody read the whole diff, and an offer to merge
+    resting on it is an offer resting on nothing. Which of the two a run is doing
+    is the caller's fact, not this file's, so it is a flag rather than a rule —
+    and either way the vetoes are reported, so the strict mode changes what the
+    verdict IS and never what the reader gets told.
     """
-    if latest.get("stop_confident") is False:
-        for v in latest.get("stop_veto") or ["(the round recorded no veto reasons)"]:
-            c.warnings.append(f"the stop was not earned: {v}")
+    if latest.get("stop_confident") is not False:
+        return
+    where = c.reasons if earned_stop else c.warnings
+    for v in latest.get("stop_veto") or ["(the round recorded no veto reasons)"]:
+        where.append(f"the stop was not earned: {v}")
+
+
+def _round_warnings(c: Check, latest: dict) -> None:
+    """What the round said that is worth reading but must not block."""
     if latest.get("unjudged"):
         c.warnings.append(f"{latest['unjudged']} finding(s) were never adjudicated" +
                           (f" ({latest['judge_skip']})" if latest.get("judge_skip") else ""))
@@ -1015,7 +1039,7 @@ def disabled_checks(cfg: dict, skip: list[str]) -> dict[str, str]:
 
 
 def gather(cfg: dict, pr: dict, base: BaseRef, off: dict[str, str],
-           mine: str = "") -> list[Check]:
+           mine: str = "", earned_stop: bool = False) -> list[Check]:
     """Every check, in report order, with the disabled ones still present.
 
     A check that did not run is REPORTED as not having run. Dropping it would
@@ -1028,7 +1052,7 @@ def gather(cfg: dict, pr: dict, base: BaseRef, off: dict[str, str],
         "pr_state": lambda: check_pr_state(pr),
         "checkout": lambda: check_checkout(root, pr),
         "ci": lambda: check_ci(pr),
-        "review": lambda: check_review(repo, pr),
+        "review": lambda: check_review(repo, pr, earned_stop),
         "merge_claim": lambda: check_merge_claim(repo, pr, mine),
         "migrations": lambda: check_migrations(root, base, versions),
         "sw_version": lambda: check_sw_version(root, base),
@@ -1122,6 +1146,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="do not refresh the base branch's remote-tracking ref first")
     ap.add_argument("--claim-holder", default="", metavar="AGENT",
                     help="a merge claim held by this identity is yours, not a conflict")
+    ap.add_argument("--require-earned-stop", action="store_true", dest="earned_stop",
+                    help="HOLD when the round's stop was not earned (stop_confident: "
+                         "false) instead of warning about it. For a caller that ran "
+                         "the round itself and is about to offer to land on it")
     args = ap.parse_args(argv)
     if args.pr is not None and args.pr < 1:
         ap.error("--pr: pull requests are numbered from 1")
@@ -1134,7 +1162,7 @@ def main(argv: list[str] | None = None) -> int:
     pr = read_pr(cfg["github"], args.pr, cfg["path"])
     base = refresh_base(cfg["path"], pr["baseRefName"], fetch=not args.no_fetch)
 
-    checks = gather(cfg, pr, base, off, args.claim_holder)
+    checks = gather(cfg, pr, base, off, args.claim_holder, args.earned_stop)
     out = payload(cfg, pr, checks, base)
     if args.as_json:
         print(json.dumps(out, indent=2))

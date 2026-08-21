@@ -72,11 +72,21 @@ panel just adds independent reviewers + hard CI/Sonar gates on top of that bar.
    one-line-per-PR roll-up (PR · to-fix count · SonarCloud gate · posted?), and name any PR whose
    agent stopped early rather than letting the roll-up imply it was panelled.
 
+7. **Land-readiness: report it, never offer it.** If the user wants to know whether the PR could
+   merge, `python3 ~/.claude/loops/preland.py --pr <pr> --repo <path>` answers it, and reporting
+   the verdict — `gates: READY`, or `blocked by: <its reasons>` — is useful and in scope. What is
+   not in scope is an offer to merge, in any wording, however green the gate came back. **This
+   command never offers to land and never merges.** It is pointed at other people's PRs, in repos
+   the caller may not own and did not write, and an offer to merge one of those is a footgun
+   whether or not it is accepted. `/panel-review-pr` §7 is the one that may offer, and it has
+   earned that: it owns the branch, it wrote the fix commits, and it re-reviewed them. Say so and
+   stop, rather than proposing the step this command does not take.
+
 Notes:
-- Posts the summary as a PR comment by default. This is review-only — it never edits code or
-  merges; pass `--no-post` for a silent read-only run. It reviews the PR **as it is now**: use
-  `/panel-review-pr` when the fix that follows should itself be reviewed, which is what its
-  rounds are for.
+- Posts the summary as a PR comment by default. This is review-only — it never edits code, never
+  merges, and never offers to merge; pass `--no-post` for a silent read-only run. It reviews the
+  PR **as it is now**: use `/panel-review-pr` when the fix that follows should itself be reviewed,
+  which is what its rounds are for, and when the review should end with an offer to land.
 - First run needs `op signin` once (the SonarCloud token then caches), `codex login` for the Codex
   reviewer and `agy` auth for the Antigravity one; missing reviewers are reported as skipped, not fatal.
 - `antigravity` is off unless a repo's `.harness-rules.sample` enables it — its CLI (`agy`) is workstation-only (personal
