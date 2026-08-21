@@ -947,14 +947,12 @@ full — including what was broken before it, which is the part no diff recovers
   to carry them, and a host that ran only the script got none of those mechanisms and no error.
   `qb-hook --version` and `qb-claude-setup --check` make the pin and the wiring answerable
   per event (#230, the precondition for #232 and #253).
-- **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
-  object store; wire `landed` refs to a cherry-pick helper.
-
-**[CHANGELOG.md](CHANGELOG.md)** has each release in full, including what was broken before it.
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
   roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps
   the real one, and nothing in the tool renames a roadmap entry.
+
+**[CHANGELOG.md](CHANGELOG.md)** has each release in full, including what was broken before it.
 
 ## Stack
 
