@@ -684,6 +684,133 @@ def _derive_repo(repo_path: str) -> str:
 
 
 @mcp.tool()
+def merge_queue(ctx: Context, base: str, repo_path: str = ".",
+                pr: int | None = None, head: str | None = None) -> dict:
+    """The line to land on a branch: who is next, who is waiting, and why (#227).
+
+    Read this BEFORE you integrate, push or start a CI run on a PR you mean to
+    land. `claims` tells you whether somebody is landing right now; it cannot tell
+    you whether *you* are next, and a PR that is third in line pays a full CI run
+    to find that out the expensive way — and invalidates the head's green checks
+    with its own integration push on the way.
+
+    Pass `pr` (and `head`, the oid `gh pr view --json headRefOid` gives you) and
+    `you` answers directly: `may_integrate`, `may_merge`, your `position`, and a
+    `reason` you can paste into a board post. `head` is how the board notices your
+    PR has moved since it was last checked — a readiness that cannot expire is a
+    permanent green light.
+
+    Being at the head is NOT the merge claim. It is permission to go and ask for
+    one: take `kind='merge'` through `claim` before you merge, and expect `claim`
+    here to sometimes name a holder who never enqueued at all — a human merging in
+    the UI is entitled to, and this queue is advisory like everything else here.
+
+    Ordering is strict FIFO by arrival. `suggested_order` is always null: ordering
+    proposals are the unfinished half of #227, deliberately absent because an
+    agent rewriting the queue while trying to land makes the queue one more shared
+    thing to fight over.
+
+    Args:
+        base: the branch being landed ONTO — `main`, `release/2.x`. One queue per
+            `repo` + `base`, exactly as the merge claim is keyed.
+        repo_path: the checkout whose origin remote names the repo.
+        pr: your pull request number, to also get `you`.
+        head: `pr`'s current head oid, so a stale entry reads as stale.
+    """
+    try:
+        return _get_client(ctx).merge_queue(
+            {"repo": _derive_repo(repo_path), "base": base, "pr": pr, "head": head})
+    except httpx.HTTPStatusError as e:
+        _raise(e, "merge_queue")
+
+
+@mcp.tool()
+def merge_queue_enqueue(ctx: Context, pr: int, base: str, head: str,
+                        verdict: str = "queued", repo_path: str = ".",
+                        note: str | None = None, ttl: int | None = None) -> dict:
+    """Take a place in the line to land, or update the place you have (#227).
+
+    Idempotent, and it never costs you your place: `entered_at` is written once,
+    so calling this on every poll is the intended use. Call it when your PR is
+    review-clean and not a draft, and re-call it whenever your head moves.
+
+    `verdict` is what preland said about THIS head, and the board takes your word
+    for it — what it adds is that your word is pinned to a commit and stops
+    counting when the branch moves:
+
+      * `ready` — preland READY at `head`. The only one that lets a queue head
+        merge, and the one that goes away the moment you push.
+      * `reconcile` — preland RECONCILE: your base is stale. Admissible, because
+        landing in turn dissolves it. Integrate, re-run preland, re-enqueue.
+      * `queued` — nothing is wrong except your turn. What to send when this
+        endpoint has just told you that.
+
+    preland HOLD is refused: a PR that cannot land would sit at the head holding
+    everyone up until its lease expired. Fix the objection first.
+
+    The response's `you` says what you may do right now. If it says you are queued
+    behind somebody, STOP — do not rebase, do not push, do not restart CI. That is
+    the entire point: you would spend a run to learn what the board already told
+    you, and invalidate the head's checks doing it.
+
+    Args:
+        pr: your pull request number.
+        base: the branch being landed onto.
+        head: the PR's full head oid (`gh pr view <pr> --json headRefOid`).
+        verdict: `ready`, `reconcile` or `queued`, about `head`.
+        repo_path: the checkout whose origin remote names the repo.
+        note: what you are landing. Everyone behind you reads it.
+        ttl: seconds before your entry lapses and the line moves past you.
+            Default 1800; re-enqueueing renews it.
+    """
+    body = {"repo": _derive_repo(repo_path), "base": base, "pr": pr, "head": head,
+            "verdict": verdict, "note": note}
+    if ttl is not None:
+        body["ttl"] = ttl
+    try:
+        return _get_client(ctx).merge_queue_write(
+            "enqueue", {k: v for k, v in body.items() if v is not None})
+    except httpx.HTTPStatusError as e:
+        _raise(e, "merge_queue_enqueue")
+
+
+@mcp.tool()
+def merge_queue_leave(ctx: Context, pr: int, base: str, reason: str,
+                      repo_path: str = ".", entry_id: str | None = None) -> dict:
+    """Stand down from the line, so everyone behind you can move (#227).
+
+    Call it the moment your PR merges, closes or is superseded. The entry expires
+    on its own if you vanish, but that is the crude fallback — until it does,
+    every PR behind yours is correctly waiting for a land that already happened.
+
+    **Any agent may retire any entry, and that is deliberate**: the one best
+    placed to notice a dead head is whoever is sitting behind it. `reason` is
+    required and `left_by` records you, so an entry stood down on somebody else's
+    behalf is visible as exactly that afterwards.
+
+    It does not touch the `kind='merge'` claim. Release that through
+    `release_claim` — two resources, two lifecycles.
+
+    Args:
+        pr: the pull request leaving the queue.
+        base: the branch it was queued to land on.
+        reason: merged / closed / superseded / abandoned, in your own words.
+        repo_path: the checkout whose origin remote names the repo.
+        entry_id: the id your enqueue returned. Send it when you have one — a PR
+            number names a pull request, not one of its stays in the line, so
+            without it a leave arriving late can retire the place the PR took
+            after re-joining.
+    """
+    body = {"repo": _derive_repo(repo_path), "base": base, "pr": pr,
+            "reason": reason, "entry_id": entry_id}
+    try:
+        return _get_client(ctx).merge_queue_write(
+            "leave", {k: v for k, v in body.items() if v is not None})
+    except httpx.HTTPStatusError as e:
+        _raise(e, "merge_queue_leave")
+
+
+@mcp.tool()
 def plan_read(ctx: Context, repo: str | None = None, plan: str | None = None,
               include_done: bool = False, limit: int | None = None) -> dict:
     """What is next, in order, and who has it. Read this when you start cold.

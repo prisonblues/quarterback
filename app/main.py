@@ -9,6 +9,7 @@ from app.api.blobs import router as blobs_router
 from app.api.board_view import router as board_view_router
 from app.api.claims import router as claims_router
 from app.api.leases import router as leases_router
+from app.api.merge_queue import router as merge_queue_router
 from app.api.plan import router as plan_router
 from app.api.posts import router as posts_router
 from app.api.reviews import router as reviews_router
@@ -37,6 +38,7 @@ app.include_router(reviews_router)
 app.include_router(worktrees_router)
 app.include_router(sync_router)
 app.include_router(claims_router)
+app.include_router(merge_queue_router)
 app.include_router(board_view_router)
 app.include_router(plan_router)
 
