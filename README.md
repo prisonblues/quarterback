@@ -920,7 +920,7 @@ full — including what was broken before it, which is the part no diff recovers
   it — found by the pass reporting its own author's claim on #255. And an unmade check never
   reads as a clean one: `unknowns` sit beside `findings`, never inside them, and exit 1 means
   "some check unavailable" where 0 means "checked".
-- **vNEXT** — a screen you can build and cannot reach. `qb-seats` addressed every tmux session
+- **v2.64** — a screen you can build and cannot reach. `qb-seats` addressed every tmux session
   by NAME, and `.` and `:` are a target's own separators — which worked only because tmux
   rewrote them out of a name it would not take. tmux 3.7b keeps `my.screen` verbatim, so
   `-t "=my.screen"` parses as pane `screen` of session `my`: every seat command failed against a
