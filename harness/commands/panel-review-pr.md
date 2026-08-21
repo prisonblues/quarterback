@@ -471,6 +471,79 @@ no with complete confidence):
   no baseline to compare against. The `veto` list says which. Report it as a stop,
   never as "clean".
 
+**Before a `stop: false` becomes another fix pass, declare the premise that pass
+will rest on.** This is the futility brake (#84), and it is yours to run — not the
+fixer's — because you are the only reader with both rounds in front of you, which
+is the same reason the *Match it by premise, not by key* rule below is yours. Every
+round from 2 on, before you go back to §4:
+
+```
+python3 ~/.claude/loops/panel.py --premise "<one sentence: what this fix pass assumes>" \
+    --pr <pr> --round <r> --premise-file /tmp/tmp.AbC123/premises.json \
+    --premise-for <each finding key the premise explains>
+```
+
+One register per PR, in the same `mktemp -d` directory as the payloads, and pass
+that path to §4's brief so the fixer can declare against the same file. It costs
+nothing — no seats, no diff, no judge, no vendor call — so it runs on every fix
+pass rather than on the ones you suspect.
+
+**Build the premise with a quoted heredoc**, exactly as `review-pr.md` step 3a
+does and for its reason: a premise about code carries backticks and `$(…)`, and
+inside a double-quoted argument bash executes them while a `$VAR` expands to
+empty and declares a premise you did not write.
+
+**Read the exit code.** `0` records the declaration: brief the fix pass. `4` is the
+brake: `review_panel.escalate_on.premise_repeated` (default `2`) says a fix has
+already been written against this premise once in this cycle, and **the second one
+is not to be written**. Do not launch §4. The findings that premise explains become
+escalations under the `--escalated` rule below — relay them, open the premise
+issue, and stop the cycle. The command prints the `--escalated` keys for the round you are recording
+against.
+
+**Why it is here and not at the end of a round.** The cap bounds cost; this bounds
+futility — it stops when the rounds have stopped being about *different things*. On
+PR #299 (2026-08-21) rounds 1, 2 and 3 each found the previous round's fix reopening
+one hole, patched three ways — merge parents, then same-named refs, then a local
+branch — and the premise underneath all three, *that a local repository can say
+where a release number LANDED*, was named at round 3 by a human. 39 of the 53
+findings after round 1 were introduced by the previous fix pass; round 2 was 17 of
+17. Evaluated at the end of a round instead, the brake would have fired one fix
+pass and one whole panel later — which is exactly the round the rule exists to save.
+
+**Pass `--premise-file` to the ROUND as well**, on the same path. The round reads
+the register (it never writes it) and the payload then says which premises repeated
+and which fix passes declared none:
+
+```
+python3 ~/.claude/loops/panel.py --pr <pr> --post --round <r> --max-rounds <N> \
+    --premise-file /tmp/tmp.AbC123/premises.json \
+    --baseline /tmp/tmp.AbC123/r1.json [--baseline …] \
+    --json-file /tmp/tmp.AbC123/r<r>.json
+```
+
+A premise declared twice that reaches a round anyway ends the cycle there: it takes
+a veto line, `confident` is false, and `round_stop.reason` names the premise. That
+is the late half of the same brake — worse than stopping before the fix, better than
+the cap.
+
+**An undeclared fix pass is unescalatable, and the report says so.** If a round's
+`config_notes` says the fix pass after round N declared no premise, that is a gap in
+the record and not a clean one: nothing could have braked that pass, and a cycle
+nobody could brake reads exactly like a cycle that did not need braking. Say which
+it was in the relay.
+
+**The honest limit.** The brake counts DECLARATIONS, and comparing declarations is
+all it does — it does not infer a premise from the findings, deliberately (#84: "the
+cheap version is to have the fixer declare the premise and compare declarations …
+treat an undeclared fix as unescalatable rather than pretending to infer"). Two
+consequences you carry, not the loop: the same premise stated through two different
+proxies — `rc == 0` one round, an artefact's existence the next — shares almost no
+words and is counted as two premises, so **state the premise, never the proxy**; and
+on #299 the fixers escalated zero times across five rounds, so a brake waiting for
+someone to volunteer a declaration would not have fired either. Running it every
+round is what makes the count real.
+
 **An escalation ends the fix half of the cycle for that finding — tell the loop,
 with `--escalated`.** Pass the key on the round you learn of it — the fixer gave you
 a finding ID, so map it through §4b's `jq` first; this flag takes keys and nothing

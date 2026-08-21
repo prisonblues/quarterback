@@ -666,6 +666,53 @@ DEFAULTS: dict = {
         # have the fix commit read at all, and remember what that buys — round 2 is
         # the only pass that ever reads the fixer's own work (#24).
         "max_rounds": 2,
+        # #78's reserved matters — the decisions the process must not take on its
+        # own — of which exactly one is implemented: `premise_repeated` (#84).
+        #
+        # **What it counts, and why it is not the cap.** The cap bounds COST: N
+        # rounds and stop, whatever is happening. This bounds FUTILITY — stop when
+        # the rounds have stopped being about different things. The number is
+        # OCCURRENCES of one declared premise, not rounds, and `2` means "the second
+        # time": the second time a fix is written against a premise the previous
+        # round invalidated, stop. Not the third.
+        #
+        # **The measurement (PR #299, 2026-08-21).** Five rounds. Rounds 1, 2 and 3
+        # each found the previous round's fix reopening the same hole, patched three
+        # different ways — merge parents, then same-named refs, then a purely local
+        # branch — and the premise underneath all three, that a local repository can
+        # say where a release number LANDED, was named at round 3 by the human and
+        # answered by deleting the machinery. 39 of the 53 findings after round 1
+        # were introduced by the previous fix pass; round 2 was 17 out of 17. The
+        # cap did not stop it; nothing did.
+        #
+        # **Evaluated when a fix is PROPOSED**, not when a round completes —
+        # `panel.py --premise`, before the fix pass runs. End-of-round is one whole
+        # fix pass and one whole panel too late, which is #84's own finding and PR
+        # #62's measurement. `round_stop` reads the same register and ends the cycle
+        # on a repeat that reached a round anyway, which is the late half.
+        #
+        # **On by default, unlike the switches in #78's table**, and the asymmetry is
+        # deliberate. Those default to today's behaviour because they can refuse a
+        # run or discard a finding on a rule nobody has exercised. This one can only
+        # fire after a fixer has DECLARED the same premise twice, which cannot happen
+        # by accident, and its output is "stop and ask a human" — #67's own required
+        # output and the cheap failure. A false positive costs one printed question;
+        # a false negative is the five-round cycle above.
+        #
+        # `null` switches the brake off and is how a repo asks for the pre-#84
+        # behaviour. `1` is REFUSED: it would escalate the first time any premise was
+        # declared, which is not a repeat, and the fastest way to teach a fixer never
+        # to declare one. The block is merged one level deep like the rest of
+        # `review_panel`, so a repo writing `escalate_on` replaces this object — but
+        # each key falls back to the default it does not mention, or
+        # `{"quorum_failed": true}` would silently switch the brake off.
+        #
+        # `quorum_failed` and `judge_absent` are #78's other two. They are ACCEPTED
+        # and not enforced, and a repo that sets one is told so in `config_notes`
+        # (`require_failing_test`'s precedent): a governance switch believed to be on
+        # and quietly off is the loudest possible way to make a process look
+        # governed.
+        "escalate_on": {"premise_repeated": 2},
     },
     "loops": {
         "dependabot_lander": False,
@@ -1305,6 +1352,14 @@ _EXTRA_REVIEWER_FIELDS: dict[str, set[str]] = {
 }
 
 
+# #78's other two reserved matters, named in `review_panel.escalate_on` but absent
+# from DEFAULTS because nothing implements them: listing them here is what tells a
+# repo that wrote one apart from a repo that mistyped `premise_repeated`. The value
+# is accepted and reported as unenforced (`panel_rounds.ESCALATE_ON_UNBUILT`), which
+# is the answer a reserved name deserves and a typo does not.
+_EXTRA_ESCALATE_ON = {"quorum_failed", "judge_absent"}
+
+
 def _validated(rules: dict) -> list[tuple[str, dict, set[str]]]:
     """Every mapping in a rules file whose key set is fully known, as
     (label, what the file said, the names that mapping may contain).
@@ -1318,6 +1373,16 @@ def _validated(rules: dict) -> list[tuple[str, dict, set[str]]]:
         if not isinstance(over, dict) or not isinstance(base, dict):
             continue
         out.append((block, over, set(base)))
+        # `review_panel.escalate_on` is the one non-reviewer setting that is itself
+        # a mapping of names (#84), so it needs the same descent for the same
+        # reason: `escalate_on: {"premise_repeatd": 2}` would otherwise leave the
+        # futility brake at its default with nothing on stderr, on the block that
+        # decides when a cycle stops asking a fixer to patch the same assumption.
+        if block == "review_panel":
+            sub, sub_base = over.get("escalate_on"), base.get("escalate_on")
+            if isinstance(sub, dict) and isinstance(sub_base, dict):
+                out.append((f"{block}.escalate_on", sub, set(sub_base)
+                            | set(_EXTRA_ESCALATE_ON)))
         if block != "reviewers":
             continue
         # Reviewer FIELDS are one level deeper again, and the failure there is

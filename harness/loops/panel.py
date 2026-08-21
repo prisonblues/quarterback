@@ -471,7 +471,8 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         max_rounds: int | None = None, scope: str = "auto",
         since: str = "", force: bool = False,
         no_code_access: bool = False,
-        escalated: list[str] | None = None) -> int:
+        escalated: list[str] | None = None,
+        premise_file: str = "") -> int:
     # A cycle is something the CALLER drives, and only /panel-review-pr does:
     # naming a cap (or a round, or a baseline) is what says this run is part of
     # one. A review-only /panel run left to the default is a single pass, and
@@ -520,6 +521,18 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # rule and the payload cannot disagree about which policy this round ran under.
     dials = resolve_dials(panel, max_rounds, notes)
     cap = dials.max_rounds
+    # #84's futility brake, from the round's side. Resolved beside the dials and for
+    # the same reason: a rules file with a bad `escalate_on` has to say so whether or
+    # not the PR read succeeds, and the brake is part of the policy the round's stop
+    # is computed under.
+    #
+    # The register is READ here and never written — `panel.py --premise` is the only
+    # writer, because the count is of fix passes PROPOSED and a round proposes none.
+    # Two writers would be two answers to "how many times was this premise declared",
+    # which is the one question the brake exists to answer.
+    premise_limit = premise_repeat_limit(panel, notes)
+    premises, premise_problems = load_premises(premise_file, gh_repo, pr_number)
+    notes.extend(premise_problems)
 
     # A repo that configured no review does not get one. Before `gh pr view`, and
     # before the --reviewers check below it, because this refusal is about the repo
@@ -2019,7 +2032,41 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                       # same reason a below-floor one is, and rule 3 would otherwise
                       # run every budgeted cycle to the cap on it.
                       # `Dials.cleared_floor` has the argument.
-                      fix_floor=dials.cleared_floor)
+                      fix_floor=dials.cleared_floor,
+                      # #84's register, read-only here. The BRAKE runs before a fix
+                      # pass (`panel.py --premise`); this is the round's half — it
+                      # ends a cycle whose premise was declared twice and reached a
+                      # round anyway, and it reports the fix passes that declared
+                      # nothing and so could not have been braked at all.
+                      premises=premise_state(premises, round_no, premise_limit))
+    # Said in `config_notes` as well as in `round_stop`, because these two are read
+    # by different people at different moments: the payload's `round_stop` is what
+    # the orchestrator's `jq` reads to decide whether to go again, and `config_notes`
+    # is what a human reads off the PR comment afterwards. An unescalatable cycle has
+    # to be legible in the second place too, or the gap is only ever found by
+    # somebody already looking for it.
+    #
+    # Gated on `--premise-file`, so it fires for a cycle that WIRED the brake and
+    # skipped a declaration and stays quiet for one that never wired it at all. Those
+    # are different facts and only the first is actionable by the caller reading this
+    # report; a note on every round of every unwired cycle is the "loud and wrong" a
+    # reader learns to skip, and it would arrive on the same line as the ones that
+    # mean something. The unwired case is still IN the payload
+    # (`round_stop.premises.undeclared_rounds`), where an auditor asking "could this
+    # cycle have been braked at all?" is looking.
+    undeclared = stop["premises"]["undeclared_rounds"]
+    if undeclared and premise_file and premise_limit is not None:
+        notes.append(
+            f"the fix pass after round(s) {', '.join(str(r) for r in undeclared)} "
+            "declared no premise (`panel.py --premise`), so #84's futility brake could "
+            "not be evaluated on it — those passes are UNESCALATABLE, which is a gap "
+            "in this cycle's record rather than a clean one")
+    for repeated in stop["premises"]["repeated"]:
+        notes.append(
+            f"premise {repeated['key']} was declared in rounds "
+            f"{', '.join(str(r) for r in repeated['rounds'])} — "
+            f"{repeated['text']!r}. A fix pass was written against it more than once, "
+            "so the cycle ends here and a human answers the premise (#67, #84)")
     # An escalated SonarCloud issue is still a RED GATE, and "the approach is wrong,
     # a human must answer the premise" does not turn it green. `round_stop` counts
     # it like any other escalation — correctly, since it is work no fix round may
@@ -3016,6 +3063,26 @@ def main() -> int:
                          "Repeatable; needs a cycle (--round/--max-rounds/--baseline) "
                          "to mean anything, and is inherited by later rounds through "
                          "--baseline")
+    ap.add_argument("--premise", metavar="TEXT",
+                    help="#84's futility brake, run BEFORE a fix pass rather than "
+                         "after it: declare in one sentence the premise the fix you "
+                         "are about to write rests on. Records it in the cycle's "
+                         "register (--premise-file) and exits non-zero when this is "
+                         "the Nth time that premise has been declared, where N is "
+                         "review_panel.escalate_on.premise_repeated — the fix is not "
+                         "to be written, the finding is escalated instead. No seats, "
+                         "no diff, no judge, no cost")
+    ap.add_argument("--premise-file", metavar="PATH", default="", dest="premise_file",
+                    help="the cycle's premise register: written by --premise, and read "
+                         "by a round so the payload can say which premises repeated "
+                         "and which fix passes declared none. One path per PR, beside "
+                         "the --json-file payloads")
+    ap.add_argument("--premise-for", action="append", default=[], metavar="KEY",
+                    dest="premise_for",
+                    help="a finding key this fix pass would have cleared. Repeatable. "
+                         "When the brake fires these are the keys to pass to the next "
+                         "round's --escalated, which is how a braked premise reaches "
+                         "the stop rule. --premise only")
     ap.add_argument("--scope", choices=ROUND_SCOPES, default="auto",
                     help="what a round past the first REVIEWS. increment: the "
                          "commits since the last round's head, with the rest of the "
@@ -3056,6 +3123,17 @@ def main() -> int:
                                    ("--baseline", bool(args.baseline)),
                                    ("--force", args.force),
                                    ("--escalated", bool(args.escalated)),
+                                   # Refused rather than ordered, because the two are
+                                   # different questions about one premise and the
+                                   # answer to "which ran?" must not be a reading of
+                                   # this file's branch order. `--ask` puts the premise
+                                   # to the SEATS (#79, and it costs a vendor call per
+                                   # seat); `--premise` counts how many times a fix has
+                                   # been written against it (#84, and it costs
+                                   # nothing). Run them as two commands.
+                                   ("--premise", args.premise is not None),
+                                   ("--premise-file", bool(args.premise_file)),
+                                   ("--premise-for", bool(args.premise_for)),
                                    ("--max-rounds", args.max_rounds is not None)) if used]
         if wrong:
             raise SystemExit(f"--ask does not take {', '.join(wrong)}: an ask is one "
@@ -3074,6 +3152,53 @@ def main() -> int:
                    # agent whose CLI this file cannot recognise, and only the
                    # second is worth a note in the report.
                    asker if args.asker is not None else None)
+    # Settled next, and on the same principle as the ask: a declaration is not a
+    # round either. It reviews nothing, so it takes none of the round flags except
+    # the two that say WHICH cycle and WHICH round's findings it is answering.
+    if args.premise is not None:
+        if not args.premise.strip():
+            raise SystemExit("--premise: the premise is empty — say in one sentence "
+                             "what the fix you are about to write assumes")
+        if not args.premise_file:
+            raise SystemExit(
+                "--premise needs --premise-file: the brake counts OCCURRENCES across a "
+                "cycle, and a declaration with nowhere to be counted is not a check. "
+                "Use one path per PR, beside the --json-file payloads")
+        wrong = [f for f, used in (("--post", args.post),
+                                   ("--baseline", bool(args.baseline)),
+                                   ("--force", args.force),
+                                   ("--escalated", bool(args.escalated))) if used]
+        if wrong:
+            raise SystemExit(
+                f"--premise does not take {', '.join(wrong)}: declaring a premise is a "
+                "check made BEFORE a fix pass, not a round — there is no diff to post "
+                "about, no pre-flight verdict to override, and nothing to compare a "
+                "baseline against. --escalated is what the NEXT round is given when "
+                "this check refuses the fix")
+        # The round flags' own check runs below, on the review path this branch
+        # returns before reaching. A round of 0 or less would date the declaration to
+        # a round that cannot exist and make `undeclared_passes` count from it.
+        if args.round_no is not None and args.round_no < 1:
+            raise SystemExit("--round: rounds are numbered from 1")
+        bad = [k for k in args.premise_for if not panel_rounds._is_key(k)]
+        if bad:
+            raise SystemExit(
+                f"--premise-for takes finding KEYS (8-64 hex characters), not "
+                f"{panel_rounds._key_gist(bad[0])!r} — these are the keys the next "
+                "round's --escalated would need, so an ID or a title here would name "
+                "no finding at all")
+        return declare(args.repo, args.premise.strip(), args.premise_file,
+                       1 if args.round_no is None else args.round_no,
+                       args.premise_for, args.pr, args.json_out)
+    # `--premise-file` is NOT refused here: a round READS the register, so the
+    # payload can say which premises repeated and which fix passes declared none.
+    # `--premise-for` has no reading outside a declaration and is refused, on the
+    # rule `--context` and `--asker` are refused by: a flag accepted and ignored is
+    # a caller believing it asked for something this run does not do.
+    if args.premise_for:
+        raise SystemExit("--premise-for belongs to --premise — it names the findings a "
+                         "refused fix pass would have cleared, and a review round has "
+                         "no fix pass to refuse. The round's equivalent is --escalated")
     if args.pr is None:
         raise SystemExit("--pr is required — or pass --ask to challenge one premise "
                          "instead of reviewing a PR")
@@ -3124,7 +3249,7 @@ def main() -> int:
     return run(args.repo, args.pr, args.post, args.json_out, args.reviewers,
                args.json_file, args.record, round_no, args.baseline,
                args.max_rounds, args.scope, args.since, args.force,
-               args.no_code_access, args.escalated)
+               args.no_code_access, args.escalated, args.premise_file)
 
 
 if __name__ == "__main__":

@@ -332,6 +332,50 @@ different files, stop and ask whether one premise explains them all. Cluster by
 the failure produced, not by the file: on #88 seven P1/P2s across two files were
 one premise, and grouped by file they read as seven unrelated defects.
 
+**Record the premise before you write the patch — that is where the brake is.**
+If the brief gave you a **premise register** path, declare the premise there
+*before* deciding whether to patch or escalate. It costs nothing — no seats, no
+diff, no judge, no vendor call — and it is the only thing that can tell you the
+same premise was already patched once:
+
+```bash
+premise=$(cat <<'PREMISE'
+<the premise, in one sentence>
+PREMISE
+)
+python3 ~/.claude/loops/panel.py --premise "$premise" --pr <n> --round <r> \
+    --premise-file <the register path from the brief> \
+    --premise-for <each finding key the premise explains>
+```
+
+Read the exit code, not the prose. **0** means this premise has not been patched
+before in this cycle: carry on and decide patch-or-escalate on the three tests
+above. **4** means it has, and `review_panel.escalate_on.premise_repeated` says
+stop — **do not write the patch**. It is an escalation now whether or not it
+passes the three tests, because a premise a fix pass has already been written
+against once is #67's circling by definition, and the second patch is what
+produces the third round. Report it under `Escalated` with the command's output,
+including the `--escalated` keys it prints, and fix everything else in the pass
+as usual.
+
+The heredoc is not optional and the reason is the same one the `--ask` block
+below gives: a premise about code carries backticks and `$(…)`, and inside a
+double-quoted argument bash *executes* them. `--premise-for` takes finding
+**keys** (8-64 hex characters, as sent with each finding), not IDs and not
+titles — they are what the orchestrator hands the next round as `--escalated`,
+and an ID there names no finding at all.
+
+**State the premise, never the proxy.** The brake compares declarations, not code:
+"the panel exiting 0 means it reviewed" and "the payload existing means it
+reviewed" are one premise wearing two proxies, they share almost no words, and
+declared that way they count as two. Declare what the fix *assumes about the
+world* — "a local check can prove a review happened" — and the second one is
+caught.
+
+If the brief gave you no register path, say so in your write-up rather than
+inventing one: an undeclared fix pass is **unescalatable** — nothing can brake it
+— and #84's rule is to report that rather than pretend the count covered it.
+
 **Put the premise to the seats before you escalate.** Best-effort, about a
 minute, and the reason it is here is that this signal cannot be self-reported by
 the agent that wrote the fix:
