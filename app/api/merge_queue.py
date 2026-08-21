@@ -569,6 +569,34 @@ async def _join(session: AsyncSession, repo: str, base: str, pr: int,
                 MergeQueueEntry.pr == pr, MergeQueueEntry.left_at.is_(None))
         )
         if existing is None:
+            # Did this PR leave AFTER this request started? Then this request is
+            # an obsolete poll — in flight when somebody stood the entry down —
+            # and inserting would resurrect a PR that has merged, at the back of
+            # a line it has no business being in. It would expire on its own, but
+            # a stale record of a claim nobody is making is worse than none: it
+            # is a second answer to a question that already has one.
+            #
+            # A leave that happened BEFORE this request is the ordinary re-join,
+            # and goes to the back exactly as it should. The comparison is what
+            # separates the two, and both timestamps come from one server clock.
+            departed = await session.scalar(
+                select(MergeQueueEntry)
+                .where(MergeQueueEntry.repo == repo, MergeQueueEntry.base == base,
+                       MergeQueueEntry.pr == pr, MergeQueueEntry.left_at > now)
+                .order_by(MergeQueueEntry.left_at.desc()).limit(1)
+            )
+            if departed is not None:
+                raise HTTPException(409, detail={
+                    "error": f"#{pr} left the queue after this request started",
+                    "repo": repo, "base": base, "pr": pr,
+                    "left_at": departed.left_at.isoformat(),
+                    "left_by": departed.left_by,
+                    "left_reason": departed.left_reason,
+                    "hint": "your request was in flight when the entry was stood "
+                            "down. If this PR really is still landing, enqueue "
+                            "again — it will join at the back, which is where a "
+                            "PR that left the line belongs",
+                })
             entry = MergeQueueEntry(repo=repo, base=base, pr=pr,
                                     entered_at=now, **values)
             session.add(entry)
@@ -671,7 +699,14 @@ async def leave_queue(
     left = await session.execute(
         update(MergeQueueEntry)
         .where(MergeQueueEntry.repo == canon_repo, MergeQueueEntry.base == canon_base,
-               MergeQueueEntry.pr == body.pr, MergeQueueEntry.left_at.is_(None))
+               MergeQueueEntry.pr == body.pr, MergeQueueEntry.left_at.is_(None),
+               # The entry this leave is ABOUT, not merely one with the same PR
+               # number. A retried or delayed leave naming an incarnation that
+               # has already gone must not retire the PR's *next* place in the
+               # line — a PR that left, was reworked and re-enqueued would be
+               # silently dropped out of the queue by the tidy-up for its
+               # predecessor, which is the one failure a queue must never have.
+               MergeQueueEntry.entered_at <= now)
         .values(left_at=now, left_by=holder, left_reason=body.reason.strip(),
                 updated_at=now)
         .returning(MergeQueueEntry.id)
@@ -685,9 +720,11 @@ async def leave_queue(
         "repo": canon_repo,
         "base": canon_base,
         "pr": body.pr,
-        # False when the entry was already gone. Not a 404: "this PR is not in the
-        # queue" is the state the caller wanted, and an agent tidying up after a
-        # merge should not have to care whether the TTL beat it to it.
+        # False when the entry was already gone — swept, stood down by a peer,
+        # or replaced by a later arrival this leave is not about. Not a 404: "the
+        # entry you meant is not in the queue" is the state the caller wanted,
+        # and an agent tidying up after a merge should not have to care whether
+        # the TTL beat it to it.
         "left": entry_id is not None,
         "entry_id": str(entry_id) if entry_id is not None else None,
         "reason": body.reason.strip(),

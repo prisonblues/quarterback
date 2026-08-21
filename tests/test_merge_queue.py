@@ -681,3 +681,62 @@ async def test_an_overtaken_enqueue_does_not_put_a_stale_ready_verdict_back(clie
     assert late["you"]["may_merge"] is False
     # And the row really is untouched, not merely reported that way.
     assert (await read(client, repo=repo))["head"]["head"] == SHA_B
+
+
+async def test_an_obsolete_enqueue_cannot_resurrect_a_pr_that_has_left(client):
+    """An enqueue in flight when somebody stood the entry down.
+
+    Its retry pass finds no live row and would insert one — putting a PR that has
+    merged back at the end of a line it has no business being in. It expires on
+    its own, but a stale record of a claim nobody is making is worse than none:
+    it is a second answer to a question that already has one. A leave that landed
+    AFTER the request started is refused; one that landed before it is the
+    ordinary re-join and still goes to the back."""
+    import app.api.merge_queue as mq
+
+    repo = "acme/resurrect"
+    await join(client, 2701, SHA_A, repo=repo, verdict="ready")
+    await leave(client, 2701, "merged", repo=repo)
+
+    real_now = mq._utcnow
+    mq._utcnow = lambda: real_now() - timedelta(minutes=5)
+    try:
+        r = await enqueue(client, 2701, SHA_A, repo=repo, verdict="ready")
+    finally:
+        mq._utcnow = real_now
+
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["left_reason"] == "merged"
+    assert (await read(client, repo=repo))["active_order"] == []
+
+    # ...and an honest re-join, whose request starts after the leave, is fine.
+    back = await join(client, 2701, SHA_A, repo=repo, verdict="ready")
+    assert back["you"]["position"] == 1
+
+
+async def test_a_delayed_leave_cannot_retire_the_prs_next_place_in_the_line(client):
+    """A retried or slow `leave` names an incarnation that has already gone. If
+    it matched on `(repo, base, pr)` alone it would retire the PR's *next* entry
+    — a PR that left, was reworked and re-enqueued would be silently dropped out
+    of the queue by the tidy-up for its predecessor, which is the one failure a
+    queue must never have."""
+    import app.api.merge_queue as mq
+
+    repo = "acme/staleleave"
+    await join(client, 2801, SHA_A, repo=repo, verdict="ready")
+    await leave(client, 2801, "closed", repo=repo)
+    await join(client, 2801, SHA_B, repo=repo, verdict="ready")
+
+    real_now = mq._utcnow
+    mq._utcnow = lambda: real_now() - timedelta(minutes=5)
+    try:
+        late = await leave(client, 2801, "closed", repo=repo)
+    finally:
+        mq._utcnow = real_now
+
+    assert late["left"] is False
+    # The new entry is untouched and still at the head.
+    assert late["active_order"] == [2801]
+    still = await read(client, repo=repo, pr=2801)
+    assert still["head"]["head"] == SHA_B
+    assert still["you"]["may_merge"] is True
