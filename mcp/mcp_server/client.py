@@ -259,6 +259,31 @@ class QuarterbackClient:
         resp.raise_for_status()
         return resp.json()
 
+    # -- the landing queue (v2.61, #227) --------------------------------
+
+    def merge_queue(self, params: dict) -> dict:
+        resp = self._http.get(self._url("/merge-queue"),
+                              params={k: v for k, v in params.items() if v is not None})
+        resp.raise_for_status()
+        return resp.json()
+
+    def merge_queue_write(self, path: str, body: dict) -> dict:
+        """Enqueue or leave.
+
+        The session is stamped on ``enqueue`` for the reason :meth:`plan_verb`
+        gives, one step sharper: everyone behind a queue head needs to know
+        *which agent on that box* to ask about it, and a machine name on a box
+        running four agents does not say. ``leave`` records the machine and the
+        reason and takes no session, so nothing is stamped onto it — an argument
+        the endpoint ignores is an argument that will one day mean something
+        else.
+        """
+        if path == "enqueue" and self._session and not body.get("session"):
+            body = {**body, "session": self._session}
+        resp = self._http.post(self._url(f"/merge-queue/{path}"), json=body)
+        resp.raise_for_status()
+        return resp.json()
+
     # -- the plan (v2.39; a plan became a row of its own in #172) ------
 
     def plans(self, params: dict) -> dict:
