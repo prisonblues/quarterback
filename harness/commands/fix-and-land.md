@@ -207,7 +207,12 @@ turns the merge off.
    If not → **STOP**, leave the line (`merge_queue_leave(..., reason="held: …")`), post a concise
    PR comment quoting preland's `reasons`, and leave it for a human.
 
-   If both hold, **claim the base, re-verify, merge, then stand down** — in that order:
+   If both hold, **say so on the line, claim the base, re-verify, merge, then stand down** — in
+   that order:
+
+   ```
+   merge_queue_enqueue(pr=<pr>, base="$BASE", head="<headRefOid>", verdict="ready")
+   ```
 
    ```bash
    claim_id=$(qb-claim branch "$BASE" --note "landing PR #<pr>" --json)  # 0 yours / 1 held / 2 unknown
@@ -220,6 +225,11 @@ turns the merge off.
    release_claim(claim_id="<$claim_id>")
    ```
 
+   - **`verdict="ready"` is the one assertion that lets a queue head merge**, and it is pinned to
+     this commit: the board clears it the moment the head moves, which is the thing an agent's own
+     memory of "preland said READY" structurally cannot do. Say it here rather than at 4a, because
+     at 4a it was not true yet — and everyone behind you reads it to know the line is about to
+     move rather than merely occupied.
    - **Being at the head of the queue is not the claim.** The queue orders; `kind=merge` is the
      one slot held across the merge itself, and the board's own answer says as much: *"take
      `kind=merge` on this base before you merge"*. Two agents at the head of two different bases,

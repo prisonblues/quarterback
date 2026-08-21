@@ -601,3 +601,17 @@ def test_the_landing_claim_is_released_on_every_exit_after_it_is_taken():
     assert re.search(r"every exit releases it", text), (
         "the release reads as a step in the happy path only; the exit that matters is the one where "
         "the re-verification did not come back READY")
+
+
+def test_the_head_asserts_its_readiness_on_the_line_before_it_merges():
+    """`ready` is the only verdict that lets a queue head merge, and it is pinned to a commit — the
+    board drops it the moment the head moves, which is what an agent's own memory of "preland said
+    READY" structurally cannot do. Asserted as an ordering: said at 4a it would be a lie, and said
+    after the merge it would be a green light on a PR that has already gone."""
+    runnable = _fenced(command("fix-and-land"))
+    ready = runnable.find('verdict="ready"')
+    merge = runnable.find("gh pr merge")
+    assert ready >= 0, (
+        "the head never tells the line it is ready, so `GET /merge-queue` reports the PR about to "
+        "land as not-ready and preland's own advice to re-enqueue at this head goes nowhere")
+    assert ready < merge, "readiness is asserted after the merge, which is a green light on a PR that has gone"
