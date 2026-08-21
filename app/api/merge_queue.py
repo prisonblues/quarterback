@@ -185,7 +185,22 @@ def is_ready(entry: MergeQueueEntry) -> bool:
     return entry.verdict == PROCEEDS and entry.ready_sha == entry.head_sha
 
 
-def entry_view(e: MergeQueueEntry, position: int) -> dict:
+def _position(entries: list[MergeQueueEntry], pr: int) -> int | None:
+    """Where this PR is in the line, or None if it is not in it.
+
+    Total on purpose. The obvious spelling — ``[e.pr for e in entries].index(pr)``
+    — raises when the entry is not there, and "not there" is reachable: a
+    concurrent ``leave`` can retire an entry between the write and the read that
+    renders it, and a 500 out of a successful enqueue is the worst of both
+    answers.
+    """
+    for i, e in enumerate(entries, start=1):
+        if e.pr == pr:
+            return i
+    return None
+
+
+def entry_view(e: MergeQueueEntry, position: int | None) -> dict:
     return {
         "entry_id": str(e.id),
         "pr": e.pr,
@@ -464,93 +479,129 @@ async def enqueue(
     await _sweep_lapsed(session, canon_repo, canon_base, now)
     await session.commit()
 
-    existing = await session.scalar(
-        select(MergeQueueEntry).where(
-            MergeQueueEntry.repo == canon_repo, MergeQueueEntry.base == canon_base,
-            MergeQueueEntry.pr == body.pr, MergeQueueEntry.left_at.is_(None))
-    )
-    if existing is None:
-        entry = MergeQueueEntry(
-            repo=canon_repo, base=canon_base, pr=body.pr, head_sha=head,
-            # Only a `ready` verdict records a ready commit. The check constraint
-            # says the same thing from the other side, so the two cannot drift.
-            ready_sha=head if verdict == PROCEEDS else None,
-            verdict=verdict, holder=holder, session=sess,
-            note=body.note, ttl_seconds=body.ttl,
-            expires_at=now + timedelta(seconds=body.ttl))
-        session.add(entry)
-        try:
-            await session.commit()
-        except IntegrityError as e:
-            await session.rollback()
-            # Only the idempotency index. Any other integrity failure is a real
-            # fault, and reporting it as "you were already queued" would send the
-            # caller looking at a row that does not exist.
-            if not is_unique_violation(e):
-                raise
-            # Somebody enqueued this PR between the SELECT and the INSERT — the
-            # caller's own retry, most likely, since one PR is driven by one
-            # agent. Fold onto their row rather than failing: this endpoint's
-            # whole contract is that calling it twice is safe.
-            entry = await session.scalar(
-                select(MergeQueueEntry).where(
-                    MergeQueueEntry.repo == canon_repo,
-                    MergeQueueEntry.base == canon_base,
-                    MergeQueueEntry.pr == body.pr,
-                    MergeQueueEntry.left_at.is_(None))
-            )
-            if entry is None:
-                raise HTTPException(409, detail={
-                    "error": "queue entry contended; try again",
-                    "repo": canon_repo, "base": canon_base, "pr": body.pr}) from None
-            _apply(entry, head=head, verdict=verdict, holder=holder, sess=sess,
-                   note=body.note, ttl=body.ttl, now=now)
-            await session.commit()
-    else:
-        entry = existing
-        _apply(entry, head=head, verdict=verdict, holder=holder, sess=sess,
-               note=body.note, ttl=body.ttl, now=now)
-        await session.commit()
+    entry = await _join(session, canon_repo, canon_base, body.pr,
+                        _row(head=head, verdict=verdict, holder=holder, sess=sess,
+                             note=body.note, ttl=body.ttl, now=now), now)
 
-    await session.refresh(entry)
     entries = await _live_entries(session, canon_repo, canon_base, now)
     claim = await live_claim(session, "merge", key, now)
     return {
         "repo": canon_repo,
         "base": canon_base,
-        "entry": entry_view(entry, [e.pr for e in entries].index(entry.pr) + 1),
+        "entry": entry_view(entry, _position(entries, entry.pr)),
         "active_order": [e.pr for e in entries],
         "you": decide(entries, entry.pr),
         "claim": _claim_view(claim, key),
     }
 
 
-def _apply(entry: MergeQueueEntry, *, head: str, verdict: str, holder: str,
-           sess: str | None, note: str | None, ttl: int, now: datetime) -> None:
-    """Update an entry in place, in the one function every re-enqueue uses.
+def _row(*, head: str, verdict: str, holder: str, sess: str | None,
+         note: str | None, ttl: int, now: datetime) -> dict:
+    """The columns an enqueue writes, whether it is inserting or renewing.
 
-    ``entered_at`` is conspicuously absent: it is the FIFO key and is written
-    once. Everything else moves, including ``holder`` — a PR handed to another
-    agent mid-land keeps its place, because the place belongs to the pull request
-    and not to whoever happens to be driving it this hour.
+    One dict for both paths, so the insert and the update cannot come to mean
+    different things — a re-enqueue that set a column the first enqueue did not
+    is how "calling this twice is safe" quietly stops being true.
+
+    ``entered_at`` is conspicuously absent: it is the FIFO key, written once by
+    the insert and never again. Everything else moves, including ``holder`` — a
+    PR handed to another agent mid-land keeps its place, because the place
+    belongs to the pull request and not to whoever is driving it this hour.
 
     ``ready_sha`` follows ``head`` **only** when the call asserts the proceeding
     verdict at that head; every other verdict clears it. So reporting a new head
     without re-running preland invalidates the readiness rather than carrying it
     forward onto a commit nobody checked, which is #227's "when a queued PR's head
     changes, its readiness is invalidated until preland is rerun against that
-    head" — and it holds whether the head moved by one commit or by fifty.
+    head" — and it holds whether the head moved by one commit or by fifty. The
+    check constraint says the same thing from the other side, so the two cannot
+    drift.
+
+    ``session`` and ``note`` are written only when sent, because a poll that
+    omits them means "unchanged", not "cleared" — and clearing the note would
+    blank the one line everyone queued behind this entry is reading.
     """
-    entry.head_sha = head
-    entry.verdict = verdict
-    entry.ready_sha = head if verdict == PROCEEDS else None
-    entry.holder = holder
-    entry.session = sess or entry.session
+    values: dict = {
+        "head_sha": head,
+        "verdict": verdict,
+        "ready_sha": head if verdict == PROCEEDS else None,
+        "holder": holder,
+        "ttl_seconds": ttl,
+        "expires_at": now + timedelta(seconds=ttl),
+        "updated_at": now,
+    }
+    if sess:
+        values["session"] = sess
     if note is not None:
-        entry.note = note
-    entry.ttl_seconds = ttl
-    entry.expires_at = now + timedelta(seconds=ttl)
-    entry.updated_at = now
+        values["note"] = note
+    return values
+
+
+async def _join(session: AsyncSession, repo: str, base: str, pr: int,
+                values: dict, now: datetime) -> MergeQueueEntry:
+    """Take or renew this PR's place. Decided by the database, never by looking first.
+
+    Two attempts, and the second is not a retry-and-hope: each attempt can lose in
+    exactly one way, and the loss says which branch to take next.
+
+    * The INSERT loses to ``ix_merge_queue_open`` when somebody enqueued this PR
+      in the gap after the SELECT. Their row is the real one, so the next pass
+      renews it — this endpoint's whole contract is that calling it twice is safe.
+    * The UPDATE is conditional on ``left_at IS NULL`` and loses when a concurrent
+      ``leave`` or sweep retired the row in that same gap. Read-then-write would
+      have stamped a fresh expiry onto a departed entry, which is worse than
+      failing: it resurrects nothing (the row has left) while reporting success,
+      and the response then cannot find its own entry in the live queue.
+
+    So each loss is the other branch's precondition and two passes is exactly
+    enough. A third would mean the two are racing each other, which they cannot:
+    one PR is driven by one agent, and the only contention here is that agent's
+    own retry.
+    """
+    for _ in range(2):
+        existing = await session.scalar(
+            select(MergeQueueEntry).where(
+                MergeQueueEntry.repo == repo, MergeQueueEntry.base == base,
+                MergeQueueEntry.pr == pr, MergeQueueEntry.left_at.is_(None))
+        )
+        if existing is None:
+            entry = MergeQueueEntry(repo=repo, base=base, pr=pr,
+                                    entered_at=now, **values)
+            session.add(entry)
+            try:
+                await session.commit()
+            except IntegrityError as e:
+                await session.rollback()
+                # Only the idempotency index. Any other integrity failure — a
+                # check constraint, say — is a real fault, and reporting it as
+                # "you were already queued" would send the caller looking at a row
+                # that does not exist.
+                if not is_unique_violation(e):
+                    raise
+                continue
+            await session.refresh(entry)
+            return entry
+        done = await session.execute(
+            update(MergeQueueEntry)
+            .where(MergeQueueEntry.id == existing.id,
+                   MergeQueueEntry.left_at.is_(None))
+            .values(**values)
+            .returning(MergeQueueEntry.id)
+        )
+        if done.scalar_one_or_none() is None:
+            await session.rollback()
+            continue
+        await session.commit()
+        fresh = await session.get(MergeQueueEntry, existing.id)
+        if fresh is not None:
+            return fresh
+    raise HTTPException(409, detail={
+        "error": "queue entry contended; try again",
+        "repo": repo, "base": base, "pr": pr,
+        "hint": "this PR was entering and leaving the queue at the same moment. "
+                "One PR is driven by one agent, so if this repeats, two of your "
+                "sessions are landing the same branch",
+    })
 
 
 @router.post("/merge-queue/leave")

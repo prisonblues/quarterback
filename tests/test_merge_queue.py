@@ -34,6 +34,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from sqlalchemy import text as sa_text
 from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
 
@@ -521,3 +522,106 @@ async def test_the_queue_is_not_readable_without_a_token(client):
     w = await client.post("/merge-queue/enqueue",
                           json={"repo": REPO, "base": BASE, "pr": 1, "head": SHA_A})
     assert w.status_code == 401
+
+
+# ------------------------------- a leave landing in the gap (codex, round 1)
+
+
+def _losing_update(mq, on_calls: set[int]):
+    """`mq.update`, but the named calls match nothing — a leave landing in the gap.
+
+    `_join` SELECTs the live entry and then UPDATEs it conditional on
+    `left_at IS NULL`. A concurrent `leave` committing between those two makes
+    the UPDATE match zero rows, and that interleaving cannot be produced from a
+    test that shares one event loop with the request. Adding `AND false` to the
+    statement produces the same zero rows at the same line, which is the thing
+    under test: what the endpoint does when its conditional write loses.
+
+    Call 1 in an enqueue is `_sweep_lapsed`'s; `_join`'s are 2 onwards.
+    """
+    real, calls = mq.update, {"n": 0}
+
+    def racing(*a, **kw):
+        calls["n"] += 1
+        stmt = real(*a, **kw)
+        return stmt.where(sa_text("false")) if calls["n"] in on_calls else stmt
+
+    return real, racing
+
+
+async def test_an_enqueue_whose_conditional_write_loses_recovers_instead_of_crashing(client):
+    """A peer's `leave` lands between the enqueue's SELECT and its write.
+
+    Read-then-write would have stamped a fresh expiry onto a row that had already
+    left: resurrecting nothing, reporting success, and then failing to find its
+    own entry in the live queue — a 500 out of an idempotent endpoint. The write
+    is conditional on `left_at IS NULL` instead, so this pass simply loses and
+    the next one re-reads and gets it right.
+    """
+    import app.api.merge_queue as mq
+
+    repo = "acme/raceleave"
+    first = await join(client, 2301, SHA_A, repo=repo, verdict="ready")
+    await join(client, 2302, SHA_B, repo=repo, headers=DESKTOP, verdict="ready")
+
+    real, racing = _losing_update(mq, {2})
+    mq.update = racing
+    try:
+        again = await join(client, 2301, SHA_B, repo=repo, verdict="ready")
+    finally:
+        mq.update = real
+
+    # Recovered on the second pass: same row, same place, and the update it lost
+    # the first time actually applied.
+    assert again["entry"]["entry_id"] == first["entry"]["entry_id"]
+    assert again["entry"]["head"] == SHA_B
+    assert again["you"]["position"] == 1
+    assert again["active_order"] == [2301, 2302]
+
+
+async def test_an_enqueue_that_cannot_settle_is_a_409_and_never_a_500(client):
+    """Both passes losing is not supposed to be reachable — one PR is driven by
+    one agent — so what matters is that the unreachable case is an answer rather
+    than a traceback. An agent told "contended, try again" retries; one handed a
+    500 has learned nothing about a queue it is still sitting in."""
+    import app.api.merge_queue as mq
+
+    repo = "acme/nosettle"
+    await join(client, 2501, SHA_A, repo=repo, verdict="ready")
+
+    real, racing = _losing_update(mq, {2, 3})
+    mq.update = racing
+    try:
+        r = await enqueue(client, 2501, SHA_B, repo=repo, verdict="ready")
+    finally:
+        mq.update = real
+
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["pr"] == 2501
+    # And the entry is untouched — a refusal must not half-apply.
+    assert (await read(client, repo=repo))["head"]["head"] == SHA_A
+
+
+async def test_an_entry_retired_between_the_write_and_the_read_is_reported_not_crashed(client):
+    """The response renders the entry's position out of the live queue, and the
+    entry can be gone by then — a peer's `leave` commits in the gap. Looking the
+    position up with `.index()` raised there, turning a successful enqueue into a
+    500. Position is `null` instead, and `you` says the PR is not in the line."""
+    import app.api.merge_queue as mq
+
+    repo = "acme/vanished"
+    real_live = mq._live_entries
+
+    async def empty_queue(*a, **kw):
+        return []
+
+    mq._live_entries = empty_queue
+    try:
+        out = await join(client, 2401, SHA_A, repo=repo, verdict="ready")
+    finally:
+        mq._live_entries = real_live
+
+    assert out["entry"]["position"] is None
+    assert out["active_order"] == []
+    assert out["you"]["queued"] is False
+    assert out["you"]["may_merge"] is False
