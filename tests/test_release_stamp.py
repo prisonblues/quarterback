@@ -1817,32 +1817,48 @@ def advance_the_integration_branch(repo: Path, *versions: str, name: str = "main
     return sha
 
 
-def test_a_number_inherited_from_a_fresher_base_is_not_one_this_branch_picked(repo, capsys):
-    """`_collision` asks whether this branch ADDED a number. This check has to ask the same.
+def test_a_number_above_a_stale_base_is_refused_and_the_message_says_both_things(
+        repo, capsys):
+    """The number is judged against the ref you gave, and the reader is told both readings.
 
-    Local `main` is stale at v2.33, `origin/main` has since issued v2.34 and v2.35, this
-    docs-only branch has merged `origin/main`, and so its CHANGELOG carries both. They are
-    above the stale base's newest — refusing them with "a branch does not pick its own
-    number" is nonsense about entries that shipped last week, and this was a clean noop
-    before the check was hoisted above the early return.
+    Local `main` is stale at v2.33, `origin/main` has since issued v2.34 and v2.35, and this
+    docs-only branch has merged `origin/main`, so its CHANGELOG carries both. They are above
+    the base's newest, so this refuses — and THE REFUSAL IS THE POINT of the trade made here.
+
+    Two earlier attempts tried to excuse this case by working out where the numbers came
+    from, and each opened a hole the other closed (see the comment in `build_plan`). A local
+    repository cannot answer it: a ref proves somebody wrote a number down, never that it was
+    issued. So the tool asks what it can — is this above the newest at the ref I was given —
+    and names both repairs instead of guessing. What this costs is exactly this test's
+    scenario: a docs-only branch on a stale base is refused where it used to be a noop, and
+    `fetch` is the whole of the remedy.
     """
     write(repo, "docs.md", "# how\n\nA branch that ships no release.\n")
     commit(repo, "docs only")
     advance_the_integration_branch(repo, "v2.35", "v2.34")
     git(repo, "merge", "-q", "--no-ff", "-m", "pull origin/main", "origin/main")
 
-    assert run(repo, "apply", "--onto", "main") == 0
+    assert run(repo, "apply", "--onto", "main") == 2
+    err = capsys.readouterr().err
+    assert "already has an entry for v2.34, v2.35" in err
+    assert "named its own number" in err, "the first reading, with its repair"
+    assert "is behind" in err and "fetch" in err, "the second reading, with its repair"
+    assert "cannot tell which" in err, "and it must not pretend to know"
+
+    # …and naming the ref that actually issued them is a clean noop, which is what makes the
+    # refusal a stale-base message rather than a wrong one.
+    assert run(repo, "apply", "--onto", "origin/main") == 0
     assert "noop" in capsys.readouterr().out
 
 
-def test_a_number_inherited_without_a_merge_commit_is_excused_too(repo, capsys):
-    """The same branch, rebased instead of merged. There is no merge commit to inspect.
+def test_the_same_thing_holds_when_the_numbers_arrived_without_a_merge_commit(repo, capsys):
+    """Rebased rather than merged: no merge commit anywhere, and the answer does not change.
 
-    Asking which refs a branch has MERGED — the second-and-later parents of its merge
-    commits — answers this one "none", so a branch created from, rebased onto or
-    fast-forwarded past a fresher `origin/main` carried its numbers in plain first-parent
-    history and was refused for them. The question is which ref ISSUED the number, and that
-    is a question about refs, not about the shape of the commits underneath.
+    That it does not change is the property worth having. The first attempt at provenance
+    read the second-and-later parents of merge commits, so this branch — carrying the same
+    numbers in plain first-parent history — was refused while its merged twin was excused,
+    for a difference neither could see. Judging the number against the given ref treats them
+    alike, because the shape of the commits underneath was never the question.
     """
     write(repo, "docs.md", "# how\n\nA branch that ships no release.\n")
     commit(repo, "docs only")
@@ -1852,7 +1868,9 @@ def test_a_number_inherited_without_a_merge_commit_is_excused_too(repo, capsys):
         "no merge commit anywhere on this branch — that is the point of the fixture"
     )
 
-    assert run(repo, "apply", "--onto", "main") == 0
+    assert run(repo, "apply", "--onto", "main") == 2
+    assert "already has an entry for v2.34, v2.35" in capsys.readouterr().err
+    assert run(repo, "apply", "--onto", "origin/main") == 0
     assert "noop" in capsys.readouterr().out
 
 
@@ -1884,27 +1902,6 @@ def test_a_number_merged_in_from_a_FEATURE_branch_is_still_this_branch_s_to_answ
     assert "already has an entry for v2.40" in capsys.readouterr().err
 
 
-def test_a_ref_of_the_same_name_that_is_not_the_base_carried_forward_is_not_consulted(repo):
-    """`origin/main` counts because it is `main` moved ON, not merely because it is `main`.
-
-    A ref sharing the short name but not descending from the base is a different line of
-    development — a fork's `main`, a force-push, a branch re-created from somewhere else —
-    and a number written there has not been issued by the ref this branch is merging into.
-    Both directions are required, so both are pinned: an ancestor of HEAD that `onto` does
-    not lead to is no more a base than one this branch has not taken.
-    """
-    behind = git(repo, "rev-parse", "main").strip()
-    advance_the_integration_branch(repo, "v2.34")
-    git(repo, "merge", "-q", "--ff-only", "origin/main")
-    ahead = git(repo, "rev-parse", "origin/main").strip()
-    assert rs._fresher_bases(repo, "main", behind) == [ahead], "the sanity check"
-
-    # Same ref name, pointed back at a commit the base has already passed: an ancestor of
-    # HEAD, but not `behind` carried forward, so there is nothing for it to have issued.
-    git(repo, "update-ref", "refs/remotes/origin/main", behind)
-    assert rs._fresher_bases(repo, "main", ahead) == []
-
-
 def test_a_number_the_branch_has_not_taken_the_merge_for_is_still_its_own(repo, capsys):
     """Inheriting a number means CONTAINING the ref that issued it, not that some ref did.
 
@@ -1924,21 +1921,6 @@ def test_a_number_the_branch_has_not_taken_the_merge_for_is_still_its_own(repo, 
 
     assert run(repo, "preflight", "--onto", "main") == 2
     assert "already has an entry for v2.35" in capsys.readouterr().err
-
-
-def test_the_provenance_lookup_cannot_turn_a_refusal_into_a_traceback(repo, capsys, monkeypatch):
-    """It runs on the hoisted path, so it has the same NEVER RAISES obligation as the advice.
-
-    Every other new git call here is guarded — `next_release`, `placeholder_at_ref`,
-    `_releases_at`, `_repair_advice` — and an unguarded one leaves a raw git message where
-    the documented refusal is a sentence about release numbers. Failing to establish
-    provenance means "not established", which refuses; it never excuses.
-    """
-    def broken(_repo, *_a):
-        raise rs.StampError("git for-each-ref failed: no output")
-
-    monkeypatch.setattr(rs, "_git", broken)
-    assert rs._inherited(repo, "main", "deadbeef") == set()
 
 
 def test_a_base_with_no_release_headings_does_not_hold_a_branch_that_ships_no_release(
@@ -2276,3 +2258,49 @@ def test_a_broken_base_warning_reaches_the_json_consumer(repo, capsys):
     assert len(warnings) == 1
     assert "carries an unstamped" in warnings[0]
     assert "ships no release" in warnings[0]
+
+
+def test_a_local_branch_of_the_same_name_cannot_launder_a_hand_written_number(repo, capsys):
+    """`git checkout main && git commit && git checkout -b feat` must not issue a number.
+
+    The second attempt at provenance excused any ref sharing `--onto`'s short name, so a
+    purely local `main` — never pushed, never reviewed, one commit somebody made on Tuesday —
+    counted as the number having landed. That is #167's hole reached without needing a merge
+    at all. Nothing is consulted now, so there is nothing to launder through.
+    """
+    # `origin/main` is where the number would have to have landed to be real, and it is at
+    # v2.33. The local `main` that follows is the unreviewed claim.
+    git(repo, "update-ref", "refs/remotes/origin/main", git(repo, "rev-parse", "main").strip())
+    git(repo, "checkout", "-q", "main")
+    text = (repo / "CHANGELOG.md").read_text()
+    write(repo, "CHANGELOG.md", text.replace("## v2.33", entry("v2.40") + "## v2.33", 1))
+    commit(repo, "a number nobody issued, on a local main")
+    git(repo, "checkout", "-q", "-b", "feat/from-local-main")
+
+    assert run(repo, "preflight", "--onto", "origin/main") == 2
+    assert "already has an entry for v2.40" in capsys.readouterr().err
+
+
+def test_an_inherited_number_cannot_make_apply_stamp_it_a_second_time(repo, capsys):
+    """The subtraction used to run before the placeholder gate, so it emptied the refusal.
+
+    A branch still carrying `## vNEXT` that had also inherited fresher numbers had them taken
+    out of `claimed`, so `ahead` never fired — and execution fell through to stamping
+    `next_version`, computed against the STALE base, which is a number the branch's own
+    CHANGELOG already held. `apply` wrote the entry twice. There is no subtraction now, so the
+    branch is refused before it can reach the stamp.
+    """
+    # The inheritance first, then the placeholder on top of it: a branch that pulled and then
+    # wrote its entry, which is the ordinary order and avoids a conflict in the same lines.
+    write(repo, "docs.md", "# how\n")
+    commit(repo, "something to make this a branch")
+    advance_the_integration_branch(repo, "v2.34")
+    git(repo, "merge", "-q", "--no-ff", "-m", "pull origin/main", "origin/main")
+    place(repo)
+    commit(repo, "and now its own release entry, still a placeholder")
+
+    before = (repo / "CHANGELOG.md").read_text()
+    assert run(repo, "apply", "--onto", "main") == 2
+    assert "already has an entry for v2.34" in capsys.readouterr().err
+    assert (repo / "CHANGELOG.md").read_text() == before, (
+        "refused before the stamp, so nothing was rewritten")

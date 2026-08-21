@@ -63,16 +63,27 @@ same resolved line. When the walk finds nothing clean within its bound it says s
 than printing a command with a `<placeholder>` in it, because a shell reads `<` as a redirect and
 a repair command that fails with a filesystem error is worse than a sentence.
 
-Hoisting also put that refusal in front of a branch that **inherited** a number rather than picking
-one: `--onto main` while `origin/main` has since issued v2.34 and v2.35, which every branch that
-pulled since carries. Those sit above the stale base's newest, and "a branch does not pick its own
-number" is nonsense about an entry that shipped last week. What excuses them is where the number
-LANDED — a ref naming the same branch `--onto` does, carried forward from it, and already contained
-by this branch. Asking instead which refs the branch had MERGED was wrong in both directions at
-once: a branch that inherited the same numbers by rebase or fast-forward has no merge commit to
-inspect and was refused anyway, and *any* number in *any* merged snapshot was excused, so a branch
-that hand-wrote `## v2.40` and was refused for it could have that refusal laundered by a second
-branch merging it. That is #167 back, through a merge.
+Hoisting also put that refusal in front of a branch that **inherited** a number rather than
+picking one: `--onto main` while `origin/main` has since issued v2.34 and v2.35, which every branch
+that pulled since carries. Those sit above the stale base's newest, and "a branch does not pick its
+own number" is nonsense about an entry that shipped last week.
+
+**Two attempts were made to tell those apart from the local repository, and both were abandoned.**
+Reading the second-and-later parents of merge commits excused *any* number in *any* merged
+snapshot, so a branch that hand-wrote `## v2.40` and was refused for it had that refusal laundered
+by a second branch merging it — and missed rebase and fast-forward, which carry no merge commit at
+all. Reading refs that share `--onto`'s branch name then excused a purely local `refs/heads/main`,
+never pushed and never reviewed, which is what `git checkout main && git commit && git checkout -b
+feat` leaves behind — and refused any checkout holding the commits but not the ref
+(`clone --single-branch`, `pull <url> main`, a pruned remote). Each was simultaneously too wide and
+too narrow, and both holes were the same hole.
+
+The premise they share is that a local repository can say where a number LANDED. It cannot: a ref
+proves somebody wrote a number down, never that it was issued. So the check asks the one question
+it can answer — is this number above the newest at the ref I was given — and **the message names
+both repairs instead of guessing**: put the entry back to `## vNEXT`, or fetch, because the base is
+behind and the entry came from a later one. What that costs is a docs-only branch on a stale base
+being refused where it used to be a noop, and `fetch` is the whole of the remedy.
 
 The repair line is **pasteable from anywhere**: an absolute path to the script and an explicit
 `--repo`, because `fix-and-review` runs this tool against a worktree that is not the caller's cwd,

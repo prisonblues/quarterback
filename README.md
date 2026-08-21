@@ -982,14 +982,12 @@ full — including what was broken before it, which is the part no diff recovers
   branch naming its own number always takes, because "no placeholder" was standing in for
   "ships no release". Measured across an eight-PR queue in #167, the guard fired for none of
   them. Both are hoisted, judging the NUMBER rather than its author, since `apply`'s own
-  output is byte-identical to a hard-coded one — which is also the limit of it: a hand-written
-  `max+1` cannot be told from a stamped one and is not refused. A broken base no longer holds
-  branches that ship no release and have not merged it (#168) — those are warned — and the
-  refusal that remains names the ref to repair from instead of describing how to find it, as a
-  line that can be pasted from any directory. A number this branch INHERITED from a base that has
-  moved on is not one it picked, and the test for that is where the number landed rather than
-  which refs got merged: a feature branch's say-so is not provenance however many merges it
-  travels through.
+  output is byte-identical to a hard-coded one. A broken base no longer holds branches that
+  ship no release (#168) — those are warned — and the refusal that remains names a resolved,
+  pasteable repair command instead of describing how to find a ref. Where a number came from
+  is deliberately NOT asked: two attempts to establish it from the local repository each
+  opened the laundering hole the other closed, so the refusal names both repairs — rewrite the
+  entry, or fetch a base that is behind — rather than guessing which applies.
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
   roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps

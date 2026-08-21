@@ -925,84 +925,6 @@ def _releases_at(repo: Path, ref: str) -> set[Release] | None:
         return None
 
 
-def _fresher_bases(repo: Path, onto: str, onto_sha: str) -> list[str]:
-    """Commits that are a LATER `onto` than `onto_sha` and that this branch already contains.
-
-    The one thing that makes a release number real is that it landed on the integration
-    branch, and `--onto` is the name of that branch. So a ref is consulted here only when all
-    three hold:
-
-      * it names the same BRANCH `onto` does, under any remote or none — `--onto main` also
-        looks at `origin/main` and `upstream/main`, and `--onto origin/main` also looks at
-        `main`. A ref with a different short name is somebody's feature branch, and a number
-        written on a feature branch has not been issued by anybody;
-      * `onto_sha` is an ancestor of it, so it is the same line of development carried
-        FORWARD rather than a divergent one — "fresher", not merely "different";
-      * it is an ancestor of HEAD, so this branch actually contains it. A number that appears
-        at a ref this branch has not taken is a number this branch wrote down on its own,
-        whoever else may also have written it.
-
-    `--onto` given as a SHA or as `HEAD~3` names no branch, so nothing matches and the caller
-    falls back to refusing — which is the safe direction, since the question "has this landed
-    anywhere" then has no ref that can answer it.
-    """
-    branch = onto.rsplit("/", 1)[-1]
-    if not branch or branch.startswith("-"):
-        return []
-    try:
-        out = _git(repo, "for-each-ref", "--format=%(objectname)",
-                   f"refs/heads/{branch}", f"refs/remotes/*/{branch}")
-    except StampError:
-        return []
-    tips = []
-    for sha in out.split():
-        if sha == onto_sha or sha in tips:
-            continue
-        if not _git_ok(repo, "merge-base", "--is-ancestor", onto_sha, sha):
-            continue
-        if not _git_ok(repo, "merge-base", "--is-ancestor", sha, "HEAD"):
-            continue
-        tips.append(sha)
-    return tips
-
-
-def _inherited(repo: Path, onto: str, onto_sha: str) -> set[Release]:
-    """Release numbers this branch INHERITED from a later `onto` rather than picked itself.
-
-    `_collision` asks "did THIS BRANCH add the number" and answers it from the merge base,
-    because a branch that merely inherited an entry is editing history and not claiming a
-    number. The ahead check below has to ask the same question, and the merge base cannot
-    answer it there: a branch sitting on top of a ref FRESHER than `--onto` — a stale local
-    `main` against a branch that has pulled `origin/main` — carries numbers that were issued
-    elsewhere and are above `onto`'s newest, and refusing those tells somebody that an entry
-    which shipped last week is a number they picked.
-
-    The question is WHERE THE NUMBER LANDED, not how it arrived. Asking instead which refs
-    this branch has MERGED — the second-and-later parents of its merge commits — got it wrong
-    in both directions at once. Too narrow: a branch that inherited the same numbers by
-    rebase or by fast-forward has no merge commit to inspect and was refused anyway. And far
-    too wide: it excused any number present in any merged snapshot, so a branch that
-    hand-wrote `## v2.40` and was refused for it could have that refusal laundered by a
-    second branch merging it — `ahead` empty, `_collision` blind because v2.40 exists neither
-    at `onto` nor twice in the file, and v2.40 lands six numbers early. That is #167 back,
-    through a merge. Provenance has to be about the ref the number landed on.
-
-    Only called when the check is otherwise about to refuse: one `git for-each-ref`, then two
-    `merge-base --is-ancestor` and a `git show` per ref that shares the name. The common
-    answer is that nothing on the branch is above the base at all, and it costs nothing.
-
-    NEVER RAISES, like the advice below and for a related reason: a git failure here would
-    otherwise leave a `StampError` carrying a raw git message on the hoisted path, where the
-    documented refusal is a sentence about release numbers. It degrades to "nothing was
-    inherited", which refuses rather than excuses — the safe direction when provenance cannot
-    be established.
-    """
-    inherited: set[Release] = set()
-    for tip in _fresher_bases(repo, onto, onto_sha):
-        inherited |= _releases_at(repo, tip) or set()
-    return inherited
-
-
 def _clean_ancestor(repo: Path, onto_sha: str) -> tuple[str | None, int]:
     """The newest first-parent commit at or before `onto_sha` with no placeholder in its tree.
 
@@ -1401,28 +1323,45 @@ def build_plan(repo: Path, onto: str, serve: bool | None, major: bool = False) -
     # number that already exists at `onto` or twice in this file and neither is true of two
     # different numbers nobody has issued yet.
     #
-    # And CLAIMED, not merely present. `_collision` asks whether this branch ADDED a number
-    # and answers it from the merge base; hoisting this check above the early return means it
-    # now runs for branches with nothing to stamp, including one sitting on top of a ref
-    # FRESHER than a stale `--onto` that carries numbers which shipped elsewhere. Refusing
-    # those with "a branch does not pick its own number" is nonsense about an entry the
-    # branch only inherited, and used to be a clean noop — so what a later `onto` had already
-    # issued comes off first, and only on the path that is otherwise about to refuse.
+    # WHERE THE NUMBER CAME FROM IS NOT ASKED, and three rounds of review are the reason.
+    # Hoisting this check above the early return means it also runs for branches with nothing
+    # to stamp — including one sitting on top of a ref FRESHER than a stale `--onto`, whose
+    # CHANGELOG carries numbers that shipped elsewhere. Refusing those as "a branch does not
+    # pick its own number" is nonsense about an entry the branch only inherited, so two
+    # attempts were made to tell the two apart from the local repository: the second-and-later
+    # parents of merge commits, and then any ref sharing `onto`'s branch name. Both were
+    # simultaneously too wide and too narrow, and each hole was the same one:
+    #
+    #   * merge parents excused a number found in ANY merged snapshot, so a branch that
+    #     hand-wrote `## v2.40` and was refused for it had the refusal laundered by a second
+    #     branch merging it — and missed rebase and fast-forward, which carry no merge commit;
+    #   * same-named refs excused a purely local `refs/heads/main`, never pushed and never
+    #     reviewed, which is what `git checkout main && git commit && git checkout -b feat`
+    #     leaves behind — and refused any checkout that holds the commits but not the ref
+    #     (`clone --single-branch`, `pull <url> main`, a pruned remote).
+    #
+    # The premise both share is that a local repository can say where a number LANDED. It
+    # cannot: a ref proves somebody wrote a number down, never that it was issued. So this
+    # asks the one question it can answer — is this number above the newest at the ref I was
+    # given — and the message names BOTH repairs rather than guessing which applies. A stale
+    # base is a real thing to be told about, and "fetch and try again" costs a reader nothing
+    # when it was not the problem.
     issued = releases_in(branch_text, "CHANGELOG.md")
     claimed = {r for r in issued if r > onto_newest}
-    if claimed:
-        claimed -= _inherited(repo, onto, onto_sha)
     allowed = (claimed if not plan.sites and len(claimed) == 1 and claimed <= could_have_issued
                else set())
     ahead = sorted(claimed - allowed)
     if ahead:
         named = ", ".join(fmt(r) for r in ahead)
         raise StampError(
-            f"this branch's CHANGELOG already has an entry for {named}, which does not exist "
-            f"at {onto} (newest there is {fmt(onto_newest)}, so the next free number is "
-            f"{fmt(next_version)}). A branch does not pick its own number — write "
-            f"`## {PLACEHOLDER}` and let this tool resolve it against the ref you are "
-            "actually merging into"
+            f"this branch's CHANGELOG already has an entry for {named}, which does not exist at "
+            f"{onto} (newest there is {fmt(onto_newest)}, so the next free number is "
+            f"{fmt(next_version)}). Either this branch named its own number — put the entry "
+            f"back to `## {PLACEHOLDER} — …` (and its README bullet with it) and run `apply` "
+            f"again — or {onto} is behind and the entry was inherited from a later one, in "
+            f"which case fetch and re-run against the updated ref. This tool cannot tell "
+            "which from here: a ref proves somebody wrote a number down, never that it was "
+            "issued."
         )
 
     # DOES THIS BRANCH SHIP A RELEASE? Not "does it carry a placeholder" — those two came
