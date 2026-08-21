@@ -17,6 +17,34 @@ the top of this file conflict every time, over nothing — both entries are righ
 and a fragment is a path no other branch will ever open. `changelog.d/README.md` has the format.
 `vNEXT` means exactly what it meant before; assembly is just what writes it.
 
+## v2.68 — the fix pass stopped being most of the PR
+
+The panel's fix floor is a rule about one finding at a time, and what went wrong is not one
+finding. Measured on 2026-08-21: PR #188's feature was **185 churned lines**, two fix passes
+turned it into **721**, and **74% of that PR was review-response code** — it stopped being a PR
+with fixes applied and became a PR that was mostly its own review. The round-2 fix list it came
+off was **89% below P2**.
+
+`review_panel.low_severity_fix_lines` (**40**) is the churned lines a round may spend on findings
+between `fix_severity_floor` and `round_trigger_floor` — at the shipped floors, exactly the P3
+band. Spent cheapest-first, **counted rather than estimated**, and the remainder is reported and
+recorded exactly as before rather than dropped.
+
+A budget and not a per-fix cap, because that round 1 was not one balloon: it was 408 lines of
+individually reasonable small fixes, which no per-fix cap can see. And a budget rather than a
+higher floor, because the class a P2 floor systematically misses is correctness expressed as
+craft — a missing regression test on a parser or an auth boundary, a missing timeout, a migration
+rollback gap — and a genuinely cheap fix of that kind is worth taking while the pass is open.
+
+Mechanical rather than discretionary. "Does this risk ballooning?" asked of the fixer is a
+judgement by the actor whose judgement the measurement impugns, so lines are measured with
+`git diff --numstat` after the fact rather than forecast before it. The panel budgets; the fixer
+counts.
+
+`0` buys nothing, so the band leaves the fixer's list and the applied floor rises to the cut;
+written `null` restores the unconditional pre-budget behaviour. The number in force is printed on
+the `Panel dials` line, so the artifact says what the round actually applied.
+
 ## v2.67 — the files two branches both had to edit, and the guard that measured the wrong thing
 
 ### the release list is rendered, and a branch stops editing the file everyone edits
