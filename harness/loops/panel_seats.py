@@ -1242,10 +1242,10 @@ def resolve_round_scope(asked: str, panel: dict, notes: list[str]) -> str:
     return DEFAULT_ROUND_SCOPE if want == "auto" else want
 
 
-# --------------------------------------------------------------- #165's dials
+# --------------------------------------------------- #165's dials, and #297's eighth
 #
-# Seven `review_panel.*` settings that trade thoroughness against convergence, read
-# in one place so a round's applied policy is one object rather than seven lookups
+# Eight `review_panel.*` settings that trade thoroughness against convergence, read
+# in one place so a round's applied policy is one object rather than eight lookups
 # scattered through `run()`. Each key's number and the measurement behind it are
 # documented beside it in `harness_rules.DEFAULTS`; what lives here is how a WRITTEN
 # value is turned into an applied one.
@@ -1366,6 +1366,69 @@ def reviewer_scope(panel: dict, notes: list[str]) -> str:
     return want.strip().lower()
 
 
+def low_severity_budget(panel: dict, notes: list[str]) -> int | None:
+    """`low_severity_fix_lines` — whole lines >= 0, or ``None`` for "no budget".
+
+    The combined churn a round may spend on the findings `fix_severity_floor` admits
+    and `round_trigger_floor` does not (#297). Three readings, all of them meant:
+
+    * a **number** is the budget, spent cheapest-first until it is gone;
+    * **0** is a budget that buys nothing, so none of that band is fixed — which is
+      `fix_severity_floor` raised to the cut, without the repo having to say the same
+      thing in two keys and keep them in step;
+    * an explicit **null** is no budget at all: every finding at or above the fix
+      floor is unconditional work, which is the pre-#297 behaviour.
+
+    So an ABSENT key inherits the default and a written `null` does not, the
+    distinction :func:`fix_growth_limit` draws and for a sharper version of its
+    reason. There, `0` is not a threshold anything can be under, so `null` was the
+    only spelling left for "off". Here `0` is a perfectly good budget and means
+    something *different* from off — nothing gets fixed, versus everything does — so
+    collapsing the two would leave one of the two readings unwritable. Which one it
+    ate would depend on which way the code happened to be written, and a repo
+    spelling "fix none of them" and getting "fix all of them" is the widest possible
+    miss.
+
+    A bool is rejected before the integer read for `resolve_max_rounds`'s reason:
+    ``isinstance(True, int)`` is True, so `low_severity_fix_lines: false` — the other
+    way a hand writes "off" — would otherwise become a 1-line budget, which is not
+    off and is not anything else either. An integral float (``40.0`` out of a
+    generator) counts; ``40.5`` does not, because half a line is not a quantity `git
+    diff --numstat` can report and rounding it silently would spend a budget the file
+    did not write. Negative is refused rather than clamped: a repo that wrote one
+    meant something, and nothing here can tell which."""
+    raw = panel.get("low_severity_fix_lines", _ABSENT)
+    if raw is _ABSENT:
+        return DEFAULT_LOW_SEVERITY_FIX_LINES
+    if raw is None or raw == "":
+        return None
+
+    def refuse(what: str) -> int | None:
+        _refuse_value("low_severity_fix_lines", raw,
+                      f"{what} — a whole number of churned lines the round may spend "
+                      "on findings below the trigger floor, 0 to spend none, or null "
+                      "for no budget at all")
+        return None            # unreachable; `_refuse_value` always raises
+
+    n = None
+    if isinstance(raw, bool):
+        n = None
+    elif isinstance(raw, int):
+        n = raw
+    elif isinstance(raw, float):
+        n = int(raw) if raw.is_integer() else None
+    elif isinstance(raw, str):
+        try:
+            n = int(raw.strip())
+        except ValueError:
+            n = None
+    if n is None:
+        return refuse("a whole number")
+    if n < 0:
+        return refuse("zero or more")
+    return n
+
+
 def fix_growth_limit(panel: dict, notes: list[str]) -> float | None:
     """`max_fix_growth` — a positive multiple, or ``None`` for "do not check".
 
@@ -1482,7 +1545,7 @@ def resolve_max_rounds(asked: int | None, panel: dict, notes: list[str]) -> int:
 
 @dataclass(frozen=True)
 class Dials:
-    """The seven #165 settings as this round applied them.
+    """The eight #165/#297 settings as this round applied them.
 
     One object, resolved once, for the four consumers that would otherwise each read
     the rules dict: the reviewer prompt, the report, the stop rule and the payload. A
@@ -1493,6 +1556,7 @@ class Dials:
     fixer_may_defer: bool = DEFAULT_FIXER_MAY_DEFER
     fix_severity_floor: str = DEFAULT_FIX_SEVERITY_FLOOR
     round_trigger_floor: str = DEFAULT_ROUND_TRIGGER_FLOOR
+    low_severity_fix_lines: int | None = DEFAULT_LOW_SEVERITY_FIX_LINES
     max_fix_growth: float | None = DEFAULT_MAX_FIX_GROWTH
     reviewer_scope: str = DEFAULT_REVIEWER_SCOPE
     require_failing_test: bool = DEFAULT_REQUIRE_FAILING_TEST
@@ -1504,10 +1568,72 @@ class Dials:
         return {"fixer_may_defer": self.fixer_may_defer,
                 "fix_severity_floor": self.fix_severity_floor,
                 "round_trigger_floor": self.round_trigger_floor,
+                "low_severity_fix_lines": self.low_severity_fix_lines,
                 "max_fix_growth": self.max_fix_growth,
                 "reviewer_scope": self.reviewer_scope,
                 "require_failing_test": self.require_failing_test,
                 "max_rounds": self.max_rounds}
+
+    @property
+    def budgeted_band(self) -> bool:
+        """Is there a band of findings this round pays for out of a budget?
+
+        True when a budget is written AND the fix floor reaches below the trigger
+        floor, which is the only shape that HAS a band. At `fix_severity_floor: P2`
+        with the default trigger floor the two meet, nothing sits between them, and
+        the budget is inert rather than mis-applied — so every reader below asks this
+        first rather than each deriving it, and a repo that closed the gap sees a
+        round that behaves exactly as it did before the key existed."""
+        return (self.low_severity_fix_lines is not None
+                and not severity_at_least(self.fix_severity_floor,
+                                          self.round_trigger_floor))
+
+    @property
+    def fix_floor(self) -> str:
+        """The floor a finding must reach to be **fixable at all** this round.
+
+        `fix_severity_floor` itself, except at a budget of `0`, where the band it
+        admits below the trigger floor can buy nothing: a finding in it is then not
+        this round's work in any sense, and reporting it as one — in the fixer's list,
+        under a header naming a floor it is above — would be the report contradicting
+        the policy the round ran under. So the applied floor rises to the cut, which
+        is what a budget of zero MEANS, and the report says so where it names it.
+
+        A positive budget does not move it: the band is in the fixer's list, marked,
+        with the budget beside it."""
+        return (self.round_trigger_floor
+                if self.budgeted_band and self.low_severity_fix_lines == 0
+                else self.fix_severity_floor)
+
+    @property
+    def cleared_floor(self) -> str:
+        """The floor the round was **required to clear**, which `round_stop` bounds
+        its repeat rules by.
+
+        Not the same question as :attr:`fix_floor`, and the difference is the whole
+        of a positive budget. A budgeted finding may be left unfixed because the
+        budget ran out before it, and the panel cannot tell which ones those were —
+        it sees a fix commit, not a ledger. `round_stop`'s rule 3 justifies itself on
+        "the fixer was told about them and they are still there", which is exactly as
+        false of an unpaid budgeted finding as it is of a below-floor one, and left
+        unbounded it would run every budgeted cycle to the cap on findings the round
+        was never obliged to clear — the jam the fix floor was bounded to avoid.
+
+        So while a budget is in force the required floor is the cut. What that costs
+        is honest and small: a budgeted finding the fixer DID pay for and got wrong
+        no longer buys another round by repeating. That is the same trade
+        `round_trigger_floor` already makes on the same tier, one round earlier."""
+        return (self.round_trigger_floor if self.budgeted_band
+                else self.fix_severity_floor)
+
+    def budgeted(self, severity: str) -> bool:
+        """Is a finding at this severity one the budget pays for — in the band, and
+        with something to spend? False at a budget of `0`: there the band is below
+        :attr:`fix_floor` and renders as the below-floor findings do, so a caller
+        asking this to decide whether to MARK a finding must not also get True."""
+        return bool(self.budgeted_band and self.low_severity_fix_lines
+                    and severity_at_least(severity, self.fix_severity_floor)
+                    and not severity_at_least(severity, self.round_trigger_floor))
 
     def gist(self) -> str:
         """The one report line. Printed on EVERY round, at the default or not: the
@@ -1517,8 +1643,17 @@ class Dials:
         Rounds block already prints the cap it actually used."""
         growth = ("off" if self.max_fix_growth is None
                   else f"{self.max_fix_growth:g}x")
-        return (f"fix at/above {self.fix_severity_floor} · another round at/above "
-                f"{self.round_trigger_floor} · reviewer scope {self.reviewer_scope} · "
+        # Spelled as what it BOUNDS, not as its key: "below-P2 fix budget" says which
+        # findings are on it without the reader holding `round_trigger_floor` in their
+        # head, and it is printed even where the band is empty (`fix_severity_floor`
+        # at the cut) because a dial that vanishes from the line at some settings is
+        # one a reader cannot tell from a dial that was never applied.
+        budget = ("off" if self.low_severity_fix_lines is None
+                  else f"{self.low_severity_fix_lines} lines")
+        return (f"fix at/above {self.fix_severity_floor} · below-"
+                f"{self.round_trigger_floor} fix budget {budget} · another round "
+                f"at/above {self.round_trigger_floor} · "
+                f"reviewer scope {self.reviewer_scope} · "
                 f"fix growth cap {growth} · fixer may defer "
                 f"{'yes' if self.fixer_may_defer else 'no'} · failing test required "
                 f"{'yes' if self.require_failing_test else 'no'}")
@@ -1526,7 +1661,7 @@ class Dials:
 
 def resolve_dials(panel: dict, asked_max_rounds: int | None,
                   notes: list[str]) -> Dials:
-    """Read, validate and report all seven at once.
+    """Read, validate and report all eight at once.
 
     `require_failing_test` gets a note of its own when it is ON, and that note is the
     whole of its behaviour: the contract it describes needs a reviewer-emitted test
@@ -1542,6 +1677,7 @@ def resolve_dials(panel: dict, asked_max_rounds: int | None,
                                           DEFAULT_FIX_SEVERITY_FLOOR, notes),
         round_trigger_floor=severity_floor(panel, "round_trigger_floor",
                                            DEFAULT_ROUND_TRIGGER_FLOOR, notes),
+        low_severity_fix_lines=low_severity_budget(panel, notes),
         max_fix_growth=fix_growth_limit(panel, notes),
         reviewer_scope=reviewer_scope(panel, notes),
         require_failing_test=panel_flag(panel, "require_failing_test",
@@ -2886,7 +3022,8 @@ __all__ = [
     "code_access_wanted", "_fetch_tarball", "TREE_RETRY_STATUSES", "code_budget",
     "READ_ONLY_TOOLS", "claude_args",
     "QB_NO_SUBCOMMAND", "record_ask", "diff_budget", "resolve_round_scope",
-    "severity_floor", "reviewer_scope", "fix_growth_limit", "panel_flag",
+    "severity_floor", "reviewer_scope", "low_severity_budget", "fix_growth_limit",
+    "panel_flag",
     "resolve_max_rounds", "Dials", "resolve_dials", "_FALSEY", "_ABSENT",
     "_refuse_value",
     "fit_argv_budget", "argv_clamp", "reviewer_label", "fallback_label",

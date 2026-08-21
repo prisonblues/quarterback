@@ -199,8 +199,8 @@ SEVERITIES = ("P1", "P2", "P3", "P4")
 # ----------------------------------------------------------------- #165's dials
 #
 # The built-in half of `review_panel.{fixer_may_defer, fix_severity_floor,
-# round_trigger_floor, max_fix_growth, reviewer_scope, require_failing_test,
-# max_rounds}`. WHY each number is this number lives beside the key in
+# round_trigger_floor, low_severity_fix_lines, max_fix_growth, reviewer_scope,
+# require_failing_test, max_rounds}`. WHY each number is this number lives beside the key in
 # `harness_rules.DEFAULTS`, which is the file an operator reads; these are what
 # the resolvers in `panel_seats` fall back to when a rules file (or a test's
 # hand-written `panel` literal) does not carry the key. The two are asserted equal
@@ -217,6 +217,13 @@ DEFAULT_FIX_SEVERITY_FLOOR = "P3"
 #: the fix floor is P3, deliberately: fixing a P3 inside a pass that is already open
 #: costs one edit; letting one buy a whole new round costs a panel plus a fix pass.
 DEFAULT_ROUND_TRIGGER_FLOOR = "P2"
+#: Churned lines the whole round may spend fixing findings BELOW the trigger floor —
+#: the tier the fix floor admits and the measurement does not. 40 because the failure
+#: is accumulation, not one balloon: PR #188's round-1 fix pass was 408 lines of
+#: individually reasonable small fixes on a 185-line feature. `None` is no budget at
+#: all (the pre-#297 behaviour); `0` fixes none of them. `harness_rules` carries the
+#: measurement.
+DEFAULT_LOW_SEVERITY_FIX_LINES = 40
 #: The floor value that means "no floor" — the least severe severity there is, so
 #: everything is at or above it. Both floors default to this INSIDE `round_stop`,
 #: which is what keeps every caller that has not heard of them on the old
@@ -2039,6 +2046,7 @@ __all__ = [
     "RAW_DETAIL_CHARS", "CLUSTER_WINDOW", "ACCOUNT_CHARS", "DEFAULT_MAX_ROUNDS",
     "DEFAULT_ROUND_SCOPE", "ROUND_SCOPES", "CLI_TIMEOUT", "BLANK_RETRY_MAX_S",
     "DEFAULT_FIX_SEVERITY_FLOOR", "DEFAULT_ROUND_TRIGGER_FLOOR", "NO_SEVERITY_FLOOR",
+    "DEFAULT_LOW_SEVERITY_FIX_LINES",
     "DEFAULT_MAX_FIX_GROWTH", "DEFAULT_REVIEWER_SCOPE", "REVIEWER_SCOPES",
     "DEFAULT_FIXER_MAY_DEFER", "DEFAULT_REQUIRE_FAILING_TEST",
     "severity_at_least", "REVIEWER_SCOPE_SLOT", "RELATED_CODE_SLOT",

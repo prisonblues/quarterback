@@ -195,11 +195,14 @@ like a full panel.
 From its output collect:
 - **Panel dials** — the line the report prints under that name, naming `review_panel`.
   It says which severity floor the fixer is being briefed to, what buys another round,
-  whether the fixer may defer, and the fix-growth ceiling. Read it BEFORE §4: the brief you build
+  whether the fixer may defer, the low-severity line budget, and the fix-growth ceiling. Read it BEFORE §4: the brief you build
   depends on it, and it is the only place the round's policy is written down where
   you can see it (#165).
 - **To fix** — the master-confirmed findings the fix round is asked to clear (any
-  reviewer count, at or above the round's `fix_severity_floor`).
+  reviewer count, at or above the round's `fix_severity_floor`). The ones marked 💸
+  are below `round_trigger_floor` and share the round's `low_severity_fix_lines`
+  budget rather than being unconditional (#297); the note under the heading states
+  the number and the rule.
 - **Reported, not this round's work** — the master-confirmed findings BELOW that
   floor, marked 🔽. Present only where the floor left something under it. These are
   recorded and relayed and **never pasted into the fixer's brief**; §4b says what
@@ -264,10 +267,16 @@ with these overrides:
   permission to fix whatever the pass noticed, three lines from the instruction that
   establishes the floor — an open route back to fixing everything, and it bit hardest
   for precisely the P3/P4 items the floor exists to hold back.
+- **Paste the 💸 marks with the findings that carry them, and the budget with the
+  list.** The marks are how the fixer tells a budgeted finding from an unconditional
+  one, and a **To fix** list pasted without them briefs the pre-#297 behaviour: every
+  low-severity finding unconditional, which is the 408-line round-1 fix pass this
+  budget exists to stop. Copy the note under the heading verbatim — it carries the
+  line count and the spend rule.
 - **Relay the dials into the brief.** The sub-agent cannot read `.harness-rules` for
   itself in worktree mode and must not guess: state `fix_severity_floor`,
-  `reviewer_scope` and `fixer_may_defer` from the panel report's **Panel dials**
-  line, in the brief, as the values in force. The brief's own opening asks for them
+  `low_severity_fix_lines`, `reviewer_scope` and `fixer_may_defer` from the panel
+  report's **Panel dials** line, in the brief, as the values in force. The brief's own opening asks for them
   by name, and a fixer left to guess reverts to "fix everything you find, anywhere",
   which is the behaviour these settings exist to bound.
 - **Parallel fixes apply here too.** A panel list is typically longer than a
@@ -353,7 +362,9 @@ One of four per finding:
   `review_panel.fixer_may_defer` — the defect is real and outside what this change is
   for, with the two justifying lines in its summary's `Deferred` block. (2) The
   panel reported it BELOW the round's `fix_severity_floor`, so it was never in the
-  fixer's brief at all; one issue for the batch is fine and usually right, since
+  fixer's brief at all — or it was marked 💸 and the round's `low_severity_fix_lines`
+  budget ran out before it, which is the same row for the same reason (#297); one
+  issue for the batch is fine and usually right, since
   filing nine issues for nine P3s is the overflow the floor exists to stop. (3) An
   **escalated** finding (the brief's step 3a): the defect is
   real and the fix is what is in dispute, so `refuted` would be a lie about the

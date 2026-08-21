@@ -64,12 +64,17 @@ standard is not "good enough" — it's "nothing left to improve".
 
 **What that scope IS is a repo setting, not your judgement.** The orchestrator
 tells you which values are in force (`review_panel.*` in `.harness-rules`; a panel
-report prints them on its **Panel dials** line). Three of them define this pass:
+report prints them on its **Panel dials** line). Four of them define this pass:
 
 - **`fix_severity_floor`** (default `P3`) — the severity at or above which a
   finding gets fixed. Below it a finding is reported and recorded and **not** fixed
   by this pass. A panel report puts those under their own heading, *Reported, not
   this round's work*, marked 🔽; do not lift them into your list.
+- **`low_severity_fix_lines`** (default `40`) — the churned lines the WHOLE pass may
+  spend on findings below `round_trigger_floor` (`P2` by default, so this is the P3
+  band). A panel report marks those 💸. Step 3 has how to spend it; what matters here
+  is that it is a budget for the round and not a cap per fix, because the failure it
+  answers was 408 lines of individually reasonable small fixes on a 185-line PR.
 - **`reviewer_scope`** (default `diff`) — whether the change under review is the
   target or the starting point. Under `diff`, findings are about the change and the
   seams where it meets what was already there.
@@ -188,7 +193,8 @@ errors, skip silently.
 
 Rank findings P1 (blocks merge) · P2 (important) · P3 (should fix) · P4 (polish).
 The rank is not decoration and not just a column: **`review_panel.fix_severity_floor`
-decides which of them this pass fixes.** At or above the floor they get fixed. Below
+decides which of them this pass fixes, and `low_severity_fix_lines` decides how much
+of the low tier it can afford.** At or above the floor they get fixed. Below
 it they are reported in step 6 with `Deferred` against them and left alone — that
 is the setting's judgement, already made, and re-making it by fixing them anyway is
 the growth it exists to stop. At `P4` it is all of them, which is the pre-#165
@@ -201,6 +207,35 @@ P3; `P4` means all of them). Write the missing tests (edge + error paths) — do
 note them. Update the stale docs. Propagate renames/patterns to
 sibling code. After fixing, re-read the full diff of your fixes and fix any new
 issues they introduce.
+
+**The low-severity band is on a budget, and you spend it by COUNTING.** Findings
+below `round_trigger_floor` — the ones a panel report marks 💸 — share
+`low_severity_fix_lines` churned lines for the whole round (40 by default). Findings
+at or above the cut are not on the budget and none of this touches them.
+
+Spend it like this, and do not improvise around it:
+
+1. Do the unbudgeted findings first and commit them. The budget pays for the budgeted
+   fixes alone, so they need a clean tree to be measured against.
+2. **Measure before you spend.** You cannot know what a fix costs until you have made
+   it, so find out rather than guessing: make each budgeted fix on its own, run `git
+   diff --numstat` for it, write down insertions + deletions, and put it back
+   (`git stash` it, or `git restore` the file — and mind the warning just below about
+   discarding your own uncommitted work). You now have a counted cost for each one.
+3. **Spend cheapest first, and stop when it runs out.** Re-apply them in ascending
+   order of that cost, subtracting each from the budget as you go. Stop at the first
+   one that does not fit — in ascending order, nothing after it fits either. If the
+   whole list fits, the whole list gets fixed and the budget never binds.
+4. Everything the budget did not reach goes into step 6 exactly as a below-floor
+   finding does: reported, recorded `deferred` against the issue you open for the
+   batch, and **not** fixed. It is not dropped and it is not yours to sneak in.
+
+**Count, never estimate, and never ask yourself whether a fix "risks ballooning".**
+That question is a judgement, and it is the judgement the measurement indicts:
+across seven PRs 63.7% of new findings were created by the fix pass immediately
+before them, and on PR #268's round 2 it was 85%. The budget is the answer to that
+question and it has already been given. Your job here is arithmetic — a numstat and
+a running total — not a forecast about your own work.
 
 **Commit before you break something on purpose.** Proving a new test bites — by
 mutating the code it guards and watching it go red — is worth doing and is the
