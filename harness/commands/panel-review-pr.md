@@ -878,7 +878,7 @@ for a verdict you dislike.
 
 ### Merging, once the user has said yes
 
-Claim the branch, re-verify, stamp the release, merge. In that order:
+Claim the base, re-verify, stamp the release, merge. In that order:
 
 ```bash
 qb-claim branch <base> --note "landing PR #<pr>" --json            # exit 1 = held
