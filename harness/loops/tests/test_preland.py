@@ -312,6 +312,47 @@ def test_an_unearned_stop_with_no_recorded_vetoes_still_says_so(board):
     assert preland.check_review("o/r", pr()).warnings
 
 
+def test_an_unearned_stop_HOLDS_when_the_caller_asks_for_the_strict_reading(board):
+    """#100. `/panel-review-pr` §7 ran the round itself and is about to offer to
+    land on the strength of it, so an unearned stop there is not background noise
+    about somebody else's box — it is this cycle saying nobody read the whole
+    diff. The vetoes still get reported; what changes is the verdict."""
+    board["reviews"] = ([review_row(stop_confident=False,
+                                    stop_veto=["codex read half the diff"])], "")
+    c = preland.check_review("o/r", pr(), earned_stop=True)
+    assert c.status == "failed"
+    assert c.reasons == ["the stop was not earned: codex read half the diff"]
+    assert not c.warnings, "the strict mode moves the veto, it must not print it twice"
+
+
+def test_the_strict_reading_changes_nothing_about_a_stop_that_WAS_earned(board):
+    """The flag is not a second bar on a clean round. A round that stopped
+    confidently is READY under both readings, or the flag would be a way of
+    refusing every PR rather than the ones whose review did not finish."""
+    board["reviews"] = ([review_row()], "")
+    c = preland.check_review("o/r", pr(), earned_stop=True)
+    assert c.status == "passed" and not c.reasons and not c.warnings
+
+
+def test_a_stop_the_board_never_recorded_a_verdict_for_is_not_an_unearned_one(board):
+    """`stop_confident` is nullable, and null is a question nobody answered rather
+    than a stop that failed. It must not become a HOLD here — `/panel-review-pr`
+    §7 catches that case against its own round payload, which is the only place
+    that can tell the two apart."""
+    board["reviews"] = ([review_row(stop_confident=None)], "")
+    assert preland.check_review("o/r", pr(), earned_stop=True).status == "passed"
+
+
+@pytest.mark.parametrize("strict", (False, True))
+def test_the_payload_says_which_reading_ran(board, strict):
+    """A READY has to say whether the strict clause was even asked. Without it a
+    caller cannot tell a stop that was earned from one nobody put the question
+    to, and the audit trail is the whole reason `checks` is in the payload."""
+    board["reviews"] = ([review_row()], "")
+    c = preland.check_review("o/r", pr(), earned_stop=strict)
+    assert c.detail["require_earned_stop"] is strict
+
+
 def test_unadjudicated_findings_warn(board):
     board["reviews"] = ([review_row(unjudged=3, judge_skip="judge crashed")], "")
     c = preland.check_review("o/r", pr())
@@ -890,6 +931,23 @@ def test_a_held_pr_exits_two(wired, capsys):
     assert preland.main(["--pr", "7", "--json"]) == 2
     out = json.loads(capsys.readouterr().out)
     assert out["verdict"] == "HOLD" and out["reasons"]
+
+
+def test_an_unearned_stop_is_a_ready_by_default_and_a_hold_under_the_flag(wired, capsys):
+    """#100, end to end: the flag has to reach the check, not just exist on the
+    parser. The same round, the same board, two verdicts — and the default one is
+    unchanged, because `/fix-and-land` on a two-seat headless box still has to be
+    able to reach green."""
+    wired["reviews"] = ([review_row(stop_confident=False,
+                                    stop_veto=["the round cap ran out"])], "")
+    assert preland.main(["--pr", "7", "--json"]) == 0
+    lax = json.loads(capsys.readouterr().out)
+    assert lax["verdict"] == "READY" and lax["warnings"]
+
+    assert preland.main(["--pr", "7", "--json", "--require-earned-stop"]) == 2
+    strict = json.loads(capsys.readouterr().out)
+    assert strict["verdict"] == "HOLD"
+    assert any("the stop was not earned" in r for r in strict["reasons"])
 
 
 def test_the_report_names_every_check_that_ran(wired, capsys):

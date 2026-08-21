@@ -300,3 +300,191 @@ def test_a_path_under_a_declared_directory_is_allowed():
     # But only genuinely beneath it — component-wise, not by string prefix.
     with pytest.raises(AssertionError, match="not covered by READS"):
         _at("harness/commands-old/epic.md")
+
+
+# ------------------------------------- the last step of a review: the verdict, and who may offer
+#
+# #100. `/panel-review-pr` spends several rounds computing whether a PR is in a landable state and
+# used to end with "merge if the user asks" — everything the rounds established, discarded at the
+# last step. The offer is now gated on a verdict; these pin the gate, and pin that the offer stays
+# where it was earned.
+
+
+def _section(text: str, heading: str) -> str:
+    """One `## `/`### ` section of a brief, up to the next heading of that level or above.
+
+    Section-scoped rather than file-wide because the words this file asserts on ("offer",
+    "READY") appear all over `panel-review-pr.md`, and a substring search across 700 lines would
+    go green on a sentence in §5 while §7 said the opposite."""
+    match = re.search(rf"^(#+) {re.escape(heading)}", text, re.MULTILINE)
+    assert match, f"no section headed {heading!r} — it was renamed, or this assertion is stale"
+    depth = len(match.group(1))
+    rest = text[match.end():]
+    end = re.search(rf"^#{{1,{depth}}} ", rest, re.MULTILINE)
+    return rest[:end.start()] if end else rest
+
+
+def _panel_review_verdict_step() -> str:
+    """§7, whatever it is called — matched on what it does, not on a title that may be reworded."""
+    heads = re.findall(r"^## (7\..*)$", command("panel-review-pr"), re.MULTILINE)
+    assert len(heads) == 1, f"panel-review-pr.md has {len(heads)} step 7 headings, expected one"
+    return _section(command("panel-review-pr"), heads[0])
+
+
+def test_the_review_ends_by_running_the_gate_rather_than_on_request():
+    """The inversion #100 asked for. A gate the user has to know to ask for is a gate that did not
+    reach them: preland HELD PR #299 twice on findings nobody had been told about, both times only
+    because somebody thought to run it by hand."""
+    step = _panel_review_verdict_step()
+    assert "preland.py" in step, "the last step no longer runs the pre-land gate at all"
+    assert re.search(r"--json", step), (
+        "the gate is run without `--json`, so its verdict reaches the step as a report to "
+        "paraphrase rather than a payload to act on")
+    assert not re.search(r"^## 7\. Merging \(only if the user asks\)", command("panel-review-pr"),
+                         re.MULTILINE), (
+        "step 7 has gone back to running only on request, which is the whole of #100")
+
+
+@pytest.mark.parametrize("verdict", ("READY", "RECONCILE", "HOLD"))
+def test_the_last_step_rules_on_every_verdict_the_gate_can_return(verdict: str):
+    """Three exits, three answers. A verdict with no branch written for it is a model improvising
+    one, which is what the gate exists to stop."""
+    step = _panel_review_verdict_step()
+    assert re.search(rf"^### {verdict}\b", step, re.MULTILINE), (
+        f"step 7 has no `### {verdict}` branch, so what the skill does with that verdict is "
+        f"whatever the model decides on the day")
+
+
+def test_the_offer_to_land_is_gated_on_ready():
+    """READY offers; HOLD refuses to, in those words. The drift to guard is not a deleted
+    sentence but a softened one — "shall I merge anyway" after a HOLD is one edit away, and it
+    hands the user the merge they think they are getting rather than the one on screen."""
+    step = _panel_review_verdict_step()
+    ready = _section(step, "READY — offer, and say what the offer rests on")
+    hold = _section(step, "HOLD — do not offer")
+    assert "offer" in ready.lower(), "the READY branch no longer offers to land"
+    assert re.search(r"do not offer|no offer", hold, re.IGNORECASE), (
+        "the HOLD branch does not forbid the offer, so the verdict gates nothing")
+    assert re.search(r"verbatim", hold), (
+        "a HOLD that does not relay preland's `reasons` verbatim is a HOLD reported as a mood")
+
+
+def test_reconcile_does_the_mechanical_work_and_re_runs_the_gate_before_offering():
+    """The RECONCILE path is the one that must not shortcut into an offer. It may take the
+    mechanical commits — that is what makes it worth having — but the verdict it offers on has to
+    be the one computed AFTER them, because the push that carried them restarted CI."""
+    reconcile = _section(_panel_review_verdict_step(),
+                         "RECONCILE — do the mechanical work, re-verify, then offer")
+    assert "actions" in reconcile, "the RECONCILE branch no longer reads preland's `actions`"
+    assert re.search(r"run the gate again|re-?run", reconcile, re.IGNORECASE), (
+        "RECONCILE does the work and then offers on the stale verdict that asked for it")
+    # And the re-verification has to be one that can actually come back READY. preland's `review`
+    # check compares the round's `head_sha` against the PR's head, so the push that carried the
+    # mechanical commits has just invalidated the round — a gate re-run alone HOLDs forever, and
+    # a branch of the skill that can never reach its own offer is worse than not having it.
+    assert "head_sha" in reconcile and re.search(r"--round|another round|re-anchor", reconcile), (
+        "RECONCILE pushes a commit and then re-runs the gate with nothing re-reading the new "
+        "head, so preland HOLDs on `head_sha` and this path can never reach the offer it "
+        "promises")
+
+
+def test_the_release_entry_is_built_before_it_is_numbered_and_only_after_a_yes():
+    """#168, the mechanical step most reviews need: two of the last three releases landed
+    unstamped and needed repair PRs (#289, #291). preland has no check for it and never returns
+    RECONCILE for it, so this step asks or nobody does.
+
+    Three orderings, and each one is a way of getting it wrong. `preflight` before the offer,
+    because `apply` resolves the placeholder against the base as it stands NOW and a number taken
+    while the user is deciding can be taken from under them — `/fix-and-review` stops at
+    `preflight` for that exact reason. `assemble` before `apply`, or `apply` sees a branch with no
+    placeholder, returns 0, and the fragments land unassembled with the release silently
+    unnumbered. And `apply` before the merge, or the release ships without its number."""
+    step = _panel_review_verdict_step()
+    runnable = _fenced(step)
+    assert runnable.strip(), "no code blocks were read out of step 7 — the fence pattern is wrong"
+    preflight = runnable.find("release_stamp.py preflight")
+    assemble = runnable.find("changelog_fragments.py assemble")
+    apply_ = runnable.find("release_stamp.py apply")
+    merge = runnable.find("gh pr merge")
+    assert preflight >= 0, (
+        "step 7 never asks whether the release could be stamped, so the offer is made without the "
+        "one fact #168 is about")
+    assert assemble >= 0, (
+        "step 7 never assembles changelog fragments, so a branch that wrote one lands with its "
+        "release entry still sitting in changelog.d/")
+    assert apply_ >= 0, "the release-number step is gone — this is #168 in the loop that ships it"
+    assert preflight < apply_, (
+        "the branch is stamped before the user has agreed to land it, so a number taken here can "
+        "be taken by another branch while they decide and the repair is a hand-edit")
+    assert assemble < apply_, (
+        "`release_stamp.py apply` runs before `changelog_fragments.py assemble`, so it stamps a "
+        "tree whose release entry has not been written yet and reports success having done "
+        "nothing")
+    assert apply_ < merge, "the PR is merged before the release is numbered"
+
+
+def test_the_stamp_commit_is_bounded_because_nothing_re_verifies_after_it():
+    """The consequence of stamping last, stated rather than left for the reader. That push moves
+    the head past the round §5 reviewed, so a gate re-run after it HOLDs on `head_sha` — correctly,
+    and about a commit two tools wrote. The verification is therefore the run above it, and what
+    makes that safe is a bound on what the commit may contain. Without the bound this step is
+    "push something unreviewed and merge"."""
+    merging = _section(_panel_review_verdict_step(), "Merging, once the user has said yes")
+    assert "head_sha" in merging, (
+        "the merge sequence does not say that the stamp commit moves the head past the reviewed "
+        "round, so a reader re-runs the gate, gets a HOLD, and has no way to tell whether it is "
+        "about the PR or about the commit they just made")
+    assert re.search(r"git diff --stat", merging), (
+        "nothing bounds what the stamp commit may contain, and it is pushed after the last "
+        "verification of the cycle")
+
+
+def test_an_unearned_stop_blocks_the_offer_even_when_the_gate_would_otherwise_pass():
+    """The third #100 input, and the one that is easy to leave as prose. `confident: false` means
+    a reviewer read a prefix, or never ran, or the cap ran out — already computed, already
+    reported to a human, and until now not wired to anything. Both halves are asserted: the flag
+    that makes preland's own verdict strict, and the cross-check against the round payload this
+    step already holds, because `stop_confident` is nullable and a board that never took the round
+    leaves it null rather than false."""
+    step = _panel_review_verdict_step()
+    assert "--require-earned-stop" in _fenced(step), (
+        "step 7 runs preland without `--require-earned-stop`, so an unearned stop is a warning "
+        "nobody on this path reads and the offer goes out on a round that nobody finished")
+    assert re.search(r"round_stop\.confident|`confident`", step), (
+        "step 7 never looks at the round's own `confident`, so a round the board recorded with a "
+        "null `stop_confident` reaches the offer as though the stop had been earned")
+
+
+def test_the_merge_is_claimed_and_re_verified_before_it_is_taken():
+    """#99: two agents accepting the same offer at the same moment. The claim is advisory and
+    that is the point — it is the only thing between them, and it has to be taken BEFORE the
+    merge rather than recorded after it. Asserted over the runnable blocks: a paragraph about
+    claiming is not a claim."""
+    runnable = _fenced(_panel_review_verdict_step())
+    claim = runnable.find("qb-claim")
+    merge = runnable.find("gh pr merge")
+    assert merge >= 0, "step 7 never actually merges in a runnable block"
+    assert claim >= 0, (
+        "the merge is taken without a `qb-claim` on the branch, so two agents accepting the offer "
+        "at once both merge — which is what happened on the day the claim was written")
+    assert claim < merge, "the claim is taken after the merge, which serialises nothing"
+    assert re.search(r"--merge\b", runnable) and not re.search(r"--squash", runnable), (
+        "step 7 must preserve the commits: the fix commits and the rounds that reviewed them are "
+        "the record of the cycle, and a squash throws away the correspondence")
+
+
+def test_bare_panel_reports_land_readiness_and_never_offers_to_merge():
+    """`/panel` is review-only by design and gets pointed at other people's PRs, in repos the
+    caller may not own. Reporting `gates: READY / blocked by X` is useful; an offer to merge one
+    of those is a footgun whether or not it is accepted. It also has to name the command that HAS
+    earned the offer, or the reader is left to guess where the step went."""
+    text = command("panel")
+    assert re.search(r"preland\.py", text), (
+        "panel.md no longer says how to report land-readiness, which is the half of #100 that is "
+        "in scope for it")
+    assert re.search(r"never (?:\w+ ){0,4}offers? to (?:merge|land)|never offer", text,
+                     re.IGNORECASE), (
+        "panel.md does not forbid the offer to merge — and 'it never merges' is not the same "
+        "prohibition, because proposing the merge is the footgun in a repo the caller does not own")
+    assert "/panel-review-pr" in text, (
+        "panel.md refuses the offer without naming the command that may make it")
