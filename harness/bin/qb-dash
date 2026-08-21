@@ -4,6 +4,7 @@
 #   qb-dash              the plain renderer, redrawing in place
 #   qb-dash --tui        the clickable one (what `qb` and `qb-dash-tui` run)
 #   qb-dash --once       one frame and exit
+#   qb-dash --scope all --tui    --tui is recognised wherever it appears
 #
 # A LAUNCHER, NOT THE DASHBOARD. The dashboard is Python and needs rich (and
 # textual, for the clickable one), which a plain python3 does not have — so a
@@ -39,8 +40,24 @@ BIN_DIR="$(self_dir "$0")" || {
   exit 1
 }
 
+# --tui ANYWHERE, not only first. It used to be `case "${1:-}"`, which was fine
+# while the plain renderer owned every flag — but both renderers take `--scope`
+# and `--repo` now, so `qb-dash --scope all --tui` is a thing a person will type,
+# and it silently ran the PLAIN renderer and then died on argparse's "unrecognized
+# arguments: --tui". Removed from the list rather than passed through, because the
+# choice of renderer is this script's to make and neither Python program knows the
+# flag. Everything after a `--` is left alone: it belongs to the target.
 MODE=plain
-case "${1:-}" in --tui) MODE=tui; shift ;; esac
+ARGS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --tui) MODE=tui ;;
+    --) ARGS+=("$@"); break ;;
+    *) ARGS+=("$1") ;;
+  esac
+  shift
+done
+set -- ${ARGS+"${ARGS[@]}"}
 case "$PROG" in *-tui) MODE=tui ;; esac
 [ "$MODE" = tui ] && TARGET="$BIN_DIR/qb-dash-tui.py" || TARGET="$BIN_DIR/qb-dash.py"
 

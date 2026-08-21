@@ -352,6 +352,321 @@ def test_an_ordinary_claim_key_is_still_shortened():
     assert qd.claim_label(f"{qd.REPO}#142", []) == "quarterback#142"
 
 
+# ---- the scope: which project's rows a dashboard is about (#261) -------------
+#
+# Two decisions, and they have to agree: which rows are kept, and whether the
+# repo cell is worth eleven columns of a 78-column pane. Tested together for that
+# reason — a column dropped from rows that were not narrowed shows nothing, and
+# rows narrowed with the column still there is the waste the scope exists to end.
+
+ONE = qd.Scope([qd.REPO])
+TWO = qd.Scope([qd.REPO, "prisonblues/nix-fleet"])
+
+
+def test_one_repo_spends_no_column_saying_which_one():
+    assert ONE.column is False
+    assert ONE.label() == "quarterback"
+
+
+def test_two_watched_repos_keep_the_cell_that_tells_them_apart():
+    assert TWO.column is True
+
+
+def test_the_wide_view_always_names_the_repo_because_that_is_why_it_is_wide():
+    wide = ONE.toggled()
+    assert wide.on is False
+    assert wide.column is True
+    assert wide.label() == "all repos"
+    assert wide.keeps("someone/else") is True
+
+
+def test_toggling_goes_both_ways_which_is_why_it_is_not_called_widened():
+    """`widened()` narrowed on every other press — the name promised one direction
+    and the method delivered two, which is the whole of the rename."""
+    assert ONE.toggled().on is False
+    assert ONE.toggled().toggled().on is True
+    assert ONE.toggled().repos == ONE.repos
+
+
+def test_two_owners_of_one_name_are_two_repositories():
+    """A fork and its upstream share a bare name and are not the same repo.
+
+    Folded to the bare name they collapsed into a single entry, and both of the
+    things that read `len(names) == 1` then went wrong at once: the column dropped
+    (nothing left to tell the two apart) and `keeps` accepted both repos' rows.
+    """
+    fork = qd.Scope(["myuser/quarterback"])
+    assert fork.keeps("myuser/quarterback")
+    assert not fork.keeps("prisonblues/quarterback")
+    # A row that gives only a bare name can only be compared as one, and is kept.
+    assert fork.keeps("quarterback")
+
+    both = qd.Scope(["myuser/quarterback", "prisonblues/quarterback"])
+    assert both.column is True, "no cell left to tell a fork from its upstream"
+    assert both.label() == "myuser/quarterback, prisonblues/quarterback"
+    # CLAIMED has no repo column for the scope to restore, so the OWNER is what
+    # tells two claims apart — dropping it here would put the ambiguity back one
+    # panel further on.
+    assert qd.claim_label("myuser/quarterback#3", [], both) == "myuser/quarterback#3"
+    assert qd.claim_label("prisonblues/quarterback#3", [], both) \
+        == "prisonblues/quarterback#3"
+
+
+def test_one_repository_named_twice_is_still_one_repository():
+    """`QB_DASH_REPOS=quarterback,prisonblues/quarterback` is one project.
+
+    `keeps` has always read it that way; counting the two spellings separately put
+    the eleven-column cell back on a single-project pane, which is the waste the
+    scope removes.
+    """
+    twice = qd.Scope(["quarterback", f"{qd.REPO}"])
+    assert twice.column is False
+    assert twice.label() == "quarterback"
+    assert qd.claim_label(f"{qd.REPO}#209", [], twice) == "#209"
+
+
+def test_an_unattributable_row_is_marked_where_the_column_is_gone():
+    """The repo cell was the only thing that said "nothing could name this".
+
+    `keeps` deliberately holds on to such a row, and narrow mode is exactly the
+    mode that drops the cell — so without a mark an agent working outside any
+    checkout reads as one working here.
+    """
+    assert qd.scope_mark(ONE, None) == "? "
+    assert qd.scope_mark(ONE, "") == "? "
+    assert qd.scope_mark(ONE, "quarterback") == ""
+    # The wide view has the repo itself, which says more than a mark can.
+    assert qd.scope_mark(ONE.toggled(), None) == ""
+    assert qd.scope_mark(TWO, None) == ""
+    assert qd.scope_mark(None, None) == ""
+
+
+def test_the_three_spellings_of_one_repository_are_one_repository():
+    """A lease reports the checkout's directory; the plan and `gh` report a slug.
+
+    Comparing the spellings would put a seat's own FLEET row outside its own
+    scope — the board says `quarterback`, the plan says `prisonblues/quarterback`,
+    and neither is wrong.
+    """
+    assert ONE.keeps("quarterback")
+    assert ONE.keeps("prisonblues/quarterback")
+    assert ONE.keeps("Quarterback")
+    assert not ONE.keeps("prisonblues/nix-fleet")
+
+
+def test_a_row_the_board_cannot_attribute_stays_on_the_pane():
+    """No repo is not evidence of ANOTHER repo.
+
+    An agent working outside a checkout reports no repo, and hiding it would drop
+    a live peer on the strength of a missing field. The narrow view is a way to
+    read the fleet, not a claim to have accounted for all of it.
+    """
+    assert ONE.keeps(None)
+    assert ONE.keeps("")
+
+
+def test_a_narrowed_panel_can_say_how_many_rows_it_hid():
+    """The count is the whole reason in_scope returns two things.
+
+    A panel that filtered silently is a panel lying about the fleet: "nothing
+    claimed" and "nothing claimed here" are different facts.
+    """
+    rows = [{"repo": "quarterback"}, {"repo": "prisonblues/nix-fleet"},
+            {"repo": None}, {"repo": "someone/other"}]
+    kept, hidden = qd.in_scope(rows, ONE)
+    assert [r["repo"] for r in kept] == ["quarterback", None]
+    assert hidden == 2
+
+
+def test_no_scope_at_all_hides_nothing():
+    rows = [{"repo": "a/one"}, {"repo": "b/two"}]
+    assert qd.in_scope(rows, None) == (rows, 0)
+
+
+def test_a_claim_names_its_repo_in_its_key_or_not_at_all():
+    """The three key shapes in use, of which two carry a repo."""
+    assert qd.claim_repo("prisonblues/quarterback#209") == "prisonblues/quarterback"
+    assert qd.claim_repo("prisonblues/quarterback:2.40") == "prisonblues/quarterback"
+    assert qd.claim_repo("merge-queue") is None
+    assert qd.claim_repo("") is None
+    assert qd.claim_repo(None) is None
+
+
+def test_a_plan_claim_gets_its_repo_from_the_plan_or_stays_unattributed():
+    """`plan:<uuid>` names an ITEM, not a repo, so the plan is what resolves it.
+
+    Unattributed when the plan has not been fetched — and that keeps the claim on
+    the pane, which is right: hiding it would drop the one row saying somebody
+    already holds the work you were about to pick up.
+    """
+    plan = [item("roof", repo="65lowther")]
+    plan[0]["item_id"] = "ea9e1623"
+    assert qd.claim_repo("plan:ea9e1623", plan) == "65lowther"
+    assert qd.claim_repo("plan:ea9e1623", []) is None
+    assert qd.claim_repo("plan:ea9e1623") is None
+
+
+def test_the_claim_key_drops_the_repo_only_when_the_header_states_it():
+    """`quarterback#209` is twelve columns to say `#209` — on a pane showing one
+    project. On a pane showing several, the repo is what tells two claims apart."""
+    assert qd.claim_label(f"{qd.REPO}#209", [], ONE) == "#209"
+    assert qd.claim_label(f"{qd.REPO}:2.40", [], ONE) == "2.40"
+    assert qd.claim_label(f"{qd.REPO}#209", [], ONE.toggled()) == "quarterback#209"
+    assert qd.claim_label(f"{qd.REPO}#209", [], TWO) == "quarterback#209"
+    assert qd.claim_label("prisonblues/nix-fleet#3", [], ONE) == "nix-fleet#3"
+    assert qd.claim_label(f"{qd.REPO}#209", []) == "quarterback#209"
+
+
+def test_the_scope_opens_narrow_and_the_env_is_how_a_pane_opens_wide(monkeypatch):
+    """Narrow by default, because that is what a screen is FOR."""
+    monkeypatch.delenv(qd.SCOPE_ENV, raising=False)
+    assert qd.resolve_scope([qd.REPO]).on is True
+    monkeypatch.setenv(qd.SCOPE_ENV, "all")
+    assert qd.resolve_scope([qd.REPO]).on is False
+    monkeypatch.setenv(qd.SCOPE_ENV, "ALL")
+    assert qd.resolve_scope([qd.REPO]).on is False
+    # Anything unrecognised is the default rather than an error: a typo in a
+    # tmux env should cost a wide pane, not a dashboard that will not start.
+    monkeypatch.setenv(qd.SCOPE_ENV, "quarterback")
+    assert qd.resolve_scope([qd.REPO]).on is True
+
+
+# ---- pointing a dashboard at a project --------------------------------------
+
+@pytest.fixture
+def watched():
+    """Restore the process-wide repo cache, whatever a test does to it."""
+    before = qd._repos
+    yield
+    qd._repos = before
+
+
+def test_repo_reaches_what_reads_resolve_repos_for_itself(watched):
+    """--repo has to land in the CACHE, not be passed around.
+
+    The plan's ordering, the `gh` calls and the ⚒ that needs a slug to start work
+    all reach resolve_repos() directly. Threading a list through the callers that
+    do take one would leave whichever was missed silently watching the cwd, which
+    is #176 again.
+    """
+    qd.set_repos(["prisonblues/nix-fleet", " ", "me/app"])
+    assert qd.resolve_repos() == ["prisonblues/nix-fleet", "me/app"]
+
+
+def test_clearing_the_pin_falls_back_to_the_environment(watched, monkeypatch):
+    qd.set_repos([])
+    monkeypatch.setenv("QB_DASH_REPOS", "me/app")
+    assert qd.resolve_repos() == ["me/app"]
+
+
+def test_a_checkout_is_asked_which_repo_it_is():
+    slug = qd.repo_arg(str(Path(__file__).resolve().parent.parent.parent))
+    assert slug.count("/") == 1 and slug.endswith("/quarterback")
+
+
+def test_a_checkout_is_returned_absolute_because_tmux_resolves_it_elsewhere():
+    """The path is handed to tmux as a `-c` start directory, and tmux resolves a
+    relative one against the SERVER's cwd — where it was started, not where the
+    dashboard is. `self.repo` was `os.getcwd()` and absolute by construction; a
+    relative `--repo` would have launched work somewhere else entirely, while the
+    guard beside it resolved the same path correctly in-process and hid it."""
+    root = Path(__file__).resolve().parent.parent.parent
+    for spelling in (".", "./"):
+        slug, path = qd.repo_target(spelling if spelling == "." else str(root) + "/")
+        assert os.path.isabs(path), f"{spelling} came back relative: {path}"
+    slug, path = qd.repo_target("harness/../")
+    assert os.path.isabs(path) and slug.endswith("/quarterback")
+
+
+def test_a_bare_name_that_is_a_directory_is_that_directory(tmp_path, monkeypatch):
+    """`--repo nix-fleet` beside a checkout of that name is not a guess about an
+    owner, and it worked before the shape rule arrived."""
+    # Asserted on the PATH, not on the slug: this suite runs in a worktree as
+    # readily as in the main checkout, and a worktree's directory name is not its
+    # repository's name — which is the whole reason a directory is asked for its
+    # origin rather than read as one.
+    root = Path(__file__).resolve().parent.parent.parent
+    monkeypatch.chdir(root.parent)
+    slug, path = qd.repo_target(root.name)
+    assert path == str(root)
+    assert slug.count("/") == 1 and " " not in slug
+
+
+def test_a_checkout_argument_says_where_work_should_run_too():
+    """`--repo <checkout>` moves the ⚒'s cwd, not only the rows the panels draw.
+
+    A SLUG cannot: it names a repository this process may have no checkout of, so
+    the second half of the answer is None and the guards refuse those rows out loud
+    rather than launching `/fix-issue` on a number that means something else here.
+    """
+    here = str(Path(__file__).resolve().parent.parent.parent)
+    slug, path = qd.repo_target(here)
+    assert slug.endswith("/quarterback") and path == here
+    assert qd.repo_target("prisonblues/nix-fleet") == ("prisonblues/nix-fleet", None)
+
+
+def test_a_slug_is_read_as_a_slug_wherever_it_is_typed(tmp_path, monkeypatch):
+    """Shape first, the filesystem second.
+
+    Under a `~/src/<owner>/<repo>` layout, `--repo prisonblues/quarterback` matched
+    `os.path.isdir` on a directory that is not itself a checkout and died as "not a
+    git checkout" — and it made the bare-name test below pass only because no
+    `./quarterback` happened to exist wherever pytest ran.
+    """
+    (tmp_path / "prisonblues" / "quarterback").mkdir(parents=True)
+    monkeypatch.chdir(tmp_path)
+    assert qd.repo_target("prisonblues/quarterback") == ("prisonblues/quarterback", None)
+    # ...and the relative path is still reachable, with the ./ that says so.
+    with pytest.raises(ValueError):
+        qd.repo_target("./prisonblues/quarterback")
+
+
+def test_a_tilde_is_expanded_because_the_help_text_advertises_one(monkeypatch):
+    """Only an interactive shell expands `~`. Quoted, built into a QB_SEATS_DASH
+    command or sent through `tmux send-keys`, it arrives intact — and was reported
+    as a bad slug, which misdiagnoses it."""
+    monkeypatch.setenv("HOME", str(Path(__file__).resolve().parent.parent.parent))
+    slug, path = qd.repo_target("~")
+    assert slug.endswith("/quarterback") and path == os.path.expanduser("~")
+
+
+def test_a_malformed_slug_is_refused_rather_than_handed_to_gh():
+    """It used to validate on the STRIPPED parts and return the RAW value, so a
+    slug's internal space reached `gh` inside a repository name.
+
+    Padding is trimmed, since that is what a repo list does with it everywhere else
+    (`set_repos`); a character no repository name may contain is refused, because
+    the alternative is `gh` being asked about `na@me` and answering about nothing.
+    """
+    assert qd.repo_target("owner/ repo") == ("owner/repo", None)
+    for bad in ("owner/name with space", "owner/na@me", "owner/repo/extra"):
+        # THE MESSAGE, not just the raise: a malformed slug used to fall through to
+        # the checkout branch, spend a `git -C` subprocess on it and come back "not
+        # a git checkout with an origin remote", which diagnoses the wrong thing.
+        with pytest.raises(ValueError, match="not an owner/name slug"):
+            qd.repo_target(bad)
+    # `owner/..` is a path, not a repository whose name happens to be dots.
+    with pytest.raises(ValueError):
+        qd.repo_target("owner/..")
+    # A trailing slash is stripped before anything looks at the shape, so this is
+    # the bare name `owner` and gets the bare name's message.
+    with pytest.raises(ValueError, match="needs its owner"):
+        qd.repo_target("owner/")
+
+
+def test_a_bare_name_is_refused_rather_than_given_an_owner():
+    """`gh` needs an owner, and the fleet works in repos whose owner is not ours.
+
+    Inventing one aims the PR panel — and the ⚒ that starts work off it — at
+    somebody else's repository of the same name.
+    """
+    with pytest.raises(ValueError):
+        qd.repo_arg("quarterback")
+    with pytest.raises(ValueError):
+        qd.repo_arg("/nowhere/at/all/really")
+    assert qd.repo_arg("prisonblues/nix-fleet") == "prisonblues/nix-fleet"
+
+
 def test_a_branch_key_is_not_mistaken_for_a_board_object():
     """A merge key has a colon in it too, and the half in front of it is a repo:
     looking that up in the plan would be looking up `prisonblues/quarterback`."""
