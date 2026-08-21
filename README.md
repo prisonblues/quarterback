@@ -906,7 +906,7 @@ full — including what was broken before it, which is the part no diff recovers
   on another screen and an issue held from another checkout are both still facts about this one.
   `--repo <checkout|owner/name>` points a pane at another project — a checkout also moves where
   the ⚒ and ⚖ launch, and both now refuse a row from a repo this checkout is not.
-- **vNEXT** — an item can be wrong and fresh at the same time. `plan_read` computes one
+- **v2.63** — an item can be wrong and fresh at the same time. `plan_read` computes one
   answer, `next`, and nothing checked it against reality: on 2026-08-20 ranks 2 and 4 pointed
   at PRs merged ninety minutes earlier and `next` returned rank 2, with `idle_days: 0.0,
   stale: false` beside it — staleness measures time-since-touched, not agreement-with-reality.

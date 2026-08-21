@@ -11,7 +11,7 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
-## vNEXT — an item can be wrong and fresh at the same time
+## v2.63 — an item can be wrong and fresh at the same time
 
 `plan_read` computes one answer, `next`, and every agent that starts cold acts on it.
 Nothing checked it against reality.
