@@ -881,7 +881,7 @@ for a verdict you dislike.
 Claim the branch, re-verify, stamp the release, merge. In that order:
 
 ```bash
-qb-claim branch <branch> --note "landing PR #<pr>" --json          # exit 1 = held
+qb-claim branch <base> --note "landing PR #<pr>" --json            # exit 1 = held
 python3 ~/.claude/loops/preland.py --pr <pr> --require-earned-stop --json \
     --claim-holder "<the holder from that answer>"                 # must be READY
 python3 scripts/changelog_fragments.py assemble
@@ -892,11 +892,19 @@ git commit -m "chore(release): stamp vNEXT" && git push
 gh pr merge <pr> --merge --delete-branch
 ```
 
-- **`qb-claim` exit 1** means another agent is already landing this branch. Stop
-  and say who holds it; two agents accepting the same offer at the same moment is
-  what the claim exists to prevent, and it is the only thing between them. Exit 2
-  is "cannot tell" — a board outage, a rotated token — and whether to land without
-  the serialisation is the user's call, so ask rather than deciding for them.
+- **The branch claimed is `<base>`, not `<branch>`** — the branch being landed
+  ONTO. #318: two agents landing two *different* PRs into `main` hold
+  `<repo>:feat/a` and `<repo>:feat/b` under a head key, never see each other, and
+  both merge, which is the incident the claim was written for. The base is what a
+  simultaneous merge collides on, and it is what `preland.py`'s `merge_claim`
+  check reads, so `--claim-holder` below only excludes your own claim if the two
+  name the same key.
+- **`qb-claim` exit 1** means another agent is already landing onto this base.
+  Stop and say who holds it; two agents accepting the same offer at the same
+  moment is what the claim exists to prevent, and it is the only thing between
+  them. Exit 2 is "cannot tell" — a board outage, a rotated token — and whether to
+  land without the serialisation is the user's call, so ask rather than deciding
+  for them.
 - **Re-run the gate after claiming**, because time passed between the offer and
   the yes: CI can have gone red and the head can have moved. `--claim-holder`
   takes the `holder` field out of `qb-claim --json`, so your own claim is not read
@@ -922,6 +930,12 @@ gh pr merge <pr> --merge --delete-branch
   nothing else — which is also why the commit stages those paths by name rather
   than with `-a`. If anything else moved, that is not a mechanical commit: stop,
   say so, and put it back through §4.
+- **If the PR was in the merge queue, stand its entry down once the merge lands**:
+  `merge_queue_leave(pr=<pr>, base="<base>", reason="merged")`. This command does not enqueue —
+  `/fix-and-land` does — so there is usually nothing to leave, and the call is a no-op that says
+  `left: false` rather than an error. But a PR this session merged on somebody else's behalf
+  leaves every PR behind it in the line correctly waiting for a land that already happened, and
+  any agent may retire any entry precisely so that whoever notices can fix it.
 - **`--merge`, never `--squash`.** Preserve the commits: the fix commits and the
   rounds that reviewed them are the record of this cycle, and a squash throws away
   the correspondence between them.

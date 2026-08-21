@@ -57,10 +57,18 @@ import uuid
 #: distinction instead, where the index can see it.
 WORK = "work"
 
-#: A branch being landed. Not folded into :data:`WORK` — landing a branch and
-#: doing the issue behind it are two resources, held at different times by
-#: possibly different agents, and ``preland.check_merge_claim`` reads this kind by
-#: name.
+#: A branch being landed ONTO. Not folded into :data:`WORK` — landing and doing
+#: the issue behind it are two resources, held at different times by possibly
+#: different agents, and ``preland.check_merge_claim`` reads this kind by name.
+#:
+#: **Which branch a lander names is the BASE, and #318 settled it.** ``derive``
+#: keys any branch and cannot tell a head from a base, so the answer lives here
+#: and in ``preland.check_merge_claim`` rather than in the validation. Two agents
+#: landing two different PRs into ``main`` are the collision worth serialising;
+#: keyed on their heads they hold two different keys, never see each other, and
+#: both merge — which is the incident ``check_merge_claim``'s docstring cites.
+#: :func:`app.api.merge_queue.merge_key` derives the queue's key the same way
+#: from the same base, so the claim and the line cannot name one land two ways.
 MERGE = "merge"
 
 #: Kinds a caller may spell that mean "a unit of work". Folded onto :data:`WORK`.
@@ -73,7 +81,7 @@ WORK_KINDS = frozenset({WORK, "issue", "item", "task", "plan", "epic"})
 #: cannot share a key — see :data:`PR_SIGIL`.
 PR_KINDS = frozenset({"pr", "pull", "review"})
 
-#: Kinds a caller may spell that mean "landing this branch".
+#: Kinds a caller may spell that mean "landing onto this branch".
 MERGE_KINDS = frozenset({MERGE, "branch", "land"})
 
 #: What separates the repo from the number for a PR. ``#`` is the issue's, and it
@@ -276,11 +284,19 @@ def derive(ref_kind: str, *, repo: str | None = None, value: object = None) -> t
     ('work', 'prisonblues/quarterback!207')
     >>> derive("branch", repo="prisonblues/quarterback", value="feat/issue-172")
     ('merge', 'prisonblues/quarterback:feat/issue-172')
+    >>> derive("branch", repo="prisonblues/quarterback", value="main")
+    ('merge', 'prisonblues/quarterback:main')
 
     An issue keeps the shape agents already take by hand and the dashboards
     already parse (``owner/name#n``) — deriving it is about who computes it, not
     about renaming it. Everything that reads a key today keeps working; what
     changes is that there is now exactly one way to produce one.
+
+    A branch is keyed whatever branch it is, and both examples above are valid
+    keys. **Which one a LANDER claims is the base** — see :data:`MERGE` and #318.
+    That is a caller's decision, not a validation one: nothing in a ref name says
+    whether it is somebody's head or somebody's trunk, so a check here would be a
+    guess dressed as a rule.
     """
     kind = (ref_kind or "").strip().lower()
     if kind == "issue":
