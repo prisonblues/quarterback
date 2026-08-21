@@ -625,3 +625,59 @@ async def test_an_entry_retired_between_the_write_and_the_read_is_reported_not_c
     assert out["active_order"] == []
     assert out["you"]["queued"] is False
     assert out["you"]["may_merge"] is False
+
+
+# ------------------------------------ what a second codex pass found (round 2)
+
+
+async def test_a_ready_verdict_with_no_commit_pinned_to_it_is_refused(client):
+    """The shape `ck_merge_queue_ready_at_head` exists to refuse was the one it
+    let through.
+
+    Written `ready_sha = head_sha`, a row with `verdict='ready'` and a NULL
+    `ready_sha` evaluates FALSE OR NULL, which is NULL — and a CHECK passes on
+    anything that is not FALSE. So a ready verdict pinned to no commit at all
+    was storable: a readiness that can never be shown to have expired, which is
+    strictly worse than one pinned to the wrong commit.
+    """
+    async with async_session() as s:
+        s.add(MergeQueueEntry(
+            repo="acme/nullready", base=BASE, pr=1, head_sha=SHA_A,
+            ready_sha=None, verdict="ready", holder="laptop",
+            ttl_seconds=60, expires_at=datetime.now(UTC) + timedelta(seconds=60)))
+        with pytest.raises(IntegrityError) as caught:
+            await s.commit()
+        await s.rollback()
+    assert "ck_merge_queue_ready_at_head" in str(caught.value)
+
+
+async def test_an_overtaken_enqueue_does_not_put_a_stale_ready_verdict_back(client):
+    """Two enqueues for one PR can be in flight at once — an agent that pushed
+    and re-registered while its previous poll was still on the wire.
+
+    Last-writer-wins would let the older one land second and restore `ready` at a
+    commit the PR has moved off, which is exactly the stale green light this
+    feature exists to remove. The write is guarded on `updated_at <= now`, so the
+    older request loses at the database and is handed the newer state instead of
+    overwriting it."""
+    import app.api.merge_queue as mq
+
+    repo = "acme/overtaken"
+    # The newer request: the PR has pushed and is honestly no longer ready.
+    await join(client, 2601, SHA_A, repo=repo, verdict="ready")
+    await join(client, 2601, SHA_B, repo=repo, verdict="queued")
+
+    real_now = mq._utcnow
+    # The older one, arriving late: it still believes SHA_A and still says ready.
+    mq._utcnow = lambda: real_now() - timedelta(minutes=5)
+    try:
+        late = await join(client, 2601, SHA_A, repo=repo, verdict="ready")
+    finally:
+        mq._utcnow = real_now
+
+    assert late["entry"]["head"] == SHA_B
+    assert late["entry"]["verdict"] == "queued"
+    assert late["entry"]["ready_sha"] is None
+    assert late["you"]["may_merge"] is False
+    # And the row really is untouched, not merely reported that way.
+    assert (await read(client, repo=repo))["head"]["head"] == SHA_B

@@ -161,8 +161,14 @@ class MergeQueueEntry(Base):
         # remembers "preland said READY" and does not reliably notice that the
         # thing preland said it about was three pushes ago — so it is enforced by
         # the database rather than by every write path remembering to.
-        CheckConstraint(f"verdict <> '{PROCEEDS}' OR ready_sha = head_sha",
-                        name="ck_merge_queue_ready_at_head"),
+        # `IS NOT DISTINCT FROM`, not `=`. With `=`, the row this constraint
+        # exists to refuse — ready, with no commit pinned to it — evaluates
+        # FALSE OR NULL, which is NULL, and a CHECK passes on anything that is
+        # not FALSE. The two-valued comparison is what makes it bite, and
+        # `head_sha` being NOT NULL is what makes it exact.
+        CheckConstraint(
+            f"verdict <> '{PROCEEDS}' OR ready_sha IS NOT DISTINCT FROM head_sha",
+            name="ck_merge_queue_ready_at_head"),
         # Idempotency, as a database fact. A second enqueue for a PR already in
         # the line updates that row; it cannot create a second place in the queue
         # for one PR, however many agents or retries ask.

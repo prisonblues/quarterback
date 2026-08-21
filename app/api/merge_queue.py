@@ -547,16 +547,20 @@ async def _join(session: AsyncSession, repo: str, base: str, pr: int,
     * The INSERT loses to ``ix_merge_queue_open`` when somebody enqueued this PR
       in the gap after the SELECT. Their row is the real one, so the next pass
       renews it — this endpoint's whole contract is that calling it twice is safe.
-    * The UPDATE is conditional on ``left_at IS NULL`` and loses when a concurrent
-      ``leave`` or sweep retired the row in that same gap. Read-then-write would
-      have stamped a fresh expiry onto a departed entry, which is worse than
-      failing: it resurrects nothing (the row has left) while reporting success,
+    * The UPDATE is conditional and can lose two ways. ``left_at IS NULL`` loses
+      when a concurrent ``leave`` or sweep retired the row in that same gap —
+      read-then-write would have stamped a fresh expiry onto a departed entry,
+      which is worse than failing: it resurrects nothing while reporting success,
       and the response then cannot find its own entry in the live queue.
+      ``updated_at <= now`` loses to a *newer* enqueue that overtook this one,
+      and there the newer row is simply the answer: returning it is truthful,
+      where overwriting it would put a stale ``ready`` verdict back onto a commit
+      the PR has moved off.
 
-    So each loss is the other branch's precondition and two passes is exactly
-    enough. A third would mean the two are racing each other, which they cannot:
-    one PR is driven by one agent, and the only contention here is that agent's
-    own retry.
+    So each loss names the next step, and two passes is exactly enough. A third
+    would mean two writers are trading the row back and forth, which they should
+    not be: one PR is driven by one agent, and the only contention expected here
+    is that agent's own overlapping polls.
     """
     for _ in range(2):
         existing = await session.scalar(
@@ -581,18 +585,44 @@ async def _join(session: AsyncSession, repo: str, base: str, pr: int,
                 continue
             await session.refresh(entry)
             return entry
+        existing_id = existing.id
         done = await session.execute(
             update(MergeQueueEntry)
-            .where(MergeQueueEntry.id == existing.id,
-                   MergeQueueEntry.left_at.is_(None))
+            .where(MergeQueueEntry.id == existing_id,
+                   MergeQueueEntry.left_at.is_(None),
+                   # Monotonic. Two enqueues for one PR can be in flight at once
+                   # — an agent that pushed and re-registered while its previous
+                   # poll was still on the wire — and last-writer-wins would let
+                   # the older one land second and put a `ready` verdict back on
+                   # a commit the PR has moved off. That is precisely the stale
+                   # green light this whole feature exists to remove, so the
+                   # older request loses at the database rather than by arriving
+                   # first. All requests are stamped by one server clock, so
+                   # there is no skew to compare across.
+                   MergeQueueEntry.updated_at <= now)
             .values(**values)
             .returning(MergeQueueEntry.id)
         )
         if done.scalar_one_or_none() is None:
             await session.rollback()
+            # Which guard refused it? The answers are different, so the test is
+            # the guard's own predicate rather than "is the row still there" —
+            # otherwise a row that merely lost a lap to contention would be
+            # reported as somebody else's newer state.
+            current = await session.get(MergeQueueEntry, existing_id)
+            if (current is not None and current.left_at is None
+                    and current.updated_at > now):
+                # A NEWER enqueue won. Its answer is the true one: return it
+                # rather than clobbering it, and rather than refusing a caller
+                # whose PR is correctly registered — by somebody holding fresher
+                # information about it, which is usually itself.
+                return current
+            # Retired in the gap, or simply contended. Either way the next pass
+            # re-reads and decides again: if it left, coming back is a new
+            # arrival, which is honest.
             continue
         await session.commit()
-        fresh = await session.get(MergeQueueEntry, existing.id)
+        fresh = await session.get(MergeQueueEntry, existing_id)
         if fresh is not None:
             return fresh
     raise HTTPException(409, detail={

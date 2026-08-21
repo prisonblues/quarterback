@@ -39,15 +39,20 @@ agents would believe they were next.
 
 ## `ck_merge_queue_ready_at_head`
 
-`verdict <> 'ready' OR ready_sha = head_sha`. A row claiming to be ready must be
-ready *at the commit it is on*, enforced by the database rather than by every
-write path remembering to. This is the single guarantee the table adds over an
-agent's own memory: an agent remembers "preland said READY" and does not reliably
-notice that the thing preland said it about was three pushes ago. A row cannot
-forget which commit it was talking about.
+`verdict <> 'ready' OR ready_sha IS NOT DISTINCT FROM head_sha`. A row claiming
+to be ready must be ready *at the commit it is on*, enforced by the database
+rather than by every write path remembering to. This is the single guarantee the
+table adds over an agent's own memory: an agent remembers "preland said READY"
+and does not reliably notice that the thing preland said it about was three
+pushes ago. A row cannot forget which commit it was talking about.
 
-Note the `<>` rather than `NOT IN`: `verdict` is NOT NULL, so there is no
-three-valued arm to fall through.
+**`IS NOT DISTINCT FROM` rather than `=`, and the difference is the whole
+constraint.** Written `ready_sha = head_sha`, the row `verdict='ready',
+ready_sha=NULL` evaluates FALSE OR NULL, which is NULL — and a CHECK passes on
+anything that is not FALSE. So the exact shape the constraint exists to refuse,
+a ready verdict with no commit pinned to it, was the one shape it let through.
+`IS NOT DISTINCT FROM` is two-valued, and `head_sha` is NOT NULL, so a NULL
+`ready_sha` is FALSE and the row is refused.
 
 Chained after 0025 because a single head is what
 `test_the_repos_own_migration_chain_is_single_headed` asserts, and
@@ -93,8 +98,9 @@ def upgrade() -> None:
         sa.CheckConstraint("length(btrim(head_sha)) > 0", name="ck_merge_queue_head_sha"),
         sa.CheckConstraint("verdict IN ('ready', 'reconcile', 'queued')",
                            name="ck_merge_queue_verdict"),
-        sa.CheckConstraint("verdict <> 'ready' OR ready_sha = head_sha",
-                           name="ck_merge_queue_ready_at_head"),
+        sa.CheckConstraint(
+            "verdict <> 'ready' OR ready_sha IS NOT DISTINCT FROM head_sha",
+            name="ck_merge_queue_ready_at_head"),
     )
     op.create_index("ix_merge_queue_open", "merge_queue_entries",
                     ["repo", "base", "pr"], unique=True,
