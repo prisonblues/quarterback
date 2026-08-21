@@ -858,7 +858,7 @@ full — including what was broken before it, which is the part no diff recovers
   followed — but shipped text that already existed is **not** exempt, since a test can assert
   on it, as this change did to its own prompt and briefs. The panel's `REVIEW_PROMPT` also stops asking only whether a test is **absent** —
   #90's fixture answered that correctly — and now asks whether a present test is load-bearing.
-- **vNEXT** — a dashboard for one project. Every dash panel was fleet-wide while every screen
+- **v2.62** — a dashboard for one project. Every dash panel was fleet-wide while every screen
   is built for one repo, so most rows were somebody else's and the repo cell was the same word,
   eleven columns wide, on every line of a 78-column pane — and on the printed panels another
   repo's plan items pushed this one's into the "…and N more" line. FLEET, CLAIMED and PLANS now

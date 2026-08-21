@@ -11,7 +11,7 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
-## vNEXT — a dashboard for one project
+## v2.62 — a dashboard for one project
 
 The dash was built to answer "who is alive, what do they hold, what is next" for a
 fleet, and then screens turned out to be built for **one project** each. So every
