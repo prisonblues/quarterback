@@ -858,7 +858,7 @@ full — including what was broken before it, which is the part no diff recovers
   followed — but shipped text that already existed is **not** exempt, since a test can assert
   on it, as this change did to its own prompt and briefs. The panel's `REVIEW_PROMPT` also stops asking only whether a test is **absent** —
   #90's fixture answered that correctly — and now asks whether a present test is load-bearing.
-- **vNEXT** — the suites that read this repo get a sandbox that holds it. Five suites under
+- **v2.61** — the suites that read this repo get a sandbox that holds it. Five suites under
   `harness/` read files at the repo root while running in nix sandboxes that did not hold them,
   so their assertions were never evaluated — they errored on missing files, in checks no
   workflow runs. `prose-consistency-tests` is one check for that whole category rather than a
