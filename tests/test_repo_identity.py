@@ -1,10 +1,10 @@
 """One repo has one spelling, because nobody spells it.
 
-#148 was not a naming problem and the fix is not a name parser. The allocator's
-key was caller-supplied text, and an agent asked "which repo is this" answers
-with whichever spelling it has to hand: `quarterback` from the directory it
-stands in, `prisonblues/quarterback` from the remote. Both true, not equal. One
-repo, two counters, 2.36 issued twice.
+#148 was not a naming problem and the fix is not a name parser. The key was
+caller-supplied text, and an agent asked "which repo is this" answers with
+whichever spelling it has to hand: `quarterback` from the directory it stands in,
+`prisonblues/quarterback` from the remote. Both true, not equal. One repo, two
+counters, 2.36 issued twice.
 
 The rejected repair was to accept every spelling and reconcile them — PR #152,
 closed. That input domain is open (bare names, `.git` suffixes, URLs, scp
@@ -13,7 +13,7 @@ one the previous fix overshooting. An alias set that can be incomplete will be.
 
 So the domain is closed instead, in two halves that have to stay in step:
 
-* the MCP release tools do not take a repo. They read `owner/name` from
+* the MCP tools do not take a repo. They read `owner/name` from
   `remote.origin.url` — which `sync_status` and `report_git` were already doing,
   six lines away in the same server.
 * the endpoints accept `owner/name` and refuse everything else with a 422, so a
@@ -21,6 +21,14 @@ So the domain is closed instead, in two halves that have to stay in step:
 
 Both halves are pinned here. The second without the first is a rule agents keep
 tripping over; the first without the second is a convention.
+
+**Where this rule LIVES moved in #172, and the tests moved with it.** The
+allocator that first needed it is deleted; the shape rule outlived it, because a
+repo name is now half of every derived claim key (`app.claimkey`). So the same
+adversarial spellings are asserted against the surfaces that key on a repo today:
+claiming a resource by ref, asking what you hold in a repo, and adding a plan item.
+That is not a weaker test — it is the same rule on strictly more paths, and the
+one it used to guard no longer exists to be guarded.
 """
 
 from __future__ import annotations
@@ -29,6 +37,8 @@ import ast
 from pathlib import Path
 
 import pytest
+
+from app.claimkey import BadRef, canonical, canonical_repo, derive
 
 from .conftest import LAPTOP
 
@@ -49,78 +59,93 @@ NOT_A_REPO = [
 ]
 
 
-async def claim_release(client, repo: str, **over):
-    return await client.post("/release/claim",
-                             json={"repo": repo, "note": "t", **over}, headers=LAPTOP)
+@pytest.mark.parametrize("repo", NOT_A_REPO)
+def test_only_owner_slash_name_is_a_repo(repo):
+    with pytest.raises(BadRef):
+        canonical_repo(repo)
 
 
 @pytest.mark.parametrize("repo", NOT_A_REPO)
-async def test_only_owner_slash_name_can_allocate(client, repo):
-    r = await claim_release(client, repo)
+async def test_a_claim_by_ref_refuses_every_other_spelling(client, repo):
+    """The write path. A `ref` the board cannot key is a 422, not a guess — the
+    whole of #148's fix, now guarding the key rather than the version number."""
+    r = await client.post("/claim", json={
+        "ref": {"kind": "issue", "repo": repo, "value": "172"}, "note": "t"},
+        headers=LAPTOP)
+    assert r.status_code == 422, f"{repo!r} was accepted: {r.text}"
+
+
+@pytest.mark.parametrize("repo", NOT_A_REPO)
+async def test_the_held_check_refuses_them_too(client, repo):
+    """The read path matters as much as the write path: asking about one spelling
+    and being answered about a different repo is how a caller concludes it holds
+    something it does not — and this is the read a pickup gate makes."""
+    r = await client.get("/claim/held", params={"repo": repo}, headers=LAPTOP)
+    assert r.status_code == 422, f"{repo!r} was accepted: {r.text}"
+
+
+@pytest.mark.parametrize("repo", NOT_A_REPO)
+async def test_the_plan_refuses_them_as_a_scope(client, repo):
+    """`_norm_scope` used to lower-case and accept anything. That made `Acme/Repo`
+    and `acme/repo` agree while leaving `quarterback` and `prisonblues/quarterback`
+    disagreeing — and since #172 the scope is half of the item's claim key, so the
+    two-spellings defect would key one issue two ways."""
+    r = await client.post("/plan/item", json={
+        "title": "t", "repo": repo, "ref_kind": "issue", "ref_value": "9001"},
+        headers=LAPTOP)
     assert r.status_code == 422, f"{repo!r} was accepted: {r.text}"
 
 
 async def test_the_canonical_spelling_still_works(client):
-    r = await claim_release(client, "acme/widget")
+    r = await client.post("/claim", json={
+        "ref": {"kind": "issue", "repo": "acme/widget", "value": "7"}, "note": "t"},
+        headers=LAPTOP)
     assert r.status_code == 200, r.text
-    assert r.json()["version"]
+    assert r.json()["key"] == "acme/widget#7"
 
 
 async def test_the_refusal_says_what_shape_is_wanted(client):
     """A 422 that only says "invalid" leaves the caller guessing, and guessing at
     a repo name is the bug. It also has to say the caller should not be typing
     this at all, or the next agent carefully supplies a better-spelled string."""
-    r = await claim_release(client, "quarterback")
+    r = await client.post("/claim", json={
+        "ref": {"kind": "issue", "repo": "quarterback", "value": "1"}}, headers=LAPTOP)
     body = r.text
     assert "owner/name" in body
     assert "origin remote" in body
 
 
-async def test_reading_releases_refuses_the_same_shapes(client):
-    """The read path matters as much as the write path: asking for one spelling
-    and being shown a different repo's numbers is how a caller concludes a number
-    is free."""
-    assert (await client.get("/releases", params={"repo": "quarterback"},
-                             headers=LAPTOP)).status_code == 422
-    assert (await client.get("/releases", params={"repo": "acme/widget"},
-                             headers=LAPTOP)).status_code == 200
-
-
-async def test_reclaim_refuses_it_too(client):
-    """The renumber path is where both real collisions actually happened."""
-    r = await client.post("/release/reclaim",
-                          json={"repo": "quarterback",
-                                "claim_id": "00000000-0000-0000-0000-000000000000"},
-                          headers=LAPTOP)
-    assert r.status_code == 422
-
-
-async def test_case_is_folded_rather_than_treated_as_a_second_repo(client):
+def test_case_is_folded_rather_than_treated_as_a_second_repo():
     """GitHub is case-insensitive and case-preserving, so `Acme/Widget` and
     `acme/widget` are one repository that can be cloned with either remote — #148
     again, in a spelling the shape rule alone lets through. Refusing the
     capitalised form would strand a repo genuinely named `acme/MyProject`, so it
     folds. This is the only normalisation here and it is safe for the reason the
     parser was not: `lower()` is total, so it has no next case to miss."""
-    first = await claim_release(client, "acme/casefold")
-    assert first.status_code == 200, first.text
-    second = await claim_release(client, "Acme/CaseFold")
-    assert second.status_code == 200, second.text
-    assert first.json()["key"].startswith("acme/casefold:")
-    assert second.json()["key"].startswith("acme/casefold:")
-    assert second.json()["version"] != first.json()["version"], (
-        "the capitalised spelling allocated from its own floor — two namespaces"
-    )
+    assert derive("issue", repo="Acme/CaseFold", value="12") == \
+        derive("issue", repo="acme/casefold", value="12")
 
 
-async def test_two_spellings_of_one_repo_can_no_longer_both_allocate(client):
-    """#148, as a test. Before this, these two calls were two namespaces and each
-    handed out its own 2.36 — the second caller being told it had the number, and
-    being wrong. Now only one of them is a repo at all."""
-    first = await claim_release(client, "prisonblues/quarterback")
+async def test_two_spellings_of_one_repo_can_no_longer_both_claim(client):
+    """#148, as a test. Before this, these two calls were two namespaces — the
+    second caller being told it had the resource, and being wrong. Now only one of
+    them is a repo at all."""
+    first = await client.post("/claim", json={
+        "ref": {"kind": "issue", "repo": "prisonblues/quarterback", "value": "148"}},
+        headers=LAPTOP)
     assert first.status_code == 200, first.text
-    second = await claim_release(client, "quarterback")
+    second = await client.post("/claim", json={
+        "ref": {"kind": "issue", "repo": "quarterback", "value": "148"}}, headers=LAPTOP)
     assert second.status_code == 422, "the bare spelling opened a second namespace"
+
+
+def test_an_unparseable_key_is_left_alone_rather_than_reshaped():
+    """The counterweight, and the reason #152 was closed: canonicalisation that
+    guesses at an open domain is the mistake. A real claim on this board reads
+    `prisonblues/lexray:serving-row:32022R2554` — a database row, not a branch —
+    and nothing here understands it well enough to rewrite it."""
+    assert canonical("work", "prisonblues/lexray:serving-row:32022R2554") == \
+        ("work", "prisonblues/lexray:serving-row:32022R2554")
 
 
 # ------------------------------------------------- the half that lives in mcp/
@@ -136,8 +161,26 @@ def _args(mod: ast.Module, name: str) -> list[str]:
     return [a.arg for a in fn.args.args] + [a.arg for a in fn.args.kwonlyargs]
 
 
+def _names(mod: ast.Module) -> set[str]:
+    return {n.name for n in ast.walk(mod) if isinstance(n, ast.FunctionDef)}
+
+
 @pytest.mark.parametrize("tool", ["claim_release_number", "reclaim_release_number", "releases"])
-def test_no_release_tool_asks_for_a_repo(mcp_source, tool):
+def test_the_release_tools_are_gone(mcp_source, tool):
+    """#172 deleted the allocator. `release_stamp.py` takes `max+1` at land from
+    the ref being merged into and shipped nine releases in a day with no
+    collision, while the allocator's own rows went stale for every PR still open.
+    A tool that still offers to allocate a number is a second answer to a question
+    that has one — which is the defect the whole issue is about."""
+    assert tool not in _names(mcp_source), (
+        f"{tool} is back. The board no longer allocates versions: release_stamp.py "
+        "reads max+1 off the ref at land, and a claimed-but-stale number is worse "
+        "than none."
+    )
+
+
+@pytest.mark.parametrize("tool", ["claim", "claims", "claim_held"])
+def test_no_claim_tool_asks_for_a_repo_STRING(mcp_source, tool):
     """The endpoint rule alone would just move the guessing one layer out: an
     agent that must supply `owner/name` still has to decide what this repo is
     called, and it has two true answers. The tools take a PATH and read the
@@ -145,8 +188,8 @@ def test_no_release_tool_asks_for_a_repo(mcp_source, tool):
     args = _args(mcp_source, tool)
     assert "repo" not in args, (
         f"{tool} takes a repo string again. That parameter is #148: two agents "
-        "answer it with the two spellings they each have, and the allocator "
-        "believes both. Take repo_path and call repo_slug()."
+        "answer it with the two spellings they each have, and the board believes "
+        "both. Take repo_path and call repo_slug()."
     )
     assert "repo_path" in args, f"{tool} should take repo_path"
 

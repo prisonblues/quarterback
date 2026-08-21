@@ -15,6 +15,7 @@ import ssl
 import subprocess
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
@@ -664,23 +665,55 @@ def _ssl_context():
 
 
 class BoardClient:
-    """The two GETs this dashboard makes. stdlib only, on purpose."""
+    """The handful of calls the harness makes. stdlib only, on purpose."""
 
     def __init__(self, cfg: BoardConfig) -> None:
         self.cfg = cfg
 
-    def get(self, path: str) -> dict:
-        req = urllib.request.Request(f"{self.cfg.base_url}{path}")
+    def _request(self, req: urllib.request.Request) -> dict:
         if self.cfg.token:
             req.add_header("Authorization", f"Bearer {self.cfg.token}")
         with urllib.request.urlopen(req, timeout=30, context=_ssl_context()) as resp:
             return json.loads(resp.read().decode())
+
+    def get(self, path: str, params: dict | None = None) -> dict:
+        query = urllib.parse.urlencode(
+            {k: v for k, v in (params or {}).items() if v is not None})
+        url = f"{self.cfg.base_url}{path}" + (f"?{query}" if query else "")
+        return self._request(urllib.request.Request(url))
+
+    def post(self, path: str, body: dict) -> dict:
+        req = urllib.request.Request(
+            f"{self.cfg.base_url}{path}",
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST")
+        return self._request(req)
 
     def active(self) -> dict:
         return self.get("/active")
 
     def claims(self) -> dict:
         return self.get("/claims")
+
+    def claim_held(self, repo: str, session: str | None = None) -> dict:
+        """Does this agent hold a live claim in `repo` — the board's own answer.
+
+        Read rather than worked out from `claims()`, because the repo a key
+        belongs to is derived from the key and this file has no business
+        re-deriving it: `issue_claims` below already joins on the key shape while
+        the plan filters on the kind, and #172 is the record of those two
+        disagreeing.
+        """
+        return self.get("/claim/held", {"repo": repo, "session": session})
+
+    def claim_ref(self, ref_kind: str, ref_value: str, repo: str | None = None,
+                  **over) -> dict:
+        """Take a claim by naming the RESOURCE. The board derives the key (#172)."""
+        ref: dict = {"kind": ref_kind, "value": str(ref_value)}
+        if repo is not None:
+            ref["repo"] = repo
+        return self.post("/claim", {"ref": ref, **over})
 
 
 def board_client():
@@ -718,7 +751,13 @@ def _gh_list(kind: str, repo: str, fields: str) -> tuple[list[dict], str | None]
             capture_output=True, text=True, timeout=45,
         )
         if raw.returncode != 0:
-            return [], f"{short_repo(repo)}: {clip(raw.stderr, 50)}" or f"gh exit {raw.returncode}"
+            # The fallback has to be INSIDE the interpolation. Outside it, `or`
+            # tests the whole f-string, which holds `": "` and so is never falsy —
+            # the exit code was unreachable and a `gh` that failed silently
+            # rendered as a repo name followed by nothing, which is the one error
+            # line a reader cannot act on.
+            why = clip(raw.stderr, 50) or f"gh exit {raw.returncode}"
+            return [], f"{short_repo(repo)}: {why}"
         rows = json.loads(raw.stdout)
         for row in rows:
             row["repo"] = repo
@@ -771,15 +810,25 @@ def issue_claims(claims: list[dict], repo: str = REPO) -> dict[int, dict]:
     return held
 
 
+def repo_ref(row: dict) -> str:
+    """'prisonblues/quarterback#176' — a numbered row's identity, across repos.
+
+    The number alone is not one. Once a panel shows more than one repo two rows
+    both called #12 are two different things, and anything that keys on the bare
+    number silently conflates them — a claim join marking ours held because
+    theirs is, or a DataTable handed the same row key twice (#209).
+    """
+    return f"{row.get('repo') or REPO}#{row.get('number')}"
+
+
 def issue_key(row: dict) -> str:
     """'prisonblues/quarterback#176' — how the board namespaces a claim.
 
-    The identity of an issue is the repo AND the number. Once the panels show
-    more than one repo, a bare number stops being unique: two repos both have a
-    #12, and marking ours held because theirs is would send the next seat past
-    the one issue it should have taken.
+    The same identity :func:`repo_ref` builds, under the name the board's claim
+    keys use, so a reader following a claim is not sent to a function about
+    table rows.
     """
-    return f"{row.get('repo') or REPO}#{row.get('number')}"
+    return repo_ref(row)
 
 
 def claims_by_issue(claims: list[dict]) -> dict[str, dict]:
@@ -851,10 +900,41 @@ def fetch_plan(client) -> tuple[list[dict], str | None]:
     return data.get("items") or [], None
 
 
+def plan_holder(item: dict) -> dict | None:
+    """The claim standing over this item — its own, or the plan's. None if free.
+
+    **The one place "is anybody on this?" is decided, because it was decided four
+    ways.** A plan claim is coarse and deliberate: an agent that claimed a whole
+    plan said "all of this is mine", so `GET /plan` reports the item's
+    `covered_by` and `next` skips it (#172). Every presentation function here read
+    `claim` alone, so the panel and the TUI drew the cyan ○ "free to take" on the
+    items of somebody else's held plan, sorted them into the free band, counted
+    them as neither running nor blocked, and showed an idle age where the holder
+    goes — advertising as free the exact work the plan claim exists to reserve.
+    The truth was in the detail line, which a reader has to ask for.
+
+    `covered_by` is already somebody ELSE's: the board resolves "mine" before it
+    answers, and your own plan claim covers nothing from you — that is what lets
+    the holder work through its own list item by item. Note that
+    :func:`fetch_plan` sends no session, so on a multi-agent box the board answers
+    by machine and a co-tenant's hold reads as nobody's. That is the documented
+    coarse fallback and not this function's to fix; it means the dashboard
+    understates coverage there, never overstates it.
+    """
+    return item.get("claim") or item.get("covered_by") or None
+
+
 def plan_state(item: dict) -> tuple[str, str]:
-    """(glyph, colour) for a plan row: running, blocked, or free to take."""
+    """(glyph, colour) for a plan row: running, held via its plan, blocked, or free.
+
+    ▷ rather than ▶ for a covered item, because the remedy is different: ▶ is an
+    agent on this line, ▷ is an agent on the whole list this line is in, and what
+    a reader does about it is talk to them rather than take one item out of it.
+    """
     if item.get("claim"):
         return "▶", "green"
+    if item.get("covered_by"):
+        return "▷", "yellow"
     if item.get("blocked_by"):
         return "⊘", "grey50"
     return "○", "cyan"
@@ -906,17 +986,22 @@ def plan_issue(item: dict, repos: list[str] | None = None) -> dict | None:
 
 
 def sort_plan(items: list[dict], repos: list[str] | None = None) -> list[dict]:
-    """Running first, then what is free to take, then what is blocked.
+    """Taken first, then what is free to take, then what is blocked.
 
     Inside each band the board's own order is kept — the plan is an ordered list
     and the order is the point — with the repos this dashboard watches ahead of
     the ones it only overhears. Blocked items sink because they are the one band
     a reader can do nothing about.
+
+    The top band is :func:`plan_holder`, not `claim`: an item inside somebody
+    else's held plan is taken, and sorting it into the free band put it in the run
+    of rows a seat reads to find work nobody has. The free band has one job, and
+    an item that is not free is the list failing at it.
     """
     watched = {short_repo(r) for r in (repos if repos is not None else resolve_repos())}
 
     def band(item: dict) -> int:
-        if item.get("claim"):
+        if plan_holder(item):
             return 0
         return 2 if item.get("blocked_by") else 1
 
@@ -928,9 +1013,16 @@ def sort_plan(items: list[dict], repos: list[str] | None = None) -> list[dict]:
 
 
 def plan_counts(items: list[dict]) -> tuple[int, int]:
-    """(running, blocked) — the two numbers both panel titles report."""
-    running = sum(1 for i in items if i.get("claim"))
-    blocked = sum(1 for i in items if not i.get("claim") and i.get("blocked_by"))
+    """(running, blocked) — the two numbers both panel titles report.
+
+    An item covered by somebody else's plan claim counts as running. The title's
+    question is "how much of this list is already somebody's", and a plan claim
+    makes it somebody's — the glyph is what says whether the agent is on the line
+    or on the whole list. Counted as neither, it read as free work in the only
+    number a reader takes in without looking at the rows.
+    """
+    running = sum(1 for i in items if plan_holder(i))
+    blocked = sum(1 for i in items if not plan_holder(i) and i.get("blocked_by"))
     return running, blocked
 
 
@@ -938,12 +1030,17 @@ def plan_who(item: dict) -> tuple[str, str]:
     """(text, colour) for the right-hand column: who has it, or what it waits on.
 
     Three different facts share one column because only one of them is ever true
-    of a row: a claimed item has a holder, a blocked one has something to wait
-    for, and a free one has only how long it has been sitting there.
+    of a row: a taken item has a holder, a blocked one has something to wait for,
+    and a free one has only how long it has been sitting there.
+
+    "Taken" includes an item inside somebody else's held plan, and the holder is
+    the whole point of showing it: the column read as an idle age — "4d", the
+    strongest possible invitation to pick something up — over work another agent
+    had reserved.
     """
-    claim = item.get("claim")
-    if claim:
-        return (claim.get("holder") or "?").split("/", 1)[-1], "yellow"
+    holder = plan_holder(item)
+    if holder:
+        return (holder.get("holder") or "?").split("/", 1)[-1], "yellow"
     blockers = item.get("blocked_by") or []
     if blockers:
         first = blockers[0].get("ref")
@@ -955,10 +1052,17 @@ def claim_label(key: str, plan: list[dict] | None = None,
                 scope: Scope | None = None) -> str:
     """What a claim is ON, in words a human can read off a pane.
 
-    A claim on a plan item is keyed ``plan:<uuid>``: right for a lock, useless on
-    a screen — 36 hex characters that say only "something on the plan". Given the
-    plan, the item's title goes in instead. Without it the raw key stays, because
-    a key nobody can resolve still beats a blank.
+    A claim on a board object is keyed by uuid — ``item:<id>`` for one line of the
+    plan, ``plan:<id>`` for a whole one: right for a lock, useless on a screen,
+    where 36 hex characters say only "something on the plan". Given the plan, the
+    item's title or the plan's label goes in instead. Without it the raw key
+    stays, because a key nobody can resolve still beats a blank.
+
+    **Both prefixes, because #172 moved them.** An ITEM claim used to be keyed
+    ``plan:<uuid>`` and is now ``item:<uuid>``, while ``plan:`` became the
+    whole-plan claim that release added — so the old test matched a plan id
+    against item ids, which cannot ever be equal, and the CLAIMED pane showed a
+    bare uuid for every claim the new plan takes.
 
     The scope trims the repo off the front for the same reason the panels drop
     their repo column (#261): on a pane showing one project, ``quarterback#209``
@@ -972,11 +1076,32 @@ def claim_label(key: str, plan: list[dict] | None = None,
     panel further on.
     """
     key = key or "?"
-    wanted = key.split(":", 1)[1] if key.startswith("plan:") else None
+    prefix, _, wanted = key.partition(":")
+    if not wanted or prefix not in ("item", "plan"):
+        # `acme/widget:feat/x` is a branch and `acme/widget#5` an issue: both are
+        # already readable, and neither is a uuid to look up — but both wear the
+        # repo the pane may already be scoped to, so they go through the trim.
+        return _scoped_key(key, scope)
     for item in (plan or []):
-        if wanted and item.get("item_id") == wanted:
+        if prefix == "item" and item.get("item_id") == wanted:
             head = " ".join(x for x in ("plan", plan_ref(item)) if x)
             return f"{head} {item.get('title') or '?'}"
+        row = item.get("plan") or {}
+        if prefix == "plan" and row.get("plan_id") == wanted and row.get("label"):
+            # The plan's own claim, over every item under that label. Named as the
+            # plan rather than as one of its items: it is not the first row's
+            # work, it is all of it.
+            return f"plan {row['label']}"
+    return _scoped_key(key, scope)
+
+
+def _scoped_key(key: str, scope: Scope | None) -> str:
+    """A claim key shortened as far as the scope allows, and no further.
+
+    Two watched repos sharing a bare name is the one case where even the owner is
+    load-bearing, so the key comes back whole: ``short_key`` would drop it and put
+    a fork's claim and its upstream's both at ``quarterback#3``.
+    """
     if scope is not None and len(scope.names) != len(scope.keys):
         return key
     return _unprefixed(short_key(key), scope)
@@ -1009,13 +1134,23 @@ def plan_detail(item: dict) -> str:
     """
     bits = [f"{short_repo(item.get('repo') or 'fleet')} {plan_ref(item)}".strip(),
             item.get("title") or "(untitled)"]
-    if item.get("phase"):
-        bits.append(f"[{item['phase']}]")
+    plan = item.get("plan") or {}
+    if plan.get("label"):
+        bits.append(f"[{plan['label']}]")
     claim = item.get("claim")
     if claim:
         held = f"held by {claim.get('holder') or '?'}"
         if claim.get("note"):
             held += f" — {claim['note']}"
+        bits.append(held)
+    covered = item.get("covered_by")
+    if covered and not claim:
+        # A plan-level claim over an item nobody has taken individually. Said
+        # differently from "held", because the remedy is: the whole plan is
+        # somebody's, so talk to them rather than taking one line out of it.
+        held = f"in {plan.get('label') or 'a plan'} held by {covered.get('holder') or '?'}"
+        if covered.get("note"):
+            held += f" — {covered['note']}"
         bits.append(held)
     blockers = item.get("blocked_by") or []
     if blockers:

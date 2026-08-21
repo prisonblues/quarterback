@@ -172,12 +172,33 @@ def item(title: str = "do the thing", repo: str | None = qd.REPO, ref: int | Non
     }
 
 
+def covered(title: str = "a line of a held plan", holder: str = "zeus/two",
+            **extra) -> dict:
+    """An item inside somebody ELSE's held plan — free itself, and not takeable.
+
+    The board decides this: `covered_by` is only ever another agent's plan claim,
+    because your own covers nothing from you (that is what lets a holder work
+    through its own list). So every presentation function has to read it, and #172
+    is what happens when four of them do not.
+    """
+    return item(title, covered_by={"holder": holder, "note": "the whole list"},
+                plan={"label": "stage one"}, **extra)
+
+
 def test_running_items_come_first_and_blocked_ones_last():
     """The panel's whole order: what is happening, what is free, what is stuck."""
     items = [item("free-a"), item("blocked", blocked=[{"ref": "9"}]),
              item("running", holder="zeus/one"), item("free-b")]
     assert [i["title"] for i in qd.sort_plan(items, [qd.REPO])] == [
         "running", "free-a", "free-b", "blocked"]
+
+
+def test_an_item_in_somebody_elses_held_plan_does_not_sort_into_the_free_band():
+    """The free band has one job — the rows a seat can pick up — and an item the
+    plan's holder has reserved is the band failing at it."""
+    items = [item("free"), item("running", holder="zeus/one"), covered("covered")]
+    assert [i["title"] for i in qd.sort_plan(items, [qd.REPO])] == [
+        "running", "covered", "free"]
 
 
 def test_the_boards_own_order_survives_inside_a_band():
@@ -221,10 +242,35 @@ def test_the_state_glyph_says_running_blocked_or_free():
     assert qd.plan_state(item())[0] == "○"
 
 
+def test_a_covered_item_does_not_get_the_free_to_take_glyph():
+    """The reported failure. The cyan ○ is the panel's invitation to pick something
+    up, and it was drawn over every item of somebody else's held plan — the exact
+    duplicated work `covered_by` and the `next` filter exist to prevent, on the
+    panel a seat reads to choose its work."""
+    glyph, colour = qd.plan_state(covered())
+    assert glyph != "○" and colour != "cyan"
+    assert glyph == "▷", "distinct from ▶ too: the holder is on the list, not the line"
+
+
+def test_an_items_own_claim_still_outranks_the_plans_glyph():
+    """A holder on the line is the more specific fact, and the one that says the
+    item itself is not free."""
+    row = covered("held outright")
+    row["claim"] = {"holder": "zeus/one", "note": "on it"}
+    assert qd.plan_state(row)[0] == "▶"
+
+
 def test_the_right_hand_column_holds_whichever_fact_is_true():
     assert qd.plan_who(item(holder="zeus/badger-ember"))[0] == "badger-ember"
     assert qd.plan_who(item(blocked=[{"ref": "9"}]))[0] == "waits #9"
     assert qd.plan_who(item(blocked=[{"ref": None}, {"ref": None}]))[0] == "waits ×2"
+
+
+def test_a_covered_item_shows_its_plans_holder_and_not_an_idle_age():
+    """An age in that column is the strongest invitation on the pane — "nobody has
+    touched this for four days" — and it was printed over work another agent had
+    reserved as a unit. Who to talk to is what a reader needs there."""
+    assert qd.plan_who(covered(holder="zeus/badger-ember"))[0] == "badger-ember"
 
 
 def test_a_blocked_item_is_not_also_counted_as_running():
@@ -233,22 +279,73 @@ def test_a_blocked_item_is_not_also_counted_as_running():
     assert qd.plan_counts(items) == (2, 1)
 
 
+def test_a_covered_item_counts_as_running_rather_than_as_nothing():
+    """The title is the number a reader takes in without reading the rows, and it
+    counted a covered item as neither running nor blocked — which in a panel whose
+    other number is "open" is the same as calling it free."""
+    items = [item("running", holder="zeus/one"), covered("covered"),
+             item("free"), item("blocked", blocked=[{"ref": "9"}])]
+    assert qd.plan_counts(items) == (2, 1)
+
+
+def test_a_covered_item_that_is_also_blocked_is_counted_once():
+    """Both bands would otherwise claim it. Taken is the stronger fact — a blocked
+    item is something a reader can do nothing about; a covered one is somebody to
+    talk to."""
+    assert qd.plan_counts([covered("both", blocked=[{"ref": "9"}])]) == (1, 0)
+
+
 def test_the_detail_line_carries_the_note_the_panel_cannot_fit():
     line = qd.plan_detail(item("short title", ref=8, holder="zeus/one",
-                               phase="phase one", note="because the order matters"))
-    assert "#8" in line and "phase one" in line
+                               plan={"label": "stage one"},
+                               note="because the order matters"))
+    assert "#8" in line and "stage one" in line
     assert "zeus/one" in line and "because the order matters" in line
 
 
-def test_a_plan_claim_shows_the_item_it_holds_and_not_its_uuid():
+def test_an_item_covered_by_somebody_elses_PLAN_claim_says_so():
+    """#172: a plan-level claim over an item nobody has taken individually. Worded
+    differently from "held", because the remedy is different — the whole plan is
+    somebody's, so talk to them rather than lifting one line out of it."""
+    line = qd.plan_detail(item("a line of a held plan", ref=9,
+                               plan={"label": "stage one"},
+                               covered_by={"holder": "zeus/two",
+                                           "note": "working the whole list"}))
+    assert "in stage one held by zeus/two" in line
+    assert "working the whole list" in line
+
+
+def test_an_items_OWN_claim_wins_over_the_plans():
+    """Both would otherwise print, and the item's own holder is the specific fact:
+    a covered item is free to take from its plan's holder, a claimed one is not."""
+    line = qd.plan_detail(item("held outright", ref=10, holder="zeus/one",
+                               plan={"label": "stage one"},
+                               covered_by={"holder": "zeus/two", "note": "the plan"}))
+    assert "held by zeus/one" in line
+    assert "zeus/two" not in line
+
+
+def test_an_item_claim_shows_the_item_it_holds_and_not_its_uuid():
+    """`item:<uuid>` since #172 — it was `plan:<uuid>`, and that spelling now means
+    a claim on the WHOLE plan, so the old lookup compared a plan id against item
+    ids and the CLAIMED pane showed a bare uuid for every claim the plan takes."""
     plan = [item("Give the annex a sloped roof", repo="65lowther", ref=None)]
     plan[0]["item_id"] = "ea9e1623"
-    assert qd.claim_label("plan:ea9e1623", plan) == "plan Give the annex a sloped roof"
+    assert qd.claim_label("item:ea9e1623", plan) == "plan Give the annex a sloped roof"
 
 
-def test_an_unresolvable_plan_key_keeps_the_key():
+def test_a_whole_plan_claim_is_named_as_the_plan_not_as_its_first_item():
+    """It is not the first row's work, it is all of it — and the label is what the
+    holder called the list."""
+    plan = [item("first line", plan={"plan_id": "aa11", "label": "the annex"}),
+            item("second line", plan={"plan_id": "aa11", "label": "the annex"})]
+    assert qd.claim_label("plan:aa11", plan) == "plan the annex"
+
+
+def test_an_unresolvable_board_object_key_keeps_the_key():
     """A key nobody can look up still beats a blank cell."""
-    assert qd.claim_label("plan:ea9e1623", []) == "plan:ea9e1623"
+    assert qd.claim_label("item:ea9e1623", []) == "item:ea9e1623"
+    assert qd.claim_label("plan:aa11", [item("x")]) == "plan:aa11"
 
 
 def test_an_ordinary_claim_key_is_still_shortened():
@@ -570,6 +667,12 @@ def test_a_bare_name_is_refused_rather_than_given_an_owner():
     assert qd.repo_arg("prisonblues/nix-fleet") == "prisonblues/nix-fleet"
 
 
+def test_a_branch_key_is_not_mistaken_for_a_board_object():
+    """A merge key has a colon in it too, and the half in front of it is a repo:
+    looking that up in the plan would be looking up `prisonblues/quarterback`."""
+    assert qd.claim_label(f"{qd.REPO}:feat/x", [item("x")]) == f"{qd.REPO}:feat/x"
+
+
 # ---- the tmux screen ---------------------------------------------------------
 
 def test_no_tmux_means_no_seats_rather_than_an_exception(monkeypatch):
@@ -873,3 +976,39 @@ def _serve(monkeypatch, payload: dict) -> list:
 
     monkeypatch.setattr(qd.urllib.request, "urlopen", urlopen)
     return calls
+
+
+# ---- when `gh` fails ---------------------------------------------------------
+
+def _gh_failing(monkeypatch, stderr: str, code: int = 1) -> None:
+    """Stand in for the `gh <kind> list` every PR and issue row comes from."""
+    class Done:
+        returncode = code
+        stdout = ""
+
+    Done.stderr = stderr
+    monkeypatch.setattr(qd.subprocess, "run", lambda *a, **k: Done())
+
+
+def test_a_failing_gh_reports_the_repo_and_what_it_said(monkeypatch):
+    """One repo of three failing is reported, not fatal — so the line has to name
+    which one, and the panels have no other place to say it."""
+    _gh_failing(monkeypatch, "HTTP 403: Resource not accessible by integration\n")
+    rows, err = qd.fetch_issues(["prisonblues/quarterback"])
+    assert rows == []
+    assert err == "quarterback: HTTP 403: Resource not accessible by integration"
+
+
+def test_a_failing_gh_that_said_nothing_still_names_its_exit_code(monkeypatch):
+    """`quarterback: ` and nothing after it is the one error a reader cannot act on.
+
+    A non-zero exit with an empty stderr is rare and real — killed by a signal, or
+    a failure `gh` wrote to stdout — and the fallback that covers it used to sit
+    outside the f-string, where `or` tested a string holding `": "` and therefore
+    never fired. This pins the fallback rather than the punctuation, which is the
+    part that regressed.
+    """
+    _gh_failing(monkeypatch, "", code=2)
+    rows, err = qd.fetch_issues(["prisonblues/quarterback"])
+    assert rows == []
+    assert err == "quarterback: gh exit 2"

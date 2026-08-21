@@ -365,6 +365,160 @@ def test_unreadable_claims_hold(board):
     assert preland.check_merge_claim("o/r", pr(), "").status == "error"
 
 
+# ------------------------------------- #172: an unclaimed repo is not evidence
+
+
+@pytest.fixture
+def claims_by_query(monkeypatch):
+    """Double `board_get` on the PARAMS, not only the path.
+
+    `check_merge_claim` reads /claims twice now — once for this branch's key, once
+    to find out whether this repo claims anything at all — and the distinction
+    between those two answers is the whole of what the capability warning says.
+
+    The third read is `/plan`, because half the claims #172 introduces are keyed on
+    a board id and say no repo at all: `plan` is what a test puts this repo's plan
+    into, and `plan_asked` records the query, since asking the wrong scope would
+    silence this repo's warning with another repo's list.
+    """
+    keyed: dict[str, object] = {"scoped": [], "fleet": [], "plan": None,
+                                "plan_asked": []}
+
+    def get(path, params):
+        if path.strip("/") == "plan":
+            keyed["plan_asked"].append(dict(params))
+            return keyed["plan"], ("" if keyed["plan"] is not None
+                                   else "board unreachable")
+        assert path.strip("/") == "claims"
+        which = "scoped" if params.get("key") else "fleet"
+        return {"claims": keyed[which]}, ""
+
+    monkeypatch.setattr(preland, "board_get", get)
+    return keyed
+
+
+def test_an_unclaimed_branch_in_an_unclaimed_REPO_says_it_proves_nothing(claims_by_query):
+    """The module's own rule — "a merge gate that fails open wherever it cannot see
+    is not a gate" — applied to the claims table. A `passed` that means "the table
+    is empty" reads identically to one that means "nobody is landing this", and the
+    first is the state #172 was filed about: `claims()` empty fleet-wide while
+    thirteen agents worked three shared checkouts."""
+    c = preland.check_merge_claim("o/r", pr(), "")
+    assert c.status == "passed", "this is a warning, not a hold — nothing is wrong with the PR"
+    assert c.warnings, "an empty claims table passed silently"
+    assert "no claims at all" in c.warnings[0]
+    assert "qb-claim" in c.warnings[0], "the warning has to name the remedy"
+
+
+def test_a_repo_that_claims_OTHER_things_is_enrolled_and_gets_no_warning(claims_by_query):
+    """The point of the check. This repo takes claims — just not on this branch —
+    so `unclaimed` here really is evidence that nobody is landing it."""
+    claims_by_query["fleet"] = [{"key": "o/r#172", "holder": "zeus/x"}]
+    c = preland.check_merge_claim("o/r", pr(), "")
+    assert c.status == "passed" and not c.warnings
+
+
+def test_another_repos_claims_do_not_count_as_this_one_being_enrolled(claims_by_query):
+    """The join is on the repo half of the key — derived by the board, prefix-tested
+    here — because "somebody somewhere claims things" says nothing about whether
+    the agents in THIS tree collide silently."""
+    claims_by_query["fleet"] = [{"key": "other/repo#5", "holder": "zeus/x"}]
+    c = preland.check_merge_claim("o/r", pr(), "")
+    assert c.warnings and "all in other repos" in c.warnings[0]
+
+
+def test_a_repo_whose_NAME_is_a_prefix_of_this_one_does_not_count(claims_by_query):
+    """`o/r` is a prefix of `o/rx`, so a bare `startswith` read a neighbour's claim
+    as this repo's — silencing the warning in exactly the case it exists for. The
+    separator (`#`, `!` or `:`) is what the board always puts after a repo in a key,
+    so requiring one costs nothing and closes the class."""
+    claims_by_query["fleet"] = [{"key": "o/rx#5", "holder": "zeus/x"}]
+    c = preland.check_merge_claim("o/r", pr(), "")
+    assert c.warnings, "a neighbouring repo's claim counted as this repo being enrolled"
+
+
+def test_a_held_branch_is_not_also_warned_about(claims_by_query):
+    """When the key itself has a claim, the check has a real answer and the
+    capability question is moot — a warning there would be noise on the one path
+    that is working."""
+    claims_by_query["scoped"] = [{"holder": "zeus/opal-kelp", "acquired": "12:00"}]
+    c = preland.check_merge_claim("o/r", pr(), "zeus/thorn-spruce")
+    assert c.status == "failed" and not c.warnings
+
+
+def test_a_repo_that_claims_its_PLAN_is_enrolled_even_though_no_key_says_so(
+        claims_by_query):
+    """The keys the warning cannot see. A plan claim is `plan:<uuid>` and a ref-less
+    item `item:<uuid>` — no repo in either, deliberately, because a board object may
+    span repos — so a repo whose agents use the plan-level claim #172 added was the
+    repo most likely to be told it claims nothing at all."""
+    claims_by_query["fleet"] = [{"key": "plan:6f2c-…", "holder": "zeus/x"}]
+    claims_by_query["plan"] = {
+        "counts": {"claimed": 0, "covered": 3},
+        "plans": [{"label": "the annex", "claim": {"holder": "zeus/x"}}]}
+    c = preland.check_merge_claim("o/r", pr(), "")
+    assert c.status == "passed" and not c.warnings, (
+        "a repo using plan-level claims was warned as claiming nothing at all")
+
+
+def test_a_plan_claimed_before_it_has_any_items_still_counts(claims_by_query):
+    """The moment the plan claim exists FOR: the surveying agent holds the list
+    before there is anything exact in it to hold, so `counts` is all zeroes and the
+    plan's own claim is the only evidence there is."""
+    claims_by_query["plan"] = {
+        "counts": {"open": 0, "claimed": 0, "covered": 0},
+        "plans": [{"label": "survey", "claim": {"holder": "zeus/x"}}]}
+    c = preland.check_merge_claim("o/r", pr(), "")
+    assert not c.warnings
+
+
+def test_a_repo_whose_plan_is_entirely_free_is_still_warned_about(claims_by_query):
+    """A plan with nothing held in it is not enrolment — it is a list nobody has
+    picked up, which is the state this whole issue is about."""
+    claims_by_query["plan"] = {"counts": {"open": 4, "claimed": 0, "covered": 0},
+                               "plans": [{"label": "stage one", "claim": None}]}
+    c = preland.check_merge_claim("o/r", pr(), "")
+    assert c.warnings and "is claimed by anybody" in c.warnings[0]
+
+
+def test_the_plan_read_is_scoped_to_this_repo_only(claims_by_query):
+    """`exact`, because a repo read widens to the fleet-wide list — and another
+    repo's plan silencing this repo's warning is the mistake the separator test
+    above exists to prevent, one scope up."""
+    claims_by_query["plan"] = {"counts": {}, "plans": []}
+    preland.check_merge_claim("o/r", pr(), "")
+    assert claims_by_query["plan_asked"] == [{"repo": "o/r", "exact": "true",
+                                              "limit": "1"}]
+
+
+def test_a_plan_read_that_fails_leaves_the_warning_standing(claims_by_query):
+    """Best-effort, on the safe side: an outage read as "this repo is fine" would be
+    the fail-open the whole check exists to close."""
+    claims_by_query["plan"] = None                 # the fixture answers with an error
+    c = preland.check_merge_claim("o/r", pr(), "")
+    assert c.status == "passed" and c.warnings
+
+
+def test_a_plan_answer_that_is_not_a_dict_is_not_read_as_enrolment(claims_by_query):
+    """Same rule the claims list has: an answer this cannot parse is not evidence
+    of anything, and least of all of the thing that silences the warning."""
+    claims_by_query["plan"] = ["not", "a", "plan"]
+    c = preland.check_merge_claim("o/r", pr(), "")
+    assert c.warnings
+
+
+def test_a_second_board_read_that_fails_says_nothing_extra(board):
+    """The capability read is best-effort by design: the caller already has its own
+    answer about the key, and a check that turned an outage on the SECOND call into
+    a different verdict would be reporting the network rather than the repo."""
+    board["claims"] = ({"claims": []}, "")
+    # The `board` fixture keys on the path, so both reads get the same empty
+    # answer; what matters here is that a well-formed empty answer still produces a
+    # warning and never an error.
+    c = preland.check_merge_claim("o/r", pr(), "")
+    assert c.status == "passed"
+
+
 # ----------------------------------------------------------------- migrations
 
 

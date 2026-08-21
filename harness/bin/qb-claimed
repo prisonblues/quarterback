@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""qb-claimed — does this agent hold a claim in this repo? Exit code says.
+
+  qb-claimed                      this checkout, this agent
+  qb-claimed --repo-path ../other another checkout
+  qb-claimed --session $SID       narrow to one session
+  qb-claimed --json               the board's answer, unmodified
+  qb-claimed --quiet              exit code only
+
+  0  held      — this agent holds at least one live claim in this repo
+  1  free      — it holds nothing here
+  2  unknown   — no board configured, or the board could not be reached
+
+**2 is not 1, and that is the whole design.** A gate that reads "cannot tell" as
+"nothing held" fails open on every unconfigured or unreachable host, which is a
+gate that stops nothing on exactly the hosts nobody checked. `preland.py` states
+the same rule about itself: *"a merge gate that fails open wherever it cannot see
+is not a gate."* So this reports three answers and leaves the policy to the
+caller — and the caller for #172 is nix-fleet's `qb-hook`, which stops
+substantive work in a repo where this says 1.
+
+The repo comes from the checkout's origin remote and the answer comes from the
+board's own `/claim/held`. Neither is worked out here: the repo a key belongs to
+is derived from the key server-side, and a fourth re-implementation of that join
+is what #172 is about.
+
+**`--session` defaults to the environment on purpose, and it is not a narrowing
+that can hide your own work.** This file sends only `Authorization`, so the board
+sees the bare machine — which on a box running several agents is every one of
+them. The session is the only thing that tells them apart, so defaulting to
+`$CLAUDE_CODE_SESSION_ID` is what stops a co-tenant's claim reading as yours.
+What it must not do is hide a claim taken *for* you: `/claim/held` therefore
+matches this session **plus every claim that named none**, because a claim with no
+session belongs to the machine (`may_mutate` says so in as many words) and the
+checkout claim `create-worktree` takes before the tree exists is exactly one of
+those. Pass `--session ''` to see everything the machine holds.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from qbdata import board_client, repo_slug  # noqa: E402
+
+HELD, FREE, UNKNOWN = 0, 1, 2
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        prog="qb-claimed", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--repo-path", default=".",
+                    help="the checkout whose origin remote names the repo")
+    ap.add_argument("--session", default=os.environ.get("CLAUDE_CODE_SESSION_ID") or None,
+                    help="narrow to one session's claims (default: $CLAUDE_CODE_SESSION_ID)")
+    ap.add_argument("--json", action="store_true", help="print the board's answer")
+    ap.add_argument("--quiet", "-q", action="store_true",
+                    help="exit code only — nothing on stdout or stderr, and it wins "
+                         "over --json, because that is the stronger promise")
+    args = ap.parse_args()
+
+    def say(message: str) -> None:
+        if not args.quiet:
+            print(message, file=sys.stderr)
+
+    repo = repo_slug(args.repo_path)
+    if not repo:
+        # Not FREE. A checkout with no origin remote is one this board cannot key
+        # a claim in at all, which is a thing to fix rather than a thing to
+        # proceed past.
+        say(f"unknown: no owner/name could be read from the git remote at "
+            f"{args.repo_path!r}")
+        return UNKNOWN
+
+    try:
+        client, _cfg = board_client()
+        answer = client.claim_held(repo, args.session)
+    except Exception as e:                                        # noqa: BLE001
+        # Broad on purpose, and it reports rather than shrugs: a board outage, a
+        # rotated token and a TLS failure are all "cannot tell", and the caller
+        # needs the reason in the text to act on it.
+        say(f"unknown: could not ask the board about {repo} — "
+            f"{e.__class__.__name__}: {e}")
+        return UNKNOWN
+
+    if args.json and not args.quiet:
+        print(json.dumps(answer, indent=2))
+
+    if answer.get("held"):
+        for claim in answer.get("claims", []):
+            say(f"held: {claim.get('key')} — {claim.get('note') or 'no note'} "
+                f"(expires {claim.get('expires')})")
+        return HELD
+
+    loose = answer.get("unattributed") or []
+    if loose:
+        # Holding something whose key names no repo — a plan, or the open
+        # free-text namespace. Reported, because "I am working, and the key does
+        # not say where" is a different answer from "I am idle", and a gate that
+        # collapsed them would stop an agent that is demonstrably busy.
+        for claim in loose:
+            say(f"free in {repo}, but holding {claim.get('key')} — "
+                f"{claim.get('note') or 'no note'}")
+    say(f"free: nothing claimed in {repo} by {answer.get('holder')}"
+        + (f" (session {answer['session']})" if answer.get("session") else ""))
+    return FREE
+
+
+if __name__ == "__main__":
+    sys.exit(main())

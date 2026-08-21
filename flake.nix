@@ -42,12 +42,60 @@
               pkgs.git
             ];
           } ''
-          cp -r ${./harness/loops} loops
-          chmod -R u+w loops
-          cd loops
+          # The suite is laid out as repo/harness/loops, not as a bare loops/,
+          # because test_panel_dials.py reads the two review briefs at
+          # `Path(__file__).parents[3] / "harness/commands"`. Copied flat, that
+          # resolves to / and the reads error as FileNotFoundError rather than
+          # being asserted — the same way #163's did, in a different check.
+          mkdir -p repo/harness
+          cp -r ${./harness/loops} repo/harness/loops
+          cp -r ${./harness/commands} repo/harness/commands
+          # The rules baseline, because the panel refuses to review a repo that
+          # configured nothing — so without it the cap guard's two tests get that
+          # refusal instead of the cap they are asserting.
+          cp ${./.harness-rules.sample} repo/.harness-rules.sample
+          # flake.nix itself, so the brief-coupling guard runs HERE rather than
+          # skipping — it compares this check's copy list against the paths the suite
+          # reads, and a guard that is inert in the sandbox it protects is no guard.
+          # Same reason release-metadata-tests copies it in.
+          cp ${./flake.nix} repo/flake.nix
+          chmod -R u+w repo
+          # A real repository, because `panel.main()` resolves the round cap
+          # through harness_rules, which shells out to git and refuses a
+          # directory that is not a checkout. Without this the cap guard's two
+          # tests fail on "is not a git repository" instead of asserting the cap
+          # — a check that reports the sandbox rather than the code.
+          export HOME=$TMPDIR
+          git -C repo init -q -b main
+          # …and an origin, because the harness addresses repos as
+          # `gh --repo owner/name` and derives that slug from this remote.
+          git -C repo remote add origin https://github.com/prisonblues/quarterback.git
+          git -C repo -c user.email=b@build -c user.name=build \
+              -c commit.gpgsign=false commit -q --allow-empty -m "sandbox"
+          cd repo/harness/loops
           # -p no:cacheprovider: the store is read-only and pytest would otherwise
           # try to write .pytest_cache beside the tests.
-          pytest -q -p no:cacheprovider
+          pytest -q -rs -p no:cacheprovider > report.txt 2>&1 || {
+            cat report.txt >&2
+            exit 1
+          }
+          cat report.txt
+          # -rs prints the reason for every skip, and the check below turns those lines
+          # into a build result. pytest exits 0 with any number of skips, and a skip
+          # nobody reads is what #163 and #246 both looked like — an assertion that
+          # reported nothing, in a check wearing a green badge.
+          #
+          # NO skip is expected here. The one test that can skip is the brief-coupling
+          # guard, when flake.nix is not beside the suite; it is copied in above
+          # precisely so that it is, so a skip from it means the copy line went away
+          # and took this sandbox's only staleness check out of the build with it.
+          if grep -q '^SKIPPED' report.txt; then
+            echo "a test skipped in the loops sandbox, and none is expected here. If it" >&2
+            echo "is the brief-coupling guard, flake.nix stopped being copied in and" >&2
+            echo "nothing is checking this copy list any more:" >&2
+            grep '^SKIPPED' report.txt >&2
+            exit 1
+          fi
           touch $out
         '';
 
@@ -86,6 +134,36 @@
           # that is gone is an error, and the person renaming it has to look at
           # both checks.
           rm harness/tests/test_release_numbers.py
+          # Nor is test_fixer_escalation.py, for the same reason and by the same
+          # mechanism (#251): it reads ten repo-root files across app/ and
+          # harness/commands/, none of which this check contains, so all ten errored
+          # here. It is a prose-consistency suite, not a worktree-scripts one — this
+          # check exists for the layout the bash scripts assume and the curl/jq they
+          # shell out to — so it gets its own check below rather than dragging the
+          # application tree into this sandbox. `rm`, not --ignore, for the reason
+          # above.
+          rm harness/tests/test_fixer_escalation.py
+          # And test_regression_test_redgreen.py (#257), which reads the command briefs
+          # via its own parents[1] and imports panel_core out of harness/loops. Fourth
+          # instance of the same mismatch, and the one that made a category check the
+          # answer rather than a fourth check. To its credit it is the only one of the
+          # four that failed LOUDLY here — "this suite is now green about nothing" —
+          # rather than erroring on a missing file.
+          rm harness/tests/test_regression_test_redgreen.py
+          # The category's own guards and their helpers go with them: they compare the
+          # prose-consistency check's install list against what its suites read, which is a
+          # question about a different check than this one. test_commands_wired.py is NOT one
+          # of those — it compares hm-module.nix's `commands` default against the briefs
+          # directory and knows nothing about install lists. It leaves for the same reason as
+          # the two suites above it: it reads harness/hm-module.nix and globs harness/commands,
+          # neither of which this check holds. Its module-level `parametrize` calls read both at
+          # COLLECTION time, so it has been erroring here since it landed — which is why the
+          # count of this mechanism's instances is five, not four.
+          rm harness/tests/test_commands_wired.py
+          rm harness/tests/test_prose_sandbox.py
+          rm harness/tests/_prose_sandbox.py
+          rm harness/tests/test_flake_sandbox.py
+          rm harness/tests/_flake_sandbox.py
           # Same treatment the package gets: there is no /usr/bin/env in the
           # sandbox, so an unpatched `#!/usr/bin/env bash` fails to exec at all
           # — and every test then fails for a reason that has nothing to do with
@@ -135,6 +213,7 @@
           # each missing path, and following that advice should not produce a second,
           # unrelated "No such file or directory".
           install -Dm644 ${./harness/tests/test_release_numbers.py} repo/harness/tests/test_release_numbers.py
+          install -Dm644 ${./harness/tests/_flake_sandbox.py} repo/harness/tests/_flake_sandbox.py
           install -Dm644 ${./CHANGELOG.md}   repo/CHANGELOG.md
           install -Dm644 ${./README.md}      repo/README.md
           install -Dm644 ${./pyproject.toml} repo/pyproject.toml
@@ -180,6 +259,111 @@
             echo "stopped reporting — both are the failure this check exists to catch." >&2
             exit 1
           }
+          touch $out
+        '';
+
+        # The prose-consistency suites: the ones under `harness/**/tests` whose subject
+        # is this repo's own text and the code it describes, rather than the worktree
+        # scripts. They read briefs, READMEs and the modules those describe, and need
+        # nothing else — no git, no tmux, no network, no database.
+        #
+        # A check for the CATEGORY rather than one per suite, deliberately. Every one of
+        # these lived in `worktree-tests`, whose sandbox holds `harness/bin` and
+        # `harness/tests`, so their repo-root reads errored on missing files instead of
+        # being asserted — #163's mechanism, five times over across four checks (#163,
+        # #246, #251, #257, and test_commands_wired.py, which had been erroring at
+        # COLLECTION since it landed). A fifth near-identical check was the alternative;
+        # one place to add the sixth suite is worth more than per-suite precision here,
+        # since these sandboxes want the same thing.
+        #
+        # Members are listed in `_prose_sandbox.MEMBERS`, not here: that list is what the
+        # guard iterates, and it is held against the suites installed below in both
+        # directions, so a second copy of it in a comment could only ever go stale. A suite
+        # in this sandbox but absent from MEMBERS would have its reads compared against
+        # nothing, and a member this check does not run would have its declaration checked
+        # against a sandbox it never sees; both are failures, and both are asserted.
+        #
+        # Each member declares its reads and routes every one through an accessor that
+        # refuses an undeclared path — three members, three accessors, no shared name for
+        # them. `test_the_check_supplies_every_path_its_suites_read` and its converse in
+        # `test_prose_sandbox.py` are the comparison; `_flake_sandbox` is the reader they
+        # share with release-metadata-tests, so there is one parser for this file rather
+        # than one per suite.
+        #
+        # Copied one by one rather than the repo root wholesale, for the reason
+        # release-metadata-tests gives: `./.` would drag a developer's `mcp/.venv` and
+        # every `__pycache__` into the store. flake.nix is copied in so the comparison
+        # named above runs HERE and not only in a checkout — a guard that is inert in the
+        # sandbox it protects is no guard.
+        prose-consistency-tests = pkgs.runCommand "quarterback-prose-consistency-tests"
+          {
+            nativeBuildInputs = [ (pkgs.python3.withPackages (ps: [ ps.pytest ])) ];
+          } ''
+          # The layout matters as much as the file set: the suite computes its repo root
+          # as the test file's parent.parent.parent, so the test has to sit two
+          # directories below the files it reads. `install -D` rather than `cp` so a
+          # file under a directory this sandbox has never held brings its own parent
+          # with it, and following the guard's "add an install line" advice cannot
+          # produce a second, unrelated "No such file or directory".
+          install -Dm644 ${./harness/tests/test_fixer_escalation.py}         repo/harness/tests/test_fixer_escalation.py
+          install -Dm644 ${./harness/tests/test_regression_test_redgreen.py} repo/harness/tests/test_regression_test_redgreen.py
+          install -Dm644 ${./harness/tests/test_commands_wired.py}           repo/harness/tests/test_commands_wired.py
+          install -Dm644 ${./harness/tests/test_prose_sandbox.py}            repo/harness/tests/test_prose_sandbox.py
+          install -Dm644 ${./harness/tests/_prose_sandbox.py}                repo/harness/tests/_prose_sandbox.py
+          install -Dm644 ${./harness/tests/_flake_sandbox.py}                 repo/harness/tests/_flake_sandbox.py
+          install -Dm644 ${./harness/tests/test_flake_sandbox.py}             repo/harness/tests/test_flake_sandbox.py
+          # The briefs as a tree, and not as a file list, because one of the suites GLOBS
+          # this directory to ask which briefs exist — the directory is the question, so a
+          # list of files could not express it. The others name individual briefs, and which
+          # ones is a judgement that moves as loops are added. No count here on purpose: the
+          # union is in the suites' own READS, and a number in a comment is the thing that
+          # goes stale.
+          cp -r ${./harness/commands} repo/harness/commands
+          # harness/loops as a tree because it has to be IMPORTABLE, not because its
+          # files are read: test_regression_test_redgreen.py asks Python for
+          # panel_core.REVIEW_PROMPT — the one read of a prompt that cannot drift from
+          # what the panel sends — and panel_core imports harness_rules, which imports
+          # further modules in the package. A file list for a Python package goes stale
+          # on every refactor, and the failure would be an ImportError naming a module
+          # rather than a path. Recorded as such in `_prose_sandbox.TREES`.
+          cp -r ${./harness/loops} repo/harness/loops
+          install -Dm644 ${./harness/hm-module.nix}                          repo/harness/hm-module.nix
+          install -Dm644 ${./harness/README.md}                              repo/harness/README.md
+          install -Dm644 ${./app/api/reviews.py}                             repo/app/api/reviews.py
+          install -Dm644 ${./app/models/review.py}                           repo/app/models/review.py
+          install -Dm644 ${./flake.nix}                                      repo/flake.nix
+          chmod -R u+w repo/harness/loops repo/harness/commands
+          cd repo/harness
+          # An empty inifile, and `-c` to pin it: the same reasoning as
+          # release-metadata-tests, minus the part about pyproject.toml, which this
+          # sandbox does not hold. It pins the rootdir here so `tests` below resolves
+          # against this directory.
+          printf '[pytest]\n' > pytest.ini
+          pytest -q -rs -p no:cacheprovider -c pytest.ini tests > report.txt 2>&1 || {
+            cat report.txt >&2
+            exit 1
+          }
+          cat report.txt
+          # pytest exits 0 with any number of skips, and a skip nobody reads is exactly what
+          # every instance of this mechanism looked like from the outside.
+          #
+          # The one skip this check expects is none at all, and the reason is specific: the
+          # only test here that can skip is test_prose_sandbox.py's flake_text fixture, when
+          # flake.nix is not beside the suites. It is installed above precisely so that it is,
+          # so a skip from it means that line went away and took the whole comparison with it.
+          #
+          # Named by test rather than counted, because this check serves three suites and a
+          # bare "expect zero" becomes the wrong diagnosis the day any member gains a skipif —
+          # the sibling check above allowlists its skips by reason for the same reason.
+          if grep -q '^SKIPPED' report.txt; then
+            echo "a test skipped in the prose-consistency sandbox, where none is expected." >&2
+            echo "If it is test_prose_sandbox.py's flake_text fixture, flake.nix stopped" >&2
+            echo "being installed and nothing is comparing this check against its suites" >&2
+            echo "any more. If it is a member's own skipif, add its reason to an allowlist" >&2
+            echo "here rather than deleting this guard:" >&2
+            grep '^SKIPPED' report.txt >&2
+            exit 1
+          fi
           touch $out
         '';
 

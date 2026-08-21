@@ -12,7 +12,7 @@ you clicked:
                 same widgets on the tmux seat bar mean
   an agent      its cwd, branch, model and session id, in the detail line
   a claim       the claim note, which is where an agent says what it is doing
-  a plan item   its phase, its note and what it waits on — the reasoning behind
+  a plan item   its plan, its note and what it waits on — the reasoning behind
                 its place in the order, which lives on the board and nowhere
                 else — or its ⚒, to start /fix-issue on the issue behind it
   a PR          open it on GitHub — or its ⚖, to start /panel-review-pr on it
@@ -105,6 +105,55 @@ class ClickTable(DataTable):
     does nothing visible. And it consumes the Click rather than letting it bubble,
     so a handler on the App never runs — this has to be on the widget itself.
     """
+
+    def add_row(self, *cells, key: str | None = None, **kwargs):
+        """`DataTable.add_row`, except a key this table already holds is
+        suffixed rather than raised on.
+
+        DataTable answers a repeated key with DuplicateKey, which does not
+        degrade the row — it takes the whole dashboard down, and this is the
+        component a human looks at when something is ALREADY wrong. So it is
+        the one that must survive unexpected input rather than replace six
+        panels with a traceback (#209).
+
+        Every panel below computes a key it believes is unique, and after #208
+        and #209 those keys are right. This is the backstop for the next panel,
+        whose duplicates nobody has thought of yet: two rows that collide are
+        kept as two rows, the second under a `~2` key.
+
+        **Degrading is not the same as reporting, and this had to be said out
+        loud.** A row key is never rendered, so the `~2` is invisible; and in
+        the case the backstop was written for — two plan items arriving with no
+        `item_id` — two rows is also exactly what CORRECT data looks like. Left
+        at that, a keying bug this once crashed loudly would now produce nothing
+        at all. So the collision is written to the app log, which is the only
+        place it can be reported from.
+
+        Returns the key actually used. Callers must file their record under
+        THAT — `dispatch_row` looks a row up by key, so a suffixed row would
+        otherwise display fine and do nothing when clicked.
+        """
+        if key is not None:
+            # Compared on the string rather than by constructing a RowKey: the
+            # key type is Textual's private business and this survives it
+            # changing. The tables here are tens of rows, not thousands.
+            taken = {rk.value for rk in self.rows}
+            if key in taken:
+                n = 2
+                while f"{key}~{n}" in taken:
+                    n += 1
+                asked, key = key, f"{key}~{n}"
+                try:
+                    self.log.warning(
+                        f"{self.id or type(self).__name__}: duplicate row key "
+                        f"{asked!r} — kept as {key!r}. The panel's key is not "
+                        f"unique across every repo and screen it can show.")
+                except Exception:                   # noqa: BLE001
+                    # The backstop exists so this table cannot take the
+                    # dashboard down. A logger that is not there (no running
+                    # app) must not be the thing that finally does.
+                    pass
+        return super().add_row(*cells, key=key, **kwargs)
 
     def on_click(self, event: Click) -> None:
         if not self.row_count:
@@ -379,7 +428,6 @@ class Dash(App):
             # rather than tolerating it — so the panel that exists to show the
             # second screen was the thing that could not survive one (#208).
             key = f"seat:{s['pane']}"
-            self.rows[key] = s
             live = s.get("command") not in ("bash", "sh", "zsh", "fish", "")
             # A pane can be running an agent and still be doing nothing you want
             # to know about, or be waiting on you and look identical. `running`
@@ -389,7 +437,7 @@ class Dash(App):
             scope = qd.pane_scope(s)
             label = f"{scope} {s['seat']}" if len(screens) > 1 and scope \
                 else f"seat {s['seat']}"
-            table.add_row(
+            key = table.add_row(
                 Text("●" if live else "·", style="green" if live else "grey50"),
                 Text("✕", style="bold red"),                 # click to close it
                 Text(qd.clip(label, 13), style="bold"),
@@ -399,15 +447,20 @@ class Dash(App):
                 Text(qd.clip(os.path.basename(s.get("path") or "") or "—", 22),
                      style="grey50"),
                 key=key,
-            )
+            ).value
+            self.rows[str(key)] = s
         # The ＋ is a ROW rather than a key, because the whole point of this
         # panel is that the mouse can do it. It carries a record of its own so
         # dispatch_row has something to look up — a row key with nothing behind
-        # it is dropped on the floor.
-        self.rows["seat:add"] = {"add": True}
-        table.add_row(Text(""), Text("＋", style="bold cyan"),
-                      Text("add seat", style="cyan"), Text(""), Text(""), Text(""),
-                      key="seat:add")
+        # it is dropped on the floor. Filed under the key add_row RETURNS like
+        # every other row here: `seat:add` cannot collide with a `seat:%12`
+        # today, but "this one call site is the exception" is how the rule
+        # above stops being a rule.
+        add_key = table.add_row(Text(""), Text("＋", style="bold cyan"),
+                                Text("add seat", style="cyan"),
+                                Text(""), Text(""), Text(""),
+                                key="seat:add").value
+        self.rows[str(add_key)] = {"add": True}
         title = f"SEATS · {len(seats)}" if seats else "SEATS · none on this screen"
         self.query_one("#t_seats", Static).update(title)
 
@@ -474,11 +527,10 @@ class Dash(App):
         table.clear()
         for i, a in enumerate(agents):
             key = f"agent:{i}"
-            self.rows[key] = a
             seat = qd.seat_number(a.get("holder"))
             who = (a.get("holder") or "?").split("/", 1)[-1]
             word, style = qd.agent_state(a)
-            table.add_row(
+            key = table.add_row(
                 Text(qd.clip(who, 13), style="bold green" if seat else "bold"),
                 Text(word or "—", style=style),
                 *self.repo_cell(a.get("repo") or "—"),
@@ -492,7 +544,8 @@ class Dash(App):
                      style="white" if seat else "grey70"),
                 Text(qd.until(a.get("expires")), style="grey50"),
                 key=key,
-            )
+            ).value
+            self.rows[str(key)] = a
         self.query_one("#t_fleet", Static).update(
             f"FLEET · {len(agents)}{qd.elsewhere(elsewhere)}")
         # Keep what the board said about each SEAT, keyed by seat number, so the
@@ -523,16 +576,16 @@ class Dash(App):
             claims, self.scope, lambda c: qd.claim_repo(c.get("key"), self.plan))
         for i, c in enumerate(shown):
             key = f"claim:{i}"
-            self.rows[key] = c
             left = qd.minutes_left(c.get("expires"))
-            ctable.add_row(
+            key = ctable.add_row(
                 Text(qd.clip((c.get("holder") or "?").split("/", 1)[-1], 13), style="bold"),
                 Text(qd.clip(qd.claim_label(c.get("key") or "?", self.plan, self.scope), 34),
                      style="yellow" if c.get("kind") == "issue" else "grey70"),
                 Text(qd.until(c.get("expires")),
                      style="red" if left is not None and left < 10 else "grey50"),
                 key=key,
-            )
+            ).value
+            self.rows[str(key)] = c
         self.query_one("#t_claims", Static).update(
             f"CLAIMED · {len(shown)}{qd.elsewhere(claims_elsewhere)}")
 
@@ -570,7 +623,13 @@ class Dash(App):
         # stale "N elsewhere" on a panel whose own rows really are unchanged — the
         # same defect `action_toggle_scope` drops `plan_sig` to avoid, on the poll
         # path rather than the keypress one.
+        #
+        # The covering holder is in it as well as the item's own: a plan claim
+        # landing changes the glyph, the band and the whole right-hand column of
+        # every item in that plan, and a signature blind to it would leave those
+        # rows advertising free work until something else moved.
         sig = (hidden, tuple((i.get("item_id"), (i.get("claim") or {}).get("holder"),
+                              (i.get("covered_by") or {}).get("holder"),
                               len(i.get("blocked_by") or []), i.get("updated"))
                              for i in ordered))
         if sig == self.plan_sig and not err:
@@ -583,9 +642,9 @@ class Dash(App):
             glyph, colour = qd.plan_state(item)
             who, who_colour = qd.plan_who(item)
             issue = qd.plan_issue(item, repos)
-            takeable = (issue is not None and not item.get("claim")
+            takeable = (issue is not None and not qd.plan_holder(item)
                         and self.wrong_repo(issue.get("repo"), "") is None)
-            table.add_row(
+            key = table.add_row(
                 Text(glyph, style=colour),
                 Text("⚒", style="bold cyan" if takeable else "grey30"),
                 *self.repo_cell(qd.short_repo(item.get("repo") or "fleet")),
@@ -597,8 +656,8 @@ class Dash(App):
                      style="grey50" if colour == "grey50" else "white"),
                 Text(qd.clip(who, 13), style=who_colour),
                 key=f"plan:{item.get('item_id')}",
-            )
-            self.rows[f"plan:{item.get('item_id')}"] = item
+            ).value
+            self.rows[str(key)] = item
         running, blocked = qd.plan_counts(items)
         title = f"PLANS · {len(items)} open"
         if running:
@@ -618,13 +677,14 @@ class Dash(App):
         for pr in sorted(prs, key=lambda p: -p.get("number", 0)):
             glyph, colour = qd.ci_state(pr)
             red += colour == "red"
-            key = f"pr:{pr.get('number')}"
-            self.rows[key] = pr
+            # By repo AND number. Two watched repos both reach #42 eventually,
+            # and the bare number handed this table the same row key twice (#209).
+            key = f"pr:{qd.repo_ref(pr)}"
             # Dimmed where the guard would refuse it: an icon that looks clickable
             # and then explains itself is the "drawn takeable, refused one by one"
             # this scope work exists to end, one panel over.
             reachable = self.wrong_repo(pr.get("repo"), "") is None
-            table.add_row(
+            key = table.add_row(
                 Text(glyph, style=colour),
                 Text("⚖", style="bold cyan" if reachable else "grey30"),
                 *self.repo_cell(qd.short_repo(pr.get("repo") or qd.REPO)),
@@ -633,7 +693,8 @@ class Dash(App):
                      style="grey50" if pr.get("isDraft") else "white"),
                 Text(qd.ago(pr.get("updatedAt")), style="grey50"),
                 key=key,
-            )
+            ).value
+            self.rows[str(key)] = pr
         title = f"OPEN PRs · {len(prs)}" + (f" · {red} red" if red else "")
         if err:
             title += f" · gh: {qd.clip(err, 24)}"
@@ -654,10 +715,9 @@ class Dash(App):
             claim = self.held.get(qd.issue_key(issue))
             holder = (claim.get("holder") or "?") if claim else None
             free += holder is None
-            key = f"issue:{number}"
-            self.rows[key] = issue
+            key = f"issue:{qd.repo_ref(issue)}"     # repo AND number (#209)
             reachable = self.wrong_repo(issue.get("repo"), "") is None
-            table.add_row(
+            key = table.add_row(
                 Text("·" if holder else "○", style="grey50" if holder else "green"),
                 Text("⚒", style="bold cyan" if reachable and not holder else "grey30"),
                 *self.repo_cell(qd.short_repo(issue.get("repo") or qd.REPO)),
@@ -668,7 +728,8 @@ class Dash(App):
                      else qd.ago(issue.get("updatedAt")),
                      style="yellow" if holder else "grey50"),
                 key=key,
-            )
+            ).value
+            self.rows[str(key)] = issue
         title = f"ISSUES · {len(issues)}" + (f" · {free} free" if issues else "")
         if err:
             title += f" · gh: {qd.clip(err, 24)}"
@@ -890,6 +951,14 @@ class Dash(App):
         qb-seat does: the brief positionally, after `--`.
         """
         number = pr.get("number")
+        # The same refusal the ⚒ on an issue row makes, for the same reason and
+        # with more at stake. /panel-review-pr takes a bare number and resolves
+        # the repository from the checkout it runs in, so a PR from a repo this
+        # dashboard only WATCHES would review whatever wears that number HERE —
+        # and this one spends money, comments on a public PR and pushes a fix
+        # commit to it. Until #209 that click was unreachable, because a second
+        # repo sharing a number crashed the panel before anything rendered; now
+        # both rows are there, so the guard has to be too.
         if (why := self.wrong_repo(pr.get("repo"), f"PR #{number}")):
             self.say(why)
             return
@@ -915,10 +984,18 @@ class Dash(App):
         if issue is None:
             self.say(f"no issue behind this item — {qd.clip(item.get('title'), 60)}")
             return
-        claim = item.get("claim")
-        if claim:
-            self.say(f"#{issue['number']} is already being worked by "
-                     f"{claim.get('holder') or '?'}")
+        # An item inside somebody else's HELD PLAN is taken too, and this is the
+        # click that spends money on it. `claim` alone let the ⚒ start /fix-issue
+        # on a line of a plan another agent had reserved as a unit — the exact
+        # duplicated work the plan claim exists to prevent, from the panel that
+        # exists to show who is on what.
+        holder = qd.plan_holder(item)
+        if holder:
+            who = holder.get("holder") or "?"
+            self.say(f"#{issue['number']} is already being worked by {who}"
+                     if item.get("claim") else
+                     f"#{issue['number']} is inside a plan {who} holds — talk to "
+                     f"them rather than taking one line out of it")
             return
         self.fix_issue(issue)
 
