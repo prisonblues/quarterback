@@ -766,7 +766,23 @@ def test_the_bar_is_a_second_status_line_and_says_which_one_it_is(screen):
     assert screen.tmux("show-options", "-v", "-t", "=t:", "@qb_bar").stdout.strip() == "1"
     assert screen.tmux("show-options", "-v", "-t", "=t:", "mouse").stdout.strip() == "on"
 
-    bound = screen.tmux("list-keys", "-T", "root", "MouseDown1Status").stdout
+    # The WHOLE root table, filtered here — not `list-keys -T root
+    # MouseDown1Status`. tmux 3.7b stopped answering the one-key query form for a
+    # mouse key (empty output, exit 0) while still listing the binding in the
+    # table, so the narrower form reported "no binding" for a binding that was
+    # present and correct, and this test failed on 3.7b while passing on the 3.6a
+    # a developer has (#259). The table form is answered by both and is no less
+    # specific.
+    table = screen.tmux("list-keys", "-T", "root").stdout
+    # The KEY field, matched whole. A substring test also catches
+    # `C-MouseDown1Status` — a different binding, and one this screen really does
+    # install — so it would find two lines and pick the wrong one.
+    lines = [ln for ln in table.splitlines()
+             if re.search(r"-T\s+root\s+MouseDown1Status\s", ln)]
+    assert len(lines) == 1, (
+        f"expected exactly one MouseDown1Status binding in the root table, got "
+        f"{len(lines)}")
+    bound = lines[0]
     assert "@qb_bar" in bound, "the binding does not check whose bar was clicked"
     assert "switch-client -t =" in bound, (
         "the binding has no fall-through — a click on the status line of an "
@@ -774,6 +790,37 @@ def test_the_bar_is_a_second_status_line_and_says_which_one_it_is(screen):
     assert "\n" not in bound.strip(), (
         "the bound command spans lines; a newline ends a tmux command, so the "
         "nested if-shell would lose its arguments and the click would be silent")
+
+
+def test_every_session_target_is_an_id_and_not_a_name():
+    """A `-t` may not address a session by NAME, whatever the name looks like.
+
+    `.` and `:` are a target's own separators. tmux used to rewrite them out of a
+    session name it would not take, so `-t "=$SESSION"` worked by accident; 3.7b
+    keeps `my.screen` verbatim and the same target then parses as pane `screen` of
+    session `my` — "can't find pane: screen" — against a screen that plainly
+    exists. Every seat command failed, `list` showed nothing and `resume` could not
+    reach it (#259).
+
+    Asserted on the SOURCE rather than by driving tmux, because the bug is
+    invisible on the tmux a developer has: 3.6a renames the dot away, so no test
+    using a session name can exercise it there. This holds under either version,
+    which is the point — the next `-t "=$SESSION"` someone adds fails here and now
+    rather than on whichever box happens to carry the newer tmux.
+    """
+    src = (Path(__file__).resolve().parents[1] / "bin" / "qb-seats").read_text()
+    offenders = [
+        f"{n}: {line.strip()}"
+        for n, line in enumerate(src.splitlines(), 1)
+        # `=$s`/`=$SESSION` and friends: an `=`-anchored target built from a shell
+        # variable holding a name. `session_id`'s own list-sessions lookup is not
+        # a `-t` and does not match.
+        if re.search(r'-t\s+"=\$', line)
+    ]
+    assert not offenders, (
+        "these address a tmux session by name, which breaks the moment the name "
+        "carries a `.` or a `:` — use the session id (SESSION_ID, or the id read "
+        "beside the name in screens()):\n  " + "\n  ".join(offenders))
 
 
 def test_the_bar_can_be_turned_off(screen):
@@ -1415,12 +1462,26 @@ def test_a_session_name_tmux_will_not_take_is_still_a_working_screen(screen):
     The fix is to ask tmux what it called the session (`new-session -P -F`) rather
     than to reimplement its naming rules, which 3.4 and 3.6a do not even share.
     """
-    real = "my_screen"
+    asked = "my.screen"
     screen.env["QB_SEATS_DASH"] = DASH_STUB
     screen.env["QB_SEATS_DASH_SIZE"] = "60"
-    done = screen("-n", "2", name="my.screen")
+    done = screen("-n", "2", name=asked)
     assert done.returncode == 0, done
-    assert real in done.stderr, f"it must say what the screen is really called: {done.stderr}"
+    # ASKED OF TMUX, not predicted. 3.6a rewrites `.` to `_`; the flake's pinned
+    # 3.7b takes the name verbatim, so there is nothing to warn about — and which
+    # of them is on PATH is not something this suite should decide (#259). What
+    # the script guarantees in BOTH is the property worth pinning: the name it
+    # reports back is the name the session really has. Hardcoding `my_screen`
+    # pinned 3.6a's naming rule instead, and went red under the flake while
+    # passing on every developer's box.
+    names = [n for _, n in listing(screen)]
+    assert len(names) == 1, f"expected exactly one screen, got {names}"
+    real = names[0]
+    if real != asked:
+        # Where tmux DID rename, the warning at build time is the only place the
+        # usable name is ever said, so it still has to be said.
+        assert real in done.stderr, (
+            f"it must say what the screen is really called: {done.stderr}")
     # A whole screen, not the first pane of one.
     assert sorted(n for _, n in panes(screen, real) if n) == ["1", "2"]
     assert labels(screen, real)["dash"][0] == 60
@@ -1697,10 +1758,18 @@ def test_list_and_resume_reach_a_screen_tmux_renamed(screen):
     and the warning at build time is the only place it was ever said. A list read
     from tmux is the durable answer: it can only print names that exist.
     """
-    assert screen("-n", "1", name="my.screen").returncode == 0
+    asked = "my.screen"
+    assert screen("-n", "1", name=asked).returncode == 0
+    real = asked
     try:
-        assert [n for _, n in listing(screen)] == ["my_screen"]
-        assert "my_screen is up" in qb(screen, "resume", "my_screen").stdout
-        assert "my_screen is up" in qb(screen, "resume", "1").stdout
+        # Whatever tmux called it — 3.6a `my_screen`, 3.7b `my.screen` (#259) —
+        # the list can only print a name that EXISTS, and that is the name that
+        # has to reattach. Asserting the 3.6a spelling asserted tmux's rules
+        # rather than this script's promise.
+        names = [n for _, n in listing(screen)]
+        assert len(names) == 1, f"expected exactly one screen, got {names}"
+        real = names[0]
+        assert f"{real} is up" in qb(screen, "resume", real).stdout
+        assert f"{real} is up" in qb(screen, "resume", "1").stdout
     finally:
-        screen("--kill", name="my_screen")
+        screen("--kill", name=real)

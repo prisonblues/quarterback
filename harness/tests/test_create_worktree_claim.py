@@ -35,6 +35,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -42,6 +43,15 @@ import pytest
 SCRIPT = Path(__file__).resolve().parents[1] / "bin" / "create-worktree"
 
 BASH = shutil.which("bash")
+
+#: Where a real `python3` lives, asked of the interpreter running this suite
+#: rather than assumed to be `/usr/bin`. The two rollback tests below need the
+#: real one — the release goes THROUGH qbdata's own client, which is the property
+#: they exist to pin — and inside a nix build sandbox there is no /usr/bin/python3
+#: at all: they failed there with `python3: command not found` and an assertion
+#: about a file the rollback never got far enough to write. Same lesson as the
+#: stub shebangs above (#177), one directory along.
+PY_DIR = os.path.dirname(sys.executable)
 
 pytestmark = pytest.mark.skipif(BASH is None, reason="bash not on PATH")
 
@@ -90,7 +100,17 @@ def run_stanza(branch: str, *, claim="true", require="false", ttl="60",
         if body is None:
             continue
         fake = bindir / name
-        fake.write_text("#!/usr/bin/env bash\n" + body + "\n")
+        # The bash this suite already resolved, named ABSOLUTELY — not
+        # `#!/usr/bin/env bash`. There is no /usr/bin/env inside a nix build
+        # sandbox, so that form cannot exec there and every test in this file
+        # fails for a reason that has nothing to do with the code under test:
+        # `patchShebangs` fixes the scripts shipped in harness/bin at build time
+        # and cannot reach a file a test writes while it runs (#177, and this is
+        # the fourth suite to learn it). `/bin/sh` is the other answer and the one
+        # test_qb_seats.py took, but not here — the python3 stub in
+        # test_a_RENEWED_claim_is_not_handed_back uses `[[ ]]`, which dash has not
+        # got.
+        fake.write_text(f"#!{BASH}\n" + body + "\n")
         fake.chmod(0o755)
     script = (PRELUDE
               + f'CLAIM={claim}\nREQUIRE_CLAIM={require}\nCLAIM_TTL={ttl}\n'
@@ -266,7 +286,7 @@ def test_the_environments_session_is_not_inherited(tmp_path):
     # `--session` on the command line replaces it — including an empty one. A stub
     # that fell back on empty would be testing itself rather than the stanza.
     fake.write_text(
-        '#!/usr/bin/env bash\n'
+        f"#!{BASH}\n"                             # not /usr/bin/env — see run_stanza
         'sess="${CLAUDE_CODE_SESSION_ID:-}"\n'
         'while [[ $# -gt 0 ]]; do\n'
         '  if [[ "$1" == "--session" ]]; then sess="$2"; shift 2; else shift; fi\n'
@@ -396,7 +416,7 @@ def test_the_real_rollback_leaves_a_renewed_claim_alone(tmp_path):
         f"    open({str(tmp_path / 'touched')!r}, 'w').close()\n"
         "    raise AssertionError('the rollback tried to release a renewed claim')\n")
     stub = bindir / "qb-claim"
-    stub.write_text('#!/usr/bin/env bash\necho \'{"claim_id":"c1","renewed":true}\'\n')
+    stub.write_text(f'#!{BASH}\necho \'{{"claim_id":"c1","renewed":true}}\'\n')
     stub.chmod(0o755)
     script = (PRELUDE
               + 'CLAIM=true\nREQUIRE_CLAIM=false\nCLAIM_TTL=60\n'
@@ -404,7 +424,7 @@ def test_the_real_rollback_leaves_a_renewed_claim_alone(tmp_path):
               + claim_block()
               + "\nclaim_the_branch 'feat/issue-9'\nfalse\n")
     got = subprocess.run([BASH, "-c", script], capture_output=True, text=True,
-                         env={"PATH": f"{bindir}:{os.path.dirname(BASH)}:/usr/bin:/bin",
+                         env={"PATH": f"{bindir}:{os.path.dirname(BASH)}:{PY_DIR}",
                               "HOME": str(tmp_path)})
     assert got.returncode != 0
     assert not (tmp_path / "touched").exists(), got.stderr
@@ -428,7 +448,7 @@ def test_the_real_rollback_posts_the_release_through_qbdata(tmp_path):
         "def board_client():\n"
         "    return _C(), None\n")
     stub = bindir / "qb-claim"
-    stub.write_text('#!/usr/bin/env bash\necho \'{"claim_id":"c9"}\'\n')
+    stub.write_text(f'#!{BASH}\necho \'{{"claim_id":"c9"}}\'\n')
     stub.chmod(0o755)
     script = (PRELUDE
               + 'CLAIM=true\nREQUIRE_CLAIM=false\nCLAIM_TTL=60\n'
@@ -436,7 +456,7 @@ def test_the_real_rollback_posts_the_release_through_qbdata(tmp_path):
               + claim_block()
               + "\nclaim_the_branch 'feat/issue-9'\nfalse\n")
     got = subprocess.run([BASH, "-c", script], capture_output=True, text=True,
-                         env={"PATH": f"{bindir}:{os.path.dirname(BASH)}:/usr/bin:/bin",
+                         env={"PATH": f"{bindir}:{os.path.dirname(BASH)}:{PY_DIR}",
                               "HOME": str(tmp_path)})
     assert got.returncode != 0
     assert (tmp_path / "posted").exists(), got.stderr

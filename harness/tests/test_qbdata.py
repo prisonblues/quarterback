@@ -559,49 +559,72 @@ def test_clearing_the_pin_falls_back_to_the_environment(watched, monkeypatch):
     assert qd.resolve_repos() == ["me/app"]
 
 
-def test_a_checkout_is_asked_which_repo_it_is():
-    slug = qd.repo_arg(str(Path(__file__).resolve().parent.parent.parent))
-    assert slug.count("/") == 1 and slug.endswith("/quarterback")
+@pytest.fixture
+def checkout(tmp_path):
+    """A real git checkout with an origin remote, BUILT here rather than borrowed.
+
+    The tests below used to reach for this suite's own repo root
+    (`Path(__file__).parents[2]`), which is a checkout when a developer runs them
+    and `/build` when the `worktree-tests` sandbox does — that sandbox holds
+    `harness/bin` and `harness/tests` and is not a git repository at all. So they
+    did not skip there, they FAILED, on "not a git checkout with an origin
+    remote": a suite asserting about a thing its environment does not hold, which
+    is #163's mechanism wearing different clothes.
+
+    A checkout the test makes is one every environment has, so these assert in the
+    sandbox instead of only on a laptop. It is also the more honest fixture: what
+    is under test is `repo_target`'s reading of *a* checkout, never this one.
+    """
+    root = tmp_path / "quarterback"
+    (root / "sub").mkdir(parents=True)
+
+    def git(*args):
+        subprocess.run(["git", "-C", str(root), *args], check=True,
+                       capture_output=True)
+
+    git("init", "-q")
+    git("remote", "add", "origin",
+        "https://github.com/prisonblues/quarterback.git")
+    return root
 
 
-def test_a_checkout_is_returned_absolute_because_tmux_resolves_it_elsewhere():
+def test_a_checkout_is_asked_which_repo_it_is(checkout):
+    slug = qd.repo_arg(str(checkout))
+    assert slug == "prisonblues/quarterback"
+
+
+def test_a_checkout_is_returned_absolute_because_tmux_resolves_it_elsewhere(
+        checkout, monkeypatch):
     """The path is handed to tmux as a `-c` start directory, and tmux resolves a
     relative one against the SERVER's cwd — where it was started, not where the
     dashboard is. `self.repo` was `os.getcwd()` and absolute by construction; a
     relative `--repo` would have launched work somewhere else entirely, while the
     guard beside it resolved the same path correctly in-process and hid it."""
-    root = Path(__file__).resolve().parent.parent.parent
-    for spelling in (".", "./"):
-        slug, path = qd.repo_target(spelling if spelling == "." else str(root) + "/")
+    monkeypatch.chdir(checkout)
+    for spelling in (".", str(checkout) + "/", "sub/../"):
+        slug, path = qd.repo_target(spelling)
         assert os.path.isabs(path), f"{spelling} came back relative: {path}"
-    slug, path = qd.repo_target("harness/../")
-    assert os.path.isabs(path) and slug.endswith("/quarterback")
+        assert slug.endswith("/quarterback")
 
 
-def test_a_bare_name_that_is_a_directory_is_that_directory(tmp_path, monkeypatch):
+def test_a_bare_name_that_is_a_directory_is_that_directory(checkout, monkeypatch):
     """`--repo nix-fleet` beside a checkout of that name is not a guess about an
     owner, and it worked before the shape rule arrived."""
-    # Asserted on the PATH, not on the slug: this suite runs in a worktree as
-    # readily as in the main checkout, and a worktree's directory name is not its
-    # repository's name — which is the whole reason a directory is asked for its
-    # origin rather than read as one.
-    root = Path(__file__).resolve().parent.parent.parent
-    monkeypatch.chdir(root.parent)
-    slug, path = qd.repo_target(root.name)
-    assert path == str(root)
+    monkeypatch.chdir(checkout.parent)
+    slug, path = qd.repo_target(checkout.name)
+    assert path == str(checkout)
     assert slug.count("/") == 1 and " " not in slug
 
 
-def test_a_checkout_argument_says_where_work_should_run_too():
+def test_a_checkout_argument_says_where_work_should_run_too(checkout):
     """`--repo <checkout>` moves the ⚒'s cwd, not only the rows the panels draw.
 
     A SLUG cannot: it names a repository this process may have no checkout of, so
     the second half of the answer is None and the guards refuse those rows out loud
     rather than launching `/fix-issue` on a number that means something else here.
     """
-    here = str(Path(__file__).resolve().parent.parent.parent)
-    slug, path = qd.repo_target(here)
-    assert slug.endswith("/quarterback") and path == here
+    slug, path = qd.repo_target(str(checkout))
+    assert slug.endswith("/quarterback") and path == str(checkout)
     assert qd.repo_target("prisonblues/nix-fleet") == ("prisonblues/nix-fleet", None)
 
 
@@ -621,13 +644,14 @@ def test_a_slug_is_read_as_a_slug_wherever_it_is_typed(tmp_path, monkeypatch):
         qd.repo_target("./prisonblues/quarterback")
 
 
-def test_a_tilde_is_expanded_because_the_help_text_advertises_one(monkeypatch):
+def test_a_tilde_is_expanded_because_the_help_text_advertises_one(
+        checkout, monkeypatch):
     """Only an interactive shell expands `~`. Quoted, built into a QB_SEATS_DASH
     command or sent through `tmux send-keys`, it arrives intact — and was reported
     as a bad slug, which misdiagnoses it."""
-    monkeypatch.setenv("HOME", str(Path(__file__).resolve().parent.parent.parent))
+    monkeypatch.setenv("HOME", str(checkout))
     slug, path = qd.repo_target("~")
-    assert slug.endswith("/quarterback") and path == os.path.expanduser("~")
+    assert slug.endswith("/quarterback") and path == str(checkout)
 
 
 def test_a_malformed_slug_is_refused_rather_than_handed_to_gh():
