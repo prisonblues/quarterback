@@ -525,7 +525,7 @@ def test_the_readme_release_list_is_in_changelog_order(readme_text, changelog_te
     """The list is RENDERED from CHANGELOG.md's order, and this is where drift is a failure.
 
     It drifted for three releases in a row — `v2.61, v2.59, v2.60, v2.62, …` — and by the time
-    #296 was written the file had eleven bullets out of place, because the ordering convention
+    #296 was written nine bullets were out of place, because the ordering convention
     was written down nowhere and checked by nothing. `74a0453` is a human pushing
     `docs(readme): put v2.62 at the end of the release list`, which is the same class being
     corrected by whoever happened to notice.

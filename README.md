@@ -1024,7 +1024,7 @@ full — including what was broken before it, which is the part no diff recovers
   entry, or fetch a base that is behind — rather than guessing which applies.
 - **vNEXT** — the files two branches both had to edit, and the guard that measured the wrong
   thing. **This list stopped being retyped.** It was a hand-kept copy of the CHANGELOG and fell
-  out of order — `v2.61, v2.59, v2.60, …` for three releases, eleven bullets adrift by the time
+  out of order — `v2.61, v2.59, v2.60, …` for three releases, nine bullets adrift by the time
   #296 was opened — so its ORDER now comes from `scripts/readme_releases.py` and a test fails when
   it drifts. Only the order: a bullet is a summary somebody chose, so it is moved byte-for-byte
   and a release with no bullet is a refusal rather than an invented sentence. **And a branch

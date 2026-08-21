@@ -25,8 +25,8 @@ Two of the four places a version lives were hand-kept copies, and both drifted t
 hand-kept copy does.
 
 **The README's release list was retyped from the CHANGELOG, so it fell out of order.** It read
-`v2.61, v2.59, v2.60, v2.62, …` for three releases, and by the time #296 was written eleven
-bullets were out of place. `74a0453` is a human pushing `docs(readme): put v2.62 at the end of
+`v2.61, v2.59, v2.60, v2.62, …` for three releases, and by the time #296 was written nine
+bullets were out of place — v2.42, v2.43, v2.46 to v2.50, v2.52 and v2.61. `74a0453` is a human pushing `docs(readme): put v2.62 at the end of
 the release list` — the same class corrected by whoever happened to notice, because the ordering
 convention was written down nowhere and checked by nothing. `scripts/readme_releases.py` renders
 the ORDER from `CHANGELOG.md` and
