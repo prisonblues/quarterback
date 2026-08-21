@@ -122,6 +122,18 @@ Detected from the checkout, **not settable** here: `path`, `github`, `default_br
   API — so check `codex --version` before pinning a new one. That failure is
   loud rather than silent: the report names the model each reviewer used and
   flags a lost reviewer next to the reviewer list, not in a footnote.
+- `antigravity` / `pi` / `grok` — the third, fourth and fifth vendors, all **off by
+  default**: each is a workstation-only package authenticated against a personal
+  account, so a repo asks for them rather than every box inheriting a reviewer it
+  cannot run. Enable per repo, or ad hoc with `--reviewers claude,codex,grok`.
+- `grok` — xAI's CLI. **Pin `model`**: grok's own default is whatever `[models]
+  default` says in the user's `~/.grok/config.toml`, which on this fleet is an
+  OpenRouter route rather than the first-party model — an unpinned seat reviews on
+  a different model, through a different account, than the report names. `grok
+  models` lists what is servable. `effort` is `low|medium|high|xhigh`, validated by
+  the CLI before the turn starts, so a typo costs a startup rather than a turn.
+  Unlike `agy` its prompt travels in a **file**, so the argv ceiling below does not
+  apply to it.
 - `sonarqube` — deterministic static-analysis **hard gate**. `project_key`,
   `organization` and `host` are non-secret and belong here; the token does not.
 

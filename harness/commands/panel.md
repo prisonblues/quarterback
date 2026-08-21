@@ -18,7 +18,7 @@ panel just adds independent reviewers + hard CI/Sonar gates on top of that bar.
 2. **Panel members.** Default to the repo's `.harness-rules` — pass no `--reviewers` at all. Pass it
    only when the user named who should review, in any phrasing ("just codex", "codex and antigravity",
    "run the whole panel"): map that to a comma-separated list of `claude`, `codex`, `antigravity`,
-   `sonarqube`. The flag REPLACES the configured set rather than filtering it, so naming a reviewer
+   `pi`, `grok`, `sonarqube`. The flag REPLACES the configured set rather than filtering it, so naming a reviewer
    runs it even where the rules disable it — which is the point. Never guess a member the user
    didn't ask for, and never pass the flag to "be explicit" about the default.
 3. Run (from anywhere — post-by-default, drop `--post` only on `--no-post`):
@@ -26,7 +26,7 @@ panel just adds independent reviewers + hard CI/Sonar gates on top of that bar.
    qb-stage R1                                                # what the statusline shows
    python3 ~/.claude/loops/panel.py --pr <pr> --post          # add --repo <path|name> for another repo
    python3 ~/.claude/loops/panel.py --pr <pr> --post --reviewers codex          # single-vendor read
-   python3 ~/.claude/loops/panel.py --pr <pr> --post --reviewers claude,codex,antigravity
+   python3 ~/.claude/loops/panel.py --pr <pr> --post --reviewers claude,codex,antigravity,grok
    ```
    **Run it in the background** (`run_in_background`), not as a foreground Bash call. A reviewer on
    a top-tier model at high effort can think for 20+ minutes, and the foreground Bash timeout caps
@@ -59,10 +59,11 @@ Notes:
   `/panel-review-pr` when the fix that follows should itself be reviewed, which is what its
   rounds are for.
 - First run needs `op signin` once (the SonarCloud token then caches), `codex login` for the Codex
-  reviewer and `agy` auth for the Antigravity one; missing reviewers are reported as skipped, not fatal.
-- `antigravity` is off unless a repo's `.harness-rules` enables it — its CLI (`agy`) is workstation-only (personal
-  Google account, so it never reaches the work box). `--reviewers` still runs it on demand anywhere
-  the CLI exists.
+  reviewer, `agy` auth for the Antigravity one and `grok login` for the Grok one; missing reviewers
+  are reported as skipped, not fatal.
+- `antigravity`, `pi` and `grok` are off unless a repo's `.harness-rules` enables them — each is a
+  workstation-only CLI on a personal account, so none reaches the work box. `--reviewers` still runs
+  them on demand anywhere the CLI exists.
 - The master judge is always `claude`, whoever the reviewers are. `--reviewers antigravity` on a machine
   without the claude CLI therefore returns findings **unjudged** rather than adjudicated — the report
   says so, and every finding is kept.
