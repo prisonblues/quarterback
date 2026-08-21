@@ -31,9 +31,9 @@ of them mean "do not merge", so a caller that conflates them fails safe.
 
 READ-ONLY, AND IT TAKES NO CLAIM
     This reports commands; it never runs them. It reads ``kind=merge`` claims and
-    HOLDs when another agent holds the base this PR lands onto, but it does not
-    TAKE that claim —
-    that is #100's, where the merge actually happens. The distinction is between
+    the merge queue, and HOLDs when another agent holds the base this PR lands
+    onto or sits ahead of it in the line — but it TAKES neither. That is #100's,
+    where the merge actually happens. The distinction is between
     the verdict (a pure function of the world) and the actor (the thing that
     merges), and conflating them costs three things at once: a verdict that
     mutates cannot run as a CI check, cannot be re-run to verify itself, and
