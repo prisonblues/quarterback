@@ -488,3 +488,144 @@ def test_bare_panel_reports_land_readiness_and_never_offers_to_merge():
         "prohibition, because proposing the merge is the footgun in a repo the caller does not own")
     assert "/panel-review-pr" in text, (
         "panel.md refuses the offer without naming the command that may make it")
+
+
+# ------------------------------------- #227: the queue that has to be binding
+
+
+def test_fix_and_land_joins_the_queue_before_it_spends_a_ci_run():
+    """#317 built the queue and stopped at the contract, saying so: *"nothing yet forces the
+    stop."* A queue nothing enqueues into is #169's defect exactly — a mechanism that ships
+    unwired — and one enqueued into after the integration is a queue that orders nothing, because
+    the expensive half is the integration and each loser's push invalidates the winner's green
+    checks on the way past. So the ordering is the assertion, over the runnable blocks."""
+    runnable = _fenced(command("fix-and-land"))
+    enqueue = runnable.find("merge_queue_enqueue")
+    gate = runnable.find("preland.py")
+    assert enqueue >= 0, (
+        "fix-and-land never enqueues, so its PRs are invisible to every other agent's queue check "
+        "and the line it is meant to stand in has nobody in it")
+    assert gate >= 0, "the pre-land gate is gone from the runnable blocks"
+    assert enqueue < gate, (
+        "the queue is joined after the gate has already run, so a PR third in line has done the "
+        "expensive work before anything could tell it not to")
+
+
+def test_fix_and_land_releases_its_place_on_every_exit_that_is_not_about_the_queue():
+    """An entry is a lease and a lease nobody releases is a queue that jams — worse than no queue,
+    because everybody behind it waits for a land that already happened. Both exits are asserted:
+    the merge, and the hold."""
+    text = command("fix-and-land")
+    assert "merge_queue_leave" in _fenced(text), (
+        "nothing in fix-and-land ever leaves the queue, so a merged or held PR holds its place "
+        "until the TTL expires")
+    runnable = _fenced(text)
+    assert runnable.find("merge_queue_leave") < runnable.rfind("merge_queue_leave"), (
+        "the queue is left in only one place — the merge and the hold are different exits and "
+        "both have to release the lease")
+    assert re.search(r'reason="merged"', runnable), "the merge exit does not say why it left"
+    assert re.search(r'reason="held', runnable), "the hold exit does not say why it left"
+
+
+def test_the_one_stop_that_keeps_its_place_is_the_one_about_position():
+    """A loop that read "not your turn" as "leave the queue" would go to the back of the line every
+    time it was overtaken, which starves the PR — strictly worse than the racing the queue
+    replaced. So the queue stand-down is the exception, and it has to be written as one."""
+    text = command("fix-and-land")
+    assert re.search(r"[Dd]o not leave the queue here", text.replace("*", "")), (
+        "the position stand-down does not say to keep the entry, so the obvious reading of "
+        "'stop and clean up' sends the PR to the back of its own line")
+    assert re.search(r"re-join at the back", text), "nothing says what leaving would cost"
+
+
+def test_a_lone_pr_meets_no_queue_at_all():
+    """The other half of the contract, and the thing that keeps this from being a gate people turn
+    off. preland owns the behaviour; what the brief must not do is add a wait of its own on top of
+    a verdict that already came back READY."""
+    text = command("fix-and-land")
+    assert re.search(r"empty|nobody is queued|nothing else queued|no new friction|"
+                     r"idempotent", text, re.IGNORECASE), (
+        "fix-and-land says nothing about the case where nobody else is in the line, so a reader "
+        "has no way to tell that the queue is meant to be free for a lone PR")
+
+
+@pytest.mark.parametrize("name", ("fix-and-land", "panel-review-pr"))
+def test_the_landing_claim_is_taken_on_the_base_branch(name: str):
+    """#318. `kind=merge` keys on a branch and nothing in the ref name says which one, so the
+    answer lives in the callers. Under the head-branch reading two agents landing two DIFFERENT
+    PRs into `main` hold `<repo>:feat/a` and `<repo>:feat/b`, never see each other, and both
+    merge — which is the incident `check_merge_claim`'s docstring cites. It is also the key
+    `preland.py` reads and the key the merge queue reports beside its line, so a caller claiming
+    the head names one land two ways."""
+    runnable = _fenced(command(name))
+    claim = re.search(r"qb-claim branch (\S+)", runnable)
+    assert claim, f"{name} no longer claims a branch before merging"
+    assert re.search(r"BASE|base", claim.group(1)), (
+        f"{name} claims {claim.group(1)} — the PR's own head branch — so it serialises two agents "
+        "landing the SAME pr and not the collision that actually happens, which is two agents "
+        "landing different PRs onto one base")
+
+
+def test_fix_and_land_claims_the_base_before_it_merges():
+    """The queue orders; the claim is the one slot held across the merge itself. Being at the head
+    is permission to go and ask for the claim, and an autonomous loop that merged on the strength
+    of its queue position alone would have made the queue a second lock — the thing #317 says in
+    its first paragraph it must not become."""
+    runnable = _fenced(command("fix-and-land"))
+    claim = runnable.find("qb-claim")
+    merge = runnable.find("gh pr merge")
+    assert merge >= 0, "fix-and-land never merges in a runnable block"
+    assert claim >= 0, (
+        "fix-and-land merges without taking `kind=merge`, so two agents each at the head of the "
+        "queue for their own base — or one agent and one human in the UI — both merge")
+    assert claim < merge, "the claim is taken after the merge, which serialises nothing"
+    assert "--claim-holder" in runnable, (
+        "the re-verification after claiming does not pass `--claim-holder`, so the loop's own "
+        "claim is read as somebody else's and it holds its own merge")
+
+
+def test_the_landing_claim_is_released_on_every_exit_after_it_is_taken():
+    """Codex, round 1. The claim is a worse thing to leak than a queue place: it is preland's
+    `merge_claim` check answering "somebody is landing onto $BASE" to every other agent in the
+    fleet, for the rest of its TTL, about a land that is not happening — so nobody merges onto that
+    base in the meantime. The post-claim re-verification can come back anything but READY, and that
+    exit has to release it too."""
+    text = command("fix-and-land")
+    runnable = _fenced(text)
+    assert "release_claim" in runnable, (
+        "fix-and-land takes `kind=merge` and never releases it, so a loop that stopped between the "
+        "claim and the merge blocks every other agent's landing until the TTL expires")
+    assert re.search(r"claim_id=\$\(", runnable), (
+        "nothing captures the claim id `qb-claim` prints on stdout, so there is no id to release "
+        "with — the release step above cannot actually be run")
+    assert re.search(r"every exit releases it", text), (
+        "the release reads as a step in the happy path only; the exit that matters is the one where "
+        "the re-verification did not come back READY")
+
+
+def test_the_head_asserts_its_readiness_on_the_line_before_it_merges():
+    """`ready` is the only verdict that lets a queue head merge, and it is pinned to a commit — the
+    board drops it the moment the head moves, which is what an agent's own memory of "preland said
+    READY" structurally cannot do. Asserted as an ordering: said at 4a it would be a lie, and said
+    after the merge it would be a green light on a PR that has already gone."""
+    runnable = _fenced(command("fix-and-land"))
+    ready = runnable.find('verdict="ready"')
+    merge = runnable.find("gh pr merge")
+    assert ready >= 0, (
+        "the head never tells the line it is ready, so `GET /merge-queue` reports the PR about to "
+        "land as not-ready and preland's own advice to re-enqueue at this head goes nowhere")
+    assert ready < merge, "readiness is asserted after the merge, which is a green light on a PR that has gone"
+
+
+@pytest.mark.parametrize("name", ("fix-and-land", "panel-review-pr"))
+def test_the_landing_claim_is_taken_on_a_bounded_ttl(name: str):
+    """Keying the claim on the base (#318) widened what a leaked one costs: it blocks every merge
+    onto that base rather than one branch's, and `preland`'s `merge_claim` check is what makes that
+    a hard stop for everybody. The TTL is the only backstop for a session that ends between the
+    claim and the release, and the board's default is an hour."""
+    runnable = _fenced(command(name))
+    claim = re.search(r"qb-claim branch \S+([^\n]*)", runnable)
+    assert claim, f"{name} no longer claims a branch before merging"
+    assert "--ttl" in claim.group(1), (
+        f"{name} takes the landing claim on the board's default hour, so a session that dies "
+        "between the claim and the merge blocks every land onto that base for an hour")

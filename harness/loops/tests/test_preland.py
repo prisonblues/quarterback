@@ -49,14 +49,23 @@ def review_row(**over):
 
 @pytest.fixture
 def board(monkeypatch):
-    """Double `board_get`, keyed by path. Anything unasked for is an outage,
-    which is what a missing answer actually means to this module."""
-    answers: dict[str, tuple[object, str]] = {}
+    """Double the board, keyed by path. Anything unasked for is an outage, which
+    is what a missing answer actually means to this module.
 
-    def get(path, params):
-        return answers.get(path.strip("/"), (None, "board unreachable (test default)"))
+    Both entry points are doubled from one table. An answer may be written as
+    `(body, err)` — what almost every check reads — or as `(body, err, status)`
+    for the one check that reads an HTTP status, so an existing answer does not
+    have to grow a third element it has no opinion about.
+    """
+    answers: dict[str, tuple] = {}
 
-    monkeypatch.setattr(preland, "board_get", get)
+    def request(path, params):
+        got = answers.get(path.strip("/"),
+                          (None, "board unreachable (test default)"))
+        return got if len(got) == 3 else (*got, None)
+
+    monkeypatch.setattr(preland, "board_request", request)
+    monkeypatch.setattr(preland, "board_get", lambda p, q: request(p, q)[:2])
     return answers
 
 
@@ -717,7 +726,7 @@ def test_a_custom_migrations_dir_is_passed_to_the_reconciler(repo, monkeypatch):
     preland.gather({"github": "o/r", "path": repo, "epic": {"migrations_dir": "db/rev"}},
                    pr(), BASE, dict.fromkeys(
                        ("pr_state", "checkout", "ci", "review", "merge_claim",
-                        "sw_version"), "skipped-flag"))
+                        "queue", "sw_version"), "skipped-flag"))
     assert seen[0][-2:] == ["--versions-path", "db/rev"]
 
 
@@ -822,7 +831,8 @@ def test_a_skipped_check_is_still_in_the_payload(monkeypatch, repo):
     monkeypatch.setattr(preland, "_git", lambda root, *a: HEAD if a[0] == "rev-parse" else "")
     cfg = {"github": "o/r", "path": repo}
     checks = preland.gather(cfg, pr(), BASE, {"review": "skipped-disabled",
-                                     "merge_claim": "skipped-flag"})
+                                     "merge_claim": "skipped-flag",
+                                     "queue": "skipped-flag"})
     by_name = {c.name: c for c in checks}
     assert [c.name for c in checks] == list(preland.CHECKS)
     assert by_name["review"].status == "skipped-disabled"
@@ -836,7 +846,8 @@ def test_a_check_that_crashes_holds_and_the_others_still_run(monkeypatch, repo):
     monkeypatch.setattr(preland, "check_ci",
                         lambda p: (_ for _ in ()).throw(KeyError("statusCheckRollup")))
     checks = preland.gather({"github": "o/r", "path": repo}, pr(), BASE,
-                            {"review": "skipped-flag", "merge_claim": "skipped-flag"})
+                            {"review": "skipped-flag", "merge_claim": "skipped-flag",
+                             "queue": "skipped-flag"})
     by_name = {c.name: c for c in checks}
     assert by_name["ci"].status == "error" and "KeyError" in by_name["ci"].reasons[0]
     assert by_name["pr_state"].status == "passed"
@@ -917,6 +928,14 @@ def wired(monkeypatch, board, repo):
     monkeypatch.setattr(preland, "run", lambda argv, cwd=None:
                         proc(1 if "cat-file" in argv else 0))
     board["claims"] = ({"claims": []}, "")
+    # The line this PR is at the head of. Written here rather than left to the
+    # default outage because an end-to-end fixture that could not reach the queue
+    # would make every one of these tests a test of the board being down.
+    board["merge-queue"] = ({"active_order": [7],
+                             "you": {"queued": True, "position": 1, "is_head": True,
+                                     "may_integrate": True, "may_merge": True,
+                                     "reason": "head and ready", "waiting_on": None}},
+                            "", 200)
     return board
 
 
@@ -1011,3 +1030,234 @@ def test_a_gh_that_says_nothing_usable_is_a_clean_exit_not_a_traceback(monkeypat
     monkeypatch.setattr(preland, "sh", lambda argv, **kw: "not json")
     with pytest.raises(SystemExit, match="no usable JSON"):
         preland.read_pr("o/r", 7, "/x")
+
+
+# ----------------------------------------------------- queue (#227, the stop)
+
+
+@pytest.fixture
+def queue(monkeypatch):
+    """Double `board_request` for `/merge-queue`, body and HTTP status both.
+
+    Two things are being doubled and only one of them is the body. The status is
+    how `check_queue` tells a board that has no queue (404, a capability answer)
+    from one whose queue broke (500, an objection), and a fixture that returned
+    only the body could not express the difference the check turns on.
+
+    Anything not `/merge-queue` falls through to an outage, which is what an
+    unasked-for path actually means to this module.
+    """
+    state: dict = {"body": None, "err": "board unreachable (test default)",
+                   "status": None, "asked": []}
+
+    def request(path, params):
+        if path.strip("/") != preland.QUEUE_PATH:
+            return None, "board unreachable (test default)", None
+        state["asked"].append(dict(params))
+        return state["body"], state["err"], state["status"]
+
+    monkeypatch.setattr(preland, "board_request", request)
+    return state
+
+
+def line(*, queued=True, position=1, is_head=True, may_merge=True, order=(7,),
+         reason="fine", waiting_on=None):
+    """A `GET /merge-queue?pr=…` answer, in the board's own shape."""
+    return {"active_order": list(order),
+            "you": {"queued": queued, "position": position, "is_head": is_head,
+                    "may_integrate": is_head, "may_merge": may_merge,
+                    "reason": reason, "waiting_on": waiting_on}}
+
+
+def queued(state, body):
+    state["body"], state["err"], state["status"] = body, "", 200
+
+
+def test_the_head_of_the_line_passes(queue):
+    queued(queue, line(order=(7, 9)))
+    c = preland.check_queue("o/r", pr())
+    assert c.status == "passed" and not c.reasons
+    assert "head of the line for main" in c.summary
+
+
+def test_a_pr_behind_another_is_not_ready_and_is_told_by_whom(queue):
+    """#317 built the queue and stopped at the contract, saying so: "nothing yet
+    forces the stop". This is the stop. A second ready PR must not rebase, push or
+    restart CI — that is a whole run spent to learn what the board already says,
+    and the push invalidates the head's green checks on the way past."""
+    queued(queue, line(
+        queued=True, position=3, is_head=False, may_merge=False, order=(9, 4, 7),
+        reason="queued behind #9, position 3 of 3 — do not rebase, push or restart CI",
+        waiting_on={"pr": 9, "holder": "zeus/opal-kelp", "note": "landing #9"}))
+    c = preland.check_queue("o/r", pr())
+    assert c.status == "failed", "a non-head PR reached READY"
+    assert preland.verdict_of([c]) == preland.HOLD
+    assert c.summary == "position 3 of 3"
+    said = c.reasons[0]
+    assert "queued behind #9" in said and "do not rebase" in said
+    assert "zeus/opal-kelp" in said, "the stand-down does not name who to go and ask"
+    assert "leaving would re-join at the back" in said
+
+
+def test_standing_down_never_tells_a_loop_to_leave_the_line(queue):
+    """The one stop that keeps its entry. A loop that read "not your turn" as
+    "leave" would go to the back of the line every time it was overtaken, which
+    starves the PR — worse than the racing the queue replaced."""
+    queued(queue, line(queued=True, position=2, is_head=False, may_merge=False,
+                       order=(9, 7), reason="queued behind #9",
+                       waiting_on={"pr": 9, "holder": "zeus/x", "note": None}))
+    said = preland.check_queue("o/r", pr()).reasons[0]
+    assert "Stay queued" in said and "your place is kept" in said
+
+
+def test_a_lone_pr_on_an_empty_line_sees_no_new_friction(queue):
+    """The other half of the contract. A gate that made the ordinary case harder
+    is a gate people turn off, and a human landing one PR with nobody else waiting
+    must not meet a queue at all."""
+    queued(queue, line(queued=False, position=None, is_head=False, may_merge=False,
+                       order=(), reason="#7 is not in the queue for this base"))
+    c = preland.check_queue("o/r", pr())
+    assert c.status == "passed" and not c.reasons and not c.warnings
+    assert c.summary == "nobody is queued to land on main"
+
+
+def test_skipping_the_queue_while_others_are_in_it_is_not_a_way_past_this_check(queue):
+    """#169's defect wearing the queue's clothes: if never enqueueing passed, the
+    way round the gate would be to not use the mechanism."""
+    queued(queue, line(queued=False, position=None, is_head=False, may_merge=False,
+                       order=(9, 4), reason="#7 is not in the queue for this base"))
+    c = preland.check_queue("o/r", pr())
+    assert c.status == "failed"
+    assert "#9, #4" in c.reasons[0] and "merge_queue_enqueue" in c.reasons[0]
+
+
+def test_a_head_whose_entry_is_behind_the_branch_warns_and_does_not_hold(queue):
+    """This check rules on POSITION and nothing else. Readiness is preland's own
+    output, so holding for want of it would be this file refusing to run until it
+    had already run — and the board's sentence about it is the caller's next step,
+    which is a warning's job."""
+    queued(queue, line(may_merge=False,
+                       reason="#7 is the head, but it has moved to abc since it "
+                              "enqueued at def: re-run preland and re-enqueue"))
+    c = preland.check_queue("o/r", pr())
+    assert c.status == "passed" and not c.reasons
+    assert "re-run preland" in c.warnings[0]
+    assert "this run is that re-check" in c.warnings[0]
+
+
+def test_the_queue_is_asked_about_the_base_and_this_head(queue):
+    """Keyed on the base, and pinned to the commit. Asking without `head` would let
+    an entry's readiness outlive the commit it was about, which is the permanent
+    green light the queue exists to remove."""
+    queued(queue, line())
+    preland.check_queue("o/r", pr())
+    assert queue["asked"] == [{"repo": "o/r", "base": "main", "pr": 7, "head": HEAD}]
+
+
+def test_a_board_with_no_queue_is_a_capability_answer_not_a_failure(board):
+    """The endpoint landed in #317 and a board deployed before it answers 404 —
+    the same fact as a repo with no `scripts/migration_reconcile.py`. Every host
+    HOLDing until its board is redeployed would be a gate people turn off."""
+    board["merge-queue"] = (None, "board answered HTTP 404", 404)
+    board["claims"] = ({"claims": []}, "")
+    c = preland.check_queue("o/r", pr())
+    assert c.status == "skipped-absent"
+    assert preland.verdict_of([c]) == preland.READY
+
+
+def test_a_404_from_a_board_that_answers_nothing_else_is_not_a_capability_answer(board):
+    """Codex, round 1. 404 is also what a base URL pointed at the wrong host
+    returns, and what a proxy with no upstream returns — and reading either of
+    those as "this board has no queue" fails the gate open on exactly the
+    misconfiguration it has no other way of noticing. So the absence is
+    corroborated against a route that predates the queue by a long way."""
+    board["merge-queue"] = (None, "board answered HTTP 404", 404)
+    board["claims"] = (None, "board answered HTTP 404 for /claims", 404)
+    c = preland.check_queue("o/r", pr())
+    assert c.status == "error", (
+        "a board that cannot answer /claims either was read as one that merely "
+        "predates the queue, so a mis-pointed board URL reaches READY")
+    assert preland.verdict_of([c]) == preland.HOLD
+
+
+def test_a_404_corroborated_against_a_REFUSED_claims_read_is_not_absence(board):
+    """A 401 on /claims is a token problem, not a board without a queue. Anything
+    that is not a clean answer leaves the 404 uncorroborated."""
+    board["merge-queue"] = (None, "board answered HTTP 404", 404)
+    board["claims"] = (None, "board answered HTTP 401 — the token was refused", 401)
+    assert preland.check_queue("o/r", pr()).status == "error"
+
+
+def test_a_queue_that_cannot_be_read_holds_and_names_the_off_switch(queue):
+    """A line this gate cannot see is a line it cannot rule on — the module's own
+    rule about the review check, word for word."""
+    queue["body"], queue["err"], queue["status"] = None, "board answered HTTP 500", 500
+    c = preland.check_queue("o/r", pr())
+    assert c.status == "error"
+    assert 'disabled_checks": ["queue"]' in c.reasons[0]
+
+
+def test_an_answer_with_no_you_verdict_is_unreadable_not_empty(queue):
+    """Reading a shape this cannot parse as "you are not queued" would report a
+    position about a namespace it never managed to look at."""
+    queue["body"], queue["err"], queue["status"] = {"active_order": [9]}, "", 200
+    assert preland.check_queue("o/r", pr()).status == "error"
+
+
+def test_the_queue_check_takes_no_claim_and_makes_no_write(queue):
+    """#317's `test_being_at_the_head_takes_no_merge_claim`, from this side. The
+    queue is ordering AROUND the `kind=merge` claim, not a second lock: this check
+    reads one endpoint with GET and touches nothing else."""
+    queued(queue, line())
+    preland.check_queue("o/r", pr())
+    assert len(queue["asked"]) == 1, "the queue check made more than the one read"
+
+
+def test_the_queue_check_actually_runs_in_a_gather(repo, monkeypatch, board):
+    """#169 in the cheapest place it happens: a check written, tested and never
+    listed in `CHECKS` is a guardrail that exists only in its own unit tests. The
+    board answer here is the fixture's default outage, so an unwired check shows
+    up as a run that reached READY with nothing objecting."""
+    monkeypatch.setattr(preland, "_git",
+                        lambda root, *a: HEAD if a[0] == "rev-parse" else "")
+    assert "queue" in preland.CHECKS
+    checks = preland.gather({"github": "o/r", "path": repo}, pr(), BASE,
+                            {"review": "skipped-flag", "merge_claim": "skipped-flag"})
+    by_name = {c.name: c for c in checks}
+    assert by_name["queue"].status == "error", (
+        "the queue check is not wired into `gather`, so nothing runs it on a real "
+        "verdict and #227's stop is a mechanism that shipped unwired")
+    assert preland.verdict_of(checks) == preland.HOLD
+
+
+# ------------------------------- #318: the merge claim keys on the BASE branch
+
+
+def test_the_merge_claim_is_read_on_the_base_not_the_head(board, monkeypatch):
+    """#318. `check_merge_claim`'s docstring names the incident it exists to
+    prevent — "on the same day two agents merged at once" — and a head-branch key
+    does not prevent it: two agents landing two DIFFERENT PRs into `main` hold
+    `o/r:feat/a` and `o/r:feat/b`, never see each other, and both merge. The base
+    is what a simultaneous merge collides on, and it is what the queue keys on."""
+    asked: list[dict] = []
+
+    def get(path, params):
+        asked.append(dict(params))
+        return {"claims": []}, ""
+
+    monkeypatch.setattr(preland, "board_get", get)
+    preland.check_merge_claim("o/r", pr(headRefName="feat/a", baseRefName="main"), "")
+    assert asked[0] == {"kind": "merge", "key": "o/r:main"}, (
+        "the merge claim is still keyed on the head branch, so two agents landing "
+        "different PRs into one base hold different keys and neither sees the other")
+
+
+def test_two_prs_landing_into_one_base_contend_on_one_key(board):
+    """The property the key change buys, stated as the incident. Under the old
+    reading these two calls produced two different keys and both passed."""
+    board["claims"] = ({"claims": [{"holder": "zeus/opal-kelp", "acquired": "12:00",
+                                    "note": "landing #9"}]}, "")
+    for branch in ("feat/a", "feat/b"):
+        c = preland.check_merge_claim("o/r", pr(headRefName=branch), "zeus/me")
+        assert c.status == "failed", f"{branch} did not see the land in progress"
+        assert "o/r:main" in c.reasons[0] and "landing onto main" in c.reasons[0]

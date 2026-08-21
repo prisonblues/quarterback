@@ -115,6 +115,12 @@ def merge_key(repo: str, base: str) -> tuple[str, str]:
     It also validates: the repo must be ``owner/name`` and the base must be a
     branch name ``git check-ref-format`` would accept, so a queue cannot be opened
     on a ref that cannot exist.
+
+    The base is the branch a *lander* claims, which #318 settled after this landed
+    keying on it: ``preland.check_merge_claim`` read the HEAD branch until then, so
+    the queue reported a claim at one key while the gate read another and the two
+    named one land two ways — the very thing the paragraph above says this function
+    exists to prevent. Both read ``<repo>:<base>`` now.
     """
     return derive("branch", repo=repo, value=base)
 

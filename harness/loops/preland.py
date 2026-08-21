@@ -31,8 +31,9 @@ of them mean "do not merge", so a caller that conflates them fails safe.
 
 READ-ONLY, AND IT TAKES NO CLAIM
     This reports commands; it never runs them. It reads ``kind=merge`` claims and
-    HOLDs when another agent holds the branch, but it does not TAKE that claim —
-    that is #100's, where the merge actually happens. The distinction is between
+    the merge queue, and HOLDs when another agent holds the base this PR lands
+    onto or sits ahead of it in the line — but it TAKES neither. That is #100's,
+    where the merge actually happens. The distinction is between
     the verdict (a pure function of the world) and the actor (the thing that
     merges), and conflating them costs three things at once: a verdict that
     mutates cannot run as a CI check, cannot be re-run to verify itself, and
@@ -129,7 +130,7 @@ EXIT = {READY: 0, RECONCILE: 3, HOLD: 2}
 #: collected from the functions so that `--skip nonsense` and a typo in
 #: `.harness-rules` are both hard errors: a gate silently running one check short
 #: is the failure mode the whole file exists to prevent.
-CHECKS = ("pr_state", "checkout", "ci", "review", "merge_claim",
+CHECKS = ("pr_state", "checkout", "ci", "review", "merge_claim", "queue",
           "migrations", "sw_version")
 
 #: The three distinct reasons a check did not run. Kept apart because "this repo
@@ -155,6 +156,11 @@ QB_CONFIG = Path(os.environ.get("QUARTERBACK_CONFIG") or (
 QB_TOKEN_FILE = Path("/run/op-secrets/quarterback-token")
 
 BOARD_TIMEOUT = 15
+
+#: The board endpoint the landing queue lives behind (#227/#317). Named here
+#: because :func:`check_queue` says it back in two messages, and a path spelled
+#: three times is a path that ends up spelled two ways.
+QUEUE_PATH = "merge-queue"
 
 
 # --------------------------------------------------------------- the two shells
@@ -361,32 +367,52 @@ def _token_from(cfg: dict[str, str]) -> str:
 
 
 def board_get(path: str, params: dict) -> tuple[object, str]:
-    """(parsed JSON, error) from the board. Never raises: an unreachable board is
-    a fact this script REPORTS, and reporting it is what makes it a HOLD rather
-    than an exception nobody mapped to a verdict."""
+    """(parsed JSON, error) from the board, for the checks with no use for a
+    status code. :func:`board_request` without its third element."""
+    body, err, _ = board_request(path, params)
+    return body, err
+
+
+def board_request(path: str, params: dict) -> tuple[object, str, int | None]:
+    """(parsed JSON, error, HTTP status) from the board. Never raises: an
+    unreachable board is a fact this script REPORTS, and reporting it is what
+    makes it a HOLD rather than an exception nobody mapped to a verdict.
+
+    The status is returned because ONE caller needs to tell two failures apart
+    that the error sentence cannot: :func:`check_queue` reads an endpoint that
+    older boards do not implement, and a 404 there means "this board has no
+    landing queue" — a capability answer — while a 500 means it has one and it
+    broke. The module docstring's capability rule for repo-local scripts is the
+    same rule; the board is simply the other place a guardrail can be absent.
+    It is `None` for everything that never reached HTTP at all.
+    """
     url, token, why = board_config()
     if why:
-        return None, why
+        return None, why, None
     full = f"{url}/{path.lstrip('/')}?{urllib.parse.urlencode(params)}"
     req = urllib.request.Request(full, headers={"Authorization": f"Bearer {token}"})
     try:
         with urllib.request.urlopen(req, timeout=BOARD_TIMEOUT) as r:
-            return json.loads(r.read().decode()), ""
+            return json.loads(r.read().decode()), "", r.status
     except urllib.error.HTTPError as e:
         # Before URLError: it is a subclass, and an HTTP status says far more
         # than "unreachable" — 401 in particular is a token problem, not a board
         # that is down, and the two want different remedies.
         hint = " — the token this host resolved was refused" if e.code == 401 else ""
-        return None, f"board answered HTTP {e.code} for /{path.lstrip('/')}{hint}"
+        return None, f"board answered HTTP {e.code} for /{path.lstrip('/')}{hint}", e.code
     except OSError as e:
         # OSError, not URLError: it covers URLError and TimeoutError both, plus a
         # connection reset partway through the read, which is an OSError that
         # urllib does not wrap. This function's contract is that it never raises,
         # and a narrow tuple is how that contract quietly stops being true.
-        return None, f"board unreachable at {url} ({e.__class__.__name__})"
+        return None, f"board unreachable at {url} ({e.__class__.__name__})", None
     except ValueError:
-        # JSONDecodeError, and a body that is not valid UTF-8.
-        return None, f"board answered /{path.lstrip('/')} with something that is not JSON"
+        # JSONDecodeError, and a body that is not valid UTF-8. The status is
+        # dropped rather than reported: the request DID reach the board, so a
+        # caller reading capability off the status would draw a conclusion from a
+        # body nothing managed to parse.
+        return (None, f"board answered /{path.lstrip('/')} with something that is "
+                "not JSON", None)
 
 
 # ------------------------------------------------------------------- the checks
@@ -776,13 +802,45 @@ def _round_warnings(c: Check, latest: dict) -> None:
 
 
 def check_merge_claim(repo: str, pr: dict, mine: str) -> Check:
-    """Is another agent already landing this branch?
+    """Is another agent already landing onto this PR's base?
 
     `kind=merge, key=<repo>:<branch>` shipped in #131 and nothing has ever read
     it — on the same day two agents merged at once. This is the read half. It
     does not TAKE the claim (see the module docstring), so `mine` is how a caller
     that already holds one says so: without it, the lander's own claim would hold
     its own merge.
+
+    **The branch is the BASE, and #318 is why.** This read the HEAD branch until
+    that issue asked which one the claim is supposed to be, and under a head key
+    the incident in the paragraph above is *not* prevented: two agents landing two
+    different PRs into `main` hold `<repo>:feat/a` and `<repo>:feat/b`, never see
+    each other, and both merge. The head key catches only the narrower case of two
+    agents landing the same PR, which is the rarer of the two and already unlikely
+    once :func:`check_queue` exists. What a simultaneous merge collides on is the
+    base — it is what every other open PR goes stale against afterwards, and #80
+    measures that collision as quadratic in the open PRs.
+
+    The audit #318 asked for is what made the change safe rather than merely
+    right. `derive("branch", …)` is the only maker of merge keys and **every**
+    branch claim in this fleet is a landing claim: `create-worktree` claims the
+    ISSUE its branch names (the function called `claim_the_branch` resolves to an
+    issue number), the plan's `ref_kind` is restricted to issue and pr, and
+    `qb-hook`'s `kind: "branch"` post ref is an annotation on a board post that
+    takes no claim at all. So the branch claim served no non-landing purpose whose
+    meaning this could change out from under.
+
+    It also removes a disagreement rather than creating one: the queue keys on
+    `repo + base` through `app.claimkey`, and `GET /merge-queue` reports the claim
+    it finds at that key. With this reading of the same land, a queue head that is
+    told "take `kind=merge` on this base before you merge" takes the claim this
+    check then reads. Under the old one the two named one land two ways, which is
+    the #172 defect `merge_key`'s own docstring says it exists to prevent.
+
+    Composed here rather than through `app.claimkey`, because this script runs out
+    of `~/.claude/loops` on hosts with no checkout of this repo on the path. The
+    shape is `derive`'s and the separator is `:`; the repo is already canonical
+    (`resolve_repo` reads it off the remote) and the branch half is deliberately
+    not case-folded there either.
 
     #142 inverted the authorisation this used to be hedged about: every kind in
     the claims table is session-owned now, so a co-tenant POSTing the same claim
@@ -797,7 +855,7 @@ def check_merge_claim(repo: str, pr: dict, mine: str) -> Check:
     thirteen agents worked three shared checkouts. So "unclaimed" is reported as
     what it is: an answer this check cannot draw a conclusion from.
     """
-    key = f"{repo}:{pr['headRefName']}"
+    key = f"{repo}:{pr['baseRefName']}"
     body, err = board_get("claims", {"kind": "merge", "key": key})
     if err:
         c = Check("merge_claim", "error", "claims unreadable")
@@ -819,7 +877,8 @@ def check_merge_claim(repo: str, pr: dict, mine: str) -> Check:
         c.reasons.append(
             f"{other.get('holder')} holds the merge claim on {key!r} since "
             f"{other.get('acquired') or '?'} ({other.get('note') or 'no note'}) "
-            "— it is landing this branch")
+            f"— it is landing onto {pr['baseRefName']} right now, and two merges "
+            "into one base at once is what this claim exists to prevent")
     if claims and not others:
         c.summary = "held by you"
     if not claims:
@@ -877,7 +936,7 @@ def _unclaimed_repo_warning(repo: str) -> list[str]:
         + (f" (the board holds {live} claim(s), all in other repos)" if live else
            " — and the board holds no claims at all, fleet-wide")
         + ". So `unclaimed` here is the absence of a record, not evidence that "
-        "nobody else is landing this branch. Agents in a repo that claims nothing "
+        "nobody else is landing onto this base. Agents in a repo that claims nothing "
         "collide in silence: enrol it (create-worktree takes the claim, "
         "`qb-claim issue <n>` by hand) or read this check as uninformative."
     ]
@@ -924,6 +983,159 @@ def _plan_claims_here(repo: str) -> int:
         # the list before there is anything exact in it to hold.
         held += sum(1 for p in plans if isinstance(p, dict) and p.get("claim"))
     return held
+
+
+def check_queue(repo: str, pr: dict) -> Check:
+    """Is this PR at the head of the line to land on its base? — #227.
+
+    The queue (#317) keys on ``repo`` + the **base** branch, because the base is
+    the resource two landings collide on. It answers what `merge_claim`
+    structurally cannot: that claim is one slot and says *somebody is landing
+    right now*, never who is next — so every review-clean PR behaved as though it
+    were. Merge the base, push, wait for CI, re-run this, discover somebody else
+    landed, repeat: #80's quadratic integration cost, with each loser's push
+    invalidating the winner's green checks on the way past.
+
+    #317 built the board side and stopped there, saying so in as many words:
+    *"nothing yet forces the stop"*. **This is the stop.** A PR behind another in
+    the line is not READY, and the reason names its position and the entry it
+    waits on, so the loop stands down before it spends the CI run rather than
+    after.
+
+    **It rules on POSITION and nothing else.** The board also reports whether an
+    entry carries a ``ready`` verdict at this commit, and this must not gate on
+    that: preland's own verdict is what produces that assertion, so holding for
+    want of it would be this file refusing to run until it had already run. A
+    head whose entry is behind the branch gets a WARNING carrying the board's own
+    sentence, because re-enqueueing at this head is the caller's next step and it
+    needs saying.
+
+    **A queue nobody is in imposes nothing**, which is the other half of the
+    contract. A lone PR on a base with an empty line passes without a word of
+    friction: there is nobody to wait for, and a gate that made the ordinary case
+    harder is a gate people turn off. What does NOT pass is a PR that never
+    enqueued while others are queued — otherwise the way past this check is to
+    skip the mechanism, which is #169's defect wearing the queue's clothes.
+
+    **A board with no queue is a capability answer, not a failure.** The endpoint
+    landed in #317 and a board deployed before it answers 404. That is the same
+    fact as a repo with no ``scripts/migration_reconcile.py`` — the invariant does
+    not exist there — and it reports ``skipped-absent`` for the same reason. Every
+    other board failure is an ERROR: a line this gate cannot see is a line it
+    cannot rule on, and the module docstring's rule about the ``review`` check
+    applies here word for word, off-switch included.
+    """
+    base = pr["baseRefName"]
+    body, err, status = board_request(
+        QUEUE_PATH, {"repo": repo, "base": base, "pr": pr["number"],
+                     "head": pr["headRefOid"]})
+    if status == 404:
+        return _queue_absent(base)
+    if err:
+        c = Check("queue", "error", "the queue is unreadable")
+        c.reasons.append(
+            f"{err}. Cannot tell whether another PR is ahead of this one in the "
+            f"line to land on {base!r}, and absent must not read as clean. Turn "
+            'this check off deliberately with `"preland": {"disabled_checks": '
+            '["queue"]}` in .harness-rules if this board has no queue')
+        return c
+    you = body.get("you") if isinstance(body, dict) else None
+    if not isinstance(you, dict):
+        c = Check("queue", "error", "the queue is unreadable")
+        c.reasons.append(
+            f"the board answered /{QUEUE_PATH} with no `you` verdict in it, so "
+            f"this PR's position in the line for {base!r} is unknown")
+        return c
+    order = body.get("active_order")
+    order = order if isinstance(order, list) else []
+    c = Check("queue", "passed",
+              detail={"base": base, "active_order": order, "you": you})
+    return _judge_place(c, you, order, pr, base)
+
+
+def _queue_absent(base: str) -> Check:
+    """A 404 on ``/merge-queue``: ruled on rather than believed.
+
+    404 is the board saying "no such route", and for THIS route that is usually a
+    capability answer — the endpoint landed in #317, and a board deployed before it
+    has no line to read. But 404 is also what a base URL pointed at the wrong host
+    returns, and what a proxy with no upstream returns, and reading either of those
+    as "this board has no queue" would fail the gate open on exactly the
+    misconfiguration it has no other way of noticing. A capability answer that
+    cannot be told apart from an outage is not a capability answer.
+
+    So the absence is corroborated, the way :func:`_detected` corroborates a
+    missing guardrail script against the base rather than taking the branch's word
+    for it: ask for a route that predates the queue by a long way. A board that
+    answers ``/claims`` is a real board that simply does not have the queue yet;
+    one that cannot answer that either is not a board this gate is talking to.
+    """
+    _, err, _status = board_request("claims", {"limit": "1"})
+    if not err:
+        return Check("queue", "skipped-absent",
+                     f"this board has no landing queue (no /{QUEUE_PATH})")
+    c = Check("queue", "error", "the queue is unreadable")
+    c.reasons.append(
+        f"the board answered 404 for /{QUEUE_PATH}, and /claims — which has existed "
+        f"far longer — came back with: {err}. So this is not a board that merely "
+        "predates the queue, and nothing here can tell whether another PR is ahead "
+        f"of this one in the line to land on {base!r}")
+    return c
+
+
+def _judge_place(c: Check, you: dict, order: list, pr: dict, base: str) -> Check:
+    """The verdict clause of :func:`check_queue`, over the board's own answer.
+
+    The board wrote the sentence and this does not rewrite it: ``reason`` is
+    quoted rather than paraphrased, so an agent reading this payload and an agent
+    reading ``merge_queue`` are told the same thing in the same words. What is
+    added is who holds the place ahead — "wait for #123" is something to act on
+    only once you know which agent to go and ask.
+    """
+    if you.get("queued") and you.get("is_head"):
+        c.summary = f"head of the line for {base} ({len(order)} queued)"
+        if not you.get("may_merge"):
+            c.warnings.append(
+                f"{you.get('reason')} — this run is that re-check, so re-enqueue "
+                "at this head once it comes back READY. Until you do, the line "
+                "advertises a readiness about a commit nobody checked")
+        return c
+    if you.get("queued"):
+        c.status = "failed"
+        c.summary = f"position {you.get('position')} of {len(order)}"
+        c.reasons.append(_waiting_sentence(you))
+        return c
+    if not order:
+        # The lone PR, and the reason this check adds no friction to it. Said in
+        # the summary rather than passed silently: a `passed` a reader cannot
+        # distinguish from "the queue was never asked" is #172's shape again.
+        c.summary = f"nobody is queued to land on {base}"
+        return c
+    c.status = "failed"
+    c.summary = f"not in the line ({len(order)} queued)"
+    c.reasons.append(
+        f"#{pr['number']} is not in the queue for {base!r} and "
+        f"{', '.join('#' + str(n) for n in order)} " +
+        ("is" if len(order) == 1 else "are") + " — the line exists so that only "
+        f"its head spends CI on integrating, and landing past #{order[0]} would "
+        "invalidate its checks. Enqueue (`merge_queue_enqueue`), then run this "
+        "again: joining the line is what makes your turn visible to everyone else")
+    return c
+
+
+def _waiting_sentence(you: dict) -> str:
+    """The board's refusal, plus who holds the place ahead — and the one thing a
+    caller must NOT do about it.
+
+    Standing down keeps the entry. Leaving and re-joining is a trip to the back of
+    the line, so a loop that read "stop" as "leave" would starve its own PR every
+    time it was overtaken, which is worse than the racing it replaced.
+    """
+    on = you.get("waiting_on") if isinstance(you.get("waiting_on"), dict) else {}
+    who = on.get("holder") or "an agent the board could not name"
+    return (f"{you.get('reason')} — #{on.get('pr')} is held by {who} "
+            f"({on.get('note') or 'no note'}). Stay queued: your place is kept "
+            "while your entry is renewed, and leaving would re-join at the back")
 
 
 def check_migrations(root: str, base: BaseRef, versions: str = "") -> Check:
@@ -1215,6 +1427,7 @@ def gather(cfg: dict, pr: dict, base: BaseRef, off: dict[str, str],
         # check's guard where it would read as that check failing.
         "review": lambda: check_review(repo, pr, earned_stop, gate),
         "merge_claim": lambda: check_merge_claim(repo, pr, mine),
+        "queue": lambda: check_queue(repo, pr),
         "migrations": lambda: check_migrations(root, base, versions),
         "sw_version": lambda: check_sw_version(root, base),
     }

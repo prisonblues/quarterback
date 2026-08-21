@@ -1354,7 +1354,8 @@ that had written up that exact confusion an hour earlier.
 | `checkout` | This tree is not at the PR's head, or has tracked modifications. Untracked files warn. |
 | `ci` | `gh`'s check rollup is red, **pending**, or **empty** — a push restarts CI, so an earlier green is stale, and no checks at all is silence rather than green. |
 | `review` | The board's newest round for this PR read another commit, did not `stop`, has `confirmed > 0`, or has a failing Sonar gate. No round at all is a HOLD too, and so is a round that recorded no finding count — unknown is not zero. |
-| `merge_claim` | Another agent holds `kind=merge` on `<repo>:<branch>`. |
+| `merge_claim` | Another agent holds `kind=merge` on `<repo>:<base>` — it is landing onto this PR's base right now. Keyed on the base rather than the head since [#318](https://github.com/prisonblues/quarterback/issues/318): two agents landing two *different* PRs into `main` is the collision worth serialising, and under head keys they never see each other. |
+| `queue` | This PR is not at the head of the merge queue for its base, or is not in the line at all while others are ([#227](https://github.com/prisonblues/quarterback/issues/227)). The reason names the position and who holds the place ahead. An empty line passes silently; a board with no `/merge-queue` reports `skipped-absent`. |
 | `migrations` | `scripts/migration_reconcile.py` says `stop`, or its plan and its exit code disagree. `relink`/`renumber`/`merge` are RECONCILE. |
 | `sw_version` | `scripts/check_sw_version.py` fails in a way `--fix` cannot repair. A repairable one is RECONCILE. |
 
@@ -1409,8 +1410,11 @@ deliberately off.
 **A check that did not run is still reported** — `skipped-absent`, `skipped-disabled`, or
 `skipped-flag` for `--skip` — because a payload must never read clean by omission.
 
-**It is read-only and takes no claim.** It reports commands and never runs them; it reads
-`kind=merge` claims and never takes one. That belongs to whatever does the merging
+**It is read-only and takes no claim, and it does not enqueue either.** It reports commands
+and never runs them; it reads `kind=merge` claims and the merge queue and writes to neither.
+Joining the line is the landing loop's job (`/fix-and-land` §4), and it has to be: a verdict
+that enqueued could not be run twice, could not run as a CI check, and would put a PR in a
+line on behalf of whoever was merely asking a question about it. That belongs to whatever does the merging
 ([#100](https://github.com/prisonblues/quarterback/issues/100)) — a verdict that mutates
 cannot run as a CI check, cannot be re-run to verify itself, and cannot be asked twice by a
 loop that wants to know whether its own fix worked. The single write is `git fetch` of the

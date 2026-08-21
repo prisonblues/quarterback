@@ -3,7 +3,7 @@
 
   qb-claim issue 172                    this checkout's repo, issue 172
   qb-claim pr 207 --note "reviewing"
-  qb-claim branch feat/x --ttl 7200
+  qb-claim branch main --ttl 7200       the BASE being landed onto, not the head
   qb-claim item <uuid>                  a plan item, by board id
 
   0  taken     — it is yours (or renewed, if it already was)

@@ -38,8 +38,33 @@ turns the merge off.
    rather than inside it, because preland cannot see it either: the escalation reaches preland only
    as an unresolved confirmed finding, and a HOLD saying "1 finding unresolved" is not the same
    sentence as "the approach is in question".
-4. **Pre-land gate (mechanical).** Work in the PR branch's checkout and ask for the verdict.
-   Do not re-derive it:
+4. **Join the line, then ask for the verdict.** Work in the PR branch's checkout.
+
+   **4a — take a place in the merge queue, before any integration push.**
+
+   ```
+   merge_queue_enqueue(pr=<pr>, base="$BASE", head="<headRefOid>",
+                       verdict="queued", note="fix-and-land: issue #<issue>")
+   ```
+
+   `head` is `gh pr view <pr> --json headRefOid`. The MCP tool derives the repo from the
+   checkout's origin remote; with no quarterback MCP in this session, `POST /merge-queue/enqueue`
+   on the board takes the same body plus `repo`.
+
+   The queue is keyed on `<repo>` + `$BASE` — the branch being landed ONTO — and it exists
+   because `kind=merge` is one slot that says *somebody is landing now* and cannot say who is
+   next. Without it every review-clean PR behaves as though it were: merge the base, push, wait
+   for CI, re-run the gate, discover somebody else landed, repeat. That is #80's quadratic
+   integration cost, and each loser's integration push invalidates the winner's green checks on
+   the way past. Enqueueing **before** step 4b is the whole point: the expensive half is the
+   integration, so the stop has to come in front of it rather than in front of the merge.
+
+   It is idempotent and re-registering never costs your place (`entered_at` is written once), so
+   call it again whenever the head moves. `verdict="queued"` is the honest thing to say here —
+   preland has not run yet, and the board takes your word for a verdict pinned to a commit rather
+   than measuring one.
+
+   **4b — the gate.** Ask for the verdict; do not re-derive it:
    ```bash
    python3 ~/.claude/loops/preland.py --pr <pr> --json
    ```
@@ -60,16 +85,50 @@ turns the merge off.
    `mergeable` + CI-green over its own panel round, which had 8 P1s outstanding, by an agent who had
    written up that precise confusion an hour earlier and had itself recorded the PR as blocked.
 
-   - **HOLD** → stop. Post `reasons` as a PR comment and leave it for a human. Do **not** clear a
-     HOLD by re-running with that check turned off; `--skip` and `.harness-rules.sample` exist for repos
-     that genuinely lack the guardrail, not for a verdict you dislike.
-   - **RECONCILE** → run every command in `actions`, in order, verbatim. Commit what they produce
-     (they deliberately do not commit for you), push, and **run preland again**. Those commits are
-     mechanical — a `down_revision` line, a version counter, a generated merge migration — and need
-     no re-review. **Never override the reconciler's choice of action**: relink vs merge turns on
-     guards you are not re-deciding. If a `git merge` in `actions` conflicts anywhere that is not
-     mechanically obvious, that is a HOLD — resolving product code by guess is the judgement this
-     loop must not make on its own.
+   - **HOLD whose only unresolved check is your place in the line** — `checks.queue.status` is
+     `failed` and every other check reads `passed` or `skipped-*`. You are in the queue and not at
+     the head. **Stand down**: report `checks.queue.reasons` — they name your position and the
+     agent holding the place ahead — and stop. (`checks.queue.status` of `error` is a different
+     thing: the board could not be read, so take the branch below. And if the reason says you are
+     not in the line at all, 4a did not land — run it again rather than proceeding past a check
+     that cannot see you.) Do **not** rebase, push or restart CI: you would
+     spend a run to learn what the board already told you, and invalidate the head's checks doing
+     it. Do **not** post a PR comment; the position changes on its own, and a comment per attempt
+     is noise on a PR whose only problem is its turn.
+
+     **Do not leave the queue here.** This is the one stop that keeps your entry — it is a lease,
+     it is renewed by re-enqueueing, and it expires by itself if nobody comes back. Leaving would
+     re-join at the back, which starves the PR every time it is overtaken.
+   - **HOLD for anything else** → stop, and **leave the line on the way out**:
+
+     ```
+     merge_queue_leave(pr=<pr>, base="$BASE", entry_id="<the id 4a returned>",
+                       reason="held: <the first reason, in a few words>")
+     ```
+
+     Then post `reasons` as a PR comment and leave it for a human. Leaving is not optional: an
+     entry for a PR that cannot land sits in the line holding everybody behind it up until its
+     TTL runs out, which is why `enqueue` refuses a `hold` verdict on the way in. Do **not** clear
+     a HOLD by re-running with that check turned off; `--skip` and `.harness-rules.sample` exist for
+     repos that genuinely lack the guardrail, not for a verdict you dislike.
+   - **RECONCILE** → you are at the head, because HOLD dominates and the queue check would have
+     held otherwise — and the head is the one entry entitled to push. Run every command in
+     `actions`, in order, verbatim. Commit what they produce (they deliberately do not commit for
+     you), push, **re-enqueue at the new head** and **run preland again**:
+
+     ```
+     merge_queue_enqueue(pr=<pr>, base="$BASE", head="<the new headRefOid>",
+                         verdict="reconcile")
+     ```
+
+     The push moved the head, so the entry is pinned to a commit the PR is no longer on and its
+     readiness is void — telling the board which commit you are on is what stops the line
+     advertising a green light about code nobody checked. Those commits are mechanical — a
+     `down_revision` line, a version counter, a generated merge migration — and need no re-review.
+     **Never override the reconciler's choice of action**: relink vs merge turns on guards you are
+     not re-deciding. If a `git merge` in `actions` conflicts anywhere that is not mechanically
+     obvious, that is a HOLD — resolving product code by guess is the judgement this loop must not
+     make on its own, and it is a HOLD that leaves the line.
    - **READY** → step 5.
 
    **Once READY, before you push: the release entry, then its number.** A branch that ships a
@@ -120,9 +179,15 @@ turns the merge off.
    `apply` writes and does not commit, so commit what it produced and push it. That commit is
    mechanical — a release number the tool chose — and needs no re-review.
 
-   Re-running after the push is not optional. The push restarts CI, so the `ci` check's earlier
-   green is a statement about a commit that is no longer the head — and preland is what re-reads it,
-   along with everything else the push may have staled.
+   Re-running after the push is not optional, and neither is re-enqueueing at the commit it
+   produced. The push restarts CI, so the `ci` check's earlier green is a statement about a commit
+   that is no longer the head — and preland is what re-reads it, along with everything else the
+   push may have staled. The queue entry is staled by exactly the same push, and the board cannot
+   see it happen:
+
+   ```
+   merge_queue_enqueue(pr=<pr>, base="$BASE", head="<the stamp commit's oid>", verdict="queued")
+   ```
 
 5. **Confidence gate — MERGE only if BOTH hold:**
    - preland's **last** run, after the final push, came out **READY**, and
@@ -130,19 +195,83 @@ turns the merge off.
 
    The first is mechanical and preland owns it whole: the PR is open and not conflicting, CI is
    green *now*, the panel's newest round read *this* head and stopped with nothing confirmed and no
-   failing Sonar gate, the migration graph lands on one head, and nobody else holds the merge claim
-   on the branch. Do not re-check those by hand and do not weigh them against each other. A READY
+   failing Sonar gate, the migration graph lands on one head, this PR is at the head of the line
+   for `$BASE`, and nobody else holds the merge claim on that base. Do not re-check those by hand
+   and do not weigh them against each other. A READY
    you talk yourself past and a HOLD you talk yourself through are the same failure in two
    directions.
 
    The second is yours, and it is stated separately because it is not mechanical and never will be:
    preland can tell you nothing objects. It cannot tell you the change is a good idea.
 
-   If both hold → `gh pr merge <pr> --squash --delete-branch`.
-   If not → **STOP**, post a concise PR comment quoting preland's `reasons`, and leave it for a human.
+   If not → **STOP**, leave the line (`merge_queue_leave(..., reason="held: …")`), post a concise
+   PR comment quoting preland's `reasons`, and leave it for a human.
 
-6. **Report** the outcome: implemented / reviewed / pre-land verdict and any actions taken /
-   merged-or-held, and the confidence reasoning. Quote the verdict; do not paraphrase it.
+   If both hold, **say so on the line, claim the base, re-verify, merge, then stand down** — in
+   that order:
+
+   ```
+   merge_queue_enqueue(pr=<pr>, base="$BASE", head="<headRefOid>", verdict="ready")
+   ```
+
+   ```bash
+   claim_id=$(qb-claim branch "$BASE" --ttl 1800 --note "landing PR #<pr>" --json)  # 0/1/2
+   python3 ~/.claude/loops/preland.py --pr <pr> --json --claim-holder "<the holder it printed>"
+   gh pr merge <pr> --squash --delete-branch
+   ```
+
+   ```
+   merge_queue_leave(pr=<pr>, base="$BASE", entry_id="<the id 4a returned>", reason="merged")
+   release_claim(claim_id="<$claim_id>")
+   ```
+
+   - **`verdict="ready"` is the one assertion that lets a queue head merge**, and it is pinned to
+     this commit: the board clears it the moment the head moves, which is the thing an agent's own
+     memory of "preland said READY" structurally cannot do. Say it here rather than at 4a, because
+     at 4a it was not true yet — and everyone behind you reads it to know the line is about to
+     move rather than merely occupied.
+   - **Being at the head of the queue is not the claim.** The queue orders; `kind=merge` is the
+     one slot held across the merge itself, and the board's own answer says as much: *"take
+     `kind=merge` on this base before you merge"*. Two agents at the head of two different bases,
+     or a human merging in the UI, are both still possible — the claim is the only thing between
+     you and somebody else's simultaneous merge, and it has to be taken BEFORE the merge rather
+     than recorded after it.
+   - **`$BASE`, not the PR's branch.** The claim keys on the branch being landed ONTO (#318),
+     which is what `preland`'s `merge_claim` check reads and what the queue reports beside its
+     line. Claim the head branch and the two name one land two ways.
+   - **Exit 1** means another agent is landing onto `$BASE` right now: stop, say who holds it,
+     and stay in the queue — your turn has not gone anywhere. **Exit 2 is "cannot tell"** — a
+     board outage, a rotated token, no `qb-claim` on this box — and an autonomous loop resolves
+     that the way it resolves every other uncertainty: do not merge. This loop has no human in it
+     to ask whether landing unserialised is acceptable.
+   - **Re-run the gate after claiming**, because time passed: CI can have gone red and the head
+     can have moved. `--claim-holder` takes the `holder` field out of `qb-claim --json` so your
+     own claim is not read as somebody else's. Anything but READY here ends the sequence — report
+     the new verdict, and **release the claim on the way out** (`release_claim(claim_id="$claim_id")`)
+     before you leave the queue and stop.
+   - **`--ttl 1800`, not the board's hour.** Keying the claim on the base (#318) widened what a
+     leaked one costs: it now blocks every merge onto `$BASE`, not one branch's. The TTL is the
+     only backstop for a session that dies between the claim and the release, so it is set to the
+     same window a queue entry gets — a land that takes longer than half an hour has gone wrong,
+     and an hour of nobody landing is a jam bought for no margin anyone needs.
+   - **Once you have taken the claim, every exit releases it — the merge and the stop alike.**
+     `qb-claim` prints the claim id on stdout and everything else on stderr, which is what makes
+     `claim_id=$(…)` above the whole capture. A claim left behind by a loop that stopped is worse
+     than a queue entry left behind: it is `preland`'s `merge_claim` check answering "somebody is
+     landing onto `$BASE`" to **every other agent in the fleet**, for the rest of its TTL, about a
+     land that is not happening. Nobody merges onto that base in the meantime. Pass the same
+     `session` you claimed with if the release is refused — `qb-claim` defaults it to
+     `$CLAUDE_CODE_SESSION_ID`, and a claim that named a session is owned by that session.
+   - **Leaving the queue is the last step and it is not optional.** The line advancing is the
+     moment every PR behind this one may start spending CI, and until the entry goes they are all
+     correctly waiting for a land that already happened. It expires on its own, but a lease
+     nobody released is a queue that jams for the length of its TTL.
+
+6. **Report** the outcome: implemented / reviewed / your place in the line / pre-land verdict and
+   any actions taken / merged-or-held, and the confidence reasoning. Quote the verdict; do not
+   paraphrase it. A stand-down says its position and what it is waiting on; a proceed says it
+   checked and found the line clear. Neither is allowed to be silent about the queue — a stop
+   whose reason nobody can read is indistinguishable from a loop that gave up.
 
 Rules:
 - **Be honest about confidence.** When unsure, do NOT merge — holding for a human is the correct,
@@ -157,6 +286,16 @@ Rules:
   Whatever invariant that hook backstops is unprotected here — CI plus step 4 are what replace it.
   That is why step 4 is not optional, and why it is a script rather than a paragraph: a paragraph
   cannot be re-run after the push that staled it, and cannot be asked afterwards whether it ran.
+- **Your queue entry is a lease, and every exit from this loop releases it.** Merged, held,
+  abandoned, handed to a human — the entry goes, with a reason, except on the one stop that is
+  *about* the queue, where keeping your place is the point. (Step 3's escalation stops the loop
+  before step 4a, so there is nothing to release there.) The TTL (30 minutes by default) is the
+  backstop for the exit nobody coded: a session that dies frees its place with nobody intervening.
+  An entry nobody releases is a queue that jams, which is worse than no queue at all.
+- **The queue is ordering, not a second lock.** Being at the head is permission to go and ask for
+  the `kind=merge` claim; it is not the claim, it does not hold anything, and it does not outrank
+  a holder who never enqueued at all. A human merging in the UI is entitled to, and the queue
+  reports them rather than overriding them.
 - **preland is advisory and says so.** It is a script this loop chooses to run; it cannot stop a
   human merging in the UI, or a loop that skips the step. What would actually block a merge is a
   required status check on a protected branch, which does not exist for this repo yet.
