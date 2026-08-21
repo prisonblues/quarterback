@@ -1191,6 +1191,30 @@ longer colliding because one stopped *re-reading* a file it still changes.
 > `--baseline`, and never the board. Do not read "the skip payload carries it" as "the
 > board can answer collision queries about a skipped PR"; it cannot.
 
+### A round the board did not take says so (#284)
+
+Recording goes through `qb record-review` and stays **best-effort** — a board that is down
+must never fail a review that already ran. What it is not is silent. `record_run` used to
+open with `if not shutil.which("qb"): return`, and since `qb` ships in the fleet's own repo
+rather than this one, whether a round was recorded depended on a binary from elsewhere being
+on the PATH of whichever box ran the panel. 67 rounds across 30 PRs went missing that way,
+leaving the board holding 39% of this repo's review history with nothing anywhere saying so
+— and every measurement taken from it (the `/panel` leaderboard, per-reviewer precision, the
+dial calibration) computed off a three-day tail nobody knew was a tail.
+
+Three ways to miss, one sentence each: **no `qb` on this host**; **`qb` refused** (no board
+URL, no token, no such subcommand); **`qb` ran and the board did not answer** — that last one
+is invisible to an exit code, because `qb record-review` exits 0 either way and distinguishes
+them on its streams. What `qb` itself said is quoted, capped, so a wrong guess about a program
+in another repo corrects itself in front of the reader.
+
+The sentence lands in **`config_notes`** — which puts it in the payload a fixer is briefed
+from, in the report, and in the `--post` PR comment — and in the `--json-file` on disk,
+because the recording is attempted *before* that file is written. The refusal notice carries
+it too. And it names its own recovery: `--json-file` writes exactly the bytes piped to `qb`,
+so `qb record-review < PAYLOAD.json` from any host with one puts the round on the board
+later. `run_key` makes the replay a join rather than a double-count.
+
 Note that `gh pr view --json` **fails the whole command** on a field it does not recognise
 rather than omitting it, so there is no graceful degradation on an older `gh` — the run
 exits before any review. `panel.py` needs a `gh` carrying `files`, `changedFiles`, `state`
