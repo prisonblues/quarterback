@@ -270,8 +270,10 @@ agent in a sibling worktree popped the red/green stash into its own checkout and
 back. Two earlier drafts tried to make stash safe (a label check, then an entry count);
 the count caught the loss, but nothing local can stop another worktree popping the entry.
 So: `git add -N` the fix's paths, `git diff HEAD` them to a patch, check `test -s`, remove
-them, run red, `git apply` the patch back. See #210 for giving the harness a per-worktree
-stash of its own.
+them, run red, `git apply` the patch back. The harness now has a per-worktree stash of its
+own as well — `qb-stash`, below — and `create-worktree` installs a hook that refuses the
+shared one outright; the patch file stays the right tool *here* because it is the one that
+takes a pathspec.
 
 Three details in that sequence exist because the obvious spelling is wrong. **`test -s` is
 the check that matters**: an empty capture — mistyped paths, or a fix already committed —
@@ -444,6 +446,100 @@ whether or not `autoUpdate` is off. So on the loop-driven path, an answer given 
 hand in one branch can be committed unread in another. That is not closed here: it wants
 either explicit staging in those two loops or rerere scoped away from loop-driven
 worktrees, and it is filed rather than guessed at.
+
+### `git stash` is unsafe here, and `create-worktree` now says so out loud
+
+`refs/stash` lives in the **common** git dir, not the per-worktree one. Every worktree of
+a repo therefore shares one stash stack: `git stash push` in `quarterback-fix-issue-114`
+is listed by `git stash list` in `quarterback-fix-issue-113`, and `stash@{0}` there
+resolves to whatever the last pusher meant. This harness runs many concurrent worktrees
+off one `.git` **by design** — that is what `create-worktree` is for — so the shared stack
+is not a corner case here, it is the normal configuration.
+
+It has already taken two working trees. Once an agent's red/green stash was popped into a
+sibling and pushed back by hand; the second time the recovery note was parked in the same
+shared stash that had eaten it, where the next racing push could take it out the same way.
+Both were noticed by luck. Nothing in git warns either party, and a stash entry carries no
+author, no worktree and no session, so there is nothing to warn *with*: the owner of the
+second one was identified from a board claim, not from git.
+
+So `create-worktree` installs a **`reference-transaction` hook** that refuses to put
+anything on `refs/stash` while the repo has linked worktrees:
+
+```
+REFUSED: refs/stash is shared across every worktree of this repo.
+  ...
+  Use 'qb-stash' instead — push/pop/list/apply/drop with the same shape, stored
+  per-worktree under refs/worktree/, invisible to every sibling.
+```
+
+Four things about that are worth knowing before it surprises you.
+
+**It catches a hand-typed `git stash`, which is the only reason it is a hook.** `stash` is
+a C built-in, so `alias.stash` is ignored and a `git-stash` on `PATH` is never consulted,
+and there is no `pre-stash` hook. A wrapper script would have covered the harness's own
+commands and nobody else, and a human clearing a dirty tree before a pull is exactly the
+case that produced the near-miss.
+
+**It guards the main checkout too**, not just the linked worktrees, because that near-miss
+was an orchestrator running `git stash push -u` in `main` while sub-agents worked in
+siblings. A repo with no linked worktrees stashes exactly as it always did — the hazard is
+the shared stack, and a single checkout does not have one.
+
+**It stops the push, not the pop, and that is a real limit rather than an oversight.**
+Measured on git 2.54.0: `git stash pop` removes its entry through the **reflog**, which
+raises no ref transaction at all while another entry remains underneath, so no hook can
+see a pop. The protection works by keeping the shared stack empty — with nothing on it,
+there is nothing for a sibling to take. Deletions of `refs/stash` are deliberately let
+through so entries that predate the guard stay droppable.
+
+**`QB_ALLOW_SHARED_STASH=1` is the escape hatch**, for somebody doing this on purpose. One
+env var, per command, so the guard does not become the thing people turn off wholesale.
+
+`core.hooksPath` **replaces** the hooks directory rather than stacking with it, and on this
+fleet its global value is a read-only nix store path whose one entry is a gitleaks
+`pre-commit`. `qb-hooks install` therefore re-exports every hook that dir provides as a
+symlink to a forwarder that resolves the delegate **at run time** — the store path changes
+on every home-manager rebuild, so an install-time snapshot would rot. Without that, turning
+on a stash guard would turn off secret scanning, which is the class of failure this repo is
+organised against; `harness/tests/test_stash_guard.py` pins it.
+
+Run `qb-hooks status` to see what is installed, `qb-hooks install` to add it to a repo by
+hand, `qb-hooks uninstall` to take it off.
+
+### `qb-stash` — a stash that belongs to one worktree
+
+The other half, because refusing a stash is only half an answer to somebody who needs one.
+`refs/worktree/*` is the one ref namespace git keeps per worktree, and `git stash create`
+mints a stash commit without touching the shared stack. `qb-stash` is those two facts
+joined up:
+
+```bash
+qb-stash push [-m msg]    # snapshot tracked changes, then revert the tree
+qb-stash list             # this worktree's entries, newest first
+qb-stash show [n]
+qb-stash apply [n] [--index]
+qb-stash pop   [n] [--index]
+qb-stash drop  [n] | qb-stash clear
+```
+
+`--index` restores the staged/unstaged split as well as the content. That asymmetry is
+what made the hand-recovery of the lost trees lossy: a staged addition came back unstaged,
+which is easy to miss and easy to commit wrong.
+
+**Two limits, measured rather than assumed, and named rather than half-implemented.**
+`git stash create` takes **no pathspec**, so `push` snapshots tracked changes across the
+whole worktree; it also has **no `-u`** and ignores untracked files, so `push` leaves them
+in the tree and says which ones. Both are refused with an error rather than silently
+widened — a pathspec quietly applied to the whole tree would revert work the caller never
+mentioned. For path-scoped work (removing a fix to prove a regression test goes red), use a
+patch file: it is per-worktree by construction too, and it *does* take a pathspec. That is
+the mechanism the red/green briefs already use.
+
+Entries die with the worktree, since `git worktree remove` takes `refs/worktree/*` with it
+and `git status` cannot see them. `remove-worktree` copies any it finds into
+`refs/qb-stash-rescued/<branch>/` before it tears anything down, and tells you where they
+went.
 
 ### `qb-claim` and `qb-claimed` — what you are working on, before you start
 

@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# reference-transaction hook — keep the SHARED refs/stash empty while a repo has
+# linked worktrees.
+#
+# Every worktree of a repo shares one `refs/stash`: it lives in the common git
+# dir, not the per-worktree one. So `git stash push` in one worktree is listed by
+# `git stash list` in every sibling, and `stash@{0}` there resolves to whatever
+# the last pusher meant. This harness runs many concurrent worktrees off one
+# `.git` by design, so that is the normal configuration here, and it has already
+# cost two working trees (issue #210).
+#
+# WHY THIS GUARDS THE PUSH AND NOT THE POP. `git stash` is a C built-in, so
+# neither a git alias nor a `git-stash` on PATH shadows it, and there is no
+# `pre-stash` hook. `reference-transaction` is the only interception point, and
+# it can abort a transaction but never rewrite one. Worse, measured on git
+# 2.54.0: `git stash pop` removes the entry with a REFLOG delete, which does not
+# raise a ref transaction at all whenever another entry remains underneath. A
+# hook therefore cannot refuse a pop.
+#
+# So the protection is to keep the stack EMPTY rather than to police reads: a
+# creation of or update to `refs/stash` is refused while linked worktrees exist,
+# and there is then nothing for a sibling to pop. DELETIONS are deliberately let
+# through, so entries pushed before the guard was installed can still be popped
+# and dropped by whoever wants to clear them.
+#
+# Refusing in the `prepared` phase leaves the working tree untouched — the stash
+# commit exists as an unreferenced object, but nothing was reverted and nothing
+# was pushed onto the shared stack.
+#
+# Escape hatch: QB_ALLOW_SHARED_STASH=1.
+set -uo pipefail
+
+phase="${1:-}"
+
+# stdin is always drained: exiting without reading it hands git a SIGPIPE on a
+# transaction we are perfectly happy with.
+guarded=""
+lines=""
+while read -r old new ref; do
+    lines+="$old $new $ref"$'\n'
+    # An all-zero <new> is a deletion, and deletions are allowed: only putting
+    # something ON the shared stack is refused.
+    if [[ "$ref" == "refs/stash" && "$new" == *[!0]* ]]; then
+        guarded=1
+    fi
+done
+
+# Anything the machine's managed hooks dir provides still runs. This fires on
+# EVERY ref update in the repo — every commit, branch, fetch and rebase step — so
+# the common case (no managed reference-transaction anywhere) has to cost no
+# subprocesses at all: an early draft resolved the delegate with two `git config`
+# calls each time and made `git branch` 8x slower. `qb-hooks install` leaves a
+# `reference-transaction.delegate` symlink only when there is something to chain
+# to, so the test below is a stat.
+chain_delegate() {
+    local hook
+    [[ "$0" == */* ]] || return 0
+    hook="${0%/*}/reference-transaction.delegate"
+    [[ -x "$hook" ]] || return 0
+    printf '%s' "$lines" | "$hook" "$@"
+}
+
+# Only `prepared` can abort a transaction; the other phases are notifications.
+if [[ "$phase" != "prepared" || -z "$guarded" ]]; then
+    chain_delegate "$phase"
+    exit $?
+fi
+
+if [[ "${QB_ALLOW_SHARED_STASH:-}" == "1" ]]; then
+    chain_delegate "$phase"
+    exit $?
+fi
+
+git_dir=$(git rev-parse --absolute-git-dir 2>/dev/null) || { chain_delegate "$phase"; exit $?; }
+common_dir=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) \
+    || { chain_delegate "$phase"; exit $?; }
+
+# The hazard exists only where the repo actually has linked worktrees. A plain
+# single-checkout repo keeps `git stash` working exactly as it always did, which
+# is what stops this guard from being the thing people turn off wholesale.
+# A de-registered worktree leaves its dir here until `git worktree prune`, so this
+# can read yes for a moment longer than it is true — which errs toward refusing,
+# and `prune-worktrees` is the thing that clears it.
+has_linked=""
+if [[ -d "$common_dir/worktrees" ]]; then
+    for _wt in "$common_dir/worktrees"/*/; do
+        [[ -d "$_wt" ]] && { has_linked=1; break; }
+    done
+fi
+[[ -n "$has_linked" ]] || { chain_delegate "$phase"; exit $?; }
+
+if [[ -f "$git_dir/gitdir" ]]; then
+    here="linked worktree $(sed 's#/\.git$##' "$git_dir/gitdir" 2>/dev/null)"
+else
+    here="main checkout $(git rev-parse --show-toplevel 2>/dev/null)"
+fi
+
+cat >&2 <<MSG
+
+REFUSED: refs/stash is shared across every worktree of this repo.
+  You are in the $here, and this repo has linked worktrees.
+  A stash pushed anywhere here is listed and poppable from every one of them, and
+  'stash@{0}' resolves to whatever the last pusher meant. Two working trees have
+  already been lost that way (issue #210). Nothing warns either party.
+
+  Use 'qb-stash' instead — push/pop/list/apply/drop with the same shape, stored
+  per-worktree under refs/worktree/, invisible to every sibling.
+  For red/green work, capture a patch file instead (see harness/README.md).
+
+  Your working tree is untouched; nothing was stashed.
+  Deliberate, and you accept the race: QB_ALLOW_SHARED_STASH=1 git stash ...
+
+MSG
+exit 1

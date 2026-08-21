@@ -95,7 +95,9 @@ pytest <the new tests>            # green again
 **Not `git stash`.** Every worktree of a repo shares one `refs/stash`, so a stash
 pushed here is poppable from every sibling worktree — the PR that added this
 instruction lost its working tree that way, to a concurrent agent in another worktree.
-A patch file shares nothing. `test -s` is the guard and it must **halt** — `|| { echo …;
+A patch file shares nothing, and `git stash` in a harness worktree is now REFUSED by a
+hook (`qb-stash push` is the per-worktree replacement; it takes no pathspec, so this step
+still wants a patch). `test -s` is the guard and it must **halt** — `|| { echo …;
 exit 1; }`, never a bare `|| echo …`, which warns and carries on: an empty capture (wrong
 paths, or a fix already committed) leaves the red run executing with the fix in place,
 coming out **green**, reading exactly like the step passing. `git add -N` is what puts a file the

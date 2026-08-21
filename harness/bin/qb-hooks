@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+# qb-hooks — install the harness's git hooks into a repo, without turning off
+# the machine's managed ones.
+#
+# Right now it installs exactly one guard: a `reference-transaction` hook that
+# refuses to put anything on the SHARED `refs/stash` while the repo has linked
+# worktrees (issue #210). `git stash` is a C built-in, so a git alias cannot
+# shadow it and a `git-stash` on PATH is never consulted; there is no
+# `pre-stash` hook. A ref-transaction refusal is the only interception point
+# git offers, which is why the guard lives here and not in a wrapper script —
+# it catches a HUMAN typing `git stash` by hand, not just the harness's own
+# scripts.
+#
+#   qb-hooks install [--repo <dir>]   idempotent; safe to re-run
+#   qb-hooks status  [--repo <dir>]   what is installed and what it delegates to
+#   qb-hooks uninstall [--repo <dir>] unset core.hooksPath, leave the dir
+#
+# `core.hooksPath` REPLACES the hooks directory rather than stacking with it, so
+# install re-exports every hook the previously-effective dir provided as a
+# symlink to `qb-hook-forward`. On this fleet that dir is a read-only nix store
+# path holding a gitleaks `pre-commit`; losing it would be a secret-scanning
+# regression introduced by a stash-safety feature.
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+die() { echo -e "${RED}qb-hooks: $*${NC}" >&2; exit 1; }
+
+SELF_DIR=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+
+# Two layouts, because the hook sources are data rather than entry points: beside
+# bin/ in a source checkout, and under share/ in an installed harness (package.nix
+# ships `githooks` with loops/commands/templates for exactly this).
+SRC_DIR=""
+for cand in "${QB_GITHOOKS_DIR:-}" \
+            "$SELF_DIR/../githooks" \
+            "$SELF_DIR/../share/quarterback-harness/githooks"; do
+    if [[ -n "$cand" && -f "$cand/reference-transaction" ]]; then SRC_DIR="$cand"; break; fi
+done
+[[ -n "$SRC_DIR" ]] || die "cannot find the githooks sources near $SELF_DIR"
+
+action="${1:-status}"
+shift || true
+repo=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --repo) repo="${2:-}"; shift 2 ;;
+        -h|--help) sed -n '3,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) die "unknown argument: $1" ;;
+    esac
+done
+[[ -n "$repo" ]] || repo="$PWD"
+
+git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 || die "$repo is not a git repository"
+
+common=$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir) \
+    || die "could not resolve the common git dir"
+hooks_dir="$common/qb-hooks"
+
+# The dir whose hooks we must keep running. Read from global/system only: the
+# repo-level value is (or is about to be) ours, and reading it back would make
+# a re-install delegate to itself.
+effective_delegate() {
+    local d
+    d=$(git -C "$repo" config --global --type=path --get core.hooksPath 2>/dev/null) || d=""
+    [[ -n "$d" ]] || d=$(git -C "$repo" config --system --type=path --get core.hooksPath 2>/dev/null) || d=""
+    [[ -n "$d" ]] || d="$common/hooks"
+    printf '%s' "$d"
+}
+
+do_install() {
+    local delegate name
+    delegate=$(effective_delegate)
+
+    mkdir -p "$hooks_dir" || die "could not create $hooks_dir"
+    install -m 0755 "$SRC_DIR/reference-transaction" "$hooks_dir/reference-transaction" \
+        || die "could not install reference-transaction"
+    install -m 0755 "$SRC_DIR/qb-hook-forward" "$hooks_dir/qb-hook-forward" \
+        || die "could not install qb-hook-forward"
+
+    # Re-export the delegate's hooks. `reference-transaction` is excluded because
+    # ours chains to it itself; `*.sample` is git's own scaffolding.
+    local exported=0
+    if [[ -d "$delegate" && "$delegate" != "$hooks_dir" ]]; then
+        for h in "$delegate"/*; do
+            [[ -e "$h" ]] || continue
+            name=$(basename "$h")
+            case "$name" in
+                *.sample|reference-transaction|qb-hook-forward) continue ;;
+            esac
+            [[ -x "$h" ]] || continue
+            ln -sfn "qb-hook-forward" "$hooks_dir/$name" || die "could not export $name"
+            exported=$((exported + 1))
+        done
+    fi
+
+    # The guard chains to a managed `reference-transaction` only when this marker
+    # is present, so the hot path (there is no such hook, which is the usual case)
+    # costs a stat rather than two `git config` invocations per ref update.
+    if [[ -x "$delegate/reference-transaction" ]]; then
+        ln -sfn "qb-hook-forward" "$hooks_dir/reference-transaction.delegate"
+    else
+        rm -f "$hooks_dir/reference-transaction.delegate"
+    fi
+
+    git -C "$repo" config core.hooksPath "$hooks_dir" \
+        || die "could not set core.hooksPath (config not writable?)"
+    git -C "$repo" config qb.hooksDelegate "$delegate" >/dev/null 2>&1 || true
+
+    echo -e "  ${GREEN}stash guard installed${NC} — 'git stash' in this repo now refuses to"
+    echo "  write the shared refs/stash while linked worktrees exist. Use 'qb-stash'."
+    if [[ "$exported" -gt 0 ]]; then
+        echo "  ($exported managed hook(s) re-exported from $delegate)"
+    fi
+}
+
+do_status() {
+    local current delegate
+    current=$(git -C "$repo" config --type=path --get core.hooksPath 2>/dev/null) || current=""
+    delegate=$(effective_delegate)
+    echo "repo:      $repo"
+    echo "hooksPath: ${current:-<unset>}"
+    echo "delegate:  $delegate"
+    if [[ "$current" == "$hooks_dir" && -x "$hooks_dir/reference-transaction" ]]; then
+        echo -e "guard:     ${GREEN}installed${NC}"
+    else
+        echo -e "guard:     ${YELLOW}not installed${NC} (run: qb-hooks install)"
+    fi
+    local n
+    n=$(git -C "$repo" stash list 2>/dev/null | wc -l)
+    if [[ "$n" -gt 0 ]]; then
+        echo -e "${YELLOW}shared refs/stash holds $n entr$([[ $n -eq 1 ]] && echo y || echo ies)${NC}" \
+                "— they predate the guard and belong to nobody in particular."
+    fi
+}
+
+do_uninstall() {
+    git -C "$repo" config --unset core.hooksPath >/dev/null 2>&1 || true
+    git -C "$repo" config --unset qb.hooksDelegate >/dev/null 2>&1 || true
+    echo "qb-hooks: core.hooksPath unset for $repo"
+}
+
+case "$action" in
+    install) do_install ;;
+    status) do_status ;;
+    uninstall) do_uninstall ;;
+    -h|--help|help) sed -n '3,30p' "$0" | sed 's/^# \{0,1\}//' ;;
+    *) die "unknown action '$action' (install|status|uninstall)" ;;
+esac

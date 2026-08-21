@@ -220,8 +220,8 @@ Spend it like this, and do not improvise around it:
 2. **Measure before you spend.** You cannot know what a fix costs until you have made
    it, so find out rather than guessing: make each budgeted fix on its own, run `git
    diff --numstat` for it, write down insertions + deletions, and put it back
-   (`git stash` it, or `git restore` the file — and mind the warning just below about
-   discarding your own uncommitted work). You now have a counted cost for each one.
+   (`qb-stash push` it, or `git restore` the file — and mind the warning just below
+   about discarding your own uncommitted work). You now have a counted cost for each one.
 3. **Spend cheapest first, and stop when it runs out.** Re-apply them in ascending
    order of that cost, subtracting each from the budget as you go. Stop at the first
    one that does not fit — in ascending order, nothing after it fits either. If the
@@ -243,8 +243,18 @@ only way to know a guard is not vacuous. But the revert is `git checkout --
 <file>`, which discards **your own uncommitted work** in that file with no
 warning and nothing to undo it from. Two fixers hit this on PR #212 within an
 hour, both while checking guards they had just written; both were lucky enough to
-notice. Commit (or `git stash`) first, and mutate a file you have not edited
-where you have the choice.
+notice. Commit first, and mutate a file you have not edited where you have the
+choice.
+
+**Not `git stash` — `qb-stash push`.** Every worktree of a repo shares one
+`refs/stash`, so a stash you push here is listed and poppable from every sibling
+worktree, and `stash@{0}` there resolves to whatever the last pusher meant. Two
+working trees have already gone that way. `create-worktree` now installs a hook
+that refuses the shared stash outright, so a plain `git stash` in a harness
+worktree stops with a `REFUSED:` message rather than racing; `qb-stash` is the
+same push/pop/list/apply/drop stored per-worktree. It takes no pathspec and does
+not save untracked files (`git stash create` supports neither), which is why the
+red/green step below uses a patch file instead.
 
 **Once the list is triaged, decide *how* to fix it.** Serially yourself is the
 default; for a big, clean list, fan the fixes out to `general-purpose` sub-agents
