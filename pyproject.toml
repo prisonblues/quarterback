@@ -17,6 +17,14 @@ dependencies = [
 dev = [
     "pytest",
     "pytest-asyncio",
+    # For `-n auto` in the harness job, which is where the wait actually is: those
+    # suites are dominated by subprocess waits — a 220-line bash suite building git
+    # repos, four tests driving a real tmux server — so they overlap almost perfectly
+    # across cores (#233). Deliberately NOT in `addopts` below: the flake's check
+    # sandboxes hold pytest and nothing else, and a project-wide `-n` would fail every
+    # one of them on an unrecognised argument. The flag lives at the call site that
+    # has this installed.
+    "pytest-xdist",
     "httpx",
     "ruff",
 ]

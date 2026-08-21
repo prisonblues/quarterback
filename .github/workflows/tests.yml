@@ -94,6 +94,23 @@ jobs:
       # test job that quietly runs nothing and reports green. That is the exact
       # failure this repo is organised against; a suite that disappears has to
       # be as loud as a suite that fails.
+      #
+      # `-n auto`, one worker per core. This step ran on a single core for 68s of
+      # every push while the runner's other three sat idle, and what dominates it
+      # is not CPU: `test_nginx_block_regressions` alone is 20s of shelling out to
+      # a 220-line bash suite that builds throwaway git repos, and four qb-seat
+      # tests wait on a real tmux server (#233). Those are subprocess waits, so
+      # they overlap across workers almost perfectly, and not one test is
+      # shortened to get it — the tmux tests still drive tmux and the nginx test
+      # still drives real git repositories, which is the whole of what they check.
+      # Not in `addopts`: the flake's check sandboxes hold pytest and nothing
+      # else, so a project-wide `-n` would fail every check in flake.nix with
+      # "unrecognized arguments". The flag stays where xdist is installed.
+      #
+      # `-n` does not weaken the report. xdist prefixes a failure with the worker
+      # that saw it ([gw2]) and prints the whole traceback in the summary, and the
+      # per-suite loop below is still one pytest run per suite, so a red step still
+      # names a suite, a module and a test.
       - name: Run every harness suite
         run: |
           set -euo pipefail
@@ -105,7 +122,7 @@ jobs:
           printf 'running %d harness suite(s): %s\n' "${#suites[@]}" "${suites[*]}"
           for suite in "${suites[@]}"; do
             echo "--- $suite"
-            uv run --extra dev pytest "$suite" -q
+            uv run --extra dev pytest "$suite" -q -n auto
           done
 
       # TWICE, with different extras, for the reason the mcp job below runs
@@ -119,15 +136,20 @@ jobs:
       # only in mcp/pyproject.toml — so those tests had never once run in CI.
       # Seven of them, green by never executing, on the file with the most
       # clicking-the-wrong-row ways to be wrong.
-      - name: Run every harness suite with the dashboard's dependencies
+      #
+      # THE DASHBOARD MODULES ONLY, and that narrowing is the other half of #233.
+      # This step used to re-run every suite under harness/ before the check below,
+      # which cost a further 74s per push to learn nothing: the tui extra changes
+      # what these two modules do and changes nothing anywhere else, so the nginx
+      # bash suite and the tmux seat tests were being paid for twice over. What
+      # makes that safe to assume is that it is not assumed — tests/test_harness_job.py
+      # scans every harness test module for a real textual/rich dependency and fails
+      # if one of them is missing from the list below. Add a module that needs the
+      # extra, forget this line, and that test is red rather than the module being
+      # silently green by never running.
+      - name: Run the dashboard suites with the dashboard's dependencies
         run: |
           set -euo pipefail
-          mapfile -t suites < <(find harness -type d -name tests -not -path '*/node_modules/*' | sort)
-          for suite in "${suites[@]}"; do
-            echo "--- $suite"
-            uv run --extra dev --extra tui pytest "$suite" -q
-          done
-
           # And loudly if the thing this step exists for skipped anyway. A module
           # that skips every test exits 0, so a green step is not evidence on its
           # own — that is exactly how the gap above went unnoticed. The tests that
@@ -137,6 +159,8 @@ jobs:
           # own dependency — test_qb_dash.py on textual, test_qb_dash_plain.py on
           # rich — so a single run over both would report `N passed` while one of
           # them contributed nothing, which is the reading this step exists to deny.
+          # Serial, and not `-n auto` like the step above: this reads pytest's own
+          # summary line back out, and it is forty-odd tests to begin with.
           for suite in harness/tests/test_qb_dash.py harness/tests/test_qb_dash_plain.py; do
             echo "--- did $suite actually run?"
             out=$(uv run --extra dev --extra tui pytest "$suite" -q -rs 2>&1)
