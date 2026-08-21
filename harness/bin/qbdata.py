@@ -1409,6 +1409,24 @@ def parse_limits(data: dict) -> list[dict]:
     return out
 
 
+def resets_in_s(stamp: str | None) -> int | None:
+    """Seconds until a cap comes back, or None when there is no readable stamp.
+
+    Split out of `limit_reset` so the pacing verdict and the bar's countdown read
+    one clock: a `hold` carries a resumption time, and a resumption time that
+    disagreed with the number drawn two inches above it would be two answers to
+    one question. Never negative — a window whose reset is in the past has come
+    back, which is 0 seconds away and not a negative wait.
+    """
+    if not stamp:
+        return None
+    try:
+        then = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return max(0, int((then - datetime.now(timezone.utc)).total_seconds()))
+
+
 def limit_reset(stamp: str | None) -> str:
     """'44m', '3h58m', '5d' — when a cap comes back, in five columns.
 
@@ -1416,13 +1434,17 @@ def limit_reset(stamp: str | None) -> str:
     window reads '128h48m', which is both too wide for the line and not how
     anybody thinks about next Monday.
     """
-    if not stamp:
-        return ""
-    try:
-        then = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
-    except ValueError:
-        return ""
-    secs = int((then - datetime.now(timezone.utc)).total_seconds())
+    secs = resets_in_s(stamp)
+    return "" if secs is None else limit_reset_secs(secs)
+
+
+def limit_reset_secs(secs: int) -> str:
+    """The same countdown from seconds rather than from a stamp.
+
+    The pacing verdict carries `resets_in_s` because a caller wants to compare
+    it, not print it; this is how it gets printed, and it is the same function
+    the bar uses so the two cannot come to spell 47 minutes differently.
+    """
     if secs <= 0:
         return "now"
     if secs < 3600:
@@ -1476,3 +1498,215 @@ def limit_cells(limits: list[dict], width: int) -> list[tuple[str, str, str, str
     return [(l["label"], limit_bar(l["percent"], bar) if bar else "",
              f"{l['percent']}%", limit_reset(l["resets"]),
              limit_colour(l["percent"], l["severity"])) for l in limits]
+
+
+# ---- pacing: the ceiling, read by something other than a bar -----------------
+#
+# The caps above are drawn and nothing consults them (#275). The whole gap is
+# that the fleet's one hard ceiling — one subscription, every machine, every
+# project — is enforced by a human noticing a bar go red, and a seat is a pane
+# nobody is watching.
+#
+# WHERE THE NUMBER LIVES, WHICH IS NOWHERE NEW. `pace()` adds no store. The cap
+# is the usage endpoint's fact; `fetch_limits()` already holds the only copy
+# there is, in a machine-wide cache that exists to keep three dash panes from
+# rate-limiting each other, and this reads THAT. No second file, no board row,
+# no figure of its own to go stale behind the endpoint's back. A verdict that
+# kept its own number would be a second source of truth about a ceiling nobody
+# here sets, which is the one thing a governor must not be.
+#
+# WHAT THIS IS NOT. It does not throttle, park, resume, or pick work. It says
+# what the window says, in words a caller can act on. #276 owns the actuator
+# (the dials, board-side, expiring), #55 owns the ceiling this repo CHOOSES, and
+# #232/#227 own what to run next. The decision here is only "how does the fleet
+# stand", and the value of having it as a function is that the answer stops
+# being a colour on a screen somebody has to be looking at.
+
+#: The bar's colours, read as decisions. Derived from `limit_colour` rather than
+#: restated with thresholds of its own: the display and the verdict disagreeing
+#: about what 88% means is exactly the failure a human debugging this at 2am
+#: cannot see, and the endpoint's `severity` — the one input that knows about
+#: caps this fleet has not modelled — only reaches the verdict because that
+#: function already honours it.
+PACE_OF_COLOUR = {"green": "go", "yellow": "slow", "red": "hold"}
+#: Worst cap wins. Never averaged: a 7d window at 12% does not buy back a 5h
+#: window at 94%, and the thing about to stop is the one that binds.
+PACE_RANK = {"go": 0, "slow": 1, "hold": 2}
+
+
+def _pace(verdict: str, source: str, reason: str, cap: dict | None = None) -> dict:
+    """One shape for every answer, so a caller never has to ask which kind it got."""
+    return {
+        "verdict": verdict,
+        "source": source,
+        "reason": reason,
+        "cap": (cap or {}).get("label"),
+        "percent": (cap or {}).get("percent"),
+        "severity": (cap or {}).get("severity"),
+        "resets_in_s": resets_in_s((cap or {}).get("resets")),
+    }
+
+
+def pace(caps: tuple[list[dict], str | None] | None = None) -> dict:
+    """How the shared subscription stands, as a verdict a caller can act on.
+
+    {verdict: go|slow|hold|unknown, source, cap, percent, severity,
+     resets_in_s, reason}
+
+    `caps` is a `fetch_limits()` answer, for a caller that already has one (the
+    dashboards do). Left out, this fetches — which costs nothing extra, because
+    `fetch_limits` is floored at one call every three minutes across every
+    process on the machine and hands back the cache in between.
+
+    The four answers, and why the fourth exists:
+
+    * **go** — room, or nothing to pace against. An API-key install has no
+      subscription caps at all, so it gets `go` and says so; that is the same
+      rule as the dash's, where no token means one line fewer rather than an
+      error.
+    * **slow** / **hold** — the bar's yellow and red, which is to say 70% and
+      90%, or sooner when the endpoint's own severity says so. `hold` carries
+      `resets_in_s` and is therefore a WAIT, not a stop: a five-hour window at
+      95% comes back, and the caller that treats it as terminal has thrown away
+      the only fact that makes it survivable.
+    * **unknown** — the figures could not be obtained at all. NOT `go`, which
+      would be a governor reporting clear on an input it never read (#244), and
+      not `hold`, which would let a dropped network park the fleet. Unknown is
+      the honest word and it leaves the decision with the caller.
+
+    Figures that are merely OLD are a third case and they are not thrown away:
+    a failed call keeps the last answer, and caps move over hours, so minutes-old
+    ones are still the right ones to act on. What staleness costs is the right to
+    say `go` — a `go` on figures nobody could refresh is the one verdict that
+    could be confidently wrong about a window that emptied while the network was
+    down. It does NOT escalate a `slow` to a `hold`: staleness is uncertainty
+    about the number, and parking work over it would be a claim about the window
+    made on the strength of a hiccup.
+    """
+    limits, err = caps if caps is not None else fetch_limits()
+    if not limits:
+        if err:
+            return _pace("unknown", "unreadable",
+                         f"the usage endpoint could not be read ({err}) and no "
+                         f"cached figures survive — the ceiling is unknown, not clear")
+        return _pace("go", "absent",
+                     "no subscription caps to read: this install has no OAuth "
+                     "token, so there is no shared window to pace against")
+
+    stale = err is not None
+    graded = [(PACE_RANK[PACE_OF_COLOUR[limit_colour(l["percent"], l["severity"])]], l)
+              for l in limits]
+    # Percent breaks a tie so the reported cap is the one nearest its ceiling,
+    # not whichever the endpoint happened to list first.
+    cap = max(graded, key=lambda g: (g[0], g[1]["percent"]))[1]
+    verdict = PACE_OF_COLOUR[limit_colour(cap["percent"], cap["severity"])]
+    reason = f"{cap['label']} at {cap['percent']}%"
+    if cap["severity"] not in ("", "normal"):
+        reason += f" ({cap['severity']})"
+    if not stale:
+        return _pace(verdict, "live", reason, cap)
+    reason += f", on figures that could not be refreshed ({err})"
+    if verdict == "go":
+        return _pace("slow", "stale", reason + " — too old to say go on", cap)
+    return _pace(verdict, "stale", reason, cap)
+
+
+def pace_line(verdict: dict) -> str:
+    """The verdict on one line, in one place.
+
+    Shared rather than formatted at each call site for the same reason
+    `limit_cells` is: `qb-pace` prints this, `qb-seat` prints this before it
+    starts an agent, and two spellings of one judgement is how a fleet ends up
+    arguing with itself about whether it is allowed to spend.
+    """
+    out = f"pace: {verdict['verdict'].upper()} — {verdict['reason']}"
+    secs = verdict.get("resets_in_s")
+    if secs is not None and verdict["verdict"] != "go":
+        out += f"; resets in {limit_reset_secs(secs)}"
+    return out
+
+
+# THE ESTIMATE IS IN TOKENS AND IT STOPS THERE, ON PURPOSE.
+#
+# "Does this job fit in what is left" is the question worth answering, and it
+# needs a rate — how much of a five-hour window one seat-run actually spends.
+# Nothing records that. The board knows what a run cost in TOKENS; the endpoint
+# knows what the window has spent in PERCENT; no row anywhere pairs them, which
+# is #275's own first sequencing step (sample the caps either side of a run) and
+# it belongs to whatever drives the run rather than here.
+#
+# So this reports the two halves and refuses to multiply them. A fit prediction
+# derived from a made-up rate would be the exact failure #275 names — a governor
+# that guesses rather than saying it cannot read its input — and it would be
+# believed, because it would arrive in the same sentence as two real numbers.
+
+def subscription_cost(client=None, reviewer: str = "claude",
+                      days: int = 30) -> tuple[dict | None, str | None]:
+    """What one seat-run of `reviewer` costs, from the board's own record.
+
+    ({tokens_per_run, runs, models}, None) or (None, why-not).
+
+    Only the seats billing to THIS subscription count, which is why there is a
+    reviewer argument with `claude` as its default: the five-hour and weekly caps
+    are the Anthropic subscription's, and `codex`, `antigravity` and `pi` bill to
+    OpenAI, a Google account and OpenRouter. A four-seat panel is not four seats
+    of pressure on this window (#276 makes the same distinction for its shed).
+    """
+    # The client is BUILT in here rather than taken as read, because resolving a
+    # board config is itself one of the ways this question goes unanswered — a box
+    # with no config is the ordinary case, not an error, and a caller that had to
+    # guard the constructor separately would report it in a different voice from
+    # the board being down.
+    try:
+        # `judged_only=false`, unlike every other reader of this endpoint. The
+        # rest of the page is about a reviewer's precision, which only an
+        # adjudicated run can measure; this is about what a run COST, and an
+        # unjudged round spent its tokens exactly the same.
+        data = (client or board_client()[0]).get(
+            "/review/stats", {"days": days, "judged_only": "false"})
+    except Exception as exc:                      # noqa: BLE001 — no board is not a failure
+        return None, f"the board did not answer ({type(exc).__name__})"
+    # `reviewer`, which is what the RESPONSE calls the column the query labels
+    # `name`. Read off a live answer rather than off the SELECT, because the two
+    # differ and the difference is silent: a filter on the wrong key matches
+    # nothing and reports "no measured history", which is indistinguishable from
+    # a board that genuinely has none.
+    rows = [r for r in (data.get("by_model") or [])
+            if (r.get("reviewer") or "") == reviewer and r.get("total_tokens")
+            and r.get("billable_runs")]
+    if not rows:
+        return None, (f"the board has no measured token history for the "
+                      f"'{reviewer}' seat in the last {days} days")
+    tokens = sum(int(r["total_tokens"]) for r in rows)
+    runs = sum(int(r["billable_runs"]) for r in rows)
+    # Summed and divided once rather than averaging the rows' own averages: the
+    # groups are (reviewer, model, effort) and they have wildly different run
+    # counts, so a mean of means weights a single opus run like forty sonnet ones.
+    return {"tokens_per_run": round(tokens / runs), "runs": runs,
+            "models": sorted({r.get("model") or "?" for r in rows})}, None
+
+
+def pace_estimate(verdict: dict, cost: dict | None, seats: int,
+                  rounds: int = 1) -> dict:
+    """What a job of `seats` × `rounds` costs, beside what the window has left.
+
+    {tokens, per_run, runs, headroom_pct, resets_in_s, fits, why} — where `fits`
+    is **always None today** and `why` says why. See the note above: the
+    tokens-to-window rate is not recorded anywhere yet, so the honest answer to
+    "will this finish" is that it cannot be predicted, not a number.
+    """
+    per_run = (cost or {}).get("tokens_per_run")
+    percent = verdict.get("percent")
+    return {
+        "seats": seats,
+        "rounds": rounds,
+        "per_run": per_run,
+        "runs": (cost or {}).get("runs"),
+        "tokens": per_run * seats * rounds if per_run else None,
+        "headroom_pct": None if percent is None else max(0, 100 - percent),
+        "resets_in_s": verdict.get("resets_in_s"),
+        "fits": None,
+        "why": ("no recorded rate from tokens to window percent — nothing samples "
+                "the caps either side of a run yet (#275 step 1), so whether this "
+                "job fits cannot be answered without guessing"),
+    }

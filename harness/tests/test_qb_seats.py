@@ -149,6 +149,14 @@ def screen(tmp_path):
         # `qb-board --follow` against the real board — fifty of them in a run.
         # A test may not need the network to be up to pass.
         "QB_SEATS_BOARD": "printf tape-stub",
+        # AND NO REAL PACE NOTE, for the third time and the same reason. qb-pace
+        # is on the BIN above, so every screen these tests build would otherwise
+        # read the developer's own subscription out of ~/.claude and call the
+        # usage endpoint — fifty times a run, on figures that decide nothing here.
+        # A test may not need the network to be up to pass. The tests that are
+        # ABOUT the note turn it back on and put a stub qb-pace ahead of the real
+        # one on PATH.
+        "QB_SEATS_PACE": "off",
     }
 
     def _run(*args, name="t", exe=None):
@@ -1891,3 +1899,67 @@ def test_list_and_resume_reach_a_screen_tmux_renamed(screen):
         assert f"{real} is up" in qb(screen, "resume", "1").stdout
     finally:
         screen("--kill", name=real)
+
+
+# ---- what a screen of N seats is about to spend (#275) ------------------------
+#
+# Bringing up N agents on one shared subscription is the largest single spending
+# decision the fleet makes, and it is the moment nobody is looking at the dash
+# the caps are drawn on. So the screen says it here, where the terminal survives
+# — a seat pane execs its agent moments later and the agent paints over anything
+# printed before it.
+
+
+def _pace_stub(screen, body: str):
+    """A stub `qb-pace` ahead of the real one, and the note turned back on.
+
+    /bin/sh, like every other stub here: there is no /usr/bin/env in the nix build
+    sandbox and a stub that cannot exec fails the test for a reason that has
+    nothing to do with the code under test.
+    """
+    stub = screen.stub_dir / "qb-pace"
+    stub.write_text("#!/bin/sh\n" + body)
+    stub.chmod(0o755)
+    screen.env["QB_SEATS_PACE"] = "on"
+    # A LOG FILE, not stderr: the caller reads this command's stdout and discards
+    # its stderr, so a stub that recorded its argv on the second stream would be
+    # recording it into the same /dev/null the real one's failures go to.
+    return screen.log.parent / "pace.log"
+
+
+def test_a_new_screen_says_what_its_seats_are_about_to_spend(screen):
+    """RED/GREEN. The prediction, not the percentage: what these N seats cost
+    against what is left. It is asked for N — the seat count the screen is actually
+    building — because "5h at 91%" is the thing the dash already showed."""
+    log = _pace_stub(screen,
+                     f'echo "asked $*" >> {screen.log.parent / "pace.log"}\n'
+                     'echo "pace: SLOW — 5h at 74%; resets in 47m"\n'
+                     'echo "estimate  3 seats x 1 round ~ 851,385 tokens"\n')
+    result = screen("-n", "3")
+    assert result.returncode == 0
+    assert log.read_text().strip() == "asked --estimate 3", \
+        "the note was not asked about THIS screen"
+    assert "qb-seats: pace: SLOW — 5h at 74%; resets in 47m" in result.stderr
+    assert "qb-seats: estimate  3 seats x 1 round ~ 851,385 tokens" in result.stderr
+
+
+def test_the_screen_is_built_whatever_the_window_says(screen):
+    """It warns and proceeds, always. A human bringing up a screen has decided to
+    spend; the refusal lives one layer down in qb-seat, off by default, for the
+    panes with nobody in front of them."""
+    # Exiting non-zero as well, because that is the shape of the case worth
+    # pinning: a verdict that says stop must still be RELAYED by the thing that
+    # has decided not to stop.
+    _pace_stub(screen, 'echo "pace: HOLD — 5h at 99%; resets in 12m"\nexit 3\n')
+    result = screen("-n", "2")
+    assert result.returncode == 0
+    assert "qb-seats: pace: HOLD — 5h at 99%; resets in 12m" in result.stderr
+    assert len([p for p in panes(screen) if p[1]]) == 2, "the screen was not built"
+
+
+def test_a_broken_pace_command_costs_the_note_and_not_the_screen(screen):
+    """This runs under `set -e` before a single pane exists. A note that could take
+    the build down with it would be a budget warning that causes outages."""
+    _pace_stub(screen, "exit 127\n")
+    assert screen("-n", "1").returncode == 0
+    assert len([p for p in panes(screen) if p[1]]) == 1
