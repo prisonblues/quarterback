@@ -11,7 +11,7 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
-## vNEXT — the suites that read this repo get a sandbox that holds it
+## v2.61 — the suites that read this repo get a sandbox that holds it
 
 Five test suites under `harness/` read files at the repo root while running in nix sandboxes
 that hold neither them nor, in one case, the Python package they import. A read nobody copied
