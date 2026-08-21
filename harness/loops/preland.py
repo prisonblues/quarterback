@@ -379,6 +379,32 @@ def board_get(path: str, params: dict) -> tuple[object, str]:
 # ------------------------------------------------------------------- the checks
 
 
+def mergeability(pr: dict) -> tuple[str, str]:
+    """``(the normalised mergeable state, the sentence to say about it)``.
+
+    The mergeability clause of :func:`check_pr_state`, lifted out because it has a
+    SECOND caller: `panel.py` refuses a review round on a branch that cannot merge
+    (#271), and the merged state a review reasons about does not exist while the
+    branch is CONFLICTING. Lifted rather than copied — the three pre-land checks in
+    #96 drifted precisely because the same question was asked in two places in two
+    wordings, and a reviewer refusing a round with one sentence while the merge gate
+    refuses the merge with another is that failure arriving one loop earlier.
+
+    The sentence is ``""`` only for ``MERGEABLE``. Every other value has something
+    to say, and the caller decides whether its own answer is a refusal or a
+    warning: at the merge gate CONFLICTING blocks and UNKNOWN warns, and the panel
+    makes the same split for its own reasons.
+    """
+    state = (pr.get("mergeable") or "UNKNOWN").upper()
+    if state == "CONFLICTING":
+        return state, ("GitHub reports the branch as CONFLICTING — resolve the "
+                       "conflicts by hand; guessing a resolution is not mechanical")
+    if state != "MERGEABLE":
+        return state, (f"GitHub has not computed mergeability yet ({state}); "
+                       "a conflict would fail the merge loudly rather than land")
+    return state, ""
+
+
 def check_pr_state(pr: dict) -> Check:
     """The PR itself: open, not a draft, and not in conflict.
 
@@ -393,13 +419,11 @@ def check_pr_state(pr: dict) -> Check:
         c.reasons.append(f"the PR is {pr['state']}, not OPEN — there is nothing to land")
     if pr.get("isDraft"):
         c.reasons.append("the PR is a draft; mark it ready for review first")
-    mergeable = (pr.get("mergeable") or "UNKNOWN").upper()
+    mergeable, said = mergeability(pr)
     if mergeable == "CONFLICTING":
-        c.reasons.append("GitHub reports the branch as CONFLICTING — resolve the "
-                         "conflicts by hand; guessing a resolution is not mechanical")
-    elif mergeable != "MERGEABLE":
-        c.warnings.append(f"GitHub has not computed mergeability yet ({mergeable}); "
-                          "a conflict would fail the merge loudly rather than land")
+        c.reasons.append(said)
+    elif said:
+        c.warnings.append(said)
     c.detail = {"state": pr["state"], "draft": bool(pr.get("isDraft")),
                 "mergeable": mergeable, "head_sha": pr["headRefOid"]}
     c.status = "failed" if c.reasons else "passed"

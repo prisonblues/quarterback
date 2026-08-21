@@ -128,6 +128,12 @@ import panel_rounds              # noqa: F401
 from panel_preflight import *     # noqa: F401,F403
 import panel_preflight            # noqa: F401
 
+# The mergeability sentence, from the merge gate that already owns it (#271). One
+# import rather than a second copy: `preland.check_pr_state` refuses a CONFLICTING
+# branch at merge time, this refuses a round on the same branch hours earlier, and
+# the two saying it differently is how the three checks in #96 came to disagree.
+from preland import mergeability   # noqa: E402
+
 # ----------------------------------------------------------------------------- run
 
 def _changed_files(meta: dict) -> tuple[list[dict], int | None, int]:
@@ -558,7 +564,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         meta = json.loads(panel_core.sh(["gh", "pr", "view", str(pr_number), "--repo", gh_repo,
                               "--json", "title,additions,deletions,baseRefName,"
                                         "baseRefOid,headRefName,headRefOid,files,"
-                                        "changedFiles,state,isDraft"]))
+                                        "changedFiles,state,isDraft,mergeable"]))
     except subprocess.CalledProcessError as e:
         tail = (e.stderr or "").strip().splitlines()
         # `gh pr view --json` rejects the WHOLE command on a field it does not
@@ -577,12 +583,26 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # is carried into the payload now because the next round needs it to tell a
     # defect its own fix pass created from one this round simply missed.
     head_sha = meta["headRefOid"]
-    # The base end of the same range (#98). `baseRefOid` is the MERGE BASE — the
-    # commit `gh pr diff`'s three-dot diff is built from — and not the base
-    # branch's tip, which is why the tip is fetched separately below rather than
-    # read off this call. `.get`, not `[...]`: every other key here is required
-    # because the run cannot proceed without it, and a base commit is not that.
-    merge_base = meta.get("baseRefOid") or None
+    # The base end of the same range (#98), as GITHUB STORES IT — which is not the
+    # merge base and must not be recorded as one (#241). It is what `gh pr diff`
+    # builds its three-dot diff from, so it is the honest answer to "what was this
+    # round's target measured against"; the true fork point is computed below, past
+    # the skip branch, and the two are reconciled there. `.get`, not `[...]`: every
+    # other key here is required because the run cannot proceed without it, and a
+    # base commit is not that.
+    stored_base = meta.get("baseRefOid") or None
+    # What the SKIP path records. The skip branch returns before the merge-base
+    # computation below, on purpose: that path exists to cost nothing, never
+    # fetches a diff and never reaches the board, so it keeps the value that is
+    # free off the metadata already in hand rather than buying an API call for a
+    # round that reviewed nothing.
+    merge_base = stored_base
+    # Must the branch be able to MERGE for a round to be worth running (#271)? The
+    # DIAL is read here, before anything is fetched, because `panel_flag` exits on
+    # a value that is neither true nor false and a rules file this harness cannot
+    # obey has to fail at the door. The question itself is asked past the skip
+    # branch below, where it may cost an API call.
+    require_mergeable = panel_flag(panel, "require_mergeable", True, notes)
     changed = meta["additions"] + meta["deletions"]
     # Same call that already produced `changed`, three fields wider — so the board
     # gets the paths behind the number, and the PR's state, without a second
@@ -749,6 +769,111 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     print(f"\n[{repo_name}#{pr_number}] {title[:60]}", file=chatter)
     print(f"  base={base}  changed={changed} lines\n", file=chatter)
 
+    # ---- CAN THIS BRANCH MERGE AT ALL (#271)? The cheapest refusal in the system,
+    # and until now the LAST one made: `preland.check_pr_state` refuses a
+    # CONFLICTING branch at the merge gate, which is after a full multi-vendor
+    # round and a judge have been spent on a diff that must be rebased before it
+    # can land. Measured on PR #270 — 28 files, 5,572 lines, a branch four commits
+    # behind its base — while the issue was being written.
+    #
+    # Past the title-skip branch, which returns above: a round skipped for its
+    # title reviewed nothing for a reason that has nothing to do with merging, and
+    # a note claiming a precondition refusal would be a second answer to "why is
+    # this payload empty" — on the one path that must also stay free of API calls.
+    #
+    # **Asked TWICE when the first answer is UNKNOWN, and that is what makes this
+    # gate work at all.** GitHub computes mergeability lazily: the first query
+    # schedules the merge test and answers UNKNOWN while it runs. Measured on this
+    # repo, three consecutive reads of an open PR gave UNKNOWN, CONFLICTING,
+    # CONFLICTING — so a gate that asks once refuses only the PRs somebody happened
+    # to have looked at recently, which is a gate that appears to work and mostly
+    # does not. The re-read is one cheap call, and only on the cold answer.
+    #
+    # The answer then travels two ways. `gate` reaches the pre-flight verdict and
+    # refuses the round through the machinery that already exists for that
+    # (`skip_reason`, `preflight.verdict`, the per-seat `ran: false` rows,
+    # `--force`); the NOTE is what a round that ran against a non-mergeable head
+    # anyway says in its payload, rather than leaving a reader to infer it.
+    # `config_notes: []` under a wrong target is the whole of #241's complaint, and
+    # this is its sibling defect.
+    mergeable, mergeable_said = mergeability(meta)
+    if mergeable == "UNKNOWN":
+        again = _mergeable_now(gh_repo, pr_number)
+        if again:
+            mergeable, mergeable_said = mergeability({"mergeable": again})
+    gate = mergeable_said if mergeable == "CONFLICTING" and require_mergeable else ""
+    if mergeable == "CONFLICTING" and not gate:
+        notes.append(f"{mergeable_said}. Reviewed anyway because "
+                     "`review_panel.require_mergeable` is off for this repo: the "
+                     "merged state these findings reason about does not exist yet, "
+                     "and the rebase will change the diff they are about")
+    elif mergeable == "CONFLICTING" and force:
+        # `gate` is still set, and still recorded — `--force` turns the verdict
+        # into `run` and leaves `preflight.would_have: refuse` behind it, which is
+        # this repo's standing rule that "the tool chose to run" and "a caller
+        # overrode the tool" must never look alike. This is the half a human reads.
+        notes.append(f"{mergeable_said}. Reviewed anyway on --force: the merged "
+                     "state these findings reason about does not exist yet, and "
+                     "the rebase will change the diff they are about")
+    elif mergeable == "CONFLICTING":
+        notes.append(f"{mergeable_said}. This round is REFUSED before any seat is "
+                     "dispatched — rebase and re-run, or set "
+                     "`review_panel.require_mergeable: false`")
+    elif mergeable_said:
+        # Still not computed after two reads, or a `gh` too old to know the field.
+        # The merge gate warns rather than refusing on it and so does this: a
+        # refusal on "we could not tell" would stop a round on GitHub's own
+        # scheduling. The fact is recorded either way — an unread precondition is
+        # not a satisfied one — and it says the question was put twice, so a reader
+        # does not take it for the cold first answer it usually is.
+        notes.append(f"{mergeable_said}. It was asked for twice")
+
+    # ---- WHERE THIS BRANCH ACTUALLY FORKED (#241). Past the skip branch, which
+    # returns above and must stay free of API calls, and before the diff so that
+    # everything downstream — the payload, the mid-round re-read, the next round's
+    # anchor — agrees about which commit it means.
+    #
+    # `baseRefOid` is not this. GitHub maintains it for its own purposes and it has
+    # been measured wrong in both directions on this repo: OLDER than the fork
+    # point on PR #187, where a commit shared with another PR landed on `main` and
+    # nothing recomputed the stored base, so `gh pr diff` returned already-landed
+    # code and a full round confirmed 15 findings about it; and NEWER on PR #270,
+    # where the stored base was the tip of `main` and named a commit the branch had
+    # never contained. Recording the stored value as `merge_base` is what let both
+    # rounds report a range nobody had reviewed.
+    #
+    # The diff is still `gh pr diff`, and that is deliberate rather than
+    # unfinished: silently re-deriving the target from a locally-computed range
+    # would swap one unannounced scope for another, and the load-bearing part of
+    # #241 is that a mis-scoped round must not be SILENT. So the fork point is
+    # recorded, the stored base is compared against it, and any disagreement is
+    # said out loud in `config_notes` — where a reader can discount findings that
+    # fall outside the true range.
+    forked_at = _merge_base_now(gh_repo, base, head_sha)
+    if forked_at is None and stored_base:
+        notes.append(
+            "the merge base could not be computed for this round, so `merge_base` "
+            f"records GitHub's stored base for the PR ({stored_base[:8]}) instead "
+            "— that field is not a merge base, so treat the recorded range as "
+            "approximate")
+    elif forked_at is None:
+        notes.append(
+            "the merge base could not be computed and GitHub stores no base commit "
+            "for this PR, so this round records neither end of its base — a later "
+            "staleness check has nothing to anchor against")
+    else:
+        merge_base = forked_at
+        if stored_base and stored_base != forked_at:
+            notes.append(
+                f"the target may be MIS-SCOPED: this round's diff came from `gh pr "
+                f"diff`, which GitHub builds against its stored base for the PR "
+                f"({stored_base[:8]}), and that is not where the branch forked from "
+                f"({forked_at[:8]} — `{base}...{head_sha[:8]}`). Findings may fall "
+                f"outside the range this PR actually contributes; check any finding "
+                f"against `git diff {forked_at[:8]}...{head_sha[:8]}` before acting "
+                "on it. `merge_base` below records the fork point, not the stored "
+                "base")
+
     # The head is read BEFORE the diff, and the order is load-bearing. The two are
     # separate requests, so a push that lands between them makes them disagree —
     # and this way round the recorded head is the OLDER of the two, so the next
@@ -810,13 +935,13 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                      "which of the two produced it cannot be told from here; the later commit "
                      "is recorded, and provenance against this round is that much less certain")
         head_sha = moved_to
-        # `merge_base` came off the metadata read before the round started, and
-        # GitHub recomputes `baseRefOid` on every push to the head branch. Leaving
-        # it would pair a re-stamped right end with a left end computed for the
-        # commit it replaced — and the pair being replayable is this release's
-        # whole claim. Worse, the common reason a head moves here is a merge of
-        # the base branch INTO the PR (~1.8 integration merges per PR landed on
-        # this repo, #80), which is exactly the case that moves the merge base:
+        # `merge_base` was computed against the head this round started with, and a
+        # fork point is a fact about a PAIR of commits — move one end and the answer
+        # can move with it. Leaving it would pair a re-stamped right end with a left
+        # end computed for the commit it replaced, and the pair being replayable is
+        # this release's whole claim. Worse, the common reason a head moves here is
+        # a merge of the base branch INTO the PR (~1.8 integration merges per PR
+        # landed on this repo, #80), which is exactly the case that moves it:
         # the stored range would then start before an integration merge its right
         # end contains, and it is a range no round ever reviewed.
         #
@@ -824,7 +949,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # already gone irregular. If it fails, the pair is not silently mismatched
         # — the note says which end is stale, because "unknown" and "stale" want
         # different treatment from whatever reads this later.
-        moved_meta = _merge_base_now(gh_repo, pr_number)
+        moved_meta = _merge_base_now(gh_repo, base, head_sha)
         if moved_meta and moved_meta != merge_base:
             notes.append(f"the merge base moved with it, from {merge_base[:8] if merge_base else '?'} "
                          f"to {moved_meta[:8]} — both ends are re-read, so the recorded range is "
@@ -964,7 +1089,13 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # different facts, and only the second one changed. Captured here rather than
     # after the refusal branch so that branch can record it too.
     target_scope = review.scope
-    pre = preflight(review.target, budgets, panel, notes, forced=force)
+    # `gate` is the mergeability precondition decided at the top of this function
+    # (#271), and it is handed to the verdict rather than acted on where it was
+    # computed so that a precondition refusal and a size refusal are ONE path: the
+    # payload, `skip_reason`, the per-seat `ran: false` rows, the board record and
+    # `--force` all already exist below, and a second refusal branch beside them is
+    # how the checks in #96 came to disagree with each other.
+    pre = preflight(review.target, budgets, panel, notes, forced=force, gate=gate)
     if pre.refused:
         # The CI gate, read on a round that dispatches nobody. It is one API call,
         # is not defeated by diff size, and costs no seat's budget — and a refusal
@@ -1001,7 +1132,15 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # limit, which is in bytes, and a per-seat skip reason that states a
         # character count against a byte ceiling disagrees with `skip_reason` in the
         # same payload. See `panel_preflight.Ceiling`.
-        refused_by = (f"not dispatched — the panel refused this round "
+        #
+        # A GATE refusal names no ceiling: nothing was measured against one, and
+        # `pre.cap` can legitimately be None there, so the size formatting would
+        # raise from inside the payload build. The seat's row says which question
+        # refused it, which is what "why is this row empty" wants.
+        refused_by = ("not dispatched — the panel refused this round before any "
+                      "seat, on a precondition the diff's size has nothing to do "
+                      "with" if pre.gate else
+                      f"not dispatched — the panel refused this round "
                       f"({pre.measured:,} {pre.cap_unit} against {pre.cap:,})")
         print(report, file=chatter)
         refuse_payload = {
@@ -2358,7 +2497,17 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                      "itself was not read by anybody** — treat its correctness as "
                      "carried over from when it landed on the base branch, not as "
                      "reviewed here.")
-    if pre.forced:
+    if pre.forced and pre.gate:
+        # A forced PRECONDITION refusal, and the size sentence below would be a
+        # non-sequitur about it — there is no ceiling in this verdict, `pre.cap` may
+        # be None, and the reader's problem is not that the seats were spread thin
+        # but that the code they read is going to change before it lands.
+        lines.append("  - ⚠️ **`--force` overrode a pre-flight `refuse` verdict** — "
+                     f"{pre.reason.removeprefix('--force: ')}. The panel refused "
+                     "this round and was overruled: what follows is a review of a "
+                     "branch whose merged form does not exist yet, so read every "
+                     "finding as provisional on the rebase.")
+    elif pre.forced:
         lines.append(f"  - ⚠️ **`--force` overrode a pre-flight `{pre.would_have}` "
                      f"verdict** — the panel judged this round "
                      f"{'not worth running' if pre.would_have == 'refuse' else 'unreadable as content'}"
