@@ -349,6 +349,16 @@ class LeaveIn(BaseModel):
     repo: str = Field(min_length=1, max_length=256)
     base: str = Field(min_length=1, max_length=256)
     pr: int = Field(ge=1)
+    #: WHICH place in the line, when the caller knows — every enqueue response
+    #: carries it. A PR number names a pull request, not one of its stays in the
+    #: queue, so a leave that arrives after the PR left and re-joined would
+    #: otherwise retire the new entry while meaning the old one. The timestamp
+    #: guard below catches that only when the two overlap at the server; a leave
+    #: delayed in transit gets a fresh timestamp on arrival and is
+    #: indistinguishable from a prompt one. This is the exact identification, and
+    #: it is optional rather than required so a caller that never held the id
+    #: (retiring a peer's abandoned entry) can still stand it down.
+    entry_id: uuid.UUID | None = None
     #: Required. The queue advancing is the moment everybody behind starts
     #: spending CI, and "the entry vanished" with no why makes that unauditable —
     #: the same argument the claim table's ``note`` already carries, one step
@@ -683,6 +693,11 @@ async def leave_queue(
     afterwards. That is the trade the claim table makes with ``note``, taken one
     step further because leaving affects other agents and not only the leaver.
 
+    Send ``entry_id`` when you have one — the enqueue that put you in the line
+    returned it. A PR number names a pull request rather than one of its stays in
+    the queue, and the difference matters exactly once: when the PR left and
+    re-joined between your decision to stand down and this call arriving.
+
     It does **not** touch the ``kind=merge`` claim. An agent that held one releases
     it through ``POST /claim/release``; a queue that released claims on its own
     would be the second implementation of the claim this module exists not to be.
@@ -696,17 +711,20 @@ async def leave_queue(
     # row between a read and a write, and re-stamping it would overwrite `lapsed`
     # — turning "its holder stopped answering" into "it stood down cleanly",
     # which is the one distinction the column exists to keep.
+    # The entry this leave is ABOUT, not merely one carrying the same PR number.
+    # A PR that left, was reworked and re-enqueued must not be dropped back out
+    # of the line by the tidy-up for its predecessor — the one failure a queue
+    # cannot have. `entry_id` is the exact answer when the caller has one, and
+    # `entered_at <= now` is the fallback: it separates the two incarnations
+    # whenever they overlap at the server, which is the case a caller that never
+    # held an id can actually be in.
+    scoped = ((MergeQueueEntry.id == body.entry_id,) if body.entry_id is not None
+              else (MergeQueueEntry.entered_at <= now,))
     left = await session.execute(
         update(MergeQueueEntry)
         .where(MergeQueueEntry.repo == canon_repo, MergeQueueEntry.base == canon_base,
                MergeQueueEntry.pr == body.pr, MergeQueueEntry.left_at.is_(None),
-               # The entry this leave is ABOUT, not merely one with the same PR
-               # number. A retried or delayed leave naming an incarnation that
-               # has already gone must not retire the PR's *next* place in the
-               # line — a PR that left, was reworked and re-enqueued would be
-               # silently dropped out of the queue by the tidy-up for its
-               # predecessor, which is the one failure a queue must never have.
-               MergeQueueEntry.entered_at <= now)
+               *scoped)
         .values(left_at=now, left_by=holder, left_reason=body.reason.strip(),
                 updated_at=now)
         .returning(MergeQueueEntry.id)

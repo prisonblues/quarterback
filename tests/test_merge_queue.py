@@ -740,3 +740,35 @@ async def test_a_delayed_leave_cannot_retire_the_prs_next_place_in_the_line(clie
     still = await read(client, repo=repo, pr=2801)
     assert still["head"]["head"] == SHA_B
     assert still["you"]["may_merge"] is True
+
+
+async def test_a_leave_naming_its_entry_cannot_retire_a_later_one(client):
+    """A PR number names a pull request, not one of its stays in the queue.
+
+    The timestamp guard separates two incarnations only while they overlap at
+    the server; a leave delayed in transit arrives with a fresh timestamp and is
+    indistinguishable from a prompt one. `entry_id` — which every enqueue
+    returns — is the exact identification, and a leave that names a place the PR
+    has already given up retires nothing rather than the place it holds now."""
+    repo = "acme/entryid"
+    first = await join(client, 2901, SHA_A, repo=repo, verdict="ready")
+    old_id = first["entry"]["entry_id"]
+    await leave(client, 2901, "closed", repo=repo)
+    again = await join(client, 2901, SHA_B, repo=repo, verdict="ready")
+    assert again["entry"]["entry_id"] != old_id
+
+    stale = await client.post(
+        "/merge-queue/leave",
+        json={"repo": repo, "base": BASE, "pr": 2901, "reason": "closed",
+              "entry_id": old_id}, headers=LAPTOP)
+    assert stale.status_code == 200, stale.text
+    assert stale.json()["left"] is False
+    assert stale.json()["active_order"] == [2901]
+
+    # ...and naming the CURRENT entry does stand it down.
+    good = await client.post(
+        "/merge-queue/leave",
+        json={"repo": repo, "base": BASE, "pr": 2901, "reason": "merged",
+              "entry_id": again["entry"]["entry_id"]}, headers=LAPTOP)
+    assert good.status_code == 200 and good.json()["left"] is True
+    assert good.json()["active_order"] == []

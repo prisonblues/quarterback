@@ -776,7 +776,7 @@ def merge_queue_enqueue(ctx: Context, pr: int, base: str, head: str,
 
 @mcp.tool()
 def merge_queue_leave(ctx: Context, pr: int, base: str, reason: str,
-                      repo_path: str = ".") -> dict:
+                      repo_path: str = ".", entry_id: str | None = None) -> dict:
     """Stand down from the line, so everyone behind you can move (#227).
 
     Call it the moment your PR merges, closes or is superseded. The entry expires
@@ -796,11 +796,16 @@ def merge_queue_leave(ctx: Context, pr: int, base: str, reason: str,
         base: the branch it was queued to land on.
         reason: merged / closed / superseded / abandoned, in your own words.
         repo_path: the checkout whose origin remote names the repo.
+        entry_id: the id your enqueue returned. Send it when you have one — a PR
+            number names a pull request, not one of its stays in the line, so
+            without it a leave arriving late can retire the place the PR took
+            after re-joining.
     """
+    body = {"repo": _derive_repo(repo_path), "base": base, "pr": pr,
+            "reason": reason, "entry_id": entry_id}
     try:
         return _get_client(ctx).merge_queue_write(
-            "leave", {"repo": _derive_repo(repo_path), "base": base, "pr": pr,
-                      "reason": reason})
+            "leave", {k: v for k, v in body.items() if v is not None})
     except httpx.HTTPStatusError as e:
         _raise(e, "merge_queue_leave")
 
