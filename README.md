@@ -920,6 +920,18 @@ full — including what was broken before it, which is the part no diff recovers
   it — found by the pass reporting its own author's claim on #255. And an unmade check never
   reads as a clean one: `unknowns` sit beside `findings`, never inside them, and exit 1 means
   "some check unavailable" where 0 means "checked".
+- **v2.64** — a screen you can build and cannot reach. `qb-seats` addressed every tmux session
+  by NAME, and `.` and `:` are a target's own separators — which worked only because tmux
+  rewrote them out of a name it would not take. tmux 3.7b keeps `my.screen` verbatim, so
+  `-t "=my.screen"` parses as pane `screen` of session `my`: every seat command failed against a
+  screen that plainly existed, `list` showed nothing and `resume` could not reach it. All
+  twenty-five targets now address `#{session_id}`, and so do the six in `qb-seat-click`, where
+  the bar's ✕ and ＋ live and where `run-shell -b` would have swallowed the error. Pinned at
+  source level, because 3.6a renames the dot away and no test using a name can exercise it there.
+  `nix flake check` also goes green for the first time: a runtime-written stub may not name
+  `/usr/bin/env` (there is none in a nix sandbox, and this had shipped five times, so it is a
+  guard now rather than a review comment), and five `test_qbdata.py` tests asked git about a
+  checkout the sandbox does not hold and build their own.
 - **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
   object store; wire `landed` refs to a cherry-pick helper.
 

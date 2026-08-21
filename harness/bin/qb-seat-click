@@ -5,7 +5,8 @@
 #
 # Exit codes:
 #   0  the click was handled, or was for something this does not act on
-#   1  not inside tmux, or the seat named by the click no longer has a pane
+#   1  not inside tmux, or the screen the click named is gone, or the seat it
+#      named no longer has a pane
 #   2  malformed arguments — a caller bug, and says so
 #
 # WHY A SCRIPT AND NOT A KEY BINDING. tmux hands every status-line click to one
@@ -71,6 +72,53 @@ range=${1:-$(tmux show-options -s -v @qb_click 2>/dev/null || true)}
 session=${2:-$(tmux show-options -s -v @qb_click_session 2>/dev/null || true)}
 [ -n "$session" ] || die "no session recorded for the click"
 
+# THE ID, NEVER THE NAME, IS WHAT A `-t` GETS — the same rule qb-seats states at
+# length beside its own `session_id`, and every button on this bar needed it too.
+# `.` and `:` are a target's own separators; tmux 3.7b keeps them in a session name
+# verbatim, so `-t "=my.screen"` parses as pane `screen` of session `my` and comes
+# back "can't find pane: screen". Measured on 3.7b, against a screen that plainly
+# exists:
+#
+#     $ tmux list-panes -s -t '=my.screen'
+#     can't find pane: screen
+#     $ tmux list-panes -s -t '$0'
+#     %0
+#
+# Every widget here — the seat cell, the ✕ and the ＋ — went through one of those
+# targets, and this is the worst place on the screen for it: the bar reaches this
+# script through `run-shell -b`, which discards both streams, so the whole bar
+# would simply stop responding with nothing said anywhere.
+#
+# THE STASH STAYS A NAME and is resolved here. `#{session_name}` is what the
+# binding records, it is what `qb-seats --add -s` takes, and it is what the tests
+# and anyone driving this by hand pass — so the name is the argument and the id is
+# derived from it, once, rather than a second thing for the binding to keep in
+# sync.
+#
+# Read off `list-sessions` rather than looked up with `-t`, because a lookup BY
+# name is the very thing that cannot be trusted here; and split by hand rather than
+# with `IFS=' ' read -r id nm`, because `read` strips trailing IFS whitespace from
+# the last field and a session tmux happily calls `mine ` would never compare equal
+# to what the caller asked for.
+session_id() {
+  local line
+  tmux list-sessions -F '#{session_id} #{session_name}' 2>/dev/null \
+    | while IFS= read -r line; do
+        [ "${line#* }" = "$1" ] && printf '%s\n' "${line%% *}"
+      done
+}
+
+# Resolved on demand, not up front: a range this script does not own exits 0 below
+# without touching tmux, and a stale @qb_click_session left behind by a screen that
+# has since been killed must not turn that into a failure.
+sid=""
+need_sid() {
+  [ -n "$sid" ] && return 0
+  sid=$(session_id "$session") || sid=""
+  [ -n "$sid" ] || die "no screen named '$session' is up"
+  return 0
+}
+
 # Seats are found by pane option, never by index: the index shifts the moment a
 # pane is added or closed, which is precisely what this script does.
 #
@@ -80,7 +128,7 @@ session=${2:-$(tmux show-options -s -v @qb_click_session 2>/dev/null || true)}
 # `qb-seat-click kill` closes the board pane. The test suite found that, not a
 # careful reading.
 seat_pane() {
-  tmux list-panes -s -t "=$session" -F '#{pane_id} #{@qb_seat}' \
+  tmux list-panes -s -t "$sid" -F '#{pane_id} #{@qb_seat}' \
     | awk -v want="$1" '$2 != "" && $2 == want { print $1; exit }'
 }
 
@@ -109,10 +157,10 @@ seat_number() {
 # need the clamp, because a width that fitted a second ago still fits.
 reflow() {
   local survivor dash was=""
-  survivor=$(tmux list-panes -s -t "=$session" -F '#{pane_id} #{@qb_seat}' \
+  survivor=$(tmux list-panes -s -t "$sid" -F '#{pane_id} #{@qb_seat}' \
     | awk '$2 != "" { print $1; exit }')
   [ -n "$survivor" ] || return 0
-  dash=$(tmux list-panes -s -t "=$session" -F '#{pane_id} #{@qb_label}' \
+  dash=$(tmux list-panes -s -t "$sid" -F '#{pane_id} #{@qb_label}' \
     | awk '$2 == "dash" { print $1; exit }')
   [ -z "$dash" ] || was=$(tmux display-message -p -t "$dash" '#{pane_width}')
   tmux select-layout -t "$survivor" -E 2>/dev/null || true
@@ -124,6 +172,7 @@ reflow() {
 case "$range" in
   seat*)
     n=$(seat_number "${range#seat}") || exit 0
+    need_sid
     pane=$(seat_pane "$n")
     [ -n "$pane" ] || die "seat $n has no pane"
     # The window too: the bar stays on screen when another window is current, so
@@ -134,6 +183,7 @@ case "$range" in
   kill*)
     # The confirmation already happened, in the binding — see the header.
     n=$(seat_number "${range#kill}") || exit 0
+    need_sid
     pane=$(seat_pane "$n")
     [ -n "$pane" ] || die "seat $n has no pane"
     tmux kill-pane -t "$pane"
@@ -147,11 +197,12 @@ case "$range" in
     # The path is read off the session because a tmux server usually predates
     # the screen running in it, and its PATH is whatever started it — which is
     # the same class of bug as the seat_env forwarding in qb-seats.
-    seats=$(tmux show-options -v -t "=$session:" @qb_seats_bin 2>/dev/null || true)
+    need_sid
+    seats=$(tmux show-options -v -t "$sid:" @qb_seats_bin 2>/dev/null || true)
     [ -n "$seats" ] || seats=$(command -v qb-seats 2>/dev/null || true)
     [ -n "$seats" ] || die "qb-seats is not on PATH and the session did not record it"
-    repo=$(tmux show-options -v -t "=$session:" @qb_repo 2>/dev/null || true)
-    [ -n "$repo" ] || repo=$(tmux display-message -p -t "=$session:" '#{pane_current_path}')
+    repo=$(tmux show-options -v -t "$sid:" @qb_repo 2>/dev/null || true)
+    [ -n "$repo" ] || repo=$(tmux display-message -p -t "$sid:" '#{pane_current_path}')
     # Its stderr is captured and re-reported rather than left to fall into the
     # same hole this script's own does: run-shell -b discards it, so a --add
     # that refused for a good reason looked identical to a button that is not

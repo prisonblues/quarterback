@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
+import subprocess
 import sys
 from pathlib import Path
 
@@ -250,13 +251,37 @@ def test_the_tui_pins_the_repos_before_it_resolves_the_scope(watched, monkeypatc
     assert Recorder.seen["scope"].names == {"other"}, "the scope resolved before the pin"
 
 
+@pytest.fixture
+def checkout(tmp_path):
+    """A git checkout with an origin remote, BUILT here rather than borrowed.
+
+    NOT `Path(__file__).parents[2]`, which is this repo when a developer runs the
+    suite and `/build` when the `worktree-tests` sandbox does — and that sandbox
+    holds `harness/bin` and `harness/tests` and is not a git repository at all.
+    `--repo <that>` would raise "not a git checkout with an origin remote" and the
+    test would fail on the environment rather than on the code. It does not fail
+    there today only because textual is absent and this test skips, which makes it
+    a trap set for whoever adds textual to that check rather than a test that
+    passes. The sibling fixture in test_qbdata.py is the same thing for the same
+    reason; what is under test is `repo_target`'s reading of *a* checkout.
+    """
+    root = tmp_path / "wt-review"
+    root.mkdir()
+    for args in (["init", "-q"],
+                 ["remote", "add", "origin",
+                  "https://github.com/prisonblues/quarterback.git"]):
+        subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True)
+    return root
+
+
 @needs_textual
-def test_a_checkout_argument_also_moves_where_the_tui_launches_work(watched, monkeypatch):
+def test_a_checkout_argument_also_moves_where_the_tui_launches_work(
+        watched, monkeypatch, checkout):
     """The P1 this closes: `--repo` used to redirect only what the panels DRAW, so
     the named repo's ⚒ rows were drawn takeable and then refused one by one."""
     tui = _tui()
     monkeypatch.setattr(tui, "Dash", Recorder)
-    here = str(Path(__file__).resolve().parent.parent.parent)
+    here = str(checkout)
     assert tui.main(["--repo", here]) == 0
     assert Recorder.seen["repo"] == here
     # A slug names a repo this process may have no checkout of, so it moves nothing.

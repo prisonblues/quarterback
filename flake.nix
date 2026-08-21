@@ -124,6 +124,17 @@
           mkdir harness
           cp -r ${./harness/bin} harness/bin
           cp -r ${./harness/tests} harness/tests
+          # harness/loops as a tree, and NOT because a test in it runs here — the
+          # pytest invocation below names `tests` and collects nothing from it.
+          # test_runtime_stub_shebangs.py READS it: the rule it enforces is about
+          # the nix sandbox rather than about a directory, and `loops-tests` is a
+          # sandbox with no /usr/bin/env in it either. Without this line the guard
+          # would quietly scan one of the two trees it names, here, in the only
+          # check that runs it — a guard that is inert in the sandbox it protects
+          # is no guard, which is the lesson prose-consistency-tests below was
+          # built out of. Same shape as that check's own copy of this tree: input
+          # to a guard, not a suite to run.
+          cp -r ${./harness/loops} harness/loops
           chmod -R u+w harness
           # test_release_numbers.py is not a harness test and cannot run in this
           # sandbox: it reads CHANGELOG.md, README.md, pyproject.toml, app/main.py

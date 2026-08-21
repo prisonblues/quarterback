@@ -11,6 +11,54 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
+## v2.64 — a screen you can build and cannot reach
+
+`qb-seats` addressed every tmux session by NAME — `-t "=$SESSION"`, `-t "$SESSION:seats"`,
+twenty-five targets across the script — and `.` and `:` are a tmux target's own separators.
+
+That worked for as long as it did because tmux rewrote those characters out of a name it
+would not take. **tmux 3.7b stopped.** `my.screen` is now kept verbatim, so `-t "=my.screen"`
+parses as pane `screen` of session `my` and comes back "can't find pane: screen" — against a
+screen that was just built and plainly exists:
+
+```
+$ tmux new-session -d -P -F '#{session_name}' -s 'my.screen'
+my.screen
+$ tmux list-panes -s -t '=my.screen'
+can't find pane: screen
+```
+
+Every seat command then failed against it, `list` showed nothing, `resume` could not reach it,
+and `--kill` could not tear it down. Every `-t` now addresses `#{session_id}` — `$3`, which has
+no separators in it and is tmux's own answer to "which session". Names stay where names belong,
+in the messages a human reads. `screens()` reads the id beside the name in one `list-sessions`
+sweep, `new-session -P -F` returns both, and `have_session` sets the id as a side effect so a
+caller cannot forget to.
+
+**The bar's buttons are in the other script and needed the same conversion.** `qb-seat-click`
+looked its session up the same way in six places, and it is the worse of the two to have it in:
+it is reached through `run-shell -b`, which discards both streams, so the ✕, the ＋ and the seat
+cells would have gone on doing nothing at all with nothing said anywhere. A click naming a
+screen that is gone now says that, rather than reporting a missing seat.
+
+**The regression is invisible on the tmux a developer has** — 3.6a renames the dot away, so no
+test using a session name can exercise it there — so it is pinned at source level instead:
+`test_every_session_target_is_an_id_and_not_a_name` reads both scripts and fails on the next
+name-shaped `-t` anyone adds, under either tmux.
+
+`nix flake check` was red on main meanwhile, and had been for long enough that nobody could say
+since when, because no workflow runs it (#179) and every developer running `pytest` sees green.
+Two more causes, sharing nothing with the above or with each other. **A stub written at runtime
+cannot name `/usr/bin/env`** — there is none inside a nix build sandbox, and `patchShebangs`
+reaches the scripts shipped in `harness/bin` at build time but not a file a test writes while it
+runs. That had now shipped five times, so the rule stopped living in changelog entries and review
+comments — neither of which runs — and became `test_runtime_stub_shebangs.py`. And **five
+`test_qbdata.py` tests asked git about `Path(__file__).parents[2]`**, which is this repo on a
+laptop and `/build` in the sandbox, where it is not a git repository at all; they build their own
+checkout now, so what is under test is `repo_target`'s reading of *a* checkout and never this one.
+
+Closes #177, closes #259.
+
 ## v2.63 — an item can be wrong and fresh at the same time
 
 `plan_read` computes one answer, `next`, and every agent that starts cold acts on it.
