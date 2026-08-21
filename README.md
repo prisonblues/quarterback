@@ -906,6 +906,20 @@ full — including what was broken before it, which is the part no diff recovers
   on another screen and an issue held from another checkout are both still facts about this one.
   `--repo <checkout|owner/name>` points a pane at another project — a checkout also moves where
   the ⚒ and ⚖ launch, and both now refuse a row from a repo this checkout is not.
+- **v2.63** — an item can be wrong and fresh at the same time. `plan_read` computes one
+  answer, `next`, and nothing checked it against reality: on 2026-08-20 ranks 2 and 4 pointed
+  at PRs merged ninety minutes earlier and `next` returned rank 2, with `idle_days: 0.0,
+  stale: false` beside it — staleness measures time-since-touched, not agreement-with-reality.
+  Every input was already on the board (items carry a `ref`, `/reviews` carries `pr_state` and
+  `stop_reason`); nothing joined them. `qb-reconcile` does, reporting `done_candidate`,
+  `dropped_candidate`, `stale_claim`, `note_contradicted` and `untracked_pr` with no agent, no
+  claims, no hooks and no `--execute` — it never edits the plan, because `dropped` is a
+  decision and not an inference. A claim is checked by its **session**, which catches the case
+  passive expiry cannot: a `/new` resets the conversation while the seat keeps its claims and
+  the hook keeps renewing, so the claim looks freshest exactly when nobody remembers holding
+  it — found by the pass reporting its own author's claim on #255. And an unmade check never
+  reads as a clean one: `unknowns` sit beside `findings`, never inside them, and exit 1 means
+  "some check unavailable" where 0 means "checked".
 - **v3 (next)** — a bare git remote on the server so cross-*device* cherry-pick has a shared
   object store; wire `landed` refs to a cherry-pick helper.
 

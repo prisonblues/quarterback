@@ -1012,3 +1012,91 @@ def test_a_failing_gh_that_said_nothing_still_names_its_exit_code(monkeypatch):
     rows, err = qd.fetch_issues(["prisonblues/quarterback"])
     assert rows == []
     assert err == "quarterback: gh exit 2"
+
+
+# ---- the board client --------------------------------------------------------
+#
+# `qb-reconcile` is the first caller to WRITE through this class, and the write
+# changed the read: `_request` was factored out for it. Nothing in this file
+# exercised either — the only cover the POST had was a hand-rolled fake in
+# test_qb_reconcile.py that never touches the real class, so nothing pinned the
+# Authorization header being sent, the Content-Type, the JSON encoding of the body,
+# or the empty-body branch, which is the one most likely to be wrong.
+
+
+class _Response(io.BytesIO):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def _client(monkeypatch, body: bytes, token: str = "s3cret") -> list:
+    """A BoardClient whose urlopen answers `body`, recording the requests made."""
+    sent: list = []
+
+    def urlopen(req, *a, **k):
+        sent.append(req)
+        return _Response(body)
+
+    monkeypatch.setattr(qd.urllib.request, "urlopen", urlopen)
+    return qd.BoardClient(qd.BoardConfig("https://board.example", token, "host")), sent
+
+
+def test_a_get_carries_the_bearer_token_and_returns_the_parsed_body(monkeypatch):
+    client, sent = _client(monkeypatch, b'{"agents": []}')
+    assert client.get("/active") == {"agents": []}
+    assert sent[0].full_url == "https://board.example/active"
+    assert sent[0].get_header("Authorization") == "Bearer s3cret"
+    assert sent[0].get_method() == "GET"
+
+
+def test_a_board_with_no_token_sends_no_authorization_header(monkeypatch):
+    """An unauthenticated board is a configuration, not an error — and a literal
+    `Bearer ` with nothing after it is a 401 that reads as a dead board."""
+    client, sent = _client(monkeypatch, b"{}", token="")
+    client.get("/active")
+    assert sent[0].get_header("Authorization") is None
+
+
+def test_a_post_sends_json_with_its_content_type_and_the_token(monkeypatch):
+    client, sent = _client(monkeypatch, b'{"id": 4207}')
+    assert client.post("/post", {"type": "finding", "summary": "hi"}) == {"id": 4207}
+    req = sent[0]
+    assert req.get_method() == "POST"
+    assert req.get_header("Content-type") == "application/json"
+    assert req.get_header("Authorization") == "Bearer s3cret"
+    assert json.loads(req.data) == {"type": "finding", "summary": "hi"}
+
+
+def test_a_post_whose_200_carries_no_body_is_not_an_error(monkeypatch):
+    """The reason the empty-body branch exists at all: a write's 200 legitimately
+    says nothing, and the caller wants an empty mapping rather than an exception."""
+    client, _ = _client(monkeypatch, b"")
+    assert client.post("/post", {"type": "status"}) == {}
+    client, _ = _client(monkeypatch, b"   \n")
+    assert client.post("/post", {"type": "status"}) == {}
+
+
+def test_a_get_with_an_empty_body_raises_rather_than_reading_as_nothing_there(monkeypatch):
+    """RED/GREEN: `_request` returned `{}` for an empty body on both verbs, so "the
+    board said nothing" arrived at every dashboard as "the board said nothing is
+    there" — a proxy's contentless 502, a 204 from a board mid-deploy, a truncated
+    response. `qb-reconcile` would print "the plan agrees with GitHub and the board
+    on everything checked" over a plan it never received, and `fetch_board` would
+    render an empty fleet as a healthy one because nothing raised. The tolerance
+    belongs to the write path alone."""
+    client, _ = _client(monkeypatch, b"")
+    with pytest.raises(json.JSONDecodeError):
+        client.get("/plan")
+
+
+def test_an_empty_get_reaches_fetch_board_as_an_error_rather_than_an_empty_fleet(monkeypatch):
+    """The consumer side of the same thing: `fetch_board` sets `error` from an
+    exception, so a `{}` would have left it None and drawn an empty fleet as a
+    healthy one."""
+    client, _ = _client(monkeypatch, b"")
+    out = qd.fetch_board(client)
+    assert out["error"] is not None
+    assert out["agents"] == []

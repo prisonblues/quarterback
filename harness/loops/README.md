@@ -1382,6 +1382,17 @@ is itself one of the checks `ci` reads, and would otherwise gate on its own pend
   `systemd.user.{services,timers}.coding-loops` in `home/rich-workstation.nix`
   (ExecStart → `%h/.claude/loops/run-loop.sh`, `OnUnitActiveSec=10min`,
   `Persistent=false`). Activate with a `rebuild`.
+- **`systemd/qb-reconcile.{service,timer}`** — reference spec too, and the odd one out in
+  this directory: the program it runs is `qb-reconcile` from `bin/`, not a loop. It is here
+  because this is where the harness's reference units live and one place for them beats two.
+  Report-only with **no `--execute` to graduate to** — the pass never edits the plan — so the
+  only cutover decision is whether to keep `--post`, which posts only when the report's
+  content has changed since the last post. Like the lander's, the service carries no
+  `[Install]`: the timer is what starts it, and enabling the oneshot would also run it at
+  every login. `OnUnitActiveSec=15min`,
+  `SuccessExitStatus=0 1` so a partial run (rate-limited `gh`, a board mid-deploy) stays out
+  of the failed state while a genuine "could not run" still goes red. See
+  [../README.md](../README.md#qb-reconcile--does-the-plan-still-describe-the-present).
 
 **Cutover to acting:** keep the timer report-only, watch a few daily logs, hand-run one
 `lander.py --execute` on a single PR, *then* set `LOOPS_EXECUTE=1` in the service env.

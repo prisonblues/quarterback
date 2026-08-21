@@ -11,6 +11,106 @@ A release in flight has no number. Write `## vNEXT — <title>` here, name no ve
 run `scripts/release_stamp.py apply` before landing — it resolves the placeholder against the ref
 you are merging into. The README's *"A branch never picks its own number"* has the whole flow.
 
+## v2.63 — an item can be wrong and fresh at the same time
+
+`plan_read` computes one answer, `next`, and every agent that starts cold acts on it.
+Nothing checked it against reality.
+
+**On 2026-08-20 the plan's ranks 2 and 4 pointed at PRs #182 and #211, both merged ninety
+minutes earlier, and `next` returned rank 2.** Finished work, offered as the thing to do,
+by the one call the plan exists to answer. Beside it: `idle_days: 0.0, stale: false` —
+because staleness measures time-since-touched and not agreement-with-reality, so an item can
+be wrong and fresh at the same time and nothing on the board could tell. Three live
+workstreams (PRs #247, #249, issue #209) were outside the plan entirely, and rank 1's note
+said `free: MERGEABLE/CLEAN` while the board's own `/review/findings?pr=216` said
+`stopped: false, "22 finding(s) no earlier round raised"`. The item and the board
+contradicted each other and nothing noticed.
+
+Every input needed to catch all four was already on the board or one `gh` call away. Plan
+items carry `ref: {kind: pr, value: "182"}`; `GET /reviews` carries `pr_state`, `head_sha`,
+`ci_status` and `stop_reason` across 37 recorded runs. **Nothing joined them.** Detecting
+"this item's PR is merged" is a mechanical comparison, not a judgement.
+
+So `qb-reconcile` walks the plan's refs against GitHub and the board's own review record and
+reports five disagreements: `done_candidate`, `dropped_candidate`, `stale_claim`,
+`note_contradicted`, `untracked_pr`. No agent, no claims, no hook wiring, and **no
+`--execute` to graduate to** — it never edits the plan, because "this item looks done" is a
+candidate for a human or a `plan_done` call, and `dropped` in particular is a *decision* the
+plan's model deliberately keeps apart from `done`. `--json` is the deterministic input #232's
+orderer needs: an orderer cannot order a plan that does not describe the present.
+
+**A claim is checked by its session, not by its holder, and that is a defect class passive
+expiry cannot reach.** Expiry covers a holder that died — it stops renewing and the row
+lapses with nobody reaping it. It does not cover the holder still being there while the
+conversation that took the claim is gone: a `/new` resets the conversation, the seat identity
+and its claims are pinned to the pane, and the lifecycle hook renews the lease on every
+prompt whatever the new conversation is now about. The claim then looks maximally fresh
+*because* the agent is busy, with something else, and it cannot lapse while the pane lives.
+This was found by the pass reporting it about **its own author's claim on #255** while that
+claim was being held. A claim naming no session — one taken by hand — can only be checked by
+holder name, and names are recycled when an agent finishes, so that is reported as unchecked
+rather than as healthy.
+
+**And an absent lease is not evidence that a claim is dead, because the two TTLs are not the
+same length.** A plan claim runs an hour; a lease runs 30 minutes here (300s by API default)
+and is renewed per *prompt*, and `/active` lists only leases that have not expired. So an
+agent in one long autonomous turn — the normal shape of the loops this harness drives —
+drops out of `/active` for up to half an hour with its claim perfectly live, and nothing in
+the payload tells "quiet" from "gone". Only the case above is a finding. When *nothing* the
+claim names is in `/active`, the claim's own `expires` is what can still be read, and while
+it holds this is reported as unchecked: the board's own passive expiry settles it at the
+claim's TTL, and a finding accusing a working agent of holding a dead claim every fifteen
+minutes settles nothing. That read is **three-valued, and the third value is the point**: a
+claim carrying no `expires`, or one that will not parse, is reported as unchecked too. A
+bare `if` on it collapses "the board did not say when this expires" into "it expired" and
+files a finding whose sentence — "the claim is past its own expiry" — asserts a comparison
+the pass never made. That is this file's own subject inverted, and it shipped in it.
+
+**`--post` posts what changed, and what has gone unheard**, hashing what the report *says*
+rather than `as_dict()` — `idle_days` and GitHub's `updatedAt` move on their own — into a
+digest under `$XDG_STATE_HOME`. On a 15-minute timer without it, one unchanged disagreement
+is ~96 identical `finding` posts a day, each carrying the whole rendered report, and
+`finding` is not in `MUTED_TYPES`: every one of them would land in every agent's orient read.
+But change detection alone trades that for eventual silence — `GET /board` orients over a
+30-minute window, so half an hour after the single post a still-live disagreement is
+invisible to every cold orient, which is the reader `--post` is for. So the digest carries
+the time it was posted and an unchanged report goes out again once it is older than
+`REPOST_AFTER`. Which puts a rule on the report's own sentences, since they are what is
+hashed: **a summary or a reason must not interpolate a value that moves on its own.** The
+live-but-quiet claim message wrote the claim's `expires` into its text, and `/plan` re-issues
+that timestamp on every renewal — so the identical disagreement was re-posted every time the
+agent holding it renewed, through the one function written to prevent exactly that.
+
+Bot PRs and drafts are not counted as untracked work — the harness ships a whole loop for
+dependabot's, so counting them would bury the findings a reader is here for — and neither is
+dropped silently: the report says how many it did not compare and why, including on a tick
+where that is the *only* thing it has to say, which is the case the `--quiet` and `--post`
+gates originally missed and the shipped timer unit runs. **What accounts for a PR is an
+item's ref or its title, never its note**: notes say "follows PR #999" and "blocked until PR
+#247 lands" without owning either, and reading those as ownership silences `untracked_pr`
+about that PR forever. **Every row accounts, not only the open ones**, because the repo scope
+is drawn from the whole plan — a repo included for its finished rows would otherwise have
+every open PR it has reported as untracked, on every tick.
+
+**An unmade check never reads as a clean one**, which is #244's shape and the half of #255
+that decided the file's structure. Every condition has a third answer, `unknowns` is never
+folded into `findings`, `complete: false` says so in the JSON, and the exit code separates
+"ran clean" (0) from "ran, some check unavailable" (1) from "could not run" (2). Not
+hypothetical: the deployed board is v2.48, its `/review/findings` returns no `cycles` field,
+so its `stopped` cannot be attributed to one cycle — and the pass says that instead of
+reading the field anyway.
+
+**The one judgement in it is a closed vocabulary, and running it found the vocabulary
+wrong.** `note_contradicted` has to decide whether a note asserts readiness, which is the
+only non-mechanical step here. The first draft included bare `green`; on this repo's own plan
+it matched "this PR is what makes it green", "should go green on its own" and "all checks
+were green at its last push" — three for three, none of them an assertion that anything is
+ready. The word belongs to CI, and CI is not the review record, so pairing a note about
+checks with a denial from `/review/findings` manufactures a contradiction out of two
+statements that never disagreed. Those three notes are now the regression tests.
+
+`BoardClient` grew a `post` — the alternative was a fourth client for one board, which
+`qb-board`'s own header already argues against.
 ## v2.62 — a dashboard for one project
 
 The dash was built to answer "who is alive, what do they hold, what is next" for a

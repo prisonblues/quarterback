@@ -1,0 +1,18 @@
+[Unit]
+Description=Timer for the plan reconcile pass (#255)
+
+[Timer]
+# Every 15 minutes, and the number is chosen against what goes stale. A plan item
+# outlives its work the moment a PR merges, and the window that matters is the one
+# between that merge and the next agent reading `next` — ninety minutes on the day
+# #255 was filed, which is how two merged PRs came to be offered as the thing to
+# do. Fifteen minutes puts a ceiling on it without asking GitHub about every ref
+# on the plan more often than the plan itself changes.
+OnBootSec=5min
+OnUnitActiveSec=15min
+# No catch-up storm after the box was off: the pass reports present state, so
+# replaying the ticks it missed would print the same report several times.
+Persistent=false
+
+[Install]
+WantedBy=timers.target

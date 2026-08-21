@@ -40,8 +40,15 @@ stdenvNoCC.mkDerivation {
   # `qb-stage`, which the slash commands call by name and so needs PATH;
   # `qb-seat`, which a multiplexer layout names as the command for each pane —
   # a layout is data on another machine, so it can only refer to it by name;
-  # and `qb-board`, which is a thing a human types on a headless box, which is
-  # the whole point of it existing.
+  # `qb-board`, which is a thing a human types on a headless box, which is
+  # the whole point of it existing; and `qb-reconcile`, which a systemd timer
+  # names as its ExecStart, for the same reason as the layout.
+  #
+  # `qbdata.py` lands in bin/ too, and is not an entry point. It is the library
+  # the dashboards and `qb-reconcile` all import as a SIBLING OF $0, which only
+  # resolves if it is installed in the same directory as they are — home-manager
+  # links each file in as its own flat store path, so "beside the script" is the
+  # only relationship that survives.
   installPhase = ''
     runHook preInstall
 
