@@ -12,9 +12,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.claims import release_session_claims
 from app.api.subagents import active_subagents_by_session
-from app.auth import identify, reader
+from app.auth import author, identify, reader
 from app.db import get_session
-from app.identity import retire, same_machine
+from app.identity import is_human, retire, same_machine
 from app.models.blob import Blob
 from app.models.lease import Lease
 from app.models.session import SessionRecord
@@ -84,6 +84,19 @@ async def _active_lease(session: AsyncSession, sess_key: str, now: datetime) -> 
         .limit(1)
     )
     return await session.scalar(stmt)
+
+
+async def _newest_lease(session: AsyncSession, sess_key: str) -> Lease | None:
+    """The most recently acquired lease on this key, whatever became of it.
+
+    Newest by ``acquired_at`` rather than by expiry, because a key can be leased
+    again: an ending belongs to a lease, and the one that matters is the last one
+    taken. Anything older has been superseded and is history.
+    """
+    return await session.scalar(
+        select(Lease).where(Lease.session == sess_key)
+        .order_by(Lease.acquired_at.desc()).limit(1)
+    )
 
 
 async def _retire_if_idle(session: AsyncSession, holder: str, now: datetime) -> None:
@@ -313,7 +326,7 @@ async def release_lease(
 @router.post("/session/end")
 async def end_session(
     body: EndIn,
-    holder: str = Depends(identify),
+    ender: str = Depends(author),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     """End a session: release its lease and its claims, and record WHY (#277).
@@ -345,16 +358,38 @@ async def end_session(
     first won. ``ended`` says whether THIS call was the one that released a live
     lease; ``lease_was`` says what it found.
 
-    **Authorised by machine**, as every other path on this table is
+    **Authorised by machine for an agent**, as every other path on this table is
     (:func:`app.identity.same_machine`) — a session's lease belongs to the box,
     so a co-tenant may end it on its behalf, which is exactly what the seat bar
     does when it closes somebody else's pane. The CLAIMS are narrower: they go
     through the claims table's own ownership rule, so ending one agent's session
     can never release a co-tenant's work.
+
+    **And by the edge for a person** (#378). This is the one verb the fleet page
+    carries, because it is the one somebody actually needs from a phone when an
+    agent has gone wrong, and until now no browser could reach it: the dependency
+    was :func:`app.auth.identify`, which wants a bearer token no browser holds.
+    :func:`app.auth.author` is the door both callers already come through
+    elsewhere — an agent by token, a person by an edge-proved ``Remote-User``
+    with the secret only the proxy knows — and it authors them into namespaces
+    that cannot be confused, so nothing here has to trust a header.
+
+    The machine check is skipped for a person and only for a person, because the
+    question it asks has no answer for one. It is not a widening of who may end
+    what: an agent's reach is unchanged, and a person's is the whole fleet by
+    construction, being the person whose fleet it is.
     """
     now = _utcnow()
     active = await _active_lease(session, body.session, now)
-    if active is not None and not same_machine(active.holder, holder):
+    # A PERSON is not on the fleet's machine table, and the check that asks which
+    # box they are would refuse every session on it (#378). The machine rule is
+    # about machines: it stops zeus ending a session running on the laptop,
+    # because only the box a session runs on can see what closing it does. A
+    # person proved at the edge is not another box — they are whoever owns all of
+    # them, holding the credential that already reorders the plan, and a phone is
+    # the one place from which a stuck agent gets noticed at all.
+    by_person = is_human(ender)
+    if active is not None and not by_person and not same_machine(active.holder, ender):
         raise HTTPException(403, detail={
             "error": "that session is leased by another machine",
             "held_by": active.holder,
@@ -363,10 +398,72 @@ async def end_session(
         })
 
     released, refused = await release_session_claims(
-        session, sess_key=body.session, holder=holder, now=now)
+        session, sess_key=body.session, holder=ender, now=now)
 
     won = False
-    if active is not None:
+    stamped = active          # the lease this call reports on, live or lapsed
+    was = None                # what it was already doing, decided before we touch it
+    if active is None:
+        # **A lease that merely LAPSED can still be told what happened to it**
+        # (#378), and until now it could not. `/session/end` stamped the reason
+        # onto an *active* lease and did nothing at all otherwise — so the one
+        # case a person opens the fleet page for, an agent that went quiet
+        # twenty minutes ago and never came back, was exactly the case the verb
+        # could not record. The row stayed "nobody ever said", permanently,
+        # because the only window in which anything could be said had closed.
+        #
+        # That is not a widening of what an ending means. #277's rule is that an
+        # ending is a REPORT by an observer, and a person looking at a dead pane
+        # is an observer; what expiry gives you is the absence of one. A lease
+        # already released is left alone, because a handoff is not an ending and
+        # an ending already recorded belongs to whoever saw it first.
+        lapsed = await _newest_lease(session, body.session)
+        # `expires_at <= now` as well as unreleased, because the read above and
+        # this one are two statements and a session can be RESUMED between them:
+        # `_active_lease` finds nothing, somebody POSTs /lease, and the newest
+        # lease is now a live one. Without this it would be stamped ended — a
+        # working session killed, with a `released_at` in the future — which is
+        # the one outcome this whole path exists to avoid causing.
+        if (lapsed is not None and lapsed.released_at is None
+                and lapsed.expires_at <= now):
+            if not by_person and not same_machine(lapsed.holder, ender):
+                # The machine rule reaches here too, now that reaching here
+                # WRITES something. Before this it was a no-op and needed no
+                # authority; a record of who stopped what does.
+                raise HTTPException(403, detail={
+                    "error": "that session was leased by another machine",
+                    "held_by": lapsed.holder,
+                    "hint": "its lease has lapsed, but saying what happened to it "
+                            "is still the box's call, or a person's",
+                })
+            done = await session.execute(
+                update(Lease)
+                # Both halves again, evaluated by the DATABASE at write time —
+                # the Python check above is one statement earlier and the resume
+                # can land in between it and this.
+                .where(Lease.id == lapsed.id, Lease.released_at.is_(None),
+                       Lease.expires_at <= now)
+                # `expires_at`, not `now`: this is when the lease stopped being
+                # valid, which is the closest the board can get to when the
+                # session stopped. Stamping `now` on a lease that lapsed on
+                # Tuesday would have `GET /sessions` report it as ending the
+                # moment somebody got round to saying so.
+                .values(released_at=lapsed.expires_at, end_reason=body.reason)
+                .returning(Lease.id)
+            )
+            won = done.scalar_one_or_none() is not None
+            # Deliberately NO `_retire_if_idle` here, and `/lease/release` states
+            # the reason for the same case: `holder` is a name, names recycle,
+            # and retiring against a lease that lapsed weeks ago would unname
+            # whichever agent has inherited it since.
+            await session.refresh(lapsed)
+            if won:
+                # `lapsed`, not "released": `lease_was` says what this call FOUND,
+                # and what it found was a lease nobody renewed. Reporting
+                # "released" would describe the write rather than the state, and
+                # a caller reading it would think a live session had been let go.
+                stamped, was = lapsed, "lapsed"
+    else:
         # Conditional UPDATE, not read-then-write — the rule `renew_claim` states
         # for the same reason. The two callers most likely to be here at once are
         # a hook and a human on the ✕, and read-then-write would let both set
@@ -393,7 +490,7 @@ async def end_session(
         # Whatever happened, the in-memory row is now behind the database.
         await session.refresh(active)
 
-    lease_was = "released" if won else await _lease_was(session, body.session)
+    lease_was = was or ("released" if won else await _lease_was(session, body.session))
     await session.commit()
     out = {
         "session": body.session,
@@ -402,7 +499,7 @@ async def end_session(
         # ender gets `false` and the same released claims, which is the truthful
         # answer to "did I do it" rather than an error that says nothing.
         "ended": won,
-        "lease": _lease_view(active) if active is not None else None,
+        "lease": _lease_view(stamped) if stamped is not None else None,
         "lease_was": lease_was,
         "released_claims": released,
         "ended_at": now.isoformat(),
@@ -429,10 +526,7 @@ async def _lease_was(session: AsyncSession, sess_key: str) -> str:
     row either was released or it lapsed, and there is no third case left to
     date-compare for.
     """
-    last = await session.scalar(
-        select(Lease).where(Lease.session == sess_key)
-        .order_by(Lease.acquired_at.desc()).limit(1)
-    )
+    last = await _newest_lease(session, sess_key)
     if last is None:
         return "never leased"
     if last.released_at is None:
@@ -503,6 +597,61 @@ async def snapshot(
     return {"session": body.session, "latest_blob": body.blob.lower()}
 
 
+async def _last_leases(session: AsyncSession, keys: list[str]) -> dict[str, Lease]:
+    """The newest lease per key, or nothing for a key that never held one.
+
+    Newest by ``acquired_at``, the rule :func:`_newest_lease` states for one key:
+    a key can be leased again, and anything older has been superseded.
+
+    ``DISTINCT ON`` so the row count is one per key rather than one per lease in
+    that key's history, and one statement whatever the page size.
+    """
+    if not keys:
+        return {}
+    rows = await session.scalars(
+        select(Lease)
+        .where(Lease.session.in_(set(keys)))
+        .distinct(Lease.session)
+        .order_by(Lease.session, Lease.acquired_at.desc())
+    )
+    return {ln.session: ln for ln in rows}
+
+
+def _ending(lease: Lease | None) -> dict | None:
+    """How this lease ended, or nothing because nobody said it did.
+
+    Only a lease carrying an ``end_reason``: a released lease with none is a
+    handoff, and a lapsed one is nobody saying anything at all. Both are honestly
+    reported as "no ending", which is the distinction #277 exists to draw.
+    """
+    if lease is None or not lease.end_reason:
+        return None
+    return {"reason": lease.end_reason,
+            "at": lease.released_at.isoformat() if lease.released_at else None,
+            "holder": lease.holder}
+
+
+def _lease_clock(lease: Lease | None) -> dict | None:
+    """When this key's newest lease stopped being valid, and who held it (#378).
+
+    **The clock a reader measures SILENCE with, and the one ``updated_at`` is
+    not.** ``updated_at`` belongs to the transcript and moves on ``/snapshot``;
+    the lease moves on every prompt. They usually track each other, and where
+    they do not the gap runs the wrong way: a session that pushed at ten, kept
+    renewing until noon and then died is two minutes quiet at 12:02 and two
+    HOURS quiet by the transcript. A fleet view judging liveness off the wrong
+    one reads a working agent as long gone — which is the misreading the fleet
+    page exists to prevent, arriving through the field it trusted.
+    """
+    if lease is None:
+        return None
+    return {"holder": lease.holder,
+            "since": lease.acquired_at.isoformat(),
+            "expires": lease.expires_at.isoformat(),
+            "released": lease.released_at.isoformat() if lease.released_at else None,
+            "end_reason": lease.end_reason}
+
+
 async def _last_endings(session: AsyncSession, keys: list[str]) -> dict[str, dict]:
     """How each session in view ended, or nothing because it has not.
 
@@ -523,18 +672,8 @@ async def _last_endings(session: AsyncSession, keys: list[str]) -> dict[str, dic
     ``DISTINCT ON`` so the row count is one per key rather than one per lease in
     that key's history, and one statement whatever the page size.
     """
-    if not keys:
-        return {}
-    rows = await session.scalars(
-        select(Lease)
-        .where(Lease.session.in_(set(keys)))
-        .distinct(Lease.session)
-        .order_by(Lease.session, Lease.acquired_at.desc())
-    )
-    return {ln.session: {"reason": ln.end_reason,
-                         "at": ln.released_at.isoformat() if ln.released_at else None,
-                         "holder": ln.holder}
-            for ln in rows if ln.end_reason}
+    leases = await _last_leases(session, keys)
+    return {key: end for key, ln in leases.items() if (end := _ending(ln))}
 
 
 @router.get("/sessions")
@@ -542,9 +681,24 @@ async def list_sessions(
     _reader: str = Depends(reader),
     session: AsyncSession = Depends(get_session),
     limit: int = Query(50, ge=1, le=500),
+    include_ended: bool = Query(
+        False,
+        description="also list sessions whose last lease was ENDED but which never "
+                    "pushed a transcript — an ending with no `sessions` row behind it",
+    ),
 ) -> list[dict]:
     """All known sessions — live (held now) and resumable (handed off) — with
-    freshness and transcript size, for the board + `qb sessions`/`qb resume`."""
+    freshness and transcript size, for the board + `qb sessions`/`qb resume`.
+
+    ``include_ended`` widens it to endings with nothing behind them (#378). It is
+    a flag rather than the default, and the reason is the ``limit``: this list is
+    built from transcript records and live leases, one page of them, and folding
+    an unbounded second population in would spend a caller's page on rows it did
+    not ask for. Off, every existing reader sees exactly what it saw before; on,
+    a fleet view gets the row a session leaves when it ends without ever having
+    pushed anything — which is the one transition such a view most needs, and the
+    same hole ``GET /session/{key}`` had until #277.
+    """
     now = _utcnow()
     records = (
         await session.scalars(
@@ -557,7 +711,8 @@ async def list_sessions(
         )
     ).all()
 
-    ends = await _last_endings(session, [r.session for r in records])
+    last = await _last_leases(session, [r.session for r in records])
+    ends = {key: end for key, ln in last.items() if (end := _ending(ln))}
     shas = {r.latest_blob for r in records if r.latest_blob}
     sizes: dict[str, int] = {}
     if shas:
@@ -586,6 +741,10 @@ async def list_sessions(
             # lease that lapsed with nobody saying anything, which is the reading
             # a fleet view most needs to stop guessing at (#252, #277).
             "ended": ends.get(r.session),
+            # The newest lease this key ever held, live or not. It is what a
+            # reader has to measure a SILENCE against: `updated_at` above is the
+            # transcript's clock, and a lease outlives its last push.
+            "last_lease": _lease_clock(lv or last.get(r.session)),
         }
     for lease in active:  # live sessions not yet handed off (no record)
         out.setdefault(lease.session, {
@@ -605,7 +764,66 @@ async def list_sessions(
             # also have been ended — but present, because a caller must not have
             # to know which branch built its row to know which keys exist.
             "ended": None,
+            "last_lease": _lease_clock(lease),
         })
+
+    # **An ending with no `sessions` row behind it is still an ending** (#378).
+    # The two loops above are built from transcript records and from live leases,
+    # so a session that never pushed a transcript is visible exactly while it
+    # holds a lease and vanishes from this list the moment it ends — the one
+    # transition a fleet view most needs to show. #277 fixed the same hole in
+    # `GET /session/{key}` ("it ended, at this time, for this reason" is not
+    # nothing to say) and left the list, which is what a page renders.
+    #
+    # Newest lease per key first, then the ones carrying a reason, so this reads
+    # the same rule `_last_endings` does: a key whose latest lease is held, or
+    # lapsed, or handed off has no ending to report however many it had before.
+    if include_ended:
+        newest = (
+            select(Lease)
+            # "no `sessions` row behind it" is the actual condition, so it is
+            # the actual filter. Excluding the keys already in `out` looked
+            # equivalent and is not: `out` is one PAGE of records, so a session
+            # whose record sits past the limit would be picked up here and
+            # rendered as transcript-less — `blob: null`, `resumable: false` —
+            # about a session that is perfectly resumable.
+            .where(Lease.session.not_in(select(SessionRecord.session)))
+            .distinct(Lease.session)
+            .order_by(Lease.session, Lease.acquired_at.desc())
+            .subquery()
+        )
+        orphaned = await session.execute(
+            select(newest)
+            .where(newest.c.end_reason.is_not(None))
+            .order_by(newest.c.released_at.desc())
+            .limit(limit)
+        )
+        for ln in orphaned.mappings():
+            at = ln["released_at"]
+            out[ln["session"]] = {
+                "session": ln["session"],
+                "cwd": ln["cwd"],
+                "title": ln["title"],
+                "recap": ln["recap"],
+                "model": ln["model"],
+                "device": ln["device"],
+                "holder": ln["holder"],
+                # There is no transcript to have been updated, so the lease's own
+                # ending is the freshest thing known about this key.
+                "updated_at": (at or ln["expires_at"]).isoformat(),
+                "blob": None,
+                "size": None,
+                "live": False,
+                "resumable": False,
+                "ended": {"reason": ln["end_reason"],
+                          "at": at.isoformat() if at else None,
+                          "holder": ln["holder"]},
+                "last_lease": {"holder": ln["holder"],
+                               "since": ln["acquired_at"].isoformat(),
+                               "expires": ln["expires_at"].isoformat(),
+                               "released": at.isoformat() if at else None,
+                               "end_reason": ln["end_reason"]},
+            }
 
     subs_by_session = await active_subagents_by_session(session, now)
     for s in out.values():

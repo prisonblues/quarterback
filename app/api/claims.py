@@ -65,7 +65,7 @@ from app.claimkey import (
     repo_of,
 )
 from app.db import async_session, get_session
-from app.identity import address_clause, resolve_alias, same_machine
+from app.identity import address_clause, is_human, resolve_alias, same_machine
 from app.models.plan import Plan
 from app.models.plan_item import PlanItem
 from app.models.resource_lease import ResourceLease
@@ -634,6 +634,18 @@ async def release_session_claims(
     change it: the session being ended is a process that has stopped or is about
     to, so a claim arriving afterwards is a race inside a dying agent rather than
     a gap here. The TTL is still underneath it, as it is for every other claim.
+
+    **A PERSON ending a session releases everything stamped with it** (#378).
+    :func:`may_mutate` asks which machine the caller is, and a person is not one:
+    ``human/rich`` shares a machine with nothing on the fleet, so the ordinary
+    rule refuses every row and a browser's end of a stuck session would report
+    ``released_claims: []`` beside ``refused_claims: [everything]`` — the verb
+    doing none of its job while returning 200. Their authority is the session
+    instead, which is the stronger half of the agent's own rule anyway: the
+    SELECT above admits only claims stamped with the key being ended, so a claim
+    naming no session is still left to its machine. The credential is the one
+    that reorders the plan — a person proved at the edge, and no bearer token
+    can authenticate into that namespace (see :func:`app.auth.human`).
     """
     rows = list(await session.scalars(
         select(ResourceLease).where(
@@ -643,8 +655,9 @@ async def release_session_claims(
         ).order_by(ResourceLease.acquired_at.desc())
     ))
     released, refused = [], []
+    by_person = is_human(holder)
     for claim in rows:
-        if not may_mutate(claim, holder, sess_key):
+        if not (by_person or may_mutate(claim, holder, sess_key)):
             refused.append(claim_view(claim))
             continue
         claim.released_at = now

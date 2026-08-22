@@ -14,6 +14,22 @@ def _sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+#: Big enough that this suite's own row is never the one paging drops. `GET
+#: /sessions` defaults to 50 and sorts live rows first, so a session this test
+#: has just HANDED OFF — no longer live, and therefore behind every live one —
+#: falls off the default page as soon as the database holds fifty livelier ones.
+#: That is the endpoint working as designed; it is this suite asking the wrong
+#: question. It is asserting registry semantics, not pagination, so it asks for a
+#: page it is certain to be on. (Without this the suite passes alone and fails in
+#: a full run, once enough sibling tests have left sessions behind — which reads
+#: as a defect in whatever was added last rather than as a limit.)
+_ALL = {"limit": 500}
+
+
+async def _sessions(client, headers) -> list[dict]:
+    return (await client.get("/sessions", params=_ALL, headers=headers)).json()
+
+
 def _find(sessions: list[dict], key: str) -> dict | None:
     return next((s for s in sessions if s["session"] == key), None)
 
@@ -29,7 +45,7 @@ async def test_sessions_lists_live_then_resumable_with_size_and_cwd(client):
         "title": "Wire the board", "recap": "building v2.3 session registry",
         "model": "claude-opus-4-8",
     }, headers=LAPTOP)
-    row = _find((await client.get("/sessions", headers=SERVER)).json(), sess)
+    row = _find(await _sessions(client, SERVER), sess)
     assert row is not None
     assert row["live"] is True and row["resumable"] is False
     assert row["cwd"] == cwd and row["size"] is None
@@ -42,13 +58,13 @@ async def test_sessions_lists_live_then_resumable_with_size_and_cwd(client):
     await client.put(f"/blob/{sha}", content=jsonl, headers=LAPTOP)
     snap = await client.post("/snapshot", json={"session": sess, "blob": sha}, headers=LAPTOP)
     assert snap.status_code == 200
-    row = _find((await client.get("/sessions", headers=SERVER)).json(), sess)
+    row = _find(await _sessions(client, SERVER), sess)
     assert row["live"] is True and row["resumable"] is True
     assert row["size"] == len(jsonl) and row["blob"] == sha
 
     # handoff: releases the lease → resumable, no longer live
     await client.post("/handoff", json={"session": sess, "blob": sha}, headers=LAPTOP)
-    row = _find((await client.get("/sessions", headers=SERVER)).json(), sess)
+    row = _find(await _sessions(client, SERVER), sess)
     assert row["live"] is False and row["resumable"] is True
     assert row["cwd"] == cwd
 
