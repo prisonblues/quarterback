@@ -238,7 +238,7 @@ refutation they disagree with. **The gap between
 and could not.** These are the only counts on that page measured per defect
 rather than per observation, which is why both denominators are published.
 
-**v2.60 — the datum, read back: which other PRs does landing this one disturb?**
+**v2.70 — the datum, read back: which other PRs does landing this one disturb?**
 v2.23 recorded the PR's changed FILES and deliberately shipped no query over
 them, because that query had been written twice and pulled twice. A four-seat
 panel reviewed it in two rounds and found the *same* defect in both, and round

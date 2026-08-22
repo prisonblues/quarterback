@@ -17,7 +17,7 @@ the top of this file conflict every time, over nothing — both entries are righ
 and a fragment is a path no other branch will ever open. `changelog.d/README.md` has the format.
 `vNEXT` means exactly what it meant before; assembly is just what writes it.
 
-## vNEXT — the same defect twice, so the third attempt has nowhere to put it
+## v2.70 — the same defect twice, so the third attempt has nowhere to put it
 
 v2.23 recorded which FILES a PR touched and shipped no query over them. That was deliberate and
 it is the whole story of this release: the query had been written twice and pulled twice, and a

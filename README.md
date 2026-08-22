@@ -1046,7 +1046,7 @@ full — including what was broken before it, which is the part no diff recovers
   regression test, built from #188's own numbers, was confirmed red first (#298).
 - **v2.68** — the fix pass stopped being most of the PR.
 - **v2.69** — the review loop becomes usable.
-- **vNEXT** — the v2.23 datum, read back: which other PRs does landing this one disturb?
+- **v2.70** — the v2.23 datum, read back: which other PRs does landing this one disturb?
   `GET /review/collisions` was written twice and pulled twice, because a four-seat panel found
   the same defect in both of its rounds and round 2's instance was introduced by round 1's fix —
   a filter composed in front of the newest-run selection, resurrecting a stale run behind a
