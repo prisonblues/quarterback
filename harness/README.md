@@ -1780,12 +1780,18 @@ check that cannot answer until after the problem is solved.
   (`/review-queue` answering `405` means ≥ v2.75) — which answers with a **range**, and a
   range is not a version, so that path reports `?` with the floor as context and never a
   pass.
-- **harness** — the files on PATH against this checkout's `harness/bin`, byte for byte.
-  Content rather than a version, because the nix flake pin is what versions the harness,
-  nothing bumps that pin automatically (#267), and no harness script can tell you it is
-  stale because each one only knows its own store path. Drift is reported in one direction:
-  a file the *install* has and the checkout does not is simply a harness newer than your
-  branch.
+- **harness** — the files on PATH against this checkout's `harness/bin`, byte for byte
+  except for what the packaging rewrites. Content rather than a version, because the nix
+  flake pin is what versions the harness, nothing bumps that pin automatically (#267), and
+  no harness script can tell you it is stale because each one only knows its own store path.
+  Drift is reported in one direction: a file the *install* has and the checkout does not is
+  simply a harness newer than your branch. Two rewrites are undone before the comparison
+  (#353): `postFixup`'s `patchShebangs`, which replaces every script's first line with a
+  store path on purpose, so a shebang-only difference is not drift; and `postInstall`'s
+  `wrapProgram`, which renames a script to `.<name>-wrapped` and generates a new one at its
+  name, so the wrapped file is what gets compared. Counting either made this row report 26
+  differing files on a host that had *just* rebuilt, with the one real finding buried among
+  them — and a row that is always red is a row nobody reads.
 - **client** — `mcp/.venv` exists, `mcp_server.server` and `mcp_server.board` both import,
   **and** the editable install resolves to this checkout. All three, because "importable"
   says nothing about which source tree answered (#203), and the documented repair for that

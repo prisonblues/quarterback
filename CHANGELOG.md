@@ -17,6 +17,39 @@ the top of this file conflict every time, over nothing — both entries are righ
 and a fragment is a path no other branch will ever open. `changelog.d/README.md` has the format.
 `vNEXT` means exactly what it meant before; assembly is just what writes it.
 
+## v2.87 — qb-doctor stops counting the packaging as drift
+
+`qb-doctor`'s `harness` row compares the harness on PATH against `harness/bin` file by file,
+and it counted every difference the *packaging* introduces. On the first run from PATH after
+a real `nixos-rebuild` it reported 26 differing binaries, of which one was a genuinely stale
+install and 25 were artefacts no rebuild could ever resolve: 24 files whose only difference
+was the first line, and `qb-dash`, which shares no bytes with its source at all.
+
+Both are deliberate and both are in `package.nix`. `postFixup` runs `patchShebangs` so an
+installed harness does not depend on what is on the user's PATH, which rewrites every
+script's shebang to a store path. `postInstall` runs `wrapProgram` on `qb-dash` to carry the
+dashboard's interpreter, which renames the script to `.qb-dash-wrapped` and puts a generated
+one at its name.
+
+The comparison now undoes both: a shebang-only difference is not drift, and a wrapper is
+followed to the file it wraps. The wrapper is recognised by its structure — the sibling
+`.<name>-wrapped` exists and the installed file carries its absolute path — rather than by
+the filename `qb-dash`, since `postInstall` may wrap others later. The absolute path and not
+the bare name, because a name is a substring any comment could hold, and this is the step
+that decides which file the rest of the check reads. The absent half of the row is
+untouched; a script the checkout has and the install does not is still reported by name.
+
+This is the second false signal in this one row. Codex caught the first before it shipped:
+the comparison ran against the script's own tree, which is the installed tree whenever
+`qb-doctor` runs from PATH, so the row could never go red at all. It went from never-red to
+always-red, and a row that is always red trains its reader to ignore it — which is the exact
+failure `qb-doctor` exists to catch.
+
+`check_harness`'s docstring now says in the code that content is a **proxy**. The question
+being asked is "was the harness on PATH built from a commit at or after this checkout's
+HEAD", and the truthful answer is the flake pin's rev. Reading that means finding the flake
+that *consumes* the harness, which this tool cannot do and which some hosts do not have.
+
 ## v2.86 — a claim is handed back when the work ends, and a repo may bound how much work is in flight
 
 Nothing in the fleet has ever known how much work was in flight at once. Eight agents were run
