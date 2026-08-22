@@ -1,0 +1,510 @@
+#!/usr/bin/env bash
+# pre-push hook — the BACKSTOP half of this fleet's migration and release discipline.
+#
+# Two refusals, both computed from the files AT THE PUSHED COMMIT and never from a live
+# database or from whatever happens to be checked out:
+#
+#   1. A protected branch would receive a migration graph that does not have exactly one
+#      head. `alembic upgrade head` refuses to run against a two-headed graph, and the
+#      deployed database is then stuck wherever the last deploy left it. Delegated to the
+#      repo's own `migration_reconcile.py heads --ref`, which already answers this from
+#      files at a ref.
+#   2. A branch that stamped a release number somebody else has since taken. Fork-relative:
+#      the question is whether THIS branch claimed the number, which needs the merge base as
+#      a third reference point. Delegated to the repo's own `release_stamp.py collision`.
+#
+# WHY A HOOK AND NOT A RUNBOOK. On 2026-08-22 four branches each minted migration `0029`.
+# Each author ran the reconciler's `preflight`, each got a TRUTHFUL answer, and each
+# proceeded in good faith — preflight compares a branch against `main` and cannot see an
+# unlanded sibling (#338). It reached CI as "Multiple head revisions are present", took five
+# preflight runs and three renumbers to settle, and poisoned three worktree databases on the
+# way. A guided runbook would have been followed correctly by all four and changed nothing.
+# The failure was not disobedience, so a procedure cannot fix it. The guided path is
+# `.claude/commands/`; this is the backstop.
+#
+# AN UNRUNNABLE GATE IS NOT A PASSING GATE. Where a check APPLIES but cannot be run — the
+# repo has migrations but no reconciler, or no Python to run it with — the push is refused
+# and the message names the missing piece. A hook that skips silently when a tool is absent
+# is worse than no hook, because it reads as protection.
+#
+# WHERE A CHECK DOES NOT APPLY IT IS SILENT. This ships with the harness and is installed
+# into repos that are neither quarterback nor lexray. No `migrations/versions/` at the
+# pushed commit, no `CHANGELOG.md`, no release stamper in the repo — nothing is printed at
+# all, because a warning nobody in that repo can act on is how the whole hook gets
+# uninstalled. Silence here is the difference between a guard that ships everywhere and one
+# that ships once.
+#
+# BYPASSABLE DELIBERATELY, NEVER ACCIDENTALLY.
+#   git push --no-verify                              one push, express
+#   git config --bool qb.prePush.migrationHeads false one repo, recorded, and
+#   git config --bool qb.prePush.releaseNumber  false `qb-hooks status` says so
+# What must not exist is a path where the hook does not run and nobody notices.
+#
+# WHAT A GREEN RUN DOES AND DOES NOT PROVE. Both checks read the COMMIT being pushed, so a
+# push carrying a bad graph is refused even from a checkout that does not have it. The
+# TOOLS, though — the reconciler, the stamper, the base ref — are read from this checkout,
+# so a checkout whose `origin/main` is a week stale judges the release number against a week
+# old base and can miss a collision that landed since. Fetch freshness is CI's job; this is
+# the cheap guard that catches it at the keyboard.
+#
+# Installed by `qb-hooks install`, which also leaves a `pre-push.delegate` symlink when the
+# machine's managed hooks dir has a pre-push of its own — `core.hooksPath` REPLACES the hooks
+# directory rather than stacking with it, so anything already there has to be re-exported or
+# this guard turns another one off as a side effect.
+#
+# No `set -e`: an unexpected non-zero from any command would exit the hook non-zero, which
+# git reads as a refusal — a push blocked with no message at all, which is the one outcome
+# worse than not checking. Every failure below is an explicit, worded refusal.
+set -uo pipefail
+
+HOOK_ARGS=("$@")
+remote="${1:-origin}"
+
+HOOK_DIR=""
+[[ "$0" == */* ]] && HOOK_DIR="${0%/*}"
+
+# stdin is drained in full before anything else, and kept verbatim: exiting without reading
+# it hands git a SIGPIPE on a push we are perfectly happy with, and the delegate below needs
+# the same bytes git gave us.
+lines=""
+while IFS= read -r line; do
+    lines+="$line"$'\n'
+done
+
+# Anything the machine's managed hooks dir provided still runs. `qb-hooks install` leaves the
+# symlink only when there is something to chain to, so the usual case is a stat.
+#
+# The delegate's OWN status is what this returns, read out of PIPESTATUS rather than off the
+# pipeline. Under `pipefail` a delegate that exits 0 without draining stdin leaves `printf`
+# holding a closed pipe: it dies of SIGPIPE, the pipeline reports 141, and a push the
+# delegate was perfectly happy with is refused with no message at all. Small pushes hide it
+# inside the pipe buffer, which is the worst way for a bug like this to be distributed.
+chain_delegate() {
+    local hook="$HOOK_DIR/pre-push.delegate"
+    [[ -n "$HOOK_DIR" && -x "$hook" ]] || return 0
+    printf '%s' "$lines" | "$hook" "${HOOK_ARGS[@]}"
+    return "${PIPESTATUS[1]}"
+}
+
+TOPLEVEL=$(git rev-parse --show-toplevel 2>/dev/null) || TOPLEVEL=""
+if [[ -z "$TOPLEVEL" ]]; then
+    chain_delegate
+    exit $?
+fi
+
+# ---------------------------------------------------------------------------
+# the refs this push would update
+# ---------------------------------------------------------------------------
+# A push can carry several refs (`git push origin main test`, or a push.default that expands
+# to more than one), and git feeds them all on stdin. They are collected first so every ref
+# is judged — an early `exit 0` on the first acceptable one leaves the rest unchecked, which
+# is a gate that reports green on the push it was written for.
+push_branches=()
+push_shas=()
+while read -r _local_ref local_sha remote_ref _remote_sha; do
+    # Not a branch (a tag, a note): nothing here guards those.
+    [[ "$remote_ref" == refs/heads/* ]] || continue
+    # A deletion — all-zero local sha — has no commit to verify.
+    [[ "$local_sha" =~ ^0+$ ]] && continue
+    push_branches+=("${remote_ref#refs/heads/}")
+    push_shas+=("$local_sha")
+done <<<"$lines"
+
+if (( ${#push_branches[@]} == 0 )); then
+    chain_delegate
+    exit $?
+fi
+
+# ---------------------------------------------------------------------------
+# knobs, all read from git config so a repo can answer for itself
+# ---------------------------------------------------------------------------
+# NOT configurable, deliberately. `release_stamp.py` reads and writes `CHANGELOG.md` by name
+# throughout, so a `qb.changelogPath` knob here would only decide which file this hook checks
+# for EXISTENCE before handing the question to a tool that then looks somewhere else — a repo
+# that set it would have every push refused as a tool failure. The stamper owns the path; this
+# reads it rather than repeating it, and there is nothing here to read it from.
+CHANGELOG="CHANGELOG.md"
+
+VERSIONS=$(git config --get qb.migrationsVersionsPath 2>/dev/null) || VERSIONS=""
+[[ -n "$VERSIONS" ]] || VERSIONS="migrations/versions"
+
+enabled() { # $1 config key — absent means on
+    local v
+    v=$(git config --bool --get "$1" 2>/dev/null) || return 0
+    [[ "$v" != "false" ]]
+}
+
+protected_list() {
+    local -a configured=()
+    mapfile -t configured < <(git config --get-all qb.protectedBranch 2>/dev/null)
+    if (( ${#configured[@]} > 0 )); then
+        printf '%s\n' "${configured[@]}"
+    else
+        printf '%s\n' main master test
+    fi
+}
+mapfile -t PROTECTED < <(protected_list)
+
+# Literal names, never patterns: the right-hand side of `[[ == ]]` is a glob unless it is
+# quoted, and a repo that configured `release/*` would get behaviour nothing documents while
+# a repo whose branch genuinely contains a bracket would get a silent non-match.
+is_protected() {
+    local b
+    for b in "${PROTECTED[@]}"; do
+        [[ "$1" == "$b" ]] && return 0
+    done
+    return 1
+}
+
+# The base this branch is judged against, as a full ref so no local branch of the same name
+# can stand in for it. Unresolvable — pushing by URL, a remote never fetched, a repo whose
+# first push this is — means there is no base, and a collision needs a base that already has
+# the number, so the release check simply does not apply. That is "no question to ask", not
+# "a question we skipped".
+BASE_CONFIGURED=$(git config --get qb.baseBranch 2>/dev/null) || BASE_CONFIGURED=""
+
+resolve_base_ref() {
+    local b cand
+    # An explicitly configured base gets NO fallback. Falling through to `main` when the
+    # named branch is not fetched would quietly judge every branch against a base the
+    # operator did not choose — a check that runs, reports, and answers a different question
+    # than the one it was configured to ask. Unresolvable is reported below instead.
+    if [[ -n "$BASE_CONFIGURED" ]]; then
+        if git rev-parse --verify --quiet \
+            "refs/remotes/$remote/$BASE_CONFIGURED^{commit}" >/dev/null 2>&1; then
+            printf '%s' "refs/remotes/$remote/$BASE_CONFIGURED"
+            return 0
+        fi
+        return 1
+    fi
+    b=$(git symbolic-ref --quiet --short "refs/remotes/$remote/HEAD" 2>/dev/null) || b=""
+    b="${b#"$remote"/}"
+    if [[ -n "$b" ]] \
+        && git rev-parse --verify --quiet "refs/remotes/$remote/$b^{commit}" >/dev/null 2>&1; then
+        printf '%s' "refs/remotes/$remote/$b"
+        return 0
+    fi
+    for cand in main master test; do
+        if git rev-parse --verify --quiet "refs/remotes/$remote/$cand^{commit}" >/dev/null 2>&1; then
+            printf '%s' "refs/remotes/$remote/$cand"
+            return 0
+        fi
+    done
+    return 1
+}
+BASE_REF=$(resolve_base_ref) || BASE_REF=""
+if [[ -n "$BASE_REF" ]]; then
+    BASE_BRANCH="${BASE_REF#refs/remotes/"$remote"/}"
+else
+    BASE_BRANCH="$BASE_CONFIGURED"
+    # Nothing fetched from this remote — a first push, or a remote named by URL. The base
+    # branch is then whichever of the usual names this push is itself introducing, which is
+    # the only base that exists at all. Without this, `git push origin main topic` into an
+    # empty remote skips the release check on BOTH refs and lands a collision on the first
+    # push a repo ever makes.
+    if [[ -z "$BASE_BRANCH" ]]; then
+        for cand in main master test; do
+            for index in "${!push_branches[@]}"; do
+                if [[ "${push_branches[$index]}" == "$cand" ]]; then
+                    BASE_BRANCH="$cand"
+                    break 2
+                fi
+            done
+        done
+    fi
+fi
+
+# One push can carry the base branch AND a branch that collides with it: `git push origin
+# main topic`, or a `push.default` that expands to both. Judging `topic` against the
+# remote-tracking ref would judge it against a base that is about to stop existing — the
+# number `main` is bringing with it is not there yet, so the collision passes and both land.
+# So when the base branch is part of THIS push, the other refs are judged against the commit
+# it is pushing. The base branch itself keeps the remote-tracking ref, or it would be
+# compared with itself and every push of it would pass by construction.
+BASE_IN_PUSH=""
+if [[ -n "$BASE_BRANCH" ]]; then
+    for index in "${!push_branches[@]}"; do
+        if [[ "${push_branches[$index]}" == "$BASE_BRANCH" ]]; then
+            BASE_IN_PUSH="${push_shas[$index]}"
+            break
+        fi
+    done
+fi
+
+# A repo-relative default, an absolute or repo-relative `git config` override, or an env var
+# for a one-off. Absent everywhere is a "no" rather than an empty string, so a caller can tell
+# "this repo has no such tool" from "it is at the empty path".
+find_tool() { # $1 env var name  $2 config key  $3 repo-relative default
+    local from_env="${!1:-}" from_cfg=""
+    if [[ -n "$from_env" ]]; then printf '%s' "$from_env"; return 0; fi
+    from_cfg=$(git config --get "$2" 2>/dev/null) || from_cfg=""
+    if [[ -n "$from_cfg" ]]; then
+        [[ "$from_cfg" == /* ]] || from_cfg="$TOPLEVEL/$from_cfg"
+        printf '%s' "$from_cfg"
+        return 0
+    fi
+    [[ -f "$TOPLEVEL/$3" ]] || return 1
+    printf '%s' "$TOPLEVEL/$3"
+}
+
+# Both tools are stdlib-only by design, so a bare `python3` runs them. The repo's own venv is
+# preferred where there is one — it is what every other entry point here uses, and on a box
+# with no system python it is the only interpreter present.
+find_python() {
+    local cand
+    for cand in "$TOPLEVEL/.venv/bin/python" "$TOPLEVEL/.venv/bin/python3"; do
+        [[ -x "$cand" ]] && { printf '%s' "$cand"; return 0; }
+    done
+    for cand in python3 python; do
+        command -v "$cand" >/dev/null 2>&1 && { printf '%s' "$cand"; return 0; }
+    done
+    return 1
+}
+
+refusals=0
+notes=()
+
+refuse() {
+    refusals=$((refusals + 1))
+    printf '\n' >&2
+    printf '%s\n' "$@" >&2
+}
+
+# ---------------------------------------------------------------------------
+# 1. the migration graph at the pushed commit has exactly one head
+# ---------------------------------------------------------------------------
+# Protected branches only, and that is deliberate: a two-headed graph is only unrunnable once
+# it is what `alembic upgrade head` is pointed at. Feature branches are reconciled at land
+# time, by the tool this check calls.
+check_migration_heads() {
+    local branch="$1" sha="$2" reconciler py out
+
+    # Silent no-op in a repo with no migrations. Read at the PUSHED COMMIT rather than from
+    # the working tree, so a branch that deletes the directory is judged by what it pushes.
+    git cat-file -e "$sha:$VERSIONS" 2>/dev/null || return 0
+
+    if ! reconciler=$(find_tool QB_MIGRATION_RECONCILE qb.migrationReconcile \
+        scripts/migration_reconcile.py); then
+        refuse \
+            "REFUSE: $branch carries migrations ($VERSIONS/ at ${sha:0:12}) and this checkout" \
+            "        has no migration reconciler, so the single-head invariant cannot be" \
+            "        checked. An unrunnable gate is not a passing gate, so the push is" \
+            "        refused as unverified rather than waved through." \
+            "" \
+            "        Point the hook at one:" \
+            "            git config qb.migrationReconcile <path to migration_reconcile.py>" \
+            "        Or record that this repo does not want the check (recorded, not silent —" \
+            "        'qb-hooks status' reports it):" \
+            "            git config --bool qb.prePush.migrationHeads false" \
+            "        Or bypass this one push:  git push --no-verify"
+        return 1
+    fi
+
+    if ! py=$(find_python); then
+        refuse \
+            "REFUSE: $branch carries migrations and no Python interpreter is on PATH, so the" \
+            "        single-head invariant cannot be checked. An unrunnable gate is not a" \
+            "        passing gate." \
+            "        Install python3, or bypass this one push: git push --no-verify"
+        return 1
+    fi
+
+    # The two streams are kept APART rather than merged. The reconciler puts the head ids on
+    # stdout and its "# N head(s)" summary — plus any git diagnostic — on stderr, and a
+    # merged capture interleaves them by whichever flushed first, so the success note read
+    # back "single migration head (# 1 head(s))". Both are shown on a refusal, because
+    # discarding stderr left a genuine tool error looking exactly like a multi-head refusal
+    # with no detail.
+    local errfile err rc
+    errfile=$(mktemp 2>/dev/null) || errfile=""
+    if [[ -n "$errfile" ]]; then
+        out=$("$py" "$reconciler" heads --repo "$TOPLEVEL" --ref "$sha" \
+            --versions-path "$VERSIONS" 2>"$errfile")
+        rc=$?
+        err=$(cat "$errfile")
+        rm -f "$errfile"
+    else
+        out=$("$py" "$reconciler" heads --repo "$TOPLEVEL" --ref "$sha" \
+            --versions-path "$VERSIONS" 2>&1)
+        rc=$?
+        err=""
+    fi
+
+    # 2 is the reconciler's documented "stop": the graph at this ref is not one it will
+    # accept — not single-headed, a cycle, or a duplicate revision id. Anything else is the
+    # tool failing to answer, and the two must not be reported as the same thing: a refusal
+    # that asserts a two-headed graph over what was really a Python traceback sends the
+    # reader to renumber a graph that is fine. lexray's hook hedges this in one sentence
+    # ("or the check failed"); saying which is cheap here because the exit code says it.
+    if (( rc == 2 )); then
+        refuse \
+            "REFUSE: pushing $branch would leave the migration graph in a state" \
+            "        'alembic upgrade head' cannot run. The reconciler refuses the graph at" \
+            "        ${sha:0:12} — not exactly one head, a cycle, or a duplicate revision id:" \
+            "" \
+            "$(printf '%s\n%s\n' "$out" "$err" | sed '/^$/d; s/^/          /')" \
+            "" \
+            "        Reconcile before pushing — the tool chooses the resolution:" \
+            "            $py $reconciler preflight${BASE_REF:+ --onto $BASE_REF}" \
+            "            $py $reconciler apply${BASE_REF:+ --onto $BASE_REF}" \
+            "" \
+            "        Deliberate? git push --no-verify"
+        return 1
+    elif (( rc != 0 )); then
+        refuse \
+            "REFUSE: the migration single-head check could not run (exit $rc), so this push" \
+            "        to $branch is unverified rather than clean. An unrunnable gate is not a" \
+            "        passing gate." \
+            "" \
+            "$(printf '%s\n%s\n' "$out" "$err" | sed '/^$/d; s/^/          /')" \
+            "" \
+            "        The command that failed:" \
+            "            $py $reconciler heads --ref $sha --versions-path $VERSIONS" \
+            "" \
+            "        Deliberate? git push --no-verify"
+        return 1
+    fi
+
+    notes+=("single migration head ($(printf '%s' "$out" | head -n1))")
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# 2. this branch has not stamped a release number somebody else already took
+# ---------------------------------------------------------------------------
+# The complement of the `stamped` CI job, which runs on push-to-main only and is right to:
+# an unstamped `## vNEXT` is the CORRECT state of every branch in flight, so a pull_request
+# version of that check would fire on every release PR and be switched off within a week.
+# It catches LANDED-UNSTAMPED. It structurally cannot catch BRANCH-PRE-STAMPED-ITSELF, which
+# is this one, and the only reason this one can be asked without crying wolf is that it is
+# FORK-RELATIVE: the merge base is what separates "this branch claimed the number" from "this
+# branch is merely behind and inherited it". A branch that never touched the file passes, and
+# has to — the merge takes the base's value cleanly, there being no competing edit.
+#
+# Every branch push, not just protected ones. In this fleet's workflow the merge to main is
+# performed by GitHub, so a check that only ran on push-to-main would never run at all.
+check_release_number() {
+    local branch="$1" sha="$2" stamper py out base base_label
+
+    stamper=$(find_tool QB_RELEASE_STAMP qb.releaseStamp scripts/release_stamp.py) || return 0
+
+    base="$BASE_REF"
+    base_label="${BASE_REF#refs/remotes/}"
+    if [[ -n "$BASE_IN_PUSH" && "$branch" != "$BASE_BRANCH" ]]; then
+        base="$BASE_IN_PUSH"
+        base_label="$BASE_BRANCH (as this push would leave it)"
+    fi
+
+    # No base to collide with, no CHANGELOG at either end, or a repo that does not ship the
+    # stamper: the convention this guards is not in use here. Silent.
+    #
+    # Silent, that is, unless the operator NAMED a base. Then its absence is a check that was
+    # asked for and cannot run, which is the one thing this hook must never do quietly.
+    #
+    # `-z "$BASE_IN_PUSH"` is load-bearing: when the configured base is itself part of this
+    # push — its own first push, into a remote that has never had it — `base` is empty for
+    # that ref by construction (it is not compared with itself), and refusing there would
+    # refuse the one push that creates the branch the refusal asks you to fetch.
+    if [[ -z "$base" ]]; then
+        if [[ -n "$BASE_CONFIGURED" && -z "$BASE_IN_PUSH" ]] \
+            && git cat-file -e "$sha:$CHANGELOG" 2>/dev/null; then
+            refuse \
+                "REFUSE: qb.baseBranch names '$BASE_CONFIGURED', and neither" \
+                "        refs/remotes/$remote/$BASE_CONFIGURED nor a push of that branch is" \
+                "        here, so a pre-stamped release cannot be checked for. An unrunnable" \
+                "        gate is not a passing gate — and silently checking against some" \
+                "        other branch would be worse still." \
+                "" \
+                "        Fetch it:  git fetch $remote $BASE_CONFIGURED" \
+                "        Or bypass this one push:  git push --no-verify"
+            return 1
+        fi
+        return 0
+    fi
+
+    git cat-file -e "$sha:$CHANGELOG" 2>/dev/null || return 0
+    git cat-file -e "$base:$CHANGELOG" 2>/dev/null || return 0
+
+    if ! py=$(find_python); then
+        refuse \
+            "REFUSE: this repo stamps release numbers ($stamper) and no Python interpreter is" \
+            "        on PATH, so a pre-stamped release cannot be checked for. An unrunnable" \
+            "        gate is not a passing gate." \
+            "        Install python3, or bypass this one push: git push --no-verify"
+        return 1
+    fi
+
+    # Same split as the graph check, and for the same reason. 2 is the stamper's documented
+    # "stop" and its message is the substance — it says WHICH of the collision shapes this is
+    # and names the next free number. Anything else is the tool failing to answer, and
+    # reporting that as a confirmed collision would send the reader to unstamp an entry that
+    # was never the problem.
+    local rc
+    out=$("$py" "$stamper" collision --repo "$TOPLEVEL" --onto "$base" --branch "$sha" 2>&1)
+    rc=$?
+    if (( rc == 2 )); then
+        refuse \
+            "REFUSE: the release number $branch carries is one the stamper refuses against" \
+            "        $base_label:" \
+            "" \
+            "$(printf '%s\n' "$out" | sed 's/^/          /')" \
+            "" \
+            "        Where that is a number this branch stamped and the base has since taken," \
+            "        the repair is two tokens: put THIS branch's entry back to the" \
+            "        placeholder and re-stamp." \
+            "            $py $stamper apply --onto ${BASE_REF:+${BASE_REF#refs/remotes/}}" \
+            "" \
+            "        Deliberate? git push --no-verify"
+        return 1
+    elif (( rc != 0 )); then
+        refuse \
+            "REFUSE: the release-number check could not run (exit $rc), so this push of" \
+            "        $branch is unverified rather than clean. An unrunnable gate is not a" \
+            "        passing gate." \
+            "" \
+            "$(printf '%s\n' "$out" | sed 's/^/          /')" \
+            "" \
+            "        The command that failed:" \
+            "            $py $stamper collision --onto $base --branch $sha" \
+            "" \
+            "        Deliberate? git push --no-verify"
+        return 1
+    fi
+
+    # The stamper says `limited:` when it could not read the fork point, and a check that
+    # covered less than it advertises has to say which. Silence would report the strong
+    # answer for the weak one.
+    if [[ "$out" == limited:* || "$out" == *$'\n'limited:* ]]; then
+        notes+=("release-number check LIMITED against $base_label — no merge base, so only \
+duplicate headings were checked")
+    else
+        notes+=("no release-number collision with $base_label")
+    fi
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+for index in "${!push_branches[@]}"; do
+    branch="${push_branches[$index]}"
+    sha="${push_shas[$index]}"
+
+    if is_protected "$branch" && enabled qb.prePush.migrationHeads; then
+        check_migration_heads "$branch" "$sha"
+    fi
+    if enabled qb.prePush.releaseNumber; then
+        check_release_number "$branch" "$sha"
+    fi
+done
+
+if (( refusals > 0 )); then
+    printf '\n%s\n\n' "Nothing was pushed." >&2
+    exit 1
+fi
+
+# Only when a check actually ran. A repo neither of these applies to sees nothing, ever.
+for note in "${notes[@]-}"; do
+    [[ -n "$note" ]] && printf 'qb pre-push: %s\n' "$note"
+done
+
+chain_delegate
+exit $?

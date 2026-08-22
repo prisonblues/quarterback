@@ -2320,3 +2320,154 @@ def test_an_inherited_number_cannot_make_apply_stamp_it_a_second_time(repo, caps
     assert "already has an entry for v2.34" in capsys.readouterr().err
     assert (repo / "CHANGELOG.md").read_text() == before, (
         "refused before the stamp, so nothing was rewritten")
+
+
+# ---------------------------------------------------------------------------
+# `collision` — the same refusal, asked of two refs
+# ---------------------------------------------------------------------------
+#
+# `harness/githooks/pre-push` is judging the commit on its way to a remote. That commit need
+# not be checked out anywhere, and in a pre-push hook usually is not: you push `main` from a
+# feature branch, or push after switching away. Every test below therefore leaves the working
+# tree somewhere ELSE and names the branch as a ref, because a command that quietly read the
+# worktree would pass every one of these for the wrong reason.
+
+
+def test_collision_refuses_a_number_the_base_has_since_taken(repo, capsys):
+    """The #287 shape. The branch stamped v2.34 while it sat; `origin/main` issued v2.34 to
+    somebody else meanwhile. Neither file conflicts — the headings are identical text in
+    different entries — so nothing but this asks the question."""
+    write(repo, "CHANGELOG.md",
+          (repo / "CHANGELOG.md").read_text().replace(
+              "## v2.33", entry("v2.34", title="what this branch shipped") + "## v2.33", 1))
+    commit(repo, "stamp v2.34 on the branch")
+    advance_the_integration_branch(repo, "v2.34")
+    git(repo, "checkout", "-q", "main")
+
+    assert run(repo, "collision", "--onto", "origin/main", "--branch", "work") == 2
+    err = capsys.readouterr().err
+    assert "v2.34" in err
+    assert "next free number is v2.35" in err, "max(base, head) + 1, named"
+
+
+def test_collision_is_answered_from_the_refs_and_not_from_the_worktree(repo):
+    """The property the pre-push hook is built on: a push carrying a pre-stamped release is
+    refused even from a checkout that does not have it. `main` is what is out here, and it
+    has never seen v2.34."""
+    write(repo, "CHANGELOG.md",
+          (repo / "CHANGELOG.md").read_text().replace(
+              "## v2.33", entry("v2.34") + "## v2.33", 1))
+    commit(repo, "stamp v2.34 on the branch")
+    advance_the_integration_branch(repo, "v2.34")
+    git(repo, "checkout", "-q", "main")
+    assert "v2.34" not in (repo / "CHANGELOG.md").read_text(), "the fixture must not have it"
+
+    assert run(repo, "collision", "--onto", "origin/main", "--branch", "work") == 2
+
+
+def test_collision_passes_a_branch_that_is_merely_behind(repo, capsys):
+    """The reason this is fork-relative rather than base-relative, and the failure mode that
+    would get the hook switched off inside a week. `work` never touched the CHANGELOG;
+    `origin/main` has taken two numbers since it forked. There is nothing to report — the
+    merge takes the base's entries cleanly, there being no competing edit."""
+    write(repo, "docs.md", "# how\n\nA branch that ships no release.\n")
+    commit(repo, "docs only")
+    advance_the_integration_branch(repo, "v2.35", "v2.34")
+    git(repo, "checkout", "-q", "main")
+
+    assert run(repo, "collision", "--onto", "origin/main", "--branch", "work") == 0
+    assert "no release number" in capsys.readouterr().out
+
+
+def test_collision_passes_an_unstamped_placeholder(repo, capsys):
+    """`## vNEXT` is the CORRECT state of a branch in flight — it is what stops two branches
+    picking the same number. A gate that refused it would be the mistake the `stamped` CI
+    job's main-only trigger exists to avoid, made a second time."""
+    place(repo)
+    commit(repo, "a placeholder, as intended")
+    advance_the_integration_branch(repo, "v2.34")
+
+    assert run(repo, "collision", "--onto", "origin/main", "--branch", "work") == 0
+    assert "next free: v2.35" in capsys.readouterr().out
+
+
+def test_collision_passes_a_branch_that_took_the_next_free_number(repo):
+    """A legitimate release branch, which is what `apply` produces. Refusing this would make
+    every release in this repo need `--no-verify`, and a gate everybody bypasses is a gate
+    that verifies nothing."""
+    advance_the_integration_branch(repo, "v2.34")
+    git(repo, "merge", "-q", "--no-ff", "-m", "pull origin/main", "origin/main")
+    write(repo, "CHANGELOG.md",
+          (repo / "CHANGELOG.md").read_text().replace(
+              "## v2.34", entry("v2.35") + "## v2.34", 1))
+    commit(repo, "stamp v2.35")
+
+    assert run(repo, "collision", "--onto", "origin/main", "--branch", "work") == 0
+
+
+def test_collision_passes_a_number_the_branch_inherited_by_merging(repo):
+    """Text equality would refuse this: v2.34 is on both sides, spelled the same way. The
+    merge base is what separates a number this branch CLAIMED from one it inherited, and it
+    is the whole of why the check can be asked without crying wolf."""
+    advance_the_integration_branch(repo, "v2.34")
+    write(repo, "docs.md", "# how\n\nBranch work.\n")
+    commit(repo, "branch work")
+    git(repo, "merge", "-q", "--no-ff", "-m", "pull origin/main", "origin/main")
+    git(repo, "checkout", "-q", "main")
+
+    assert run(repo, "collision", "--onto", "origin/main", "--branch", "work") == 0
+
+
+def test_collision_reports_its_verdict_as_json(repo, capsys):
+    write(repo, "CHANGELOG.md",
+          (repo / "CHANGELOG.md").read_text().replace(
+              "## v2.33", entry("v2.34") + "## v2.33", 1))
+    commit(repo, "stamp v2.34 on the branch")
+    advance_the_integration_branch(repo, "v2.34")
+
+    assert run(repo, "collision", "--onto", "origin/main", "--branch", "work", "--json") == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert payload["next_free"] == "v2.35"
+    assert "v2.34" in payload["collision"]
+    assert payload["branch_sha"] == git(repo, "rev-parse", "work").strip()
+
+
+def test_collision_says_which_ref_it_cannot_find(repo, capsys):
+    """A gate consuming 0/2 reads Python's uncaught-exception 1 as "unknown". A bad `--branch`
+    has to arrive as a sentence and a 2, like every other refusal in this file."""
+    assert run(repo, "collision", "--onto", "origin/main", "--branch", "no-such-ref") == 2
+    assert "does not exist here" in capsys.readouterr().err
+
+
+def test_collision_says_when_it_could_not_read_the_fork_point(repo, capsys):
+    """An unreadable fork point is the one input this check cannot do without. `_collision`
+    passes rather than refusing every branch that shares a number with its base — the right
+    call, since refusing on a question it could not ask would stop correct branches — but a
+    gate consuming this has to be told it got the weaker answer."""
+    git(repo, "checkout", "-q", "--orphan", "detached-history")
+    write(repo, "CHANGELOG.md", CHANGELOG_HEAD + entry("v2.33") + entry("v2"))
+    commit(repo, "a history with no common ancestor")
+
+    assert run(repo, "collision", "--onto", "main", "--branch", "detached-history") == 0
+    captured = capsys.readouterr()
+    assert "limited: no merge base" in captured.err
+    assert "ok:" in captured.out
+
+
+def test_collision_reports_an_unreadable_fork_point_to_the_json_consumer(repo, capsys):
+    git(repo, "checkout", "-q", "--orphan", "detached-history")
+    write(repo, "CHANGELOG.md", CHANGELOG_HEAD + entry("v2.33") + entry("v2"))
+    commit(repo, "a history with no common ancestor")
+
+    assert run(repo, "collision", "--onto", "main", "--branch", "detached-history",
+               "--json") == 0
+    assert json.loads(capsys.readouterr().out)["fork_point"] == "unreadable"
+
+
+def test_collision_reports_a_readable_fork_point_on_an_ordinary_branch(repo, capsys):
+    write(repo, "docs.md", "# how\n")
+    commit(repo, "docs only")
+
+    assert run(repo, "collision", "--onto", "main", "--json") == 0
+    assert json.loads(capsys.readouterr().out)["fork_point"] == "read"

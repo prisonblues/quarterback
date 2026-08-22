@@ -507,7 +507,93 @@ on a stash guard would turn off secret scanning, which is the class of failure t
 organised against; `harness/tests/test_stash_guard.py` pins it.
 
 Run `qb-hooks status` to see what is installed, `qb-hooks install` to add it to a repo by
-hand, `qb-hooks uninstall` to take it off.
+hand, `qb-hooks uninstall` to take it off. `install` is idempotent, and re-running it is how a
+repo that was set up before a new guard existed picks it up — `create-worktree` runs it on the
+main checkout every time it makes a worktree, so that normally happens on its own.
+
+### The pre-push guard — a two-headed graph and a pre-stamped release
+
+The other hook `qb-hooks` installs, and the reason it exists is that on 2026-08-22 four
+branches each minted migration `0029`. Every one of those authors ran
+`migration_reconcile.py preflight`, every one got a **truthful** answer, and every one
+proceeded in good faith — preflight compares a branch against `main` and cannot see an
+unlanded sibling (#338). It reached CI as *"Multiple head revisions are present"*, took five
+preflight runs and three renumbers to settle, and poisoned three worktree databases on the
+way.
+
+A runbook would have been followed correctly by all four and changed nothing. The failure
+was not disobedience, so a procedure cannot fix it. Hence a hook.
+
+It refuses two things, both read from the files **at the commit being pushed** rather than
+from the working tree or from a live database — so a push carrying a broken graph is refused
+even from a checkout that does not have it:
+
+**A protected branch that would receive a multi-head migration graph.** `alembic upgrade
+head` refuses to load one, and the deployed database is then stuck wherever the last deploy
+left it. The question is handed to the repo's own `migration_reconcile.py heads --ref`; the
+refusal names both heads and the `preflight`/`apply` pair that resolves them. Protected
+branches are `main`, `master` and `test` unless the repo says otherwise
+(`git config --add qb.protectedBranch <name>`).
+
+**A branch that has stamped a release number the base already carries.** This is the half the
+`stamped` CI job structurally cannot do, and that job is right not to try: it runs on
+push-to-main only because an unstamped `## vNEXT` is the *correct* state of every branch in
+flight, so a `pull_request` version would fire on every release PR and be switched off within
+a week. It catches *landed unstamped*. It cannot catch *branch pre-stamped itself* — #287,
+where a branch took v2.60 while it sat, main took v2.60 for something else meanwhile, and the
+collision hit four files without git conflicting on any of them.
+
+That second question is answerable without crying wolf **only because it is fork-relative**.
+The merge base is a third reference point, and it is what separates "this branch claimed the
+number" from "this branch is merely behind and inherited it". A branch that never touched the
+CHANGELOG passes, and has to: the merge takes the base's entries cleanly, there being no
+competing edit. Only a branch that actively set a value trips it, and the refusal names
+`max(base, head) + 1` — computed by `release_stamp.py collision`, which is `preflight`'s
+refusal asked of two refs instead of the working tree.
+
+**Where a check does not apply, it says nothing at all.** No `migrations/versions/` at the
+pushed commit, no `CHANGELOG.md`, no reconciler or stamper in the repo: silence, not a
+warning. This harness installs into repos that are neither quarterback nor lexray, and a hook
+that greets every push in an unrelated repo with a line about Alembic is a hook that gets
+uninstalled — after which it is protecting neither repo.
+
+**Where a check *does* apply and cannot be run, the push is refused.** A repo with migrations
+but no reconciler, or no Python to run one with, is refused by name with the remedy attached.
+An unrunnable gate is not a passing gate; a hook that skips silently when a tool is missing is
+worse than no hook, because it reads as protection.
+
+**Bypassable deliberately, never accidentally.** `git push --no-verify` is the express opt-out
+for one push. A repo that genuinely does not want a check records it —
+`git config --bool qb.prePush.migrationHeads false`, or `qb.prePush.releaseNumber` — and
+`qb-hooks status` reports it, so a guard that has been switched off cannot look like one
+quietly passing.
+
+The tools are found at `scripts/migration_reconcile.py` and `scripts/release_stamp.py`,
+overridable per repo with `qb.migrationReconcile` / `qb.releaseStamp` (or the
+`QB_MIGRATION_RECONCILE` / `QB_RELEASE_STAMP` env vars for a one-off). The base ref comes from
+`refs/remotes/<remote>/HEAD`, falling back to `main`, `master`, `test`, and overridable with
+`qb.baseBranch` — which, when set, gets no fallback: an operator who named a base meant that
+base, so a `qb.baseBranch` that is not fetched is a refusal with `git fetch` as the remedy
+rather than a quiet swap to `main`. When the base branch is part of the same push — `git push origin main topic`
+— the other refs are judged against the commit `main` is bringing, not against the
+remote-tracking ref it is about to replace; otherwise a base and a branch claiming the same
+number could land together with the guard reporting green.
+
+The CHANGELOG path is *not* configurable, and that is the point: `release_stamp.py` reads and
+writes `CHANGELOG.md` by name, so a knob here would only decide which file the hook checks for
+existence before handing the question to a tool looking somewhere else.
+
+When the fork point cannot be read at all — a shallow clone, unrelated histories — the
+release check says `LIMITED` and passes: without a merge base, a number this branch *claimed*
+is indistinguishable from one it inherited, and refusing every branch that shares a number
+with its base would stop correct ones. It says so rather than reporting the strong answer for
+the weak one.
+
+One limit, stated rather than discovered: the base ref is read from **this checkout**. A
+checkout whose `origin/main` is a week stale judges the release number against a week-old
+base and can miss a collision that landed since. Fetch freshness is CI's job — this is the
+cheap guard that catches it at the keyboard. `harness/tests/test_pre_push_hook.py` drives all
+of the above through real `git push` against real remotes.
 
 ### `qb-stash` — a stash that belongs to one worktree
 
