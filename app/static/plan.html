@@ -47,11 +47,14 @@
   .chip.plan { color:#c9b6f5; border-color:#3a2f56; }
   .chip.covered { color:#e0c890; border-color:#4a3b1e; }
   .chip.fleet { color:#8fb4e8; border-color:#31435c; }
+  .chip.project { color:#d9a5c8; border-color:#5c3149; }
   .refless { color:var(--muted); }
   .acts { display:flex; gap:4px; }
   .acts button { font:inherit; font-size:11px; cursor:pointer; background:#222831;
     color:#9fddc7; border:1px solid #2e3742; border-radius:5px; padding:1px 7px; }
   .acts button:disabled { opacity:.35; cursor:default; }
+  header button { font:inherit; font-size:12px; cursor:pointer; background:var(--chip);
+    color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:4px 8px; }
   #err { color:#e5484d; font-size:12px; }
 </style>
 </head>
@@ -59,6 +62,7 @@
 <header>
   <h1>plan</h1>
   <select id="repo"></select>
+  <button id="newScope" title="declare a scope with no repo behind it — house work, admin, anything with no forge">+ scope</button>
   <label class="counts"><input type="checkbox" id="showDone" /> show done</label>
   <span id="counts" class="counts"></span>
   <span class="spacer"></span>
@@ -87,7 +91,13 @@ const showDone = document.getElementById("showDone");
 // because they have to agree — the header, the list and the next panel used to be
 // worked out separately here, over a subset, and so disagreed on the same page load.
 let plan = {items:[], counts:{}, next:null, order_trust:{}};
-let repos = new Set(); // every repo scope seen, so the filter can be built from data
+let repos = new Set(); // every scope seen, so the filter can be built from data
+// The DECLARED project scopes, from the read's own `scopes`. Kept apart from the set
+// above because they are known for a different reason: `repos` is inferred from the
+// items present, and a scope just declared has none — built from the items alone it
+// would be missing from the picker until somebody had already managed to put work in
+// it, which is the one thing the picker is how you do.
+let declared = [];
 let gen = 0;           // read generation — a reply from a superseded read is discarded
 let busy = false;      // a write is in flight — the 20s tick must not read back over it
 
@@ -113,17 +123,28 @@ function ago(iso){ return span(Math.max(0,(Date.now()-Date.parse(iso))/1000)); }
 // that has lapsed.
 function until(iso){ const s=(Date.parse(iso)-Date.now())/1000;
   return s<=0 ? "lapsed" : "in "+span(s); }
-function refUrl(it){ return (it.repo && it.ref && it.ref.kind)
+// A scope is a name for a body of work; a repo scope names a GitHub repository as
+// well, and that binding is the only thing that makes a github.com URL constructible
+// (#323). `project:65lowther` carries no repository, so it is never interpolated into
+// one — the server refuses to attach an issue or PR ref to such an item at all, and
+// this is the second half of that rule, where the URL would be built.
+const PROJECT_SIGIL = "project:";
+function isProject(s){ return typeof s === "string" && s.toLowerCase().startsWith(PROJECT_SIGIL); }
+// What a scope is CALLED. The sigil is load-bearing on the wire and noise on screen.
+function scopeLabel(s){ return s===null||s===undefined ? "fleet"
+  : isProject(s) ? s.slice(PROJECT_SIGIL.length) : s; }
+function refUrl(it){ return (it.repo && !isProject(it.repo) && it.ref && it.ref.kind)
   ? `https://github.com/${it.repo}/${it.ref.kind==="pr"?"pull":"issues"}/${it.ref.value}` : null; }
 function refLabel(it){ return it.ref ? (it.ref.kind==="pr"?"PR #":"#")+it.ref.value : null; }
 function say(msg){ errEl.textContent = msg||""; }
 
-// A fleet item names no repo, so there is no GitHub URL to build from its ref — show
-// the ref it does carry, and say why it is not a link, rather than dropping it.
+// An item whose scope names no repository has no GitHub URL to build from its ref —
+// show the ref it does carry, and say why it is not a link, rather than dropping it.
 function refHtml(it){
   if(!it.ref) return "";
   const url = refUrl(it), lbl = esc(refLabel(it));
-  const why = "fleet-wide item — it names no repo to link the ref to";
+  const why = it.repo ? "a project scope — no repo behind it to link the ref to"
+                      : "fleet-wide item — it names no repo to link the ref to";
   return url ? `<a href="${esc(url)}" target="_blank" rel="noopener">${lbl}</a>`
              : `<span class="refless" title="${why}">${lbl}</span>`;
 }
@@ -161,7 +182,7 @@ function row(it, s){
   const canMove = it.state==="open" && s!==undefined && it.repo===s;
   const why = canMove ? null
     : it.state!=="open" ? "only open items carry an order"
-    : s===undefined ? "pick a repo (or the fleet list) to reorder — order is per scope"
+    : s===undefined ? "pick a scope (or the fleet list) to reorder — order is per scope"
     : "ordered in its own list, not this one";
   // A done row exists FOR its completion record, so dropping it would destroy the one
   // thing it is there to hold (the server refuses too). Present-but-dead, because a
@@ -176,6 +197,7 @@ function row(it, s){
         ${refHtml(it)}
         <span class="title">${esc(it.title)}</span>
         ${it.repo===null&&s!==null?`<span class="chip fleet">fleet</span>`:""}
+        ${isProject(it.repo)&&it.repo!==s?`<span class="chip project">project</span>`:""}
         ${it.plan?`<span class="chip plan">${esc(it.plan.label)}</span>`:""}
         ${held?`<span class="chip hold">held by ${who(held.holder)} · expires ${until(held.expires)}</span>`:""}
         ${!held&&it.covered_by?`<span class="chip covered">in ${esc((it.plan&&it.plan.label)||"a plan")} held by ${who(it.covered_by.holder)}</span>`:""}
@@ -184,7 +206,7 @@ function row(it, s){
         ${it.state!=="open"?`<span class="chip">${esc(it.state)}</span>`:""}
       </div>
       ${it.note?`<div class="note">${esc(it.note)}</div>`:""}
-      <div class="meta">${esc(it.repo||"fleet")} · added by ${who(it.added_by)} · touched ${ago(it.updated)} ago${
+      <div class="meta">${esc(scopeLabel(it.repo))} · added by ${who(it.added_by)} · touched ${ago(it.updated)} ago${
         held&&held.note?` · “${esc(held.note)}”`:""}${
         !held&&it.covered_by&&it.covered_by.note?` · “${esc(it.covered_by.note)}”`:""}</div>
     </div>
@@ -267,6 +289,9 @@ async function load(){
   if(my !== gen) return;
   plan = {items: d.items || [], counts: d.counts || {}, next: d.next || null,
           order_trust: d.order_trust || {}};
+  // Every read carries them, so this is current on every tick and needs no second
+  // fetch — the same reason `next` and `counts` ride along with the items.
+  if(Array.isArray(d.scopes)) declared = d.scopes.map(x => x.scope);
   const seen = new Set(plan.items.map(it => it.repo || "(fleet)"));
   // Only the unscoped (all) read sees every repo, so only it may REPLACE the option
   // list; a repo read returns that repo plus the fleet band, and the fleet read returns
@@ -281,12 +306,37 @@ async function load(){
 }
 
 function buildRepoOptions(){
-  const want = ["(all)", ...[...repos].sort()];
+  const want = ["(all)", ...new Set([...repos, ...declared])].sort(
+    (a,b) => a==="(all)" ? -1 : b==="(all)" ? 1 : a.localeCompare(b));
   if(want.join("|") === [...repoSel.options].map(o=>o.value).join("|")) return;
   const keep = repoSel.value;
-  repoSel.innerHTML = want.map(v=>`<option value="${esc(v)}">${esc(v)}</option>`).join("");
+  // The VALUE is the canonical scope the server is asked for; the TEXT is what the
+  // scope is called. Two spellings on the wire is the defect this whole feature is
+  // downstream of, so only the label is ever shortened.
+  repoSel.innerHTML = want.map(v=>`<option value="${esc(v)}">${
+    esc(v==="(all)"||v==="(fleet)" ? v : scopeLabel(v))}</option>`).join("");
   repoSel.value = want.includes(keep) ? keep : "(all)";
 }
+
+// Declaring a scope is a HUMAN's call, like reordering — see app.auth.human and
+// app/scope.py. It is on this page because this page is where a person is: an agent
+// that could mint a scope would eventually mint one by typo, and the work would be in
+// a second list nobody can see both halves of.
+document.getElementById("newScope").onclick = async ()=>{
+  const name = (prompt("Name a scope with no repo behind it — house work, admin, "
+    + "anything with no forge.\n\nLetters, digits, . - _ (e.g. 65lowther)") || "").trim();
+  if(!name) return;
+  const note = (prompt(`What is “${name}”? One line, for whoever reads the plan next.`) || "").trim();
+  busy = true;
+  let made;
+  try { made = await post("/plan/scope", {name, note: note || null}); } finally { busy = false; }
+  if(!made) return;
+  say(made.created ? `declared ${made.scope}` : `${made.scope} was already declared`);
+  declared = [...new Set([...declared, made.scope])];
+  buildRepoOptions();
+  repoSel.value = made.scope;
+  load();
+};
 
 async function post(path, body){
   let r;
@@ -327,7 +377,7 @@ listEl.addEventListener("click", async (e)=>{
     // neighbours', so the page sends the order it is showing rather than a delta. Only
     // OPEN items of the exact scope may be in it — anything else is a 422.
     const s = scope();
-    if(s === undefined){ say("pick a repo (or the fleet list) before reordering — order is per scope"); return; }
+    if(s === undefined){ say("pick a scope (or the fleet list) before reordering — order is per scope"); return; }
     const ids = plan.items.filter(it => it.repo === s && it.state === "open").map(it => it.item_id);
     const i = ids.indexOf(move.dataset.id);
     const j = move.dataset.move === "up" ? i-1 : i+1;

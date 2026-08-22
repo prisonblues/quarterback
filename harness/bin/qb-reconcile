@@ -286,6 +286,22 @@ class Report:
     #: disagrees — but never silent either: "no untracked PRs" and "no untracked
     #: PRs among the ones I looked at" are different sentences.
     prs_skipped: list[dict] = field(default_factory=list)
+    #: Plan scopes with no forge binding, so there was nothing to compare (#323).
+    #:
+    #: **The third state, and it is not the second one softened.** `unknowns` means
+    #: "I could not look"; `findings` means "I looked and the two disagree"; this
+    #: means there was never a second source. A `project:` scope has no repository
+    #: behind it, so there are no PRs, no issue states and no CI runs anywhere for
+    #: the plan to disagree with — not none *found*, none *existing*. Reporting
+    #: that as `COULD NOT CHECK` put a permanent unresolvable warning on a
+    #: fifteen-minute timer, on a surface whose entire value is that it is
+    #: trustworthy; a surface that cries wolf every quarter of an hour stops being
+    #: trustworthy in about a day.
+    #:
+    #: It does not raise `exit_code` and does not clear `complete`, for the same
+    #: reason `prs_skipped` does neither: nothing went unchecked. Said once per
+    #: tick, in one line, so it is not silent either.
+    scopes_skipped: list[dict] = field(default_factory=list)
 
     @property
     def exit_code(self) -> int:
@@ -304,6 +320,7 @@ class Report:
             # reads only `findings` and calls the plan reconciled is the bug.
             "unknowns": [asdict(u) for u in self.unknowns],
             "prs_skipped": list(self.prs_skipped),
+            "scopes_skipped": list(self.scopes_skipped),
             "complete": not self.unknowns,
         }
 
@@ -809,14 +826,22 @@ def reconcile(items: list[dict], ref_states: dict[tuple[str, str, str], dict | N
         if kind and value:
             ref = f"{kind}#{value}"
             state = ref_states.get((repo or "", kind, value), "missing")
-            if not repo:
-                # A fleet-scoped item names no repo, so there is no repository to
-                # ask about its ref. Said plainly rather than reported as a failed
+            if not forge_repo(repo):
+                # The item's scope names no repository, so there is nothing to ask
+                # about its ref. Said plainly rather than reported as a failed
                 # lookup: nothing went wrong, the item is simply not answerable.
+                #
+                # Two scopes reach this and one sentence covers both. A fleet item
+                # has named no repo since the column existed. A `project:` item
+                # cannot legitimately carry an `issue` or `pr` ref at all — the
+                # board refuses one (#323) — so a row here is a real disagreement
+                # about a row that predates the refusal, and an unknown is what it
+                # is. The scope being skipped elsewhere in this report is about
+                # scopes; this is about one row inside one.
                 report.unknowns.append(Unknown(
                     condition="ref_unresolved", subject=label, repo=repo, ref=ref,
-                    reason=f"the item names no repo, so {ref} cannot be resolved "
-                           "against any GitHub project"))
+                    reason=f"the item's scope names no repository, so {ref} cannot "
+                           "be resolved against any GitHub project"))
             elif state == "missing" or state is None:
                 why = errors.get((repo, kind, value))
                 report.unknowns.append(Unknown(
@@ -949,6 +974,49 @@ def _gh_json(args: list[str]) -> tuple[object | None, str | None]:
 #: it is.
 _REPO_OK = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 
+#: The sigil `app/scope.py` gives a plan scope with no forge behind it (#323).
+#: Pinned here rather than imported: the harness does not import from `app/` (it
+#: talks to the board over HTTP and ships separately), and the spelling is part of
+#: the wire format either way.
+NON_FORGE_SIGIL = "project:"
+
+
+def forge_repo(scope: str | None) -> str | None:
+    """The repository this plan scope is bound to, or None if it is bound to none.
+
+    **This is the question, and asking it the other way round is what produced the
+    noise #323 is about.** `fetch_open_prs` asked "why can I not ask `gh` about
+    this?", which presumes the answer should be yes and so reports every no as a
+    failure. A plan scope is a name for a body of work; most of them name a GitHub
+    repo *as well*, and that binding is what there is to reconcile against. A scope
+    with none — `project:65lowther`, the fleet scope — is not a failed lookup and
+    not a lookup at all.
+
+    Binding is decided by the spelling and **not** by whether the bound name is
+    usable, and keeping those two apart is the whole point. `65lowther` is a scope
+    that claims to name a repository and names an unusable one: still a bound
+    scope, still `gh`'s to refuse, still an honest `COULD NOT CHECK` from
+    :func:`fetch_open_prs` with the reason it always gave. Only NULL (the fleet,
+    which has named no repository since the column existed) and the sigil are
+    bound to nothing — and both of those say so, rather than being inferred from a
+    failed match, which is exactly the inference #323 forbids.
+    """
+    if not scope or str(scope).lower().startswith(NON_FORGE_SIGIL):
+        return None
+    return str(scope)
+
+
+def scope_label(scope: str) -> str:
+    """What a scope is called in the report. `project:65lowther` -> `65lowther`.
+
+    `short_repo` drops the owner because it never distinguishes two repos anybody
+    is looking at; the sigil is the same kind of noise on a line a person reads,
+    and the same kind of load-bearing detail everywhere else.
+    """
+    if str(scope).lower().startswith(NON_FORGE_SIGIL):
+        return str(scope)[len(NON_FORGE_SIGIL):]
+    return short_repo(scope)
+
 
 def fetch_ref_state(repo: str, kind: str, value: str) -> tuple[dict | None, str | None]:
     """``(what GitHub says about one ref, why it could not be asked)``."""
@@ -1035,7 +1103,16 @@ def client_once():
 
 
 def run(repo_filter: str | None = None, include_drafts: bool = False) -> Report:
-    """Fetch everything the conditions need, then reconcile."""
+    """Fetch everything the conditions need, then reconcile.
+
+    ``repo_filter`` is folded to lower case, because the board folds a scope when
+    it stores one (``app.api.plan._norm_scope``) and this compares against what the
+    board returned. Unfolded, ``--repo PrisonBlues/Quarterback`` matched no row,
+    reconciled nothing and printed "the plan agrees with GitHub on everything
+    checked" — a clean bill from a pass that never ran, which is the one output
+    this pass exists to make impossible.
+    """
+    repo_filter = repo_filter.strip().lower() if repo_filter else None
     try:
         client, _cfg = client_once()
     except Exception as exc:                                # noqa: BLE001
@@ -1083,16 +1160,29 @@ def run(repo_filter: str | None = None, include_drafts: bool = False) -> Report:
     # place for untracked work to be, so dropping it from the scope means its open
     # PRs cannot be reported at all, silently, under a report headed "every repo
     # the board's plan names".
-    repos = sorted({i["repo"] for i in all_items if i.get("repo")})
-    if repo_filter:
-        repos = [repo_filter]
+    named = sorted({i["repo"] for i in all_items if i.get("repo")})
+    scopes = [repo_filter] if repo_filter else named
+    # Split before anything reaches `gh`. A scope with no forge binding is not a
+    # repo whose lookup failed, so it must not be handed to a function whose only
+    # two answers are "here are its PRs" and "I could not ask" (#323). It is
+    # reported once, here, as the third thing it is.
+    repos = [s for s in scopes if forge_repo(s)]
+    # …but only for a scope the PLAN NAMES. `--repo` is an argument, not a fact:
+    # `--repo project:65lowthr` would otherwise print "1 scope with nothing to
+    # compare" and exit clean, asserting that scope exists on the strength of
+    # somebody having typed it — and the registry that would have refused the typo
+    # lives on the board, which this pass reads over HTTP and cannot consult. A
+    # BOUND scope keeps taking the filter as given, because asking about a
+    # repository the plan has no rows for is the legitimate way to find out that
+    # none of its open PRs are tracked.
+    unbound = [s for s in scopes if not forge_repo(s) and s in set(named)]
 
     ref_states: dict[tuple[str, str, str], dict | None] = {}
     ref_errors: dict[tuple[str, str, str], str] = {}
     for item in items:
         repo = item.get("repo")
         kind, value = item_ref(item)
-        if not (repo and kind and value):
+        if not (forge_repo(repo) and kind and value):
             continue
         key = (repo, kind, value)
         if key not in ref_states:
@@ -1104,7 +1194,7 @@ def run(repo_filter: str | None = None, include_drafts: bool = False) -> Report:
     for item in items:
         repo = item.get("repo")
         pr = item_pr(item)
-        if not (repo and pr and note_asserts_ready(item.get("note"))):
+        if not (forge_repo(repo) and pr and note_asserts_ready(item.get("note"))):
             continue
         if (repo, pr) not in histories:
             histories[(repo, pr)] = fetch_history(client, repo, pr)
@@ -1128,6 +1218,12 @@ def run(repo_filter: str | None = None, include_drafts: bool = False) -> Report:
                        histories, open_prs, repos, ref_errors=ref_errors,
                        include_drafts=include_drafts, tracking_items=tracking)
     report.unknowns.extend(pr_unknowns)
+    report.scopes_skipped.extend(
+        {"scope": scope, "label": scope_label(scope),
+         "items": sum(1 for i in items if i.get("repo") == scope),
+         "reason": "a project scope: no repo behind it, so there are no PRs, "
+                   "issue states or CI runs anywhere for the plan to disagree with"}
+        for scope in unbound)
     if truncated:
         # Reported once, for the plan as a whole: the rows past the cap were never
         # read, so there is no subject to attach a per-item unknown to — and no
@@ -1162,6 +1258,16 @@ def render(report: Report) -> str:
     lines = [f"qb-reconcile {report.generated}",
              f"  {report.items_checked} open plan item(s), {report.prs_checked} open PR(s), "
              f"repos: {', '.join(short_repo(r) for r in report.repos) or 'none'}"]
+    if report.scopes_skipped:
+        # One line, once, and then nothing more about it — the whole ask of #323.
+        # Above the findings rather than below, because it says what this tick's
+        # scope actually WAS: the header line names the repos compared, and a
+        # reader who cannot see where the plan's other scopes went is left to
+        # wonder whether they were silently dropped.
+        lines.append(
+            f"  {len(report.scopes_skipped)} scope(s) with nothing to compare: "
+            + "; ".join(f"{s['label']} ({s['items']} open item(s)) — {s['reason']}"
+                        for s in report.scopes_skipped))
     if report.prs_skipped:
         # No silent filters, the same rule the fetch cap follows: "no untracked PRs"
         # and "no untracked PRs among the ones I compared" are different sentences.
@@ -1380,6 +1486,14 @@ def main(argv: list[str] | None = None) -> int:
     # only content was thirty skipped dependabot PRs printed nothing under `--quiet`
     # and posted nothing under `--post` — which is the shipped systemd unit's exact
     # invocation, so in the deployed configuration the feature did not exist.
+    #
+    # `scopes_skipped` is deliberately NOT in it (#323). A skipped PR is a filter
+    # this pass applied and might have applied wrongly, so it owes an account of
+    # it; a project scope having no forge behind it is a standing fact about the
+    # plan, true on every tick and unchanged by anything. Counting it would make
+    # `--quiet` print and `--post` post on every fifteen-minute tick forever, which
+    # is the noise this issue is about, arriving through the gate rather than
+    # through the report.
     has_content = bool(report.findings or report.unknowns or report.prs_skipped)
 
     if args.as_json:

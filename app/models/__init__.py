@@ -7,6 +7,7 @@ from app.models.merge_queue import MergeQueueEntry
 from app.models.order_proposal import OrderProposal
 from app.models.plan import Plan
 from app.models.plan_item import PlanItem
+from app.models.plan_scope import PlanScope
 from app.models.post import Post
 from app.models.resource_lease import ResourceLease
 from app.models.review import (
@@ -31,6 +32,7 @@ __all__ = [
     "OrderProposal",
     "Plan",
     "PlanItem",
+    "PlanScope",
     "Post",
     "ResourceLease",
     "ReviewFinding",

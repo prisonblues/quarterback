@@ -67,15 +67,24 @@ from app.api.claims import (
     may_mutate,
 )
 from app.auth import human, identify, reader
-from app.claimkey import REPO_SHAPE, WORK, BadRef, canonical_repo, derive
+from app.claimkey import WORK, BadRef, canonical_repo, derive
 from app.db import get_session
 from app.identity import same_machine
 from app.models.order_proposal import OrderProposal
 from app.models.plan import Plan
 from app.models.plan_item import PlanItem
+from app.models.plan_scope import PlanScope
 from app.models.resource_lease import ResourceLease
 from app.models.review import ReviewFinding, ReviewFindingOutcome, ReviewRun
 from app.ordering import BASES, Candidate, Ordering, moves_between, suggest_order
+from app.scope import (
+    PROJECT_SIGIL,
+    SCOPE_SHAPE,
+    canonical_project,
+    canonical_scope,
+    is_project,
+    project_name,
+)
 
 router = APIRouter(tags=["plan"])
 
@@ -127,6 +136,11 @@ MAX_LABEL = 64
 #: justification: the reasoning still goes in ``note``, and a field long enough to
 #: hold an argument would collect one.
 MAX_PLACED_FOR = 120
+#: A scope, on the wire. Long enough for the sigil plus the 64 characters
+#: :data:`app.scope.PROJECT_NAME_RE` allows, and for any ``owner/name`` GitHub can
+#: issue. The `repo` fields stay at 256 for compatibility with what is already
+#: stored; this bounds the one field that only ever carries a scope name.
+MAX_SCOPE = len(PROJECT_SIGIL) + 64
 #: Most items one ``POST /plan/submit`` may carry. A plan is tens of rows by
 #: design (rule 4), and the atomicity this endpoint exists for is a single
 #: transaction — an unbounded batch would hold the scope lock for as long as the
@@ -200,7 +214,7 @@ def plan_claim_key(plan: Plan) -> str:
     return key
 
 
-def _norm_scope(repo: str | None) -> str | None:
+async def _norm_scope(session: AsyncSession, repo: str | None) -> str | None:
     """``""`` is not a repo — it is a third scope nothing agrees on.
 
     The unique index keys on ``COALESCE(repo, '')``, so an empty-string repo
@@ -212,11 +226,22 @@ def _norm_scope(repo: str | None) -> str | None:
     case-insensitive, so ``Acme/Repo`` and ``acme/repo`` are one repo everywhere
     except here, where they would pass the uniqueness index as two open items
     with two claim keys — "one open item per issue" defeated by a shift key.
+
+    **A scope is not always a repo** (#323). ``project:65lowther`` is a scope with
+    no forge behind it, and it passes here — but only if a *person* has declared
+    it, which is the check that needs this session. See :mod:`app.scope` for the
+    two gates and why neither can be dropped: the sigil is what stops a mistyped
+    repo becoming a scope, and the registry is what stops a mistyped scope
+    becoming one. Everything without the sigil goes to
+    :func:`~app.claimkey.canonical_repo` exactly as before, and a bare
+    ``quarterback`` still meets #148's refusal.
     """
     if repo is None:
         return None
     if not repo.strip():
         return None
+    if is_project(repo):
+        return await _declared_scope(session, repo)
     try:
         return canonical_repo(repo)
     except BadRef:
@@ -226,7 +251,76 @@ def _norm_scope(repo: str | None) -> str | None:
         # level down, and it would key the same issue two ways. The lower-casing
         # this used to do was necessary and not sufficient — it made `Acme/Repo`
         # and `acme/repo` agree and left `repo` and `acme/repo` disagreeing.
-        raise HTTPException(422, REPO_SHAPE) from None
+        #
+        # #323 changed the MESSAGE and not one thing about the refusal: `65lowther`
+        # is still refused as a repo, and the added sentence says the other
+        # namespace exists rather than opening a way into it from here.
+        raise HTTPException(422, SCOPE_SHAPE) from None
+
+
+async def _declared_scope(session: AsyncSession, repo: str) -> str:
+    """A ``project:`` scope, if a person has declared it. 422 naming the ones they have.
+
+    **The 422 is the whole anti-typo gate**, so it carries what a caller needs to
+    get it right rather than only what it got wrong: an agent that mistyped a live
+    scope sees the real one in the list and fixes itself, and an agent that meant a
+    new one learns it is not its call to make. The list is read only on the way to
+    that refusal — the path that succeeds asks one indexed question and is done.
+
+    The shape is checked first and separately. ``project:`` with nothing after it
+    is a malformed scope and not an undeclared one, and answering "no scope called
+    ``project:`` is declared" would send a caller looking for a row it should never
+    create.
+    """
+    try:
+        wanted = canonical_scope(repo)
+    except BadRef as e:
+        raise HTTPException(422, str(e)) from None
+    if await session.scalar(select(PlanScope.name).where(PlanScope.name == wanted)):
+        return wanted
+    known = list(await session.scalars(select(PlanScope.name).order_by(PlanScope.name)))
+    raise HTTPException(422, detail={
+        "error": f"no scope called {wanted!r} has been declared",
+        "scope": wanted,
+        "declared": known,
+        "hint": "a project scope is a scope with no repo behind it, and a PERSON "
+                "declares it (POST /plan/scope, from the board in a browser). An "
+                "agent cannot: a scope invented from a typo is a second name for "
+                "work that already has one, and nothing would reconcile the two "
+                "lists. If you meant a repo, spell it `owner/name`.",
+    })
+
+
+def _refuse_forge_ref(repo: str | None, ref_kind: str | None,
+                      position: int | None = None) -> None:
+    """An ``issue`` or ``pr`` ref needs a forge to point into. A project scope has none.
+
+    ``ref_kind`` is what makes an item *link rather than restate* — the plan's
+    first rule — and the two kinds it takes today are both GitHub's. A repo scope
+    supplies the other half of that link; ``project:65lowther`` supplies nothing to
+    resolve ``#7`` against, and an item carrying one would be a link to a page that
+    does not exist, rendered as a URL on the board page and chased by
+    ``qb-reconcile`` every quarter of an hour.
+
+    Refused rather than ignored, for :data:`_PHASE_GONE`'s reason: a field silently
+    dropped is a caller believing it wrote something. And refused **on the ref kind
+    rather than on "does this scope have issues"**, which is the axis #327 is about
+    — when a git-native ref kind exists (a branch, a commit, a worktree), it needs
+    no forge and belongs in a project scope, and only this one function has to
+    learn that.
+    """
+    if ref_kind is None or not is_project(repo):
+        return
+    raise HTTPException(422, detail={
+        "error": f"{f'item {position}: ' if position is not None else ''}"
+                 f"a {ref_kind} ref needs a repo, and {repo!r} is a project scope",
+        **({"item": position} if position is not None else {}),
+        "scope": repo,
+        "hint": "a project scope has no forge behind it, so there is nothing for "
+                f"{ref_kind} to name. Put the item in the repo scope if the work "
+                "really is an issue or a PR, or drop the ref and let the title and "
+                "note carry it — which is what every item in a project scope does.",
+    })
 
 
 def _norm_text(value: str | None) -> str | None:
@@ -1253,6 +1347,113 @@ class ReorderIn(BaseModel):
     order: list[uuid.UUID] = Field(min_length=1)
 
 
+class ScopeIn(BaseModel):
+    """A scope being declared. ``name`` takes the sigil or goes without it.
+
+    Going without it is safe **only here**, and only because of who is calling:
+    this endpoint is behind :func:`app.auth.human`, so a person has already said
+    which namespace they mean by arriving at it at all. Every path an agent can
+    reach still refuses a bare name with ``REPO_SHAPE``, which is #148's rule and
+    the thing #323 must not weaken.
+    """
+
+    name: str = Field(min_length=1, max_length=MAX_SCOPE)
+    #: What this scope is, in the declaring person's words. A repo scope has a
+    #: GitHub page to answer that; this has only what is typed here, so the field
+    #: exists and is worth filling in.
+    note: str | None = Field(default=None, max_length=MAX_NOTE)
+
+
+# ------------------------------------------------- scopes, as declared things
+
+
+def _scope_view(scope: PlanScope) -> dict:
+    """One declared scope as it reads. ``name`` is canonical, ``label`` is spoken."""
+    return {
+        "scope": scope.name,
+        "label": project_name(scope.name),
+        "note": scope.note,
+        "added_by": scope.added_by,
+        "created": scope.created_at.isoformat(),
+    }
+
+
+@router.get("/plan/scopes")
+async def list_scopes(
+    caller: str = Depends(reader),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """The project scopes a person has declared — the scopes with no repo behind them.
+
+    Repo scopes are deliberately absent: there is no list of them and there should
+    not be one. A repo scope exists because a repository does, and enumerating them
+    here would be a second register of something GitHub already holds — the "do not
+    build a second store" rule this board keeps everywhere else.
+
+    Read this to find out what a project scope is *called* before naming one. The
+    board page reads it too, so a scope declared with nothing in it yet still
+    appears in the picker; built from the items alone it would be invisible until
+    somebody had already managed to add to it.
+    """
+    rows = list(await session.scalars(select(PlanScope).order_by(PlanScope.name)))
+    return {"scopes": [_scope_view(r) for r in rows], "count": len(rows),
+            "sigil": PROJECT_SIGIL}
+
+
+@router.post("/plan/scope", status_code=201)
+async def declare_scope(
+    body: ScopeIn,
+    editor: str = Depends(human),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Declare a scope with no repo behind it. **Human-only**, like reordering.
+
+    Rule 3 says only a person orders the plan, because the plan is the fleet's
+    shared intent and an agent rewriting it makes it thrash. *What the scopes are*
+    is that decision one level up. An agent able to mint a scope could split the
+    plan into lists nobody asked for and would do it silently — one mistyped
+    ``project:65lowthr``, and the work is in a second list that no read reconciles
+    against the first and no reader can see both halves of. That is #148's
+    two-spellings defect wearing the plan's clothes, and the reason the declaration
+    is explicit rather than inferred from "this does not look like a repo".
+
+    **Idempotent, and that is not laxness.** Declaring a scope that exists returns
+    the existing row with ``created: false``. The alternative is a 409 for a call
+    whose whole content is "let this scope exist", which it already does — and a
+    person on a phone tapping a button twice is not an error condition. What is
+    refused is the thing that would actually be wrong: a name in the *repo*
+    namespace, which is refused by shape before it reaches the database.
+    """
+    try:
+        name = canonical_project(body.name)
+    except BadRef as e:
+        raise HTTPException(422, detail={
+            "error": str(e), "name": body.name,
+            "hint": "this endpoint declares a scope that is NOT a repo. A repo needs "
+                    "no declaring — it is a scope already, spelled `owner/name`.",
+        }) from None
+    existing = await session.scalar(select(PlanScope).where(PlanScope.name == name))
+    if existing is not None:
+        return {**_scope_view(existing), "created": False}
+    scope = PlanScope(name=name, note=_norm_text(body.note), added_by=editor)
+    session.add(scope)
+    try:
+        await session.commit()
+    except IntegrityError as e:
+        # Somebody declared it between the read and the insert. The unique index is
+        # what makes "one row per scope" true, and this is the losing side of it
+        # doing the only correct thing — the same shape `_ensure_plan` takes.
+        await session.rollback()
+        if not is_unique_violation(e):
+            raise
+        raced = await session.scalar(select(PlanScope).where(PlanScope.name == name))
+        if raced is None:  # pragma: no cover — the index just said otherwise
+            raise
+        return {**_scope_view(raced), "created": False}
+    await session.refresh(scope)
+    return {**_scope_view(scope), "created": True}
+
+
 @router.get("/plan")
 async def read_plan(
     repo: str | None = Query(default=None, description="this repo's items plus the fleet-wide ones"),
@@ -1294,7 +1495,7 @@ async def read_plan(
     """
     _refuse_phase(phase)
     now = _utcnow()
-    repo = _norm_scope(repo)
+    repo = await _norm_scope(session, repo)
     # An id needs no scope, and only here: an unscoped read covers every scope, so
     # narrowing it by plan id must not be the one thing that cannot reach one.
     scoped = await _plan_or_422(session, plan, repo, open_only=False,
@@ -1344,6 +1545,13 @@ async def read_plan(
     return {
         "repo": repo,
         "exact": exact,
+        # The declared project scopes, on the ONE call an agent makes cold (#323).
+        # Not a second tool and not a thing to know to ask for: an agent learns
+        # this API from the read it already makes, and a scope nobody can find the
+        # name of is a scope nobody puts work into. Tens of rows at the outside —
+        # a scope is a name for a body of work, not a row per piece of it.
+        "scopes": [_scope_view(r) for r in await session.scalars(
+            select(PlanScope).order_by(PlanScope.name))],
         "plan": scoped_view,
         "plans": plans,
         "generated": now.isoformat(),
@@ -1415,7 +1623,8 @@ async def add_item(
     if not title:
         raise HTTPException(422, "a title is what an agent reads in `next`: it cannot be blank")
     ref_value = _norm_ref(body.ref_value)
-    repo = _norm_scope(body.repo)
+    repo = await _norm_scope(session, body.repo)
+    _refuse_forge_ref(repo, body.ref_kind)
     # Normalised BEFORE the either-or check: `after=""` is no position at all, and
     # refusing `{"after": "", "before": "#84"}` as "two positions" would refuse a
     # request that names one.
@@ -1887,7 +2096,7 @@ async def reorder(
     the same response returned — so the page, the request and the reply each
     believed something different about a row nobody could see.
     """
-    repo = _norm_scope(body.repo)
+    repo = await _norm_scope(session, body.repo)
     # Taken before the read, so the list this rewrites is the list it validated
     # against and two rewrites of one scope cannot interleave. It also fixes the
     # order rows are locked in: two callers reordering the same items in opposite
@@ -2320,7 +2529,7 @@ async def read_order(
     than moving unexplained.
     """
     now = _utcnow()
-    repo = _norm_scope(repo)
+    repo = await _norm_scope(session, repo)
     return _order_view(repo, now, await _compute_order(session, repo, now))
 
 
@@ -2417,7 +2626,7 @@ async def record_order_proposal(
     thousand copies of it. ``force`` records anyway.
     """
     now = _utcnow()
-    repo = _norm_scope(body.repo)
+    repo = await _norm_scope(session, body.repo)
     # The SAME per-scope lock `reorder` takes, and taken for the reason it is there:
     # what follows reads the newest proposal, decides against it, and inserts — so
     # without it two concurrent runs both see no predecessor and both write, which
@@ -2544,16 +2753,17 @@ async def list_order_proposals(
     changed digest with an unchanged ``suggested_order`` says the world moved and
     the order did not.
     """
+    scope = await _norm_scope(session, repo)
     stmt = select(OrderProposal)
     if repo is not None:
-        stmt = stmt.where(OrderProposal.repo == _norm_scope(repo))
+        stmt = stmt.where(OrderProposal.repo == scope)
     elif exact:
         stmt = stmt.where(OrderProposal.repo.is_(None))
     rows = list(await session.scalars(stmt.order_by(OrderProposal.id.desc()).limit(limit)))
     total = await session.scalar(
         select(func.count()).select_from(stmt.subquery())) or 0
     return {
-        "repo": _norm_scope(repo),
+        "repo": scope,
         "scope": "exact" if repo is not None or exact else "all",
         "proposals": [_proposal_view(r, full=False) for r in rows],
         "count": len(rows),
@@ -2655,7 +2865,7 @@ async def list_plans(
     somebody already is.
     """
     now = _utcnow()
-    repo = _norm_scope(repo)
+    repo = await _norm_scope(session, repo)
     return {"repo": repo, "exact": exact, "generated": now.isoformat(),
             "plans": await _plans_view(session, repo, exact, now, caller,
                                        include_closed=include_closed,
@@ -2696,7 +2906,7 @@ async def submit_plan(
     like a successful submission.
     """
     now = _utcnow()
-    repo = _norm_scope(body.repo)
+    repo = await _norm_scope(session, body.repo)
     label = _norm_text(body.label)
     if not label:
         raise HTTPException(422, "a plan needs a label: it is what agents say out loud")
@@ -2711,6 +2921,7 @@ async def submit_plan(
         if (item.ref_kind is None) != (ref is None):
             raise HTTPException(422, detail={
                 "error": f"item {n}: a ref needs both kind and value, or neither"})
+        _refuse_forge_ref(repo, item.ref_kind, position=n)
     seen: dict[tuple[str | None, str], int] = {}
     for n, (item, ref) in enumerate(zip(body.items, refs, strict=True), start=1):
         if ref is None:

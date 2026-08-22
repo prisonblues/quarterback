@@ -54,8 +54,9 @@ async def plan_view(_reader: str = Depends(reader)) -> HTMLResponse:
 
     Under ``/plan/`` rather than beside ``/panel`` because ``/plan`` itself is
     the JSON this page fetches. It matters more here than for the panel: the
-    reorder and drop buttons are the *only* way into the human-only endpoints
-    from a browser, since :func:`app.auth.human` refuses a bearer token, and the
-    edge identity this page carries is what makes them a person's decision.
+    reorder, drop and declare-a-scope controls are the *only* way into the
+    human-only endpoints from a browser, since :func:`app.auth.human` refuses a
+    bearer token, and the edge identity this page carries is what makes them a
+    person's decision.
     """
     return HTMLResponse(_PLAN_HTML)
