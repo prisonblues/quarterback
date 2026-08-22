@@ -17,6 +17,705 @@ the top of this file conflict every time, over nothing — both entries are righ
 and a fragment is a path no other branch will ever open. `changelog.d/README.md` has the format.
 `vNEXT` means exactly what it meant before; assembly is just what writes it.
 
+## v2.69 — the review loop becomes usable
+
+### the landing queue stops being advice and starts being a verdict
+
+The queue that shipped with #227 answered correctly and bound nothing. Its own closing note said
+so: *"nothing yet forces the stop."* Five agents could each still rebase, push, wait for CI and
+race, because the only thing that could have stopped them was a board endpoint nobody was obliged
+to call — a mechanism that ships unwired, which is this repo's named defect (#169) and the exact
+shape of the thing the queue was built to fix.
+
+The stop is now part of the pre-land verdict, and the loop that lands code takes its place in the
+line before it spends anything.
+
+### `preland.py` grows a `queue` check
+
+A PR that is not at the head of the line for its base is **not READY**. The reason names the
+position and the agent holding the place ahead, in the board's own words, so a stand-down is
+something to act on rather than something to poll against:
+
+> `queued behind #123, position 3 of 5 — do not rebase, push or restart CI: you would spend a run
+> to learn what this line already says, and invalidate #123's checks doing it` — #123 is held by
+> `zeus/opal-kelp` (landing the auth fix). Stay queued: your place is kept while your entry is
+> renewed, and leaving would re-join at the back.
+
+A PR that never enqueued while others are queued is refused too, because otherwise the way past
+the gate is to skip the mechanism. Three things it deliberately does **not** do:
+
+- **It rules on position and nothing else.** The board also records whether an entry is `ready` at
+  a given commit, and gating on that would be preland refusing to run until it had already run —
+  its own verdict is what produces that assertion. A head whose entry is behind the branch gets a
+  warning saying so, and this run is the re-check that clears it.
+- **It imposes nothing on a lone PR.** An empty line passes with no friction at all. A gate that
+  made the ordinary case harder is a gate people turn off.
+- **It takes nothing.** One `GET`, no writes, no claim. Being at the head is still only permission
+  to go and ask for `kind='merge'`.
+
+A board that answers 404 reports `skipped-absent` — the same capability answer a repo with no
+`scripts/migration_reconcile.py` gets, because a board deployed before the queue existed has no
+line to read. Every other failure is an ERROR: a line this gate cannot see is a line it cannot
+rule on.
+
+### `/fix-and-land` joins the line before it integrates, and always leaves it
+
+Enqueue is step 4a, ahead of the gate and ahead of any integration push, because the expensive
+half is the integration — a stop in front of the merge would already have paid for the CI run. Then:
+
+- **a HOLD that is only the queue** stands down, reports the position, and **keeps its entry**. A
+  loop that read "not your turn" as "leave" would go to the back of the line every time it was
+  overtaken, which starves the PR;
+- **a HOLD for anything else leaves**, with a reason. An entry for a PR that cannot land holds up
+  everybody behind it until its TTL runs out, which is why `enqueue` refuses a `hold` verdict on
+  the way in;
+- **a RECONCILE re-enqueues at the commit its push produced**, because the push voids the entry's
+  readiness and the board cannot see it happen;
+- **a merge claims the base, re-verifies, merges, and then stands down** with `reason="merged"`.
+
+Every exit releases the lease, and the 30-minute TTL is the backstop for the exit nobody coded.
+
+### The merge claim now keys on the base, not the head (#318)
+
+`preland.check_merge_claim` read `<repo>:<head branch>` while the queue read `<repo>:<base>`. Its
+docstring names the incident it exists to prevent — *"on the same day two agents merged at once"* —
+and under a head key that incident is not prevented: two agents landing two **different** PRs into
+`main` hold `<repo>:feat/a` and `<repo>:feat/b`, never see each other, and both merge. The head key
+catches only the rarer case of two agents landing the same PR.
+
+The audit that made the change safe rather than merely right: `derive("branch", …)` is the only
+maker of merge keys, and **every branch claim in this fleet is a landing claim**. `create-worktree`
+claims the *issue* its branch names, the plan restricts `ref_kind` to issue and pr, and `qb-hook`'s
+`kind: "branch"` post ref is an annotation that takes no claim. So there was no non-landing meaning
+to change out from under.
+
+It removes a disagreement rather than creating one. `GET /merge-queue` reports the claim it finds
+at `<repo>:<base>`, and a queue head is told *"take `kind=merge` on this base before you merge"* —
+so the claim a lander takes is now the claim the gate reads. `/panel-review-pr` §7 and
+`/fix-and-land` both claim `<base>`, and `/fix-and-land` takes the claim across its merge at all,
+which it did not before: a loop merging on its queue position alone would have made the queue the
+second lock #227 says it must not become.
+
+### the panel stops when the rounds stop being about different things
+
+The round cap bounded what a review cycle could COST — N rounds and stop, whatever was
+happening. Nothing bounded what it could waste. On PR #299 that cost five rounds: rounds 1, 2
+and 3 each found the previous round's fix reopening the same hole, patched three different ways
+— merge parents, then same-named refs, then a purely local branch — and the premise underneath
+all three, *that a local repository can say where a release number LANDED*, was named only at
+round 3, by the human running the panel, and answered by deleting the machinery rather than
+patching it a fourth time. 39 of the 53 findings raised after round 1 were introduced by the
+previous fix pass; round 2 was 17 out of 17.
+
+Now a fix pass declares the premise it rests on before it is written, and the second fix written
+against one premise is refused.
+
+### The brake
+
+`panel.py --premise "<one sentence>" --premise-file <register> --round <r> --premise-for <key>`
+records the declaration in the cycle's register and exits `4` when this is the Nth time that
+premise has been declared, where N is `review_panel.escalate_on.premise_repeated` — new, and `2`
+by default, meaning *the second time*. The findings that premise explains become escalations
+instead: the command prints the `--escalated` keys for the next round, so a braked premise ends
+the cycle through the stop rule that already exists rather than through a second one.
+
+It runs where a fix is **proposed**, not where a round completes. Evaluated at the end of a
+round it would have fired one whole fix pass and one whole panel later, which is the round the
+rule exists to save. No seats, no diff, no judge and no vendor call, so it can run before every
+fix pass rather than before the ones somebody already suspects.
+
+`/panel-review-pr` §5 runs it before it re-briefs a fix pass, and `review-pr.md` step 3a has the
+fixer's half. Pass `--premise-file` to the round as well and the payload says which premises
+repeated and which fix passes declared none.
+
+### The late half, and the gap
+
+A premise declared twice that reaches a round anyway ends the cycle there: `round_stop` takes a
+veto line, `confident` is false, and the reason names the premise and the rounds it was declared
+in. Worse than stopping before the fix, better than the cap. Declarations only ever end a loop —
+none of them can buy another round.
+
+A fix pass that declared no premise is reported as **unescalatable**, in the payload and in the
+PR comment, because a cycle nobody could have braked reads exactly like a cycle that did not
+need braking.
+
+### What it deliberately does not do
+
+It compares declarations. It does not infer a premise from the findings — the same premise wearing
+two different proxies (`rc == 0` one round, an artefact's existence the next) shares almost no
+words and is counted as two, which is why both briefs ask for the premise and never the proxy.
+And a declaration is still a claim by the agent about to write the fix: across #299's five rounds
+the fixers escalated zero times, so what this adds is the count and the stop, not a detector.
+
+### a panel review ends with a verdict and an offer, instead of trailing off
+
+`/panel-review-pr` spends several rounds working out whether a PR is in a landable state, and then
+threw the answer away. Its last step was one line — merge if the user asks — so the gate ran only
+when somebody knew to ask for it. On PR #299 somebody did, by hand, twice, at the end of a full
+cycle. It HELD both times: once on 17 unresolved findings, once because the round had read
+`a48225b` while the PR's head was `4316b37`, making it a review of earlier code. Neither of those
+reached the person running the review from the review itself.
+
+The last step now runs the pre-land gate every time, reports the verdict whatever it is, and offers
+to land only on **READY** — saying which round the gate ruled on, what has moved since it, and which
+checks were skipped, so the offer is backed by something a reader can check. **RECONCILE** takes the
+mechanical commits preland's `actions` name, re-runs the gate, and offers only if the re-run agrees.
+**HOLD** relays preland's reasons verbatim and offers nothing, however the run was asked for.
+
+Accepting an offer claims the branch before it merges, so two agents that both say yes at the same
+moment do not both land, and re-runs the gate first, because CI restarts and heads move in the gap
+between the offer and the answer.
+
+### The release number stops being the step everyone forgets
+
+Forgetting `release_stamp.py` is issue #168, and two of the last three releases landed unstamped and
+needed repair PRs (#289, #291). preland has no check for it and never returns RECONCILE for it, so
+the review step asks or nobody does. It asks twice: `preflight` before the offer, so the answer is
+in the sentence the user says yes to, and `assemble` then `apply` after the yes, in that order —
+run the other way round, `apply` sees a branch with no placeholder, returns 0, and the fragments
+land unassembled with the release silently unnumbered.
+
+The number is not taken at the offer, because `apply` resolves the placeholder against the base as
+it stands now and another branch can take it while the user is deciding. It is taken last instead,
+which moves the head past the round that was reviewed — so that commit is bounded to what those two
+tools write and checked against `git diff --stat` before it is pushed, and the verification it rests
+on is the gate run immediately above it rather than one that cannot exist.
+
+### An unearned stop is now a reason not to land, not a note about one
+
+A round can stop without converging: a reviewer read a prefix of the diff, or never ran, or
+returned nothing parseable, or the cap ran out. The panel has always computed that and reported it
+as prose. It is now an input to the landing decision — `preland.py --require-earned-stop` turns
+`stop_confident: false` from a warning into a HOLD, and the review step passes that flag because it
+ran the round itself.
+
+The flag is opt-in and the default is unchanged. A headless box with two permanently-absent
+reviewer seats would never reach a green verdict under the strict reading, and `/fix-and-land` still
+has to be able to land there. Which of the two a run is doing is the caller's fact, so it is a flag
+rather than a rule; either way the vetoes are reported, so what the strict mode changes is the
+verdict and never what the reader is told.
+
+### Bare `/panel` reports land-readiness and does not offer
+
+`/panel` is review-only and gets pointed at other people's PRs, in repos the caller may not own.
+It may now say `gates: READY` or what is blocking — that is worth knowing — and it must not propose
+the merge, which is a footgun whether or not anybody accepts it. `/panel-review-pr` is the one that
+has earned the offer, because it owns the branch: it wrote the fix commits and it re-reviewed them.
+
+### ready PRs land in a visible line instead of all racing to be first
+
+`kind='merge'` says *somebody is landing on this branch right now*. It cannot say who is next, so
+every review-clean PR behaved as though it were: merge the base, push, wait for CI, re-run preland,
+find that somebody else landed, and start again. That is #80's quadratic integration cost — five
+open PRs is about ten integration merges — with a second failure mode stacked on it, because each
+loser's integration push invalidates the winners' green checks on the way past. #278 stopped a
+distant integration throwing away a review; nothing stopped five agents each racing to be the one
+who integrates.
+
+The board now holds the line itself, keyed on `repo` + `base_branch` — the same scope the merge
+claim is keyed on. A PR enters when it is plausibly landable, and is told immediately what it may
+do:
+
+- **the head** may integrate with the base, push, wait for CI, re-run preland, take `kind='merge'`
+  and merge;
+- **anyone else stops before spending anything**, with a reason naming the PR ahead and the
+  position — `queued behind #123, position 3` — and the instruction not to rebase, push or restart
+  CI. That refusal is the whole feature. An agent told "not yet" can only poll; one told whom it is
+  waiting behind can go and talk to them, or pick up something else.
+
+Three endpoints: `GET /merge-queue` for the line, `POST /merge-queue/enqueue` to take or renew a
+place, `POST /merge-queue/leave` to stand down. Three MCP tools mirror them (`merge_queue`,
+`merge_queue_enqueue`, `merge_queue_leave`), deriving the repo from the checkout's origin remote
+like everything else does.
+
+### It is ordering around the claim, not a second lock
+
+Nothing in the queue takes, renews, releases or refuses a `kind='merge'` claim. Being at the head is
+not permission to merge; it is permission to go and ask for the claim, which may well be held by
+somebody who never enqueued — a human merging in the UI is entitled to, and the queue reports that
+holder rather than pretending to outrank them. Two implementations of "who has this right now" is
+the outcome #99 was filed to avoid, and a queue that also held the resource would have been the
+second one.
+
+The line advances when the head merges, closes or is superseded, and — because a wedged head would
+block everybody's landing — on its own when an entry stops being renewed. That expiry is passive,
+borrowed from the claim table: no reaper, and a crashed lander frees the line by doing nothing.
+Standing an entry down is open to any agent, because whoever is sitting behind a dead head is best
+placed to notice, and the row records who did it and why.
+
+### Readiness is about a commit, not a memory
+
+An agent remembers "preland said READY". It does not reliably notice that the thing preland said it
+about was three pushes ago. Every entry names the commit its verdict is about, so reporting a new
+head clears the readiness unless preland has actually been re-run against that head, and a reader
+that can see the PR's real head is told the entry is behind it without anything being written. The
+database enforces the pairing rather than each write path remembering to.
+
+Invalidation does not cost the slot. Pushing is exactly the work a head's place in the line is for,
+and demoting it for that would hand the line to a PR that then invalidates the first one's checks —
+the thrash this exists to remove.
+
+### Strict FIFO, deliberately, and only half of #227
+
+The order is arrival order and nothing else. Every richer input the issue lists — changed-file
+overlap, PR size, risk flags, plan dependencies — and the proposal and reorder endpoints that would
+carry them are absent on purpose, on the issue's own argument: agents may propose an order, but an
+agent rewriting the queue while also trying to land turns the queue into one more shared resource
+to fight over. A deterministic arrival order cannot thrash, and it can ship before the machinery
+that decides which proposals are accepted exists.
+
+`GET /merge-queue` returns `active_order` alongside a permanently null `suggested_order`, so the
+distinction is in the API from the first release and a later proposal has somewhere to go that is
+visibly not the live order. #227 stays open for that half, and for the `/fix-and-land` and preland
+wiring that will make the stop automatic rather than something a loop has to ask for.
+
+### the fleet's one hard ceiling stops being a bar somebody has to be looking at
+
+Every seat, panel and `/fix-issue` on the fleet bills to one Claude subscription, across every
+machine and every project. `qb-dash` has drawn that subscription's five-hour and weekly windows
+since the seats started sharing it, and **nothing read them**: `fetch_limits()` had exactly two
+callers and both of them drew a bar. The brake on the only hard ceiling any of this has was a
+human noticing the bar go red — on a fleet whose own documentation says a seat is a pane nobody
+is watching.
+
+`qbdata.pace()` turns the figures the dash already fetched into a verdict a caller can act on:
+**go**, **slow**, **hold** or **unknown**. `qb-pace` is what a script asks.
+
+### The verdict is the bar's own judgement, not a second one
+
+The thresholds are derived from `limit_colour` rather than restated — 70% and 90%, or sooner
+when the endpoint's own `severity` says so — because a display and a decision disagreeing about
+what 88% means is exactly the failure nobody can see. It reads the same machine-wide cache
+behind the same three-minute floor, so a verdict never costs a call to an endpoint that
+rate-limits harder than a dashboard's instincts suggest, and no new copy of the number exists
+to drift behind the source's back. `hold` carries `resets_in_s`, because a spent window is a
+**wait** and a caller that treats it as terminal has thrown away the only fact that makes it
+survivable.
+
+### A ceiling that could not be read is unknown, never clear
+
+`unknown` is the fourth verdict and the reason for it. Reporting `go` on figures nobody could
+obtain would be a governor announcing clear on an input it never read; reporting `hold` would
+let a dropped network park the whole fleet. Figures that are merely stale keep being used —
+caps move over hours — but they lose the right to say `go`, and staleness never promotes a
+`slow` into a `hold`: that would be a claim about the window made on the strength of the
+weather. An install authenticating with an API key has no subscription caps at all, so it gets
+`go` and says why, exactly as the dash's answer to that state is one line fewer rather than an
+error.
+
+### Being told is on by default; being stopped is asked for
+
+`qb-seats` prints the estimate when it builds a screen — N agents on one subscription is the
+largest single spending decision here, made at a prompt by somebody not looking at the dash —
+and warns and proceeds, always. `qb-seat` carries the refusal, off by default:
+`QB_SEAT_PACE=obey` is for panes with nobody in front of them, and at `hold` such a seat does
+not start, names when the window comes back, and exits 4. `unknown` never stops a seat under
+either mode. `qb-pace --gate` puts the verdict in the exit status (3 hold, 4 unknown) and says
+nothing at `go`, so an unattended caller is one line away from obeying it — but nothing here
+throttles, parks, resumes or chooses work, and no dial is turned automatically.
+
+### The estimate states two measured halves and refuses to multiply them
+
+`qb-pace --estimate <seats>` prices a job from the board's own record, counting only the seats
+that bill to *this* subscription — `codex`, `antigravity` and `pi` bill to OpenAI, a Google
+account and OpenRouter, so a four-seat panel is not four seats of pressure on an Anthropic
+window — and prints what the window has left beside it. The third line says `fit unknown`,
+because nothing records how much of a five-hour window a seat-run actually spends: the board
+knows tokens, the endpoint knows percent, and no row pairs them. Sampling the caps either side
+of a run is what would close that, and it belongs to whatever drives the run. A fit predicted
+from a rate nobody measured would arrive in the same sentence as two real numbers and be
+believed.
+
+### an integration no longer throws away the round that preceded it
+
+Merging `origin/main` into a branch to clear a stale base used to cost a whole panel cycle. Any
+integration moves the head, and the pre-land gate read a moved head one way only — *"the round read
+`a48225b`, the PR's head is now `4316b37` — it is a review of earlier code"* — so the cheapest thing
+a PR can need was also the most expensive thing to do to it. The other order is no better: reviewing
+after every integration pays for a fresh cycle whatever the merge contained. Both spend the same
+amount however trivial the merge was, and neither looks at what actually changed.
+
+Neither order is applied blindly now. After an integration the question is how much of the merge is
+genuinely new material **to this PR**:
+
+- **the merged code is distant** — it touched nothing this PR touches, and the resolution was
+  trivial or absent. The earlier round STANDS, and no lying is involved: nothing is claimed as
+  reviewed that was not, because the merged code is not this PR's change and is not what the
+  findings are about.
+- **the merge was involved** — a real resolution in code this PR also touches. That resolution is
+  unreviewed work and it gets reviewed — only that part, not the whole PR again, which is the
+  increment scope that already exists pointed at a different range.
+
+### The measurement, and the dial that draws the line
+
+`git diff` between the commit the round read and the merge result, **restricted to the files this
+PR touches**, counted in changed lines. A merge whose resolution is empty over this PR's own files
+is the distant case, mechanically.
+
+Lines rather than file overlap or hunk overlap. File overlap is a hair-trigger — `main` touching one
+docstring in a file this PR also edits would force a full re-review, which is the behaviour being
+replaced. Hunk overlap predicts a genuine conflict best and is the one measurement that cannot be
+had cheaply from GitHub's compare API and read the same way from a local `git diff`, so the panel
+and the gate would answer differently about the same commit. Lines is continuous, which is what
+makes a dial mean something rather than rename a boolean.
+
+`review_panel.distant_merge_lines` is the dial, default **20**, and it sits at the low end on
+purpose: reading *involved* when the merge was distant buys one scoped round, while reading
+*distant* when it was involved ships a hand-resolved merge nobody read — the incident where
+`stderr_gist` ended up defined twice because a branch that had *moved* the function met a `main`
+that already had it, git conflicting on neither and the second definition winning. `null` restores
+the old flat behaviour where every head move is a review of earlier code; `0` admits only a
+resolution that is empty over this PR's files. A range carrying no merge commit at all is never
+distant whatever its size — that is a push, and unreviewed work of this PR's own kind holds at any
+size.
+
+### What the measurement refuses to read
+
+Two ways a range can look small while hiding unreviewed work, and neither is allowed
+to buy the cheap reading. A resolution that reverted one of the PR's files all the
+way back to base drops that file out of the head's own diff — the change an earlier
+round confirmed, silently discarded by the merge, scoring zero — so the files the PR
+touched *as the round read it* are counted too. And a branch that was rewritten has
+no range at all: `git diff` compares two commits with no ancestry between them quite
+happily, and anything dropped in the rewrite is in neither side, so a non-ancestor
+anchor is refused outright rather than measured.
+
+### Both halves say which reading they took
+
+A round that stood on a distant merge and one that re-reviewed a resolution are different claims
+about coverage, so neither is left to be inferred. The round writes `round N follows an integration
+and takes the DISTANT reading` — or `INVOLVED` — into `config_notes`, with the line count, the files
+and the limit it was measured against. The pre-land gate reports the same sentence: a warning and a
+pass on the distant reading, its existing HOLD with the numbers attached on the involved one, and
+the HOLD unchanged when the range could not be measured at all.
+
+### the panel's floors stop being a commit and become a setting you can ask about
+
+`review_panel.fix_severity_floor` decides which findings a fix pass may touch; `round_trigger_floor` decides which ones buy another round. Between them they decide what a review costs and what it is worth — and changing either was a commit on a pull request, reviewed by the panel those very dials configure.
+
+That shape had already produced a disagreement nobody could see. This repo's `.harness-rules.sample` stated both floors at P2 while every round of the five run on PR #299 put P4 findings in `to_fix` with `below_fix_floor` empty, which cannot happen under a P2 fix floor. The file that stated the policy and the rounds that applied it disagreed, for five rounds, four agents and a landed release, because there was no way to *ask* what the floor was. You could read a file and hope it was the one that ran.
+
+There is now a third layer, applied last: **the repo supplies a default, the board states the value in force, and the reported answer names which layer produced it.**
+
+```bash
+harness_rules.py --dial review_panel.fix_severity_floor
+# review_panel.fix_severity_floor  "P3"  [board] repo — 'trying P3 for a fortnight' by rich, 2026-09-05T00:00:00+00:00
+```
+
+`--dials` prints the same for every dial, `--json` carries it as `_dials`, every reviewed round records it in the payload's `rules.dials`, and a round that ran under a board dial says so in `config_notes` — which `--post` puts in the public PR comment. Setting one is `POST /dials` and takes effect on the next resolution.
+
+### It expires by itself, and a repo with no dial is untouched
+
+`expires_at` is optional — omit it for a floor you mean to keep — and an expired dial is simply *absent*: a resolution whose dial lapsed and one that never had a dial are indistinguishable, so a fortnight's experiment cannot quietly become the permanent setting. A repo with no board dial, and a host on no board at all, resolve exactly as they did before this landed and say nothing. A board that is configured on this host and will not answer is a different fact and is reported, in `_rules_from` and as a `config_notes` line, rather than swallowed.
+
+### What may be set, and the one dial with a direction rule
+
+The settable set is the dials whose value is a judgement about **cost** rather than about capability: both floors, `low_severity_fix_lines`, `max_fix_growth`, `max_rounds`, `reviewer_scope`, `max_diff_chars`, `judge_max_diff_chars`, `judge_model`, `distant_merge_lines` and `escalate_on.premise_repeated`. Everything that decides what may be **merged** — `auto_merge`, the `epic` and `preland` blocks, title patterns, the loop schedule — stays in the tracked sample, for the reason the per-box overlay already refuses the same set.
+
+`reviewers.<seat>.enabled` is the boundary case and is settable with one rule: the board **may turn a seat off and may not turn one on.** It is both capability and policy, and the board's claim is the policy half only — whether a seat is worth its tokens. Nothing on the board knows which CLIs a machine carries, and the panel counts a seat that never ran as coverage it did not get. Every other dial may move **either way**: raising `fix_severity_floor` from P3 to P2 makes rounds cheaper and coverage thinner while lowering it does the reverse, so neither direction is the safe one.
+
+### Writes are human-only, and reads happen unattended too
+
+The board layer is read on the unattended path, unlike the per-box overlay — the overlay is excluded there because it is a file in an untrusted working tree, and the board is not in the working tree. Reads take any agent's bearer token; writes take the same edge-authenticated human gate the plan's order takes. Anything running while a branch under review is checked out — a test suite, a build step, a git hook — holds this box's machine token, so a machine-writable dial would reopen from the board side the exact hole the two-ref rule exists to close.
+
+### The board does not learn the vocabulary
+
+`GET /dials` stores an opaque name and opaque JSON. The harness ships the dial table and the server image carries no `harness/` directory, so a copy there would be a second place a dial is written down — the confusion this change exists to end. A dial the harness does not recognise, or holds at a value it may not take, is refused and named on stderr at every resolution rather than dropped quietly.
+
+`board_config` and the site-config reader moved from `preland.py` into `harness_rules.py`, where that module's own comment said they belonged the moment anything needed them twice.
+
+### `git stash` in a worktree can no longer take another agent's work
+
+`refs/stash` lives in the **common** git dir, not the per-worktree one, so every worktree of a repo
+shares one stash stack. A stash pushed in `quarterback-fix-issue-114` is listed by `git stash list`
+in `quarterback-fix-issue-113`, and `stash@{0}` there resolves to whatever the last pusher meant.
+This harness runs many concurrent worktrees off one `.git` by design, which makes that the normal
+configuration rather than a corner case, and it has already taken two working trees: one agent's
+red/green stash was popped into a sibling and pushed back by hand, and the second time the recovery
+note was parked in the same shared stash that had eaten it. Both were caught by luck — nothing in
+git warns either side, and a stash entry carries no author, no worktree and no session, so there is
+nothing to warn with.
+
+`create-worktree` now installs a `reference-transaction` hook that refuses to put anything on
+`refs/stash` while the repo has linked worktrees, and `qb-stash` gives a worktree a stash of its own
+under `refs/worktree/*`, which is the one ref namespace git keeps per worktree.
+
+### The guard is a hook because a wrapper would only have covered our own scripts
+
+`git stash` is what a human reaches for too, and the near-miss that prompted this was a person
+clearing a dirty tree before a pull. `stash` is a C built-in: `alias.stash` is silently ignored, a
+`git-stash` on `PATH` is never consulted, and there is no `pre-stash` hook. A ref-transaction
+refusal is the only interception point git offers, so it is the only shape that catches a
+hand-typed `git stash` rather than just the harness's own commands.
+
+It guards the **main checkout** as well as the linked worktrees, because the near-miss was an
+orchestrator stashing in `main` while sub-agents ran in siblings. A repo with no linked worktrees
+stashes exactly as before — the hazard is the shared stack, and a single checkout does not have one.
+`QB_ALLOW_SHARED_STASH=1` is the per-command escape hatch.
+
+### It stops the push, not the pop, and that limit is measured rather than assumed
+
+On git 2.54.0, `git stash pop` removes its entry through the **reflog**, which raises no ref
+transaction at all while another entry remains underneath. No hook can see a pop. So the protection
+is to keep the shared stack empty — with nothing on it, there is nothing for a sibling to take —
+and deletions of `refs/stash` are deliberately allowed so entries that predate the guard stay
+droppable. `test_the_pop_side_is_not_interceptable` records that, so it is not re-derived.
+
+### Installing the guard must not uninstall gitleaks
+
+`core.hooksPath` **replaces** the hooks directory rather than stacking with it, and on this fleet
+its global value is a read-only nix store path whose one entry is a gitleaks `pre-commit`. Pointing
+a repo at a harness hooks dir without re-exporting that would have switched secret scanning off as
+a side effect of a stash-safety feature. `qb-hooks install` re-exports every hook the managed dir
+provides through a forwarder that resolves the delegate **at run time**, since the store path
+changes on every rebuild and an install-time snapshot would rot into a garbage-collected path.
+
+### `qb-stash` names its two limits instead of half-implementing them
+
+`git stash create` takes no pathspec and has no `-u`. `qb-stash push` therefore refuses both with an
+error rather than silently widening a pathspec to the whole tree, leaves untracked files where they
+are, and prints which ones it did not save. `--index` restores the staged/unstaged split, the
+asymmetry that made the hand-recovery of the lost trees lossy. Path-scoped work — removing a fix to
+prove a regression test goes red — still wants a patch file, which is per-worktree by construction
+and does take a pathspec.
+
+Entries live under `refs/worktree/*` and so die with the worktree, invisible to `git status`;
+`remove-worktree` copies any it finds to `refs/qb-stash-rescued/<branch>/` before tearing anything
+down.
+
+### a round measured from GitHub's stored base says so
+
+`panel.py` recorded `baseRefOid` as the round's `merge_base`. That field is one GitHub
+maintains for its own purposes, and it is not a merge base — measured wrong in both directions
+on this repo. On PR #187 it was **older** than the fork point: a commit shared with #182 landed
+on `main`, nothing recomputed the stored base, and `gh pr diff` returned that commit's own work
+on top of the twenty lines #187 contributed. Four seats and a master judge spent a round on it
+and returned 15 confirmed findings, 13 of them against code already on `main`. On PR #270 it
+was **newer** — the tip of `main`, naming a commit the branch had never contained.
+
+The payload said nothing either way. `preflight.verdict: run`, `reviewed: true`, `scope: "pr"`,
+and `config_notes: []`. A judge-confirmed finding list is exactly the thing the next step of the
+cycle briefs a fixer not to re-derive, so an unchecked hand-off would have rewritten landed code
+onto a twenty-line PR. It was caught by a peer noticing the diff looked smaller than GitHub
+advertised.
+
+`merge_base` is now a merge base: read from the compare API's `merge_base_commit`, which is
+`git merge-base <base> <head>` computed by GitHub, rather than off the PR's stored field. From
+the API rather than from a local `git`, because nothing else in the panel needs a checkout — a
+local computation would be right only when the head happened to have been fetched into whatever
+directory the panel was started in, and silently approximate the rest of the time.
+
+### The load-bearing part is that a mis-scoped round is not silent
+
+The diff still comes from `gh pr diff`, which GitHub builds against its stored base. Silently
+re-deriving the target from a locally-computed range would swap one unannounced scope for
+another. So the two bases are compared, and a disagreement is a `config_notes` line naming both
+commits, saying which one the diff was actually built from, and giving the reader the range to
+check a finding against before acting on it.
+
+A fork point that cannot be computed falls back to the stored base and says that too — the
+panel says every other scope failure out loud, and this was the one that did not.
+
+### the panel refuses a branch that cannot merge, before it spends the round
+
+`preland.check_pr_state` has always refused a `CONFLICTING` branch — at the merge gate, which
+is the far end of the cycle. `panel.py` never asked. So the cheapest refusal in the system ran
+after the most expensive step: a full multi-vendor round plus a judge, and only then the news
+that the branch could never have merged. Measured live on PR #270 — 28 files, 5,572 lines, a
+branch four commits behind its base — while the issue was being written.
+
+Every finding in such a round is about a diff that is going to change. Under `max_rounds: 2` a
+pre-rebase round was partly recoverable, because round 2 re-read the result; at the cap of
+**1** this repo moved to in PR #247 there is no second read, so whatever the rebase changes is
+never reviewed by anything.
+
+The panel now asks before it dispatches. `review_panel.require_mergeable` defaults **on**, and
+a `CONFLICTING` branch gets a `refuse` verdict with no seat dispatched, no judge, and no
+tarball fetched — the same `preflight` machinery that already refuses an oversized diff, so
+`skip_reason`, `preflight.verdict`, the per-seat `ran: false` rows and the board record all
+work as they already did.
+
+The sentence it refuses with is `preland`'s own, imported rather than copied. Two
+implementations of one question is how the three pre-land checks in #96 came to disagree, and
+a reviewer refusing with one wording while the merge gate refuses with another is that failure
+arriving a loop earlier.
+
+### It is a dial, and an override, and it is never silent
+
+Reviewing a conflicted branch is a real thing to want — an architectural read where the
+conflict is incidental, or a PR whose conflict *is* the subject.
+`review_panel.require_mergeable: false` allows it for a repo and `panel.py --force` for one
+run. Both say so in `config_notes`, and `--force` leaves `preflight.would_have: refuse` behind
+it, because "the tool chose to run" and "a caller overrode the tool" must never look alike.
+
+GitHub computes mergeability **lazily**: the first query schedules the merge test and answers
+`UNKNOWN` while it runs. Measured here, three consecutive reads of an open PR gave `UNKNOWN`,
+`CONFLICTING`, `CONFLICTING` — so a gate that asked once would refuse only the PRs somebody
+happened to have looked at recently, which is a gate that appears to work and mostly does not.
+The question is put a second time when the first answer is cold, and only then. An `UNKNOWN`
+that survives both reads is a note and never a refusal: refusing on "we could not tell" would
+stop rounds on GitHub's scheduling.
+
+A precondition refusal quotes no ceiling, because none was consulted: the notice's measurement
+table and its "split the PR" remedies are about a diff that is too big, and printed over a
+five-line conflicted branch they send an operator after the wrong problem.
+
+### a panel round the board never saw now says so on the PR
+
+The board held 39% of this repo's review history and nothing said so. A sweep of 100 PRs found 45 panelled on GitHub, **30 with no board record at all**, and **67 rounds the board never saw** — 43 recorded against 110 actually run. There is a clean cutover at 2026-08-18T12:57: every panel before it is absent, every panel after it is present. Nothing was sampled deliberately; the rounds evaporated through one line.
+
+`record_run` opened with `if not shutil.which("qb"): return`. No stderr line, no `config_notes` entry, nothing in the payload, nothing in the PR comment. `qb` lives in the fleet's own repo rather than this one, so whether a round was recorded depended on a binary from elsewhere being on the PATH of whichever box happened to run the panel — and when it was not, the round was indistinguishable from one recorded successfully. A second path was quieter still: `qb record-review` exits 0 whether or not the board answered, and says which on its streams, so a reachable `qb` talking to a down board also lost the run and left only a line in a subprocess nobody reads afterwards.
+
+The cost is not the missing rows. It is that every judgement made from the board was computed off a three-day tail nobody knew was a tail — the `/panel` leaderboard, the per-reviewer precision numbers, the dial calibration taken across "the seven PRs panelled on 2026-08-16" (all seven in the missing set), and the deterministic orderer now being written against `/reviews`. One capped round's four P1s existed only as a GitHub comment for three days; three of its findings turned out to be against code still on `main`.
+
+### Not failing the run was right. Being silent about it was not
+
+Recording stays best-effort — telemetry that can fail a review which already succeeded is worse than no telemetry, and a board outage still costs nothing. What changes is that a failure to record is now **visible**, in the three artefacts a round leaves behind:
+
+- **`config_notes`**, the channel that already exists for exactly this kind of note, so the payload a fixer is briefed from carries it;
+- **the `--json-file` payload on disk**, which is round *r+1*'s baseline — the recording is attempted before the file is written, so the file cannot be the one copy that fails to mention it;
+- **the report**, and therefore the `--post` PR comment. The refusal notice carries it too: that exit records on purpose, and it is the one most likely to be read by somebody asking why nothing happened.
+
+`record_run` now answers three distinct misses in a sentence each — no `qb` on this host, `qb` refused (no board URL, no token, no such subcommand), and `qb` ran but the board did not answer — and quotes what `qb` itself said, so a wrong guess about a program in another repo corrects itself in front of the reader rather than becoming a confident wrong diagnosis.
+
+### A lost round is recoverable, with nothing new to keep
+
+`--json-file` writes exactly the bytes `record_run` pipes to `qb`, so the note names the recovery rather than describing it: `qb record-review < PAYLOAD.json`, from any host that has one. That needs no queue, no retry daemon and no state that can go stale — the artefact already exists, and the board's own idempotency key means a replay joins the run rather than double-counting it.
+
+The 67 rounds already lost are a separate question, and this does not answer it: they exist in full in their PR comments and could be parsed back in, but whether that is worth doing depends on whether the orderer is going to learn from them.
+
+### half of a review cycle's wall clock had no number anywhere
+
+`/panel-review-pr` is slow, and the working hypothesis has been the serial fixer. The panel
+recorded `duration_ms` per reviewer and nothing else: no timing for the phase before the seats
+were dispatched, none for the judge, and **none at all for the fix phase between two rounds**.
+So the hypothesis could not be checked, and the parts of a round nobody had measured were the
+parts nobody suspected.
+
+A completed round now says where its wall clock went. The payload carries a `timing` block and
+the PR comment carries a `**Wall clock:**` line built from the same structure, so the record and
+the report cannot disagree about a number:
+
+```
+**Wall clock:** 14m 26s — setup 41s, seats 11m 31s, judge 2m 12s, wrapup 2.0s.
+Slowest seat codex at 11m 30s, holding the round alone for 7m 12s (49.9% of it).
+Fix phase before this round: 7m 26s (recorded).
+```
+
+### The four phases partition the round
+
+`setup` (the PR read, the diff fetch, the scope decision, the pre-flight verdict, the CI read and
+the code-tree download), `seats`, `judge` and `wrapup` sum to the round exactly, because each
+mark closes at the previous one. A total that quietly exceeded its own parts would make "the
+judge took two minutes" unfalsifiable. What is outside the partition is everything after the
+payload is built — the report render and the board POST — and `measured_to` says so rather than
+leaving an unexplained shortfall.
+
+### `gated_ms` — how much of the round was spent waiting on one thing
+
+The panel is parallel but gated on its slowest seat: every reviewer is submitted to one
+executor and the judge runs after all of them have joined, so a seat on a top-tier model holds
+the round, the judge and the fix phase behind it while finished seats sit with their findings
+undelivered. `gated_ms` is the span in which every seat but one had finished — the slowest
+seat's finish minus the *second* slowest's, deliberately not its whole duration, since a stretch
+in which two seats are still running is not attributable to either. With fewer than two seats it
+is 0: a single-vendor round is not a round held up by one seat.
+
+The seats also report as they land now, so a round in progress names the seat it is still
+waiting for instead of printing nothing between dispatch and the report. The collection loop
+still reads the futures in submission order, which is what keeps finding ids and the reported
+reviewer list deterministic across runs.
+
+### The fix phase, and where deriving it breaks
+
+Round *r+1* measures the fix phase from round *r*'s recorded finish to its own start — the
+fixer, the verification and the push together. Where the previous round predates the field it
+falls back to `git show -s --format=%ct` on the two rounds' `head_sha`, which needs nothing that
+did not already exist. `timing.fix.source` says which was used, because they are not
+interchangeable: the derivation is a **lower bound**, and it breaks in the two places it would
+matter most. A round that pushed nothing leaves the head unmoved, and a rebase between rounds
+leaves the earlier commit unreachable. Both are reported as `null` with the reason — a fix phase
+of `0` would be a claim that the fixer was instantaneous.
+
+### Nothing was made faster in this change, on purpose
+
+The issue's own order is measure first. The one structural thing taken here is live per-seat
+reporting, which costs no wall clock and buys none; the round cycle's barrier structure is
+untouched, and starting the judge or the fixer on partial panel results stays ruled out —
+63.7% of new findings on the seven PRs behind #165 were introduced by the preceding fix pass,
+and speed bought against that rate converts saved minutes into extra rounds.
+
+Board ingest is `extra="ignore"`, so `timing` is dropped there until a column exists for it. It
+travels in `--json` and `--json-file`, which is what a cycle chains its rounds through, and
+`finished_at` is read straight back out by the next round's baseline reader.
+
+### The pre-flight verdict was reading PATH behind the round's back
+
+`panel.run` resolves which vendor CLIs this box carries **once** per round, precisely so the
+budgets, the argv clamp, the prompt and the payload all describe one host. `seat_ceilings`
+resolves the same predicate in its own body when it is handed none, and the pre-flight verdict
+was calling it that way — a second, independently-timed reading, and the one consumer still
+outside the snapshot.
+
+The effect was a review tool whose answer depended on the machine: the same PR at the same size
+refused on a workstation carrying `claude` and reviewed, truncated to a fifth of its diff, on a
+runner that did not, with nothing reporting the difference. The round's snapshot is now passed
+in. It surfaced here as a timing test that passed locally and failed in CI, which is the mildest
+way it could have shown up.
+
+**This is the mechanism behind #239**, which is titled for the symptom:
+`test_a_real_panel_payload_records_and_reads_back` passed or failed on whether a `codex` binary
+was installed. That module pins every seat as present, so the budgets gave codex its configured
+40-char cap while the verdict read the real PATH — and on a box with no codex the two disagreed
+in the direction that hid it, weighing a 268-char diff against no ceiling at all and letting the
+round run. With a codex installed the verdict saw the cap, measured 6.7x against the 3x refusal
+threshold, and refused. One snapshot, one answer, and the outcome stops depending on the host.
+
+That test's fixture then has to mean what it always intended: it asserts codex was **truncated**,
+which needs a cap the diff exceeds without passing the refusal threshold. At 40 the round is
+refused on every box. The cap is now 120 — 2.2x, cut but reviewable — and the test asserts
+`reviewed` and the pre-flight verdict up front, so a refusal can never again be read as a round
+that found nothing.
+
+### the dials go back to P3 and two rounds, because the reasons they moved are fixed
+
+`.harness-rules.sample` has run `fix_severity_floor: P2` and `max_rounds: 1` since 2026-08-20. Both
+were right when they were set, and both were set to work around problems that shipped fixes on
+2026-08-21.
+
+**The floor.** P3 was given up because fixing that tier ACCUMULATES — PR #188's 185-line feature
+became 721 churned lines, 74% of it review-response code, off a round-2 list 89% below P2. Both
+halves of that are now bounded: `low_severity_fix_lines` (#297) budgets the band cheapest-first and
+counts rather than estimates, and `max_fix_growth` (#298) was dividing a whole-PR baseline by *one
+round's increment*, so a PR at 3.90x cleared a 3.0x cap and the backstop never fired.
+
+Note what is NOT being claimed: this key's own condition was "restore P3/P2 the day the
+deferred-finding backlog is empty", and that backlog is still there. It is the other half of the
+argument that changed.
+
+**The rounds.** One was chosen because every panel measured had ended on the cap, making the cap a
+budget rather than a safety net. But round 2 is where this repo's expensive defects are found: it
+caught the FIFO hang round 1 created on PR #236, and on PR #299 five rounds produced 39 of 53
+findings introduced by the previous fix pass, round 2 being 17 of 17. And `max_rounds: 1` is the
+setting that switches #84's premise brake OFF — there is no second fix pass for it to refuse, so
+the futility brake shipped and could not fire.
+
+Both changes are experiments with a stated way back, written at the keys themselves: tighten the
+budget before touching the floor, and `max_rounds: 1` remains the known-good value with its
+argument intact. `panel.py --max-rounds` still wins for a single run.
+
+### CI stops running the harness suites three times over
+
+Every push waited about two and a half minutes on `harness suites` while the other two test jobs finished inside a minute. The job was doing roughly three times the necessary work: it discovered every `tests` directory under `harness/` and ran the lot, ran **the lot again** with the `tui` extra, then ran the two dashboard modules a third time to prove they had not skipped. On top of that it ran on one core, and what dominates those suites is not CPU — one test shells out to a 220-line bash suite that builds throwaway git repos, and four more wait on a real tmux server.
+
+The second full pass was the waste. Its claim is about the dashboard modules and nothing else: the `tui` extra changes what `test_qb_dash.py` and `test_qb_dash_plain.py` do and changes nothing anywhere else, so re-running the nginx bash suite and the seat tests with Textual installed bought nothing. That pass is now the two dashboard modules only — which is what the third pass already was, so the two collapse into one step. The wide pass keeps running everything, because it is the run that proves the harness imports neither Textual nor rich.
+
+The wide pass now runs `-n auto`, one pytest worker per core. Subprocess waits overlap almost perfectly, so it comes down without any test being shortened. Nothing was made "fast" by weakening it: the tmux tests still drive a real tmux server and the nginx test still drives real `create-worktree` against real git repositories, because those are the things they exist to check.
+
+### Faster is the easy half; still-running is the hard half
+
+The cheapest way to speed up any test job is to stop running things, and a job that runs less reports the same green as one that runs everything. So the narrowing is checked rather than believed. `tests/test_harness_job.py` reads the workflow and every harness test module and fails if a module with a real `textual` or `rich` dependency is missing from the narrowed step — add one, forget the step, and that test is red instead of the module being green by never executing. It also holds the rest of the arrangement in place: the wide pass may not name individual modules, the narrow pass may not go wide again, the `N passed` grep that proves the dashboard suites actually ran must survive, and the two modules must keep being checked one at a time, since either one skipping in full is invisible when both are collected together.
+
 ## v2.68 — the fix pass stopped being most of the PR
 
 The panel's fix floor is a rule about one finding at a time, and what went wrong is not one
