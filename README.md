@@ -1023,6 +1023,12 @@ number is already `stamped`'s red job and there is nothing here to fix. What it 
 release that landed through a `--no-verify` push, so the tags do not quietly drift out of
 step with the file they are supposed to be about.
 
+The tags are annotated, so writing one means writing an object, and git will not write an
+object without a tagger. `backfill` supplies one itself where the environment cannot name
+anybody — a CI runner has no `user.name` and no GECOS field to guess from, which is how #379
+cost `v2.99` and `v3` their tags. A resolvable identity is never overridden: where `git var
+GIT_COMMITTER_IDENT` answers, the tag is from whoever ran the command.
+
 ### A released entry is immutable
 
 Once a number is stamped and merged, that entry is finished. It says what was broken or

@@ -75,6 +75,11 @@ that already exists is left exactly where it is, and one pointing somewhere the 
 does not hold is REPORTED rather than corrected. A moved tag is worse than an absent one:
 absent, everybody knows they have to look it up; moved, everybody trusts the wrong answer.
 
+The tags it writes are annotated, which means it writes an OBJECT, which means git wants to
+know who is tagging. It supplies a tagger itself when the environment cannot name one, so the
+command works on a bare CI runner and not only where somebody remembered to run `git config`
+first (#379). A resolvable identity is never overridden: see `_tagger_env`.
+
 ## Exit codes
 
 0 = go / clean · 1 = checked, but a condition could not be checked · 2 = STOP.
@@ -93,6 +98,7 @@ import argparse
 import contextlib
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -153,14 +159,15 @@ CHANGELOG = "CHANGELOG.md"
 # --------------------------------------------------------------------------------- git
 
 
-def _run(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+def _run(repo: Path, *args: str, env: dict[str, str] | None = None
+         ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["git", "-C", str(repo), *args], capture_output=True, text=True, check=False
+        ["git", "-C", str(repo), *args], capture_output=True, text=True, check=False, env=env
     )
 
 
-def _git(repo: Path, *args: str) -> str:
-    proc = _run(repo, *args)
+def _git(repo: Path, *args: str, env: dict[str, str] | None = None) -> str:
+    proc = _run(repo, *args, env=env)
     if proc.returncode != 0:
         raise TagError(f"git {' '.join(args)} failed: {proc.stderr.strip() or 'no output'}")
     return proc.stdout
@@ -168,6 +175,50 @@ def _git(repo: Path, *args: str) -> str:
 
 def _git_ok(repo: Path, *args: str) -> bool:
     return _run(repo, *args).returncode == 0
+
+
+#: Who a backfilled tag is FROM when nothing else can say. An annotated tag is an object and
+#: an object has a tagger, so git refuses to write one where it cannot name anybody — and the
+#: place where it never can is a CI runner: no `user.name`, and no GECOS field to guess one
+#: from. That is #379, where the `tagged` job died on `fatal: empty ident name` and two
+#: releases landed untagged. The address is `.invalid` on purpose: a backfill's tagger is a
+#: script, and an address that cannot receive mail says so rather than implying somebody.
+_TAGGER_NAME = "release_tag.py"
+_TAGGER_EMAIL = "release-tag@quarterback.invalid"
+
+
+def _tagger_env(repo: Path) -> dict[str, str]:
+    """The environment for a git command that writes a tag OBJECT.
+
+    Whatever git can already work out wins. The gate is `git var GIT_COMMITTER_IDENT`, which
+    is the same question git asks itself before it writes an object: when it answers, this
+    returns the environment untouched and the tag carries the caller's own name exactly as it
+    would have. Only when it refuses does anything here apply — and then a configured half is
+    still preferred over the fallback, because a set `user.name` with no resolvable email is a
+    real shape and inventing a name over it would be a lie about who tagged.
+
+    Env rather than `-c user.name=…`: an exported `GIT_COMMITTER_NAME` outranks any config, so
+    the empty one that CI leaves behind would outrank a `-c` too. Reading each var and filling
+    only what is blank covers unset, set-to-empty and set-to-whitespace alike.
+
+    `git tag -a` reads the committer half only; the author half is set alongside it because an
+    environment where the two disagree is a trap for whatever writes an object here next, and
+    it costs two dict entries.
+    """
+    env = dict(os.environ)
+    if _run(repo, "var", "GIT_COMMITTER_IDENT").returncode == 0:
+        return env
+    for var, key, fallback in (
+        ("GIT_COMMITTER_NAME", "user.name", _TAGGER_NAME),
+        ("GIT_AUTHOR_NAME", "user.name", _TAGGER_NAME),
+        ("GIT_COMMITTER_EMAIL", "user.email", _TAGGER_EMAIL),
+        ("GIT_AUTHOR_EMAIL", "user.email", _TAGGER_EMAIL),
+    ):
+        # `.strip()`, because git strips an ident before it judges it: a name of one space
+        # is truthy here and still `empty ident name` there.
+        if not env.get(var, "").strip():
+            env[var] = _run(repo, "config", "--get", key).stdout.strip() or fallback
+    return env
 
 
 def resolve(repo: Path, ref: str) -> str:
@@ -459,6 +510,9 @@ def cmd_backfill(args: argparse.Namespace) -> int:
         )
 
     have = local_tags(repo)
+    # Resolved once, before anything is written: the probe inside it is a git call, and the
+    # loop below runs once per release this repo has ever had.
+    tagger = None if args.dry_run else _tagger_env(repo)
     created: list[tuple[str, str]] = []
     misplaced: list[str] = []
     for r in sorted(where):
@@ -473,7 +527,7 @@ def cmd_backfill(args: argparse.Namespace) -> int:
             continue
         if not args.dry_run:
             _git(repo, "tag", "-a", "-m", f"{name}\n\nBackfilled from {CHANGELOG}.", name,
-                 target)
+                 target, env=tagger)
         created.append((name, target))
 
     pushed: list[str] = []
