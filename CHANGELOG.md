@@ -17,6 +17,64 @@ the top of this file conflict every time, over nothing — both entries are righ
 and a fragment is a path no other branch will ever open. `changelog.d/README.md` has the format.
 `vNEXT` means exactly what it meant before; assembly is just what writes it.
 
+## v2.85 — a shipped release's notes cannot be quietly replaced by a merge resolution
+
+A CHANGELOG conflict on `feat/issue-232` was resolved by relocating that branch's own 133-line
+entry **under `## v2.59`**, on top of the release notes that already lived there. It was pushed,
+and it sat on an open pull request for two days, and every guard in the repo was green — because
+they all read this file as a *list of headings*, and every heading was present, unique and in the
+right order. The corruption was entirely in which text sat under which one. A landing agent caught
+it by diffing the bodies by hand, and "diff the bodies of neighbouring released entries" has been a
+line in the lander's brief ever since: a checklist item where a test belongs.
+
+The deleted half is the expensive half. A release entry says what was broken or missing before it,
+which is exactly what this file's own preamble says it exists for — *"the part that isn't
+recoverable from the diff"*.
+
+### A released entry is immutable, and `release_stamp.py frozen` says so
+
+For every `## vX[.Y]` entry present at both refs, the whole slab — heading line and body — has to
+be byte-identical. An entry that has vanished is a refusal too; nothing here noticed that either,
+since counting duplicates and taking a maximum both survive a release simply ceasing to exist.
+
+Verbatim, not normalised. The failure being caught is a body **moved intact** from one heading to
+another, so a comparison that stripped, re-wrapped or compared line sets would pass it.
+
+### It compares against the merge base, and stores nothing
+
+The same third reference point `collision` uses, chosen for the same reason: it separates what a
+branch *did* from what it *inherited*, so a branch that is merely behind is never asked about
+releases that landed while it was open, and a branch that does not touch a released entry passes by
+construction. That is what lets this run on every push and every pull request without ever crying
+wolf — the property the `stamped` job's main-only trigger exists to protect.
+
+The alternative was a digest per entry checked into the repo. It would catch strictly more, and it
+was rejected: it adds a file that must be maintained per release, that every stamping branch
+conflicts over, and that the very merge resolution this exists to catch could rewrite alongside the
+CHANGELOG. The shipped text is already in git, where a bad resolution cannot reach it.
+
+**What it does not catch**, said out loud because a guard whose blind spot is undocumented is how
+this defect survived the first time: a corruption that has already landed on `main` — the merge
+base moves with it, so the window is the one pull request carrying it; a commit pushed straight to
+`main`, once it is pushed (before the push, `pre-push` still catches it, because `origin/main` is
+behind); a number declared twice at either ref, which is `collision`'s refusal and not repeated
+here in different words; and anything outside a numbered entry, since the file's preamble is living
+documentation of the convention and is edited on purpose.
+
+### Two gates, and a way to say a typo fix was meant
+
+`harness/githooks/pre-push` grows a third refusal beside the multi-head graph and the pre-stamped
+number, switchable off per repo with `qb.prePush.releaseBodies` and reported by `qb-hooks status`
+when it is. A `frozen` CI job runs on every pull request against the branch it targets — and
+unlike `stamped` it is safe to require, since it reports on the event branch protection gates on.
+
+Editing a shipped entry on purpose is declared rather than bypassed: a `Release-Body-Edit: v2.59`
+trailer on a commit of the branch, read from `base..HEAD` only, so the exemption expires with the
+merge it was written for. Git's own trailer parser answers it, not a regex over the message — the
+refusal ends with a pasteable copy of that line, which makes "a commit body quoting the refusal"
+the most likely message the branch will ever produce, and reading it as consent would waive the
+entry on the strength of a paste.
+
 ## v2.84 — a repository spelt with capitals is the same repository
 
 `GET /review/collisions` matched `review_runs.repo` with `==` against a column stored exactly as the panel sent it. GitHub folds owner and repository names while preserving what you typed, so `PrisonBlues/Quarterback` and `prisonblues/quarterback` are one repository the board held as two — and a query in either spelling was answered about half of it.
