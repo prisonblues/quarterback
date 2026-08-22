@@ -17,6 +17,42 @@ the top of this file conflict every time, over nothing — both entries are righ
 and a fragment is a path no other branch will ever open. `changelog.d/README.md` has the format.
 `vNEXT` means exactly what it meant before; assembly is just what writes it.
 
+## v3.5 — a page that says what every agent is doing, and how much of that is actually known
+
+Rich, describing what he wants off a phone: *"see the plan, state of each agent, drag them up and down if needed, and then the seats pick things up."* Three of those four were built. The state-of-each-agent half had no page at all — `board.html` renders `/sessions` beside the feed, but nothing existed whose job was the fleet — and the data it needed (`GET /active`, `GET /sessions`, `GET /claims`) had all been served for months.
+
+`GET /fleet` is that page: mobile-first, one row per agent, on the same footing as `/plan/view`.
+
+### It shows the ambiguity rather than resolving it
+
+The reason this was never just a render is that the naive one lies in both directions. `/active` lists only leases inside their TTL, a lease is renewed once per **prompt**, and one prompt can be an hour of autonomous work — so a busy agent leaves `/active` precisely while it is busiest. Read as "who is alive", the endpoint reports a working agent as gone and a lapsed one as merely quiet.
+
+So a row gets one of four readings, and only two of them are things somebody reported. `live`: a lease is being renewed. `ended`: somebody called `/session/end` and said why. `unclear`: no lease, no reported ending, and either a claim still standing or a silence too young for the board's own passive expiry to have settled it. `unreported`: old enough that expiry has had its say, and still nobody ever said what happened. None of the four asserts a death, and the two shapes of silence are named as silence — in `qb-reconcile`'s own wording for the same ambiguity, because two readers wording it two ways teaches an operator to believe whichever they read first.
+
+A `working` that has stood longer than `qbdata.py`'s `STALL_AFTER` is remarked on and deliberately not called stalled: the dashboard concludes a stall from the same beacon, but on a phone the row is all the reader has, so this one names both readings.
+
+A finished session and a slow one stay different rows. `GET /sessions` carries an `ended` block that is null for a lease nobody ended, and that null is the whole distinction.
+
+### One verb, and it reaches the browser for the first time
+
+Ending a session is the thing a person actually needs from a phone when something has gone wrong. `POST /session/end` already existed but depended on `app.auth.identify`, which wants a bearer token no browser holds — so the one verb a person needed was the one they could not reach. It now goes through `app.auth.author`: an agent by token, authorised by machine exactly as before, or a person by an edge-proved `Remote-User` with the secret only the auth proxy knows.
+
+The machine check is skipped for a person and only for a person, because the question it asks has no answer for one: `human/rich` shares a machine with nothing on the fleet. For the same reason a person's ending releases the claims stamped with that session — the ordinary ownership rule asks which box the caller is and would refuse every row, returning 200 having done none of the job. A claim naming no session still belongs to its machine and is left alone.
+
+There is deliberately **no spawn button**. `qb-start` is off by default per machine, a phone is the worst place to reason about whether a box has opted in, and that argument belongs elsewhere.
+
+### And two things that had to change for that verb to be worth pressing
+
+`/session/end` only ever stamped a reason onto an **active** lease. So the one case somebody opens this page for — an agent that went quiet twenty minutes ago and never came back — was the one case the verb could not record: the only window in which anything could be said had already closed, and the row stayed "nobody ever said" permanently. A lapsed lease can now be told what happened to it, stamped at its own `expires_at` rather than at the moment somebody got round to saying so, because a lease that lapsed on Tuesday did not end on Thursday. A lease already *released* is still left alone — a handoff is not an ending, and an ending already recorded belongs to whoever saw it first — and reaching that path now writes something, so it is authorised by machine like every other write on the leases table.
+
+`GET /sessions` gained two things, and the first is the more important. Every row now carries `last_lease` — when this key's newest lease stopped being valid — because that is the clock a silence has to be measured against, and `updated_at` is not it. `updated_at` belongs to the transcript and moves on `/snapshot`; the lease moves on every prompt. Where the two diverge the gap runs the wrong way: a session that pushed at ten, kept renewing until noon and then died is two minutes quiet at 12:02 and two *hours* quiet by the transcript, so a view reading the wrong one calls a working agent long gone. That is the exact misreading this page exists to prevent, arriving through the field it trusted.
+
+Second, `?include_ended=` widens the list to a session whose last lease was ended but which never pushed a transcript. Without it such a session is visible exactly while it holds a lease and vanishes the moment it ends. It is a flag rather than the default because this list is paged, and folding an unbounded second population in would spend an existing caller's page on rows it never asked for. A lease that merely lapsed still gets no row either way: inventing one for a silence would be this page's own failure mode written into the endpoint.
+
+### Pending the edge secret
+
+Like the plan's reorder buttons, the end verb is inert in production until `HUMAN_EDGE_SECRET` is deployed: with no secret configured, nobody is a person and every human write is refused. The page asks `/whoami` and prints the server's own explanation at the top rather than presenting a button whose refusal arrives as a bare 403.
+
 ## v3.4 — a PR body saying "this does not close #N" no longer closes #N
 
 GitHub's closing-keyword parser does not understand negation. PR #372 opened with **"This
