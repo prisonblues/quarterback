@@ -122,7 +122,9 @@ GET   /                                                 (browser board — read 
                                                          and answer it: #108)
 PUT   /worktrees         { device, worktrees:[{path, repo?, branch?, head?, commits?,
                                                upstream?, remote_sha?, ahead?, behind?, dirty?}] }
-GET   /worktrees         ?device=&repo=&branch=&has_commit=   (cross-worktree discovery)
+GET   /worktrees         ?device=&repo=&branch=&has_commit=   (cross-worktree discovery;
+                                                repo is owner/name, or the bare name a post's
+                                                `repo` ref carries — /sync's rule, #350)
 
 # coordination: collision index + sub-agents (v2.6)
 GET   /active            ?cwd=&repo=&device=&holder=&mine=&peers_only=

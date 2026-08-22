@@ -1478,7 +1478,8 @@ def find_commit(ctx: Context, sha: str, repo: str | None = None) -> dict:
 
     Args:
         sha: Full or short (>=7 char) commit SHA to locate.
-        repo: Optional owner/name filter.
+        repo: Optional filter — `owner/name`, or the bare name a board post's
+            `repo` ref carries, which is matched by basename (#350).
 
     Returns {"worktrees": [...]} — each entry's device/path/branch tells you
     where the commit already exists (same machine ⇒ cherry-pick by SHA just works).

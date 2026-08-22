@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import Boolean, DateTime, Index, Integer, Text, func
+from sqlalchemy import Boolean, CheckConstraint, DateTime, Index, Integer, Text, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -22,6 +22,9 @@ class Worktree(Base):
 
     device: Mapped[str] = mapped_column(Text, primary_key=True)
     path: Mapped[str] = mapped_column(Text, primary_key=True)
+    #: ``owner/name`` lower-cased — the origin slug, folded on the write through
+    #: :func:`app.claimkey.canonical_repo` (#350). NULL where the device's
+    #: checkout has no GitHub-style remote to read one off.
     repo: Mapped[str | None] = mapped_column(Text)
     branch: Mapped[str | None] = mapped_column(Text)
     head_sha: Mapped[str | None] = mapped_column(Text)
@@ -38,6 +41,20 @@ class Worktree(Base):
     )
 
     __table_args__ = (
+        # One repository, one stored spelling (#350, migration 0034). `PUT
+        # /worktrees` folds through `canonical_repo`, and this is what lets
+        # `GET /worktrees?repo=` compare the column rather than fold it — which
+        # is what keeps `ix_worktrees_repo` serving the query.
+        #
+        # Case and surrounding whitespace only, NOT `owner/name` shape: the shape
+        # is refused at ingest where a caller can be told why, and a constraint
+        # asserting it would make 0034 abort on a legacy row rather than make it
+        # canonical. `btrim` is given its character class because the
+        # one-argument form trims ordinary spaces alone; vertical tab is `\013`
+        # and never `\v`, since Postgres has no `\v` escape and the class would
+        # gain the LETTER `v` — `btrim('vercel/next', …)` is `'ercel/next'`.
+        CheckConstraint(r"repo IS NULL OR repo = lower(btrim(repo, E' \t\n\r\f\013'))",
+                        name="ck_worktrees_repo_canonical"),
         Index("ix_worktrees_repo", "repo"),
         Index("ix_worktrees_head", "head_sha"),
     )

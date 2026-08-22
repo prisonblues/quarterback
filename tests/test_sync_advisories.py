@@ -262,15 +262,16 @@ async def test_unregistered_worktree_says_so_instead_of_reading_as_in_sync(clien
 
 async def test_a_feature_worktree_is_not_stale_for_lacking_a_main_publish(client):
     repo = f"{REPO}-multibranch"
+    slug = f"prisonblues/{repo}"
     await _publish(client, repo, C, "shipped on main", branch="main")
     await client.put(
         "/worktrees",
         json={
             "device": "sync-multi",
             "worktrees": [
-                {"path": "/src/main", "repo": repo, "branch": "main", "head": B,
+                {"path": "/src/main", "repo": slug, "branch": "main", "head": B,
                  "commits": [{"sha": B, "subject": "base"}]},
-                {"path": "/src/feat", "repo": repo, "branch": "feat/x", "head": D,
+                {"path": "/src/feat", "repo": slug, "branch": "feat/x", "head": D,
                  "commits": [{"sha": D, "subject": "wip"}]},
             ],
         },
@@ -319,7 +320,8 @@ async def test_caller_verdict_wins_over_other_stale_worktrees(client):
         "/worktrees",
         json={
             "device": "sync-laggard",
-            "worktrees": [{"path": "/src/old", "repo": repo, "branch": "main", "head": A,
+            "worktrees": [{"path": "/src/old", "repo": f"prisonblues/{repo}",
+                           "branch": "main", "head": A,
                            "commits": [{"sha": A, "subject": "ancient"}]}],
         },
         headers=SERVER,
