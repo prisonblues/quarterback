@@ -206,9 +206,15 @@ async def _drive_issues() -> list[str]:
     app = app_module.Dash(interval=3600, gh_interval=3600)
     app.refresh_limits = lambda: None
 
-    started: list[tuple[str, str]] = []
+    started: list[tuple[str, list]] = []
     opened: list[int] = []
-    app.run_in_window = lambda name, command: started.append((name, command))
+    # The ⚒ goes through `qb-start` now (#371), and the machine this runs on has
+    # almost certainly not opted in — so the gate is answered here rather than
+    # asked. What this drive is about is which column was clicked, not which
+    # machine it was clicked on; the gate has its own tests below.
+    app.spawn_refusal = lambda command: None
+    app.run_spawn = lambda name, argv: started.append((name, argv))
+    app.run_in_window = lambda name, command: started.append((name, [command]))
     app.open_issue = lambda issue: opened.append(issue.get("number"))
 
     failures: list[str] = []
@@ -238,9 +244,9 @@ async def _drive_issues() -> list[str]:
             await pilot.pause(0.3)
             if not started:
                 failures.append("confirming did not start the fix")
-            elif f"/fix-issue {top}" not in started[0][1]:
+            elif ["/fix-issue", str(top)] != list(started[0][1][1:3]):
                 failures.append(f"wrong command launched: {started[0][1]}")
-            elif started[0][0] != f"fix-{top}":
+            elif started[0][0] != f"fix-issue-{top}":
                 failures.append(f"wrong window name: {started[0][0]}")
 
         # A click anywhere else on the row still means "open it on GitHub".
@@ -270,8 +276,10 @@ async def _drive_plan() -> list[str]:
     app = app_module.Dash(interval=3600, gh_interval=3600, plan_interval=3600)
     app.refresh_limits = lambda: None
 
-    started: list[tuple[str, str]] = []
-    app.run_in_window = lambda name, command: started.append((name, command))
+    started: list[tuple[str, list]] = []
+    app.spawn_refusal = lambda command: None
+    app.run_spawn = lambda name, argv: started.append((name, argv))
+    app.run_in_window = lambda name, command: started.append((name, [command]))
 
     failures: list[str] = []
     async with app.run_test(size=(100, 50)) as pilot:
@@ -327,7 +335,7 @@ async def _drive_plan() -> list[str]:
             await pilot.pause(0.3)
             if not started:
                 failures.append("confirming did not start the fix")
-            elif f"/fix-issue {issue['number']}" not in started[0][1]:
+            elif ["/fix-issue", str(issue["number"])] != list(started[0][1][1:3]):
                 failures.append(f"wrong command launched: {started[0][1]}")
 
     return failures
@@ -1218,3 +1226,217 @@ async def _drive_a_watched_repos_pr() -> list[str]:
 def test_the_scales_refuse_a_pr_from_a_repo_this_dashboard_only_watches():
     """The ⚖ makes the same check the ⚒ does, and #209 is what makes it reachable."""
     assert asyncio.run(_drive_a_watched_repos_pr()) == []
+
+
+# ------------------------------------------------- the ⚒, and the gate under it
+#
+# NO BOARD AND NO LIVE DATA. Every test below hands the dashboard a `qb-start`
+# that answers however the test needs and an issue that is a literal, so they run
+# in CI under the `tui` extra rather than only on a developer's laptop — which
+# matters here more than anywhere else in this file, because what they are about
+# is a button that must refuse on a machine that has not opted in, and CI is such
+# a machine.
+#
+# They also do not run the app. `fix_issue` is a decision — refuse, ask, or start
+# — and the decision is reachable with `say` and `push_screen` stubbed, so none of
+# these needs an event loop to say what the button does.
+
+def _fake_qb_start(tmp_path, *, answer: str = "{}", policy_exit: int = 0,
+                   spawn_exit: int = 0, spawn_out: str = "", spawn_err: str = "") -> str:
+    """A `qb-start` that answers `--policy` one way and a spawn another.
+
+    `#!/bin/sh`, never `#!/usr/bin/env` — a runtime-written stub is past
+    `patchShebangs` and there is no `/usr/bin/env` inside a nix build (#177,
+    and `test_runtime_stub_shebangs.py` enforces it).
+    """
+    script = tmp_path / "qb-start"
+    script.write_text(
+        "#!/bin/sh\n"
+        f'printf "%s\\n" "$*" >> {tmp_path / "ran.log"}\n'
+        'if [ "$1" = "--policy" ]; then\n'
+        f"  printf '%s' '{answer}'\n"
+        f"  exit {policy_exit}\n"
+        "fi\n"
+        f"printf '%s' '{spawn_out}'\n"
+        f"printf '%s' '{spawn_err}' >&2\n"
+        f"exit {spawn_exit}\n")
+    script.chmod(0o755)
+    return str(script)
+
+
+ENABLED_ANSWER = ('{"enabled": true, "commands": ["/fix-issue"], '
+                  '"max_sessions": 1, "policy": "/home/x/.config/quarterback/spawn.json"}')
+OFF_ANSWER = ('{"enabled": false, "commands": [], "reason": '
+              '"spawning is not enabled on this machine - there is no '
+              '/home/x/.config/quarterback/spawn.json. A machine opts in by setting '
+              '`programs.quarterback-harness.spawn.enable = true`"}')
+
+
+class _Clicked:
+    """One dashboard with its three outward edges recorded instead of taken."""
+
+    def __init__(self, tmp_path, start_bin: str, held: dict | None = None):
+        module = _load_app()
+        self.module = module
+        self.app = module.Dash(interval=3600, gh_interval=3600)
+        self.app.start_bin = start_bin
+        self.app.held = held or {}
+        self.said: list[str] = []
+        self.dialogs: list[tuple] = []
+        self.spawned: list[tuple] = []
+        self.windowed: list[tuple] = []
+        self.app.say = self.said.append
+        self.app.push_screen = lambda screen, cb=None: self.dialogs.append((screen, cb))
+        self.app.run_spawn = lambda name, argv: self.spawned.append((name, argv))
+        # Stubbed so that the ⚒ quietly reverting to the old direct spawn shows up
+        # here as a failure rather than as a passing test.
+        self.app.run_in_window = lambda name, command: self.windowed.append((name, command))
+
+    def confirm(self) -> None:
+        """Say yes to the dialog the click raised."""
+        assert self.dialogs, "no confirmation was raised"
+        self.dialogs[-1][1](True)
+
+
+def test_the_hammer_refuses_on_a_machine_that_has_not_opted_in(tmp_path):
+    """The obstacle #360 named and declined to walk into: `qb-start` ships off, so
+    routing a working button through it makes the button stop working until
+    somebody writes one line of nix. The answer is to refuse with the reason and
+    the remedy — and to do it INSTEAD of the dialog rather than after it, since
+    the machine's answer is knowable before the click is spent."""
+    box = _Clicked(tmp_path, _fake_qb_start(tmp_path, answer=OFF_ANSWER, policy_exit=3))
+    box.app.fix_issue({"number": 7})
+    assert box.dialogs == [], "a machine that cannot spawn still asked whether to"
+    assert box.spawned == []
+    assert box.said and "programs.quarterback-harness.spawn.enable" in box.said[-1], \
+        f"the refusal must name the remedy: {box.said}"
+
+
+def test_the_hammer_does_not_fall_back_to_the_old_uncounted_spawn(tmp_path):
+    """The tempting shape, and the one thing this must not do. A fallback would
+    make "this machine has not opted in" a fact about which code path ran rather
+    than about the machine, and would put two behaviours behind one icon — a
+    counted, claimed, board-recorded session on one box and an uncounted one on
+    another, with nothing on screen to say which you got."""
+    box = _Clicked(tmp_path, _fake_qb_start(tmp_path, answer=OFF_ANSWER, policy_exit=3))
+    box.app.fix_issue({"number": 7})
+    assert box.windowed == [], "the ⚒ started a session the gate had refused"
+    # And it did not get as far as offering to: a dialog raised on a machine that
+    # cannot spawn is the fallback's first half, whether or not the second half
+    # is there yet.
+    assert box.dialogs == []
+
+
+def test_a_qb_start_that_will_not_run_fails_closed(tmp_path):
+    """A broken install is not a machine that said no, and the two want different
+    things done about them — but neither of them starts a session."""
+    box = _Clicked(tmp_path, str(tmp_path / "not-installed"))
+    box.app.fix_issue({"number": 7})
+    assert box.dialogs == [] and box.spawned == [] and box.windowed == []
+    assert "not-installed" in box.said[-1]
+
+
+def test_a_command_this_machine_did_not_name_says_which_option_names_it(tmp_path):
+    """`spawn.commands` is the second lock — turning spawning on is one decision
+    and saying what may come through it is another — so it is a refusal an
+    operator meets while opting in, and it has to name the key."""
+    box = _Clicked(tmp_path, _fake_qb_start(
+        tmp_path, answer='{"enabled": true, "commands": [], "policy": "/tmp/spawn.json"}'))
+    box.app.fix_issue({"number": 7})
+    assert box.dialogs == [] and box.spawned == []
+    assert "spawn.commands" in box.said[-1]
+
+
+def test_an_enabled_machine_asks_first_and_then_runs_qb_start(tmp_path):
+    """The confirmation is not weakened by any of this: /fix-issue writes a branch
+    and opens a PR, so a stray click on a 78-column pane still must not start one."""
+    box = _Clicked(tmp_path, _fake_qb_start(tmp_path, answer=ENABLED_ANSWER))
+    box.app.fix_issue({"number": 7})
+    assert box.spawned == [], "the icon started a fix with no confirmation"
+    assert len(box.dialogs) == 1
+    box.confirm()
+    assert len(box.spawned) == 1, "confirming did not start the fix"
+    name, argv = box.spawned[0]
+    assert argv[0] == box.app.start_bin, f"the ⚒ did not go through qb-start: {argv}"
+    assert argv[1:3] == ["/fix-issue", "7"]
+    assert "--via" in argv and argv[argv.index("--via") + 1] == "dash", \
+        f"a spawn with no provenance cannot be traced back to the click: {argv}"
+    assert argv[argv.index("--repo-path") + 1] == box.app.repo
+    assert name == "fix-issue-7", "the window named should be the one qb-start makes"
+
+
+def test_cancelling_the_confirmation_starts_nothing(tmp_path):
+    box = _Clicked(tmp_path, _fake_qb_start(tmp_path, answer=ENABLED_ANSWER))
+    box.app.fix_issue({"number": 7})
+    box.dialogs[-1][1](False)
+    assert box.spawned == [] and box.windowed == []
+    assert box.said[-1] == "cancelled"
+
+
+def test_a_held_issue_is_refused_with_the_release_that_would_free_it(tmp_path):
+    """The reversal of this method's own previous sentence, and the claim is what
+    reverses it. Warning and proceeding cost nothing while the click took no
+    claim; now it takes one, so proceeding is `qb-claim` refusing at exit 8 — a
+    dialog whose only possible outcome is no."""
+    import qbdata as qd
+    issue = {"number": 7, "repo": None}
+    box = _Clicked(tmp_path, _fake_qb_start(tmp_path, answer=ENABLED_ANSWER),
+                   held={qd.issue_key(issue): {"holder": "zeus/seat-1"}})
+    box.app.fix_issue(issue)
+    assert box.dialogs == [] and box.spawned == []
+    assert "zeus/seat-1" in box.said[-1] and "qb-release issue 7" in box.said[-1]
+
+
+def test_the_machine_is_asked_on_every_click_rather_than_once_at_mount(tmp_path):
+    """So that opting a machine in takes effect on the next click instead of on
+    the next dashboard. It costs one local process that reads one file."""
+    box = _Clicked(tmp_path, _fake_qb_start(tmp_path, answer=ENABLED_ANSWER))
+    box.app.fix_issue({"number": 7})
+    box.app.fix_issue({"number": 8})
+    log = tmp_path / "ran.log"                 # never written is an answer, not an error
+    asked = [ln for ln in (log.read_text().splitlines() if log.exists() else [])
+             if ln.startswith("--policy")]
+    assert len(asked) == 2, f"the gate was asked {len(asked)} times for two clicks"
+
+
+def test_the_plan_hammer_goes_through_the_same_gate(tmp_path):
+    """A plan row's ⚒ and an issue row's ⚒ are one verb — that is why they are in
+    the same column — so a gate on one of them and not the other would be the
+    worst of both."""
+    box = _Clicked(tmp_path, _fake_qb_start(tmp_path, answer=OFF_ANSWER, policy_exit=3))
+    box.app.fix_plan_item({"item_id": "abc", "title": "do the thing",
+                           "ref": {"kind": "issue", "value": "7"},
+                           "repo": box.app.repo_slug})
+    assert box.dialogs == [] and box.spawned == [] and box.windowed == []
+    assert "programs.quarterback-harness.spawn.enable" in box.said[-1]
+
+
+# ---- what qb-start answered, as a line somebody reads --------------------------
+
+def _done(returncode: int, stdout: str = "", stderr: str = ""):
+    from subprocess import CompletedProcess
+    return CompletedProcess(["qb-start"], returncode, stdout, stderr)
+
+
+def test_a_started_session_is_reported_with_the_way_to_stop_it():
+    module = _load_app()
+    line = module.spawn_answer("fix-issue-7", _done(
+        0, '{"started": true, "session": "0f2c1d5e-aaaa-bbbb-cccc-ddddeeeeffff"}'))
+    assert "fix-issue-7" in line and "0f2c1d5e" in line and "qb-end" in line
+
+
+def test_a_refusal_is_reported_in_qb_starts_own_words():
+    """Seven refusals with seven different remedies, and a second copy of those
+    sentences in the dashboard would be a second copy to keep true. The last two
+    lines are the verdict and its remedy; the gates print theirs above them."""
+    module = _load_app()
+    line = module.spawn_answer("fix-issue-7", _done(
+        8, "", "qb-claim: held by zeus/seat-1\n"
+               "refused: issue 7 is already claimed\n"
+               "  run `qb-claimed` to see who has it\n"))
+    assert "already claimed" in line and "qb-claimed" in line
+
+
+def test_an_answer_with_no_words_at_all_still_names_the_exit():
+    module = _load_app()
+    assert "9" in module.spawn_answer("fix-issue-7", _done(9, "not json", ""))

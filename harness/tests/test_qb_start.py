@@ -482,6 +482,114 @@ def test_a_dry_run_prints_the_argv_it_would_run(tmp_path):
     assert "'/fix-issue 277'" in got.stderr
 
 
+# ------------------------------- what pulled it, and asking before you pull it
+
+def test_a_caller_can_ask_what_this_machine_will_start_without_asking_for_one(tmp_path):
+    """`--policy` is the question a trigger with a button on it has to ask BEFORE
+    the click. It starts nothing, claims nothing, posts nothing — and `explode` is
+    left ON here, so "consults nothing but the policy file" is a board client that
+    could not have been imported rather than a sentence about one."""
+    box = sandbox(tmp_path, policy=ENABLED)
+    got = run(box, "--policy", "--json", tmux="/tmp/fake,1,0")
+    assert got.returncode == STARTED, got.stderr
+    answer = json.loads(got.stdout)
+    assert answer["enabled"] is True
+    assert answer["commands"] == ["/fix-issue", "/panel-review-pr"]
+    assert answer["max_sessions"] == 2
+    assert got.ran == [], f"asking the question consulted {got.ran}"
+    assert got.posts == []
+
+
+def test_asking_a_machine_that_never_opted_in_gets_the_refusal_and_the_remedy(tmp_path):
+    """The answer a button needs in order to refuse usefully rather than to look
+    live, take the click and only then explain itself."""
+    got = run(sandbox(tmp_path), "--policy", "--json")
+    assert got.returncode == NOT_ENABLED
+    answer = json.loads(got.stdout)
+    assert answer["enabled"] is False
+    assert answer["commands"] == []
+    assert "programs.quarterback-harness.spawn.enable" in answer["reason"]
+    assert got.ran == []
+
+
+def test_the_answer_cannot_widen_the_compiled_in_set_either(tmp_path):
+    """A caller reading `commands` off this and drawing a button for each would
+    otherwise be handed the policy's wishes rather than what would actually run —
+    and then the button it drew would be refused at exit 4."""
+    box = sandbox(tmp_path, policy={"enabled": True,
+                                    "commands": ["/anything-i-like", "/fix-issue"]})
+    got = run(box, "--policy", "--json")
+    assert got.returncode == STARTED
+    assert json.loads(got.stdout)["commands"] == ["/fix-issue"]
+
+
+def test_what_pulled_the_spawn_is_on_the_claim_the_post_and_the_pane(tmp_path):
+    """The question a session nobody started raises, and the only one. Recorded in
+    three places on purpose: the claim is what `qb-claimed` shows, the post
+    outlives the pane, and the pane is what somebody who found a running window
+    can interrogate without leaving tmux."""
+    box = sandbox(tmp_path, policy=ENABLED, explode=False)
+    got = run(box, "/fix-issue", "277", "--via", "dash", tmux="/tmp/fake,1,0")
+    assert got.returncode == STARTED, got.stderr
+    claim = next(ln for ln in got.ran if ln.startswith("qb-claim"))
+    assert "via dash" in claim
+    body = got.posts[0]["body"]
+    assert "via dash" in body["summary"]
+    assert "asked for by: dash" in body["detail"]
+    assert any("@qb_spawn_via dash" in ln for ln in got.ran), \
+        f"the pane should wear its provenance: {got.ran}"
+
+
+def test_a_provenance_stamp_that_fails_does_not_throw_the_session_away(tmp_path):
+    """It is outside the checked three deliberately. `@qb_spawn`, `@qb_session` and
+    `@qb_label` are what make a spawn countable and endable, so a window that lost
+    one is closed rather than run; provenance is a label on a session that is
+    already counted, claimed and endable, and the board post says who asked for it
+    whatever the pane wears."""
+    box = sandbox(tmp_path, policy=ENABLED, explode=False)
+    # A tmux whose `set-option` refuses ONLY the provenance stamp.
+    (box["tools"] / "tmux").write_text(
+        "#!/bin/sh\n"
+        f'printf "%s\\n" "tmux $*" >> {box["log"]}\n'
+        'if [ "$1" = "new-window" ]; then printf "%s\\n" "%9"; exit 0; fi\n'
+        'if [ "$1" = "set-option" ]; then\n'
+        '  case "$*" in *@qb_spawn_via*) exit 1;; esac\n'
+        '  exit 0\n'
+        "fi\n"
+        "exit 0\n")
+    (box["tools"] / "tmux").chmod(0o755)
+    got = run(box, "/fix-issue", "277", "--via", "dash", tmux="/tmp/fake,1,0")
+    assert got.returncode == STARTED, got.stderr
+    assert not any(ln.startswith("tmux kill-pane") for ln in got.ran)
+
+
+def test_a_trigger_the_script_does_not_name_is_refused(tmp_path):
+    """Closed for `SPAWNABLE`'s reason: a provenance field its caller fills in
+    freely is one that can be made to say a human did it."""
+    box = sandbox(tmp_path, policy=ENABLED, explode=False)
+    got = run(box, "/fix-issue", "277", "--via", "a-human-obviously", tmux="/tmp/fake,1,0")
+    assert got.returncode == MISUSE, got.stderr
+    assert got.ran == []
+
+
+def test_a_refusal_records_what_asked_for_it_too(tmp_path):
+    """"The dash was refused forty times today" is a sentence somebody should be
+    able to read off the board, and a refusal that did not say who was refused
+    cannot say it."""
+    box = sandbox(tmp_path, policy=ENABLED, explode=False, admit=1)
+    got = run(box, "/fix-issue", "277", "--via", "dash", tmux="/tmp/fake,1,0")
+    assert got.returncode == FULL
+    assert "asked for by: dash" in got.posts[0]["body"]["detail"]
+
+
+def test_with_no_via_a_spawn_is_recorded_as_a_person_at_a_prompt(tmp_path):
+    """The default, and it is the caller that needs no explaining."""
+    box = sandbox(tmp_path, policy=ENABLED, explode=False)
+    got = run(box, "/fix-issue", "277", tmux="/tmp/fake,1,0")
+    assert "via cli" in next(ln for ln in got.ran if ln.startswith("qb-claim"))
+    assert "asked for by: cli" in got.posts[0]["body"]["detail"]
+
+
 # -------------------------------------------------------- the board record
 
 def test_a_spawn_is_a_post_before_it_is_a_process(tmp_path):
