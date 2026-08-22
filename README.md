@@ -1526,6 +1526,7 @@ full — including what was broken before it, which is the part no diff recovers
 - **v2.95** — a pull request that ships something is asked whether it wrote an entry.
 - **v2.96** — a round cap and a spend ceiling the worker enforces on itself.
 - **v2.97** — the loop gains a beginning: the dashboard's ⚒ starts a session through `qb-start`.
+- **v2.98** — two branches can no longer mint the same migration id.
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
   roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps
@@ -1774,8 +1775,10 @@ uv run --extra dev --extra tui pytest -q
 
 ### Database migrations
 
-Four rules. The first two are enforced by tests; the other two cannot be, and are here
-because the failures they prevent are silent and land on somebody else's machine.
+Five rules. Three are enforced — by `test_migrations_self_contained.py`,
+`test_migration_ids.py`, and the head checks in CI and `pre-push`. The other two cannot be,
+and are here because the failures they prevent are silent and land on somebody else's
+machine.
 
 **Never stamp, always upgrade.** `alembic stamp` records a revision in `alembic_version`
 without executing its SQL, so the version table asserts a schema that was never built. The
@@ -1801,9 +1804,12 @@ new-column code deploys. So write the SQL into the migration — `op.*`, `sa.tab
 that list in a comment.
 
 **More than one row in `alembic_version` is a multi-head state.** The fix is a merge
-migration, not a stamp. Two branches minting the same number is the way this repo reaches it
-(revision identity here *is* the number, #341), and `scripts/migration_reconcile.py` is the
-tool that renumbers and relinks before the merge rather than after.
+migration, not a stamp. `scripts/migration_reconcile.py` is the tool that relinks — and, for
+the legacy chain only, renumbers — before the merge rather than after.
+
+**A revision id is opaque, and the ones that are not are frozen.** New migrations are named
+`m` plus eight hex digits; `0001` … `0034` keep their numbers forever. Why, and what to do
+about it, is [below](#two-schemes-in-one-directory).
 
 What enforces what:
 
@@ -1811,10 +1817,11 @@ What enforces what:
 |---|---|---|
 | `tests/test_migrations_self_contained.py` | AST-scans `migrations/versions/` against an **allowlist** — the standard library plus `alembic`/`sqlalchemy` — covering both import spellings, module-level and function-local, and constant-string `importlib.import_module`/`__import__` | no database, no app import, milliseconds |
 | `tests/test_migration_drift.py` | builds a throwaway database, replays every revision from empty, and diffs the result against `app.models` | one database, about a second |
-| `scripts/migration_reconcile.py` | renumber-and-relink when two branches both mint the next number | git only, no database |
+| `tests/test_migration_ids.py` | pins every legacy id against a rename, and refuses a new revision that carries a chain number | no database, milliseconds |
+| `scripts/migration_reconcile.py` | relinks a branch's base onto the integration head; renumber-and-relink for the legacy chain only | git only, no database |
 | `migration-heads` CI job | refuses a pull request whose **merge** would leave the base with more than one Alembic head, reporting the reconciler's own head list | git only, no database, seconds |
 
-`harness/githooks/pre-push` asks the multi-head question too, and in this fleet it is never the one that answers: it gates that check on the branch being protected, and `gh pr merge` goes through the GitHub API and touches no local hook at all. So the CI job is where it actually fires and the hook is the backstop for a direct push to `main` (#343, #351). Neither sees a revision id minted by two branches that have **both** yet to land — each is single-headed on its own, and the duplicate exists only in their union. That is #338, and #341 closes it by hash-naming revisions so the collision cannot be made rather than being caught after.
+`harness/githooks/pre-push` asks the multi-head question too, and in this fleet it is never the one that answers: it gates that check on the branch being protected, and `gh pr merge` goes through the GitHub API and touches no local hook at all. So the CI job is where it actually fires and the hook is the backstop for a direct push to `main` (#343, #351). Neither sees a revision id minted by two branches that have **both** yet to land — each is single-headed on its own, and the duplicate exists only in their union. That is #338. #341 closes it from the other end rather than by adding a third check: a revision id is now opaque, so two branches mint different ones and their union is an ordinary two-head graph — which is precisely what these two do catch.
 
 The two tests are one mechanism in two halves: the drift test is where an app-importing
 migration *detonates*, and the AST scan is what stops it being written. An allowlist rather
@@ -1831,21 +1838,64 @@ repos: drop it into a `tests/`, adjust the four constants at the top. The two fi
 pinned byte-identical below their constants by a test in the copy here, so the one you are
 given is the one that runs.
 
+#### Two schemes in one directory
+
+`migrations/versions/` holds `0034_canonical_dial_and_worktree_repo.py` and
+`mdee05a89_the_first_opaque_revision_id.py` side by side, and that is deliberate.
+
+`0001` … `0034` are the **legacy chain**: hand-numbered, so the id *is* the position. That
+is what made a collision possible at all — the next number is a value two branches can both
+work out. On 2026-08-22 four of them worked out `0029`. Every one of the four ran
+`migration_reconcile.py preflight`, every one was told GO, and not one answer was wrong: each
+branch really was a single clean chain on main's head. The duplicate existed only in the
+union of four branches none of which had landed, which no check reading one ref against a
+base can see. It surfaced in CI as *"Multiple head revisions are present"*, and settling it
+took five preflight runs, three renumbers and three rebuilt worktree databases.
+
+Everything written since is **opaque**: `m` and eight hex digits, drawn at random rather than
+counted to. Two branches cannot pick the same one, so the same morning under this scheme is
+an ordinary **two-head graph** — a state `migration_reconcile.py heads` counts, the
+`migration-heads` job refuses, and a `relink` resolves without touching anybody's id.
+`tests/test_migration_reconcile.py` replays that morning under both schemes side by side.
+
+**Nothing was renamed to get here, and nothing will be.** A renumber rewrites `revision`, and
+`revision` is what `alembic_version` stores — rename one and every database that has applied
+it names a revision the repository no longer has. That is not theoretical; it is what cost
+three worktree databases on the 22nd. So the legacy ids are frozen, pinned file by file in
+`tests/test_migration_ids.py`, and `scripts/migration_reconcile.py` keeps its renumber path
+for the only branch that can still need it: one cut before the change, carrying a number
+somebody else also took.
+
 #### Writing one
 
 ```bash
-# --rev-id is not optional here: revision identity IS the number, and alembic's
-# default is a random hash. The filename follows from it (`0033_<slug>.py`).
-.venv/bin/alembic revision --autogenerate --rev-id 0033 -m "what it does"
+# No --rev-id. migrations/env.py mints an opaque one (`m` + 8 hex) for every
+# generated revision, and the filename follows from it (`m7f2a91c4_<slug>.py`).
+.venv/bin/alembic revision --autogenerate -m "what it does"
 
 # Review what autogenerate wrote — it misses renames (it sees a drop and a create),
 # server defaults and anything that is not a table, column, index or constraint.
 .venv/bin/alembic upgrade head
-.venv/bin/pytest -q tests/test_migration_drift.py tests/test_migrations_self_contained.py
+.venv/bin/pytest -q tests/test_migration_drift.py tests/test_migrations_self_contained.py \
+                   tests/test_migration_ids.py
 ```
 
-If someone else lands `0033` first, `scripts/migration_reconcile.py` renumbers yours onto
-the new head rather than leaving two revisions claiming one id.
+The hook lives in `migrations/env.py`, so it fires wherever alembic runs that file — which
+is `--autogenerate` and nothing else. A bare `alembic revision`, or `alembic merge heads`,
+keeps alembic's own 12-hex id; ask for one instead:
+
+```bash
+.venv/bin/alembic merge heads -m "merge X and main heads" \
+    --rev-id "$(scripts/migration_reconcile.py new-id)"
+```
+
+An explicit `--rev-id` is honoured rather than overridden, including one that looks like an
+id alembic would have generated. A *number* passed that way is refused by
+`tests/test_migration_ids.py` rather than quietly renamed — being told beats being
+corrected.
+
+If someone else lands a migration first, `scripts/migration_reconcile.py` relinks yours onto
+the new head. Your revision keeps the id it was born with.
 
 ### Layout
 
@@ -1885,7 +1935,9 @@ app/          FastAPI service
                    needs-human/* GitHub labels it projects onto (no model, no I/O)
   api/board_view.py GET / (browser board — read and answer) + GET /panel (leaderboard);
                    static/board.html, static/reviews.html
-migrations/   Alembic (async), a hand-numbered linear chain 0001 → 0032. 0001-0013:
+migrations/   Alembic (async), one linear chain under two naming schemes: 0001 → 0034
+              hand-numbered and frozen, everything above it an opaque `m<8 hex>` id
+              minted by env.py's process_revision_directives hook (#341). 0001-0013:
               posts+trigger, blobs/sessions/leases, refs+worktrees, session
               cwd/title/recap/model, post session, subagents, lease repo, worktree
               sync, review stats + reports, agent names. Each file's own docstring
@@ -1904,6 +1956,8 @@ tests/        end-to-end tests against real Postgres (conftest.py shared fixture
   test_migrations_self_contained.py  the allowlist keeping a migration from
                    importing live app code (no database; also the guard shipped
                    in harness/templates/)
+  test_migration_ids.py              the frozen legacy ids and the rule that a
+                   new revision is never a chain number (no database)
 harness/      step 2 of the install — the workflow the board coordinates
   loops/           panel.py (reviewer panel), epic.py, lander.py, harness_rules.py
                    needs_human.py — the one door an escalation leaves by (#274)

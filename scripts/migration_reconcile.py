@@ -1,24 +1,44 @@
 #!/usr/bin/env python3
 """Deterministic Alembic migration-graph reconciler for quarterback.
 
-`migrations/versions/` is a hand-numbered linear chain — `0017_review_provenance.py`
-declares `revision = "0017"` and `down_revision = "0016"`. Several agents work this
-repo at once, so the first two branches to need a schema change both write the next
-number. That costs two things at once, and only the first is what lexray's reconciler
-(the donor for this file) was built for:
+`migrations/versions/` holds two eras of revision id and the directory shows both.
+`0001_initial.py` … `0034_canonical_dial_and_worktree_repo.py` are the **legacy chain**:
+hand-numbered, so `0017_review_provenance.py` declares `revision = "0017"` and
+`down_revision = "0016"`, and the id *is* the chain position. Everything written after
+#341 gets an **opaque id** instead — `m` and eight hex digits, minted by
+`new_revision_id()` below and handed to `alembic revision --autogenerate` by
+`migrations/env.py`, so nobody has to remember. Nothing was renamed to get there, and
+that was the point: a renumber rewrites `revision`, `revision` is what `alembic_version`
+stores, and a mass rename would have made every database in the fleet lie about itself
+at once. The legacy ids keep their numbers for good.
+
+Hand-numbering costs two things at once when two branches both need the next number,
+and only the first is what lexray's reconciler (the donor for this file) was built for:
 
   * **Two Alembic heads** — `alembic upgrade head` refuses to run, and the deployed
     database is left unable to advance.
   * **A duplicate revision id.** lexray's revisions are hash-named, so two branches
-    can never pick the same one. Here the id *is* the number, so both branches write
-    `revision = "0018"`. Git conflicts on neither (the filenames differ), and a
-    graph-only reconciler reports the merge CLEAN: id `0018` is present at both refs
-    with the same `down_revision`, so nothing looks rewritten, and the branch's real
-    work is excluded from `branch_new` as "already present". The wrong answer is the
-    reassuring one, which is why this case is detected before anything else.
+    can never pick the same one. Under a number, the id *is* the number, so both
+    branches write `revision = "0018"`. Git conflicts on neither (the filenames
+    differ), and a graph-only reconciler reports the merge CLEAN: id `0018` is present
+    at both refs with the same `down_revision`, so nothing looks rewritten, and the
+    branch's real work is excluded from `branch_new` as "already present". The wrong
+    answer is the reassuring one, which is why this case is detected before anything
+    else.
 
-So quarterback's resolution is **renumber-and-relink**, not lexray's relink: rename
-the file, rewrite `revision`, and rewrite `down_revision` onto the integration head.
+So quarterback has two resolutions where lexray has one, and which one you get is now
+decided by the id the branch carries:
+
+  * **relink** — rewrite the branch's base `down_revision` onto the integration head,
+    leaving every id alone. Two branches with opaque ids can only ever reach an
+    ordinary two-head graph, which this resolves, and it is what every migration
+    written from now on will get.
+  * **renumber-and-relink** — rename the file, rewrite `revision`, and relink. Only a
+    numbered id can need this, so it is the **legacy path**: a branch that has been in
+    flight since before #341 and minted `0035` while somebody else did too. It is kept
+    rather than deleted because such a branch is still legal and still collides; it is
+    no longer reachable for new work, because a new revision does not carry a number
+    to contest.
 
 Everything is computed from the migration files **at a git ref, never from a live
 database**. The deployed database is at whatever revision the last Portainer deploy
@@ -63,6 +83,7 @@ Usage (the file has a shebang and the executable bit; `python scripts/… ` work
     migration_reconcile.py apply     [--repo DIR] [--versions-path DIR] \
                                      [--onto REF] [--branch REF] [--json]
     migration_reconcile.py heads     [--repo DIR] [--versions-path DIR] [--ref REF]
+    migration_reconcile.py new-id
 """
 
 from __future__ import annotations
@@ -72,6 +93,7 @@ import ast
 import hashlib
 import json
 import re
+import secrets
 import shlex
 import subprocess
 import sys
@@ -112,12 +134,81 @@ class ApplyError(ReconcileError):
 #: The three module-level assignments Alembic reads out of a migration.
 _META = ("revision", "down_revision", "depends_on")
 
-#: A revision id that encodes its own position in the chain. quarterback's whole
-#: numbering convention, and the thing that makes a collision possible at all.
+#: A revision id that encodes its own position in the chain. quarterback's legacy
+#: numbering convention, and the thing that makes a collision possible at all: the
+#: next number is a value two branches can both work out. `0001` … `0034` match; no
+#: id minted after #341 does, which is what retires the collision rather than
+#: detecting it.
 _NUM_ID_RE = re.compile(r"^(\d{4,})$")
 
 #: `0017_review_provenance.py` -> ("0017", "review_provenance")
 _FILENAME_RE = re.compile(r"^(?P<num>\d{4,})_(?P<slug>.+)\.py$")
+
+#: The shape `new_revision_id` mints, and the one `migrations/env.py` puts on every
+#: new revision. `tests/test_migration_ids.py` is where it is enforced on the files.
+_HASH_ID_RE = re.compile(r"^m[0-9a-f]{8}$")
+
+#: Hex digits of randomness in a minted id. Eight is 4.3e9 values, so the birthday
+#: probability of any two of a thousand migrations sharing an id is about 1.2e-4 —
+#: and a thousand is far beyond the span this scheme has to survive (34 revisions in
+#: five months). It is also short enough to type into a `down_revision` by hand, which
+#: four is not: 65536 values puts a hundred migrations at a 7% chance of collision,
+#: and the one thing this id may not do is collide.
+_ID_HEX_DIGITS = 8
+
+
+def new_revision_id() -> str:
+    """A fresh opaque revision id: ``m`` and eight hex digits.
+
+    Random rather than derived from anything — an issue number, a branch name, a
+    timestamp, a content hash. Each of those is a value a second branch can also
+    compute, and a shared computation is exactly the property that let four branches
+    mint ``0029`` on one morning. The id has to come out of a namespace nobody is
+    counting through.
+
+    The ``m`` prefix is not decoration. Without it a hex id comes out all digits about
+    one time in 43, and ``_NUM_ID_RE`` would then read it as a chain position of ninety
+    million and hand it to the legacy renumber path. A leading letter keeps the two
+    namespaces disjoint by construction rather than by luck.
+    """
+    return "m" + secrets.token_hex(_ID_HEX_DIGITS // 2)
+
+
+#: What `alembic.util.rev_id()` produces: `uuid4().hex[-12:]`. Recognising it is how
+#: `adopt_revision_id` tells an id ALEMBIC picked from one a PERSON picked.
+_ALEMBIC_DEFAULT_ID_RE = re.compile(r"^[0-9a-f]{12}$")
+
+
+def adopt_revision_id(chosen: str | None, *, explicit: bool = False) -> str:
+    """The id a newly generated revision should carry, given the one alembic picked.
+
+    `migrations/env.py` calls this from its `process_revision_directives` hook, which
+    is what makes `alembic revision --autogenerate -m "..."` produce a hash-named
+    revision with no flag to remember. It is here rather than there because this file
+    is where every revision-id shape is already defined, and because env.py runs the
+    migrations on import and so cannot be imported by a test.
+
+    `explicit` is the caller reporting that a person named the id — `--rev-id` on the
+    command line. It is kept untouched: that flag is the only way to write a merge or a
+    fixup revision under a known id, and a tool that silently overrides its caller's
+    stated choice is the bug #97 is about. A hand-picked id that should NOT have been
+    picked — `0035`, say — is caught by `tests/test_migration_ids.py` rather than
+    papered over here, because being told is more useful than being corrected.
+
+    Without that signal the id is judged by its shape, and only alembic's own
+    `uuid4().hex[-12:]` is replaced. That fallback covers the programmatic entry point
+    (`alembic.command.revision(config, rev_id=...)`), where there are no parsed command
+    options to read, and it has one blind spot worth naming: an explicit id that is
+    itself twelve lowercase hex characters is indistinguishable from a generated one
+    and would be replaced. Nothing in this repo takes that path — the CLI always passes
+    `explicit` — and the alternative, trusting every id that arrives, would mean no id
+    was ever replaced at all.
+    """
+    if explicit and chosen:
+        return chosen
+    # `not chosen` rather than `chosen is None`: an empty string is not an id either,
+    # and returning it would write `revision = ""` into a migration file.
+    return new_revision_id() if not chosen or _ALEMBIC_DEFAULT_ID_RE.match(chosen) else chosen
 
 
 @dataclass(frozen=True)
@@ -733,20 +824,25 @@ def reconcile(
             guards=guards,
         )
 
-    onto_by_id = _by_id(onto_revs)
-    head_number = onto_by_id[onto_head].number
+    taken = {r.number for r in onto_revs if r.number is not None}
+    # The highest chain position in use at the integration ref, and the floor a
+    # renumber allocates above. That is the integration HEAD's own number only while
+    # the chain is entirely numbered. Once an opaque id is the head (#341) the head
+    # has no number at all — while `0001` … `0034` are still down there, still
+    # contestable by a branch that was cut before the scheme changed — so keying off
+    # the head would refuse every legacy renumber from that day on, and refuse it
+    # with "not a chain number", which is true of the head and beside the point.
+    ceiling = max(taken, default=None)
 
     # Renumber when an id is contested, and also when the branch's numbers merely sit
-    # at or below the integration head — a number that no longer states its own
-    # position is the collision one merge away, and the fix is identical.
+    # at or below that ceiling — a number that no longer states its own position is
+    # the collision one merge away, and the fix is identical.
     stale_numbers = [
-        r.id
-        for r in chain
-        if r.number is not None and head_number is not None and r.number <= head_number
+        r.id for r in chain if r.number is not None and ceiling is not None and r.number <= ceiling
     ]
     if collisions or stale_numbers:
         unnumbered = [r.id for r in chain if r.number is None]
-        if unnumbered or head_number is None:
+        if unnumbered or ceiling is None:
             blocker = unnumbered or [onto_head]
             if collisions:
                 return Plan(
@@ -769,9 +865,13 @@ def reconcile(
                 branch_head=branch_heads[0],
                 guards=guards,
             )
-        width = max(len(onto_head), max(len(r.id) for r in chain))
-        taken = {r.number for r in onto_revs if r.number is not None}
-        numbers = _allocate(taken, head_number, len(chain))
+        # Zero-padding width comes from the NUMBERED ids only. `onto_head` is in that
+        # set while the chain is all-numeric and is nine characters wide once it is an
+        # opaque id, which would pad the next legacy number out to `000000036`.
+        # `unnumbered` above proved every chain rev carries a number, and `ceiling`
+        # proved the integration ref carries at least one, so this is never empty.
+        width = max(len(r.id) for r in (*onto_revs, *chain) if r.number is not None)
+        numbers = _allocate(taken, ceiling, len(chain))
         id_map = {r.id: str(n).zfill(width) for r, n in zip(chain, numbers, strict=True)}
         renames, prev = [], onto_head
         for r, num in zip(chain, numbers, strict=True):
@@ -1255,7 +1355,10 @@ def _print_plan(plan: Plan, merged_ok: bool | None, merged_heads: list[str] | No
             if rn.new_path != rn.old_path:
                 print(f"  rename {rn.old_path} -> {rn.new_path}")
     if plan.action == "merge":
-        print("  run: uv run alembic merge heads -m 'merge <branch> and main heads'")
+        print(
+            "  run: uv run alembic merge heads -m 'merge <branch> and main heads' \\\n"
+            '         --rev-id "$(scripts/migration_reconcile.py new-id)"'
+        )
     if merged_ok is not None:
         print(f"merged single head: {merged_ok} {merged_heads}")
     for w in plan.warnings:
@@ -1426,7 +1529,8 @@ def cmd_apply(args: argparse.Namespace) -> int:
     elif plan.action == "merge":
         messages = [
             "merge migration required — this needs alembic, not a file edit:",
-            "  uv run alembic merge heads -m 'merge <branch> and main heads'",
+            "  uv run alembic merge heads -m 'merge <branch> and main heads' \\",
+            '         --rev-id "$(scripts/migration_reconcile.py new-id)"',
         ]
     elif plan.action == "noop":
         messages = ["nothing to do: " + plan.reason]
@@ -1471,6 +1575,19 @@ def cmd_heads(args: argparse.Namespace) -> int:
     return 0 if len(h) == 1 or not revs else 2
 
 
+def cmd_new_id(args: argparse.Namespace) -> int:
+    """Mint one opaque revision id and print it.
+
+    `migrations/env.py` calls `new_revision_id()` directly, so `alembic revision
+    --autogenerate` needs nothing from here. This verb is for the two spellings that
+    reach past that hook: `alembic merge heads --rev-id "$(… new-id)"`, which alembic
+    numbers itself without consulting `process_revision_directives`, and a human
+    writing a revision file by hand.
+    """
+    print(new_revision_id())
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -1509,6 +1626,9 @@ def main(argv: list[str] | None = None) -> int:
     common(hd)
     hd.add_argument("--ref", default="HEAD")
     hd.set_defaults(func=cmd_heads)
+
+    ni = sub.add_parser("new-id", help="mint an opaque revision id (m + 8 hex)")
+    ni.set_defaults(func=cmd_new_id)
 
     args = p.parse_args(argv)
     try:
