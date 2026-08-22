@@ -264,6 +264,174 @@ def test_an_unnumbered_id_with_no_collision_still_falls_back_to_the_merge_migrat
 
 
 # ---------------------------------------------------------------------------
+# 2026-08-22 replayed: four branches, one number — and the same morning under
+# opaque ids
+# ---------------------------------------------------------------------------
+#
+# What happened. main was at `0028`. Four branches — #329, #331, #333 and one
+# more — each cut from it, each needed a schema change, and each wrote the next
+# number. All four ran `preflight`; all four were told GO; none of the answers was
+# wrong, because at the moment it was asked each branch really was a single clean
+# chain sitting on main's head. The duplicate existed only in the union of four
+# branches none of which had landed, and no check that reads one ref against a
+# base can see that (#338). It surfaced in CI as "Multiple head revisions are
+# present", cost five preflight runs, three renumbers and three rebuilt worktree
+# databases.
+#
+# The tests below run that morning twice: once with the numbers it actually had,
+# and once with the ids `new_revision_id` mints. Nothing about the *process*
+# changes — the same four agents, equally ignorant of each other, still get four
+# GOs. What changes is what their union is: an unloadable graph carrying a
+# duplicate id, or an ordinary two-head graph that every guard in this repo
+# already refuses and `relink` already resolves.
+
+#: The four branches, by issue number.
+FOUR = ("329", "331", "333", "336")
+
+
+def _morning(ids):
+    """main at `0028`, and four branches that each cut from it and added one
+    migration under the id they were given."""
+    main = chain("0026", "0027", "0028")
+    branches = [
+        [*main, rev(i, "0028", slug=f"issue_{n}", col=f"c{n}")]
+        for i, n in zip(ids, FOUR, strict=True)
+    ]
+    return main, branches
+
+
+ANCESTORS = frozenset({"0026", "0027", "0028"})
+
+
+def test_every_branch_gets_a_truthful_go_under_either_scheme():
+    """The premise of the whole reconstruction: preflight was not broken, and
+    hash-naming does not make it any less blind. Each branch is a clean chain on
+    main's head whichever id it carries, and each is told so."""
+    for ids in (["0029"] * 4, [mr.new_revision_id() for _ in range(4)]):
+        _main, branches = _morning(ids)
+        for branch in branches:
+            plan = mr.reconcile(_main, branch, ANCESTORS)
+            assert (plan.action, plan.go, plan.exit_code) == ("noop", True, 0)
+
+
+def test_four_branches_cannot_mint_one_opaque_id():
+    """The property the scheme buys, stated on the generator rather than inferred:
+    four independent draws are four different ids, and none is a chain number any
+    fifth branch could arrive at by counting."""
+    ids = [mr.new_revision_id() for _ in FOUR]
+    assert len(set(ids)) == 4
+    assert all(mr.Rev(i).number is None for i in ids)
+
+
+def test_under_numbers_two_landed_branches_are_a_duplicate_id_reporting_one_head():
+    """The union of two of them, as git would leave it: both files land, because
+    git conflicts on neither — the filenames differ and the additions do not
+    overlap. `heads()` is keyed by id, so it folds the two into one node and
+    answers `["0029"]`: a single head, which is the reassuring wrong answer.
+    Alembic will not load that graph at all."""
+    _main, branches = _morning(["0029"] * 4)
+    union = [*_main, branches[0][-1], branches[1][-1]]
+
+    assert mr.duplicate_ids(union) == ["0029"]
+    assert mr.heads(union) == ["0029"]
+    assert len({r.path for r in union if r.id == "0029"}) == 2
+
+
+def test_under_opaque_ids_the_same_two_branches_are_an_ordinary_two_head_graph():
+    """Same morning, same ignorance, same merge — and now the union is a state
+    that has a name, that `migration_reconcile.py heads` counts, and that the
+    `migration-heads` job and `pre-push` both already refuse."""
+    ids = [mr.new_revision_id() for _ in FOUR]
+    _main, branches = _morning(ids)
+    union = [*_main, branches[0][-1], branches[1][-1]]
+
+    assert mr.duplicate_ids(union) == []
+    assert sorted(mr.heads(union)) == sorted(ids[:2])
+
+
+def test_the_second_opaque_branch_relinks_onto_the_first_renaming_nothing():
+    """And the two-head graph never has to happen: with the first branch landed,
+    the second reconciles by moving its own `down_revision`. No id changes, so no
+    database that has applied either revision is left naming one that is gone —
+    which is the entire reason the legacy chain was not rewritten to match."""
+    ids = [mr.new_revision_id() for _ in FOUR]
+    _main, branches = _morning(ids)
+    onto = [*_main, branches[0][-1]]
+
+    plan = mr.reconcile(onto, branches[1], ANCESTORS)
+
+    assert (plan.action, plan.go, plan.exit_code) == ("relink", True, 0)
+    assert plan.renames == []
+    assert plan.new_down == (ids[0],)
+    assert mr.verify_single_head(mr.simulate_merged(onto, branches[1], plan)) == (
+        True,
+        [ids[1]],
+    )
+
+
+def test_all_four_land_in_turn_and_no_revision_id_ever_changes():
+    """The morning played out to the end. Each branch reconciles against a main
+    that has moved under it, relinks, and lands; the next one does the same. Five
+    preflight runs and three renumbers becomes four relinks, and the id every one
+    of these revisions was born with is the id it lands with."""
+    ids = [mr.new_revision_id() for _ in FOUR]
+    _main, branches = _morning(ids)
+    onto = list(_main)
+
+    for i, branch in enumerate(branches):
+        plan = mr.reconcile(onto, branch, ANCESTORS)
+        assert plan.action in ("noop", "relink"), (i, plan.action, plan.reason)
+        assert plan.renames == []
+        merged = mr.simulate_merged(onto, branch, plan)
+        assert mr.verify_single_head(merged) == (True, [ids[i]])
+        onto = merged
+
+    assert sorted(r.id for r in onto) == sorted(["0026", "0027", "0028", *ids])
+
+
+# --- the legacy path, which stays reachable for branches that predate the scheme
+
+
+def test_a_branch_that_minted_the_next_number_first_still_relinks_onto_an_opaque_head():
+    """A branch cut before #341 carries `0029`. By the time it lands, main's head
+    is an opaque id. Nothing is contested and `0029` is above every number in use,
+    so it lands as written with its base moved — a numbered revision sitting on top
+    of a hash-named one, which is what a mixed chain looks like."""
+    opaque = "m7f2a91c4"  # literal: this is about the graph, not about the generator
+    onto = [*chain("0026", "0027", "0028"), rev(opaque, "0028", slug="seam", col="seam")]
+    branch = [*chain("0026", "0027", "0028"), rev("0029", "0028", slug="mine", col="mine")]
+
+    plan = mr.reconcile(onto, branch, ANCESTORS)
+
+    assert plan.action == "relink" and plan.new_down == (opaque,)
+    assert mr.verify_single_head(mr.simulate_merged(onto, branch, plan)) == (True, ["0029"])
+
+
+def test_a_contested_legacy_number_is_still_renumbered_under_an_opaque_head():
+    """Renumber-and-relink is kept, not deleted, and this is the case that needs
+    it: two branches that both predate #341 minted `0028`, and one has landed
+    beneath an opaque head. The head carries no number, so the next free position
+    is derived from the numbers actually in use — keying it off the head would
+    refuse every legacy renumber from the day the first opaque id landed, and
+    refuse it as "not a chain number", which is true of the head and beside the
+    point."""
+    opaque = "m7f2a91c4"  # literal: this is about the graph, not about the generator
+    onto = [
+        *chain("0026", "0027"),
+        rev("0028", "0027", slug="theirs", col="theirs"),
+        rev(opaque, "0028", slug="seam", col="seam"),
+    ]
+    branch = [*chain("0026", "0027"), rev("0028", "0027", slug="mine", col="mine")]
+
+    plan = mr.reconcile(onto, branch, frozenset({"0026", "0027"}))
+
+    assert plan.action == "renumber" and plan.collisions == ["0028"]
+    assert [(r.old_id, r.new_id, r.new_down) for r in plan.renames] == [("0028", "0029", (opaque,))]
+    assert plan.renames[0].new_path == "migrations/versions/0029_mine.py"
+    assert mr.verify_single_head(mr.simulate_merged(onto, branch, plan)) == (True, ["0029"])
+
+
+# ---------------------------------------------------------------------------
 # collision vs rewrite
 # ---------------------------------------------------------------------------
 
