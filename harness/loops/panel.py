@@ -128,6 +128,13 @@ import panel_rounds              # noqa: F401
 from panel_preflight import *     # noqa: F401,F403
 import panel_preflight            # noqa: F401
 
+# The caps (#55) — the board's round ceiling and the spend ceiling, and what an
+# unverifiable ceiling means. Deliberately NOT star-imported, for `panel_timing`'s
+# reason with more force: a cap is policy, `panel_caps.` on every call site is what
+# makes "where is the ceiling checked" answerable with one grep, and a bare
+# `check(...)` in this file would read like one of the dozen local helpers.
+import panel_caps                 # noqa: F401
+
 # Where the round's wall clock went (#192). Its own module, and deliberately NOT
 # star-imported: nothing here calls it as a bare global, so an explicit import
 # keeps `panel_timing.` on every call site and makes the instrumentation greppable
@@ -641,7 +648,12 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # The eight `review_panel` settings that trade thoroughness against convergence,
     # resolved once (`panel_seats.resolve_dials`) so the prompt, the report, the stop
     # rule and the payload cannot disagree about which policy this round ran under.
-    dials = resolve_dials(panel, max_rounds, notes)
+    # #55's round ceiling, resolved before the dials because it is an INPUT to
+    # them. `None` unless the board stated `review_panel.max_rounds` itself, and
+    # `None` is exactly today's behaviour — which is what lets this land on a fleet
+    # that has set no dial and change nothing at all.
+    round_cap_ceiling, _ceiling_said = panel_caps.round_ceiling(cfg)
+    dials = resolve_dials(panel, max_rounds, notes, round_cap_ceiling)
     cap = dials.max_rounds
     # #84's futility brake, from the round's side. Resolved beside the dials and for
     # the same reason: a rules file with a bad `escalate_on` has to say so whether or
@@ -666,7 +678,16 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # merge gate, which reads `reviewed`/`skip_reason` off the payload precisely
     # because a zero exit, a push and the existence of a payload have each been
     # mistaken for a review in turn (see `epic.sub_pr_merge` in the sample).
-    refusal = review_refusal(cfg)
+    # `enabled: false` — the repo's off switch, honoured here for the first time.
+    # `lander.py` has read it since it existed and the review paths never did, so a
+    # repo that had switched itself off still got panelled. It rides on
+    # `review_refusal`'s path rather than beside it because it is the same KIND of
+    # answer: per-repo, terminal, decided before an API call is spent, and not a
+    # review that happened. #55's fourth acceptance criterion is served by the dial
+    # behind it (`POST /dials {"dial": "enabled", "value": false, "repo": …}`),
+    # which takes effect on the next resolution rather than the next restart —
+    # `resolve_repo` reads the board on every run.
+    refusal = panel_caps.enabled_refusal(cfg) or review_refusal(cfg)
     if refusal:
         # Its own stream selection rather than `chatter`, which is assigned below the
         # PR fetch this refusal exists to skip.
@@ -711,12 +732,31 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # branch on the spot, writing "round cap (2) reached — …, unreviewed" into a round
     # 3 whose caller believed it had asked for more.
     if round_no > cap:
-        blame = ("--max-rounds" if max_rounds is not None
+        # The BOARD's ceiling is named first when it is what bound, because the two
+        # remedies differ and only one of them is available to the person reading
+        # this: a repo cap is raised by editing a file, and a fleet ceiling is not
+        # raisable from here at all (#55).
+        blame = (f"`review_panel.max_rounds` ({round_cap_ceiling}) set on the board"
+                 if round_cap_ceiling is not None and cap == round_cap_ceiling
+                 else "--max-rounds" if max_rounds is not None
                  else f"`review_panel.max_rounds` ({panel.get('max_rounds')})"
                  if panel.get("max_rounds") not in (None, "") else
                  f"the default cap of {DEFAULT_MAX_ROUNDS}")
+        remedy = ("this ceiling is fleet policy and cannot be raised from inside the "
+                  "repo being reviewed — clear or move the dial on the board"
+                  if round_cap_ceiling is not None and cap == round_cap_ceiling
+                  else "raise the cap")
         sys.exit(f"panel: --round {round_no} is past the cap of {cap}, from {blame}: "
-                 "raise the cap, or pass the round this run actually is")
+                 f"{remedy}, or pass the round this run actually is")
+
+    # #55's spend ceiling, RESOLVED here and CHECKED further down. The two halves
+    # are split because they cost different things and want different moments: this
+    # one is pure validation over the resolved rules, so a typo'd ceiling dies
+    # beside the other bad-dial refusals and before an API call is spent on a run
+    # that cannot proceed; the board read that checks it against what has actually
+    # been spent waits until this PR is known to be one the panel would review at
+    # all. Dormant unless somebody has set a number.
+    budget = panel_caps.resolve_budget(panel, notes)
 
     # Resolved before anything is fetched, so a typo'd --reviewers fails on the
     # spot rather than after a PR read and a diff download.
@@ -962,6 +1002,24 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             if json_out:
                 print(json.dumps(skipped_payload, indent=2))
             return finish(failed)
+    # #55's spend ceiling, checked at last — past the title-pattern skip and long
+    # before a seat is dispatched, which is the issue's requirement that enforcement
+    # happen before the spend rather than after it.
+    #
+    # AFTER the title skip and not before it, and that is a correctness ordering
+    # rather than one fewer request. A title-skipped PR spends nothing, so a ceiling
+    # has nothing to say about it — and an unattended run whose board is unreachable
+    # REFUSES on an unverifiable ceiling, which checked earlier would have turned a
+    # release-merge that costs zero into a refusal. Cheap for the same reason: with
+    # every ceiling unset this makes no board call at all.
+    #
+    # The verdict is carried to the pre-flight gate rather than acted on here, for
+    # the reason the mergeability precondition is: everything a refusal needs — the
+    # payload, `skip_reason`, the per-seat `ran: false` rows, the board record and
+    # the PR comment — already exists down there, and a budget stop that did not
+    # travel it would be the "looks like a clean review" failure #55 names.
+    caps = panel_caps.check(cfg, panel, pr_number, notes, budget=budget)
+
     print(f"\n[{repo_name}#{pr_number}] {title[:60]}", file=chatter)
     print(f"  base={base}  changed={changed} lines\n", file=chatter)
 
@@ -998,7 +1056,8 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         if again:
             mergeable, mergeable_said = mergeability({"mergeable": again})
     gate = mergeable_said if mergeable == "CONFLICTING" and require_mergeable else ""
-    if mergeable == "CONFLICTING" and not gate:
+    merge_gate = gate
+    if mergeable == "CONFLICTING" and not merge_gate:
         notes.append(f"{mergeable_said}. Reviewed anyway because "
                      "`review_panel.require_mergeable` is off for this repo: the "
                      "merged state these findings reason about does not exist yet, "
@@ -1023,6 +1082,26 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # not a satisfied one — and it says the question was put twice, so a reader
         # does not take it for the cold first answer it usually is.
         notes.append(f"{mergeable_said}. It was asked for twice")
+
+    # The spend ceiling outranks the mergeability precondition, and not only
+    # because it was decided first. A CONFLICTING branch is a reason this round
+    # would be WASTED; a reached ceiling is a reason this round may not HAPPEN —
+    # and the second is the one `--force` must not turn into a run, so which of the
+    # two occupies `gate` decides whether the flag works. Naming both would be a
+    # refusal whose remedy list contains one thing the reader cannot do.
+    #
+    # Applied AFTER the mergeability notes rather than instead of them: a round
+    # stopped for spend on a branch that also cannot merge should still say so, in
+    # the payload, where the next round reads it.
+    gate_overridable = not caps.stop
+    if caps.stop:
+        gate = caps.refusal
+        if force:
+            notes.append(
+                "--force did NOT override the spend ceiling. It overrides this "
+                "host's judgement about what its own seats can read; the ceiling "
+                "is a number a person set on the board for the fleet, and a local "
+                "flag that switched it off would make it advice again")
 
     # ---- WHERE THIS BRANCH ACTUALLY FORKED (#241). Past the skip branch, which
     # returns above and must stay free of API calls, and before the diff so that
@@ -1311,6 +1390,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # means an empty `budgets` and nothing to ask about — which is why there is no
     # test for it. It is spelled the safe way because the cost is a dunder.
     pre = preflight(review.target, budgets, panel, notes, forced=force, gate=gate,
+                    gate_overridable=gate_overridable,
                     installed=installed.__contains__)
     if pre.refused:
         # The CI gate, read on a round that dispatches nobody. It is one API call,
@@ -1446,6 +1526,24 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 measured_to="refusal"),
             "run_key": run_key,
         }
+        if caps.stop:
+            # #55's second acceptance criterion, and v2.15 is what serves it: a cap
+            # stop and a convergence are already distinguishable on the board by
+            # `stop_confident`, so this only has to SAY it. Set on the caps refusal
+            # alone and not on the size or mergeability ones — those are "this
+            # round could not usefully read the diff", which leaves the cycle open
+            # and is not a stop; a ceiling ends the cycle whether or not the caller
+            # believed it was driving one.
+            #
+            # `confident: False` is what stops it reading as convergence downstream
+            # — `preland --require-earned-stop` HOLDs on it and the review queue
+            # files it `unconverged` — which is exactly right: a PR that stopped
+            # because the money ran out has not been reviewed to a conclusion.
+            refuse_payload["round_stop"] = {
+                "stop": True, "confident": False, "reason": pre.reason,
+                "veto": [caps.refusal],
+            }
+            refuse_payload["stop_reason"] = pre.reason
         # RECORDED, unlike the title-pattern skip, and that is the difference
         # between the two paths rather than an inconsistency. A title skip says
         # "this PR was never worth a panel"; a refusal says "a panel was wanted

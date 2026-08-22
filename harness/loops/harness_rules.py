@@ -769,6 +769,52 @@ DEFAULTS: dict = {
         # and quietly off is the loudest possible way to make a process look
         # governed.
         "escalate_on": {"premise_repeated": 2},
+        # #55's spend ceiling. EVERY ONE IS `None`, and that is the feature rather
+        # than a placeholder: `None` means "no ceiling", the panel makes no board
+        # call at all when every one of them is `None`, and a fleet that installs
+        # this release spends exactly what it spent before until a human writes a
+        # number. A cap that arrived switched on at a number nobody chose would be
+        # the same mistake as a review nobody configured (`review_refusal`).
+        #
+        # UNITS. Tokens are input + output, which is `/review/stats`' own
+        # `billable` — cached input is a slice OF input and reasoning sits inside
+        # output for some vendors and beside it for others, so adding either
+        # double-counts. #15 landed both halves of that measurement (`ReviewReviewer`
+        # carries the four columns, `panel_seats._usage` emits them only where the
+        # vendor stated them), which is why this ceiling can be denominated in the
+        # honest unit rather than in #55's crude "reviews per day" proxy.
+        #
+        # The RUN ceilings are not the proxy's leftovers. They measure something
+        # tokens cannot: a seat nobody instrumented (`antigravity`) and a run
+        # recorded before v2.14 report no tokens at all, so a token-only ceiling
+        # reads an unmeasured spend as no spend. A run is a row either way.
+        # `runs_per_pr` is also the only one of the five that binds a caller which
+        # renumbers its rounds — `--round 1` costs a round whatever it is called,
+        # and #55's requirement is that the cap holds "whoever or whatever is
+        # driving it".
+        #
+        # WHERE THEY MAY BE SET. On the board, by a person, and nowhere else — see
+        # `BOARD_DIALS` and `app/api/dials.py`. A repo may write them here too and
+        # a board dial of the same name beats what it wrote, which is what makes
+        # the ceiling something the repo under review cannot raise.
+        "budget": {
+            # This repo's own spend over a rolling window (`budget_window_hours`).
+            "tokens_per_day": None,
+            "runs_per_day": None,
+            # This PR's whole life, across every cycle and every head it has had.
+            "tokens_per_pr": None,
+            "runs_per_pr": None,
+            # Every watched repo combined, over the same rolling window. Meant for
+            # the fleet scope (`POST /dials` with no `repo`); set per repo it still
+            # says the same thing about the fleet, which is why it is named for
+            # what it measures rather than for where it is written.
+            "fleet_tokens_per_day": None,
+        },
+        # What "per day" means, in hours. A dial rather than a constant because the
+        # window and the ceiling are one decision — halving the window halves the
+        # ceiling — and a fleet that could set only one of them would be setting a
+        # number whose meaning it could not see.
+        "budget_window_hours": 24,
     },
     "loops": {
         "dependabot_lander": False,
@@ -1486,6 +1532,13 @@ _EXTRA_REVIEWER_FIELDS: dict[str, set[str]] = {
 # is the answer a reserved name deserves and a typo does not.
 _EXTRA_ESCALATE_ON = {"quorum_failed", "judge_absent"}
 
+#: Names a NESTED block accepts beyond the ones DEFAULTS gives it, keyed by the
+#: block's dotted path. Only `escalate_on` has any, and the map exists so that the
+#: descent in `_validated` can be driven off DEFAULTS — a nested block added later
+#: is checked without a second edit here, which is the same rule `BOARD_DIALS`
+#: applies to seats.
+_EXTRA_NESTED: dict[str, set[str]] = {"review_panel.escalate_on": _EXTRA_ESCALATE_ON}
+
 
 def _validated(rules: dict) -> list[tuple[str, dict, set[str]]]:
     """Every mapping in a rules file whose key set is fully known, as
@@ -1500,17 +1553,20 @@ def _validated(rules: dict) -> list[tuple[str, dict, set[str]]]:
         if not isinstance(over, dict) or not isinstance(base, dict):
             continue
         out.append((block, over, set(base)))
-        # `review_panel.escalate_on` is the one non-reviewer setting that is itself
-        # a mapping of names (#84), so it needs the same descent for the same
-        # reason: `escalate_on: {"premise_repeatd": 2}` would otherwise leave the
-        # futility brake at its default with nothing on stderr, on the block that
-        # decides when a cycle stops asking a fixer to patch the same assumption.
-        if block == "review_panel":
-            sub, sub_base = over.get("escalate_on"), base.get("escalate_on")
-            if isinstance(sub, dict) and isinstance(sub_base, dict):
-                out.append((f"{block}.escalate_on", sub, set(sub_base)
-                            | set(_EXTRA_ESCALATE_ON)))
         if block != "reviewers":
+            # Any setting that is ITSELF a mapping of names needs the same descent,
+            # for the reason #84's `escalate_on` needed it first: `escalate_on:
+            # {"premise_repeatd": 2}` leaves the futility brake at its default with
+            # nothing on stderr, and `budget: {"tokens_per_dy": 4e6}` leaves #55's
+            # ceiling absent on the block whose whole job is to stop a spend.
+            # Driven off DEFAULTS rather than named one at a time, so the next
+            # nested block is checked the day it is added rather than the day
+            # somebody notices it is not.
+            for name, sub_base in base.items():
+                sub = over.get(name)
+                if isinstance(sub, dict) and isinstance(sub_base, dict):
+                    out.append((f"{block}.{name}", sub, set(sub_base)
+                                | _EXTRA_NESTED.get(f"{block}.{name}", set())))
             continue
         # Reviewer FIELDS are one level deeper again, and the failure there is
         # the quietest of the lot: `reviewers.pi.enabld` leaves a seat off with
@@ -1829,6 +1885,27 @@ BOARD_DIALS: dict[str, Dial] = {
     # #278's dial, and #84's futility brake.
     "review_panel.distant_merge_lines": Dial("number", True, "either"),
     "review_panel.escalate_on.premise_repeated": Dial("number", True, "either"),
+    # #55's ceiling, and it is the reason this table's `narrow`/`either` split is
+    # not the whole story. These five are `either` — a person may raise a ceiling
+    # as well as lower one, which is the point of a settings channel — but they are
+    # ALSO the only dials whose value is enforced against a MEASUREMENT rather than
+    # applied to a run, and `panel_caps` treats the layer that answered as part of
+    # the answer: a ceiling the board stated cannot be exceeded by the repo's own
+    # file, by `--max-rounds`, or by `--force`. See `panel_caps.ceiling_of`.
+    "review_panel.budget.tokens_per_day": Dial("number", True, "either"),
+    "review_panel.budget.runs_per_day": Dial("number", True, "either"),
+    "review_panel.budget.tokens_per_pr": Dial("number", True, "either"),
+    "review_panel.budget.runs_per_pr": Dial("number", True, "either"),
+    "review_panel.budget.fleet_tokens_per_day": Dial("number", True, "either"),
+    "review_panel.budget_window_hours": Dial("number", False, "either"),
+    # #55's fourth acceptance criterion: turning the watcher off for a repo takes
+    # ONE setting and takes effect on the next resolution rather than the next
+    # restart — which is what a dial is, since `resolve_repo` reads them on every
+    # run. NARROW for `reviewers.<seat>.enabled`'s reason with the halves swapped:
+    # a repo that has switched its own reviews off knows something the board does
+    # not, so the board may turn a repo OFF and may not turn one back ON over the
+    # top of a file that said no.
+    "enabled": Dial("flag", False, _NARROW_ONLY_ENABLED),
     # The boundary case, narrow-only. Filled in below from DEFAULTS' seat list so
     # that a seat added there is settable without a second edit here — a seat named
     # in two places is a seat the two places can disagree about.
@@ -2224,13 +2301,18 @@ def apply_dials(cfg: dict, dials: dict[str, dict]) -> tuple[dict[str, dict], lis
                 f"nothing to override and is ignored")
             continue
         if dial.rule == "narrow" and entry["value"] and not current:
+            # Spelled as the PATH rather than as "a seat", because `enabled` — the
+            # repo's own off switch (#55) — takes the same rule with the halves
+            # swapped: a repo that switched its reviews off knows something the
+            # board does not, so the board may turn one off and may not turn one
+            # back on over the top of a file that said no.
             problems.append(
-                f"`{path}: true` would ENABLE a seat this box or "
-                f"{SAMPLE_FILENAME} has off — ignored. A board dial may only narrow "
-                f"the panel: turning a seat off is a judgement about what it is "
-                f"worth, which is what this layer is for, and turning one on is a "
-                f"claim about what this machine can run, which only the machine and "
-                f"the sample can make")
+                f"`{path}: true` would turn ON something this box or "
+                f"{SAMPLE_FILENAME} has off — ignored. A board dial may only narrow: "
+                f"turning something off is a judgement about what it is worth, which "
+                f"is what this layer is for, and turning it on is a claim about what "
+                f"this machine or this repo can do, which only the machine and the "
+                f"sample can make")
             continue
         if not _set_dial(cfg, path, entry["value"]):
             problems.append(f"`{path}` could not be written — ignored")

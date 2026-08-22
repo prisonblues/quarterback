@@ -183,6 +183,16 @@ GET   /review/stats      ?repo=&author=&days=&judged_only=       -> {by_model, b
                           (what survived the fix) — the GAP is the measurement. Read it
                           against outcomes_scored (fixed+refuted, the ratio's own
                           population) and confirmed_defects, never outcomes_recorded
+GET   /review/spend      ?repo=&pr=&hours=                        -> {repo_window, fleet_window,
+                                                                     pr_total}
+                          what review has already COST, so a ceiling can be checked before
+                          the spend rather than after it (#55). `tokens` is input+output —
+                          `/review/stats`' `billable` — and is **null when nothing in the
+                          window was instrumented, never 0**: read `rows` against
+                          `measured_rows` to tell an unmeasured window from an idle one.
+                          The board states what was spent and never what may be: the
+                          ceiling is a dial, the board does not know what a dial means,
+                          and the comparison is the harness's (`panel_caps.py`)
 GET   /review/needs-human ?repo=&pr=&class=&days=&since=          -> {classes, labels, waiting,
                           &include_settled=&limit=                          by_class, listed,
                                                                             truncated, items}
@@ -1514,6 +1524,7 @@ full — including what was broken before it, which is the part no diff recovers
 - **v2.93** — an issue watcher that reads the tracker and mostly declines.
 - **v2.94** — /fix-issue stops offering a database it then guarantees is unsafe.
 - **v2.95** — a pull request that ships something is asked whether it wrote an entry.
+- **v2.96** — a round cap and a spend ceiling the worker enforces on itself.
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
   roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps
@@ -1859,7 +1870,7 @@ app/          FastAPI service
                    GET /sessions, GET /session/{key}
   api/subagents.py POST /subagent[/end], GET /active (collision index), GET /overlap
   api/reviews.py   POST /review, GET /reviews, /review/{id}, /review/stats, /review/findings,
-                   /review/needs-human, /review/collisions
+                   /review/needs-human, /review/collisions, /review/spend
   api/worktrees.py PUT/GET /worktrees (cross-worktree discovery)
   api/sync.py      GET /sync (published line vs registered checkouts)
   api/whoami.py    GET /whoami (the caller's resolved board identity)

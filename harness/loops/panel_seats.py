@@ -1627,9 +1627,11 @@ def panel_flag(panel: dict, key: str, fallback: bool, notes: list[str]) -> bool:
     return fallback            # unreachable; `_refuse_value` always raises
 
 
-def resolve_max_rounds(asked: int | None, panel: dict, notes: list[str]) -> int:
+def resolve_max_rounds(asked: int | None, panel: dict, notes: list[str],
+                       ceiling: int | None = None) -> int:
     """The round cap: the CLI's answer if it gave one, else the repo's
-    ``review_panel.max_rounds``, else :data:`DEFAULT_MAX_ROUNDS`.
+    ``review_panel.max_rounds``, else :data:`DEFAULT_MAX_ROUNDS`. Never above
+    ``ceiling``.
 
     :func:`resolve_round_scope`'s order, for the same reason — ``--max-rounds`` is
     the CALLER's cap and only `/panel-review-pr` drives a loop, so a caller that
@@ -1637,16 +1639,39 @@ def resolve_max_rounds(asked: int | None, panel: dict, notes: list[str]) -> int:
     already refuses a CLI cap below 1 before `run()` is reached; this is the other
     half, for the value nothing else checks.
 
+    ``ceiling`` is what makes that order safe rather than merely convenient (#55).
+    It is the value the **board** stated for ``review_panel.max_rounds`` —
+    :func:`panel_caps.round_ceiling`, ``None`` when the board stated none — and
+    the caller may say anything at all below it and nothing above it. Under the
+    ceiling this function behaves exactly as it always did, which is the whole of
+    the "changes nothing until somebody sets a number" property: a fleet that sets
+    no dial passes ``None`` here for ever.
+
+    A cap is the one setting where combining layers by MINIMUM is always the safe
+    reading — every layer that wants to spend less gets its way and none can spend
+    more — so the clamp is silent about which of the two bound and loud about the
+    fact that one did, in ``notes``.
+
     An integer, and a float that is one (``2.0`` from a generator) is accepted with
     it; ``2.5`` is not, because a cap is a round number and rounding it silently
     would run a round the file did not ask for. A bool is rejected before the
     integer read: ``max_rounds: true`` is ``1`` to Python, which would cap every
     cycle at one round on a value that says nothing about rounds."""
+    def clamped(value: int, whose: str) -> int:
+        if ceiling is None or value <= ceiling:
+            return value
+        notes.append(
+            f"round cap lowered to {ceiling} — {whose} asked for {value} and the "
+            f"board's `review_panel.max_rounds` is {ceiling}. A ceiling set on the "
+            f"board is fleet policy and cannot be raised from inside the repo being "
+            f"reviewed, or by the caller driving the cycle")
+        return ceiling
+
     if asked is not None:
-        return asked
+        return clamped(asked, "--max-rounds")
     raw = panel.get("max_rounds")
     if raw is None or raw == "":
-        return DEFAULT_MAX_ROUNDS
+        return clamped(DEFAULT_MAX_ROUNDS, "the built-in default")
     n = None
     if isinstance(raw, bool):
         n = None
@@ -1661,7 +1686,13 @@ def resolve_max_rounds(asked: int | None, panel: dict, notes: list[str]) -> int:
             n = None
     if n is None or n < 1:
         _refuse_value("max_rounds", raw, "a whole number of rounds >= 1")
-    return n
+    # The board dial has ALREADY replaced `panel["max_rounds"]` by the time this
+    # runs (`apply_dials` is the last layer), so under a board ceiling this clamp
+    # is a no-op on the value and the note never fires. It is here for the case
+    # `apply_dials` cannot reach: a repo whose `.harness-rules.sample` replaced the
+    # whole `review_panel` block leaves the dial with nothing to override, and the
+    # board said what it said either way.
+    return clamped(n, f"`review_panel.max_rounds` ({raw!r})")
 
 
 @dataclass(frozen=True)
@@ -1781,8 +1812,12 @@ class Dials:
 
 
 def resolve_dials(panel: dict, asked_max_rounds: int | None,
-                  notes: list[str]) -> Dials:
+                  notes: list[str], round_ceiling: int | None = None) -> Dials:
     """Read, validate and report all eight at once.
+
+    `round_ceiling` is #55's board-set cap and is passed straight to
+    :func:`resolve_max_rounds`; `None` — a fleet that has set no dial — is the
+    unchanged behaviour this function has always had.
 
     `require_failing_test` gets a note of its own when it is ON, and that note is the
     whole of its behaviour: the contract it describes needs a reviewer-emitted test
@@ -1803,7 +1838,7 @@ def resolve_dials(panel: dict, asked_max_rounds: int | None,
         reviewer_scope=reviewer_scope(panel, notes),
         require_failing_test=panel_flag(panel, "require_failing_test",
                                         DEFAULT_REQUIRE_FAILING_TEST, notes),
-        max_rounds=resolve_max_rounds(asked_max_rounds, panel, notes),
+        max_rounds=resolve_max_rounds(asked_max_rounds, panel, notes, round_ceiling),
     )
     if dials.require_failing_test:
         notes.append("`require_failing_test: true` is recorded and NOT enforced — the "

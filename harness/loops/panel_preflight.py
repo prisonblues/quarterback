@@ -948,14 +948,26 @@ class Preflight:
 
 def preflight(diff: str, budgets: dict[str, int | None], panel: dict,
               notes: list[str], forced: bool = False,
-              installed=None, gate: str = "") -> Preflight:
+              installed=None, gate: str = "", gate_overridable: bool = True) -> Preflight:
     """Rule on a round before it is dispatched.
 
     `gate` is a PRECONDITION that has already failed — a sentence saying why this
     round should not happen at all, decided by the caller before any of the sizes
     below are looked at (#271). Handed one, this refuses on it and says so, and
     `--force` overrides it through exactly the same machinery that overrides a
-    size refusal. It arrives as a parameter rather than being asked here because
+    size refusal — **unless the caller says otherwise**.
+
+    `gate_overridable=False` is #55's spend ceiling and is the one refusal on this
+    path that `--force` may not turn into a run. Everything else here is a
+    judgement about what THIS host's seats can usefully read, which is exactly the
+    kind of judgement an operator standing in front of it may overrule; a ceiling
+    is fleet policy set by a person on the board, and a local flag that switched it
+    off would make it advice again — which is the state #55 exists to end. The
+    refusal is still recorded and posted through the identical machinery, so a
+    reader cannot tell the two apart by how loudly they arrive, only by whether
+    `--force` moved them.
+
+    It arrives as a parameter rather than being asked here because
     the question is not about the diff: `panel.run` reads the PR's mergeability off
     metadata it has already fetched, and the ONLY reason to route the answer
     through this function is that everything downstream of a refusal — the payload,
@@ -1056,6 +1068,13 @@ def preflight(diff: str, budgets: dict[str, int | None], panel: dict,
     # After the measurement above, though, and deliberately — `preflight.shape` is
     # what a reader has instead of the round, and a gate refusal that recorded
     # nothing about the diff it declined would be the silent target #241 is about.
+    if gate and not gate_overridable:
+        # Built without `verdict()`, which is where --force is applied. Spelled as
+        # its own return rather than as a flag threaded through that closure
+        # because there is exactly one caller and the alternative is a `forced`
+        # parameter that sometimes means forced — see the docstring.
+        return Preflight("refuse", gate, shape, ceiling, over,
+                         gate=gate, thresholds=thresholds)
     if gate:
         return verdict("refuse", gate)
     if ceiling is None:

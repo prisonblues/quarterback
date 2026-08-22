@@ -271,7 +271,7 @@ def test_the_board_may_take_a_seat_off_and_may_not_put_one_on(repo, monkeypatch,
     cfg = hr.resolve_repo(str(repo))
     assert cfg["reviewers"]["antigravity"]["enabled"] is False
     err = capsys.readouterr().err
-    assert "would ENABLE a seat" in err and "may only narrow" in err
+    assert "would turn ON something" in err and "may only narrow" in err
 
 
 def test_a_dial_the_harness_does_not_recognise_is_refused_out_loud(repo, monkeypatch,

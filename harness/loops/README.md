@@ -290,7 +290,7 @@ Detected from the checkout, **not settable** here: `path`, `github`, `default_br
 
 | Key | Meaning |
 |---|---|
-| `enabled` | Master switch — `false` means the loops skip this repo. |
+| `enabled` | Master switch — `false` means the loops skip this repo, **the panel included** as of #55 (it was honoured by `lander.py` alone before that, so a repo that had switched itself off still got reviewed). Board-settable and **narrow-only**: the board may turn a repo off and may not turn one back on over a file that said no. One `POST /dials` is #55's "turning the watcher off takes one setting", and it takes effect on the next resolution rather than the next restart. |
 | `auto_merge` | `none` \| `dependabot_patch_minor` \| `all_green` — see below. |
 | `headless_permission_mode` | `claude -p` mode for headless agents. `acceptEdits` = edit-only (safe). `/epic`'s executor runs `/fix-issue` + `/review-pr`, which need git+gh, so it needs `bypassPermissions`. |
 | `executor_pr_base` | Base branch the issue→PR executor opens PRs against. Defaults to the default branch. **Only used when *creating* PRs** — see "Branch base". |
@@ -311,7 +311,9 @@ Detected from the checkout, **not settable** here: `path`, `github`, `default_br
 | `review_panel.max_fix_growth` | Multiple of its size at the cycle's FIRST round that the PR may grow to before the cycle stops and says the change wants splitting. **3.0**; `null` switches the check off (the one key here where `null` is not "inherit"). Not dressed up as convergence — it takes a veto line and `confident` is false. **Both ends are whole-PR sizes whatever `round_scope` is** (#298): that dial decides what the reviewers are asked to *look at*, this one asks how big the change has *become*. Measured on the review target it compared one round's fix commit against the cycle's whole-PR starting size, and PR #188 reached 3.90x — 185 → 593 → 721 churned lines — without the guard firing. `pr_chars` in the payload is the number both ends are read from. |
 | `review_panel.reviewer_scope` | What a reviewer is asked to look for: **`diff`** (defects in the change and its seams; anything outside it is an observation) or `repo` (the pre-#165 wording — "search the codebase, don't just review the diff"). Not how hard anyone looks: every dimension stays in the prompt and a code-reading seat still reads the callers. |
 | `review_panel.require_failing_test` | A finding must carry a reproducible failing test to block. **false, and read-only**: the reviewer-emitted test artefact it needs is not built (#92 — a reviewer emits a test and never runs one; #114 — it must be shown RED pre-fix). Setting it `true` is recorded, reported, and enforces nothing, and the round says so in `config_notes`. |
-| `review_panel.max_rounds` | The round cap, as a repo setting. **2**. `panel.py --max-rounds` still wins; this wins over the built-in constant. #165 proposes 1 and this keeps 2 deliberately — round 2 is what caught a defect *created* by round 1's fix on #236 — because the three keys above attack the fix pass's growth instead. |
+| `review_panel.max_rounds` | The round cap, as a repo setting. **2**. `panel.py --max-rounds` still wins over it, and neither wins over the BOARD: a value the board states is a ceiling nothing below it may exceed (#55). This wins over the built-in constant. #165 proposes 1 and this keeps 2 deliberately — round 2 is what caught a defect *created* by round 1's fix on #236 — because the three keys above attack the fix pass's growth instead. |
+| `review_panel.budget` | #55's spend ceiling: `tokens_per_day`, `runs_per_day`, `tokens_per_pr`, `runs_per_pr`, `fleet_tokens_per_day`. **Every one `null` — no ceiling — which is what landing it did to every repo.** Checked against `GET /review/spend` *before any seat is dispatched*, and a repo at its ceiling is refused through the pre-flight's own machinery: printed, recorded with `reviewed: false` and a per-seat `ran: false`, posted to the PR, and carrying `stop_confident: false` so a budget stop cannot read as convergence. Tokens are input + output (`/review/stats`' `billable`); the run ceilings are what still binds where nothing was instrumented, and `runs_per_pr` is the one that binds a caller which renumbers its rounds. `0` is a real value and means nothing may be spent; `--force` overrides none of them. Board-settable, and the board's value beats this file's — a ceiling a repo can raise from inside itself is decorative. |
+| `review_panel.budget_window_hours` | What "per day" means for the two rolling ceilings. **24**. A dial rather than a constant because the window and the ceiling are one decision: halving the window halves the ceiling. The per-PR ceilings have no window — they are about one pull request's whole cost, and a rolling one would let a PR reviewed daily for a fortnight stay under a ceiling it passed on day two. |
 | `loops` | `dependabot_lander` / `stacked_driver` / `issue_executor` — which loops may run. |
 | `issue_pickup` | What a loop may pick up **of its own accord** — on/off, an author allowlist, a label allowlist, human triage, and the labels that refuse outright. Every default refuses; see below. |
 | `issue_filing` | How much a loop may **file** — a per-run cap, a duplicate search, and whether an unattended run may file at all. See below. |
@@ -1050,6 +1052,102 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   and then panels the fix commit, 2 rounds by default (`--rounds N`), so the fixer's
   own work is read by somebody. `panel.py` itself stays read-only either way: the
   fix/verify/commit lives in the skill, and so does the loop.
+
+### Caps — the round ceiling and the spend ceiling (#55)
+
+`--max-rounds` has existed since the cycle did and has never bound anything. It is
+*"the caller's cap"*, honoured by a human reading a markdown file — and unattended
+there is no such reader. Meanwhile the long tail needs no loop at all: a busy repo
+with a dozen open PRs, each pushed to several times a day, each panel running
+several models over a large diff. This repo carries the scar — one release-merge
+review came to about $750, which is why `skip_title_patterns` exists.
+
+`panel_caps.py` is the enforcement, and it is deliberately **not** a second pacing
+mechanism. `qb-pace` already reads the shared subscription's five-hour and weekly
+windows and `qb-start` already gates a spawn on it; what was missing was a
+*policy* a person sets and the spender obeys.
+
+**Where the number lives.** On the board, as a dial — the layer described above,
+whose writes take `app.auth.human` (a `Remote-User` plus the edge secret; a machine
+token is refused 403). That is what makes the ceiling something the repo under
+review cannot raise: the dial layer is applied last, the per-box overlay is not
+read at all on the unattended path, and the rules baseline is read from
+`origin/<default branch>` rather than from the branch being reviewed. A repo may
+write a ceiling into its own `.harness-rules.sample` and it is honoured when the
+board has stated none — that is a self-imposed bound, not a way to raise one.
+
+**Two ceilings, two questions.**
+
+*The round ceiling* is `review_panel.max_rounds` when the **board** is the layer
+that stated it. Under it, `--max-rounds` and the repo's file say whatever they
+like; above it they do not, and the clamp says which number bound. A `--round N`
+past a board ceiling exits naming the remedy that exists — *clear or move the dial*
+— rather than the one that does not.
+
+*The spend ceiling* is `review_panel.budget`, checked against `GET /review/spend`
+before any seat is dispatched. Five numbers, all `null` by default:
+
+| dial | measured over |
+|---|---|
+| `tokens_per_day` / `runs_per_day` | this repo, rolling `budget_window_hours` |
+| `tokens_per_pr` / `runs_per_pr` | this PR's whole life, no time bound |
+| `fleet_tokens_per_day` | every repo on the board, same rolling window |
+
+**What spend is measured in.** Tokens, input + output — `/review/stats`' own
+`billable`, since cached input is a slice *of* input and reasoning sits inside
+output for some vendors and beside it for others. #55 named per-reviewer token
+capture (#15) as its blocker and settled meanwhile for a crude "reviews per day"
+proxy; #15 landed, so the honest unit is available and is what the ceiling uses.
+
+The run ceilings are not that proxy's leftovers. A seat nobody instrumented
+(`antigravity`), a vendor that states nothing, a run recorded before v2.14 — each
+spent real money and measured no tokens, so a token-only ceiling reads an
+unmeasured spend as *no* spend. `/review/spend` reports `rows` against
+`measured_rows` and a refusal that was computed over partial coverage says
+*"measured over 6 of 20 reviewer runs — the real spend is higher"*. And
+`runs_per_pr` is the only one of the five that binds a caller which **renumbers its
+rounds**: `--round N` is an argument, so a driver that always says `--round 1`
+never reaches the round ceiling at all, while a run is a row on the board whatever
+it called itself.
+
+**What a stopped run says.** It travels the pre-flight refusal's existing path,
+which is the whole reason it was routed there: printed, recorded with
+`reviewed: false`, a `skip_reason`, a per-seat `ran: false` row so the board cannot
+file the refusal as a panel that found nothing, and posted to the PR under
+`--post`. On top of that it carries `round_stop: {stop: true, confident: false}`,
+because *"a budget stop that looks like a clean review is the exact failure v2.15
+exists to prevent"* — `preland --require-earned-stop` HOLDs on it and the review
+queue files it `unconverged`. A size refusal is deliberately **not** a stop: that
+one means "this round could not usefully read the diff" and leaves the cycle open.
+
+**`--force` does not override a ceiling.** It overrides this host's judgement about
+what its own seats can read, which is exactly the kind of judgement an operator
+standing in front of it may overrule. A fleet ceiling a local flag could switch off
+would be advice again.
+
+**When the board cannot be read**, the answer differs by whether anybody is
+watching, and #59 asked for that decision to be made here rather than inherited:
+
+* **attended** — proceed, and say in the report that the ceiling was unverified.
+  `/panel` on a laptop with no board, no network and no `qb` reviews a PR and
+  always has; the round ceiling still binds, because it needs no board read.
+* **unattended** — refuse. `qb-start` already reasons this way about `qb-pace`
+  (a spawn proceeds only on a definite go), and a governor that cannot read its
+  input must not report clear (#244). An unattended run that treated an
+  unreachable board as headroom would be a ceiling anybody could remove by
+  unplugging a cable.
+
+**With every ceiling unset, none of this happens** — including the board call.
+`Budget.dormant` returns before `fetch_spend` is reached, which is asserted by a
+test that makes the read raise rather than by a comment.
+
+**It does not reserve.** The check is a read and the dispatch after it is a
+separate act, so two panels starting in the same second both see the same
+headroom. The overshoot is bounded at one round per concurrent run and is a
+stated property, not an oversight. Closing it would mean the board holding a claim
+on part of a budget for a run's duration — a reservation, whose own failure mode
+is a leak that parks a repo until somebody notices, which is what `qb-pace`
+refuses when it insists a `hold` is a wait and not a stop.
 
 ### The pre-flight verdict — whether a round is worth running
 
