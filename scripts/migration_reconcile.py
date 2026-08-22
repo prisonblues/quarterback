@@ -40,6 +40,16 @@ multi-head or still carry a duplicate. Anything this tool will not guess about e
 with a message, never as an uncaught traceback — a gate consuming the 0/2/3 scheme
 reads Python's exit 1 as "unknown".
 
+Exit codes (`heads`): 0 = exactly one head, or a ref carrying no migrations at all;
+2 = a stop. **Two different outcomes share that 2 and a caller must not report them as
+one thing.** Either the heads were COUNTED and the count was not one — the ids on
+stdout, `# N head(s)` on stderr — or the tool DECLINED TO ANSWER and no count exists,
+which is announced by a `STOP: ` line on stderr and nothing on stdout. `STOP: ` is the
+contract both callers read (`harness/githooks/pre-push` and the `migration-heads` job in
+`.github/workflows/tests.yml`); it is not carried by a third exit code so that a caller
+shipped ahead of the reconciler in front of it still reads a decline correctly. See
+`cmd_heads` and #357.
+
 `preflight --json` reports the plan verbatim, and `guards` always carries all three
 keys (`null` for "not reached") so a consumer can read one without a KeyError.
 
@@ -1450,7 +1460,14 @@ def cmd_heads(args: argparse.Namespace) -> int:
     print(f"# {len(h)} head(s)", file=sys.stderr)
     # A ref with no migrations at all has nothing to break `upgrade head`, so it is
     # fine. A ref with migrations and no head has a cycle, which is not. A duplicate id
-    # never reaches here: `revs_at_ref` refuses to build a graph carrying one.
+    # never reaches here: `revs_at_ref` refuses to build a graph carrying one, and that
+    # refusal leaves by `main`'s handler as `STOP: …` on stderr with exit 2.
+    #
+    # THE 2 RETURNED HERE AND THAT ONE ARE NOT THE SAME ANSWER, and the contract callers
+    # read is that the second says `STOP: ` and produces no head count while this one
+    # never does. Every reach of this line has counted: `h` is a real count, zero
+    # included, so "renumber or merge" is sound advice. A caller that reports a decline
+    # as a head count sends its reader off to renumber a graph that may be fine (#357).
     return 0 if len(h) == 1 or not revs else 2
 
 

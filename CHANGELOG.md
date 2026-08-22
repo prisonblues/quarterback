@@ -17,6 +17,54 @@ the top of this file conflict every time, over nothing — both entries are righ
 and a fragment is a path no other branch will ever open. `changelog.d/README.md` has the format.
 `vNEXT` means exactly what it meant before; assembly is just what writes it.
 
+## v2.92 — the pre-push hook stops telling you to renumber a graph it never counted
+
+`migration_reconcile.py heads` exits 2 for two outcomes that want opposite remedies. Either it
+counted the heads and the count was not one — a graph defect, fixed by renumbering or by a merge
+revision — or it declined to answer at all, because two files claim one revision id, or a
+migration will not parse, or git failed underneath it. In the second case no head count was ever
+produced and the graph may be perfectly single-headed.
+
+The pre-push hook reported both with one line, `not exactly one head, a cycle, or a duplicate
+revision id`, followed by the `preflight`/`apply` pair. Told that, a reader goes and renumbers —
+and when the real problem was a file the tool could not read, they renumber something that was
+fine. That is a worse outcome than the refusal was protecting against.
+
+The hook now has two refusals. One says the heads were counted and the count was not one, and
+carries the ids. The other says the reconciler never counted them, names the usual cause, and
+prints what the reconciler actually said. This is the split PR #355 made in the `migration-heads`
+CI job, applied to the other caller, with the same wording.
+
+### Why the exit code still does not carry this
+
+Both callers tell the two apart by the reconciler's own `STOP: ` line, and the obvious tidy-up is
+a third exit code so neither has to read strings. It is deliberately not done. This hook ships
+with the harness into repos whose `migration_reconcile.py` is that repo's own copy and can be
+older than the hook; every version of the tool has printed `STOP: `, while a new code would be
+emitted only by versions from this change onwards. A hook keying its decline branch off a code
+the reconciler in front of it does not emit would print the renumber message for a decline again
+— this exact bug, in exactly the deployment the harness exists to serve.
+
+What the duplication actually needed was a contract stated once instead of inferred twice, so
+`heads`'s two exit-2 answers and the marker that separates them are now written down on the tool
+and pinned by a test there, rather than living as a comment in each caller.
+
+## v2.91 — qb-doctor's harness row stops counting five files and naming four
+
+The row printed the full count of drifted files and only the first four names, with nothing to
+say the list had been shortened — `5 differ (create-worktree, prune-worktrees, qb-doctor,
+qb-hooks)`, and `remove-worktree` gone in silence. `--json` carried every name, so nothing was
+lost to a machine; what was lost was the point of the row, which is that a person can trust it
+at a glance without going to `--json` to check it. The count was the honest half, which is the
+confusing way round: a reader who counts the names concludes the count is broken.
+
+Both lists on that row were capped the same way and both now spell the elision out —
+`5 differ (create-worktree, prune-worktrees, qb-doctor, qb-hooks, +1 more)`, the `+N more`
+shape `qb-dash` already uses when it trims a table. The regression guard is written against the
+row's shape rather than against the cap: it parses whatever the row prints and holds each
+counted list to its own arithmetic, so a list that starts eliding without saying so fails
+whatever the cap becomes.
+
 ## v2.90 — a session can be started by something other than a hand, and it ships off
 
 Rich asked for a loop: a plan that says what is next, a board that helps agents work through
