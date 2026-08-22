@@ -313,8 +313,167 @@ Detected from the checkout, **not settable** here: `path`, `github`, `default_br
 | `review_panel.require_failing_test` | A finding must carry a reproducible failing test to block. **false, and read-only**: the reviewer-emitted test artefact it needs is not built (#92 — a reviewer emits a test and never runs one; #114 — it must be shown RED pre-fix). Setting it `true` is recorded, reported, and enforces nothing, and the round says so in `config_notes`. |
 | `review_panel.max_rounds` | The round cap, as a repo setting. **2**. `panel.py --max-rounds` still wins; this wins over the built-in constant. #165 proposes 1 and this keeps 2 deliberately — round 2 is what caught a defect *created* by round 1's fix on #236 — because the three keys above attack the fix pass's growth instead. |
 | `loops` | `dependabot_lander` / `stacked_driver` / `issue_executor` — which loops may run. |
+| `issue_pickup` | What a loop may pick up **of its own accord** — on/off, an author allowlist, a label allowlist, human triage, and the labels that refuse outright. Every default refuses; see below. |
+| `issue_filing` | How much a loop may **file** — a per-run cap, a duplicate search, and whether an unattended run may file at all. See below. |
 | `epic` | Epic-driver settings — see below. |
 | `preland.disabled_checks` | Checks `preland.py` must not run, by name. Empty by default — every guardrail it can detect, it runs. A name nothing answers to is a **hard error**, not a warning; see below. |
+
+### The appetite gates — `issue_pickup` and `issue_filing` (#85, #86)
+
+An autonomous loop needs limits in **both** directions, and neither existed. A
+watcher that acts on whatever it finds "actionable" works the backlog in whatever
+order it happens to enumerate it — not an order anybody chose. And a loop applying
+a consistent standard with no ceiling produces a backlog nobody reads: nine issues
+were filed here in one day, every one a response to something real, which is what
+makes it a risk rather than a bug.
+
+The policy lives here rather than in the issue watcher (#63) that first wanted it,
+because that watcher is one consumer. The PR watcher (#54), the epic driver and
+whatever acquires an appetite next want the same brakes, and a brake implemented
+per-consumer is three brakes that will disagree. `appetite.py` reads these blocks
+and answers; nothing else should re-implement the question.
+
+```json
+"issue_pickup": {
+  "enabled": false,
+  "only_labels": [],
+  "allowed_authors": [],
+  "require_human_triage": true,
+  "agent_actors": [],
+  "skip_labels": ["needs-human/*"],
+  "skip_when_unlabelled": true
+},
+"issue_filing": {
+  "max_per_run": 1,
+  "require_dedup_check": true,
+  "unattended": false
+}
+```
+
+**Every default refuses, and that is the design.** Acting is what needs
+justifying; refusing does not. `enabled` is off, so no repo acquires an appetite by
+upgrading. `only_labels` and `allowed_authors` are empty, and empty means **nothing
+and nobody qualifies** rather than everything and anyone: turning the gate on is
+one decision and saying what may come through it is another, and a repo that has
+made only the first has not said "anything".
+
+**`require_human_triage` is the load-bearing line.** An allowlist of labels
+authorises nothing if the agent can apply the labels — #78's `judge_model` problem
+one level out. So the check does not ask whether the label is *present*; it reads
+the issue's label **events** and asks who put it there. A Bot-type actor never
+counts, and `agent_actors` names any further logins that do not. The hole it leaves
+is worth stating rather than discovering: an agent authenticating as its human's
+own GitHub account is indistinguishable here from that human. The check is sound
+against bots and against a named agent account, and is not a substitute for agents
+having their own identity.
+
+**`allowed_authors` is an allowlist, not a filter, and the distinction is the
+whole mitigation.** `prisonblues/quarterback` is public, anyone can open an issue,
+and under a watcher that text becomes the instructions for an agent with a full
+shell. A filter is a list of the phrasings somebody already thought of; the attack
+is the phrasing nobody thought of.
+
+**`skip_labels` refuses what no diff can settle.** Some issues cannot be auto-fixed
+well, and the failure is not that the agent writes bad code — it is that it writes
+*plausible* code for a question nobody has answered yet. A UI issue reads as
+actionable to any "is this actionable" test: there are files, there is an obvious
+place to put a change, and a diff will appear. What will not appear is the design
+decision the issue was waiting on, and a reviewed, tested, merged answer to the
+wrong question is worse than nothing — it is now the thing to argue with.
+
+The default list is **#279's closed vocabulary** (`needs-human/decision`, `taste`,
+`ui`, `environment`, `auth`, `other`), matched as a glob so the `other` escape
+hatch can grow the vocabulary a word without this list going stale by letting the
+new class through. Entries are globs *or* plain names, so a repo listing `design`
+loses nothing.
+
+**A label a person applied, never a classifier.** An agent could be asked to judge
+whether an issue needs human judgement, but that is self-referential and wrong in
+the expensive direction: the issues most needing a human are the ones a model is
+most confident it understands. #64 is the measured shape — three of six confirmed
+findings were conditionals from a reviewer that had *declared it could not assess
+the condition*, and it raised them anyway.
+
+`skip_when_unlabelled` is the safe end and the default: an unlabelled issue has
+not been triaged by *anyone*, so nothing has established which class it is, and
+"no signal" must not read as "no objection".
+
+**Two entry points, because there are two questions.** `pickup_verdict` is the
+whole gate and answers *may a loop CHOOSE this issue, with no human having named
+it*. `refusal_verdict` is the `skip_labels` half alone and answers *regardless of
+who chose it, has a person marked this as one no diff can settle*. `epic.py
+--execute 42` names an epic on the command line and the human typing it is the
+authorisation, so the epic driver calls the second and not the first: a
+`needs-human/ui` label a person applied does not stop meaning what it says because
+the issue arrived inside an epic, but `skip_when_unlabelled` — a statement about
+selecting out of an untriaged backlog — deliberately does not apply to it. Gated
+sub-issues appear in the plan as `stage: blocked` / `action: skip-blocked` with a
+reason naming the label and the setting, and their `doable` stays `null`: no
+doability ruling was made, because we declined to ask for one, and claiming a
+verdict never obtained is the fabrication the triage reason lines exist to
+prevent. The gate runs **before** the judge, so a refused issue costs nothing.
+
+**A refusal names the setting that refused it, and the CLI exits 3.** "No" and
+"misconfigured" look identical from a caller's side, and an agent that cannot tell
+them apart routes around the gate instead of fixing it.
+
+**`max_per_run` persists its tally** under `$LOOPS_STATE_DIR`, keyed by `--run`:
+the gate is a CLI invoked once per candidate, so a count held only in the process
+it constrains is self-reported rather than enforced. Without a `--run` id only the
+current process is counted, which is the weak form and a caller should know it is
+choosing it.
+
+**`require_dedup_check` searches the title's own words**, not the whole title. The
+duplicate that matters is the one somebody phrased differently, and an exact-title
+check would pass every single time and read as a working gate. An *unsearched*
+check and an *empty* one are the same value in Python and are deliberately not the
+same answer here. If `gh` search is unavailable the call raises rather than
+returning "no duplicates" — an outage must not silently open the gate.
+
+A malformed value is a **hard error**, like `preland.disabled_checks`. Unlike a
+misspelled *key* — which leaves the setting at its safe default — a malformed
+*value* would leave the gate reading as configured while doing nothing: an open
+door that looks shut. `skip_labels`, `only_labels`, `allowed_authors` and
+`agent_actors` must each be a list of strings, `max_per_run` a non-negative
+integer or `null`, and **every switch here must be a real JSON boolean**. A bare
+string where a list belongs is the subtle one, because a string is *iterable*: it
+silently becomes a list of single characters, which for `agent_actors` fails
+**open** — the named agent account stops being recognised as an agent, and the one
+setting whose job is to stop self-approval stops doing it. A quoted `"false"` is a non-empty string and therefore *truthy*, so it
+would turn the gate on; `harness_rules` already checks overlay *values* and not
+just their names for exactly this reason, and every default in these two blocks
+is closed, so the direction of that mistake is always "gate silently open".
+
+Two more places where a failed read must not read as an allow. An **unreadable
+filing tally** — truncated JSON, a hand-mangled count — refuses rather than
+reporting zero, because zero hands a fresh budget to a run that may have spent
+it; the tally is written via `os.replace` so a crash mid-write cannot produce
+that state in the first place. And a **title with no searchable words** counts as
+*unsearched* rather than *searched and clean*, or `require_dedup_check` could be
+defeated by choosing a title of short words.
+
+A `labeled` event that names **no actor** — a deleted account, or the API
+omitting the block — does not count as human triage either. "Somebody applied this
+and we cannot see who" is exactly the state the check exists to distinguish.
+
+`human_triaged` reads only the **current** application of each qualifying label.
+Scanning for any historical `labeled` event by a human would let a
+removed-and-re-applied label inherit an authorisation given to a different
+application of it: a person applies `p0`, someone takes it off, an agent puts it
+back, and the agent is now working under the person's signature.
+
+Two limits stated rather than papered over. `max_per_run` is enforced across
+invocations only when a `--run` id is given, and an allow **says so** when it is
+not — otherwise the weak form and the strong form print the same "within budget".
+And the read-increment-write of the tally is not atomic across processes, so two
+filers sharing a run id can both pass a cap of 1 before either records; it bounds
+an enthusiastic loop rather than a concurrent one.
+
+```bash
+python3 appetite.py pickup 85 --repo quarterback          # may I work this?
+python3 appetite.py file --title "..." --run $SESSION      # may I file this?
+python3 appetite.py file --title "..." --run $SESSION --record   # I did
+```
 
 `auto_merge`:
 - `none` — never auto-merge; always stop for a human.
