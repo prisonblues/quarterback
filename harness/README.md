@@ -915,6 +915,8 @@ either.
 qb-start /fix-issue 277               # a session working issue 277
 qb-start /panel-review-pr 352         # …reviewing PR 352
 qb-start --dry-run /fix-issue 277     # every refusal, nothing started
+qb-start --policy --json              # what will this machine start? (starts nothing)
+qb-start --via dash /fix-issue 277    # …and record what pulled it
 #   exit 0  started  — a real, attachable session exists
 #   exit 2  used wrongly
 #   exit 3  NOT ENABLED on this machine — the default, and the whole of it
@@ -994,6 +996,24 @@ work does not exist yet, and a claim stamped with a session that is not the work
 session's own `create-worktree` renews and that the land step, the teardown and the sweep hand
 back.
 
+**And what pulled it is recorded, which is the question a session nobody started raises.**
+`--via` names the caller — `cli` for a person at a prompt, `dash` for the dashboard's ⚒ —
+and it lands on the claim note, on the board post (spawns *and* refusals) and on the pane as
+`@qb_spawn_via`, so `tmux list-panes -a -F '#{@qb_spawn_via}'` answers it for a window
+somebody has found and does not recognise. The set is closed for the same reason the command
+allowlist is: a provenance field its caller fills in freely is one that can be made to say a
+human did it. Adding a trigger is a line in `qb-start` and a line here.
+
+**A caller can ask before it offers.** `qb-start --policy` answers *what will this machine
+start* — enabled or not, which commands, how many at once, and the refusal in full when the
+answer is no — then exits 0 or 3 having started nothing, claimed nothing, posted nothing and
+consulted nothing but the policy file. It exists because a trigger with a button on it needs
+the answer *before* the click: an affordance that looks live, is clicked, and only then
+explains that this machine never opted in has spent somebody's attention to tell them
+something it knew all along. It is the same `read_policy` the spawn path uses, at the same
+point, so it can never answer yes to a machine the next line would refuse — and asking it is
+not a second implementation of the gate.
+
 **It is endable before it exists.** The session id is minted by `qb-start` and handed to the
 agent with `--session-id`, so the pane wears `@qb_session` from the moment it is created rather
 than from whenever the agent's SessionStart hook gets round to it — `qb-end <id>` works
@@ -1006,9 +1026,20 @@ the plan, picks an item, or tells an agent what to work on. It is told a command
 by whatever pulled it, exactly as the dashboard's ⚒ is told one by a click. Which work an
 agent takes stays the agent's own choice, self-selected and claimed atomically.
 
-**What still pulls it is a human.** A cron floor, a lifecycle hook or a dashboard button
-is the trigger, and there is not one yet — this is the primitive, deliberately landed before
-anything automatic can pull it.
+**What pulls it: the dashboard's ⚒, and nothing else yet (#371).** The primitive landed with
+no caller at all, which made the loop readable and still unstartable. The first caller is the
+cheapest one there is — `qb-dash-tui`'s ⚒, which is still a human click, so it needed no new
+safety: the gates, the machine cap, the allowlist and the claim are all here, at the
+primitive, rather than at the caller. What that click gains is everything the old direct
+spawn lacked: a session inside `qb-admit`'s window, holding a claim taken before the process
+existed, endable by session id from the moment the pane appears, and posted to the board as
+`via dash`.
+
+**A hook or a cron floor is still not built, and that is the deliberate part.** The button
+is paced by a person; the other two are not, and a trigger nobody is watching is the thing
+that turns a bug into an overnight incident. A `SessionEnd` hook also has a question to
+answer first that the button does not — *what is next* — and answering it by reading the
+plan and handing an agent the first item is the dispatch this whole design refuses.
 
 ### `qb-status` — the pane's answer, the agent's answer, and the gap
 
@@ -1476,12 +1507,33 @@ same cache and the same three-minute floor, so a verdict never costs a call and 
 the bar cannot come to disagree.
 
 **Clicking starts work, not just navigation.** Each PR row carries a `⚖` and each issue row
-a `⚒`; clicking one opens a confirmation showing the exact command, and confirming runs
-`/panel-review-pr <n>` or `/fix-issue <n>` in a detached tmux window of its own — the same
-way `qb-seat` starts an agent, so what it starts is a real session you can attach to, read
-and interrupt. Clicking anywhere else on the row still opens the thing on GitHub. The keys
-are `o` open, `p` panel-review, `f` fix the selected issue or plan item, `s` this project's
-rows or the whole fleet's, `r` refresh, `?` the list, `q` quit.
+a `⚒`; clicking one opens a confirmation showing the exact command, and confirming starts a
+real session you can attach to, read and interrupt. Clicking anywhere else on the row still
+opens the thing on GitHub. The keys are `o` open, `p` panel-review, `f` fix the selected
+issue or plan item, `s` this project's rows or the whole fleet's, `r` refresh, `?` the list,
+`q` quit.
+
+**The `⚒` goes through `qb-start` (#371), and therefore inherits its gate.** It used to
+compose `claude -- /fix-issue <n>` and hand it to tmux, and what that started was a session
+nothing could count: outside `qb-admit`'s in-flight window, holding no claim, and known to
+the board only once the agent's own hook got round to saying so. Now it is
+`qb-start /fix-issue <n> --via dash`, so the click is counted, claimed before the process
+exists, endable by session id, and on the board. The cost is that **on a machine that has
+not opted in the button refuses** — which is every machine by default — and the dashboard
+asks `qb-start --policy` *before* raising the confirmation, so the refusal arrives instead of
+the dialog rather than after it, naming the file and the one line of nix that turns it on.
+
+It does **not** fall back to the old uncounted spawn when the gate says no. That shape is
+tempting and wrong three times over: it would make "this machine has not opted in" a fact
+about which code path ran rather than about the machine; it would put two behaviours behind
+one icon, a counted session on one box and an uncounted one on another with nothing on
+screen to say which you got; and it would set the precedent for the next trigger, which will
+not have a human behind it. A permission with a fallback is not a permission.
+
+**The `⚖` still starts its review directly**, and that is a placement decision rather than an
+oversight: a panel review lands in a *pane of the seat row*, beside the work it is about, and
+`qb-start` makes windows. Teaching it where to put a session is a bigger change than #371,
+and the `⚒` is where the loop needed a beginning.
 
 **The plans panel is the one that says what the work is FOR.** FLEET says who is here and
 CLAIMED says what they hold; neither answers why. `PLANS` is the board's plan — every repo's
@@ -1513,9 +1565,16 @@ or the item's title instead.
 board, so what matters is which issues nobody holds: the free ones sort to the top, and a
 held one is greyed and carries its holder's name. That marking is the board's own claims,
 joined on the claim key — an issue claim is namespaced `owner/repo#n`, which is the number
-`gh issue list` reports. The `⚒` on a held issue still works and the confirmation names the
-holder: a session that died leaves its claim standing, and picking that work up is a thing
-to warn about, not to forbid.
+`gh issue list` reports. The `⚒` on a held issue used to work anyway, with the confirmation
+naming the holder — a session that died leaves its claim standing, and picking that work up
+was a thing to warn about rather than forbid. Since #371 it is refused, and the reversal is
+the claim's doing rather than a change of mind: the click now *takes* that claim, so
+proceeding is `qb-claim` refusing at exit 8, and a dialog whose only possible outcome is no
+is worse than the answer. The message names the release that makes the work takeable again
+(`qb-release issue <n>`) for the case the warning was written for — and it names its own
+source, because `held` is the board's answer from up to one poll ago and a claim released two
+seconds back is still on it. `qb-claim` stays the authority: it is what settles the race the
+other way, where the panel shows an issue as free and the spawn is refused at exit 8.
 
 The confirmation is deliberate: a panel review costs money, comments on a public PR and
 pushes a fix commit, and `/fix-issue` writes a branch and opens a PR — so a stray click in a

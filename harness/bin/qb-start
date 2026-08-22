@@ -72,6 +72,14 @@ moment it is created rather than from whenever the agent's SessionStart hook get
 round to it. `qb-end <that id>` works immediately, the seat bar's ✕ can reach it,
 and the ordinary SessionEnd hook ends it with a reason like any other session.
 
+**AND WHAT PULLED IT IS RECORDED.** `--via` names the caller — a person at a
+prompt, the dashboard's ⚒ — and it lands on the claim note, on the board post
+(spawns AND refusals) and on the pane as `@qb_spawn_via`. A session that appears
+on a machine nobody is watching raises exactly one question, and this is the file
+that has to be able to answer it. It is a closed set for :data:`SPAWNABLE`'s
+reason: a provenance field the caller fills in freely is one that can be made to
+say a human did it.
+
 **THE CLAIM IS THE COUNT.** Taken before the process exists, through the ordinary
 `qb-claim` path, on the resource the command names — so `qb-admit`'s window,
 `GET /claim/held`, the plan and `qb-reconcile` all see a spawn as one unit of
@@ -126,6 +134,22 @@ SPAWNABLE = {
     "/panel-review-pr": "pr",
 }
 
+#: Who may be recorded as having pulled this, and why it is a closed set rather
+#: than a string the caller fills in. `--via` goes into a claim note and a board
+#: post, which is where an operator looks to answer the only question a session
+#: that appeared on its own raises: WHAT STARTED THIS. A free-text field there is
+#: one that can be made to say a human did — and the answer has to be worth more
+#: than the thing it is explaining. Every trigger is a caller somebody wrote and
+#: can go and read, so adding one is a line here and a line in `harness/README.md`.
+#:
+#: The default is `cli`, because a person at a prompt is the only caller that
+#: needs no explaining, and it is the one this shipped with.
+TRIGGERS = {
+    "cli": "a person typed it",
+    "dash": "the ⚒ on qb-dash-tui, on a click somebody made",
+}
+DEFAULT_VIA = "cli"
+
 #: Where a machine says yes, and there is NO environment override for it.
 #:
 #: There was one while this was being written — a `$QUARTERBACK_SPAWN` naming a
@@ -174,6 +198,14 @@ OPT_SPAWN = "@qb_spawn"
 OPT_ENDED = "@qb_spawn_ended"
 OPT_SESSION = "@qb_session"
 OPT_LABEL = "@qb_label"
+#: And what pulled it, on the pane itself — see `--via`. Stamped best-effort and
+#: deliberately outside the checked three below: the other options are what make
+#: a spawn countable and endable, and a window that lost one of those is closed
+#: rather than run. Provenance is not that. A pane whose `@qb_spawn_via` did not
+#: land is still counted, still claimed and still endable, and the board post
+#: says who asked for it either way — so killing a working session over a label
+#: would trade the thing that matters for the thing that explains it.
+OPT_VIA = "@qb_spawn_via"
 
 
 # ---- the machine's policy ----------------------------------------------------
@@ -388,6 +420,17 @@ def main() -> int:
                     help="the checkout the session runs in (default: here)")
     ap.add_argument("--model", default=None,
                     help="passed to the agent as --model; omitted when unset")
+    ap.add_argument("--via", default=DEFAULT_VIA, choices=sorted(TRIGGERS),
+                    help="what pulled this, recorded on the claim, the board post "
+                         "and the pane, so a session that appeared can be traced "
+                         "to the thing that asked for it (default: "
+                         + DEFAULT_VIA + ")")
+    ap.add_argument("--policy", action="store_true",
+                    help="say what this machine will start, and exit. Starts "
+                         "nothing, claims nothing, posts nothing and consults "
+                         "nothing but the policy file — it is the question a "
+                         "caller asks before it offers somebody a button. Exits "
+                         "0 when spawning is enabled here, 3 when it is not")
     ap.add_argument("--dry-run", action="store_true",
                     help="make every refusal, print what would run, start nothing "
                          "— and take no claim and post nothing")
@@ -409,6 +452,32 @@ def main() -> int:
     # ---- 1. the machine. FIRST, and before anything is imported, looked for or
     # asked. This is the default path and it has to cost nothing at all.
     policy = read_policy()
+
+    # ---- 1a. …and a caller may ask that same question without asking for a
+    # session. A trigger with a button on it needs the answer BEFORE the click:
+    # an affordance that looks live, is clicked, and then explains that this
+    # machine never opted in has spent somebody's attention to tell them
+    # something it knew all along. The alternative is for the caller to read
+    # `spawn.json` itself, which is a second implementation of the one gate this
+    # file exists to be the only copy of.
+    #
+    # It is the SAME `read_policy` the spawn path uses and it happens at the same
+    # point, so it can never answer yes to a machine the next line would refuse.
+    # And it consults nothing else — no board, no tmux, no network — so a caller
+    # may ask it on every click without paying for it.
+    if args.policy:
+        allows = sorted(policy.commands & set(SPAWNABLE))
+        if policy.enabled:
+            say(f"spawning is enabled here — {policy.where}")
+            say(f"  allows: {', '.join(allows) or '(nothing — `commands` is empty)'}"
+                f"; up to {policy.max_sessions} at once")
+        else:
+            say(f"not enabled: {policy.refusal}")
+        out(enabled=policy.enabled, policy=policy.where, commands=allows,
+            max_sessions=policy.max_sessions, reason=policy.refusal or None,
+            spawnable=sorted(SPAWNABLE), triggers=sorted(TRIGGERS))
+        return STARTED if policy.enabled else NOT_ENABLED
+
     if not policy.enabled:
         say(f"not enabled: {policy.refusal}")
         out(started=False, enabled=False, policy=policy.where, reason=policy.refusal)
@@ -425,15 +494,23 @@ def main() -> int:
     command = args.command if args.command.startswith("/") else "/" + args.command
     repo_path = os.path.abspath(args.repo_path)
 
+    # What asked for this, in the words the board post carries. On the refusals
+    # as well as the spawns: "the dash was refused forty times today because this
+    # machine never opted in" is a sentence somebody should be able to read off
+    # the board, and a refusal that did not say who was refused cannot say it.
+    def provenance(*parts: str) -> str:
+        return "\n\n".join([*(p for p in parts if p),
+                             f"asked for by: {args.via} — {TRIGGERS[args.via]}"])
+
     def refuse(code: int, summary: str, detail: str = "") -> int:
         say(f"refused: {summary}")
         if detail:
             say(f"  {detail}")
         out(started=False, enabled=True, policy=policy.where, command=command,
-            reason=summary)
+            via=args.via, reason=summary)
         if not args.dry_run:
             board_post("note", f"spawn refused: {summary}",
-                       detail or None, board_refs(repo_path, command, args.number))
+                       provenance(detail), board_refs(repo_path, command, args.number))
         return code
 
     # ---- 2. the allowlist, both halves. The table is what CAN be spawned; the
@@ -535,11 +612,13 @@ def main() -> int:
         say(f"policy:   {policy.where}")
         say(f"cwd:      {repo_path}")
         say(f"claim:    {kind} {number} (no session, machine-held, as create-worktree's is)")
+        say(f"via:      {args.via} — {TRIGGERS[args.via]}")
         say(f"session:  {session}")
         argv = agent_argv(command, number, policy, args.model, session)
         say(f"command:  {' '.join(shlex.quote(a) for a in argv)}")
         out(started=False, dry_run=True, enabled=True, policy=policy.where,
-            command=command, number=number, claim={"kind": kind, "value": number},
+            command=command, number=number, via=args.via,
+            claim={"kind": kind, "value": number},
             repo_path=repo_path, running=len(running), max_sessions=policy.max_sessions)
         return STARTED
 
@@ -547,7 +626,8 @@ def main() -> int:
     session = str(uuid.uuid4())
     claim = run_gate(
         "qb-claim", kind, number, "--repo-path", repo_path, "--session", "",
-        "--note", f"spawned {command} {number} by qb-start (session {session[:8]})",
+        "--note", f"spawned {command} {number} by qb-start via {args.via} "
+                  f"(session {session[:8]})",
         "--quiet", timeout=60)
     if claim.returncode == 1:
         return refuse(HELD, f"{kind} {number} is already claimed",
@@ -566,13 +646,14 @@ def main() -> int:
                       "worse than one nobody started")
 
     refs = board_refs(repo_path, command, number)
-    board_post("status", f"spawning {command} {number}",
-               f"qb-start on this machine: session {session}, cwd {repo_path}, "
-               f"claim {kind}/{number}. Attachable in tmux; end it with "
-               f"`qb-end {session}`.", refs)
+    board_post("status", f"spawning {command} {number} (via {args.via})",
+               provenance(f"qb-start on this machine: session {session}, cwd "
+                          f"{repo_path}, claim {kind}/{number}. Attachable in "
+                          f"tmux; end it with `qb-end {session}`."), refs)
 
     # ---- 9. the pane.
-    started, why = spawn(command, number, policy, args.model, session, repo_path)
+    started, why = spawn(command, number, policy, args.model, session, repo_path,
+                         args.via)
     if not started:
         # The claim goes back. It was taken for a session that now does not exist,
         # and leaving it would hold the slot the whole point of taking it was to
@@ -594,14 +675,15 @@ def main() -> int:
         say(f"  {note}")
         out(started=False, enabled=True, reason=why, session=session,
             claim_released=handed)
-        board_post("note", f"spawn failed: {command} {number} — {why}", note, refs)
+        board_post("note", f"spawn failed: {command} {number} — {why}",
+                   provenance(note), refs)
         return COULD_NOT_START
 
     say(f"started: {command} {number} in {os.path.basename(repo_path)}")
     say(f"  session {session} — attach in tmux, or end it with `qb-end {session}`")
     out(started=True, enabled=True, policy=policy.where, command=command,
         number=number, session=session, repo_path=repo_path, pane=why,
-        claim={"kind": kind, "value": number})
+        via=args.via, claim={"kind": kind, "value": number})
     return STARTED
 
 
@@ -653,7 +735,7 @@ def agent_argv(command: str, number: str, policy: Policy, model: str | None,
 
 
 def spawn(command: str, number: str, policy: Policy, model: str | None,
-          session: str, repo_path: str) -> tuple[bool, str]:
+          session: str, repo_path: str, via: str = DEFAULT_VIA) -> tuple[bool, str]:
     """A detached tmux window, stamped so everything else can find it.
 
     Detached, and dropping to a shell afterwards, because `qb-dash-tui` already
@@ -718,6 +800,13 @@ def spawn(command: str, number: str, policy: Policy, model: str | None,
                       f"human can stop it: `tmux kill-pane -t {pane}`")
             return False, (f"tmux made the window and would not stamp {option} on "
                            f"it ({why}) — {closed}")
+    # And the provenance, AFTER the loop and unchecked, which is the whole of the
+    # difference between the two: `tmux list-panes -F '#{@qb_spawn_via}'` answers
+    # "what asked for this pane" for a window somebody found and does not
+    # recognise, and it is worth having — but it is a label on a session, and the
+    # board post above is the record that survives the pane being closed. See
+    # OPT_VIA on why a spawn that got everything else is not thrown away for it.
+    tmux("set-option", "-p", "-t", pane, OPT_VIA, via, timeout=5)
     return True, pane
 
 

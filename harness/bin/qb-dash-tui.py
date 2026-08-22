@@ -19,6 +19,19 @@ you clicked:
                 in a new pane of the seat row, beside the work it is about
   an issue      open it on GitHub — or its ⚒, to start /fix-issue on it
 
+The ⚒ goes through `qb-start` (#371), so what it starts is counted by
+`qb-admit`, holds a claim taken before the process exists, is endable by session
+id from the moment the pane appears, and is recorded on the board as `via dash`.
+It therefore also inherits `qb-start`'s gate: on a machine that has not opted in
+— which is every machine by default — the ⚒ refuses and names the one line of
+nix that turns it on. It does not fall back to starting an uncounted session;
+`Dash.spawn_refusal` is where that decision is argued.
+
+The ⚖ still starts its review directly, and that is not an oversight: a panel
+review lands in a PANE of the seat row, beside the work it is about, and
+`qb-start` makes windows. Giving it a placement argument is a bigger change than
+#371, and the ⚒ is where the loop needed a beginning.
+
 Keys: r refresh now, o open the selected PR, s widen or narrow the scope, q quit.
 
 It opens NARROW: the rows of the project this screen is for (`--repo`, else
@@ -36,6 +49,7 @@ behaviour (selecting text) instead of the app's.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shlex
 import subprocess
@@ -53,6 +67,48 @@ from textual.widgets import DataTable, Footer, Static
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import qbdata as qd                                             # noqa: E402
+
+
+def sibling(name: str) -> str:
+    """`name` on PATH, or beside this file.
+
+    `qb-start.sibling`'s resolution, for its reason: a home-manager install has
+    both, a checkout has only the second, and a partial install has only the
+    first. The dashboard has always called `qb-seat-click` by its bare name and
+    got away with it because it is launched from a shell that has the harness on
+    PATH — but the ⚒ now runs the one tool whose absence must not be mistaken for
+    a machine that has not opted in, and `which` returning None is a different
+    answer from `spawn.json` being absent.
+    """
+    from shutil import which
+    return which(name) or os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
+
+
+def spawn_answer(name: str, done: "subprocess.CompletedProcess") -> str:
+    """The detail line after `qb-start` has answered, in `qb-start`'s own words.
+
+    Module level, and not a method, because it is the one part of the ⚒ that is
+    pure: a completed process in, the sentence a human reads out. That is what
+    makes "a refusal is reported rather than swallowed" testable without a board,
+    a tmux server or a policy file.
+
+    The LAST two lines of stderr, because that is where `qb-start` puts its
+    verdict: the gates it ran print theirs first — `qb-claim` naming the holder,
+    `qb-admit` listing the slots — and then it says `refused: …` and its detail.
+    Taking the last two keeps the verdict and its remedy and drops the noise
+    above them, and the whole of it is still on the pane the click came from.
+    """
+    try:
+        answer = json.loads(done.stdout or "")
+    except ValueError:
+        answer = {}
+    if done.returncode == 0 and answer.get("started"):
+        session = str(answer.get("session") or "")
+        return (f"started '{name}' — session {session[:8]} · Ctrl-b n to watch it · "
+                f"`qb-end {session}` to stop it")
+    lines = [ln.strip() for ln in (done.stderr or "").splitlines() if ln.strip()]
+    return "⚒ " + (qd.clip(" — ".join(lines[-2:]), 240)
+                   or f"qb-start exited {done.returncode} and said nothing")
 
 
 def holders(held: dict[str, dict]) -> dict[str, str]:
@@ -284,6 +340,11 @@ class Dash(App):
         # list several repos now, so "issue #12" is not an address on its own.
         self.repo_slug = qd.repo_slug(self.repo)
         self.agent_bin = os.environ.get("QB_SEAT_AGENT", "claude")
+        # The ⚒ runs this rather than the agent directly (#371). Resolved once
+        # and kept, so that a test can point it somewhere and so that the two
+        # calls the button makes — `--policy` before the click and the spawn
+        # after it — cannot end up asking two different binaries.
+        self.start_bin = sibling("qb-start")
         self.confirm = os.environ.get("QB_DASH_CONFIRM", "1") != "0"
         self.pr_err: str | None = None
 
@@ -1006,12 +1067,43 @@ class Dash(App):
         self.fix_issue(issue)
 
     def fix_issue(self, issue: dict) -> None:
-        """Kick off /fix-issue for an issue, the same way ⚖ starts a review.
+        """Kick off /fix-issue for an issue — THROUGH `qb-start`, since #371.
 
-        The prompt names the holder when the board already has a claim on it:
-        taking a held issue is somebody else's work redone, and that is worth a
-        sentence before the click, not a rule against it — a lapsed session
-        leaves a claim standing that somebody should pick up.
+        It used to compose `claude -- /fix-issue N` here and hand it to tmux, and
+        what that started was a session nothing could count: outside `qb-admit`'s
+        in-flight window, holding no claim, and known to the board only once the
+        agent's own SessionStart hook got round to saying so. `qb-start` is the
+        primitive that fixes all three (#277, #360) and until now nothing pulled
+        it. This is its first caller: the cheapest possible trigger, because a
+        click is still a human hand and so it needs no new safety at all — the
+        gates, the machine cap, the allowlist and the claim are all at the
+        primitive, and this only has to ask it.
+
+        **AND ON A MACHINE THAT HAS NOT OPTED IN IT REFUSES, WITH THE REMEDY.**
+        That is the obstacle #360 named and declined to walk into: `qb-start`
+        ships off, so routing a working button through it makes the button stop
+        working until somebody writes one line of nix. The alternative — fall
+        back to the old direct spawn when the gate says no — was rejected, and
+        the argument is in `spawn_refusal`.
+
+        A held issue is now refused rather than warned about, which reverses this
+        method's own previous sentence. That sentence was right about a click
+        that took NO CLAIM: warning and letting you proceed cost nothing but your
+        own judgement. This click takes the claim, so proceeding is `qb-claim`
+        refusing at exit 8 — a dialog whose only possible outcome is no. What was
+        a warning is now the answer, and it names the way to release a claim that
+        has genuinely lapsed.
+
+        **THIS ONE READS A SNAPSHOT, AND SAYS SO.** `self.held` is the board's
+        answer from up to one poll ago, so a claim released two seconds back is
+        still on it and this refuses work that is in fact free — the one thing
+        the atomic claim would have got right. Which is why the message names its
+        source and the key that re-reads it rather than stating the holder as a
+        fact: `qb-claim` remains the authority, and it is still the one that
+        settles the race in the other direction, where the panel shows an issue
+        as free and the spawn is refused at exit 8. What is traded is a stale
+        refusal a keypress fixes, against a confirmation dialog that could only
+        ever end in the same no, three board round trips later.
         """
         number = issue.get("number")
         # Somebody else's work redone under the wrong title, if this is skipped —
@@ -1019,19 +1111,131 @@ class Dash(App):
         if (why := self.wrong_repo(issue.get("repo"), f"#{number}")):
             self.say(why)
             return
-        command = f"{shlex.quote(self.agent_bin)} -- {shlex.quote(f'/fix-issue {number}')}"
-        holder = holders(self.held).get(qd.issue_key(issue))
-        prompt = f"start /fix-issue on #{number}?"
-        if holder:
-            prompt += f"  (held by {holder})"
+        if (holder := holders(self.held).get(qd.issue_key(issue))):
+            self.say(f"#{number} is claimed by {holder} (the board's last answer, "
+                     f"`r` re-reads it) — the spawn takes that claim, so "
+                     f"`qb-release issue {number}` is what frees it")
+            return
+        self.start_work("/fix-issue", number, f"start /fix-issue on #{number}?")
+
+    # ---- the ⚒, through qb-start ------------------------------------------
+
+    def start_work(self, command: str, number: int | str, prompt: str) -> None:
+        """Ask this machine, then ask the human, then ask `qb-start`.
+
+        In that order, and the first one is the point. A button that raises a
+        confirmation, takes the click and THEN says the machine never opted in
+        has spent somebody's attention telling them something it could have
+        known before it drew itself — and #371 is explicit that a button which
+        appears to work and does not is worse than one that is absent.
+        """
+        if (why := self.spawn_refusal(command)):
+            self.say(why)
+            return
+        # The window `qb-start` will make, spelled its way rather than this
+        # panel's old `fix-<n>`: the message this ends on tells you what to go
+        # and look at, and a name only the dashboard uses is one you cannot find.
+        name = f"{command.lstrip('/')}-{number}"
+        argv = self.spawn_argv(command, number)
+        shown = " ".join(shlex.quote(a) for a in argv)
         if self.confirm:
             self.push_screen(
-                Confirm(prompt, command, self.repo),
-                lambda go: self.run_in_window(f"fix-{number}", command) if go else
-                self.say("cancelled"),
+                Confirm(prompt, shown, self.repo),
+                lambda go: self.run_spawn(name, argv) if go else self.say("cancelled"),
             )
         else:
-            self.run_in_window(f"fix-{number}", command)
+            self.run_spawn(name, argv)
+
+    def spawn_argv(self, command: str, number: int | str) -> list[str]:
+        """What the ⚒ runs. `--via dash` is the provenance #371 asks for: it lands
+        on the claim note, on the board post and on the pane as `@qb_spawn_via`,
+        so a session somebody finds running can be traced to the click that asked
+        for it rather than guessed at."""
+        return [self.start_bin, command, str(number), "--repo-path", self.repo,
+                "--via", "dash", "--json"]
+
+    def spawn_refusal(self, command: str) -> str | None:
+        """Why this machine will not start `command`, or None if it will.
+
+        `qb-start --policy` is the question, so this is not a second reading of
+        `spawn.json` — one gate, asked rather than reimplemented. It costs one
+        local process and reads one file: no board, no tmux, no network. Asked on
+        every click rather than cached at mount, so opting a machine in takes
+        effect on the next click instead of on the next dashboard.
+
+        **AND IT DOES NOT FALL BACK TO THE OLD SPAWN.** The tempting shape is
+        obvious — refuse through `qb-start`, and when the machine has not opted
+        in start the session the way this button did last week — and it is wrong
+        three times over. It would make "this machine has not opted in" a fact
+        about which code path ran rather than about the machine. It would put two
+        behaviours behind one icon, a counted, claimed, board-recorded session on
+        one box and an uncounted one on another, with nothing on screen to say
+        which you got. And it would set the precedent for the next trigger, which
+        will not have a human behind it. A permission with a fallback is not a
+        permission; the honest cost is one line of nix, once, on the machine
+        somebody wants this on.
+        """
+        try:
+            got = subprocess.run([self.start_bin, "--policy", "--json"],
+                                 capture_output=True, text=True, timeout=15)
+        except Exception as exc:                       # noqa: BLE001
+            # Fails CLOSED, and says which failure it was. `qb-start` missing is
+            # a broken install, not a machine that said no, and the two want
+            # different things done about them.
+            return (f"⚒ cannot ask {self.start_bin} whether this machine may "
+                    f"spawn ({type(exc).__name__}) — the ⚒ goes through qb-start "
+                    f"now, and a gate that cannot be asked has not said yes")
+        try:
+            answer = json.loads(got.stdout)
+        except ValueError:
+            answer = {}
+        if not answer.get("enabled"):
+            return "⚒ " + qd.clip(
+                answer.get("reason") or got.stderr.strip()
+                or f"qb-start --policy exited {got.returncode} and said nothing", 240)
+        if command not in (answer.get("commands") or []):
+            return (f"⚒ {command} is not on this machine's allowlist — name it in "
+                    f"`programs.quarterback-harness.spawn.commands` "
+                    f"({answer.get('policy')} allows: "
+                    f"{', '.join(answer.get('commands') or []) or 'nothing'})")
+        return None
+
+    @work(thread=True, group="spawn")
+    def run_spawn(self, name: str, argv: list[str]) -> None:
+        """Run `qb-start` and report what it answered.
+
+        In a thread, unlike every other subprocess this app runs from a click:
+        those are tmux calls that return in milliseconds, and this one asks
+        `qb-pace`, `qb-admit` and `qb-claim` in turn — three board round trips
+        before a pane exists. On the ui thread that is a dashboard that stops
+        redrawing while it starts a session.
+
+        Every refusal is reported in `qb-start`'s OWN words rather than
+        translated by exit code here. There are seven of them, each with a
+        different remedy, and a second copy of those sentences in this file would
+        be a second copy to keep true.
+        """
+        # Outside tmux, `run_in_window`'s answer and its reason: the useful thing
+        # to say is the exact command, and it is said AFTER the confirmation
+        # because a dialog that never appears is also a dialog that cannot be
+        # tested. Before `qb-start` runs, though, and that part is new — it would
+        # otherwise pass every gate, take the claim and post the spawn before
+        # discovering it has nowhere to put a pane, then hand both back. A
+        # refusal that costs three board round trips is worse than the same
+        # refusal made here.
+        if not os.environ.get("TMUX"):
+            self.call_from_thread(
+                self.say, "not inside tmux — run it yourself: "
+                          + " ".join(shlex.quote(a) for a in argv))
+            return
+        try:
+            done = subprocess.run(argv, capture_output=True, text=True, timeout=300)
+        except Exception as exc:                       # noqa: BLE001
+            self.call_from_thread(
+                self.say, f"could not run qb-start ({type(exc).__name__})")
+            return
+        self.call_from_thread(self.say, spawn_answer(name, done))
+
 
     def run_in_window(self, name: str, command: str) -> None:
         """A detached tmux window running `command`, dropping to a shell after.
