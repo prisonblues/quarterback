@@ -18,6 +18,17 @@ A stale record of a deleted mechanism is the same defect #172 is about, one laye
 up: a second answer to a question that has one. There is no way to grep for "is
 described in the present tense", so this pins the sentences that were wrong and
 the sentence that replaced them — crude, and enough to make a revert visible.
+
+**#296 gave the release number an allocator again, and this file had to be told
+which one is which.** `scripts/release_tag.py` takes `refs/tags/vX.Y` on the
+remote, and a ref create is compare-and-swap: it succeeds for one caller and is
+rejected for every other, whether or not anybody looks. That is the property
+`POST /release/claim` never had — it recorded an intention nothing read — so the
+two are not the same thing wearing different clothes, and the pin below is no
+longer "there is no allocator" but "the BOARD one is gone, and here is what
+answers the question instead". A pin on the older, blunter wording would now be
+satisfied by a docstring that had gone quiet about the mechanism actually in use,
+which is the failure this file exists to catch rather than a version of passing.
 """
 
 from __future__ import annotations
@@ -41,13 +52,28 @@ def test_the_lease_table_does_not_list_a_kind_nothing_can_write():
     assert '``kind="work"``' in text and '``kind="merge"``' in text
 
 
-def test_release_stamp_does_not_describe_the_allocator_as_live():
-    """`release_stamp.py` is the whole mechanism now. Its docstring is where an
-    agent goes to learn how release numbers work, so it is the one place that must
-    not send them to an endpoint that 404s."""
+def test_release_stamp_does_not_describe_the_board_allocator_as_live():
+    """Its docstring is where an agent goes to learn how release numbers work, so
+    it is the one place that must not send them to an endpoint that 404s."""
     text = (REPO_ROOT / "scripts/release_stamp.py").read_text()
 
     assert "records that a caller INTENDS to take a number" not in text, \
-        "the allocator is described in the present tense again"
-    assert "the allocator is deleted" in text, \
-        "the docstring must say the other mechanism is gone, not merely unused"
+        "the board allocator is described in the present tense again"
+    assert "It is\ngone (#172)" in text, \
+        "the docstring must say the board allocator is gone, not merely unused"
+
+
+def test_release_stamp_names_the_allocator_that_did_replace_it():
+    """The other half, and the one a reader is actually stopped by. Saying only
+    that the board allocator is gone leaves an agent believing the number has no
+    lock at all — which was true until #296 and is what this module's own opening
+    paragraph still describes. A docstring that has gone quiet about
+    `release_tag.py` is stale in the same way the #172 one was, in the direction
+    that costs a lander a red `main` rather than a 404."""
+    text = (REPO_ROOT / "scripts/release_stamp.py").read_text()
+
+    assert "release_tag.py" in text, \
+        "the docstring must name the tool that actually allocates the number"
+    assert (REPO_ROOT / "scripts/release_tag.py").exists(), \
+        "and that tool has to be here — a docstring naming a deleted script is the "\
+        "exact defect this file was written for"

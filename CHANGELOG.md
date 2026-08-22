@@ -17,6 +17,60 @@ the top of this file conflict every time, over nothing — both entries are righ
 and a fragment is a path no other branch will ever open. `changelog.d/README.md` has the format.
 `vNEXT` means exactly what it meant before; assembly is just what writes it.
 
+## v3 — the release number gets an allocator, and it is a git tag
+
+The number was handed out by reading a file. `release_stamp.py apply` computes
+`max(release headings at origin/main) + 1`, which is the right answer to the question it
+asks and is not a lock — two landers who ask seconds apart get the same answer, because
+reading a file reserves nothing. That file's own first paragraph has said so since it was
+written: *"a release number is a shared namespace with no lock on it."* Everything built on
+top of it — 2,300 lines of stamper, a suite behind it, the `no unstamped release on main`
+job — is a response to that sentence rather than a fix for it, and the fix arrives after the
+second merge, with `main` red and everybody else's landing blocked (#289, #291).
+
+The primitive that is an allocator was in git the whole time, unused: this repo had **zero
+tags**. Creating a ref on a remote is compare-and-swap. `git push origin
+<sha>:refs/tags/v2.96` succeeds for exactly one caller and is rejected for every other,
+forever, with no server and no table of numbers going stale for every PR still open — which
+is what #172 deleted, and it was right to. That allocator recorded an *intention* to take a
+number, which nothing read. A tag **is** the number.
+
+### The number is taken at push time
+
+`scripts/release_tag.py` is new and sits beside `release_stamp.py` rather than replacing any
+of it. `harness/githooks/pre-push` calls its `reserve` for the branch it is pushing, which is
+the only moment the tag can be a reservation rather than a record: at stamp time it is
+fork-relative like everything else, and at merge time there is no local hook to run, because
+this fleet lands through `gh pr merge` on the GitHub API — #351's finding, one domain over.
+`--onto` keeps it silent on every branch that stamped nothing, which is what makes it safe to
+run on every push.
+
+`release_stamp.py` learned to read tags in the two places it reasons about numbers, and
+nowhere else. `next_release` folds them into the same `max`, so a number a sibling reserved
+and has not yet merged is skipped instead of handed out twice. `collision` refuses a number
+this branch added that a tag holds on a commit this branch does not contain — both halves
+required, so a backfilled tag for a landed release (an ancestor of every branch off `main`)
+refuses nothing.
+
+### What it does not close
+
+`git push --no-verify` skips the hook, and so does a checkout where the hook was never
+installed; neither can be closed from inside a hook. If **neither** lander reserves, both
+stamp the same number and the second merge turns main red exactly as before. The new
+`every release on main has a tag` CI job covers those for the **record** — it runs after the
+merge, so it can only write down what landed, and calling it a lock would be the reassuring
+wrong answer this repo keeps finding.
+
+### The ninety-seven releases that had no tag
+
+`backfill` reads the CHANGELOG at each commit along `main`'s first-parent line and tags every
+release at the commit that first declared it — the merge that landed it, not the branch
+commit that wrote it. It **never moves a tag**: one in the wrong place is reported and left,
+because everything downstream of a tag quietly changes meaning when they move, and a moved
+tag is worse than an absent one. `check` reconciles the two directions of one invariant — a
+tag `vX.Y` points at a commit whose `CHANGELOG.md` declares `## vX.Y` — one condition per
+line, with 0/1/2 exit codes so "could not be checked" is not reported as "clean".
+
 ## v2.99 — something acts on a stale harness, and stops one step short of your password
 
 Landing has never been deploying. `qb-doctor` has said "the harness on PATH is behind this

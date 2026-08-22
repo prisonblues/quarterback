@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # pre-push hook — the BACKSTOP half of this fleet's migration and release discipline.
 #
-# Three refusals, all computed from the files AT THE PUSHED COMMIT and never from a live
-# database or from whatever happens to be checked out:
+# Three refusals and one CREATE, all computed from the files AT THE PUSHED COMMIT and never
+# from a live database or from whatever happens to be checked out:
 #
 #   1. A protected branch would receive a migration graph that does not have exactly one
 #      head. `alembic upgrade head` refuses to run against a two-headed graph, and the
@@ -21,6 +21,25 @@
 #      Fork-relative for the same reason as 2: the merge base holds the shipped text to
 #      compare against, and a branch merely behind has touched nothing. `release_stamp.py
 #      frozen`, and a deliberate edit says so in a `Release-Body-Edit:` commit trailer.
+#   4. THE ONE STEP HERE THAT TAKES SOMETHING RATHER THAN CHECKING IT. Where the pushed
+#      commit adds a release number the base does not have, `release_tag.py reserve` creates
+#      `refs/tags/vX.Y` on the remote — which is a compare-and-swap: it succeeds for exactly
+#      one caller and is rejected for every other, forever. That is the lock #296 says the
+#      release number has never had, and this is the only moment it can be taken. At stamp
+#      time the number is still a reading of a shared file in one worktree; at merge time
+#      the merge is `gh pr merge` through the GitHub API, which runs no local hook at all
+#      (#351's finding, one domain over). At push time the release commit exists, the remote
+#      is right there, and the create either wins or loses cleanly.
+#      It runs LAST and only when 1-3 all passed, because a tag taken for a branch that is
+#      about to be refused is a number nobody can ever use again.
+#      WHAT IT CANNOT AVOID, said here rather than left to be found: a pre-push hook runs
+#      BEFORE the push, so a tag is created for a push git then fails to deliver — a rejected
+#      non-fast-forward, a dropped connection, or a second ref in the same push being refused
+#      after the first was reserved. The tag is then a reservation for a branch that never
+#      arrived. That costs a skipped release number and nothing else: `release_tag.py check`
+#      lists a tag that is not on the integration ref as a reservation rather than a defect,
+#      because that is also what every release still in flight looks like. The alternative is
+#      deleting a tag, which this file will not do for the same reason it never moves one.
 #
 # WHY A HOOK AND NOT A RUNBOOK. On 2026-08-22 four branches each minted migration `0029`.
 # Each author ran the reconciler's `preflight`, each got a TRUTHFUL answer, and each
@@ -48,6 +67,7 @@
 #   git config --bool qb.prePush.migrationHeads false one repo, recorded, and
 #   git config --bool qb.prePush.releaseNumber  false `qb-hooks status` says so
 #   git config --bool qb.prePush.releaseBodies  false
+#   git config --bool qb.prePush.reserveRelease false
 # What must not exist is a path where the hook does not run and nobody notices.
 #
 # WHAT A GREEN RUN DOES AND DOES NOT PROVE. Both checks read the COMMIT being pushed, so a
@@ -636,6 +656,78 @@ shipped text to compare with")
 }
 
 # ---------------------------------------------------------------------------
+# 4. this branch's release number is TAKEN, on the remote, atomically
+# ---------------------------------------------------------------------------
+# The only step in this hook that changes anything, and the only one that is a lock rather
+# than a check. `release_stamp.py` hands out `max(headings at the base) + 1`, which is a
+# READING of a shared file — two landers seconds apart read the same answer, which is the
+# collision the three checks above can only report afterwards. `git push <remote>
+# <sha>:refs/tags/v2.96` is compare-and-swap: one caller creates it, everybody else is
+# rejected, and nothing has to be remembered for that to hold.
+#
+# `--onto` is what makes this safe on EVERY push rather than on release pushes only: a
+# branch whose newest heading is one it INHERITED reserves nothing and says so. So a repo's
+# ordinary feature-branch pushes are one subprocess and no network write.
+#
+# NOT A REFUSAL WHEN IT CANNOT RUN, which is the one place this file departs from "an
+# unrunnable gate is not a passing gate" — and the exception is principled rather than
+# convenient. That rule is about a CHECK reporting clean over a question it never asked.
+# This asks nothing. A reservation that could not be made leaves the repository in exactly
+# the state the three checks above found and passed it in, so there is nothing to be wrong
+# about; what there is instead is a number still unlocked, and that is reported as a note on
+# the push rather than hidden. Refusing here would mean a remote that is briefly unreachable
+# blocks a push that is provably fine.
+reserve_release_number() {
+    local branch="$1" sha="$2" tagger py out rc base
+
+    tagger=$(find_tool QB_RELEASE_TAG qb.releaseTag scripts/release_tag.py) || return 0
+
+    base="$BASE_REF"
+    if [[ -n "$BASE_IN_PUSH" && "$branch" != "$BASE_BRANCH" ]]; then
+        base="$BASE_IN_PUSH"
+    fi
+    # No base to be "new relative to", or no CHANGELOG at either end: this repo either does
+    # not use the convention or there is nothing here to reserve. Silent, like every other
+    # check in this file where the question does not apply.
+    [[ -n "$base" ]] || return 0
+    git cat-file -e "$sha:$CHANGELOG" 2>/dev/null || return 0
+    git cat-file -e "$base:$CHANGELOG" 2>/dev/null || return 0
+
+    if ! py=$(find_python); then
+        notes+=("release number NOT reserved — no Python interpreter on PATH")
+        return 0
+    fi
+
+    out=$("$py" "$tagger" reserve --repo "$TOPLEVEL" --remote "$remote" --commit "$sha" \
+        --onto "$base" 2>&1)
+    rc=$?
+
+    # 2 is the tagger's documented STOP and it means one thing here: somebody else holds this
+    # number. That IS a refusal — pushing anyway lands a second branch on a number a tag says
+    # is taken, which is the exact state this whole mechanism exists to prevent, and it is
+    # cheaper to fix now than after the merge turns main red.
+    if (( rc == 2 )); then
+        refuse \
+            "REFUSE: the release number $branch carries has already been reserved by another" \
+            "        branch, on $remote:" \
+            "" \
+            "$(printf '%s\n' "$out" | sed 's/^/          /')" \
+            "" \
+            "        A release tag can only be created once, so that number is theirs and" \
+            "        this branch needs the next one." \
+            "" \
+            "        Deliberate? git push --no-verify"
+        return 1
+    fi
+    if (( rc != 0 )); then
+        notes+=("release number NOT reserved on $remote — $(printf '%s' "$out" | head -n1)")
+        return 0
+    fi
+    notes+=("$(printf '%s' "$out" | head -n1)")
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 for index in "${!push_branches[@]}"; do
     branch="${push_branches[$index]}"
     sha="${push_shas[$index]}"
@@ -650,6 +742,20 @@ for index in "${!push_branches[@]}"; do
         check_release_bodies "$branch" "$sha"
     fi
 done
+
+# A SECOND pass, and only when the first one found nothing. A tag is permanent — the whole
+# reason it can be a lock — so taking one for a branch that is about to be refused burns a
+# release number nobody can ever use, on a push that never happened.
+if (( refusals == 0 )) && enabled qb.prePush.reserveRelease; then
+    for index in "${!push_branches[@]}"; do
+        # STOP at the first refusal. Once one ref of a multi-ref push is refused the whole
+        # push is aborted, so every number taken after that point is taken for a push that
+        # will not happen. It cannot be made all-or-nothing — a tag already created is not
+        # something this file will delete, for the same reason it never moves one — so the
+        # window is narrowed to the refs already done rather than left open across the rest.
+        reserve_release_number "${push_branches[$index]}" "${push_shas[$index]}" || break
+    done
+fi
 
 if (( refusals > 0 )); then
     printf '\n%s\n\n' "Nothing was pushed." >&2

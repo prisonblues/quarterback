@@ -187,6 +187,13 @@
           # test_pre_push_hook.py's own coupling guard holds this pair against what it reads.
           install -Dm644 ${./scripts/migration_reconcile.py} scripts/migration_reconcile.py
           install -Dm644 ${./scripts/release_stamp.py} scripts/release_stamp.py
+          # And the third, since #296: the hook now RESERVES the release number as well as
+          # checking it, by handing `release_tag.py reserve` the commit being pushed. That is
+          # the only step in the hook that creates anything, so a fixture repo without the
+          # tool would exercise every refusal and none of the lock. `release_tag.py` loads
+          # `release_stamp.py` from beside itself for the one definition of a release
+          # heading, which is why the pair above is not optional here either.
+          install -Dm644 ${./scripts/release_tag.py} scripts/release_tag.py
           # test_claude_wiring.py's reads (#230). It stays in THIS check rather than
           # joining prose-consistency-tests, and the split is the same one that check's
           # comment draws: two thirds of it drives `qb-claude-setup` and `qb-hook` as
