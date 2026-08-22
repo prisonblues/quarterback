@@ -931,7 +931,7 @@ def test_the_tree_still_exists_when_the_judge_runs(monkeypatch, tmp_path, capsys
     judged = {}
 
     def fake_adjudicate(clusters, diff, model, pr, budget=None, coverage=None,
-                        ci="", code_tree=None, budget_usd=None):
+                        ci="", code_tree=None, budget_usd=None, recurrence=""):
         judged["tree"] = str(code_tree) if code_tree else None
         judged["alive"] = bool(code_tree) and (Path(code_tree) / "app/main.py").exists()
         return [], None, ""

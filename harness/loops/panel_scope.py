@@ -313,6 +313,154 @@ def _provenance(file: str, line: int | None, added: dict[str, set[int]],
     return "missed"
 
 
+#: Where a new finding sits relative to the fix pass that preceded it — #67's
+#: third question, beside #48's ``provenance`` and #24's ``new_this_round``.
+#:
+#: Those two ask what a round FOUND. This asks whether the round before it made
+#: any progress on the same defect: *is this finding standing where the last fix
+#: pass was working, on a complaint that pass was sent to answer?* A fix that
+#: patches a wrong assumption produces the next round's findings; a fix that
+#: removes the assumption does not.
+#:
+#: **The names describe a POSITION and not a verdict, and that is a correction
+#: this made under measurement.** It was first written with a bucket called
+#: `circling`, and replaying it over 36 rounds of this board's own history said
+#: the word could not be earned — see :func:`_recurrence` for the numbers.
+#: `revisited` says what is actually known: the previous round complained about
+#: this file, the fixer wrote lines in it, and here is a fresh finding on top of
+#: what it wrote. Whether that is one premise being patched twice or two
+#: unrelated bugs in a busy file is the judge's question
+#: (:data:`panel_core.PREMISE_VERDICTS`), not this one's.
+#:
+#: ``unknown`` is a real answer here for exactly the reason it is one under
+#: :data:`PROVENANCE`: an unreadable fix range or an unplaceable finding leaves
+#: the question asked and unanswered, which is not the same as never asking it
+#: (that one is NULL).
+RECURRENCE = ("revisited", "fix-site", "elsewhere", "unknown")
+
+#: How near a finding must sit to a line the fix pass WROTE before it counts as
+#: standing at that pass's site, in lines.
+#:
+#: Wider than :func:`_provenance`'s rule, deliberately, and the two are measuring
+#: different things over the same input. ``introduced`` demands exact membership
+#: because it is an accusation about authorship, and its docstring records that
+#: reviewer line-drift therefore biases it toward ``missed``. This is not an
+#: accusation about authorship — it asks whether the fixer was WORKING HERE — so
+#: the drift that ``introduced`` must refuse is the drift this has to absorb. A
+#: reviewer that names the top of the enclosing function, the closing brace or
+#: the line after the defect is describing the same neighbourhood.
+#:
+#: **Twenty is a guess, it is written down as one, and the replay says the guess
+#: barely matters.** Every radius from 0 to 20 moves the ``revisited`` rate on
+#: #67's own cases and on the controls by the SAME amount (see
+#: :func:`_recurrence`), so nothing here is tuned and there is nothing yet to
+#: tune it against. It is roughly a short function, it is not a dial, and it is
+#: not read by anything that stops a run — which is the whole design: the number
+#: can be wrong for a few dozen cycles and cost nothing but a mislabelled row,
+#: and those rows are the data that would settle it.
+SITE_RADIUS = 20
+
+
+def _recurrence(file: str, line: int | None, added: dict[str, set[int]],
+                fixed_here: dict[str, set[str]], have_range: bool,
+                radius: int = SITE_RADIUS) -> tuple[str, str | None]:
+    """``(bucket, the earlier finding this one stands on)`` — where is this finding
+    relative to the fix that preceded it, and was that fix answering a complaint
+    about the same place?
+
+    A MEASUREMENT, and nothing reads it to stop a run. #67 asks for it before
+    anything gates on it and says why in one line: two pull requests in one day is
+    an observation, not a calibrated rule. What follows is the first evidence
+    about whether it generalises, and it argues the same way.
+
+    Three predicates, and ``revisited`` is the conjunction:
+
+    1. the previous round raised a finding in this file, and it was work that
+       round's fixer was ASKED to do (``fixed_here`` is built from the findings a
+       fix pass was briefed on, never from the ones the judge dismissed — a
+       dismissed finding is nobody's premise);
+    2. the fix pass wrote lines in this file;
+    3. this finding sits within ``radius`` lines of one of them.
+
+    Two of three — the fixer worked here, but no earlier round had complained
+    about here — is ``fix-site``: fresh damage at the site, which is real
+    information and is not the same news. Neither is ``elsewhere``.
+
+    **What the replay found, and why this is called `revisited` rather than
+    `circling`.** Run over 36 rounds from 26 pull requests on this board — every
+    multi-round cycle it holds — ``revisited`` fires on a MEDIAN of about 80% of a
+    round's new findings, and it does not separate the three cycles #67 identifies
+    as circling (#61, #29, #88) from the rest of the dataset:
+
+    ==========================  ================  ==============
+    narrowing                   #61 / #29 / #88   every other PR
+    ==========================  ================  ==============
+    file + within 20 lines            83%              69%
+    file + within 5 lines             79%              64%
+    file + exactly on a line          65%              52%
+    ...and prior finding ±20          29%              27%
+    ==========================  ================  ==============
+
+    Tightening the rule lowers both columns together. There is no radius at which
+    this becomes a detector, and the reason is visible in the raw runs: under #41's
+    increment scope a later round is READING the fix commit, so a new finding at
+    the fix's site is the ordinary case rather than the exceptional one. That is
+    the same fact ``provenance``'s ``introduced`` bucket reports, and a bucket that
+    fires four times in five carries very little.
+
+    So this half is context and a denominator, not a verdict — which is exactly
+    what #67's own comment on PR #88 predicted when it said the grouping key needed
+    is "not 'same file' but 'same way of being wrong'". The half that can see shape
+    is the judge's (:data:`panel_core.RECURRENCE_BRIEF`), it is asked separately,
+    and its answer is stored beside this one rather than folded into it: two
+    witnesses, and the rows where they disagree are the interesting ones. Storing
+    the negative result rather than deleting the measurement is the point — a rate
+    that saturates is itself a finding about the loop, and it is the baseline any
+    later rule has to beat.
+
+    **The two ends are measured at different grains, and that is not an
+    oversight.** The new finding is placed to the line; the earlier one only to
+    the file. ``added`` holds NEW-side line numbers, so an earlier round's line
+    number — written against the file as it stood BEFORE the fix — is not on the
+    same axis and cannot be compared to them without reconstructing the fix's line
+    mapping. File-grain on that end is the honest reading of what is actually
+    known, the same call :func:`_diff_files_cut` makes and for the same reason.
+    (The replay's last row is what a line-grain prior end would buy, ignoring that
+    caveat: it halves both columns and separates neither.)
+
+    A longer circle is out of scope too: a premise raised in round 1, quiet in
+    round 2 and back in round 3 is invisible here, because the fix range under
+    attribution is one round wide and ``fixed_here`` is the round that anchored it.
+    """
+    if not have_range:
+        return "unknown", None
+    # Same ambiguity guard as `_provenance`, and it has to be the same one: the
+    # suffix rule that lets `panel.py` match `harness/loops/panel.py` also lets it
+    # match a second tree's copy, and a coin toss between two files is not a
+    # measurement.
+    hits = [f for f in added if _same_file(file, f)]
+    if line is None or not file or len(hits) > 1:
+        return "unknown", None
+    # NO hit is an answer, and a different one from an ambiguous hit. The fix pass
+    # did not write in this file at all, so wherever this finding is, it is not
+    # where that pass was working — which is `elsewhere` on the nose. Folding it
+    # into `unknown` (the first spelling of this, and the one an end-to-end test
+    # caught) made `elsewhere` almost unreachable: every finding outside the fix's
+    # own files landed in the bucket that means "we could not tell", so the one
+    # bucket that says a round looked away from the fix never fired.
+    if not hits:
+        return "elsewhere", None
+    if not any(abs(line - wrote) <= radius for wrote in added[hits[0]]):
+        return "elsewhere", None
+    # Which earlier finding this one is standing on. Sorted, so a file the last
+    # round raised two findings in names the same one on every run — an arbitrary
+    # pick that moved between runs would make the column unauditable, which is the
+    # one thing an uncalibrated signal cannot afford.
+    was = sorted({k for path, keys in fixed_here.items()
+                  if _same_file(file, path) for k in keys})
+    return ("revisited", was[0]) if was else ("fix-site", None)
+
+
 #: The key :func:`_diff_by_file` files anything before the first ``diff --git``
 #: header under. Empty, so it can never collide with a path, and falsy, so the
 #: callers that count FILES can skip it in one word.
@@ -1601,6 +1749,7 @@ __all__ = [
     "_mergeable_now",
     "_merge_base_now", "_MERGE_BASE_JQ", "_SHA_TEXT",
     "_base_tip_now", "PROVENANCE", "_provenance",
+    "RECURRENCE", "SITE_RADIUS", "_recurrence",
     "DIFF_PREAMBLE", "_diff_by_file", "_diff_subset", "_fit_parts",
     "fetch_increment", "COMPARE_FILE_CAP", "_count", "compare_facts",
     "_range_notes", "MERGE_DISTANT", "MERGE_INVOLVED", "MERGE_UNREAD",
