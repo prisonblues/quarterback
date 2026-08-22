@@ -584,9 +584,20 @@ else:
 ```
 python3 ~/.claude/loops/panel.py --pr <pr> --post --round <r> --max-rounds <N> \
     --escalated <the key the fixer's escalated ID maps to> \
+    --escalated-from-board \
     --baseline /tmp/tmp.AbC123/r1.json [--baseline …] \
     --json-file /tmp/tmp.AbC123/r<r>.json
 ```
+
+**Pass `--escalated-from-board` on every round of a cycle.** It adds the keys the
+BOARD already knows are waiting on a human — the findings a seat flagged
+`needs_human` (#279), published as `needs_human_keys` — to whatever you named by
+hand. The two lists are different and neither contains the other: the board knows
+what an earlier round declared, you know what the fix pass just decided. It costs
+one read and it closes the failure mode this whole section is written around,
+which is a key that only ever existed in prose a fixer wrote and somebody had to
+transcribe. Over thirty days and sixty-five rounds, `by_outcome.deferred` was 0 —
+the escalation path was documented at length here and never once exercised.
 
 Without it the cycle jams, and the jam is the mechanism defeating itself: the
 finding is outstanding (correctly), no fixer may touch it (correctly), so

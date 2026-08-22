@@ -196,7 +196,7 @@ def test_an_unrunnable_judge_says_so_rather_than_just_untriaged(monkeypatch):
     a judge that disagreed from one that never spoke."""
     _judge(monkeypatch, ran(rc=1, err="Error: model 'opus' is not available"))
 
-    doable, reason, model = epic.triage(work(), "opus")
+    doable, reason, model, _cls = epic.triage(work(), "opus")
 
     assert doable is None
     assert "model 'opus' is not available" in reason
@@ -206,7 +206,7 @@ def test_an_unrunnable_judge_says_so_rather_than_just_untriaged(monkeypatch):
 def test_a_judge_that_answered_without_a_verdict_quotes_the_answer(monkeypatch):
     _judge(monkeypatch, ran(out="I cannot assess this issue: its body is empty."))
 
-    doable, reason, _ = epic.triage(work(), "opus")
+    doable, reason, _, _cls = epic.triage(work(), "opus")
 
     assert doable is None
     assert "its body is empty" in reason
@@ -215,7 +215,7 @@ def test_a_judge_that_answered_without_a_verdict_quotes_the_answer(monkeypatch):
 def test_a_real_verdict_is_unaffected(monkeypatch):
     _judge(monkeypatch, ran(out='{"doable": true, "reason": "clear scope", "model": ""}'))
 
-    doable, reason, _ = epic.triage(work(), "opus")
+    doable, reason, _, _cls = epic.triage(work(), "opus")
 
     assert doable is True
     assert reason == "clear scope"

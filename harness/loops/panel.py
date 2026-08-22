@@ -139,7 +139,101 @@ import panel_timing               # noqa: F401
 # import rather than a second copy: `preland.check_pr_state` refuses a CONFLICTING
 # branch at merge time, this refuses a round on the same branch hours earlier, and
 # the two saying it differently is how the three checks in #96 came to disagree.
-from preland import mergeability   # noqa: E402
+from preland import board_get, mergeability   # noqa: E402
+# #274's one door, and #279's escalation list read back through it.
+from needs_human import announce, digest as nh_digest   # noqa: E402
+
+#: What `GET /review/findings` calls the escalation list (#279). Named because
+#: two things read it: the fetch below, and the note it writes when a board is
+#: too old to publish it.
+NEEDS_HUMAN_KEYS = "needs_human_keys"
+
+
+def board_escalations(gh_repo: str, pr_number: int) -> tuple[list[str], str]:
+    """`(the keys waiting on a human, why there are none)` for this PR.
+
+    The read half of #274. `--escalated` has always taken keys the CALLER typed,
+    which means the escalation list only ever existed in whatever prose the fixer
+    wrote — the defect #274 measured as `deferred: 0` across sixty-five rounds.
+    #279 publishes the same list as a field, so a fix cycle can subtract it
+    without anybody transcribing a hex string.
+
+    An error is REPORTED and never returns an empty list quietly. Absent must not
+    read as clean here for the reason it must not in `preland`: "no escalations"
+    and "we could not find out" have different remedies, and only one of them is
+    a round that may count this work as clearable.
+    """
+    body, err = board_get("review/findings", {"repo": gh_repo, "pr": pr_number})
+    if err:
+        return [], (f"--escalated-from-board: {err} — this round could not read "
+                    "which findings are waiting on a human, so it may count one of "
+                    "them as work a fix round can clear")
+    if not isinstance(body, dict):
+        return [], ("--escalated-from-board: the board answered /review/findings "
+                    f"with a {type(body).__name__}, not an object")
+    keys = body.get(NEEDS_HUMAN_KEYS)
+    if keys is None:
+        # A CAPABILITY answer, not a failure — and still not "none". A board
+        # older than #279 has no such field, and reading its silence as an empty
+        # escalation list is the same mistake as reading no CI as green.
+        return [], (f"--escalated-from-board: the board published no "
+                    f"`{NEEDS_HUMAN_KEYS}` for this PR — it predates the field, so "
+                    "escalations must be named with --escalated by hand")
+    if not isinstance(keys, list):
+        return [], (f"--escalated-from-board: `{NEEDS_HUMAN_KEYS}` came back as a "
+                    f"{type(keys).__name__}, not a list")
+    return [str(k) for k in keys], ""
+
+
+def announce_escalations(payload: dict, cfg: dict) -> list[str]:
+    """Tell the board about every finding this round says a human has to settle.
+
+    The write half of #274 for the panel door. It runs on the round that FORMED
+    the judgement rather than on the fix pass that inherits it, because the fix
+    pass is exactly where the escalation used to evaporate: `--escalated` takes
+    keys a fixer had to transcribe out of its own prose, and thirty days of
+    rounds recorded not one.
+
+    Confirmed findings only. A dismissed finding's escalation is a claim the
+    judge already refused, and putting it on a person's queue would make "the
+    panel disagreed with itself" indistinguishable from "you have to decide
+    this". One post per CLASS, for the reason `preland.announce_hold` gives.
+    """
+    flagged = [f for f in (payload.get("to_fix") or [])
+               if isinstance(f, dict) and f.get("needs_human")]
+    if not flagged:
+        return []
+    repo = payload.get("github") or ""
+    pr = payload.get("pr")
+    head = str(payload.get("head_sha") or "")
+    by_class: dict[str, list[dict]] = {}
+    for f in flagged:
+        by_class.setdefault(str(f.get("needs_human_class") or ""), []).append(f)
+    said = []
+    for cls, group in by_class.items():
+        head_finding = group[0]
+        note = announce(
+            cls=cls, reason=str(head_finding.get("needs_human_reason") or ""),
+            summary=(f"PR #{pr} — {len(group)} confirmed finding(s) no reviewer can "
+                     f"settle from the diff"),
+            repo=repo, cfg=cfg,
+            # The finding keys are IN the dedupe key, not just the commit: a
+            # later round on the same head that raises a NEW `decision` finding
+            # is a new question, and a key naming only the class would swallow
+            # it behind the first one for twelve hours (Codex).
+            key=(f"panel:{repo}:{pr}:{cls}:{head}:"
+                 + nh_digest(*sorted(str(f.get("key") or "") for f in group))),
+            detail="\n".join(
+                [f"Panel round on {payload.get('branch') or '?'} at {head[:12]}.", ""]
+                + [f"- {str(f.get('key') or '')[:12]} {f.get('synthesis') or ''}\n"
+                   f"    {f.get('needs_human_reason') or ''}" for f in group]
+                + ["", "Pass these to the next round with --escalated-from-board so a "
+                   "fix cycle stops counting them as work it can clear."]),
+            refs=[{"kind": "pr", "value": str(pr), "repo": repo}])
+        if note:
+            said.append(note)
+    return said
+
 
 # ----------------------------------------------------------------------------- run
 
@@ -478,6 +572,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         since: str = "", force: bool = False,
         no_code_access: bool = False,
         escalated: list[str] | None = None,
+        escalated_from_board: bool = False,
         premise_file: str = "") -> int:
     # A cycle is something the CALLER drives, and only /panel-review-pr does:
     # naming a cap (or a round, or a baseline) is what says this run is part of
@@ -696,7 +791,25 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # assumes the caller passed something hashable.
     declared: list[str] = []
     reported: set[str] = set()
-    for raw in (escalated or []):
+    named = list(escalated or [])
+    if escalated_from_board:
+        # Unioned with the hand-named keys rather than replacing them: the board
+        # knows what an earlier round recorded, the caller knows what the fix
+        # pass just decided, and neither is a superset of the other. The fetch's
+        # own failure is a note and never an exception — a board that will not
+        # answer must not cost a review that can still run.
+        from_board, why = board_escalations(gh_repo, pr_number)
+        if why:
+            notes.append(why)
+        else:
+            fresh = [k for k in from_board if str(k) not in {str(x) for x in named}]
+            notes.append(
+                f"--escalated-from-board: the board reports {len(from_board)} "
+                f"finding(s) waiting on a human on this PR"
+                + (f", {len(fresh)} of them not named on the command line" if fresh
+                   else " and every one was already named"))
+            named += fresh
+    for raw in named:
         if str(raw) in reported:
             continue
         reported.add(str(raw))
@@ -2538,6 +2651,19 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         if missed:
             notes.append(missed)
 
+    # #274: the round that formed the judgement is the one that announces it.
+    # After the record and before the render, so the board has the run this post
+    # points at; a failure here is a note in the same list, never an exception —
+    # a review that ran is not undone by a board that would not take a post.
+    #
+    # Under `record`, because `--no-record` is a caller saying this run does not
+    # go on the board, and an escalation post is a board write like any other.
+    # A preview or a dry read that silently interrupted somebody would be the
+    # same surprise in the opposite direction from the one #274 is fixing
+    # (Codex).
+    if record:
+        notes.extend(announce_escalations(payload, cfg))
+
     # So a caller can have BOTH the PR comment and the machine-readable run.
     # Without --json-file, --json suppresses the report and the only way to get
     # both was to review the PR twice — several CLI invocations, for a copy. A
@@ -3090,6 +3216,17 @@ def main() -> int:
                          "Repeatable; needs a cycle (--round/--max-rounds/--baseline) "
                          "to mean anything, and is inherited by later rounds through "
                          "--baseline")
+    ap.add_argument("--escalated-from-board", action="store_true",
+                    dest="escalated_from_board",
+                    help="take the escalation list from the board instead of naming "
+                         "keys by hand: every finding on this PR the panel flagged as "
+                         "needing a human (`needs_human_keys`, #279) is added to "
+                         "--escalated. This is the half that makes the flag actually "
+                         "get used — a key a fixer has to transcribe out of its own "
+                         "prose is a key nobody transcribes, which is why thirty days "
+                         "of rounds recorded zero escalations. Unions with --escalated "
+                         "rather than replacing it, and needs a cycle for the same "
+                         "reason --escalated does")
     ap.add_argument("--premise", metavar="TEXT",
                     help="#84's futility brake, run BEFORE a fix pass rather than "
                          "after it: declare in one sentence the premise the fix you "
@@ -3150,6 +3287,8 @@ def main() -> int:
                                    ("--baseline", bool(args.baseline)),
                                    ("--force", args.force),
                                    ("--escalated", bool(args.escalated)),
+                                   ("--escalated-from-board",
+                                    args.escalated_from_board),
                                    # Refused rather than ordered, because the two are
                                    # different questions about one premise and the
                                    # answer to "which ran?" must not be a reading of
@@ -3194,7 +3333,9 @@ def main() -> int:
         wrong = [f for f, used in (("--post", args.post),
                                    ("--baseline", bool(args.baseline)),
                                    ("--force", args.force),
-                                   ("--escalated", bool(args.escalated))) if used]
+                                   ("--escalated", bool(args.escalated)),
+                                   ("--escalated-from-board",
+                                    args.escalated_from_board)) if used]
         if wrong:
             raise SystemExit(
                 f"--premise does not take {', '.join(wrong)}: declaring a premise is a "
@@ -3266,8 +3407,8 @@ def main() -> int:
     # the case this refusal exists for. Two conditions for one predicate is how
     # that happened, so they are spelled the same way and `in_cycle`'s own terms
     # are the ones used.
-    if args.escalated and not (round_no > 1 or args.max_rounds is not None
-                               or args.baseline):
+    if (args.escalated or args.escalated_from_board) and not (
+            round_no > 1 or args.max_rounds is not None or args.baseline):
         raise SystemExit("--escalated needs a cycle to mean anything: pass --round (2 or "
                          "more) and --max-rounds, plus the earlier rounds' --baseline. "
                          "It names work a LATER round must not count, and a single-pass "
@@ -3276,7 +3417,8 @@ def main() -> int:
     return run(args.repo, args.pr, args.post, args.json_out, args.reviewers,
                args.json_file, args.record, round_no, args.baseline,
                args.max_rounds, args.scope, args.since, args.force,
-               args.no_code_access, args.escalated, args.premise_file)
+               args.no_code_access, args.escalated, args.escalated_from_board,
+               args.premise_file)
 
 
 if __name__ == "__main__":

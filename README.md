@@ -738,6 +738,23 @@ a fix cycle and #67 is explicit that an agent must not escalate to end a cycle i
 call, and `scripts/needs_human_labels.py` projects the vocabulary onto `needs-human/*` GitHub
 labels so a person finds it on the surface they already have open.
 
+**And it leaves the fleet by one door.** Recording the judgement is half of it; a record nobody is
+told about is the state `deferred: 0` measured — zero escalations across sixty-five rounds and
+thirty days, while an escalation path was documented at length in three skill files.
+`harness/loops/needs_human.py` is the door: one `announce()` that posts a `stuck` post carrying the
+class, the reason and the artefact it is about, and **the only place** that knows the destination —
+so when a durable blocker row lands there is one function to repoint, not four call sites, and the
+fleet cannot end up with two homes for one judgement. All four producers go through it: `epic.py`'s
+blocked ruling (with a class the triage judge now names, and `environment` rather than `decision`
+for an issue the judge never managed to rule on), `preland`'s HOLD reasons that only a person can
+clear (a merge conflict, a repo with no CI, an unreadable board — never a mechanical `RECONCILE`,
+or the board becomes a CI log), a panel seat's flag, and `panel.py --escalated-from-board`, which
+reads the escalation list off `needs_human_keys` instead of asking a fixer to transcribe a hex key
+out of its own prose. An announcement costs a reason, an unrecognised class goes to `other` with
+the spelling named, and the same question is asked once every twelve hours rather than once per
+tick. `QUARTERBACK_NEEDS_HUMAN=off` switches it off; `QUARTERBACK_NEEDS_HUMAN_TO` (or
+`needs_human.to` in `.harness-rules`) addresses it, and there is deliberately no default addressee.
+
 **Anything the ingest drops is named back and logged.** An unrecognised bucket, a `head_sha` that
 cannot be a commit id, an unread path over the cap or unreadable, a known bucket carrying an
 unbelievable count, a field whose value is not the shape that field takes: each comes back in the
@@ -1689,6 +1706,7 @@ tests/        end-to-end tests against real Postgres (conftest.py shared fixture
                    pointed at the main checkout's data
 harness/      step 2 of the install — the workflow the board coordinates
   loops/           panel.py (reviewer panel), epic.py, lander.py, harness_rules.py
+                   needs_human.py — the one door an escalation leaves by (#274)
   commands/        Claude Code slash commands (/panel, /fix-issue, /wt, …)
   bin/             create-worktree, remove-worktree, prune-worktrees,
                    worktree-holder (who is live in a worktree — asked before
