@@ -10,11 +10,12 @@
   2  used wrongly
   3  NOT ENABLED on this machine — the default, and the whole of it
   4  refused    — that command is not on this machine's allowlist
-  5  refused    — this machine is already running as many spawns as it may
-  6  refused    — the shared subscription's window is spent (`qb-pace`)
-  7  refused    — this repo's in-flight window is full (`qb-admit`)
-  8  refused    — somebody already holds that work (`qb-claim`)
-  9  could not start it — tmux refused, or there is no tmux. The claim is handed back
+  5  refused    — this machine's cap is spent, or its panes could not be counted
+  6  refused    — the shared window is spent, or `qb-pace` could not read it
+  7  refused    — this repo's window is full, or `qb-admit` could not read it
+  8  refused    — somebody holds that work, or the claim could not be taken at all
+  9  could not start it — no tmux, tmux refused, or the pane could not be stamped.
+                 The claim is handed back
 
 **THE HALF OF #277 THAT WAS NEVER BUILT.** There were three ways to start a
 session here and every one of them ended at a human hand: `qb-seat` in a pane

@@ -886,10 +886,10 @@ qb-start --dry-run /fix-issue 277     # every refusal, nothing started
 #   exit 2  used wrongly
 #   exit 3  NOT ENABLED on this machine — the default, and the whole of it
 #   exit 4  that command is not on this machine's allowlist
-#   exit 5  this machine is already running as many spawns as it may
-#   exit 6  the shared subscription's window is spent (qb-pace)
-#   exit 7  this repo's in-flight window is full (qb-admit)
-#   exit 8  somebody already holds that work (qb-claim)
+#   exit 5  this machine's cap is spent, or its panes could not be counted
+#   exit 6  the shared window is spent, or qb-pace could not read it
+#   exit 7  this repo's window is full, or qb-admit could not read it
+#   exit 8  somebody holds that work, or the claim could not be taken at all
 #   exit 9  could not start it — the claim is handed back
 ```
 

@@ -718,6 +718,18 @@ def test_every_spawnable_command_claims_something():
     assert set(kinds.values()) <= {"issue", "pr"}
 
 
+def test_the_module_and_the_script_agree_on_the_policys_key_names():
+    """The nix option names are camelCase and the file's keys are snake_case, so the
+    translation between them is a place a rename lands silently: a policy carrying
+    `maxSessions` reads as "no ceiling named" and falls back to the default, which
+    is a cap quietly loosened by a refactor rather than by a decision."""
+    written = set(re.findall(r"^\s+([a-z_]+) = ",
+                             HM_MODULE.read_text().split("spawnPolicy = builtins.toJSON {", 1)[1]
+                             .split("};", 1)[0], re.M))
+    read = set(re.findall(r'raw\.get\("([a-z_]+)"', START.read_text()))
+    assert written == read, f"the module writes {written} and qb-start reads {read}"
+
+
 def test_the_module_writes_the_policy_only_when_spawning_is_enabled():
     """The ABSENCE of the file is what "off" means, so a host that has not opted in
     must have nothing on disk for a bug to misread."""
