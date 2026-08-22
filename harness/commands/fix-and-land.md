@@ -522,7 +522,7 @@ gets wrong.
 ### One thing that is true of this box and not of the tools — checked 2026-08-22
 
 `harness/tests/test_create_worktree_claim.py::test_a_missing_qb_claim_does_not_abort_the_run_under_set_e`
-fails on this machine and passes in CI. It is not your branch. Do not chase it.
+fails on this machine and passes in CI. It is a **host artefact**, not your branch. Do not chase it.
 
 The test runs `create-worktree`'s claim stanza with no `qb-claim` available and asserts stderr
 carries `qb-claim is not on PATH`. Here `qb-claim` **is** on PATH — the user profile puts it at

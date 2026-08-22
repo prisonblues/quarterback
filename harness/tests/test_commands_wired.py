@@ -701,7 +701,7 @@ def _workflow_jobs() -> dict[str, str]:
 _MEASURED = {
     "the --delete-branch cleanup failing from a worktree": r"delete-branch[\s\S]*worktree",
     "#260 itself, by number": r"#260",
-    "the host-specific artefact": r"host artefact|true of this box",
+    "the host-specific artefact, in the words the grep looked for": r"host artefact",
     "two concurrent pytest runs": r"concurrent[\s\S]{0,80}pytest|pytest[\s\S]{0,80}concurrent",
 }
 
