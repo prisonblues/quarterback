@@ -178,9 +178,21 @@ class Policy:
         self.refusal = refusal
 
 
-def policy_path() -> Path:
-    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
-        os.environ.get("HOME", ""), ".config")
+def policy_path() -> Path | None:
+    """The one file that can say yes, or None when there is no config home at all.
+
+    **None, and not a relative path.** `os.path.join("", ".config")` is
+    `.config` — so with neither `$XDG_CONFIG_HOME` nor `$HOME` set, the obvious
+    spelling of this resolves the gate against the CURRENT DIRECTORY, and a
+    repository shipping `.config/quarterback/spawn.json` would then be granting
+    itself the permission. That is the exact party this exists to exclude,
+    reached by a variable being absent rather than by one being set. A machine
+    with no config home has not opted in to anything.
+    """
+    base = os.environ.get("XDG_CONFIG_HOME") or (
+        os.path.join(home, ".config") if (home := os.environ.get("HOME")) else "")
+    if not base or not os.path.isabs(base):
+        return None
     return Path(base) / POLICY_NAME
 
 
@@ -188,8 +200,13 @@ def read_policy() -> Policy:
     path = policy_path()
 
     def no(why: str) -> Policy:
-        return Policy(False, frozenset(), 0, False, str(path), why)
+        return Policy(False, frozenset(), 0, False, str(path or "(nowhere)"), why)
 
+    if path is None:
+        return no("neither $XDG_CONFIG_HOME nor $HOME names a config directory, so "
+                  "there is nowhere this machine could have said yes — and a "
+                  "relative path here would let the checkout being worked in "
+                  "grant the permission to itself")
     if not path.is_file():
         return no(f"spawning is not enabled on this machine — there is no {path}. "
                   f"A machine opts in by setting "

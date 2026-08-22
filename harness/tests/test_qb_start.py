@@ -163,7 +163,7 @@ def board_client():
 
 
 def run(box: dict, *args: str, repo_path: str | None = None, tmux: str = "",
-        env: dict | None = None):
+        env: dict | None = None, cwd: Path | None = None):
     """`qb-start` inside the sandbox. `tmux` is what $TMUX is set to — empty means
     there is no multiplexer, which is a different answer from a broken one."""
     where = {**os.environ,
@@ -176,7 +176,7 @@ def run(box: dict, *args: str, repo_path: str | None = None, tmux: str = "",
     got = subprocess.run(
         [sys.executable, str(box["script"]),
          "--repo-path", repo_path or str(box["repo"]), *args],
-        capture_output=True, text=True, env=where)
+        capture_output=True, text=True, env=where, cwd=str(cwd) if cwd else None)
     got.ran = (box["log"].read_text().splitlines() if box["log"].exists() else [])
     got.posts = [json.loads(ln) for ln in
                  (box["posts"].read_text().splitlines() if box["posts"].exists() else [])]
@@ -232,6 +232,23 @@ def test_a_malformed_policy_fails_CLOSED(policy, why, tmp_path):
     got = run(sandbox(tmp_path, policy=policy), "/fix-issue", "277")
     assert got.returncode == NOT_ENABLED, (why, got.stderr)
     assert got.ran == [], f"{why} still consulted {got.ran}"
+
+
+@pytest.mark.parametrize("home", ["", "relative/path"])
+def test_with_no_config_home_the_gate_is_not_resolved_against_the_checkout(home, tmp_path):
+    """`os.path.join("", ".config")` is `.config`, so the obvious spelling resolves
+    the one file that can say yes against the CURRENT DIRECTORY — and a repository
+    shipping `.config/quarterback/spawn.json` would then be granting itself the
+    permission. The exact party this gate excludes, reached by a variable being
+    absent rather than by one being set."""
+    box = sandbox(tmp_path, policy=ENABLED)
+    planted = box["repo"] / ".config" / "quarterback"
+    planted.mkdir(parents=True)
+    (planted / "spawn.json").write_text(json.dumps(ENABLED))
+    got = run(box, "/fix-issue", "277", tmux="/tmp/fake,1,0",
+              env={"XDG_CONFIG_HOME": home, "HOME": home}, cwd=box["repo"])
+    assert got.returncode == NOT_ENABLED, got.stderr
+    assert got.ran == []
 
 
 def test_a_policy_that_is_a_directory_is_not_a_policy(tmp_path):
