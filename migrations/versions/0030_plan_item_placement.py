@@ -44,18 +44,22 @@ can make it once, in the browser, and have the claim become true.
 Cheap to apply: two nullable-or-defaulted columns on a table that holds tens of
 rows by design, no rewrite of anything else, and no index touched.
 
-Chained after 0028 because a single head is what
-`test_the_repos_own_migration_chain_is_single_headed` asserts — this was written as
-0028 and renumbered when #232's order-proposal ledger took that number first, which
-is exactly the case `scripts/migration_reconcile.py preflight` is for. Run it again
-if another branch has taken 0029 by the time this lands.
+Chained after 0029 because a single head is what
+`test_the_repos_own_migration_chain_is_single_headed` asserts. This file has now been
+renumbered twice: written as 0028, moved to 0029 when #232's order-proposal ledger took
+0028, and moved to 0030 at land time when #279's `needs_human` took 0029. Both moves are
+what `scripts/migration_reconcile.py` is for, and the second one is worth reading twice —
+`preflight` had already answered GO for 0029 against main, and that answer was true of
+main and silent about the two sibling branches also holding 0029. A GO here means "does
+not collide with main", not "does not collide"; re-run it against the ref you are actually
+merging into, at the moment you merge, rather than trusting the one in the PR body.
 """
 
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0029"
-down_revision: str | None = "0028"
+revision: str = "0030"
+down_revision: str | None = "0029"
 branch_labels = None
 depends_on = None
 
