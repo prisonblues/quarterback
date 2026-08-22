@@ -44,17 +44,18 @@ can make it once, in the browser, and have the claim become true.
 Cheap to apply: two nullable-or-defaulted columns on a table that holds tens of
 rows by design, no rewrite of anything else, and no index touched.
 
-Chained after 0027 because a single head is what
-`test_the_repos_own_migration_chain_is_single_headed` asserts, and
-`scripts/migration_reconcile.py` is what to run if another branch has taken 0028
-by the time this lands.
+Chained after 0028 because a single head is what
+`test_the_repos_own_migration_chain_is_single_headed` asserts — this was written as
+0028 and renumbered when #232's order-proposal ledger took that number first, which
+is exactly the case `scripts/migration_reconcile.py preflight` is for. Run it again
+if another branch has taken 0029 by the time this lands.
 """
 
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0028"
-down_revision: str | None = "0027"
+revision: str = "0029"
+down_revision: str | None = "0028"
 branch_labels = None
 depends_on = None
 
