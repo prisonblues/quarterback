@@ -1,0 +1,1285 @@
+#!/usr/bin/env python3
+"""qb-doctor — is this host actually wired up?
+
+Two questions, one command, one report.
+
+THE FIRST QUESTION (#204's original thesis). Three independently versioned things
+have to agree — the board image, the harness on PATH, the Python client's venv —
+and no component can compare them, because each one can only see itself. So each
+one's staleness surfaces as a different one's error: `qb-dash` said "board
+unreachable" about a board that was up (the image was six days old), `qb-board`
+said "build a venv" about a venv that was fine (the checkout was 269 commits
+behind), and the fix for that broke the MCP server. Four symptoms, not one of
+which named its cause. The value here is not any single check; it is that the
+version lines get compared to each other in one place.
+
+THE SECOND QUESTION (the note added 2026-08-22). Is each of the harness's own
+guards INSTALLED — not written, not tested, not documented, INSTALLED on this
+machine? One morning produced four instances of the same failure: a mechanism
+that shipped and was never wired up. The `qb-reconcile` timer existed in-repo and
+on no host, so the plan went 39% stale. The `reference-transaction` stash guard
+existed in `harness/githooks/` and in no repo, so an agent popped another
+worktree's work. `HUMAN_EDGE_SECRET` was documented in DEPLOY.md with a checklist
+and never deployed, so every human-only endpoint has 403'd since v2.39. Not one
+announced itself; each was found by tripping over a downstream symptom, which is
+the pattern this file's first paragraph is about.
+
+THE RULE THAT DECIDES THE SHAPE OF EVERY CHECK BELOW: look where the mechanism
+RUNS, never where its source lives. `ls harness/githooks/reference-transaction`
+succeeds on a host with no guard installed at all — the file is in git, which is
+precisely what every one of the four had going for it. So the hooks check reads
+`core.hooksPath` and the files under the common git dir; the reconcile check asks
+systemd; the edge check makes a live request.
+
+AND THE RULE THAT DECIDES HOW THEY REPORT: a check that could not be made is NOT
+a check that passed. This repo has now settled that argument three times — #244
+(`prune-worktrees` called a skipped scan "Clean"), `qb-reconcile`'s
+could-not-check versus nothing-to-report, and #324's `qbdata.CI_STATES`, where an
+absent CI result must not render as a benign one. A doctor that prints `ok`
+because it could not look is worse than one that does not check, because it
+launders ignorance into assurance — and unlike a stale layer, a false green never
+announces itself later.
+
+Exit codes, and they are the same distinction:
+
+    0   every check ran; none failed (warnings are still a 0 — the host works)
+    1   at least one check COULD NOT BE MADE, and none of the rest failed
+    2   at least one check ran and failed
+    3   could not run at all: bad arguments, or no repo to look at
+
+Usage:
+    qb-doctor                     every check against this host
+    qb-doctor --fix               also run the installers that are safe to re-run
+    qb-doctor --json              the whole report as JSON
+    qb-doctor --repo DIR          check that checkout instead of the cwd's
+    qb-doctor --only hooks,edge   just those rows
+    qb-doctor --human-url URL     the browser vhost, for the edge check
+    qb-doctor --quiet             print only the rows that are not ok
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import textwrap
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field
+from pathlib import Path
+
+#: The four answers a check can give. Closed, and closed for the reason
+#: `qbdata.CI_STATES` is closed (#324): these feed a count, a glyph and an exit
+#: code, and a fifth value invented at a call site would leave the numerator
+#: while still counting as coverage.
+#:
+#: They are four because collapsing any pair loses the distinction that bit:
+#:
+#: * ``ok``      — the check ran and the answer is good.
+#: * ``warn``    — the check ran, the mechanism works, and it carries residue no
+#:                 installer can clear. Installing the stash guard does not drain
+#:                 the entries pushed before it, so a freshly-guarded repo is
+#:                 protected going forward and still holds its old landmines.
+#:                 ``guard active, 4 pre-guard entries remain`` is the report; a
+#:                 bare ``ok`` is not.
+#: * ``fail``    — the check ran and the answer is bad.
+#: * ``unknown`` — the check could not be made, and why. NOT a synonym for ``ok``
+#:                 and not a synonym for ``fail`` either: the remedy for a guard
+#:                 that is off is to switch it on, and the remedy for a guard
+#:                 nobody could ask about is to make it askable.
+VERDICTS = ("ok", "warn", "fail", "unknown")
+
+#: Which verdicts mean "this host is wired up". `warn` is in it on purpose: the
+#: mechanism is installed and working, and the residue beside it is a separate
+#: piece of work with its own remedy.
+HEALTHY = ("ok", "warn")
+
+_GLYPHS = {"ok": "ok", "warn": "warn", "fail": "FAIL", "unknown": "?"}
+
+#: ANSI, applied only to a TTY and never when `NO_COLOR` is set. `unknown` shares
+#: yellow with `warn` rather than borrowing green, because the one rendering this
+#: file exists to forbid is the one where a check nobody could make looks fine.
+_COLOURS = {"ok": "\033[0;32m", "warn": "\033[1;33m", "fail": "\033[0;31m",
+            "unknown": "\033[1;33m"}
+_RESET = "\033[0m"
+
+#: Seconds for any single HTTP probe. Short: this is a diagnostic somebody is
+#: waiting on, and "the board did not answer in five seconds" is itself a finding.
+HTTP_TIMEOUT = 8
+
+#: Seconds for one subprocess (`git`, `systemctl`, `gh`). `git fetch` is the slow
+#: one and it is the reason this is not 5.
+CMD_TIMEOUT = 30
+
+#: Bytes read from any one response. Generous rather than tidy, because the
+#: response this has to survive is `/openapi.json`, which is a megabyte of schema
+#: on a board this size. A 64 KiB cap truncated it mid-object, `json.loads` raised,
+#: and the board row reported "carried no info.version" about a document that
+#: carried one — a version check answering `unknown` because of its own buffer,
+#: which is this file's subject happening to this file.
+MAX_BODY = 8 * 1024 * 1024
+
+#: Where the runbook for the edge secret lives. Named in full because the whole
+#: point of the edge row is that its remedy belongs to a person, and "ask Rich"
+#: is not a remedy — a path is.
+EDGE_RUNBOOK = ("~/source/selfhost/issues/open/"
+                "160-bug-quarterback-human-writes-refused-at-the-edge.md")
+
+
+@dataclass
+class Check:
+    """One row of the report.
+
+    ``fix`` and ``manual`` are the two halves of #204's third property, and they
+    are separate fields rather than one command plus a flag so that nothing can
+    run a command the author did not mark runnable. ``fix`` is an argv this tool
+    will execute under ``--fix``: it must be idempotent, must need no secret, and
+    must be safe to run against a host that is already correct. ``manual`` is a
+    command STRING printed for a person and never executed — the edge secret
+    needs 1Password and a Portainer redeploy, and a doctor that tried would fail
+    halfway through somebody's production deploy.
+    """
+
+    name: str
+    subject: str
+    detail: str
+    verdict: str
+    manual: str | None = None
+    fix: list[str] | None = None
+    extra: dict = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        assert self.verdict in VERDICTS, f"{self.verdict!r} is not one of {VERDICTS}"
+
+    def as_dict(self) -> dict:
+        return {"name": self.name, "subject": self.subject, "detail": self.detail,
+                "verdict": self.verdict, "manual": self.manual, "fix": self.fix,
+                **({"extra": self.extra} if self.extra else {})}
+
+
+#: How systemd says it could not be asked. Matched FIRST, before anything is read as
+#: an answer about a unit, because "No such file or directory" is systemd's wording
+#: for a missing unit file AND for a missing bus socket — so a rule that looked for
+#: that phrase alone called a dead session bus an uninstalled timer. Codex found that
+#: on the first fix; the tail of the message is ambiguous, the head is not.
+_BUS_UNREACHABLE = ("failed to connect to bus", "no medium found",
+                    "operation not permitted", "connection refused")
+
+#: How systemd says the unit is not there, when it says it on stderr rather than
+#: answering `not-found` on stdout. Requires the "unit file" wording, so it cannot
+#: match a bus error that happens to end the same way.
+_MISSING_UNIT = ("unit file state", "no such unit", "unit file", "does not exist")
+
+
+def clip_line(text: str, width: int = 90) -> str:
+    """The first line of a tool's stderr, short enough to sit in a report row."""
+    first = (text or "").strip().splitlines()
+    if not first:
+        return ""
+    return first[0] if len(first[0]) <= width else first[0][:width - 1] + "…"
+
+
+def run_cmd(argv: list[str], *, cwd: str | None = None, env: dict | None = None,
+            timeout: int = CMD_TIMEOUT) -> tuple[int, str, str]:
+    """One subprocess. Returns ``(rc, stdout, stderr)``; never raises.
+
+    A missing binary comes back as ``(127, "", "<name>: not found")`` rather than
+    an exception, because "this host has no systemctl" is an answer a check has
+    to be able to turn into an `unknown` — and an exception at the call site
+    would have to be turned back into one anyway, in each of the six places.
+    """
+    try:
+        p = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True,
+                           timeout=timeout)
+    except FileNotFoundError:
+        return 127, "", f"{argv[0]}: not found"
+    except subprocess.TimeoutExpired:
+        return 124, "", f"{argv[0]}: timed out after {timeout}s"
+    except OSError as exc:                                    # noqa: BLE001 — report it
+        return 126, "", f"{argv[0]}: {exc}"
+    return p.returncode, p.stdout.strip(), p.stderr.strip()
+
+
+def http_get(url: str, headers: dict | None = None) -> tuple[int, str, str | None]:
+    """One GET. Returns ``(status, body, error)``; ``status`` is 0 when there was none.
+
+    Redirects are NOT followed, and that is load-bearing for the edge check: a
+    302 to a forward-auth portal is the answer ("this host has no session"), and
+    following it would turn it into a 200 carrying a login page, which reads as
+    the board answering.
+    """
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *_args, **_kw):            # noqa: D102
+            return None
+
+    opener = urllib.request.build_opener(_NoRedirect)
+    req = urllib.request.Request(url, headers=headers or {})
+    try:
+        with opener.open(req, timeout=HTTP_TIMEOUT) as resp:
+            return resp.status, resp.read(MAX_BODY).decode("utf-8", "replace"), None
+    except urllib.error.HTTPError as exc:
+        body = ""
+        with contextlib.suppress(Exception):
+            body = exc.read(MAX_BODY).decode("utf-8", "replace")
+        return exc.code, body, None
+    except Exception as exc:                                  # noqa: BLE001
+        return 0, "", f"{type(exc).__name__}: {exc}"
+
+
+@dataclass
+class Host:
+    """Everything the checks need to know about where they are looking.
+
+    Assembled once by :func:`survey` and passed in, so every check function is a
+    pure-ish function of it and a test can drive one without a board, a git repo
+    or a systemd.
+    """
+
+    repo: Path
+    common_git_dir: Path | None
+    base_url: str | None
+    token: str | None
+    human_url: str | None
+    harness_bin: Path | None
+    source_harness: Path
+    githooks: Path | None
+    #: The checkout whose `mcp/.venv` this host's MCP shim actually runs, which is
+    #: `QUARTERBACK_REPO` and NOT necessarily `repo`. They differ every time this is
+    #: pointed at a worktree with `--repo`, and the honest answer there is still the
+    #: configured one: `qb-mcp` execs `$QUARTERBACK_REPO/mcp/.venv/bin/python` whatever
+    #: directory you happen to be standing in. Resolved in `survey` rather than read
+    #: from the environment inside the check, so a test can set it and a reader can
+    #: see that every check is a function of this object.
+    client_repo: Path | None = None
+    remote: str = "origin"
+
+
+# --------------------------------------------------------------------------- #
+# survey — resolve the host once
+# --------------------------------------------------------------------------- #
+
+def source_harness_dir(script: str) -> Path:
+    """The `harness/` tree this script belongs to.
+
+    ``readlink -f`` deliberately, unlike `qb-mcp`'s one-link-at-a-time walk: this
+    file is only ever run out of a checkout or out of the package's own `bin/`,
+    both of which keep `bin/` and `githooks/` as siblings, and neither of which
+    home-manager flattens the way it flattens the board client's four.
+    """
+    return Path(os.path.realpath(script)).parent.parent
+
+
+def githooks_dir(harness: Path) -> Path | None:
+    """Where `qb-hooks` reads its hook sources from — the two layouts it knows.
+
+    Read from the same two places rather than hard-coded, because this is what
+    the hooks check compares the INSTALLED set against. Hard-coding the file
+    names here would mean #343's `pre-push` landing in `githooks/` and this tool
+    reporting a repo with no `pre-push` as fully hooked.
+    """
+    for cand in (os.environ.get("QB_GITHOOKS_DIR"),
+                 harness / "githooks",
+                 harness / "share" / "quarterback-harness" / "githooks"):
+        if cand and Path(cand, "reference-transaction").is_file():
+            return Path(cand)
+    return None
+
+
+def installed_harness_bin() -> Path | None:
+    """The `bin/` of the harness that is actually on PATH, or None.
+
+    Resolved through `create-worktree` — the package's `mainProgram`, and a name
+    no checkout puts on PATH by accident — rather than through `qb-doctor`
+    itself, which is the one script guaranteed absent from PATH on the branch
+    that adds it.
+    """
+    found = shutil.which("create-worktree")
+    return Path(os.path.realpath(found)).parent if found else None
+
+
+def load_site_config() -> dict:
+    """`qb-env`'s config file, parsed as the shell assignments it is.
+
+    Parsed rather than sourced. Sourcing it would run whatever is in it as this
+    user, and the file is machine-generated by home-manager on some hosts and
+    hand-written on others; a diagnostic must not be the thing that executes an
+    unreviewed line. `QUARTERBACK_TOKEN_CMD` is a command and is left as text —
+    :func:`resolve_token` is where the decision to run it is made and stated.
+    """
+    path = Path(os.environ.get(
+        "QUARTERBACK_CONFIG",
+        Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "quarterback/config"))
+    out: dict = {}
+    try:
+        text = path.read_text()
+    except OSError:
+        return out
+    for line in text.splitlines():
+        m = re.match(r"^\s*(?:export\s+)?([A-Z_][A-Z0-9_]*)=(.*)$", line)
+        if not m:
+            continue
+        value = m.group(2).strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        out[m.group(1)] = value
+    return out
+
+
+def resolve_token(cfg: dict) -> str | None:
+    """This machine's bearer, by `qb-env`'s own precedence — env, TOKEN_CMD, tmpfs.
+
+    The TOKEN_CMD branch runs a command out of the config file, which
+    :func:`load_site_config` refuses to do wholesale. The narrowing is the point:
+    that one variable is DEFINED as a command to run (`qb-env` calls it "the
+    per-site hook … kept cheap — it runs on every call"), so running it is using
+    the file as documented rather than executing it.
+    """
+    if os.environ.get("QUARTERBACK_TOKEN"):
+        return os.environ["QUARTERBACK_TOKEN"]
+    cmd = cfg.get("QUARTERBACK_TOKEN_CMD")
+    if cmd:
+        # `QUARTERBACK_AGENT` is exported before the command runs because every
+        # site's TOKEN_CMD interpolates it — `op read op://…/quarterback-$AGENT/token`
+        # on this fleet — and `qb-env` sets it from the hostname before resolving.
+        # Without it the command reads a path with an empty segment and returns
+        # nothing, which this would report as "no token on this machine".
+        env = {**os.environ, "QUARTERBACK_AGENT": cfg.get("QUARTERBACK_AGENT") or agent_name()}
+        rc, out, _ = run_cmd(["bash", "-c", cmd], env=env, timeout=15)
+        if rc == 0 and out.splitlines():
+            return out.splitlines()[0].strip() or None
+    try:
+        return (Path("/run/op-secrets/quarterback-token").read_text().strip() or None)
+    except OSError:
+        return None
+
+
+def agent_name() -> str:
+    """This machine's name in the token file, `qb-env`'s default: the short hostname."""
+    import socket
+    return socket.gethostname().split(".", 1)[0]
+
+
+def survey(repo_arg: str | None, human_url_arg: str | None, script: str) -> Host:
+    """Resolve everything the checks look at. Raises ``SystemExit(3)`` with no repo."""
+    start = Path(repo_arg).expanduser() if repo_arg else Path.cwd()
+    rc, top, _ = run_cmd(["git", "-C", str(start), "rev-parse", "--show-toplevel"])
+    if rc != 0:
+        print(f"qb-doctor: {start} is not a git repository — there is nothing to check "
+              "against. Run it inside a quarterback checkout, or pass --repo.",
+              file=sys.stderr)
+        raise SystemExit(3)
+    repo = Path(top)
+    rc, common, _ = run_cmd(
+        ["git", "-C", str(repo), "rev-parse", "--path-format=absolute", "--git-common-dir"])
+    cfg = load_site_config()
+    harness = source_harness_dir(script)
+    return Host(
+        repo=repo,
+        common_git_dir=Path(common) if rc == 0 and common else None,
+        base_url=os.environ.get("QUARTERBACK_BASE_URL") or cfg.get("QUARTERBACK_BASE_URL"),
+        token=resolve_token(cfg),
+        human_url=(human_url_arg or os.environ.get("QUARTERBACK_HUMAN_URL")
+                   or cfg.get("QUARTERBACK_HUMAN_URL")),
+        harness_bin=installed_harness_bin(),
+        source_harness=harness,
+        githooks=githooks_dir(harness),
+        client_repo=_as_path(os.environ.get("QUARTERBACK_REPO")
+                             or cfg.get("QUARTERBACK_REPO")) or repo,
+    )
+
+
+def _as_path(value: str | None) -> Path | None:
+    """A config value that names a directory, resolved the way a shell would.
+
+    `$HOME` and `~` both, because the config file is shell and this fleet's
+    generated one writes `QUARTERBACK_REPO="$HOME/source/quarterback"`. Reading
+    that literally put the client row at a path with a dollar sign in it and
+    reported `no MCP venv` about a venv that was there — a check answering
+    confidently about the wrong place, which is worse than not checking.
+    `expandvars` substitutes; it does not execute, so this stays inside the rule
+    that the config is parsed rather than sourced.
+    """
+    if not value:
+        return None
+    return Path(os.path.expanduser(os.path.expandvars(value)))
+
+
+# --------------------------------------------------------------------------- #
+# the three version lines (#204's original thesis)
+# --------------------------------------------------------------------------- #
+
+def declared_version(repo: Path) -> str | None:
+    """The version `app/main.py` declares — what a board built from here would serve.
+
+    Read out of the source text rather than by importing the app: this runs on
+    hosts with no venv and no database, and importing `app.main` needs both.
+    """
+    try:
+        text = (repo / "app" / "main.py").read_text()
+    except OSError:
+        return None
+    m = re.search(r"""FastAPI\([^)]*version\s*=\s*["']([^"']+)["']""", text, re.S)
+    return m.group(1) if m else None
+
+
+def _version_tuple(v: str) -> tuple:
+    return tuple(int(p) if p.isdigit() else 0 for p in v.split("."))
+
+
+def check_board(host: Host) -> Check:
+    """Is the running board built from something at least as new as this checkout?
+
+    THE VERSION COMES FROM `/openapi.json`, and that is not a workaround. CHANGELOG.md
+    opens by defining the board's version as exactly this — "what `GET /openapi.json`
+    reports in `.info.version` — the way to tell which release a running instance is
+    on" — and it is the same string `app/main.py` declares, so the two sides of this
+    comparison are the same fact measured in two places. #199 asks for a first-class
+    `/version` and should still land; it would make this cheaper, not truer.
+
+    Capability probing (`/review/needs-human` present means >= v2.72) is the fallback
+    below and is deliberately second. It answers with a RANGE, and a range is not a
+    version: it can say the board is new enough for one feature while telling you
+    nothing about the next one. So a board that will not serve its own metadata is
+    reported as `unknown` with the range as context, never as a pass.
+    """
+    if not host.base_url:
+        return Check("board", "-", "QUARTERBACK_BASE_URL is unset and there is no default",
+                     "unknown", manual="set QUARTERBACK_BASE_URL in ~/.config/quarterback/config")
+    mine = declared_version(host.repo)
+    status, body, err = http_get(f"{host.base_url}/openapi.json")
+    if err or status != 200:
+        return _board_by_capability(host, mine, err or f"HTTP {status}")
+    try:
+        served = json.loads(body).get("info", {}).get("version")
+    except ValueError:
+        served = None
+    if not served:
+        return _board_by_capability(host, mine, "/openapi.json carried no info.version")
+    if not mine:
+        return Check("board", host.base_url, f"serving {served}; this checkout declares no "
+                     "version in app/main.py, so there is nothing to compare it to", "unknown",
+                     extra={"served": served})
+    return _board_verdict(host, served, mine)
+
+
+def _board_verdict(host: Host, served: str, mine: str) -> Check:
+    """The three-way compare, once both numbers are in hand."""
+    extra = {"served": served, "declared": mine}
+    if served == mine:
+        return Check("board", host.base_url, f"{served}, matching this checkout", "ok",
+                     extra=extra)
+    if _version_tuple(served) < _version_tuple(mine):
+        return Check(
+            "board", host.base_url,
+            f"serving {served}; this checkout declares {mine} — the image is behind",
+            "fail",
+            manual="rebuild and redeploy the board image (DEPLOY.md), then re-run",
+            extra=extra)
+    return Check("board", host.base_url,
+                 f"serving {served}; this checkout declares {mine} — the CHECKOUT is behind",
+                 "warn", manual=f"git -C {host.repo} pull", extra=extra)
+
+
+#: Capability probes, newest first: a path, the method to try, the response that
+#: proves the route exists, and the release that added it. Used only when the
+#: board will not serve `/openapi.json`. A 405 counts as proof for a POST-only
+#: route — the router matched the path and refused the verb, which is exactly the
+#: evidence wanted and the reason a bare 404/200 test is not enough.
+_CAPABILITIES = (
+    ("/review-queue", "GET", (405,), "2.75"),
+    ("/review/needs-human", "GET", (200, 401, 403, 422), "2.72"),
+)
+
+
+def _board_by_capability(host: Host, mine: str | None, why: str) -> Check:
+    """A floor for the board's version, when it will not state one. Never a pass.
+
+    Reported as `unknown` even when a probe succeeds, and the docstring on
+    :func:`check_board` says why: this establishes ">= 2.75", and ">= 2.75" does
+    not answer "does the board agree with this checkout".
+    """
+    floor = None
+    for path, _method, proofs, release in _CAPABILITIES:
+        headers = {"Authorization": f"Bearer {host.token}"} if host.token else {}
+        status, _body, err = http_get(f"{host.base_url}{path}", headers)
+        if err:
+            break
+        if status in proofs:
+            floor = release
+            break
+    if floor:
+        detail = (f"no version from the board ({why}); capability probing puts it at "
+                  f">= {floor}, which is a floor and not a version"
+                  + (f" — this checkout declares {mine}" if mine else ""))
+    else:
+        detail = f"no version from the board ({why}), and no capability probe answered either"
+    return Check("board", host.base_url or "-", detail, "unknown",
+                 manual="check the board is up and serving /openapi.json (#199 would make "
+                        "this a first-class /version)",
+                 extra={"floor": floor, "declared": mine})
+
+
+def checkout_harness_bin(host: Host) -> Path | None:
+    """The `bin/` this comparison is ABOUT: the one in the checkout under inspection.
+
+    Found by Codex, and it is the finding that mattered most on this change. The
+    first cut compared the harness on PATH against *this script's own* harness —
+    which is the same directory whenever `qb-doctor` is run from PATH, i.e. in
+    every installed use there will ever be. The row reported `ok` by comparing an
+    installed harness with itself, forever, on the one check whose entire subject
+    is a stale install. A version check that cannot go red is the false green this
+    file opens by arguing against.
+
+    So the checkout wins, and the script's own tree is only the fallback for a
+    `--repo` that carries no `harness/` at all (`qb-doctor` pointed at some other
+    project, where the question is still "is the harness on PATH the one I have").
+    """
+    from_repo = host.repo / "harness" / "bin"
+    if from_repo.is_dir():
+        return from_repo
+    own = host.source_harness / "bin"
+    return own if own.is_dir() else None
+
+
+def check_harness(host: Host) -> Check:
+    """Is the harness on PATH built from this checkout?
+
+    The nix flake pin is what versions it, nothing bumps that pin automatically
+    (#267), and no harness script can tell you it is stale because each one only
+    knows its own store path. So this compares CONTENT: every file the package
+    installs from `bin/`, byte for byte, against the checkout's. That answers the
+    question the version number would have, without needing one to exist.
+    """
+    if host.harness_bin is None:
+        return Check("harness", "-", "no harness on PATH (create-worktree not found), so "
+                     "nothing to compare this checkout against", "unknown",
+                     manual="install the harness (harness/README.md, 'Installing')")
+    src = checkout_harness_bin(host)
+    if src is None:
+        return Check("harness", str(host.harness_bin),
+                     f"no harness/bin to compare against, in {host.repo} or beside this script",
+                     "unknown")
+    if host.harness_bin.resolve() == src.resolve():
+        return Check("harness", str(host.harness_bin),
+                     "the harness on PATH IS this checkout", "ok")
+    differ, missing = _harness_drift(src, host.harness_bin)
+    if not differ and not missing:
+        return Check("harness", str(host.harness_bin),
+                     f"identical to {src} ({len(list(src.iterdir()))} files)", "ok")
+    parts = []
+    if missing:
+        parts.append(f"{len(missing)} absent ({', '.join(sorted(missing)[:4])})")
+    if differ:
+        parts.append(f"{len(differ)} differ ({', '.join(sorted(differ)[:4])})")
+    return Check("harness", str(host.harness_bin),
+                 "behind this checkout: " + ", ".join(parts), "fail",
+                 manual="bump the quarterback-harness flake input on this host and rebuild "
+                        "(#267 — nothing bumps it for you)",
+                 extra={"differ": sorted(differ), "missing": sorted(missing)})
+
+
+def _harness_drift(src: Path, installed: Path) -> tuple[set[str], set[str]]:
+    """``(differing names, names absent from the install)``.
+
+    One direction only. A file the INSTALL has and the checkout does not is a
+    harness newer than this branch, which is normal on any branch that has not
+    added a script, and reporting it would make the row red for every developer.
+    """
+    differ: set[str] = set()
+    missing: set[str] = set()
+    for f in src.iterdir():
+        if not f.is_file():
+            continue
+        there = installed / f.name
+        if not there.is_file():
+            missing.add(f.name)
+        elif there.read_bytes() != f.read_bytes():
+            differ.add(f.name)
+    return differ, missing
+
+
+def check_client(host: Host) -> Check:
+    """Is the MCP client's venv there, importable, and pointing at THIS checkout?
+
+    Both halves, because #203 and #200 are different failures wearing one face.
+    A venv can be perfectly healthy and editable-installed from a checkout that
+    has since drifted (#203), and the documented repair for that installs a
+    different half of the package and breaks the server (#200). "Importable" on
+    its own says nothing about which source tree answered.
+    """
+    repo = host.client_repo or host.repo
+    py = repo / "mcp" / ".venv" / "bin" / "python"
+    if not py.is_file() or not os.access(py, os.X_OK):
+        return Check("client", str(py), "no MCP venv", "fail",
+                     manual=f"cd {repo}/mcp && uv venv --python 3.12 .venv && uv pip install -e .")
+    rc, out, err = run_cmd([
+        str(py), "-c",
+        "import mcp_server.server, mcp_server.board, mcp_server as m; print(m.__file__)"])
+    if rc != 0:
+        return Check("client", str(py), f"venv present but the modules will not import: "
+                     f"{(err or out).splitlines()[-1] if (err or out) else f'exit {rc}'}", "fail",
+                     manual=f"cd {repo}/mcp && uv pip install -e .")
+    served_from = Path(out.strip()).resolve().parent.parent if out.strip() else None
+    want = (repo / "mcp").resolve()
+    if served_from and served_from != want:
+        return Check("client", str(py),
+                     f"imports fine, but from {served_from}, not {want} — the editable "
+                     "install points at another checkout", "fail",
+                     manual=f"cd {repo}/mcp && uv pip install -e .",
+                     extra={"serving_from": str(served_from)})
+    return Check("client", str(py), f"importable, from {want}", "ok")
+
+
+def check_checkout(host: Host) -> Check:
+    """Is this checkout current with its remote?
+
+    `git status` alone cannot answer it — a branch is "up to date with
+    origin/main" against whatever was last fetched, which on a box that has not
+    fetched for a week is a sentence about the past. So this fetches first, and
+    a fetch that fails is an `unknown` rather than a clean bill.
+    """
+    r = str(host.repo)
+    rc, _out, err = run_cmd(["git", "-C", r, "fetch", "--quiet", host.remote])
+    if rc != 0:
+        return Check("checkout", r, f"could not fetch {host.remote}: {err or f'exit {rc}'}",
+                     "unknown", manual=f"git -C {r} fetch {host.remote}")
+    _rc, branch, _ = run_cmd(["git", "-C", r, "rev-parse", "--abbrev-ref", "HEAD"])
+    _rc, head, _ = run_cmd(["git", "-C", r, "rev-parse", "--short", "HEAD"])
+    base = _default_branch(host)
+    if base is None:
+        return Check("checkout", r, f"{branch} @ {head}; could not resolve "
+                     f"{host.remote}'s default branch", "unknown")
+    rc3, count, _ = run_cmd(
+        ["git", "-C", r, "rev-list", "--count", f"HEAD..{host.remote}/{base}"])
+    subject = f"{branch} @ {head}"
+    if rc3 != 0 or not count.isdigit():
+        return Check("checkout", r, f"{subject}; could not count against "
+                     f"{host.remote}/{base}", "unknown")
+    behind = int(count)
+    if behind == 0:
+        return Check("checkout", r, f"{subject}, 0 behind {host.remote}/{base}", "ok")
+    return Check("checkout", r,
+                 f"{subject}, {behind} behind {host.remote}/{base}", "warn",
+                 manual=f"git -C {r} pull", extra={"behind": behind})
+
+
+def _default_branch(host: Host) -> str | None:
+    """The remote's default branch, from its own HEAD ref."""
+    rc, out, _ = run_cmd(["git", "-C", str(host.repo), "symbolic-ref", "--short",
+                          f"refs/remotes/{host.remote}/HEAD"])
+    if rc == 0 and "/" in out:
+        return out.split("/", 1)[1]
+    for guess in ("main", "master"):
+        rc, _, _ = run_cmd(["git", "-C", str(host.repo), "rev-parse", "--verify", "--quiet",
+                            f"refs/remotes/{host.remote}/{guess}"])
+        if rc == 0:
+            return guess
+    return None
+
+
+def check_token(host: Host) -> Check:
+    """Can this machine actually authenticate to its board?
+
+    #201's defect: `qb-board` said "this machine has no token" while the token
+    was valid — the client never set the variable its own token command needs.
+    The only answer that settles it is a live authenticated call, so this makes
+    one rather than checking that a variable is non-empty.
+    """
+    if not host.base_url:
+        return Check("token", "-", "no board configured (QUARTERBACK_BASE_URL unset)", "fail",
+                     manual="set QUARTERBACK_BASE_URL in ~/.config/quarterback/config")
+    if not host.token:
+        return Check("token", host.base_url, "no token resolved (QUARTERBACK_TOKEN, "
+                     "QUARTERBACK_TOKEN_CMD, /run/op-secrets/quarterback-token all empty)",
+                     "fail", manual="set QUARTERBACK_TOKEN_CMD in ~/.config/quarterback/config")
+    status, body, err = http_get(f"{host.base_url}/whoami",
+                                 {"Authorization": f"Bearer {host.token}"})
+    if err:
+        return Check("token", host.base_url, f"could not reach the board: {err}", "unknown")
+    if status == 401:
+        return Check("token", host.base_url, "the board refused this machine's bearer (401)",
+                     "fail", manual="re-mint the token (QUARTERBACK_TOKEN_REFRESH_CMD) and "
+                                    "check API_TOKENS on the board")
+    if status != 200:
+        return Check("token", host.base_url, f"/whoami answered {status}", "unknown")
+    try:
+        who = json.loads(body)
+    except ValueError:
+        return Check("token", host.base_url, "/whoami did not answer JSON", "unknown")
+    return Check("token", host.base_url,
+                 f"resolved — this session is {who.get('agent')}", "ok",
+                 extra={"agent": who.get("agent"), "kind": who.get("kind")})
+
+
+# --------------------------------------------------------------------------- #
+# the guards (the 2026-08-22 note)
+# --------------------------------------------------------------------------- #
+
+def expected_hooks(host: Host) -> set[str] | None:
+    """Every file `qb-hooks` has to put in a repo's hook dir, from the SOURCES.
+
+    Derived, never listed. #343 is adding a `pre-push` guard in another worktree
+    right now, and a hard-coded pair here would report a repo with no `pre-push`
+    as fully hooked from the day that lands — which is this file's whole subject
+    happening to this file.
+    """
+    if host.githooks is None:
+        return None
+    return {f.name for f in host.githooks.iterdir() if f.is_file()}
+
+
+def check_hooks(host: Host) -> Check:
+    """Is the stash guard INSTALLED in this repo — not present in git, installed?
+
+    `ls harness/githooks/reference-transaction` succeeds on a host with no guard
+    at all. What makes a guard run is `core.hooksPath` pointing at a directory
+    that holds it, so that is what this reads.
+    """
+    r = str(host.repo)
+    if host.common_git_dir is None:
+        return Check("hooks", r, "could not resolve the common git dir", "unknown")
+    want_dir = host.common_git_dir / "qb-hooks"
+    rc, current, _ = run_cmd(["git", "-C", r, "config", "--type=path", "--get", "core.hooksPath"])
+    fix = ["qb-hooks", "install", "--repo", r]
+    if rc != 0 or not current:
+        return Check("hooks", str(want_dir), "core.hooksPath is unset — no guard runs here",
+                     "fail", manual=f"qb-hooks install --repo {r}", fix=fix)
+    if Path(current).resolve() != want_dir.resolve():
+        return Check("hooks", current, f"core.hooksPath points elsewhere (expected {want_dir})",
+                     "fail", manual=f"qb-hooks install --repo {r}", fix=fix)
+    want = expected_hooks(host)
+    if want is None:
+        return Check("hooks", current, "installed, but this harness has no githooks/ sources "
+                     "to compare against, so the file list cannot be checked", "unknown",
+                     manual="reinstall the harness — githooks/ is missing from it")
+    here = Path(current)
+    absent = sorted(n for n in want
+                    if not (here / n).is_file() or not os.access(here / n, os.X_OK))
+    if absent:
+        return Check("hooks", current,
+                     f"installed, but missing {len(absent)} of {len(want)}: {', '.join(absent)}",
+                     "fail", manual=f"qb-hooks install --repo {r}", fix=fix,
+                     extra={"missing": absent})
+    return Check("hooks", current, f"installed ({', '.join(sorted(want))})", "ok",
+                 extra={"installed": sorted(want)})
+
+
+def check_stash(host: Host) -> Check:
+    """The SHARED `refs/stash`, and the residue installing the guard cannot clear.
+
+    Every worktree of a repo shares one `refs/stash` — it is in the common git
+    dir — so an entry pushed from any of them is `stash@{0}` for all of them.
+    #210's hook refuses new entries and deliberately allows deletions, so
+    installing it protects a repo going forward and drains nothing: a
+    freshly-guarded repo is exactly as mined as it was an hour earlier. `ok` for
+    that state would be a lie of omission, so it is a `warn` naming the count,
+    which is the behaviour `qb-hooks status` already models and the only reason
+    the four entries on this repo were ever found.
+    """
+    rc, out, err = run_cmd(["git", "-C", str(host.repo), "stash", "list"])
+    if rc != 0:
+        return Check("stash", "refs/stash", f"could not list: {err or f'exit {rc}'}", "unknown")
+    n = len([ln for ln in out.splitlines() if ln.strip()])
+    guarded = check_hooks(host).verdict == "ok"
+    if n == 0:
+        # Clean AND unguarded is still not `ok`. The ref is empty because nobody
+        # has stashed yet, not because anything stops them — which is the state
+        # this repo was in for weeks before an agent popped another worktree's
+        # work out of it. The remedy points at the hooks row rather than
+        # repeating its command, so `--fix` reports one installation and not two.
+        return Check("stash", "refs/stash",
+                     "0 entries" + (" (guard active)" if guarded
+                                    else ", but nothing guards the shared ref"),
+                     "ok" if guarded else "warn",
+                     manual=None if guarded else "see the hooks row — the guard is not installed")
+    word = "entry" if n == 1 else "entries"
+    if guarded:
+        return Check("stash", "refs/stash",
+                     f"guard active, {n} pre-guard {word} remain — the hook allows deletions "
+                     "so nothing drains them for you", "warn",
+                     manual=f"git -C {host.repo} stash list   # then drop each, once you know "
+                            "whose it is", extra={"entries": n})
+    return Check("stash", "refs/stash",
+                 f"{n} {word} on the shared ref and NO guard installed", "fail",
+                 manual="see the hooks row — install the guard, then drop the entries above",
+                 extra={"entries": n})
+
+
+def unit_state(verb: str, unit: str) -> tuple[str, str | None]:
+    """``(what systemctl said, None)`` — or ``("", why it could not say)``.
+
+    One place, for both `is-enabled` and `is-active`, because every caller has to
+    make the same three-way distinction and a second hand-rolled copy is how the
+    two come to disagree about which failures are answers.
+
+    `systemctl` exits non-zero for perfectly good answers — 4 for `not-found`, 1 for
+    `disabled` — so the exit code cannot be the discriminator. What settles it is
+    whether anything was SAID: a word on stdout is an answer whatever the code, an
+    empty stdout with a bus error is not an answer at all, and an empty stdout with
+    systemd's unit-file wording is the answer `not-found`.
+    """
+    rc, out, err = run_cmd(["systemctl", "--user", verb, unit])
+    if out:
+        return out, None
+    low = (err or "").lower()
+    if any(phrase in low for phrase in _BUS_UNREACHABLE):
+        return "", clip_line(err) or f"{verb}: exit {rc}"
+    if any(phrase in low for phrase in _MISSING_UNIT):
+        return "not-found", None
+    if rc != 0:
+        return "", clip_line(err) or f"{verb}: exit {rc}"
+    return "", f"{verb} said nothing"
+
+
+def check_reconcile(host: Host) -> Check:
+    """Is the reconcile timer enabled and running ON THIS HOST?
+
+    It shipped with its units in `harness/loops/systemd/` and was installed on no
+    host at all, so the plan `plan_read` hands a cold agent went 39% wrong — 13 of
+    33 items pointing at closed issues — while every component involved reported
+    itself healthy.
+    """
+    if shutil.which("systemctl") is None:
+        return Check("reconcile", "qb-reconcile.timer",
+                     "no systemctl on this host, so nothing can say whether the timer runs",
+                     "unknown", manual="run qb-reconcile from cron, or install systemd units")
+    unit = "qb-reconcile.timer"
+    enabled, why_e = unit_state("is-enabled", unit)
+    active, why_a = unit_state("is-active", unit)
+    fix = ["systemctl", "--user", "enable", "--now", unit]
+    # EITHER question failing is an unknown, not a fail. The second cut checked only
+    # the first: a bus that went away between the two calls, or a version that
+    # answers `is-enabled` from disk and `is-active` from the bus, produced
+    # `is-enabled=enabled, is-active=` and reported the timer as broken. Codex found
+    # that on the fix for the first one — the same collapse, one call along.
+    if why_e or why_a:
+        return Check("reconcile", unit, f"systemctl could not answer: {why_e or why_a}",
+                     "unknown",
+                     manual="check the user bus is up (loginctl enable-linger, or run "
+                            "inside a login session) and re-run")
+    if enabled == "not-found":
+        return Check("reconcile", unit,
+                     "no such unit on this host — the units are in harness/loops/systemd/ "
+                     "and were never installed", "fail",
+                     manual="install harness/loops/systemd/qb-reconcile.{service,timer} into "
+                            "~/.config/systemd/user (nix-fleet does this) and "
+                            "`systemctl --user daemon-reload`")
+    if enabled != "enabled" or active != "active":
+        return Check("reconcile", unit, f"is-enabled={enabled}, is-active={active}", "fail",
+                     manual="systemctl --user enable --now " + unit, fix=fix)
+    return Check("reconcile", unit, f"enabled, active{_last_run()}", "ok")
+
+
+def _last_run() -> str:
+    """`, last run <when>` when systemd will say, and nothing at all when it will not."""
+    rc, out, _ = run_cmd(["systemctl", "--user", "show", "qb-reconcile.service",
+                          "-p", "ExecMainStartTimestamp", "--value"])
+    return f", last run {out}" if rc == 0 and out.strip() else ""
+
+
+def check_edge(host: Host) -> Check:
+    """Can a PERSON write to the board — and can an agent host forge one?
+
+    Two properties, one row, because they are one boundary. `human()` needs an
+    edge-asserted `Remote-User` AND the edge's own `X-Edge-Auth` secret, so:
+
+    * the agent vhost must REFUSE a `Remote-User` a caller supplied itself. If it
+      ever stopped stripping, any agent on any box could post as Rich. That half
+      is checkable from here and it is checked first, because a false pass on it
+      is worse than a fail on the other.
+    * the browser vhost must ACCEPT the person it authenticated. That is the half
+      that has been broken since v2.39 — `HUMAN_EDGE_SECRET` was never generated,
+      never given to the app and never injected by nginx — and it is the half a
+      machine with no forward-auth session cannot see. Hence `unknown` there and
+      not `ok`: the honest answer is "nothing on this host can tell", and the
+      remedy is a runbook rather than a command.
+
+    Deliberately NOT done by asking the app whether the secret is configured.
+    That would need a new endpoint, and a new endpoint would be absent from the
+    deployed image until the very redeploy that fixes the secret — a check that
+    cannot answer until after the problem is solved.
+    """
+    if not host.base_url:
+        return Check("edge", "-", "no board configured, so neither vhost can be probed",
+                     "unknown")
+    spoof = _edge_spoof_refused(host)
+    if spoof is not None:
+        return spoof
+    if not host.human_url:
+        return Check("edge", host.base_url,
+                     "agent vhost refuses a self-supplied Remote-User; the browser vhost is "
+                     "not known to this host, so human writes could not be tested", "unknown",
+                     manual="set QUARTERBACK_HUMAN_URL in ~/.config/quarterback/config, then "
+                            f"re-run. If human writes are refused, the runbook is {EDGE_RUNBOOK}")
+    return _edge_human_writes(host)
+
+
+#: The answers that PROVE the agent vhost refused a self-supplied `Remote-User`.
+#: A closed set, because the alternative is treating everything-but-200 as proof —
+#: which makes a 404 (no such route on an old image) and a 502 (the app is down)
+#: read as a security property holding. Found by Codex; it is the same collapse as
+#: #324's absent-check-result-as-a-benign-one, in the row where a false pass is
+#: worst, since the property it would vouch for is "nobody can forge a person".
+_EDGE_REFUSALS = (401, 403)
+
+
+def _edge_spoof_refused(host: Host) -> Check | None:
+    """None when the agent vhost correctly refuses a forged person; a Check when not."""
+    status, _body, err = http_get(
+        f"{host.base_url}/whoami",
+        {"Remote-User": "qb-doctor-probe", "X-Edge-Auth": "qb-doctor-not-the-secret"})
+    if err:
+        return Check("edge", host.base_url, f"could not reach the agent vhost: {err}", "unknown")
+    if status not in (*_EDGE_REFUSALS, 200):
+        return Check("edge", host.base_url,
+                     f"the agent vhost answered {status} to a forged Remote-User — neither an "
+                     "acceptance nor a refusal, so whether it strips the header is untested",
+                     "unknown",
+                     manual=f"check {host.base_url}/whoami is reachable and serving the board")
+    if status == 200:
+        return Check("edge", host.base_url,
+                     "the agent vhost ACCEPTED a self-supplied Remote-User — anything that "
+                     "can reach it can post as a person", "fail",
+                     manual="strip Remote-* and X-Edge-Auth on the agent vhost (DEPLOY.md, "
+                            "'Security — strip Remote-* on BOTH vhosts'); on a dev board "
+                            "this is BROWSER_DEV_HUMAN, which DEPLOY.md's checklist says "
+                            "must be unset on a reachable one")
+    return None
+
+
+#: Words that appear in the board's OWN refusal of an unvouched person and in
+#: nothing an auth proxy says. `app/auth.py`'s `_NOT_FROM_THE_EDGE` names the header
+#: and the setting in full, deliberately — "a message that drifts between the two
+#: teaches an operator the wrong fix for whichever one they hit first" — which is
+#: what makes it a usable signature here.
+_BOARD_REFUSAL_MARKS = ("remote-user", "x-edge-auth", "human_edge_secret", "deploy.md")
+
+
+def _looks_like_the_boards_refusal(body: str) -> bool:
+    """Did the APP refuse this, or did something in front of it?
+
+    A FastAPI refusal is JSON with a `detail`, and the board's own says which
+    mechanism it is about. Both are required: an auth portal can serve JSON, and a
+    board can serve a `detail` about something else entirely.
+    """
+    try:
+        detail = json.loads(body).get("detail")
+    except ValueError:
+        return False
+    if not isinstance(detail, str):
+        return False
+    low = detail.lower()
+    return any(mark in low for mark in _BOARD_REFUSAL_MARKS)
+
+
+def _edge_human_writes(host: Host) -> Check:
+    """The end-to-end half: does the browser vhost's own person get through?"""
+    headers = {}
+    cookie = os.environ.get("QUARTERBACK_EDGE_COOKIE")
+    if cookie:
+        headers["Cookie"] = cookie
+    status, body, err = http_get(f"{host.human_url}/whoami", headers)
+    if err:
+        return Check("edge", host.human_url, f"could not reach the browser vhost: {err}",
+                     "unknown", manual=f"runbook: {EDGE_RUNBOOK}")
+    if status in (301, 302, 303, 307, 308):
+        return Check(
+            "edge", host.human_url,
+            f"the browser vhost answered {status} — forward-auth, and this host has no "
+            "session, so nothing here can see whether HUMAN_EDGE_SECRET is set", "unknown",
+            manual=f"runbook: {EDGE_RUNBOOK} (or set QUARTERBACK_EDGE_COOKIE to a "
+                   "signed-in session and re-run)")
+    if status in (401, 403):
+        # WHICH hop refused matters, and the status code cannot say. The auth proxy
+        # in front of the browser vhost answers 401/403 to a caller with no session,
+        # and so does the app to a person the edge did not vouch for — identical
+        # codes, opposite diagnoses, and reading the proxy's as the app's would tell
+        # somebody the secret is broken when all they are is signed out. Codex found
+        # this on the second pass. The board's own refusal names the mechanism in its
+        # body, so that is what decides it; anything else is a refusal this tool
+        # cannot attribute, which is an unknown.
+        if not _looks_like_the_boards_refusal(body):
+            return Check("edge", host.human_url,
+                         f"the browser vhost answered {status}, and the body is not the "
+                         "board's — the auth proxy refused this host before the app saw the "
+                         "request, so nothing here can see whether HUMAN_EDGE_SECRET is set",
+                         "unknown",
+                         manual=f"runbook: {EDGE_RUNBOOK} (or set QUARTERBACK_EDGE_COOKIE to "
+                                "a signed-in session and re-run)")
+        return Check("edge", host.human_url,
+                     f"human writes are REFUSED ({status}) — the edge authenticated a person "
+                     "and the app would not take them, which is HUMAN_EDGE_SECRET unset or "
+                     "disagreeing between 1Password and sops", "fail",
+                     manual=f"runbook: {EDGE_RUNBOOK} — needs a generated secret in TWO "
+                            "stores and two deploys; that is a person's job, not this tool's")
+    if status != 200:
+        return Check("edge", host.human_url, f"/whoami answered {status}", "unknown",
+                     manual=f"runbook: {EDGE_RUNBOOK}")
+    try:
+        kind = json.loads(body).get("kind")
+    except ValueError:
+        kind = None
+    if kind != "human":
+        return Check("edge", host.human_url,
+                     f"the browser vhost answered as {kind!r}, not a person — Remote-User is "
+                     "not reaching the app", "fail",
+                     manual=f"runbook: {EDGE_RUNBOOK}")
+    return Check("edge", host.human_url, "human writes accepted", "ok")
+
+
+def check_tools(host: Host) -> Check:
+    """What this host carries that the harness shells out to — and `gh`'s auth.
+
+    The fourth layer from #204's comments: a suite's behaviour depends on host
+    facts nothing declares and nothing reports, and isolating one of those cost
+    four CI round trips. This does not fix that; it prints it, which is the whole
+    of what was missing.
+    """
+    required = ("git", "gh", "curl", "jq")
+    optional = ("docker", "psql", "tmux", "codex", "uv")
+    missing = [t for t in required if shutil.which(t) is None]
+    have_opt = [t for t in optional if shutil.which(t) is not None]
+    detail_tail = (f"; optional present: {', '.join(have_opt) or 'none'}"
+                   f"; python {sys.version.split()[0]} at {sys.executable}")
+    if missing:
+        return Check("tools", "PATH", f"missing: {', '.join(missing)}{detail_tail}", "fail",
+                     manual=f"install {', '.join(missing)} on this host",
+                     extra={"missing": missing, "optional": have_opt})
+    rc, _out, err = run_cmd(["gh", "auth", "status"], timeout=15)
+    if rc != 0:
+        why = err.splitlines()[0] if err else f"exit {rc}"
+        return Check("tools", "PATH", f"gh is not authenticated ({why}){detail_tail}", "fail",
+                     manual="gh auth login", extra={"optional": have_opt})
+    return Check("tools", "PATH", f"{', '.join(required)} present, gh authenticated{detail_tail}",
+                 "ok", extra={"optional": have_opt})
+
+
+#: Every check, in the order the report prints them: the three version lines and
+#: what they depend on first, then the guards. A tuple rather than a registry
+#: decorator so `--only` can validate a name against it before anything runs.
+CHECKS = (
+    ("checkout", check_checkout),
+    ("board", check_board),
+    ("harness", check_harness),
+    ("client", check_client),
+    ("token", check_token),
+    ("hooks", check_hooks),
+    ("stash", check_stash),
+    ("reconcile", check_reconcile),
+    ("edge", check_edge),
+    ("tools", check_tools),
+)
+
+
+def run_checks(host: Host, only: set[str] | None = None) -> list[Check]:
+    """Every selected check, each one's own failure contained.
+
+    A check that raises becomes an `unknown` naming the exception rather than
+    taking the report down with it. A doctor is the thing you run when the host
+    is already odd, so "one row could not be computed" has to be a row.
+    """
+    out: list[Check] = []
+    for name, fn in CHECKS:
+        if only is not None and name not in only:
+            continue
+        try:
+            out.append(fn(host))
+        except Exception as exc:                              # noqa: BLE001 — it IS the report
+            out.append(Check(name, "-", f"the check itself raised {type(exc).__name__}: {exc}",
+                             "unknown"))
+    return out
+
+
+def apply_fixes(host: Host, checks: list[Check],
+                only: set[str] | None = None) -> list[Check]:
+    """Run the safe, idempotent installers, then take the whole report again.
+
+    RE-CHECKED, never inferred from the installer's exit code. "The command
+    succeeded" and "the guard is now installed" are the two sentences this whole
+    file exists to keep apart, and an installer that exits 0 having written to a
+    directory nothing reads would otherwise be reported as a fix.
+
+    The re-check is the WHOLE selected set rather than only the rows that were
+    fixed, because one guard's state is another row's input: `stash` reports
+    residue differently depending on whether the guard is live, so installing
+    hooks and re-running only `hooks` left the stash row describing a repo that
+    had stopped existing a second earlier.
+    """
+    ran: dict[str, tuple[list[str], int]] = {}
+    for check in checks:
+        if check.verdict in HEALTHY or not check.fix:
+            continue
+        rc, stdout, stderr = run_cmd(check.fix, cwd=str(host.repo), timeout=120)
+        for line in (stdout or stderr).splitlines():
+            # stderr, for the reason `qb-reconcile` gives for its own aside: under
+            # `--json` stdout is a document a consumer parses, and an installer's
+            # chatter printed before it makes the whole run unparseable. Found by
+            # Codex, on `--fix --json` together.
+            print(f"  {check.name}: {line}", file=sys.stderr)
+        ran[check.name] = (check.fix, rc)
+    if not ran:
+        return checks
+    out = run_checks(host, only)
+    for check in out:
+        if check.name not in ran:
+            continue
+        argv, rc = ran[check.name]
+        if check.verdict in HEALTHY:
+            check.detail = f"{check.detail} (fixed by qb-doctor --fix)"
+        else:
+            check.detail = (f"{check.detail} — `{' '.join(argv)}` ran and did not fix it "
+                            f"(exit {rc})")
+    return out
+
+
+#: Widest the report will grow, whatever the terminal says. A diagnostic is read,
+#: quoted into an issue and pasted into a board post, and columns that stretch to
+#: a 210-column monitor survive none of those.
+MAX_WIDTH = 110
+
+#: The subject column: a URL, a store path, a unit name. Truncated from the LEFT
+#: when it will not fit, because the informative end of `/nix/store/<hash>-…/bin`
+#: is the tail.
+SUBJECT_WIDTH = 30
+
+
+def _elide(text: str, width: int) -> str:
+    return text if len(text) <= width else "…" + text[-(width - 1):]
+
+
+def _wrap(text: str, width: int) -> list[str]:
+    """Wrap on spaces only.
+
+    `break_on_hyphens` and `break_long_words` are both off because every remedy
+    this file prints is a path, a URL or a command line, and textwrap's defaults
+    split `160-bug-quarterback-…` across two lines at a hyphen. A remedy a reader
+    cannot select and paste is not a remedy — running past the right margin is the
+    lesser harm, and the one a terminal already knows how to handle.
+    """
+    return textwrap.wrap(text, width, break_on_hyphens=False,
+                         break_long_words=False) or [""]
+
+
+def render(checks: list[Check], colour: bool, quiet: bool = False) -> str:
+    """The report: one row per check, verdict last, remedy underneath.
+
+    Verdict last rather than first because that is the shape #204 asked for, and
+    because the eye reading a doctor's output is scanning the right-hand edge for
+    the one word that is not `ok`. Long details wrap under the detail column
+    rather than being truncated: the reason a check failed is the payload, and a
+    report that hides it behind an ellipsis sends the reader back to the source.
+    """
+    rows = [c for c in checks if not quiet or c.verdict != "ok"]
+    if not rows:
+        return summary(checks)
+    name_w = max(len(c.name) for c in rows)
+    subj_w = min(max(len(c.subject) for c in rows), SUBJECT_WIDTH)
+    verdict_w = max(len(_GLYPHS[c.verdict]) for c in rows)
+    lead = name_w + 2 + subj_w + 2
+    detail_w = max(MAX_WIDTH - lead - verdict_w - 2, 30)
+
+    lines: list[str] = []
+    for c in rows:
+        glyph = _GLYPHS[c.verdict].rjust(verdict_w)
+        if colour:
+            glyph = f"{_COLOURS[c.verdict]}{glyph}{_RESET}"
+        wrapped = _wrap(c.detail, detail_w)
+        head = f"{c.name:<{name_w}}  {_elide(c.subject, subj_w):<{subj_w}}  "
+        lines.append(f"{head}{wrapped[0]:<{detail_w}}  {glyph}")
+        for extra in wrapped[1:]:
+            lines.append(f"{'':<{lead}}{extra}")
+        # NOT wrapped. A remedy is a command or a path, and hard-wrapping one
+        # breaks copy-and-paste for the reader it exists to serve; a terminal's
+        # own soft wrap runs past the margin and still yields one line on select.
+        if c.manual:
+            lines.append(f"{'':<{lead}}-> {c.manual}")
+    lines += ["", summary(checks)]
+    return "\n".join(lines)
+
+
+def summary(checks: list[Check]) -> str:
+    """One line saying what the verdicts add up to — and refusing to round up.
+
+    `N ok` on its own is the sentence that hides an unknown, so the counts are
+    always spelled in full and the trailing clause names the state of the host in
+    words rather than leaving a reader to add them up.
+    """
+    counts = {v: sum(1 for c in checks if c.verdict == v) for v in VERDICTS}
+    spelled = ", ".join(f"{counts[v]} {v}" for v in VERDICTS)
+    if counts["fail"]:
+        verdict = "this host is NOT wired up"
+    elif counts["unknown"]:
+        verdict = ("some of this host could not be checked, which is not the same as it "
+                   "being fine")
+    elif counts["warn"]:
+        verdict = "wired up, with residue nothing installs away"
+    else:
+        verdict = "wired up"
+    return f"{spelled} — {verdict}"
+
+
+def exit_code(checks: list[Check]) -> int:
+    """0 healthy, 1 something could not be checked, 2 something failed."""
+    if any(c.verdict == "fail" for c in checks):
+        return 2
+    if any(c.verdict == "unknown" for c in checks):
+        return 1
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="qb-doctor",
+        description="Is this host wired up? Compares the board, the harness and the client "
+                    "against each other, and checks the harness's own guards are installed.")
+    parser.add_argument("--repo", metavar="DIR",
+                        help="the checkout to check (default: the cwd's)")
+    parser.add_argument("--fix", action="store_true",
+                        help="also run the installers that are safe and idempotent; anything "
+                             "needing a person is still only printed")
+    parser.add_argument("--json", action="store_true", dest="as_json",
+                        help="the whole report as JSON")
+    parser.add_argument("--only", metavar="NAMES",
+                        help="comma-separated check names (" + ",".join(n for n, _ in CHECKS) + ")")
+    parser.add_argument("--human-url", metavar="URL", dest="human_url",
+                        help="the browser vhost, for the edge check (else QUARTERBACK_HUMAN_URL)")
+    parser.add_argument("--quiet", action="store_true",
+                        help="print only the rows that are not ok")
+    args = parser.parse_args(argv)
+
+    only = None
+    if args.only:
+        only = {n.strip() for n in args.only.split(",") if n.strip()}
+        unknown_names = only - {n for n, _ in CHECKS}
+        if unknown_names:
+            print(f"qb-doctor: no such check: {', '.join(sorted(unknown_names))}", file=sys.stderr)
+            return 3
+
+    host = survey(args.repo, args.human_url, __file__)
+    checks = run_checks(host, only)
+    if args.fix:
+        checks = apply_fixes(host, checks, only)
+
+    if args.as_json:
+        print(json.dumps({"checks": [c.as_dict() for c in checks],
+                          "summary": summary(checks),
+                          "exit_code": exit_code(checks)}, indent=2))
+    else:
+        colour = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+        print(render(checks, colour, quiet=args.quiet))
+        manual = [c for c in checks if c.verdict not in HEALTHY and c.manual and not c.fix]
+        if manual:
+            print("\nNeeds a person — nothing above ran these:")
+            for c in manual:
+                print(f"  {c.name}: {c.manual}")
+    return exit_code(checks)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
