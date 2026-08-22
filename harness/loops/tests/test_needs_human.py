@@ -553,12 +553,41 @@ def test_the_escalation_list_comes_off_the_board(findings):
     assert findings["params"] == {"repo": "acme/r", "pr": 7}
 
 
-def test_a_board_too_old_to_publish_the_list_is_not_a_board_with_none(findings):
+def test_a_missing_list_is_not_a_board_with_none(findings):
     """Absent must not read as clean: a missing field and an empty list have
     different remedies, and only one of them lets a round count the work."""
     findings["body"] = {"findings": []}
     keys, why = panel.board_escalations("acme/r", 7)
-    assert keys == [] and "predates the field" in why
+    assert keys == [] and "must be named with --escalated by hand" in why
+
+
+def test_a_missing_list_does_not_pick_a_cause_for_its_own_absence(findings):
+    """The message reports the observation and offers the causes; it does not
+    choose one, because nothing in the response distinguishes them.
+
+    Two produce the identical absence — a board older than #279, and a PR with
+    no recorded review run — and both are real: on the live board a PR with
+    rounds returns `needs_human_keys: []` while a PR with none omits the field.
+    The first draft of this line asserted "it predates the field" and was wrong
+    about a board running current code, which is the same
+    inference-from-an-absence the branch exists to refuse. #199's version
+    endpoint would let it name the cause instead of listing them.
+    """
+    findings["body"] = {"findings": []}
+    _keys, why = panel.board_escalations("acme/r", 7)
+    assert "Either" in why and " or " in why, why
+    assert "nothing in the answer says which" in why
+    assert "predates the field, so" not in why, (
+        "the message is asserting one cause as fact again")
+
+
+def test_an_empty_list_from_a_board_that_has_the_field_is_an_answer(findings):
+    """`[]` and a missing key are the two halves of the distinction, and the
+    empty one is a real answer: this PR has been reviewed and nothing on it is
+    waiting on a human. It must not acquire the missing-field note."""
+    findings["body"] = {"findings": [], "needs_human_keys": []}
+    keys, why = panel.board_escalations("acme/r", 7)
+    assert keys == [] and why == ""
 
 
 def test_a_board_that_will_not_answer_is_reported_not_treated_as_empty(findings):

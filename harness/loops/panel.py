@@ -173,12 +173,28 @@ def board_escalations(gh_repo: str, pr_number: int) -> tuple[list[str], str]:
                     f"with a {type(body).__name__}, not an object")
     keys = body.get(NEEDS_HUMAN_KEYS)
     if keys is None:
-        # A CAPABILITY answer, not a failure — and still not "none". A board
-        # older than #279 has no such field, and reading its silence as an empty
-        # escalation list is the same mistake as reading no CI as green.
+        # A CAPABILITY answer, not a failure — and still not "none". Reading its
+        # silence as an empty escalation list is the same mistake as reading no
+        # CI as green.
+        #
+        # What it does NOT say is WHY, and the message must not pretend
+        # otherwise. At least two causes produce the identical absence: a board
+        # older than #279, which has no such field at all, and a PR with no
+        # recorded review run, where the field is simply not rendered. Both are
+        # real — measured on the live board, where a PR with rounds returns
+        # `needs_human_keys: []` and a PR with none omits it — and nothing in
+        # this response tells them apart. Asserting one of them as fact here
+        # would be exactly the inference-from-absence this branch exists to
+        # refuse, one level up: the first draft of this line said "it predates
+        # the field" and was wrong about a board running current code.
+        #
+        # A `/version` endpoint (#199, open) would separate them properly, at
+        # which point this can name the cause instead of listing them.
         return [], (f"--escalated-from-board: the board published no "
-                    f"`{NEEDS_HUMAN_KEYS}` for this PR — it predates the field, so "
-                    "escalations must be named with --escalated by hand")
+                    f"`{NEEDS_HUMAN_KEYS}` for this PR. Either this board predates "
+                    "the field, or no review run carrying it has been recorded on "
+                    "this PR — nothing in the answer says which, so escalations "
+                    "must be named with --escalated by hand")
     if not isinstance(keys, list):
         return [], (f"--escalated-from-board: `{NEEDS_HUMAN_KEYS}` came back as a "
                     f"{type(keys).__name__}, not a list")
