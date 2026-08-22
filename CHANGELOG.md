@@ -17,6 +17,58 @@ the top of this file conflict every time, over nothing — both entries are righ
 and a fragment is a path no other branch will ever open. `changelog.d/README.md` has the format.
 `vNEXT` means exactly what it meant before; assembly is just what writes it.
 
+## v2.95 — a pull request that ships something is asked whether it wrote an entry
+
+Nothing asked. Every guard in this repo verifies that what is **present** is correct —
+`release_stamp.py check` asks whether an unstamped `## vNEXT` is sitting on `main`, `frozen`
+asks whether a shipped entry still says what it said — and to both of them a branch that never
+wrote an entry at all looks exactly like one that wrote a correct one. So a branch could add a
+module, sixty-seven tests and two public helpers with `changelog.d/` holding nothing but its
+own README, and the app suite, the harness suites, mcp, the flake checks, `frozen` and
+`migration-heads` would all be green. One did, on the day this was written; a landing agent
+caught it by hand and wrote the entry before assembling (#363).
+
+A new `a change that ships carries a release note` job runs on every pull request, beside
+`frozen` and `migration-heads`, and refuses a branch that changes something that ships and
+carries neither a fragment nor a release entry. It also runs `changelog_fragments.py check`,
+which nothing in CI ran before: a fragment that will not parse used to surface at land time,
+one merge away from surfacing as a release entry coming out wrong.
+
+### The scoping rule is the feature
+
+A check that fires on every pull request and is usually wrong is switched off within a week —
+which is the argument the `stamped` job's own comment makes, and the reason that job is
+push-to-main only. So the rule is an **exempt** list rather than a list of source directories.
+An allowlist of `app/`, `harness/`, `mcp/`, `scripts/` would reproduce this very defect one
+level up: the day somebody adds a top-level `worker/`, every branch confined to it passes
+forever and nothing anywhere notices, because an absent rule and a satisfied one are the same
+shape. Exempt are `changelog.d/`, `CHANGELOG.md`, any `README.md`, and tests — anything under a
+`tests/` directory or named like one. Everything else ships, `.github/` and
+`harness/commands/*.md` included: `ci` is one of the fragment kinds, and the command briefs are
+prose an agent executes rather than documentation about code.
+
+Judged against history rather than asserted: run over all thirty-eight pull requests merged
+since fragments existed, it refuses exactly one, and that one is the branch that prompted the
+issue. A docs-only branch and a test-only branch pass in silence.
+
+`fetch-depth: 0` on the checkout, for the reason spelled out on `frozen`: what changed is
+measured from the fork point, and at depth 1 there is no fork point at all. With none to find,
+this refuses rather than reporting the empty diff as a clean bill.
+
+### The way out is a line a reviewer reads
+
+```
+Changelog-Exempt: a comment typo, no behaviour changed
+```
+
+The same shape as `Release-Body-Edit:`, and read the same way — git's own trailer parser over
+`base..HEAD`, never a regex over the message. The refusal ends with a pasteable copy of that
+line, so a commit body quoting the refusal it has just been given is the likeliest message the
+branch will ever produce, and a regex would read that paste as consent. A value still wearing
+the refusal's `<angle brackets>` waives nothing either. The waiver expires with the merge it
+was written for, and is printed on the job's own output: a change that ships with no entry is
+still that, and the place it has to be unmissable is the run that let it through.
+
 ## v2.94 — /fix-issue stops offering a database it then guarantees is unsafe
 
 `/fix-issue` step 2 asked the agent to classify its change — "read-only / no DB → shared DB is

@@ -54,3 +54,26 @@ it into that release's entry, which is what a release IS: everything since the l
 Hand-writing `## vNEXT — <title>` in `CHANGELOG.md` still works and is still what that file's
 convention paragraph describes. Fragments are how you avoid the conflict, not a new
 requirement.
+
+## Something checks that you wrote one
+
+```bash
+scripts/changelog_fragments.py required --onto origin/main --branch HEAD
+```
+
+The `a change that ships carries a release note` CI job runs this on every pull request. A
+branch that changes something that ships and carries neither a fragment nor a release entry is
+refused — because nothing else could notice. `release_stamp.py check` asks whether a `vNEXT` is
+unstamped and `frozen` guards the entries that exist, so an entry nobody wrote is the same
+shape to both as a correct one, which is how #363 landed with this directory holding only the
+file you are reading (#365).
+
+A branch confined to documentation or tests passes in silence: `changelog.d/`, `CHANGELOG.md`,
+any `README.md`, and anything under a `tests/` directory or named like a test are exempt.
+Everything else ships — `.github/` and `harness/commands/*.md` included.
+
+Genuinely nothing to tell a reader? Say so on a commit of the branch, where a reviewer sees it:
+
+```
+Changelog-Exempt: a comment typo, no behaviour changed
+```

@@ -924,6 +924,49 @@ them** — `tests/test_resource_claims.py`, never `tests/test_v231.py`. A versio
 number that has to be guessed before landing, and two branches guessing the same one add the same
 PATH, which git cannot resolve by keeping both sides the way it can a conflicting heading.
 
+### Something asks whether an entry should have existed
+
+Every guard above verifies that what is **present** is correct. `release_stamp.py check` asks
+whether a `## vNEXT` is unstamped; `frozen` asks whether a shipped entry still says what it
+said. To both of them a branch that never wrote an entry at all looks exactly like one that
+wrote a correct one — so PR #363 landed a new module, sixty-seven tests and two public helpers
+with `changelog.d/` holding nothing but its README, and every job was green (#365).
+
+```bash
+scripts/changelog_fragments.py required --onto origin/main --branch HEAD
+```
+
+It runs as the `a change that ships carries a release note` CI job on every pull request, and
+refuses one that changes something that ships and carries neither a fragment nor a release
+entry. Safe to require, for `frozen`'s reason rather than `stamped`'s: it reports on every pull
+request. `fetch-depth: 0` on the checkout is load-bearing — what changed is measured from the
+fork point — and with no fork point to find it **refuses** rather than reporting the empty diff
+as a clean bill.
+
+The scoping rule is the feature, because a check that fires on every PR and is usually wrong is
+switched off within a week. It is an **exempt** list rather than a list of source directories,
+which is deliberate: an allowlist of `app/`, `harness/`, `mcp/`, `scripts/` reproduces the
+defect one level up, since the day somebody adds a top-level `worker/` every branch confined to
+it passes forever and nothing notices. Exempt are `changelog.d/`, `CHANGELOG.md`, any
+`README.md`, and tests — anything under a `tests/` directory or named like a test. Everything
+else ships, `.github/` and `harness/commands/*.md` included: `ci` is one of the fragment kinds,
+and the command briefs are prose an agent executes rather than documentation about code. Run
+against every pull request merged since fragments existed, it refuses exactly one, and that one
+is #363.
+
+Genuinely nothing for a reader of the release notes — a comment, a rename, a revert of
+something unlanded? Declare it, the same shape and for the same reason as `Release-Body-Edit:`:
+
+```
+Changelog-Exempt: a comment typo, no behaviour changed
+```
+
+Read with git's own trailer parser from `base..HEAD`, so it expires with the merge it was
+written for, a commit body quoting the refusal is not consent to it, and a value still wearing
+the refusal's `<angle brackets>` waives nothing. The waiver is printed on the job's own output:
+a change that ships with no entry is still that, and the place it has to be unmissable is the
+run that let it through.
+
 ### Every release, oldest first
 
 **The ORDER of this list is rendered from [CHANGELOG.md](CHANGELOG.md)** by
@@ -1470,6 +1513,7 @@ full — including what was broken before it, which is the part no diff recovers
 - **v2.92** — the pre-push hook stops telling you to renumber a graph it never counted.
 - **v2.93** — an issue watcher that reads the tracker and mostly declines.
 - **v2.94** — /fix-issue stops offering a database it then guarantees is unsafe.
+- **v2.95** — a pull request that ships something is asked whether it wrote an entry.
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
   roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps

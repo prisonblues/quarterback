@@ -14,6 +14,20 @@ same path and the conflict has nowhere to occur. It is the towncrier model:
 
     changelog_fragments.py check      # are the fragments well formed?
     changelog_fragments.py assemble   # fold them into a `## vNEXT` entry and delete them
+    changelog_fragments.py required   # did a branch that changes something WRITE one?
+
+## Why `required` is here rather than left to the landing
+
+Because nothing else could ask it. Every other guard in this repo verifies that what is
+PRESENT is correct — `release_stamp.py check` asks whether a `## vNEXT` is unstamped,
+`frozen` asks whether a shipped entry still says what it said — and to all of them a branch
+that never wrote an entry looks exactly like one that wrote a correct one. #363 landed a new
+module, sixty-seven tests and two public helpers with `changelog.d/` holding nothing but its
+README, and every CI job was green; a landing agent noticed by hand (#365).
+
+It runs on `pull_request` and is scoped so that a docs-only or test-only branch passes in
+silence, because a check that fires on every PR and is usually wrong is switched off within a
+week. `_exempt` is where that scoping lives and is the part to read.
 
 ## Why not towncrier itself
 
@@ -50,11 +64,13 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 import re
+import subprocess
 import sys
 import textwrap
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 _SCRIPTS = Path(__file__).resolve().parent
 
@@ -274,6 +290,299 @@ def insert_bullet(readme: str, changelog: str, title: str) -> str:
     return rr.render(readme[:end] + bullet + readme[end:], changelog)
 
 
+# ------------------------------------------------------ was an entry written at all
+
+#: The trailer that waives the requirement, written on a commit of the branch that owes the
+#: entry. `Release-Body-Edit:` is the model, both in shape — a line a reviewer reads on the
+#: PR rather than a setting somewhere nobody looks — and in how it is READ: git's own trailer
+#: parser over the branch's range, never a regex over the message. The refusal below ends
+#: with a ready-to-paste `Changelog-Exempt:` line, so a commit body quoting the refusal it
+#: has just been given is the most likely message this branch will ever produce, and a regex
+#: would read that paste as consent. A trailer block is the last paragraph of a message; a
+#: quoted refusal in the middle of one is not it (#348).
+_EXEMPT_KEY = "Changelog-Exempt"
+
+#: A waiver still wearing its angle brackets — the refusal's own `<one line saying why>`,
+#: pasted verbatim. git's trailer parser is perfectly happy with it and it says nothing,
+#: which is the one shape of waiver indistinguishable from nobody having thought about it.
+_UNFILLED = re.compile(r"^<.*>$")
+
+#: A test file recognised by NAME, for the ones that do not live in a `tests/` tree. Both
+#: forms exist here — `tests/test_dials.py` and `harness/tests/create_worktree_nginx.test.sh`
+#: are under one, and a `conftest.py` beside a suite need not be.
+_TEST_FILE = re.compile(r"^(?:test_.*\.py|.*_test\.py|.*\.test\.sh|conftest\.py)$")
+
+
+def _exempt(path: str) -> str | None:
+    """Why a change confined to `path` owes the release notes nothing — None if it ships.
+
+    This function IS the check; everything else in this section is plumbing. A scoping rule
+    that is wrong often enough to annoy anybody gets the whole job switched off within a
+    week, which is the argument the `stamped` job's comment in `.github/workflows/tests.yml`
+    makes at length and it is right.
+
+    It is written as an EXEMPT list rather than as a list of source directories, and that is
+    the load-bearing choice. An allowlist — `app/`, `harness/`, `mcp/`, `scripts/` —
+    reproduces one level up the exact defect this check exists for: the day somebody adds a
+    top-level `worker/`, every PR confined to it passes forever and nothing notices, because
+    an absent rule and a satisfied one are the same shape. Here a new directory is in scope
+    from the moment it exists, and exempting one means saying so here, in a diff a reviewer
+    reads.
+
+    What is exempt:
+
+    * `changelog.d/` — the mechanism itself. A branch that only writes a fragment cannot owe
+      a fragment.
+    * `CHANGELOG.md` — the assembled notes, which is what a release commit consists of.
+    * any `README.md` — description of the code rather than the code, and the root one's
+      release list is written by `assemble`, so requiring an entry for touching it would be
+      circular.
+    * anything under a `tests/` directory, plus test files by name — a test asserts about
+      behaviour that already shipped, and the release notes have nothing to say about it.
+      `test` is one of `KINDS` all the same: a test-only branch MAY write a fragment, it is
+      simply never made to.
+
+    What is deliberately NOT exempt, because in this repo it ships:
+
+    * `.github/` — `ci` is one of `KINDS`, and every CI-only PR since fragments existed
+      (#306, #355) wrote one.
+    * markdown that is not a README — `harness/commands/*.md` are the skills an agent
+      executes and `harness/claude/quarterback-workflow.md` is installed into every session
+      on the fleet. A blanket `*.md` exemption would have waved through #38, #103, #105,
+      #212, #216 and #364, each of which changed how the fleet behaves and nothing else.
+    * `flake.nix`, `pyproject.toml`, `Dockerfile`, `.harness-rules.sample` — what is built,
+      shipped and defaulted to.
+    """
+    parts = PurePosixPath(path).parts
+    if not parts:
+        return None
+    if parts[0] == FRAGMENT_DIR:
+        return "the fragment directory"
+    if path == "CHANGELOG.md":
+        return "the assembled release notes"
+    if parts[-1] == "README.md":
+        return "documentation"
+    if "tests" in parts[:-1] or _TEST_FILE.match(parts[-1]):
+        return "tests"
+    return None
+
+
+def _run(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(["git", "-C", str(repo), *args],
+                          capture_output=True, text=True, check=False)
+
+
+def _git(repo: Path, *args: str) -> str:
+    proc = _run(repo, *args)
+    if proc.returncode != 0:
+        raise FragmentError(
+            f"git {' '.join(args)} failed: {proc.stderr.strip() or 'no output'}")
+    return proc.stdout
+
+
+def changed_between(repo: Path, base: str, ref: str) -> list[str]:
+    """Every path `ref` changes relative to `base`, from the trees and nothing else.
+
+    Deliberately not `release_stamp.changed_paths`, which folds in the working tree and
+    untracked files because `apply` runs on a branch that is not finished being written. A
+    gate judges a COMMIT — the one being pushed, or the merge commit a pull request would
+    land — and whatever happens to be lying around the runner's checkout is not part of it.
+
+    `--no-renames`, and it is not a tidiness flag. `diff.renames` is on by default, and with
+    `--name-only` a detected rename prints the DESTINATION alone — so a shipping module
+    relocated under `tests/` would arrive here as one exempt path, the departure of the module
+    itself would be invisible, and the branch would pass in silence. Both halves of a move are
+    changes and both are wanted.
+    """
+    out = _git(repo, "diff", "--name-only", "--no-renames", "-z", base, ref)
+    return sorted({p for p in out.split("\0") if p})
+
+
+def fragments_at(repo: Path, ref: str) -> dict[str, str]:
+    """`changelog.d/<issue>.<kind>.md` -> blob id, at `ref`. Nothing else in the directory.
+
+    Filtered through `_NAME` rather than taken as "every file under `changelog.d/`", so the
+    directory's own README is not an entry — which is precisely the state #363 landed in and
+    the one this whole check exists to name.
+    """
+    found: dict[str, str] = {}
+    for record in _git(repo, "ls-tree", "-r", "-z", ref, "--", FRAGMENT_DIR).split("\0"):
+        if not record:
+            continue
+        meta, _, path = record.partition("\t")
+        fields = meta.split()
+        if len(fields) < 3 or fields[1] != "blob":
+            continue
+        directory, _, name = path.rpartition("/")
+        if directory == FRAGMENT_DIR and _NAME.match(name):
+            found[path] = fields[2]
+    return found
+
+
+def _changelog_at(repo: Path, ref: str) -> str:
+    """`CHANGELOG.md` at `ref`, or empty when there is none. A repo without one has no
+    entries rather than an unreadable state, and `frozen` is what refuses a branch that
+    deleted the file."""
+    proc = _run(repo, "show", f"{ref}:CHANGELOG.md")
+    return proc.stdout if proc.returncode == 0 else ""
+
+
+def waivers(repo: Path, base: str, branch: str) -> list[str]:
+    """Reasons a commit in `base..branch` gives for owing no entry, in order, deduplicated.
+
+    Read from the RANGE, so the waiver expires with the merge it was written for — the same
+    property, for the same reason, as `release_stamp._body_edit_exemptions`.
+
+    Fails CLOSED. A range git will not walk yields no waivers, which is the same answer as a
+    branch that declared none: the entry is still required and the refusal still names the
+    trailer that would have excused it. The other direction — an unreadable range read as
+    blanket consent — is a waiver granted by a tool failure.
+    """
+    proc = _run(repo, "log", f"--format=%(trailers:key={_EXEMPT_KEY},valueonly)",
+                f"{base}..{branch}")
+    if proc.returncode != 0:
+        return []
+    seen: list[str] = []
+    for line in proc.stdout.split("\n"):
+        value = line.strip()
+        if value and not _UNFILLED.match(value) and value not in seen:
+            seen.append(value)
+    return seen
+
+
+def cmd_required(args: argparse.Namespace) -> int:
+    """Refuse a branch that changes something that ships and writes no changelog entry.
+
+    The gap #365 names: every other guard here verifies that what is PRESENT is correct.
+    `release_stamp.py check` asks whether a `vNEXT` is unstamped, `frozen` asks whether a
+    shipped entry still says what it said — and to both of them a branch that never wrote an
+    entry at all looks exactly like one that wrote a correct one. #363 landed a new module,
+    sixty-seven tests and two public helpers with `changelog.d/` holding only its README, and
+    every job was green.
+
+    Two refs, like `frozen` and `collision`, and for the same reason: what is judged is a
+    commit, which need not be checked out anywhere.
+
+    The two questions are asked of two different bases, deliberately:
+
+    * WHAT CHANGED is fork-relative, against the merge base. `git diff <onto> HEAD` describes
+      the round trip and would report, in reverse, every path that landed on the base while
+      this branch was open — so a branch that touched nothing but its own tests would be told
+      it had changed `app/`.
+    * WHETHER AN ENTRY IS CARRIED is asked against `--onto` itself. A branch that merges the
+      base in inherits whatever fragments and release headings the base has, and against the
+      fork point those read as this branch's own work. #363's own head is that case exactly:
+      it merged main and picked up three releases' headings, so a fork-relative reading of
+      the CHANGELOG would have passed the very branch this check exists for.
+    """
+    repo = Path(args.repo).resolve()
+    onto_sha = rs.resolve(repo, args.onto)
+    branch_sha = rs.resolve(repo, args.branch)
+    try:
+        base = rs.merge_base(repo, onto_sha, branch_sha)
+    except rs.StampError as e:
+        # Fail CLOSED, and this is the one place it is worth spelling out. Without a fork
+        # point there is no set of changed paths, so the honest answer is "cannot tell" — and
+        # the shape a CI job takes when it cannot tell must not be the shape it takes when
+        # everything is fine. On a runner this means `fetch-depth: 0` has gone missing from
+        # the checkout, which is how #348's job would have reported green forever.
+        raise FragmentError(
+            f"{args.onto} and {args.branch} have no common ancestor, so there is no fork "
+            "point to read this branch's changes against and nothing here can say whether an "
+            "entry was owed. In CI that is a checkout without `fetch-depth: 0`; locally it "
+            f"is a base that has not been fetched. ({e})"
+        ) from e
+
+    changed = changed_between(repo, base, branch_sha)
+    ships = [p for p in changed if _exempt(p) is None]
+
+    at_branch, at_onto = fragments_at(repo, branch_sha), fragments_at(repo, onto_sha)
+    carried = sorted(p for p, blob in at_branch.items() if at_onto.get(p) != blob)
+
+    # A hand-written release entry, which the CHANGELOG's own convention paragraph still
+    # allows and which is also what a branch looks like AFTER `assemble` has run on it.
+    #
+    # Considered only when this branch edited `CHANGELOG.md` ITSELF — read from the fork
+    # point, so merging the base in is not an edit. Without that clause a branch that merely
+    # merged main inherits main's release headings and passes on somebody else's entry, which
+    # is exactly the shape of #363's own head: it merged three releases in and wrote nothing.
+    #
+    # A NUMBER the base does not carry is this branch's, by name: numbered entries are only
+    # ever added, and one the base lacks came from here.
+    #
+    # The PLACEHOLDER cannot be judged by name, because a base may legitimately carry a `##
+    # vNEXT` of its own — a stacked PR onto an epic integration branch, and main itself did on
+    # 2026-08-21, which is what made #302 read as entry-less. So its TEXT is compared across
+    # the two refs. By name alone, a branch that edited CHANGELOG.md for some unrelated reason
+    # — a typo in the preamble, a `Release-Body-Edit` correction — would be credited with the
+    # base's own in-flight entry and ship with no note of its own.
+    headings: list[str] = []
+    if "CHANGELOG.md" in changed:
+        branch_text = _changelog_at(repo, branch_sha)
+        onto_text = _changelog_at(repo, onto_sha)
+        onto_where = f"{args.onto}:CHANGELOG.md"
+        mine = rs.unstamped_entry(branch_text, "CHANGELOG.md")
+        if mine is not None and mine != rs.unstamped_entry(onto_text, onto_where):
+            headings.append(rs.PLACEHOLDER)
+        onto_names = set(rs.entry_names(onto_text, onto_where))
+        headings += [n for n in rs.entry_names(branch_text, "CHANGELOG.md")
+                     if n != rs.PLACEHOLDER and n not in onto_names]
+
+    payload: dict[str, object] = {
+        "onto": args.onto, "onto_sha": onto_sha,
+        "branch": args.branch, "branch_sha": branch_sha,
+        "base": base, "changed_paths": len(changed), "ships": ships,
+        "fragments": carried, "headings": headings, "waivers": [],
+    }
+
+    def report(ok: bool, note: str, waived: list[str] | None = None) -> int:
+        payload["ok"] = ok
+        payload["waivers"] = waived or []
+        if args.json:
+            payload["refusal" if not ok else "note"] = note
+            print(json.dumps(payload, indent=2))
+            return 0 if ok else 2
+        if waived:
+            # stderr, and worded as a waiver rather than folded into the `ok:` line. A change
+            # that ships with no entry is still a change that ships with no entry, and the
+            # one place that has to be unmissable is the job that let it through.
+            print("waived: " + "; ".join(waived), file=sys.stderr)
+        print(note if ok else f"STOP: {note}", file=sys.stdout if ok else sys.stderr)
+        return 0 if ok else 2
+
+    if not ships:
+        # Silent for a docs-only or test-only branch, which is the other half of the design.
+        # A check that nags them is a check somebody deletes.
+        return report(True, f"ok: nothing that ships changed ({len(changed)} path(s), all "
+                            "documentation, tests or release bookkeeping)")
+    if carried or headings:
+        return report(True, f"ok: {len(ships)} path(s) that ship changed, and this branch "
+                            "carries " + ", ".join([*carried, *headings]))
+    waived = waivers(repo, base, branch_sha)
+    if waived:
+        return report(True, f"ok: {len(ships)} path(s) that ship changed and no entry was "
+                            f"written; a {_EXEMPT_KEY} trailer on this branch says why",
+                      waived=waived)
+
+    listing = "\n".join(f"    {p}" for p in ships[:20])
+    if len(ships) > 20:
+        listing += f"\n    … and {len(ships) - 20} more"
+    return report(False, (
+        f"{args.branch} changes {len(ships)} path(s) that ship and carries no changelog "
+        f"entry:\n{listing}\n"
+        "Nothing else here can notice that. `release_stamp.py check` asks whether a `vNEXT` "
+        "is unstamped and `frozen` guards the entries that exist, so an entry that was never "
+        "written is the same shape to both as a correct one (#365).\n"
+        "Write one file, named after the issue, that no other branch will ever open:\n"
+        f"    {FRAGMENT_DIR}/<issue>.<kind>.md      kinds: " + ", ".join(KINDS) + "\n"
+        f"    # <what was broken or missing before this change>\n"
+        f"{FRAGMENT_DIR}/README.md has the shape. Name no version in it — `assemble` and "
+        "`release_stamp.py apply` decide that at land time, against the ref you merge into.\n"
+        "Genuinely nothing for a reader of the release notes (a comment, a rename, a revert "
+        "of something unlanded)? Say so on a commit of this branch, where a reviewer sees "
+        f"it:\n    {_EXEMPT_KEY}: <one line saying why>"))
+
+
 def cmd_check(args: argparse.Namespace) -> int:
     fragments = load(Path(args.repo))
     if not fragments:
@@ -333,6 +642,21 @@ def main(argv: list[str] | None = None) -> int:
     asm.add_argument("--keep", action="store_true", help="do not delete the fragments")
     asm.add_argument("--dry-run", action="store_true", help="print the entry, write nothing")
     asm.set_defaults(func=cmd_assemble)
+
+    rq = sub.add_parser(
+        "required",
+        help="fail if a REF changes something that ships and writes no changelog entry",
+    )
+    rq.add_argument("--repo", default=".", help="repo dir (default: cwd)")
+    rq.add_argument("--json", action="store_true", help="machine-readable verdict")
+    rq.add_argument("--onto", default="origin/main", help="the ref you are merging into")
+    rq.add_argument(
+        "--branch",
+        default="HEAD",
+        help="the ref being judged (default: HEAD). A commit, not a worktree — the same "
+        "reason as `release_stamp.py frozen`: a gate judges what is being merged.",
+    )
+    rq.set_defaults(func=cmd_required)
 
     args = p.parse_args(argv)
     try:
