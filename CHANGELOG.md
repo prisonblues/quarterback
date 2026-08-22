@@ -17,6 +17,88 @@ the top of this file conflict every time, over nothing — both entries are righ
 and a fragment is a path no other branch will ever open. `changelog.d/README.md` has the format.
 `vNEXT` means exactly what it meant before; assembly is just what writes it.
 
+## v2.89 — a dial and a worktree are the same repository however the remote is spelt
+
+#326's audit named three more `repo` columns stored as the caller sent them and compared with `==`. Two of them were repositories and are closed here; the third, `leases.repo`, is a bare label the lifecycle hook writes and is deliberately left alone.
+
+**`dial_settings.repo` was the sharp one.** `POST /dials` checked the shape of a repo and never lower-cased it — the one repo validator on this board that did one without the other, while `merge_queue` cites the hazard for its own column three files away. `ix_dial_settings_live` is UNIQUE over `COALESCE(repo,'')` and `dial`, so `Acme/X` and `acme/x` could each hold a **live row for the same dial**: two answers to a settings question that has one, with `GET /dials?repo=acme/x` seeing whichever it matched. `harness_rules.detect_github` reads the repo off `remote.origin.url` and keeps its capitals, so which severity floor a review actually ran under depended on how that remote was spelt.
+
+**`worktrees.repo` was the same defect plus a disagreement.** `GET /worktrees?repo=` compared the column exactly while `/sync` folded it through `app.sync.repo_key` (basename, lower-cased). One column, two readers, two different ideas of what "the same repo" is.
+
+### Fixed on the write, for the reason #349 gave
+
+Both write paths fold through `app.claimkey.canonical_repo`, migration `0034` folds the rows written before them, and a CHECK constraint on each column holds it there — so a write path added later fails loudly instead of inventing a second spelling. Neither column has a read as exotic as the `COUNT(DISTINCT repo)` that decided #326, but each has something a read-side fold cannot repair either: a **unique index**, where two spellings are two rows no query can undo, and a **second endpoint** that does not know about the first.
+
+Migration `0034` stops rather than guessing in the two cases where it cannot: folding a repo that would put **two live rows on one dial** — two values a person set, each with a reason and an author, where picking the newer would move a policy floor on the strength of a timestamp — and a **live dial scoped to a spelling the old validator admitted and `canonical_repo` refuses**, which after this would be a setting in force that no caller can name, list or turn off. Both name the rows and the SQL to settle them, and both are reported in one pass so two problems are not two failed deploys.
+
+The constraints assert case and surrounding whitespace, not `owner/name` shape. The shape is refused at ingest where a caller can be told why; rows written before that check — `worktrees` holds bare names from before the MCP tools derived the slug — are legitimately here, and a constraint rejecting them would make the migration unrunnable rather than make it canonical.
+
+### `GET /worktrees?repo=` and `GET /sync?repo=` now agree
+
+The bare name is the one spelling the board's own posts carry — the lifecycle hook tags them with the checkout's basename — and it is what the board TUI has to pass when it looks for a checkout to cherry-pick into. This endpoint answered `[]`, which renders as "no registered checkout of quarterback on zeus": the false-clean the class is about. So the filter is two-tier and the tiers cannot be confused: `owner/name` is canonicalised and matched exactly against the column, and a **bare name** — the spelling `REPO_RE` refuses precisely because it is ambiguous — is matched by basename, the same rule `/sync` applies to the same column. It widens a read; it never widens the column, which only `canonical_repo` can write.
+
+Anything that is neither — a clone URL, a path — is a 422 carrying `REPO_SHAPE` rather than an empty list, and `PUT /worktrees` refuses a snapshot whose repo is not `owner/name` before it deletes the one it would replace, so a bad spelling cannot cost a device its registry.
+
+## v2.88 — the migration-heads guard now runs where the fleet actually merges
+
+`pre-push` has asked whether a push would leave the migration graph two-headed since v2.83,
+and in this fleet nothing has ever made it answer. The hook gates that half on
+`is_protected "$branch"`, so a feature-branch push skips it, and `gh pr merge` goes through
+the GitHub API and touches no local hook at all — which is how every PR here lands, twelve of
+them on 2026-08-22 alone. The guard was correct and dormant: pushing the branch that carried
+`0033` printed one line, and that line was about release numbers.
+
+A `migration-heads` job on `pull_request` asks the same question at the merge. It reads the
+merge commit GitHub builds for the PR — what would actually land — through
+`migration_reconcile.py heads`, so a pull request whose merge would leave the base with a
+graph `alembic upgrade head` cannot run is refused, with the reconciler's own head list in
+the output and a note saying whether the branch introduced the second head or inherited it.
+The hook is unchanged; it stays as the local backstop for anyone who does push a protected
+branch directly.
+
+### What it does not catch
+
+A revision id minted independently by two branches that have **both** yet to land. Four
+branches did that in one day and all four preflights truthfully said GO — each was
+single-headed on its own, and the duplicate exists only in the union of two unlanded
+branches. No check reading one ref against its base can see it, this job included. Hash-named
+revisions are what close that case, by making the collision impossible rather than
+detectable. The job's own comment says so, so the person who trips it does not read it as
+cover it never had.
+
+## v2.87 — qb-doctor stops counting the packaging as drift
+
+`qb-doctor`'s `harness` row compares the harness on PATH against `harness/bin` file by file,
+and it counted every difference the *packaging* introduces. On the first run from PATH after
+a real `nixos-rebuild` it reported 26 differing binaries, of which one was a genuinely stale
+install and 25 were artefacts no rebuild could ever resolve: 24 files whose only difference
+was the first line, and `qb-dash`, which shares no bytes with its source at all.
+
+Both are deliberate and both are in `package.nix`. `postFixup` runs `patchShebangs` so an
+installed harness does not depend on what is on the user's PATH, which rewrites every
+script's shebang to a store path. `postInstall` runs `wrapProgram` on `qb-dash` to carry the
+dashboard's interpreter, which renames the script to `.qb-dash-wrapped` and puts a generated
+one at its name.
+
+The comparison now undoes both: a shebang-only difference is not drift, and a wrapper is
+followed to the file it wraps. The wrapper is recognised by its structure — the sibling
+`.<name>-wrapped` exists and the installed file carries its absolute path — rather than by
+the filename `qb-dash`, since `postInstall` may wrap others later. The absolute path and not
+the bare name, because a name is a substring any comment could hold, and this is the step
+that decides which file the rest of the check reads. The absent half of the row is
+untouched; a script the checkout has and the install does not is still reported by name.
+
+This is the second false signal in this one row. Codex caught the first before it shipped:
+the comparison ran against the script's own tree, which is the installed tree whenever
+`qb-doctor` runs from PATH, so the row could never go red at all. It went from never-red to
+always-red, and a row that is always red trains its reader to ignore it — which is the exact
+failure `qb-doctor` exists to catch.
+
+`check_harness`'s docstring now says in the code that content is a **proxy**. The question
+being asked is "was the harness on PATH built from a commit at or after this checkout's
+HEAD", and the truthful answer is the flake pin's rev. Reading that means finding the flake
+that *consumes* the harness, which this tool cannot do and which some hosts do not have.
+
 ## v2.86 — a claim is handed back when the work ends, and a repo may bound how much work is in flight
 
 Nothing in the fleet has ever known how much work was in flight at once. Eight agents were run
