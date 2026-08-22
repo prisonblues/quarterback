@@ -15,11 +15,13 @@ set -uo pipefail
 # just the harness's own scripts.
 #
 # A `pre-push` hook that refuses a multi-head migration graph on a protected
-# branch, and a branch that has stamped a release number the base already
-# carries (issue #343). Both are silent in a repo the check does not apply to —
-# no migrations, no CHANGELOG, no reconciler — because this installs into repos
-# that are neither quarterback nor lexray, and a warning nobody there can act on
-# is how the whole thing gets uninstalled. See `harness/githooks/pre-push`.
+# branch, a branch that has stamped a release number the base already carries
+# (issue #343), and a branch that has rewritten or deleted a release entry that
+# already shipped (issue #325). All three are silent in a repo the check does not
+# apply to — no migrations, no CHANGELOG, no reconciler — because this installs
+# into repos that are neither quarterback nor lexray, and a warning nobody there
+# can act on is how the whole thing gets uninstalled. See
+# `harness/githooks/pre-push`.
 #
 #   qb-hooks install [--repo <dir>]   idempotent; safe to re-run
 #   qb-hooks status  [--repo <dir>]   what is installed and what it delegates to
@@ -57,7 +59,7 @@ repo=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --repo) repo="${2:-}"; shift 2 ;;
-        -h|--help) sed -n '3,32p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '3,34p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) die "unknown argument: $1" ;;
     esac
 done
@@ -143,8 +145,9 @@ do_install() {
     echo -e "  ${GREEN}stash guard installed${NC} — 'git stash' in this repo now refuses to"
     echo "  write the shared refs/stash while linked worktrees exist. Use 'qb-stash'."
     echo -e "  ${GREEN}pre-push guard installed${NC} — a push is refused when it would leave a"
-    echo "  protected branch multi-headed in migrations, or when the branch has stamped a"
-    echo "  release number the base already carries. Silent where neither applies."
+    echo "  protected branch multi-headed in migrations, when the branch has stamped a"
+    echo "  release number the base already carries, or when it rewrites the text of a"
+    echo "  release that already shipped. Silent where none of those applies."
     if [[ "$exported" -gt 0 ]]; then
         echo "  ($exported managed hook(s) re-exported from $delegate)"
     fi
@@ -171,7 +174,7 @@ do_status() {
     # has been switched off cannot look like one where it is quietly passing. That is the
     # whole difference between an escape hatch and a hole.
     local knob off
-    for knob in qb.prePush.migrationHeads qb.prePush.releaseNumber; do
+    for knob in qb.prePush.migrationHeads qb.prePush.releaseNumber qb.prePush.releaseBodies; do
         off=$(git -C "$repo" config --bool --get "$knob" 2>/dev/null) || off=""
         if [[ "$off" == "false" ]]; then
             echo -e "           ${YELLOW}$knob is off${NC} for this repo"
@@ -195,6 +198,6 @@ case "$action" in
     install) do_install ;;
     status) do_status ;;
     uninstall) do_uninstall ;;
-    -h|--help|help) sed -n '3,32p' "$0" | sed 's/^# \{0,1\}//' ;;
+    -h|--help|help) sed -n '3,34p' "$0" | sed 's/^# \{0,1\}//' ;;
     *) die "unknown action '$action' (install|status|uninstall)" ;;
 esac

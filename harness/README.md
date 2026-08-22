@@ -514,7 +514,7 @@ hand, `qb-hooks uninstall` to take it off. `install` is idempotent, and re-runni
 repo that was set up before a new guard existed picks it up — `create-worktree` runs it on the
 main checkout every time it makes a worktree, so that normally happens on its own.
 
-### The pre-push guard — a two-headed graph and a pre-stamped release
+### The pre-push guard — a two-headed graph, a pre-stamped release, a rewritten one
 
 The other hook `qb-hooks` installs, and the reason it exists is that on 2026-08-22 four
 branches each minted migration `0029`. Every one of those authors ran
@@ -527,7 +527,7 @@ way.
 A runbook would have been followed correctly by all four and changed nothing. The failure
 was not disobedience, so a procedure cannot fix it. Hence a hook.
 
-It refuses two things, both read from the files **at the commit being pushed** rather than
+It refuses three things, all read from the files **at the commit being pushed** rather than
 from the working tree or from a live database — so a push carrying a broken graph is refused
 even from a checkout that does not have it:
 
@@ -554,6 +554,31 @@ competing edit. Only a branch that actively set a value trips it, and the refusa
 `max(base, head) + 1` — computed by `release_stamp.py collision`, which is `preflight`'s
 refusal asked of two refs instead of the working tree.
 
+**A branch that has rewritten or deleted a release entry that already shipped.** A released
+entry is immutable: it records what was broken or missing before that release, which is the
+one part of a release no diff recovers. On 2026-08-20 a CHANGELOG conflict was resolved by
+relocating the branch's own 133-line entry **under `## v2.59`**, on top of that release's
+notes, and the branch sat on an open PR for two days with every guard in the repo green —
+because they all read the file as a list of headings, and the headings were present, unique
+and correctly ordered (#325). `release_stamp.py frozen` compares the TEXT instead: every
+`## vX[.Y]` entry present at both the merge base and the pushed commit has to be identical,
+byte for byte, and one that has vanished is a refusal too.
+
+Fork-relative for the same reason as the number check, and it needs no stored state — the
+shipped text lives in git, where a bad merge resolution cannot reach it. A branch that does
+not touch a released entry passes by construction, which is what lets it run on every push.
+Editing a shipped entry deliberately — fixing a typo in one — is done by saying so on a
+commit of the branch, in a trailer a reviewer can see:
+
+```
+Release-Body-Edit: v2.59
+```
+
+Git's own trailer parser reads it, so it has to be in the trailer block rather than anywhere
+in the message: the refusal ends with a pasteable copy of that line, and a commit body quoting
+the refusal is not consent to it. It is scoped to `base..HEAD`, so the exemption expires with
+the merge it was written for.
+
 **Where a check does not apply, it says nothing at all.** No `migrations/versions/` at the
 pushed commit, no `CHANGELOG.md`, no reconciler or stamper in the repo: silence, not a
 warning. This harness installs into repos that are neither quarterback nor lexray, and a hook
@@ -567,7 +592,8 @@ worse than no hook, because it reads as protection.
 
 **Bypassable deliberately, never accidentally.** `git push --no-verify` is the express opt-out
 for one push. A repo that genuinely does not want a check records it —
-`git config --bool qb.prePush.migrationHeads false`, or `qb.prePush.releaseNumber` — and
+`git config --bool qb.prePush.migrationHeads false`, or `qb.prePush.releaseNumber`, or
+`qb.prePush.releaseBodies` — and
 `qb-hooks status` reports it, so a guard that has been switched off cannot look like one
 quietly passing.
 

@@ -19,6 +19,7 @@ because `origin/main` is sitting right there:
     release_stamp.py preflight            # what would happen, read-only
     release_stamp.py apply                # rewrite the worktree (never commits)
     release_stamp.py check                # is anything unstamped? (the post-merge guard)
+    release_stamp.py frozen               # has a shipped release's text been rewritten?
 
 The number is `max(release headings at --onto) + 1`. It is computed from the CHANGELOG at a
 git ref and from nothing else — not from a live board, not from the local checkout's own
@@ -103,6 +104,53 @@ v2.21 and v2.32 all did). So the bump is INFERRED — from whether the branch ch
 or `migrations/` — and always reported rather than done quietly. `--serve` / `--no-serve`
 override the inference for the release the inference gets wrong.
 
+## A released entry is immutable, and `frozen` is what says so
+
+Once `vN` is stamped and merged its entry is finished. It records what was broken or missing
+before that release, which is the one part of a release not recoverable from the diff — so a
+branch rewriting it is destroying the only copy, and doing so behind headings that all still
+read correctly. That happened on `feat/issue-232`: a CHANGELOG conflict was resolved by
+moving the branch's own 133-line entry under `## v2.59`, on top of that release's notes. The
+duplicate-`vNEXT` half was caught; the deleted release was not, and could not be, because
+every check in this file and in `test_release_numbers.py` reads the CHANGELOG as a LIST OF
+HEADINGS and all the headings were present, unique and correctly ordered (#325).
+
+`frozen` compares the TEXT. For every `## vX[.Y]` entry that exists at both refs, the whole
+slab — heading line and body, byte for byte — must be identical. Gone is a refusal too.
+
+**What it compares against, and why that ref.** The MERGE BASE of `--branch` and `--onto`,
+which is the same third reference point `collision` uses and is chosen for the same reason:
+it is the only ref that separates what this branch DID from what it merely inherited.
+Comparing against `--onto` itself would report every entry that landed while the branch was
+open as one the branch deleted. It needs no stored state — no digest file checked into the
+repo to be maintained per release, kept in step by hand, conflicted over by every branch that
+stamps, and rewritten by the very merge resolution this exists to catch. The true text lives
+in git, where the bad merge cannot reach it.
+
+**What it therefore does NOT catch, stated because a guard whose blind spot is undocumented
+is how the original defect survived:**
+
+  * a corruption that has already LANDED on main. The merge base moves with it and the wrong
+    text becomes the text every later branch is judged against. The window is one pull
+    request: it is red for as long as that PR is open, and green forever after it merges.
+  * a commit pushed straight to main, once it is pushed. On main the merge base with
+    `origin/main` is HEAD, so there is nothing to compare. Before the push there is:
+    `harness/githooks/pre-push` runs this against `refs/remotes/origin/main`, which is behind,
+    so a direct commit IS refused at the keyboard — but only where the hook is installed, and
+    `--no-verify` and the GitHub web editor both go around it.
+  * anything outside a numbered entry. The file's preamble documents the convention and is
+    legitimately edited; so is the entry the branch is shipping, which has no earlier text.
+  * a release number declared twice at either ref. There is no way to say which of two
+    `## v2.34` entries answers to which, so both are skipped — that state is `collision`'s
+    refusal, which names a repair, and reporting it twice in different words helps nobody.
+
+**The override is a commit trailer**, `Release-Body-Edit: v2.59`, on any commit the branch
+adds. Fixing a typo in a shipped entry is legitimate and rare, and this makes it a deliberate,
+reviewer-visible line rather than a `--no-verify`. It is scoped to the range `base..branch`,
+so it expires the moment the edit lands: nothing carries a permanent exemption forward. A real
+trailer, in the trailer block git parses — the refusal above ends with a pasteable copy of the
+line, and a commit body quoting the refusal is not consent to it.
+
 ## Exit codes
 
 0 = go (stamped, or nothing to stamp) · 2 = STOP, a human decides.
@@ -116,6 +164,7 @@ Usage (the file has a shebang and the executable bit; `python scripts/…` works
                                [--serve | --no-serve]
     release_stamp.py check     [--repo DIR] [--json]
     release_stamp.py collision [--repo DIR] [--onto REF] [--branch REF] [--json]
+    release_stamp.py frozen    [--repo DIR] [--onto REF] [--branch REF] [--json]
 
 `collision` is `preflight`'s refusal on its own, asked of two REFS rather than of the working
 tree, for a gate with no worktree to read: `harness/githooks/pre-push` judges the commit on
@@ -169,6 +218,28 @@ _HEADING_PLACEHOLDER = re.compile(rf"^##[ \t]+{PLACEHOLDER}{_END}", re.MULTILINE
 #: the bullets are stamped independently of the headings — a merge that kept both sides of the
 #: README list and only one side of the CHANGELOG is a duplicate nothing else could see.
 _README_BULLET = re.compile(rf"^-[ \t]+\*\*{_V}\*\*", re.MULTILINE)
+
+#: Where one release entry ENDS: the next top- or second-level heading, whatever it says.
+#: `## v2.58`, `## vNEXT` and a stray `## Notes` all close the entry above them, and `###`
+#: and below do not — sub-headings are how a long entry is structured and `changelog.d`
+#: requires them to be `###` or deeper for exactly this reason. Deliberately not `_HEADING`:
+#: an entry that ended only at the next NUMBERED heading would swallow the unstamped `##
+#: vNEXT` sitting above it, and the newest released entry's body would then change every time
+#: a branch wrote its own.
+_SECTION = re.compile(r"^\#{1,2}[ \t]", re.MULTILINE)
+
+#: `Release-Body-Edit: v2.59` — the one sanctioned way to edit a shipped entry, written as a
+#: git TRAILER on a commit of the branch making the edit. It lives in a commit message rather
+#: than in a file on purpose: a file would accumulate a permanent exemption per typo ever
+#: fixed, and would itself be editable by the same careless merge resolution this check exists
+#: to catch.
+#:
+#: A trailer, and never merely a line that looks like one — which is why git's own parser
+#: answers this rather than a regex over the message. The refusal below ENDS with a
+#: ready-to-paste `Release-Body-Edit: v2.59`, so a commit body quoting the refusal it just
+#: got is not a hypothetical: it is the most likely message this branch will ever produce,
+#: and reading it as consent would waive the entry on the strength of a paste.
+_BODY_EDIT_KEY = "Release-Body-Edit"
 
 #: Where a placeholder is legal, and therefore where it gets rewritten: a markdown heading
 #: of any level, or the opening of a bold run. Group 1 is the token itself, so the rewrite
@@ -511,6 +582,44 @@ def release_headings(text: str, where: str = "") -> list[tuple[Release, str]]:
 def releases_in(text: str, where: str = "") -> list[Release]:
     """Every `## vX[.Y]` heading, in file order (this repo's CHANGELOG is newest first)."""
     return [r for r, _ in release_headings(text, where)]
+
+
+def release_entries(text: str, where: str = "") -> dict[Release, str]:
+    """Every released entry as a whole SLAB: its heading line and everything under it.
+
+    Verbatim out of the original text — offsets are located in the masked copy and sliced out
+    of the real one, which `mask_code` guarantees is safe by preserving length. Verbatim is
+    the point: this is the only thing in this file that reads what an entry SAYS rather than
+    what number it carries, and a normalising read (stripping, re-wrapping, comparing line
+    sets) would pass the exact corruption it exists to catch, which was a body MOVED intact
+    from one heading to another.
+
+    The heading line is part of the slab. A released entry's title is as shipped as its prose
+    and `## v2.59 — a row key the dashboard can actually tell apart` is not a line a branch
+    has any business rewriting either. Note that this is the opposite call from `_collision`,
+    which deliberately does NOT compare heading text — but it is answering a different
+    question there ("is this a number this branch CLAIMED"), where a retitled old entry is a
+    false positive with a nonsensical repair. Here a retitled old entry is precisely the
+    finding, and the trailer is how a deliberate one says so.
+
+    A number declared twice is omitted rather than guessed at: there is no way to say which
+    of two `## v2.34` entries corresponds to which, and a duplicate heading is already
+    `_collision`'s refusal with a repair attached. Passing it through as "unchanged" would be
+    a lie; refusing on it here would report the same defect twice in different words.
+    """
+    masked = mask_code(text, where)
+    ends = [m.start() for m in _SECTION.finditer(masked)]
+    starts: dict[Release, int] = {}
+    seen: Counter[Release] = Counter()
+    for m in _HEADING.finditer(masked):
+        rel = release(m.group(1), m.group(2))
+        seen[rel] += 1
+        starts.setdefault(rel, m.start())
+    return {
+        rel: text[off:next((e for e in ends if e > off), len(text))]
+        for rel, off in starts.items()
+        if seen[rel] == 1
+    }
 
 
 def entry_names(text: str, where: str = "") -> list[str]:
@@ -1208,6 +1317,90 @@ def _releases_at_fork(repo: Path, onto: str, branch: str = "HEAD") -> set[Releas
     return set(releases_in(_git(repo, "show", f"{base}:CHANGELOG.md"), f"{base}:CHANGELOG.md"))
 
 
+#: One finding: (release, what happened, the first line that differs or None).
+Drift = tuple[Release, str, str | None]
+
+
+def _first_difference(before: str, after: str) -> str | None:
+    """The first line the two slabs disagree on, as the reader will recognise it.
+
+    A refusal that only names `v2.59` sends somebody to read two 130-line entries side by
+    side. One line is enough to tell "the whole body was replaced" from "a word was
+    rewrapped", which are the two shapes this catches and they want different repairs.
+    """
+    old, new = before.split("\n"), after.split("\n")
+    for i in range(max(len(old), len(new))):
+        was = old[i] if i < len(old) else "<end of entry>"
+        now = new[i] if i < len(new) else "<end of entry>"
+        if was != now:
+            return f"line {i + 1}: was {was.strip()!r}, now {now.strip()!r}"
+    return None
+
+
+def _body_edit_exemptions(repo: Path, base: str, branch: str) -> set[Release]:
+    """Releases a commit in `base..branch` says out loud it meant to edit.
+
+    Read from the RANGE and never from the whole history, so the exemption expires with the
+    merge it was written for: once the edit is on main, the base moves past the commit
+    carrying the trailer and the entry is immutable again for everybody after. That is what a
+    file of stored exemptions could not do, and the reason there is no such file.
+
+    Never fatal, and it fails CLOSED. A range git will not walk — an odd ref pair, a repo
+    mid-rebase, a git too old for `%(trailers:…)` — yields no exemptions, which is the same
+    answer as a branch that declared none: the entry stays frozen and the refusal still names
+    the trailer that would have applied. The other direction, treating an unreadable range as
+    blanket consent, is a waiver granted by a tool failure.
+    """
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "log",
+         f"--format=%(trailers:key={_BODY_EDIT_KEY},valueonly)", f"{base}..{branch}"],
+        capture_output=True, text=True, check=False,
+    )
+    if proc.returncode != 0:
+        return set()
+    found: set[Release] = set()
+    for token in re.split(r"[,\s]+", proc.stdout):
+        named = re.fullmatch(rf"{_V}", token.strip())
+        if named:
+            found.add(release(named.group(1), named.group(2)))
+    return found
+
+
+def _frozen(before: dict[Release, str], after: dict[Release, str],
+            unalignable: set[Release]) -> list[Drift]:
+    """Every released entry that is not what it was, newest first.
+
+    Two shapes, and the second is the worse one: an entry whose text CHANGED, and an entry
+    that is GONE. Both arrived by the same door on `feat/issue-232` — a merge resolution that
+    relocated the branch's own 133-line entry under `## v2.59`, replacing that release's
+    notes — and every guard in this repo passed, because they all read the file as a list of
+    headings and the heading was still there and still in order (#325).
+
+    Deleting a released heading outright is not caught by anything either: `duplicates_in`
+    counts repeats, `next_release` takes a maximum, and neither notices that v2.59 has
+    stopped existing. It costs one branch of an `if` to catch here, so it is caught here.
+
+    Only entries present at BOTH ends are compared. A number the branch adds is the release
+    it is shipping and has no prior text to be identical to; one it removes is reported as
+    gone. Nothing outside a `## vX[.Y]` entry is looked at at all — the file's preamble is
+    living documentation of the convention and is edited on purpose.
+
+    `unalignable` is the numbers declared twice at either ref, and it has to be subtracted
+    rather than left to `release_entries` dropping them: dropped from the AFTER map alone,
+    a "keep both sides" resolution reads as the entry having VANISHED, which is a confident
+    refusal naming the wrong defect. The caller reports them as uncompared instead.
+    """
+    out: list[Drift] = []
+    for rel in sorted(before, reverse=True):
+        if rel in unalignable:
+            continue
+        if rel not in after:
+            out.append((rel, "gone", None))
+        elif after[rel] != before[rel]:
+            out.append((rel, "changed", _first_difference(before[rel], after[rel])))
+    return out
+
+
 def build_plan(repo: Path, onto: str, serve: bool | None, major: bool = False) -> Plan:
     plan = Plan()
     plan.sites, plan.loose = scan(repo, plan.symlinked)
@@ -1661,6 +1854,155 @@ def cmd_collision(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_frozen(args: argparse.Namespace) -> int:
+    """Refuse when a branch has rewritten or deleted a release that had already shipped.
+
+    Asked of two refs, like `collision`, and for the same reason: the thing being judged is a
+    COMMIT, and a pre-push hook or a CI job need not have it checked out. Also like
+    `collision`, it is FORK-RELATIVE — the comparison is against the merge base, not against
+    `--onto` itself, so a branch that is merely behind is judged against what it forked from
+    and never against entries that landed while it was open. A branch that does not touch the
+    released part of the file passes by construction, which is what lets this one run on
+    every pull request without ever crying wolf.
+
+    An unstamped `## vNEXT` is invisible here — it carries no number, so it is in neither
+    map. So is the entry this branch is shipping. There is nothing to switch off.
+    """
+    repo = Path(args.repo).resolve()
+    onto_sha = resolve(repo, args.onto)
+    branch_sha = resolve(repo, args.branch)
+    payload: dict[str, object] = {
+        "onto": args.onto,
+        "onto_sha": onto_sha,
+        "branch": args.branch,
+        "branch_sha": branch_sha,
+    }
+
+    # The same "cannot tell" as `_releases_at_fork`, reported rather than guessed at. Without
+    # a fork point there is no text to be identical TO: comparing against `--onto` itself
+    # would report every entry that landed while this branch was open as one the branch
+    # deleted, which is a gate that refuses correct work and is off within the week.
+    try:
+        base = merge_base(repo, onto_sha, branch_sha)
+    except StampError:
+        base = ""
+    # `base == branch_sha` is a fork point that IS the branch: everything it carries is
+    # already contained in `--onto`, so every entry is identical to itself and the check has
+    # judged nothing. Reported as limited rather than as a clean bill, because the two look
+    # identical from outside and one of them is a gate covering nothing. It is the normal
+    # state of a run on `main` after the merge landed — which is the blind spot `pre-push`
+    # covers, by asking before the push while `origin/main` is still behind — and it is also
+    # what a depth-1 CI checkout produces, where `origin/main` and HEAD are the same grafted
+    # commit and there is no history to find a real fork point in.
+    if not base or base == branch_sha \
+            or not _git_ok(repo, "cat-file", "-e", f"{base}:CHANGELOG.md"):
+        payload |= {"ok": True, "fork_point": "unreadable", "base": base or None,
+                    "compared": 0, "changed": [], "exempt": [], "skipped": []}
+        why = (
+            f"{args.branch} is already contained in {args.onto}, so its fork point is itself"
+            if base == branch_sha else
+            f"no merge base with {args.onto} (or no CHANGELOG.md there)"
+        )
+        if args.json:
+            print(json.dumps(payload, indent=2))
+            return 0
+        print(
+            f"limited: {why}, so there is no shipped text for {args.branch}'s released "
+            "entries to be compared with. Nothing was checked.",
+            file=sys.stderr,
+        )
+        print(f"ok: 0 released entries compared with {args.onto}")
+        return 0
+
+    before_text = _git(repo, "show", f"{base}:CHANGELOG.md")
+    # The whole file gone is the largest version of the defect this exists for, and reporting
+    # it as eighty-five entries each individually "gone" buries the one fact that matters. The
+    # other direction — a base with no CHANGELOG and a branch that adds one — is the repo
+    # growing its first release notes, and is handled by the `limited:` path above.
+    if not _git_ok(repo, "cat-file", "-e", f"{branch_sha}:CHANGELOG.md"):
+        shipped = len(release_entries(before_text, f"{base}:CHANGELOG.md"))
+        raise StampError(
+            f"{args.branch} has no CHANGELOG.md at all, and {base[:12]} — the commit it "
+            f"forked from — has {shipped} released entries in one. Every release note this "
+            "repo has ever written is in that file and nowhere else. If the file genuinely "
+            f"moved, this check has to move with it (`git show {base[:12]}:CHANGELOG.md`)"
+        )
+    after_text = _show(repo, branch_sha, "CHANGELOG.md", args.branch)
+    before = release_entries(before_text, f"{base}:CHANGELOG.md")
+    after = release_entries(after_text, "CHANGELOG.md")
+    unalignable = {*duplicates_in(before_text, f"{base}:CHANGELOG.md"),
+                   *duplicates_in(after_text, "CHANGELOG.md")}
+    drifted = _frozen(before, after, unalignable)
+    exempt = _body_edit_exemptions(repo, base, branch_sha) if drifted else set()
+    refused = [d for d in drifted if d[0] not in exempt]
+    # The trailers that actually EXCUSED something. A branch may name a release it then left
+    # alone — a fix that turned out not to be needed — and reporting that as a waiver would
+    # tell a reader a shipped entry had been edited when none had.
+    waived = sorted({d[0] for d in drifted if d[0] in exempt}, reverse=True)
+
+    payload |= {
+        "fork_point": "read",
+        "base": base,
+        "compared": len(before) - len(unalignable & set(before)),
+        "changed": [{"release": fmt(r), "what": what, "where": where}
+                    for r, what, where in refused],
+        "exempt": [fmt(r) for r in waived],
+        "skipped": sorted((fmt(r) for r in unalignable), reverse=True),
+    }
+
+    if refused:
+        named = ", ".join(fmt(r) for r, _, _ in refused)
+        detail = "\n".join(
+            f"  {fmt(r)} is {what}" + (f" ({where})" if where else "")
+            for r, what, where in refused
+        )
+        payload["ok"] = False
+        message = (
+            f"{named} already shipped, and {args.branch} does not carry the same text for "
+            f"{'them' if len(refused) > 1 else 'it'} as {base[:12]}, the commit it forked "
+            f"from:\n{detail}\n"
+            "A released entry is immutable — it says what was broken before that release, "
+            "which is the part no diff recovers. The way this happens is a CHANGELOG "
+            "conflict resolved by moving a body under the wrong heading, which leaves every "
+            "heading present and correctly ordered and every other check green (#325).\n"
+            f"Read what shipped:  git show {base[:12]}:CHANGELOG.md\n"
+            "Deliberate (a typo in a shipped entry)? Say so on a commit of this branch, "
+            f"where a reviewer sees it:  Release-Body-Edit: {fmt(refused[0][0])}"
+        )
+        if args.json:
+            payload["refusal"] = message
+            print(json.dumps(payload, indent=2))
+        else:
+            print(f"STOP: {message}", file=sys.stderr)
+        return 2
+
+    payload["ok"] = True
+    if args.json:
+        print(json.dumps(payload, indent=2))
+        return 0
+    if unalignable:
+        # Not a refusal and not silence. `collision` owns this state and names a repair for
+        # it; what this has to do is say which entries it therefore did not read, or the
+        # `ok:` line below claims cover it does not have.
+        print(
+            "uncompared: " + ", ".join(sorted((fmt(r) for r in unalignable), reverse=True))
+            + " is declared twice, so there is no saying which entry answers to which. "
+            "`collision` refuses that state and names the repair.",
+            file=sys.stderr,
+        )
+    if waived:
+        # stderr and worded as a waiver rather than folded into the ok: line. An entry edited
+        # under an exemption is still an edited release, and the one place that has to be
+        # unmissable is the push or the job that let it through.
+        print(
+            "waived: " + ", ".join(fmt(r) for r in waived)
+            + " changed and a Release-Body-Edit trailer on this branch says that was meant.",
+            file=sys.stderr,
+        )
+    print(f"ok: {payload['compared']} released entries unchanged since {base[:12]}")
+    return 0
+
+
 def cmd_preflight(args: argparse.Namespace) -> int:
     repo = Path(args.repo).resolve()
     plan = build_plan(repo, args.onto, None, args.major)
@@ -1977,6 +2319,20 @@ def main(argv: list[str] | None = None) -> int:
         "lets a pre-push hook judge what is being PUSHED rather than what is checked out.",
     )
     co.set_defaults(func=cmd_collision)
+
+    fr = sub.add_parser(
+        "frozen",
+        help="fail if a REF rewrote or deleted a release that had already shipped",
+    )
+    common(fr)
+    fr.add_argument("--onto", default="origin/main", help="the ref you are merging into")
+    fr.add_argument(
+        "--branch",
+        default="HEAD",
+        help="the ref being judged (default: HEAD). A commit, not a worktree — the same "
+        "reason as `collision`: a gate judges what is being pushed or merged.",
+    )
+    fr.set_defaults(func=cmd_frozen)
 
     args = p.parse_args(argv)
     try:

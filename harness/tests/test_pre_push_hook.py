@@ -18,6 +18,11 @@ The scenarios are the ones from #343, stated as the failures they are:
   * `test_a_branch_that_is_merely_behind_is_not_refused` — the reason the check above is
     fork-relative and not base-relative. A guard that fires on every branch that forked a
     while ago is a guard that gets switched off, and this is the test that says so.
+  * `test_a_branch_that_rewrote_a_shipped_release_entry_is_refused` — the #325 case, and
+    `test_the_number_check_passes_the_very_push_the_body_check_refuses` is the argument for
+    it being a separate question. A conflict resolved by moving a body under an existing
+    heading deletes a shipped release's notes while leaving every heading present, unique and
+    in order, so a check reading the file as a list of numbers reports it clean.
   * `test_a_repo_with_no_migrations_pushes_silently` — this hook ships with the harness into
     repos that are neither quarterback nor lexray. Not merely "does not refuse": prints
     NOTHING, because a warning nobody in that repo can act on is how it gets uninstalled.
@@ -27,6 +32,7 @@ Run: pytest harness/tests/test_pre_push_hook.py
 
 from __future__ import annotations
 
+import itertools
 import os
 import shutil
 import subprocess
@@ -437,6 +443,115 @@ def test_a_branch_that_inherited_the_number_by_merging_is_not_refused(repo, home
 
 
 # ---------------------------------------------------------------------------
+# 2b. the text of a release that already shipped
+# ---------------------------------------------------------------------------
+#
+# The #325 case. A CHANGELOG conflict resolved by relocating the branch's own entry under an
+# existing heading deletes a shipped release's notes and leaves every heading present, unique
+# and correctly ordered — so the number check above passes on it, and so did every other
+# guard in the repo, for two days on an open PR.
+
+
+def rewrite_the_shipped_entry(repo: Path, home: Path) -> None:
+    """A resolution that moves the branch's own body under `## v1`, whose text it replaces."""
+    (repo / "CHANGELOG.md").write_text(
+        CHANGELOG_V1.replace("It did a thing.", "A claim nobody takes: derive the key.")
+    )
+    commit(repo, "chore: resolving merge conflicts with origin/main", home)
+
+
+def test_a_branch_that_rewrote_a_shipped_release_entry_is_refused(repo, home):
+    """The push that should have stopped. `v1` is on the remote with its own prose; this
+    branch carries the same heading over different text."""
+    git(repo, "checkout", "-qb", "work", home=home)
+    rewrite_the_shipped_entry(repo, home)
+
+    r = push(repo, home, "work")
+
+    assert r.returncode != 0
+    assert "REFUSE" in r.stderr
+    assert "v1" in r.stderr
+    assert "already shipped" in r.stderr
+    assert "Release-Body-Edit" in r.stderr, "the sanctioned exception, named where it is due"
+    assert remote_sha(repo, "work", home) == "", "and nothing was pushed"
+
+
+def test_the_number_check_passes_the_very_push_the_body_check_refuses(repo, home):
+    """Stated as an assertion because it is the whole argument for a third check. Both read
+    the same file at the same commit against the same base; one reads the numbers, which are
+    faultless here, and the other reads the bytes."""
+    git(repo, "checkout", "-qb", "work", home=home)
+    rewrite_the_shipped_entry(repo, home)
+    git(repo, "config", "--bool", "qb.prePush.releaseBodies", "false", home=home)
+
+    r = push(repo, home, "work")
+
+    assert r.returncode == 0, r.stderr
+    assert "no release-number collision" in r.stdout + r.stderr
+
+
+def test_a_branch_that_deleted_the_changelog_is_refused(repo, home):
+    """Codex found this one. Asking whether the PUSHED commit has a CHANGELOG before running
+    the check makes deleting the file the single edit that passes — every release note gone,
+    silently, because the guard reads its own absence as "this repo does not use the
+    convention". Only the BASE decides whether the question applies."""
+    git(repo, "checkout", "-qb", "work", home=home)
+    (repo / "CHANGELOG.md").unlink()
+    commit(repo, "chore: drop the changelog", home)
+
+    r = push(repo, home, "work")
+
+    assert r.returncode != 0
+    assert "REFUSE" in r.stderr
+    assert "no CHANGELOG.md at all" in r.stderr
+    assert remote_sha(repo, "work", home) == ""
+
+
+def test_a_branch_that_only_adds_a_release_entry_is_not_refused(repo, home):
+    """The release branch this must never fire on. `v2` is new text above an untouched `v1`,
+    which is what every release in this repo looks like, and a guard that stopped them all
+    would be off within the week."""
+    git(repo, "checkout", "-qb", "work", home=home)
+    (repo / "CHANGELOG.md").write_text(CHANGELOG_V2)
+    commit(repo, "ship v2", home)
+
+    r = push(repo, home, "work")
+
+    assert r.returncode == 0, r.stderr
+    assert "no shipped release entry rewritten" in r.stdout + r.stderr
+
+
+def test_a_release_body_edit_trailer_lets_the_push_through(repo, home):
+    """Deliberate, declared, and still reported. A waived edit is an edited release, and the
+    push that let it through is the place that cannot be quiet about it."""
+    git(repo, "checkout", "-qb", "work", home=home)
+    (repo / "CHANGELOG.md").write_text(CHANGELOG_V1.replace("It did a thing.",
+                                                            "It did a thing, once."))
+    commit(repo, "docs: a word in v1's entry\n\nRelease-Body-Edit: v1", home)
+
+    r = push(repo, home, "work")
+
+    assert r.returncode == 0, r.stderr
+    assert "waived: v1" in r.stdout + r.stderr
+
+
+def test_the_released_entry_opt_out_is_recorded_in_config_and_reported_by_status(repo, home):
+    """Bypassable deliberately, never accidentally — and a guard that has been switched off
+    must never look like one quietly passing."""
+    git(repo, "checkout", "-qb", "work", home=home)
+    rewrite_the_shipped_entry(repo, home)
+    git(repo, "config", "--bool", "qb.prePush.releaseBodies", "false", home=home)
+
+    assert push(repo, home, "work").returncode == 0
+
+    status = subprocess.run(
+        [str(QB_HOOKS), "status", "--repo", str(repo)], capture_output=True, text=True,
+        env=env(home),
+    )
+    assert "qb.prePush.releaseBodies is off" in status.stdout
+
+
+# ---------------------------------------------------------------------------
 # 3. repos this hook is not for
 # ---------------------------------------------------------------------------
 
@@ -504,6 +619,16 @@ def test_a_repo_with_a_changelog_but_no_stamper_is_silent_about_releases(tmp_pat
 
     (work / "CHANGELOG.md").write_text(CHANGELOG_V2)
     commit(work, "another release", home)
+    r = push(work, home, "main")
+
+    assert r.returncode == 0, r.stderr
+    assert "qb pre-push" not in r.stdout + r.stderr
+
+    # And the same for a REWRITTEN entry, which is the other release question this hook asks.
+    # `v1`'s text is replaced outright here — a refusal in the repo above, silence in one that
+    # has no stamper and therefore no such convention to have broken.
+    (work / "CHANGELOG.md").write_text(CHANGELOG_V2.replace("It did a thing.", "Something."))
+    commit(work, "rewrite a shipped entry", home)
     r = push(work, home, "main")
 
     assert r.returncode == 0, r.stderr
@@ -598,6 +723,28 @@ def test_the_installer_reports_the_pre_push_guard(repo, home):
     )
     assert "pre-push" in status.stdout
     assert "installed" in status.stdout
+
+
+def test_the_help_prints_the_whole_header_comment(repo, home):
+    """`--help` is a hardcoded line range over this script's own comment block, so a comment
+    that grows past it is silently truncated help. Growing it is exactly what documenting a
+    third refusal does, and the truncation is invisible from any other test here.
+
+    Run from inside a repo, because `--help` in that position falls through to the dispatch
+    at the bottom of the script, which is past the `rev-parse --git-dir` check. Without a cwd
+    that is a checkout this asserts about an empty string in the flake's build sandbox and
+    passes on a developer's machine — which is the difference between the two, not the help.
+    """
+    lines = QB_HOOKS.read_text(encoding="utf-8").splitlines()
+    header = list(itertools.takewhile(lambda line: line.startswith("#"), lines[3:]))
+    assert header, "qb-hooks has no header comment block where --help reads one from"
+    last = next(line for line in reversed(header) if line.strip("# "))
+    out = subprocess.run([str(QB_HOOKS), "--help"], capture_output=True, text=True,
+                         cwd=str(repo), env=env(home)).stdout
+    assert out.strip(), "`qb-hooks --help` printed nothing at all"
+    assert last.lstrip("# ") in out, (
+        "`qb-hooks --help` stops before the end of its own header comment — widen the "
+        "`sed -n '3,Np'` range that renders it")
 
 
 def test_the_hook_source_is_executable_and_shipped():
