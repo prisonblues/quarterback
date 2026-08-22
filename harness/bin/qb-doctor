@@ -553,8 +553,20 @@ def check_harness(host: Host) -> Check:
     The nix flake pin is what versions it, nothing bumps that pin automatically
     (#267), and no harness script can tell you it is stale because each one only
     knows its own store path. So this compares CONTENT: every file the package
-    installs from `bin/`, byte for byte, against the checkout's. That answers the
-    question the version number would have, without needing one to exist.
+    installs from `bin/`, against the checkout's. That answers the question the
+    version number would have, without needing one to exist.
+
+    CONTENT IS A PROXY, and the next reader should know it is one. The question
+    actually being asked is "was the harness on PATH built from a commit at or
+    after this checkout's HEAD", and the truthful answer to that is in the flake
+    pin's rev, not in the files. Reading the pin means finding the flake that
+    CONSUMES this harness, which this tool cannot do — it knows the checkout and
+    the store path, and the consuming flake is a third thing that lives somewhere
+    else on some hosts and nowhere at all on others. So content stands in, and it
+    is a proxy in both directions: it cannot tell an install that is AHEAD of this
+    branch from one that is behind (hence `_harness_drift`'s one direction), and
+    it counts anything the packaging rewrites unless the rewrite is undone here,
+    which is what `_same_after_packaging` exists to do (#353).
     """
     if host.harness_bin is None:
         return Check("harness", "-", "no harness on PATH (create-worktree not found), so "
@@ -599,9 +611,81 @@ def _harness_drift(src: Path, installed: Path) -> tuple[set[str], set[str]]:
         there = installed / f.name
         if not there.is_file():
             missing.add(f.name)
-        elif there.read_bytes() != f.read_bytes():
+        elif not _same_after_packaging(f, there):
             differ.add(f.name)
     return differ, missing
+
+
+def _wrapped_file(installed: Path, data: bytes) -> Path | None:
+    """The file a `wrapProgram` wrapper wraps, or None if this is not a wrapper.
+
+    `postInstall` wraps `qb-dash` to carry the dashboard's interpreter, and a
+    wrapped program is no longer its source: nix renames the script to
+    `.<name>-wrapped` and puts a generated shell script at the original name,
+    whose job is to set a variable and `exec` the renamed one. It shares no bytes
+    with the checkout's copy and never will, so byte-comparing it reports a file
+    that is exactly right as drift, permanently.
+
+    Detected structurally rather than by name — `postInstall` may wrap others,
+    and a check that knows one filename would go quietly wrong on the second.
+    Both halves are required: the sibling `.<name>-wrapped` has to exist AND the
+    file at `name` has to point at it, which is what makes this a wrapper rather
+    than a dotfile that happens to be lying there.
+
+    Pointing at it means carrying its ABSOLUTE path, not its name. A bare name is
+    a substring anything could hold — a comment, a doc string, an error message —
+    and this function decides which file the caller reads instead, so a loose
+    match here is a way for real drift to go unreported. The absolute path is not
+    forgeable in the same way: it contains the build's own output hash, so no file
+    written before the build can carry it. What nix generates is that full path,
+    in both wrapper flavours — looked for in bytes rather than as text so a
+    `makeBinaryWrapper` build, which compiles the same indirection into an ELF,
+    reads the same way, and in two spellings so a `bin/` reached through a symlink
+    still matches the store path the wrapper was written with.
+    """
+    wrapped = installed.with_name(f".{installed.name}-wrapped")
+    if not wrapped.is_file():
+        return None
+    return wrapped if any(str(p).encode() in data
+                          for p in (wrapped, wrapped.resolve())) else None
+
+
+def _same_but_for_shebang(here: bytes, there: bytes) -> bool:
+    """Equal, or equal once the first line of each is dropped.
+
+    `package.nix`'s `postFixup` runs `patchShebangs`, deliberately and with its
+    reason written down: an installed harness must not depend on what happens to
+    be on the user's PATH. So every installed script differs from its source by
+    its first line, for as long as that decision stands, and a comparison that
+    counts it reported 24 files as behind the checkout on a host that had just
+    rebuilt from it.
+
+    The line is dropped only when the rest matches byte for byte, and only when
+    BOTH files have one. `patchShebangs` rewrites a shebang; it never adds one and
+    never removes one, so a file that gained or lost its first line changed by
+    something other than the packaging.
+    """
+    if here == there:
+        return True
+    if not here.startswith(b"#!") or not there.startswith(b"#!"):
+        return False
+    return here.partition(b"\n")[2] == there.partition(b"\n")[2]
+
+
+def _same_after_packaging(source: Path, installed: Path) -> bool:
+    """Is the installed file this checkout's file, once the packaging is undone?
+
+    Content first and the wrapper only as an explanation for a mismatch: a file
+    that already matches is never read through the indirection, so the one step
+    here that can pick a DIFFERENT file to compare is reached only for a file that
+    does not match as it stands.
+    """
+    here = source.read_bytes()
+    there = installed.read_bytes()
+    if _same_but_for_shebang(here, there):
+        return True
+    wrapped = _wrapped_file(installed, there)
+    return wrapped is not None and _same_but_for_shebang(here, wrapped.read_bytes())
 
 
 def check_client(host: Host) -> Check:
