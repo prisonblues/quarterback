@@ -1388,6 +1388,7 @@ full — including what was broken before it, which is the part no diff recovers
 - **v2.74** — the board can reach a person, and a person can answer it.
 - **v2.75** — the review queue only drained when a human typed, and nobody could see it.
 - **v2.76** — a plan scope stops pretending to be a GitHub repo.
+- **v2.77** — a session can end.
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
   roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps
