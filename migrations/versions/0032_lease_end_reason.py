@@ -22,8 +22,8 @@ Nullable, no default, no backfill. A default would invent a reason for every liv
 lease at deploy time, and inventing ``finished`` for a session nobody ended is
 precisely the confident-wrong answer this field exists to remove.
 
-Revision ID: 0029
-Revises: 0028
+Revision ID: 0032
+Revises: 0031
 Create Date: 2026-08-22
 
 """
@@ -35,8 +35,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0029"
-down_revision: str | None = "0028"
+revision: str = "0032"
+down_revision: str | None = "0031"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
