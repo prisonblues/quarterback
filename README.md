@@ -1638,6 +1638,7 @@ full — including what was broken before it, which is the part no diff recovers
 - **v2.97** — the loop gains a beginning: the dashboard's ⚒ starts a session through `qb-start`.
 - **v2.98** — two branches can no longer mint the same migration id.
 - **v2.99** — something acts on a stale harness, and stops one step short of your password.
+- **v3** — the release number gets an allocator, and it is a git tag.
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
   roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps
