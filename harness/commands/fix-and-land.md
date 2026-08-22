@@ -318,3 +318,22 @@ Rules:
   A repo that closes issues by reading the commits landing on its integration branch — lexray does —
   gets nothing from a PR-body keyword, and GitHub's default squash message depends on a repo
   setting. Pass `--body` explicitly if the default would drop it.
+- **Ask GitHub which issues the merge will close; never grep the body for keywords.** GitHub's
+  closing-keyword parser does not understand negation. PR #372 opened with "**This does not close
+  #371** — see the bottom", the parser matched the literal `close #371`, and merging as written
+  would have closed the issue the PR existed to keep open — while a keyword grep returned that one
+  hit and it read, to a human, as a disclaimer. The authoritative list is the one the merge acts on:
+
+  ```bash
+  gh api graphql -f query='{repository(owner:"OWNER",name:"NAME"){
+    pullRequest(number:N){closingIssuesReferences(first:50){totalCount nodes{number state}}}}}'
+  ```
+
+  Run it before merging. If it lists an issue the PR is meant to leave open, reword the body until
+  it does not (`#N stays open` parses as nothing) and re-run the query until `nodes` is empty — then
+  merge. If it lists an issue the PR really does close, make sure a commit says `Fixes #N` too, for
+  the reason the bullet above gives. The `closing-refs` CI job asks the same question against the
+  branch's own reference lines and refuses the contradiction, but it passes — with a `::warning::`,
+  not a refusal — when the body picks up an issue no commit names at all, and it cannot see one where
+  the commit and the body agree with each other and only the prose disagrees, which is PR #363's
+  case. Both are why this is still a step here (#374).
