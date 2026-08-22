@@ -31,11 +31,12 @@ import subprocess
 import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
+from appetite import label_names, refusal_verdict  # noqa: E402
 from harness_rules import (  # noqa: E402
     DEFAULTS, RepoNotFound, agent_failure, agent_gist, ci_report, cli_failure_gist,
     describe, resolve_repo, run_agent, tail_gist,
@@ -157,6 +158,11 @@ class IssueWork:
     reason: str = ""             # triage reason
     phase: str = ""              # grouping header from the epic body (fan-out layer)
     model: str = ""              # implementation tier the judge picked (<= run ceiling)
+    # Label NAMES only, already unwrapped from gh's [{"name": ...}] shape by
+    # appetite.label_names, because the pickup gate compares strings and a second
+    # unwrapping at the comparison site is how one of them ends up matching
+    # nothing, silently.
+    labels: list[str] = field(default_factory=list)
 
 
 def gh_json(args: list[str], repo: str):
@@ -331,7 +337,8 @@ def build_worklist(repo: str, epic: int) -> list[IssueWork]:
                    "--json", "number,state,headRefName,body"], repo)
     work = []
     for num, checked, phase in refs:
-        issue = gh_json(["issue", "view", str(num), "--json", "title,state,body"], repo)
+        issue = gh_json(["issue", "view", str(num),
+                         "--json", "title,state,body,labels"], repo)
         pr = find_pr_for_issue(prs, num)
         work.append(IssueWork(
             num=num, title=issue.get("title", "?"), checked=checked,
@@ -339,7 +346,8 @@ def build_worklist(repo: str, epic: int) -> list[IssueWork]:
             pr_number=pr["number"] if pr else None,
             pr_state=pr["state"] if pr else None,
             stage=classify(issue, pr, checked),
-            body=issue.get("body", "") or "", phase=phase))
+            body=issue.get("body", "") or "", phase=phase,
+            labels=label_names(issue.get("labels"))))
     return work
 
 
@@ -1216,6 +1224,40 @@ def run(repo_name: str, epic: int, execute: bool, max_issues: int | None,
     # equal-or-lesser tier for implementation.
     #
     ceiling = resolve_ceiling(cfg, model)
+
+    # The refusal gate runs BEFORE the doability judge, and the order is the whole
+    # point (#86). `triage` asks a model "can an agent implement this?", and a
+    # design issue answers YES — there are files, there is an obvious place to put
+    # a change, and the diff it produces will be plausible. What it will not
+    # produce is the decision the issue was waiting on, and a reviewed, tested,
+    # merged answer to a question nobody asked is worse than nothing: it is now
+    # the thing to argue with. So a person's label decides admissibility first,
+    # and only what a person has admitted is worth paying a judge to assess.
+    #
+    # `unlabelled_refuses=False` because this is not a pickup. A human named this
+    # epic on the command line and its sub-issues inherit that; `skip_when_
+    # unlabelled` is a statement about selecting out of an untriaged backlog, and
+    # applying it here would plan every epic over unlabelled sub-issues as blocked
+    # while preventing nothing anybody was worried about. What DOES apply is
+    # `skip_labels`: a `needs-human/ui` label a person put there does not stop
+    # meaning what it says because the issue arrived inside an epic.
+    #
+    # It gates the PLAN, not just --execute, because the plan is what the /epic
+    # skill reads to decide what to run — gating only the --execute branch would
+    # leave the actually-autonomous path ungated and ship the mechanism unwired.
+    #
+    # `doable` is deliberately left None on a refusal rather than set False: no
+    # doability ruling was made, because we declined to ask for one. Claiming a
+    # verdict we never obtained is the same kind of fabrication the reason lines
+    # in `triage` exist to prevent.
+    for w in work:
+        if w.stage != "implement":
+            continue
+        v = refusal_verdict(cfg, w.labels, number=w.num, unlabelled_refuses=False)
+        if not v.allowed:
+            w.stage = "blocked"
+            w.reason = f"{v.reason} [{v.setting}]"
+
     impl = [w for w in work if w.stage == "implement"]
     if impl:
         with ThreadPoolExecutor(max_workers=4) as ex:

@@ -1493,3 +1493,56 @@ def test_a_repo_with_no_rules_file_still_resolves_for_the_other_loops(repo):
     assert cfg["_rules_baseline"] == ""
     assert cfg["auto_merge"] == hr.DEFAULTS["auto_merge"]
     assert cfg["loops"]["dependabot_lander"] is False
+
+
+# ------------------------------------------------- the appetite blocks (#85/#86)
+
+def test_issue_pickup_merges_rather_than_replaces(repo):
+    """Setting one key must not wipe the others, or a repo relaxing the unlabelled
+    rule would silently lose the skip list AND the human-triage requirement."""
+    write_rules(repo, {"issue_pickup": {"skip_when_unlabelled": False}})
+    cfg = hr.resolve_repo(str(repo))
+    assert cfg["issue_pickup"]["skip_when_unlabelled"] is False
+    assert cfg["issue_pickup"]["skip_labels"] == ["needs-human/*"]
+    assert cfg["issue_pickup"]["require_human_triage"] is True
+    assert cfg["issue_pickup"]["allowed_authors"] == []
+
+
+def test_issue_filing_merges_rather_than_replaces(repo):
+    write_rules(repo, {"issue_filing": {"max_per_run": 3}})
+    cfg = hr.resolve_repo(str(repo))
+    assert cfg["issue_filing"]["max_per_run"] == 3
+    assert cfg["issue_filing"]["require_dedup_check"] is True
+    assert cfg["issue_filing"]["unattended"] is False
+
+
+def test_a_typo_in_issue_pickup_is_reported(repo, capsys):
+    """`skip_when_unlabeled` (one l) merges in inert while the real setting stays
+    on, so the operator sees refusals they believe they turned off."""
+    write_rules(repo, {"issue_pickup": {"skip_when_unlabeled": False}})
+    cfg = hr.resolve_repo(str(repo))
+    assert "skip_when_unlabeled" in capsys.readouterr().err
+    assert cfg["issue_pickup"]["skip_when_unlabelled"] is True
+
+
+def test_a_typo_in_issue_filing_is_reported(repo, capsys):
+    write_rules(repo, {"issue_filing": {"max_per_runs": 9}})
+    cfg = hr.resolve_repo(str(repo))
+    assert "max_per_runs" in capsys.readouterr().err
+    assert cfg["issue_filing"]["max_per_run"] == 1
+
+
+def test_the_unknown_key_report_covers_the_new_blocks():
+    assert hr.unknown_keys({"issue_pickup": {"nope": 1}}) == {"issue_pickup": ["nope"]}
+    assert hr.unknown_keys({"issue_filing": {"nope": 1}}) == {"issue_filing": ["nope"]}
+
+
+def test_a_repo_with_no_rules_file_gets_the_closed_end_of_both_gates(repo):
+    """The module docstring claims DEFAULTS is "the safe end of every switch".
+    Two more switches now, and the claim has to keep being true of them."""
+    cfg = hr.resolve_repo(str(repo))
+    assert cfg["issue_pickup"]["enabled"] is False
+    assert cfg["issue_pickup"]["only_labels"] == []
+    assert cfg["issue_pickup"]["allowed_authors"] == []
+    assert cfg["issue_filing"]["unattended"] is False
+    assert cfg["issue_filing"]["max_per_run"] == 1

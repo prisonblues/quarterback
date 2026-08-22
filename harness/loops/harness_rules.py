@@ -774,6 +774,51 @@ DEFAULTS: dict = {
         "stacked_driver": False,
         "issue_executor": False,
     },
+    # What a loop may pick up of its own accord (#85, #86). Read by appetite.py,
+    # which is where the reasoning lives; the short version is that every default
+    # here refuses, because ACTING is what needs justifying and refusing is not.
+    "issue_pickup": {
+        # Off, so no repo acquires an appetite by upgrading. Note this governs a
+        # loop CHOOSING its own work — `epic.py --execute 42` names an epic on the
+        # command line and the human typing it is the authorisation.
+        "enabled": False,
+        # Empty means NOTHING qualifies, not everything. Turning the gate on is
+        # one decision; saying what may come through it is another.
+        "only_labels": [],
+        # #63's security section, and it is an allowlist rather than a filter on
+        # purpose: this repo is public, anyone may open an issue, and under a
+        # watcher that text becomes the instructions for an agent with a full
+        # shell. A filter is a list of the phrasings somebody already thought of.
+        "allowed_authors": [],
+        # The load-bearing line. An allowlist of labels authorises nothing if the
+        # agent can apply the labels — #78's `judge_model` problem one level out —
+        # so the check reads the issue's label EVENTS and asks who applied it.
+        "require_human_triage": True,
+        # Logins that are agents rather than people, beyond the Bot actor type
+        # GitHub already reports. See appetite.py on what this cannot close.
+        "agent_actors": [],
+        # #279's closed vocabulary, matched as a glob so the `other` escape hatch
+        # can grow the vocabulary a word without this list going stale. #86
+        # proposed design/ui/decision-owed/needs-scoping, written when this repo
+        # had no labels at all; these six exist, and two vocabularies for one idea
+        # is the drift #65 has already been paid for once.
+        "skip_labels": ["needs-human/*"],
+        # The safe end: an unlabelled issue has not been triaged by ANYONE, so
+        # nothing has established which class it is, and "no signal" must not read
+        # as "no objection". Applies to SELECTING from a backlog only — see
+        # appetite.refusal_verdict on why the epic driver declines it.
+        "skip_when_unlabelled": True,
+    },
+    # How much a loop may file (#85). The risk in the other direction: nine issues
+    # in one day, every one a response to something real, which is what makes it a
+    # risk rather than a bug.
+    "issue_filing": {
+        "max_per_run": 1,
+        "require_dedup_check": True,
+        # Restates #40's standing decision as config, so a repo can relax it
+        # deliberately rather than by accident.
+        "unattended": False,
+    },
     "epic": {
         "landing": "auto",
         # `gate` (hold each sub-PR at a human merge) until a repo opts in, on the
@@ -839,7 +884,8 @@ DEFAULTS: dict = {
 
 # Blocks merged one level deep rather than replaced wholesale, so a repo can set
 # `reviewers.sonarqube` without having to restate claude and codex.
-_DEEP_BLOCKS = ("reviewers", "review_panel", "loops", "epic", "preland")
+_DEEP_BLOCKS = ("reviewers", "review_panel", "loops", "issue_pickup",
+                "issue_filing", "epic", "preland")
 
 # The documentation convention every rules file in the fleet leans on: a key
 # whose name starts with "_" is prose for whoever reads the file next, not a

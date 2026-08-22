@@ -19,10 +19,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import epic  # noqa: E402
 
 
-def mk(num, stage="implement", title="t", body="", pr=None, pr_state=None, phase=""):
+def mk(num, stage="implement", title="t", body="", pr=None, pr_state=None,
+       phase="", labels=()):
+    """`labels` defaults to NONE, and the pickup gate still admits it.
+
+    That is deliberate and is the epic driver's whole exemption: a human named
+    this epic on the command line, so `skip_when_unlabelled` — a rule about
+    selecting out of an untriaged backlog — does not apply to its sub-issues.
+    Tests that mean to exercise the gate pass a `needs-human/*` label."""
     return epic.IssueWork(
         num=num, title=title, checked=False, issue_state="OPEN",
-        pr_number=pr, pr_state=pr_state, stage=stage, body=body, phase=phase)
+        pr_number=pr, pr_state=pr_state, stage=stage, body=body, phase=phase,
+        labels=list(labels))
 
 
 # --------------------------------------------------------------- classify
@@ -450,3 +458,120 @@ def test_triage_reads_a_real_verdict_unchanged(monkeypatch):
         {"doable": True, "reason": "self-contained", "model": "sonnet"}),
         stderr="loaded 3 plugins")
     assert epic.triage(mk(1), "opus") == (True, "self-contained", "sonnet")
+
+
+# ------------------------------------------------- the refusal gate (#85/#86)
+
+def _plan(monkeypatch, capsys, work, cfg_extra=None, triaged=None):
+    """Run the planner over `work` with gh/judge stubbed, and return the JSON plan
+    plus the set of issue numbers the doability judge was actually asked about."""
+    cfg = {"name": "r", "github": "acme/r", "path": "/w", "default_branch": "main",
+           "_rules_from": "test", "loops": {"issue_executor": True}}
+    cfg.update(cfg_extra or {})
+    monkeypatch.setattr(epic, "load_repo_cfg", lambda name: cfg)
+    monkeypatch.setattr(epic, "build_worklist", lambda repo, e: work)
+    monkeypatch.setattr(epic, "gh_json", lambda args, repo: {"title": "an epic"})
+    asked = set()
+
+    def judge(w, model):
+        asked.add(w.num)
+        return (triaged or {}).get(w.num, (True, "self-contained", "sonnet"))
+
+    monkeypatch.setattr(epic, "triage", judge)
+    assert epic.run("r", 7, execute=False, max_issues=None, json_out=True,
+                    landing="multi") == 0
+    out = capsys.readouterr().out
+    return json.loads(out[out.index("{"):]), asked
+
+
+def test_a_needs_human_sub_issue_is_blocked_and_never_reaches_the_judge(
+        monkeypatch, capsys):
+    """The order is the point. `triage` asks a model "can an agent implement
+    this?" and a UI issue answers YES — there are files and there is an obvious
+    place to put a change. Admissibility is a person's call and it comes first,
+    so the judge must not even be consulted, and nothing is paid for."""
+    plan, asked = _plan(monkeypatch, capsys,
+                        [mk(1, labels=["needs-human/ui"]), mk(2, labels=["bug"])])
+    issues = {i["num"]: i for i in plan["issues"]}
+    assert issues[1]["stage"] == "blocked" and issues[1]["action"] == "skip-blocked"
+    assert issues[2]["action"] == "implement"
+    assert asked == {2}, "the gate must refuse before anything is paid for"
+
+
+def test_a_gated_sub_issue_says_which_label_and_which_setting_refused_it(
+        monkeypatch, capsys):
+    """A refusal that does not name its cause is indistinguishable from a broken
+    watcher, and the operator has several gates to go looking through."""
+    plan, _ = _plan(monkeypatch, capsys, [mk(1, labels=["needs-human/decision"])])
+    reason = plan["issues"][0]["reason"]
+    assert "'needs-human/decision'" in reason
+    assert "issue_pickup.skip_labels" in reason
+
+
+def test_an_unlabelled_sub_issue_is_still_planned(monkeypatch, capsys):
+    """The epic driver's exemption, asserted rather than assumed. A human named
+    the epic; `skip_when_unlabelled` is about picking out of a backlog, and
+    applying it here would plan every epic over unlabelled sub-issues as blocked
+    while preventing nothing anybody was worried about."""
+    plan, asked = _plan(monkeypatch, capsys, [mk(1, labels=[])])
+    assert plan["issues"][0]["action"] == "implement"
+    assert asked == {1}
+
+
+def test_a_gated_sub_issue_claims_no_doability_ruling(monkeypatch, capsys):
+    """`doable` stays None because we declined to ASK, not because a judge said
+    no. Recording False would fabricate a verdict never obtained — the same
+    failure the triage reason lines exist to prevent."""
+    plan, _ = _plan(monkeypatch, capsys, [mk(1, labels=["needs-human/taste"])])
+    assert plan["issues"][0]["doable"] is None
+    assert plan["issues"][0]["model"] == ""
+
+
+def test_the_gate_leaves_review_and_done_stages_alone(monkeypatch, capsys):
+    """It gates PICKUP — starting new work. An issue already in review has a PR a
+    human can see, and blocking it would strand open work no one is told about."""
+    plan, _ = _plan(monkeypatch, capsys, [
+        mk(1, stage="review", pr=9, pr_state="OPEN", labels=["needs-human/ui"]),
+        mk(2, stage="done", labels=["needs-human/ui"]),
+    ])
+    issues = {i["num"]: i for i in plan["issues"]}
+    assert issues[1]["action"] == "review"
+    assert issues[2]["action"] == "skip"
+
+
+def test_gated_sub_issues_are_counted_as_blocked_in_the_plan(monkeypatch, capsys):
+    """The counts are what the /epic skill reads to decide there is work to do."""
+    plan, _ = _plan(monkeypatch, capsys,
+                    [mk(1, labels=["needs-human/ui"]),
+                     mk(2, labels=["needs-human/other"]),
+                     mk(3, labels=["bug"])])
+    assert plan["counts"]["workable"] == 1
+    assert plan["counts"]["blocked"] == 2
+
+
+def test_a_repo_may_widen_the_skip_list_for_its_epics(monkeypatch, capsys):
+    plan, _ = _plan(monkeypatch, capsys, [mk(1, labels=["blocked-on-design"])],
+                    cfg_extra={"issue_pickup": {"skip_labels": ["blocked-on-*"]}})
+    assert plan["issues"][0]["action"] == "skip-blocked"
+
+
+def test_the_gate_reads_labels_the_worklist_actually_fetched(monkeypatch):
+    """A gate is only as good as its input, and `build_worklist` asked gh for
+    `title,state,body` — a field never requested comes back absent, every issue
+    reads as unlabelled, and the gate admits the entire backlog while looking
+    like it is working."""
+    calls = []
+
+    def fake_gh(args, repo):
+        calls.append(args)
+        if args[0] == "pr":
+            return []
+        return {"title": "t", "state": "OPEN", "body": "",
+                "labels": [{"name": "needs-human/ui"}]}
+
+    monkeypatch.setattr(epic, "gh_json", fake_gh)
+    monkeypatch.setattr(epic, "decompose", lambda repo, e: [(1, False, "")])
+    work = epic.build_worklist("acme/r", 7)
+    assert work[0].labels == ["needs-human/ui"]
+    issue_args = next(a for a in calls if a[0] == "issue")
+    assert "labels" in issue_args[issue_args.index("--json") + 1]
