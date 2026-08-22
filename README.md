@@ -130,7 +130,8 @@ GET   /sync              ?repo=&branch=&device=&path=          (registered workt
                          -> {published:[…], worktrees:[…], caller, stale, registered, advice}
 
 # reviewer-panel stats (v2.10, accounts v2.11, rounds + coverage v2.15, cost v2.19,
-#                        changed files v2.23, provenance v2.26, outcomes v2.37)
+#                        changed files v2.23, provenance v2.26, outcomes v2.37,
+#                        needs-a-human #279)
 POST  /review            (panel.py --json payload)              -> {id, recorded, findings,
                                                                     accounts, changed_files
                                                                     [, changed_files_dropped]
@@ -138,6 +139,8 @@ POST  /review            (panel.py --json payload)              -> {id, recorded
                                                                     [, head_sha_dropped]
                                                                     [, provenance_unknown]
                                                                     [, provenance_counts_unusable]
+                                                                    [, needs_human_unknown]
+                                                                    [, needs_human_refused]
                                                                     [, unreadable_fields]}
                           the bracketed keys appear only when something was dropped, and are the
                           machine-readable drift signal #65 reads; every one is logged too
@@ -165,6 +168,16 @@ GET   /review/stats      ?repo=&author=&days=&judged_only=       -> {by_model, b
                           (what survived the fix) — the GAP is the measurement. Read it
                           against outcomes_scored (fixed+refuted, the ratio's own
                           population) and confirmed_defects, never outcomes_recorded
+GET   /review/needs-human ?repo=&pr=&class=&days=&since=          -> {classes, labels, waiting,
+                          &include_settled=&limit=                          by_class, listed,
+                                                                            truncated, items}
+                          what is waiting on a HUMAN, by class, and for how long — one call,
+                          per defect, oldest first. `class` is one of decision | taste | ui |
+                          environment | auth | other and is REFUSED when it is not, because
+                          an empty list reads exactly like "nothing is waiting". Waiting means
+                          no outcome has been recorded; `include_settled` shows the retired
+                          ones with their outcome. `waiting`/`by_class` cover everything the
+                          filters matched, never just the page (#279)
 GET   /review/findings   ?repo=&pr=&limit=                       (one PR's findings as
                                                                   chains of observations,
                                                                   per round: what was new,
@@ -515,6 +528,26 @@ round already raised — and is never the `unknown` bucket, which means the ques
 the answer could not be placed. `provenance_runs` says how much of a window could attribute at all,
 and counts only judged runs: the per-member counters are tallied over confirmed findings, so an
 unjudged run can only contribute zeros to the sums it annotates.
+
+**"A human has to look at this" is a class, not a sentence.** Some findings no fix round can
+settle: which of these product options, whether that name is the right word, whether the pane
+actually renders on a real screen, whether the credential path works on the box it has to work on.
+The harness formed that judgement in four places — `epic.py`'s not-agent-doable triage,
+`panel-review-pr` step 3a, `preland`'s HOLD, a panel seat — and recorded it in none of them, and
+the `needs-decision` label #63's watcher reads had never existed here. A finding now carries
+`needs_human` with a class from a closed, database-constrained vocabulary (`decision | taste | ui |
+environment | auth | other`, defined once in `app/needs_human.py`) and a **required** reason, per
+reporter as well as per finding, counted per seat as `human_flagged`.
+
+This is deliberately **not** `could_not_assess`. That field means *I lacked context* — a gap a
+grep or a wider scope closes, and on PR #160 round 1 nine such declarations, 47% of that round's
+veto lines, were all answered with `grep` in about four minutes. `needs_human` means *no context
+would close this*. A bare flag is refused at the database as well as at ingest, because a flag ends
+a fix cycle and #67 is explicit that an agent must not escalate to end a cycle it finds tedious;
+`human_refuted` in `GET /review/stats` is what keeps the declaration falsifiable rather than free.
+`GET /review/needs-human` answers "what is waiting on a human, by class, and for how long" in one
+call, and `scripts/needs_human_labels.py` projects the vocabulary onto `needs-human/*` GitHub
+labels so a person finds it on the surface they already have open.
 
 **Anything the ingest drops is named back and logged.** An unrecognised bucket, a `head_sha` that
 cannot be a commit id, an unread path over the cap or unreadable, a known bucket carrying an
@@ -1161,6 +1194,7 @@ full — including what was broken before it, which is the part no diff recovers
   orders cost until something has been recording them while they were still predictions — and
   the outcome half is absent rather than stubbed, since a null `outcome` column invites the
   question to be answered by whoever is looking.
+- **v2.72** — "a human has to look at this" stops being a sentence nobody can count.
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
   roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps
@@ -1425,7 +1459,7 @@ app/          FastAPI service
                    GET /sessions, GET /session/{key}
   api/subagents.py POST /subagent[/end], GET /active (collision index), GET /overlap
   api/reviews.py   POST /review, GET /reviews, /review/{id}, /review/stats, /review/findings,
-                   /review/collisions
+                   /review/needs-human, /review/collisions
   api/worktrees.py PUT/GET /worktrees (cross-worktree discovery)
   api/sync.py      GET /sync (published line vs registered checkouts)
   api/whoami.py    GET /whoami (the caller's resolved board identity)
@@ -1435,6 +1469,8 @@ app/          FastAPI service
   ordering.py      pure ordering rules for /plan/order — the order the facts imply,
                    with each placement labelled derived or ambiguous (no model, no I/O)
   sync.py          pure staleness reasoning (no I/O), like overlap.py
+  needs_human.py   the closed "a human has to look at this" vocabulary (#279) and the
+                   needs-human/* GitHub labels it projects onto (no model, no I/O)
   api/board_view.py GET / (browser board) + GET /panel (leaderboard);
                    static/board.html, static/reviews.html
 migrations/   Alembic (async), 0001 → 0013: posts+trigger, blobs/sessions/leases,

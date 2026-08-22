@@ -281,6 +281,48 @@ discoverable from the numbers: the population is **PRs this board has panelled**
 #80's to close), and every cap says what it dropped, per class, ``unanswerable``
 included — it is by construction the largest list, and this is the query an
 automated lander issues in a loop with ``days`` up to 3650.
+
+**#279 — "a human has to look at this" becomes a class, a reason and a count.**
+The harness formed that judgement in four places and could record it in none:
+``epic.py``'s not-agent-doable triage printed it, ``panel-review-pr``'s step 3a
+left a ``deferred`` outcome, ``preland``'s HOLD left an exit code, a panel seat
+left prose in a JSONB list. Four vocabularies, none shared, none countable — and
+the ``needs-decision`` label #63's watcher reads had never existed in any repo
+here (``gh label list`` returned the nine GitHub defaults, unmodified).
+
+A finding now carries ``needs_human`` with a ``needs_human_class`` — one of
+``decision | taste | ui | environment | auth | other``, defined once in
+:mod:`app.needs_human` and constrained in the database — and a required
+``needs_human_reason``. Per reporter as well as per finding
+(:class:`~app.models.review.ReviewFindingReport`), and counted per seat
+(``human_flagged``), which is the ``needs_rereview`` / ``rereview_flagged``
+treatment and is here for a sharper reason: a flag is a way OUT of work, so #67's
+"do not escalate to end a cycle you find tedious" is only enforceable if the rate
+at which each seat reaches for it is on the row.
+
+Three rules make the number worth reading:
+
+* **It is not ``could_not_assess``.** That field means "I lacked context" — a gap
+  a tool or a wider scope closes, and ``panel_seats.py``'s measurement of PR #160
+  round 1 says how literally: nine such declarations asked about a file in this
+  repo, 47% of that round's veto lines, all nine answered with ``grep`` in about
+  four minutes. This means "no context would close this". One column holding both
+  would put a grep-able question and a design decision in the same bucket.
+* **A bare flag is refused**, at the database as well as at ingest — the CHECK is
+  a biconditional, so a flag without a class and a non-blank reason is refused
+  and so is a class or reason with no flag behind it. A flag refused at ingest
+  does not cost the caller its run: the finding records unflagged and the refusal
+  comes back under ``needs_human_refused``, with any unrecognised class spelling
+  under ``needs_human_unknown``.
+* **The class is what routes it.** ``ui`` means somebody has to look at a
+  terminal; ``auth`` means somebody has to try the credential path on a real box.
+  ``GET /review/needs-human`` answers "what is waiting on a human, by class, and
+  for how long" in one call, per defect, oldest first; ``GET /review/findings``
+  publishes ``needs_human_keys``, the escalation list a fix round subtracts; and
+  ``GET /review/stats`` carries ``human_flagged`` beside ``human_flagged_defects``
+  and ``human_refuted``, which is what makes the declaration falsifiable rather
+  than free. ``scripts/needs_human_labels.py`` projects the vocabulary onto the
+  ``needs-human/*`` GitHub labels, so #63's stated signal is real.
 """
 
 from __future__ import annotations
@@ -330,6 +372,14 @@ from app.models.review import (
     ReviewReviewer,
     ReviewRun,
     ReviewRunFile,
+)
+from app.needs_human import (
+    NEEDS_HUMAN_CLASS_HELP,
+    NEEDS_HUMAN_CLASSES,
+    NEEDS_HUMAN_LABELS,
+    label_for,
+    needs_human_class_or_none,
+    needs_human_reason_or_none,
 )
 
 router = APIRouter(tags=["review"])
@@ -568,6 +618,40 @@ if _declared != set(OUTCOMES):  # pragma: no cover - import guard
     )
 del _declared
 
+#: The ``needs_human`` vocabulary is stated three times for the same reason
+#: :data:`OUTCOMES` is: here (imported from :mod:`app.needs_human`, the one
+#: definition), as a SQL CHECK on each of the two tables that store it, and as a
+#: frozen snapshot in migration 0028. The CHECKs cannot import the tuple, so the
+#: two that CAN be compared are, at import, with the mismatch named — a class
+#: added on one side and not the other is either rejected at ingest or refused by
+#: the database on insert, a long way from where the edit was made.
+#:
+#: Both tables are checked, not just the finding's. They are written from
+#: different branches of the ingest and only one of them feeds ``/review/stats``'s
+#: per-reviewer figures, so a drift on either is a different bug.
+_NEEDS_HUMAN_CONSTRAINTS = {
+    "ck_review_findings_needs_human_class": ReviewFinding,
+    "ck_review_finding_reports_needs_human_class": ReviewFindingReport,
+}
+for _name, _model in _NEEDS_HUMAN_CONSTRAINTS.items():
+    _declared = {
+        c for con in _model.__table__.constraints
+        if getattr(con, "name", None) == _name
+        # Deliberately wider than today's vocabulary, the reason
+        # `_VOCAB_CONSTRAINT` gives: a class added correctly to BOTH sides would
+        # make a narrower pattern match nothing, and a guard that matches nothing
+        # reports a mismatch against the empty set — failing at import on a
+        # correct change, which is how a guard gets deleted rather than fixed.
+        for c in re.findall(r"'([a-z][a-z0-9_-]*)'", str(con.sqltext))
+    }
+    if _declared != set(NEEDS_HUMAN_CLASSES):  # pragma: no cover - import guard
+        raise RuntimeError(
+            f"NEEDS_HUMAN_CLASSES and the {_name} CHECK disagree: "
+            f"{sorted(_declared ^ set(NEEDS_HUMAN_CLASSES))} — a class in one and not the "
+            "other is either rejected at ingest or refused by the database on insert."
+        )
+del _declared, _name, _model
+
 #: How many outcomes one request may carry. A fix pass clears a round's findings
 #: in one call — a round is tens of findings, not thousands — and this is the same
 #: "one request should not insert a million rows in one transaction" bound
@@ -709,6 +793,29 @@ def _same_file(a: str, b: str) -> bool:
 
 # ----------------------------------------------------------------- ingest models
 
+def _with_class_sent(v: object) -> object:
+    """Record what a caller actually spelled for ``needs_human_class``.
+
+    Set unconditionally, so a caller cannot supply it: it is evidence about what
+    arrived, and evidence the sender can write is not evidence. The reasoning and
+    the coverage over every construction path are
+    :meth:`FindingIn._keep_provenance_sent`'s, one vocabulary over.
+
+    ``None`` means the key was absent — nobody said. ``""`` means a blank or
+    all-whitespace string arrived, which IS a statement, just not a usable one,
+    so the response filter tests ``is not None`` rather than truthiness.
+    """
+    if not isinstance(v, Mapping):
+        return v
+    raw = v.get("needs_human_class")
+    # `_echo`, not a bare strip: a non-string class (`5`, `["ui"]`) would
+    # otherwise leave nothing here at all, so a type-confused producer would read
+    # as one that never declared. `_echo` also does the bounding, and it must do
+    # it alone — it marks a cut value with `…`, and a second slice on top would
+    # take that mark off and hand a reader a truncated name as a whole one.
+    return {**v, "needs_human_class_sent": None if raw is None else _echo(raw)}
+
+
 class ReportIn(BaseModel):
     """One reviewer's own account of a finding, before the judge merged it.
 
@@ -729,10 +836,41 @@ class ReportIn(BaseModel):
     #: "no", and only that overrides the finding-level ``rereview_by``.
     needs_rereview: bool = False
 
+    #: THIS reviewer declared no fix round can settle this — a person has to
+    #: (#279). Omitting the key is not a declaration either way, the rule
+    #: ``needs_rereview`` follows one line up, and only an explicit ``false``
+    #: overrides the finding-level ``needs_human_by``.
+    needs_human: bool = False
+    #: Which judgement is owed, and why. Both are REQUIRED of a flag — a bare one
+    #: is a confident assertion with nothing behind it, and this one ends a fix
+    #: cycle. Where a reporter flags without them the finding's own class and
+    #: reason stand in; where neither channel supplies both, the flag is refused
+    #: and named in the response rather than stored bare (see :func:`_prepare`).
+    needs_human_class: str | None = None
+    needs_human_reason: str | None = None
+    #: What was spelled when it was not a class this board knows. Set by the
+    #: validator, never by the sender — see :func:`_with_class_sent`.
+    needs_human_class_sent: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _keep_class_sent(cls, v: object) -> object:
+        return _with_class_sent(v)
+
     @field_validator("reviewer")
     @classmethod
     def _trim(cls, v: str) -> str:
         return v.strip()
+
+    @field_validator("needs_human_class", mode="before")
+    @classmethod
+    def _class(cls, v: object) -> str | None:
+        return needs_human_class_or_none(v)
+
+    @field_validator("needs_human_reason", mode="before")
+    @classmethod
+    def _reason(cls, v: object) -> str | None:
+        return needs_human_reason_or_none(v)
 
     @field_validator("line")
     @classmethod
@@ -789,6 +927,28 @@ class FindingIn(BaseModel):
     #: OMITS ``needs_rereview`` has declared nothing, so this still speaks for it.
     needs_rereview: bool = False
     rereview_by: list[str] = Field(default_factory=list)
+
+    #: No fix round can settle this: a person has to (#279). ``needs_human_by``
+    #: names which members said so, for a caller that merges before it can send
+    #: per-reporter accounts; where ``reported_by`` carries its own flags those
+    #: win, being the finer grain. A reporter that OMITS ``needs_human`` has
+    #: declared nothing, so this still speaks for it — the exact attribution
+    #: ladder ``rereview_by`` climbs, kept identical on purpose so there is one
+    #: rule to learn rather than two that nearly agree.
+    needs_human: bool = False
+    #: Which judgement is owed — one of :data:`app.needs_human.NEEDS_HUMAN_CLASSES`
+    #: — and why, in a line. BOTH are required of a flag, at the database as well
+    #: as here: a bare flag is a way out of work with nothing behind it, and #67
+    #: is explicit that an agent must not escalate to end a cycle it finds
+    #: tedious. A flag that carries neither its own pair nor a flagged reporter's
+    #: is refused and NAMED in the response, never stored bare.
+    needs_human_class: str | None = None
+    needs_human_reason: str | None = None
+    needs_human_by: list[str] = Field(default_factory=list)
+    #: What was spelled when it was not a class this board knows — see
+    #: :func:`_with_class_sent`. Reported as drift rather than dropped in
+    #: silence, which is the failure #279 was filed about.
+    needs_human_class_sent: str | None = None
     #: No earlier round of this PR raised this. The panel computes it against the
     #: baseline it was given; None means it was not asked to.
     new_this_round: bool | None = None
@@ -836,10 +996,32 @@ class FindingIn(BaseModel):
         raw = v.get("provenance")
         return {**v, "provenance_sent": None if raw is None else _echo(raw)}
 
+    @model_validator(mode="before")
+    @classmethod
+    def _keep_class_sent(cls, v: object) -> object:
+        return _with_class_sent(v)
+
     @field_validator("provenance", mode="before")
     @classmethod
     def _provenance(cls, v: object) -> str | None:
         return _bucket_or_none(v)
+
+    @field_validator("needs_human_class", mode="before")
+    @classmethod
+    def _class(cls, v: object) -> str | None:
+        return needs_human_class_or_none(v)
+
+    @field_validator("needs_human_reason", mode="before")
+    @classmethod
+    def _reason(cls, v: object) -> str | None:
+        return needs_human_reason_or_none(v)
+
+    @field_validator("needs_human_by", mode="before")
+    @classmethod
+    def _human_by(cls, v: object) -> list[str]:
+        """Coerced, not rejected — ``needs_human_by: "codex"`` from a hand-rolled
+        caller must not cost it the whole run (see :func:`_phrases`)."""
+        return _phrases(v)
 
     @field_validator("line")
     @classmethod
@@ -1550,6 +1732,61 @@ class Prepared:
     #: counts it — a caller contradicting itself, recorded rather than resolved.
     rereview_by: list[str] = field(default_factory=list)
 
+    #: Members credited with declaring that no fix round can settle this (#279),
+    #: by exactly the ladder :attr:`rereview_by` climbs. Empty whenever
+    #: :attr:`needs_human` is False, including when a flag was REFUSED for want of
+    #: evidence: `human_flagged` is tallied from this list, so crediting a
+    #: declaration the finding does not store would publish a per-reviewer count
+    #: with nothing behind it — the failure the evidence rule exists to prevent,
+    #: arriving through the scorecard instead of the finding.
+    needs_human_by: list[str] = field(default_factory=list)
+    #: The resolved declaration, or nothing. True only with a class AND a
+    #: non-blank reason; a flag lacking either is refused here rather than at the
+    #: database, so the run still records and the refusal is NAMED in the
+    #: response instead of costing the caller its findings.
+    needs_human: bool = False
+    needs_human_class: str | None = None
+    needs_human_reason: str | None = None
+    #: Why a claimed flag was not stored: ``"no_class"`` or ``"no_reason"``.
+    #: None when nothing was claimed, or when the claim was evidenced.
+    needs_human_refused: str | None = None
+
+
+def _resolve_needs_human(f: FindingIn, reports: list[ReportIn],
+                         flagged: list[str]) -> tuple[bool, str | None, str | None, str | None]:
+    """Settle one finding's ``needs_human`` declaration: is it evidenced, and by what?
+
+    Returns ``(stored, class, reason, refused)``.
+
+    The class and the reason are taken from ONE donor wherever the finding itself
+    does not state them: the first flagged reporter carrying both. Not assembled
+    from whichever reporter happened to supply each half — two members can agree a
+    human is needed and disagree about what for, and a class from one paired with
+    a reason from another is a declaration nobody made.
+
+    A finding that states a class but no reason still borrows the donor's reason,
+    and that pairing is deliberate rather than an oversight of the rule above: the
+    caller named the class at finding level (that IS the merged statement) and the
+    argument for it comes from the member that made the declaration.
+
+    ``refused`` is the honest failure. A claimed flag with no class, or none with
+    a reason, is not stored — a bare flag is a confident assertion with nothing
+    behind it and this one ends a fix cycle (#67) — but the RUN still records,
+    because ingest is best-effort for the panel and one malformed field must not
+    cost a caller its findings. The response names it instead.
+    """
+    if not (f.needs_human or flagged):
+        return False, None, None, None
+    donor = next((r for r in reports
+                  if r.needs_human and r.needs_human_class and r.needs_human_reason), None)
+    cls = f.needs_human_class or (donor.needs_human_class if donor else None)
+    reason = f.needs_human_reason or (donor.needs_human_reason if donor else None)
+    if cls is None:
+        return False, None, None, "no_class"
+    if reason is None:
+        return False, None, None, "no_reason"
+    return True, cls, reason, None
+
 
 def _prepare(findings: list[tuple[FindingIn, str]]) -> list[Prepared]:
     """Settle attribution, defect key and ``related`` links for one payload.
@@ -1607,6 +1844,19 @@ def _prepare(findings: list[tuple[FindingIn, str]]) -> list[Prepared]:
         # `uq_review_report_finding_reviewer` to reject. The field feeds a
         # published per-reviewer statistic, so over-counting is not benign.
         flagged = list(dict.fromkeys(flagged))
+
+        # The same ladder again for #279's declaration, deliberately identical
+        # rung for rung: a reporter's own explicit flag (its `false` included, so
+        # a member's no is never overturned), then the panel's `needs_human_by`
+        # filtered by membership, then — for a finding flagged with nobody
+        # creditable — every credited member that said nothing of its own.
+        h_named = {r.reviewer for r in reports if "needs_human" in r.model_fields_set}
+        h_flagged = [r.reviewer for r in reports if r.needs_human]
+        h_flagged += [n for n in f.needs_human_by if n in reviewers and n not in h_named]
+        if not h_flagged and f.needs_human:
+            h_flagged = [n for n in reviewers if n not in h_named]
+        h_flagged = list(dict.fromkeys(h_flagged))
+        stored, cls, reason, refused = _resolve_needs_human(f, reports, h_flagged)
         prepared.append(Prepared(
             f=f,
             verdict=verdict,
@@ -1615,6 +1865,13 @@ def _prepare(findings: list[tuple[FindingIn, str]]) -> list[Prepared]:
             reports=reports,
             key=(f.key or "").strip() or _derive_key(f.file, title),
             rereview_by=flagged,
+            # Emptied when the flag was refused, so `human_flagged` can never
+            # count a declaration no row stores. See :class:`Prepared`.
+            needs_human_by=h_flagged if stored else [],
+            needs_human=stored,
+            needs_human_class=cls,
+            needs_human_reason=reason,
+            needs_human_refused=refused,
         ))
 
     # `related` arrives as the panel's run-local ids; stored as keys so the
@@ -1662,7 +1919,8 @@ def _scorecards(
     # `reviewers` itself, so it is always a subset. The tally below indexes
     # `tally[name]` for every name in it, and that lookup must stay total if the
     # attribution rules ever widen.
-    credited = {r for p in findings for r in (*p.reviewers, *p.rereview_by)}
+    credited = {r for p in findings
+                for r in (*p.reviewers, *p.rereview_by, *p.needs_human_by)}
     skips = {s.split(":", 1)[0].strip(): s for s in skipped if ":" in s}
     names = sorted(set(cfg) | set(selected) | credited)
 
@@ -1671,6 +1929,7 @@ def _scorecards(
     # None.
     zero = ("raised", "confirmed", "dismissed", "unjudged", "solo", "shared",
             "sev_stricter", "sev_agree", "sev_looser", "rereview_flagged",
+            "human_flagged",
             *(s.lower() for s in SEVERITIES), *PROVENANCE_COUNTER.values())
     tally: dict[str, dict[str, int]] = {n: dict.fromkeys(zero, 0) for n in names}
     for p in findings:
@@ -1683,6 +1942,14 @@ def _scorecards(
         if p.verdict == "confirmed":
             for name in p.rereview_by:
                 tally[name]["rereview_flagged"] += 1
+            # Confirmed only, the same population and the same reason: a
+            # declaration attached to a finding the judge dismissed is not a
+            # claim worth scoring, and #279's whole calibration argument is that
+            # the rate at which a seat reaches for this has to be readable
+            # against something. `needs_human_by` is empty on a refused flag, so
+            # a bare claim cannot reach this counter.
+            for name in p.needs_human_by:
+                tally[name]["human_flagged"] += 1
         for name in p.reviewers:
             t = tally[name]
             t["raised"] += 1
@@ -1910,6 +2177,13 @@ async def record_review(
                 reviewers=p.reviewers or None,
                 n_reviewers=len(p.reviewers),
                 needs_rereview=bool(p.rereview_by) or p.f.needs_rereview,
+                # #279. Resolved in `_prepare`: true only with a class AND a
+                # non-blank reason, which is also what the table's CHECK demands
+                # — so a refused flag lands as an ordinary finding rather than
+                # taking the whole run down on an IntegrityError.
+                needs_human=p.needs_human,
+                needs_human_class=p.needs_human_class,
+                needs_human_reason=p.needs_human_reason,
                 new_this_round=p.f.new_this_round,
                 # The irreplaceable one: per finding, so nothing the board keeps
                 # could reconstruct it after the fact.
@@ -1931,6 +2205,18 @@ async def record_review(
     for p, (finding, reports) in zip(findings, rows, strict=True):
         for r in reports:
             accounts += 1
+            # #279, per reporter. A member credited on the finding carries the
+            # flag on its own row — same declaration, arriving by the only
+            # channel a panel that merges before the judge still has — with its
+            # OWN class and reason where it sent both, and the finding's resolved
+            # pair where it did not. Never a half of each: see
+            # :func:`_resolve_needs_human`.
+            #
+            # Gated on `p.needs_human` rather than on `r.needs_human`, because a
+            # reporter's bare claim is refused for exactly the reason the
+            # finding's is, and this table carries the same CHECK.
+            human = p.needs_human and r.reviewer in p.needs_human_by
+            own = r.needs_human_class and r.needs_human_reason
             session.add(
                 ReviewFindingReport(
                     finding_id=finding.id,
@@ -1942,6 +2228,13 @@ async def record_review(
                     # reporter's row too — same declaration, arriving by the only
                     # channel a panel that merges before the judge still has.
                     needs_rereview=r.needs_rereview or r.reviewer in p.rereview_by,
+                    needs_human=human,
+                    needs_human_class=(
+                        (r.needs_human_class if own else p.needs_human_class)
+                        if human else None),
+                    needs_human_reason=(
+                        (r.needs_human_reason if own else p.needs_human_reason)
+                        if human else None),
                 )
             )
 
@@ -2016,6 +2309,36 @@ async def record_review(
         if len(body.provenance_counts_unusable) > MAX_UNKNOWN_BUCKETS:
             dropped["provenance_counts_unusable_total"] = len(
                 body.provenance_counts_unusable)
+    # Every needs_human class this board did not recognise, from the findings and
+    # from their reporters' own declarations. Named rather than swallowed, for the
+    # reason `provenance_unknown` beside it is: a misspelt class would otherwise
+    # leave every by-class count while still reading as a flag — silently, and in
+    # the direction that hides the signal.
+    #
+    # A `""` echo counts: a blank or all-whitespace class is a producer sending a
+    # malformed value, not one declaring nothing, and the two must not read the
+    # same. Hence `is not None`.
+    unknown_classes = sorted({
+        src.needs_human_class_sent
+        for p in findings
+        for src in (p.f, *p.f.reported_by)
+        if src.needs_human_class is None and src.needs_human_class_sent is not None
+    })
+    if unknown_classes:
+        dropped["needs_human_unknown"] = unknown_classes[:MAX_UNKNOWN_BUCKETS]
+        if len(unknown_classes) > MAX_UNKNOWN_BUCKETS:
+            dropped["needs_human_unknown_total"] = len(unknown_classes)
+    # Flags claimed and NOT stored, counted by which half of the evidence was
+    # missing. The refusal is the rule (#67: a flag is a way out of work, so a
+    # bare one is refused), and a refusal nobody is told about is indistinguishable
+    # from a producer that never flagged — which is the whole failure #279 was
+    # filed over, arriving inside its own repair.
+    refusals: dict[str, int] = {}
+    for p in findings:
+        if p.needs_human_refused:
+            refusals[p.needs_human_refused] = refusals.get(p.needs_human_refused, 0) + 1
+    if refusals:
+        dropped["needs_human_refused"] = refusals
     # A field whose value was not a shape this board reads at all. Last of the
     # silent drops, and the coarsest: nothing about the value could be reported
     # per entry, because nothing about it could be walked.
@@ -2768,6 +3091,11 @@ def _card_view(c: ReviewReviewer, run: ReviewRun) -> dict:
         "code_blind": c.code_blind,
         "argv_capped": c.argv_capped,
         "rereview_flagged": c.rereview_flagged,
+        # #279: findings this member declared no fix round can settle. Beside
+        # `rereview_flagged` because they are the same kind of claim measured the
+        # same way — except that this one is a way OUT of work, which is why it is
+        # published per seat rather than only per run.
+        "human_flagged": c.human_flagged,
         "input_tokens": c.input_tokens,
         "output_tokens": c.output_tokens,
         "cached_input_tokens": c.cached_input_tokens,
@@ -2810,6 +3138,11 @@ def _report_view(r: ReviewFindingReport) -> dict:
         "line": r.line,
         "account": r.account,
         "needs_rereview": r.needs_rereview,
+        # This reviewer's own #279 declaration — which may differ in class or
+        # wording from the finding's synthesis, and that disagreement is data.
+        "needs_human": r.needs_human,
+        "needs_human_class": r.needs_human_class,
+        "needs_human_reason": r.needs_human_reason,
     }
 
 
@@ -2878,6 +3211,15 @@ def _finding_view(f: ReviewFinding, reports: list[ReviewFindingReport],
         "reviewers": f.reviewers or [],
         "related": f.related or [],
         "needs_rereview": f.needs_rereview,
+        # #279. NOT a severity and not a verdict: it says no fix round can settle
+        # this one, so a fixer must not be briefed with it and a round must not
+        # count it as work it could have cleared. The class is what routes it —
+        # `ui` means somebody has to look at a terminal, `auth` means somebody has
+        # to try the credential path on a real box — and the reason is required,
+        # so this trio is never a bare "stop".
+        "needs_human": f.needs_human,
+        "needs_human_class": f.needs_human_class,
+        "needs_human_reason": f.needs_human_reason,
         "new_this_round": f.new_this_round,
         # Beside `new_this_round`, which it splits in two: that field says the
         # defect is new to this cycle, this one says whether the last fix pass
@@ -3129,6 +3471,11 @@ async def review_stats(
                 func.count(ReviewReviewer.id)
                     .filter(ReviewReviewer.unstructured.is_(True)).label("unstructured_runs"),
                 func.sum(ReviewReviewer.rereview_flagged).label("rereview_flagged"),
+                # #279's calibration axis: how often this seat declared no fix
+                # round could settle a finding. Per OBSERVATION, like every other
+                # counter in this select — `human_refuted` below is per defect and
+                # is deliberately not summed here for that reason.
+                func.sum(ReviewReviewer.human_flagged).label("human_flagged"),
                 func.sum(ReviewReviewer.input_tokens).label("input_tokens"),
                 func.sum(ReviewReviewer.output_tokens).label("output_tokens"),
                 func.sum(ReviewReviewer.cached_input_tokens).label("cached_input_tokens"),
@@ -3300,6 +3647,46 @@ async def review_stats(
         g["attested"][r.outcome] = g["attested"].get(r.outcome, 0) + att
         g["recorded"] += n
 
+    # Was the seat right to say a person was needed? (#279) The declaration is a
+    # claim, and `refuted` is the record contradicting it — the same falsifiability
+    # `rereview_flagged` gets from the round that follows, and the reason a flag is
+    # not simply a way out of work.
+    #
+    # Attributed through `review_finding_reports`, NOT through
+    # `ReviewFinding.reviewers` as the outcome block above is, and the difference
+    # is deliberate: this measures who MADE the declaration, and the finding's
+    # reviewer list names everyone who raised the finding. So a caller that sent no
+    # `reported_by` scores here for nobody — the caveat `pr_finding_history` states
+    # for `rereview_by_reviewer`, and the reason `human_flagged` (which counts
+    # every channel) is published beside these two rather than instead of them.
+    #
+    # Per DEFECT, like the outcome counts it sits with: one flag on a defect raised
+    # in three rounds is one thing a person is owed.
+    human_rows = (
+        await session.execute(
+            select(
+                ReviewReviewer.name.label("name"),
+                ReviewReviewer.model.label("model"),
+                ReviewReviewer.effort.label("effort"),
+                func.count(func.distinct(defect)).label("flagged"),
+                func.count(func.distinct(defect))
+                    .filter(ReviewFindingOutcome.outcome == "refuted").label("refuted"),
+            )
+            .select_from(ReviewFindingReport)
+            .join(ReviewFinding, ReviewFinding.id == ReviewFindingReport.finding_id)
+            .join(ReviewRun, ReviewRun.id == ReviewFinding.run_id)
+            .join(ReviewReviewer, sa_and(
+                ReviewReviewer.run_id == ReviewFinding.run_id,
+                ReviewReviewer.name == ReviewFindingReport.reviewer,
+            ))
+            .outerjoin(ReviewFindingOutcome, outcome_join)
+            .where(*filters, ReviewFindingReport.needs_human.is_(True),
+                   ReviewFinding.verdict == "confirmed")
+            .group_by(ReviewReviewer.name, ReviewReviewer.model, ReviewReviewer.effort)
+        )
+    ).all()
+    human_by_group = {(r.name, r.model, r.effort): r for r in human_rows}
+
     by_model = []
     for r in model_rows:
         confirmed, dismissed = int(r.confirmed or 0), int(r.dismissed or 0)
@@ -3333,6 +3720,7 @@ async def review_stats(
         # when it was credited on no confirmed finding in the window at all, which
         # is a real zero rather than missing coverage.
         og = outcomes_by_group.get((r.name, r.model, r.effort))
+        hg = human_by_group.get((r.name, r.model, r.effort))
         outcome_counts = og["counts"] if og else dict.fromkeys(OUTCOMES, 0)
         outcome_attested = og["attested"] if og else dict.fromkeys(OUTCOMES, 0)
         outcomes_recorded, confirmed_defects = (og["recorded"], og["defects"]) if og else (0, 0)
@@ -3392,6 +3780,18 @@ async def review_stats(
             # null — not because the member had nothing to say.
             "unstructured_runs": r.unstructured_runs,
             "rereview_flagged": int(r.rereview_flagged or 0),
+            # #279. Three numbers, two grains, and the pair is the measurement:
+            # `human_flagged` counts OBSERVATIONS this seat flagged through any
+            # channel, while `human_flagged_defects` and `human_refuted` are per
+            # DEFECT and attributable only where the caller sent `reported_by` —
+            # so `human_flagged_defects` can be 0 on a seat with a non-zero
+            # `human_flagged`, and that means "not attributable", never "none".
+            # `human_refuted` is what stops the flag being a free way out of work:
+            # a seat that flags `taste` on everything and is refuted every time is
+            # visible here and nowhere else.
+            "human_flagged": int(r.human_flagged or 0),
+            "human_flagged_defects": int(getattr(hg, "flagged", 0) or 0),
+            "human_refuted": int(getattr(hg, "refuted", 0) or 0),
             "avg_duration_ms": round(float(avg_ms)) if avg_ms is not None else None,
             # The cost side of "is the expensive tier worth it": time spent per
             # finding that survived the judge, not per finding raised.
@@ -3603,6 +4003,24 @@ async def review_stats(
         # The subset a human signed off, so an unattended agent's refutations
         # cannot be read as adjudicated without the reader choosing to.
         "by_outcome_attested": by_outcome_attested,
+    }
+
+
+def _chain_needs_human(obs: list[ReviewFinding]) -> dict:
+    """One defect's live ``needs_human`` declaration, from its newest flagged
+    observation.
+
+    A chain is flagged while ANY observation of it is: the judgement is a fact
+    about the defect, and a later round whose producer does not emit the flag has
+    not withdrawn it — it has said nothing. Withdrawal is
+    ``POST /review/outcomes``, which is where "somebody acted on this" lives.
+    """
+    flagged = [f for f in obs if f.needs_human]
+    latest = flagged[-1] if flagged else None
+    return {
+        "needs_human": latest is not None,
+        "needs_human_class": latest.needs_human_class if latest else None,
+        "needs_human_reason": latest.needs_human_reason if latest else None,
     }
 
 
@@ -3901,6 +4319,13 @@ async def pr_finding_history(
             "reviewers": reviewers,
             "related": related,
             "needs_rereview": any(f.needs_rereview for f in obs),
+            # #279, from the newest observation that carried it rather than from
+            # `last`: a defect flagged in round 2 and raised again in round 3 by a
+            # producer that does not yet emit the flag is still owed the same
+            # judgement, and reading only the latest row would quietly retire it.
+            # The class and reason travel together so the pair is never split
+            # across two rounds' declarations.
+            **_chain_needs_human(obs),
             "observations": [
                 {
                     "run_id": f.run_id,
@@ -4071,6 +4496,15 @@ async def pr_finding_history(
              **rereview(i)}
             for i, r in enumerate(runs)
         ],
+        # The escalation list, ready to be subtracted (#279). Every defect in this
+        # window that a round declared no fix pass can settle, oldest first — which
+        # is exactly the set `panel.py --escalated` takes, so a fix loop can brief
+        # around them without re-deriving the rule from `findings[]`.
+        #
+        # Published as KEYS and not as findings because that is the grain the
+        # brake works at, and because a caller that wants the words already has
+        # them in `findings[]` under the same key.
+        "needs_human_keys": [c["key"] for c in out if c["needs_human"]],
         "findings": out,
     }
 
@@ -4477,6 +4911,251 @@ async def pr_collisions(
         # announces itself, or the trimmed answer reads as the whole one.
         out[f"{cls}_dropped"] = max(0, len(buckets[cls]) - limit)
     return out
+
+
+@router.get("/review/needs-human")
+async def needs_human_open(
+    _reader: str = Depends(reader),
+    repo: str | None = Query(None, description="github nameWithOwner"),
+    pr: int | None = Query(None, ge=1),
+    needs_class: str | None = Query(
+        None, alias="class", description=f"one of {', '.join(NEEDS_HUMAN_CLASSES)}"),
+    since: str | None = Query(None, description="ISO timestamp"),
+    days: int | None = Query(None, ge=1, le=3650),
+    include_settled: bool = Query(
+        False, description="also list defects an outcome has since been recorded for"),
+    limit: int = Query(100, ge=1, le=500, description="how many items to LIST"),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """What is waiting on a human, by class, and for how long — in one call (#279).
+
+    The question the harness could not answer. "A human has to look at this" was a
+    judgement formed in four places — ``epic.py``'s not-agent-doable triage,
+    ``panel-review-pr``'s step 3a, ``preland``'s HOLD, a panel seat — and recorded
+    in none of them, so "how many things are waiting on me, and what kind of
+    judgement do they need?" had no query behind it. Five ``ui`` checks and one
+    ``decision`` is a different afternoon from six decisions, which is why the
+    class is in the answer and not just the count.
+
+    **Per DEFECT**, keyed as ``finding_key`` is keyed — by (repo, pr, key) —
+    because a defect flagged in rounds 2, 3 and 4 is three observations and one
+    thing a person owes an answer about. ``observations`` says how many rounds
+    raised it and ``first_flagged`` is where ``age_seconds`` is measured from: the
+    age of the QUESTION, not of the latest time somebody restated it.
+
+    **"Waiting" means no outcome has been recorded**, and nothing subtler. Any
+    value of ``POST /review/outcomes`` retires it, ``deferred`` included — that is
+    not the human having answered, it is somebody having ACTED, and where a
+    deferral went is on the outcome's own ``deferred_to``. Pass
+    ``include_settled`` to see the retired ones with their outcomes attached; the
+    counts then cover both and ``waiting`` still says how many are outstanding.
+
+    ``dismissed`` and ``sonar`` findings are excluded. A dismissed finding is one
+    the judge ruled was not a defect, so it is not work waiting on anybody, and
+    ``sonar`` rows are the hard gate's own issues, which carry no panel
+    declaration. ``unjudged`` findings ARE included: an unjudged run had no judge,
+    so excluding them would hide every flag raised on a run whose judge was
+    skipped or crashed.
+
+    ``class`` and the window are **selectors, not row predicates** — v2.70's
+    lesson, one endpoint over, and both get a different answer written into the
+    WHERE. A defect's class is its NEWEST flagged observation's, so filtering rows
+    by class first answers with whatever historical observation survives the
+    filter: a defect flagged ``ui`` in round 2 and ``taste`` in round 3 would come
+    back under both, with a different age each time, and the ``ui`` answer would
+    name a class it no longer carries. The window decides which DEFECTS are in
+    scope and never which of their observations are counted: ``first_flagged`` is
+    the age of the question, and an age measured only inside the window is short
+    by however long the question predates it — understating exactly the oldest
+    items, which is the flattering direction. An unrecognised ``class`` is a 400
+    rather than an empty list, because an empty list here reads as "nothing is
+    waiting".
+
+    "Newest" is the newest ROUND, not the newest row: observations are ordered by
+    the run's timestamp, so a round backfilled after a later one does not become
+    the defect's current statement. ``GET /review/findings`` orders a chain the
+    same way, and the two must not disagree about what class a defect carries.
+
+    Ordered **oldest first**, which is the order a person actually works: the
+    thing that has been waiting three weeks is the thing to answer, and a list
+    sorted by severity buries it under whatever was flagged this morning.
+    ``truncated`` says the list was cut, never the counts — ``by_class`` and
+    ``waiting`` are computed over everything the filters matched, so a capped page
+    still reports the true totals.
+
+    ``classes`` publishes the vocabulary with each class's meaning, so a producer
+    discovers it here rather than hardcoding a fourth copy of it — the drift this
+    whole issue is about.
+    """
+    want_class = None
+    if needs_class is not None:
+        # Refused rather than silently matching nothing. Every other filter here
+        # is free text where a typo returning [] is the honest answer; this one is
+        # a closed vocabulary, so a typo is a caller bug and an empty list reads
+        # exactly like "nothing is waiting" — the most dangerous possible answer
+        # to this endpoint's question.
+        want_class = needs_human_class_or_none(needs_class)
+        if want_class is None:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                f"class={_echo(needs_class)!r} is not one of "
+                f"{', '.join(NEEDS_HUMAN_CLASSES)}",
+            )
+    cutoff = _since_clause(since, days)
+
+    # SELECT FIRST, CLASSIFY SECOND — v2.70's lesson, one endpoint over. Neither
+    # `class` nor the window is a predicate on the rows this reads, and writing
+    # either into the WHERE gets a different answer, wrongly:
+    #
+    # * a defect's class is its NEWEST flagged observation's, so filtering rows by
+    #   class before grouping answers with whatever historical observation
+    #   survives the filter. A defect flagged `ui` in round 2 and `taste` in round
+    #   3 would come back under BOTH filters, each with a different age, and the
+    #   `ui` answer would name a class it no longer carries.
+    # * the window decides which DEFECTS are in scope and never which of their
+    #   observations are counted. `first_flagged` is the age of the question, and
+    #   an age measured only inside the window is short by however long the
+    #   question predates it — understating exactly the oldest items, in the
+    #   flattering direction.
+    #
+    # So the rows arrive unnarrowed by both, ordered, and every question is asked
+    # afterwards over one defect's whole flagged history.
+    scope = [
+        ReviewFinding.needs_human.is_(True),
+        # The two to_fix verdicts. See the docstring: a dismissed finding is one
+        # the judge ruled was not a defect, so it is not work waiting on anybody,
+        # and `sonar` rows are the hard gate's own.
+        ReviewFinding.verdict.in_(("confirmed", "unjudged")),
+    ]
+    if repo is not None:
+        scope.append(ReviewRun.repo == repo)
+    if pr is not None:
+        scope.append(ReviewRun.pr == pr)
+    # Columns, not ORM objects: `detail` is unbounded text and nothing here shows
+    # it, so a repo with a long flagged history would otherwise ship a page of
+    # prose to compute a count. Reading them in Python rather than aggregating in
+    # SQL is deliberate — a flagged finding is a small minority of this table by
+    # construction (the partial index says so), and the alternative spellings of
+    # "the newest of the group" in one GROUP BY are `MAX(id)`, which follows
+    # INSERTION order and so hands the current class to whichever round was
+    # recorded last rather than to the last round, or an `array_agg` with an
+    # ordering clause, which is the same loop written where it cannot be read.
+    rows = (
+        await session.execute(
+            select(
+                ReviewRun.repo, ReviewRun.pr, ReviewRun.ts,
+                ReviewFinding.id, ReviewFinding.finding_key,
+                ReviewFinding.needs_human_class, ReviewFinding.needs_human_reason,
+                ReviewFinding.title, ReviewFinding.file, ReviewFinding.line,
+                ReviewFinding.severity, ReviewFinding.reviewers,
+            )
+            .select_from(ReviewFinding)
+            .join(ReviewRun, ReviewRun.id == ReviewFinding.run_id)
+            .where(*scope)
+            # Chronological, ties broken by id: the LAST row of a defect's group
+            # is its current statement, and "current" follows the review's clock
+            # rather than the board's insertion order. `GET /review/findings`
+            # orders a chain the same way, and the two must not disagree about
+            # what class a defect carries.
+            .order_by(ReviewRun.ts, ReviewFinding.id)
+        )
+    ).all()
+
+    chains: dict[tuple[str, int, str], list] = {}
+    for r in rows:
+        chains.setdefault((r.repo, r.pr, r.finding_key), []).append(r)
+
+    # The two selectors, applied to the DEFECT. `obs[-1].ts` is the newest flagged
+    # observation, so a chain whose newest is older than the cutoff has none
+    # inside the window at all.
+    picked = []
+    for triple, obs in chains.items():
+        if cutoff is not None and obs[-1].ts < cutoff:
+            continue
+        if want_class is not None and obs[-1].needs_human_class != want_class:
+            continue
+        picked.append((triple, obs))
+
+    # One statement rather than one per repo. A row constructor, not a concatenated
+    # key: `repo` and `finding_key` are both free text, so any separator can occur
+    # inside a value — the argument `review_stats` spells out for its own defect
+    # tuple, and the failure would be silent here too.
+    settled: dict[tuple[str, int, str], ReviewFindingOutcome] = {}
+    if picked:
+        settled = {
+            (o.repo, o.pr, o.finding_key): o
+            for o in (await session.scalars(
+                select(ReviewFindingOutcome).where(
+                    tuple_(ReviewFindingOutcome.repo, ReviewFindingOutcome.pr,
+                           ReviewFindingOutcome.finding_key).in_([t for t, _ in picked]))
+            )).all()
+        }
+
+    now = datetime.now(UTC)
+    items = []
+    by_class: dict[str, dict] = {}
+    waiting = 0
+    for (t_repo, t_pr, key), obs in picked:
+        outcome = settled.get((t_repo, t_pr, key))
+        if outcome is not None and not include_settled:
+            continue
+        f = obs[-1]
+        first_flagged = obs[0].ts
+        age = int((now - first_flagged).total_seconds())
+        items.append({
+            "repo": t_repo,
+            "pr": t_pr,
+            "key": key,
+            "class": f.needs_human_class,
+            "reason": f.needs_human_reason,
+            "title": f.title,
+            "file": f.file,
+            "line": f.line,
+            "severity": f.severity,
+            "reviewers": f.reviewers or [],
+            # The age of the QUESTION. `last_flagged` is beside it because a
+            # defect restated this morning and one last raised three weeks ago
+            # need the same answer and are not the same situation.
+            "first_flagged": first_flagged.isoformat(),
+            "last_flagged": f.ts.isoformat(),
+            "age_seconds": age,
+            "observations": len(obs),
+            # The label a human reads this under on GitHub — the projection #63's
+            # watcher was written against and this repo had never created.
+            "label": label_for(f.needs_human_class) if f.needs_human_class else None,
+            # Null while it is waiting, which is what waiting means here.
+            "outcome": _outcome_view(outcome) if outcome is not None else None,
+        })
+        if outcome is not None:
+            continue
+        waiting += 1
+        b = by_class.setdefault(
+            f.needs_human_class, {"waiting": 0, "oldest_ts": None, "oldest_age_seconds": 0})
+        b["waiting"] += 1
+        if b["oldest_ts"] is None or age > b["oldest_age_seconds"]:
+            b["oldest_ts"] = first_flagged.isoformat()
+            b["oldest_age_seconds"] = age
+
+    # Oldest first: the thing that has been waiting three weeks is the thing to
+    # answer. `key` breaks the tie so the order is stable across calls — a list a
+    # person is working down must not reshuffle between refreshes.
+    items.sort(key=lambda i: (i["first_flagged"], i["repo"], i["pr"], i["key"]))
+    return {
+        "repo": repo,
+        "pr": pr,
+        # The vocabulary, with what each class means. Published so a producer
+        # discovers it rather than hardcoding a fourth copy — see #279.
+        "classes": NEEDS_HUMAN_CLASS_HELP,
+        "labels": NEEDS_HUMAN_LABELS,
+        # Over everything the filters matched, never over the page: a capped list
+        # that also capped its counts would answer "how many are waiting?" with
+        # `limit`, which is the one number that is never the answer.
+        "waiting": waiting,
+        "by_class": {c: by_class[c] for c in NEEDS_HUMAN_CLASSES if c in by_class},
+        "listed": min(len(items), limit),
+        "truncated": len(items) > limit,
+        "items": items[:limit],
+    }
 
 
 @router.get("/review/{run_id}")

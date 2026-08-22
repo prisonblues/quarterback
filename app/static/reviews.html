@@ -474,6 +474,8 @@ function renderLeaderboard(rows, judgedOnly){
       ${r.unstructured_runs ? `<br>answered unparseably in ${r.unstructured_runs} of them` : ""}
       ${r.declared_gaps_runs ? `<br>said what it could not assess in ${r.declared_gaps_runs}` : ""}
       ${r.rereview_flagged ? `<br>${r.rereview_flagged} fix(es) it asked to have re-read` : ""}
+      ${r.human_flagged ? `<br>${r.human_flagged} finding(s) it said no fix round could settle${
+        r.human_refuted ? ` (${r.human_refuted} later refuted)` : ""}` : ""}
       ${r.avg_duration_ms ? `<br>avg ${Math.round(r.avg_duration_ms / 1000)}s per review` : ""}
       ${r.ms_per_confirmed ? `<br>${Math.round(r.ms_per_confirmed / 1000)}s per confirmed finding` : ""}
       ${provTip(r)}
@@ -570,6 +572,7 @@ const PROV_CHIP_TIP = "did the previous fix pass cause this, or did the previous
 // instead of it. The two are allowed to disagree, and a `confirmed` finding
 // carrying a `refuted` outcome is the whole reason this exists, so the chip has
 // to sit next to the row rather than restyle it.
+
 function outcomeChip(o){
   if (!o) return "";
   // "claims" and not "signed off by": `attested_by` is free text from the same
@@ -596,6 +599,16 @@ function outcomeChip(o){
     esc(extra)}${!refuted ? ""
       : o.attested_by ? ' <span class="un">·signoff claimed</span>'
       : ' <span class="un">·unattested</span>'}</span>`;
+}
+
+// #279: this defect needs a PERSON, and the chip says what for. Not a severity
+// and not a verdict — a fix round cannot clear it, so it is marked apart from
+// the outcome chip beside it rather than folded into the same vocabulary. The
+// reason is required, so the title is never empty.
+function humanChip(c){
+  if (!c.needs_human) return "";
+  return `<span class="chip" style="border-color:var(--warn);color:var(--warn)"
+    title="${esc(c.needs_human_reason || "")}">needs a human · ${esc(c.needs_human_class || "?")}</span>`;
 }
 
 function findingBlock(f){
@@ -637,6 +650,7 @@ async function renderHistory(box, repo, pr){
       <span class="loc">${esc(c.file || "")}${c.line ? ":" + c.line : ""}</span>
       <span>${esc(c.title)}</span>
       ${c.needs_rereview ? `<span class="chip" title="a reporter said this fix needs re-reading">↻</span>` : ""}
+      ${humanChip(c)}
       ${outcomeChip(c.outcome)}
       <span class="dim">${c.reviewers.map(esc).join(", ")}${
         c.related.length ? ` · fix with ${c.related.length} other` : ""}</span>
@@ -765,6 +779,7 @@ async function toggleRun(tr){
         : c.could_not_assess.length ? esc(c.could_not_assess.join(" · "))
         : "nothing"}</td>
       <td class="dim">${c.rereview_flagged || 0}</td>
+      <td class="dim">${c.human_flagged || 0}</td>
     </tr>`).join("");
   const finds = r.findings.map(findingBlock).join("") || '<div class="dim">no findings</div>';
   // The run's own verdict on itself, above the findings: whether it stopped
@@ -785,7 +800,9 @@ async function toggleRun(tr){
     <table><thead><tr><th>panel member</th><th>raised</th><th>confirmed</th>
       <th>dismissed</th><th>solo</th><th>took</th><th>cost</th><th>diff seen</th>
       <th>could not assess</th>
-      <th>flagged for re-review</th></tr></thead><tbody>${cards}</tbody></table>
+      <th>flagged for re-review</th>
+      <th title="findings it declared no fix round can settle — a person has to (#279)"
+        >needs a human</th></tr></thead><tbody>${cards}</tbody></table>
     ${r.skipped.length ? `<div class="dim" style="margin-top:8px">skipped: ${r.skipped.map(esc).join(" · ")}</div>` : ""}
     ${stop}${note}
     <div style="margin-top:10px">${finds}</div>
