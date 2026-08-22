@@ -1,0 +1,1049 @@
+#!/usr/bin/env python3
+"""qb-bump — carry a landed harness change onto this machine, as far as sudo allows (#267).
+
+  qb-bump                       stale? prepare the flake bump, BUILD it, propose it
+  qb-bump --json                the same answer as a document
+  qb-bump --apply               what a PERSON runs: install the prepared lock and switch
+  qb-bump --apply --dry-run     print that command rather than running it
+
+  0  nothing to carry — the harness on PATH is this checkout's
+  1  cannot tell — no qb-doctor, no nix, no consuming flake, or more than one
+  2  a bump is prepared and BUILT, and one command by a person finishes it
+  3  nothing to apply — no prepared bump, a moved tree, no terminal, or a bad flag
+  4  the bump does not build — refused to propose it
+
+**Landing is not deploying.** Sixteen releases landed on 2026-08-22 and the harness
+half of every one of them reached this box only when a person remembered to run
+`nix flake update` by hand. The pin was 162 commits behind that morning — eleven
+of the repo's binaries were simply absent from PATH, including `qb-reconcile`,
+whose systemd units had therefore never been installable — and it was stale again
+by 14:00, and again by 22:00. Nothing in the fleet carries a merged change to a
+machine, which is #267, and this is the half of it that ACTS.
+
+**It is not a second detector.** `qb-doctor`'s `harness` row (#204) already
+answers "is the harness on PATH the one this checkout has", and it has been
+answering it correctly all day. This shells out to it — `qb-doctor --json --only
+harness` — and reads the verdict. A comparison re-implemented here would be a
+second opinion about a fact that already has one, and the two would disagree on
+the day one of them learned something (`_same_after_packaging` and its wrapper
+handling is exactly the kind of thing only one of two copies would ever get).
+
+**The ceiling is sudo, and it is designed around rather than fought.** A
+`nixos-rebuild switch` needs root. An agent has no root and should not go looking
+for it, so this stops one step short: it prepares the change, builds it, proves it
+evaluates, and hands a person a single command. That is the ten minutes; the
+`sudo` is the ten seconds.
+
+**A proposal that has not been built is a proposal to break somebody's machine.**
+The first bump on 2026-08-22 failed on a collision — quarterback's module had
+started installing `~/.claude/quarterback-workflow.md` while the consuming flake
+still declared its own copy, and two definitions of one `home.file` path is an
+eval error, not a merge. So the build is not a nicety here: a bump that does not
+build is REFUSED and announced as a refusal, with the error, rather than proposed.
+
+**It never commits in the consumer, and never reads its uncommitted work.** The
+preparation happens on `git archive HEAD` unpacked into a temporary directory —
+so a consumer's dirty working tree can neither be swept into what is built nor
+have anything written over it. The only file this ever writes into a consumer's
+checkout is `flake.lock`, only under `--apply`, and only when the human running it
+is the one who typed the command. Committing that lock is the consumer's business
+and stays theirs.
+
+**The consuming flake is a third thing, and it is found rather than assumed.**
+`qb-doctor` records that it cannot find it, which is why its comparison is a
+content proxy and not a pin comparison: it knows the checkout and the store path,
+and the flake that CONSUMES the harness lives somewhere else on some hosts and
+nowhere at all on others. So this asks four questions in order — `--flake`, the
+environment, the site config, and a bounded scan for a `flake.lock` that pins this
+repo — and refuses rather than guessing when the scan finds two. The third of
+those is the door a consumer declares itself through
+(`programs.quarterback-harness.consumer.flake`); the fourth is what runs on a
+fleet that has declared nothing, which is every fleet today.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import io
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+
+# --------------------------------------------------------------------------- #
+# constants
+# --------------------------------------------------------------------------- #
+
+#: How long `nix flake update` gets. It is one input against a network that may
+#: be slow, and a minute of a hanging GitHub is not worth an hour of a hung timer.
+UPDATE_TIMEOUT = 300
+
+#: How long the system build gets. Generous on purpose: the first build after a
+#: nixpkgs-touching bump compiles, and a build killed at ten minutes reports "does
+#: not build" about a machine that builds fine — the one lie this file must not
+#: tell, since a false refusal trains a reader to ignore the true one.
+BUILD_TIMEOUT = 3600
+
+#: How much of a failed build's output is carried into the report and the board
+#: post. The tail, not the head: nix prints the trace last and the "these N
+#: derivations will be built" list first.
+ERROR_LINES = 40
+
+#: Where a prepared proposal lives between the agent that built it and the person
+#: who applies it. Under the cache dir because losing it costs a rerun of
+#: something reproducible, never a decision.
+CACHE = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") \
+    / "quarterback" / "harness-bump"
+
+#: Roots the consumer scan looks in, one level deep, when nothing declares a
+#: flake. `~/source` first because that is where this fleet keeps checkouts;
+#: `~` because a single-repo host often keeps it there. Override with
+#: `QUARTERBACK_CONSUMER_ROOTS` (colon-separated), which is also how a host with
+#: its flake at `/etc/nixos` says so.
+DEFAULT_ROOTS = ("~/source", "~")
+
+#: Config keys, read from `~/.config/quarterback/config` — the same file `qb-env`
+#: writes and `qb-doctor` parses, so a consumer that declares itself does it once.
+FLAKE_KEY = "QUARTERBACK_CONSUMER_FLAKE"
+ATTR_KEY = "QUARTERBACK_CONSUMER_ATTR"
+
+#: The needs-human class this escalates under. `environment` from #279's
+#: vocabulary: the decision is not a matter of taste or design, it is that this
+#: machine's state can only be changed by somebody who can become root.
+NEEDS_HUMAN_CLASS = "environment"
+
+
+# --------------------------------------------------------------------------- #
+# small shared plumbing
+# --------------------------------------------------------------------------- #
+
+def run(argv: list[str], cwd: str | None = None, timeout: int = 60,
+        env: dict | None = None) -> tuple[int, str, str]:
+    """``(rc, stdout, stderr)``, with every failure mode as a return rather than a raise.
+
+    A missing binary is ``(127, "", …)`` and a timeout is ``(124, "", …)``, both
+    spelled the way a shell would spell them, because every caller here has to
+    turn "could not run it" into a row rather than a traceback.
+    """
+    try:
+        p = subprocess.run(argv, cwd=cwd, capture_output=True, text=True,
+                           timeout=timeout, env=env)
+    except FileNotFoundError:
+        return 127, "", f"{argv[0]}: not found"
+    except subprocess.TimeoutExpired:
+        return 124, "", f"{argv[0]}: timed out after {timeout}s"
+    return p.returncode, p.stdout.strip(), p.stderr.strip()
+
+
+def nix(*args: str, timeout: int = 60, cwd: str | None = None) -> tuple[int, str, str]:
+    """`nix` with the two experimental features this file needs, asked for explicitly.
+
+    `--extra-experimental-features` rather than relying on the host's `nix.conf`:
+    this runs on machines the fleet does not configure, and "error: experimental
+    Nix feature 'nix-command' is disabled" is a refusal that has nothing to do
+    with the question being asked.
+    """
+    return run(["nix", "--extra-experimental-features", "nix-command flakes", *args],
+               timeout=timeout, cwd=cwd)
+
+
+def have_nix() -> bool:
+    """Is there a nix on this host at all? A named function so a suite can say no.
+
+    Asked once, in `main`, rather than discovered as a puzzling failure three
+    steps in: a machine with no nix cannot take a flake bump by any route, and
+    "no nixosConfigurations this can read" would be a true sentence about the
+    wrong problem.
+    """
+    return shutil.which("nix") is not None
+
+
+def site_config(path: Path | None = None) -> dict[str, str]:
+    """`~/.config/quarterback/config`, parsed as the shell assignments it is.
+
+    Parsed and never sourced, for the reason `qb-doctor.load_site_config` gives:
+    the file is machine-generated on some hosts and hand-written on others, and a
+    tool that prepares a proposal must not be the thing that executes an
+    unreviewed line. This is the second implementation of that parser and it is
+    deliberately kept to the same shape —
+    `harness/tests/test_qb_bump.py::test_the_config_parser_agrees_with_qb_doctors`
+    parses one fixture with both and fails if they ever disagree, which is the
+    guard `test_in_flight_drift.py` puts between `qb-admit` and `harness_rules`.
+    A bin script cannot import a loops module, and importing `qb-doctor` to read
+    two keys would make every run of this depend on that file executing cleanly.
+    """
+    path = path or Path(os.environ.get(
+        "QUARTERBACK_CONFIG",
+        Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "quarterback/config"))
+    out: dict[str, str] = {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return out
+    for line in text.splitlines():
+        m = re.match(r"^\s*(?:export\s+)?([A-Z_][A-Z0-9_]*)=(.*)$", line)
+        if not m:
+            continue
+        value = m.group(2).strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        out[m.group(1)] = value
+    return out
+
+
+def as_path(value: str | None) -> Path | None:
+    """A config value naming a directory, expanded the way the shell that wrote it meant.
+
+    `$HOME` and `~` both: the generated config on this fleet writes
+    `QUARTERBACK_REPO="$HOME/source/quarterback"`, and reading that literally is
+    how `qb-doctor` once reported confidently about a path with a dollar sign in
+    it. `expandvars` substitutes; it does not execute.
+    """
+    if not value:
+        return None
+    return Path(os.path.expanduser(os.path.expandvars(value)))
+
+
+def sha(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def tail(text: str, lines: int = ERROR_LINES) -> str:
+    kept = [ln for ln in text.splitlines() if ln.strip()]
+    return "\n".join(kept[-lines:])
+
+
+# --------------------------------------------------------------------------- #
+# 1. the drift — asked of qb-doctor, never worked out here
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class Drift:
+    """What `qb-doctor`'s `harness` row says, and nothing this file decided."""
+
+    verdict: str                       #: ok | warn | fail | unknown
+    detail: str
+    subject: str = ""
+    missing: list[str] = field(default_factory=list)
+    differ: list[str] = field(default_factory=list)
+
+    @property
+    def stale(self) -> bool:
+        return self.verdict == "fail"
+
+
+def doctor_path(script: str) -> str | None:
+    """The `qb-doctor` to ask: the one beside this script, else the one on PATH.
+
+    Beside first, and it matters on the branch that adds a check: a checkout's
+    `qb-doctor` knows about drift the installed one has never heard of, and the
+    installed one is by definition the stale copy this whole file exists because
+    of. Falling back to PATH covers the reverse case — this script run out of a
+    checkout on a host whose harness ships a `qb-doctor` and whose checkout, for
+    whatever reason, does not.
+    """
+    beside = Path(os.path.realpath(script)).parent / "qb-doctor"
+    if beside.is_file():
+        return str(beside)
+    return shutil.which("qb-doctor")
+
+
+def harness_drift(repo: Path, script: str) -> tuple[Drift | None, str]:
+    """``(Drift, "")`` or ``(None, why-there-is-none)``, from `qb-doctor --json`.
+
+    The verdict is READ, not re-derived. `--only harness` so the board, the
+    client, systemd and the network are not consulted to answer a question about
+    files on a disk — a doctor row that needs a token would make this refuse to
+    work on a box with no board, and staleness is not a board question.
+    """
+    doctor = doctor_path(script)
+    if doctor is None:
+        return None, ("no qb-doctor beside this script or on PATH, and the drift is its "
+                      "answer to give (#204)")
+    rc, out, err = run([sys.executable, doctor, "--json", "--only", "harness",
+                        "--repo", str(repo)], timeout=120)
+    if rc == 127 or (not out and rc not in (0, 1, 2)):
+        return None, f"qb-doctor could not be run: {err or rc}"
+    try:
+        checks = json.loads(out)["checks"]
+    except (ValueError, KeyError, TypeError):
+        return None, "qb-doctor did not answer with a report this can read"
+    row = next((c for c in checks if c.get("name") == "harness"), None)
+    if row is None:
+        return None, "qb-doctor's report carried no harness row"
+    extra = row.get("extra") or {}
+    return Drift(verdict=row.get("verdict", "unknown"), detail=row.get("detail", ""),
+                 subject=row.get("subject", ""),
+                 missing=list(extra.get("missing") or []),
+                 differ=list(extra.get("differ") or [])), ""
+
+
+# --------------------------------------------------------------------------- #
+# 2. the consumer — the flake that PINS this repo, which is not this repo
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class Consumer:
+    """A flake that pins this repo: where it is, what it calls the input, what it pins."""
+
+    flake: Path
+    input: str        #: what `nix flake update` is given — the root's name for it
+    node: str         #: what the lock stores it under, which is not always the name
+    rev: str
+    found_by: str
+
+
+def repo_slug(repo: Path) -> str | None:
+    """`owner/name` from the checkout's origin, which is what a lock entry names."""
+    rc, out, _ = run(["git", "-C", str(repo), "remote", "get-url", "origin"])
+    if rc != 0 or not out:
+        return None
+    m = re.search(r"[:/]([^/:]+)/([^/]+?)(?:\.git)?/?$", out)
+    return f"{m.group(1)}/{m.group(2)}" if m else None
+
+
+def pins_repo(lock_text: str, slug: str) -> tuple[str, str, str] | None:
+    """``(input name, node id, locked rev)`` if this lock pins `slug` DIRECTLY, else None.
+
+    Two distinctions Codex made on the first cut of this file, and both of them
+    are the difference between updating the right thing and updating something
+    else:
+
+    **Direct inputs only.** `nodes` is the whole graph — every transitive
+    dependency of every input is in there — so scanning it finds a repository
+    that some other flake pins, in a consumer that does not pin it at all.
+    `nix flake update` cannot move such a node, and a lock that mentions this
+    repo three levels down is not a consumer of this harness. So the walk starts
+    at the root node's own `inputs`.
+
+    **The input's NAME is not the node's ID.** A lock disambiguates a second node
+    for the same flake as `quarterback_2`, and `nix flake update quarterback_2`
+    is not a command: the name to pass is the one the root node uses. Both are
+    returned, because the name is what updates and the id is what the lock is
+    read by.
+
+    Matched on the LOCKED half rather than the original: an input written as
+    `github:owner/repo` and one written as a `git+https` URL to the same
+    repository are the same pin, and the locked node is where both spell it out.
+    """
+    try:
+        doc = json.loads(lock_text)
+        nodes = doc.get("nodes") or {}
+        root = nodes.get(doc.get("root") or "root") or {}
+        direct = root.get("inputs") or {}
+    except (ValueError, AttributeError):
+        return None
+    owner, _, name = slug.partition("/")
+    for input_name, node_id in direct.items():
+        # A `follows` is spelled as a LIST (a path through the graph) rather than
+        # a node id. Such an input is somebody else's node by definition, so it is
+        # not the input a bump of this repo would move.
+        if not isinstance(node_id, str):
+            continue
+        node = nodes.get(node_id)
+        locked = node.get("locked") if isinstance(node, dict) else None
+        if not isinstance(locked, dict):
+            continue
+        same = (str(locked.get("owner", "")).lower() == owner.lower()
+                and str(locked.get("repo", "")).lower() == name.lower())
+        if not same:
+            url = str(locked.get("url", "")).lower()
+            same = bool(url) and slug.lower() in url
+        if same:
+            return str(input_name), node_id, str(locked.get("rev", ""))
+    return None
+
+
+def main_worktree(path: Path) -> Path:
+    """The main checkout of whatever repository `path` is a worktree of.
+
+    Eight directories under `~/source` pinned this repo on the machine this was
+    written for, and they were eight worktrees of ONE consuming flake — a scan
+    that reported eight candidates and refused was correct and useless. They are
+    not eight consumers: a machine is rebuilt from the checkout, not from a
+    feature branch's worktree, and proposing a bump into one of those would put
+    somebody's in-flight branch in the path of their next rebuild.
+
+    Every worktree of a repository shares its common git dir, which is the main
+    checkout's `.git`, so its parent is the main checkout. Anything that is not a
+    git repository at all — a plain directory with a `flake.lock` in it — is left
+    exactly as it was found.
+    """
+    rc, out, _ = run(["git", "-C", str(path), "rev-parse", "--path-format=absolute",
+                      "--git-common-dir"])
+    if rc == 0 and out and Path(out).name == ".git" and Path(out).parent.is_dir():
+        return Path(out).parent
+    return path
+
+
+def scan_roots(roots: list[Path], slug: str) -> list[Consumer]:
+    """Every flake under `roots` (one level down, plus the root itself) that pins `slug`.
+
+    One level and no deeper, deliberately. This runs on a laptop with a home
+    directory in it, and a recursive walk looking for `flake.lock` is a tool that
+    takes a minute to answer a question about a file it already knows the shape
+    of. A host that keeps its flake somewhere else says so — that is what
+    `QUARTERBACK_CONSUMER_ROOTS` and `--flake` are for.
+
+    Each hit is collapsed onto its main checkout before being counted, so N
+    worktrees of one flake are one candidate and not N.
+    """
+    found: list[Consumer] = []
+    seen: set[Path] = set()
+    for root in roots:
+        if not root.is_dir():
+            continue
+        candidates = [root / "flake.lock"]
+        try:
+            candidates += sorted(root.glob("*/flake.lock"))
+        except OSError:
+            pass
+        for lock in candidates:
+            if not lock.is_file():
+                continue
+            flake = main_worktree(lock.parent.resolve()).resolve()
+            if flake in seen:
+                continue
+            seen.add(flake)
+            try:
+                text = (flake / "flake.lock").read_text(encoding="utf-8")
+            except OSError:
+                continue
+            hit = pins_repo(text, slug)
+            if hit:
+                found.append(Consumer(flake=flake, input=hit[0], node=hit[1], rev=hit[2],
+                                      found_by=f"found by scanning {root}"))
+    return found
+
+
+def consumer_roots(cfg: dict[str, str]) -> list[Path]:
+    raw = os.environ.get("QUARTERBACK_CONSUMER_ROOTS") or cfg.get("QUARTERBACK_CONSUMER_ROOTS")
+    spec = raw.split(":") if raw else list(DEFAULT_ROOTS)
+    return [p for p in (as_path(s) for s in spec if s.strip()) if p]
+
+
+def named_consumer(where: Path, slug: str, how: str) -> tuple[Consumer | None, str]:
+    """A flake somebody NAMED — checked, because a name that pins nothing is a typo."""
+    lock = where / "flake.lock"
+    try:
+        text = lock.read_text(encoding="utf-8")
+    except OSError:
+        return None, f"{how} names {where}, which has no readable flake.lock"
+    hit = pins_repo(text, slug)
+    if not hit:
+        return None, (f"{how} names {where}, whose flake.lock does not pin {slug} — "
+                      "so bumping it would not carry this harness anywhere")
+    return Consumer(flake=where.resolve(), input=hit[0], node=hit[1], rev=hit[2],
+                    found_by=how), ""
+
+
+def resolve_consumer(flake_arg: str | None, cfg: dict[str, str],
+                     slug: str) -> tuple[Consumer | None, str]:
+    """The consuming flake, by the four doors, in order. Ambiguity REFUSES.
+
+    Two candidates is the case worth being careful about: a fleet flake and a
+    scratch copy of it both pin this repo, and picking the alphabetically first
+    would prepare a bump against a directory nobody rebuilds from — a proposal
+    that looks exactly like a good one and does nothing. So it names both and
+    stops, which is a question a person answers once with `--flake` or a config
+    line.
+    """
+    if flake_arg:
+        return named_consumer(as_path(flake_arg), slug, "--flake")
+    env = os.environ.get(FLAKE_KEY)
+    if env:
+        return named_consumer(as_path(env), slug, f"${FLAKE_KEY}")
+    declared = cfg.get(FLAKE_KEY)
+    if declared:
+        return named_consumer(as_path(declared), slug, f"{FLAKE_KEY} in the site config")
+    found = scan_roots(consumer_roots(cfg), slug)
+    if not found:
+        return None, (f"no flake pinning {slug} under "
+                      f"{', '.join(str(r) for r in consumer_roots(cfg))} — name it with "
+                      f"--flake, or set {FLAKE_KEY} (programs.quarterback-harness."
+                      "consumer.flake)")
+    if len(found) > 1:
+        names = ", ".join(str(c.flake) for c in found)
+        return None, (f"{len(found)} flakes pin {slug} ({names}) — this will not guess "
+                      f"which one this machine is rebuilt from; name it with --flake or "
+                      f"{FLAKE_KEY}")
+    return found[0], ""
+
+
+# --------------------------------------------------------------------------- #
+# 3. the attribute — which nixosConfiguration IS this machine
+# --------------------------------------------------------------------------- #
+
+def host_attrs(flake: Path) -> list[str]:
+    """`nixosConfigurations`' attribute names. Cheap: names do not evaluate configs."""
+    rc, out, _ = nix("eval", f"path:{flake}#nixosConfigurations",
+                     "--apply", "builtins.attrNames", "--json", timeout=120)
+    if rc != 0:
+        return []
+    try:
+        return [str(a) for a in json.loads(out)]
+    except ValueError:
+        return []
+
+
+def resolve_attr(flake: Path, attr_arg: str | None, cfg: dict[str, str]) -> tuple[str, str]:
+    """``(attr, "")`` or ``("", why-not)`` — which system output is this machine.
+
+    **The attribute is not the hostname**, and assuming it is fails silently in
+    the worst possible way: this fleet's `zeus` is `nixosConfigurations.desktop`,
+    so a tool that built `#zeus` would report "no such output" on the one machine
+    it was written for, and a tool that built the wrong host's `#hermes` would
+    hand a person a command that switches their desktop to a laptop's config. So
+    the hostname is only a first guess, checked against the flake's own names, and
+    the fallback is to ask each configuration what hostname it declares.
+
+    That fallback evaluates configurations, which is slow and can fail — an
+    installer image or a VM variant may not evaluate on this machine at all. A
+    failure to evaluate is skipped rather than fatal: it means "not this one" for
+    the purposes of a question about which host we are.
+    """
+    if attr_arg:
+        return attr_arg, ""
+    declared = os.environ.get(ATTR_KEY) or cfg.get(ATTR_KEY)
+    if declared:
+        return declared, ""
+    me = socket.gethostname().split(".", 1)[0]
+    attrs = host_attrs(flake)
+    if not attrs:
+        return "", (f"{flake} declares no nixosConfigurations this can read — name the "
+                    f"output with --host or {ATTR_KEY}")
+    if me in attrs:
+        return me, ""
+    matches = []
+    for attr in attrs:
+        rc, out, _ = nix("eval", f"path:{flake}#nixosConfigurations.{attr}"
+                                 ".config.networking.hostName", "--raw", timeout=300)
+        if rc == 0 and out == me:
+            matches.append(attr)
+    if len(matches) == 1:
+        return matches[0], ""
+    if not matches:
+        return "", (f"none of {flake}'s {len(attrs)} nixosConfigurations declares "
+                    f"hostName {me!r} — name this machine's output with --host or "
+                    f"{ATTR_KEY}")
+    return "", (f"{len(matches)} of {flake}'s outputs declare hostName {me!r} "
+                f"({', '.join(matches)}) — name the one to build with --host, or once and "
+                f"for all with {ATTR_KEY} (programs.quarterback-harness.consumer.attr)")
+
+
+# --------------------------------------------------------------------------- #
+# 4. preparation — on a copy of HEAD, and never on the consumer's working tree
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class Proposal:
+    """A bump that has been prepared AND built, saved for the person who applies it."""
+
+    flake: str
+    attr: str
+    input: str
+    old_rev: str
+    new_rev: str
+    out_path: str
+    base_lock_sha: str
+    new_lock_sha: str
+    prepared: float
+    prepared_by: str
+    drift: dict
+    #: The consumer's HEAD when this was built. What was proven is THAT commit
+    #: plus one moved input, so a consumer who commits afterwards has a system
+    #: nothing here has built, and `--apply` refuses rather than switch onto it.
+    base_head: str = ""
+    #: Tracked files that were modified in the consumer when this was built,
+    #: `flake.lock` aside. They were NOT part of what was built — preparation
+    #: reads HEAD — but `nixos-rebuild --flake <dir>` builds the working tree, so
+    #: a switch WILL include them. Recorded so the person switching is told.
+    dirty: list = field(default_factory=list)
+
+    @property
+    def moved(self) -> bool:
+        return self.old_rev != self.new_rev
+
+
+def export_head(flake: Path, into: Path) -> str:
+    """Unpack `git archive HEAD` of `flake` into `into`. ``""`` on success.
+
+    HEAD and not the working tree, and this is the safety property the whole file
+    rests on: the consumer's uncommitted work — a half-written module, a secret
+    being edited — can neither be built here nor swept into anything. What gets
+    proposed is "the committed consumer, with one input moved", which is the only
+    change this tool is entitled to have an opinion about.
+    """
+    p = subprocess.run(["git", "-C", str(flake), "archive", "--format=tar", "HEAD"],
+                       capture_output=True, timeout=120)
+    if p.returncode != 0:
+        return f"git archive failed in {flake}: {p.stderr.decode(errors='replace').strip()}"
+    with tarfile.open(fileobj=io.BytesIO(p.stdout), mode="r|") as tar:
+        tar.extractall(into, filter="data")
+    return ""
+
+
+def head_of(flake: Path) -> str:
+    rc, out, _ = run(["git", "-C", str(flake), "rev-parse", "HEAD"])
+    return out if rc == 0 else ""
+
+
+def dirty_tracked(flake: Path) -> list[str]:
+    """Tracked files modified in the consumer, `flake.lock` aside.
+
+    `flake.lock` is excluded because it is the one file this change is ABOUT and
+    :func:`lock_is_committed` has already refused if it was dirty for any other
+    reason.
+
+    `diff --name-only` rather than `status --porcelain`: the porcelain format puts
+    two status characters before the path, and this file's `run` strips the output
+    — which ate the leading space of the first line and with it the first letter of
+    the first filename. Names, not statuses, is what a caller wants anyway.
+    """
+    rc, out, _ = run(["git", "-C", str(flake), "diff", "--name-only", "HEAD"])
+    if rc != 0:
+        return []
+    return [n for n in (line.strip() for line in out.splitlines()) if n and n != "flake.lock"]
+
+
+def lock_is_committed(flake: Path) -> str:
+    """``""`` if the consumer's `flake.lock` is what HEAD says, else why that matters.
+
+    The preparation builds `HEAD` plus one moved input, and `--apply` writes that
+    result over the file in the working tree. If those two locks already differ,
+    the consumer has an uncommitted lock change of their own — a nixpkgs bump they
+    were part-way through — and applying would silently discard it. Reading it
+    instead is not the alternative: this file's whole safety property is that it
+    does not build somebody's uncommitted work.
+
+    So it stops and says so, which costs a `git commit` or a `git checkout` and is
+    the only outcome that neither loses their change nor builds a tree nobody
+    wrote.
+    """
+    rc, _, _ = run(["git", "-C", str(flake), "diff", "--quiet", "HEAD", "--", "flake.lock"])
+    if rc == 0:
+        return ""
+    return (f"{flake}/flake.lock has uncommitted changes. This prepares against HEAD, so "
+            "applying the result would discard them — commit or revert that file first")
+
+
+def prepare(consumer: Consumer, attr: str, script: str,
+            drift: Drift) -> tuple[Proposal | None, str, str]:
+    """Update the pin, build the system, and keep what a person needs to switch.
+
+    Returns ``(proposal, build log, why-there-is-none)``. A build that fails
+    returns no proposal AND its log, because the log is the whole value of the
+    refusal — "it does not build" without the error is a dead end, and this is
+    exactly where the `home.file` collision of 2026-08-22 showed up.
+
+    `path:` on every flakeref, and it is not decoration. Given a bare directory
+    nix walks UPWARDS looking for a git repository to treat as the flake's source,
+    and on a machine where that walk finds something unexpected the build fails
+    with `error: opening Git repository "/tmp"` — an error about the temporary
+    directory this file chose, reported as if it were about the consumer. `path:`
+    says "this directory, as it is", which is what has just been unpacked.
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="qb-bump-"))
+    try:
+        base_lock = (consumer.flake / "flake.lock").read_text(encoding="utf-8")
+        why = export_head(consumer.flake, tmp)
+        if why:
+            return None, "", why
+        rc, out, err = nix("flake", "update", consumer.input, "--flake", f"path:{tmp}",
+                           timeout=UPDATE_TIMEOUT)
+        if rc != 0:
+            return None, "", f"`nix flake update {consumer.input}` failed: {tail(err, 8)}"
+        new_lock = (tmp / "flake.lock").read_text(encoding="utf-8")
+        try:
+            new_rev = str(json.loads(new_lock)["nodes"][consumer.node]["locked"]["rev"])
+        except (ValueError, KeyError, TypeError):
+            return None, "", "the updated lock has no rev for the input that was updated"
+        rc, out, err = nix("build", f"path:{tmp}#nixosConfigurations.{attr}"
+                                    ".config.system.build.toplevel",
+                           "--no-link", "--print-out-paths", timeout=BUILD_TIMEOUT)
+        log = err or out
+        if rc != 0:
+            save_refusal(new_rev, log)
+            return None, log, (f"the bumped flake does not build "
+                               f"(nix build exited {rc}) — not proposing it")
+        proposal = Proposal(
+            base_head=head_of(consumer.flake), dirty=dirty_tracked(consumer.flake),
+            flake=str(consumer.flake), attr=attr, input=consumer.input,
+            old_rev=consumer.rev, new_rev=new_rev, out_path=out.splitlines()[-1] if out else "",
+            base_lock_sha=sha(base_lock), new_lock_sha=sha(new_lock),
+            prepared=time.time(), prepared_by=invocation(script),
+            drift={"detail": drift.detail, "missing": drift.missing, "differ": drift.differ})
+        save(proposal, new_lock, log)
+        return proposal, log, ""
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def save(proposal: Proposal, lock_text: str, log: str) -> None:
+    """Write the proposal, the lock it proposes and the build's output to the cache."""
+    CACHE.mkdir(parents=True, exist_ok=True)
+    (CACHE / "flake.lock").write_text(lock_text, encoding="utf-8")
+    (CACHE / "build.log").write_text(log, encoding="utf-8")
+    (CACHE / "proposal.json").write_text(json.dumps(asdict(proposal), indent=2),
+                                         encoding="utf-8")
+
+
+def save_refusal(rev: str, log: str) -> None:
+    """Record that a bump to `rev` was refused, beside whatever is cached.
+
+    The cache is not cleared, and that is the decision rather than an oversight.
+    An earlier proposal that DID build is still worth applying — it carries the
+    machine most of the way and it was proven — so throwing it away would answer a
+    refusal by leaving the person with nothing. What must not happen is applying
+    it silently after being told today's bump is broken, which is why `--apply`
+    reads this file and says so first.
+    """
+    try:
+        CACHE.mkdir(parents=True, exist_ok=True)
+        (CACHE / "refused.json").write_text(
+            json.dumps({"rev": rev, "at": time.time(), "log": tail(log, 8)}, indent=2),
+            encoding="utf-8")
+    except OSError:
+        pass
+
+
+def load_refusal() -> dict | None:
+    try:
+        got = json.loads((CACHE / "refused.json").read_text(encoding="utf-8"))
+        return got if isinstance(got, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def load() -> Proposal | None:
+    try:
+        raw = json.loads((CACHE / "proposal.json").read_text(encoding="utf-8"))
+        return Proposal(**raw)
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def invocation(script: str) -> str:
+    """How to type this command again — the name if it is on PATH, else the full path.
+
+    Bootstrapping, and it is not hypothetical: the harness that carries `qb-bump`
+    is by definition the one that is NOT installed on the host it is diagnosing,
+    so on the first run there is no `qb-bump` on PATH and a report that says
+    `qb-bump --apply` gives the reader a `command not found`. When the name
+    resolves to this very file it is used, because a short command is easier to
+    trust; otherwise the report prints the path that just worked.
+    """
+    me = Path(os.path.realpath(script))
+    on_path = shutil.which(me.name)
+    if on_path and Path(os.path.realpath(on_path)) == me:
+        return me.name
+    return str(me)
+
+
+# --------------------------------------------------------------------------- #
+# 5. the escalation — through #274's door, in #279's vocabulary
+# --------------------------------------------------------------------------- #
+
+def loops_dir(script: str) -> Path | None:
+    """`harness/loops`, in the two layouts there are — a checkout and the package.
+
+    The same two-place lookup `qb-hooks` does for `githooks/`, and for the same
+    reason: `bin/` and `share/quarterback-harness/loops` are siblings in the store
+    output, and `bin/` and `loops/` are siblings in a checkout.
+    """
+    here = Path(os.path.realpath(script)).parent
+    for cand in (os.environ.get("QB_LOOPS_DIR"),
+                 here.parent / "loops",
+                 here.parent / "share" / "quarterback-harness" / "loops"):
+        if cand and Path(cand, "needs_human.py").is_file():
+            return Path(cand)
+    return None
+
+
+def escalate(script: str, *, summary: str, reason: str, detail: str, repo: str,
+             key_parts: list[str]) -> str:
+    """Tell the board a human has to finish this — through `needs_human.announce`.
+
+    Not a `board_post` written here, and not a print. #274 landed one door for
+    "a human must do this" and #279 the vocabulary it speaks; a second spelling of
+    the same escalation is how a fleet ends up with two places to look and a
+    person watching neither. The class is `environment`: nothing about this needs
+    taste or a design decision, it needs root on a particular machine.
+
+    Never raises and never blocks. An unannounced escalation is still an
+    escalation — it is printed either way, and the return value says which.
+    """
+    where = loops_dir(script)
+    if where is None:
+        return ("needs-human NOT announced: no harness/loops beside this script, so "
+                "#274's door is not reachable from here")
+    sys.path.insert(0, str(where))
+    try:
+        import needs_human  # noqa: PLC0415 — resolved at call time, by design
+    except Exception as exc:  # noqa: BLE001 — an escalation must survive its own courier
+        return f"needs-human NOT announced: {type(exc).__name__} importing needs_human"
+    return needs_human.announce(
+        cls=NEEDS_HUMAN_CLASS, reason=reason, summary=summary, detail=detail, repo=repo,
+        key=needs_human.digest(*key_parts),
+        refs=[{"kind": "issue", "value": "267", "repo": repo}])
+
+
+# --------------------------------------------------------------------------- #
+# 6. --apply — the one command, run by the person who has the sudo
+# --------------------------------------------------------------------------- #
+
+def switch_command(proposal: Proposal) -> list[str]:
+    return ["sudo", "nixos-rebuild", "switch", "--flake",
+            f"{proposal.flake}#{proposal.attr}"]
+
+
+def apply(proposal: Proposal | None, dry_run: bool) -> int:
+    """Install the prepared lock into the consumer and hand the terminal to `sudo`.
+
+    Every refusal here is about applying something OTHER than what was built. The
+    lock is compared against the one that was in place when the proposal was
+    prepared: if the consumer's lock has moved since, the build that was proven is
+    a build of a tree that no longer exists, and re-preparing costs a few minutes
+    against the alternative of switching a machine onto something nobody built.
+
+    **A terminal is required, and that is the point of the whole file.** `sudo`
+    with no tty either fails or, worse, succeeds from a cached credential in some
+    other session — an agent switching a live machine because a person happened to
+    have authenticated ten minutes ago. So this refuses without one and prints the
+    command instead, which is the correct outcome for every non-human caller.
+    """
+    if proposal is None:
+        print("qb-bump: no prepared bump to apply — run `qb-bump` first", file=sys.stderr)
+        return 3
+    flake = Path(proposal.flake)
+    lock = flake / "flake.lock"
+    try:
+        current = lock.read_text(encoding="utf-8")
+    except OSError as exc:
+        print(f"qb-bump: cannot read {lock}: {exc}", file=sys.stderr)
+        return 3
+    try:
+        fresh = (CACHE / "flake.lock").read_text(encoding="utf-8")
+    except OSError:
+        print(f"qb-bump: {CACHE / 'flake.lock'} is gone, so the lock this proposal names "
+              "cannot be installed. Re-run `qb-bump`.", file=sys.stderr)
+        return 3
+    if sha(fresh) != proposal.new_lock_sha:
+        # The cached lock is not the one this proposal was built from — a second
+        # qb-bump wrote the cache between the build and this call, or a write was
+        # interrupted. Installing it would switch onto a lock nothing here built,
+        # which is the one thing this file exists to prevent.
+        print(f"qb-bump: the cached lock is not the one this proposal was built from "
+              "(another run wrote it, or a write was interrupted). Re-run `qb-bump`.",
+              file=sys.stderr)
+        return 3
+    now = head_of(Path(proposal.flake))
+    if proposal.base_head and now and now != proposal.base_head:
+        print(f"qb-bump: {proposal.flake} has committed {proposal.base_head[:12]} -> "
+              f"{now[:12]} since this bump was built, so the system that was proven is not "
+              "the one a switch would build now. Re-run `qb-bump`.", file=sys.stderr)
+        return 3
+    refusal = load_refusal()
+    if refusal and refusal.get("at", 0) > proposal.prepared:
+        print(f"note: a later bump (to {str(refusal.get('rev', ''))[:12]}) was refused "
+              "because it does not build. This applies the earlier one, which does.")
+    already = sha(current) == proposal.new_lock_sha
+    if not already and sha(current) != proposal.base_lock_sha:
+        print(f"qb-bump: {lock} has changed since this bump was prepared — the build that "
+              "was proven is not a build of this tree any more. Re-run `qb-bump`.",
+              file=sys.stderr)
+        return 3
+    cmd = switch_command(proposal)
+    if dry_run:
+        print(f"would write {lock} ({proposal.input} -> {proposal.new_rev[:12]})"
+              if not already else f"{lock} already carries {proposal.new_rev[:12]}")
+        print(" ".join(cmd))
+        return 0
+    if not sys.stdin.isatty():
+        print("qb-bump: --apply needs a terminal, because the next thing it does is ask "
+              "for a password. Nothing has been changed. Run this yourself:\n"
+              f"  {proposal.prepared_by} --apply", file=sys.stderr)
+        return 3
+    if not already:
+        lock.write_text(fresh, encoding="utf-8")
+        print(f"wrote {lock}: {proposal.input} {proposal.old_rev[:12]} -> "
+              f"{proposal.new_rev[:12]}")
+        print("(that file is the ONLY thing this wrote; committing it is yours)")
+    if proposal.dirty:
+        # `nixos-rebuild --flake <dir>` builds the WORKING TREE; this built HEAD.
+        # Said rather than refused: an uncommitted module is a normal state for a
+        # person's own flake, and refusing here would make the tool useless on the
+        # machine it was written for. What it must not do is let somebody believe
+        # the switch ahead of them is the one that was proven.
+        print(f"note: {len(proposal.dirty)} modified file(s) in {proposal.flake} "
+              f"({', '.join(proposal.dirty[:3])}) were NOT part of what was built — the "
+              "switch below builds your working tree, so it includes them.")
+    print(" ".join(cmd))
+    os.execvp("sudo", cmd)
+    return 0  # unreachable; execvp does not return
+
+
+# --------------------------------------------------------------------------- #
+# 7. the report
+# --------------------------------------------------------------------------- #
+
+def render_proposal(proposal: Proposal, drift: Drift, consumer: Consumer,
+                    announced: str) -> str:
+    n = len(drift.missing) + len(drift.differ)
+    lines = [
+        f"stale: {drift.detail}",
+        "",
+        f"consumer   {consumer.flake} ({consumer.found_by})",
+        f"input      {proposal.input}",
+    ]
+    if proposal.moved:
+        lines.append(f"pin        {proposal.old_rev[:12]} -> {proposal.new_rev[:12]}")
+    else:
+        lines.append(f"pin        {proposal.new_rev[:12]} already — this machine has not "
+                     "been rebuilt onto its own pin")
+    lines += [
+        f"built      {proposal.attr}: {proposal.out_path or 'ok'}",
+        "",
+        f"{n} script{'s' if n != 1 else ''} arrive on PATH when a person runs:",
+        f"  {proposal.prepared_by} --apply",
+        "",
+        "That writes the prepared flake.lock into the consumer and runs "
+        "`nixos-rebuild switch`, which needs a password; nothing above it did.",
+    ]
+    if announced:
+        lines += ["", announced]
+    return "\n".join(lines)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="qb-bump",
+        description="Carry a landed harness change onto this machine: prepare the consuming "
+                    "flake's bump, build it, and hand a person one command (#267).")
+    parser.add_argument("--repo", metavar="DIR",
+                        help="the quarterback checkout the harness is compared against "
+                             "(default: the cwd's)")
+    parser.add_argument("--flake", metavar="DIR",
+                        help="the consuming flake (default: $" + FLAKE_KEY + ", the site "
+                             "config, then a scan)")
+    parser.add_argument("--host", metavar="ATTR", dest="attr",
+                        help="the nixosConfigurations output that IS this machine "
+                             "(default: matched by hostName)")
+    parser.add_argument("--apply", action="store_true",
+                        help="what a person runs: install the prepared lock and switch")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="with --apply, print what it would do and change nothing")
+    parser.add_argument("--json", action="store_true", dest="as_json",
+                        help="the outcome as a document")
+    parser.add_argument("--no-announce", action="store_true",
+                        help="do not post the escalation to the board")
+    args = parser.parse_args(argv)
+
+    if args.dry_run and not args.apply:
+        print("qb-bump: --dry-run is about --apply; preparing a bump changes nothing on "
+              "this machine anyway, which is the point of it", file=sys.stderr)
+        return 3
+    if args.apply:
+        return apply(load(), args.dry_run)
+
+    script = __file__
+    repo = Path(args.repo).expanduser() if args.repo else Path.cwd()
+    out: dict = {"outcome": "", "detail": ""}
+
+    drift, why = harness_drift(repo, script)
+    if drift is None:
+        return report(args, {"outcome": "unknown", "detail": why}, 1)
+    out["drift"] = {"verdict": drift.verdict, "detail": drift.detail,
+                    "missing": drift.missing, "differ": drift.differ}
+    if not drift.stale:
+        return report(args, {**out, "outcome": "current",
+                             "detail": f"nothing to carry: {drift.detail}"}, 0)
+
+    if not have_nix():
+        return report(args, {**out, "outcome": "unknown",
+                             "detail": "no nix on this host, and a flake bump is the only "
+                                       "thing this knows how to prepare"}, 1)
+    slug = repo_slug(repo)
+    if not slug:
+        return report(args, {**out, "outcome": "unknown",
+                             "detail": f"{repo} has no origin remote, so nothing here knows "
+                                       "which repository a consumer would be pinning"}, 1)
+    cfg = site_config()
+    consumer, why = resolve_consumer(args.flake, cfg, slug)
+    if consumer is None:
+        return report(args, {**out, "outcome": "unknown", "detail": why}, 1)
+    out["consumer"] = {"flake": str(consumer.flake), "input": consumer.input,
+                       "found_by": consumer.found_by}
+
+    why = lock_is_committed(consumer.flake)
+    if why:
+        return report(args, {**out, "outcome": "unknown", "detail": why}, 1)
+
+    attr, why = resolve_attr(consumer.flake, args.attr, cfg)
+    if not attr:
+        return report(args, {**out, "outcome": "unknown", "detail": why}, 1)
+    out["attr"] = attr
+
+    proposal, log, why = prepare(consumer, attr, script, drift)
+    if proposal is None:
+        detail = why
+        announced = "" if args.no_announce else escalate(
+            script,
+            summary=f"the flake bump for {consumer.flake.name} does not build — "
+                    "this machine cannot take today's harness",
+            reason=("bumping the quarterback input and building this machine's system fails, "
+                    "so proposing the bump would propose breaking the machine; only a person "
+                    "can decide what gives"),
+            detail=f"{why}\n\n{tail(log)}", repo=slug,
+            key_parts=["qb-bump", "build-failed", str(consumer.flake), attr,
+                       sha(tail(log, 5))])
+        text = "\n".join([detail, "", tail(log)] + ([announced] if announced else []))
+        return report(args, {**out, "outcome": "refused", "detail": detail,
+                             "log": tail(log), "announced": announced}, 4, text=text)
+
+    me = socket.gethostname().split(".", 1)[0]
+    n = len(drift.missing) + len(drift.differ)
+    announced = "" if args.no_announce else escalate(
+        script,
+        summary=(f"{n} harness scripts are not on {me}: a built bump is waiting"
+                 if proposal.moved else
+                 f"{n} harness scripts are not on {me}: the pin already names them and "
+                 "this machine has not been rebuilt onto it"),
+        reason=("a nixos-rebuild switch needs root and no agent has it; the bump is prepared "
+                "and has been built, so what is left is one command by a person"),
+        detail="\n".join([
+            drift.detail,
+            f"consumer: {consumer.flake} (input {consumer.input})",
+            f"pin:      {proposal.old_rev[:12]} -> {proposal.new_rev[:12]}",
+            f"built:    {attr} -> {proposal.out_path}",
+            "",
+            f"run: {proposal.prepared_by} --apply",
+        ]), repo=slug,
+        key_parts=["qb-bump", "prepared", str(consumer.flake), attr, proposal.new_rev])
+    out.update({"outcome": "prepared", "proposal": asdict(proposal), "announced": announced,
+                "detail": f"a bump to {proposal.new_rev[:12]} is built and waiting for "
+                          f"`{proposal.prepared_by} --apply`"})
+    return report(args, out, 2, text=render_proposal(proposal, drift, consumer, announced))
+
+
+def report(args, out: dict, code: int, text: str | None = None) -> int:
+    """One place decides stdout, so `--json` is a document and never a document plus prose."""
+    if args.as_json:
+        print(json.dumps({**out, "exit_code": code}, indent=2))
+    else:
+        stream = sys.stdout if code in (0, 2) else sys.stderr
+        print(text if text is not None else f"qb-bump: {out.get('detail', '')}", file=stream)
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
