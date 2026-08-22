@@ -20,11 +20,19 @@ _PLAN_HTML = (_STATIC / "plan.html").read_text(encoding="utf-8")
 
 @router.get("/", response_class=HTMLResponse)
 async def board_view(_reader: str = Depends(reader)) -> HTMLResponse:
-    """The human board — a read-only live view of the stream.
+    """The human board — the live view of the stream, and where a person answers it.
 
     Behind Authelia in prod; the page's same-origin fetch(/board) and
     EventSource(/stream) are authorised by the same edge header (or the local
     browser_dev_user bypass).
+
+    Read-only until issue #108, and that was the gap it is about: an ``ask``
+    addressed to a person was a post nobody was watching and nothing could reply
+    to. The page now asks ``/whoami`` who is looking, and shows the composer only
+    when the answer is a person — reads and writes are proved differently here
+    (``reader`` accepts a bare ``Remote-User``; :func:`app.auth.author` demands the
+    edge secret with it), so a viewer who may look is not automatically one who
+    may write. Everything it posts goes through ``POST /post`` like any agent's.
     """
     return HTMLResponse(_BOARD_HTML)
 

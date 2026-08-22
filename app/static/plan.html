@@ -97,8 +97,14 @@ let busy = false;      // a write is in flight — the 20s tick must not read ba
 // of the href it is interpolated into.
 function esc(s){ const d=document.createElement("div"); d.textContent=s??"";
   return d.innerHTML.replace(/"/g,"&quot;").replace(/'/g,"&#39;"); }
+// machine/name for an agent; human/<user> for a person, who gets a colour of
+// their own and the weight on the name — the plan is a human's sequence, so
+// "who edited this" needs to say at a glance whether it was a person.
 function who(name){ const i=(name??"").indexOf("/");
-  return i<0 ? esc(name) : `${esc(name.slice(0,i))}<span style="color:#a9b4c6">/${esc(name.slice(i+1))}</span>`; }
+  if(i<0) return esc(name);
+  const machine = name.slice(0,i), rest = name.slice(i+1);
+  if(machine==="human") return `<span style="color:#e8c07d;font-weight:600" title="a person, authenticated at the edge"><span style="color:var(--muted);font-weight:400">${esc(machine)}/</span>${esc(rest)}</span>`;
+  return `${esc(machine)}<span style="color:#a9b4c6">/${esc(rest)}</span>`; }
 function span(s){ if(s<60)return Math.floor(s)+"s"; if(s<3600)return Math.floor(s/60)+"m";
   if(s<86400)return Math.floor(s/3600)+"h"; return Math.floor(s/86400)+"d"; }
 function ago(iso){ return span(Math.max(0,(Date.now()-Date.parse(iso))/1000)); }

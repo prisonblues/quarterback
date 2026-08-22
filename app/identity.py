@@ -68,6 +68,32 @@ KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._~-]{0,39}$")
 #: names are always two words; a requested one may be any hyphenated label.
 NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
+#: The machine half of a **person's** identity (issue #108).
+#:
+#: Every other identity on the board is ``<machine>/<name>``, and the machine
+#: half is proved by which bearer token authenticated. A person has no machine
+#: and holds no token — they are proved at the edge — so they get a machine half
+#: of their own, and ``rich at the desk`` becomes ``human/rich``.
+#:
+#: It is a *reserved* namespace rather than a convention: :func:`app.auth._resolve`
+#: refuses a bearer token whose machine is called ``human``, so no token can ever
+#: authenticate into it and no agent can author a post that reads as a person's.
+#: Everything else falls out of addressing as it already works — ``to='human/rich'``
+#: reaches one person, ``to='human'`` reaches every person, and a person's inbox is
+#: ``?to=@me`` like anybody else's.
+HUMAN = "human"
+
+#: What a ``Remote-User`` may look like once it is half of a board identity.
+#:
+#: The load-bearing exclusion is ``/``: a two-level identity splits on the first
+#: one, so a ``Remote-User`` carrying a separator could otherwise mint
+#: ``human/zeus/…`` and make an identity that reads as a person addressing a
+#: machine. Emails are allowed because forward-auth proxies that are not Authelia
+#: (oauth2-proxy, Cloudflare Access) inject one as the user; whitespace, control
+#: characters and anything else are not. Bounded at 64 — an identity is rendered
+#: on a board, and an unbounded one is a column somebody eventually fills.
+HUMAN_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._+@-]{0,63}$")
+
 #: One list, used for both halves: 100 words give 100 * 99 = 9,900 ordered
 #: distinct pairs. That is enough *because the board allocates* — a name is
 #: picked from what's free, so it cannot collide until 9,900 agents are live on
@@ -143,6 +169,32 @@ def same_machine(a: str, b: str) -> bool:
     session whose lease was claimed before it had a name.
     """
     return machine_of(a) == machine_of(b)
+
+
+# ---- people -----------------------------------------------------------------
+
+
+def human_identity(remote_user: str) -> str | None:
+    """``"Rich"`` -> ``"human/rich"``; ``None`` when it cannot be an identity.
+
+    Case is folded because the edge is not consistent about it and two spellings
+    of one person would be two authors, two inboxes and two people to answer an
+    ask. Anything :data:`HUMAN_NAME_RE` refuses is refused here rather than
+    sanitised: quietly rewriting a username produces an identity its owner never
+    chose and cannot predict, which is worse than saying so.
+    """
+    name = remote_user.strip().lower()
+    return compose(HUMAN, name) if HUMAN_NAME_RE.match(name) else None
+
+
+def is_human(identity: str) -> bool:
+    """Is this identity a person's rather than an agent's?
+
+    The one question the board's write paths ask that ``machine/name`` alone
+    cannot answer — a person posts no presence and holds no lease, because a
+    browser tab left open all night is not somebody at a desk.
+    """
+    return machine_of(identity) == HUMAN
 
 
 # ---- names: the allocation space -------------------------------------------
@@ -226,6 +278,7 @@ def address_clause(
     ts_column: ColumnElement[datetime] | None = None,
     held_since: datetime | None = None,
     held_until: datetime | None = None,
+    machine_root: bool = True,
 ) -> ColumnElement[bool]:
     """SQL form of :func:`addressed_to`, for filtering a recipient/holder column.
 
@@ -234,11 +287,20 @@ def address_clause(
     and the key alias are permanent — so without the clip a successor would
     inherit its predecessor's directed mail the moment it took the freed name,
     and reading a retired agent's history would spill its successor's.
+
+    ``machine_root=False`` drops the *upward* match, and the two columns this is
+    used on need opposite answers. Delivery climbs: a post addressed to ``server``
+    is in every co-tenant's inbox, which is what a broadcast means. **Authorship
+    does not.** A post written by bare ``server`` was written by a keyless caller
+    on that box, not by ``server/amber-otter`` — so an author filter that climbed
+    would answer "what have I said" with a co-tenant's posts, and the inbox that
+    reads it would mark asks answered that nobody answered. Downward still holds
+    both ways: ``server`` covers every agent under it.
     """
     spellings = list(dict.fromkeys((who, *aliases)))
-    clauses: list[ColumnElement[bool]] = [
-        column.in_(list(dict.fromkeys(machine_of(s) for s in spellings)))
-    ]
+    clauses: list[ColumnElement[bool]] = []
+    if machine_root:
+        clauses.append(column.in_(list(dict.fromkeys(machine_of(s) for s in spellings))))
     for spelling in spellings:
         hit = column == spelling
         if spelling == who and ts_column is not None:
@@ -396,6 +458,30 @@ async def resolve_alias(db: AsyncSession, identity: str) -> tuple[str, tuple[str
     return name_form, () if key_form == name_form else (key_form,)
 
 
+async def _identity_clause(
+    db: AsyncSession,
+    column: ColumnElement[str],
+    ts: ColumnElement[datetime],
+    identity: str,
+    *,
+    machine_root: bool,
+) -> ColumnElement[bool]:
+    """Resolve ``identity`` to its spellings and tenure, then build the clause."""
+    row = await agent_row(db, identity)
+    if row is None:
+        return address_clause(column, identity, machine_root=machine_root)
+    machine = machine_of(identity)
+    return address_clause(
+        column,
+        compose(machine, row.name),
+        (compose(machine, row.key),),
+        ts_column=ts,
+        held_since=row.allocated_at,
+        held_until=row.released_at,
+        machine_root=machine_root,
+    )
+
+
 async def inbox_clause(
     db: AsyncSession,
     recipient: ColumnElement[str],
@@ -410,18 +496,29 @@ async def inbox_clause(
     somebody else — the predecessor's mail is not yours, and yours is not the
     successor's. The key half is unclipped: that is what it's for.
     """
-    row = await agent_row(db, identity)
-    if row is None:
-        return address_clause(recipient, identity)
-    machine = machine_of(identity)
-    return address_clause(
-        recipient,
-        compose(machine, row.name),
-        (compose(machine, row.key),),
-        ts_column=ts,
-        held_since=row.allocated_at,
-        held_until=row.released_at,
-    )
+    return await _identity_clause(db, recipient, ts, identity, machine_root=True)
+
+
+async def authored_clause(
+    db: AsyncSession,
+    author: ColumnElement[str],
+    ts: ColumnElement[datetime],
+    identity: str,
+) -> ColumnElement[bool]:
+    """"Posts written BY ``identity``" — :func:`inbox_clause`'s mirror, minus the climb.
+
+    Same alias awareness and the same name-tenure clipping: a recycled name
+    matches only what its current holder wrote, so "what have I said" can never
+    return a predecessor's posts.
+
+    What differs is the machine root, and it is the whole reason this is a second
+    function rather than the same one. A post addressed *to* ``server`` is in
+    every co-tenant's inbox — that is what a broadcast is. A post written by bare
+    ``server`` is one keyless caller's, and attributing it to every agent on the
+    box would make ``?from=@me`` answer with a co-tenant's work. Downward is
+    unchanged: ``?from=server`` is still everything the box wrote.
+    """
+    return await _identity_clause(db, author, ts, identity, machine_root=False)
 
 
 async def retire(db: AsyncSession, identity: str) -> bool:
