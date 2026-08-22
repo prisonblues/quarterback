@@ -188,6 +188,17 @@ def policy_path() -> Path | None:
     itself the permission. That is the exact party this exists to exclude,
     reached by a variable being absent rather than by one being set. A machine
     with no config home has not opted in to anything.
+
+    **And None rather than `expanduser("~")`, which is what every neighbour does
+    here** — `qbdata.resolve_config`, `mcp.board.config.config_path` (whose
+    comment names this same trap) and `harness_rules` all fall back to the passwd
+    entry, and they are right to. The difference is what the file IS. Theirs
+    answer "where is my board token", where failing to find it means the tool
+    cannot work, so reaching past a missing `$HOME` to the real home is the
+    helpful answer. This one answers "may I start an agent", where failing to
+    find it means the tool must not ACT — and "I cannot name a config home" is a
+    perfectly good no. In practice nothing reaches it: a user systemd unit sets
+    `$HOME`, and so does every shell.
     """
     base = os.environ.get("XDG_CONFIG_HOME") or (
         os.path.join(home, ".config") if (home := os.environ.get("HOME")) else "")
