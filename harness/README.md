@@ -1506,8 +1506,10 @@ Copy the closest template from `templates/` and edit `project`:
 
 `worktree.example.json` documents every key in one annotated file; quarterback's own
 `.worktree.json` (repo root) is the live worked example of the middle row. `templates/` also
-holds `dbtarget.py`, the test-suite half of database isolation — see the prerequisites below,
-because a `.worktree.json` alone does not get you there.
+holds two test files, which are not about worktrees at all: `dbtarget.py`, the test-suite half
+of database isolation — see the prerequisites below, because a `.worktree.json` alone does not
+get you there — and `test_migrations_self_contained.py`, described after them. Both are run in
+quarterback's own suite and pinned byte-identical to the copy you are given.
 
 Keys the script reads: `project`, `framework`, `base_port`, `app_port`,
 `docker.{enabled,network_pattern,network_default,image_pattern}`,
@@ -1589,6 +1591,48 @@ Not piped into `head`: closing the pipe early hands pytest a SIGPIPE partway thr
 
 `create-worktree` also shouts if any `.env` var still equals the main database name after
 rewriting. If you see that warning, stop — a migration would hit shared data.
+
+### A migration must not import your application
+
+`templates/test_migrations_self_contained.py` is the second shipped test file, and it is
+about a different accident from `dbtarget.py`. Drop it into your `tests/` and adjust the four
+constants at the top; it needs no database, no app import and no fixtures, so it runs in
+whatever your fast suite is.
+
+**A migration is a frozen artefact; live app code is not.** A migration runs at a fixed point
+in schema history, but anything imported from your application package is whatever that
+package says today. The sharpest form is an ORM model — an ORM SELECT or INSERT names *every*
+mapped column, so the day a later migration adds a column, an older migration starts emitting
+SQL for a column that does not exist yet at that point in the chain, and the replay aborts on
+`UndefinedColumn`.
+
+It hides, which is why a guard is worth the file. Applied revisions never re-run, so it is
+invisible on every database that is already past the offending migration — every developer's,
+and production's. It detonates on a **fresh replay**: a new worktree, a CI database built
+from empty, a disaster-recovery rebuild, or an instance still behind that revision when the
+new-column code deploys.
+
+The guard is an **allowlist** — the standard library plus `alembic`/`sqlalchemy` — and not a
+denylist of your app package, because every first-party package carries the identical hazard
+and so does any third-party library whose next release changes what a frozen migration does.
+It covers both import spellings, at module level and inside a function, and constant-string
+`importlib.import_module`/`__import__`, which walk straight through a scan that only looks at
+`Import` nodes. Its own negative tests ship with it: a guard nobody has watched fail is not a
+guard.
+
+**Adopt it while it is green.** On a repo whose migrations are already self-contained it
+costs nothing and every migration written afterwards is one that cannot acquire the problem.
+Adopt it late and you owe yourself an audit first. If you find a migration that genuinely
+must import something, `EXEMPT_MODULES` pins the **exact** import statements one file may
+make — so an exempt migration cannot quietly grow an ORM import, and an exemption that is no
+longer used fails the guard rather than rotting into a permanent hole.
+
+The other half of the pair does not ship. quarterback's `tests/test_migration_drift.py`
+replays every migration into a throwaway database and diffs the result against its models —
+that is what *detects* an app-importing migration, where the guard above *prevents* one — but
+it needs a live database, your models' import path and your project's alembic invocation, so
+a template of it would be wrong for most repos in at least two of those three. Copy the
+shape from that file rather than expecting a drop-in.
 
 ---
 
