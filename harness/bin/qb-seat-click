@@ -169,6 +169,42 @@ reflow() {
   [ -z "$dash" ] || tmux resize-pane -t "$dash" -x "$was" || true
 }
 
+# TELL THE BOARD BEFORE THE PANE GOES (#277). A `kill-pane` SIGHUPs the agent,
+# and Claude Code's SessionEnd hook is not documented to survive that — so a ✕
+# used to leave the board holding a live lease and every claim that session had
+# taken, for the rest of their TTL. Nothing was wrong with the pane; it just was
+# not there any more, and an expired lease cannot say that: "nobody renewed" is
+# the same row as an agent thinking hard for half an hour.
+#
+# The pane knows which session it holds because `qb-hook` stamps it at
+# SessionStart. That stamp is the thing #266 records as missing — "nothing stamps
+# a pane with its session id, so a plain local session is not locatable at all" —
+# and it is what makes a fleet view able to act on a row rather than only describe
+# it.
+#
+# BEST EFFORT, ALWAYS. A ✕ closes the pane whether or not the board hears about
+# it: no stamp, no qb-end, no board, a refusal — every one of those falls through
+# to the kill below. `timeout` bounds the wait, because the alternative to a
+# button that reports nothing is a button that hangs for half a minute on a board
+# that is down, and of those two the silent one is right.
+end_agent() {   # end_agent <pane id> — best effort, never fails, never blocks long
+  local sess bin
+  sess=$(tmux show-options -p -t "$1" -v @qb_session 2>/dev/null) || sess=""
+  [ -n "$sess" ] || return 0
+  # PATH first so an installed copy beats a checkout, then this script's own
+  # directory — the same order and the same reason as qb-seats' SELF resolution.
+  # A run-shell from a mouse binding inherits the tmux SERVER's PATH, which
+  # usually predates anything that put this harness on one.
+  bin=$(command -v qb-end 2>/dev/null) || bin="$(dirname -- "$0")/qb-end"
+  [ -x "$bin" ] || return 0
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 5 "$bin" "$sess" --reason killed --quiet || true
+  else
+    "$bin" "$sess" --reason killed --quiet || true
+  fi
+  return 0
+}
+
 case "$range" in
   seat*)
     n=$(seat_number "${range#seat}") || exit 0
@@ -186,6 +222,7 @@ case "$range" in
     need_sid
     pane=$(seat_pane "$n")
     [ -n "$pane" ] || die "seat $n has no pane"
+    end_agent "$pane"
     tmux kill-pane -t "$pane"
     reflow
     ;;

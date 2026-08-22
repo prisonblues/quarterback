@@ -143,3 +143,37 @@ def test_the_force_escape_is_documented_where_an_agent_reads_it():
     assert "holder" in doc, (
         "the refusal names the item's holder and their session; the docstring has "
         "to say that a refusal is somebody to talk to")
+
+
+# -- end_session (#277) -------------------------------------------------
+#
+# The tool checks the vocabulary before the call for the same reason the claim
+# tools check their arguments: the board's refusal is a 422 the caller reads as
+# "the board is unhappy", where a local one can say what the five words are. And
+# the vocabulary being closed is the point of the field — it is branched on by a
+# dashboard, so a sixth spelling of "finished" reaches a human as an unknown.
+
+
+@pytest.mark.parametrize("reason", ["gave up", "stalled", "crashed", "", "FINISHED"])
+def test_a_reason_outside_the_vocabulary_never_reaches_the_board(reason):
+    """`stalled` and `crashed` are in here deliberately: both are conclusions a
+    reader draws from silence, never reports an agent makes about itself."""
+    with pytest.raises(ToolError) as e:
+        srv.end_session(None, session="sid-1", reason=reason)
+    assert "finished" in str(e.value) and "context_reset" in str(e.value)
+
+
+@pytest.mark.parametrize("reason", list(srv.END_REASONS))
+def test_every_reason_the_tool_advertises_is_one_it_will_send(reason, monkeypatch):
+    """The list in the docstring and the list it enforces are one list. Two would
+    disagree the day somebody adds a sixth to whichever they read first."""
+    sent = {}
+
+    class _Client:
+        def end_session(self, session, why):
+            sent.update(session=session, reason=why)
+            return {"ended": True}
+
+    monkeypatch.setattr(srv, "_get_client", lambda ctx: _Client())
+    assert srv.end_session(None, session="sid-1", reason=reason)["ended"] is True
+    assert sent == {"session": "sid-1", "reason": reason}

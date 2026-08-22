@@ -950,6 +950,86 @@ def test_the_cross_closes_that_seat_and_reflows_the_row(screen):
     assert max(widths) - min(widths) <= 1, f"the row was not reflowed: {widths}"
 
 
+def stub_qb_end(screen, tmp_path, exit_code: int = 0) -> tuple[Path, dict]:
+    """A `qb-end` on PATH that records its arguments. Returns (log, env).
+
+    The ✕ has to tell the board the agent is going BEFORE it kills the pane, and
+    that call is the only part of closing a seat that leaves the machine — so it
+    is stubbed rather than pointed at a board, exactly as the agent itself is.
+    """
+    d = tmp_path / "endbin"
+    d.mkdir(exist_ok=True)
+    log = tmp_path / "qb-end.log"
+    (d / "qb-end").write_text(
+        "#!/bin/sh\n"
+        f'printf "%s\\n" "$*" >> {log}\n'
+        f"exit {exit_code}\n")
+    (d / "qb-end").chmod(0o755)
+    env = {**click_env(screen), "PATH": f"{d}:{screen.env['PATH']}"}
+    return log, env
+
+
+def click_with(env, *args):
+    return subprocess.run([str(BIN / "qb-seat-click"), *args], env=env,
+                          capture_output=True, text=True, timeout=60)
+
+
+def test_the_cross_ends_the_agents_session_before_it_kills_the_pane(screen, tmp_path):
+    """#277. A `kill-pane` SIGHUPs the agent, and Claude Code's SessionEnd hook is
+    not documented to survive that — so the ✕ used to leave the board holding a
+    live lease and every claim that session had taken, for the rest of their TTL.
+    Nothing was wrong with the pane; it just was not there any more, and an
+    expired lease cannot say that.
+
+    The pane knows which session it holds because `qb-hook` stamps it at
+    SessionStart. That stamp is what #266 records as missing — "nothing stamps a
+    pane with its session id, so a plain local session is not locatable at all".
+    """
+    screen("-n", "2")
+    wait_for_log(screen.log, 2)
+    pane = next(p for p, n in panes(screen) if n == "1")
+    screen.tmux("set-option", "-p", "-t", pane, "@qb_session", "sid-of-seat-1")
+
+    log, env = stub_qb_end(screen, tmp_path)
+    assert click_with(env, "kill1", "t").returncode == 0
+
+    assert log.exists(), "the ✕ closed the pane without telling the board"
+    said = log.read_text()
+    assert "sid-of-seat-1" in said
+    # `killed`, because that is what happened: something closed it from outside.
+    # `finished` would say the agent was done, which nobody knows.
+    assert "--reason killed" in said
+    assert sorted(n for _, n in panes(screen) if n) == ["2"]
+
+
+def test_a_pane_with_no_session_stamp_is_closed_all_the_same(screen, tmp_path):
+    """A seat whose agent never reached the board — no hook, no token, an
+    unconfigured host — has no stamp, and a ✕ that refused to close it would make
+    the board a prerequisite for a button that closes a pane."""
+    screen("-n", "2")
+    wait_for_log(screen.log, 2)
+    log, env = stub_qb_end(screen, tmp_path)
+
+    assert click_with(env, "kill1", "t").returncode == 0
+    assert not log.exists(), "qb-end was called for a pane holding no session"
+    assert sorted(n for _, n in panes(screen) if n) == ["2"]
+
+
+def test_a_board_that_refuses_or_is_down_does_not_keep_the_pane_open(screen, tmp_path):
+    """Best effort, always. Of "a button that reports nothing" and "a button that
+    does nothing", the silent one is right — the pane is what the human clicked
+    to close."""
+    screen("-n", "2")
+    wait_for_log(screen.log, 2)
+    pane = next(p for p, n in panes(screen) if n == "1")
+    screen.tmux("set-option", "-p", "-t", pane, "@qb_session", "sid-unreachable")
+
+    log, env = stub_qb_end(screen, tmp_path, exit_code=2)
+    assert click_with(env, "kill1", "t").returncode == 0
+    assert "sid-unreachable" in log.read_text()
+    assert sorted(n for _, n in panes(screen) if n) == ["2"]
+
+
 def test_the_plus_adds_a_seat_and_does_not_reuse_a_closed_number(screen):
     """A recycled seat number is a board bug, not a cosmetic one.
 

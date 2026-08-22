@@ -471,6 +471,57 @@ def release_lease(ctx: Context, lease_id: str) -> dict:
         _raise(e, "release")
 
 
+#: The reasons `end_session` will send. Stated here as well as on the board so a
+#: caller reads the vocabulary in the tool that takes it — and short, because the
+#: board refuses anything outside it with a 422 rather than storing a sixth
+#: spelling of "finished".
+END_REASONS = ("finished", "killed", "timed_out", "context_reset", "superseded")
+
+
+@mcp.tool()
+def end_session(ctx: Context, session: str, reason: str = "finished") -> dict:
+    """End a session cleanly: hand back its claims and its lease, and say why.
+
+    The verb the fleet did not have. Without it the only thing that ever freed a
+    finished agent's work was the TTL, so a claim outlived the conversation that
+    took it and the board could not tell a session that finished from one that
+    merely stopped answering — an expired lease says "nobody renewed", which is
+    the identical row whether the work landed, the pane was closed, or the agent
+    is thinking hard.
+
+    Call it when a session is over and the harness did not do it for you: a
+    conversation you are abandoning, a peer's pane you have just closed, a run
+    you are superseding. Under Claude Code the SessionEnd hook already calls this
+    for the ordinary endings, so you rarely need to end YOURSELF.
+
+    It records; it does not operate. Nothing is signalled and no pane is closed —
+    whatever stopped the session is what calls this.
+
+    Idempotent: ending an already-ended session is a fine answer, not an error.
+    `ended` says whether this call was the one that released a live lease, and
+    `lease_was` says what it found instead.
+
+    Args:
+        session: the session key — the Claude Code session id, the same string
+            its lease and its claims were taken with.
+        reason: why it stopped. One of: finished (it said so), killed (something
+            closed it), timed_out (a bounded run hit its ceiling), context_reset
+            (/clear or /new — the pane lives on, this conversation does not),
+            superseded (another session took the work over). Anything else is
+            refused: this is read as a word in a fleet view, and a sixth spelling
+            of "finished" reaches a human as an unknown.
+    """
+    if reason not in END_REASONS:
+        raise ToolError(
+            f"reason={reason!r} is not one of: {', '.join(END_REASONS)}. Say which "
+            "of those it was — the point of the field is that a reader can branch "
+            "on it, and free text cannot be branched on.")
+    try:
+        return _get_client(ctx).end_session(session, reason)
+    except httpx.HTTPStatusError as e:
+        _raise(e, "end_session")
+
+
 @mcp.tool()
 def claim(ctx: Context, ref_kind: str | None = None, ref_value: str | None = None,
           repo_path: str = ".", kind: str | None = None, key: str | None = None,

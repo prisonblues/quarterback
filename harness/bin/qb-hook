@@ -379,6 +379,49 @@ _record() {     # _record <endpoint> <sha> — snapshot (keep lease) or handoff 
           "{session:\$s, blob:\$b} + $(_opt)")" \
     >/dev/null 2>&1 || true
 }
+# ---- ending a session (#277) -----------------------------------------
+# Starting a session was three primitives; ending one was none at all. What stood
+# in for it was expiry, and expiry is a floor rather than a report: an expired
+# lease says NOBODY RENEWED, which is the same row whether the work finished, the
+# pane was closed, or the agent is thinking hard for nine minutes (#252). #263 is
+# the sharper half — a seat whose context was reset kept every claim the previous
+# conversation took, renewing them from a conversation with no memory of taking
+# them, where passive expiry could never reach them because nothing had died.
+#
+# One call, and it is the LAST word rather than the only one: the board releases
+# the lease with the reason on it and hands back every claim stamped with that
+# session, so "this session is over" is a fact somebody reported instead of a
+# silence a reader has to interpret.
+_end_session() {   # _end_session <session key> <reason>
+  curl -sS --max-time 8 "${_auth[@]}" "${_json[@]}" -X POST "$BASE/session/end" \
+    -d "$(jq -nc --arg s "$1" --arg r "$2" '{session:$s, reason:$r}')" \
+    >/dev/null 2>&1 || true
+}
+
+# The session this pane last ran, so a NEW one can end it if nothing else did.
+# Keyed on the instance rather than the session, which is the whole point: a seat
+# keeps one instance across restarts and resets (that is #263's "the seat is the
+# identity; the conversation is the worker"), so this file is the only local
+# record that the pane held a different conversation five seconds ago. For a
+# session with no QUARTERBACK_INSTANCE the instance IS the session prefix, so the
+# file is per-session, never holds anything else, and this whole path no-ops.
+_sidfile="${XDG_RUNTIME_DIR:-/tmp}/qb-sid-$AGENT-$INSTANCE"
+
+_supersede_previous() {   # end the conversation this pane held before this one
+  local prev
+  prev=$(cat "$_sidfile" 2>/dev/null)
+  printf '%s' "$sid" > "$_sidfile" 2>/dev/null
+  [ -n "$prev" ] && [ "$prev" != "$sid" ] || return 0
+  # `superseded`, not `context_reset`, and the distinction is the honest one: all
+  # this knows is that a different conversation is now in this pane. SessionEnd
+  # knows WHY — Claude Code tells it — and fires first, so on the ordinary paths
+  # this is a no-op that the board answers "already ended" to and the precise
+  # reason is the one that got recorded. This is the backstop for the endings
+  # nothing observed: a killed pane, a crashed CLI, a hook that could not reach
+  # the board at the time.
+  _end_session "$prev" superseded
+}
+
 # ---- the ask courier (v2.13, #107) ------------------------------------------
 # A directed ask used to reach an agent only at its next prompt. For a headless
 # /epic, /lander or /fix-and-land run that meant one poll at the start and then
@@ -522,6 +565,17 @@ _publish_push() {   # announce HEAD if a push just put it on the tracking branch
 
 case "$EVENT" in
   SessionStart)
+    # WHOSE PANE IS THIS, and what was in it before. Both are needed by things
+    # outside this session: the stamp is how a ✕ on the seat bar can end the
+    # agent it is about to kill (nothing else records a pane's session id, which
+    # #266 names as the honest limit of what a fleet view can act on), and the
+    # supersede is what closes a conversation whose own ending never reached the
+    # board. Backgrounded like the state write below and for the same reason —
+    # tmux is a socket round trip and this is cosmetic to the turn.
+    if [ -n "${TMUX:-}" ] && [ -n "${TMUX_PANE:-}" ]; then
+      ( tmux set-option -p -t "$TMUX_PANE" @qb_session "$sid" ) >/dev/null 2>&1 &
+    fi
+    _supersede_previous
     # `waiting`, not `working`: the session exists and nothing has been asked of
     # it yet. A seat started by qb-seats submits its brief within the second and
     # flips to working on its own, so the honest value here costs nothing.
@@ -653,15 +707,40 @@ case "$EVENT" in
     if _throttle "snap-$sid" 120; then sha=$(_put_blob); [ -n "$sha" ] && _record snapshot "$sha"; fi
     ;;
   SessionEnd)
+    # WHY, from Claude Code's own payload, because the endings are not one event.
+    # `clear` is the pane living on with a new conversation in it — the exact
+    # thing #263 is about, and the one ending where an agent's claims outlive the
+    # context that took them. Everything else (`logout`, `prompt_input_exit`,
+    # `other`, and an older Claude Code that sends no reason at all) is the
+    # session going away, which is `finished`: the session reported its own end,
+    # which is all that word claims. A reason this does not recognise is NOT
+    # forwarded — the board's vocabulary is closed, and a 422 swallowed by this
+    # fail-open hook would leave the session unended for the sake of a label.
+    case "$(printf '%s' "$IN" | jq -r '.reason // empty' 2>/dev/null)" in
+      clear) why=context_reset ;;
+      *)     why=finished ;;
+    esac
     # The beacons go with the session. A `waiting` left behind by a closed pane
     # would be indistinguishable from one that is still open and wants you, and
     # the session id is never reused.
     rm -f "${XDG_RUNTIME_DIR:-/tmp}/qb-state-$sid" \
           "${XDG_RUNTIME_DIR:-/tmp}/qb-title-$sid" 2>/dev/null
-    # push the transcript so another device can pull + resume, then hand off (release)
-    sha=$(_put_blob); [ -n "$sha" ] && _record handoff "$sha"
-    _post presence "ended${repo:+ on $repo}"
-    # Handoff releases the lease, which retires the name — it may be another
+    # Push the transcript so another device can pull + resume. SNAPSHOT, not
+    # handoff, and the swap is a bug fix rather than a tidy-up: handoff is what
+    # used to release the lease, and it only ran `[ -n "$sha" ]` — so a session
+    # with no readable transcript, no sha256sum, or a 45s upload timing out on a
+    # huge JSONL never released anything at all and sat on the board as a live
+    # agent until its TTL. The two facts are independent and are now two calls:
+    # this records the transcript, `_end_session` below ends the session, and
+    # neither can take the other down with it.
+    sha=$(_put_blob); [ -n "$sha" ] && _record snapshot "$sha"
+    _end_session "$sid" "$why"
+    # The reason rides the presence post too, so the tape a human scrolls says
+    # which kind of ending it was without a second lookup. Only when it is not
+    # the ordinary one: "ended" already means finished, and a parenthesis on
+    # every session's last line would be the noisiest thing on the board.
+    _post presence "ended${repo:+ on $repo}$([ "$why" = finished ] || printf ' — %s' "$why")"
+    # Ending releases the lease, which retires the name — it may be another
     # agent's within the minute, so stop claiming it here.
     rm -f "$_namefile" 2>/dev/null
     ;;

@@ -625,6 +625,51 @@ alone rather than destroyed by somebody else's failed checkout. That second one 
 checkout claims with `--json` — the flag exists so a caller can read `renewed` without
 grepping the prose on stderr.
 
+### `qb-end` — the verb that stops a session
+
+There were three ways to start a session on this fleet and, until #277, none to end one.
+What stood in for ending was the TTL, and a TTL is a floor rather than a report: an expired
+lease says *nobody renewed*, which is the identical row whether the work landed, the pane
+was closed, or the agent is thinking hard for nine minutes (#252). And because nothing
+released a claim except the agent that took it, a seat whose context was reset kept work it
+had no memory of taking — renewing it from a fresh conversation, where passive expiry could
+never reach it because nothing had died (#263).
+
+```bash
+qb-end                                     # this session ($CLAUDE_CODE_SESSION_ID), finished
+qb-end "$sid" --reason killed              # something closed it
+qb-end "$sid" --reason context_reset       # /clear: the pane lives on, this conversation does not
+#   exit 0  recorded — including "it had already ended"
+#   exit 1  refused  — another machine's session
+#   exit 2  unknown  — no board, no token, an outage
+```
+
+One call releases the session's lease **and** every live claim stamped with that session, and
+stamps the lease with why. The reasons are a closed set — `finished`, `killed`, `timed_out`,
+`context_reset`, `superseded` — because the field is branched on by a dashboard, and a sixth
+spelling of "finished" reaches a human as an unknown. `stalled` and `crashed` are not among
+them: both are conclusions a reader draws from silence, never a report an agent makes about
+itself, and a lease with no reason on it *is* that report.
+
+**It records; it does not operate.** Nothing here signals a process or closes a pane. Its two
+automatic callers are the ones that actually observe an ending:
+
+| caller | when | reason |
+|---|---|---|
+| `qb-hook` SessionEnd | Claude Code says the session is over | `context_reset` when its payload says `clear`, else `finished` |
+| `qb-hook` SessionStart | a different conversation appears in a pane that held one | `superseded` — the backstop for endings nothing observed |
+| `qb-seat-click` | the ✕ on the seat bar, and the dashboard's, just before `kill-pane` | `killed` |
+
+The ✕ can do that because `qb-hook` stamps the pane with `@qb_session` at SessionStart —
+nothing else records which session a pane holds, which is the limit #266 names on what a
+fleet view can *act* on rather than only describe. Best effort throughout: no stamp, no
+board, or a refusal all fall through to closing the pane, because the pane is what the
+human clicked to close.
+
+The line `qb-seat` draws — *"the board coordinates work, it does not operate the machine"* —
+is about **dispatch**, and none of this moves it. What an agent works on is still its own
+choice, self-selected and claimed atomically.
+
 ### `worktree-holder` — is somebody else in there?
 
 The fourth script answers one question: **which live agent is working in this
@@ -1590,11 +1635,12 @@ Five files, one pin:
 
 | file | what it is |
 |---|---|
-| `bin/qb-hook` | the lifecycle reflexes — presence, lease, handoff, publish-on-push, the ask courier, sync advice, sub-agent records. Fired by Claude Code, never by the model: these must not depend on anybody remembering them. Fail-open by contract |
+| `bin/qb-hook` | the lifecycle reflexes — presence, lease, session end, publish-on-push, the ask courier, sync advice, sub-agent records. Fired by Claude Code, never by the model: these must not depend on anybody remembering them. Fail-open by contract |
 | `bin/qb-env` | the site-config contract — which board, which token. Sourced, not run |
 | `bin/qb-mcp` | one stdio MCP server per session, so each agent carries its own identity |
 | `bin/qb-claude-setup` | the wiring: merges the hook fragment into `~/.claude/settings.json`, registers the MCP server in `~/.claude.json`, @imports the workflow doc |
 | `bin/qb` | what a human types — `qb sessions`, `qb resume <id>` |
+| `bin/qb-end` | the stop verb: hand back a session's claims and its lease, saying why (#277). Called by the hook and by the seat bar's ✕; usable by hand |
 
 ### Which qb-hook am I running?
 

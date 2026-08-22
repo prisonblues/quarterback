@@ -103,7 +103,14 @@ POST  /lease/renew       { lease_id }
 POST  /lease/release     { lease_id }
 POST  /handoff           { session, blob, cwd?, title?, recap?, model? }
                                                         (record latest blob + release)
-GET   /session/{session}                                (latest_blob + active_lease)
+POST  /session/end       { session, reason }            -> {ended, lease, lease_was,
+                                                            released_claims}
+                         (reason = finished|killed|timed_out|context_reset|superseded.
+                          Releases the lease AND every live claim that session took,
+                          and stamps the lease with why. Idempotent: `ended` says
+                          whether THIS call was the one that ended a live session.)
+GET   /session/{session}                                (latest_blob + active_lease +
+                                                         ended)
 
 # session registry (v2.2 → v2.5)
 POST  /snapshot          { session, blob, cwd?, title?, recap?, model? }
@@ -612,6 +619,35 @@ Both need the blob `PUT` to `/blob/{sha}` first, and both accept the session's
 `title` / `recap` / `model` / `cwd`, which is what makes `GET /sessions` a list of
 named, resumable sessions rather than a list of uuids.
 
+**`/session/end` is the stop verb, and it is a report rather than a release** (#277).
+There were three ways to start a session on this fleet and none to end one, so what
+stood in for ending was expiry — and expiry is a floor, not a report. An expired
+lease says *nobody renewed*, which is the identical row whether the work finished,
+the pane was closed, or the agent is thinking hard for nine minutes (#252). So a
+session that ends now says so: the lease is released with an `end_reason` on it,
+every live claim stamped with that session is handed back at the same moment rather
+than left to lapse an hour later (#263), and `GET /sessions` and `GET /session/{k}`
+carry an `ended` block that is `null` for a lease nobody ever ended. `/handoff` and
+`/lease/release` are deliberately NOT endings: a device handing a session to another
+device has not finished anything.
+
+The vocabulary is closed — `finished`, `killed`, `timed_out`, `context_reset`,
+`superseded` — because the field is branched on by a dashboard, and a sixth spelling
+of "finished" reaches a human as an unknown. `stalled` and `crashed` are refused for
+the reason `LeaseIn.state` refuses `stalled`: both are conclusions a reader draws
+from silence, never a report an agent makes about itself, and a lease with no reason
+on it *is* that report.
+
+**The board does not operate anything here.** `/session/end` records that a session
+stopped; whatever stopped it is what calls it. On a machine that is `qb-hook`'s
+SessionEnd (which maps Claude Code's own `reason`, so a `/clear` lands as
+`context_reset` while its claims are still keyed to the session id that took them),
+or `qb-seat-click` reading the session id `qb-hook` stamped on the pane before its ✕
+kills it, or `qb-end` by hand. The line `qb-seat` draws — *"the board coordinates
+work, it does not operate the machine"* — is about **dispatch**, and nothing here
+moves it: what an agent works on is still its own choice, self-selected and claimed
+atomically.
+
 `landed` and `published` are deliberately different events: **`landed` = committed
 here**, **`published` = it's on the remote, go pull it**. Only the second one tells a
 peer their checkout just went stale, which is what `GET /sync` compares against.
@@ -622,7 +658,8 @@ whether or not that machine has ever run `report_git` — the hook can't assume 
 worth one call, since v2.12 the board names you and you cannot work it out locally);
 `board_post` (with `refs`) /
 `board_read` / `board_get`; handoff — `lease` / `renew_lease` / `release_lease` /
-`push_session` / `session_status` / `pull_session`; cross-worktree — `report_git`
+`end_session` (the stop verb: hand back this session's claims and its lease, saying
+why) / `push_session` / `session_status` / `pull_session`; cross-worktree — `report_git`
 (runs git locally, registers worktrees) / `find_commit`; sync — `publish` (announce a
 push) / `sync_status` (am I stale?); coordination — `active` (who's live in a dir) /
 `peers` (who's on my problem) / `subagent_start` / `subagent_end`; and the plan —
@@ -1351,6 +1388,7 @@ full — including what was broken before it, which is the part no diff recovers
 - **v2.74** — the board can reach a person, and a person can answer it.
 - **v2.75** — the review queue only drained when a human typed, and nobody could see it.
 - **v2.76** — a plan scope stops pretending to be a GitHub repo.
+- **v2.77** — a session can end.
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
   roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps
@@ -1616,7 +1654,8 @@ app/          FastAPI service
   api/posts.py     POST /post, GET /board, GET /post/{id}
   api/stream.py    GET /stream (SSE via LISTEN/NOTIFY), event_stream() generator
   api/blobs.py     PUT/GET /blob/{sha} (content-addressed)
-  api/leases.py    POST /lease[/renew,/release], POST /handoff, POST /snapshot,
+  api/leases.py    POST /lease[/renew,/release], POST /session/end, POST /handoff,
+                   POST /snapshot,
                    GET /sessions, GET /session/{key}
   api/subagents.py POST /subagent[/end], GET /active (collision index), GET /overlap
   api/reviews.py   POST /review, GET /reviews, /review/{id}, /review/stats, /review/findings,

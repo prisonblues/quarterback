@@ -597,6 +597,60 @@ async def release_claim(
     return {"claim_id": str(claim.id), "released": True, "lapsed": claim.lapsed}
 
 
+async def release_session_claims(
+    session: AsyncSession, *, sess_key: str, holder: str, now: datetime
+) -> tuple[list[dict], list[dict]]:
+    """Let go of every live claim a session took. ``(released, refused)`` (#277).
+
+    The stop half of a session's lifecycle. Until this existed there was no way
+    to give a claim back except one call per claim id, by a conversation that
+    still remembered taking it — so the only thing that ever actually freed a
+    dead agent's work was the TTL, and #263 is what that costs: a seat whose
+    context was reset kept every claim the previous conversation took, renewing
+    them from a conversation with no memory of the work, where passive expiry
+    could never reach them because nothing had died.
+
+    **Owned by the session, exactly as a mutation is.** The filter is the
+    ownership rule this module already states — :func:`may_mutate`, applied as a
+    filter rather than restated — so ending a session cannot touch a co-tenant's
+    claims on the same box. Applied in Python over the rows rather than compiled
+    into SQL for the same reason ``held_claims`` gives about its own filter:
+    three re-derivations of one rule is three chances to disagree with it.
+
+    **A claim that named NO session is left alone**, and that is not an
+    oversight. Such a claim belongs to the machine (``may_mutate``'s fallback):
+    ``create-worktree`` takes one before the agent that will use the tree
+    exists, and sweeping it up when some unrelated session on the box ended
+    would free a checkout's issue out from under whoever is about to pick it up.
+
+    ``lapsed`` stays false. The holder let go; nobody vanished. That is the
+    distinction ``_sweep_lapsed`` exists to keep, and an ended session is on the
+    "finished" side of it however unhappily it ended — something reported this,
+    which is the whole difference from a TTL running out.
+
+    **"Every live claim" means every one live when this ran.** A claim committed
+    by that session after this SELECT survives, and there is no lock that would
+    change it: the session being ended is a process that has stopped or is about
+    to, so a claim arriving afterwards is a race inside a dying agent rather than
+    a gap here. The TTL is still underneath it, as it is for every other claim.
+    """
+    rows = list(await session.scalars(
+        select(ResourceLease).where(
+            ResourceLease.session == sess_key,
+            ResourceLease.released_at.is_(None),
+            ResourceLease.expires_at > now,
+        ).order_by(ResourceLease.acquired_at.desc())
+    ))
+    released, refused = [], []
+    for claim in rows:
+        if not may_mutate(claim, holder, sess_key):
+            refused.append(claim_view(claim))
+            continue
+        claim.released_at = now
+        released.append(claim_view(claim))
+    return released, refused
+
+
 @router.get("/claims")
 async def list_claims(
     kind: str | None = None,
