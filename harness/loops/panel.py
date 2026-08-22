@@ -359,6 +359,12 @@ def _payload_defaults() -> dict:
         # in the rules file is still reported on those paths — it lands in
         # `config_notes`, which the skip payloads carry.
         "review_panel": None,
+        # WHICH LAYER supplied each of them (#305) — and unlike `review_panel`
+        # above, present on every payload including the ones that reviewed nothing.
+        # A round that refused still resolved a policy, and "what rules did this
+        # repo have when it refused" is exactly the question a refusal raises. Null
+        # only as the shape a caller building a payload by hand would leave.
+        "rules": None,
         "reviewers_selected": [],
         "reviewers_override": None,
         "to_fix": [],
@@ -515,7 +521,12 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # fetched: a rules file with a bad `fix_severity_floor` has to say so whether or
     # not the PR read succeeds, and the round cap the verdict is computed against
     # comes out of the same resolution. Everything downstream still just appends.
-    notes: list[str] = []
+    # A round that ran under a board-set dial SAYS SO, in the list `--post` puts in
+    # a public PR comment — #52's "never silent" applied to the layer that can move
+    # a floor without a pull request. First, before the dial resolution below it,
+    # because it is about where the dials came FROM and reads oddly after a
+    # complaint about one of their values.
+    notes: list[str] = board_dial_notes(cfg)
     # The eight `review_panel` settings that trade thoroughness against convergence,
     # resolved once (`panel_seats.resolve_dials`) so the prompt, the report, the stop
     # rule and the payload cannot disagree about which policy this round ran under.
@@ -561,6 +572,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             "round": round_no,
             "skip_reason": refusal,
             "config_notes": [refusal],
+            "rules": rules_record(cfg),
             # No baseline was read on this path, so there is no earlier end and no
             # fix phase — but the payload still says when it started and stopped,
             # because `_payload_defaults`' rule is that a consumer reading a key
@@ -780,6 +792,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 # read is a fact about the cycle, not about the review it skipped,
                 # so it travels rather than being dropped on the floor.
                 "config_notes": notes + skip_prior.problems,
+                "rules": rules_record(cfg),
                 # A skipped round carries the cycle's open escalations forward
                 # and adds nothing to them. It is the baseline the NEXT round
                 # inherits, and a register that emptied whenever a title matched
@@ -1226,6 +1239,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         clock.mark("setup")
         refuse_payload = {
             **_payload_defaults(),
+            "rules": rules_record(cfg),
             "repo": repo_name, "github": gh_repo, "pr": pr_number,
             "title": title, "base": base,
             # Same three ends the skip path records, and for the same reasons: a
@@ -2501,6 +2515,11 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # every reviewed round, so a consumer never has to tell "the default applied"
         # from "a payload written before the field".
         "review_panel": dials.as_dict(),
+        # …and which layer supplied each of them (#305). `review_panel` says what
+        # ran; this says which of the four layers said so, so a round that ran under
+        # a moved floor names the mover instead of leaving a reader to infer it from
+        # three files and a resolution order.
+        "rules": rules_record(cfg),
         "provenance_counts": provenance_counts,
         "skipped": result.skipped,
         "run_key": run_key,

@@ -773,6 +773,69 @@ def load_repo_cfg(name: str) -> dict:
         sys.exit(str(e))
 
 
+#: The dials a REVIEW runs under. `resolve_repo` reports the layer that answered
+#: for every dial in the config, including the loop schedule and the epic's model
+#: ceiling; a round's artifact only wants the ones that governed the round.
+_REVIEW_BLOCKS = ("review_panel.", "reviewers.")
+
+
+def rules_record(cfg: dict) -> dict:
+    """WHICH LAYER SUPPLIED EACH DIAL THIS ROUND RAN UNDER — #305.
+
+    The payload already carried `review_panel`, the dials AS APPLIED. What it could
+    not say is where each of them came from, and that is the half the incident
+    turned on: `.harness-rules.sample` stated both floors at P2 while five rounds on
+    #299 put P4 findings in `to_fix`, and nothing in any round's artifact could
+    settle which of the two was describing the run. A value with no provenance is
+    a value a reader has to go and guess the source of, from three files and a
+    resolution order.
+
+    So every reviewed round now records the layer beside the value — `defaults`,
+    `sample`, `overlay` or `board` — plus, for a board dial, the reason somebody
+    gave for moving it and when it lapses. On EVERY payload including the ones that
+    reviewed nothing, unlike `review_panel` itself: a refusal or a skip did not
+    apply a review policy, but it certainly resolved one, and "which rules did this
+    repo have when it refused" is exactly the question a refusal raises.
+    """
+    return {
+        "from": cfg.get("_rules_from", ""),
+        "baseline": cfg.get("_rules_baseline", ""),
+        "unreadable": bool(cfg.get("_rules_unreadable")),
+        "dials_from": cfg.get("_dials_from", ""),
+        # The board is configured on this box and did not answer, so the layers
+        # below are this repo's own and not necessarily the ones in force. A
+        # separate fact from `unreadable`, which is about the default branch.
+        "dials_unreadable": bool(cfg.get("_dials_unreadable")),
+        "dials": {path: said for path, said in (cfg.get("_dials") or {}).items()
+                  if path.startswith(_REVIEW_BLOCKS)},
+    }
+
+
+def board_dial_notes(cfg: dict) -> list[str]:
+    """`config_notes` lines for a round that ran under a board dial, or none.
+
+    #52's rule — a round that ran under a changed dial SAYS SO — and the reason it
+    is `config_notes` rather than the report alone is that `--post` puts these in a
+    public PR comment, so the person reading the review sees the floor it was run
+    against and who moved it.
+    """
+    said = [(path, d) for path, d in (cfg.get("_dials") or {}).items()
+            if d.get("layer") == "board" and path.startswith(_REVIEW_BLOCKS)]
+    notes = []
+    if cfg.get("_dials_unreadable"):
+        notes.append(
+            f"the board at {cfg.get('_dials_from')} would not answer, so this round "
+            f"ran on this repo's own rules — which is not the same thing as no dial "
+            f"being set on the board")
+    for path, d in sorted(said):
+        lapses = f", until {d['expires_at']}" if d.get("expires_at") else ""
+        notes.append(f"{path} is {json.dumps(d['value'])} from the BOARD "
+                     f"({d['scope']} scope), not from {SAMPLE_FILENAME}: "
+                     f"{d['reason'] or 'no reason given'} — set by "
+                     f"{d['set_by'] or 'nobody named'}{lapses}")
+    return notes
+
+
 def review_refusal(cfg: dict) -> str:
     """Why this repo may not be REVIEWED, or `""` when it may.
 
@@ -2069,7 +2132,8 @@ __all__ = [
     "_FINDINGS_ENVELOPE", "REVIEW_PROMPT", "MOVE_MANIFEST_PROMPT",
     "CODE_ACCESS_BRIEF",
     "JUDGE_PROMPT", "ASK_PROMPT", "Finding", "ReviewerRun",
-    "PanelResult", "sh", "load_repo_cfg", "review_refusal",
+    "PanelResult", "sh", "load_repo_cfg", "review_refusal", "rules_record",
+    "board_dial_notes",
     "RULES_FILENAME", "SAMPLE_FILENAME", "_spans",
     "ENVELOPE_KEYS", "DECLARATION_KEYS", "_scalar", "_Tok",
     "_TOKEN", "_TOKEN_MARK", "_tokenise", "_schema",
