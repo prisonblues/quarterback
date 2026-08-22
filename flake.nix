@@ -159,6 +159,16 @@
           # against them, so without this line every assertion about either guard errors
           # on a missing file rather than being evaluated (#163).
           cp -r ${./harness/githooks} harness/githooks
+          # The two tools the pre-push guard hands its questions to. Its whole contract is
+          # that it DELEGATES — the graph to `migration_reconcile.py heads --ref`, the release
+          # number to `release_stamp.py collision` — so test_pre_push_hook.py copies the real
+          # ones into every fixture repo it builds; a stub would verify the hook against a
+          # thing nobody runs. Named files rather than the `scripts/` tree, because this
+          # sandbox exists for the worktree scripts and a directory of unrelated tools would
+          # leave the next reader guessing which of them a test needs.
+          # test_pre_push_hook.py's own coupling guard holds this pair against what it reads.
+          install -Dm644 ${./scripts/migration_reconcile.py} scripts/migration_reconcile.py
+          install -Dm644 ${./scripts/release_stamp.py} scripts/release_stamp.py
           # test_claude_wiring.py's reads (#230). It stays in THIS check rather than
           # joining prose-consistency-tests, and the split is the same one that check's
           # comment draws: two thirds of it drives `qb-claude-setup` and `qb-hook` as

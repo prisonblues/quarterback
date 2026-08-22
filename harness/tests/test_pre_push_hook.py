@@ -30,9 +30,20 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
+
+# A sibling module, imported by bare name the way #264's own members import it: the sandboxes
+# that run these suites put `harness/tests` on the path by running pytest from `harness/`, and
+# a developer running `pytest harness/tests` from the repo root does not. One entry, both work.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+# Imported hard, not through `importorskip`. A skip here would be indistinguishable from a
+# pass, and the coupling guard at the bottom of this file would be inert in exactly the
+# sandbox it exists to protect.
+import _flake_sandbox  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
 BIN = ROOT / "harness" / "bin"
@@ -852,3 +863,50 @@ def test_a_branch_with_no_merge_base_says_the_check_was_limited(repo, home):
     assert r.returncode == 0, r.stderr
     assert "LIMITED" in r.stdout + r.stderr
     assert "no merge base" in r.stdout + r.stderr
+
+
+# ---------------------------------------------------------------------------
+# 5. this suite's own sandbox
+# ---------------------------------------------------------------------------
+
+#: What this suite reads from outside `harness/`. `nix build .#checks.<system>.worktree-tests`
+#: runs it in a store sandbox holding only what that check copies in, and a read nobody copied
+#: does not FAIL there — it ERRORS on a missing file, in a build log nobody reads, which is how
+#: #163 sat unnoticed for a day. This pair arrived exactly that way: every test above errored
+#: with `FileNotFoundError: /build/scripts/mig...` on the first CI run of this file.
+READS = (
+    "harness/githooks",      # the hook under test, and the forwarder it chains through
+    "scripts/migration_reconcile.py",
+    "scripts/release_stamp.py",
+)
+
+#: The check that runs this suite. Written out, not discovered: a renamed check has to be an
+#: error here rather than an empty comparison reporting everything as fine.
+CHECK_NAME = "worktree-tests"
+
+
+@pytest.mark.parametrize("path", READS)
+def test_the_worktree_flake_check_supplies_what_this_suite_reads(path: str):
+    region = _flake_sandbox.check_region(
+        (ROOT / "flake.nix").read_text(encoding="utf-8"), CHECK_NAME)
+    pairs = _flake_sandbox.copies(region)
+    # prefix="" and not the default "repo/": this check builds `harness/…` at the top level
+    # and `cd harness`, where the prose and release-metadata sandboxes build a `repo/` tree.
+    assert not _flake_sandbox.misdirected(pairs, prefix=""), \
+        _flake_sandbox.misdirected(pairs, prefix="")
+    assert _flake_sandbox.supplied_by(path, set(pairs)), (
+        f"flake.nix's {CHECK_NAME} sandbox does not supply {path}, which this suite reads. "
+        f"Add a `cp -r`/`install -D` line for it beside the others, or every assertion about "
+        f"it errors on a missing file instead of being evaluated (#163).")
+
+
+@pytest.mark.parametrize("path", READS)
+def test_every_declared_read_is_a_path_this_file_names(path: str):
+    """The converse: a declaration whose last reader was deleted still matches the copy line
+    answering it, and the two then keep each other alive over a file nothing needs."""
+    named = {str(HOOKS.relative_to(ROOT))} | {
+        str((SCRIPTS / name).relative_to(ROOT)) for name in ("migration_reconcile.py",
+                                                             "release_stamp.py")}
+    assert any(p == path or p.startswith(path + "/") for p in named), (
+        f"READS declares {path}, which no constant in this module resolves to — either the "
+        f"read went away and the declaration should too, or it moved")
