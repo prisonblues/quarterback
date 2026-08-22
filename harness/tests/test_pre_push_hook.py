@@ -23,6 +23,11 @@ The scenarios are the ones from #343, stated as the failures they are:
     it being a separate question. A conflict resolved by moving a body under an existing
     heading deletes a shipped release's notes while leaving every heading present, unique and
     in order, so a check reading the file as a list of numbers reports it clean.
+  * `test_a_duplicate_revision_id_is_not_reported_as_a_head_count` and its partner
+    `test_a_two_head_refusal_says_the_heads_were_counted` — #357. The reconciler's exit 2
+    is two answers, and the renumber remedy is only right for one of them. A pair, because
+    the property is which message goes with which answer, and either test alone passes
+    against a hook that prints one message for both.
   * `test_a_repo_with_no_migrations_pushes_silently` — this hook ships with the harness into
     repos that are neither quarterback nor lexray. Not merely "does not refuse": prints
     NOTHING, because a warning nobody in that repo can act on is how it gets uninstalled.
@@ -117,11 +122,16 @@ def install(repo: Path, home: Path) -> subprocess.CompletedProcess:
     return r
 
 
-def write_migration(repo: Path, rev: str, down: str | None) -> None:
+def write_migration(repo: Path, rev: str, down: str | None, filename: str | None = None) -> None:
+    """`filename` is what makes a DUPLICATE REVISION ID expressible: two files at one ref
+    declaring one `revision`. Alembic reads the assignment and not the name, so the pair
+    collides in the graph while colliding on nothing in git — the case #338 is about, and
+    the one the reconciler declines to answer rather than counting heads on."""
     versions = repo / "migrations" / "versions"
     versions.mkdir(parents=True, exist_ok=True)
     down_literal = "None" if down is None else f'"{down}"'
-    (versions / f"{rev}_m.py").write_text(MIGRATION.format(rev=rev, down=down_literal))
+    name = filename or f"{rev}_m.py"
+    (versions / name).write_text(MIGRATION.format(rev=rev, down=down_literal))
 
 
 def commit(repo: Path, message: str, home: Path) -> str:
@@ -204,6 +214,98 @@ def test_a_two_head_graph_on_a_protected_push_is_refused(repo, home):
     assert "0002" in r.stderr and "0003" in r.stderr, "the refusal must name both heads"
     assert "migration_reconcile.py" in r.stderr, "and point at the reconciler"
     assert remote_sha(repo, "main", home) == before, "the remote moved anyway"
+
+
+def test_a_two_head_refusal_says_the_heads_were_counted(repo, home):
+    """The remedy the refusal prints — renumber, or add a merge revision — is only right
+    when a head count exists, so the message that carries it has to be the one that says a
+    count was made. It used to hedge across both of the reconciler's exit-2 answers in a
+    single line ("not exactly one head, a cycle, or a duplicate revision id"), which is
+    correct advice here and wrong advice in the test below (#357)."""
+    write_migration(repo, "0003", "0001")
+    commit(repo, "a second head", home)
+
+    r = push(repo, home, "main")
+
+    assert r.returncode != 0
+    assert "counted the heads" in r.stderr, (
+        f"the refusal does not say a count was made, which is what makes the renumber "
+        f"remedy beneath it correct:\n{r.stderr}"
+    )
+    assert "0002" in r.stderr and "0003" in r.stderr
+    assert "preflight" in r.stderr and "apply" in r.stderr
+
+
+def test_a_duplicate_revision_id_is_not_reported_as_a_head_count(repo, home):
+    """The refusal that used to send a reader off to renumber a graph that was fine.
+
+    Two files at `0003` is not a graph the reconciler will build, so it never counts the
+    heads — and the graph underneath may be single-headed, as this one is. Told "not exactly
+    one head", the reader renumbers; the actual problem is the pair of files, and the
+    reconciler said so in the output the hook was already printing. Same split, same
+    reasoning and largely the same words as the `migration-heads` CI job (#351 / PR #355).
+    """
+    write_migration(repo, "0003", "0002", filename="0003_mine.py")
+    write_migration(repo, "0003", "0002", filename="0003_theirs.py")
+    commit(repo, "two files at 0003", home)
+
+    r = push(repo, home, "main")
+
+    assert r.returncode != 0, "a graph the reconciler refuses to build is not a passing push"
+    assert "REFUSE" in r.stderr
+    assert "never counted the heads" in r.stderr, (
+        f"the refusal does not say the count is missing:\n{r.stderr}"
+    )
+    assert "not exactly one" not in r.stderr, (
+        "the reconciler never counted the heads here, so the hook must not report a head "
+        f"count it was not given:\n{r.stderr}"
+    )
+    assert "counted the heads" not in r.stderr.replace("never counted the heads", "")
+    assert "0003" in r.stderr and "more than one file" in r.stderr, (
+        f"the refusal does not carry the reconciler's own diagnosis:\n{r.stderr}"
+    )
+    assert "duplicate revision id" in r.stderr, "and it should name the usual cause"
+
+
+def test_a_decline_too_large_for_a_pipe_buffer_is_still_read_as_a_decline(repo, home, tmp_path):
+    """The size threshold the obvious implementation of the split has, and the reason it is
+    not written as `printf … | grep -q`.
+
+    `grep -q` exits at the first match. Feed it more than a pipe buffer's worth and the
+    writer is still going when the pipe closes, dies of SIGPIPE, and `pipefail` gives the
+    whole pipeline 141 — failure, on precisely the input that matched. The decline would
+    then be reported as a head count again, for large diagnostics only, which is the worst
+    size for a bug to be. `chain_delegate` at the top of the hook was bitten by the same
+    thing and says so; this is that hazard asserted rather than described.
+    """
+    huge = tmp_path / "loud-reconciler.py"
+    # No shebang, for the reason the broken-tool stubs below give: the hook runs these
+    # through the interpreter it resolved, never by exec'ing the file.
+    # `STOP: ` on the FIRST line and bulk after it, which is the shape that triggers this
+    # and the shape a chatty reconciler has: grep matches immediately and stops reading,
+    # while the writer still has most of the payload to push. A single enormous STOP line
+    # would not trigger it — grep has to buffer to the newline before it can match, by which
+    # time the writer is done — which is exactly why this is worth pinning rather than
+    # reasoning about. `qb.migrationReconcile` accepts any tool, so this is reachable.
+    huge.write_text(
+        "import sys\n"
+        "print('STOP: two files declare one revision id', file=sys.stderr)\n"
+        "for i in range(20000):\n"
+        "    print(f'  considered migrations/versions/{i:05d}_something.py', file=sys.stderr)\n"
+        "sys.exit(2)\n"
+    )
+    (repo / "notes.txt").write_text("x\n")
+    commit(repo, "something", home)
+
+    r = git(repo, "push", "origin", "main", home=home, check=False,
+            QB_MIGRATION_RECONCILE=str(huge))
+
+    assert r.returncode != 0
+    assert "never counted the heads" in r.stderr, (
+        "a STOP: larger than a pipe buffer is still a decline, and reporting it as a head "
+        f"count is the bug this whole change is about:\n{r.stderr[:2000]}"
+    )
+    assert "not exactly one" not in r.stderr
 
 
 def test_a_single_head_graph_on_a_protected_push_is_allowed(repo, home):
