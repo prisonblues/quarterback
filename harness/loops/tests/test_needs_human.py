@@ -167,7 +167,7 @@ def test_a_board_that_will_not_answer_is_reported_never_raised(monkeypatch, tmp_
     monkeypatch.setattr(nh, "SEEN_PATH", tmp_path / "seen.json")
     monkeypatch.setattr(nh, "board_config", lambda: ("http://b", "t", ""))
 
-    def boom(_req, timeout=0):
+    def boom(_req, timeout=0, context=None):
         raise OSError("connection reset")
 
     monkeypatch.setattr(nh.urllib.request, "urlopen", boom)
@@ -652,3 +652,48 @@ def test_a_new_objection_of_a_class_already_announced_is_still_announced(door):
     preland.announce_hold(hold(first, second), {})
     assert len(door) == 2
 
+
+
+def test_an_interpreter_that_trusts_nothing_still_reaches_the_board(monkeypatch):
+    """A uv-installed standalone Python has no CA bundle, so `urllib` there
+    fails every HTTPS request with CERTIFICATE_VERIFY_FAILED — and the failure
+    arrives as "the board was unreachable", a sentence about a board that is up.
+
+    `qbdata._ssl_context` was written after that bit the dashboard. It matters
+    more here: an empty pane gets noticed, a question a person never learns they
+    were asked does not. Found by running the measurement for this very issue out
+    of the project venv, where every announcement failed against a live board.
+    """
+    seen: dict = {}
+
+    def urlopen(req, timeout=0, context=None):
+        seen["context"] = context
+        raise OSError("not actually opening a socket in a test")
+
+    monkeypatch.setattr(nh, "board_config", lambda: ("https://b", "t", ""))
+    monkeypatch.setattr(nh.urllib.request, "urlopen", urlopen)
+    nh._post({"type": "stuck", "summary": "s"})
+    assert "context" in seen, "the post no longer passes an SSL context at all"
+    # `None` is the right answer on an interpreter whose default store works;
+    # what must never happen is the argument going missing, because then the
+    # venv case is back and it fails as an unreachable board.
+    expected = nh.ssl_context()
+    assert (seen["context"] is None) == (expected is None)
+
+
+def test_the_read_half_trusts_the_same_store_as_the_write_half(monkeypatch):
+    """`--escalated-from-board` goes through `preland.board_request`, and on the
+    venv interpreter that read failed while the post beside it succeeded — the
+    round then reported "board unreachable" about a board it had just written to,
+    and would have counted an escalation as work a fix round can clear."""
+    seen: dict = {}
+
+    def urlopen(req, timeout=0, context=None):
+        seen["context"] = context
+        raise OSError("not actually opening a socket in a test")
+
+    monkeypatch.setattr(preland, "board_config", lambda: ("https://b", "t", ""))
+    monkeypatch.setattr(preland.urllib.request, "urlopen", urlopen)
+    preland.board_request("review/findings", {"repo": "o/r", "pr": 1})
+    assert "context" in seen
+    assert (seen["context"] is None) == (nh.ssl_context() is None)

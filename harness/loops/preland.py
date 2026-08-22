@@ -117,6 +117,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 # older board from a broken one.
 from harness_rules import (  # noqa: E402
     BOARD_TIMEOUT, RepoNotFound, board_config, ci_report, describe, resolve_repo,
+    ssl_context,
 )
 # #278's reading lives in `panel_scope` because that is where the review target is
 # decided, and the JUDGEMENT must not exist twice: this gate and the round it rules
@@ -341,7 +342,8 @@ def board_request(path: str, params: dict) -> tuple[object, str, int | None]:
     full = f"{url}/{path.lstrip('/')}?{urllib.parse.urlencode(params)}"
     req = urllib.request.Request(full, headers={"Authorization": f"Bearer {token}"})
     try:
-        with urllib.request.urlopen(req, timeout=BOARD_TIMEOUT) as r:
+        with urllib.request.urlopen(req, timeout=BOARD_TIMEOUT,
+                                    context=ssl_context()) as r:
             return json.loads(r.read().decode()), "", r.status
     except urllib.error.HTTPError as e:
         # Before URLError: it is a subclass, and an HTTP status says far more

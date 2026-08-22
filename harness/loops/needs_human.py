@@ -50,7 +50,7 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from harness_rules import BOARD_TIMEOUT, board_config  # noqa: E402
+from harness_rules import BOARD_TIMEOUT, board_config, ssl_context  # noqa: E402
 
 # ------------------------------------------------------------------ vocabulary
 
@@ -279,7 +279,8 @@ def _post(body: dict) -> tuple[int | None, str]:
         headers={"Authorization": f"Bearer {token}",
                  "Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=ANNOUNCE_TIMEOUT) as r:
+        with urllib.request.urlopen(req, timeout=ANNOUNCE_TIMEOUT,
+                                    context=ssl_context()) as r:
             answer = json.loads(r.read().decode())
     except urllib.error.HTTPError as e:
         hint = " — the token this host resolved was refused" if e.code == 401 else ""
