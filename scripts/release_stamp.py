@@ -115,6 +115,13 @@ Usage (the file has a shebang and the executable bit; `python scripts/…` works
     release_stamp.py apply     [--repo DIR] [--onto REF] [--json] [--major]
                                [--serve | --no-serve]
     release_stamp.py check     [--repo DIR] [--json]
+    release_stamp.py collision [--repo DIR] [--onto REF] [--branch REF] [--json]
+
+`collision` is `preflight`'s refusal on its own, asked of two REFS rather than of the working
+tree, for a gate with no worktree to read: `harness/githooks/pre-push` judges the commit on
+its way to the remote, which need not be checked out anywhere. It never scans, stamps or
+writes, and an unstamped `## vNEXT` is a pass — that is the correct state of a branch in
+flight, and the whole reason the `stamped` CI job runs on main only.
 """
 
 from __future__ import annotations
@@ -423,8 +430,13 @@ def resolve(repo: Path, ref: str) -> str:
     return _git(repo, "rev-parse", "--verify", f"{ref}^{{commit}}").strip()
 
 
-def merge_base(repo: Path, onto: str) -> str:
+def merge_base(repo: Path, onto: str, branch: str = "HEAD") -> str:
     """The commit this branch forked from, as a SHA.
+
+    `branch` defaults to HEAD because every command that stamps is reasoning about the
+    worktree it is standing in. `collision` passes a ref instead: a pre-push hook judges a
+    COMMIT, which need not be checked out anywhere, and the fork point of a commit nobody has
+    out is exactly as well defined.
 
     Run through a raw `subprocess` rather than `_git`, because `git merge-base` exits 1 when
     there is no common ancestor and `_git` turns any non-zero exit into "git merge-base failed:
@@ -432,14 +444,14 @@ def merge_base(repo: Path, onto: str) -> str:
     on, and routing through `_git` made it unreachable.
     """
     proc = subprocess.run(
-        ["git", "-C", str(repo), "merge-base", onto, "HEAD"],
+        ["git", "-C", str(repo), "merge-base", onto, branch],
         capture_output=True, text=True, check=False,
     )
     out = proc.stdout.split()
     if proc.returncode != 0 or not out:
         raise StampError(
-            f"{onto} and HEAD have no common ancestor, so there is no base to compute this "
-            "branch's changes against. Fetch the ref you are actually merging into"
+            f"{onto} and {branch} have no common ancestor, so there is no base to compute "
+            "this branch's changes against. Fetch the ref you are actually merging into"
         )
     return out[0]
 
@@ -1090,7 +1102,14 @@ def _repair_advice(repo: Path, onto: str, onto_sha: str | None = None) -> str:
         )
 
 
-def _collision(repo: Path, branch_text: str, onto: str, onto_text: str) -> None:
+def _collision(
+    repo: Path,
+    branch_text: str,
+    onto: str,
+    onto_text: str,
+    branch: str = "HEAD",
+    onto_rev: str | None = None,
+) -> None:
     """Refuse when this branch's release number is one somebody else has already used.
 
     This is the failure the whole file exists to remove, arriving by the one door the
@@ -1148,7 +1167,13 @@ def _collision(repo: Path, branch_text: str, onto: str, onto_text: str) -> None:
             f"`## {PLACEHOLDER} — …` and be re-stamped."
         )
 
-    inherited = _releases_at_fork(repo, onto)
+    # `onto_rev` is the SHA the caller already resolved `onto` to; `onto` itself is only ever
+    # a LABEL from here down, because a message has to name the ref the operator typed. The
+    # merge base has to be taken at the same commit `onto_text` was read from — re-resolving
+    # the name is how a push landing mid-run gets the branch's numbers judged against one base
+    # and its fork point against another, with nothing anywhere noticing. Same reasoning as
+    # `build_plan`'s "resolved ONCE, and every later question is asked of the SHA".
+    inherited = _releases_at_fork(repo, onto_rev or onto, branch)
     if inherited is None:
         # No CHANGELOG.md at the merge base, so nothing here can tell which numbers this
         # branch claimed and which it inherited. Refusing on every shared number would stop
@@ -1166,7 +1191,7 @@ def _collision(repo: Path, branch_text: str, onto: str, onto_text: str) -> None:
         )
 
 
-def _releases_at_fork(repo: Path, onto: str) -> set[Release] | None:
+def _releases_at_fork(repo: Path, onto: str, branch: str = "HEAD") -> set[Release] | None:
     """Release numbers already in CHANGELOG.md at the commit this branch forked from.
 
     None when there is no merge base, or the merge base has no CHANGELOG.md at all — a repo
@@ -1175,7 +1200,7 @@ def _releases_at_fork(repo: Path, onto: str) -> set[Release] | None:
     would stop a correct branch over a question this could not answer.
     """
     try:
-        base = merge_base(repo, onto)
+        base = merge_base(repo, onto, branch)
     except StampError:
         return None
     if not _git_ok(repo, "cat-file", "-e", f"{base}:CHANGELOG.md"):
@@ -1260,7 +1285,7 @@ def build_plan(repo: Path, onto: str, serve: bool | None, major: bool = False) -
     # Outside that guard on purpose: a collision is a real refusal and must not be swallowed
     # by the "nothing to stamp" case, since a branch that has ALREADY stamped is exactly the
     # state with no placeholder left and the one this check exists for.
-    _collision(repo, branch_text, onto, onto_text)
+    _collision(repo, branch_text, onto, onto_text, onto_rev=onto_sha)
 
     # THE NUMBERS COME FIRST, into LOCALS. Both checks below are about the base and about
     # numbers already written down — neither is a question about this branch's placeholder,
@@ -1546,6 +1571,94 @@ def _show(repo: Path, ref: str, path: str, named: str | None = None) -> str:
 
 
 # ---------------------------------------------------------------------- the commands
+
+
+def next_free(onto_text: str, branch_text: str, onto: str, branch: str) -> Release | None:
+    """`max(base, head) + 1` — the number a colliding branch should have taken.
+
+    Both sides, not just the base: a branch that stamped ABOVE the base and collided with a
+    sibling anyway would otherwise be told to take a number it already has. None when neither
+    ref declares a release at all, which is a repo where there is no counter to advance.
+    """
+    found = releases_in(onto_text, f"{onto}:CHANGELOG.md")
+    found += releases_in(branch_text, f"{branch}:CHANGELOG.md")
+    if not found:
+        return None
+    major, minor = max(found)
+    return major, minor + 1
+
+
+def cmd_collision(args: argparse.Namespace) -> int:
+    """The collision half of `preflight`, asked of two REFS instead of the working tree.
+
+    `preflight` reads the branch side from the worktree, which is the right reading for a
+    person about to land: what they are going to merge is what is in front of them. A gate is
+    judging a COMMIT — the one on its way to a remote, which need not be checked out anywhere
+    and, in a pre-push hook, frequently is not. Same question, same answer, different place to
+    read the branch from; nothing about "is this number one this branch claimed" needs a
+    working tree.
+
+    Nothing here scans, stamps or writes. A branch with an unstamped `## vNEXT` is *fine* by
+    this command and reports so — the placeholder is the correct state of a branch in flight,
+    and a command that refused it would be the `stamped` CI job's mistake made twice.
+    """
+    repo = Path(args.repo).resolve()
+    onto_sha = resolve(repo, args.onto)
+    branch_sha = resolve(repo, args.branch)
+    onto_text = _show(repo, onto_sha, "CHANGELOG.md", args.onto)
+    branch_text = _show(repo, branch_sha, "CHANGELOG.md", args.branch)
+
+    free = next_free(onto_text, branch_text, args.onto, args.branch)
+    payload = {
+        "onto": args.onto,
+        "onto_sha": onto_sha,
+        "branch": args.branch,
+        "branch_sha": branch_sha,
+        "next_free": fmt(free) if free else None,
+    }
+
+    # Asked here as well as inside `_collision`, and only to REPORT it. A fork point that
+    # cannot be read — a shallow clone, unrelated histories, a base with no CHANGELOG at the
+    # merge base — is the one input this check cannot do without: without it, a number this
+    # branch CLAIMED is indistinguishable from one it inherited, and `_collision` deliberately
+    # passes rather than refusing every branch that shares a number with its base. That is the
+    # right call and it is not this command's to revisit. What is this command's is saying so
+    # out loud, because a gate that quietly checked less than it advertises is the failure this
+    # whole file is a reaction to.
+    fork_read = _releases_at_fork(repo, onto_sha, branch_sha) is not None
+    payload["fork_point"] = "read" if fork_read else "unreadable"
+
+    try:
+        _collision(repo, branch_text, args.onto, onto_text, branch=branch_sha,
+                   onto_rev=onto_sha)
+    except StampError as e:
+        remedy = f" The next free number is {fmt(free)}." if free else ""
+        payload |= {"ok": False, "collision": f"{e}{remedy}"}
+        if args.json:
+            print(json.dumps(payload, indent=2))
+        else:
+            print(f"STOP: {payload['collision']}", file=sys.stderr)
+        return 2
+
+    payload |= {"ok": True, "collision": None}
+    if args.json:
+        print(json.dumps(payload, indent=2))
+        return 0
+
+    # stderr, so a caller capturing only stdout still cannot miss it, and prefixed with a
+    # word a shell gate can test for without parsing JSON.
+    if not fork_read:
+        print(
+            f"limited: no merge base with {args.onto} (or no CHANGELOG.md there), so a number "
+            f"{args.branch} CLAIMED cannot be told from one it inherited. Only the "
+            "duplicate-heading checks applied.",
+            file=sys.stderr,
+        )
+    print(
+        f"ok: no release number in {args.branch} that {args.onto} has already taken"
+        + (f" (next free: {fmt(free)})" if free else "")
+    )
+    return 0
 
 
 def cmd_preflight(args: argparse.Namespace) -> int:
@@ -1850,6 +1963,20 @@ def main(argv: list[str] | None = None) -> int:
     ck = sub.add_parser("check", help="fail if an unstamped placeholder is present")
     common(ck)
     ck.set_defaults(func=cmd_check)
+
+    co = sub.add_parser(
+        "collision",
+        help="fail if a REF has stamped a number --onto already carries (fork-relative)",
+    )
+    common(co)
+    co.add_argument("--onto", default="origin/main", help="the ref you are merging into")
+    co.add_argument(
+        "--branch",
+        default="HEAD",
+        help="the ref being judged (default: HEAD). A commit, not a worktree — this is what "
+        "lets a pre-push hook judge what is being PUSHED rather than what is checked out.",
+    )
+    co.set_defaults(func=cmd_collision)
 
     args = p.parse_args(argv)
     try:

@@ -17,6 +17,29 @@ the top of this file conflict every time, over nothing — both entries are righ
 and a fragment is a path no other branch will ever open. `changelog.d/README.md` has the format.
 `vNEXT` means exactly what it meant before; assembly is just what writes it.
 
+## v2.83 — a push that would break the migration graph or the release numbering is refused before it leaves the machine
+
+On 2026-08-22 four branches each minted migration `0029`. Every one of those authors ran `scripts/migration_reconcile.py preflight`, every one got a **truthful** answer, and every one proceeded in good faith — preflight compares a branch against `main` and cannot see an unlanded sibling (#338). It reached CI as *"Multiple head revisions are present"*, took five preflight runs and three renumbers to settle, and poisoned three worktree databases on the way.
+
+A guided runbook would have been followed correctly by all four and changed nothing. The failure was not disobedience, so a procedure cannot fix it. So the harness now ships a `pre-push` hook alongside the `reference-transaction` stash guard, installed by `qb-hooks install` into any repo that consumes `programs.quarterback-harness` — a guard that only protected this repo would protect the one repo that already knows about the problem.
+
+### Two refusals, both read at the pushed commit
+
+Never from the working tree and never from a live database, so a push carrying a broken graph is refused even from a checkout that does not have it.
+
+- **A protected branch that would receive a multi-head migration graph.** Handed to the repo's own `migration_reconcile.py heads --ref`; the refusal names both heads and the `preflight`/`apply` pair that resolves them.
+- **A branch that stamped a release number the base already carries.** The half `tests.yml`'s `stamped` job structurally cannot do — and it is right not to try, because it runs on push-to-main only and an unstamped `## vNEXT` is the *correct* state of every branch in flight. It catches *landed unstamped*; it cannot catch *branch pre-stamped itself*, which is #287, where a branch took v2.60 while it sat and main took v2.60 for something else meanwhile.
+
+### Fork-relative, which is the only reason the second one can be asked at all
+
+The merge base is a third reference point, and it is what separates "this branch claimed the number" from "this branch is merely behind and inherited it". A branch that never touched the CHANGELOG passes, and has to — the merge takes the base's entries cleanly, there being no competing edit. `release_stamp.py` grows a `collision` subcommand for it: `preflight`'s refusal asked of two refs rather than of a worktree, because a hook is judging a commit that need not be checked out anywhere. The refusal names `max(base, head) + 1`, computed by the stamper's own arithmetic rather than re-derived.
+
+### Silent where it does not apply, refusing where it cannot run
+
+No `migrations/versions/` at the pushed commit, no `CHANGELOG.md`, no reconciler or stamper: nothing is printed at all. This installs into repos that are neither quarterback nor lexray, and a hook that greets every push in an unrelated repo with a line about Alembic is a hook that gets uninstalled — after which it protects neither repo. Where a check *does* apply and cannot be run — migrations but no reconciler, no Python — the push is refused by name with the remedy attached, because an unrunnable gate is not a passing gate.
+
+`git push --no-verify` stays the express opt-out for one push. A repo that genuinely does not want a check records it in its own config, and `qb-hooks status` reports it, so a guard that has been switched off cannot look like one quietly passing.
+
 ## v2.82 — nothing could answer "is this host wired up", so each layer's failure showed up as another layer's error
 
 Three independently versioned things have to agree — the board image, the harness on PATH,

@@ -334,13 +334,13 @@ def test_remove_worktree_rescues_qb_stash_entries(repo, home):
 
 
 def test_the_hook_sources_ship_with_an_installed_harness():
-    """`qb-hooks` copies its two scripts out of `harness/githooks`, which is data
+    """`qb-hooks` copies its scripts out of `harness/githooks`, which is data
     rather than a bin entry point. If package.nix stops shipping the directory,
     an installed harness creates worktrees with no stash guard at all — and does
     it quietly, because create-worktree's call is best-effort."""
     nix = (Path(__file__).resolve().parents[1] / "package.nix").read_text()
     assert "githooks" in nix, "package.nix no longer installs harness/githooks"
-    for name in ("reference-transaction", "qb-hook-forward"):
+    for name in ("reference-transaction", "pre-push", "qb-hook-forward"):
         assert (HOOKS / name).exists()
         assert os.access(HOOKS / name, os.X_OK), f"{name} is not executable"
 

@@ -1412,6 +1412,8 @@ full — including what was broken before it, which is the part no diff recovers
 - **v2.81** — two migration guards, adopted while the field is still empty.
 - **v2.82** — nothing could answer "is this host wired up", so each layer's failure showed up as
   another layer's error.
+- **v2.83** — a push that would break the migration graph or the release numbering is refused before
+  it leaves the machine.
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
   roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps
