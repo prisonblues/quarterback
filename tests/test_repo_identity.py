@@ -40,7 +40,7 @@ import pytest
 
 from app.claimkey import BadRef, canonical, canonical_repo, derive
 
-from .conftest import LAPTOP
+from .conftest import LAPTOP, PINNED_SETTINGS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MCP_SERVER = REPO_ROOT / "mcp" / "mcp_server" / "server.py"
@@ -226,7 +226,8 @@ async def test_every_review_read_refuses_a_spelling_that_is_not_a_repo(
     assert r.status_code == 422, f"{path} accepted {repo!r}: {r.text}"
 
 
-@pytest.mark.parametrize("table", ["review_runs", "review_finding_outcomes"])
+@pytest.mark.parametrize("table", ["review_runs", "review_finding_outcomes",
+                                   "dial_settings", "worktrees"])
 async def test_the_database_refuses_a_second_spelling_of_one_repo(client, table):
     """What actually closes the class, rather than fixing the endpoint twice.
 
@@ -248,11 +249,193 @@ async def test_the_database_refuses_a_second_spelling_of_one_repo(client, table)
         "review_finding_outcomes":
             "INSERT INTO review_finding_outcomes (repo, pr, finding_key, outcome, "
             "set_by) VALUES ('Acme/Sneaky', 1, 'F-1', 'fixed', 'zeus/x')",
+        # #350's two, closed the same way and for a sharper reason: a second
+        # spelling in `dial_settings` is a second LIVE ROW under a unique index,
+        # which no read can undo, and one in `worktrees` is a repository two
+        # endpoints then disagree about.
+        "dial_settings":
+            "INSERT INTO dial_settings (repo, dial, value, reason, set_by) VALUES "
+            "('Acme/Sneaky', 'review_panel.max_rounds', '{\"value\": 1}', 'r', 'rich')",
+        "worktrees": "INSERT INTO worktrees (device, path, repo) "
+                     "VALUES ('zeus', '/sneaky', 'Acme/Sneaky')",
     }
     with pytest.raises(IntegrityError) as e:
         async with engine.begin() as conn:
             await conn.execute(text(rows[table]))
     assert "repo_canonical" in str(e.value)
+
+
+# -------------------------------- the same rule, on the dial and worktree tables
+
+#: `POST /dials` is human-gated (see `app.api.dials`), so these need the edge
+#: secret the suite pins rather than a machine token.
+HUMAN = {"Remote-User": "rich", "X-Edge-Auth": PINNED_SETTINGS["HUMAN_EDGE_SECRET"]}
+
+
+async def _set_dial(client, repo, dial, value):
+    return await client.post("/dials", json={
+        "dial": dial, "value": value, "reason": "pinning the rule", "repo": repo},
+        headers=HUMAN)
+
+
+async def test_a_dial_set_with_capitals_is_in_force_for_the_canonical_spelling(client):
+    """#350's sharpest half. `_norm_repo` checked the shape and never lower-cased —
+    the one repo validator on this board that did one without the other — while
+    `harness_rules.detect_github` reads the repo off the origin remote and keeps
+    its capitals. So which value a review ran under depended on how the remote was
+    spelled."""
+    dial = "review_panel.fix_severity_floor"
+    r = await _set_dial(client, "Acme/CaseDial", dial, "P2")
+    assert r.status_code == 200, r.text
+    assert r.json()["dial"]["repo"] == "acme/casedial"
+
+    for asked in ("acme/casedial", "Acme/CaseDial", "ACME/CASEDIAL"):
+        got = await client.get("/dials", params={"repo": asked}, headers=LAPTOP)
+        assert got.status_code == 200, got.text
+        mine = [d for d in got.json()["dials"] if d["dial"] == dial]
+        assert [(d["repo"], d["value"]) for d in mine] == [("acme/casedial", "P2")], \
+            f"{asked!r} could not see the dial it set"
+
+
+async def test_one_dial_cannot_hold_two_live_values_under_two_spellings(client):
+    """The consequence a read-side fold could never have reached.
+    `ix_dial_settings_live` is UNIQUE over `COALESCE(repo,'')` and `dial` where
+    `cleared_at IS NULL`, so two spellings were two rows in the index: two answers
+    to a settings question that has one, and a resolver seeing whichever the
+    planner returned. Setting it the second way now REPLACES the first, which is
+    what the endpoint has always promised."""
+    dial = "review_panel.max_rounds"
+    assert (await _set_dial(client, "Acme/TwiceDial", dial, 1)).status_code == 200
+    second = await _set_dial(client, "acme/twicedial", dial, 2)
+    assert second.status_code == 200, second.text
+    assert [d["value"] for d in second.json()["replaced"]] == [1], second.text
+
+    live = (await client.get("/dials", params={"repo": "acme/twicedial"},
+                             headers=LAPTOP)).json()["dials"]
+    assert [(d["repo"], d["value"]) for d in live if d["dial"] == dial] == \
+        [("acme/twicedial", 2)]
+
+
+@pytest.mark.parametrize("repo", NOT_A_REPO)
+async def test_every_dial_surface_refuses_a_spelling_that_is_not_a_repo(client, repo):
+    """All three surfaces, because a dial that can be written under a spelling the
+    reads refuse is a setting nobody can turn off again."""
+    listed = await client.get("/dials", params={"repo": repo}, headers=LAPTOP)
+    assert listed.status_code == 422, f"GET accepted {repo!r}: {listed.text}"
+    written = await _set_dial(client, repo, "review_panel.max_rounds", 1)
+    assert written.status_code == 422, f"POST accepted {repo!r}: {written.text}"
+    cleared = await client.post("/dials/clear", json={
+        "dial": "review_panel.max_rounds", "repo": repo}, headers=HUMAN)
+    assert cleared.status_code == 422, f"clear accepted {repo!r}: {cleared.text}"
+
+
+async def _register(client, device, repo, path="/src/wt"):
+    return await client.put("/worktrees", json={
+        "device": device,
+        "worktrees": [{"path": path, "repo": repo, "branch": "main",
+                       "head": "0" * 40, "commits": []}]}, headers=LAPTOP)
+
+
+async def test_a_worktree_registered_with_capitals_is_found_by_either_spelling(client):
+    """`worktrees.repo` is the origin slug and `GET /worktrees?repo=` compared it
+    with `==`, so a device whose remote is spelled `PrisonBlues/Quarterback`
+    registered a repository the board held apart from the same one registered in
+    lower case — and each spelling's query answered about half the fleet."""
+    assert (await _register(client, "wt-caps", "Acme/CaseTree",
+                            "/src/caps")).status_code == 200
+    for asked in ("acme/casetree", "Acme/CaseTree", "ACME/CASETREE"):
+        got = await client.get("/worktrees", params={"repo": asked}, headers=LAPTOP)
+        assert got.status_code == 200, got.text
+        assert [(w["device"], w["repo"]) for w in got.json()] == \
+            [("wt-caps", "acme/casetree")], f"{asked!r} saw a different fleet"
+
+
+async def test_the_worktree_and_sync_endpoints_agree_about_one_repo(client):
+    """The disagreement #350 names. `/sync` folds this column through
+    `app.sync.repo_key` (basename, lower-cased) while `/worktrees` compared it
+    exactly — and the only caller of the `?repo=` filter in the tree, the board
+    TUI's cherry-pick discovery, has the bare name off a POST's `repo` ref and
+    nothing else. It was answered `[]`, which renders as "no registered checkout
+    of quarterback on zeus": the false-clean this class is about."""
+    assert (await _register(client, "wt-agree", "PrisonBlues/AgreeTree",
+                            "/src/agree")).status_code == 200
+
+    bare = await client.get("/worktrees", params={"repo": "AgreeTree"}, headers=LAPTOP)
+    assert bare.status_code == 200, bare.text
+    assert [w["path"] for w in bare.json()] == ["/src/agree"], \
+        "the bare name the board's own posts carry still finds nothing"
+
+    synced = await client.get("/sync", params={"repo": "agreetree"}, headers=LAPTOP)
+    assert synced.status_code == 200, synced.text
+    assert [w["path"] for w in synced.json()["worktrees"]] == ["/src/agree"]
+
+
+#: Everything `REPO_RE` refuses that is not simply the ambiguous bare name. A bare
+#: name IS accepted by `GET /worktrees?repo=` and by nothing else on the board —
+#: see the endpoint's module docstring for why that widening is a read and not a
+#: second namespace.
+NOT_A_REPO_NOR_A_NAME = [r for r in NOT_A_REPO if "/" in r]
+
+
+@pytest.mark.parametrize("repo", NOT_A_REPO_NOR_A_NAME)
+async def test_a_worktree_read_refuses_a_spelling_that_is_neither(client, repo):
+    """A clone URL or a path answered with `[]` reads as "nothing is registered"
+    when it means "I could not tell what you asked about"."""
+    r = await client.get("/worktrees", params={"repo": repo}, headers=LAPTOP)
+    assert r.status_code == 422, f"accepted {repo!r}: {r.text}"
+
+
+#: Spellings that have a bare name INSIDE them, and are not one. `repo_key` is
+#: total and answers `passwd` for `/etc/passwd` and `c` for `a/b/c`, so a widening
+#: that checked its output rather than the caller's whole string would turn every
+#: path and clone URL into a match on whatever it ends with.
+NOT_A_NAME_EITHER = ["/quarterback", "quarterback/", "quarterback.git",
+                     "quarter back", ".quarterback", "a/b/c", "/etc/passwd"]
+
+
+@pytest.mark.parametrize("repo", NOT_A_NAME_EITHER)
+async def test_the_bare_name_widening_is_a_name_and_not_a_basename(client, repo):
+    """The widening is `REPO_NAME_RE` — the repository half of `REPO_RE` itself —
+    applied to the whole string, so it admits exactly the spelling a board post
+    carries and nothing that merely ends with one."""
+    r = await client.get("/worktrees", params={"repo": repo}, headers=LAPTOP)
+    assert r.status_code == 422, f"accepted {repo!r}: {r.text}"
+
+
+@pytest.mark.parametrize("repo", NOT_A_REPO)
+async def test_a_worktree_cannot_be_REGISTERED_under_any_of_them(client, repo):
+    """The write is strict where the read is not, and that asymmetry is the whole
+    design: the column stays `owner/name` because only `canonical_repo` can write
+    it, which is what lets the read compare it rather than fold it."""
+    r = await _register(client, "wt-refused", repo, "/src/refused")
+    assert r.status_code == 422, f"accepted {repo!r}: {r.text}"
+
+
+async def test_a_checkout_with_no_github_remote_still_registers(client):
+    """`repo_slug` returns None where the origin is not a GitHub-style remote, and
+    that is a fact about the checkout rather than a bad spelling. It must not be
+    caught by the refusal above — the row is what makes the commit findable by
+    SHA, which is the index's main job."""
+    r = await client.put("/worktrees", json={
+        "device": "wt-remoteless",
+        "worktrees": [{"path": "/src/local", "repo": None, "branch": "main",
+                       "head": "0" * 40, "commits": []}]}, headers=LAPTOP)
+    assert r.status_code == 200, r.text
+    listed = await client.get("/worktrees", params={"device": "wt-remoteless"},
+                              headers=LAPTOP)
+    assert [w["repo"] for w in listed.json()] == [None]
+
+
+async def test_a_refused_snapshot_does_not_destroy_the_one_it_would_replace(client):
+    """`PUT /worktrees` is a full replace, so the refusal has to happen before the
+    DELETE — a 422 that had already emptied the device's registry would make a bad
+    spelling cost the fleet its cross-worktree discovery until the next report."""
+    assert (await _register(client, "wt-keep", "acme/keeptree",
+                            "/src/keep")).status_code == 200
+    assert (await _register(client, "wt-keep", "quarterback",
+                            "/src/keep")).status_code == 422
+    still = await client.get("/worktrees", params={"device": "wt-keep"}, headers=LAPTOP)
+    assert [w["path"] for w in still.json()] == ["/src/keep"]
 
 
 # ------------------------------------------------- the half that lives in mcp/

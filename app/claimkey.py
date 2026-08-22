@@ -111,9 +111,20 @@ PR_SIGIL = "!"
 #: in ``.git`` either, so the only thing that spelling can be is a clone URL's
 #: suffix — and stripping it would be the first step back onto the parser this
 #: replaces.
-REPO_RE = re.compile(
-    r"\A[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9][A-Za-z0-9._-]{0,99}\Z(?<!\.git)"
-)
+#: The owner half and the repository half, named so the second can be matched on
+#: its own without a second copy of it. ``GET /worktrees?repo=`` needs that: it is
+#: the one read on this board that also accepts a **bare** name — the board's own
+#: posts carry no other spelling — and "bare name" has to mean the same thing there
+#: as the half of a repo it is, or the widening becomes its own little parser.
+_OWNER = r"[A-Za-z0-9][A-Za-z0-9-]{0,38}"
+_NAME = r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}"
+
+REPO_RE = re.compile(rf"\A{_OWNER}/{_NAME}\Z(?<!\.git)")
+
+#: The repository half alone. NOT a repo — a bare name is refused everywhere a
+#: repo is asked for, for the reason above. This exists so the one place that
+#: takes a bare name can check it against the same rule rather than a fresh one.
+REPO_NAME_RE = re.compile(rf"\A{_NAME}\Z(?<!\.git)")
 
 #: The message a refusal carries. Named once so every endpoint, query parameter
 #: and migration says the same thing to whoever hits it.

@@ -85,6 +85,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.claims import is_unique_violation
 from app.auth import human, reader
+from app.claimkey import BadRef, canonical_repo
 from app.db import get_session
 from app.models.dial import MAX_DIAL, MAX_REASON, DialSetting
 
@@ -96,9 +97,6 @@ router = APIRouter(tags=["dials"])
 #: both pass and ``"; drop table"`` does not. What the segments MEAN is the
 #: client's business — see the module docstring.
 _DIAL_RE = re.compile(r"^[A-Za-z_][\w-]*(\.[A-Za-z_][\w-]*)*$")
-
-#: ``owner/name``, GitHub's own shape. Fleet scope is the empty/absent repo.
-_REPO_RE = re.compile(r"^[\w.-]+/[\w.-]+$")
 
 #: The largest a stored value may serialise to. A dial is a knob, not a document:
 #: 8 KiB is room for a list of title patterns and nowhere near room for somebody
@@ -118,21 +116,40 @@ def _aware(ts: datetime | None) -> datetime | None:
 
 
 def _norm_repo(repo: str | None) -> str | None:
-    """``None`` for the fleet scope, a validated ``owner/name`` otherwise.
+    """``None`` for the fleet scope, a canonical ``owner/name`` otherwise.
 
     Blank and absent are the SAME scope on purpose. A query string cannot express
     "absent" reliably — ``?repo=`` arrives as the empty string — and a fleet dial
     that could be written under two different keys is a fleet dial that can be set
     twice and resolved once.
+
+    **The case is folded, and that argument is the same one one line down** (#350).
+    This used to check the shape with a regex of its own and stop there — the only
+    validator on the board that checked a repo's shape without folding its case —
+    while ``merge_queue`` cites the hazard for its own column three files away.
+    GitHub treats owner and repository names case-insensitively and preserves what
+    you typed, so ``Acme/X`` and ``acme/x`` are one repository, and
+    ``ix_dial_settings_live`` is UNIQUE over ``COALESCE(repo,'')`` and ``dial``:
+    two spellings could each hold a **live row for the same dial**, which is two
+    answers to a settings question that has one. ``harness_rules.detect_github``
+    reads the repo off the origin remote and preserves its capitals, so which of
+    the two a resolution saw depended on how the remote was spelled.
+
+    :func:`app.claimkey.canonical_repo` is the fold, and it brings the board's one
+    shape rule with it: the local regex admitted ``a_b/c.git`` and a bare
+    ``quarterback`` was already refused, so what changes for a caller is that the
+    refusal is now the board's own :data:`app.claimkey.REPO_SHAPE` message, and
+    dial scopes are spelled the way claim keys, plan scopes and review rows are.
     """
     r = (repo or "").strip()
     if not r:
         return None
-    if not _REPO_RE.match(r):
+    try:
+        return canonical_repo(r)
+    except BadRef as e:
         raise HTTPException(422, detail={
-            "error": "repo must be owner/name", "repo": r,
-            "hint": "omit it entirely for a dial that applies to every repo"})
-    return r
+            "error": str(e), "repo": r,
+            "hint": "omit it entirely for a dial that applies to every repo"}) from e
 
 
 def _live(rows: list[DialSetting], now: datetime) -> list[DialSetting]:

@@ -79,7 +79,10 @@ class DialSetting(Base):
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()"))
 
-    #: ``owner/name``, or NULL for every repo on the fleet.
+    #: ``owner/name`` lower-cased, or NULL for every repo on the fleet. Folded on
+    #: the write through :func:`app.claimkey.canonical_repo` and held there by
+    #: ``ck_dial_settings_repo_canonical`` — see that constraint for why the
+    #: unique index below needs it (#350).
     repo: Mapped[str | None] = mapped_column(Text(), nullable=True)
 
     #: The dotted path into the harness rules tree. Opaque here — see the class
@@ -121,6 +124,25 @@ class DialSetting(Base):
         CheckConstraint("length(btrim(reason)) > 0", name="ck_dial_settings_reason"),
         CheckConstraint("repo IS NULL OR length(btrim(repo)) > 0",
                         name="ck_dial_settings_repo"),
+        # One repository, one stored spelling (#350, migration 0034). `POST
+        # /dials` folds through `canonical_repo` now, and this is what makes the
+        # unique index above mean what it says: without it `Acme/X` and `acme/x`
+        # are two rows in the index and two live values for one dial, and a
+        # resolution answers with whichever spelling the reader's origin remote
+        # happened to carry.
+        #
+        # Case and surrounding whitespace only, NOT `owner/name` shape — the
+        # shape is refused at ingest where a caller can be told why, and a
+        # constraint that also asserted it would make 0034 abort on any legacy
+        # row instead of making it canonical. `btrim` is given its character
+        # class because the one-argument form trims ordinary spaces and nothing
+        # else, while `canonical_repo`'s `str.strip()` takes the lot; vertical
+        # tab is `\013` and never `\v`, because Postgres has no `\v` escape and
+        # the class would gain the LETTER `v` — `btrim('vercel/next', …)` is
+        # `'ercel/next'`, and this constraint would refuse a repository for being
+        # named after its owner.
+        CheckConstraint(r"repo IS NULL OR repo = lower(btrim(repo, E' \t\n\r\f\013'))",
+                        name="ck_dial_settings_repo_canonical"),
         # COALESCE, not the bare column: a UNIQUE index treats two NULLs as
         # distinct, so the fleet scope — the one #276's throttle writes to —
         # would have been the one scope that could hold two contradictory live
